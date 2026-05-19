@@ -1,0 +1,25 @@
+# RLX/burnembed HF revision lockfile (plan #62).
+#
+# Mirrors MAX's max/tests/integration/hf-repo-lock.tsv pattern. Every
+# HF model used in burnembed benches and rlx-models tests should be
+# resolved to a specific commit SHA so an upstream publisher's
+# silent edit can't break our tests.
+#
+# Format (tab-separated):
+#   <repo_id>\t<revision_sha_or_main>\t<resolved_date_iso8601>\t<note>
+#
+# `revision_sha_or_main` may be the literal string `main` if the
+# revision hasn't been resolved yet — in which case the bench
+# fetches whatever HEAD is. Run scripts/refresh-hf-lock.sh (planned
+# follow-on) to populate real SHAs.
+#
+# Bench / test code reads this with read_lock(repo_id) → revision
+# and passes it to hf_hub::api::sync::Api::repo(Repo::with_revision(...)).
+# The wrapper lives in rlx-models or burnembed (TBD).
+
+sentence-transformers/all-MiniLM-L6-v2	main	2026-04-28	burnembed minilm6 bench
+sentence-transformers/all-MiniLM-L12-v2	main	2026-04-28	burnembed minilm12 bench
+BAAI/bge-small-en-v1.5	main	2026-04-28	burnembed bge-small bench
+BAAI/bge-base-en-v1.5	main	2026-04-28	burnembed bge-base bench
+BAAI/bge-small-zh-v1.5	main	2026-04-28	burnembed bge-zh bench
+nomic-ai/nomic-embed-text-v1.5	main	2026-04-28	burnembed nomic bench

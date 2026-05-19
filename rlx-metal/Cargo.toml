@@ -1,0 +1,42 @@
+[package]
+name = "rlx-metal"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Metal backend for RLX — Apple Silicon GPU via Metal Performance Shaders + custom MSL kernels"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+# rlx-cpu is pulled in solely for its FFT host-fallback kernels
+# (`execute_fft1d_f32` / `execute_fft1d_f64`) — Apple Silicon's
+# unified memory lets us run them against the Metal arena pointer
+# with no copies. A native Metal FFT kernel will replace this when a
+# real workload justifies the .metal kernel work.
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.0" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.30"
+foreign-types = "0.5"
+objc = "0.2"
+core-graphics-types = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+half = "2"
+
+[lints]
+workspace = true
+
+# Apple-Silicon-only crate; render docs against the macOS targets so
+# the platform-conditional dependencies and types resolve.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets        = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+rustdoc-args   = ["--cfg", "docsrs"]

@@ -1,0 +1,41 @@
+# TOML-driven sgemm bench (plan #13).
+#
+# Each `[[shape]]` row produces one criterion timing in the
+# group named by `kernel`. Add or comment out rows without
+# touching the bench driver.
+#
+# Run via:
+#   cargo bench -p rlx-cpu --bench tuned -- sgemm
+# or `just micro tuned`.
+
+kernel = "sgemm"
+
+[[shape]]
+label = "tiny_64"
+m = 64
+k = 64
+n = 64
+
+[[shape]]
+label = "bert_ffn_up_b16"
+m = 256
+k = 768
+n = 3072
+
+[[shape]]
+label = "bge_attn_qkv"
+m = 512
+k = 768
+n = 2304
+
+[[shape]]
+label = "minilm_attn_qkv"
+m = 480
+k = 384
+n = 1152
+
+[[shape]]
+label = "tiny_strided_64"
+m = 8
+k = 512
+n = 512

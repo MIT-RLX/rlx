@@ -1,0 +1,78 @@
+[package]
+name = "rlx-rocm"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "AMD ROCm/HIP backend — same .cu kernel sources as rlx-cuda, dispatched via HIP. Mac-iterable scaffold; real HIP runtime bindings are follow-up work."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# Not on crates.io (vendor-bundled): src/kernels/sources.rs uses
+# `include_str!("../../../rlx-cuda/src/kernels/*.cu")` to share kernel
+# sources with rlx-cuda. Those workspace-relative paths aren't in the
+# published `.crate` tarball. Distributed via the workspace git tree
+# only — depend on it via `git = "https://github.com/MIT-RLX/rlx"`.
+# When the kernel sources are copied into rlx-rocm/src/kernels/ (or
+# rlx-cuda's are exposed via a re-export), flip this back.
+publish = false
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+
+# libloading dlopens libamdhip64 / libhiprtc at runtime so the crate
+# compiles + tests cleanly on hosts that don't have HIP installed
+# (Mac, headless CI). Same trick cudarc's `dynamic-loading` feature
+# uses for libcuda — minus the panic-on-missing-driver behaviour,
+# which we replace with a clean Option<HipRuntime>.
+libloading = "0.8"
+
+# HIP runtime + hipRTC bindings will land here. The current scaffold
+# compiles on any host (including Mac, where libamdhip64 doesn't exist
+# at all) by stubbing `is_available()` to false. When we wire real
+# dispatch, options are:
+#
+#   * `hip-sys` (raw bindings, well-maintained — good first choice)
+#   * `rocm-rs` (broader ecosystem; check status before adopting)
+#   * Hand-written `bindgen` shim against `hip_runtime_api.h`
+#
+# Higher-level libraries to wire in later (mirror rlx-cuda's tier
+# ladder): rocBLAS / hipBLAS (cuBLAS equivalent), hipBLASLt (cuBLASLt),
+# MIOpen (cuDNN). Each ships `.so` libs that get dlopen'd via the
+# same panic-catching probe pattern as rlx-cuda's libcuda load.
+
+[lib]
+path = "src/lib.rs"
+
+# ── Dev-only validation features ────────────────────────────────
+#
+# `hip-cpu-validate` compiles the same `.cu` kernel sources via HIP-CPU
+# headers and runs them on CPU threads — exactly mirroring rlx-cuda's
+# `hip-cpu-validate` feature. Off by default. Never enabled in workspace
+# `cargo build` / production builds. Only useful for
+# `cargo test --features hip-cpu-validate` on Mac (or any other host
+# without an AMD driver) to validate the kernel logic without paying
+# for cloud-GPU time.
+#
+# The .cu kernel sources are shared with rlx-cuda (pulled in via
+# relative `include_str!`), so this harness reuses rlx-cuda's
+# `cpp/cpu_dispatch.cpp` wrapper layer (single-line proxy `#include`)
+# and the same HIP-CPU submodule at `rlx-cuda/vendor/HIP-CPU`.
+[features]
+default = []
+hip-cpu-validate = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[dev-dependencies]
+# (none — hip_cpu_validate.rs links against the static lib produced
+# by build.rs and uses only std for assertions.)
+
+[lints]
+workspace = true

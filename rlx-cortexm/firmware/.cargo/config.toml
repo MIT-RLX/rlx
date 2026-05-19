@@ -1,0 +1,11 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+# `cargo run --release` flashes via probe-rs when a debug probe is
+# attached. For the bootloader / DFU path, use `just flash` (which
+# auto-detects probe vs DFU and falls back accordingly).
+runner = "probe-rs run --chip nRF52840_xxAA"
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+]

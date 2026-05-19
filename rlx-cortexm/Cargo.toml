@@ -1,0 +1,39 @@
+[package]
+name = "rlx-cortexm"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Cortex-M backend for RLX — INT8 kernels for ARMv7E-M microcontrollers (e.g. nRF52840)"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# Library is no_std by default. The `std` feature pulls in fp32
+# reference kernels used by tests and host-side validation; firmware
+# builds simply omit it.
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+# Intentionally none — kernels are pure scalar arithmetic on i8 / i32.
+# When we add ARMv7E-M DSP intrinsics we'll gate them behind a target
+# check, not a dependency.
+
+[dev-dependencies]
+# Tests only need the std feature for the fp32 reference.
+
+[lints]
+workspace = true
+
+# Render docs against the host target with the `std` feature on (the
+# default) so the parity-test fp32 reference kernels appear in the
+# rendered API. The actual firmware target (thumbv7em-none-eabihf)
+# requires xargo / build-std and isn't available on docs.rs.
+[package.metadata.docs.rs]
+features     = ["std"]
+rustdoc-args = ["--cfg", "docsrs"]

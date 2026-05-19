@@ -1,0 +1,144 @@
+# rlx-cortexm — one-stop developer commands.
+#
+# Run `just --list` to see everything. Cross-platform: macOS, Linux,
+# Windows (where `just` is available). Defers to Python for
+# OS-specific bits (port detection, flash workflow).
+
+# Default recipe: print the recipe list.
+default:
+    @just --list
+
+# ── Setup ─────────────────────────────────────────────────────────
+
+# Install every prerequisite (rustup target, llvm-tools, nrfutil, pyserial).
+# Idempotent — safe to re-run.
+setup:
+    python3 tools/setup.py
+
+# Also install probe-rs-tools (for SWD flashing). Slow first time.
+setup-full:
+    python3 tools/setup.py --probe-rs
+
+# ── Train / build ─────────────────────────────────────────────────
+
+# Train MNIST and re-export INT8 weights + 500-image validation blob.
+# Native-Rust trainer: builds the same TinyConv graph as the Python
+# script, autodiffs through rlx-opt, runs SGD on rlx-cpu. ~50s for the
+# default 2 epochs on Apple Silicon. Reads MNIST IDX files from the
+# torchvision cache (run `just train-pytorch` once if it isn't there).
+# `cd ..` so the trainer's relative --out path resolves at the
+# workspace root.
+#
+# `bits` selects weight precision: 8 (default), 4 (nibble-packed,
+# ~50% smaller flash, ~0.4 pp accuracy cost), 2 (ternary, brutal
+# accuracy cost without QAT — see README).
+train epochs="2" bits="8":
+    cd .. && cargo run -p rlx-cortexm-trainer --release -- \
+        --epochs {{epochs}} \
+        --weight-bits {{bits}} \
+        --out rlx-cortexm/src/model_weights.rs
+
+# Legacy PyTorch trainer — kept for reference and to populate the
+# torchvision MNIST cache the Rust trainer reads from.
+train-pytorch epochs="2":
+    python3 tools/train_mnist.py --epochs {{epochs}}
+
+# Train both backends, then bench: parallel-run the rlx-cpu and PyTorch
+# trainers, compare quantized weights / scales / INT8 accuracy, and
+# report cross-trainer prediction agreement on the embedded test set.
+# Used as the integration test when changing the trainer or the
+# rlx-cpu autodiff / quantization paths.
+compare epochs="2":
+    cd .. && cargo run -p rlx-cortexm-trainer --release -- \
+        --epochs {{epochs}} \
+        --out /tmp/rlx_compare/src/model_weights.rs
+    python3 tools/train_mnist.py --epochs {{epochs}} \
+        --out /tmp/torch_compare/src/model_weights.rs
+    python3 tools/compare_weights.py \
+        /tmp/rlx_compare/src/model_weights.rs \
+        /tmp/torch_compare/src/model_weights.rs \
+        --label-a rlx --label-b torch \
+        --test-set /tmp/rlx_compare/tests/data/test_set.bin
+
+# Same as `compare`, but assumes both trainers have already run.
+# Just runs the python diff over existing artifacts. Handy when
+# iterating on the comparison script itself.
+compare-only:
+    python3 tools/compare_weights.py \
+        /tmp/rlx_compare/src/model_weights.rs \
+        /tmp/torch_compare/src/model_weights.rs \
+        --label-a rlx --label-b torch \
+        --test-set /tmp/rlx_compare/tests/data/test_set.bin
+
+# Full three-way bench: trains with rlx-cpu, runs the host Rust
+# kernels via `mnist_validate.rs`, and (if a flashed dongle is
+# attached at 0x16c0:0x27dd) sweeps the same 500 images on real M4F
+# silicon via `mnist_client.py`. All three should print identical
+# 483/500 = 0.9660. Numbers documented in README.md.
+bench n="500" bits="8":
+    cd .. && cargo run -p rlx-cortexm-trainer --release -- \
+        --epochs 2 \
+        --weight-bits {{bits}} \
+        --val-set {{n}} \
+        --out rlx-cortexm/src/model_weights.rs
+    cd .. && cargo test -p rlx-cortexm --release \
+        int8_accuracy_close_to_fp32 -- --nocapture
+    @echo "── on-device sweep (will skip if no dongle at 0x16c0:0x27dd) ──"
+    @python3 -c "from serial.tools import list_ports; \
+        d=[p.device for p in list_ports.comports() if (p.vid,p.pid)==(0x16c0,0x27dd)]; \
+        import sys; print(d[0] if d else '(no dongle attached — flash first via just flash)'); \
+        sys.exit(0 if d else 1)" \
+        && python3 tools/mnist_client.py --n {{n}} \
+        || echo "(skipped — flash and re-run \`just bench\` to capture on-device numbers)"
+
+# Bit-width sweep: trains the network three times (i8 / i4 / i2),
+# captures host validation accuracy + blob size for each, and prints a
+# table. Doesn't flash the dongle — re-run `just bench BITS=N` then
+# `just flash` to lock in a particular precision on hardware.
+bench-bits n="500":
+    @for B in 8 4 2; do \
+        echo "── weight_bits=$B ────────────────────────────────"; \
+        cd .. && cargo run -p rlx-cortexm-trainer --release -- \
+            --epochs 2 --weight-bits $B --val-set {{n}} \
+            --out rlx-cortexm/src/model_weights.rs 2>&1 | grep -E "wrote|calibration"; \
+        cd .. && cargo test -p rlx-cortexm --release \
+            int8_accuracy_close_to_fp32 -- --nocapture 2>&1 | grep INT8 || true; \
+    done
+
+# Build firmware for the dongle (release).
+build-fw:
+    cd firmware && cargo build --release
+
+# Print firmware size.
+size: build-fw
+    python3 firmware/scripts/size.py
+
+# ── Test ──────────────────────────────────────────────────────────
+
+# Host-side tests: parity, single-image e2e, 500-image bulk validation.
+test:
+    cargo test -p rlx-cortexm
+
+# ── Flash + run ───────────────────────────────────────────────────
+
+# Flash the dongle (auto-picks SWD via probe-rs or DFU via nrfutil).
+flash:
+    python3 firmware/scripts/flash.py
+
+# Force DFU. Make sure the dongle is in bootloader mode (red LED pulsing).
+flash-dfu:
+    python3 firmware/scripts/flash.py --dfu
+
+# Force SWD via probe-rs.
+flash-swd:
+    python3 firmware/scripts/flash.py --swd
+
+# Send N test images to the flashed dongle and print accuracy.
+client n="50":
+    python3 tools/mnist_client.py --n {{n}}
+
+# Full end-to-end: train, build, flash, exercise.
+demo n="50":
+    just train
+    just flash
+    just client {{n}}

@@ -1,0 +1,176 @@
+# RLX
+
+A small ML compiler and runtime for transformer inference. Started
+Apple-Silicon-first; now spans CPU, six GPU/accel backends, an MCU
+backend, and an FPGA backend through a shared IR. Cargo workspace;
+layered crates.
+
+## Layout
+
+### Core (no backend dependencies)
+- `rlx-ir` — leaf crate. Tensor IR (`Op`, `Shape`, `DType`), graph
+  builder, shape inference, verifier, and general-purpose primitives:
+  `Tick` (cycle counter), `CacheBuster` (bench infra), `QuantScheme` /
+  `QuantMap` (quantization metadata), `DType::promote` (promotion
+  table), `MaskKind { None, Causal, SlidingWindow(w), Custom }`.
+- `rlx-opt` — graph rewrites: fusion, precision, memory plan,
+  view-aliasing, DCE, const fold. `is_pure_view` predicate identifies
+  Reshape / same-dtype Cast / axis-0 Narrow as buffer aliases.
+  `run_passes` verifies between every pass in debug builds.
+- `rlx-driver` — device handles, arenas, buffers, command streams.
+  Owns the unified `Device` enum (11 variants); backends import it.
+
+### Backends
+- `rlx-cpu` — CPU. SIMD kernels (NEON), Accelerate / MKL / OpenBLAS
+  dispatch, persistent thread pool. Two execution paths in
+  `thunk.rs`: closure-based (older, ~750 lines) and direct (hot, with
+  the strided Narrow×3→Attention fusion at the end).
+- `rlx-metal` — Apple GPU native. MSL kernels, MPS BLAS, MPSGraph
+  lowering, ICB-batched dispatch. Mirrors the CPU's Narrow→Rope
+  fusion via stride-aware MSL kernels.
+- `rlx-mlx` — Apple MLX. Hand-rolled C++ shim driving MLX's lazy
+  graph + eager modes. Submodule at `vendor/mlx`.
+- `rlx-wgpu` — cross-platform GPU via wgpu (Metal/Vulkan/DX12/WebGPU).
+  Single-pass online-softmax attention (FlashAttention-v1 style).
+- `rlx-cuda` — NVIDIA via `cudarc`. cuBLAS + NVRTC kernels. 5-tier
+  matmul dispatch (mixed-precision GemmEx → cublasLt fused → cuBLAS
+  + epilogue → WMMA → scalar register-tile). cuDNN v7 conv1d/2d/3d.
+  `hip-cpu-validate` feature runs the kernels on host via HIP-CPU.
+- `rlx-rocm` — AMD ROCm/HIP. Same `.cu` sources as rlx-cuda,
+  dispatched via HIP. Library tiers: hipBLAS / hipBLASLt / MIOpen.
+  Real-hardware validation gated on first MI300X / RX 7900 XTX run.
+- `rlx-tpu` — Google TPU via libtpu's PJRT plugin (no Python). HLO
+  emission from the IR; XLA CPU plugin used for local bench.
+- `rlx-cortexm` — ARMv7E-M (Cortex-M4/M7) INT8 kernels (nRF52840
+  etc). Companion `rlx-cortexm/trainer` is a native fp32 trainer
+  that emits the INT8 `model_weights.rs`.
+- `rlx-fpga` — per-graph datapath synthesis. IR → Verilog →
+  bitstream, integer-only Q0.31 requant.
+
+### Model loading + macros + runtime
+- `rlx-models` — config parsing, safetensors loading, graph builders
+  for BERT, NomicBERT, vision. Used by burnembed.
+- `rlx-gguf` — GGUF v1/v2/v3 parser + dequant. Standalone, no rlx-*
+  deps.
+- `rlx-macros` — proc macros. `#[rlx_model]` AOT compilation.
+- `rlx-runtime` — user-facing API. `Session::new(Device).compile(graph)`
+  → `CompiledGraph`. Re-exports `Tick`, `CacheBuster`, `ktrace!`,
+  `nan_check::scan`. Backend selection is feature-gated (see below).
+
+### Umbrella + downstream + tooling
+- `rlx` — prelude crate. Re-exports IR + optimizer + runtime + the
+  downstream packages behind feature gates. The `cargo add rlx`
+  entry point.
+- `rlx-sparse` — sparse linalg (CSR LU, mat-vec, CG). Downstream
+  package; registers against the custom-op scaffold.
+- `rlx-linalg` — dense linalg (eigh / svd / qr / cholesky /
+  solve_triangular) via LAPACK. Same downstream pattern.
+- `rlx-bench` — uniform benchmark harness. `BenchmarkPattern` trait
+  + per-backend timing; thermal-throttle gate; cycle-counter timing.
+- `pyrlx` — PyO3 + maturin Python bindings. Run any RLX backend
+  from Python.
+
+## Where to read first
+
+- `PLAN.md` — improvements lifted from MAX
+  (`/Users/Shared/modular`), ranked by leverage. The `## Landed`
+  section at the bottom records what's already in tree, with bench
+  deltas where measurable.
+- `Justfile` — dev recipes. `just --list` shows everything; key
+  ones: `build`, `build-all`, `test`, `lint`, `fmt`, `bench MODEL`,
+  `micro NAME`, `throttle`, `ci`.
+
+## Bench harness
+
+Two layers:
+
+1. **`rlx-bench`** — in-tree pattern × backend matrix. Thin
+   `BenchmarkPattern` trait, `run_benchmark(pattern, device, ...)`
+   returns `BenchResult` (mean / median / p99 in ns). See
+   `rlx-bench/examples/bench_all.rs`.
+
+2. **`/Users/Shared/burnembed`** — integration testbed against real
+   embedding models. Primary command:
+
+   ```
+   cargo run --release --example bench_rlx_single \
+     --features "ndarray,blas-accelerate,rlx,hf-download" \
+     -- --model {minilm6 | minilm12 | bge-small | bge-base | bge-zh | nomic}
+   ```
+
+   Cross-backend harness: `bench_rlx_device.rs` — model × device ×
+   policy. On async backends call `forward()`, not `forward_slots()`.
+
+Always run `scripts/check-throttle.sh` first (or `just throttle`) —
+it refuses (exit 1) on thermal pressure detected via `pmset -g therm`.
+`--warn` mode for CI. `RLX_ALLOW_THROTTLE=1` env to bypass for one-off
+runs.
+
+## Useful env vars
+
+- `RLX_VERBOSE=1` — fusion log lines + hardware detection summary.
+- `RLX_FUSE_ATTN_THRESHOLD=N` — change the batch*seq cutoff for
+  `FusedAttnBlock` (default 64).
+- `RLX_ALLOW_THROTTLE=1` — bypass `check-throttle.sh` exit 1.
+- `RLX_ARENA_ALIGN=N` — buffer alignment.
+- `RLX_CUDA_LOG_FALLBACK=1` — log *why* a CUDA dispatch tier was
+  skipped (silent fall-through paths become visible).
+
+## Cargo features (rlx-runtime)
+
+Default: `cpu`. Backends are mutually compatible — turn on what you
+need and `Device::*` selects at runtime.
+
+- `cpu` — CPU executor + SIMD kernels.
+- `blas-accelerate` / `blas-mkl` / `blas-openblas` — BLAS provider
+  (each implies `cpu`).
+- `metal` — Apple GPU native via MPSGraph + MSL kernels.
+- `mlx` — Apple MLX backend.
+- `gpu` — wgpu (cross-platform; Metal/Vulkan/DX12/WebGPU).
+- `cuda` / `rocm` / `tpu` — discrete-accelerator backends.
+- `ane` — Apple Neural Engine (CoreML/ANE).
+- `kernel-trace` — emit `[ktrace:<kind>]` lines via `ktrace!` macro.
+  Compile-time gated; off pays zero overhead.
+- `nan-check` — make `nan_check::scan` actually walk slices instead
+  of returning `Ok(())`.
+
+## Common patterns to know
+
+- **Adding a new op**: rlx-ir/op.rs (enum), infer.rs (shape),
+  graph.rs (builder), verify.rs (invariants), each backend's
+  `compile_thunks` lowering, fusion patterns, cost model.
+- **View vs copy**: `rlx_opt::is_pure_view` returns true for
+  Reshape / same-dtype Cast / axis-0 Narrow; the planner aliases
+  them to root buffer + offset, backends emit `Nop` for them.
+- **Fusion ordering** in `compile_thunks`: graph-level passes →
+  per-op lowering → FusedAttnBlock → FusedNomicLayer → strided
+  Narrow×3→Attention → Narrow→Rope. Each one operates on the
+  output of the previous.
+- **Mask synthesis**: `Op::Attention` carries a `MaskKind`. `None`
+  skips the mask load; `Causal` / `SlidingWindow` synthesize
+  in-kernel; `Custom` takes a real mask tensor (4-input form).
+- **Sub-microsecond timing**: use `rlx_ir::Tick` (reads CNTVCT_EL0
+  directly via `mrs` on Apple Silicon) instead of `Instant::now`.
+- **Trustworthy benches**: `CacheBuster::thrash()` between
+  iterations to evict L1+L2; `check-throttle.sh` to gate the run.
+- **Backend tooling locality**: training scripts, firmware,
+  fixtures, generators live under `rlx-<backend>/`, never at the
+  workspace root.
+- **Application code stays downstream**: Sparse-LU / FFT / eigensolve
+  / SuiteSparse FFI / photonics ops live in separate downstream
+  crates (`rlx-sparse`, `rlx-linalg`, …) or tests, never inside the
+  core `rlx-*` crates.
+
+## Recent phases (git log shorthand)
+
+A → J: progressive feature ramp (dtype dispatch, AutoMixed precision,
+cast-tax elimination, segmented ICB, f16 reduction kernels, MPSGraph
+extension). MaskKind / view-aliasing / fused QK-RoPE / strided
+Narrow→Attention all landed after J.
+
+K → L: backend breadth. rlx-driver split out; Device enum unified
+across 11 variants. wgpu / cuda / rocm / mlx / tpu / cortexm / fpga
+landed as scaffolds and progressively filled in (rlx-cuda 5-tier
+matmul, rlx-rocm library-tier ladder + nd-conv, rlx-wgpu single-pass
+attention, rlx-bench harness). See `git log --oneline` and
+`PLAN.md ## Landed` for the through-line.

@@ -1,0 +1,77 @@
+[package]
+name = "rlx-cuda"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "NVIDIA CUDA backend — cuBLAS for matmul + NVRTC-compiled kernels for everything else, via the pure-Rust `cudarc` crate."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+
+# `dynamic-loading` lets the crate compile and link on hosts without a
+# CUDA SDK installed — libcuda is dlopen()'d at runtime. That's what
+# makes Mac-side iteration possible: the crate builds, IR-lowering tests
+# run, but actual kernel dispatch fails fast when no driver is present.
+#
+# `cublas` for sgemm. `nvrtc` so we can ship CUDA C++ kernel sources as
+# `&'static str` (mirrors rlx-wgpu's WGSL pattern) and JIT-compile them
+# on first device init. No nvcc needed at workspace build time.
+# `cuda-12030` is the symbol-set floor: cudarc's `dynamic-loading` only
+# resolves symbols present in this version, so picking the lowest CUDA
+# we want to support keeps the crate runnable across more installs.
+# Bumping past 12.3 trips `GetProcAddress` failures on older drivers
+# (12.3 ships with macOS-XCode-style "current LTS" Linux distros and is
+# common in CI). `nvtx` lives behind the `nvtx` cargo feature below
+# because CUDA 13 removed `nvToolsExt.dll` entirely — opting in only
+# when actually profiling with nsight keeps the default build runnable
+# on modern toolkits.
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "cublas",
+    "cublaslt",
+    "cudnn",
+    "cuda-12030",
+    "dynamic-loading",
+] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[lib]
+path = "src/lib.rs"
+
+# ── Dev-only validation features ────────────────────────────────
+#
+# `hip-cpu-validate` compiles the same `.cu` kernel sources via HIP-CPU
+# headers and runs them on CPU threads instead of via cudarc + libcuda.
+# Off by default. Never enabled in workspace `cargo build` / production
+# builds. Only useful for `cargo test --features hip-cpu-validate` on
+# Mac (or any other host without a CUDA driver) to validate the kernel
+# logic without paying for cloud-GPU time.
+#
+# Requires HIP-CPU headers at `vendor/HIP-CPU/include` (git submodule).
+# The build.rs compiles `cpu_dispatch.cpp` against those headers when
+# this feature is on; the resulting object file is linked into the
+# crate and called via Rust FFI.
+[features]
+default = []
+# Opt-in: enable cudarc's nvtx feature + the per-step `scoped_range`
+# call in `backend.rs`. CUDA 13 removed `nvToolsExt.dll`, so leaving
+# this off by default keeps builds runnable on modern installs. Turn
+# on when profiling with nsight-systems on a CUDA 12.x host.
+nvtx = ["cudarc/nvtx"]
+hip-cpu-validate = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[lints]
+workspace = true

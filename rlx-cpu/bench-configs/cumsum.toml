@@ -1,0 +1,16 @@
+kernel = "cumsum"
+
+[[shape]]
+label = "topp_30k"
+rows = 1
+cols = 30000
+
+[[shape]]
+label = "batch_8_topp_32k"
+rows = 8
+cols = 32000
+
+[[shape]]
+label = "wide_batch_4k"
+rows = 32
+cols = 4096

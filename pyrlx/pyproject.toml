@@ -1,0 +1,95 @@
+[build-system]
+requires      = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name            = "pyrlx"
+# Single source of truth — must match `Cargo.toml` `[package].version`.
+version         = "0.1.0"
+description     = "Run RLX (Rust ML compiler) graphs and HuggingFace models on any backend — CPU, Metal, MLX, CUDA, ROCm, wgpu — from Python."
+readme          = "README.md"
+license         = { text = "GPL-3.0-only" }
+requires-python = ">=3.9"
+authors         = [{ name = "RLX maintainers" }]
+keywords        = [
+    "machine-learning", "compiler", "ml-compiler", "inference",
+    "metal", "cuda", "rocm", "mlx", "wgpu", "vulkan",
+    "transformer", "bert", "nomic-bert",
+    "pytorch-alternative", "jax-alternative",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+    "Typing :: Typed",
+]
+dependencies = [
+    "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+hf   = ["huggingface-hub", "tokenizers"]
+test = ["pytest>=7", "numpy>=1.23"]
+dev  = ["pytest>=7", "ruff>=0.5", "mypy>=1.10", "maturin>=1.7"]
+
+[project.urls]
+Homepage      = "https://github.com/anthropics/rlx"
+Documentation = "https://github.com/anthropics/rlx/tree/main/pyrlx#readme"
+Repository    = "https://github.com/anthropics/rlx"
+Issues        = "https://github.com/anthropics/rlx/issues"
+Changelog     = "https://github.com/anthropics/rlx/blob/main/pyrlx/CHANGELOG.md"
+
+# ── maturin ──────────────────────────────────────────────────────
+# Mixed Rust + Python layout. abi3 keeps a single wheel working from
+# CPython 3.9 onwards (no per-version rebuild).
+[tool.maturin]
+python-source       = "python"
+module-name         = "pyrlx._pyrlx"
+features            = ["pyo3/extension-module"]
+include             = [
+    { path = "README.md",                format = "sdist" },
+    { path = "CHANGELOG.md",             format = "sdist" },
+    { path = "python/pyrlx/py.typed",    format = ["sdist", "wheel"] },
+    { path = "python/pyrlx/_pyrlx.pyi",  format = ["sdist", "wheel"] },
+]
+
+# ── Suggested feature combos ─────────────────────────────────────
+#
+# Default `pip install pyrlx` builds with cargo `default` features
+# (= `cpu` only). For backends, install editable with `--features`
+# forwarded through maturin's PEP 517 build-args:
+#
+#   # uv / pip — full Apple Silicon stack
+#   uv pip install -e . --no-build-isolation \
+#       --config-settings=build-args='--features cpu,blas-accelerate,metal,embed,hf-download'
+#
+#   # NVIDIA
+#   uv pip install -e . --no-build-isolation \
+#       --config-settings=build-args='--features cpu,cuda,embed,hf-download'
+#
+#   # AMD
+#   uv pip install -e . --no-build-isolation \
+#       --config-settings=build-args='--features cpu,rocm,embed,hf-download'
+#
+#   # Cross-platform GPU only (Vulkan / DX12 / WebGPU via wgpu)
+#   uv pip install -e . --no-build-isolation \
+#       --config-settings=build-args='--features cpu,gpu,embed,hf-download'
+#
+# Or, with maturin directly:
+#   maturin develop --release \
+#       --features cpu,blas-accelerate,metal,embed,hf-download

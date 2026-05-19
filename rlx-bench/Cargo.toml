@@ -1,0 +1,30 @@
+[package]
+name = "rlx-bench"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "PLAN L5 — uniform benchmark harness for RLX backends + patterns"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.0", features = ["cpu"] }
+rlx-driver = { path = "../rlx-driver", version = "0.2.0" }
+
+[features]
+default = []
+metal = ["rlx-runtime/metal"]
+mlx   = ["rlx-runtime/mlx"]
+gpu   = ["rlx-runtime/gpu"]
+cuda  = ["rlx-runtime/cuda"]
+rocm  = ["rlx-runtime/rocm"]
+
+[lints]
+workspace = true

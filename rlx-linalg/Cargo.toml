@@ -1,0 +1,27 @@
+[package]
+name = "rlx-linalg"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Dense linear algebra for RLX — eigh / svd / qr / cholesky / solve_triangular via LAPACK. Downstream package; registers against rlx's custom-op scaffold."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+[features]
+default = ["cpu"]
+
+# CPU execution: pulls in rlx-cpu's CpuKernel registry + LAPACK
+# wrappers (`dpotrf`, `dsyevd`, `dgeqrf`, `dgesvd`, `dtrsm`).
+cpu = ["dep:rlx-cpu"]
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", optional = true }
+
+[lints]
+workspace = true

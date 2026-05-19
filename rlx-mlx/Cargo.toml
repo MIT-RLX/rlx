@@ -1,0 +1,54 @@
+[package]
+name = "rlx-mlx"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "MLX backend for RLX — Apple's array framework via hand-rolled C++ shim, eager + lazy execution"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# Not on crates.io (vendor-bundled): build.rs reads `../vendor/mlx`, which sits
+# outside the rlx-mlx crate boundary and isn't included in the
+# published `.crate` tarball. Distributed via the workspace git tree
+# only — depend on it via `git = "https://github.com/MIT-RLX/rlx"`.
+# When the submodule is relocated under rlx-mlx/vendor/mlx/, or the
+# build script is taught to fetch MLX at build time, flip this back.
+publish = false
+# We vendor MLX as a git submodule under ../vendor/mlx and build it from
+# source via cmake-rs. The cc step builds our cpp/rlx_mlx_shim.cpp and
+# links against the static libmlx.a that cmake produces.
+links = "mlx"
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+half = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"
+
+[lints]
+workspace = true
+
+# rlx-mlx vendors MLX as a git submodule at workspace-root
+# `vendor/mlx`. That path is OUTSIDE the rlx-mlx package boundary and
+# is therefore not included in the published `.crate` tarball — both
+# crates.io publish-verification and docs.rs build will fail until
+# the submodule is relocated under `rlx-mlx/vendor/mlx/` or the build
+# script is taught to fetch MLX at build time. Until then, the docs
+# config below records the intended targets but docs.rs will report a
+# build failure for rlx-mlx until the vendored path issue is resolved.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets        = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+rustdoc-args   = ["--cfg", "docsrs"]

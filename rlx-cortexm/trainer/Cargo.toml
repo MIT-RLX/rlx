@@ -1,0 +1,29 @@
+[package]
+name = "rlx-cortexm-trainer"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Native fp32 trainer that emits the rlx-cortexm INT8 model_weights.rs (replaces the PyTorch-based tools/train_mnist.py)."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# Not on crates.io: bin-only training tool, not a library. Distributed
+# via the workspace git tree.
+publish = false
+
+[[bin]]
+name = "train-mnist"
+path = "src/main.rs"
+
+[dependencies]
+rlx-ir = { path = "../../rlx-ir", version = "0.2.0" }
+rlx-opt = { path = "../../rlx-opt", version = "0.2.0" }
+rlx-cpu = { path = "../../rlx-cpu", version = "0.2.0" }
+
+[lints]
+workspace = true

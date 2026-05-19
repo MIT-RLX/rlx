@@ -1,0 +1,134 @@
+[workspace]
+resolver = "2"
+members = [
+    # Core (no backend dependencies)
+    "rlx-ir",          # Tensor IR: types, shapes, ops, graph, verifier
+    "rlx-opt",         # Graph optimizer: fusion passes, memory planner
+
+    # Driver layer (devices, arenas, buffers, streams)
+    "rlx-driver",
+
+    # CPU backend
+    "rlx-cpu",         # SIMD kernels, BLAS FFI, thread pool, arena executor
+
+    # GPU backends
+    "rlx-metal",       # Apple Metal native (MPS + custom MSL kernels)
+    "rlx-mlx",         # Apple MLX (lazy graph + eager modes, hand-rolled C++ shim)
+    "rlx-wgpu",        # Cross-platform GPU via wgpu (Metal/Vulkan/DX12/WebGPU)
+    "rlx-cuda",        # NVIDIA CUDA (cuBLAS + NVRTC kernels via cudarc)
+    "rlx-rocm",        # AMD ROCm/HIP — same kernels as rlx-cuda
+    "rlx-tpu",         # Google TPU via libtpu's PJRT plugin (no Python)
+
+    # Microcontroller backend
+    "rlx-cortexm",     # ARMv7E-M (Cortex-M4/M7) INT8 kernels — nRF52840 etc.
+    "rlx-cortexm/trainer",  # Native fp32 trainer that emits the INT8 model_weights.rs
+
+    # FPGA backend
+    "rlx-fpga",        # IR → Verilog → bitstream (per-graph datapath, integer-only Q0.31 requant)
+
+    # GPU backends (future)
+    # "rlx-vulkan",    # Vulkan compute
+    # "rlx-opengl",    # OpenGL compute (legacy)
+    # "rlx-directx",   # DirectX 12 compute
+    # "rlx-webgpu",    # WebGPU/WASM
+
+    # Model loading
+    "rlx-models",      # Config parsing, safetensors loading, graph builders
+    "rlx-gguf",        # GGUF parser + dequant (standalone, format-only)
+
+    # Proc macros
+    "rlx-macros",      # #[rlx_model] AOT compilation macro
+
+    # Runtime (user-facing, feature-gated)
+    "rlx-runtime",     # Session API, backend dispatch
+
+    # Prelude crate — re-exports IR + optimizer + runtime + companion
+    # crates behind feature gates. The `cargo add rlx` entry point.
+    "rlx",
+
+    # Downstream packages (registered against the custom-op scaffold)
+    "rlx-sparse",      # Sparse linear algebra (CSR LU/MatVec/CG) — JAX-style downstream
+    "rlx-linalg",      # Dense linalg (eigh/svd/qr/cholesky/solve_triangular) via LAPACK
+
+    # Benchmark framework (PLAN L5)
+    "rlx-bench",       # BenchmarkPattern + per-backend timing harness
+
+    # Python bindings
+    "pyrlx",           # PyO3 + maturin: run any RLX backend from Python
+]
+
+# ── Sanitizer / debug profiles (plan #41) ────────────────────────
+#
+# Borrowed from MAX's --config=asan / --config=debug-modular pattern.
+# Run sanitized builds with:
+#
+#   cargo +nightly build --profile=asan
+#   cargo +nightly test  --profile=asan
+#
+# AddressSanitizer needs the nightly toolchain on most targets; on
+# Apple Silicon it compiles fine via `RUSTFLAGS="-Zsanitizer=address"`
+# (which we set per-profile via .cargo/config.toml when present).
+# `debug-rlx` is a stable-toolchain debug profile with extra checks
+# (overflow, debug-assertions, less inlining for tractable backtraces).
+
+[profile.asan]
+inherits = "dev"
+debug = "full"
+debug-assertions = true
+overflow-checks = true
+opt-level = 1
+lto = false
+incremental = false
+
+# ── Workspace-wide lint posture (plan #17) ─────────────────────
+#
+# Tightens the bar without going to "deny all the things." Crates can
+# locally `#[allow(...)]` for genuinely-needed exceptions. Pair with
+# `cargo clippy --all-targets -- -D warnings` in CI (see Justfile).
+#
+# Not yet enabled (would generate ~1000 warnings to fix in one go):
+#   missing_docs / unsafe_op_in_unsafe_fn / clippy::pedantic.
+# Add them as crates reach individual readiness.
+
+[workspace.package]
+version       = "0.2.0"
+edition       = "2024"
+rust-version  = "1.87"  # edition=2024 needs ≥1.85; we use `is_multiple_of` (stable in 1.87)
+license       = "GPL-3.0-only"
+authors       = ["Eugene Hauptmann", "Nataliya Kosmyna"]
+repository    = "https://github.com/MIT-RLX/rlx"
+homepage      = "https://github.com/MIT-RLX/rlx"
+documentation = "https://docs.rs/rlx"
+keywords      = ["ml", "tensor", "compiler", "neural-network", "autodiff"]
+categories    = ["science", "algorithms", "compilers"]
+
+[workspace.lints.rust]
+unused = { level = "warn" }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Common false positives in numeric / SIMD code.
+manual_range_contains = "allow"
+needless_range_loop   = "allow"
+too_many_arguments    = "allow"
+upper_case_acronyms   = "allow"
+# Macro / FFI-driven noise we don't want to silence per call-site.
+useless_conversion          = "allow"  # pyo3 ?-into-PyErr boilerplate
+missing_safety_doc          = "allow"  # cover incrementally; not 1.0.0-blocking
+doc_overindented_list_items = "allow"  # rustfmt-vs-clippy disagreement
+doc_lazy_continuation       = "allow"  # same family — multi-line list continuations
+unnecessary_wraps           = "allow"  # API symmetry > "this could be infallible"
+type_complexity             = "allow"  # IR types are intentionally explicit
+large_enum_variant          = "allow"  # Op enum carries Box<Graph> in CustomFn / Scan
+single_range_in_vec_init    = "allow"  # `vec![0..1]` is fine in tests / scaffolding
+collapsible_if              = "allow"  # nested-if is often more readable in numeric code
+should_implement_trait      = "allow"  # builder methods named like trait methods
+
+[profile.debug-rlx]
+inherits = "dev"
+debug = "full"
+debug-assertions = true
+overflow-checks = true
+opt-level = 1
+lto = false
+incremental = true

@@ -1,0 +1,27 @@
+# Numerical validation harness: rlx-tpu test suite + a real
+# `libpjrt_c_cpu.so` so the round-trip suite in tests/pjrt_roundtrip.rs
+# actually runs (instead of skipping with "LIBTPU_PATH not set").
+#
+# Layered FROM the `rlx-xla-cpu-plugin` base image (built once via
+# `Dockerfile.xla-cpu`). Keep that base around — the Bazel build is
+# slow and gets cached across rebuilds of this image.
+
+FROM rlx-xla-cpu-plugin:latest AS plugin
+
+FROM rust:1.89-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl libgomp1 libstdc++6 \
+        libopenblas-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pull the .so from the plugin base.
+COPY --from=plugin /usr/local/lib/libpjrt_c_cpu.so /usr/local/lib/libpjrt_c_cpu.so
+RUN echo /usr/local/lib > /etc/ld.so.conf.d/pjrt.conf && ldconfig
+
+ENV LIBTPU_PATH=/usr/local/lib/libpjrt_c_cpu.so
+
+WORKDIR /work
+CMD ["cargo", "test", "-p", "rlx-tpu", "--release", "--", "--test-threads=1", "--nocapture"]

@@ -1,0 +1,24 @@
+[package]
+name = "rlx-macros"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "RLX proc macros — #[rlx_model] for AOT-compiled ML models"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
+proc-macro2 = "1"
+
+[lints]
+workspace = true

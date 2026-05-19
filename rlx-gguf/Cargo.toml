@@ -1,0 +1,24 @@
+[package]
+name = "rlx-gguf"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "GGUF v1/v2/v3 parser + dequantization to f32. Standalone — no rlx-* deps."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+[dependencies]
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "rlx-driver"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "RLX driver layer — device handles, arenas, buffers, command streams"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+half = "2"
+
+[lints]
+workspace = true

@@ -1,0 +1,92 @@
+# Build XLA's CPU PJRT plugin (libpjrt_c_cpu.so) from source.
+#
+# Multi-stage: stage 1 runs the heavy Bazel build, stage 2 keeps just
+# the resulting .so. The output image is the base for the rlx-tpu
+# numerical-validation harness — pair with `Dockerfile.numerical`
+# (which adds Rust + jaxlib for HLO inspection) to get the full
+# pipeline.
+#
+# Why this exists: jaxlib doesn't ship `libpjrt_c_cpu.so` (XLA's CPU
+# PJRT is statically linked into `xla_extension.so`). For numerical
+# round-trip validation that calls `PJRT_Client_Compile` +
+# `LoadedExecutable_Execute` on actual data, we need a standalone
+# .so the same shape as `libtpu.so`. Building it from openxla/xla is
+# the only path until upstream publishes the artifact.
+#
+# Build expectations on Apple Silicon Docker Desktop (linux/aarch64
+# native): 30–90 minutes, ~50 GB transient disk, ~12 GB peak RAM.
+# After stage 2 the published image is small (the .so + dynamic libs
+# it needs).
+
+ARG XLA_REF=main
+
+# ── Stage 1: Bazel build ─────────────────────────────────────────
+
+FROM debian:bookworm-slim AS xla-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates unzip \
+        clang lld \
+        python3 python3-dev python3-pip python3-numpy \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# bazelisk auto-fetches the right Bazel version per the repo's
+# `.bazelversion` file. Avoids pinning Bazel to a specific version
+# in the Dockerfile that drifts from XLA's expectations.
+RUN ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v1.20.0/bazelisk-linux-$ARCH" \
+        -o /usr/local/bin/bazel \
+    && chmod +x /usr/local/bin/bazel
+
+# Clone shallow at the requested ref. Keeping the depth low saves
+# ~500 MB of git history we don't need.
+ARG XLA_REF
+RUN git clone --depth 1 --branch ${XLA_REF} \
+    https://github.com/openxla/xla.git /opt/xla
+
+WORKDIR /opt/xla
+
+# XLA's `.bazelrc` doesn't define a `cpu` config — the hermetic
+# toolchain selected by `MODULE.bazel` already builds CPU-only by
+# default. Limit jobs to keep peak RAM bounded — Bazel will otherwise
+# spawn one job per core and OOM small Docker hosts.
+RUN bazel build --jobs=4 \
+        //xla/pjrt/c:pjrt_c_api_cpu_plugin.so
+
+# ── Stage 2: slim runtime image ──────────────────────────────────
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libstdc++6 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=xla-builder \
+    /opt/xla/bazel-bin/xla/pjrt/c/pjrt_c_api_cpu_plugin.so \
+    /usr/local/lib/libpjrt_c_cpu.so
+
+RUN echo /usr/local/lib > /etc/ld.so.conf.d/pjrt.conf && ldconfig
+
+ENV LIBTPU_PATH=/usr/local/lib/libpjrt_c_cpu.so
+
+# Smoke check: dlopen the plugin and resolve GetPjrtApi. Catches
+# missing-symbol issues at image-build time rather than during a
+# rlx-tpu test pass.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && printf '%s\n' \
+        '#include <stdio.h>' \
+        '#include <dlfcn.h>' \
+        'int main(void){' \
+        '  void *h = dlopen("/usr/local/lib/libpjrt_c_cpu.so", RTLD_NOW);' \
+        '  if (!h) { fprintf(stderr, "%s\n", dlerror()); return 1; }' \
+        '  void *f = dlsym(h, "GetPjrtApi");' \
+        '  if (!f) { fprintf(stderr, "GetPjrtApi missing\n"); return 1; }' \
+        '  printf("ok\n"); return 0;' \
+        '}' > /tmp/probe.c \
+    && gcc /tmp/probe.c -o /tmp/probe -ldl \
+    && /tmp/probe \
+    && apt-get purge -y gcc libc6-dev && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /tmp/probe*

@@ -1,0 +1,22 @@
+# Workspace clippy configuration (plan #17).
+#
+# Tightens the bar for what's considered "clean" beyond Rust's
+# defaults. Combined with `cargo clippy --all-targets -- -D warnings`
+# in CI, this keeps API hygiene a build-time check, not a code-review
+# afterthought.
+
+# Cognitive complexity threshold — keep functions readable.
+cognitive-complexity-threshold = 30
+
+# Require Self::variant where possible (catches drift when an enum
+# is renamed but a match arm wasn't updated).
+avoid-breaking-exported-api = true
+
+# Reject too-many-arguments for new functions (inherits clippy's
+# default of 7, but we're explicit so future bumps to clippy don't
+# silently relax us).
+too-many-arguments-threshold = 9
+
+# We're a kernel-heavy crate; allow more single-char binding names
+# in inner-loop code where i / j / k are conventional.
+single-char-binding-names-threshold = 5

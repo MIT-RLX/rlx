@@ -1,0 +1,43 @@
+[package]
+name = "rlx-fpga"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "FPGA backend for RLX — per-graph datapath synthesis. IR → Verilog → bitstream."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# Library crate + a single emit binary. No proc-macro, no build script.
+# Verilog generation is pure Rust; no Python, no `.sv` templates on disk.
+
+[features]
+default = ["std"]
+std = []
+
+# Pull in the cortexm crate so the first model we can target — TinyConv-MNIST
+# — uses exactly the same weight blob, scales, and shapes that the M4F path
+# already validates against. The kernels themselves we re-derive (cortexm
+# uses an f32 requantize; FPGA fabric needs integer-only Q0.31).
+[dependencies]
+rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.0", default-features = false, features = ["std"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+
+[dev-dependencies]
+tempfile = "3"
+rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.0", default-features = false, features = ["std"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rlx-fpga-emit"
+path = "src/bin/emit.rs"
+
+[lints]
+workspace = true

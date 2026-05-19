@@ -1,0 +1,38 @@
+[package]
+name = "rlx-sparse"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Sparse linear algebra for RLX — CSR LU, mat-vec, Conjugate Gradient. Downstream package; registers against rlx's custom-op scaffold."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+[features]
+default = ["cpu"]
+
+# CPU execution: pulls in rlx-cpu's CpuKernel registry + LAPACK dgesv.
+cpu = ["dep:rlx-cpu"]
+
+# Metal execution: pulls in rlx-metal's MetalKernel registry. Implies
+# `cpu` because the kernel bodies share LAPACK `dgesv` for Sparse-LU
+# (Apple Silicon ships Accelerate, so the dep is free in practice).
+metal = ["dep:rlx-metal", "cpu"]
+
+# MLX execution: pulls in rlx-mlx's MlxKernel registry. Same shared-cpu
+# rationale as `metal`. Kernels read input `Array` bytes, run the host
+# `algos::*` body, and rebuild an output `Array`.
+mlx = ["dep:rlx-mlx", "cpu"]
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", optional = true }
+rlx-metal = { path = "../rlx-metal", version = "0.2.0", optional = true }
+rlx-mlx = { path = "../rlx-mlx", version = "0.2.0", optional = true }
+
+[lints]
+workspace = true

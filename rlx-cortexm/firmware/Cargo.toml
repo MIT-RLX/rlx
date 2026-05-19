@@ -1,0 +1,36 @@
+# Standalone workspace: the firmware binary cross-compiles for
+# thumbv7em-none-eabihf, which doesn't mix with the host workspace.
+
+[workspace]
+
+[package]
+name = "rlx-cortexm-firmware"
+version = "0.2.0"
+edition = "2024"
+description = "MNIST-on-nRF52840 firmware demo for rlx-cortexm"
+license = "GPL-3.0-only"
+
+[dependencies]
+rlx-cortexm   = { path = "..", default-features = false }
+cortex-m      = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt   = "0.7"
+panic-halt    = "1"
+
+# nRF52840 USB stack. Pure-Rust, no Embassy.
+nrf52840-hal  = "0.18"
+nrf-usbd      = "0.3"
+usb-device    = "0.3"
+usbd-serial   = "0.2"
+
+# Smallest possible binary: opt-level=z, LTO, single codegen unit, abort on panic.
+[profile.release]
+opt-level     = "z"
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = true
+
+[profile.dev]
+opt-level     = 1
+debug         = true
+panic         = "abort"

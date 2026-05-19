@@ -1,0 +1,72 @@
+[package]
+name = "rlx-cpu"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "CPU backend for RLX — SIMD kernels, BLAS dispatch, thread pool, arena executor"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# `blas` is on by default and links the platform CBLAS (Accelerate on
+# macOS, OpenBLAS elsewhere). Disable with `--no-default-features` to
+# build a pure-Rust scalar fallback — slow, but useful on hosts that
+# don't have a system BLAS available (CI containers, fresh Win dev
+# boxes, or just verifying the kernels in isolation).
+[features]
+default = ["blas"]
+blas = []
+# Route sgemm_auto through the `gemm` crate (the same CPU BLAS candle
+# uses) for bit-exact numerical parity with candle. Trades AMX
+# throughput for byte-equivalent output — useful for parity tests
+# and reproducibility-critical workloads.
+parity-gemm = ["dep:gemm"]
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+# GGUF K-quant block decoders — used by Op::DequantMatMul's GGUF
+# schemes so packed weight bytes can stay in the arena until matmul
+# time instead of round-tripping through f32 at load.
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.0" }
+# F16/BF16 conversion for the CastDtype thunk (and any future
+# half-precision kernel work). Already in the workspace via
+# rlx-runtime / rlx-metal.
+half = "2"
+# Optional same-as-candle CPU sgemm; gated behind `parity-gemm`.
+gemm = { version = "0.19", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+serde = { version = "1", features = ["derive"] }
+
+# ── Snippet micro-benches (plan #52) ──────────────────────────
+# Pattern: one .rs per kernel, cargo bench runs the lot.
+# `cargo bench --bench sgemm`, `cargo bench --bench sample`, etc.
+
+[[bench]]
+name = "sgemm"
+harness = false
+
+[[bench]]
+name = "sample"
+harness = false
+
+[[bench]]
+name = "cumsum"
+harness = false
+
+# Plan #13: one driver that reads bench-configs/*.toml and
+# dispatches per-shape criterion timings. Add a new TOML to
+# extend coverage without writing a new .rs.
+[[bench]]
+name = "tuned"
+harness = false
+
+[lints]
+workspace = true

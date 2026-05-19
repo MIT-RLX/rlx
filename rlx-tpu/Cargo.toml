@@ -1,0 +1,54 @@
+[package]
+name = "rlx-tpu"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Google TPU backend — drives libtpu's PJRT plugin from Rust."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+build = "build.rs"
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+
+# libloading dlopens libtpu.so at runtime so the crate compiles + tests
+# cleanly on Mac/Windows hosts that don't have it installed.
+libloading = "0.8"
+
+# prost compiles the vendored xla/*.proto files into Rust types with
+# field-number-correct wire encoding. Single source of truth (the .proto
+# files) — replaces the previous hand-rolled encoder, which drifted from
+# upstream's renumbered `entry_computation_id` / `operand_ids` /
+# `comparison_direction` and required a hard debugging session before
+# JAX's `xla_extension` would accept the bytes.
+prost = "0.13"
+prost-types = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
+# Vendored protoc binary so the build doesn't need a system install.
+# Supports macOS aarch64 / linux x86_64 / linux aarch64 — covers every
+# host we run on (incl. the Docker validation harness).
+protoc-bin-vendored = "3"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[lints]
+workspace = true
+
+# libtpu / libpjrt is dlopen'd at runtime; build.rs compiles the
+# vendored protos via the `protoc-bin-vendored` binary, which works
+# on docs.rs's Linux container.
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
