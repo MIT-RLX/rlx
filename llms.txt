@@ -13,10 +13,11 @@ layered crates.
   `Tick` (cycle counter), `CacheBuster` (bench infra), `QuantScheme` /
   `QuantMap` (quantization metadata), `DType::promote` (promotion
   table), `MaskKind { None, Causal, SlidingWindow(w), Custom }`.
-- `rlx-opt` — graph rewrites: fusion, precision, memory plan,
-  view-aliasing, DCE, const fold. `is_pure_view` predicate identifies
-  Reshape / same-dtype Cast / axis-0 Narrow as buffer aliases.
-  `run_passes` verifies between every pass in debug builds.
+- `rlx-flow` — block assembly-line API for model builders (tier 0/1/2).
+- `rlx-fusion` — MIR fusion passes, `Pass` trait, unfuse for AD/backends.
+- `rlx-autodiff` — `grad_with_loss`, `jvp`, `hvp`, `vmap`, prepare-for-AD.
+- `rlx-compile` — `CompilePipeline`, legalization, memory plan, precision/PTQ.
+- `rlx-opt` — facade re-exporting fusion + autodiff + compile (`rlx::opt`).
 - `rlx-driver` — device handles, arenas, buffers, command streams.
   Owns the unified `Device` enum (11 variants); backends import it.
 
@@ -48,8 +49,6 @@ layered crates.
   bitstream, integer-only Q0.31 requant.
 
 ### Model loading + macros + runtime
-- `rlx-models` — config parsing, safetensors loading, graph builders
-  for BERT, NomicBERT, vision. Used by burnembed.
 - `rlx-gguf` — GGUF v1/v2/v3 parser + dequant. Standalone, no rlx-*
   deps.
 - `rlx-macros` — proc macros. `#[rlx_model]` AOT compilation.

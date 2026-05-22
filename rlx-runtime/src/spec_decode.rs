@@ -91,6 +91,13 @@ pub trait Speculator {
     /// probability distribution conditioned on
     /// `context ++ proposed[..i]`.
     fn verify(&mut self, context: &[u32], proposed: &[u32]) -> VerifyResult;
+
+    /// Commit `accepted` tokens into persistent decode state after a
+    /// speculative round. Default no-op; MTP draft overrides so GDN
+    /// recurrent state only advances for accepted tokens.
+    fn commit(&mut self, context: &[u32], accepted: &[u32]) {
+        let _ = (context, accepted);
+    }
 }
 
 /// Pure speculative-acceptance algorithm. Given the draft's
@@ -208,6 +215,8 @@ impl<D: Speculator, T: Speculator> SpecDecoder<D, T> {
         if let Some(c) = decision.corrected {
             out.push(c);
         }
+        self.draft.commit(context, &out);
+        self.target.commit(context, &out);
         out
     }
 }
@@ -291,7 +300,7 @@ mod tests {
         );
     }
 
-    /// Mock speculators for end-to-end SpecDecoder smoke test.
+    /// Mock speculators for end-to-end SpecDecoder basic test.
     /// Both return canned probability tables.
     struct CannedSpeculator {
         next_token: u32,

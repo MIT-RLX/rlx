@@ -20,6 +20,22 @@
 //   2 Int4Block        (signed nibbles, per-block scale)
 //   3 Fp8E4m3
 //   4 Fp8E5m2
+//   5 Nvfp4Block (E2M1 + FP8 block scales + f32 global_scale @ zp_off)
+
+__device__ __forceinline__ float fp4_e2m1_lut(unsigned int nib) {
+    static const float lut[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    return lut[nib & 0xf];
+}
+
+__device__ __forceinline__ unsigned int read_packed_byte(const float* arena, unsigned int off, unsigned int byte_idx) {
+    unsigned int word = byte_idx / 4;
+    unsigned int shift = (byte_idx % 4) * 8;
+    unsigned int bits = __float_as_uint(arena[off + word]);
+    return (bits >> shift) & 0xff;
+}
 
 __device__ __forceinline__ float decode_e4m3(unsigned int byte) {
     unsigned int sign = (byte >> 7) & 1;
@@ -98,13 +114,21 @@ extern "C" __global__ void dequant_matmul(
             unsigned int block = kk / block_size;
             float scale = arena[scale_off + block * n + col];
             w_dq = (float)q * scale;
-        } else {
+        } else if (scheme_id == 3 || scheme_id == 4) {
             // FP8 e4m3 / e5m2 — direct bit decode, no scale.
-            unsigned int word = elem_idx / 4;
-            unsigned int shift = (elem_idx % 4) * 8;
-            unsigned int bits = __float_as_uint(arena[w_off + word]);
-            unsigned int byte = (bits >> shift) & 0xff;
+            unsigned int byte = read_packed_byte(arena, w_off, elem_idx);
             w_dq = (scheme_id == 3) ? decode_e4m3(byte) : decode_e5m2(byte);
+        } else {
+            // Nvfp4Block — E2M1 nibble × FP8 block scale × global f32 scale.
+            unsigned int word = elem_idx / 8;
+            unsigned int shift = (elem_idx % 8) * 4;
+            unsigned int bits = __float_as_uint(arena[w_off + word]);
+            unsigned int nib = (bits >> shift) & 0xf;
+            unsigned int block = kk / block_size;
+            unsigned int scale_byte = read_packed_byte(arena, scale_off, block * n + col);
+            float scale = decode_e4m3(scale_byte);
+            float gs = arena[zp_off];
+            w_dq = fp4_e2m1_lut(nib) * scale * gs;
         }
 
         acc += arena[x_off + row * k + kk] * w_dq;

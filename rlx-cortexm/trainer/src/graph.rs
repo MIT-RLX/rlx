@@ -229,7 +229,9 @@ pub fn build_train_graph(spec: &Spec) -> TrainGraph {
 
     // ── Build gradient graph ──────────────────────────────────
     let param_ids = vec![conv1_w, conv1_b, conv2_w, conv2_b, fc_w, fc_b];
-    let mut bwd = rlx_opt::autodiff::grad_with_loss(&g, &param_ids);
+    // `grad_with_loss` runs `rlx_autodiff::prepare_graph_for_ad` internally
+    // (unfuse fused ops, scans, control-flow) before the VJP walk.
+    let mut bwd = rlx_autodiff::grad_with_loss(&g, &param_ids);
 
     // Look up each NodeId's mirror in the bwd graph. The mirroring
     // preserves NodeId values (autodiff iterates `forward.nodes()` in

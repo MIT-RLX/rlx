@@ -23,7 +23,7 @@ to any of them through a uniform interface.
 
 ```toml
 [dependencies]
-rlx-driver = "0.1"
+rlx-driver = "0.2"
 ```
 
 Usually pulled in transitively via [`rlx-runtime`](https://crates.io/crates/rlx-runtime)

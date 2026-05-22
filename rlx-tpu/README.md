@@ -152,7 +152,7 @@ Four test harnesses, in increasing order of weight:
 ```sh
 # 1. Host-agnostic — prost decode + HLO builder + lowering walker.
 cargo test -p rlx-tpu                        # 2 unit + 12 hlo_decode
-                                              # + 32 hlo_match + 4 smoke
+                                              # + 32 hlo_match + 4 check
                                               # = 50 tests
 
 # 2. Off-TPU parse — runs the full cargo test inside a Docker

@@ -26,11 +26,15 @@
 //! `graph.rs`.
 
 pub mod attention;
+pub mod axial_rope2d;
 pub mod backward;
+pub mod blocks;
+pub mod conv2d;
 pub mod elementwise;
 pub mod io;
 pub mod linalg;
 pub mod normalization;
 pub mod reduction;
 pub mod shape_ops;
+pub mod splat;
 pub mod special;

@@ -63,7 +63,7 @@ static STATE: OnceLock<Option<PerfettoState>> = OnceLock::new();
 fn state() -> Option<&'static PerfettoState> {
     STATE
         .get_or_init(|| {
-            let path = std::env::var("RLX_TRACE_PERFETTO").ok()?;
+            let path = crate::env::var("RLX_TRACE_PERFETTO")?;
             let mut file = File::create(&path).ok()?;
             // Open the JSON array.
             file.write_all(b"[\n").ok()?;
@@ -166,7 +166,7 @@ mod tests {
     use super::*;
     use std::io::Read;
 
-    /// Smoke-test the API surface without enabling the env var. With
+    /// basic-test the API surface without enabling the env var. With
     /// tracing disabled, every entry point is a no-op and `enabled()`
     /// returns false. We can't actually exercise the file path in a
     /// unit test because `STATE` is process-wide — once initialized,
@@ -214,7 +214,7 @@ mod tests {
     /// from a previous test, the env var won't take effect; we just
     /// confirm the file-open code path works in isolation.
     #[test]
-    fn end_to_end_temp_file_smoke() {
+    fn end_to_end_temp_file_check() {
         use std::env;
         use std::fs;
         // Use a unique temp path so tests can run in parallel without

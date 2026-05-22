@@ -85,6 +85,12 @@ fn register_builtin(r: &Registry) {
         Box::new(crate::backend::wgpu_backend::WgpuBackend) as Box<dyn Backend>
     });
 
+    #[cfg(feature = "vulkan")]
+    map.insert(Device::Vulkan, || {
+        rlx_wgpu::select_vulkan_backend();
+        Box::new(crate::backend::wgpu_backend::WgpuBackend) as Box<dyn Backend>
+    });
+
     #[cfg(feature = "cuda")]
     map.insert(Device::Cuda, || {
         Box::new(crate::backend::cuda_backend::CudaBackend) as Box<dyn Backend>

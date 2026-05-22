@@ -106,7 +106,9 @@ fn mps_segment_eligible(op: &Op) -> bool {
         | Op::Activation(Activation::Silu)
         | Op::Binary(_)
         | Op::LayerNorm { .. }
+        | Op::RmsNorm { .. }
         | Op::FusedResidualLN { .. }
+        | Op::FusedResidualRmsNorm { .. }
         | Op::Reshape { .. }
         | Op::Expand { .. }
         | Op::Cast { .. }

@@ -48,7 +48,7 @@ fn skip_unless_bench() -> bool {
         eprintln!("[tpu_cpu_speed] LIBTPU_PATH not set — skipping");
         return true;
     }
-    if std::env::var("RLX_TPU_BENCH").is_err() {
+    if rlx_ir::env::is_unset("RLX_TPU_BENCH") {
         eprintln!("[tpu_cpu_speed] RLX_TPU_BENCH not set — skipping");
         return true;
     }

@@ -26,19 +26,19 @@ straight through to `rlx-runtime`.
 ```sh
 # Apple Silicon — everything that fits
 maturin develop --release \
-  --features cpu,blas-accelerate,metal,mlx,gpu,embed,hf-download
+  --features cpu,blas-accelerate,metal,mlx,gpu
 
 # Linux + NVIDIA
 maturin develop --release \
-  --features cpu,cuda,embed,hf-download
+  --features cpu,cuda
 
 # Linux + AMD
 maturin develop --release \
-  --features cpu,rocm,embed,hf-download
+  --features cpu,rocm
 
 # Cross-platform GPU only (Vulkan / DX12 / WebGPU via wgpu)
 maturin develop --release \
-  --features cpu,gpu,embed,hf-download
+  --features cpu,gpu
 ```
 
 ## Behavior contract

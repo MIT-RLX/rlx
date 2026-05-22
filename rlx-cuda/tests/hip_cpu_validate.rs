@@ -370,7 +370,7 @@ fn expand_broadcasts_axis() {
 // ── attention / rope ────────────────────────────────────────────────
 
 #[test]
-fn attention_no_mask_smoke() {
+fn attention_no_mask_check() {
     // batch=1, heads=1, seq_q=2, seq_k=2, head_dim=2.
     // Q = K = V = identity-ish; expect output equal to weighted V.
     let mut arena = vec![
@@ -384,7 +384,7 @@ fn attention_no_mask_smoke() {
         &mut arena, 1, 1, 2, 2, 2, /*qo*/ 0, /*ko*/ 4, /*vo*/ 8, /*oo*/ 12,
         /*mask_o*/ 0, /*mask_kind None*/ 0, /*scale*/ 1.0, /*window*/ 0,
     );
-    // Smoke: outputs are finite and differ from initial 0.
+    // check: outputs are finite and differ from initial 0.
     for v in &arena[12..16] {
         assert!(v.is_finite() && *v != 0.0, "got {v}");
     }
@@ -553,7 +553,7 @@ fn fused_binary_unary_mul_then_silu() {
 }
 
 #[test]
-fn conv3d_identity_smoke() {
+fn conv3d_identity_check() {
     // n=c_in=c_out=d=h=w=k=1 → identity passes through.
     let mut arena = vec![
         // input

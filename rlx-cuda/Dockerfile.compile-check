@@ -38,7 +38,6 @@ RUN sed -i 's|"rlx-cpu",|# "rlx-cpu",|; \
             s|"rlx-metal",|# "rlx-metal",|; \
             s|"rlx-mlx",|# "rlx-mlx",|; \
             s|"rlx-wgpu",|# "rlx-wgpu",|; \
-            s|"rlx-models",|# "rlx-models",|; \
             s|"rlx-gguf",|# "rlx-gguf",|; \
             s|"rlx-macros",|# "rlx-macros",|; \
             s|"rlx-runtime",|# "rlx-runtime",|;' Cargo.toml
@@ -46,7 +45,7 @@ RUN sed -i 's|"rlx-cpu",|# "rlx-cpu",|; \
 # Verify rlx-cuda compiles cleanly under linux-gnu with NVRTC available.
 RUN cargo build -p rlx-cuda --release 2>&1 | tail -20
 
-# Optional: run the smoke tests. They no-op without a GPU but verify
+# Optional: run the basic tests. They no-op without a GPU but verify
 # the test harness compiles and the unit-test path links.
 RUN cargo test -p rlx-cuda --release --no-run 2>&1 | tail -10
 

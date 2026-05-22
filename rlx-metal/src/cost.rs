@@ -142,8 +142,7 @@ impl MetalHwModel {
         // least ~5× that to net win. With our 32×32 simd kernel running near
         // 1 TFLOPS, that's M·K·N ≥ ~25M FLOPs (≈ 256×256×768). Use 16M as a
         // conservative cutoff; tune with RLX_MPS_THRESHOLD_FLOP env var.
-        let mps_threshold_flop = std::env::var("RLX_MPS_THRESHOLD_FLOP")
-            .ok()
+        let mps_threshold_flop = rlx_ir::env::var("RLX_MPS_THRESHOLD_FLOP")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(16_000_000);
 
@@ -175,7 +174,7 @@ impl MetalHwModel {
         // 32×32 simd kernel. Below the threshold the ~5–20µs objc bridging
         // cost dominates and we stay on the in-encoder MSL path.
         // Override via env var for A/B benchmarking.
-        let mps_disabled = std::env::var("RLX_DISABLE_MPS")
+        let mps_disabled = rlx_ir::env::var("RLX_DISABLE_MPS")
             .map(|v| v == "1")
             .unwrap_or(false);
         let flop = (m as u64) * (k as u64) * (n as u64);
@@ -289,16 +288,14 @@ mod tests {
     fn picks_simd_for_aligned() {
         // Force the in-encoder MSL path so the threshold logic doesn't shadow
         // the alignment routing (these dims would otherwise hit Mps).
-        unsafe {
-            std::env::set_var("RLX_DISABLE_MPS", "1");
-        }
+        rlx_ir::env::set("RLX_DISABLE_MPS", "1");
         let hw = MetalHwModel::detect();
         assert_eq!(hw.pick_sgemm(64, 768, 2304), SgemmVariant::Simd4x4);
         assert_eq!(hw.pick_sgemm(8, 16, 16), SgemmVariant::Simd);
         assert_eq!(hw.pick_sgemm(6, 768, 2304), SgemmVariant::SimdPadded);
         assert_eq!(hw.pick_sgemm(6, 7, 7), SgemmVariant::Naive);
         unsafe {
-            std::env::remove_var("RLX_DISABLE_MPS");
+            rlx_ir::env::unset("RLX_DISABLE_MPS");
         }
     }
 }

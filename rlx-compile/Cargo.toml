@@ -1,0 +1,26 @@
+[package]
+name = "rlx-compile"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "HIR → MIR → LIR compile pipeline for RLX"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[features]
+default = []
+training = ["dep:rlx-autodiff"]
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-fusion = { path = "../rlx-fusion", version = "0.2.0" }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.0", optional = true }
+
+[lints]
+workspace = true

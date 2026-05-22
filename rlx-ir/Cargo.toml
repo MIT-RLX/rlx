@@ -13,7 +13,12 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-smallvec = "1"
+smallvec = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+serialize = ["dep:serde", "dep:serde_json"]
 
 [dev-dependencies]
 

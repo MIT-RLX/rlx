@@ -17,7 +17,7 @@ default = ["cpu"]
 
 # ── CPU backends ─────────────────────────────────────────────
 # Base CPU with SIMD kernels (NEON/AVX) + persistent thread pool
-cpu = ["dep:rlx-cpu"]
+cpu = ["dep:rlx-cpu", "rlx-cpu/splat"]
 
 # Compile-time gated kernel tracing (plan #7).
 # Off by default — production builds pay zero overhead; turn on for
@@ -49,34 +49,38 @@ ane = []                           # Apple Neural Engine (via CoreML/ANE framewo
 
 # ── GPU backends ─────────────────────────────────────────────
 # Portable GPU via wgpu (Metal on macOS, Vulkan on Linux, DX12 on Windows, WebGPU in browsers)
-gpu = ["dep:rlx-wgpu"]
+gpu = ["dep:rlx-wgpu", "rlx-wgpu/splat"]
 
-# Apple Metal native (Metal Performance Shaders, direct compute)
-metal = ["dep:rlx-metal"]
+# Apple Metal (MPSGraph + custom MSL). Splat: CPU reference + common IR.
+metal = ["dep:rlx-metal", "rlx-cpu/splat"]
 
-# Apple MLX framework (lazy graph optimizer, unified memory on Apple Silicon)
-mlx = ["dep:rlx-mlx"]
+# Apple MLX (unified memory); splat via CPU reference on host buffers.
+mlx = ["dep:rlx-mlx", "rlx-cpu/splat"]
 
-# NVIDIA CUDA native (cuBLAS, cuDNN, TensorRT)
-cuda = ["dep:rlx-cuda"]
+# All Apple RLX backends: Metal (incl. MPS), MLX, and portable wgpu-on-Metal.
+apple = ["metal", "mlx", "gpu"]
 
-# AMD GPU (ROCm/HIP)
-rocm = ["dep:rlx-rocm"]
+# NVIDIA CUDA native; native CUDA tile raster.
+cuda = ["dep:rlx-cuda", "rlx-cpu/splat"]
+
+# AMD GPU (ROCm/HIP); splat via CPU reference between segments.
+rocm = ["dep:rlx-rocm", "rlx-cpu/splat"]
 
 # Google TPU via libtpu's PJRT plugin
-tpu = ["dep:rlx-tpu"]
+tpu = ["dep:rlx-tpu", "rlx-cpu/splat"]
 
 # ── Cross-platform GPU APIs ─────────────────────────────────
 # Declared (empty) so device_ext.rs's `cfg!(feature = "...")` checks
 # compile cleanly. Flip to `dep:rlx-vulkan` etc. once each backend
 # crate lands.
-vulkan = []                        # Vulkan compute shaders
+# Vulkan via wgpu (`Device::Vulkan` — separate adapter from `Device::Gpu`).
+vulkan = ["gpu"]
 opengl = []                        # OpenGL compute shaders (legacy)
 directx = []                       # DirectX 12 compute (Windows)
 webgpu = []                        # WebGPU (WASM target)
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.0", features = ["serialize"] }
 rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
 rlx-driver = { path = "../rlx-driver", version = "0.2.0" }
 rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", optional = true }
@@ -98,7 +102,7 @@ serde_json = "1"
 # Enable both `metal` and `mlx` features so the per-backend tests
 # can register rlx-sparse's per-backend kernels. On non-macOS these
 # are no-ops (each kernels module is cfg-gated to target_os = "macos").
-rlx-sparse = { path = "../rlx-sparse", version = "0.2.0", features = ["metal", "mlx"] }
+rlx-sparse = { path = "../rlx-sparse", version = "0.2.0", default-features = false, features = ["cpu"] }
 rlx-linalg = { path = "../rlx-linalg", version = "0.2.0" }
 # Used by dequant_matmul_gguf.rs to construct reference GGUF block
 # bytes and verify the in-graph Op::DequantMatMul (GGUF schemes)

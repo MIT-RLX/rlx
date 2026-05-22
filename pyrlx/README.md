@@ -13,14 +13,27 @@ Python bindings for RLX via [PyO3](https://pyo3.rs/) +
   graph, ready to compile.
 - **JVP / vmap** — `pyrlx.jvp` + `pyrlx.vmap` for forward-mode AD and
   batched function transforms.
-- **Embed**: `pyrlx.RlxEmbed.from_pretrained("…")` mirroring the Rust
-  `rlx_models::embed::RlxEmbed`.
 
 ## Install (from source)
 
 ```sh
-pip install maturin
-maturin develop --release -m pyrlx/Cargo.toml
+cd pyrlx
+python3 -m venv .venv && source .venv/bin/activate
+pip install maturin numpy pytest
+maturin develop --features cpu   # add metal,mlx,cuda,… as needed
+```
+
+From the repo root you can also use `maturin develop --release -m pyrlx/Cargo.toml`
+inside an activated virtualenv.
+
+## Tests
+
+Run from `pyrlx/` after `maturin develop` (not from the repo root without a
+venv — the bare `pyrlx/` directory is a namespace package and lacks `Graph`):
+
+```sh
+cd pyrlx && source .venv/bin/activate
+pytest tests/ -q
 ```
 
 ## Install (PyPI)

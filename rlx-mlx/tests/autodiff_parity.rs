@@ -130,6 +130,11 @@ fn activation_grad_ref(kind: Activation, x: f32, dy: f32) -> f32 {
         Activation::Round => dy,
         Activation::Sin => x.cos() * dy,
         Activation::Cos => -x.sin() * dy,
+        Activation::Tan => {
+            let t = x.tan();
+            dy * (1.0 + t * t)
+        }
+        Activation::Atan => dy / (1.0 + x * x),
     }
 }
 
@@ -341,6 +346,311 @@ fn layer_norm_backward_gamma_matches_reference() {
         close(&got, &want, 5e-5),
         "LayerNormBackwardGamma: got {got:?} want {want:?}"
     );
+}
+
+#[test]
+fn attention_backward_query_matches_reference() {
+    use rlx_ir::op::{AttentionBwdWrt, MaskKind};
+    const B: usize = 1;
+    const H: usize = 2;
+    const S: usize = 4;
+    const D: usize = 3;
+    let f = DType::F32;
+    let mut g = Graph::new("attn_bwd_q");
+    let q = g.input("q", Shape::new(&[B, H, S, D], f));
+    let k = g.input("k", Shape::new(&[B, H, S, D], f));
+    let v = g.input("v", Shape::new(&[B, H, S, D], f));
+    let dy = g.input("dy", Shape::new(&[B, H, S, D], f));
+    let dq = g.add_node(
+        Op::AttentionBackward {
+            num_heads: H,
+            head_dim: D,
+            mask_kind: MaskKind::Causal,
+            wrt: AttentionBwdWrt::Query,
+        },
+        vec![q, k, v, dy],
+        Shape::new(&[B, H, S, D], f),
+    );
+    g.set_outputs(vec![dq]);
+
+    let n = B * H * S * D;
+    let qv: Vec<f32> = (0..n).map(|i| 0.05 * (i as f32 - 3.0)).collect();
+    let kv: Vec<f32> = (0..n).map(|i| 0.03 * (i as f32 - 2.0)).collect();
+    let vv: Vec<f32> = (0..n).map(|i| 0.02 * (i as f32 - 1.0)).collect();
+    let dyv: Vec<f32> = (0..n).map(|i| 1.0 + 0.1 * i as f32).collect();
+
+    let mut want = vec![0f32; n];
+    rlx_cpu::attention_bwd::attention_backward(
+        AttentionBwdWrt::Query,
+        &qv,
+        &kv,
+        &vv,
+        &dyv,
+        &mut want,
+        B,
+        H,
+        S,
+        S,
+        D,
+        MaskKind::Causal,
+        &[],
+        true,
+    );
+
+    let got = run(g, &[("q", &qv), ("k", &kv), ("v", &vv), ("dy", &dyv)]);
+    assert!(
+        close(&got, &want, 2e-3),
+        "AttentionBackward Query: max err"
+    );
+}
+
+#[test]
+fn rms_norm_backward_input_matches_reference() {
+    let rows = 3usize;
+    let h = 5usize;
+    let eps = 1e-5f32;
+    let mut g = Graph::new("rms_bwd_in");
+    let x = g.input("x", Shape::new(&[rows, h], DType::F32));
+    let gamma = g.input("gamma", Shape::new(&[h], DType::F32));
+    let beta = g.input("beta", Shape::new(&[h], DType::F32));
+    let dy = g.input("dy", Shape::new(&[rows, h], DType::F32));
+    let dx = g.rms_norm_backward_input(x, gamma, beta, dy, -1, eps);
+    g.set_outputs(vec![dx]);
+
+    let xs: Vec<f32> = (0..rows * h).map(|i| 0.1 * (i as f32 - 5.0)).collect();
+    let gs: Vec<f32> = (0..h).map(|i| 0.5 + 0.2 * i as f32).collect();
+    let bs: Vec<f32> = vec![0.01; h];
+    let dys: Vec<f32> = (0..rows * h).map(|i| 1.0 + 0.05 * i as f32).collect();
+
+    let mut want = vec![0f32; rows * h];
+    let mut dg = vec![0f32; h];
+    let mut db = vec![0f32; h];
+    for r in 0..rows {
+        rlx_cpu::training_bwd::rms_norm_backward_row(
+            &xs[r * h..(r + 1) * h],
+            &gs,
+            &bs,
+            &dys[r * h..(r + 1) * h],
+            &mut want[r * h..(r + 1) * h],
+            &mut dg,
+            &mut db,
+            eps,
+        );
+    }
+    let got = run(g, &[("x", &xs), ("gamma", &gs), ("beta", &bs), ("dy", &dys)]);
+    assert!(
+        close(&got, &want, 5e-5),
+        "RmsNormBackwardInput: got {got:?} want {want:?}"
+    );
+}
+
+#[test]
+fn rms_norm_backward_gamma_matches_reference() {
+    let rows = 3usize;
+    let h = 5usize;
+    let eps = 1e-5f32;
+    let mut g = Graph::new("rms_bwd_g");
+    let x = g.input("x", Shape::new(&[rows, h], DType::F32));
+    let gamma = g.input("gamma", Shape::new(&[h], DType::F32));
+    let beta = g.input("beta", Shape::new(&[h], DType::F32));
+    let dy = g.input("dy", Shape::new(&[rows, h], DType::F32));
+    let dgamma = g.rms_norm_backward_gamma(x, gamma, beta, dy, -1, eps);
+    g.set_outputs(vec![dgamma]);
+
+    let xs: Vec<f32> = (0..rows * h).map(|i| 0.1 * (i as f32 - 5.0)).collect();
+    let gs: Vec<f32> = (0..h).map(|i| 0.5 + 0.2 * i as f32).collect();
+    let bs: Vec<f32> = vec![0.01; h];
+    let dys: Vec<f32> = (0..rows * h).map(|i| 1.0 + 0.05 * i as f32).collect();
+
+    let mut want = vec![0f32; h];
+    for r in 0..rows {
+        let mut dx = vec![0f32; h];
+        let mut db = vec![0f32; h];
+        rlx_cpu::training_bwd::rms_norm_backward_row(
+            &xs[r * h..(r + 1) * h],
+            &gs,
+            &bs,
+            &dys[r * h..(r + 1) * h],
+            &mut dx,
+            &mut want,
+            &mut db,
+            eps,
+        );
+    }
+    let got = run(g, &[("x", &xs), ("gamma", &gs), ("beta", &bs), ("dy", &dys)]);
+    assert!(close(&got, &want, 5e-4), "RmsNormBackwardGamma");
+}
+
+#[test]
+fn rms_norm_backward_beta_matches_reference() {
+    let rows = 2usize;
+    let h = 4usize;
+    let eps = 1e-5f32;
+    let mut g = Graph::new("rms_bwd_b");
+    let x = g.input("x", Shape::new(&[rows, h], DType::F32));
+    let gamma = g.input("gamma", Shape::new(&[h], DType::F32));
+    let beta = g.input("beta", Shape::new(&[h], DType::F32));
+    let dy = g.input("dy", Shape::new(&[rows, h], DType::F32));
+    let dbeta = g.rms_norm_backward_beta(x, gamma, beta, dy, -1, eps);
+    g.set_outputs(vec![dbeta]);
+
+    let xs: Vec<f32> = (0..rows * h).map(|i| 0.2 * i as f32).collect();
+    let gs: Vec<f32> = vec![1.0; h];
+    let bs: Vec<f32> = vec![0.0; h];
+    let dys: Vec<f32> = (0..rows * h).map(|i| 0.5 + i as f32).collect();
+
+    let mut want = vec![0f32; h];
+    for r in 0..rows {
+        let mut dx = vec![0f32; h];
+        let mut dg = vec![0f32; h];
+        rlx_cpu::training_bwd::rms_norm_backward_row(
+            &xs[r * h..(r + 1) * h],
+            &gs,
+            &bs,
+            &dys[r * h..(r + 1) * h],
+            &mut dx,
+            &mut dg,
+            &mut want,
+            eps,
+        );
+    }
+    let got = run(g, &[("x", &xs), ("gamma", &gs), ("beta", &bs), ("dy", &dys)]);
+    assert!(close(&got, &want, 5e-4), "RmsNormBackwardBeta");
+}
+
+#[test]
+fn rope_backward_matches_reference() {
+    let b = 1usize;
+    let s = 2usize;
+    let hd = 8usize;
+    let n_rot = 6usize;
+    let tab = hd / 2;
+    let mut g = Graph::new("rope_bwd");
+    let dy = g.input("dy", Shape::new(&[b, s, hd], DType::F32));
+    let cos = g.input("cos", Shape::new(&[s, tab], DType::F32));
+    let sin = g.input("sin", Shape::new(&[s, tab], DType::F32));
+    let dx = g.rope_backward(dy, cos, sin, hd, n_rot);
+    g.set_outputs(vec![dx]);
+
+    let dyv: Vec<f32> = (0..b * s * hd).map(|i| 0.1 * i as f32).collect();
+    let cosv: Vec<f32> = (0..s * tab).map(|i| (i as f32 * 0.3).cos()).collect();
+    let sinv: Vec<f32> = (0..s * tab).map(|i| (i as f32 * 0.3).sin()).collect();
+    let mut want = vec![0f32; b * s * hd];
+    for si in 0..s {
+        let cp = &cosv[si * tab..(si + 1) * tab];
+        let sp = &sinv[si * tab..(si + 1) * tab];
+        rlx_cpu::training_bwd::rope_backward_row(
+            &dyv[si * hd..(si + 1) * hd],
+            cp,
+            sp,
+            &mut want[si * hd..(si + 1) * hd],
+            hd,
+            n_rot,
+        );
+    }
+    let got = run(g, &[("dy", &dyv), ("cos", &cosv), ("sin", &sinv)]);
+    assert!(close(&got, &want, 5e-4), "RopeBackward");
+}
+
+#[test]
+fn cumsum_backward_inclusive_matches_reference() {
+    let rows = 3usize;
+    let cols = 4usize;
+    let mut g = Graph::new("cum_bwd");
+    let dy = g.input("dy", Shape::new(&[rows, cols], DType::F32));
+    let dx = g.cumsum_backward(dy, Shape::new(&[rows, cols], DType::F32), -1, false);
+    g.set_outputs(vec![dx]);
+
+    let dyv: Vec<f32> = (0..rows * cols).map(|i| 1.0 + 0.1 * i as f32).collect();
+    let mut want = vec![0f32; rows * cols];
+    for r in 0..rows {
+        rlx_cpu::training_bwd::cumsum_backward_row(
+            &dyv[r * cols..(r + 1) * cols],
+            &mut want[r * cols..(r + 1) * cols],
+            false,
+        );
+    }
+    let got = run(g, &[("dy", &dyv)]);
+    assert!(close(&got, &want, 5e-4), "CumsumBackward");
+}
+
+#[test]
+fn group_norm_backward_input_matches_reference() {
+    let n = 1usize;
+    let c = 4usize;
+    let h = 2usize;
+    let w = 2usize;
+    let eps = 1e-5f32;
+    let mut g = Graph::new("gn_bwd_in");
+    let x = g.input("x", Shape::new(&[n, c, h, w], DType::F32));
+    let gamma = g.input("gamma", Shape::new(&[c], DType::F32));
+    let beta = g.input("beta", Shape::new(&[c], DType::F32));
+    let dy = g.input("dy", Shape::new(&[n, c, h, w], DType::F32));
+    let dx = g.group_norm_backward_input(x, gamma, beta, dy, 2, eps);
+    g.set_outputs(vec![dx]);
+
+    let plane = c * h * w;
+    let xv: Vec<f32> = (0..plane).map(|i| 0.1 * i as f32 - 0.2).collect();
+    let gv: Vec<f32> = vec![1.0, 1.1, 1.2, 1.3];
+    let bv: Vec<f32> = vec![0.01; c];
+    let dys: Vec<f32> = (0..plane).map(|i| 0.5 + 0.1 * i as f32).collect();
+    let mut want = vec![0f32; plane];
+    rlx_cpu::training_bwd::group_norm_backward_input_nchw(
+        &xv, &gv, &dys, &mut want, n, c, h, w, 2, eps,
+    );
+    let got = run(g, &[("x", &xv), ("gamma", &gv), ("beta", &bv), ("dy", &dys)]);
+    assert!(close(&got, &want, 5e-3), "GroupNormBackwardInput");
+}
+
+#[test]
+fn attention_backward_key_matches_reference() {
+    use rlx_ir::op::{AttentionBwdWrt, MaskKind};
+    const B: usize = 1;
+    const H: usize = 2;
+    const S: usize = 3;
+    const D: usize = 2;
+    let f = DType::F32;
+    let mut g = Graph::new("attn_bwd_k");
+    let q = g.input("q", Shape::new(&[B, H, S, D], f));
+    let k = g.input("k", Shape::new(&[B, H, S, D], f));
+    let v = g.input("v", Shape::new(&[B, H, S, D], f));
+    let dy = g.input("dy", Shape::new(&[B, H, S, D], f));
+    let dk = g.add_node(
+        Op::AttentionBackward {
+            num_heads: H,
+            head_dim: D,
+            mask_kind: MaskKind::None,
+            wrt: AttentionBwdWrt::Key,
+        },
+        vec![q, k, v, dy],
+        Shape::new(&[B, H, S, D], f),
+    );
+    g.set_outputs(vec![dk]);
+
+    let n = B * H * S * D;
+    let qv: Vec<f32> = (0..n).map(|i| 0.05 * (i as f32 - 2.0)).collect();
+    let kv: Vec<f32> = (0..n).map(|i| 0.03 * (i as f32 - 1.0)).collect();
+    let vv: Vec<f32> = (0..n).map(|i| 0.02 * i as f32).collect();
+    let dyv: Vec<f32> = (0..n).map(|i| 1.0 + 0.1 * i as f32).collect();
+    let mut want = vec![0f32; n];
+    rlx_cpu::attention_bwd::attention_backward(
+        AttentionBwdWrt::Key,
+        &qv,
+        &kv,
+        &vv,
+        &dyv,
+        &mut want,
+        B,
+        H,
+        S,
+        S,
+        D,
+        MaskKind::None,
+        &[],
+        true,
+    );
+    let got = run(g, &[("q", &qv), ("k", &kv), ("v", &vv), ("dy", &dyv)]);
+    assert!(close(&got, &want, 2e-3), "AttentionBackward Key");
 }
 
 #[test]

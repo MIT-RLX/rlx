@@ -270,7 +270,7 @@ mod tests {
     }
 
     // Tuple tests live here so `tuple` test names cover the new
-    // hierarchical type (the runtime smoke covers the const fns).
+    // hierarchical type (the runtime check covers the const fns).
     #[test]
     fn tuple_leaf_constructors() {
         let a = ShapeTuple::leaf(8);

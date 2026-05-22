@@ -60,7 +60,39 @@ pub trait GraphExt {
 
     // ── Normalization ───────────────────────────────────────
     fn ln(&mut self, x: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId;
+    fn layer_norm2d(&mut self, x: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId;
+    fn group_norm(
+        &mut self,
+        x: NodeId,
+        gamma: NodeId,
+        beta: NodeId,
+        num_groups: usize,
+        eps: f32,
+    ) -> NodeId;
     fn rms_norm(&mut self, x: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId;
+
+    // ── Convolution (NCHW) ───────────────────────────────────
+    fn conv2d(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        kernel_size: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+        dilation: [usize; 2],
+        groups: usize,
+    ) -> NodeId;
+    fn conv_transpose2d(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        kernel_size: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+        dilation: [usize; 2],
+        output_padding: [usize; 2],
+        groups: usize,
+    ) -> NodeId;
 
     // ── Reduction ───────────────────────────────────────────
     fn sum(&mut self, x: NodeId, axes: Vec<usize>, keep_dim: bool) -> NodeId;
@@ -91,6 +123,15 @@ pub trait GraphExt {
 
     // ── RoPE ────────────────────────────────────────────────
     fn rope(&mut self, x: NodeId, cos: NodeId, sin: NodeId, head_dim: usize) -> NodeId;
+    /// Partial RoPE: rotate the first `n_rot` dims (NeoX offset `n_rot/2`).
+    fn rope_n(
+        &mut self,
+        x: NodeId,
+        cos: NodeId,
+        sin: NodeId,
+        head_dim: usize,
+        n_rot: usize,
+    ) -> NodeId;
 
     // ── Cast ────────────────────────────────────────────────
     fn cast(&mut self, x: NodeId, to: DType) -> NodeId;
@@ -168,6 +209,60 @@ impl GraphExt for Graph {
         self.layer_norm(x, gamma, beta, -1, eps, s)
     }
 
+    fn layer_norm2d(&mut self, x: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId {
+        Graph::layer_norm2d(self, x, gamma, beta, eps)
+    }
+
+    fn group_norm(
+        &mut self,
+        x: NodeId,
+        gamma: NodeId,
+        beta: NodeId,
+        num_groups: usize,
+        eps: f32,
+    ) -> NodeId {
+        Graph::group_norm(self, x, gamma, beta, num_groups, eps)
+    }
+
+    fn conv2d(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        kernel_size: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+        dilation: [usize; 2],
+        groups: usize,
+    ) -> NodeId {
+        Graph::conv2d(
+            self, input, weight, kernel_size, stride, padding, dilation, groups,
+        )
+    }
+
+    fn conv_transpose2d(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        kernel_size: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+        dilation: [usize; 2],
+        output_padding: [usize; 2],
+        groups: usize,
+    ) -> NodeId {
+        Graph::conv_transpose2d(
+            self,
+            input,
+            weight,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            output_padding,
+            groups,
+        )
+    }
+
     fn rms_norm(&mut self, x: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId {
         let s = shape::unary_shape(self.shape(x));
         self.add_node(Op::RmsNorm { axis: -1, eps }, vec![x, gamma, beta], s)
@@ -243,8 +338,23 @@ impl GraphExt for Graph {
     }
 
     fn rope(&mut self, x: NodeId, cos: NodeId, sin: NodeId, head_dim: usize) -> NodeId {
+        self.rope_n(x, cos, sin, head_dim, head_dim)
+    }
+
+    fn rope_n(
+        &mut self,
+        x: NodeId,
+        cos: NodeId,
+        sin: NodeId,
+        head_dim: usize,
+        n_rot: usize,
+    ) -> NodeId {
+        assert!(
+            n_rot <= head_dim && n_rot.is_multiple_of(2),
+            "rope_n: n_rot={n_rot} must be even and <= head_dim={head_dim}"
+        );
         let s = shape::unary_shape(self.shape(x));
-        self.add_node(Op::Rope { head_dim }, vec![x, cos, sin], s)
+        self.add_node(Op::Rope { head_dim, n_rot }, vec![x, cos, sin], s)
     }
 
     fn cast(&mut self, x: NodeId, to: DType) -> NodeId {
@@ -256,6 +366,31 @@ impl GraphExt for Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inferred_conv2d_and_conv_transpose2d() {
+        let mut g = Graph::new("conv");
+        let f = DType::F32;
+        let x = g.input("x", Shape::new(&[1, 4, 8, 8], f));
+        let w = g.param("w", Shape::new(&[8, 2, 3, 3], f));
+        let y = g.conv2d(x, w, [3, 3], [1, 1], [1, 1], [1, 1], 2);
+        assert_eq!(g.shape(y), &Shape::new(&[1, 8, 8, 8], f));
+
+        let wt = g.param("wt", Shape::new(&[4, 8, 2, 2], f));
+        let z = g.conv_transpose2d(x, wt, [2, 2], [2, 2], [0, 0], [1, 1], [0, 0], 1);
+        assert_eq!(g.shape(z), &Shape::new(&[1, 8, 16, 16], f));
+    }
+
+    #[test]
+    fn inferred_layer_norm2d() {
+        let mut g = Graph::new("ln2d");
+        let f = DType::F32;
+        let x = g.input("x", Shape::new(&[1, 4, 8, 8], f));
+        let gamma = g.param("g", Shape::new(&[4], f));
+        let beta = g.param("b", Shape::new(&[4], f));
+        let y = g.layer_norm2d(x, gamma, beta, 1e-6);
+        assert_eq!(g.shape(y), &Shape::new(&[1, 4, 8, 8], f));
+    }
 
     #[test]
     fn inferred_matmul_bias_gelu() {

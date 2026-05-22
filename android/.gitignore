@@ -1,0 +1,29 @@
+# Rust / Cargo (rlx-jni)
+target/
+
+# Gradle
+.gradle/
+build/
+**/build/
+**/intermediates/
+
+# Android Studio / NDK
+.idea/
+*.iml
+local.properties
+.cxx/
+
+# Packaged outputs
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Copied in by build-openblas.sh / build.sh
+app/src/main/jniLibs/
+
+# Fetched / built vendor trees (OpenBLAS, etc.)
+third_party/
+
+captures/
+*.hprof

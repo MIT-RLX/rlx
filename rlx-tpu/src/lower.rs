@@ -507,7 +507,7 @@ impl<'a> LowerCtx<'a> {
                 mask_kind,
             } => self.lower_attention(&n.inputs, *num_heads, *head_dim, *mask_kind, out_shape),
 
-            Op::Rope { head_dim } => {
+            Op::Rope { head_dim, n_rot: _ } => {
                 self.lower_rope(n.inputs[0], n.inputs[1], n.inputs[2], *head_dim, out_shape)
             }
 
@@ -713,6 +713,13 @@ impl<'a> LowerCtx<'a> {
                 "rlx-tpu: Op::Scan / Scan-backward / BatchedDenseSolve / \
                  CustomFn / Fft have no TPU lowering yet — use Device::Cpu.",
             ),
+
+            Op::GaussianSplatRender { .. } | Op::GaussianSplatRenderBackward { .. } => panic!(
+                "rlx-tpu: Gaussian splat ops are host-only; graphs containing \
+                 them must compile via segmented orchestration (not whole-graph HLO)."
+            ),
+
+            _ => panic!("rlx-tpu: unsupported op {:?}", n.op),
         }
     }
 
@@ -891,6 +898,8 @@ impl<'a> LowerCtx<'a> {
                 let half_x = self.entry.binary("multiply", x, half_b, shape.clone());
                 self.entry.binary("multiply", half_x, one_plus, shape)
             }
+            Activation::Tan => self.entry.unary("tan", x, shape),
+            Activation::Atan => self.entry.unary("atan", x, shape),
         }
     }
 
@@ -1496,7 +1505,7 @@ impl<'a> LowerCtx<'a> {
                 w as i64,
                 prim_ty,
             ),
-            MaskKind::Custom => {
+            MaskKind::Custom | MaskKind::Bias => {
                 // 4th input is the mask, additive [B, ?, S_q, S_k].
                 let mask = self.hlo(inputs[3]);
                 let mask_dims = self.ir_shape_dims(inputs[3]);
@@ -2135,6 +2144,15 @@ impl<'a> LowerCtx<'a> {
             | QuantScheme::Int4Block { block_size } => block_size as i64,
             // Fp8 schemes are per-tensor; treat as one-block-of-K.
             QuantScheme::Fp8E4m3 | QuantScheme::Fp8E5m2 => k,
+            QuantScheme::GgufQ4K
+            | QuantScheme::GgufQ5K
+            | QuantScheme::GgufQ6K
+            | QuantScheme::GgufQ8K
+            | QuantScheme::GgufQ2K
+            | QuantScheme::GgufQ3K
+            | QuantScheme::Nvfp4Block => panic!(
+                "rlx-tpu: GGUF / NVFP4 quant schemes have no HLO lowering — dequantize on CPU first."
+            ),
         };
         let kb = (k + block - 1) / block;
 

@@ -16,9 +16,10 @@
 //! Graph verification — catches IR bugs early.
 //!
 //! Verifies structural invariants: valid node references, input counts,
-//! acyclicity, and output validity.
+//! acyclicity, output validity, and (optionally) shape consistency.
 
 use crate::graph::{Graph, NodeId};
+use crate::infer_shape;
 
 /// Error found during graph verification.
 #[derive(Debug)]
@@ -90,20 +91,79 @@ pub fn verify(graph: &Graph) -> Vec<VerifyError> {
     errors
 }
 
+/// Re-derive output shapes from inputs and diff against declared shapes.
+pub fn verify_shapes(graph: &Graph) -> Vec<VerifyError> {
+    let mut errors = Vec::new();
+    for node in graph.nodes() {
+        let Some(expected) = infer_shape::infer_output_shape(graph, node) else {
+            continue;
+        };
+        if expected != node.shape {
+            errors.push(VerifyError {
+                node: Some(node.id),
+                message: format!(
+                    "shape mismatch: declared {}, inferred {expected}",
+                    node.shape
+                ),
+            });
+        }
+    }
+    errors
+}
+
+/// Structural + shape verification.
+pub fn verify_all(graph: &Graph) -> Vec<VerifyError> {
+    let mut errors = verify(graph);
+    errors.extend(verify_shapes(graph));
+    errors
+}
+
+/// Panic when verification fails. **Debug builds only** — in release
+/// this macro expands to nothing and is not compiled.
+#[macro_export]
+macro_rules! debug_assert_valid {
+    ($graph:expr, $stage:expr) => {{
+        #[cfg(debug_assertions)]
+        {
+            let __errors = $crate::verify::verify_all($graph);
+            if !__errors.is_empty() {
+                let __msg = __errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n  ");
+                panic!("IR verifier failed at `{}`:\n  {}", $stage, __msg);
+            }
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::*;
 
     #[test]
-    fn valid_graph_verifies() {
+    fn shape_mismatch_is_caught() {
+        let mut g = Graph::new("bad");
+        let x = g.input("x", Shape::new(&[4, 8], DType::F32));
+        let w = g.param("w", Shape::new(&[8, 16], DType::F32));
+        // Wrong output shape on purpose.
+        let mm = g.matmul(x, w, Shape::new(&[99, 99], DType::F32));
+        g.set_outputs(vec![mm]);
+
+        let errs = verify_shapes(&g);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].message.contains("shape mismatch"));
+    }
+
+    #[test]
+    fn verify_all_combines_checks() {
         let mut g = Graph::new("ok");
         let x = g.input("x", Shape::new(&[4, 384], DType::F32));
         let w = g.param("w", Shape::new(&[384, 384], DType::F32));
         let mm = g.matmul(x, w, Shape::new(&[4, 384], DType::F32));
         g.set_outputs(vec![mm]);
-
-        let errs = verify(&g);
-        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert!(verify_all(&g).is_empty());
     }
 }

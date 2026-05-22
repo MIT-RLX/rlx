@@ -49,7 +49,7 @@ pub fn unfuse(graph: Graph) -> Graph {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|&id| id_map[&id]).collect();
 
         let new_id = match &node.op {
-            Op::FusedSwiGLU { cast_to: _ } => {
+            Op::FusedSwiGLU { cast_to: _, .. } => {
                 expand_swiglu(&mut out, &graph, node.inputs[0], &new_inputs, &node.shape)
             }
             Op::LoraMatMul { scale } => expand_lora(
@@ -424,12 +424,12 @@ fn expand_fab(
 
     if has_rope {
         q4 = out.add_node(
-            Op::Rope { head_dim },
+            Op::Rope { head_dim, n_rot: head_dim },
             vec![q4, inputs[cos_idx], inputs[sin_idx]],
             bhsd_shape.clone(),
         );
         k4 = out.add_node(
-            Op::Rope { head_dim },
+            Op::Rope { head_dim, n_rot: head_dim },
             vec![k4, inputs[cos_idx], inputs[sin_idx]],
             bhsd_shape.clone(),
         );

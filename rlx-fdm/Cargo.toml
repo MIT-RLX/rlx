@@ -1,0 +1,152 @@
+[package]
+name = "rlx-fdm"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Force density method (FDM) for RLX — pin-jointed form-finding ported from jax_fdm."
+authors.workspace      = true
+license.workspace      = true
+keywords = ["fdm", "form-finding", "structural", "rlx", "force-density"]
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[features]
+default = ["reference", "sparse", "nonlinear"]
+
+# Pure-Rust equilibrium reference (dense K, LAPACK-free Gaussian elimination).
+reference = []
+
+# CSR stiffness + Jacobi PCG (jax_fdm `EquilibriumModelSparse`).
+sparse = ["reference"]
+
+# Fixed-point iteration with shape-dependent edge loads (`solver_forward`).
+nonlinear = ["reference", "sparse"]
+
+# COMPAS-style JSON network I/O (`data/json/*.json` from jax_fdm).
+io = ["dep:serde", "dep:serde_json"]
+
+# Build equilibrium as `Op::DenseSolve` on MIR (for Session / autodiff follow-ups).
+ir = ["reference", "dep:rlx-ir", "dep:rlx-runtime"]
+
+# `rlx_sparse.pcg_solve` for compiled FDM stiffness systems.
+rlx-sparse = ["sparse", "dep:rlx-ir", "dep:rlx-sparse", "dep:rlx-cpu"]
+
+# Fused MIR equilibrium + optional autodiff loss (`constrained_fdm` + `FusedAutodiffFormFinding`).
+fuse = ["ir", "rlx-sparse", "dep:rlx-autodiff"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+rlx-ir = { path = "../rlx-ir", version = "0.2.0", optional = true }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.0", default-features = false, features = ["cpu"], optional = true }
+rlx-sparse = { path = "../rlx-sparse", version = "0.2.0", default-features = false, features = ["cpu"], optional = true }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", optional = true }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.0", optional = true }
+
+[dev-dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.0" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.0", default-features = false, features = ["cpu"] }
+bytemuck = "1"
+
+[[test]]
+name = "io_arch_json"
+required-features = ["io"]
+
+[[test]]
+name = "ir_dense_solve"
+required-features = ["ir"]
+
+[[test]]
+name = "sparse_parity"
+required-features = ["sparse"]
+
+[[test]]
+name = "nonlinear_iter"
+required-features = ["nonlinear"]
+
+[[test]]
+name = "sparse_fast_parity"
+required-features = ["sparse"]
+
+[[test]]
+name = "face_loads"
+required-features = ["nonlinear"]
+
+[[test]]
+name = "implicit_grad"
+required-features = ["nonlinear"]
+
+[[test]]
+name = "rlx_sparse_pcg"
+required-features = ["rlx-sparse"]
+
+[[example]]
+name = "inverse_design"
+required-features = ["reference"]
+
+[[example]]
+name = "constrained_arch"
+required-features = ["reference"]
+
+[[test]]
+name = "constrained_opt"
+required-features = ["reference"]
+
+[[test]]
+name = "nonlinear_adjoint"
+required-features = ["nonlinear"]
+
+[[test]]
+name = "goals_extended"
+required-features = ["reference"]
+
+[[test]]
+name = "io_mesh_json"
+required-features = ["io"]
+
+[[test]]
+name = "mir_opt_hook"
+required-features = ["ir"]
+
+[[test]]
+name = "mir_sparse_pcg"
+required-features = ["ir", "rlx-sparse"]
+
+[[test]]
+name = "mir_sparse_autodiff"
+required-features = ["ir", "rlx-sparse"]
+
+[[test]]
+name = "mesh_goals"
+required-features = ["reference"]
+
+[[test]]
+name = "lbfgs_opt"
+required-features = ["reference"]
+
+[[test]]
+name = "pcg_adjoint"
+required-features = ["reference", "sparse"]
+
+[[test]]
+name = "fixed_coord_grad"
+required-features = ["reference"]
+
+[[test]]
+name = "anderson_accel"
+required-features = ["nonlinear"]
+
+[[test]]
+name = "fused_e2e"
+required-features = ["ir", "rlx-sparse"]
+
+[[test]]
+name = "fused_autodiff_opt"
+required-features = ["fuse"]
+
+[lints]
+workspace = true

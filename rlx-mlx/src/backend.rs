@@ -36,6 +36,10 @@ pub struct MlxExecutable {
     /// act as defaults when run() is called without an explicit input
     /// of the same name.
     handles: HashMap<String, Vec<f32>>,
+    /// GPU-resident inputs — reused across `run()` without host upload.
+    gpu_handles: HashMap<String, Array>,
+    /// After each `run`, copy `outputs[idx]` into the named GPU handle.
+    gpu_handle_feeds: HashMap<String, usize>,
     /// (byte_offset, num_elements) per output. Slots are ordered to
     /// match `graph.outputs`. Filled at compile time from output
     /// shapes; the offsets are stable across `run_slots` calls so the
@@ -87,6 +91,12 @@ impl MlxExecutable {
     }
 
     pub fn compile_with_mode(graph: Graph, mode: MlxMode) -> Self {
+        Self::compile_from_fused(graph, mode)
+    }
+
+    /// Compile a graph that already went through the fusion pipeline
+    /// (e.g. from [`rlx_ir::LirModule`]). Does not re-run fusion passes.
+    pub fn compile_from_fused(graph: Graph, mode: MlxMode) -> Self {
         let output_names = graph.outputs.clone();
 
         // Pre-resolve output slot layout. We pack outputs end-to-end
@@ -125,6 +135,8 @@ impl MlxExecutable {
             mode,
             params: HashMap::new(),
             handles: HashMap::new(),
+            gpu_handles: HashMap::new(),
+            gpu_handle_feeds: HashMap::new(),
             output_slots,
             arena,
             output_names,
@@ -175,57 +187,8 @@ impl MlxExecutable {
     }
 
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
-        // Drain anything still in flight from a prior commit_no_wait
-        // before we mutate input data — otherwise the async run might
-        // observe partially-overwritten inputs.
-        self.sync_pending();
-
-        // Build a name→data map for inputs, applying handles first then
-        // letting explicit inputs override.
-        let mut input_map: HashMap<String, Vec<f32>> = self.handles.clone();
-        for &(name, data) in inputs {
-            input_map.insert(name.to_string(), data.to_vec());
-        }
-
-        let outs = if self.mode == MlxMode::Compiled {
-            match self.run_compiled(&input_map) {
-                Ok(outs) => outs,
-                Err(e) => panic!("MLX compiled run failed: {e}"),
-            }
-        } else {
-            // Thread typed param overrides so set_param_typed-bound
-            // weights are honored on the f32 run() path too. PLAN L1
-            // active-extent (when set + safe) is honored inside the
-            // `_with_extent` variant by slicing input leaves.
-            match lower::lower_and_run_typed_with_extent(
-                &self.graph,
-                &self.params,
-                &self.params_typed,
-                &input_map,
-                &self.inputs_typed,
-                self.mode,
-                self.active_extent,
-            ) {
-                Ok(outs) => outs,
-                Err(e) => panic!("MLX backend run failed: {e}"),
-            }
-        };
-
-        let result: Vec<Vec<f32>> = outs
-            .iter()
-            .map(|a| a.to_f32().unwrap_or_default())
-            .collect();
-        // KV-cache pattern (matches the CPU backend): if a
-        // persistent handle's name matches "out{i}" for an
-        // output slot, sync the f32 data back so the next run
-        // picks it up as the input of the same name.
-        for (i, vals) in result.iter().enumerate() {
-            let name = format!("out{i}");
-            if self.handles.contains_key(&name) {
-                self.handles.insert(name, vals.clone());
-            }
-        }
-        result
+        self.run_internal(inputs, true)
+            .unwrap_or_else(|e| panic!("MLX backend run failed: {e}"))
     }
 
     /// Run with typed inputs and read outputs back as raw bytes in
@@ -260,6 +223,7 @@ impl MlxExecutable {
                 &self.inputs_typed,
                 self.mode,
                 self.active_extent,
+                Some(&self.gpu_handles),
             ) {
                 Ok(o) => o,
                 Err(e) => panic!("MLX run_typed failed: {e}"),
@@ -304,6 +268,7 @@ impl MlxExecutable {
                     input_map,
                     &self.params_typed,
                     &self.inputs_typed,
+                    Some(&self.gpu_handles),
                 )?,
             };
             leaves.push(leaf);
@@ -446,6 +411,124 @@ impl MlxExecutable {
         self.handles.get(name).cloned()
     }
 
+    /// Upload `data` once and keep the MLX array as a graph input across runs.
+    pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> Result<(), MlxError> {
+        let shape = self.input_shape_for_name(name)?;
+        let data = lower::broadcast_leaf_data(name, data, &shape)?;
+        let arr = Array::from_f32_slice(&data, &shape, DType::F32)?;
+        self.gpu_handles.insert(name.to_string(), arr);
+        Ok(())
+    }
+
+    pub fn has_gpu_handle(&self, name: &str) -> bool {
+        self.gpu_handles.contains_key(name)
+    }
+
+    /// After each [`run`] / [`run_feed_gpu`], copy `outputs[out_idx]` into `handle_name`.
+    pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
+        self.gpu_handle_feeds
+            .insert(handle_name.to_string(), output_index);
+    }
+
+    /// Read a GPU-resident handle back to host `f32` (eval + sync).
+    pub fn read_gpu_handle(&self, name: &str) -> Result<Vec<f32>, MlxError> {
+        let arr = self
+            .gpu_handles
+            .get(name)
+            .ok_or_else(|| MlxError(format!("no gpu handle '{name}'")))?;
+        arr.to_f32()
+    }
+
+    /// Run with host inputs, refresh GPU handle feeds, optional readback of `out_idx`.
+    pub fn run_feed_gpu(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        handle_name: &str,
+        output_index: usize,
+    ) -> Result<Vec<f32>, MlxError> {
+        self.set_gpu_handle_feed(handle_name, output_index);
+        let outs = self.run_internal(inputs, true)?;
+        outs.into_iter()
+            .nth(output_index)
+            .ok_or_else(|| MlxError(format!("output index {output_index} missing")))
+    }
+
+    fn input_shape_for_name(&self, name: &str) -> Result<Vec<usize>, MlxError> {
+        for node in self.graph.nodes() {
+            if let rlx_ir::Op::Input { name: n } = &node.op {
+                if n == name {
+                    return Ok(
+                        node.shape
+                            .dims()
+                            .iter()
+                            .map(|d| d.unwrap_static())
+                            .collect(),
+                    );
+                }
+            }
+        }
+        Err(MlxError(format!("input '{name}' not in graph")))
+    }
+
+    fn refresh_gpu_handles_from_outputs(&mut self, outs: &[Array]) -> Result<(), MlxError> {
+        for (name, &idx) in &self.gpu_handle_feeds {
+            let arr = outs
+                .get(idx)
+                .ok_or_else(|| MlxError(format!("gpu feed output {idx} missing")))?;
+            self.gpu_handles.insert(name.clone(), arr.clone_handle()?);
+        }
+        Ok(())
+    }
+
+    fn run_internal(&mut self, inputs: &[(&str, &[f32])], readback_outputs: bool) -> Result<Vec<Vec<f32>>, MlxError> {
+        self.sync_pending();
+        let mut input_map: HashMap<String, Vec<f32>> = self.handles.clone();
+        for &(name, data) in inputs {
+            if !self.gpu_handles.contains_key(name) {
+                input_map.insert(name.to_string(), data.to_vec());
+            } else {
+                input_map.insert(name.to_string(), data.to_vec());
+            }
+        }
+
+        let outs = if self.mode == MlxMode::Compiled {
+            self.run_compiled(&input_map)?
+        } else {
+            lower::lower_and_run_typed_with_extent(
+                &self.graph,
+                &self.params,
+                &self.params_typed,
+                &input_map,
+                &self.inputs_typed,
+                self.mode,
+                self.active_extent,
+                Some(&self.gpu_handles),
+            )?
+        };
+
+        self.refresh_gpu_handles_from_outputs(&outs)?;
+
+        if !readback_outputs {
+            return Ok(Vec::new());
+        }
+
+        let result: Vec<Vec<f32>> = outs
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                a.to_f32()
+                    .unwrap_or_else(|e| panic!("MLX backend output {i} readback failed: {e}"))
+            })
+            .collect();
+        for (i, vals) in result.iter().enumerate() {
+            let name = format!("out{i}");
+            if self.handles.contains_key(&name) {
+                self.handles.insert(name, vals.clone());
+            }
+        }
+        Ok(result)
+    }
+
     pub fn graph(&self) -> &Graph {
         &self.graph
     }
@@ -462,7 +545,7 @@ impl MlxExecutable {
 /// caching; `eager` evals after every op (debug-friendly); `lazy`
 /// (default) evals once per run.
 fn mode_from_env() -> MlxMode {
-    match std::env::var("RLX_MLX_MODE").ok().as_deref() {
+    match rlx_ir::env::var("RLX_MLX_MODE").as_deref() {
         Some(s) if s.eq_ignore_ascii_case("eager") => MlxMode::Eager,
         Some(s) if s.eq_ignore_ascii_case("compiled") => MlxMode::Compiled,
         _ => MlxMode::Lazy,

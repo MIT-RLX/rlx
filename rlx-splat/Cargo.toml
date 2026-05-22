@@ -1,0 +1,84 @@
+[package]
+name = "rlx-splat"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "3D Gaussian splatting for RLX — scene types, reference pipeline, IR builders, and CPU execution."
+authors.workspace      = true
+license.workspace      = true
+keywords = ["gaussian-splatting", "3dgs", "rendering", "rlx", "ml"]
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[features]
+default = ["core", "reference"]
+
+# Scene/camera/SH types (vendored in `src/core`).
+core = []
+
+# CPU reference pipeline: project → bin → sort → raster (vendored in `src/reference`).
+reference = ["core"]
+
+# Rayon parallel geometry / splat backprop (training hot path).
+parallel = ["reference", "dep:rayon"]
+
+# Arena execution hooks registered into `rlx-cpu` (no `rlx-runtime` — avoids cycles).
+execute = ["reference", "dep:rlx-cpu"]
+
+# Register legacy `Op::Custom` aliases + wire CPU splat executors into `rlx-cpu`.
+cpu = ["execute", "dep:rlx-ir", "dep:rlx-cpu"]
+
+# Graph builders (`graph`, `pipeline`) + backward helpers.
+backward = ["cpu", "dep:rlx-ir"]
+
+# PLY/COLMAP I/O (`src/io_format`).
+io = ["reference", "cpu", "dep:anyhow", "dep:image", "dep:bytemuck"]
+
+# Metal tile raster dispatch (`src/backends/metal.rs`); no `rlx-runtime` dependency.
+metal = ["reference", "dep:metal", "dep:rlx-ir"]
+
+test-support = ["cpu"]
+# Omit `rlx-runtime/metal` — `rlx-metal` → `rlx-splat` → `rlx-runtime` cycle.
+# Omit `rlx-runtime/mlx` — `rlx-mlx` → `rlx-cpu` → `rlx-splat` → `rlx-runtime` cycle.
+integration-backends = []
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0", optional = true }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", optional = true }
+anyhow = { version = "1", optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"], optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+metal = { version = "0.30", optional = true }
+rayon = { version = "1.10", optional = true }
+
+[dev-dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", features = ["splat"] }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.0", default-features = false, features = ["cpu"] }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.0" }
+anyhow = "1"
+tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[example]]
+name = "render_ply_session"
+required-features = ["io", "test-support"]
+
+
+[[example]]
+name = "common_splat_session"
+required-features = ["cpu", "reference"]
+
+[[example]]
+name = "decomposed_session"
+required-features = ["test-support"]
+
+[[test]]
+name = "colmap_loader"
+required-features = ["io"]
+
+[lints]
+workspace = true

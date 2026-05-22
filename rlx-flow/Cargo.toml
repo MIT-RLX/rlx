@@ -1,0 +1,25 @@
+[package]
+name = "rlx-flow"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Block assembly-line API for RLX model builders — fusion-first, config-driven"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.0", features = ["serialize"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+
+[lints]
+workspace = true

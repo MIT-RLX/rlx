@@ -47,7 +47,7 @@ fn tpu_available() -> bool {
 }
 
 fn skip_unless_bench() -> bool {
-    std::env::var("RLX_TPU_BENCH").is_err()
+    rlx_ir::env::is_unset("RLX_TPU_BENCH")
 }
 
 fn det_random(seed: u64, n: usize, scale: f32) -> Vec<f32> {

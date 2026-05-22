@@ -37,6 +37,7 @@
 //! fits_in`] takes a budget and returns the gating decision plus
 //! a structured reason.
 
+use crate::expert_pool::gpu_expert_budget_from_vram;
 use crate::weight_registry::WeightRegistry;
 use rlx_ir::Graph;
 use rlx_opt::memory::plan_memory;
@@ -110,6 +111,65 @@ impl std::error::Error for MemoryDeficit {}
 /// `registry`. Pure analysis — runs the memory planner internally
 /// and queries the registry for weight bytes; doesn't compile or
 /// execute.
+/// MoE offload sizing (TIDE `enable_predictive_expert_offload`).
+#[derive(Debug, Clone)]
+pub struct MoeOffloadEstimate {
+    /// Bytes for one expert FFN (gate+up+down) at runtime dtype.
+    pub expert_param_bytes: usize,
+    pub num_moe_layers: usize,
+    pub num_experts: usize,
+    /// Experts pinned on device per layer after budget clamp.
+    pub gpu_expert_budget_per_layer: usize,
+    /// All experts resident on host+device (upper bound).
+    pub all_expert_weight_bytes: usize,
+    /// Only `gpu_expert_budget_per_layer` experts per layer on device.
+    pub resident_expert_weight_bytes: usize,
+}
+
+impl MoeOffloadEstimate {
+    /// Resident expert weights + non-expert peak from [`MemoryEstimate`].
+    pub fn peak_with_offload(&self, base: &MemoryEstimate) -> usize {
+        base.activation_bytes
+            + base.input_bytes
+            + (base.weight_bytes - self.all_expert_weight_bytes)
+            + self.resident_expert_weight_bytes
+    }
+}
+
+/// Compute GPU expert budget from a memory budget (unified RAM or VRAM).
+pub fn estimate_moe_offload(
+    expert_param_bytes: usize,
+    num_moe_layers: usize,
+    num_experts: usize,
+    max_gpu_experts_per_layer: usize,
+    memory_budget_bytes: usize,
+    reserve_fraction: f32,
+) -> MoeOffloadEstimate {
+    let reserve_bytes = (memory_budget_bytes as f64 * reserve_fraction as f64) as usize;
+    let gpu_budget = gpu_expert_budget_from_vram(
+        memory_budget_bytes,
+        reserve_bytes,
+        expert_param_bytes,
+        num_moe_layers,
+        max_gpu_experts_per_layer,
+        num_experts,
+    );
+    let all_expert = expert_param_bytes
+        .saturating_mul(num_experts)
+        .saturating_mul(num_moe_layers);
+    let resident_expert = expert_param_bytes
+        .saturating_mul(gpu_budget)
+        .saturating_mul(num_moe_layers);
+    MoeOffloadEstimate {
+        expert_param_bytes,
+        num_moe_layers,
+        num_experts,
+        gpu_expert_budget_per_layer: gpu_budget,
+        all_expert_weight_bytes: all_expert,
+        resident_expert_weight_bytes: resident_expert,
+    }
+}
+
 pub fn estimate(graph: &Graph, registry: &WeightRegistry) -> MemoryEstimate {
     let plan = plan_memory(graph);
     // Inputs: walk the graph once; sum each Op::Input's shape.
@@ -237,7 +297,7 @@ mod tests {
 
     #[test]
     fn available_memory_returns_something_on_macos() {
-        // Smoke test — on macOS this should return Some(>0).
+        // basic test — on macOS this should return Some(>0).
         // Elsewhere (CI) we accept None.
         if cfg!(target_os = "macos") {
             let mem = available_unified_memory();

@@ -46,7 +46,7 @@ fn skip_unless_bench() -> bool {
         eprintln!("[pjrt_bench] LIBTPU_PATH not set — skipping");
         return true;
     }
-    if std::env::var("RLX_TPU_BENCH").is_err() {
+    if rlx_ir::env::is_unset("RLX_TPU_BENCH") {
         eprintln!(
             "[pjrt_bench] RLX_TPU_BENCH not set — skipping. \
                    set RLX_TPU_BENCH=1 to run."
@@ -219,7 +219,7 @@ fn run_one(b: usize, s: usize, h: usize, n_heads: usize, ffn: usize) -> BenchRow
     }
 }
 
-/// Single canonical configuration — quick smoke for the bench
+/// Single canonical configuration — quick check for the bench
 /// machinery itself. Always runs when `RLX_TPU_BENCH=1`.
 #[test]
 fn transformer_block_bench() {
@@ -251,7 +251,7 @@ fn transformer_block_bench_sweep() {
     if skip_unless_bench() {
         return;
     }
-    if std::env::var("RLX_TPU_BENCH_SWEEP").is_err() {
+    if rlx_ir::env::is_unset("RLX_TPU_BENCH_SWEEP") {
         eprintln!(
             "[pjrt_bench] sweep skipped — set \
                    RLX_TPU_BENCH_SWEEP=1 to enable"

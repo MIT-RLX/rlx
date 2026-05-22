@@ -46,30 +46,26 @@ use crate::libtpu::{
     event_await,
 };
 use crate::lower::{HloModule, lower_graph};
+use crate::orchestrated::OrchestratedExecutable;
+use crate::segment;
 
 /// Compiled-once, run-many TPU executable.
 pub struct TpuExecutable {
-    /// Compiled HLO module + I/O metadata. Owned because we re-read
-    /// the param/input layout on every `run` — the IR is small, this
-    /// is cheap.
-    module: HloModule,
+    inner: ExecInner,
+}
 
-    /// Owning host copies of every parameter buffer.
-    params: HashMap<String, Vec<u8>>,
-    param_dtypes: HashMap<String, DType>,
-
-    /// PJRT executable handle. NULL if compile failed (we panic
-    /// before constructing in that case, so reading this in non-Drop
-    /// paths is always safe — but keep the option pattern for Drop).
-    executable: *mut PjrtLoadedExecutable,
-
-    /// Lazily-uploaded device-resident parameter buffers, keyed by
-    /// the parameter index in the HLO program. None until the first
-    /// `run` populates it.
-    param_buffers: Vec<*mut PjrtBuffer>,
-    /// True after the first run uploaded everything. Subsequent runs
-    /// reuse `param_buffers` and only upload inputs.
-    params_uploaded: bool,
+enum ExecInner {
+    /// Whole-graph HLO (no Gaussian splat ops).
+    Single {
+        module: HloModule,
+        params: HashMap<String, Vec<u8>>,
+        param_dtypes: HashMap<String, DType>,
+        executable: *mut PjrtLoadedExecutable,
+        param_buffers: Vec<*mut PjrtBuffer>,
+        params_uploaded: bool,
+    },
+    /// HLO segments + host splat steps.
+    Orchestrated(OrchestratedExecutable),
 }
 
 // PJRT executables + buffers are documented as thread-safe by the
@@ -79,7 +75,7 @@ unsafe impl Send for TpuExecutable {}
 impl TpuExecutable {
     /// Compile `graph` for the active TPU device.
     pub fn compile(graph: Graph) -> Self {
-        let ctx = tpu_context().unwrap_or_else(|| {
+        let _ctx = tpu_context().unwrap_or_else(|| {
             panic!(
                 "rlx-tpu: no PJRT runtime available. \
                  libtpu.so / libpjrt_c_cpu.so could not be loaded. Set \
@@ -116,6 +112,8 @@ impl TpuExecutable {
         let graph = rlx_opt::DeadCodeElimination.run(graph);
         let graph = rlx_opt::ConstantFolding.run(graph);
         let graph = rlx_opt::FuseResidualLN.run(graph);
+        let graph = rlx_opt::FuseResidualRmsNorm.run(graph);
+        let graph = rlx_opt::FuseRmsNormReshape.run(graph);
         let graph = rlx_opt::FuseMatMulBiasAct.run(graph);
         let graph = rlx_opt::LegalizeBroadcast.run(graph);
         let graph = rlx_opt::MarkElementwiseRegions.run(graph);
@@ -127,6 +125,12 @@ impl TpuExecutable {
         // are NOT unfused — they're tier-2 fused ops that have their
         // own dedicated lowering paths in lower.rs.
         let graph = crate::unfuse::unfuse(graph);
+
+        if segment::needs_orchestration(&graph) {
+            return Self {
+                inner: ExecInner::Orchestrated(OrchestratedExecutable::compile(graph)),
+            };
+        }
 
         let module = lower_graph(&graph);
 
@@ -141,7 +145,7 @@ impl TpuExecutable {
         //   m = xla_extension.HloModule.from_serialized_hlo_module_proto(
         //       open("graph.pb", "rb").read())
         //   print(m.to_string())
-        if let Ok(dump_path) = std::env::var("RLX_TPU_HLO_DUMP") {
+        if let Some(dump_path) = rlx_ir::env::var("RLX_TPU_HLO_DUMP") {
             let p = std::path::Path::new(&dump_path);
             let target: std::path::PathBuf = if p.is_dir() {
                 p.join(format!("{}.pb", graph.name))
@@ -161,63 +165,17 @@ impl TpuExecutable {
             }
         }
 
-        // Compile via PJRT_Client_Compile. Format = "hlo" — bytes are
-        // an HloModuleProto. We must pass a non-empty CompileOptions
-        // proto: XLA's default leaves replica_count=0, which trips a
-        // CHECK in DeviceAssignment::DeviceAssignment(). Minimal
-        // proto:
-        //   CompileOptionsProto {
-        //     executable_build_options: {  // field 3, message
-        //       num_replicas: 1,           // field 4, int64
-        //       num_partitions: 1,         // field 5, int64
-        //     }
-        //   }
-        // Hand-encoded:
-        //   0x1a 0x04            -- field 3, length-delim, len=4
-        //     0x20 0x01          -- field 4, varint, value=1
-        //     0x28 0x01          -- field 5, varint, value=1
-        const COMPILE_OPTIONS: [u8; 6] = [0x1a, 0x04, 0x20, 0x01, 0x28, 0x01];
-        let format = PJRT_PROGRAM_FORMAT_HLO;
-        let mut program = PJRT_Program {
-            struct_size: std::mem::size_of::<PJRT_Program>(),
-            extension_start: std::ptr::null_mut(),
-            code: module.bytes.as_ptr() as *mut u8,
-            code_size: module.bytes.len(),
-            format: format.as_ptr(),
-            format_size: format.len(),
-        };
-        let mut args = PJRT_Client_Compile_Args {
-            struct_size: std::mem::size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: std::ptr::null_mut(),
-            client: ctx.client,
-            program: &program,
-            compile_options: COMPILE_OPTIONS.as_ptr(),
-            compile_options_size: COMPILE_OPTIONS.len(),
-            executable: std::ptr::null_mut(),
-        };
-        let err = unsafe { (ctx.runtime.fns.client_compile)(&mut args) };
-        if !err.is_null() {
-            let msg = unsafe { error_to_string(&ctx.runtime.fns, err) };
-            panic!("rlx-tpu: PJRT_Client_Compile failed: {msg}");
-        }
-        let executable = args.executable;
-        if executable.is_null() {
-            panic!(
-                "rlx-tpu: PJRT_Client_Compile returned NULL executable \
-                 without setting an error — plugin contract violation."
-            );
-        }
-        // `program` is read-only during the call; safe to drop now.
-        let _ = &mut program;
-
+        let executable = compile_pjrt_executable(&module.bytes);
         let n_params = module.param_names.len();
         Self {
-            module,
-            params: HashMap::new(),
-            param_dtypes: HashMap::new(),
-            executable,
-            param_buffers: vec![std::ptr::null_mut(); n_params],
-            params_uploaded: false,
+            inner: ExecInner::Single {
+                module,
+                params: HashMap::new(),
+                param_dtypes: HashMap::new(),
+                executable,
+                param_buffers: vec![std::ptr::null_mut(); n_params],
+                params_uploaded: false,
+            },
         }
     }
 
@@ -225,65 +183,89 @@ impl TpuExecutable {
     /// runtime converts non-f32 dtypes via the typed setter before
     /// calling here.
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
-        let bytes =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) }
+        match &mut self.inner {
+            ExecInner::Single { params, param_dtypes, .. } => {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+                }
                 .to_vec();
-        self.params.insert(name.to_string(), bytes);
-        self.param_dtypes.insert(name.to_string(), DType::F32);
+                params.insert(name.to_string(), bytes);
+                param_dtypes.insert(name.to_string(), DType::F32);
+            }
+            ExecInner::Orchestrated(o) => o.set_param(name, data),
+        }
     }
 
     /// Stash a parameter's host bytes with a non-f32 dtype.
     pub fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: DType) {
-        self.params.insert(name.to_string(), data.to_vec());
-        self.param_dtypes.insert(name.to_string(), dtype);
+        match &mut self.inner {
+            ExecInner::Single { params, param_dtypes, .. } => {
+                params.insert(name.to_string(), data.to_vec());
+                param_dtypes.insert(name.to_string(), dtype);
+            }
+            ExecInner::Orchestrated(o) => o.set_param_typed(name, data, dtype),
+        }
     }
 
     /// Execute the graph. Inputs are matched by name to the IR's
     /// `Op::Input` nodes; outputs come back in graph-output order.
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        match &mut self.inner {
+            ExecInner::Orchestrated(o) => return o.run(inputs),
+            ExecInner::Single { .. } => {}
+        }
+        let ExecInner::Single {
+            module,
+            params,
+            param_dtypes,
+            executable,
+            param_buffers,
+            params_uploaded,
+        } = &mut self.inner
+        else {
+            unreachable!();
+        };
         let ctx = tpu_context().expect("rlx-tpu: PJRT context vanished");
         let fns = &ctx.runtime.fns;
 
         // 1. Upload params on the first run.
-        if !self.params_uploaded {
-            for (i, name) in self.module.param_names.iter().enumerate() {
-                let dtype = *self
-                    .param_dtypes
+        if !*params_uploaded {
+            for (i, name) in module.param_names.iter().enumerate() {
+                let dtype = *param_dtypes
                     .get(name)
-                    .unwrap_or(&self.module.param_dtypes[i]);
-                let dims = self.module.param_shapes[i].clone();
-                let bytes = self.params.get(name).unwrap_or_else(|| {
+                    .unwrap_or(&module.param_dtypes[i]);
+                let dims = module.param_shapes[i].clone();
+                let bytes = params.get(name).unwrap_or_else(|| {
                     panic!(
                         "rlx-tpu: parameter '{name}' was never set; call \
                      set_param before run"
                     )
                 });
-                let buf = upload_buffer(ctx, bytes, dtype, &dims);
-                self.param_buffers[i] = buf;
+                param_buffers[i] = upload_buffer(ctx, bytes, dtype, &dims);
             }
-            self.params_uploaded = true;
+            *params_uploaded = true;
         }
 
         // 2. Upload inputs (every run).
         let mut input_buffers: Vec<*mut PjrtBuffer> =
-            vec![std::ptr::null_mut(); self.module.input_names.len()];
-        for (i, name) in self.module.input_names.iter().enumerate() {
+            vec![std::ptr::null_mut(); module.input_names.len()];
+        for (i, name) in module.input_names.iter().enumerate() {
             let (_, slice) = inputs
                 .iter()
                 .find(|(n, _)| n == name)
                 .unwrap_or_else(|| panic!("rlx-tpu: input '{name}' missing from run() arguments"));
             let bytes =
                 unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4) };
-            let dtype = self.module.input_dtypes[i];
-            let dims = self.module.input_shapes[i].clone();
+            let dtype = module.input_dtypes[i];
+            let dims = module.input_shapes[i].clone();
             input_buffers[i] = upload_buffer(ctx, bytes, dtype, &dims);
         }
 
         // 3. Build the per-device argument list. Single device.
         let mut all_args: Vec<*mut PjrtBuffer> =
-            Vec::with_capacity(input_buffers.len() + self.param_buffers.len());
+            Vec::with_capacity(input_buffers.len() + param_buffers.len());
         all_args.extend_from_slice(&input_buffers);
-        all_args.extend_from_slice(&self.param_buffers);
+        all_args.extend_from_slice(param_buffers);
         // Outer pointers required by PJRT_LoadedExecutable_Execute_Args.
         let inner_args_ptr = all_args.as_ptr();
         let device_args_ptr = std::ptr::from_ref(&inner_args_ptr).cast::<*const *mut PjrtBuffer>();
@@ -294,7 +276,7 @@ impl TpuExecutable {
         //    flattens single-tuple outputs across the buffer list).
         //    PJRT contract: we pre-allocate the per-device output
         //    pointer array; the plugin fills the buffer pointers.
-        let n_outputs = self.module.output_lens.len();
+        let n_outputs = module.output_lens.len();
         let mut output_buffers: Vec<*mut PjrtBuffer> = vec![std::ptr::null_mut(); n_outputs];
         let device_outputs_ptr = output_buffers.as_mut_ptr();
         let device_outputs_outer = std::ptr::from_ref(&device_outputs_ptr);
@@ -319,7 +301,7 @@ impl TpuExecutable {
         let mut exec_args = PJRT_LoadedExecutable_Execute_Args {
             struct_size: std::mem::size_of::<PJRT_LoadedExecutable_Execute_Args>(),
             extension_start: std::ptr::null_mut(),
-            executable: self.executable,
+            executable: *executable,
             options: &exec_options,
             argument_lists: device_args_ptr,
             num_devices: 1,
@@ -343,8 +325,8 @@ impl TpuExecutable {
         //    non-f32 dtypes).
         let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(n_outputs);
         for (oi, &buf) in output_buffers.iter().enumerate() {
-            let n_elems = self.module.output_lens[oi];
-            let dtype = self.module.output_dtypes[oi];
+            let n_elems = module.output_lens[oi];
+            let dtype = module.output_dtypes[oi];
             let host = download_buffer(ctx, buf, n_elems, dtype);
             outputs.push(host);
             destroy_buffer(ctx, buf);
@@ -360,34 +342,80 @@ impl TpuExecutable {
 
     /// Output dtypes in graph-output order.
     pub fn output_dtypes(&self) -> Vec<DType> {
-        self.module.output_dtypes.clone()
+        match &self.inner {
+            ExecInner::Single { module, .. } => module.output_dtypes.clone(),
+            ExecInner::Orchestrated(o) => o.output_dtypes(),
+        }
     }
+}
+
+/// Compile serialized HLO bytes to a PJRT executable.
+pub(crate) fn compile_pjrt_executable(bytes: &[u8]) -> *mut PjrtLoadedExecutable {
+    let ctx = tpu_context().unwrap_or_else(|| {
+        panic!(
+            "rlx-tpu: no PJRT runtime available. \
+             libtpu.so / libpjrt_c_cpu.so could not be loaded."
+        )
+    });
+    const COMPILE_OPTIONS: [u8; 6] = [0x1a, 0x04, 0x20, 0x01, 0x28, 0x01];
+    let format = PJRT_PROGRAM_FORMAT_HLO;
+    let mut program = PJRT_Program {
+        struct_size: std::mem::size_of::<PJRT_Program>(),
+        extension_start: std::ptr::null_mut(),
+        code: bytes.as_ptr() as *mut u8,
+        code_size: bytes.len(),
+        format: format.as_ptr(),
+        format_size: format.len(),
+    };
+    let mut args = PJRT_Client_Compile_Args {
+        struct_size: std::mem::size_of::<PJRT_Client_Compile_Args>(),
+        extension_start: std::ptr::null_mut(),
+        client: ctx.client,
+        program: &program,
+        compile_options: COMPILE_OPTIONS.as_ptr(),
+        compile_options_size: COMPILE_OPTIONS.len(),
+        executable: std::ptr::null_mut(),
+    };
+    let err = unsafe { (ctx.runtime.fns.client_compile)(&mut args) };
+    if !err.is_null() {
+        let msg = unsafe { error_to_string(&ctx.runtime.fns, err) };
+        panic!("rlx-tpu: PJRT_Client_Compile failed: {msg}");
+    }
+    let executable = args.executable;
+    if executable.is_null() {
+        panic!(
+            "rlx-tpu: PJRT_Client_Compile returned NULL executable \
+             without setting an error — plugin contract violation."
+        );
+    }
+    executable
 }
 
 impl Drop for TpuExecutable {
     fn drop(&mut self) {
-        // Best-effort cleanup. tpu_context() should still resolve; if
-        // not we leak — better than a Drop panic.
-        if let Some(ctx) = tpu_context() {
-            for &b in &self.param_buffers {
-                destroy_buffer(ctx, b);
-            }
-            if !self.executable.is_null() {
-                let mut args = PJRT_LoadedExecutable_Destroy_Args {
-                    struct_size: std::mem::size_of::<PJRT_LoadedExecutable_Destroy_Args>(),
-                    extension_start: std::ptr::null_mut(),
-                    executable: self.executable,
-                };
-                let err = unsafe { (ctx.runtime.fns.loaded_executable_destroy)(&mut args) };
-                if !err.is_null() {
-                    // We're in Drop — eat the error rather than
-                    // panicking (which would abort if Drop is called
-                    // during unwinding).
-                    let _ = unsafe { error_to_string(&ctx.runtime.fns, err) };
+        if let ExecInner::Single {
+            param_buffers,
+            executable,
+            ..
+        } = &mut self.inner
+        {
+            if let Some(ctx) = tpu_context() {
+                for b in param_buffers.drain(..) {
+                    destroy_buffer(ctx, b);
                 }
-                self.executable = std::ptr::null_mut();
+                if !executable.is_null() {
+                    let mut args = PJRT_LoadedExecutable_Destroy_Args {
+                        struct_size: std::mem::size_of::<PJRT_LoadedExecutable_Destroy_Args>(),
+                        extension_start: std::ptr::null_mut(),
+                        executable: *executable,
+                    };
+                    let err = unsafe { (ctx.runtime.fns.loaded_executable_destroy)(&mut args) };
+                    let _ = unsafe { error_to_string(&ctx.runtime.fns, err) };
+                    *executable = std::ptr::null_mut();
+                }
             }
         }
+        // OrchestratedExecutable cleans up in its own Drop.
     }
 }
 
@@ -410,7 +438,7 @@ fn pjrt_buffer_type(dt: DType) -> i32 {
     }
 }
 
-fn upload_buffer(
+pub(crate) fn upload_buffer(
     ctx: &crate::device::TpuContext,
     bytes: &[u8],
     dtype: DType,
@@ -456,7 +484,7 @@ fn upload_buffer(
     args.buffer
 }
 
-fn destroy_buffer(ctx: &crate::device::TpuContext, buf: *mut PjrtBuffer) {
+pub(crate) fn destroy_buffer(ctx: &crate::device::TpuContext, buf: *mut PjrtBuffer) {
     if buf.is_null() {
         return;
     }
@@ -471,7 +499,7 @@ fn destroy_buffer(ctx: &crate::device::TpuContext, buf: *mut PjrtBuffer) {
     }
 }
 
-fn download_buffer(
+pub(crate) fn download_buffer(
     ctx: &crate::device::TpuContext,
     buf: *mut PjrtBuffer,
     n_elems: usize,

@@ -20,8 +20,11 @@
 //! rather than as new trait methods.
 
 use crate::CompileOptions;
-use rlx_ir::Graph;
+use rlx_ir::hir::HirModule;
+use rlx_ir::lir::LirModule;
+use rlx_ir::{Graph, Op};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ── Typed I/O helpers (shared across f32-arena backends) ────────────────
 
@@ -194,6 +197,27 @@ pub trait ExecutableGraph: Send {
         let _ = extent;
     }
 
+    /// TIDE merged placement mask (union across MoE layers). CPU: stats + host path.
+    fn set_moe_resident_experts(&mut self, _mask: &[bool]) {}
+
+    /// Per MoE layer placement (`masks[layer][expert]`). Preferred over merged on CPU.
+    fn set_moe_resident_experts_per_layer(&mut self, _masks: &[&[bool]]) {}
+
+    /// Capture MoE router TopK indices on the next CPU forward (TIDE refresh).
+    fn enable_moe_topk_capture(&mut self, _num_experts: usize) -> bool {
+        false
+    }
+
+    /// Take captured per-layer expert indices (one vec per MoE TopK in order).
+    fn take_moe_topk_capture(&mut self) -> Option<Vec<Vec<u32>>> {
+        None
+    }
+
+    /// MoE GroupedMatMul residency accounting from the last forward (CPU).
+    fn take_moe_residency_stats(&mut self) -> Option<crate::MoeResidencyStats> {
+        None
+    }
+
     /// Bind a persistent buffer handle (KV-cache, training state, etc.).
     /// The buffer lives across run() calls and is not in the arena.
     /// Returns true if the backend supports persistent handles.
@@ -203,6 +227,34 @@ pub trait ExecutableGraph: Send {
 
     /// Read a persistent buffer's current contents.
     fn read_handle(&self, _name: &str) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// GPU-resident input (MLX): upload once, reuse across runs.
+    fn bind_gpu_handle(&mut self, _name: &str, _data: &[f32]) -> bool {
+        false
+    }
+
+    fn has_gpu_handle(&self, _name: &str) -> bool {
+        false
+    }
+
+    fn set_gpu_handle_feed(&mut self, _handle_name: &str, _output_index: usize) -> bool {
+        false
+    }
+
+    fn read_gpu_handle(&self, _name: &str) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Run and refresh a GPU handle from `output_index`; returns that output on host.
+    fn run_feed_gpu_handle(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        _handle_name: &str,
+        _output_index: usize,
+    ) -> Option<Vec<f32>> {
+        let _ = inputs;
         None
     }
 
@@ -331,6 +383,37 @@ pub trait Backend: Send + Sync {
     /// Compile a graph for this backend with the given options.
     fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph>;
 
+    /// Compile pre-optimized LIR (HIR → MIR → LIR pipeline output).
+    /// Default re-enters [`Self::compile`] — backends should override
+    /// when they can reuse the embedded buffer plan.
+    fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+        self.compile(lir.into_graph(), options)
+    }
+
+    /// HIR-first compile: lower blocks, run fusion pipeline, emit executable.
+    fn compile_hir(
+        &self,
+        hir: HirModule,
+        device: rlx_driver::Device,
+        options: &CompileOptions,
+    ) -> Result<Box<dyn ExecutableGraph>, rlx_ir::hir::LowerError> {
+        let result = crate::stages::compile_hir_stages(device, hir, options)?;
+        crate::stages::maybe_log_fusion(&result.fusion);
+        Ok(self.compile_lir(result.lir, options))
+    }
+
+    /// [`GraphModule`] compile — unified HIR/MIR/LIR entry.
+    fn compile_module(
+        &self,
+        module: rlx_ir::GraphModule,
+        device: rlx_driver::Device,
+        options: &CompileOptions,
+    ) -> Result<Box<dyn ExecutableGraph>, rlx_ir::hir::LowerError> {
+        let result = crate::stages::compile_module_stages(device, module, options)?;
+        crate::stages::maybe_log_fusion(&result.fusion);
+        Ok(self.compile_lir(result.lir, options))
+    }
+
     /// PLAN L4: declare which `OpKind`s this backend can lower.
     /// Default: empty slice = "no claim made — accept everything"
     /// (preserves existing behavior; backends opt in by overriding).
@@ -342,6 +425,41 @@ pub trait Backend: Send + Sync {
     }
 }
 
+/// Prepare a fused MIR graph from LIR for backend executable construction.
+/// Skips the fusion pipeline — LIR must come from `compile_*_stages`.
+fn prepare_fused_graph(
+    mut graph: Graph,
+    options: &CompileOptions,
+    supported_ops: &[rlx_ir::OpKind],
+    backend_name: &str,
+) -> Graph {
+    let (mut graph, report) = rlx_opt::prepare_graph_for_backend_with_report(
+        graph,
+        backend_name,
+        supported_ops,
+        options.kernel_dispatch,
+    );
+    rlx_opt::maybe_log_dispatch_report(&report);
+    if !report.compile_ready {
+        panic!(
+            "{}\n{}",
+            rlx_opt::format_legalize_error(backend_name, &report.still_unsupported),
+            rlx_opt::format_dispatch_report(&report)
+        );
+    }
+    use rlx_opt::pass::Pass as _;
+    if options.dce {
+        graph = rlx_opt::DeadCodeElimination.run(graph);
+    }
+    if options.constant_folding {
+        graph = rlx_opt::ConstantFolding.run(graph);
+    }
+    if let Some(p) = options.policy.clone() {
+        graph = rlx_opt::AutoMixedPrecision::new(p).run(graph);
+    }
+    graph
+}
+
 // ── Convenience helpers preserved from older API ──────────────────────
 //
 // These let existing call sites keep working unchanged while the new
@@ -351,6 +469,26 @@ pub trait Backend: Send + Sync {
 /// Compile at default options (F32, no policy).
 pub fn compile(backend: &dyn Backend, graph: Graph) -> Box<dyn ExecutableGraph> {
     backend.compile(graph, &CompileOptions::default())
+}
+
+/// Compile HIR through the fusion-first pipeline.
+pub fn compile_hir(
+    backend: &dyn Backend,
+    hir: HirModule,
+    device: rlx_driver::Device,
+    options: &CompileOptions,
+) -> Result<Box<dyn ExecutableGraph>, rlx_ir::hir::LowerError> {
+    backend.compile_hir(hir, device, options)
+}
+
+/// Compile a [`GraphModule`] through the fusion-first pipeline.
+pub fn compile_module(
+    backend: &dyn Backend,
+    module: rlx_ir::GraphModule,
+    device: rlx_driver::Device,
+    options: &CompileOptions,
+) -> Result<Box<dyn ExecutableGraph>, rlx_ir::hir::LowerError> {
+    backend.compile_module(module, device, options)
 }
 
 /// Compile at a specific precision (default policy = none).
@@ -383,7 +521,8 @@ pub mod cpu_backend {
     use super::*;
     use rlx_cpu::{arena::Arena, thunk};
     use rlx_ir::{DType, NodeId, Op};
-    use rlx_opt::{fusion, memory, pass::Pass};
+    use rlx_opt::memory::{self, MemoryPlan};
+    use rlx_opt::pass::Pass;
 
     // Arena typed read/write helpers live in `crate::arena` so every
     // backend (CPU, Metal, future CUDA/wgpu/WASM) shares one implementation.
@@ -417,7 +556,11 @@ pub mod cpu_backend {
             ScanBackward,
             ScanBackwardXs,
             LayerNorm,
+            LayerNorm2d,
+            GroupNorm,
             RmsNorm,
+            ResizeNearest2x,
+            AxialRope2d,
             Attention,
             Rope,
             Reshape,
@@ -432,8 +575,11 @@ pub mod cpu_backend {
             TopK,
             Sample,
             Conv,
+            ConvTranspose2d,
             Pool,
             GroupedMatMul,
+            DequantGroupedMatMul,
+            DequantMoEWeights,
             ScatterAdd,
             LoraMatMul,
             DequantMatMul,
@@ -442,6 +588,7 @@ pub mod cpu_backend {
             FusedSwiGLU,
             FusedMatMulBiasAct,
             FusedResidualLN,
+            FusedResidualRmsNorm,
             FusedAttentionBlock,
             // Backward ops emitted by `rlx_opt::autodiff::grad_with_loss`.
             // Their thunks live in rlx-cpu/src/thunk.rs alongside the
@@ -456,8 +603,20 @@ pub mod cpu_backend {
             Conv2dBackwardWeight,
             SoftmaxCrossEntropyWithLogits,
             SoftmaxCrossEntropyBackward,
+            AttentionBackward,
             LayerNormBackwardInput,
             LayerNormBackwardGamma,
+            RmsNormBackwardInput,
+            RmsNormBackwardGamma,
+            RmsNormBackwardBeta,
+            RopeBackward,
+            CumsumBackward,
+            GatherBackward,
+            // 3D Gaussian splat CPU reference render/backward (requires `rlx-cpu/splat`).
+            GaussianSplatRender,
+            GaussianSplatRenderBackward,
+            GaussianSplatPrepare,
+            GaussianSplatRasterize,
             // User-registered custom ops dispatched through
             // `rlx_cpu::op_registry`. Lowering panics with a clear
             // message if the named CPU kernel isn't registered.
@@ -515,36 +674,17 @@ pub mod cpu_backend {
                 graph
             };
 
-            // Run fusion passes.
-            // FuseAttentionBlock runs first on the raw graph (before other fusions
-            // rewrite the pattern it looks for). It auto-checks batch*seq and is
-            // a no-op for large batches.
-            let passes: Vec<&dyn Pass> = vec![
-                // LowerDotGeneral runs FIRST so any DotGeneral becomes a
-                // MatMul (or stays put when the pattern isn't canonical),
-                // letting the rest of the fusion pipeline see only MatMuls.
-                &rlx_opt::LowerDotGeneral,
-                &fusion::FuseAttentionBlock,
-                &fusion::FuseMatMulBiasAct,
-                &fusion::FuseResidualLN,
-                &fusion::FuseSharedInputMatMul,
-                // FuseSwiGLU runs AFTER FuseSharedInputMatMul because it
-                // matches the narrow×2 + silu + mul pattern that pass
-                // produces.
-                &fusion::FuseSwiGLU,
-                // PLAN L2: collapse maximal element-wise chains AFTER the
-                // big-pattern fusions so we only catch leftover ops the
-                // pattern fusions didn't claim.
-                &rlx_opt::MarkElementwiseRegions,
-                // CPU backend doesn't yet have an ElementwiseRegion thunk;
-                // run the inverse pass to break any regions back into
-                // primitive Activation/Cast/Binary/Compare/Where ops the
-                // thunk lowering does handle. Cheap no-op when no regions
-                // were marked.
-                &rlx_opt::UnfuseElementwiseRegions,
-            ];
-            let verbose = cfg.verbose >= 1;
-            let fused = rlx_opt::run_passes(graph, &passes, verbose);
+            // Run fusion pipeline (HIR/MIR/LIR ideology — fusion is first-class).
+            let mut compile_opts = options.clone();
+            compile_opts.arena_alignment = cfg.arena_alignment;
+            let compile_result = crate::stages::compile_graph_stages_for_backend(
+                rlx_driver::Device::Cpu,
+                graph,
+                &compile_opts,
+                CPU_SUPPORTED_OPS,
+            );
+            crate::stages::maybe_log_fusion(&compile_result.fusion);
+            let fused = compile_result.lir.into_graph();
 
             // Apply precision policy AFTER fusion — Cast nodes don't disrupt
             // the now-flattened fused ops.
@@ -553,7 +693,7 @@ pub mod cpu_backend {
                 None => fused,
             };
 
-            // Plan memory with configured alignment
+            // Re-plan after precision rewrites (may change dtypes / sizes).
             let plan = memory::plan_memory_aligned(&fused, cfg.arena_alignment);
             if cfg.verbose >= 1 {
                 eprintln!(
@@ -563,103 +703,119 @@ pub mod cpu_backend {
                     cfg.arena_alignment
                 );
             }
-            let mut arena = Arena::from_plan(plan);
+            Box::new(build_cpu_executable(fused, plan))
+        }
 
-            // Pre-compute name → NodeId maps + dtype map (so set_param /
-            // run() can cast f32 ↔ F16/BF16 when AutoMixedPrecision has
-            // rewritten a Param/Input node away from F32).
-            let mut input_ids = HashMap::new();
-            let mut param_ids = HashMap::new();
-            let mut node_dtypes: HashMap<NodeId, DType> = HashMap::new();
-            for node in fused.nodes() {
-                node_dtypes.insert(node.id, node.shape.dtype());
-                match &node.op {
-                    Op::Input { name } => {
-                        input_ids.insert(name.clone(), node.id);
-                    }
-                    Op::Param { name } => {
-                        param_ids.insert(name.clone(), node.id);
-                    }
-                    _ => {}
-                }
+        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+            let alignment = lir.buffers.alignment.max(options.arena_alignment);
+            let embedded: MemoryPlan = (&lir.buffers).into();
+            let mut graph = lir.into_graph();
+            if let Some(p) = options.policy.clone() {
+                use rlx_opt::pass::Pass;
+                graph = rlx_opt::AutoMixedPrecision::new(p).run(graph);
             }
-
-            // Compile thunk schedule and strip Nop entries
-            let schedule = thunk::compile_thunks(&fused, &arena);
-            // Don't strip_nops — compiled_fns already filters them out
-
-            // Pre-resolve input slots (name → byte offset, max_elems, dtype)
-            let mut input_slots = Vec::new();
-            for node in fused.nodes() {
-                if let Op::Input { name } = &node.op {
-                    let off = arena.byte_offset(node.id);
-                    let len = node.shape.num_elements().unwrap_or(0);
-                    input_slots.push((name.clone(), off, len, node.shape.dtype()));
-                }
+            let plan = if options.policy.is_some() {
+                memory::plan_memory_aligned(&graph, alignment)
+            } else {
+                embedded
+            };
+            let cfg = rlx_cpu::config::RuntimeConfig::global();
+            if cfg.verbose >= 1 {
+                eprintln!(
+                    "[rlx] compile_lir: arena {} bytes ({} buffers, alignment {})",
+                    plan.arena_size,
+                    plan.assignments.len(),
+                    alignment,
+                );
             }
+            Box::new(build_cpu_executable(graph, plan))
+        }
+    }
 
-            // Pre-resolve output (byte_offset, num_elements) — dtype is
-            // already available via node_dtypes for typed reads.
-            let output_slots: Vec<(usize, usize)> = fused
-                .outputs
-                .iter()
-                .map(|&id| {
-                    let off = arena.byte_offset(id);
-                    let len = fused.node(id).shape.num_elements().unwrap_or(0);
-                    (off, len)
-                })
-                .collect();
-
-            // Initialize Constant nodes' arena slots with their literal data.
-            // (Without this, constant buffers stay zero — silent miscompute.)
-            // Dispatch on dtype: f64 constants must NOT be reinterpreted as
-            // f32 (silent garbage). The byte width is whatever the dtype's
-            // size says.
-            for node in fused.nodes() {
-                if let Op::Constant { data } = &node.op
-                    && arena.has_buffer(node.id)
-                    && !data.is_empty()
-                {
-                    match node.shape.dtype() {
-                        DType::F64 => {
-                            let off = arena.byte_offset(node.id);
-                            let buf = arena.raw_buf_mut();
-                            let n = buf.len().saturating_sub(off).min(data.len());
-                            buf[off..off + n].copy_from_slice(&data[..n]);
-                        }
-                        // Default: f32-aliased arena. Existing F32 + half-
-                        // precision rewrite paths land here.
-                        _ => {
-                            let buf = arena.slice_mut(node.id);
-                            let n_floats = data.len() / 4;
-                            let n = buf.len().min(n_floats);
-                            for i in 0..n {
-                                let bytes = [
-                                    data[i * 4],
-                                    data[i * 4 + 1],
-                                    data[i * 4 + 2],
-                                    data[i * 4 + 3],
-                                ];
-                                buf[i] = f32::from_le_bytes(bytes);
-                            }
-                        }
-                    }
+    fn build_cpu_executable(graph: Graph, plan: MemoryPlan) -> CpuExecutable {
+        let mut arena = Arena::from_plan(plan);
+        let mut input_ids = HashMap::new();
+        let mut param_ids = HashMap::new();
+        let mut node_dtypes: HashMap<NodeId, DType> = HashMap::new();
+        for node in graph.nodes() {
+            node_dtypes.insert(node.id, node.shape.dtype());
+            match &node.op {
+                Op::Input { name } => {
+                    input_ids.insert(name.clone(), node.id);
                 }
+                Op::Param { name } => {
+                    param_ids.insert(name.clone(), node.id);
+                }
+                _ => {}
             }
+        }
 
-            Box::new(CpuExecutable {
-                graph: fused,
-                arena,
-                params: HashMap::new(),
-                input_ids,
-                param_ids,
-                node_dtypes,
-                schedule,
-                input_slots,
-                output_slots,
-                handles: HashMap::new(),
-                active_extent: None,
+        let schedule = thunk::compile_thunks(&graph, &arena);
+
+        let mut input_slots = Vec::new();
+        for node in graph.nodes() {
+            if let Op::Input { name } = &node.op {
+                let off = arena.byte_offset(node.id);
+                let len = node.shape.num_elements().unwrap_or(0);
+                input_slots.push((name.clone(), off, len, node.shape.dtype()));
+            }
+        }
+
+        let output_slots: Vec<(usize, usize)> = graph
+            .outputs
+            .iter()
+            .map(|&id| {
+                let off = arena.byte_offset(id);
+                let len = graph.node(id).shape.num_elements().unwrap_or(0);
+                (off, len)
             })
+            .collect();
+
+        for node in graph.nodes() {
+            if let Op::Constant { data } = &node.op
+                && arena.has_buffer(node.id)
+                && !data.is_empty()
+            {
+                match node.shape.dtype() {
+                    DType::F64 => {
+                        let off = arena.byte_offset(node.id);
+                        let buf = arena.raw_buf_mut();
+                        let n = buf.len().saturating_sub(off).min(data.len());
+                        buf[off..off + n].copy_from_slice(&data[..n]);
+                    }
+                    _ => {
+                        let buf = arena.slice_mut(node.id);
+                        let n_floats = data.len() / 4;
+                        let n = buf.len().min(n_floats);
+                        for i in 0..n {
+                            let bytes = [
+                                data[i * 4],
+                                data[i * 4 + 1],
+                                data[i * 4 + 2],
+                                data[i * 4 + 3],
+                            ];
+                            buf[i] = f32::from_le_bytes(bytes);
+                        }
+                    }
+                }
+            }
+        }
+
+        CpuExecutable {
+            graph,
+            arena,
+            params: HashMap::new(),
+            input_ids,
+            param_ids,
+            node_dtypes,
+            schedule,
+            input_slots,
+            output_slots,
+            handles: HashMap::new(),
+            active_extent: None,
+            moe_resident: None,
+            moe_resident_layers: None,
+            moe_topk_capture: None,
         }
     }
 
@@ -689,6 +845,9 @@ pub mod cpu_backend {
         /// `actual / upper` of each kernel's work. Otherwise (or when
         /// `None`) runs at the full compiled extent. See PLAN L1.
         active_extent: Option<(usize, usize)>,
+        moe_resident: Option<std::sync::Arc<[bool]>>,
+        moe_resident_layers: Option<std::sync::Arc<Vec<std::sync::Arc<[bool]>>>>,
+        moe_topk_capture: Option<std::sync::Arc<rlx_cpu::moe_topk_capture::MoeTopkCapture>>,
     }
 
     unsafe impl Send for CpuExecutable {}
@@ -859,6 +1018,43 @@ pub mod cpu_backend {
             self.active_extent = extent;
         }
 
+        fn set_moe_resident_experts(&mut self, mask: &[bool]) {
+            self.moe_resident_layers = None;
+            self.schedule.moe_resident_layers = None;
+            self.moe_resident = Some(Arc::from(mask));
+            self.schedule.moe_resident = self.moe_resident.clone();
+        }
+
+        fn set_moe_resident_experts_per_layer(&mut self, masks: &[&[bool]]) {
+            self.moe_resident = None;
+            self.schedule.moe_resident = None;
+            let layers: Vec<Arc<[bool]>> = masks.iter().map(|m| Arc::from(*m)).collect();
+            let arc = Arc::new(layers);
+            self.moe_resident_layers = Some(arc.clone());
+            self.schedule.moe_resident_layers = Some(arc);
+        }
+
+        fn enable_moe_topk_capture(&mut self, num_experts: usize) -> bool {
+            let cap = rlx_cpu::moe_topk_capture::MoeTopkCapture::new(num_experts);
+            self.moe_topk_capture = Some(cap.clone());
+            self.schedule.moe_topk_capture = Some(cap);
+            true
+        }
+
+        fn take_moe_topk_capture(&mut self) -> Option<Vec<Vec<u32>>> {
+            let cap = self.moe_topk_capture.as_ref()?;
+            let layers = cap.take_layers();
+            if layers.is_empty() {
+                None
+            } else {
+                Some(layers)
+            }
+        }
+
+        fn take_moe_residency_stats(&mut self) -> Option<crate::MoeResidencyStats> {
+            rlx_cpu::moe_residency::take_last_forward_stats()
+        }
+
         /// Typed param upload. F32 / F16 / BF16 go through the existing
         /// widen-to-f32 path (the CPU arena is historically f32 with
         /// optional half-precision rewrite). F64 (and any future
@@ -1023,6 +1219,13 @@ pub mod wgpu_backend {
         OpKind::LayerNorm,
         OpKind::RmsNorm,
         OpKind::Attention,
+        OpKind::AttentionBackward,
+        OpKind::RmsNormBackwardInput,
+        OpKind::RmsNormBackwardGamma,
+        OpKind::RmsNormBackwardBeta,
+        OpKind::RopeBackward,
+        OpKind::CumsumBackward,
+        OpKind::GatherBackward,
         OpKind::Rope,
         OpKind::Reshape,
         OpKind::Transpose,
@@ -1038,11 +1241,14 @@ pub mod wgpu_backend {
         OpKind::Conv,
         OpKind::Pool,
         OpKind::GroupedMatMul,
+        OpKind::DequantGroupedMatMul,
+        OpKind::DequantMoEWeights,
         OpKind::ScatterAdd,
         OpKind::SelectiveScan,
         OpKind::DequantMatMul,
         OpKind::FusedMatMulBiasAct,
         OpKind::FusedResidualLN,
+        OpKind::FusedResidualRmsNorm,
         OpKind::FusedSwiGLU,
         OpKind::FusedAttentionBlock,
         OpKind::FusedTransformerLayer,
@@ -1052,6 +1258,12 @@ pub mod wgpu_backend {
         // unified memory, so silent CPU round-trip would be a hidden
         // performance cliff.
         OpKind::Fft,
+        // 3D Gaussian splat: native Metal / CPU reference per backend.
+        OpKind::GaussianSplatRender,
+        OpKind::GaussianSplatRenderBackward,
+        OpKind::GaussianSplatPrepare,
+        OpKind::GaussianSplatRasterize,
+        OpKind::Custom,
         // LoRA, If, While: not yet wired in wgpu — fail loudly.
     ];
 
@@ -1067,7 +1279,6 @@ pub mod wgpu_backend {
             if let Err(errors) = rlx_opt::legalize_for_backend(&graph, WGPU_SUPPORTED_OPS) {
                 panic!("{}", rlx_opt::format_legalize_error("wgpu", &errors));
             }
-            use rlx_opt::fusion;
             use rlx_opt::pass::Pass as _;
             // Cleanup passes upstream of wgpu's pipeline.
             let graph = if options.dce {
@@ -1088,15 +1299,30 @@ pub mod wgpu_backend {
             // ~377 already orders these correctly; wgpu was inverted
             // and silently shipped 13 unfused LayerNorms per BERT
             // forward where 12 should have been FusedResidualLN.)
-            let graph = fusion::FuseMatMulBiasAct.run(graph);
-            let graph = fusion::FuseResidualLN.run(graph);
-            // Then collapse the leftover element-wise ops the targeted
-            // fusions didn't claim.
-            let graph = rlx_opt::MarkElementwiseRegions.run(graph);
+            let compile_result = crate::stages::compile_graph_stages_for_backend(
+                rlx_driver::Device::Gpu,
+                graph,
+                options,
+                WGPU_SUPPORTED_OPS,
+            );
+            crate::stages::maybe_log_fusion(&compile_result.fusion);
+            let graph = compile_result.lir.into_graph();
             let graph = match options.policy.clone() {
                 Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
                 None => graph,
             };
+            Box::new(WgpuExecutableWrapper {
+                inner: WgpuExecutable::compile(graph),
+            })
+        }
+
+        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+            let graph = prepare_fused_graph(
+                lir.into_graph(),
+                options,
+                WGPU_SUPPORTED_OPS,
+                "wgpu",
+            );
             Box::new(WgpuExecutableWrapper {
                 inner: WgpuExecutable::compile(graph),
             })
@@ -1124,6 +1350,9 @@ pub mod wgpu_backend {
         /// since the wgpu arena is f32-uniform.
         fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
             match dtype {
+                rlx_ir::DType::U8 | rlx_ir::DType::I8 => {
+                    self.inner.set_param_bytes(name, data);
+                }
                 rlx_ir::DType::F32 => {
                     let n = data.len() / 4;
                     let f32_slice =
@@ -1318,7 +1547,10 @@ pub mod mlx_backend {
             ElementwiseRegion,
             MatMul,
             DotGeneral,
+            DenseSolve,
+            BatchedDenseSolve,
             LayerNorm,
+            LayerNorm2d,
             RmsNorm,
             Attention,
             Rope,
@@ -1334,15 +1566,20 @@ pub mod mlx_backend {
             TopK,
             Sample,
             Conv,
+            ConvTranspose2d,
             Pool,
             GroupedMatMul,
+            DequantGroupedMatMul,
+            DequantMoEWeights,
             ScatterAdd,
             LoraMatMul,
             DequantMatMul,
             SelectiveScan,
+            GatedDeltaNet,
             FusedSwiGLU,
             FusedMatMulBiasAct,
             FusedResidualLN,
+            FusedResidualRmsNorm,
             FusedAttentionBlock,
             FusedTransformerLayer,
             If,
@@ -1360,6 +1597,7 @@ pub mod mlx_backend {
             ActivationBackward,
             SoftmaxCrossEntropyWithLogits,
             SoftmaxCrossEntropyBackward,
+            AttentionBackward,
             LayerNormBackwardInput,
             LayerNormBackwardGamma,
             // Tier 2 — conv backward via `mc::conv_general` with the
@@ -1383,6 +1621,8 @@ pub mod mlx_backend {
             // registered `MlxKernel` and calls its `execute` method
             // to produce the lazy MLX `Array` for this node.
             Custom,
+            GaussianSplatRender,
+            GaussianSplatRenderBackward,
             // Op::Fft on MLX: NOT supported. Host-fallback was tried
             // and rejected — MLX's compile callback forbids `eval`,
             // and `Array::to_bytes` requires eval, so we can't
@@ -1400,71 +1640,49 @@ pub mod mlx_backend {
         }
 
         fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-            // PLAN L4: legalize against MLX's claimed op set.
-            if let Err(errors) = rlx_opt::legalize_for_backend(&graph, MLX_SUPPORTED_OPS) {
-                panic!("{}", rlx_opt::format_legalize_error("mlx", &errors));
-            }
-            use rlx_opt::fusion;
+            let compile_result = crate::stages::compile_graph_stages_for_backend(
+                rlx_driver::Device::Mlx,
+                graph,
+                options,
+                MLX_SUPPORTED_OPS,
+            );
+            crate::stages::maybe_log_fusion(&compile_result.fusion);
+            self.compile_lir(compile_result.lir, options)
+        }
+
+        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
             use rlx_opt::pass::Pass as _;
-            // Optional cleanup passes upstream of MLX's pipeline.
-            let graph = if options.dce {
-                rlx_opt::DeadCodeElimination.run(graph)
-            } else {
-                graph
-            };
-            let graph = if options.constant_folding {
-                rlx_opt::ConstantFolding.run(graph)
-            } else {
-                graph
-            };
+            let mut graph = lir.into_graph();
+            graph = rlx_opt::LowerControlFlow.run(graph);
+            let graph = prepare_fused_graph(
+                graph,
+                options,
+                MLX_SUPPORTED_OPS,
+                "mlx",
+            );
+            Box::new(build_mlx_executable(graph))
+        }
+    }
 
-            // Fusion: enable the passes whose output ops we lower in
-            // rlx-mlx/src/lower.rs. FuseAttentionBlock is intentionally
-            // skipped — its output op (FusedAttnBlock-style monolithic
-            // kernel) doesn't have an MLX equivalent yet, and the
-            // unfused path through fast::scaled_dot_product_attention
-            // already gets us most of the benefit.
-            let passes: Vec<&dyn rlx_opt::pass::Pass> = vec![
-                // PLAN L2: collapse maximal element-wise chains into
-                // Op::ElementwiseRegion — MLX lowers them natively in
-                // lower.rs by composing per-step ops::* into the lazy
-                // trace. mlx::compile then folds the whole region into
-                // a single fused kernel.
-                &rlx_opt::MarkElementwiseRegions,
-                &rlx_opt::LowerDotGeneral,
-                &fusion::FuseMatMulBiasAct,
-                &fusion::FuseResidualLN,
-                &fusion::FuseSharedInputMatMul,
-                &fusion::FuseSwiGLU,
-            ];
-            let graph = rlx_opt::run_passes(graph, &passes, /*verbose=*/ false);
-
-            // Apply precision policy AFTER fusion — Cast nodes don't
-            // disrupt the now-flattened fused ops.
-            let graph = match options.policy.clone() {
-                Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
-                None => graph,
-            };
-            // Default to `MlxMode::Compiled` + eager warm-compile so the
-            // expensive trace + JIT cost is paid once at `Session::compile`
-            // time rather than on every `run()`. Without this, MLX
-            // re-lowers and re-traces the full graph on every forward,
-            // making it ~10× slower than CPU for SAM ViT-B. Set
-            // `RLX_MLX_MODE=lazy`/`eager` to opt out.
-            let mode = match std::env::var("RLX_MLX_MODE").ok().as_deref() {
-                Some(s) if s.eq_ignore_ascii_case("eager") => rlx_mlx::lower::MlxMode::Eager,
-                Some(s) if s.eq_ignore_ascii_case("lazy") => rlx_mlx::lower::MlxMode::Lazy,
-                _ => rlx_mlx::lower::MlxMode::Compiled,
-            };
-            let mut exe = MlxExecutable::compile_with_mode(graph, mode);
-            if mode == rlx_mlx::lower::MlxMode::Compiled {
-                if let Err(e) = exe.warm_compile() {
-                    eprintln!(
-                        "[rlx-runtime] MLX warm_compile failed ({e}); first run will pay the trace cost"
-                    );
-                }
+    fn build_mlx_executable(graph: Graph) -> MlxExecutableWrapper {
+        let mode = mlx_mode_from_env();
+        let mut exe = MlxExecutable::compile_from_fused(graph, mode);
+        if mode == rlx_mlx::lower::MlxMode::Compiled {
+            if let Err(e) = exe.warm_compile() {
+                eprintln!(
+                    "[rlx-runtime] MLX warm_compile failed ({e}); first run will pay the trace cost"
+                );
             }
-            Box::new(MlxExecutableWrapper { inner: exe })
+        }
+        MlxExecutableWrapper { inner: exe }
+    }
+
+    fn mlx_mode_from_env() -> rlx_mlx::lower::MlxMode {
+        match rlx_ir::env::var("RLX_MLX_MODE").as_deref() {
+            Some(s) if s.eq_ignore_ascii_case("eager") => rlx_mlx::lower::MlxMode::Eager,
+            Some(s) if s.eq_ignore_ascii_case("lazy") => rlx_mlx::lower::MlxMode::Lazy,
+            Some(s) if s.eq_ignore_ascii_case("compiled") => rlx_mlx::lower::MlxMode::Compiled,
+            _ => rlx_mlx::lower::MlxMode::Compiled,
         }
     }
 
@@ -1502,6 +1720,29 @@ pub mod mlx_backend {
         fn read_handle(&self, name: &str) -> Option<Vec<f32>> {
             self.inner.read_handle(name)
         }
+        fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
+            self.inner.bind_gpu_handle(name, data).is_ok()
+        }
+        fn has_gpu_handle(&self, name: &str) -> bool {
+            self.inner.has_gpu_handle(name)
+        }
+        fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+            self.inner.set_gpu_handle_feed(handle_name, output_index);
+            true
+        }
+        fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
+            self.inner.read_gpu_handle(name).ok()
+        }
+        fn run_feed_gpu_handle(
+            &mut self,
+            inputs: &[(&str, &[f32])],
+            handle_name: &str,
+            output_index: usize,
+        ) -> Option<Vec<f32>> {
+            self.inner
+                .run_feed_gpu(inputs, handle_name, output_index)
+                .ok()
+        }
         fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
             self.inner.set_param_typed(name, data, dtype);
         }
@@ -1527,9 +1768,11 @@ pub mod metal_backend {
     /// PLAN L4: ops the Metal backend can lower today. Includes
     /// DotGeneral (LowerDotGeneral pass) and ElementwiseRegion
     /// (decomposed by UnfuseElementwiseRegions). Excludes Cumsum,
-    /// SelectiveScan, LoraMatMul, DequantMatMul, Sample,
+    /// SelectiveScan, LoraMatMul, Sample,
     /// FusedAttentionBlock, FusedTransformerLayer, If, While —
     /// not yet wired in `rlx-metal/src/thunk.rs`'s compile_thunks.
+    /// DequantMatMul (GGUF K-quants) lowers to a GPU dequant kernel
+    /// + MPS matmul; legacy Int8 schemes remain CPU-only.
     const METAL_SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         use rlx_ir::OpKind::*;
         &[
@@ -1545,8 +1788,19 @@ pub mod metal_backend {
             MatMul,
             DotGeneral,
             LayerNorm,
+            LayerNorm2d,
+            GroupNorm,
             RmsNorm,
+            ResizeNearest2x,
+            AxialRope2d,
             Attention,
+            AttentionBackward,
+            RmsNormBackwardInput,
+            RmsNormBackwardGamma,
+            RmsNormBackwardBeta,
+            RopeBackward,
+            CumsumBackward,
+            GatherBackward,
             Rope,
             Reshape,
             Transpose,
@@ -1558,12 +1812,18 @@ pub mod metal_backend {
             Softmax,
             TopK,
             Conv,
+            ConvTranspose2d,
             Pool,
             GroupedMatMul,
+            DequantGroupedMatMul,
+            DequantMoEWeights,
             ScatterAdd,
+            DequantMatMul,
+            GatedDeltaNet,
             FusedSwiGLU,
             FusedMatMulBiasAct,
             FusedResidualLN,
+            FusedResidualRmsNorm,
             // User-registered custom ops dispatched through
             // `rlx_metal::op_registry`. Lowering panics with a clear
             // message if the named MetalKernel isn't registered;
@@ -1576,6 +1836,11 @@ pub mod metal_backend {
             // compute kernel will replace this when a workload makes
             // the sync the bottleneck.
             Fft,
+            // Host-fallback splat (unified-memory arena + rlx-cpu/splat).
+            GaussianSplatRender,
+            GaussianSplatRenderBackward,
+            GaussianSplatPrepare,
+            GaussianSplatRasterize,
         ]
     };
 
@@ -1590,10 +1855,15 @@ pub mod metal_backend {
             // (Metal also has no native sub-graph executor wired
             // through its thunk schedule).
             let graph = rlx_opt::LowerControlFlow.run(graph);
-            // PLAN L4: legalize against Metal's claimed op set.
-            if let Err(errors) = rlx_opt::legalize_for_backend(&graph, METAL_SUPPORTED_OPS) {
+            let mut dispatch = options.kernel_dispatch;
+            let graph = rlx_opt::legalize_or_rewrite_for_backend_with_config(
+                graph,
+                METAL_SUPPORTED_OPS,
+                dispatch,
+            )
+            .unwrap_or_else(|errors| {
                 panic!("{}", rlx_opt::format_legalize_error("metal", &errors));
-            }
+            });
             // Optional cleanup passes upstream of Metal's pipeline
             let graph = if options.dce {
                 rlx_opt::DeadCodeElimination.run(graph)
@@ -1609,7 +1879,39 @@ pub mod metal_backend {
             // Hand the policy to MetalExecutable so the rewrite runs AFTER
             // its internal fusion passes (avoids breaking pattern matchers).
             Box::new(MetalExecutableWrapper {
-                inner: MetalExecutable::compile_with_policy(graph, options.policy.clone()),
+                inner: MetalExecutable::compile_with_policy(
+                    graph,
+                    options.policy.clone(),
+                    Some(METAL_SUPPORTED_OPS),
+                ),
+            })
+        }
+
+        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+            use rlx_opt::pass::Pass as _;
+            let mut graph = lir.into_graph();
+            graph = rlx_opt::LowerControlFlow.run(graph);
+            let mut dispatch = options.kernel_dispatch;
+            let mut graph = rlx_opt::legalize_or_rewrite_for_backend_with_config(
+                graph,
+                METAL_SUPPORTED_OPS,
+                dispatch,
+            )
+            .unwrap_or_else(|errors| {
+                panic!("{}", rlx_opt::format_legalize_error("metal", &errors));
+            });
+            if options.dce {
+                graph = rlx_opt::DeadCodeElimination.run(graph);
+            }
+            if options.constant_folding {
+                graph = rlx_opt::ConstantFolding.run(graph);
+            }
+            Box::new(MetalExecutableWrapper {
+                inner: MetalExecutable::compile_from_fused(
+                    graph,
+                    options.policy.clone(),
+                    Some(METAL_SUPPORTED_OPS),
+                ),
             })
         }
     }
@@ -1649,8 +1951,13 @@ pub mod metal_backend {
         /// Typed param upload — accepts F16/BF16 host bytes by widening
         /// to F32 first, then routing through `set_param`. The Metal
         /// arena's `write_from_f32` honors per-node F16 storage when
-        /// AutoMixedPrecision rewrote the param.
+        /// AutoMixedPrecision rewrote the param. U8/I8 packed weights
+        /// copy directly into the arena for `Op::DequantMatMul`.
         fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+            if matches!(dtype, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
+                self.inner.set_param_bytes(name, data);
+                return;
+            }
             if dtype == rlx_ir::DType::F32 {
                 let n = data.len() / 4;
                 let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
@@ -1730,8 +2037,16 @@ pub mod cuda_backend {
             MatMul,
             DotGeneral,
             LayerNorm,
+            LayerNorm2d,
             RmsNorm,
             Attention,
+            AttentionBackward,
+            RmsNormBackwardInput,
+            RmsNormBackwardGamma,
+            RmsNormBackwardBeta,
+            RopeBackward,
+            CumsumBackward,
+            GatherBackward,
             Rope,
             Reshape,
             Transpose,
@@ -1745,13 +2060,22 @@ pub mod cuda_backend {
             TopK,
             Sample,
             Conv,
+            ConvTranspose2d,
             Pool,
             GroupedMatMul,
+            DequantGroupedMatMul,
+            DequantMoEWeights,
             ScatterAdd,
             DequantMatMul,
             SelectiveScan,
             FusedMatMulBiasAct,
             FusedResidualLN,
+            FusedResidualRmsNorm,
+            GaussianSplatRender,
+            GaussianSplatRenderBackward,
+            GaussianSplatPrepare,
+            GaussianSplatRasterize,
+            Custom,
         ]
     };
 
@@ -1761,18 +2085,14 @@ pub mod cuda_backend {
         }
 
         fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-            // PLAN L4: legalize against CUDA's claimed op set.
+            // Decompose FusedSwiGLU / FAB / etc. before legalization (CudaExecutable
+            // unfuses again; this pass is idempotent).
+            let graph = rlx_cuda::unfuse::unfuse(graph);
+            let graph = rlx_opt::rewrite_for_backend(graph, CUDA_SUPPORTED_OPS);
             if let Err(errors) = rlx_opt::legalize_for_backend(&graph, CUDA_SUPPORTED_OPS) {
                 panic!("{}", rlx_opt::format_legalize_error("cuda", &errors));
             }
             use rlx_opt::pass::Pass as _;
-            // Match the cleanup passes the wgpu backend runs. CUDA's
-            // op coverage is a strict subset of wgpu's today (matmul +
-            // element-wise + leaves), so fusion passes that target ops
-            // we haven't lowered yet would just leak through to the
-            // executable's "op not yet lowered" panic. Skip them here
-            // and let users run the unfusion-style rewrite within
-            // rlx-cuda once the kernel set catches up.
             let graph = if options.dce {
                 rlx_opt::DeadCodeElimination.run(graph)
             } else {
@@ -1783,16 +2103,31 @@ pub mod cuda_backend {
             } else {
                 graph
             };
-            // PLAN L2: collapse maximal element-wise chains into
-            // Op::ElementwiseRegion — CUDA lowers them natively via
-            // an NVRTC interpreted-chain kernel
-            // (`kernels/elementwise_region.cu`). Safe no-op when no
-            // chains are eligible.
-            let graph = rlx_opt::MarkElementwiseRegions.run(graph);
+            // Backend-aware fusion via the shared compile pipeline.
+            let compile_result = crate::stages::compile_graph_stages_for_backend(
+                rlx_driver::Device::Cuda,
+                graph,
+                options,
+                CUDA_SUPPORTED_OPS,
+            );
+            crate::stages::maybe_log_fusion(&compile_result.fusion);
+            let graph = compile_result.lir.into_graph();
             let graph = match options.policy.clone() {
                 Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
                 None => graph,
             };
+            Box::new(CudaExecutableWrapper {
+                inner: CudaExecutable::compile(graph),
+            })
+        }
+
+        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+            let graph = prepare_fused_graph(
+                rlx_cuda::unfuse::unfuse(lir.into_graph()),
+                options,
+                CUDA_SUPPORTED_OPS,
+                "cuda",
+            );
             Box::new(CudaExecutableWrapper {
                 inner: CudaExecutable::compile(graph),
             })
@@ -1825,6 +2160,10 @@ pub mod cuda_backend {
         /// f32-uniform; the half-precision matmul tier opts in via
         /// the separate `set_param_half` API.
         fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+            if matches!(dtype, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
+                self.inner.set_param_bytes(name, data);
+                return;
+            }
             if dtype == rlx_ir::DType::F32 {
                 let n = data.len() / 4;
                 let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
@@ -1892,6 +2231,7 @@ pub mod rocm_backend {
             LayerNorm,
             RmsNorm,
             Attention,
+            AttentionBackward,
             Rope,
             Reshape,
             Transpose,
@@ -1907,11 +2247,19 @@ pub mod rocm_backend {
             Conv,
             Pool,
             GroupedMatMul,
+            DequantGroupedMatMul,
+            DequantMoEWeights,
             ScatterAdd,
             DequantMatMul,
             SelectiveScan,
             FusedMatMulBiasAct,
             FusedResidualLN,
+            FusedResidualRmsNorm,
+            GaussianSplatRender,
+            GaussianSplatRenderBackward,
+            GaussianSplatPrepare,
+            GaussianSplatRasterize,
+            Custom,
         ]
     };
 
@@ -1921,13 +2269,11 @@ pub mod rocm_backend {
         }
 
         fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-            // PLAN L4: legalize against ROCm's claimed op set.
+            let graph = rlx_opt::rewrite_for_backend(graph, ROCM_SUPPORTED_OPS);
             if let Err(errors) = rlx_opt::legalize_for_backend(&graph, ROCM_SUPPORTED_OPS) {
                 panic!("{}", rlx_opt::format_legalize_error("rocm", &errors));
             }
             use rlx_opt::pass::Pass as _;
-            // Same upstream cleanup as the CUDA backend — ROCm's op
-            // coverage matches rlx-cuda's, so the same passes apply.
             let graph = if options.dce {
                 rlx_opt::DeadCodeElimination.run(graph)
             } else {
@@ -1938,16 +2284,30 @@ pub mod rocm_backend {
             } else {
                 graph
             };
-            // PLAN L2: collapse maximal element-wise chains into
-            // Op::ElementwiseRegion — ROCm lowers them natively via
-            // a hipRTC interpreted-chain kernel (`elementwise_region.cu`,
-            // shared with rlx-cuda via include_str!). Safe no-op when
-            // no chains are eligible.
-            let graph = rlx_opt::MarkElementwiseRegions.run(graph);
+            let compile_result = crate::stages::compile_graph_stages_for_backend(
+                rlx_driver::Device::Rocm,
+                graph,
+                options,
+                ROCM_SUPPORTED_OPS,
+            );
+            crate::stages::maybe_log_fusion(&compile_result.fusion);
+            let graph = compile_result.lir.into_graph();
             let graph = match options.policy.clone() {
                 Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
                 None => graph,
             };
+            Box::new(RocmExecutableWrapper {
+                inner: RocmExecutable::compile(graph),
+            })
+        }
+
+        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+            let graph = prepare_fused_graph(
+                lir.into_graph(),
+                options,
+                ROCM_SUPPORTED_OPS,
+                "rocm",
+            );
             Box::new(RocmExecutableWrapper {
                 inner: RocmExecutable::compile(graph),
             })
@@ -1979,6 +2339,10 @@ pub mod rocm_backend {
         /// f32-uniform; the half-precision matmul tier opts in via
         /// the separate `set_param_half` API.
         fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+            if matches!(dtype, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
+                self.inner.set_param_bytes(name, data);
+                return;
+            }
             if dtype == rlx_ir::DType::F32 {
                 let n = data.len() / 4;
                 let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
@@ -2064,6 +2428,8 @@ pub mod tpu_backend {
             Conv,
             Pool,
             GroupedMatMul,
+            DequantGroupedMatMul,
+            DequantMoEWeights,
             ScatterAdd,
             DequantMatMul,
             SelectiveScan,
@@ -2074,6 +2440,8 @@ pub mod tpu_backend {
             Dequantize,
             FusedMatMulBiasAct,
             FusedResidualLN,
+            FusedResidualRmsNorm,
+            // Splat: no on-chip kernel — lowered to common primitive MIR via logical_kernel.
         ]
     };
 
@@ -2083,9 +2451,14 @@ pub mod tpu_backend {
         }
 
         fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-            if let Err(errors) = rlx_opt::legalize_for_backend(&graph, TPU_SUPPORTED_OPS) {
+            let graph = rlx_opt::legalize_or_rewrite_for_backend_with_config(
+                graph,
+                TPU_SUPPORTED_OPS,
+                options.kernel_dispatch,
+            )
+            .unwrap_or_else(|errors| {
                 panic!("{}", rlx_opt::format_legalize_error("tpu", &errors));
-            }
+            });
             // The TPU's IR-side pass pipeline (DCE, ConstFold,
             // FuseResidualLN, FuseMatMulBiasAct, LegalizeBroadcast,
             // MarkElementwiseRegions) lives inside

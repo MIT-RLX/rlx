@@ -497,6 +497,39 @@ impl MpsGraph {
         self.reshape(&out_perm, &[batch, seq, num_heads * head_dim])
     }
 
+    /// Unmasked multi-head SDPA. Supports cross-attention when `seq_kv != seq_q`.
+    ///
+    /// Inputs are flat `[B, S, NH·DH]` tensors. No mask tensor is read.
+    /// Returns `[B, seq_q, NH·DH]`.
+    pub fn attention_unmasked(
+        &self,
+        q: &MpsTensor,
+        k: &MpsTensor,
+        v: &MpsTensor,
+        batch: usize,
+        seq_q: usize,
+        seq_kv: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> MpsTensor {
+        let r4 = |t: &MpsTensor, seq: usize| {
+            let r = self.reshape(t, &[batch, seq, num_heads, head_dim]);
+            self.transpose(&r, 1, 2) // [B, S, NH, DH] → [B, NH, S, DH]
+        };
+        let q4 = r4(q, seq_q);
+        let k4 = r4(k, seq_kv);
+        let v4 = r4(v, seq_kv);
+
+        let k4_t = self.transpose(&k4, 2, 3);
+        let scores = self.matmul(&q4, &k4_t);
+        let scale = self.constant_scalar((head_dim as f32).sqrt().recip());
+        let scores = self.mul(&scores, &scale);
+        let weights = self.softmax(&scores, 3);
+        let out4 = self.matmul(&weights, &v4);
+        let out_perm = self.transpose(&out4, 1, 2);
+        self.reshape(&out_perm, &[batch, seq_q, num_heads * head_dim])
+    }
+
     /// Multi-head SDPA with a causal mask baked in as a graph constant.
     ///
     /// Inputs are `[B, S, NH·DH]` flat tensors (qwen3 layout — after
@@ -565,8 +598,8 @@ impl MpsGraph {
     /// Apply rotary position embedding.
     ///
     /// `x`: [B, S, NH*DH] where DH must be even. `cos`, `sin`: [S, DH/2]
-    /// (precomputed). Splits each head's DH dim into two halves and rotates
-    /// pairwise.
+    /// (precomputed). When `n_rot < head_dim`, only the first `n_rot` dims
+    /// per head are rotated (Qwen3.5 uses partial RoPE); the tail is copied.
     pub fn rope(
         &self,
         x: &MpsTensor,
@@ -576,21 +609,27 @@ impl MpsGraph {
         seq: usize,
         num_heads: usize,
         head_dim: usize,
+        n_rot: usize,
     ) -> MpsTensor {
-        let half = head_dim / 2;
-        // Reshape to [B, S, NH, DH], split into halves along last axis.
+        let rot_half = n_rot / 2;
         let r = self.reshape(x, &[batch, seq, num_heads, head_dim]);
-        let x1 = self.slice(&r, 3, 0, half as i64);
-        let x2 = self.slice(&r, 3, half as i64, half as i64);
 
-        // cos/sin tables are typically [max_position, DH/2]; the kernel
-        // path indexes only the first `seq` rows. Slice to the active
-        // seq length before reshape so MPSGraph's strict reshape doesn't
-        // fault on the size mismatch.
         let cos_sliced = self.slice(cos_t, 0, 0, seq as i64);
         let sin_sliced = self.slice(sin_t, 0, 0, seq as i64);
-        let cos_bc = self.reshape(&cos_sliced, &[1, seq, 1, half]);
-        let sin_bc = self.reshape(&sin_sliced, &[1, seq, 1, half]);
+        let cos_rot = self.slice(&cos_sliced, 1, 0, rot_half as i64);
+        let sin_rot = self.slice(&sin_sliced, 1, 0, rot_half as i64);
+        let cos_bc = self.reshape(&cos_rot, &[1, seq, 1, rot_half]);
+        let sin_bc = self.reshape(&sin_rot, &[1, seq, 1, rot_half]);
+
+        let (rot_block, tail) = if n_rot < head_dim {
+            let rot = self.slice(&r, 3, 0, n_rot as i64);
+            let tail = self.slice(&r, 3, n_rot as i64, (head_dim - n_rot) as i64);
+            (rot, Some(tail))
+        } else {
+            (r, None)
+        };
+        let x1 = self.slice(&rot_block, 3, 0, rot_half as i64);
+        let x2 = self.slice(&rot_block, 3, rot_half as i64, rot_half as i64);
 
         // rotated x1 = x1*cos - x2*sin
         let a = self.mul(&x1, &cos_bc);
@@ -603,9 +642,12 @@ impl MpsGraph {
         let d = self.mul(&x2, &cos_bc);
         let rx2 = self.add(&c, &d);
 
-        // Concat rx1, rx2 along last axis → [B, S, NH, DH]
-        let cat = self.concat(&[&rx1, &rx2], 3);
-        // Reshape back to [B, S, NH*DH]
+        let rotated = self.concat(&[&rx1, &rx2], 3);
+        let cat = if let Some(tail) = tail {
+            self.concat(&[&rotated, &tail], 3)
+        } else {
+            rotated
+        };
         self.reshape(&cat, &[batch, seq, num_heads * head_dim])
     }
 
@@ -769,7 +811,7 @@ impl MpsGraph {
         result_dtypes: &[u32],
     ) {
         unsafe {
-            let trace = std::env::var("RLX_MPSG_TRACE").is_ok();
+            let trace = rlx_ir::env::flag("RLX_MPSG_TRACE");
             if trace {
                 eprintln!("[mpsg] feed dict");
             }

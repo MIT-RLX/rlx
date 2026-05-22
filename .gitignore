@@ -1,5 +1,25 @@
 /target
+/models
+*.bak
+
+# rig.sh — local remote CUDA rig (see rig.sh, scripts/rig/local.env.example)
+rig.sh
+scripts/.host
+scripts/rig/local.env
+
+# local-only docs (not in repo history)
+PLAN.md
+AGENTS.md
+
+# android build outputs (details in android/.gitignore)
+android/target/
+android/build/
+android/.gradle/
+android/app/build/
+android/**/intermediates/
+
 .env
 .env.local
 .DS_Store
 /weights
+.venv-sam3/

@@ -38,13 +38,19 @@ pub const WHERE_CU: &str = include_str!("where_select.cu");
 pub const REDUCE_CU: &str = include_str!("reduce.cu");
 pub const SOFTMAX_CU: &str = include_str!("softmax.cu");
 pub const LAYERNORM_CU: &str = include_str!("layernorm.cu");
+pub const RMS_NORM_BWD_CU: &str = include_str!("rms_norm_backward.cu");
+pub const CUMSUM_BWD_CU: &str = include_str!("cumsum_backward.cu");
+pub const ROPE_BWD_CU: &str = include_str!("rope_backward.cu");
+pub const GATHER_BWD_CU: &str = include_str!("gather_backward.cu");
 pub const FUSED_RESIDUAL_LN_CU: &str = include_str!("fused_residual_ln.cu");
 pub const GATHER_CU: &str = include_str!("gather.cu");
+pub const GATHER_AXIS_CU: &str = include_str!("gather_axis.cu");
 pub const NARROW_CU: &str = include_str!("narrow.cu");
 pub const CONCAT_CU: &str = include_str!("concat.cu");
 pub const TRANSPOSE_CU: &str = include_str!("transpose.cu");
 pub const EXPAND_CU: &str = include_str!("expand.cu");
 pub const ATTENTION_CU: &str = include_str!("attention.cu");
+pub const ATTENTION_BWD_CU: &str = include_str!("attention_bwd.cu");
 pub const ARGMAX_CU: &str = include_str!("argmax.cu");
 pub const ROPE_CU: &str = include_str!("rope.cu");
 pub const CUMSUM_CU: &str = include_str!("cumsum.cu");
@@ -52,6 +58,7 @@ pub const TOPK_CU: &str = include_str!("topk.cu");
 pub const GROUPED_MATMUL_CU: &str = include_str!("grouped_matmul.cu");
 pub const SCATTER_ADD_CU: &str = include_str!("scatter_add.cu");
 pub const DEQUANT_MATMUL_CU: &str = include_str!("dequant_matmul.cu");
+pub const DEQUANT_GGUF_CU: &str = include_str!("dequant_gguf.cu");
 pub const SAMPLE_CU: &str = include_str!("sample.cu");
 pub const SELECTIVE_SCAN_CU: &str = include_str!("selective_scan.cu");
 pub const POOL1D_CU: &str = include_str!("pool1d.cu");
@@ -60,7 +67,12 @@ pub const POOL3D_CU: &str = include_str!("pool3d.cu");
 pub const CONV1D_CU: &str = include_str!("conv1d.cu");
 pub const CONV2D_CU: &str = include_str!("conv2d.cu");
 pub const CONV3D_CU: &str = include_str!("conv3d.cu");
+pub const LAYER_NORM2D_CU: &str = include_str!("layer_norm2d.cu");
+pub const CONV_TRANSPOSE2D_CU: &str = include_str!("conv_transpose2d.cu");
+pub const GROUP_NORM_CU: &str = include_str!("group_norm.cu");
+pub const RESIZE_NEAREST_2X_CU: &str = include_str!("resize_nearest_2x.cu");
 pub const ELEMENTWISE_REGION_CU: &str = include_str!("elementwise_region.cu");
+pub const GAUSSIAN_SPLAT_RASTERIZE_CU: &str = include_str!("gaussian_splat_rasterize.cu");
 
 /// One compiled NVRTC module + the function handle we use from it.
 pub struct CudaKernel {
@@ -75,7 +87,7 @@ pub struct CudaKernel {
 /// cold-start).
 fn ptx_cache_dir() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
-    if let Ok(p) = std::env::var("RLX_CUDA_PTX_CACHE") {
+    if let Some(p) = rlx_ir::env::var("RLX_CUDA_PTX_CACHE") {
         return Some(PathBuf::from(p));
     }
     let base = std::env::var("XDG_CACHE_HOME")
@@ -183,17 +195,39 @@ kernel_cache!(REDUCE, reduce_kernel, REDUCE_CU, "reduce");
 kernel_cache!(SOFTMAX, softmax_kernel, SOFTMAX_CU, "softmax");
 kernel_cache!(LAYERNORM, layernorm_kernel, LAYERNORM_CU, "rlx_norm");
 kernel_cache!(
+    RMS_NORM_BWD,
+    rms_norm_backward_kernel,
+    RMS_NORM_BWD_CU,
+    "rlx_rms_norm_bwd"
+);
+kernel_cache!(
+    RMS_NORM_BWD_ZERO,
+    rms_norm_bwd_zero_kernel,
+    RMS_NORM_BWD_CU,
+    "rlx_zero_f32"
+);
+kernel_cache!(CUMSUM_BWD, cumsum_backward_kernel, CUMSUM_BWD_CU, "rlx_cumsum_bwd");
+kernel_cache!(ROPE_BWD, rope_backward_kernel, ROPE_BWD_CU, "rlx_rope_bwd");
+kernel_cache!(GATHER_BWD, gather_backward_kernel, GATHER_BWD_CU, "rlx_gather_axis_bwd");
+kernel_cache!(
     FUSED_RESIDUAL_LN,
     fused_residual_ln_kernel,
     FUSED_RESIDUAL_LN_CU,
     "fused_residual_ln"
 );
 kernel_cache!(GATHER, gather_kernel, GATHER_CU, "gather");
+kernel_cache!(GATHER_AXIS, gather_axis_kernel, GATHER_AXIS_CU, "gather_axis");
 kernel_cache!(NARROW, narrow_kernel, NARROW_CU, "narrow");
 kernel_cache!(CONCAT, concat_kernel, CONCAT_CU, "concat");
 kernel_cache!(TRANSPOSE, transpose_kernel, TRANSPOSE_CU, "transpose");
 kernel_cache!(EXPAND, expand_kernel, EXPAND_CU, "expand");
 kernel_cache!(ATTENTION, attention_kernel, ATTENTION_CU, "attention");
+kernel_cache!(
+    ATTENTION_BWD,
+    attention_bwd_kernel,
+    ATTENTION_BWD_CU,
+    "attention_bwd"
+);
 kernel_cache!(ARGMAX, argmax_kernel, ARGMAX_CU, "argmax");
 kernel_cache!(ROPE, rope_kernel, ROPE_CU, "rope");
 kernel_cache!(CUMSUM, cumsum_kernel, CUMSUM_CU, "cumsum");
@@ -222,6 +256,12 @@ kernel_cache!(
     DEQUANT_MATMUL_CU,
     "dequant_matmul"
 );
+kernel_cache!(
+    DEQUANT_GGUF,
+    dequant_gguf_kernel,
+    DEQUANT_GGUF_CU,
+    "dequant_gguf"
+);
 kernel_cache!(SAMPLE, sample_kernel, SAMPLE_CU, "sample");
 kernel_cache!(
     SELECTIVE_SCAN,
@@ -236,10 +276,35 @@ kernel_cache!(CONV1D, conv1d_kernel, CONV1D_CU, "conv1d");
 kernel_cache!(CONV2D, conv2d_kernel, CONV2D_CU, "conv2d");
 kernel_cache!(CONV3D, conv3d_kernel, CONV3D_CU, "conv3d");
 kernel_cache!(
+    LAYER_NORM2D,
+    layer_norm2d_kernel,
+    LAYER_NORM2D_CU,
+    "layer_norm2d"
+);
+kernel_cache!(
+    CONV_TRANSPOSE2D,
+    conv_transpose2d_kernel,
+    CONV_TRANSPOSE2D_CU,
+    "conv_transpose2d"
+);
+kernel_cache!(GROUP_NORM, group_norm_kernel, GROUP_NORM_CU, "group_norm");
+kernel_cache!(
+    RESIZE_NEAREST_2X,
+    resize_nearest_2x_kernel,
+    RESIZE_NEAREST_2X_CU,
+    "resize_nearest_2x"
+);
+kernel_cache!(
     ELEMENTWISE_REGION,
     elementwise_region_kernel,
     ELEMENTWISE_REGION_CU,
     "elementwise_region"
+);
+kernel_cache!(
+    GAUSSIAN_SPLAT_RASTERIZE,
+    gaussian_splat_rasterize_kernel,
+    GAUSSIAN_SPLAT_RASTERIZE_CU,
+    "gaussian_splat_rasterize"
 );
 
 /// Dispatch grid for a 1-D workload of `n` threads with workgroup
@@ -247,4 +312,17 @@ kernel_cache!(
 /// so the 2-D fallback wgpu requires isn't needed here.
 pub fn dispatch_grid_1d(n: u32, block_x: u32) -> (u32, u32) {
     (n.div_ceil(block_x), block_x)
+}
+
+/// 2-D grid for pixel kernels (`block_x` × `block_y` threads per block).
+pub fn dispatch_grid_2d(
+    width: u32,
+    height: u32,
+    block_x: u32,
+    block_y: u32,
+) -> ((u32, u32, u32), (u32, u32, u32)) {
+    (
+        (width.div_ceil(block_x), height.div_ceil(block_y), 1),
+        (block_x, block_y, 1),
+    )
 }

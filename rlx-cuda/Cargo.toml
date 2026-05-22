@@ -15,6 +15,7 @@ documentation.workspace = true
 [dependencies]
 rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", features = ["splat"] }
 
 # `dynamic-loading` lets the crate compile and link on hosts without a
 # CUDA SDK installed — libcuda is dlopen()'d at runtime. That's what

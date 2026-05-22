@@ -52,7 +52,7 @@ pub fn unfuse(graph: Graph) -> Graph {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|&id| id_map[&id]).collect();
 
         let new_id = match &node.op {
-            Op::FusedSwiGLU { cast_to: _ } => {
+            Op::FusedSwiGLU { cast_to: _, .. } => {
                 expand_swiglu(&mut out, &graph, node.inputs[0], &new_inputs, &node.shape)
             }
             Op::LoraMatMul { scale } => expand_lora(
@@ -443,12 +443,12 @@ fn expand_fab(
         let v4 = to_bhsd(out, v);
 
         q4 = out.add_node(
-            Op::Rope { head_dim },
+            Op::Rope { head_dim, n_rot: head_dim },
             vec![q4, inputs[cos_idx], inputs[sin_idx]],
             bhsd_shape.clone(),
         );
         k4 = out.add_node(
-            Op::Rope { head_dim },
+            Op::Rope { head_dim, n_rot: head_dim },
             vec![k4, inputs[cos_idx], inputs[sin_idx]],
             bhsd_shape.clone(),
         );
@@ -968,7 +968,7 @@ fn expand_attention_rank3(
     let bsd_k = Shape::new(&[batch, seq_k, num_heads * head_dim], dtype);
 
     let mut attn_inputs = vec![new_inputs[0], new_inputs[1], new_inputs[2]];
-    if matches!(mask_kind, MaskKind::Custom) {
+    if matches!(mask_kind, MaskKind::Custom | MaskKind::Bias) {
         // The wgpu attention kernel reads the mask via per-axis strides
         // (mask_batch_stride / mask_head_stride / seq_q_stride /
         // seq_k_stride). Setting head/q strides to 0 makes the kernel

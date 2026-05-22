@@ -160,8 +160,7 @@ impl Calibration {
         if let Some(cal) = Self::load(dev.registry_id) {
             return cal;
         }
-        let verbose = std::env::var("RLX_VERBOSE")
-            .ok()
+        let verbose = rlx_ir::env::var("RLX_VERBOSE")
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(0)
             >= 1;

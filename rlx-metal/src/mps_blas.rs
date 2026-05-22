@@ -29,7 +29,7 @@
 //! is wired in `backend::encode_and_run`.
 
 use metal::{Buffer, CommandBufferRef};
-use objc::runtime::{BOOL, NO, Object};
+use objc::runtime::{BOOL, NO, Object, YES};
 use objc::{class, msg_send, sel, sel_impl};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -59,7 +59,7 @@ pub fn mps_supports_matmul() -> bool {
 /// the same shapes recur every layer, so caching reduces per-call objc
 /// overhead.
 struct KernelCache {
-    map: Mutex<HashMap<(usize, usize, usize), usize>>,
+    map: Mutex<HashMap<(usize, usize, usize, bool), usize>>,
 }
 unsafe impl Send for KernelCache {}
 unsafe impl Sync for KernelCache {}
@@ -166,10 +166,10 @@ pub fn invalidate_caches() {
     km.clear();
 }
 
-unsafe fn get_or_build_kernel(m: usize, k: usize, n: usize) -> *mut Object {
+unsafe fn get_or_build_kernel(m: usize, k: usize, n: usize, transpose_b: bool) -> *mut Object {
     let cache = kernel_cache();
     let mut map = cache.map.lock().expect("kernel cache poisoned");
-    if let Some(&p) = map.get(&(m, k, n)) {
+    if let Some(&p) = map.get(&(m, k, n, transpose_b)) {
         return p as *mut Object;
     }
     use crate::device::metal_device;
@@ -180,16 +180,14 @@ unsafe fn get_or_build_kernel(m: usize, k: usize, n: usize) -> *mut Object {
     let kernel: *mut Object = msg_send![alloc,
         initWithDevice: dev_ref
         transposeLeft: NO as BOOL
-        transposeRight: NO as BOOL
+        transposeRight: if transpose_b { YES } else { NO } as BOOL
         resultRows: m as u64
         resultColumns: n as u64
         interiorColumns: k as u64
         alpha: 1.0_f64
         beta: 0.0_f64
     ];
-    // Cached forever — kernel objects are tiny and we want the OS pipeline
-    // cache to keep the underlying GPU shader hot too.
-    map.insert((m, k, n), kernel as usize);
+    map.insert((m, k, n, transpose_b), kernel as usize);
     kernel
 }
 
@@ -217,6 +215,32 @@ pub fn encode_mps_sgemm(
         k,
         n,
         mps_dtype::Float32,
+        false,
+    );
+}
+
+/// `C = A @ B^T` where `B` is stored as `[n, k]` row-major (GGUF dequant layout).
+pub fn encode_mps_sgemm_bt(
+    cmd_buf: &CommandBufferRef,
+    arena: &Buffer,
+    a_off: usize,
+    b_off: usize,
+    c_off: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    encode_mps_matmul(
+        cmd_buf,
+        arena,
+        a_off,
+        b_off,
+        c_off,
+        m,
+        k,
+        n,
+        mps_dtype::Float32,
+        true,
     );
 }
 
@@ -241,6 +265,7 @@ pub fn encode_mps_hgemm(
         k,
         n,
         mps_dtype::Float16,
+        false,
     );
 }
 
@@ -254,12 +279,14 @@ fn encode_mps_matmul(
     k: usize,
     n: usize,
     dtype: u32,
+    transpose_b: bool,
 ) {
     unsafe {
         let a_mat = get_or_build_matrix(arena, a_off, m, k, dtype);
-        let b_mat = get_or_build_matrix(arena, b_off, k, n, dtype);
+        let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
+        let b_mat = get_or_build_matrix(arena, b_off, b_rows, b_cols, dtype);
         let c_mat = get_or_build_matrix(arena, c_off, m, n, dtype);
-        let kernel = get_or_build_kernel(m, k, n);
+        let kernel = get_or_build_kernel(m, k, n, transpose_b);
         let _: () = msg_send![kernel,
             encodeToCommandBuffer: cmd_buf
             leftMatrix: a_mat

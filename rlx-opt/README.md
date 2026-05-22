@@ -1,89 +1,71 @@
 # rlx-opt
 
-Graph rewrites + autodiff for `rlx-ir`. Stateless passes (every pass
-takes `&mut Graph` and mutates in place), JAX-shaped transforms, opt-in
-legalization.
+Facade crate that re-exports [`rlx-fusion`], [`rlx-autodiff`], and [`rlx-compile`]
+with the historical `rlx_opt::` module paths. Most callers use [`rlx`] and
+import `rlx::opt::*`; depend on `rlx-opt` directly only when you want the
+optimizer stack without the runtime.
 
-## Default pass pipeline
+## Crate split (0.2)
 
-Every backend runs roughly:
+| Crate | Role |
+|-------|------|
+| [`rlx-fusion`] | MIR fusion passes, `Pass` trait, `unfuse_fused_for_autodiff` |
+| [`rlx-autodiff`] | `grad_with_loss`, `jvp`, `hvp`, `vmap`, `prepare_graph_for_ad` |
+| [`rlx-compile`] | `CompilePipeline`, legalization, memory plan, precision / PTQ |
 
-1. **`ConstantFolding`** — fold compile-time-known subgraphs.
-2. **`fusion::*`** — `MatMul + bias + Activation`, residual + LayerNorm,
-   QKV concat, SwiGLU, attention block, BERT layer.
-3. **`MarkElementwiseRegions`** — collapse element-wise chains into a
-   single region op (one kernel per chain).
-4. **`legalize_for_backend`** — reject ops the target backend can't lower,
-   so missing op coverage fails at compile time instead of runtime.
-5. **`memory::*`** — liveness analysis → arena buffer assignment.
-6. **`dce`** — dead-code elimination. Always last.
+Implementation lives in those crates; `rlx-opt` only wires backward-compatible
+`rlx_opt::fusion`, `rlx_opt::autodiff`, `rlx_opt::legalize`, etc.
 
-## Opt-in passes
+## Features
 
-Run by specific backends or user code:
+| Feature | Enables |
+|---------|---------|
+| `compile` *(default)* | `rlx-compile` — HIR → MIR → LIR pipeline |
+| `training` *(default)* | `rlx-autodiff` — reverse / forward AD, vmap |
+| `full` | both |
 
-- **`LegalizeBroadcast`** — materialize non-trailing broadcasts via
-  `Op::Expand`. Required for TPU (HLO) and rlx-cortexm; CPU/Metal handle
-  modulo broadcasts inline.
-- **`insert_q_dq`** — post-training quantization Q/DQ insertion. Caller
-  supplies a `CalibrationRecord`.
-- **`LowerControlFlow`** / **`LowerDotGeneral`** — lower XLA-shaped
-  primitives to the standard op set.
+## Fusion pipeline (via `rlx-compile`)
 
-## Transforms (JAX-shaped)
+Fusion is **backend-aware**: `fusion_passes_for_supported` selects passes from a
+backend's `OpKind` claim set so the optimizer never emits fused ops the target
+cannot lower (e.g. Metal may skip `FuseAttentionBlock`).
 
-- **`autodiff::grad_with_loss`** — reverse-mode AD. Phases 1–9 cover
-  every non-fused op + `If` / `While` / `Scan` / `SelectiveScan` / fused
-  attention / fused transformer layer.
-- **`jvp` / `hvp`** — forward-mode AD; Hessian-vector products via
-  forward-over-reverse.
-- **`vmap`** — batched function transform (leading-axis batching).
-- **`Op::CustomFn`** — `custom_vjp` / `custom_jvp`-style overrides for
-  user-defined sub-graphs.
+Typical order:
 
-## What's here
+1. **Constant folding** — fold compile-time-known subgraphs.
+2. **Fusion passes** — gated pattern fusions + elementwise regions.
+3. **Legalize** — broadcast materialization, backend-specific rewrites.
+4. **Memory plan** — liveness → arena buffer assignment.
+5. **DCE** — dead-code elimination (last in the fusion pipeline).
 
-- `pass.rs` — `Pass` trait + the canonical pipeline order.
-- `dce.rs` — dead-code elimination.
-- `const_fold.rs` — fold constant subgraphs at compile time.
-- `fusion.rs` — pattern-match fusion. Patterns live next to the op they
-  produce.
-- `precision.rs` — auto-mixed precision policy (f32 → f16/bf16 around
-  matmul; cast tax handled in Phase G).
-- `memory.rs` — liveness analysis + arena assignment. Output is an
-  offset-per-node map.
-- `autodiff.rs` — reverse-mode AD.
-- `lower_dot_general.rs` — XLA-style DotGeneral → MatMul + reshapes.
+See [`rlx-fusion/README.md`](../rlx-fusion/README.md) and
+[`rlx-compile/README.md`](../rlx-compile/README.md) for crate-local detail.
 
 ## Install
 
 ```toml
 [dependencies]
-rlx-opt = "0.1"
+rlx-opt = "0.2"
 ```
-
-Most users want the [`rlx`](https://crates.io/crates/rlx) prelude crate;
-it re-exports `rlx_opt` as `rlx::opt`.
 
 ## Build / test
 
 ```sh
 cargo build -p rlx-opt
-cargo test  -p rlx-opt       # ~17 tests, fusion-heavy
+cargo test  -p rlx-fusion -p rlx-autodiff -p rlx-compile
 ```
 
 ## Gotchas
 
-- Pass order matters. `const_fold` must run before `fusion` (fusion
-  patterns assume constant inputs are already inlined). `memory.rs`
-  must run last; it depends on the final node count.
-- Don't introduce a new fused op without also: adding it to `Op`,
-  shape inference, both backends, cost model, **and** the verifier.
-- `precision.rs` inserts `Cast` nodes; some are eliminated by the cast-
-  elision peephole in fusion. Don't double-handle.
-- Fusion is conservative — it only fires when `num_consumers == 1` for
-  intermediate nodes. Multi-consumer ops stay unfused on purpose.
+- Pass order matters: const-fold before fusion; memory plan after fusion.
+- New fused ops need `Op` + infer + verifier + every backend thunk you target.
+- `precision` inserts `Cast` nodes; some are eliminated by fusion peepholes.
 
 ## License
 
 GPL-3.0-only.
+
+[`rlx`]: https://docs.rs/rlx
+[`rlx-fusion`]: ../rlx-fusion/README.md
+[`rlx-autodiff`]: ../rlx-autodiff/README.md
+[`rlx-compile`]: ../rlx-compile/README.md

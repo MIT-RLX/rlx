@@ -1,0 +1,1189 @@
+// RLX native Gaussian splat raster — tile-list forward matching slang-splat-ref/raster.rs.
+#include <metal_stdlib>
+using namespace metal;
+
+constant float kGaussianSupportSigmaRadius = 3.0;
+constant float kOutputGamma = 2.2;
+
+struct SplatRasterParams {
+    uint width;
+    uint height;
+    uint tile_size;
+    uint tile_width;
+    float alpha_cutoff;
+    float transmittance_threshold;
+    float bg_r;
+    float bg_g;
+    float bg_b;
+    uint max_splat_steps;
+};
+
+inline float3 quat_rotate(float3 v, float4 q_wxyz) {
+    float3 qv = q_wxyz.yzw;
+    float w = q_wxyz.x;
+    float3 t1 = cross(v, qv);
+    float3 mid = t1 + w * v;
+    float3 t2 = cross(mid, qv);
+    return v + 2.0f * t2;
+}
+
+inline float ray_splat_intersection_alpha(
+    device const float* color_alpha,
+    device const float* pos_local,
+    device const float* inv_scale,
+    device const float* quat,
+    uint splat_id,
+    float3 ray_direction,
+    float alpha_cutoff
+) {
+    uint ca = splat_id * 4u;
+    float opacity = clamp(color_alpha[ca + 3], 0.0f, 1.0f);
+    if (opacity < alpha_cutoff) {
+        return 0.0f;
+    }
+    float support_sigma_radius = sqrt(max(0.0f, -2.0f * log(alpha_cutoff / max(opacity, alpha_cutoff))));
+    if (support_sigma_radius <= 1e-10f) {
+        return 0.0f;
+    }
+    float support_scale = kGaussianSupportSigmaRadius / support_sigma_radius;
+    uint pl = splat_id * 3u;
+    float3 ro_local = float3(pos_local[pl], pos_local[pl + 1], pos_local[pl + 2]) * support_scale;
+    uint qb = splat_id * 4u;
+    float4 q_wxyz = float4(quat[qb], quat[qb + 1], quat[qb + 2], quat[qb + 3]);
+    uint is = splat_id * 3u;
+    float3 inv = float3(inv_scale[is], inv_scale[is + 1], inv_scale[is + 2]);
+    float3 rotated = quat_rotate(ray_direction, q_wxyz);
+    float3 ray_local = float3(rotated.x * inv.x, rotated.y * inv.y, rotated.z * inv.z) * support_scale;
+    float denom = dot(ray_local, ray_local);
+    if (denom <= 1e-10f) {
+        return 0.0f;
+    }
+    float t_closest = -dot(ray_local, ro_local) / denom;
+    if (t_closest <= 0.0f) {
+        return 0.0f;
+    }
+    float3 closest = ro_local + ray_local * t_closest;
+    float rho2 = max(0.0f, dot(closest, closest));
+    return opacity * exp(-0.5f * support_sigma_radius * support_sigma_radius * rho2);
+}
+
+kernel void gaussian_splat_rasterize(
+    device float* dst [[buffer(0)]],
+    device const float* color_alpha [[buffer(1)]],
+    device const uint* valid [[buffer(2)]],
+    device const float* pos_local [[buffer(3)]],
+    device const float* inv_scale [[buffer(4)]],
+    device const float* quat [[buffer(5)]],
+    device const uint* sorted_values [[buffer(6)]],
+    device const uint* tile_ranges [[buffer(7)]],
+    device const float* rays [[buffer(8)]],
+    constant SplatRasterParams& params [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint px = gid.x;
+    uint py = gid.y;
+    if (px >= params.width || py >= params.height) {
+        return;
+    }
+    uint out_base = (py * params.width + px) * 4u;
+    uint tile_y = py / params.tile_size;
+    uint tile = tile_y * params.tile_width + px / params.tile_size;
+    uint range_base = tile * 2u;
+    uint start = tile_ranges[range_base];
+    uint end = tile_ranges[range_base + 1u];
+    if (start == 0xFFFFFFFFu || end <= start) {
+        dst[out_base] = params.bg_r;
+        dst[out_base + 1u] = params.bg_g;
+        dst[out_base + 2u] = params.bg_b;
+        dst[out_base + 3u] = 1.0f;
+        return;
+    }
+    uint ray_base = (py * params.width + px) * 3u;
+    float3 ray = float3(rays[ray_base], rays[ray_base + 1u], rays[ray_base + 2u]);
+    float3 accum = float3(0.0f);
+    float trans = 1.0f;
+    uint steps = 0u;
+    uint step_cap = params.max_splat_steps == 0u ? 0xFFFFFFFFu : params.max_splat_steps;
+    for (uint i = start; i < end; ++i) {
+        if (steps >= step_cap) {
+            break;
+        }
+        uint splat_id = sorted_values[i];
+        if (valid[splat_id] == 0u) {
+            continue;
+        }
+        float alpha = ray_splat_intersection_alpha(
+            color_alpha, pos_local, inv_scale, quat, splat_id, ray, params.alpha_cutoff);
+        if (alpha < params.alpha_cutoff) {
+            continue;
+        }
+        uint rgb_base = splat_id * 4u;
+        accum.x += trans * alpha * color_alpha[rgb_base];
+        accum.y += trans * alpha * color_alpha[rgb_base + 1u];
+        accum.z += trans * alpha * color_alpha[rgb_base + 2u];
+        trans *= 1.0f - alpha;
+        steps += 1u;
+        if (trans < params.transmittance_threshold) {
+            break;
+        }
+    }
+    float3 bg = float3(params.bg_r, params.bg_g, params.bg_b);
+    float3 composed = max(float3(0.0f), accum + trans * bg);
+    dst[out_base] = pow(composed.x, kOutputGamma);
+    dst[out_base + 1u] = pow(composed.y, kOutputGamma);
+    dst[out_base + 2u] = pow(composed.z, kOutputGamma);
+    dst[out_base + 3u] = 1.0f - trans;
+}
+
+/// Training raster: linear radiance + opacity (no display gamma).
+kernel void gaussian_splat_rasterize_linear(
+    device float* dst [[buffer(0)]],
+    device const float* color_alpha [[buffer(1)]],
+    device const uint* valid [[buffer(2)]],
+    device const float* pos_local [[buffer(3)]],
+    device const float* inv_scale [[buffer(4)]],
+    device const float* quat [[buffer(5)]],
+    device const uint* sorted_values [[buffer(6)]],
+    device const uint* tile_ranges [[buffer(7)]],
+    device const float* rays [[buffer(8)]],
+    constant SplatRasterParams& params [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint px = gid.x;
+    uint py = gid.y;
+    if (px >= params.width || py >= params.height) {
+        return;
+    }
+    uint out_base = (py * params.width + px) * 4u;
+    uint tile_y = py / params.tile_size;
+    uint tile = tile_y * params.tile_width + px / params.tile_size;
+    uint range_base = tile * 2u;
+    uint start = tile_ranges[range_base];
+    uint end = tile_ranges[range_base + 1u];
+    if (start == 0xFFFFFFFFu || end <= start) {
+        dst[out_base] = params.bg_r;
+        dst[out_base + 1u] = params.bg_g;
+        dst[out_base + 2u] = params.bg_b;
+        dst[out_base + 3u] = 1.0f;
+        return;
+    }
+    uint ray_base = (py * params.width + px) * 3u;
+    float3 ray = float3(rays[ray_base], rays[ray_base + 1u], rays[ray_base + 2u]);
+    float3 accum = float3(0.0f);
+    float trans = 1.0f;
+    uint steps = 0u;
+    uint step_cap = params.max_splat_steps == 0u ? 0xFFFFFFFFu : params.max_splat_steps;
+    for (uint i = start; i < end; ++i) {
+        if (steps >= step_cap) {
+            break;
+        }
+        uint splat_id = sorted_values[i];
+        if (valid[splat_id] == 0u) {
+            continue;
+        }
+        float alpha = ray_splat_intersection_alpha(
+            color_alpha, pos_local, inv_scale, quat, splat_id, ray, params.alpha_cutoff);
+        if (alpha < params.alpha_cutoff) {
+            continue;
+        }
+        uint rgb_base = splat_id * 4u;
+        accum.x += trans * alpha * color_alpha[rgb_base];
+        accum.y += trans * alpha * color_alpha[rgb_base + 1u];
+        accum.z += trans * alpha * color_alpha[rgb_base + 2u];
+        trans *= 1.0f - alpha;
+        steps += 1u;
+        if (trans < params.transmittance_threshold) {
+            break;
+        }
+    }
+    float3 bg = float3(params.bg_r, params.bg_g, params.bg_b);
+    float3 composed = max(float3(0.0f), accum + trans * bg);
+    dst[out_base] = composed.x;
+    dst[out_base + 1u] = composed.y;
+    dst[out_base + 2u] = composed.z;
+    dst[out_base + 3u] = 1.0f - trans;
+}
+
+struct SplatRasterBwdParams {
+    uint width;
+    uint height;
+    uint max_splat_steps;
+    float loss_grad_clip;
+    float bg_r;
+    float bg_g;
+    float bg_b;
+    float cam_px;
+    float cam_py;
+    float cam_pz;
+    float radius_scale;
+    float alpha_cutoff;
+};
+
+/// Training forward: linear RGBA + per-pixel hit lists for backward.
+kernel void gaussian_splat_rasterize_linear_traced(
+    device float* dst [[buffer(0)]],
+    device const float* color_alpha [[buffer(1)]],
+    device const uint* valid [[buffer(2)]],
+    device const float* pos_local [[buffer(3)]],
+    device const float* inv_scale [[buffer(4)]],
+    device const float* quat [[buffer(5)]],
+    device const uint* sorted_values [[buffer(6)]],
+    device const uint* tile_ranges [[buffer(7)]],
+    device const float* rays [[buffer(8)]],
+    constant SplatRasterParams& params [[buffer(9)]],
+    device uint* hit_counts [[buffer(10)]],
+    device uint* hit_splat_ids [[buffer(11)]],
+    device float* hit_meta [[buffer(12)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint px = gid.x;
+    uint py = gid.y;
+    if (px >= params.width || py >= params.height) {
+        return;
+    }
+    uint pix = py * params.width + px;
+    uint out_base = pix * 4u;
+    uint tile_y = py / params.tile_size;
+    uint tile = tile_y * params.tile_width + px / params.tile_size;
+    uint range_base = tile * 2u;
+    uint start = tile_ranges[range_base];
+    uint end = tile_ranges[range_base + 1u];
+    uint step_cap = params.max_splat_steps == 0u ? 0xFFFFFFFFu : params.max_splat_steps;
+    if (start == 0xFFFFFFFFu || end <= start) {
+        dst[out_base] = params.bg_r;
+        dst[out_base + 1u] = params.bg_g;
+        dst[out_base + 2u] = params.bg_b;
+        dst[out_base + 3u] = 1.0f;
+        hit_counts[pix] = 0u;
+        return;
+    }
+    uint ray_base = pix * 3u;
+    float3 ray = float3(rays[ray_base], rays[ray_base + 1u], rays[ray_base + 2u]);
+    float3 accum = float3(0.0f);
+    float trans = 1.0f;
+    uint steps = 0u;
+    for (uint i = start; i < end; ++i) {
+        if (steps >= step_cap) {
+            break;
+        }
+        uint splat_id = sorted_values[i];
+        if (valid[splat_id] == 0u) {
+            continue;
+        }
+        float alpha = ray_splat_intersection_alpha(
+            color_alpha, pos_local, inv_scale, quat, splat_id, ray, params.alpha_cutoff);
+        if (alpha < params.alpha_cutoff) {
+            continue;
+        }
+        uint rgb_base = splat_id * 4u;
+        float3 color = float3(
+            color_alpha[rgb_base], color_alpha[rgb_base + 1u], color_alpha[rgb_base + 2u]);
+        uint hidx = pix * step_cap + steps;
+        hit_splat_ids[hidx] = splat_id;
+        hit_meta[hidx * 6u + 0u] = alpha;
+        hit_meta[hidx * 6u + 1u] = trans;
+        hit_meta[hidx * 6u + 2u] = color.x;
+        hit_meta[hidx * 6u + 3u] = color.y;
+        hit_meta[hidx * 6u + 4u] = color.z;
+        accum.x += trans * alpha * color.x;
+        accum.y += trans * alpha * color.y;
+        accum.z += trans * alpha * color.z;
+        trans *= 1.0f - alpha;
+        steps += 1u;
+        if (trans < params.transmittance_threshold) {
+            break;
+        }
+    }
+    hit_counts[pix] = steps;
+    float3 bg = float3(params.bg_r, params.bg_g, params.bg_b);
+    float3 composed = max(float3(0.0f), accum + trans * bg);
+    dst[out_base] = composed.x;
+    dst[out_base + 1u] = composed.y;
+    dst[out_base + 2u] = composed.z;
+    dst[out_base + 3u] = 1.0f - trans;
+}
+
+/// Raster backward: pixel RGB grads → atomic splat `color_alpha` grads.
+kernel void gaussian_splat_rasterize_backward_linear(
+    device atomic_float* color_alpha_grad [[buffer(0)]],
+    device const float* pixel_rgb_grad [[buffer(1)]],
+    device const uint* hit_counts [[buffer(2)]],
+    device const uint* hit_splat_ids [[buffer(3)]],
+    device const float* hit_meta [[buffer(4)]],
+    constant SplatRasterBwdParams& bwd [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint px = gid.x;
+    uint py = gid.y;
+    if (px >= bwd.width || py >= bwd.height) {
+        return;
+    }
+    uint pix = py * bwd.width + px;
+    uint n_hits = hit_counts[pix];
+    if (n_hits == 0u) {
+        return;
+    }
+    uint grad_base = pix * 3u;
+    float3 d_ld_rgb = float3(
+        pixel_rgb_grad[grad_base],
+        pixel_rgb_grad[grad_base + 1u],
+        pixel_rgb_grad[grad_base + 2u]);
+    float clip = max(bwd.loss_grad_clip, 1e-8f);
+    d_ld_rgb.x = clamp(d_ld_rgb.x, -clip, clip);
+    d_ld_rgb.y = clamp(d_ld_rgb.y, -clip, clip);
+    d_ld_rgb.z = clamp(d_ld_rgb.z, -clip, clip);
+    float3 bg = float3(bwd.bg_r, bwd.bg_g, bwd.bg_b);
+    float d_ld_trans = dot(d_ld_rgb, bg);
+    uint cap = bwd.max_splat_steps == 0u ? 0xFFFFFFFFu : bwd.max_splat_steps;
+    for (uint s = 0u; s < n_hits; ++s) {
+        uint rev = n_hits - 1u - s;
+        uint idx = pix * cap + rev;
+        uint splat_id = hit_splat_ids[idx];
+        uint mb = idx * 6u;
+        float alpha = hit_meta[mb];
+        float trans_before = hit_meta[mb + 1u];
+        float3 color = float3(hit_meta[mb + 2u], hit_meta[mb + 3u], hit_meta[mb + 4u]);
+        float one_minus = max(1e-8f, 1.0f - alpha);
+        uint ca = splat_id * 4u;
+        atomic_fetch_add_explicit(&color_alpha_grad[ca + 0u], d_ld_rgb.x * trans_before * alpha, memory_order_relaxed);
+        atomic_fetch_add_explicit(&color_alpha_grad[ca + 1u], d_ld_rgb.y * trans_before * alpha, memory_order_relaxed);
+        atomic_fetch_add_explicit(&color_alpha_grad[ca + 2u], d_ld_rgb.z * trans_before * alpha, memory_order_relaxed);
+        float d_ld_alpha = trans_before * dot(d_ld_rgb, color);
+        d_ld_alpha += d_ld_trans * (-trans_before / one_minus);
+        d_ld_alpha = clamp(d_ld_alpha, -clip, clip);
+        atomic_fetch_add_explicit(&color_alpha_grad[ca + 3u], d_ld_alpha, memory_order_relaxed);
+        d_ld_trans = d_ld_trans * one_minus + dot(d_ld_rgb * alpha, color);
+    }
+}
+
+struct AdamParamGpu {
+    float lr;
+    float grad_clip;
+    float vmin;
+    float vmax;
+};
+
+struct AdamHyperGpu {
+    uint param_count;
+    uint splat_count;
+    float beta1;
+    float beta2;
+    float bias_corr1;
+    float bias_corr2;
+    float adam_eps;
+    float huge_value;
+    float max_update;
+};
+
+kernel void gaussian_splat_adam_step(
+    device float* params [[buffer(0)]],
+    device const float* grads [[buffer(1)]],
+    device float* moments [[buffer(2)]],
+    device const AdamParamGpu* settings [[buffer(3)]],
+    constant AdamHyperGpu& hyper [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= hyper.param_count) {
+        return;
+    }
+    uint splat_count = max(hyper.splat_count, 1u);
+    uint param_id = tid / splat_count;
+    AdamParamGpu s = settings[param_id];
+    float value = params[tid];
+    if (!isfinite(value)) {
+        value = 0.0f;
+    }
+    value = clamp(value, -hyper.huge_value, hyper.huge_value);
+    float grad = grads[tid];
+    if (!isfinite(grad)) {
+        grad = 0.0f;
+    }
+    grad = clamp(grad, -s.grad_clip, s.grad_clip);
+    uint mom_base = tid * 2u;
+    float m = moments[mom_base];
+    float v = moments[mom_base + 1u];
+    m = hyper.beta1 * m + (1.0f - hyper.beta1) * grad;
+    v = hyper.beta2 * v + (1.0f - hyper.beta2) * grad * grad;
+    if (!isfinite(m)) {
+        m = 0.0f;
+    }
+    if (!isfinite(v)) {
+        v = 0.0f;
+    }
+    m = clamp(m, -hyper.huge_value, hyper.huge_value);
+    v = clamp(v, -hyper.huge_value, hyper.huge_value);
+    moments[mom_base] = m;
+    moments[mom_base + 1u] = v;
+    float m_hat = m / hyper.bias_corr1;
+    float v_hat = v / hyper.bias_corr2;
+    float update = s.lr * m_hat / (sqrt(max(v_hat, 0.0f)) + hyper.adam_eps);
+    if (!isfinite(update)) {
+        update = 0.0f;
+    }
+    update = clamp(update, -hyper.max_update, hyper.max_update);
+    float next = value - update;
+    if (!isfinite(next)) {
+        next = value;
+    }
+    next = clamp(next, s.vmin, s.vmax);
+    params[tid] = next;
+}
+
+struct SplatLossParams {
+    uint width;
+    uint height;
+    float inv_pixel_count;
+    float mse_grad_scale;
+    float ssim_weight;
+    float ssim_c2;
+};
+
+constant int SSIM_WINDOW = 11;
+constant int SSIM_HALF = 5;
+constant float SSIM_BOX_NORM = 1.0f / 121.0f;
+constant float SSIM_C1 = 0.01f * 0.01f;
+
+inline float splat_ch(device const float* rgba, uint pix, uint ch) {
+    return rgba[pix * 4u + ch];
+}
+
+inline float splat_box_blur_ch(
+    device const float* rgba,
+    uint width,
+    uint height,
+    uint cx,
+    uint cy,
+    uint ch
+) {
+    int w = int(width);
+    int h = int(height);
+    float sum = 0.0f;
+    for (int ky = -SSIM_HALF; ky <= SSIM_HALF; ++ky) {
+        for (int kx = -SSIM_HALF; kx <= SSIM_HALF; ++kx) {
+            int x = clamp(int(cx) + kx, 0, w - 1);
+            int y = clamp(int(cy) + ky, 0, h - 1);
+            uint p = uint(y) * width + uint(x);
+            sum += splat_ch(rgba, p, ch);
+        }
+    }
+    return sum * SSIM_BOX_NORM;
+}
+
+inline float splat_box_blur_sq_ch(
+    device const float* rgba,
+    uint width,
+    uint height,
+    uint cx,
+    uint cy,
+    uint ch
+) {
+    int w = int(width);
+    int h = int(height);
+    float sum = 0.0f;
+    for (int ky = -SSIM_HALF; ky <= SSIM_HALF; ++ky) {
+        for (int kx = -SSIM_HALF; kx <= SSIM_HALF; ++kx) {
+            int x = clamp(int(cx) + kx, 0, w - 1);
+            int y = clamp(int(cy) + ky, 0, h - 1);
+            uint p = uint(y) * width + uint(x);
+            float v = splat_ch(rgba, p, ch);
+            sum += v * v;
+        }
+    }
+    return sum * SSIM_BOX_NORM;
+}
+
+inline float splat_box_blur_prod_ch(
+    device const float* a,
+    device const float* b,
+    uint width,
+    uint height,
+    uint cx,
+    uint cy,
+    uint ch
+) {
+    int w = int(width);
+    int h = int(height);
+    float sum = 0.0f;
+    for (int ky = -SSIM_HALF; ky <= SSIM_HALF; ++ky) {
+        for (int kx = -SSIM_HALF; kx <= SSIM_HALF; ++kx) {
+            int x = clamp(int(cx) + kx, 0, w - 1);
+            int y = clamp(int(cy) + ky, 0, h - 1);
+            uint p = uint(y) * width + uint(x);
+            sum += splat_ch(a, p, ch) * splat_ch(b, p, ch);
+        }
+    }
+    return sum * SSIM_BOX_NORM;
+}
+
+inline float splat_ssim_map(
+    float mu_x,
+    float mu_y,
+    float mu_x2,
+    float mu_y2,
+    float mu_xy,
+    float c2
+) {
+    float sigma_x2 = max(mu_x2 - mu_x * mu_x, 0.0f);
+    float sigma_y2 = max(mu_y2 - mu_y * mu_y, 0.0f);
+    float sigma_xy = mu_xy - mu_x * mu_y;
+    float a = 2.0f * mu_x * mu_y + SSIM_C1;
+    float b = 2.0f * sigma_xy + c2;
+    float c = mu_x * mu_x + mu_y * mu_y + SSIM_C1;
+    float d = sigma_x2 + sigma_y2 + c2;
+    return (a * b) / max(c * d, 1e-8f);
+}
+
+inline void splat_ssim_partials(
+    float mu_x,
+    float mu_y,
+    float mu_x2,
+    float mu_y2,
+    float mu_xy,
+    float c2,
+    thread float& d_mu_x,
+    thread float& d_mu_x2,
+    thread float& d_mu_xy
+) {
+    float sigma_x2 = max(mu_x2 - mu_x * mu_x, 0.0f);
+    float sigma_y2 = max(mu_y2 - mu_y * mu_y, 0.0f);
+    float sigma_xy = mu_xy - mu_x * mu_y;
+    float a = 2.0f * mu_x * mu_y + SSIM_C1;
+    float b = 2.0f * sigma_xy + c2;
+    float c = mu_x * mu_x + mu_y * mu_y + SSIM_C1;
+    float d = sigma_x2 + sigma_y2 + c2;
+    float num = a * b;
+    float den = max(c * d, 1e-8f);
+    float inv_den2 = 1.0f / (den * den);
+    float dnum_dmu_x = 2.0f * mu_y * b + a * (-2.0f * mu_y);
+    float dden_dmu_x = 2.0f * mu_x * d + c * (-2.0f * mu_x);
+    float d_ssim_dmu_x = (dnum_dmu_x * den - num * dden_dmu_x) * inv_den2;
+    float d_ssim_dsigma_x2 = (-num * c) * inv_den2;
+    float d_ssim_dsigma_xy = (2.0f * a * den) * inv_den2;
+    d_mu_x = d_ssim_dmu_x + d_ssim_dsigma_x2 * (-2.0f * mu_x) + d_ssim_dsigma_xy * (-mu_y);
+    d_mu_x2 = d_ssim_dsigma_x2;
+    d_mu_xy = d_ssim_dsigma_xy;
+}
+
+/// Per-pixel SSIM blur stats (5 floats × 3 channels).
+kernel void gaussian_splat_ssim_stats(
+    device const float* rendered [[buffer(0)]],
+    device const float* target [[buffer(1)]],
+    device float* stats [[buffer(2)]],
+    constant SplatLossParams& p [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint px = gid.x;
+    uint py = gid.y;
+    if (px >= p.width || py >= p.height) {
+        return;
+    }
+    uint pix = py * p.width + px;
+    for (uint ch = 0u; ch < 3u; ++ch) {
+        uint base = pix * 15u + ch * 5u;
+        stats[base + 0u] = splat_box_blur_ch(rendered, p.width, p.height, px, py, ch);
+        stats[base + 1u] = splat_box_blur_ch(target, p.width, p.height, px, py, ch);
+        stats[base + 2u] = splat_box_blur_sq_ch(rendered, p.width, p.height, px, py, ch);
+        stats[base + 3u] = splat_box_blur_sq_ch(target, p.width, p.height, px, py, ch);
+        stats[base + 4u] = splat_box_blur_prod_ch(rendered, target, p.width, p.height, px, py, ch);
+    }
+}
+
+/// Blended MSE + SSIM loss (atomics) and RGB gradient.
+kernel void gaussian_splat_blended_loss_grad(
+    device const float* rendered [[buffer(0)]],
+    device const float* target [[buffer(1)]],
+    device const float* ssim_stats [[buffer(2)]],
+    device float* pixel_rgb_grad [[buffer(3)]],
+    device atomic_float* mse_out [[buffer(4)]],
+    device atomic_float* ssim_sum_out [[buffer(5)]],
+    constant SplatLossParams& p [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint px = gid.x;
+    uint py = gid.y;
+    if (px >= p.width || py >= p.height) {
+        return;
+    }
+    uint pix = py * p.width + px;
+    uint rgba = pix * 4u;
+    uint rgb = pix * 3u;
+    float w = clamp(p.ssim_weight, 0.0f, 1.0f);
+    float c2 = max(p.ssim_c2, 1e-8f);
+    float inv_ch = p.inv_pixel_count / 3.0f;
+    float mse_acc = 0.0f;
+    float ssim_acc = 0.0f;
+    for (uint ch = 0u; ch < 3u; ++ch) {
+        float r = rendered[rgba + ch];
+        float t = target[rgba + ch];
+        float diff = r - t;
+        mse_acc += diff * diff * inv_ch;
+        float mse_g = p.mse_grad_scale * diff;
+        float ssim_g = 0.0f;
+        if (w > 0.0f) {
+            uint base0 = pix * 15u + ch * 5u;
+            ssim_acc += splat_ssim_map(
+                ssim_stats[base0 + 0u],
+                ssim_stats[base0 + 1u],
+                ssim_stats[base0 + 2u],
+                ssim_stats[base0 + 3u],
+                ssim_stats[base0 + 4u],
+                c2
+            );
+            for (int dy = -SSIM_HALF; dy <= SSIM_HALF; ++dy) {
+                for (int dx = -SSIM_HALF; dx <= SSIM_HALF; ++dx) {
+                    int cx = int(px) + dx;
+                    int cy = int(py) + dy;
+                    if (cx < 0 || cy < 0 || cx >= int(p.width) || cy >= int(p.height)) {
+                        continue;
+                    }
+                    uint cpix = uint(cy) * p.width + uint(cx);
+                    uint base = cpix * 15u + ch * 5u;
+                    float mu_x = ssim_stats[base +  0u];
+                    float mu_y = ssim_stats[base + 1u];
+                    float mu_x2 = ssim_stats[base + 2u];
+                    float mu_y2 = ssim_stats[base + 3u];
+                    float mu_xy = ssim_stats[base + 4u];
+                    float d_mu_x = 0.0f;
+                    float d_mu_x2 = 0.0f;
+                    float d_mu_xy = 0.0f;
+                    splat_ssim_partials(mu_x, mu_y, mu_x2, mu_y2, mu_xy, c2, d_mu_x, d_mu_x2, d_mu_xy);
+                    float dL_d_ssim = -w * inv_ch;
+                    ssim_g += dL_d_ssim * (
+                        d_mu_x * SSIM_BOX_NORM +
+                        d_mu_x2 * (2.0f * r) * SSIM_BOX_NORM +
+                        d_mu_xy * t * SSIM_BOX_NORM
+                    );
+                }
+            }
+        }
+        pixel_rgb_grad[rgb + ch] = (1.0f - w) * mse_g + ssim_g;
+    }
+    atomic_fetch_add_explicit(mse_out, mse_acc, memory_order_relaxed);
+    if (w > 0.0f) {
+        atomic_fetch_add_explicit(ssim_sum_out, ssim_acc, memory_order_relaxed);
+    }
+}
+
+/// MSE loss partial sum (atomic) + per-pixel RGB gradient (no image readback).
+kernel void gaussian_splat_mse_loss_grad(
+    device const float* rendered [[buffer(0)]],
+    device const float* target [[buffer(1)]],
+    device float* pixel_rgb_grad [[buffer(2)]],
+    device atomic_float* loss_out [[buffer(3)]],
+    constant SplatLossParams& p [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint px = gid.x;
+    uint py = gid.y;
+    if (px >= p.width || py >= p.height) {
+        return;
+    }
+    uint pix = py * p.width + px;
+    uint rgba = pix * 4u;
+    uint rgb = pix * 3u;
+    float mse_acc = 0.0f;
+    for (uint ch = 0u; ch < 3u; ++ch) {
+        float r = rendered[rgba + ch];
+        float t = target[rgba + ch];
+        float diff = r - t;
+        mse_acc += diff * diff * (1.0f / 3.0f) * p.inv_pixel_count;
+        pixel_rgb_grad[rgb + ch] = p.mse_grad_scale * diff;
+    }
+    atomic_fetch_add_explicit(loss_out, mse_acc, memory_order_relaxed);
+}
+
+struct SplatProjectParams {
+    uint splat_count;
+    float radius_scale;
+    float alpha_cutoff;
+    float cam_px;
+    float cam_py;
+    float cam_pz;
+    float focal_x;
+    float focal_y;
+    float principal_x;
+    float principal_y;
+    float view_forward_x;
+    float view_forward_y;
+    float view_forward_z;
+    float view_right_x;
+    float view_right_y;
+    float view_right_z;
+    float view_up_x;
+    float view_up_y;
+    float view_up_z;
+    uint tile_size;
+    uint tile_width;
+    uint tile_height;
+};
+
+struct SplatBinParams {
+    uint tile_width;
+    uint tile_height;
+    uint tile_size;
+    uint max_list_entries;
+    uint tile_count;
+};
+
+struct PackGradParams {
+    uint splat_count;
+    uint packed_param_count;
+    uint coeff_count;
+    uint opacity_param;
+    uint use_sh;
+};
+
+/// Per-splat project into training raster buffers (pos_local, inv_scale, valid, color_alpha).
+kernel void gaussian_splat_project_training(
+    device const float* positions [[buffer(0)]],
+    device const float* scales [[buffer(1)]],
+    device const float* rotations [[buffer(2)]],
+    device const float* opacities [[buffer(3)]],
+    device const float* color_alpha [[buffer(4)]],
+    device float* pos_local [[buffer(5)]],
+    device float* inv_scale [[buffer(6)]],
+    device uint* valid [[buffer(7)]],
+    device float* out_color_alpha [[buffer(8)]],
+    device float* center_radius_depth [[buffer(9)]],
+    constant SplatProjectParams& pr [[buffer(10)]],
+    uint sid [[thread_position_in_grid]]
+) {
+    if (sid >= pr.splat_count) {
+        return;
+    }
+    float3 world = float3(positions[sid * 3u], positions[sid * 3u + 1u], positions[sid * 3u + 2u]);
+    float4 q = float4(rotations[sid * 4u], rotations[sid * 4u + 1u], rotations[sid * 4u + 2u], rotations[sid * 4u + 3u]);
+    float3 sigma = float3(scales[sid * 3u], scales[sid * 3u + 1u], scales[sid * 3u + 2u]);
+    float3 raster_scale = float3(
+        max(1e-6f, exp(sigma.x) * pr.radius_scale * 3.0f),
+        max(1e-6f, exp(sigma.y) * pr.radius_scale * 3.0f),
+        max(1e-6f, exp(sigma.z) * pr.radius_scale * 3.0f));
+    inv_scale[sid * 3u] = 1.0f / raster_scale.x;
+    inv_scale[sid * 3u + 1u] = 1.0f / raster_scale.y;
+    inv_scale[sid * 3u + 2u] = 1.0f / raster_scale.z;
+    float3 delta = float3(pr.cam_px, pr.cam_py, pr.cam_pz) - world;
+    float3 qv = q.yzw;
+    float w = q.x;
+    float3 t1 = cross(delta, qv);
+    float3 mid = t1 + w * delta;
+    float3 rotated = delta + 2.0f * cross(mid, qv);
+    pos_local[sid * 3u] = rotated.x * inv_scale[sid * 3u];
+    pos_local[sid * 3u + 1u] = rotated.y * inv_scale[sid * 3u + 1u];
+    pos_local[sid * 3u + 2u] = rotated.z * inv_scale[sid * 3u + 2u];
+    float o = clamp(opacities[sid], 0.0f, 1.0f);
+    float3 vf = float3(pr.view_forward_x, pr.view_forward_y, pr.view_forward_z);
+    float3 vr = float3(pr.view_right_x, pr.view_right_y, pr.view_right_z);
+    float3 vu = float3(pr.view_up_x, pr.view_up_y, pr.view_up_z);
+    float depth = dot(delta, vf);
+    bool visible = o >= pr.alpha_cutoff && depth > 1e-4f;
+    valid[sid] = visible ? 1u : 0u;
+    out_color_alpha[sid * 4u] = color_alpha[sid * 4u];
+    out_color_alpha[sid * 4u + 1u] = color_alpha[sid * 4u + 1u];
+    out_color_alpha[sid * 4u + 2u] = color_alpha[sid * 4u + 2u];
+    out_color_alpha[sid * 4u + 3u] = o;
+    if (!visible) {
+        return;
+    }
+    float cx = pr.focal_x * dot(delta, vr) / depth + pr.principal_x;
+    float cy = pr.focal_y * dot(delta, vu) / depth + pr.principal_y;
+    float max_scale = max(exp(sigma.x), max(exp(sigma.y), exp(sigma.z))) * pr.radius_scale * 3.0f;
+    float radius_px = pr.focal_x * max_scale / depth + 2.0f;
+    center_radius_depth[sid * 4u] = cx;
+    center_radius_depth[sid * 4u + 1u] = cy;
+    center_radius_depth[sid * 4u + 2u] = radius_px;
+    center_radius_depth[sid * 4u + 3u] = depth;
+}
+
+inline float3 quat_rotate_msl(float3 v, float4 q_wxyz) {
+    float3 qv = q_wxyz.yzw;
+    float w = q_wxyz.x;
+    float3 t1 = cross(v, qv);
+    float3 mid = t1 + w * v;
+    return v + 2.0f * cross(mid, qv);
+}
+
+inline void ray_hit_alpha_grad_projected_msl(
+    float3 pos_local,
+    float3 inv_s,
+    float4 quat,
+    float opacity,
+    float3 ray_dir,
+    float alpha_cutoff,
+    float d_alpha,
+    thread float3& d_pos_local,
+    thread float3& d_inv,
+    thread float4& d_quat,
+    thread float& d_opacity)
+{
+    float o = clamp(opacity, 0.0f, 1.0f);
+    if (abs(d_alpha) < 1e-12f || o < alpha_cutoff) {
+        return;
+    }
+    float ratio = max(1e-8f, alpha_cutoff / max(o, alpha_cutoff));
+    float ssr = sqrt(max(0.0f, -2.0f * log(ratio)));
+    if (ssr <= 1e-10f) {
+        return;
+    }
+    float ss = 3.0f / ssr;
+    float3 ro = pos_local * ss;
+    float3 rd_rot = quat_rotate_msl(ray_dir, quat);
+    float3 rl = float3(rd_rot.x * inv_s.x * ss, rd_rot.y * inv_s.y * ss, rd_rot.z * inv_s.z * ss);
+    float denom = max(1e-10f, dot(rl, rl));
+    float dot_ro_rl = dot(ro, rl);
+    float t = -dot_ro_rl / denom;
+    if (t <= 0.0f) {
+        return;
+    }
+    float3 closest = ro + rl * t;
+    float rho2 = max(0.0f, dot(closest, closest));
+    float exp_term = exp(-0.5f * ssr * ssr * rho2);
+    float d_alpha_do = exp_term;
+    float d_alpha_drho2 = o * exp_term * (-0.5f * ssr * ssr);
+    float3 g_ro = float3(0.0f);
+    float3 g_rl = float3(0.0f);
+    for (uint i = 0u; i < 3u; ++i) {
+        g_ro[i] += d_alpha_drho2 * 2.0f * closest[i] * d_alpha;
+        g_rl[i] += d_alpha_drho2 * 2.0f * closest[i] * t * d_alpha;
+        g_rl[i] += d_alpha_drho2 * 2.0f * closest[i] * (-rl[i] / denom) * d_alpha;
+        g_ro[i] += d_alpha_drho2 * 2.0f * closest[i] * (-rl[i] / denom) * d_alpha;
+    }
+    d_pos_local += g_ro * ss;
+    d_inv.x += g_rl.x * rd_rot.x * ss;
+    d_inv.y += g_rl.y * rd_rot.y * ss;
+    d_inv.z += g_rl.z * rd_rot.z * ss;
+    d_opacity += d_alpha * d_alpha_do;
+    float eps = 1e-4f;
+    for (uint k = 0u; k < 4u; ++k) {
+        float4 qp = quat;
+        qp[k] += eps;
+        float3 rp = quat_rotate_msl(ray_dir, qp);
+        float3 rlp = float3(rp.x * inv_s.x * ss, rp.y * inv_s.y * ss, rp.z * inv_s.z * ss);
+        qp[k] -= 2.0f * eps;
+        float3 rm = quat_rotate_msl(ray_dir, qp);
+        float3 rlm = float3(rm.x * inv_s.x * ss, rm.y * inv_s.y * ss, rm.z * inv_s.z * ss);
+        qp[k] += eps;
+        float gp = dot(g_rl, (rlp - rlm) / (2.0f * eps));
+        d_quat[k] += gp;
+    }
+}
+
+/// Geometry backward: trace walk → atomic projected-field grads.
+kernel void gaussian_splat_geometry_backward(
+    device atomic_float* grad_pos_local [[buffer(0)]],
+    device atomic_float* grad_inv_scale [[buffer(1)]],
+    device atomic_float* grad_quat [[buffer(2)]],
+    device atomic_float* grad_opacity [[buffer(3)]],
+    device const float* pixel_rgb_grad [[buffer(4)]],
+    device const uint* hit_counts [[buffer(5)]],
+    device const uint* hit_splat_ids [[buffer(6)]],
+    device const float* hit_meta [[buffer(7)]],
+    device const float* pos_local [[buffer(8)]],
+    device const float* inv_scale [[buffer(9)]],
+    device const float* quat [[buffer(10)]],
+    device const float* color_alpha [[buffer(11)]],
+    device const float* rays [[buffer(12)]],
+    constant SplatRasterBwdParams& bwd [[buffer(13)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint px = gid.x;
+    uint py = gid.y;
+    if (px >= bwd.width || py >= bwd.height) {
+        return;
+    }
+    uint pix = py * bwd.width + px;
+    uint n_hits = hit_counts[pix];
+    if (n_hits == 0u) {
+        return;
+    }
+    float3 d_ld_rgb = float3(
+        pixel_rgb_grad[pix * 3u],
+        pixel_rgb_grad[pix * 3u + 1u],
+        pixel_rgb_grad[pix * 3u + 2u]);
+    float clip = max(bwd.loss_grad_clip, 1e-8f);
+    d_ld_rgb = clamp(d_ld_rgb, float3(-clip), float3(clip));
+    float3 bg = float3(bwd.bg_r, bwd.bg_g, bwd.bg_b);
+    float d_ld_trans = dot(d_ld_rgb, bg);
+    uint cap = bwd.max_splat_steps == 0u ? 0xFFFFFFFFu : bwd.max_splat_steps;
+    for (uint s = 0u; s < n_hits; ++s) {
+        uint rev = n_hits - 1u - s;
+        uint idx = pix * cap + rev;
+        uint splat_id = hit_splat_ids[idx];
+        uint mb = idx * 6u;
+        float alpha = hit_meta[mb];
+        float trans_before = hit_meta[mb + 1u];
+        float3 color = float3(hit_meta[mb + 2u], hit_meta[mb + 3u], hit_meta[mb + 4u]);
+        float one_minus = max(1e-8f, 1.0f - alpha);
+        float d_ld_alpha = trans_before * dot(d_ld_rgb, color);
+        d_ld_alpha += d_ld_trans * (-trans_before / one_minus);
+        d_ld_alpha = clamp(d_ld_alpha, -clip, clip);
+        float3 pl = float3(pos_local[splat_id * 3u], pos_local[splat_id * 3u + 1u], pos_local[splat_id * 3u + 2u]);
+        float3 inv_s = float3(inv_scale[splat_id * 3u], inv_scale[splat_id * 3u + 1u], inv_scale[splat_id * 3u + 2u]);
+        float4 q = float4(quat[splat_id * 4u], quat[splat_id * 4u + 1u], quat[splat_id * 4u + 2u], quat[splat_id * 4u + 3u]);
+        float o = color_alpha[splat_id * 4u + 3u];
+        float3 ray_dir = float3(rays[pix * 3u], rays[pix * 3u + 1u], rays[pix * 3u + 2u]);
+        float3 d_pl = float3(0.0f);
+        float3 d_inv = float3(0.0f);
+        float4 d_q = float4(0.0f);
+        float d_o = 0.0f;
+        ray_hit_alpha_grad_projected_msl(pl, inv_s, q, o, ray_dir, bwd.alpha_cutoff, d_ld_alpha, d_pl, d_inv, d_q, d_o);
+        for (uint k = 0u; k < 3u; ++k) {
+            atomic_fetch_add_explicit(&grad_pos_local[splat_id * 3u + k], d_pl[k], memory_order_relaxed);
+            atomic_fetch_add_explicit(&grad_inv_scale[splat_id * 3u + k], d_inv[k], memory_order_relaxed);
+        }
+        for (uint k = 0u; k < 4u; ++k) {
+            atomic_fetch_add_explicit(&grad_quat[splat_id * 4u + k], d_q[k], memory_order_relaxed);
+        }
+        atomic_fetch_add_explicit(&grad_opacity[splat_id], d_o, memory_order_relaxed);
+        d_ld_trans = d_ld_trans * one_minus + dot(d_ld_rgb * alpha, color);
+    }
+}
+
+inline void quat_rotate_vjp_msl(float3 v, float4 q, float3 g_out, thread float4& g_q, thread float3& g_v) {
+    float eps = 1e-4f;
+    for (uint k = 0u; k < 4u; ++k) {
+        float4 qp = q;
+        qp[k] += eps;
+        float3 pp = quat_rotate_msl(v, qp);
+        qp[k] -= 2.0f * eps;
+        float3 pm = quat_rotate_msl(v, qp);
+        qp[k] += eps;
+        float3 gq_k = float3(
+            dot(g_out, (pp - pm) / (2.0f * eps)),
+            dot(g_out, (pp - pm) / (2.0f * eps)),
+            dot(g_out, (pp - pm) / (2.0f * eps)));
+        g_q[k] += gq_k.x;
+    }
+    g_v = g_out;
+}
+
+/// Analytical VJP: projected pos_local/inv_scale/quat/opacity → scene grads.
+kernel void gaussian_splat_scene_grad_projection(
+    device atomic_float* grad_positions [[buffer(0)]],
+    device atomic_float* grad_scales [[buffer(1)]],
+    device atomic_float* grad_rotations [[buffer(2)]],
+    device atomic_float* grad_opacities [[buffer(3)]],
+    device const float* grad_pos_local [[buffer(4)]],
+    device const float* grad_inv_scale [[buffer(5)]],
+    device const float* grad_quat [[buffer(6)]],
+    device const float* grad_opacity [[buffer(7)]],
+    device const float* positions [[buffer(8)]],
+    device const float* scales [[buffer(9)]],
+    device const float* rotations [[buffer(10)]],
+    constant SplatProjectParams& pr [[buffer(11)]],
+    uint sid [[thread_position_in_grid]]
+) {
+    if (sid >= pr.splat_count) {
+        return;
+    }
+    float3 gpl = float3(grad_pos_local[sid * 3u], grad_pos_local[sid * 3u + 1u], grad_pos_local[sid * 3u + 2u]);
+    float3 gin = float3(grad_inv_scale[sid * 3u], grad_inv_scale[sid * 3u + 1u], grad_inv_scale[sid * 3u + 2u]);
+    float4 gq = float4(grad_quat[sid * 4u], grad_quat[sid * 4u + 1u], grad_quat[sid * 4u + 2u], grad_quat[sid * 4u + 3u]);
+    float go = grad_opacity[sid];
+    if (dot(gpl, gpl) + dot(gin, gin) + dot(gq, gq) + go * go < 1e-20f) {
+        return;
+    }
+    float3 pos = float3(positions[sid * 3u], positions[sid * 3u + 1u], positions[sid * 3u + 2u]);
+    float3 sigma = float3(scales[sid * 3u], scales[sid * 3u + 1u], scales[sid * 3u + 2u]);
+    float4 rot = float4(rotations[sid * 4u], rotations[sid * 4u + 1u], rotations[sid * 4u + 2u], rotations[sid * 4u + 3u]);
+    float3 cam = float3(pr.cam_px, pr.cam_py, pr.cam_pz);
+    float3 s = float3(
+        max(1e-6f, exp(sigma.x) * pr.radius_scale * 3.0f),
+        max(1e-6f, exp(sigma.y) * pr.radius_scale * 3.0f),
+        max(1e-6f, exp(sigma.z) * pr.radius_scale * 3.0f));
+    float3 delta = cam - pos;
+    float3 r = quat_rotate_msl(delta, rot);
+    float3 g_r = float3(gpl.x / s.x, gpl.y / s.y, gpl.z / s.z);
+    float4 g_rot_q = float4(0.0f);
+    float3 g_delta = float3(0.0f);
+    quat_rotate_vjp_msl(delta, rot, g_r, g_rot_q, g_delta);
+    for (uint k = 0u; k < 3u; ++k) {
+        atomic_fetch_add_explicit(&grad_positions[sid * 3u + k], -g_delta[k], memory_order_relaxed);
+        atomic_fetch_add_explicit(&grad_scales[sid * 3u + k], -gpl[k] * r[k] - gin[k] / s[k], memory_order_relaxed);
+        atomic_fetch_add_explicit(&grad_rotations[sid * 4u + k], g_rot_q[k] + gq[k], memory_order_relaxed);
+    }
+    atomic_fetch_add_explicit(&grad_rotations[sid * 4u + 3u], g_rot_q.w + gq.w, memory_order_relaxed);
+    atomic_fetch_add_explicit(&grad_opacities[sid], go, memory_order_relaxed);
+}
+
+/// Emit tile keys (radius AABB) with atomic append.
+kernel void gaussian_splat_emit_tile_keys(
+    device const float* center_radius [[buffer(0)]],
+    device const uint* valid [[buffer(1)]],
+    device uint* keys [[buffer(2)]],
+    device uint* values [[buffer(3)]],
+    device atomic_uint* counter [[buffer(4)]],
+    constant SplatBinParams& bp [[buffer(5)]],
+    uint sid [[thread_position_in_grid]]
+) {
+    if (valid[sid] == 0u) {
+        return;
+    }
+    float cx = center_radius[sid * 4u];
+    float cy = center_radius[sid * 4u + 1u];
+    float r = center_radius[sid * 4u + 2u] + float(bp.tile_size);
+    float ts = float(bp.tile_size);
+    int min_x = int(floor((cx - r) / ts));
+    int max_x = int(ceil((cx + r) / ts));
+    int min_y = int(floor((cy - r) / ts));
+    int max_y = int(ceil((cy + r) / ts));
+    min_x = clamp(min_x, 0, int(bp.tile_width) - 1);
+    max_x = clamp(max_x, 0, int(bp.tile_width) - 1);
+    min_y = clamp(min_y, 0, int(bp.tile_height) - 1);
+    max_y = clamp(max_y, 0, int(bp.tile_height) - 1);
+    for (int ty = min_y; ty <= max_y; ++ty) {
+        for (int tx = min_x; tx <= max_x; ++tx) {
+            uint idx = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+            if (idx >= bp.max_list_entries) {
+                return;
+            }
+            keys[idx] = uint(ty) * bp.tile_width + uint(tx);
+            values[idx] = sid;
+        }
+    }
+}
+
+kernel void gaussian_splat_bin_histogram(
+    device const uint* keys [[buffer(0)]],
+    device uint* histogram [[buffer(1)]],
+    device const atomic_uint* list_count [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint n = atomic_load_explicit(list_count, memory_order_relaxed);
+    if (tid >= n) {
+        return;
+    }
+    atomic_fetch_add_explicit((device atomic_uint*)&histogram[keys[tid]], 1u, memory_order_relaxed);
+}
+
+kernel void gaussian_splat_bin_copy_counts(
+    device const uint* histogram [[buffer(0)]],
+    device uint* tile_counts [[buffer(1)]],
+    constant uint& tile_count [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid > 0u) {
+        return;
+    }
+    for (uint t = 0u; t < tile_count; ++t) {
+        tile_counts[t] = histogram[t];
+    }
+}
+
+kernel void gaussian_splat_bin_prefix_sum(
+    device uint* histogram [[buffer(0)]],
+    constant uint& tile_count [[buffer(1)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid > 0u) {
+        return;
+    }
+    uint sum = 0u;
+    for (uint t = 0u; t < tile_count; ++t) {
+        uint c = histogram[t];
+        histogram[t] = sum;
+        sum += c;
+    }
+}
+
+kernel void gaussian_splat_bin_scatter(
+    device const uint* keys_in [[buffer(0)]],
+    device const uint* values_in [[buffer(1)]],
+    device uint* keys_out [[buffer(2)]],
+    device uint* values_out [[buffer(3)]],
+    device uint* tile_cursor [[buffer(4)]],
+    device const atomic_uint* list_count [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint n = atomic_load_explicit(list_count, memory_order_relaxed);
+    if (tid >= n) {
+        return;
+    }
+    uint tile = keys_in[tid];
+    uint dst = atomic_fetch_add_explicit((device atomic_uint*)&tile_cursor[tile], 1u, memory_order_relaxed);
+    keys_out[dst] = keys_in[tid];
+    values_out[dst] = values_in[tid];
+}
+
+kernel void gaussian_splat_build_tile_ranges(
+    device const uint* tile_ends [[buffer(0)]],
+    device const uint* tile_counts [[buffer(1)]],
+    device uint* tile_ranges [[buffer(2)]],
+    constant uint& tile_count [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid > 0u) {
+        return;
+    }
+    for (uint i = 0u; i < tile_count * 2u; ++i) {
+        tile_ranges[i] = 0xFFFFFFFFu;
+    }
+    for (uint i = 1u; i < tile_count * 2u; i += 2u) {
+        tile_ranges[i] = 0u;
+    }
+    for (uint t = 0u; t < tile_count; ++t) {
+        uint c = tile_counts[t];
+        if (c == 0u) {
+            continue;
+        }
+        uint end = tile_ends[t];
+        uint start = end - c;
+        uint base = t * 2u;
+        if (base + 1u < tile_count * 2u) {
+            tile_ranges[base] = start;
+            tile_ranges[base + 1u] = end;
+        }
+    }
+}
+
+/// Pack scene grads → param-major layout for Adam.
+kernel void gaussian_splat_pack_grads(
+    device float* packed_grads [[buffer(0)]],
+    device const float* grad_positions [[buffer(1)]],
+    device const float* grad_scales [[buffer(2)]],
+    device const float* grad_rotations [[buffer(3)]],
+    device const float* grad_opacities [[buffer(4)]],
+    device const float* grad_colors [[buffer(5)]],
+    device const float* opacities [[buffer(6)]],
+    constant PackGradParams& pg [[buffer(7)]],
+    uint sid [[thread_position_in_grid]]
+) {
+    if (sid >= pg.splat_count) {
+        return;
+    }
+    uint count = pg.splat_count;
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        packed_grads[(0u + axis) * count + sid] = grad_positions[sid * 3u + axis];
+        packed_grads[(3u + axis) * count + sid] = grad_scales[sid * 3u + axis];
+    }
+    for (uint axis = 0u; axis < 4u; ++axis) {
+        packed_grads[(6u + axis) * count + sid] = grad_rotations[sid * 4u + axis];
+    }
+    uint coeff_count = pg.coeff_count;
+    for (uint coeff = 0u; coeff < coeff_count; ++coeff) {
+        for (uint ch = 0u; ch < 3u; ++ch) {
+            uint param_id = 10u + coeff * 3u + ch;
+            float g = grad_colors[sid * 3u + ch];
+            packed_grads[param_id * count + sid] = g;
+        }
+    }
+    float o = clamp(opacities[sid], 0.0f, 1.0f);
+    float d_raw = grad_opacities[sid] * o * (1.0f - o);
+    packed_grads[pg.opacity_param * count + sid] = d_raw;
+}
+
+/// Per-splat color/opacity grad from raster backward (SH coeffs direct, opacity sigmoid).
+kernel void gaussian_splat_splat_color_backward(
+    device atomic_float* grad_colors [[buffer(0)]],
+    device atomic_float* grad_opacities [[buffer(1)]],
+    device const float* color_alpha_grad [[buffer(2)]],
+    device const float* opacities [[buffer(3)]],
+    uint sid [[thread_position_in_grid]]
+) {
+    uint ca = sid * 4u;
+    float o = clamp(opacities[sid], 0.0f, 1.0f);
+    atomic_fetch_add_explicit(&grad_colors[sid * 3u], color_alpha_grad[ca], memory_order_relaxed);
+    atomic_fetch_add_explicit(&grad_colors[sid * 3u + 1u], color_alpha_grad[ca + 1u], memory_order_relaxed);
+    atomic_fetch_add_explicit(&grad_colors[sid * 3u + 2u], color_alpha_grad[ca + 2u], memory_order_relaxed);
+    float d_raw = color_alpha_grad[ca + 3u] * o * (1.0f - o);
+    atomic_fetch_add_explicit(&grad_opacities[sid], d_raw, memory_order_relaxed);
+}

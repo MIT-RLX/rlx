@@ -98,7 +98,7 @@ unsafe impl Sync for IcbKernels {}
 
 impl IcbKernels {
     fn new(dev: &Device, library: &metal::LibraryRef) -> Self {
-        let trace = std::env::var("RLX_ICB_TRACE").is_ok();
+        let trace = rlx_ir::env::flag("RLX_ICB_TRACE");
         let make = |name: &str| -> ComputePipelineState {
             let f = library.get_function(name, None).expect(name);
             let desc = ComputePipelineDescriptor::new();
@@ -270,7 +270,7 @@ const MIN_ICB_RUN: usize = 2;
 /// interleave segment execution with per-op encoding for the gaps that
 /// hold matmul / MPS / cast / etc.
 pub fn compile_segments(thunks: &[Thunk], arena: &Buffer, dev: &Device) -> Vec<IcbRange> {
-    let trace = std::env::var("RLX_ICB_TRACE").is_ok();
+    let trace = rlx_ir::env::flag("RLX_ICB_TRACE");
     if trace {
         let mut hist: std::collections::HashMap<&'static str, usize> = Default::default();
         for t in thunks {
@@ -332,7 +332,7 @@ pub fn compile_segments(thunks: &[Thunk], arena: &Buffer, dev: &Device) -> Vec<I
 }
 
 /// Strict mode: returns `Some` only if **all** non-Nop thunks are ICB-able.
-/// Used by the standalone `icb_smoke` example; production paths use
+/// Used by the standalone `icb_check` example; production paths use
 /// `compile_segments` instead.
 pub fn try_compile(thunks: &[Thunk], arena: &Buffer, dev: &Device) -> Option<IcbSegment> {
     let compute_thunks: Vec<&Thunk> = thunks.iter().filter(|t| !matches!(t, Thunk::Nop)).collect();
@@ -348,7 +348,7 @@ pub fn try_compile(thunks: &[Thunk], arena: &Buffer, dev: &Device) -> Option<Icb
 /// Encode a list of (already filtered) ICB-compatible thunks into one
 /// ICB segment. Returns `None` if the list is empty.
 fn build_segment(icb_thunks: &[&Thunk], arena: &Buffer, dev: &Device) -> Option<IcbSegment> {
-    let trace = std::env::var("RLX_ICB_TRACE").is_ok();
+    let trace = rlx_ir::env::flag("RLX_ICB_TRACE");
     if icb_thunks.is_empty() {
         return None;
     }
@@ -470,7 +470,7 @@ fn encode_thunk_into_icb(
             cmd.concurrent_dispatch_threads(grid, tg);
         }
         Thunk::ActivationInPlace { data, len, act, .. } => {
-            let trace = std::env::var("RLX_ICB_TRACE").is_ok();
+            let trace = rlx_ir::env::flag("RLX_ICB_TRACE");
             if trace {
                 eprintln!("  [act] write u32");
             }
@@ -683,11 +683,20 @@ fn encode_thunk_into_icb(
             seq,
             hidden,
             head_dim,
+            n_rot,
             src_row_stride,
             ..
         } => {
-            // Layout: [batch, seq, hidden, head_dim, src_row_stride]
-            write_u32s(&[*batch, *seq, *hidden, *head_dim, *src_row_stride]);
+            // Layout: [batch, seq, hidden, head_dim, src_row_stride, seq_stride, n_rot]
+            write_u32s(&[
+                *batch,
+                *seq,
+                *hidden,
+                *head_dim,
+                *src_row_stride,
+                *seq,
+                *n_rot,
+            ]);
             cmd.set_compute_pipeline_state(&k.rope);
             cmd.set_kernel_buffer(0, Some(&**arena), *src as u64);
             cmd.set_kernel_buffer(1, Some(&**arena), *cos as u64);
@@ -698,15 +707,16 @@ fn encode_thunk_into_icb(
             cmd.set_kernel_buffer(6, Some(&**constants_buf), cb_arg(2));
             cmd.set_kernel_buffer(7, Some(&**constants_buf), cb_arg(3));
             cmd.set_kernel_buffer(8, Some(&**constants_buf), cb_arg(4));
+            cmd.set_kernel_buffer(9, Some(&**constants_buf), cb_arg(5));
+            cmd.set_kernel_buffer(10, Some(&**constants_buf), cb_arg(6));
             let nh = *hidden / *head_dim;
-            let half = *head_dim / 2;
             let grid = MTLSize {
-                width: half as u64,
+                width: *head_dim as u64,
                 height: nh as u64,
                 depth: (*batch * *seq) as u64,
             };
             let tg = MTLSize {
-                width: half.min(16) as u64,
+                width: (*head_dim).min(16) as u64,
                 height: nh.min(8) as u64,
                 depth: 1,
             };

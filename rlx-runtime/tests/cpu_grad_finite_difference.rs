@@ -26,7 +26,7 @@
 //! gradient values match the FD approximation within a relative
 //! tolerance set by the FD truncation error". Catches sign flips,
 //! transpose mistakes, broadcast bugs, and missing-VJP-rule fallbacks
-//! that no smoke test would detect.
+//! that no basic test would detect.
 
 #![cfg(feature = "cpu")]
 

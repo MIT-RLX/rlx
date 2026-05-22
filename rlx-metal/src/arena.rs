@@ -144,4 +144,15 @@ impl Arena {
             }
         }
     }
+
+    /// Copy raw bytes into the node's arena slot (U8/I8 packed weights).
+    pub fn write_bytes(&mut self, id: NodeId, data: &[u8]) {
+        let off = self.byte_offset(id);
+        let cap = *self.element_counts.get(&id).unwrap_or(&0);
+        let len = data.len().min(cap);
+        unsafe {
+            let base = (self.buffer.contents() as *mut u8).add(off);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), base, len);
+        }
+    }
 }

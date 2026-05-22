@@ -97,6 +97,34 @@ impl CompiledGraph {
         self.inner.read_handle(name)
     }
 
+    /// GPU-resident MLX input (no-op on non-MLX backends).
+    pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
+        self.inner.bind_gpu_handle(name, data)
+    }
+
+    pub fn has_gpu_handle(&self, name: &str) -> bool {
+        self.inner.has_gpu_handle(name)
+    }
+
+    pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+        self.inner.set_gpu_handle_feed(handle_name, output_index)
+    }
+
+    pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
+        self.inner.read_gpu_handle(name)
+    }
+
+    /// Run, refresh GPU handle from output, return that output vector.
+    pub fn run_feed_gpu_handle(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        handle_name: &str,
+        output_index: usize,
+    ) -> Option<Vec<f32>> {
+        self.inner
+            .run_feed_gpu_handle(inputs, handle_name, output_index)
+    }
+
     /// Hint subsequent `run` calls to process only the first `actual`
     /// rows along the bucket axis (out of `upper`, the compile extent).
     /// Backends that support per-kernel active-extent dispatch honor
@@ -105,6 +133,31 @@ impl CompiledGraph {
     /// See `BucketedCompileCache::run_padded` for the canonical caller.
     pub fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
         self.inner.set_active_extent(extent);
+    }
+
+    /// TIDE merged MoE placement (`mask[expert]` device-resident if any layer has it).
+    pub fn set_moe_resident_experts(&mut self, mask: &[bool]) {
+        self.inner.set_moe_resident_experts(mask);
+    }
+
+    /// Per MoE layer placement (forward order). Preferred on CPU over merged mask.
+    pub fn set_moe_resident_experts_per_layer(&mut self, masks: &[&[bool]]) {
+        self.inner.set_moe_resident_experts_per_layer(masks);
+    }
+
+    /// Capture MoE router TopK on next forward (CPU). Returns false if unsupported.
+    pub fn enable_moe_topk_capture(&mut self, num_experts: usize) -> bool {
+        self.inner.enable_moe_topk_capture(num_experts)
+    }
+
+    /// Per-layer expert indices from the last forward (MoE router TopK order).
+    pub fn take_moe_topk_capture(&mut self) -> Option<Vec<Vec<u32>>> {
+        self.inner.take_moe_topk_capture()
+    }
+
+    /// GroupedMatMul GPU/CPU token accounting from the last forward (CPU).
+    pub fn take_moe_residency_stats(&mut self) -> Option<crate::MoeResidencyStats> {
+        self.inner.take_moe_residency_stats()
     }
 
     // ── Pipelined / async execution (Phase C) ─────────────────────────

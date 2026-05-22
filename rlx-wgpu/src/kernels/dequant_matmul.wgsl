@@ -37,6 +37,7 @@
 //   2 = Int4Block      (bits=4, signed, per-block scale)
 //   3 = Fp8E4m3        (bits=8, no scale, OCP E4M3 bit decode)
 //   4 = Fp8E5m2        (bits=8, no scale, OCP E5M2 bit decode)
+//   5 = Nvfp4Block     (E2M1 nibbles + FP8 E4M3 block scales + f32 global_scale @ zp_off)
 
 struct Params {
     m: u32,
@@ -74,6 +75,27 @@ fn read_nibble_signed(elem_idx: u32) -> i32 {
     if (q >= 8) { q = q - 16; }
     return q;
 }
+
+// Read one byte from the f32-packed scale stream at flat byte index.
+fn read_scale_byte(byte_idx: u32) -> u32 {
+    let word_idx = byte_idx / 4u;
+    let byte_shift = (byte_idx % 4u) * 8u;
+    let bits = bitcast<u32>(arena[params.scale_off + word_idx]);
+    return (bits >> byte_shift) & 0xffu;
+}
+
+// Read one unsigned nibble (FP4 E2M1 code 0..15).
+fn read_nibble_u4(elem_idx: u32) -> u32 {
+    let word_idx = elem_idx / 8u;
+    let nib_shift = (elem_idx % 8u) * 4u;
+    let bits = bitcast<u32>(arena[params.w_off + word_idx]);
+    return (bits >> nib_shift) & 0xfu;
+}
+
+const FP4_E2M1: array<f32, 16> = array<f32, 16>(
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+);
 
 // OCP E4M3: 1 sign + 4 exp + 3 mantissa, exp bias = 7, no infinity.
 // The all-ones exp + max mantissa pattern (0x7F / 0xFF) is reserved for NaN.
@@ -153,10 +175,18 @@ fn dequant_matmul(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Fp8E4m3 — direct bit decode, no scale.
             let byte = read_byte(elem_idx);
             w_dq = decode_e4m3(byte);
-        } else {
+        } else if (params.scheme_id == 4u) {
             // Fp8E5m2 — direct bit decode, no scale.
             let byte = read_byte(elem_idx);
             w_dq = decode_e5m2(byte);
+        } else {
+            // Nvfp4Block — E2M1 nibble × FP8 block scale × global f32 scale.
+            let nib = read_nibble_u4(elem_idx);
+            let block = k / params.block_size;
+            let scale_byte = read_scale_byte(block * params.n + col);
+            let scale = decode_e4m3(scale_byte);
+            let gs = arena[params.zp_off];
+            w_dq = FP4_E2M1[nib] * scale * gs;
         }
         acc = acc + arena[params.x_off + row * params.k + k] * w_dq;
     }

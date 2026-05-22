@@ -23,6 +23,7 @@ use crate::DType;
 use smallvec::SmallVec;
 
 /// A single dimension — either a concrete size or a symbolic dynamic dim.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Dim {
     /// Known at graph construction time.
@@ -63,6 +64,7 @@ impl std::fmt::Display for Dim {
 /// Tensor shape: ordered list of dimensions + element type.
 ///
 /// SmallVec<[Dim; 4]> avoids heap allocation for up to 4D tensors (the common case).
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Shape {
     dims: SmallVec<[Dim; 4]>,
@@ -178,6 +180,11 @@ impl Shape {
         self.dtype = dtype;
         self
     }
+
+    /// Numpy-style broadcast with another shape (fusion / lowering).
+    pub fn broadcast_with(&self, other: &Shape) -> Result<Shape, String> {
+        broadcast(self, other)
+    }
 }
 
 // ── Shape inference functions ────────────────────────────────────────────
@@ -231,10 +238,14 @@ pub fn matmul_shape(lhs: &Shape, rhs: &Shape) -> Result<Shape, String> {
     let n = rhs.dims[rhs.rank() - 1];
 
     // Verify K dimensions match
-    if let (Dim::Static(a), Dim::Static(b)) = (k1, k2)
-        && a != b
-    {
-        return Err(format!("matmul K mismatch: {a} vs {b}"));
+    match (k1, k2) {
+        (Dim::Static(a), Dim::Static(b)) if a != b => {
+            return Err(format!("matmul K mismatch: {a} vs {b}"));
+        }
+        (Dim::Dynamic(s), Dim::Dynamic(t)) if s != t => {
+            return Err(format!("matmul K mismatch: ?{s} vs ?{t}"));
+        }
+        _ => {}
     }
 
     // Broadcast batch dimensions
@@ -330,7 +341,8 @@ pub fn concat_shape(inputs: &[&Shape], axis: usize) -> Result<Shape, String> {
         return Err("concat: no inputs".into());
     }
     let base = inputs[0];
-    let mut total = 0usize;
+    let mut static_sum = 0usize;
+    let mut dyn_sym: Option<u32> = None;
     for s in inputs {
         if s.rank() != base.rank() {
             return Err(format!(
@@ -340,11 +352,30 @@ pub fn concat_shape(inputs: &[&Shape], axis: usize) -> Result<Shape, String> {
             ));
         }
         match s.dims[axis] {
-            Dim::Static(n) => total += n,
-            Dim::Dynamic(_) => return Err("concat: cannot concat dynamic axis".into()),
+            Dim::Static(n) => static_sum += n,
+            Dim::Dynamic(sym) => {
+                if let Some(prev) = dyn_sym {
+                    if prev != sym {
+                        return Err(format!(
+                            "concat: mismatched dynamic symbols {prev} vs {sym} on axis {axis}"
+                        ));
+                    }
+                }
+                dyn_sym = Some(sym);
+            }
         }
     }
-    Ok(base.clone().with_dim(axis, Dim::Static(total)))
+    let out_dim = match dyn_sym {
+        None => Dim::Static(static_sum),
+        Some(sym) if static_sum == 0 => Dim::Dynamic(sym),
+        Some(sym) => {
+            // Mixed static + dynamic (e.g. conv_state || qkv). After `bind_graph`,
+            // `sync_concat_shapes` recomputes from concrete input shapes.
+            let _ = static_sum;
+            Dim::Dynamic(sym)
+        }
+    };
+    Ok(base.clone().with_dim(axis, out_dim))
 }
 
 /// Gather (embedding lookup): table\[V,D\] + indices\[B,S\] → \[B,S,D\].
@@ -364,27 +395,120 @@ pub fn gather_shape(table: &Shape, indices: &Shape, axis: usize) -> Result<Shape
 
 /// Reshape with -1 wildcard support.
 pub fn reshape_shape(input: &Shape, new_shape: &[i64]) -> Result<Shape, String> {
-    let total = input
-        .num_elements()
-        .ok_or_else(|| "reshape: input has dynamic dims".to_string())?;
     let neg_count = new_shape.iter().filter(|&&d| d == -1).count();
     if neg_count > 1 {
         return Err("reshape: at most one -1".into());
     }
-    let known_product: i64 = new_shape.iter().filter(|&&d| d != -1).product();
-    let mut dims = SmallVec::new();
-    for &d in new_shape {
-        if d == -1 {
-            let inferred = total as i64 / known_product;
-            dims.push(Dim::Static(inferred as usize));
-        } else {
-            dims.push(Dim::Static(d as usize));
+
+    if input.is_static() {
+        let total = input
+            .num_elements()
+            .ok_or_else(|| "reshape: input has dynamic dims".to_string())?;
+        let known_product: i64 = new_shape.iter().filter(|&&d| d != -1).product();
+        let mut dims = SmallVec::new();
+        for &d in new_shape {
+            if d == -1 {
+                let inferred = total as i64 / known_product;
+                dims.push(Dim::Static(inferred as usize));
+            } else if d < 0 {
+                return Err(format!("reshape: invalid dim {d}"));
+            } else {
+                dims.push(Dim::Static(d as usize));
+            }
         }
+        return Ok(Shape {
+            dims,
+            dtype: input.dtype,
+        });
+    }
+
+    // Symbolic input: map `-1` to the sole dynamic symbol when unambiguous
+    // (qwen35 prefill with batch=1 and `sym::SEQ`), otherwise keep dynamic.
+    let dyn_syms = input.dynamic_symbols();
+    let neg_idx = new_shape.iter().position(|&d| d == -1);
+    let mut out_dims: SmallVec<[Dim; 4]> = SmallVec::new();
+    for (i, &d) in new_shape.iter().enumerate() {
+        if Some(i) == neg_idx {
+            continue;
+        }
+        if d < 0 {
+            return Err(format!("reshape: invalid dim {d}"));
+        }
+        out_dims.push(Dim::Static(d as usize));
+    }
+    if let Some(ni) = neg_idx {
+        let inferred = if dyn_syms.len() == 1 {
+            Dim::Dynamic(dyn_syms[0])
+        } else if dyn_syms.is_empty() {
+            return Err("reshape: cannot infer -1 on static input".into());
+        } else {
+            Dim::Dynamic(crate::dynamic::sym::ROWS)
+        };
+        out_dims.insert(ni, inferred);
     }
     Ok(Shape {
-        dims,
+        dims: out_dims,
         dtype: input.dtype,
     })
+}
+
+/// Flatten leading axes to `[∏leading, H]` — used by `FuseRmsNormReshape` and shape verify.
+pub fn leading_flatten_fused_shape(input: &Shape) -> Option<Shape> {
+    if input.rank() < 2 {
+        return None;
+    }
+    let Dim::Static(h) = input.dim(input.rank() - 1) else {
+        return None;
+    };
+    let leading = &input.dims()[..input.rank() - 1];
+    let lead_dim = if leading.iter().all(|d| d.is_static()) {
+        Dim::Static(
+            leading
+                .iter()
+                .map(|d| d.unwrap_static())
+                .product::<usize>(),
+        )
+    } else {
+        let mut syms: Vec<u32> = leading
+            .iter()
+            .filter_map(|d| match d {
+                Dim::Dynamic(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        syms.sort();
+        syms.dedup();
+        match syms.len() {
+            0 => Dim::Static(
+                leading
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .product::<usize>(),
+            ),
+            1 => Dim::Dynamic(syms[0]),
+            _ => Dim::Dynamic(crate::dynamic::sym::ROWS),
+        }
+    };
+    Some(Shape::from_dims(&[lead_dim, Dim::Static(h)], input.dtype()))
+}
+
+/// Match `Reshape { new_shape }` after RmsNorm when fusing to a single op.
+pub fn leading_flatten_shape(input: &Shape, new_shape: &[i64]) -> Option<Shape> {
+    if new_shape.len() != 2 {
+        return None;
+    }
+    let flat = leading_flatten_fused_shape(input)?;
+    let Dim::Static(h) = input.dim(input.rank() - 1) else {
+        return None;
+    };
+    if new_shape[1] as usize != h {
+        return None;
+    }
+    match flat.dim(0) {
+        Dim::Static(lead) if new_shape[0] as usize == lead => Some(flat),
+        Dim::Dynamic(_) if new_shape[0] == -1 => Some(flat),
+        _ => None,
+    }
 }
 
 /// Attention: output shape = Q shape.
@@ -403,6 +527,105 @@ impl std::fmt::Display for Shape {
         }
         write!(f, "] {}", self.dtype)
     }
+}
+
+/// Spatial output size for NCHW `Op::Conv` / `conv2d`.
+pub fn conv2d_spatial_output(
+    in_size: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+) -> usize {
+    let dil_k = dilation.saturating_mul(kernel.saturating_sub(1));
+    (in_size + 2 * padding).saturating_sub(dil_k).saturating_sub(1) / stride + 1
+}
+
+/// Spatial output size for NCHW `Op::ConvTranspose2d`.
+pub fn conv_transpose2d_spatial_output(
+    in_size: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    output_padding: usize,
+) -> usize {
+    let dil_k = dilation.saturating_mul(kernel.saturating_sub(1));
+    (in_size - 1) * stride + output_padding + dil_k - 2 * padding + 1
+}
+
+/// Output shape for `conv2d` given NCHW `input` and weight `[C_out, C_in/g, kH, kW]`.
+pub fn conv2d_output_shape(
+    input: &Shape,
+    weight: &Shape,
+    kernel_size: [usize; 2],
+    stride: [usize; 2],
+    padding: [usize; 2],
+    dilation: [usize; 2],
+    groups: usize,
+) -> Result<Shape, String> {
+    if input.rank() != 4 || weight.rank() != 4 {
+        return Err("conv2d requires NCHW input and 4-D weight".into());
+    }
+    let n = input.dim(0).unwrap_static();
+    let c_in = input.dim(1).unwrap_static();
+    let h = input.dim(2).unwrap_static();
+    let w = input.dim(3).unwrap_static();
+    let c_out = weight.dim(0).unwrap_static();
+    let w_cin = weight.dim(1).unwrap_static();
+    if w_cin * groups != c_in {
+        return Err(format!(
+            "conv2d weight C_in/g={w_cin} * groups={groups} != input C={c_in}"
+        ));
+    }
+    let h_out = conv2d_spatial_output(h, kernel_size[0], stride[0], padding[0], dilation[0]);
+    let w_out = conv2d_spatial_output(w, kernel_size[1], stride[1], padding[1], dilation[1]);
+    Ok(Shape::new(&[n, c_out, h_out, w_out], input.dtype()))
+}
+
+/// Output shape for `conv_transpose2d` (weight `[C_in, C_out/g, kH, kW]`).
+pub fn conv_transpose2d_output_shape(
+    input: &Shape,
+    weight: &Shape,
+    kernel_size: [usize; 2],
+    stride: [usize; 2],
+    padding: [usize; 2],
+    dilation: [usize; 2],
+    output_padding: [usize; 2],
+    groups: usize,
+) -> Result<Shape, String> {
+    if input.rank() != 4 || weight.rank() != 4 {
+        return Err("conv_transpose2d requires NCHW input and 4-D weight".into());
+    }
+    let n = input.dim(0).unwrap_static();
+    let c_in = input.dim(1).unwrap_static();
+    let h = input.dim(2).unwrap_static();
+    let w = input.dim(3).unwrap_static();
+    let w_cin = weight.dim(0).unwrap_static();
+    let c_out_per_g = weight.dim(1).unwrap_static();
+    if w_cin != c_in {
+        return Err(format!("conv_transpose2d weight C_in={w_cin} != input C={c_in}"));
+    }
+    let h_out = conv_transpose2d_spatial_output(
+        h,
+        kernel_size[0],
+        stride[0],
+        padding[0],
+        dilation[0],
+        output_padding[0],
+    );
+    let w_out = conv_transpose2d_spatial_output(
+        w,
+        kernel_size[1],
+        stride[1],
+        padding[1],
+        dilation[1],
+        output_padding[1],
+    );
+    Ok(Shape::new(
+        &[n, c_out_per_g * groups, h_out, w_out],
+        input.dtype(),
+    ))
 }
 
 #[cfg(test)]

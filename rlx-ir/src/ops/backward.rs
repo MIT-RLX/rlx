@@ -26,6 +26,7 @@
 //! Shape checks here are debug-only; the verifier in `verify.rs` does
 //! the rigorous version.
 
+use crate::op::{AttentionBwdWrt, MaskKind};
 use crate::{DType, Graph, NodeId, Op, Shape};
 
 impl Graph {
@@ -78,6 +79,159 @@ impl Graph {
             Op::LayerNormBackwardInput { axis, eps },
             vec![x, gamma, dy],
             x_shape,
+            None,
+        )
+    }
+
+    /// RMSNorm backward w.r.t. input. Inputs `[x, gamma, beta, dy]`.
+    pub fn rms_norm_backward_input(
+        &mut self,
+        x: NodeId,
+        gamma: NodeId,
+        beta: NodeId,
+        dy: NodeId,
+        axis: i32,
+        eps: f32,
+    ) -> NodeId {
+        let x_shape = self.shape(x).clone();
+        self.push(
+            Op::RmsNormBackwardInput { axis, eps },
+            vec![x, gamma, beta, dy],
+            x_shape,
+            None,
+        )
+    }
+
+    pub fn rms_norm_backward_gamma(
+        &mut self,
+        x: NodeId,
+        gamma: NodeId,
+        beta: NodeId,
+        dy: NodeId,
+        axis: i32,
+        eps: f32,
+    ) -> NodeId {
+        self.push(
+            Op::RmsNormBackwardGamma { axis, eps },
+            vec![x, gamma, beta, dy],
+            self.shape(gamma).clone(),
+            None,
+        )
+    }
+
+    pub fn rms_norm_backward_beta(
+        &mut self,
+        x: NodeId,
+        gamma: NodeId,
+        beta: NodeId,
+        dy: NodeId,
+        axis: i32,
+        eps: f32,
+    ) -> NodeId {
+        self.push(
+            Op::RmsNormBackwardBeta { axis, eps },
+            vec![x, gamma, beta, dy],
+            self.shape(beta).clone(),
+            None,
+        )
+    }
+
+    pub fn rope_backward(
+        &mut self,
+        dy: NodeId,
+        cos: NodeId,
+        sin: NodeId,
+        head_dim: usize,
+        n_rot: usize,
+    ) -> NodeId {
+        let out_shape = self.shape(dy).clone();
+        self.push(
+            Op::RopeBackward { head_dim, n_rot },
+            vec![dy, cos, sin],
+            out_shape,
+            None,
+        )
+    }
+
+    pub fn cumsum_backward(
+        &mut self,
+        dy: NodeId,
+        out_shape: Shape,
+        axis: i32,
+        exclusive: bool,
+    ) -> NodeId {
+        self.push(
+            Op::CumsumBackward { axis, exclusive },
+            vec![dy],
+            out_shape,
+            None,
+        )
+    }
+
+    pub fn gather_backward(
+        &mut self,
+        dy: NodeId,
+        indices: NodeId,
+        table_shape: Shape,
+        axis: i32,
+    ) -> NodeId {
+        self.push(
+            Op::GatherBackward { axis },
+            vec![dy, indices],
+            table_shape,
+            None,
+        )
+    }
+
+    /// GroupNorm (NCHW) backward w.r.t. input. Inputs `[x, gamma, beta, dy]`.
+    pub fn group_norm_backward_input(
+        &mut self,
+        x: NodeId,
+        gamma: NodeId,
+        beta: NodeId,
+        dy: NodeId,
+        num_groups: usize,
+        eps: f32,
+    ) -> NodeId {
+        let x_shape = self.shape(x).clone();
+        self.push(
+            Op::GroupNormBackwardInput { num_groups, eps },
+            vec![x, gamma, beta, dy],
+            x_shape,
+            None,
+        )
+    }
+
+    /// GroupNorm backward w.r.t. gamma. Inputs `[x, dy]`.
+    pub fn group_norm_backward_gamma(
+        &mut self,
+        x: NodeId,
+        dy: NodeId,
+        gamma_shape: Shape,
+        num_groups: usize,
+        eps: f32,
+    ) -> NodeId {
+        self.push(
+            Op::GroupNormBackwardGamma { num_groups, eps },
+            vec![x, dy],
+            gamma_shape,
+            None,
+        )
+    }
+
+    /// GroupNorm backward w.r.t. beta. Inputs `[x, dy]`.
+    pub fn group_norm_backward_beta(
+        &mut self,
+        x: NodeId,
+        dy: NodeId,
+        beta_shape: Shape,
+        num_groups: usize,
+        eps: f32,
+    ) -> NodeId {
+        self.push(
+            Op::GroupNormBackwardBeta { num_groups, eps },
+            vec![x, dy],
+            beta_shape,
             None,
         )
     }
@@ -254,6 +408,91 @@ impl Graph {
         );
         let out_shape = Shape::from_dims(z_shape.dims(), DType::F32);
         self.push(Op::ComplexNormSq, vec![z], out_shape, None)
+    }
+
+    /// Scaled dot-product attention backward w.r.t. `q`, `k`, or `v`.
+    /// See [`Op::AttentionBackward`]. When `mask_kind` is [`MaskKind::Custom`]
+    /// or [`MaskKind::Bias`], pass the same mask tensor used in forward.
+    pub fn attention_backward(
+        &mut self,
+        wrt: AttentionBwdWrt,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        dy: NodeId,
+        num_heads: usize,
+        head_dim: usize,
+        mask_kind: MaskKind,
+        mask: Option<NodeId>,
+    ) -> NodeId {
+        let out_shape = match wrt {
+            AttentionBwdWrt::Query => self.shape(q).clone(),
+            AttentionBwdWrt::Key => self.shape(k).clone(),
+            AttentionBwdWrt::Value => self.shape(v).clone(),
+        };
+        let mut inputs = vec![q, k, v, dy];
+        if matches!(mask_kind, MaskKind::Custom | MaskKind::Bias) {
+            inputs.push(mask.expect("attention_backward: mask required for Custom/Bias"));
+        }
+        self.push(
+            Op::AttentionBackward {
+                num_heads,
+                head_dim,
+                mask_kind,
+                wrt,
+            },
+            inputs,
+            out_shape,
+            None,
+        )
+    }
+
+    /// Emit `dQ`, `dK`, and `dV` for one [`Op::Attention`] forward node.
+    pub fn attention_backward_all(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        dy: NodeId,
+        num_heads: usize,
+        head_dim: usize,
+        mask_kind: MaskKind,
+        mask: Option<NodeId>,
+    ) -> (NodeId, NodeId, NodeId) {
+        let dq = self.attention_backward(
+            AttentionBwdWrt::Query,
+            q,
+            k,
+            v,
+            dy,
+            num_heads,
+            head_dim,
+            mask_kind,
+            mask,
+        );
+        let dk = self.attention_backward(
+            AttentionBwdWrt::Key,
+            q,
+            k,
+            v,
+            dy,
+            num_heads,
+            head_dim,
+            mask_kind,
+            mask,
+        );
+        let dv = self.attention_backward(
+            AttentionBwdWrt::Value,
+            q,
+            k,
+            v,
+            dy,
+            num_heads,
+            head_dim,
+            mask_kind,
+            mask,
+        );
+        (dq, dk, dv)
     }
 
     /// Wirtinger backward for [`complex_norm_sq`]: given upstream `g`

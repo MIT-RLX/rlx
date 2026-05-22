@@ -22,22 +22,30 @@
 use std::collections::{HashMap, HashSet};
 
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::dynamic::{
+    bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding,
+};
 use rlx_ir::shape::DimBinding;
 use rlx_ir::{Graph, NodeId, Op};
 
 use crate::buffer::{Arena, plan_f32_uniform};
 use crate::device::wgpu_device;
 use crate::kernels::{
-    ArgmaxParams, AttentionParams, BinaryParams, Conv1dParams, Conv2dParams, Conv3dParams,
+    ArgmaxParams, AttentionBwdParams, AttentionParams, BinaryParams, Conv1dParams, Conv2dParams,
+    Conv3dParams,
     CopyParams, CumsumParams, DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FftParams,
-    FusedResidualLnParams, FusedResidualLnTeeParams, GatherParams, GroupedMatmulParams, Kernel,
-    LayerNormParams, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
+    FusedResidualLnParams, FusedResidualLnTeeParams, GatherAxisParams, GatherParams, GroupedMatmulParams, Kernel,
+    CumsumBwdParams, GatherBwdParams, LayerNormParams, MatmulParams, MatmulQkvParams,
+    NarrowConcatParams, Pool1dParams, Pool2dParams, RmsNormBwdParams, RopeBwdParams,
     Pool3dParams, ReduceParams, RopeParams, SampleParams, ScatterAddParams, SelectiveScanParams,
     SoftmaxParams, TopKParams, TransposeParams, UnaryParams, WhereParams, argmax_kernel,
-    attention_kernel, binary_kernel, cast_f32_to_f16_kernel, compare_kernel, concat_kernel,
+    attention_bwd_kernel, attention_kernel, binary_kernel, cast_f32_to_f16_kernel, compare_kernel,
+    concat_kernel,
     conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel, cumsum_kernel, dequant_matmul_kernel, fft_kernel,
     elementwise_region_kernel, expand_kernel, fused_residual_ln_kernel,
-    fused_residual_ln_tee_kernel, gather_kernel, grouped_matmul_kernel, layernorm_kernel,
+    fused_residual_ln_tee_kernel, gather_axis_kernel, gather_kernel, grouped_matmul_kernel, layernorm_kernel,
+    cumsum_backward_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel,
+    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rope_backward_kernel,
     matmul_coop_f32_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel, matmul_f16w_kernel,
     matmul_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_kernel,
     narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel, rope_kernel,
@@ -180,8 +188,15 @@ enum Step {
     Gather {
         params: GatherParams,
     },
+    GatherAxis {
+        params: GatherAxisParams,
+    },
     Attention {
         params: AttentionParams,
+        mask_buf: Option<wgpu::Buffer>,
+    },
+    AttentionBackward {
+        params: AttentionBwdParams,
         mask_buf: Option<wgpu::Buffer>,
     },
     Rope {
@@ -229,6 +244,171 @@ enum Step {
     },
     DequantMatmul {
         params: DequantMatmulParams,
+    },
+    /// GGUF K-quant — host fused dequant+matmul between GPU segments.
+    DequantMatmulGguf {
+        m: u32,
+        k: u32,
+        n: u32,
+        scheme_id: u32,
+        x_byte_off: u32,
+        w_byte_off: u32,
+        out_byte_off: u32,
+    },
+    /// GGUF K-quant — host fused dequant+grouped matmul between GPU segments.
+    DequantGroupedMatmulGguf {
+        m: u32,
+        k: u32,
+        n: u32,
+        num_experts: u32,
+        scheme_id: u32,
+        x_byte_off: u32,
+        w_byte_off: u32,
+        idx_byte_off: u32,
+        out_byte_off: u32,
+    },
+    /// Gated-DeltaNet — host scan between GPU segments (qwen35 linear layers).
+    GatedDeltaNet {
+        q_byte_off: u32,
+        k_byte_off: u32,
+        v_byte_off: u32,
+        g_byte_off: u32,
+        beta_byte_off: u32,
+        state_byte_off: u32,
+        dst_byte_off: u32,
+        batch: u32,
+        seq: u32,
+        heads: u32,
+        state_size: u32,
+        use_carry: bool,
+    },
+    Llada2GroupLimitedGate {
+        sig_byte_off: u32,
+        route_byte_off: u32,
+        out_byte_off: u32,
+        n_elems: u32,
+        attrs: [u8; 20],
+    },
+    /// 3D Gaussian splat forward (CPU reference between segments).
+    #[cfg(feature = "splat")]
+    GaussianSplatRender {
+        positions_byte_off: u32,
+        positions_len: u32,
+        scales_byte_off: u32,
+        scales_len: u32,
+        rotations_byte_off: u32,
+        rotations_len: u32,
+        opacities_byte_off: u32,
+        opacities_len: u32,
+        colors_byte_off: u32,
+        colors_len: u32,
+        sh_coeffs_byte_off: u32,
+        sh_coeffs_len: u32,
+        meta_byte_off: u32,
+        dst_byte_off: u32,
+        dst_len: u32,
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        radius_scale: f32,
+        alpha_cutoff: f32,
+        max_splat_steps: u32,
+        transmittance_threshold: f32,
+        max_list_entries: u32,
+    },
+    /// Backward splat — host round-trip via rlx-cpu/splat.
+    #[cfg(feature = "splat")]
+    GaussianSplatRenderBackward {
+        positions_byte_off: u32,
+        positions_len: u32,
+        scales_byte_off: u32,
+        scales_len: u32,
+        rotations_byte_off: u32,
+        rotations_len: u32,
+        opacities_byte_off: u32,
+        opacities_len: u32,
+        colors_byte_off: u32,
+        colors_len: u32,
+        sh_coeffs_byte_off: u32,
+        sh_coeffs_len: u32,
+        meta_byte_off: u32,
+        d_loss_byte_off: u32,
+        d_loss_len: u32,
+        packed_byte_off: u32,
+        packed_len: u32,
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        radius_scale: f32,
+        alpha_cutoff: f32,
+        max_splat_steps: u32,
+        transmittance_threshold: f32,
+        max_list_entries: u32,
+        loss_grad_clip: f32,
+        sh_band: u32,
+        max_anisotropy: f32,
+    },
+    #[cfg(feature = "splat")]
+    GaussianSplatPrepare {
+        positions_byte_off: u32,
+        positions_len: u32,
+        scales_byte_off: u32,
+        scales_len: u32,
+        rotations_byte_off: u32,
+        rotations_len: u32,
+        opacities_byte_off: u32,
+        opacities_len: u32,
+        colors_byte_off: u32,
+        colors_len: u32,
+        sh_coeffs_byte_off: u32,
+        sh_coeffs_len: u32,
+        meta_byte_off: u32,
+        meta_len: u32,
+        prep_byte_off: u32,
+        prep_len: u32,
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        radius_scale: f32,
+        alpha_cutoff: f32,
+        max_splat_steps: u32,
+        transmittance_threshold: f32,
+        max_list_entries: u32,
+    },
+    #[cfg(feature = "splat")]
+    GaussianSplatRasterize {
+        prep_byte_off: u32,
+        prep_len: u32,
+        meta_byte_off: u32,
+        meta_len: u32,
+        dst_byte_off: u32,
+        dst_len: u32,
+        count: u32,
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        alpha_cutoff: f32,
+        max_splat_steps: u32,
+        transmittance_threshold: f32,
+        max_list_entries: u32,
+    },
+    RmsNormBackwardInput {
+        params: RmsNormBwdParams,
+    },
+    RmsNormBackwardGamma {
+        params: RmsNormBwdParams,
+    },
+    RmsNormBackwardBeta {
+        params: RmsNormBwdParams,
+    },
+    RopeBackward {
+        params: RopeBwdParams,
+    },
+    CumsumBackward {
+        params: CumsumBwdParams,
+    },
+    GatherBackward {
+        params: GatherBwdParams,
     },
     FusedResidualLn {
         params: FusedResidualLnParams,
@@ -319,8 +499,13 @@ impl Step {
             | Step::TopK { .. }
             | Step::Sample { .. }
             | Step::Gather { .. }
+            | Step::GatherAxis { .. }
             | Step::GroupedMatmul { .. }
             | Step::DequantMatmul { .. }
+            | Step::DequantMatmulGguf { .. }
+            | Step::DequantGroupedMatmulGguf { .. }
+            | Step::GatedDeltaNet { .. }
+            | Step::Llada2GroupLimitedGate { .. }
             | Step::Conv1d { .. }
             | Step::Conv2d { .. }
             | Step::Conv3d { .. }
@@ -349,6 +534,7 @@ impl Step {
             // bounds only. Scaling seq_q/seq_k shrinks the iteration
             // without corrupting per-head strides. Safe at any batch.
             Step::Attention { .. } => true,
+            Step::AttentionBackward { .. } => true,
             // SelectiveScan: WGSL kernel uses `params.seq_stride`
             // (full extent, set at compile time) for per-batch stride
             // math; `params.seq` is the loop bound only. Safe at any
@@ -380,6 +566,19 @@ impl Step {
             // 1 iff `in_dims[0] == out_dims[0]` (no broadcast at the
             // bucket axis).
             Step::Expand { params, .. } => params.bucket_outermost == 1,
+            // Training backward ops: not used in inference; disable
+            // active-extent fast path until individually audited.
+            Step::RmsNormBackwardInput { .. }
+            | Step::RmsNormBackwardGamma { .. }
+            | Step::RmsNormBackwardBeta { .. }
+            | Step::RopeBackward { .. }
+            | Step::CumsumBackward { .. }
+            | Step::GatherBackward { .. } => false,
+            #[cfg(feature = "splat")]
+            Step::GaussianSplatRender { .. }
+            | Step::GaussianSplatRenderBackward { .. }
+            | Step::GaussianSplatPrepare { .. }
+            | Step::GaussianSplatRasterize { .. } => false,
         }
     }
 }
@@ -404,7 +603,9 @@ fn step_name(step: &Step) -> &'static str {
         Step::Narrow { .. } => "narrow",
         Step::Concat { .. } => "concat",
         Step::Gather { .. } => "gather",
+        Step::GatherAxis { .. } => "gather_axis",
         Step::Attention { .. } => "attention",
+        Step::AttentionBackward { .. } => "attention_bwd",
         Step::Rope { .. } => "rope",
         Step::Expand { .. } => "expand",
         Step::Argmax { .. } => "argmax",
@@ -420,10 +621,43 @@ fn step_name(step: &Step) -> &'static str {
         Step::Sample { .. } => "sample",
         Step::SelectiveScan { .. } => "selective_scan",
         Step::DequantMatmul { .. } => "dequant_matmul",
+        Step::DequantMatmulGguf { .. } => "dequant_matmul_gguf",
+        Step::DequantGroupedMatmulGguf { .. } => "dequant_grouped_matmul_gguf",
+        Step::GatedDeltaNet { .. } => "gated_delta_net",
+        Step::Llada2GroupLimitedGate { .. } => "llada2_group_limited_gate",
+        #[cfg(feature = "splat")]
+        Step::GaussianSplatRender { .. } => "gaussian_splat_render",
+        #[cfg(feature = "splat")]
+        Step::GaussianSplatRenderBackward { .. } => "gaussian_splat_render_backward",
+        #[cfg(feature = "splat")]
+        Step::GaussianSplatPrepare { .. } => "gaussian_splat_prepare",
+        #[cfg(feature = "splat")]
+        Step::GaussianSplatRasterize { .. } => "gaussian_splat_rasterize",
+        Step::RmsNormBackwardInput { .. } => "rms_norm_backward_input",
+        Step::RmsNormBackwardGamma { .. } => "rms_norm_backward_gamma",
+        Step::RmsNormBackwardBeta { .. } => "rms_norm_backward_beta",
+        Step::RopeBackward { .. } => "rope_backward",
+        Step::CumsumBackward { .. } => "cumsum_backward",
+        Step::GatherBackward { .. } => "gather_backward",
         Step::FusedResidualLn { .. } => "fused_residual_ln",
         Step::FusedResidualLnTee { .. } => "fused_residual_ln_tee",
         Step::MatmulQkv { .. } => "matmul_qkv",
         Step::ElementwiseRegion { .. } => "elementwise_region",
+    }
+}
+
+fn step_runs_on_host(step: &Step) -> bool {
+    match step {
+        Step::DequantMatmulGguf { .. }
+        | Step::DequantGroupedMatmulGguf { .. }
+        | Step::GatedDeltaNet { .. }
+        | Step::Llada2GroupLimitedGate { .. } => true,
+        #[cfg(feature = "splat")]
+        Step::GaussianSplatRender { .. }
+        | Step::GaussianSplatRenderBackward { .. }
+        | Step::GaussianSplatPrepare { .. }
+        | Step::GaussianSplatRasterize { .. } => true,
+        _ => false,
     }
 }
 
@@ -491,7 +725,7 @@ impl WgpuExecutable {
             .unresolved
             .as_ref()
             .expect("lazy_compile_for_inputs called without an unresolved graph");
-        let binding = collect_bindings(unresolved, inputs)
+        let binding = infer_bindings_from_f32_inputs(unresolved, inputs)
             .expect("rlx-wgpu lazy compile: could not infer DimBinding from inputs");
 
         // No-op if shapes haven't changed since the last compile.
@@ -502,7 +736,7 @@ impl WgpuExecutable {
         }
 
         // Resolve and recompile.
-        let resolved = resolve_graph(unresolved, &binding);
+        let resolved = bind_graph(unresolved, &binding);
         let original = self.unresolved.take();
         let pending_params = std::mem::take(&mut self.pending_params);
         let pending_bytes = std::mem::take(&mut self.pending_param_bytes);
@@ -680,6 +914,7 @@ impl WgpuExecutable {
         let mut schedule = Vec::new();
         let mut uniforms = Vec::new();
         let mut bind_groups = Vec::new();
+        let mut gguf_host_pad: Option<(wgpu::Buffer, wgpu::BindGroup)> = None;
         let mut meta_buffers: Vec<wgpu::Buffer> = Vec::new();
 
         // Detect (FusedMatMulBiasAct → Narrow×3) split-QKV pattern. Returns
@@ -1459,7 +1694,7 @@ impl WgpuExecutable {
                     let (mask_kind_id, mask_off, mask_buf, window) = match mask_kind {
                         MaskKind::None => (0u32, 0u32, None, 0u32),
                         MaskKind::Causal => (1u32, 0u32, None, 0u32),
-                        MaskKind::Custom => {
+                        MaskKind::Custom | MaskKind::Bias => {
                             let m_id = node.inputs[3];
                             (2u32, (arena.offset(m_id) / 4) as u32, None, 0u32)
                         }
@@ -1599,7 +1834,172 @@ impl WgpuExecutable {
                     bind_groups.push(bg);
                 }
 
-                Op::Rope { head_dim } => {
+                Op::AttentionBackward {
+                    num_heads: _,
+                    head_dim,
+                    mask_kind,
+                    wrt,
+                } => {
+                    use rlx_ir::op::AttentionBwdWrt;
+                    let q_id = node.inputs[0];
+                    let k_id = node.inputs[1];
+                    let v_id = node.inputs[2];
+                    let dy_id = node.inputs[3];
+                    let q_shape = graph.node(q_id).shape.dims();
+                    let k_shape = graph.node(k_id).shape.dims();
+                    let hd = *head_dim as u32;
+                    let (batch, heads, seq_q, seq_k) = match q_shape.len() {
+                        4 => (
+                            q_shape[0].unwrap_static() as u32,
+                            q_shape[1].unwrap_static() as u32,
+                            q_shape[2].unwrap_static() as u32,
+                            k_shape[2].unwrap_static() as u32,
+                        ),
+                        3 => {
+                            let h = q_shape[2].unwrap_static() as u32 / hd;
+                            (
+                                q_shape[0].unwrap_static() as u32 / h,
+                                h,
+                                q_shape[1].unwrap_static() as u32,
+                                k_shape[1].unwrap_static() as u32,
+                            )
+                        }
+                        other => panic!(
+                            "rlx-wgpu AttentionBackward: only rank-3/4 Q,K,V (got rank {other})"
+                        ),
+                    };
+                    let scale = 1.0_f32 / (hd as f32).sqrt();
+                    let (mask_kind_id, mask_off, mask_buf, window) = match mask_kind {
+                        MaskKind::None => (0u32, 0u32, None, 0u32),
+                        MaskKind::Causal => (1u32, 0u32, None, 0u32),
+                        MaskKind::Custom => {
+                            (2u32, (arena.offset(node.inputs[4]) / 4) as u32, None, 0u32)
+                        }
+                        MaskKind::Bias => {
+                            (4u32, (arena.offset(node.inputs[4]) / 4) as u32, None, 0u32)
+                        }
+                        MaskKind::SlidingWindow(w) => (3u32, 0u32, None, *w as u32),
+                    };
+                    struct MStrides {
+                        b: u32,
+                        h: u32,
+                        q: u32,
+                        k: u32,
+                    }
+                    let mask_strides = if mask_kind_id == 2 || mask_kind_id == 4 {
+                        let m_dims = graph.node(node.inputs[4]).shape.dims();
+                        let dim = |i: usize| m_dims[i].unwrap_static() as u32;
+                        match m_dims.len() {
+                            2 => MStrides {
+                                b: dim(1),
+                                h: 0,
+                                q: 0,
+                                k: 1,
+                            },
+                            3 => MStrides {
+                                b: dim(1) * dim(2),
+                                h: 0,
+                                q: dim(2),
+                                k: 1,
+                            },
+                            4 => MStrides {
+                                b: dim(1) * dim(2) * dim(3),
+                                h: dim(2) * dim(3),
+                                q: dim(3),
+                                k: 1,
+                            },
+                            _ => MStrides {
+                                b: heads * seq_q * seq_k,
+                                h: seq_q * seq_k,
+                                q: seq_k,
+                                k: 1,
+                            },
+                        }
+                    } else {
+                        MStrides {
+                            b: heads * seq_q * seq_k,
+                            h: seq_q * seq_k,
+                            q: seq_k,
+                            k: 1,
+                        }
+                    };
+                    let infer_strides =
+                        |shape: &[rlx_ir::shape::Dim], seq_extent: u32| -> (u32, u32, u32) {
+                            let last = shape[shape.len() - 1].unwrap_static() as u32;
+                            if shape.len() == 3 && last == (heads * hd) {
+                                let head_dim_total = heads * hd;
+                                (seq_extent * head_dim_total, hd, head_dim_total)
+                            } else {
+                                (heads * seq_extent * hd, seq_extent * hd, hd)
+                            }
+                        };
+                    let (q_b, q_h, q_s) = infer_strides(q_shape, seq_q);
+                    let (k_b, k_h, k_s) = infer_strides(k_shape, seq_k);
+                    let v_shape = graph.node(v_id).shape.dims();
+                    let (v_b, v_h, v_s) = infer_strides(v_shape, seq_k);
+                    let out_shape = node.shape.dims();
+                    let out_seq = match wrt {
+                        AttentionBwdWrt::Query => seq_q,
+                        AttentionBwdWrt::Key | AttentionBwdWrt::Value => seq_k,
+                    };
+                    let (o_b, o_h, o_s) = infer_strides(out_shape, out_seq);
+                    let wrt_id = match wrt {
+                        AttentionBwdWrt::Query => 0u32,
+                        AttentionBwdWrt::Key => 1u32,
+                        AttentionBwdWrt::Value => 2u32,
+                    };
+                    let p = AttentionBwdParams {
+                        batch,
+                        heads,
+                        seq_q,
+                        seq_k,
+                        head_dim: hd,
+                        q_off: (arena.offset(q_id) / 4) as u32,
+                        k_off: (arena.offset(k_id) / 4) as u32,
+                        v_off: (arena.offset(v_id) / 4) as u32,
+                        dy_off: (arena.offset(dy_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        mask_off,
+                        mask_kind: mask_kind_id,
+                        scale_bits: scale.to_bits(),
+                        window,
+                        wrt: wrt_id,
+                        seq_q_stride: mask_strides.q,
+                        seq_k_stride: mask_strides.k,
+                        mask_batch_stride: mask_strides.b,
+                        mask_head_stride: mask_strides.h,
+                        _pad_mask_0: 0,
+                        _pad_mask_1: 0,
+                        _pad_mask_2: 0,
+                        q_batch_stride: q_b,
+                        q_head_stride: q_h,
+                        q_seq_stride: q_s,
+                        _pad_q: 0,
+                        k_batch_stride: k_b,
+                        k_head_stride: k_h,
+                        k_seq_stride: k_s,
+                        _pad_k: 0,
+                        v_batch_stride: v_b,
+                        v_head_stride: v_h,
+                        v_seq_stride: v_s,
+                        _pad_v: 0,
+                        o_batch_stride: o_b,
+                        o_head_stride: o_h,
+                        o_seq_stride: o_s,
+                        _pad_o: 0,
+                    };
+                    schedule.push(Step::AttentionBackward {
+                        params: p,
+                        mask_buf,
+                    });
+                    let ak = attention_bwd_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<AttentionBwdParams>());
+                    let bg = bind_two(&dev.device, ak, &arena.buffer, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
+
+                Op::Rope { head_dim, n_rot: _ } => {
                     let x_id = node.inputs[0];
                     let cos_id = node.inputs[1];
                     let sin_id = node.inputs[2];
@@ -1738,36 +2138,69 @@ impl WgpuExecutable {
                 }
 
                 Op::Gather { axis } => {
-                    if *axis != 0 {
-                        panic!("rlx-wgpu Gather: only axis=0 (embedding lookup) wired");
-                    }
                     let table_id = node.inputs[0];
                     let idx_id = node.inputs[1];
-                    let table_shape = graph.node(table_id).shape.dims();
-                    let idx_shape = graph.node(idx_id).shape.dims();
-                    let vocab = table_shape[0].unwrap_static() as u32;
-                    let dim: u32 = table_shape[1..]
-                        .iter()
-                        .map(|d| d.unwrap_static() as u32)
-                        .product::<u32>()
-                        .max(1);
-                    let n_idx: u32 = idx_shape.iter().map(|d| d.unwrap_static() as u32).product();
-                    let p = GatherParams {
-                        n_out: elems,
-                        n_idx,
-                        dim,
-                        vocab,
-                        in_off: (arena.offset(table_id) / 4) as u32,
-                        idx_off: (arena.offset(idx_id) / 4) as u32,
-                        out_off: (arena.offset(node.id) / 4) as u32,
-                        _p0: 0,
-                    };
-                    schedule.push(Step::Gather { params: p });
-                    let gk = gather_kernel(&dev.device);
-                    let u = emit_uniform(std::mem::size_of::<GatherParams>());
-                    let bg = bind_two(&dev.device, gk, &arena.buffer, &u);
-                    uniforms.push(u);
-                    bind_groups.push(bg);
+                    if *axis == 0 {
+                        let table_shape = graph.node(table_id).shape.dims();
+                        let idx_shape = graph.node(idx_id).shape.dims();
+                        let vocab = table_shape[0].unwrap_static() as u32;
+                        let dim: u32 = table_shape[1..]
+                            .iter()
+                            .map(|d| d.unwrap_static() as u32)
+                            .product::<u32>()
+                            .max(1);
+                        let n_idx: u32 =
+                            idx_shape.iter().map(|d| d.unwrap_static() as u32).product();
+                        let p = GatherParams {
+                            n_out: elems,
+                            n_idx,
+                            dim,
+                            vocab,
+                            in_off: (arena.offset(table_id) / 4) as u32,
+                            idx_off: (arena.offset(idx_id) / 4) as u32,
+                            out_off: (arena.offset(node.id) / 4) as u32,
+                            _p0: 0,
+                        };
+                        schedule.push(Step::Gather { params: p });
+                        let gk = gather_kernel(&dev.device);
+                        let u = emit_uniform(std::mem::size_of::<GatherParams>());
+                        let bg = bind_two(&dev.device, gk, &arena.buffer, &u);
+                        uniforms.push(u);
+                        bind_groups.push(bg);
+                    } else {
+                        let table_shape = graph.node(table_id).shape.dims();
+                        let idx_shape = graph.node(idx_id).shape.dims();
+                        let outer: u32 = table_shape[..*axis]
+                            .iter()
+                            .map(|d| d.unwrap_static() as u32)
+                            .product::<u32>()
+                            .max(1);
+                        let trailing: u32 = table_shape[*axis + 1..]
+                            .iter()
+                            .map(|d| d.unwrap_static() as u32)
+                            .product::<u32>()
+                            .max(1);
+                        let axis_dim = table_shape[*axis].unwrap_static() as u32;
+                        let num_idx: u32 =
+                            idx_shape.iter().map(|d| d.unwrap_static() as u32).product();
+                        let total = outer * num_idx * trailing;
+                        let p = GatherAxisParams {
+                            total,
+                            outer,
+                            axis_dim,
+                            num_idx,
+                            trailing,
+                            table_off: (arena.offset(table_id) / 4) as u32,
+                            idx_off: (arena.offset(idx_id) / 4) as u32,
+                            out_off: (arena.offset(node.id) / 4) as u32,
+                        };
+                        schedule.push(Step::GatherAxis { params: p });
+                        let gk = gather_axis_kernel(&dev.device);
+                        let u = emit_uniform(std::mem::size_of::<GatherAxisParams>());
+                        let bg = bind_two(&dev.device, gk, &arena.buffer, &u);
+                        uniforms.push(u);
+                        bind_groups.push(bg);
+                    }
                 }
 
                 Op::FusedMatMulBiasAct { activation } => {
@@ -2316,6 +2749,67 @@ impl WgpuExecutable {
                     uniforms.push(u);
                     bind_groups.push(bg);
                 }
+                Op::GatedDeltaNet {
+                    state_size,
+                    carry_state,
+                } => {
+                    if *state_size > rlx_cpu::gdn::GDN_MAX_STATE {
+                        panic!(
+                            "rlx-wgpu GatedDeltaNet: state_size {state_size} > {}",
+                            rlx_cpu::gdn::GDN_MAX_STATE
+                        );
+                    }
+                    let q_id = node.inputs[0];
+                    let q_shape = &graph.node(q_id).shape;
+                    let state_off = if *carry_state {
+                        arena.offset(node.inputs[5])
+                    } else {
+                        0
+                    };
+                    schedule.push(Step::GatedDeltaNet {
+                        q_byte_off: arena.offset(q_id) as u32,
+                        k_byte_off: arena.offset(node.inputs[1]) as u32,
+                        v_byte_off: arena.offset(node.inputs[2]) as u32,
+                        g_byte_off: arena.offset(node.inputs[3]) as u32,
+                        beta_byte_off: arena.offset(node.inputs[4]) as u32,
+                        state_byte_off: state_off as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        batch: q_shape.dim(0).unwrap_static() as u32,
+                        seq: q_shape.dim(1).unwrap_static() as u32,
+                        heads: q_shape.dim(2).unwrap_static() as u32,
+                        state_size: *state_size as u32,
+                        use_carry: *carry_state,
+                    });
+                    if gguf_host_pad.is_none() {
+                        let bk = binary_kernel(&dev.device);
+                        let u = emit_uniform(256);
+                        gguf_host_pad = Some((
+                            u.clone(),
+                            bind_two(&dev.device, bk, &arena.buffer, &u),
+                        ));
+                    }
+                    let (u, bg) = gguf_host_pad.as_ref().unwrap();
+                    uniforms.push(u.clone());
+                    bind_groups.push(bg.clone());
+                }
+                Op::Custom { name, attrs, .. } => {
+                    if name != "llada2.group_limited_gate" {
+                        panic!("rlx-wgpu: unsupported Op::Custom('{name}')");
+                    }
+                    let sig_id = node.inputs[0];
+                    let route_id = node.inputs[1];
+                    let n_elems = graph.node(sig_id).shape.num_elements().unwrap() as u32;
+                    let mut attr_buf = [0u8; 20];
+                    let n = attrs.len().min(20);
+                    attr_buf[..n].copy_from_slice(&attrs[..n]);
+                    schedule.push(Step::Llada2GroupLimitedGate {
+                        sig_byte_off: arena.offset(sig_id) as u32,
+                        route_byte_off: arena.offset(route_id) as u32,
+                        out_byte_off: arena.offset(node.id) as u32,
+                        n_elems,
+                        attrs: attr_buf,
+                    });
+                }
                 Op::GroupedMatMul => {
                     // Inputs: input [M, K], weight [E, K, N], expert_idx [M]
                     let in_id = node.inputs[0];
@@ -2343,6 +2837,43 @@ impl WgpuExecutable {
                     let bg = bind_two(&dev.device, gk, &arena.buffer, &u);
                     uniforms.push(u);
                     bind_groups.push(bg);
+                }
+                Op::DequantGroupedMatMul { scheme } => {
+                    let in_id = node.inputs[0];
+                    let w_id = node.inputs[1];
+                    let idx_id = node.inputs[2];
+                    let in_dims = graph.node(in_id).shape.dims();
+                    let out_dims = node.shape.dims();
+                    let m = in_dims[0].unwrap_static() as u32;
+                    let k = in_dims[1].unwrap_static() as u32;
+                    let n = out_dims[out_dims.len() - 1].unwrap_static() as u32;
+                    let block_elems = scheme.gguf_block_size() as usize;
+                    let block_bytes = scheme.gguf_block_bytes() as usize;
+                    let slab_bytes = (k as usize * n as usize) / block_elems * block_bytes;
+                    let total_bytes = graph.node(w_id).shape.num_elements().unwrap();
+                    let ne = (total_bytes / slab_bytes.max(1)) as u32;
+                    schedule.push(Step::DequantGroupedMatmulGguf {
+                        m,
+                        k,
+                        n,
+                        num_experts: ne,
+                        scheme_id: crate::gguf_host::gguf_scheme_id(*scheme),
+                        x_byte_off: arena.offset(in_id) as u32,
+                        w_byte_off: arena.offset(w_id) as u32,
+                        idx_byte_off: arena.offset(idx_id) as u32,
+                        out_byte_off: arena.offset(node.id) as u32,
+                    });
+                    if gguf_host_pad.is_none() {
+                        let bk = binary_kernel(&dev.device);
+                        let u = emit_uniform(256);
+                        gguf_host_pad = Some((
+                            u.clone(),
+                            bind_two(&dev.device, bk, &arena.buffer, &u),
+                        ));
+                    }
+                    let (u, bg) = gguf_host_pad.as_ref().unwrap();
+                    uniforms.push(u.clone());
+                    bind_groups.push(bg.clone());
                 }
                 Op::TopK { k } => {
                     let in_id = node.inputs[0];
@@ -2453,54 +2984,385 @@ impl WgpuExecutable {
                 }
                 Op::DequantMatMul { scheme } => {
                     use rlx_ir::QuantScheme;
-                    // scheme_id encoding (mirrors the WGSL kernel):
-                    //   0 Int8Block  1 Int8BlockAsym  2 Int4Block
-                    //   3 Fp8E4m3    4 Fp8E5m2
-                    let (block_size, scheme_id) = match scheme {
-                        QuantScheme::Int8Block { block_size } => (*block_size, 0u32),
-                        QuantScheme::Int8BlockAsym { block_size } => (*block_size, 1u32),
-                        QuantScheme::Int4Block { block_size } => (*block_size, 2u32),
-                        QuantScheme::Fp8E4m3 => (1, 3u32), // block_size unused
-                        QuantScheme::Fp8E5m2 => (1, 4u32),
-                        QuantScheme::GgufQ4K
-                        | QuantScheme::GgufQ5K
-                        | QuantScheme::GgufQ6K
-                        | QuantScheme::GgufQ8K => panic!(
-                            "rlx-wgpu DequantMatMul: GGUF K-quant scheme {scheme:?} \
-                             not yet wired. Pin GGUF graphs to Device::Cpu or Device::Metal."
-                        ),
-                    };
                     let x_id = node.inputs[0];
                     let w_id = node.inputs[1];
-                    let scale_id = node.inputs[2];
-                    let zp_id = node.inputs[3];
-                    // Output is [m, n]; x is [m, k]; w_q is [k, n].
                     let out_dims = node.shape.dims();
                     let x_dims = graph.node(x_id).shape.dims();
                     let m = out_dims[0].unwrap_static() as u32;
                     let n = out_dims[1].unwrap_static() as u32;
                     let k = x_dims[1].unwrap_static() as u32;
-                    let p = DequantMatmulParams {
-                        m,
-                        k,
-                        n,
-                        block_size,
-                        scheme_id,
-                        x_off: (arena.offset(x_id) / 4) as u32,
-                        w_off: (arena.offset(w_id) / 4) as u32,
-                        scale_off: (arena.offset(scale_id) / 4) as u32,
-                        zp_off: (arena.offset(zp_id) / 4) as u32,
-                        out_off: (arena.offset(node.id) / 4) as u32,
-                        _p0: 0,
-                        _p1: 0,
+                    if scheme.is_gguf() {
+                        schedule.push(Step::DequantMatmulGguf {
+                            m,
+                            k,
+                            n,
+                            scheme_id: crate::gguf_host::gguf_scheme_id(*scheme),
+                            x_byte_off: arena.offset(x_id) as u32,
+                            w_byte_off: arena.offset(w_id) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                        });
+                        if gguf_host_pad.is_none() {
+                            let bk = binary_kernel(&dev.device);
+                            let u = emit_uniform(256);
+                            gguf_host_pad = Some((
+                                u.clone(),
+                                bind_two(&dev.device, bk, &arena.buffer, &u),
+                            ));
+                        }
+                        let (u, bg) = gguf_host_pad.as_ref().unwrap();
+                        uniforms.push(u.clone());
+                        bind_groups.push(bg.clone());
+                    } else {
+                        let (block_size, scheme_id) = match scheme {
+                            QuantScheme::Int8Block { block_size } => (*block_size, 0u32),
+                            QuantScheme::Int8BlockAsym { block_size } => (*block_size, 1u32),
+                            QuantScheme::Int4Block { block_size } => (*block_size, 2u32),
+                            QuantScheme::Fp8E4m3 => (1, 3u32),
+                            QuantScheme::Fp8E5m2 => (1, 4u32),
+                            QuantScheme::Nvfp4Block => (rlx_ir::NVFP4_GROUP_SIZE as u32, 5u32),
+                            other => panic!(
+                                "rlx-wgpu DequantMatMul: unsupported scheme {other:?}"
+                            ),
+                        };
+                        let scale_id = node.inputs[2];
+                        let zp_id = node.inputs[3];
+                        let p = DequantMatmulParams {
+                            m,
+                            k,
+                            n,
+                            block_size,
+                            scheme_id,
+                            x_off: (arena.offset(x_id) / 4) as u32,
+                            w_off: (arena.offset(w_id) / 4) as u32,
+                            scale_off: (arena.offset(scale_id) / 4) as u32,
+                            zp_off: (arena.offset(zp_id) / 4) as u32,
+                            out_off: (arena.offset(node.id) / 4) as u32,
+                            _p0: 0,
+                            _p1: 0,
+                        };
+                        schedule.push(Step::DequantMatmul { params: p });
+                        let dk = dequant_matmul_kernel(&dev.device);
+                        let u = emit_uniform(std::mem::size_of::<DequantMatmulParams>());
+                        let bg = bind_two(&dev.device, dk, &arena.buffer, &u);
+                        uniforms.push(u);
+                        bind_groups.push(bg);
+                    }
+                }
+                Op::RmsNormBackwardInput { eps, .. }
+                | Op::RmsNormBackwardGamma { eps, .. }
+                | Op::RmsNormBackwardBeta { eps, .. } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let h = x_shape.dim(x_shape.rank() - 1).unwrap_static() as u32;
+                    let rows =
+                        (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
+                    let foff = |i: usize| (arena.offset(node.inputs[i]) / 4) as u32;
+                    let wrt = match &node.op {
+                        Op::RmsNormBackwardInput { .. } => 0u32,
+                        Op::RmsNormBackwardGamma { .. } => 1u32,
+                        Op::RmsNormBackwardBeta { .. } => 2u32,
+                        _ => unreachable!(),
                     };
-                    schedule.push(Step::DequantMatmul { params: p });
-                    let dk = dequant_matmul_kernel(&dev.device);
-                    let u = emit_uniform(std::mem::size_of::<DequantMatmulParams>());
-                    let bg = bind_two(&dev.device, dk, &arena.buffer, &u);
+                    let p = RmsNormBwdParams {
+                        outer: rows,
+                        inner: h,
+                        x_off: foff(0),
+                        gamma_off: foff(1),
+                        beta_off: foff(2),
+                        dy_off: foff(3),
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        eps_bits: eps.to_bits(),
+                        wrt,
+                    };
+                    let rk = if wrt == 0 {
+                        rms_norm_backward_kernel(&dev.device)
+                    } else {
+                        rms_norm_backward_param_kernel(&dev.device)
+                    };
+                    let u = emit_uniform(std::mem::size_of::<RmsNormBwdParams>());
+                    let bg = bind_two(&dev.device, rk, &arena.buffer, &u);
+                    match &node.op {
+                        Op::RmsNormBackwardInput { .. } => {
+                            schedule.push(Step::RmsNormBackwardInput { params: p });
+                        }
+                        Op::RmsNormBackwardGamma { .. } => {
+                            schedule.push(Step::RmsNormBackwardGamma { params: p });
+                        }
+                        Op::RmsNormBackwardBeta { .. } => {
+                            schedule.push(Step::RmsNormBackwardBeta { params: p });
+                        }
+                        _ => unreachable!(),
+                    }
                     uniforms.push(u);
                     bind_groups.push(bg);
                 }
+                Op::RopeBackward { head_dim, n_rot } => {
+                    let dy_shape = &graph.node(node.inputs[0]).shape;
+                    let (batch, seq, hidden) = if dy_shape.rank() >= 3 {
+                        (
+                            dy_shape.dim(0).unwrap_static() as u32,
+                            dy_shape.dim(1).unwrap_static() as u32,
+                            dy_shape.dim(2).unwrap_static() as u32,
+                        )
+                    } else {
+                        (
+                            1,
+                            dy_shape.dim(0).unwrap_static() as u32,
+                            dy_shape.dim(1).unwrap_static() as u32,
+                        )
+                    };
+                    let cos_len = graph.node(node.inputs[1]).shape.num_elements().unwrap() as u32;
+                    let p = RopeBwdParams {
+                        batch,
+                        seq,
+                        hidden,
+                        head_dim: *head_dim as u32,
+                        n_rot: *n_rot as u32,
+                        dy_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        cos_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        sin_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        dx_off: (arena.offset(node.id) / 4) as u32,
+                        cos_len,
+                    };
+                    let rk = rope_backward_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<RopeBwdParams>());
+                    let bg = bind_two(&dev.device, rk, &arena.buffer, &u);
+                    schedule.push(Step::RopeBackward { params: p });
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
+                Op::CumsumBackward { exclusive, .. } => {
+                    let dy_shape = &graph.node(node.inputs[0]).shape;
+                    let cols = dy_shape.dim(dy_shape.rank() - 1).unwrap_static() as u32;
+                    let rows =
+                        (dy_shape.num_elements().unwrap() / cols.max(1) as usize) as u32;
+                    let p = CumsumBwdParams {
+                        outer: rows,
+                        inner: cols,
+                        dy_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        dx_off: (arena.offset(node.id) / 4) as u32,
+                        exclusive: if *exclusive { 1 } else { 0 },
+                        _p0: 0,
+                        _p1: 0,
+                        _p2: 0,
+                    };
+                    let ck = cumsum_backward_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<CumsumBwdParams>());
+                    let bg = bind_two(&dev.device, ck, &arena.buffer, &u);
+                    schedule.push(Step::CumsumBackward { params: p });
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
+                Op::GatherBackward { .. } => {
+                    let dy_shape = &graph.node(node.inputs[0]).shape;
+                    let idx_shape = &graph.node(node.inputs[1]).shape;
+                    let out_shape = &node.shape;
+                    let rank = out_shape.rank();
+                    let axis = match &node.op {
+                        Op::GatherBackward { axis } => *axis,
+                        _ => 0,
+                    };
+                    let axis_u = if axis < 0 {
+                        (rank as i32 + axis) as usize
+                    } else {
+                        axis as usize
+                    };
+                    let outer: usize = (0..axis_u)
+                        .map(|i| dy_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let num_idx = idx_shape.dim(axis_u).unwrap_static();
+                    let trailing: usize = (axis_u + 1..dy_shape.rank())
+                        .map(|i| dy_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let axis_dim = out_shape.dim(axis_u).unwrap_static();
+                    let p = GatherBwdParams {
+                        outer: outer as u32,
+                        axis_dim: axis_dim as u32,
+                        num_idx: num_idx as u32,
+                        trailing: trailing as u32,
+                        dy_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        idx_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        _p0: 0,
+                    };
+                    let zk = gather_backward_zero_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<GatherBwdParams>());
+                    let bg = bind_two(&dev.device, zk, &arena.buffer, &u);
+                    schedule.push(Step::GatherBackward { params: p });
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
+                #[cfg(feature = "splat")]
+                Op::GaussianSplatRender {
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    let elem_len = |id: NodeId| -> u32 {
+                        graph.node(id).shape.num_elements().unwrap_or(0) as u32
+                    };
+                    schedule.push(Step::GaussianSplatRender {
+                        positions_byte_off: arena.offset(node.inputs[0]) as u32,
+                        positions_len: elem_len(node.inputs[0]),
+                        scales_byte_off: arena.offset(node.inputs[1]) as u32,
+                        scales_len: elem_len(node.inputs[1]),
+                        rotations_byte_off: arena.offset(node.inputs[2]) as u32,
+                        rotations_len: elem_len(node.inputs[2]),
+                        opacities_byte_off: arena.offset(node.inputs[3]) as u32,
+                        opacities_len: elem_len(node.inputs[3]),
+                        colors_byte_off: arena.offset(node.inputs[4]) as u32,
+                        colors_len: elem_len(node.inputs[4]),
+                        sh_coeffs_byte_off: arena.offset(node.inputs[5]) as u32,
+                        sh_coeffs_len: elem_len(node.inputs[5]),
+                        meta_byte_off: arena.offset(node.inputs[6]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        dst_len: node.shape.num_elements().unwrap_or(0) as u32,
+                        width: *width,
+                        height: *height,
+                        tile_size: *tile_size,
+                        radius_scale: *radius_scale,
+                        alpha_cutoff: *alpha_cutoff,
+                        max_splat_steps: *max_splat_steps,
+                        transmittance_threshold: *transmittance_threshold,
+                        max_list_entries: *max_list_entries,
+                    });
+                }
+
+                #[cfg(feature = "splat")]
+                Op::GaussianSplatRenderBackward {
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                    loss_grad_clip,
+                    sh_band,
+                    max_anisotropy,
+                } => {
+                    let elem_len = |id: NodeId| -> u32 {
+                        graph.node(id).shape.num_elements().unwrap_or(0) as u32
+                    };
+                    schedule.push(Step::GaussianSplatRenderBackward {
+                        positions_byte_off: arena.offset(node.inputs[0]) as u32,
+                        positions_len: elem_len(node.inputs[0]),
+                        scales_byte_off: arena.offset(node.inputs[1]) as u32,
+                        scales_len: elem_len(node.inputs[1]),
+                        rotations_byte_off: arena.offset(node.inputs[2]) as u32,
+                        rotations_len: elem_len(node.inputs[2]),
+                        opacities_byte_off: arena.offset(node.inputs[3]) as u32,
+                        opacities_len: elem_len(node.inputs[3]),
+                        colors_byte_off: arena.offset(node.inputs[4]) as u32,
+                        colors_len: elem_len(node.inputs[4]),
+                        sh_coeffs_byte_off: arena.offset(node.inputs[5]) as u32,
+                        sh_coeffs_len: elem_len(node.inputs[5]),
+                        meta_byte_off: arena.offset(node.inputs[6]) as u32,
+                        d_loss_byte_off: arena.offset(node.inputs[7]) as u32,
+                        d_loss_len: elem_len(node.inputs[7]),
+                        packed_byte_off: arena.offset(node.id) as u32,
+                        packed_len: node.shape.num_elements().unwrap_or(0) as u32,
+                        width: *width,
+                        height: *height,
+                        tile_size: *tile_size,
+                        radius_scale: *radius_scale,
+                        alpha_cutoff: *alpha_cutoff,
+                        max_splat_steps: *max_splat_steps,
+                        transmittance_threshold: *transmittance_threshold,
+                        max_list_entries: *max_list_entries,
+                        loss_grad_clip: *loss_grad_clip,
+                        sh_band: *sh_band,
+                        max_anisotropy: *max_anisotropy,
+                    });
+                }
+
+                #[cfg(feature = "splat")]
+                Op::GaussianSplatPrepare {
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    let elem_len = |id: NodeId| -> u32 {
+                        graph.node(id).shape.num_elements().unwrap_or(0) as u32
+                    };
+                    schedule.push(Step::GaussianSplatPrepare {
+                        positions_byte_off: arena.offset(node.inputs[0]) as u32,
+                        positions_len: elem_len(node.inputs[0]),
+                        scales_byte_off: arena.offset(node.inputs[1]) as u32,
+                        scales_len: elem_len(node.inputs[1]),
+                        rotations_byte_off: arena.offset(node.inputs[2]) as u32,
+                        rotations_len: elem_len(node.inputs[2]),
+                        opacities_byte_off: arena.offset(node.inputs[3]) as u32,
+                        opacities_len: elem_len(node.inputs[3]),
+                        colors_byte_off: arena.offset(node.inputs[4]) as u32,
+                        colors_len: elem_len(node.inputs[4]),
+                        sh_coeffs_byte_off: arena.offset(node.inputs[5]) as u32,
+                        sh_coeffs_len: elem_len(node.inputs[5]),
+                        meta_byte_off: arena.offset(node.inputs[6]) as u32,
+                        meta_len: elem_len(node.inputs[6]),
+                        prep_byte_off: arena.offset(node.id) as u32,
+                        prep_len: node.shape.num_elements().unwrap_or(0) as u32,
+                        width: *width,
+                        height: *height,
+                        tile_size: *tile_size,
+                        radius_scale: *radius_scale,
+                        alpha_cutoff: *alpha_cutoff,
+                        max_splat_steps: *max_splat_steps,
+                        transmittance_threshold: *transmittance_threshold,
+                        max_list_entries: *max_list_entries,
+                    });
+                }
+
+                #[cfg(feature = "splat")]
+                Op::GaussianSplatRasterize {
+                    width,
+                    height,
+                    tile_size,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    let elem_len = |id: NodeId| -> u32 {
+                        graph.node(id).shape.num_elements().unwrap_or(0) as u32
+                    };
+                    let prep_id = node.inputs[0];
+                    let count = match &graph.node(prep_id).op {
+                        rlx_ir::Op::GaussianSplatPrepare { .. } => {
+                            elem_len(graph.node(prep_id).inputs[0]) / 3
+                        }
+                        _ => 1,
+                    };
+                    schedule.push(Step::GaussianSplatRasterize {
+                        prep_byte_off: arena.offset(prep_id) as u32,
+                        prep_len: elem_len(prep_id),
+                        meta_byte_off: arena.offset(node.inputs[1]) as u32,
+                        meta_len: elem_len(node.inputs[1]),
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        dst_len: node.shape.num_elements().unwrap_or(0) as u32,
+                        count,
+                        width: *width,
+                        height: *height,
+                        tile_size: *tile_size,
+                        alpha_cutoff: *alpha_cutoff,
+                        max_splat_steps: *max_splat_steps,
+                        transmittance_threshold: *transmittance_threshold,
+                        max_list_entries: *max_list_entries,
+                    });
+                }
+
                 Op::If { .. } | Op::While { .. } => {
                     // Should be unreachable: unfuse.rs inlines both branches
                     // (If) or unrolls max_iterations (While) into the parent
@@ -2518,7 +3380,7 @@ impl WgpuExecutable {
             }
         }
 
-        if std::env::var_os("RLX_WGPU_SCHEDULE").is_some() {
+        if rlx_ir::env::flag("RLX_WGPU_SCHEDULE") {
             let mut counts: std::collections::BTreeMap<&'static str, usize> =
                 std::collections::BTreeMap::new();
             for s in &schedule {
@@ -2759,6 +3621,32 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::RmsNormBackwardInput { params }
+                    | Step::RmsNormBackwardGamma { params }
+                    | Step::RmsNormBackwardBeta { params } => {
+                        let mut p = *params;
+                        p.outer = scale(p.outer);
+                        dev.queue
+                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::CumsumBackward { params } => {
+                        let mut p = *params;
+                        p.outer = scale(p.outer);
+                        dev.queue
+                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::RopeBackward { params } => {
+                        let mut p = *params;
+                        p.seq = scale(p.seq);
+                        dev.queue
+                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::GatherBackward { params } => {
+                        let mut p = *params;
+                        p.outer = scale(p.outer);
+                        dev.queue
+                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::Cumsum { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
@@ -2819,6 +3707,12 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::GatherAxis { params } => {
+                        let mut p = *params;
+                        p.total = scale(p.total);
+                        dev.queue
+                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::Attention { params, .. } => {
                         // PLAN L1: scale seq_q + seq_k. Stride fields
                         // (seq_q_stride / seq_k_stride) stay at the
@@ -2827,6 +3721,16 @@ impl WgpuExecutable {
                         let mut p = *params;
                         p.seq_q = scale(p.seq_q);
                         p.seq_k = scale(p.seq_k);
+                        dev.queue
+                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::AttentionBackward { params, .. } => {
+                        let mut p = *params;
+                        if p.wrt == 0 {
+                            p.seq_q = scale(p.seq_q);
+                        } else {
+                            p.seq_k = scale(p.seq_k);
+                        }
                         dev.queue
                             .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
                     }
@@ -2937,6 +3841,13 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::DequantMatmulGguf { .. }
+                    | Step::DequantGroupedMatmulGguf { .. }
+                    | Step::GatedDeltaNet { .. }
+            | Step::Llada2GroupLimitedGate { .. }
+                    | Step::RopeBackward { .. }
+                    | Step::CumsumBackward { .. }
+                    | Step::GatherBackward { .. } => {}
                     Step::FusedResidualLn { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
@@ -2955,6 +3866,11 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
                     }
+                    #[cfg(feature = "splat")]
+                    Step::GaussianSplatRender { .. }
+                    | Step::GaussianSplatRenderBackward { .. }
+                    | Step::GaussianSplatPrepare { .. }
+                    | Step::GaussianSplatRasterize { .. } => {}
                 }
             }
             self.uniforms_active_extent = Some(active);
@@ -2972,21 +3888,28 @@ impl WgpuExecutable {
         let uk = unary_kernel(&dev.device);
         let ck = compare_kernel(&dev.device);
         let wk = where_kernel(&dev.device);
-        let mut enc = dev
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rlx-wgpu run"),
-            });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rlx-wgpu compute pass"),
-                timestamp_writes: None,
-            });
-            for (i, step) in self.schedule.iter().enumerate() {
-                // PLAN L3: per-step Perfetto trace span; no-op when
-                // env var RLX_TRACE_PERFETTO unset.
-                let _perf = rlx_ir::perfetto::TraceSpan::new(step_name(step), "wgpu");
-                match step {
+        let mut step_i = 0;
+        while step_i < self.schedule.len() {
+            let mut enc = dev
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rlx-wgpu run"),
+                });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rlx-wgpu compute pass"),
+                    timestamp_writes: None,
+                });
+                while step_i < self.schedule.len() {
+                    if step_runs_on_host(&self.schedule[step_i]) {
+                        break;
+                    }
+                    let i = step_i;
+                    let step = &self.schedule[i];
+                    // PLAN L3: per-step Perfetto trace span; no-op when
+                    // env var RLX_TRACE_PERFETTO unset.
+                    let _perf = rlx_ir::perfetto::TraceSpan::new(step_name(step), "wgpu");
+                    match step {
                     Step::CastF32ToF16 { params } => {
                         // Pre-pass for matmul_coop16: mirror f32 arena
                         // region into f16 shadow buffer so the matmul
@@ -3032,7 +3955,7 @@ impl WgpuExecutable {
                         //      currently regresses on Apple)
                         //   3. wide-N (m≥32, n≥64)   → matmul_wide
                         //   4. otherwise            → matmul (small/skinny)
-                        let f16w_opt_in = std::env::var_os("RLX_WGPU_F16_WEIGHTS").is_some();
+                        let f16w_opt_in = rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS");
                         if let Some(coop) = mm_coop.as_ref()
                             && *b_is_param
                             && *compute_precision == MatmulCompute::Coop16
@@ -3146,6 +4069,66 @@ impl WgpuExecutable {
                         let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                         pass.dispatch_workgroups(gx, gy, gz);
                     }
+                    Step::RmsNormBackwardInput { params } => {
+                        let outer_s = scale(params.outer);
+                        if outer_s == 0 {
+                            continue;
+                        }
+                        let rk = rms_norm_backward_kernel(&dev.device);
+                        pass.set_pipeline(&rk.pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                        pass.dispatch_workgroups(outer_s, 1, 1);
+                    }
+                    Step::RmsNormBackwardGamma { params } | Step::RmsNormBackwardBeta { params } => {
+                        if params.inner == 0 {
+                            continue;
+                        }
+                        let rk = rms_norm_backward_param_kernel(&dev.device);
+                        pass.set_pipeline(&rk.pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
+                    Step::CumsumBackward { params } => {
+                        let outer_s = scale(params.outer);
+                        if outer_s == 0 {
+                            continue;
+                        }
+                        let ck = cumsum_backward_kernel(&dev.device);
+                        pass.set_pipeline(&ck.pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                        pass.dispatch_workgroups(gx, gy, gz);
+                    }
+                    Step::RopeBackward { params } => {
+                        let seq_s = scale(params.seq);
+                        if seq_s == 0 {
+                            continue;
+                        }
+                        let rk = rope_backward_kernel(&dev.device);
+                        pass.set_pipeline(&rk.pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                        let total = params.batch * seq_s * params.hidden;
+                        let (gx, gy, gz) = dispatch_dims(total, 64);
+                        pass.dispatch_workgroups(gx, gy, gz);
+                    }
+                    Step::GatherBackward { params } => {
+                        let outer_s = scale(params.outer);
+                        if outer_s == 0 {
+                            continue;
+                        }
+                        let total = outer_s * params.axis_dim * params.trailing;
+                        if total > 0 {
+                            let zk = gather_backward_zero_kernel(&dev.device);
+                            pass.set_pipeline(&zk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, _, _) = dispatch_dims(total, 256);
+                            pass.dispatch_workgroups(gx, 1, 1);
+                        }
+                        let ak = gather_backward_acc_kernel(&dev.device);
+                        pass.set_pipeline(&ak.pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                        pass.dispatch_workgroups(outer_s, 1, 1);
+                    }
                     Step::Cumsum { params } => {
                         let outer_s = scale(params.outer);
                         if outer_s == 0 {
@@ -3244,6 +4227,17 @@ impl WgpuExecutable {
                         let (gx, gy, gz) = dispatch_dims(n_out_s, 64);
                         pass.dispatch_workgroups(gx, gy, gz);
                     }
+                    Step::GatherAxis { params } => {
+                        let total_s = scale(params.total);
+                        if total_s == 0 {
+                            continue;
+                        }
+                        let gk = gather_axis_kernel(&dev.device);
+                        pass.set_pipeline(&gk.pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                        let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                        pass.dispatch_workgroups(gx, gy, gz);
+                    }
                     Step::Attention { params, .. } => {
                         // Scale seq_q for grid dim; per-head strides
                         // come from seq_q_stride / seq_k_stride (full
@@ -3256,6 +4250,23 @@ impl WgpuExecutable {
                         pass.set_pipeline(&ak.pipeline);
                         pass.set_bind_group(0, &self.bind_groups[i], &[]);
                         let total = params.batch * params.heads * seq_q_s;
+                        let (gx, gy, gz) = dispatch_dims(total, 64);
+                        pass.dispatch_workgroups(gx, gy, gz);
+                    }
+                    Step::AttentionBackward { params, .. } => {
+                        let axis = if params.wrt == 0 {
+                            params.seq_q
+                        } else {
+                            params.seq_k
+                        };
+                        let axis_s = scale(axis);
+                        if axis_s == 0 {
+                            continue;
+                        }
+                        let ak = attention_bwd_kernel(&dev.device);
+                        pass.set_pipeline(&ak.pipeline);
+                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                        let total = params.batch * params.heads * axis_s;
                         let (gx, gy, gz) = dispatch_dims(total, 64);
                         pass.dispatch_workgroups(gx, gy, gz);
                     }
@@ -3483,17 +4494,348 @@ impl WgpuExecutable {
                         pass.set_bind_group(0, &self.bind_groups[i], &[]);
                         pass.dispatch_workgroups(params.n.div_ceil(32), m_s.div_ceil(32), 1);
                     }
+                    Step::DequantMatmulGguf { .. }
+                    | Step::DequantGroupedMatmulGguf { .. }
+                    | Step::GatedDeltaNet { .. }
+            | Step::Llada2GroupLimitedGate { .. } => {}
+                    #[cfg(feature = "splat")]
+                    | Step::GaussianSplatRender { .. }
+                    | Step::GaussianSplatRenderBackward { .. }
+                    | Step::GaussianSplatPrepare { .. }
+                    | Step::GaussianSplatRasterize { .. } => {}
+                }
+                    step_i += 1;
                 }
             }
+            dev.queue.submit(std::iter::once(enc.finish()));
+            let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+            if step_i >= self.schedule.len() {
+                break;
+            }
+            match &self.schedule[step_i] {
+                Step::DequantMatmulGguf {
+                    m,
+                    k,
+                    n,
+                    scheme_id,
+                    x_byte_off,
+                    w_byte_off,
+                    out_byte_off,
+                } => {
+                    crate::gguf_host::run_dequant_matmul_gguf(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *m as usize,
+                        *k as usize,
+                        *n as usize,
+                        *scheme_id,
+                        *x_byte_off as usize,
+                        *w_byte_off as usize,
+                        *out_byte_off as usize,
+                    );
+                }
+                Step::DequantGroupedMatmulGguf {
+                    m,
+                    k,
+                    n,
+                    num_experts,
+                    scheme_id,
+                    x_byte_off,
+                    w_byte_off,
+                    idx_byte_off,
+                    out_byte_off,
+                } => {
+                    crate::gguf_host::run_dequant_grouped_matmul_gguf(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *m as usize,
+                        *k as usize,
+                        *n as usize,
+                        *num_experts as usize,
+                        *scheme_id,
+                        *x_byte_off as usize,
+                        *w_byte_off as usize,
+                        *idx_byte_off as usize,
+                        *out_byte_off as usize,
+                    );
+                }
+                Step::GatedDeltaNet {
+                    q_byte_off,
+                    k_byte_off,
+                    v_byte_off,
+                    g_byte_off,
+                    beta_byte_off,
+                    state_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    heads,
+                    state_size,
+                    use_carry,
+                } => {
+                    crate::gdn_host::run_gated_delta_net(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *q_byte_off as usize,
+                        *k_byte_off as usize,
+                        *v_byte_off as usize,
+                        *g_byte_off as usize,
+                        *beta_byte_off as usize,
+                        *state_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *heads as usize,
+                        *state_size as usize,
+                        *use_carry,
+                    );
+                }
+                Step::Llada2GroupLimitedGate {
+                    sig_byte_off,
+                    route_byte_off,
+                    out_byte_off,
+                    n_elems,
+                    attrs,
+                } => {
+                    crate::llada2_gate_host::run_llada2_group_limited_gate(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *sig_byte_off as usize,
+                        *route_byte_off as usize,
+                        *out_byte_off as usize,
+                        *n_elems as usize,
+                        attrs,
+                    );
+                }
+                #[cfg(feature = "splat")]
+                Step::GaussianSplatRender {
+                    positions_byte_off,
+                    positions_len,
+                    scales_byte_off,
+                    scales_len,
+                    rotations_byte_off,
+                    rotations_len,
+                    opacities_byte_off,
+                    opacities_len,
+                    colors_byte_off,
+                    colors_len,
+                    sh_coeffs_byte_off,
+                    sh_coeffs_len,
+                    meta_byte_off,
+                    dst_byte_off,
+                    dst_len,
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    crate::splat::run_gaussian_splat_render(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *positions_byte_off as usize,
+                        *positions_len as usize,
+                        *scales_byte_off as usize,
+                        *scales_len as usize,
+                        *rotations_byte_off as usize,
+                        *rotations_len as usize,
+                        *opacities_byte_off as usize,
+                        *opacities_len as usize,
+                        *colors_byte_off as usize,
+                        *colors_len as usize,
+                        *sh_coeffs_byte_off as usize,
+                        *sh_coeffs_len as usize,
+                        *meta_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *dst_len as usize,
+                        *width,
+                        *height,
+                        *tile_size,
+                        *radius_scale,
+                        *alpha_cutoff,
+                        *max_splat_steps,
+                        *transmittance_threshold,
+                        *max_list_entries,
+                    );
+                }
+                #[cfg(feature = "splat")]
+                Step::GaussianSplatPrepare {
+                    positions_byte_off,
+                    positions_len,
+                    scales_byte_off,
+                    scales_len,
+                    rotations_byte_off,
+                    rotations_len,
+                    opacities_byte_off,
+                    opacities_len,
+                    colors_byte_off,
+                    colors_len,
+                    sh_coeffs_byte_off,
+                    sh_coeffs_len,
+                    meta_byte_off,
+                    meta_len,
+                    prep_byte_off,
+                    prep_len,
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    crate::splat::run_gaussian_splat_prepare(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *positions_byte_off as usize,
+                        *positions_len as usize,
+                        *scales_byte_off as usize,
+                        *scales_len as usize,
+                        *rotations_byte_off as usize,
+                        *rotations_len as usize,
+                        *opacities_byte_off as usize,
+                        *opacities_len as usize,
+                        *colors_byte_off as usize,
+                        *colors_len as usize,
+                        *sh_coeffs_byte_off as usize,
+                        *sh_coeffs_len as usize,
+                        *meta_byte_off as usize,
+                        *meta_len as usize,
+                        *prep_byte_off as usize,
+                        *prep_len as usize,
+                        *width,
+                        *height,
+                        *tile_size,
+                        *radius_scale,
+                        *alpha_cutoff,
+                        *max_splat_steps,
+                        *transmittance_threshold,
+                        *max_list_entries,
+                    );
+                }
+                #[cfg(feature = "splat")]
+                Step::GaussianSplatRasterize {
+                    prep_byte_off,
+                    prep_len,
+                    meta_byte_off,
+                    meta_len,
+                    dst_byte_off,
+                    dst_len,
+                    count,
+                    width,
+                    height,
+                    tile_size,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    crate::splat::run_gaussian_splat_rasterize(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *prep_byte_off as usize,
+                        *prep_len as usize,
+                        *meta_byte_off as usize,
+                        *meta_len as usize,
+                        *dst_byte_off as usize,
+                        *dst_len as usize,
+                        *count as usize,
+                        *width,
+                        *height,
+                        *tile_size,
+                        *alpha_cutoff,
+                        *max_splat_steps,
+                        *transmittance_threshold,
+                        *max_list_entries,
+                    );
+                }
+                #[cfg(feature = "splat")]
+                Step::GaussianSplatRenderBackward {
+                    positions_byte_off,
+                    positions_len,
+                    scales_byte_off,
+                    scales_len,
+                    rotations_byte_off,
+                    rotations_len,
+                    opacities_byte_off,
+                    opacities_len,
+                    colors_byte_off,
+                    colors_len,
+                    sh_coeffs_byte_off,
+                    sh_coeffs_len,
+                    meta_byte_off,
+                    d_loss_byte_off,
+                    d_loss_len,
+                    packed_byte_off,
+                    packed_len,
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                    loss_grad_clip,
+                    sh_band,
+                    max_anisotropy,
+                } => {
+                    crate::splat::run_gaussian_splat_render_backward(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *positions_byte_off as usize,
+                        *positions_len as usize,
+                        *scales_byte_off as usize,
+                        *scales_len as usize,
+                        *rotations_byte_off as usize,
+                        *rotations_len as usize,
+                        *opacities_byte_off as usize,
+                        *opacities_len as usize,
+                        *colors_byte_off as usize,
+                        *colors_len as usize,
+                        *sh_coeffs_byte_off as usize,
+                        *sh_coeffs_len as usize,
+                        *meta_byte_off as usize,
+                        *d_loss_byte_off as usize,
+                        *d_loss_len as usize,
+                        *packed_byte_off as usize,
+                        *packed_len as usize,
+                        *width,
+                        *height,
+                        *tile_size,
+                        *radius_scale,
+                        *alpha_cutoff,
+                        *max_splat_steps,
+                        *transmittance_threshold,
+                        *max_list_entries,
+                        *loss_grad_clip,
+                        *sh_band,
+                        *max_anisotropy,
+                    );
+                }
+                _ => break,
+            }
+            step_i += 1;
         }
-        dev.queue.submit(std::iter::once(enc.finish()));
 
         // RLX_WGPU_NAN_TRACE=1: after submission, scan every node's
         // arena slot for NaN. Print the first N nodes whose output
         // contains NaN (in IR topo order). Used to bisect which kernel
         // first introduces NaN — once we know the producer, we know
         // which WGSL to look at.
-        if std::env::var("RLX_WGPU_NAN_TRACE").is_ok() {
+        if rlx_ir::env::flag("RLX_WGPU_NAN_TRACE") {
             let mut bad_nodes = Vec::new();
             for node in self.graph.nodes() {
                 if !self.arena.has(node.id) {
@@ -3568,94 +4910,6 @@ fn dispatch_dims(threads_total: u32, workgroup_size: u32) -> (u32, u32, u32) {
         let gy = groups.div_ceil(gx);
         (gx, gy, 1)
     }
-}
-
-fn has_dynamic_dims(graph: &Graph) -> bool {
-    use rlx_ir::shape::Dim;
-    graph
-        .nodes()
-        .iter()
-        .any(|n| n.shape.dims().iter().any(|d| matches!(d, Dim::Dynamic(_))))
-}
-
-/// Walk Op::Input nodes; for each one, infer one Dim::Dynamic symbol's
-/// concrete size from the supplied input data length divided by the
-/// product of the static dims. Errors if an Input has multiple dynamic
-/// dims (we can only solve one unknown per data-length number).
-fn collect_bindings(graph: &Graph, inputs: &[(&str, &[f32])]) -> Result<DimBinding, String> {
-    use rlx_ir::shape::Dim;
-    let mut binding = DimBinding::new();
-    let by_name: HashMap<&str, usize> = inputs.iter().map(|(n, d)| (*n, d.len())).collect();
-    for node in graph.nodes() {
-        if let Op::Input { name } = &node.op {
-            let Some(&n_elems) = by_name.get(name.as_str()) else {
-                continue;
-            };
-            let mut static_prod: usize = 1;
-            let mut dynamic_sym: Option<u32> = None;
-            for d in node.shape.dims().iter() {
-                match d {
-                    Dim::Static(n) => {
-                        static_prod *= *n;
-                    }
-                    Dim::Dynamic(sym) => {
-                        if dynamic_sym.is_some() {
-                            return Err(format!(
-                                "Input '{name}' has multiple dynamic dims; \
-                                 use compile_with_bindings"
-                            ));
-                        }
-                        dynamic_sym = Some(*sym);
-                    }
-                }
-            }
-            if let Some(sym) = dynamic_sym {
-                if static_prod == 0 {
-                    return Err(format!("Input '{name}': static dim product is zero"));
-                }
-                if n_elems % static_prod != 0 {
-                    return Err(format!(
-                        "Input '{name}': data len {n_elems} not divisible by \
-                         static dim product {static_prod}"
-                    ));
-                }
-                let size = n_elems / static_prod;
-                if let Some(prev) = binding.get(sym) {
-                    if prev != size {
-                        return Err(format!(
-                            "Input '{name}': symbol {sym} bound twice to \
-                             different sizes ({prev} vs {size})"
-                        ));
-                    }
-                } else {
-                    binding.set(sym, size);
-                }
-            }
-        }
-    }
-    Ok(binding)
-}
-
-fn resolve_graph(graph: &Graph, binding: &DimBinding) -> Graph {
-    let mut fresh = Graph::new(&graph.name);
-    for node in graph.nodes() {
-        let bound = node.shape.bind(binding);
-        fresh.add_node(node.op.clone(), node.inputs.clone(), bound);
-    }
-    fresh.set_outputs(graph.outputs.clone());
-    fresh
-}
-
-fn same_binding(a: &DimBinding, b: &DimBinding) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for (sym, size) in a.iter() {
-        if b.get(sym) != Some(size) {
-            return false;
-        }
-    }
-    true
 }
 
 fn require_equal_shapes(graph: &Graph, ids: &[NodeId], op_name: &str) {
@@ -3765,8 +5019,8 @@ fn derive_matmul_compute(
     // the simdgroup_float8x8 path on layout or stride. Re-enable on
     // Vulkan/DX12 once the path is verified end-to-end. Override
     // with RLX_WGPU_FORCE_COOP_F32=1 to bench the broken path.
-    let disabled = std::env::var_os("RLX_WGPU_NO_COOP_F32").is_some();
-    let forced = std::env::var_os("RLX_WGPU_FORCE_COOP_F32").is_some();
+    let disabled = rlx_ir::env::flag("RLX_WGPU_NO_COOP_F32");
+    let forced = rlx_ir::env::flag("RLX_WGPU_FORCE_COOP_F32");
     let backend_ok = forced
         || matches!(
             crate::device::wgpu_device().map(|d| d.backend),
@@ -4161,7 +5415,7 @@ fn build_matmul_bind_group(
             ],
         });
     }
-    let f16w_opt_in = std::env::var_os("RLX_WGPU_F16_WEIGHTS").is_some();
+    let f16w_opt_in = rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS");
     if b_is_param
         && f16w_opt_in
         && let (Some(f16_buf), Some(f16w)) = (&arena.f16_buffer, mm_f16w)

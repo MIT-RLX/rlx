@@ -40,7 +40,7 @@ fn ternary_dense_model() -> Model {
     let packed = pack(&logical, 2);
     let (m0, sh) = quantize_multiplier(0.5);
     Model {
-        name: "ternary_smoke".into(),
+        name: "ternary_check".into(),
         input_len: 4,
         layers: vec![Layer::Dense {
             name: "fc",

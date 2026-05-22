@@ -47,6 +47,9 @@ pub mod device;
 pub mod hlo;
 pub mod libtpu;
 pub mod lower;
+pub mod orchestrated;
+pub mod segment;
+pub mod splat_host;
 pub mod unfuse;
 
 pub use backend::TpuExecutable;

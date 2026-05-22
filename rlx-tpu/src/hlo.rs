@@ -1033,7 +1033,7 @@ mod tests {
 
     #[test]
     fn minimal_module_encodes() {
-        let mut b = HloBuilder::new("rlx_smoke");
+        let mut b = HloBuilder::new("rlx_basic");
         let entry = b.computation("entry");
         let s = Shape::f32(&[4]);
         let p0 = entry.parameter(0, "x", s.clone());
@@ -1051,7 +1051,7 @@ mod tests {
         // structurally valid.
         let reparsed = xla::HloModuleProto::decode(bytes.as_slice())
             .expect("emitted module must round-trip through prost");
-        assert_eq!(reparsed.name, "rlx_smoke");
+        assert_eq!(reparsed.name, "rlx_basic");
         assert_eq!(reparsed.entry_computation_name, "entry");
         assert_eq!(reparsed.computations.len(), 1);
     }

@@ -1,16 +1,5 @@
-# Python
+.venv/
 __pycache__/
-*.py[cod]
 *.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Editable install / build outputs
-*.so
-*.dylib
-*.pyd
-build/
 dist/
 target/
-.venv/

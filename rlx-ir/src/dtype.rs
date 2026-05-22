@@ -16,6 +16,7 @@
 //! Element data types for tensors.
 
 /// Scalar element type. Matches hardware-supported types.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     F32,

@@ -35,8 +35,12 @@ throughput unlock — Phase H made matmul-interleaved schedules use it.
 
 ## Cargo features
 
+| Feature | Description |
+|---------|-------------|
+| `native-splat` (default) | RLX-owned MSL tile raster (`splat.msl`) + CPU project/bin/sort via `slang-splat-ref` (Rust reference, no Slang compiler). |
+
 The crate is built unconditionally on macOS via [`rlx`](https://crates.io/crates/rlx)'s
-`metal` feature; on other platforms it stubs out at link time.
+`metal` feature (which enables `native-splat`); on other platforms it stubs out at link time.
 
 ## Install
 

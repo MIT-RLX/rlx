@@ -2741,6 +2741,19 @@ mod mlx_kernels {
 /// kernels enabled at compile time. Idempotent — the underlying
 /// registries already warn on overwrite. Call once at application
 /// startup.
+/// Host CG for SPD `A·x = b` given CSR `(values, col_idx, row_ptr)`.
+pub fn cg_solve(
+    values: &[f64],
+    col_idx: &[i32],
+    row_ptr: &[i32],
+    b: &[f64],
+    out: &mut [f64],
+    max_iter: u32,
+    tol: f64,
+) -> Result<(), String> {
+    algos::cg_solve(values, col_idx, row_ptr, b, out, max_iter, tol)
+}
+
 pub fn register() {
     register_op(Arc::new(SparseLuExt));
     register_op(Arc::new(SparseMatVecExt));

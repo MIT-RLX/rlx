@@ -56,7 +56,7 @@ fn ternary_dense_model() -> Model {
         bias: None,
     };
     Model {
-        name: "ternary_dense_smoke".into(),
+        name: "ternary_dense_check".into(),
         input_len: 4,
         layers: vec![dense],
     }
@@ -130,7 +130,7 @@ fn nibble_dense_reference_matches_hand_compute() {
     let (m0, shift) = quantize_multiplier(0.5);
 
     let model = Model {
-        name: "i4_dense_smoke".into(),
+        name: "i4_dense_check".into(),
         input_len: 4,
         layers: vec![Layer::Dense {
             name: "fc_i4",

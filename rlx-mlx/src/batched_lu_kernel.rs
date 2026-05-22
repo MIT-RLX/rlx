@@ -18,7 +18,7 @@
 //! ## Status: dispatch wired, no-pivot kernel only
 //!
 //! The Rust trait impl, the FFI surface to `mc::fast::metal_kernel`,
-//! and the MSL kernel are all live. Smoke test in
+//! and the MSL kernel are all live. basic test in
 //! `tests/batched_lu_solve.rs` confirms a small batched system runs
 //! on the Apple GPU and matches a hand-computed reference.
 //!

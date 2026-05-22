@@ -20,6 +20,8 @@ use crate::compiled::CompiledGraph;
 use crate::precision::Precision;
 use rlx_driver::Device;
 use rlx_ir::Graph;
+use rlx_ir::GraphModule;
+use rlx_ir::hir::HirModule;
 use rlx_opt::PrecisionPolicy;
 
 /// A session manages graph compilation and execution on a device.
@@ -75,14 +77,18 @@ impl Session {
         self.policy.as_ref()
     }
 
-    /// Compile a graph for execution at the session's default options.
+    /// Compile a MIR graph through the fusion-first pipeline (`GraphModule` → LIR).
+    ///
+    /// Prefer [`Self::compile_hir`] or [`Self::compile_module`] for new code.
+    /// This entry wraps the graph as a MIR-stage [`GraphModule`].
     pub fn compile(&self, graph: Graph) -> CompiledGraph {
-        let opts = crate::CompileOptions::new().precision(self.precision);
-        let opts = match &self.policy {
-            Some(p) => opts.policy(p.clone()),
-            None => opts,
-        };
-        self.compile_with(graph, &opts)
+        self.compile_module(GraphModule::from_graph(graph))
+            .expect("compile MIR graph through fusion pipeline")
+    }
+
+    /// Explicit legacy alias — same as [`Self::compile`].
+    pub fn compile_graph(&self, graph: Graph) -> CompiledGraph {
+        self.compile(graph)
     }
 
     /// Compile with explicit options (full control over the pipeline).
@@ -90,9 +96,54 @@ impl Session {
     /// `new_with_precision` / `with_policy`. This escape hatch is for
     /// callers that need finer control (e.g., disable DCE for debugging).
     pub fn compile_with(&self, graph: Graph, options: &crate::CompileOptions) -> CompiledGraph {
+        self.compile_module_with(GraphModule::from_graph(graph), options)
+            .expect("compile MIR graph through fusion pipeline")
+    }
+
+    /// Compile a fusion-first HIR module through HIR → MIR → LIR.
+    pub fn compile_hir(
+        &self,
+        hir: HirModule,
+    ) -> Result<CompiledGraph, rlx_ir::hir::LowerError> {
+        self.compile_hir_with(hir, &self.default_options())
+    }
+
+    /// Compile HIR with explicit compile options.
+    pub fn compile_hir_with(
+        &self,
+        hir: HirModule,
+        options: &crate::CompileOptions,
+    ) -> Result<CompiledGraph, rlx_ir::hir::LowerError> {
         let backend = self.create_backend();
-        let executable = backend.compile(graph, options);
-        CompiledGraph::new(executable, self.device)
+        let executable = backend.compile_hir(hir, self.device, options)?;
+        Ok(CompiledGraph::new(executable, self.device))
+    }
+
+    /// Compile a [`GraphModule`] (HIR/MIR/LIR stage) through the pipeline.
+    pub fn compile_module(
+        &self,
+        module: GraphModule,
+    ) -> Result<CompiledGraph, rlx_ir::hir::LowerError> {
+        self.compile_module_with(module, &self.default_options())
+    }
+
+    /// Compile a [`GraphModule`] with explicit compile options.
+    pub fn compile_module_with(
+        &self,
+        module: GraphModule,
+        options: &crate::CompileOptions,
+    ) -> Result<CompiledGraph, rlx_ir::hir::LowerError> {
+        let backend = self.create_backend();
+        let executable = backend.compile_module(module, self.device, options)?;
+        Ok(CompiledGraph::new(executable, self.device))
+    }
+
+    fn default_options(&self) -> crate::CompileOptions {
+        let opts = crate::CompileOptions::new().precision(self.precision);
+        match &self.policy {
+            Some(p) => opts.policy(p.clone()),
+            None => opts,
+        }
     }
 
     fn create_backend(&self) -> Box<dyn Backend> {

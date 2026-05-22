@@ -54,12 +54,16 @@ pub mod mps_graph;
 
 #[cfg(target_os = "macos")]
 pub mod mps_graph_lower;
+pub mod mps_graph_hybrid;
 
 #[cfg(target_os = "macos")]
 pub mod icb;
 
 #[cfg(target_os = "macos")]
 pub mod kernels;
+
+#[cfg(target_os = "macos")]
+pub mod llada2_gate;
 
 #[cfg(target_os = "macos")]
 pub mod cost;
@@ -72,6 +76,15 @@ pub mod thunk;
 
 #[cfg(target_os = "macos")]
 pub mod backend;
+
+#[cfg(all(feature = "native-splat", target_os = "macos"))]
+pub mod splat_native;
+#[cfg(all(feature = "native-splat", target_os = "macos"))]
+pub mod splat_training;
+#[cfg(all(feature = "native-splat", target_os = "macos"))]
+pub mod splat_adam;
+#[cfg(all(feature = "native-splat", target_os = "macos"))]
+pub mod splat_training_pipeline;
 
 #[cfg(target_os = "macos")]
 pub mod async_copy;
