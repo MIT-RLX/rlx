@@ -5,10 +5,10 @@
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, version 3.
 
-//! End-to-end smoke test for the MLX `Op::DenseSolve` lowering.
+//! End-to-end basic test for the MLX `Op::DenseSolve` lowering.
 //!
 //! Builds a tiny f32 system A·x = b, runs it on MLX, checks the result
-//! against a hand-computed reference. Same shape of test as smoke.rs,
+//! against a hand-computed reference. Same shape of test as check.rs,
 //! restricted to macOS where MLX is actually built.
 //!
 //! The batched variant is exercised separately so a regression in

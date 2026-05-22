@@ -1,0 +1,240 @@
+// GGUF K-quant super-block dequant → f32 scratch (one 256-element block / thread).
+// scheme_id: 0=Q4K, 1=Q5K, 2=Q6K, 3=Q8K, 4=Q2K, 5=Q3K.
+
+constant uint DQ_QK_K = 256u;
+constant uint DQ_K_SCALE_SIZE = 12u;
+
+inline float dq_read_f16(device const uchar* b, uint off) {
+    ushort bits = ushort(b[off]) | (ushort(b[off + 1u]) << 8u);
+    // half → float (OCP binary16).
+    uint sign = (uint(bits) >> 15u) & 1u;
+    uint exp  = (uint(bits) >> 10u) & 0x1Fu;
+    uint mant = uint(bits) & 0x3FFu;
+    float v;
+    if (exp == 0u) {
+        v = float(mant) / 1024.0f * exp2(-14.0f);
+    } else if (exp == 31u) {
+        v = (mant == 0u) ? INFINITY : 0.0f;
+    } else {
+        v = (1.0f + float(mant) / 1024.0f) * exp2(float(int(exp) - 15));
+    }
+    return (sign != 0u) ? -v : v;
+}
+
+inline void dq_get_scale_min_k4(device const uchar* q, uint j, thread uint& sc, thread uint& mn) {
+    if (j < 4u) {
+        sc = uint(q[j]) & 63u;
+        mn = uint(q[j + 4u]) & 63u;
+    } else {
+        sc = (uint(q[j + 4u]) & 0x0Fu) | (((uint(q[j - 4u]) >> 6u) & 3u) << 4u);
+        mn = (uint(q[j + 4u]) >> 4u) | (((uint(q[j]) >> 6u) & 3u) << 4u);
+    }
+}
+
+kernel void dequant_gguf(
+    device float* arena        [[buffer(0)]],
+    constant uint& w_byte_off    [[buffer(1)]],
+    constant uint& dst_f32_off   [[buffer(2)]],
+    constant uint& scheme_id     [[buffer(3)]],
+    constant uint& num_blocks    [[buffer(4)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= num_blocks) return;
+
+    device uchar* w_base = (device uchar*)((device char*)arena + w_byte_off);
+    device float* dst = arena + dst_f32_off + gid * DQ_QK_K;
+
+    if (scheme_id == 3u) {
+        // Q8_K: 276 bytes / block
+        uint off = gid * (4u + DQ_QK_K + (DQ_QK_K / 16u) * 2u);
+        float d = as_type<float>(*(device uint*)(w_base + off));
+        device const uchar* qs = w_base + off + 4u;
+        for (uint i = 0; i < DQ_QK_K; ++i) {
+            dst[i] = d * float(int8_t(qs[i]));
+        }
+        return;
+    }
+
+    if (scheme_id == 0u) {
+        // Q4_K: 144 bytes / block
+        uint blk = 2u + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 2u;
+        uint off = gid * blk;
+        float d = dq_read_f16(w_base, off);
+        float dmin = dq_read_f16(w_base, off + 2u);
+        device const uchar* scales = w_base + off + 4u;
+        device const uchar* qs = w_base + off + 4u + DQ_K_SCALE_SIZE;
+        uint is = 0u;
+        uint out_i = 0u;
+        for (uint j = 0u; j < 8u; j += 2u) {
+            uint sc0, m0, sc1, m1;
+            dq_get_scale_min_k4(scales, j, sc0, m0);
+            dq_get_scale_min_k4(scales, j + 1u, sc1, m1);
+            float d0 = d * float(sc0);
+            float m0f = dmin * float(m0);
+            float d1 = d * float(sc1);
+            float m1f = dmin * float(m1);
+            for (uint l = 0u; l < 32u; ++l) {
+                uchar q = qs[is + l];
+                dst[out_i++] = d0 * float(q & 0x0Fu) - m0f;
+            }
+            for (uint l = 0u; l < 32u; ++l) {
+                uchar q = qs[is + l];
+                dst[out_i++] = d1 * float(q >> 4) - m1f;
+            }
+            is += 32u;
+        }
+        return;
+    }
+
+    if (scheme_id == 1u) {
+        // Q5_K: 176 bytes / block
+        uint blk = 2u + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 8u + DQ_QK_K / 2u;
+        uint off = gid * blk;
+        float d = dq_read_f16(w_base, off);
+        float dmin = dq_read_f16(w_base, off + 2u);
+        device const uchar* scales = w_base + off + 4u;
+        uint qh_off = off + 4u + DQ_K_SCALE_SIZE;
+        device const uchar* qh = w_base + qh_off;
+        device const uchar* qs = w_base + qh_off + DQ_QK_K / 8u;
+        uint is = 0u;
+        uint out_i = 0u;
+        uchar u1 = 1u;
+        uchar u2 = 2u;
+        for (uint j = 0u; j < 8u; j += 2u) {
+            uint sc0, m0, sc1, m1;
+            dq_get_scale_min_k4(scales, j, sc0, m0);
+            dq_get_scale_min_k4(scales, j + 1u, sc1, m1);
+            float d0 = d * float(sc0);
+            float m0f = dmin * float(m0);
+            float d1 = d * float(sc1);
+            float m1f = dmin * float(m1);
+            for (uint l = 0u; l < 32u; ++l) {
+                uint lo = uint(qs[is + l]) & 0x0Fu;
+                uint hi = (qh[l] & u1) != 0u ? 16u : 0u;
+                dst[out_i++] = d0 * float(lo + hi) - m0f;
+            }
+            for (uint l = 0u; l < 32u; ++l) {
+                uint lo = uint(qs[is + l]) >> 4u;
+                uint hi = (qh[l] & u2) != 0u ? 16u : 0u;
+                dst[out_i++] = d1 * float(lo + hi) - m1f;
+            }
+            is += 32u;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+        return;
+    }
+
+    if (scheme_id == 2u) {
+        // Q6_K: 210 bytes / block
+        uint ql_len = DQ_QK_K / 2u;
+        uint qh_len = DQ_QK_K / 4u;
+        uint sc_len = DQ_QK_K / 16u;
+        uint blk = ql_len + qh_len + sc_len + 2u;
+        uint off = gid * blk;
+        device const uchar* ql = w_base + off;
+        device const uchar* qh = w_base + off + ql_len;
+        device const uchar* sc = w_base + off + ql_len + qh_len;
+        float d = dq_read_f16(w_base, off + ql_len + qh_len + sc_len);
+        for (uint h = 0u; h < 2u; ++h) {
+            uint dst_base = h * 128u;
+            uint ql_off = h * 64u;
+            uint qh_off_h = h * 32u;
+            uint sc_off = h * 8u;
+            for (uint l = 0u; l < 32u; ++l) {
+                uint is = l / 16u;
+                uchar qh_b = qh[qh_off_h + l];
+                float q1 = float(int(((ql[ql_off + l] & 0x0Fu) | (((qh_b >> 0) & 3u) << 4u)) - 32));
+                float q2 = float(int(((ql[ql_off + l + 32u] & 0x0Fu) | (((qh_b >> 2) & 3u) << 4u)) - 32));
+                float q3 = float(int(((ql[ql_off + l] >> 4) | (((qh_b >> 4) & 3u) << 4u)) - 32));
+                float q4 = float(int(((ql[ql_off + l + 32u] >> 4) | (((qh_b >> 6) & 3u) << 4u)) - 32));
+                dst[dst_base + l] = d * float(int8_t(sc[sc_off + is])) * q1;
+                dst[dst_base + l + 32u] = d * float(int8_t(sc[sc_off + is + 2u])) * q2;
+                dst[dst_base + l + 64u] = d * float(int8_t(sc[sc_off + is + 4u])) * q3;
+                dst[dst_base + l + 96u] = d * float(int8_t(sc[sc_off + is + 6u])) * q4;
+            }
+        }
+        return;
+    }
+
+    if (scheme_id == 4u) {
+        // Q2_K: 84 bytes / block
+        uint blk = 2u + 2u + DQ_QK_K / 16u + DQ_QK_K / 4u;
+        uint off = gid * blk;
+        float d = dq_read_f16(w_base, off);
+        float min = dq_read_f16(w_base, off + 2u);
+        device const uchar* q = w_base + off + 4u + DQ_QK_K / 16u;
+        uint is = 0u;
+        uint out_i = 0u;
+        for (uint sb = 0u; sb < 2u; ++sb) {
+            uint shift = 0u;
+            for (uint t = 0u; t < 4u; ++t) {
+                uchar sc = w_base[off + 4u + is];
+                is += 1u;
+                float dl = d * float(sc & 0xFu);
+                float ml = min * float(sc >> 4);
+                for (uint l = 0u; l < 16u; ++l) {
+                    dst[out_i++] = dl * float((q[l] >> shift) & 3u) - ml;
+                }
+                sc = w_base[off + 4u + is];
+                is += 1u;
+                dl = d * float(sc & 0xFu);
+                ml = min * float(sc >> 4);
+                for (uint l = 0u; l < 16u; ++l) {
+                    dst[out_i++] = dl * float((q[l + 16u] >> shift) & 3u) - ml;
+                }
+                shift += 2u;
+            }
+            q += 32u;
+        }
+        return;
+    }
+
+    if (scheme_id == 5u) {
+        // Q3_K: 110 bytes / block
+        const uint KMASK1 = 0x03030303u;
+        const uint KMASK2 = 0x0f0f0f0fu;
+        uint blk = 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 8u + DQ_QK_K / 4u;
+        uint off = gid * blk;
+        float d_all = dq_read_f16(w_base, off);
+        device const uchar* hm = w_base + off + 2u + DQ_K_SCALE_SIZE;
+        device const uchar* q = w_base + off + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 8u;
+        uint aux0 = uint(w_base[off + 2u]) | (uint(w_base[off + 3u]) << 8u)
+                  | (uint(w_base[off + 4u]) << 16u) | (uint(w_base[off + 5u]) << 24u);
+        uint aux1 = uint(w_base[off + 6u]) | (uint(w_base[off + 7u]) << 8u)
+                  | (uint(w_base[off + 8u]) << 16u) | (uint(w_base[off + 9u]) << 24u);
+        uint aux2 = uint(w_base[off + 10u]) | (uint(w_base[off + 11u]) << 8u)
+                  | (uint(w_base[off + 12u]) << 16u) | (uint(w_base[off + 13u]) << 24u);
+        uint tmp = aux2;
+        aux2 = ((aux0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        uint aux3 = ((aux1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        aux0 = (aux0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+        aux1 = (aux1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        thread char scales[8];
+        *((thread uint*)&scales[0]) = aux0;
+        *((thread uint*)&scales[4]) = aux1;
+        uint is = 0u;
+        uchar m = 1u;
+        uint out_i = 0u;
+        for (uint sb = 0u; sb < 2u; ++sb) {
+            uint shift = 0u;
+            for (uint t = 0u; t < 4u; ++t) {
+                float dl = d_all * float(int(scales[is]) - 32);
+                is += 1u;
+                for (uint l = 0u; l < 16u; ++l) {
+                    int h = (hm[l] & m) != 0u ? 0 : 4;
+                    dst[out_i++] = dl * float(int(((q[l] >> shift) & 3u)) - h);
+                }
+                dl = d_all * float(int(scales[is]) - 32);
+                is += 1u;
+                for (uint l = 0u; l < 16u; ++l) {
+                    int h = (hm[l + 16u] & m) != 0u ? 0 : 4;
+                    dst[out_i++] = dl * float(int(((q[l + 16u] >> shift) & 3u)) - h);
+                }
+                shift += 2u;
+                m <<= 1;
+            }
+            q += 32u;
+        }
+    }
+}

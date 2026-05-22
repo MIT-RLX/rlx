@@ -81,6 +81,22 @@ pub fn leaf_order(graph: &Graph) -> Vec<(NodeId, LeafKey)> {
     out
 }
 
+/// Expand scalar host buffers to match a batched graph leaf when vmap
+/// left a shared `[1]` binding but the lifted node is `[B, …]`.
+pub(crate) fn broadcast_leaf_data(name: &str, data: &[f32], shape: &[usize]) -> Result<Vec<f32>, MlxError> {
+    let product: usize = shape.iter().product();
+    if data.len() == product {
+        return Ok(data.to_vec());
+    }
+    if data.len() == 1 && product > 1 {
+        return Ok(vec![data[0]; product]);
+    }
+    Err(MlxError(format!(
+        "leaf '{name}': host len {} != shape {shape:?} product {product}",
+        data.len()
+    )))
+}
+
 /// Build the leaf array for a single node. Prefers typed bytes if a
 /// matching name appears in `inputs_typed` / `params_typed`; falls
 /// back to the f32 host map. The typed path uses Array::from_bytes
@@ -92,6 +108,7 @@ pub fn build_leaf_for(
     inputs: &HashMap<String, Vec<f32>>,
     params_typed: &HashMap<String, (Vec<u8>, DType)>,
     inputs_typed: &HashMap<String, (Vec<u8>, DType)>,
+    gpu_inputs: Option<&HashMap<String, Array>>,
 ) -> Result<Array, MlxError> {
     let node = graph.node(id);
     let shape: Vec<usize> = node
@@ -103,6 +120,11 @@ pub fn build_leaf_for(
     let dtype = node.shape.dtype();
     match &node.op {
         Op::Input { name } => {
+            if let Some(map) = gpu_inputs {
+                if let Some(arr) = map.get(name) {
+                    return arr.clone_handle();
+                }
+            }
             if let Some((bytes, dt)) = inputs_typed.get(name) {
                 if *dt != dtype {
                     return Err(MlxError(format!(
@@ -114,7 +136,8 @@ pub fn build_leaf_for(
             let data = inputs
                 .get(name)
                 .ok_or_else(|| MlxError(format!("missing input '{name}'")))?;
-            Array::from_f32_slice(data, &shape, dtype)
+            let data = broadcast_leaf_data(name, data, &shape)?;
+            Array::from_f32_slice(&data, &shape, dtype)
         }
         Op::Param { name } => {
             if let Some((bytes, dt)) = params_typed.get(name) {
@@ -128,7 +151,8 @@ pub fn build_leaf_for(
             let data = params
                 .get(name)
                 .ok_or_else(|| MlxError(format!("missing param '{name}'")))?;
-            Array::from_f32_slice(data, &shape, dtype)
+            let data = broadcast_leaf_data(name, data, &shape)?;
+            Array::from_f32_slice(&data, &shape, dtype)
         }
         Op::Constant { data } => {
             // Constants are little-endian raw bytes in the node's
@@ -291,7 +315,10 @@ pub fn lower_with_env(
             Op::MatMul => {
                 let a = lookup(&env, node.inputs[0])?;
                 let b = lookup(&env, node.inputs[1])?;
-                ops::matmul(a, b)?
+                let graph_a = node_input_shape(graph, node.inputs[0]);
+                let graph_out = node_input_shape(graph, node.id);
+                let a = flatten_matmul_lhs_if_needed(a, &graph_a, &graph_out)?;
+                ops::matmul(&a, b)?
             }
             // Dense linear solve. MLX's linalg::solve handles the
             // rank-2 single-system case directly. For rlx's
@@ -657,11 +684,13 @@ pub fn lower_with_env(
             }
             Op::Narrow { axis, start, len } => {
                 let x = lookup(&env, node.inputs[0])?;
-                let in_shape: Vec<i32> = node_input_shape(graph, node.inputs[0]);
-                let mut s_start = vec![0i32; in_shape.len()];
-                let mut s_stop = in_shape.clone();
-                s_start[*axis] = *start as i32;
-                s_stop[*axis] = (*start + *len) as i32;
+                let graph_shape = node_input_shape(graph, node.inputs[0]);
+                let runtime_shape: Vec<i32> = x.shape()?.iter().map(|&d| d as i32).collect();
+                let axis_rt = map_graph_axis_to_runtime(*axis, graph_shape.len(), runtime_shape.len());
+                let mut s_start = vec![0i32; runtime_shape.len()];
+                let mut s_stop = runtime_shape.clone();
+                s_start[axis_rt] = *start as i32;
+                s_stop[axis_rt] = (*start + *len) as i32;
                 ops::slice(x, &s_start, &s_stop)?
             }
             Op::Concat { axis } => {
@@ -876,26 +905,34 @@ pub fn lower_with_env(
                 let b = lookup(&env, node.inputs[b_idx])?;
                 ops::layer_norm(&summed, g, Some(b), *eps)?
             }
-            Op::Rope { head_dim } => {
-                // Standard transformer RoPE applied per (batch, seq,
-                // head): for each token at sequence position `s`,
-                // rotate every head's `head_dim` vector using
-                // `cos[s, :]` / `sin[s, :]`. Same position for all
-                // heads (matches candle's `rotary_emb.apply` and HF
-                // transformers `apply_rotary_pos_emb`).
-                //
-                // Accepted layouts (axis containing `seq` shown bold):
-                //   - `[B, **S**, H*D]` — rlx-models packed multi-head;
-                //     reshape to `[B, S, H, D]`, rotate over axis 1.
-                //   - `[B, H, **S**, D]` — candle-style; rotate over axis 2.
-                //   - `[..., **S**, D]` last dim == head_dim — rotate over axis n-2.
-                //   - `[..., **S**, head_dim+tail]` — partial-dim;
-                //     rotate first `head_dim`, pass tail through.
+            Op::FusedResidualRmsNorm { has_bias, eps } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let r = lookup(&env, node.inputs[1])?;
+                let summed = ops::add(x, r)?;
+                let summed = if *has_bias {
+                    let bias = lookup(&env, node.inputs[2])?;
+                    ops::add(&summed, bias)?
+                } else {
+                    summed
+                };
+                let g_idx = if *has_bias { 3 } else { 2 };
+                let g = lookup(&env, node.inputs[g_idx])?;
+                ops::rms_norm(&summed, g, *eps)?
+            }
+            Op::Rope { head_dim, n_rot } => {
                 let x = lookup(&env, node.inputs[0])?;
                 let cos = lookup(&env, node.inputs[1])?;
                 let sin = lookup(&env, node.inputs[2])?;
 
-                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let graph_x = node_input_shape(graph, node.inputs[0]);
+                let x_shape = runtime_shape_or_graph(x, &graph_x)?;
+                let cos_runtime = cos.shape().unwrap_or_default();
+                if cos_runtime.len() != 2 {
+                    return Err(MlxError(format!(
+                        "Rope: cos must be rank-2 [seq, half], got rank-{} shape={cos_runtime:?} (graph x={x_shape:?}, n_rot={n_rot})",
+                        cos_runtime.len()
+                    )));
+                }
                 let n = x_shape.len();
                 if n < 2 {
                     return Err(MlxError("Rope: x must be rank ≥ 2".into()));
@@ -903,49 +940,48 @@ pub fn lower_with_env(
                 if head_dim % 2 != 0 {
                     return Err(MlxError(format!("Rope: head_dim {head_dim} must be even")));
                 }
-                let last = *x_shape.last().unwrap() as usize;
-                if last < *head_dim {
+                if *n_rot > *head_dim || !n_rot.is_multiple_of(2) {
                     return Err(MlxError(format!(
-                        "Rope: x last dim {last} < head_dim {head_dim}"
+                        "Rope: n_rot={n_rot} must be even and <= head_dim={head_dim}"
                     )));
                 }
                 let hd = *head_dim as i32;
-                let half = (head_dim / 2) as i32;
+                let nr = *n_rot as i32;
+                let rot_half = nr / 2;
 
+                let last = *x_shape.last().unwrap() as usize;
+                if last < *n_rot {
+                    return Err(MlxError(format!(
+                        "Rope: x last dim {last} < n_rot {n_rot}"
+                    )));
+                }
                 let heads_in_last = (last / *head_dim) as i32;
-                let multi_head_packed = heads_in_last > 1 && last % *head_dim == 0 && n >= 3;
+                let multi_head_packed =
+                    heads_in_last > 1 && last % *head_dim == 0 && n >= 3;
                 let has_tail = last % *head_dim != 0;
 
-                // ── Helper: rotate `x_rot` of shape `rot_shape`,
-                // broadcasting cos/sin across all axes except `seq_axis`
-                // (which selects the cos/sin row). Returns same-shape.
                 let rotate = |x_rot: &Array,
                               rot_shape: &[i32],
-                              seq_axis: usize|
+                              seq_axis: usize,
+                              pairs: i32|
                  -> Result<Array, MlxError> {
                     let rn = rot_shape.len();
                     let seq_v = rot_shape[seq_axis];
-
-                    let cos_seq = ops::slice(cos, &[0, 0], &[seq_v, half])?;
-                    let sin_seq = ops::slice(sin, &[0, 0], &[seq_v, half])?;
-
-                    // Broadcast cos/sin: [1, ..., 1, seq, 1, ..., 1, half]
-                    // where `seq` is at position `seq_axis` and `half`
-                    // is at the last axis.
+                    let cos_rows = cos.shape()?.first().copied().unwrap_or(0) as i32;
+                    let seq_cos = seq_v.min(cos_rows.max(1));
+                    let cos_seq = ops::slice(cos, &[0, 0], &[seq_cos, pairs])?;
+                    let sin_seq = ops::slice(sin, &[0, 0], &[seq_cos, pairs])?;
                     let mut bshape = vec![1i32; rn];
-                    bshape[seq_axis] = seq_v;
-                    bshape[rn - 1] = half;
+                    bshape[seq_axis] = seq_cos;
+                    bshape[rn - 1] = pairs;
                     let cos_b = ops::reshape(&cos_seq, &bshape)?;
                     let sin_b = ops::reshape(&sin_seq, &bshape)?;
-
-                    // Split last dim into halves.
                     let mut x1_stop = rot_shape.to_vec();
-                    x1_stop[rn - 1] = half;
+                    x1_stop[rn - 1] = pairs;
                     let x1 = ops::slice(x_rot, &vec![0i32; rn], &x1_stop)?;
                     let mut x2_start = vec![0i32; rn];
-                    x2_start[rn - 1] = half;
+                    x2_start[rn - 1] = pairs;
                     let x2 = ops::slice(x_rot, &x2_start, rot_shape)?;
-
                     let x1_cos = ops::mul(&x1, &cos_b)?;
                     let x2_sin = ops::mul(&x2, &sin_b)?;
                     let x2_cos = ops::mul(&x2, &cos_b)?;
@@ -956,31 +992,50 @@ pub fn lower_with_env(
                 };
 
                 if has_tail {
-                    // Rotate first head_dim; concat the unrotated tail.
                     let mut rot_stop = x_shape.clone();
-                    rot_stop[n - 1] = hd;
+                    rot_stop[n - 1] = nr.min(hd);
                     let rot = ops::slice(x, &vec![0i32; n], &rot_stop)?;
                     let mut tail_start = vec![0i32; n];
-                    tail_start[n - 1] = hd;
+                    tail_start[n - 1] = nr.min(hd);
                     let tail = ops::slice(x, &tail_start, &x_shape)?;
                     let mut rot_shape = x_shape.clone();
-                    rot_shape[n - 1] = hd;
-                    let y_rot = rotate(&rot, &rot_shape, n - 2)?;
+                    rot_shape[n - 1] = nr.min(hd);
+                    let y_rot = rotate(&rot, &rot_shape, n - 2, rot_half)?;
                     ops::concat(&[&y_rot, &tail], (n - 1) as i32)?
                 } else if multi_head_packed {
-                    // [B, S, H*D] → [B, S, H, D]. Seq is at axis n-2
-                    // of the ORIGINAL shape == axis n-2 of the split
-                    // shape too (because we only split the last axis).
                     let mut split_shape = x_shape.clone();
                     split_shape[n - 1] = heads_in_last;
                     split_shape.push(hd);
                     let x_split = ops::reshape(x, &split_shape)?;
-                    // seq is at axis n-2 of x_shape == axis n-2 of split_shape
-                    let y_split = rotate(&x_split, &split_shape, n - 2)?;
-                    ops::reshape(&y_split, &x_shape)?
+                    if nr < hd {
+                        let mut rot_stop = split_shape.clone();
+                        rot_stop[n] = nr;
+                        let rot = ops::slice(&x_split, &vec![0i32; n + 1], &rot_stop)?;
+                        let mut pass_start = vec![0i32; n + 1];
+                        pass_start[n] = nr;
+                        let pass = ops::slice(&x_split, &pass_start, &split_shape)?;
+                        let mut rot_shape = split_shape.clone();
+                        rot_shape[n] = nr;
+                        let y_rot = rotate(&rot, &rot_shape, n - 1, rot_half)?;
+                        let y_head = ops::concat(&[&y_rot, &pass], n as i32)?;
+                        ops::reshape(&y_head, &x_shape)?
+                    } else {
+                        let y_split = rotate(&x_split, &split_shape, n - 1, rot_half)?;
+                        ops::reshape(&y_split, &x_shape)?
+                    }
+                } else if nr < hd {
+                    let mut rot_stop = x_shape.clone();
+                    rot_stop[n - 1] = nr;
+                    let rot = ops::slice(x, &vec![0i32; n], &rot_stop)?;
+                    let mut pass_start = vec![0i32; n];
+                    pass_start[n - 1] = nr;
+                    let pass = ops::slice(x, &pass_start, &x_shape)?;
+                    let mut rot_shape = x_shape.clone();
+                    rot_shape[n - 1] = nr;
+                    let y_rot = rotate(&rot, &rot_shape, n - 2, rot_half)?;
+                    ops::concat(&[&y_rot, &pass], (n - 1) as i32)?
                 } else {
-                    // last == head_dim. seq at axis n-2.
-                    rotate(x, &x_shape, n - 2)?
+                    rotate(x, &x_shape, n - 2, rot_half)?
                 }
             }
             Op::Conv {
@@ -1047,6 +1102,118 @@ pub fn lower_with_env(
                         )));
                     }
                 }
+            }
+            Op::LayerNorm2d { eps } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let g = lookup(&env, node.inputs[1])?;
+                let b = lookup(&env, node.inputs[2])?;
+                let shape = x.shape()?;
+                if shape.len() != 4 {
+                    return Err(MlxError(
+                        "LayerNorm2d on MLX: expects NCHW rank-4 input".into(),
+                    ));
+                }
+                let n = shape[0];
+                let c = shape[1];
+                let h = shape[2];
+                let w = shape[3];
+                let flat = ops::reshape(x, &[(n * h * w) as i32, c as i32])?;
+                let y = ops::layer_norm(&flat, g, Some(b), *eps)?;
+                ops::reshape(&y, &[n as i32, c as i32, h as i32, w as i32])?
+            }
+            Op::ConvTranspose2d {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                output_padding,
+                groups,
+            } => {
+                if kernel_size.len() != 2 {
+                    return Err(MlxError(
+                        "ConvTranspose2d on MLX: 2D NCHW only".into(),
+                    ));
+                }
+                let x = lookup(&env, node.inputs[0])?;
+                let w = lookup(&env, node.inputs[1])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let w_shape = node_input_shape(graph, node.inputs[1]);
+                let out_shape: Vec<i32> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
+                if x_shape.len() != 4 || w_shape.len() != 4 || out_shape.len() != 4 {
+                    return Err(MlxError(
+                        "ConvTranspose2d on MLX: rank-4 NCHW tensors only".into(),
+                    ));
+                }
+                let g = *groups as i32;
+                let c_in = x_shape[1];
+                let c_out = out_shape[1];
+                let h = x_shape[2];
+                let w_in = x_shape[3];
+                let h_out = out_shape[2];
+                let w_out = out_shape[3];
+                let kh = w_shape[2];
+                let kw = w_shape[3];
+                let c_in_per_g = c_in / g;
+                let c_out_per_g = c_out / g;
+                let s = |i: usize| stride.get(i).copied().unwrap_or(1) as i32;
+                let p = |i: usize| padding.get(i).copied().unwrap_or(0) as i32;
+                let d = |i: usize| dilation.get(i).copied().unwrap_or(1) as i32;
+                let opad = |i: usize| output_padding.get(i).copied().unwrap_or(0) as i32;
+                let pad_lo: Vec<i32> = vec![d(0) * (kh - 1) - p(0), d(1) * (kw - 1) - p(1)];
+                let pad_hi: Vec<i32> = vec![
+                    h - 1 - s(0) * (h_out - 1) + p(0) + opad(0),
+                    w_in - 1 - s(1) * (w_out - 1) + p(1) + opad(1),
+                ];
+                let x_nhwc = ops::transpose(x, &[0, 2, 3, 1])?;
+                let needs_inflate = g > 1 && (s(0) > 1 || s(1) > 1);
+                let (x_input, conv_input_dilation): (Array, [i32; 2]) = if needs_inflate {
+                    let inflated = inflate_spatial_2d(&x_nhwc, s(0) as usize, s(1) as usize)?;
+                    (inflated, [1, 1])
+                } else {
+                    (x_nhwc.clone_handle()?, [s(0), s(1)])
+                };
+                // Weight [C_in, C_out/g, kH, kW] → MLX [C_in, kH, kW, C_out/g]
+                let w_t = if g == 1 {
+                    ops::transpose(w, &[0, 2, 3, 1])?
+                } else {
+                    let split = ops::reshape(w, &[g, c_in_per_g, c_out_per_g, kh, kw])?;
+                    let perm = ops::transpose(&split, &[0, 1, 3, 4, 2])?;
+                    ops::reshape(&perm, &[c_in, kh, kw, c_out_per_g])?
+                };
+                let raw = ops::conv_general(
+                    &x_input,
+                    &w_t,
+                    &[1, 1],
+                    &pad_lo,
+                    &pad_hi,
+                    &[d(0), d(1)],
+                    &conv_input_dilation,
+                    g,
+                    true,
+                )?;
+                let needs_slice = pad_lo.iter().chain(pad_hi.iter()).any(|&p| p < 0);
+                let adjusted = if needs_slice {
+                    let cur: Vec<i32> = raw.shape()?.iter().map(|&d| d as i32).collect();
+                    let mut start = vec![0i32; cur.len()];
+                    let mut stop = cur.clone();
+                    for i in 0..2 {
+                        if pad_lo[i] < 0 {
+                            start[1 + i] = -pad_lo[i];
+                        }
+                        if pad_hi[i] < 0 {
+                            stop[1 + i] += pad_hi[i];
+                        }
+                    }
+                    ops::slice(&raw, &start, &stop)?
+                } else {
+                    raw
+                };
+                ops::transpose(&adjusted, &[0, 3, 1, 2])?
             }
             Op::TopK { k } => {
                 // Op::TopK returns f32-encoded indices of the k largest
@@ -1115,16 +1282,107 @@ pub fn lower_with_env(
                 let i = lookup(&env, node.inputs[2])?;
                 ops::gather_mm(x, w, i)?
             }
-            Op::DequantMatMul { scheme } => {
-                // Inputs: [x, w_q, scale, zp]. Map to MLX's
-                // quantized_matmul. The bit-width and group-size come
-                // from the rlx QuantScheme.
+            Op::DequantGroupedMatMul { scheme } => {
+                if !scheme.is_gguf() {
+                    return Err(MlxError(
+                        "DequantGroupedMatMul: only GGUF K-quants supported".into(),
+                    ));
+                }
                 let x = lookup(&env, node.inputs[0])?;
                 let wq = lookup(&env, node.inputs[1])?;
-                let s = lookup(&env, node.inputs[2])?;
-                let zp = lookup(&env, node.inputs[3])?;
-                let (bits, gs) = quant_scheme_to_mlx(scheme)?;
-                ops::quantized_matmul(x, wq, s, Some(zp), /*transpose=*/ true, gs, bits)?
+                let idx = lookup(&env, node.inputs[2])?;
+                let out_shape: Vec<usize> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect();
+                let m = out_shape[out_shape.len() - 2];
+                let n = out_shape[out_shape.len() - 1];
+                let x_f32 = x.to_f32()?;
+                let k = x_f32.len() / m.max(1);
+                let w_bytes = wq.to_bytes()?;
+                let idx_f32 = idx.to_f32()?;
+                let block_elems = scheme.gguf_block_size() as usize;
+                let block_bytes = scheme.gguf_block_bytes() as usize;
+                let slab_bytes = (k * n) / block_elems * block_bytes;
+                let num_experts = w_bytes.len() / slab_bytes.max(1);
+                let mut out_host = vec![0f32; m * n];
+                rlx_cpu::gguf_matmul::gguf_grouped_matmul_bt(
+                    &x_f32,
+                    &w_bytes,
+                    &idx_f32,
+                    &mut out_host,
+                    m,
+                    k,
+                    n,
+                    num_experts,
+                    *scheme,
+                );
+                Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
+            }
+            Op::DequantMatMul { scheme } => {
+                if scheme.is_gguf() {
+                    let x = lookup(&env, node.inputs[0])?;
+                    let wq = lookup(&env, node.inputs[1])?;
+                    let w_shape = graph.node(node.inputs[1]).shape.clone();
+                    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                    let total = node.shape.num_elements().unwrap();
+                    let m = total / n.max(1);
+                    let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+                    let k = x_total / m.max(1);
+                    let w_bytes = wq.to_bytes()?;
+                    let mut out_host = vec![0f32; m * n];
+                    rlx_cpu::gguf_matmul::gguf_matmul_bt(
+                        &x.to_f32()?,
+                        &w_bytes,
+                        &mut out_host,
+                        m,
+                        k,
+                        n,
+                        *scheme,
+                    );
+                    let out_shape: Vec<usize> = node.shape.dims().iter().map(|d| d.unwrap_static()).collect();
+                    Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
+                } else if matches!(scheme, rlx_ir::QuantScheme::Nvfp4Block) {
+                    let x = lookup(&env, node.inputs[0])?;
+                    let wq = lookup(&env, node.inputs[1])?;
+                    let sc = lookup(&env, node.inputs[2])?;
+                    let gs_arr = lookup(&env, node.inputs[3])?;
+                    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                    let total = node.shape.num_elements().unwrap();
+                    let m = total / n.max(1);
+                    let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+                    let k = x_total / m.max(1);
+                    let xs = x.to_f32()?;
+                    let w_bytes = wq.to_bytes()?;
+                    let scale_bytes = sc.to_bytes()?;
+                    let global_scale = gs_arr.to_f32()?[0];
+                    let mut out_host = vec![0f32; m * n];
+                    rlx_cpu::thunk::dequant_matmul_nvfp4(
+                        &xs,
+                        &w_bytes,
+                        &scale_bytes,
+                        global_scale,
+                        &mut out_host,
+                        m,
+                        k,
+                        n,
+                    );
+                    let out_shape: Vec<usize> =
+                        node.shape.dims().iter().map(|d| d.unwrap_static()).collect();
+                    Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
+                } else {
+                    // Inputs: [x, w_q, scale, zp]. Map to MLX's
+                    // quantized_matmul. The bit-width and group-size come
+                    // from the rlx QuantScheme.
+                    let x = lookup(&env, node.inputs[0])?;
+                    let wq = lookup(&env, node.inputs[1])?;
+                    let s = lookup(&env, node.inputs[2])?;
+                    let zp = lookup(&env, node.inputs[3])?;
+                    let (bits, gs) = quant_scheme_to_mlx(scheme)?;
+                    ops::quantized_matmul(x, wq, s, Some(zp), /*transpose=*/ true, gs, bits)?
+                }
             }
             Op::LoraMatMul { scale } => {
                 // out = x @ W + scale * (x @ A) @ B
@@ -1347,8 +1605,7 @@ pub fn lower_with_env(
                         h_shape.len()
                     )));
                 }
-                let batch = h_shape[0];
-                let seq = h_shape[1];
+                let (batch, seq) = runtime_bsh_dims(hidden, &h_shape)?;
                 let nh = *num_heads as i32;
                 let hd = *head_dim as i32;
                 let inner = nh * hd;
@@ -1385,13 +1642,22 @@ pub fn lower_with_env(
                     // [B, H, S, D]).
                     let do_rope = |x: &Array| -> Result<Array, MlxError> {
                         let half = hd / 2;
-                        let cos_seq = ops::slice(cos, &[0, 0], &[seq, half])?;
-                        let sin_seq = ops::slice(sin, &[0, 0], &[seq, half])?;
-                        let bshape = [1, 1, seq, half];
+                        let cos_shape = cos.shape().unwrap_or_default();
+                        if cos_shape.len() != 2 {
+                            return Err(MlxError(format!(
+                                "FusedAttentionBlock rope: cos must be rank-2, got rank-{} shape={cos_shape:?}",
+                                cos_shape.len()
+                            )));
+                        }
+                        let cos_rows = cos_shape[0] as i32;
+                        let seq_rope = seq.min(cos_rows);
+                        let cos_seq = ops::slice(cos, &[0, 0], &[seq_rope, half])?;
+                        let sin_seq = ops::slice(sin, &[0, 0], &[seq_rope, half])?;
+                        let bshape = [1, 1, seq_rope, half];
                         let cos_b = ops::reshape(&cos_seq, &bshape)?;
                         let sin_b = ops::reshape(&sin_seq, &bshape)?;
-                        let x1 = ops::slice(x, &[0, 0, 0, 0], &[batch, nh, seq, half])?;
-                        let x2 = ops::slice(x, &[0, 0, 0, half], &[batch, nh, seq, hd])?;
+                        let x1 = ops::slice(x, &[0, 0, 0, 0], &[batch, nh, seq_rope, half])?;
+                        let x2 = ops::slice(x, &[0, 0, 0, half], &[batch, nh, seq_rope, hd])?;
                         let y1 = ops::sub(&ops::mul(&x1, &cos_b)?, &ops::mul(&x2, &sin_b)?)?;
                         let y2 = ops::add(&ops::mul(&x2, &cos_b)?, &ops::mul(&x1, &sin_b)?)?;
                         ops::concat(&[&y1, &y2], 3)
@@ -1434,7 +1700,7 @@ pub fn lower_with_env(
                     y
                 }
             }
-            Op::FusedSwiGLU { cast_to } => {
+            Op::FusedSwiGLU { cast_to, .. } => {
                 let src = lookup(&env, node.inputs[0])?;
                 let in_shape = node_input_shape(graph, node.inputs[0]);
                 let last = *in_shape
@@ -1927,6 +2193,36 @@ pub fn lower_with_env(
 
                 let refs: Vec<&Array> = ys.iter().collect();
                 ops::concat(&refs, 1)?
+            }
+            Op::GatedDeltaNet {
+                state_size,
+                carry_state,
+            } => {
+                let q = lookup(&env, node.inputs[0])?;
+                let k = lookup(&env, node.inputs[1])?;
+                let v = lookup(&env, node.inputs[2])?;
+                let g_in = lookup(&env, node.inputs[3])?;
+                let beta = lookup(&env, node.inputs[4])?;
+                let (out, state_wb) = lower_gated_delta_net(
+                    q,
+                    k,
+                    v,
+                    g_in,
+                    beta,
+                    *state_size,
+                    if *carry_state {
+                        Some(lookup(&env, node.inputs[5])?)
+                    } else {
+                        None
+                    },
+                    node_input_shape(graph, node.inputs[0]),
+                )?;
+                if *carry_state {
+                    if let Some(state_arr) = state_wb {
+                        env.insert(node.inputs[5], state_arr);
+                    }
+                }
+                out
             }
 
             // ── Tier 1 autodiff backward ops ─────────────────────────
@@ -2425,6 +2721,486 @@ pub fn lower_with_env(
                 }
             }
 
+            Op::AttentionBackward {
+                num_heads,
+                head_dim,
+                mask_kind,
+                wrt,
+            } => {
+                let q_in = lookup(&env, node.inputs[0])?;
+                let k_in = lookup(&env, node.inputs[1])?;
+                let v_in = lookup(&env, node.inputs[2])?;
+                let dy_in = lookup(&env, node.inputs[3])?;
+                let q_shape = node_input_shape(graph, node.inputs[0]);
+                let k_shape = node_input_shape(graph, node.inputs[1]);
+                let nh = *num_heads as i32;
+                let hd = *head_dim as i32;
+                let need_split = q_shape.len() == 3;
+                let to_bhsd = |t: &Array, sh: &[i32]| -> Result<Array, MlxError> {
+                    if sh.len() == 4 {
+                        return t.clone_handle();
+                    }
+                    let b = sh[0];
+                    let s = sh[1];
+                    let r = ops::reshape(t, &[b, s, nh, hd])?;
+                    ops::transpose(&r, &[0, 2, 1, 3])
+                };
+                let q = to_bhsd(q_in, &q_shape)?;
+                let k = to_bhsd(k_in, &k_shape)?;
+                let v = to_bhsd(v_in, &node_input_shape(graph, node.inputs[2]))?;
+                let dy = to_bhsd(dy_in, &node_input_shape(graph, node.inputs[3]))?;
+                let q_dtype = graph.node(node.inputs[0]).shape.dtype();
+                let normalize_mask = |m: &Array, m_shape: &[i32]| -> Result<Array, MlxError> {
+                    match m_shape.len() {
+                        2 => ops::reshape(m, &[m_shape[0], 1, 1, m_shape[1]]),
+                        3 => ops::reshape(m, &[m_shape[0], 1, m_shape[1], m_shape[2]]),
+                        _ => m.clone_handle(),
+                    }
+                };
+                let (mask_additive, window) = match mask_kind {
+                    MaskKind::Custom => {
+                        let m = lookup(&env, node.inputs[4])?;
+                        let m_shape = node_input_shape(graph, node.inputs[4]);
+                        let one = Array::from_f32_slice(&[1.0], &[1], q_dtype)?;
+                        let scl = Array::from_f32_slice(&[1.0e9], &[1], q_dtype)?;
+                        let m_cast = if q_dtype != DType::F32 {
+                            ops::cast(m, q_dtype)?
+                        } else {
+                            m.clone_handle()?
+                        };
+                        let shifted = ops::sub(&m_cast, &one)?;
+                        let additive = ops::mul(&shifted, &scl)?;
+                        (Some(normalize_mask(&additive, &m_shape)?), 0usize)
+                    }
+                    MaskKind::Bias => {
+                        let m = lookup(&env, node.inputs[4])?;
+                        let m_shape = node_input_shape(graph, node.inputs[4]);
+                        let m_cast = if q_dtype != DType::F32 {
+                            ops::cast(m, q_dtype)?
+                        } else {
+                            m.clone_handle()?
+                        };
+                        (Some(normalize_mask(&m_cast, &m_shape)?), 0usize)
+                    }
+                    MaskKind::SlidingWindow(w) => (None, *w),
+                    _ => (None, 0usize),
+                };
+                let mask_ref = mask_additive.as_ref();
+                let grad = crate::attention_bwd::attention_backward_bhsd(
+                    *wrt,
+                    &q,
+                    &k,
+                    &v,
+                    &dy,
+                    hd,
+                    *mask_kind,
+                    mask_ref,
+                    window,
+                )?;
+                if need_split {
+                    let b = q_shape[0];
+                    let s = q_shape[1];
+                    let bsd = ops::transpose(&grad, &[0, 2, 1, 3])?;
+                    ops::reshape(&bsd, &[b, s, nh * hd])?
+                } else {
+                    grad
+                }
+            }
+
+            Op::RmsNormBackwardInput { eps, axis: _ } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let gamma = lookup(&env, node.inputs[1])?;
+                let _beta = lookup(&env, node.inputs[2])?;
+                let dy = lookup(&env, node.inputs[3])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let last = (x_shape.len() - 1) as i32;
+                let dtype = node.shape.dtype();
+                let eps_arr = Array::from_f32_slice(&[*eps], &[1], dtype)?;
+
+                let x_sq = ops::mul(x, x)?;
+                let mean_sq = ops::reduce(&x_sq, MlxReduce::Mean, &[last], true)?;
+                let var_eps = ops::add(&mean_sq, &eps_arr)?;
+                let inv_r = ops::unary(&var_eps, MlxUnary::Rsqrt)?;
+                let inv_r3 = ops::mul(&inv_r, &ops::mul(&inv_r, &inv_r)?)?;
+                let dy_g = ops::mul(dy, gamma)?;
+                let dy_gx = ops::mul(&dy_g, x)?;
+                let dot = ops::reduce(&dy_gx, MlxReduce::Mean, &[last], true)?;
+                let x_dot = ops::mul(x, &dot)?;
+                let term = ops::sub(&dy_g, &ops::mul(&x_dot, &inv_r3)?)?;
+                ops::mul(&inv_r, &term)?
+            }
+
+            Op::RmsNormBackwardGamma { eps, axis: _ } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let _gamma = lookup(&env, node.inputs[1])?;
+                let _beta = lookup(&env, node.inputs[2])?;
+                let dy = lookup(&env, node.inputs[3])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let last = (x_shape.len() - 1) as i32;
+                let dtype = node.shape.dtype();
+                let eps_arr = Array::from_f32_slice(&[*eps], &[1], dtype)?;
+
+                let x_sq = ops::mul(x, x)?;
+                let mean_sq = ops::reduce(&x_sq, MlxReduce::Mean, &[last], true)?;
+                let var_eps = ops::add(&mean_sq, &eps_arr)?;
+                let inv_r = ops::unary(&var_eps, MlxUnary::Rsqrt)?;
+                let prod = ops::mul(dy, &ops::mul(x, &inv_r)?)?;
+
+                if last == 0 {
+                    prod
+                } else {
+                    let reduce_axes: Vec<i32> = (0..last).collect();
+                    let summed = ops::reduce(
+                        &prod,
+                        MlxReduce::Sum,
+                        &reduce_axes,
+                        /*keep_dim=*/ false,
+                    )?;
+                    let want: Vec<i32> = node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static() as i32)
+                        .collect();
+                    let got = summed.shape()?;
+                    let got_i32: Vec<i32> = got.iter().map(|&d| d as i32).collect();
+                    if got_i32 == want {
+                        summed
+                    } else {
+                        ops::reshape(&summed, &want)?
+                    }
+                }
+            }
+
+            Op::RmsNormBackwardBeta { axis: _, .. } => {
+                let dy = lookup(&env, node.inputs[3])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let last = (x_shape.len() - 1) as i32;
+                if last == 0 {
+                    dy.clone_handle()?
+                } else {
+                    let reduce_axes: Vec<i32> = (0..last).collect();
+                    let summed = ops::reduce(
+                        dy,
+                        MlxReduce::Sum,
+                        &reduce_axes,
+                        /*keep_dim=*/ false,
+                    )?;
+                    let want: Vec<i32> = node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static() as i32)
+                        .collect();
+                    let got = summed.shape()?;
+                    let got_i32: Vec<i32> = got.iter().map(|&d| d as i32).collect();
+                    if got_i32 == want {
+                        summed
+                    } else {
+                        ops::reshape(&summed, &want)?
+                    }
+                }
+            }
+
+            Op::GroupNormBackwardInput { num_groups, eps } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let gamma = lookup(&env, node.inputs[1])?;
+                let dy = lookup(&env, node.inputs[3])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let dtype = node.shape.dtype();
+                let n = x_shape[0] as i32;
+                let c = x_shape[1] as i32;
+                let h = x_shape[2] as i32;
+                let w = x_shape[3] as i32;
+                let g = *num_groups as i32;
+                let cpg = c / g;
+                let inner = cpg * h * w;
+                let x5 = ops::reshape(x, &[n, g, cpg, h, w])?;
+                let dy5 = ops::reshape(dy, &[n, g, cpg, h, w])?;
+                let x3 = ops::reshape(&x5, &[n, g, inner])?;
+                let dy3 = ops::reshape(&dy5, &[n, g, inner])?;
+                let gamma_g = ops::reshape(gamma, &[1, g, cpg, 1])?;
+                let gamma_b = ops::broadcast_to(&gamma_g, &[n, g, cpg, h * w])?;
+                let gamma_flat = ops::reshape(&gamma_b, &[n, g, inner])?;
+                let eps_arr = Array::from_f32_slice(&[*eps], &[1], dtype)?;
+                let mean = ops::reduce(&x3, MlxReduce::Mean, &[2], true)?;
+                let x_c = ops::sub(&x3, &mean)?;
+                let x_sq = ops::mul(&x_c, &x_c)?;
+                let var = ops::reduce(&x_sq, MlxReduce::Mean, &[2], true)?;
+                let var_eps = ops::add(&var, &eps_arr)?;
+                let inv_std = ops::unary(&var_eps, MlxUnary::Rsqrt)?;
+                let x_hat = ops::mul(&x_c, &inv_std)?;
+                let dy_g = ops::mul(&dy3, &gamma_flat)?;
+                let m_sy = ops::reduce(&dy_g, MlxReduce::Mean, &[2], true)?;
+                let dy_gxh = ops::mul(&dy_g, &x_hat)?;
+                let m_sxh = ops::reduce(&dy_gxh, MlxReduce::Mean, &[2], true)?;
+                let term = ops::sub(
+                    &dy_g,
+                    &ops::add(&m_sy, &ops::mul(&x_hat, &m_sxh)?)?,
+                )?;
+                let dx3 = ops::mul(&inv_std, &term)?;
+                let dx5 = ops::reshape(&dx3, &[n, g, cpg, h, w])?;
+                ops::reshape(&dx5, &[n, c, h, w])?
+            }
+
+            Op::GroupNormBackwardGamma { num_groups, eps } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let dy = lookup(&env, node.inputs[1])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let n = x_shape[0] as i32;
+                let c = x_shape[1] as i32;
+                let h = x_shape[2] as i32;
+                let w = x_shape[3] as i32;
+                let g = *num_groups as i32;
+                let cpg = c / g;
+                let inner = cpg * h * w;
+                let dtype = node.shape.dtype();
+                let eps_arr = Array::from_f32_slice(&[*eps], &[1], dtype)?;
+                let x5 = ops::reshape(x, &[n, g, cpg, h, w])?;
+                let x3 = ops::reshape(&x5, &[n, g, inner])?;
+                let x_sq = ops::mul(&x3, &x3)?;
+                let mean_sq = ops::reduce(&x_sq, MlxReduce::Mean, &[2], true)?;
+                let mean = ops::reduce(&x3, MlxReduce::Mean, &[2], true)?;
+                let mean_sq2 = ops::mul(&mean, &mean)?;
+                let var = ops::sub(&mean_sq, &mean_sq2)?;
+                let var_eps = ops::add(&var, &eps_arr)?;
+                let inv_std = ops::unary(&var_eps, MlxUnary::Rsqrt)?;
+                let x_hat3 = ops::mul(&ops::sub(&x3, &mean)?, &inv_std)?;
+                let x_hat = ops::reshape(&x_hat3, &[n, c, h, w])?;
+                let prod = ops::mul(dy, &x_hat)?;
+                let summed = ops::reduce(&prod, MlxReduce::Sum, &[0, 2, 3], false)?;
+                let want: Vec<i32> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
+                let got = summed.shape()?;
+                let got_i32: Vec<i32> = got.iter().map(|&d| d as i32).collect();
+                if got_i32 == want {
+                    summed
+                } else {
+                    ops::reshape(&summed, &want)?
+                }
+            }
+
+            Op::GroupNormBackwardBeta { num_groups: _, eps: _ } => {
+                let dy = lookup(&env, node.inputs[1])?;
+                let summed = ops::reduce(dy, MlxReduce::Sum, &[0, 2, 3], false)?;
+                let want: Vec<i32> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
+                let got = summed.shape()?;
+                let got_i32: Vec<i32> = got.iter().map(|&d| d as i32).collect();
+                if got_i32 == want {
+                    summed
+                } else {
+                    ops::reshape(&summed, &want)?
+                }
+            }
+
+            Op::CumsumBackward { axis, exclusive } => {
+                let dy = lookup(&env, node.inputs[0])?;
+                let axis_pos = if *axis < 0 {
+                    (node_input_shape(graph, node.inputs[0]).len() as i32 + *axis) as i32
+                } else {
+                    *axis
+                };
+                let total = ops::reduce(dy, MlxReduce::Sum, &[axis_pos], true)?;
+                if *exclusive {
+                    let inc = ops::cumsum(dy, axis_pos, false)?;
+                    ops::sub(&total, &inc)?
+                } else {
+                    let pref = ops::cumsum(dy, axis_pos, true)?;
+                    ops::sub(&total, &pref)?
+                }
+            }
+
+            Op::GatherBackward { axis } => {
+                let dy = lookup(&env, node.inputs[0])?;
+                let indices = lookup(&env, node.inputs[1])?;
+                let out_shape: Vec<i32> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
+                let axis_pos = if *axis < 0 {
+                    (out_shape.len() as i32 + *axis) as i32
+                } else {
+                    *axis
+                };
+                let n_elem: usize = out_shape.iter().product::<i32>() as usize;
+                let zeros = vec![0.0_f32; n_elem];
+                let out_shape_usize: Vec<usize> = out_shape.iter().map(|d| *d as usize).collect();
+                let zero_target = crate::array::Array::from_f32_slice(
+                    &zeros,
+                    &out_shape_usize,
+                    DType::F32,
+                )?;
+                ops::scatter_add_axis(&zero_target, indices, dy, axis_pos)?
+            }
+
+            Op::RopeBackward { head_dim, n_rot } => {
+                // Backward = forward rotation with negated sin (NeoX).
+                let dy = lookup(&env, node.inputs[0])?;
+                let cos = lookup(&env, node.inputs[1])?;
+                let sin = lookup(&env, node.inputs[2])?;
+                let neg_one = Array::from_f32_slice(&[-1.0], &[1], node.shape.dtype())?;
+                let sin_neg = ops::mul(sin, &neg_one)?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let n = x_shape.len();
+                let hd = *head_dim as i32;
+                let nr = *n_rot as i32;
+                let rot_half = nr / 2;
+                if n < 2 {
+                    return Err(MlxError("RopeBackward: dy must be rank ≥ 2".into()));
+                }
+                let rotate = |x_rot: &Array,
+                              rot_shape: &[i32],
+                              seq_axis: usize,
+                              pairs: i32|
+                 -> Result<Array, MlxError> {
+                    let rn = rot_shape.len();
+                    let seq_v = rot_shape[seq_axis];
+                    let cos_seq = ops::slice(cos, &[0, 0], &[seq_v, pairs])?;
+                    let sin_seq = ops::slice(&sin_neg, &[0, 0], &[seq_v, pairs])?;
+                    let mut bshape = vec![1i32; rn];
+                    bshape[seq_axis] = seq_v;
+                    bshape[rn - 1] = pairs;
+                    let cos_b = ops::reshape(&cos_seq, &bshape)?;
+                    let sin_b = ops::reshape(&sin_seq, &bshape)?;
+                    let mut x1_stop = rot_shape.to_vec();
+                    x1_stop[rn - 1] = pairs;
+                    let x1 = ops::slice(x_rot, &vec![0i32; rn], &x1_stop)?;
+                    let mut x2_start = vec![0i32; rn];
+                    x2_start[rn - 1] = pairs;
+                    let x2 = ops::slice(x_rot, &x2_start, rot_shape)?;
+                    let x1_cos = ops::mul(&x1, &cos_b)?;
+                    let x2_sin = ops::mul(&x2, &sin_b)?;
+                    let x2_cos = ops::mul(&x2, &cos_b)?;
+                    let x1_sin = ops::mul(&x1, &sin_b)?;
+                    let y1 = ops::sub(&x1_cos, &x2_sin)?;
+                    let y2 = ops::add(&x2_cos, &x1_sin)?;
+                    ops::concat(&[&y1, &y2], (rn - 1) as i32)
+                };
+                let last = *x_shape.last().unwrap();
+                if last < nr {
+                    return Err(MlxError(format!(
+                        "RopeBackward: last dim {last} < n_rot {n_rot}"
+                    )));
+                }
+                let mut rot_stop = x_shape.clone();
+                rot_stop[n - 1] = nr.min(hd);
+                let rot = ops::slice(dy, &vec![0i32; n], &rot_stop)?;
+                let rotated = rotate(&rot, &rot_stop, n - 2, rot_half)?;
+                if last == nr.min(hd) {
+                    rotated
+                } else {
+                    let mut tail_start = vec![0i32; n];
+                    tail_start[n - 1] = nr.min(hd);
+                    let tail = ops::slice(dy, &tail_start, &x_shape)?;
+                    ops::concat(&[&rotated, &tail], (n - 1) as i32)?
+                }
+            }
+
+            Op::GaussianSplatRender {
+                width,
+                height,
+                tile_size,
+                radius_scale,
+                alpha_cutoff,
+                max_splat_steps,
+                transmittance_threshold,
+                max_list_entries,
+            } => {
+                let positions = lookup(&env, node.inputs[0])?.to_f32()?;
+                let scales = lookup(&env, node.inputs[1])?.to_f32()?;
+                let rotations = lookup(&env, node.inputs[2])?.to_f32()?;
+                let opacities = lookup(&env, node.inputs[3])?.to_f32()?;
+                let colors = lookup(&env, node.inputs[4])?.to_f32()?;
+                let sh_coeffs = lookup(&env, node.inputs[5])?.to_f32()?;
+                let meta = lookup(&env, node.inputs[6])?.to_f32()?;
+                let out_host = crate::splat::render_host_slices(
+                    &positions,
+                    &scales,
+                    &rotations,
+                    &opacities,
+                    &colors,
+                    &sh_coeffs,
+                    &meta,
+                    *width,
+                    *height,
+                    *tile_size,
+                    *radius_scale,
+                    *alpha_cutoff,
+                    *max_splat_steps,
+                    *transmittance_threshold,
+                    *max_list_entries,
+                );
+                let out_shape: Vec<usize> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect();
+                Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
+            }
+
+            Op::GaussianSplatRenderBackward {
+                width,
+                height,
+                tile_size,
+                radius_scale,
+                alpha_cutoff,
+                max_splat_steps,
+                transmittance_threshold,
+                max_list_entries,
+                loss_grad_clip,
+                sh_band,
+                max_anisotropy,
+            } => {
+                let positions = lookup(&env, node.inputs[0])?.to_f32()?;
+                let scales = lookup(&env, node.inputs[1])?.to_f32()?;
+                let rotations = lookup(&env, node.inputs[2])?.to_f32()?;
+                let opacities = lookup(&env, node.inputs[3])?.to_f32()?;
+                let colors = lookup(&env, node.inputs[4])?.to_f32()?;
+                let sh_coeffs = lookup(&env, node.inputs[5])?.to_f32()?;
+                let meta = lookup(&env, node.inputs[6])?.to_f32()?;
+                let d_loss = lookup(&env, node.inputs[7])?.to_f32()?;
+                let packed = crate::splat::backward_host_slices(
+                    &positions,
+                    &scales,
+                    &rotations,
+                    &opacities,
+                    &colors,
+                    &sh_coeffs,
+                    &meta,
+                    &d_loss,
+                    *width,
+                    *height,
+                    *tile_size,
+                    *radius_scale,
+                    *alpha_cutoff,
+                    *max_splat_steps,
+                    *transmittance_threshold,
+                    *max_list_entries,
+                    *loss_grad_clip,
+                    *sh_band,
+                    *max_anisotropy,
+                );
+                let out_shape: Vec<usize> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect();
+                Array::from_f32_slice(&packed, &out_shape, DType::F32)?
+            }
+
             Op::Custom { name, attrs, .. } => {
                 // Dispatch through the registered MlxKernel. Each
                 // input is looked up as an MLX Array (already
@@ -2528,6 +3304,7 @@ pub fn lower_and_run_typed(
         inputs_typed,
         mode,
         /*active_extent=*/ None,
+        None,
     )
 }
 
@@ -2547,6 +3324,7 @@ pub fn lower_and_run_typed_with_extent(
     inputs_typed: &HashMap<String, (Vec<u8>, DType)>,
     mode: MlxMode,
     active_extent: Option<(usize, usize)>,
+    gpu_inputs: Option<&HashMap<String, Array>>,
 ) -> Result<Vec<Array>, MlxError> {
     // Resolve dynamic dims if any. The graph as-given may have
     // Dim::Dynamic entries in Input shapes (and propagated through
@@ -2566,7 +3344,15 @@ pub fn lower_and_run_typed_with_extent(
     for (id, _key) in &order {
         env.insert(
             *id,
-            build_leaf_for(graph, *id, params, inputs, params_typed, inputs_typed)?,
+            build_leaf_for(
+                graph,
+                *id,
+                params,
+                inputs,
+                params_typed,
+                inputs_typed,
+                gpu_inputs,
+            )?,
         );
     }
 
@@ -2668,7 +3454,12 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::ElementwiseRegion { .. } => {}
             // Per-row normalizations: operate on inner axes, batch is
             // pass-through. Safe.
-            Op::Softmax { axis: _ } | Op::LayerNorm { .. } | Op::RmsNorm { .. } => {}
+            Op::Softmax { axis: _ }
+            | Op::LayerNorm { .. }
+            | Op::LayerNorm2d { .. }
+            | Op::GroupNorm { .. }
+            | Op::RmsNorm { .. }
+            | Op::ResizeNearest2x => {}
             // Rope / Attention / matmul: batch in outer dim, computation
             // on inner axes. Safe by construction.
             Op::Rope { .. }
@@ -2678,6 +3469,7 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::FusedMatMulBiasAct { .. }
             | Op::FusedSwiGLU { .. }
             | Op::FusedResidualLN { .. }
+            | Op::FusedResidualRmsNorm { .. }
             | Op::FusedAttentionBlock { .. } => {}
             // DequantMatMul / LoraMatMul follow MatMul's batch-outer
             // contract.
@@ -2740,9 +3532,12 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::Sample { .. }
             | Op::TopK { .. }
             | Op::SelectiveScan { .. }
+            | Op::GatedDeltaNet { .. }
             | Op::GroupedMatMul
             | Op::Pool { .. }
+            | Op::ResizeNearest2x
             | Op::Conv { .. }
+            | Op::ConvTranspose2d { .. }
             | Op::FusedTransformerLayer { .. }
             | Op::DenseSolve
             | Op::Custom { .. }
@@ -2761,8 +3556,8 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             // inference-only batch-bucketing optimization, so the safe
             // default for any training-graph node is `false` regardless
             // of whether MLX can lower it. Tier 1 (Relu/Activation/SCE/
-            // LayerNorm backward) DOES lower on MLX — see the Op match
-            // in `lower_with_env` — it's just never relevant here.
+            // LayerNorm/RmsNorm/Rope/Cumsum/Gather backward) DOES lower
+            // on MLX — see `lower_with_env`.
             Op::ReluBackward
             | Op::ActivationBackward { .. }
             | Op::MaxPool2dBackward { .. }
@@ -2771,7 +3566,16 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::SoftmaxCrossEntropyWithLogits
             | Op::SoftmaxCrossEntropyBackward
             | Op::LayerNormBackwardInput { .. }
-            | Op::LayerNormBackwardGamma { .. } => return false,
+            | Op::LayerNormBackwardGamma { .. }
+            | Op::RmsNormBackwardInput { .. }
+            | Op::RmsNormBackwardGamma { .. }
+            | Op::RmsNormBackwardBeta { .. }
+            | Op::RopeBackward { .. }
+            | Op::CumsumBackward { .. }
+            | Op::GatherBackward { .. }
+            | Op::GroupNormBackwardInput { .. }
+            | Op::GroupNormBackwardGamma { .. }
+            | Op::GroupNormBackwardBeta { .. } => return false,
             Op::Scan { .. }
             | Op::ScanBackward { .. }
             | Op::ScanBackwardXs { .. }
@@ -2785,8 +3589,7 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             Op::Fft { .. } => return false,
             // C64 ops are CPU-only today; pin to Device::Cpu.
             Op::ComplexNormSq | Op::ComplexNormSqBackward | Op::Conjugate => return false,
-            // Stateful RNN op — conservatively pin to CPU.
-            Op::GatedDeltaNet { .. } => return false,
+            _ => return false,
         }
     }
     true
@@ -2940,6 +3743,111 @@ fn quant_scheme_to_mlx(scheme: &rlx_ir::QuantScheme) -> Result<(i32, i32), MlxEr
     Ok((bits, gs))
 }
 
+fn dequant_gguf_weight(
+    w_bytes: &[u8],
+    k: usize,
+    n: usize,
+    scheme: &rlx_ir::QuantScheme,
+) -> Result<Vec<f32>, MlxError> {
+    use rlx_ir::QuantScheme as Q;
+    let elems = k * n;
+    match scheme {
+        Q::GgufQ4K => rlx_gguf::dequant_q4_k(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF Q4_K dequant: {e}"))),
+        Q::GgufQ5K => rlx_gguf::dequant_q5_k(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF Q5_K dequant: {e}"))),
+        Q::GgufQ6K => rlx_gguf::dequant_q6_k(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF Q6_K dequant: {e}"))),
+        Q::GgufQ8K => rlx_gguf::dequant_q8_k(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF Q8_K dequant: {e}"))),
+        other => Err(MlxError(format!(
+            "MLX DequantMatMul: unsupported GGUF scheme {other:?}"
+        ))),
+    }
+}
+
+/// Lower `Op::GatedDeltaNet` by unrolling the time loop into MLX
+/// primitives (same strategy as [`Op::SelectiveScan`]).
+///
+/// When `state_in` is `Some`, threads recurrent state in/out (written
+/// back by the caller to the state input node).
+fn lower_gated_delta_net(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g_in: &Array,
+    beta: &Array,
+    state_size: usize,
+    state_in: Option<&Array>,
+    q_shape: Vec<i32>,
+) -> Result<(Array, Option<Array>), MlxError> {
+    if q_shape.len() != 4 {
+        return Err(MlxError(format!(
+            "GatedDeltaNet: q must be rank-4 [B, S, H, N], got rank {}",
+            q_shape.len()
+        )));
+    }
+    let batch = q_shape[0];
+    let seq = q_shape[1];
+    let heads = q_shape[2];
+    let n = state_size as i32;
+    if n != q_shape[3] {
+        return Err(MlxError(format!(
+            "GatedDeltaNet: state_size={state_size} != q last dim {}",
+            q_shape[3]
+        )));
+    }
+    let bh = batch * heads;
+
+    let mut state = if let Some(s0) = state_in {
+        s0.clone_handle()?
+    } else {
+        let zero = Array::from_f32_slice(&[0.0], &[1], DType::F32)?;
+        ops::broadcast_to(&zero, &[batch, heads, n, n])?
+    };
+
+    let scale = 1.0f32 / (n as f32).sqrt();
+    let scale_arr = Array::from_f32_slice(&[scale], &[1], DType::F32)?;
+
+    let mut ys: Vec<Array> = Vec::with_capacity(seq as usize);
+    for t in 0..seq {
+        let qt = ops::slice(q, &[0, t, 0, 0], &[batch, t + 1, heads, n])?;
+        let kt = ops::slice(k, &[0, t, 0, 0], &[batch, t + 1, heads, n])?;
+        let vt = ops::slice(v, &[0, t, 0, 0], &[batch, t + 1, heads, n])?;
+        let gt = ops::slice(g_in, &[0, t, 0], &[batch, t + 1, heads])?;
+        let beta_t = ops::slice(beta, &[0, t, 0], &[batch, t + 1, heads])?;
+
+        let gt = ops::reshape(&gt, &[batch, heads, 1, 1])?;
+        let beta_bh = ops::reshape(&beta_t, &[bh, 1, 1])?;
+        let exp_g = ops::unary(&gt, MlxUnary::Exp)?;
+        state = ops::mul(&state, &exp_g)?;
+
+        let state_bh = ops::reshape(&state, &[bh, n, n])?;
+        let kt_bh = ops::reshape(&kt, &[bh, 1, n])?;
+        let vt_bh = ops::reshape(&vt, &[bh, 1, n])?;
+
+        let mut sk = ops::matmul(&kt_bh, &state_bh)?;
+        sk = ops::sub(&vt_bh, &sk)?;
+        sk = ops::mul(&sk, &beta_bh)?;
+
+        let kt_col = ops::reshape(&kt, &[bh, n, 1])?;
+        let sk_row = ops::reshape(&sk, &[bh, 1, n])?;
+        let outer = ops::mul(&kt_col, &sk_row)?;
+        state = ops::add(&state, &ops::reshape(&outer, &[batch, heads, n, n])?)?;
+
+        let state_bh = ops::reshape(&state, &[bh, n, n])?;
+        let qt_bh = ops::reshape(&qt, &[bh, 1, n])?;
+        let mut out_t = ops::matmul(&qt_bh, &state_bh)?;
+        out_t = ops::mul(&out_t, &scale_arr)?;
+        out_t = ops::reshape(&out_t, &[batch, 1, heads, n])?;
+        ys.push(out_t);
+    }
+
+    let refs: Vec<&Array> = ys.iter().collect();
+    let out = ops::concat(&refs, 1)?;
+    Ok((out, state_in.map(|_| state)))
+}
+
 fn node_input_shape(graph: &Graph, id: NodeId) -> Vec<i32> {
     graph
         .node(id)
@@ -2948,6 +3856,68 @@ fn node_input_shape(graph: &Graph, id: NodeId) -> Vec<i32> {
         .iter()
         .map(|d| d.unwrap_static() as i32)
         .collect()
+}
+
+/// Prefer runtime shape when rank matches the graph (dynamic seq
+/// specialization can leave stale static dims in the IR).
+fn runtime_shape_or_graph(arr: &Array, graph_shape: &[i32]) -> Result<Vec<i32>, MlxError> {
+    let rt = arr.shape()?;
+    if rt.len() == graph_shape.len() {
+        Ok(rt.iter().map(|&d| d as i32).collect())
+    } else {
+        Ok(graph_shape.to_vec())
+    }
+}
+
+/// Batch/seq from runtime hidden `[B,S,H]` when available (graph dims can
+/// lag dynamic specialization); fall back to graph shape otherwise.
+fn runtime_bsh_dims(hidden: &Array, graph_h: &[i32]) -> Result<(i32, i32), MlxError> {
+    let rt = hidden.shape()?;
+    if rt.len() == 3 {
+        Ok((rt[0] as i32, rt[1] as i32))
+    } else if graph_h.len() == 3 {
+        Ok((graph_h[0], graph_h[1]))
+    } else {
+        Err(MlxError(format!(
+            "runtime_bsh_dims: expected rank-3 hidden, got runtime {rt:?} graph {graph_h:?}"
+        )))
+    }
+}
+
+/// When the graph flattened leading dims (e.g. `[batch*seq, K]`) but MLX
+/// still carries them as `[1, batch*seq, K]`, squeeze the unit batch
+/// dim before matmul. Only applied when the trailing dims match exactly.
+fn flatten_matmul_lhs_if_needed(
+    a: &Array,
+    graph_a: &[i32],
+    graph_out: &[i32],
+) -> Result<Array, MlxError> {
+    if graph_a.len() < 2 || graph_out.len() != graph_a.len() {
+        return a.clone_handle();
+    }
+    let a_rt = a.shape()?;
+    if a_rt.len() != graph_a.len() + 1 || a_rt[0] != 1 {
+        return a.clone_handle();
+    }
+    let matches = graph_a
+        .iter()
+        .enumerate()
+        .all(|(i, &d)| a_rt[i + 1] == d as usize);
+    if matches {
+        ops::reshape(a, graph_a)
+    } else {
+        a.clone_handle()
+    }
+}
+
+/// Map a graph axis index onto the runtime rank when leading dims were
+/// preserved by MLX (graph rank < runtime rank).
+fn map_graph_axis_to_runtime(axis: usize, graph_rank: usize, runtime_rank: usize) -> usize {
+    if runtime_rank <= graph_rank {
+        axis
+    } else {
+        axis + (runtime_rank - graph_rank)
+    }
 }
 
 fn lookup(env: &HashMap<NodeId, Array>, id: NodeId) -> Result<&Array, MlxError> {

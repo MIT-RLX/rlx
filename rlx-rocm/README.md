@@ -107,7 +107,7 @@ What's **not** here yet:
 ## Status
 
 Sister-crate parity with `rlx-cuda`. Build-clean, clippy-clean, 8 unit +
-2 smoke tests pass on Mac. Runtime correctness on real AMD hardware is
+2 basic tests pass on Mac. Runtime correctness on real AMD hardware is
 **unverified** — first cloud-GPU run on MI300X / RX 7900 XTX is the
 validation gate. All library tiers fall through gracefully to the
 kernel-only path when their `.so` isn't loadable.
@@ -154,7 +154,7 @@ git submodule add https://github.com/ROCm-Developer-Tools/HIP-CPU.git \
     rlx-cuda/vendor/HIP-CPU
 git submodule update --init
 
-# Compile + smoke-test the CPU-execution path from rlx-rocm.
+# Compile + basic-test the CPU-execution path from rlx-rocm.
 cargo test -p rlx-rocm --features hip-cpu-validate
 
 # In Docker (any architecture, no GPU needed):
@@ -167,7 +167,7 @@ docker run --rm -v $PWD:/work -w /work rust:1.76 \
 
 ```sh
 cargo build -p rlx-rocm --release          # compile-check on any host
-cargo test  -p rlx-rocm --release          # 2 smoke tests
+cargo test  -p rlx-rocm --release          # 2 basic tests
 ```
 
 ## License

@@ -116,14 +116,12 @@ fn cpu_vs_metal_attention_no_mask_unpadded() {
     let cpu_out = run_on(Device::Cpu, b, s, nh, dh, &qkv, &mask);
     // Force MPSGraph attention path so we exercise the lowering we're
     // trying to validate.
-    unsafe {
-        std::env::set_var("RLX_USE_MPSGRAPH", "1");
-        std::env::set_var("RLX_MPSGRAPH_ATTENTION", "1");
-    }
+    rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
+        rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
     unsafe {
-        std::env::remove_var("RLX_USE_MPSGRAPH");
-        std::env::remove_var("RLX_MPSGRAPH_ATTENTION");
+        rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+        rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
     }
 
     assert_eq!(cpu_out.len(), mtl_out.len());
@@ -150,14 +148,12 @@ fn cpu_vs_metal_attention_multi_head_unpadded() {
     let mask = vec![1.0f32; b * s];
 
     let cpu_out = run_on(Device::Cpu, b, s, nh, dh, &qkv, &mask);
-    unsafe {
-        std::env::set_var("RLX_USE_MPSGRAPH", "1");
-        std::env::set_var("RLX_MPSGRAPH_ATTENTION", "1");
-    }
+    rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
+        rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
     unsafe {
-        std::env::remove_var("RLX_USE_MPSGRAPH");
-        std::env::remove_var("RLX_MPSGRAPH_ATTENTION");
+        rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+        rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
     }
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
@@ -252,10 +248,8 @@ fn cpu_vs_metal_full_block_unpadded() {
         .unwrap();
 
     // Metal with MPSGraph
-    unsafe {
-        std::env::set_var("RLX_USE_MPSGRAPH", "1");
-        std::env::set_var("RLX_MPSGRAPH_ATTENTION", "1");
-    }
+    rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
+        rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
     let session_mtl = Session::new(Device::Metal);
     let mut mtl = session_mtl.compile_with(g, &CompileOptions::default());
     mtl.set_param("qkv_w", &qkv_w_data);
@@ -266,8 +260,8 @@ fn cpu_vs_metal_full_block_unpadded() {
         .next()
         .unwrap();
     unsafe {
-        std::env::remove_var("RLX_USE_MPSGRAPH");
-        std::env::remove_var("RLX_MPSGRAPH_ATTENTION");
+        rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+        rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
     }
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
@@ -303,10 +297,8 @@ fn bisect(
     }
     let cpu_out = cpu.run(inputs).into_iter().next().unwrap();
 
-    unsafe {
-        std::env::set_var("RLX_USE_MPSGRAPH", "1");
-        std::env::set_var("RLX_MPSGRAPH_ATTENTION", "1");
-    }
+    rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
+        rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
     let session_mtl = Session::new(Device::Metal);
     let mut mtl = session_mtl.compile_with(g, &opts);
     for (n, d) in params {
@@ -314,8 +306,8 @@ fn bisect(
     }
     let mtl_out = mtl.run(inputs).into_iter().next().unwrap();
     unsafe {
-        std::env::remove_var("RLX_USE_MPSGRAPH");
-        std::env::remove_var("RLX_MPSGRAPH_ATTENTION");
+        rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+        rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
     }
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
@@ -820,14 +812,12 @@ fn cpu_vs_metal_attention_with_padding() {
     let mask = vec![1.0f32, 1.0, 0.0, 0.0];
 
     let cpu_out = run_on(Device::Cpu, b, s, nh, dh, &qkv, &mask);
-    unsafe {
-        std::env::set_var("RLX_USE_MPSGRAPH", "1");
-        std::env::set_var("RLX_MPSGRAPH_ATTENTION", "1");
-    }
+    rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
+        rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
     unsafe {
-        std::env::remove_var("RLX_USE_MPSGRAPH");
-        std::env::remove_var("RLX_MPSGRAPH_ATTENTION");
+        rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+        rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
     }
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);

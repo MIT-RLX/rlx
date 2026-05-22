@@ -21,8 +21,9 @@
 //!   - **Eager** — eval after every op. Slower; useful for debugging
 //!     where the failure surfaces at the offending op.
 //!
-//! Mode is selected at compile time via `MlxBackend::compile_with_mode`
-//! or globally via the `RLX_MLX_MODE=eager|lazy` env var.
+//! Mode is selected at compile time via `MlxExecutable::compile_with_mode`
+//! or `MlxExecutable::compile_from_fused` (pre-fused LIR graphs), or
+//! globally via the `RLX_MLX_MODE=eager|lazy|compiled` env var.
 //!
 //! Layout mirrors rlx-cpu / rlx-metal:
 //! - `ffi`     — raw `extern "C"` declarations for the C++ shim
@@ -41,6 +42,9 @@ pub mod array;
 pub mod ops;
 
 #[cfg(target_os = "macos")]
+pub mod attention_bwd;
+
+#[cfg(target_os = "macos")]
 pub mod lower;
 
 #[cfg(target_os = "macos")]
@@ -56,7 +60,13 @@ pub mod calibrate;
 pub mod op_registry;
 
 #[cfg(target_os = "macos")]
+pub mod splat;
+
+#[cfg(target_os = "macos")]
 pub mod batched_lu_kernel;
+
+#[cfg(target_os = "macos")]
+pub mod llada2_gate;
 
 #[cfg(target_os = "macos")]
 pub use array::{Array, MlxError, eval, version};

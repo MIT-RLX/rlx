@@ -50,12 +50,10 @@ fn main() {
 
     let run_with = |use_mpsgraph: bool| -> Vec<f32> {
         if use_mpsgraph {
-            unsafe {
-                std::env::set_var("RLX_USE_MPSGRAPH", "1");
-            }
+            rlx_ir::env::set("RLX_USE_MPSGRAPH", "1")
         } else {
             unsafe {
-                std::env::remove_var("RLX_USE_MPSGRAPH");
+                rlx_ir::env::unset("RLX_USE_MPSGRAPH");
             }
         }
         let session = Session::new(Device::Metal);

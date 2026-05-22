@@ -24,6 +24,7 @@ publish = false
 [dependencies]
 rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", features = ["splat"] }
 
 # libloading dlopens libamdhip64 / libhiprtc at runtime so the crate
 # compiles + tests cleanly on hosts that don't have HIP installed

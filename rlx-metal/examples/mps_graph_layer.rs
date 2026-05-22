@@ -49,7 +49,7 @@ fn main() {
 
     // Allocate one shared MTLBuffer per parameter / activation. Real
     // integration would slice from the arena; here separate buffers
-    // simplify the smoke setup.
+    // simplify the check setup.
     let alloc_buf = |n_floats: usize| -> metal::Buffer {
         dev.device
             .new_buffer((n_floats * 4) as u64, MTLResourceOptions::StorageModeShared)

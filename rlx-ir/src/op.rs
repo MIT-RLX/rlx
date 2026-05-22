@@ -21,6 +21,7 @@
 use crate::DType;
 
 /// Unary element-wise activation functions.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Activation {
     Gelu,
@@ -69,6 +70,7 @@ pub enum Activation {
 /// * `Fixed` — never recompute. The state tensor's value is
 ///   used as-is each call (set once at construction or by the
 ///   caller). Useful when scales are pre-calibrated.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
 pub enum ScaleMode {
     #[default]
@@ -114,6 +116,7 @@ impl std::hash::Hash for ScaleMode {
 /// * `HardTanh` — `dx = upstream * (1 - |x/(q_max·s)|).max(0)`.
 ///   Piecewise-linear cousin of `Tanh`; cheaper to compute and
 ///   nearly as effective.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SteKind {
     #[default]
@@ -124,6 +127,7 @@ pub enum SteKind {
 }
 
 /// Binary element-wise operations.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Add,
@@ -136,6 +140,7 @@ pub enum BinaryOp {
 }
 
 /// Comparison operations (return Bool tensor).
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Eq,
@@ -159,6 +164,7 @@ pub enum CmpOp {
 ///      ever exists.
 ///
 /// `Custom` is the existing path — read mask values from the 4th input.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MaskKind {
     /// No masking — every position attends to every position.
@@ -179,7 +185,17 @@ pub enum MaskKind {
     Bias,
 }
 
+/// Which forward input an [`Op::AttentionBackward`] node differentiates.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AttentionBwdWrt {
+    Query,
+    Key,
+    Value,
+}
+
 /// Reduction operations along specified axes.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReduceOp {
     Sum,
@@ -194,6 +210,7 @@ pub enum ReduceOp {
 /// which ops a backend can lower; the `LegalizeForBackend` pass in
 /// `rlx-opt` checks the graph against this set and fails the compile
 /// when an unsupported op is present (instead of silent fallback).
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpKind {
     Input,
@@ -216,9 +233,13 @@ pub enum OpKind {
     DenseSolve,
     BatchedDenseSolve,
     LayerNorm,
+    LayerNorm2d,
+    GroupNorm,
     RmsNorm,
+    ResizeNearest2x,
     Attention,
     Rope,
+    AxialRope2d,
     Reshape,
     Transpose,
     Narrow,
@@ -231,6 +252,7 @@ pub enum OpKind {
     TopK,
     Sample,
     Conv,
+    ConvTranspose2d,
     Pool,
     ReluBackward,
     ActivationBackward,
@@ -243,9 +265,21 @@ pub enum OpKind {
     Conv2dBackwardWeight,
     SoftmaxCrossEntropyWithLogits,
     SoftmaxCrossEntropyBackward,
+    AttentionBackward,
     LayerNormBackwardInput,
     LayerNormBackwardGamma,
+    RmsNormBackwardInput,
+    RmsNormBackwardGamma,
+    RmsNormBackwardBeta,
+    RopeBackward,
+    GroupNormBackwardInput,
+    GroupNormBackwardGamma,
+    GroupNormBackwardBeta,
+    CumsumBackward,
+    GatherBackward,
     GroupedMatMul,
+    DequantGroupedMatMul,
+    DequantMoEWeights,
     ScatterAdd,
     LoraMatMul,
     DequantMatMul,
@@ -256,6 +290,7 @@ pub enum OpKind {
     FusedSwiGLU,
     FusedMatMulBiasAct,
     FusedResidualLN,
+    FusedResidualRmsNorm,
     FusedAttentionBlock,
     FusedTransformerLayer,
     If,
@@ -263,6 +298,15 @@ pub enum OpKind {
     Scan,
     ScanBackward,
     ScanBackwardXs,
+    /// CPU reference 3D Gaussian splat raster (project → bin → sort → raster).
+    /// See [`Op::GaussianSplatRender`].
+    GaussianSplatRender,
+    /// Backward of [`Op::GaussianSplatRender`] — packed scene parameter gradients.
+    GaussianSplatRenderBackward,
+    /// Project + tile bin + sort + ray grid (strict IR splat stage 1).
+    GaussianSplatPrepare,
+    /// Per-pixel raster from prepared buffers (strict IR splat stage 2).
+    GaussianSplatRasterize,
     /// User-registered op dispatched through `op_registry`. All
     /// custom ops (Sparse-LU, FFT, eigensolve, ...) share this kind;
     /// the per-op identity lives in `Op::Custom::name`.
@@ -277,6 +321,7 @@ pub enum OpKind {
 /// An operand inside a fused [`ChainStep`] — either a graph-level input
 /// to the [`Op::ElementwiseRegion`] (by index 0..num_inputs) or the
 /// result of a previous step in the chain (by index 0..step_position).
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChainOperand {
     Input(u32),
@@ -286,6 +331,7 @@ pub enum ChainOperand {
 /// One step in a fused element-wise chain. Each step produces exactly
 /// one scalar result (per element); later steps can refer to it via
 /// [`ChainOperand::Step`]. The whole chain runs per element in registers.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChainStep {
     Activation(Activation, ChainOperand),
@@ -306,6 +352,7 @@ pub enum ChainStep {
 /// - Element-wise ops fuse with anything reading their output
 /// - Matmul/Conv are BLAS-dispatched and form fusion boundaries
 /// - Reductions are fusion roots (drive the loop iteration)
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     // ── Graph inputs ────────────────────────────────────────────
@@ -508,6 +555,22 @@ pub enum Op {
         eps: f32,
     },
 
+    /// Group normalization on NCHW tensors: `input`, `gamma`, `beta` → same shape.
+    /// Normalizes over `(C/num_groups) × H × W` per group.
+    GroupNorm {
+        num_groups: usize,
+        eps: f32,
+    },
+
+    /// LayerNorm2d on NCHW: normalize across the channel axis at each spatial
+    /// position (candle / SAM `LayerNorm2d` semantics — not PyTorch's H×W norm).
+    LayerNorm2d {
+        eps: f32,
+    },
+
+    /// Nearest-neighbor 2× upsample on NCHW (doubles spatial dims 2 and 3).
+    ResizeNearest2x,
+
     /// RMS normalization: input, gamma → normalized output.
     RmsNorm {
         axis: i32,
@@ -528,9 +591,22 @@ pub enum Op {
     },
 
     /// Rotary position embedding applied to one tensor: x, cos, sin → x_rotated.
-    /// Apply separately to Q and K. head_dim determines the rotation split.
+    /// Apply separately to Q and K. `head_dim` is the per-head width; `n_rot`
+    /// is how many leading dims get NeoX RoPE (pair offset `n_rot/2`). When
+    /// `n_rot < head_dim`, trailing dims are copied unchanged (Qwen3.5 MRoPE).
     Rope {
         head_dim: usize,
+        n_rot: usize,
+    },
+
+    /// SAM2 axial 2-D RoPE on `[batch, seq, num_heads * head_dim]`.
+    AxialRope2d {
+        end_x: usize,
+        end_y: usize,
+        head_dim: usize,
+        num_heads: usize,
+        theta: f32,
+        repeat_factor: usize,
     },
 
     // ── Shape manipulation ──────────────────────────────────────
@@ -612,14 +688,16 @@ pub enum Op {
     ///   `g     [b, s, h_v]`     f32 log-gate (exp'd inside kernel)
     ///   `beta  [b, s, h_v]`     f32 delta-rule mixing factor
     ///
-    /// Output: `[b, s, h_v, n]` f32. The (S×S×H) state matrix is
-    /// not exposed to the graph — kernel allocates internally and
-    /// resets per batch.
+    /// Output: `[b, s, h_v, n]` f32.
     ///
-    /// `state_size` = `n` is exposed for the cost model + so the
-    /// kernel can preallocate without inspecting input shapes.
+    /// When `carry_state` is true, a sixth input `state [b, h_v, n, n]`
+    /// provides the initial SSM matrix per head; the kernel updates it
+    /// in place across the sequence and leaves the final state in the
+    /// same buffer (same layout as the internal scan state:
+    /// `state[h, i, j]` row-major over `(n, n)` per head).
     GatedDeltaNet {
         state_size: usize,
+        carry_state: bool,
     },
 
     /// Fused dequant + matmul (plan #5). The biggest LLM-bandwidth
@@ -641,6 +719,12 @@ pub enum Op {
     ///   `scale [k/block, n]`   per-block f32 dequant scale
     ///   `zp    [k/block, n]`   per-block f32 zero-point
     ///                          (zero-tensor if symmetric)
+    ///
+    /// Inputs (`Nvfp4Block` — fixed group size 16 along K):
+    ///   `x [m, k]`             f32 activations
+    ///   `w_q [k,n/2]` packed   FP4 E2M1 codes (unsigned nibble 0..15)
+    ///   `scale [k/16, n]` u8   FP8 E4M3 block scales (one byte / group)
+    ///   `global_scale [1]` f32 per-tensor scale (pass `[1.0]` if unused)
     ///
     /// Inputs (GGUF schemes — `scheme.is_gguf() == true`):
     ///   `x [m, k]`             f32 activations
@@ -771,6 +855,21 @@ pub enum Op {
     /// segmented/grouped GEMM when there's a real workload.
     GroupedMatMul,
 
+    /// Fused GGUF K-quant dequant + [`Op::GroupedMatMul`]. Same three
+    /// inputs as `GroupedMatMul`, but `weight` is a U8 tensor holding
+    /// `num_experts` contiguous packed expert slabs (GGML layout, expert
+    /// dimension outermost). Scales live inside the packed bytes.
+    DequantGroupedMatMul {
+        scheme: crate::quant::QuantScheme,
+    },
+
+    /// Dequant a packed MoE expert stack to F32 `[num_experts, K, N]` in
+    /// GroupedMatMul layout. Input: U8 packed bytes; output shape is
+    /// declared on the node (`[E, K, N]`).
+    DequantMoEWeights {
+        scheme: crate::quant::QuantScheme,
+    },
+
     /// Scatter-add into a destination tensor. The "unpermute" half of
     /// MoE routing (also useful for embedding gradient updates).
     /// Inputs: `[updates, indices]`
@@ -783,11 +882,24 @@ pub enum Op {
     ScatterAdd,
 
     // ── Convolution ─────────────────────────────────────────────
+    /// 2D convolution on NCHW tensors. Also exposed as [`OpKind::Conv`] / `conv2d`.
+    /// Weight layout: `[C_out, C_in / groups, kH, kW]`.
     Conv {
         kernel_size: Vec<usize>,
         stride: Vec<usize>,
         padding: Vec<usize>,
         dilation: Vec<usize>,
+        groups: usize,
+    },
+
+    /// 2D transposed convolution on NCHW. Weight layout (PyTorch):
+    /// `[C_in, C_out / groups, kH, kW]`.
+    ConvTranspose2d {
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+        dilation: Vec<usize>,
+        output_padding: Vec<usize>,
         groups: usize,
     },
 
@@ -850,6 +962,60 @@ pub enum Op {
     LayerNormBackwardGamma {
         axis: i32,
         eps: f32,
+    },
+
+    /// RMSNorm backward w.r.t. input. Inputs `[x, gamma, beta, dy]`; output = `x.shape`.
+    RmsNormBackwardInput {
+        axis: i32,
+        eps: f32,
+    },
+
+    /// RMSNorm backward w.r.t. gamma. Inputs `[x, gamma, beta, dy]`; output = `gamma.shape`.
+    RmsNormBackwardGamma {
+        axis: i32,
+        eps: f32,
+    },
+
+    /// RMSNorm backward w.r.t. beta. Inputs `[x, gamma, beta, dy]`; output = `beta.shape`.
+    RmsNormBackwardBeta {
+        axis: i32,
+        eps: f32,
+    },
+
+    /// RoPE backward w.r.t. `x`. Inputs `[dy, cos, sin]`; output = `dy.shape`.
+    RopeBackward {
+        head_dim: usize,
+        n_rot: usize,
+    },
+
+    /// GroupNorm (NCHW) backward w.r.t. input. Inputs `[x, gamma, beta, dy]`.
+    GroupNormBackwardInput {
+        num_groups: usize,
+        eps: f32,
+    },
+
+    /// GroupNorm backward w.r.t. gamma. Inputs `[x, dy]`; output = `gamma.shape`.
+    GroupNormBackwardGamma {
+        num_groups: usize,
+        eps: f32,
+    },
+
+    /// GroupNorm backward w.r.t. beta. Inputs `[x, dy]`; output = `beta.shape`.
+    GroupNormBackwardBeta {
+        num_groups: usize,
+        eps: f32,
+    },
+
+    /// Cumsum backward along `axis`. Inputs `[dy]`; output matches forward input shape.
+    CumsumBackward {
+        axis: i32,
+        exclusive: bool,
+    },
+
+    /// Gather backward (scatter-add into table). Inputs `[dy, indices]`; output = table shape.
+    /// `axis` matches forward [`Op::Gather`].
+    GatherBackward {
+        axis: i32,
     },
 
     /// Generic element-wise activation backward. `kind` selects the
@@ -945,6 +1111,22 @@ pub enum Op {
     /// it through from the forward node.
     SoftmaxCrossEntropyBackward,
 
+    /// Backward of [`Op::Attention`]. Recomputes scaled `QK^T`, applies
+    /// the same `mask_kind` as the forward op, softmaxes scores, then
+    /// emits **one** of `dQ`, `dK`, or `dV` selected by [`AttentionBwdWrt`].
+    /// Autodiff emits three nodes (one per `wrt`) so each output shape
+    /// stays a normal single-output MIR node.
+    ///
+    /// Inputs: `[q, k, v, dy]` plus optional mask when `mask_kind` is
+    /// [`MaskKind::Custom`] or [`MaskKind::Bias`] (same convention as
+    /// forward). Output shape matches `q`, `k`, or `v` respectively.
+    AttentionBackward {
+        num_heads: usize,
+        head_dim: usize,
+        mask_kind: MaskKind,
+        wrt: AttentionBwdWrt,
+    },
+
     // ── Fused operations (created by optimization passes) ──────
     /// Fused matmul + bias + activation. Created from MatMul → Add → Activation.
     FusedMatMulBiasAct {
@@ -954,6 +1136,13 @@ pub enum Op {
     /// Fused residual + optional bias + layer norm.
     /// Created from Add(x, residual) → [Add(bias)] → LayerNorm.
     FusedResidualLN {
+        has_bias: bool,
+        eps: f32,
+    },
+
+    /// Fused residual + optional bias + RMS norm.
+    /// Created from Add(x, residual) → [Add(bias)] → RmsNorm.
+    FusedResidualRmsNorm {
         has_bias: bool,
         eps: f32,
     },
@@ -968,6 +1157,11 @@ pub enum Op {
     /// inserts a Cast node so this stays `None` in current pipelines.
     FusedSwiGLU {
         cast_to: Option<DType>,
+        /// When `true`, the concatenated input stores gate in the low half
+        /// `[..., 0..N)` and up in the high half `[..., N..2N)` — the layout
+        /// produced when gate projection is emitted before up in the builder.
+        /// Default `false`: up @ low, gate @ high (canonical concat order).
+        gate_first: bool,
     },
 
     /// Fused full transformer layer: attention block + residual+LN + FFN + residual+LN.
@@ -1036,7 +1230,7 @@ pub enum Op {
     //   3. Schedule-level dispatch when the predicate / loop cond is
     //      resolved at runtime.
     // Estimate: 4–6 hours of focused work + parity tests. Deferred
-    // because no current model in burnembed/rlx-models uses these ops;
+    // because no current in-tree model uses these ops;
     // surface area without a validation target invites silent bugs.
     /// Conditional: pick between two subgraphs based on a boolean predicate.
     /// Inputs: [predicate, ...captures (used inside both branches)].
@@ -1169,6 +1363,85 @@ pub enum Op {
         forward_body: Option<Box<crate::Graph>>,
     },
 
+    /// CPU reference 3D Gaussian splat forward render.
+    ///
+    /// Seven flat F32 inputs (scene buffers + camera/render meta):
+    ///   0. positions `[N*3]`
+    ///   1. scales `[N*3]` (log-space)
+    ///   2. rotations `[N*4]` (xyzw)
+    ///   3. opacities `[N]` (logit)
+    ///   4. colors `[N*3]` (linear RGB)
+    ///   5. sh_coeffs `[N * sh_coeff_count * 3]`
+    ///   6. meta `[23]` — camera position/target/up/fov/near/far, background RGB,
+    ///      then width/height/tile_size/radius_scale/alpha_cutoff/max_splat_steps/
+    ///      transmittance_threshold/max_list_entries as f32 bit-patterns.
+    ///
+    /// Output: `[height * width * 4]` linear RGBA (display gamma baked in).
+    /// Build via [`crate::Graph::gaussian_splat_render`].
+    ///
+    /// Differentiable backward is not implemented in v1; autodiff treats this
+    /// op as non-differentiable (same as [`Op::Sample`]).
+    GaussianSplatRender {
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        radius_scale: f32,
+        alpha_cutoff: f32,
+        max_splat_steps: u32,
+        transmittance_threshold: f32,
+        max_list_entries: u32,
+    },
+
+    /// Backward pass for [`Self::GaussianSplatRender`].
+    ///
+    /// Eight inputs: the same seven as forward plus `d_loss_rgba` `[W*H*4]`
+    /// (only RGB channels are used). Re-runs the training forward internally.
+    ///
+    /// Output: packed gradients
+    /// `[positions(3N) | scales(3N) | rotations(4N) | opacities(N) | colors(3N) | sh(N*sh*3)]`.
+    /// Unpack via [`crate::ops::splat::unpack_gaussian_splat_packed_grads`].
+    GaussianSplatRenderBackward {
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        radius_scale: f32,
+        alpha_cutoff: f32,
+        max_splat_steps: u32,
+        transmittance_threshold: f32,
+        max_list_entries: u32,
+        loss_grad_clip: f32,
+        sh_band: u32,
+        max_anisotropy: f32,
+    },
+
+    /// Strict IR stage 1: project, bin, sort, build per-pixel rays.
+    ///
+    /// Seven inputs (same scene + meta as [`Self::GaussianSplatRender`]). Output: packed
+    /// prepare buffer (see `rlx_splat::prep_layout::prep_packed_len`).
+    GaussianSplatPrepare {
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        radius_scale: f32,
+        alpha_cutoff: f32,
+        max_splat_steps: u32,
+        transmittance_threshold: f32,
+        max_list_entries: u32,
+    },
+
+    /// Strict IR stage 2: tile raster from [`Self::GaussianSplatPrepare`] output.
+    ///
+    /// Inputs: `prep` packed buffer, `meta` `[23]`. Output: `[width * height * 4]` RGBA.
+    GaussianSplatRasterize {
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        alpha_cutoff: f32,
+        max_splat_steps: u32,
+        transmittance_threshold: f32,
+        max_list_entries: u32,
+    },
+
     /// User-registered custom op. `name` keys into the
     /// [`crate::op_registry`] for shape inference, autodiff, and
     /// per-backend execution. `attrs` is an opaque blob passed
@@ -1282,9 +1555,13 @@ impl Op {
             Op::DenseSolve => OpKind::DenseSolve,
             Op::BatchedDenseSolve => OpKind::BatchedDenseSolve,
             Op::LayerNorm { .. } => OpKind::LayerNorm,
+            Op::LayerNorm2d { .. } => OpKind::LayerNorm2d,
+            Op::GroupNorm { .. } => OpKind::GroupNorm,
             Op::RmsNorm { .. } => OpKind::RmsNorm,
+            Op::ResizeNearest2x => OpKind::ResizeNearest2x,
             Op::Attention { .. } => OpKind::Attention,
             Op::Rope { .. } => OpKind::Rope,
+            Op::AxialRope2d { .. } => OpKind::AxialRope2d,
             Op::Reshape { .. } => OpKind::Reshape,
             Op::Transpose { .. } => OpKind::Transpose,
             Op::Narrow { .. } => OpKind::Narrow,
@@ -1297,6 +1574,7 @@ impl Op {
             Op::TopK { .. } => OpKind::TopK,
             Op::Sample { .. } => OpKind::Sample,
             Op::Conv { .. } => OpKind::Conv,
+            Op::ConvTranspose2d { .. } => OpKind::ConvTranspose2d,
             Op::Pool { .. } => OpKind::Pool,
             Op::ReluBackward => OpKind::ReluBackward,
             Op::ActivationBackward { .. } => OpKind::ActivationBackward,
@@ -1306,12 +1584,24 @@ impl Op {
             Op::Conjugate => OpKind::Conjugate,
             Op::LayerNormBackwardInput { .. } => OpKind::LayerNormBackwardInput,
             Op::LayerNormBackwardGamma { .. } => OpKind::LayerNormBackwardGamma,
+            Op::RmsNormBackwardInput { .. } => OpKind::RmsNormBackwardInput,
+            Op::RmsNormBackwardGamma { .. } => OpKind::RmsNormBackwardGamma,
+            Op::RmsNormBackwardBeta { .. } => OpKind::RmsNormBackwardBeta,
+            Op::RopeBackward { .. } => OpKind::RopeBackward,
+            Op::GroupNormBackwardInput { .. } => OpKind::GroupNormBackwardInput,
+            Op::GroupNormBackwardGamma { .. } => OpKind::GroupNormBackwardGamma,
+            Op::GroupNormBackwardBeta { .. } => OpKind::GroupNormBackwardBeta,
+            Op::CumsumBackward { .. } => OpKind::CumsumBackward,
+            Op::GatherBackward { .. } => OpKind::GatherBackward,
             Op::MaxPool2dBackward { .. } => OpKind::MaxPool2dBackward,
             Op::Conv2dBackwardInput { .. } => OpKind::Conv2dBackwardInput,
             Op::Conv2dBackwardWeight { .. } => OpKind::Conv2dBackwardWeight,
             Op::SoftmaxCrossEntropyWithLogits => OpKind::SoftmaxCrossEntropyWithLogits,
             Op::SoftmaxCrossEntropyBackward => OpKind::SoftmaxCrossEntropyBackward,
+            Op::AttentionBackward { .. } => OpKind::AttentionBackward,
             Op::GroupedMatMul => OpKind::GroupedMatMul,
+            Op::DequantGroupedMatMul { .. } => OpKind::DequantGroupedMatMul,
+            Op::DequantMoEWeights { .. } => OpKind::DequantMoEWeights,
             Op::ScatterAdd => OpKind::ScatterAdd,
             Op::LoraMatMul { .. } => OpKind::LoraMatMul,
             Op::DequantMatMul { .. } => OpKind::DequantMatMul,
@@ -1322,6 +1612,7 @@ impl Op {
             Op::FusedSwiGLU { .. } => OpKind::FusedSwiGLU,
             Op::FusedMatMulBiasAct { .. } => OpKind::FusedMatMulBiasAct,
             Op::FusedResidualLN { .. } => OpKind::FusedResidualLN,
+            Op::FusedResidualRmsNorm { .. } => OpKind::FusedResidualRmsNorm,
             Op::FusedAttentionBlock { .. } => OpKind::FusedAttentionBlock,
             Op::FusedTransformerLayer { .. } => OpKind::FusedTransformerLayer,
             Op::If { .. } => OpKind::If,
@@ -1329,6 +1620,10 @@ impl Op {
             Op::Scan { .. } => OpKind::Scan,
             Op::ScanBackward { .. } => OpKind::ScanBackward,
             Op::ScanBackwardXs { .. } => OpKind::ScanBackwardXs,
+            Op::GaussianSplatRender { .. } => OpKind::GaussianSplatRender,
+            Op::GaussianSplatRenderBackward { .. } => OpKind::GaussianSplatRenderBackward,
+            Op::GaussianSplatPrepare { .. } => OpKind::GaussianSplatPrepare,
+            Op::GaussianSplatRasterize { .. } => OpKind::GaussianSplatRasterize,
             Op::Custom { .. } => OpKind::Custom,
             Op::CustomFn { .. } => OpKind::CustomFn,
             Op::Fft { .. } => OpKind::Fft,
@@ -1358,13 +1653,28 @@ impl Op {
                 | Op::DenseSolve
                 | Op::BatchedDenseSolve
                 | Op::Conv { .. }
+                | Op::ConvTranspose2d { .. }
                 | Op::FusedMatMulBiasAct { .. }
                 | Op::GroupedMatMul
+                | Op::DequantGroupedMatMul { .. }
+                | Op::DequantMoEWeights { .. }
                 | Op::LoraMatMul { .. }
                 | Op::DequantMatMul { .. }
                 | Op::QMatMul { .. }
                 | Op::QConv2d { .. }
         )
+    }
+
+    /// True if element-wise fusion must not span across this op.
+    pub fn is_fusion_boundary(&self) -> bool {
+        self.is_blas()
+            || matches!(
+                self,
+                Op::GaussianSplatRender { .. }
+                    | Op::GaussianSplatRenderBackward { .. }
+                    | Op::GaussianSplatPrepare { .. }
+                    | Op::GaussianSplatRasterize { .. }
+            )
     }
 
     /// True if this op is a reduction (drives loop iteration in fused kernels).
@@ -1392,7 +1702,8 @@ impl Op {
             | Op::FusedSwiGLU { .. }
             | Op::TopK { .. }
             | Op::Cumsum { .. }
-            | Op::Sample { .. } => 1,
+            | Op::Sample { .. }
+            | Op::ResizeNearest2x => 1,
             // EMA / Fixed scale modes carry a state tensor as a 2nd input;
             // PerBatch (default) doesn't need one.
             Op::FakeQuantize { scale_mode, .. } => match scale_mode {
@@ -1403,6 +1714,8 @@ impl Op {
             Op::FakeQuantizeLSQBackwardX { .. } | Op::FakeQuantizeLSQBackwardScale { .. } => 3, // x, scale, dy
             Op::Binary(_) | Op::Compare(_) | Op::Gather { .. } | Op::MatMul | Op::ScatterAdd => 2,
             Op::GroupedMatMul => 3,        // input, weight, expert_idx
+            Op::DequantGroupedMatMul { .. } => 3, // input, packed_w, expert_idx
+            Op::DequantMoEWeights { .. } => 1,    // packed_w
             Op::LoraMatMul { .. } => 4,    // x, w, a, b
             // x, w_q, scale, zp — or x, packed_w_bytes for GGUF
             // schemes (their scales/mins live inside the packed bytes,
@@ -1417,20 +1730,33 @@ impl Op {
             Op::QMatMul { .. } => 3,       // x, w, bias
             Op::QConv2d { .. } => 3,       // x, w, bias
             Op::SelectiveScan { .. } => 5, // x, delta, a, b, c
+            Op::GatedDeltaNet { carry_state, .. } if *carry_state => 6, // + state in/out
             Op::GatedDeltaNet { .. } => 5, // q, k, v, g, beta
             Op::Where => 3,                // cond, on_true, on_false
             Op::Attention { mask_kind, .. } => match mask_kind {
-                MaskKind::Custom => 4, // Q, K, V, mask
-                _ => 3,                // Q, K, V (mask synthesized in-kernel)
+                MaskKind::Custom | MaskKind::Bias => 4, // Q, K, V, mask
+                _ => 3,                                 // Q, K, V (mask synthesized in-kernel)
+            },
+            Op::AttentionBackward { mask_kind, .. } => match mask_kind {
+                MaskKind::Custom | MaskKind::Bias => 5, // q, k, v, dy, mask
+                _ => 4,                                 // q, k, v, dy
             },
             Op::Rope { .. } => 3,                            // x, cos, sin
-            Op::LayerNorm { .. } | Op::RmsNorm { .. } => 3,  // input, gamma, beta
+            Op::AxialRope2d { .. } => 1,
+            Op::LayerNorm { .. }
+            | Op::LayerNorm2d { .. }
+            | Op::GroupNorm { .. }
+            | Op::RmsNorm { .. } => 3, // input, gamma, beta
             Op::FusedMatMulBiasAct { .. } => 3,              // input, weight, bias
             Op::FusedResidualLN { has_bias: true, .. } => 5, // x, residual, bias, gamma, beta
             Op::FusedResidualLN {
                 has_bias: false, ..
             } => 4, // x, residual, gamma, beta
-            Op::Conv { .. } => 2, // input, kernel (bias separate via Add)
+            Op::FusedResidualRmsNorm { has_bias: true, .. } => 5, // x, residual, bias, gamma, beta
+            Op::FusedResidualRmsNorm {
+                has_bias: false, ..
+            } => 4, // x, residual, gamma, beta
+            Op::Conv { .. } | Op::ConvTranspose2d { .. } => 2, // input, weight (bias via Add)
             Op::Pool { .. } => 1,
             Op::ReluBackward => 2,                  // x, dy
             Op::ActivationBackward { .. } => 2,     // x, dy
@@ -1440,6 +1766,15 @@ impl Op {
             Op::Conjugate => 1,                     // z (C64)
             Op::LayerNormBackwardInput { .. } => 3, // x, gamma, dy
             Op::LayerNormBackwardGamma { .. } => 2, // x, dy
+            Op::RmsNormBackwardInput { .. } => 4,  // x, gamma, beta, dy
+            Op::RmsNormBackwardGamma { .. } => 4,
+            Op::RmsNormBackwardBeta { .. } => 4,
+            Op::RopeBackward { .. } => 3,            // dy, cos, sin
+            Op::GroupNormBackwardInput { .. } => 4,  // x, gamma, beta, dy
+            Op::GroupNormBackwardGamma { .. } => 2,  // x, dy
+            Op::GroupNormBackwardBeta { .. } => 2,
+            Op::CumsumBackward { .. } => 1,          // dy
+            Op::GatherBackward { .. } => 2,         // dy, indices
             Op::MaxPool2dBackward { .. } => 2,      // x, dy
             Op::Conv2dBackwardInput { .. } => 2,    // dy, w
             Op::Conv2dBackwardWeight { .. } => 2,   // x, dy
@@ -1459,6 +1794,10 @@ impl Op {
             } => 1 + *num_bcast as usize + *num_xs as usize,
             Op::ScanBackward { num_xs, .. } => 3 + *num_xs as usize, // init, trajectory, upstream, xs_0..
             Op::ScanBackwardXs { num_xs, .. } => 3 + *num_xs as usize, // same as ScanBackward
+            Op::GaussianSplatRender { .. } => 7,
+            Op::GaussianSplatRenderBackward { .. } => 8,
+            Op::GaussianSplatPrepare { .. } => 7,
+            Op::GaussianSplatRasterize { .. } => 2,
             Op::FusedTransformerLayer { has_bias, .. } => {
                 // hidden + qkv_w + out_w + ln1_g + ln1_b + fc1_w + fc2_w + ln2_g + ln2_b + mask = 10
                 // bias variant adds: qkv_b + out_b + fc1_b + fc2_b = 4 more
@@ -1508,10 +1847,10 @@ impl std::fmt::Display for Op {
             },
             Op::FakeQuantizeLSQBackwardX { bits, .. } => {
                 write!(f, "fake_quant_lsq_bwd_x(bits={bits})")
-            }
+            },
             Op::FakeQuantizeLSQBackwardScale { bits, .. } => {
                 write!(f, "fake_quant_lsq_bwd_s(bits={bits})")
-            }
+            },
             Op::Cast { to } => write!(f, "cast({to})"),
             Op::Binary(op) => write!(f, "{op:?}"),
             Op::Compare(op) => write!(f, "{op:?}"),
@@ -1521,6 +1860,10 @@ impl std::fmt::Display for Op {
             Op::DenseSolve => write!(f, "dense_solve"),
             Op::BatchedDenseSolve => write!(f, "batched_dense_solve"),
             Op::LayerNorm { eps, .. } => write!(f, "layer_norm(eps={eps})"),
+            Op::GroupNorm { num_groups, eps } => {
+                write!(f, "group_norm(groups={num_groups},eps={eps})")
+            }
+            Op::ResizeNearest2x => write!(f, "resize_nearest_2x"),
             Op::RmsNorm { eps, .. } => write!(f, "rms_norm(eps={eps})"),
             Op::Attention {
                 num_heads,
@@ -1535,7 +1878,18 @@ impl std::fmt::Display for Op {
                 }
                 MaskKind::Bias => write!(f, "attention(h={num_heads},d={head_dim},bias)"),
             },
-            Op::Rope { head_dim } => write!(f, "rope(d={head_dim})"),
+            Op::Rope { head_dim, n_rot } => write!(f, "rope(d={head_dim}, n_rot={n_rot})"),
+            Op::AxialRope2d {
+                end_x,
+                end_y,
+                head_dim,
+                num_heads,
+                theta,
+                repeat_factor,
+            } => write!(
+                f,
+                "axial_rope2d({end_x}x{end_y},h={num_heads},d={head_dim},θ={theta},r={repeat_factor})"
+            ),
             Op::Reshape { new_shape } => write!(f, "reshape({new_shape:?})"),
             Op::Transpose { perm } => write!(f, "transpose({perm:?})"),
             Op::Narrow { axis, start, len } => write!(f, "narrow({axis},{start},{len})"),
@@ -1568,6 +1922,10 @@ impl std::fmt::Display for Op {
             }
             Op::TopK { k } => write!(f, "topk(k={k})"),
             Op::GroupedMatMul => write!(f, "grouped_matmul"),
+            Op::DequantGroupedMatMul { scheme } => {
+                write!(f, "dequant_grouped_matmul({scheme})")
+            }
+            Op::DequantMoEWeights { scheme } => write!(f, "dequant_moe_weights({scheme})"),
             Op::LoraMatMul { scale } => write!(f, "lora_matmul(scale={scale})"),
             Op::DequantMatMul { scheme } => write!(f, "dequant_matmul({scheme})"),
             Op::QMatMul {
@@ -1581,9 +1939,22 @@ impl std::fmt::Display for Op {
             ),
             Op::QConv2d { kernel_size, .. } => write!(f, "q_conv2d({kernel_size:?})"),
             Op::SelectiveScan { state_size } => write!(f, "ssm_scan(n={state_size})"),
-            Op::GatedDeltaNet { state_size } => write!(f, "gated_delta_net(n={state_size})"),
+            Op::GatedDeltaNet {
+                state_size,
+                carry_state,
+            } => {
+                if *carry_state {
+                    write!(f, "gated_delta_net(n={state_size},carry)")
+                } else {
+                    write!(f, "gated_delta_net(n={state_size})")
+                }
+            }
             Op::ScatterAdd => write!(f, "scatter_add"),
-            Op::Conv { kernel_size, .. } => write!(f, "conv({kernel_size:?})"),
+            Op::Conv { kernel_size, .. } => write!(f, "conv2d({kernel_size:?})"),
+            Op::ConvTranspose2d { kernel_size, .. } => {
+                write!(f, "conv_transpose2d({kernel_size:?})")
+            }
+            Op::LayerNorm2d { eps } => write!(f, "layer_norm2d(eps={eps})"),
             Op::Pool {
                 kind, kernel_size, ..
             } => write!(f, "pool_{kind:?}({kernel_size:?})"),
@@ -1606,6 +1977,20 @@ impl std::fmt::Display for Op {
             }
             Op::SoftmaxCrossEntropyWithLogits => write!(f, "sce_with_logits"),
             Op::SoftmaxCrossEntropyBackward => write!(f, "sce_backward"),
+            Op::AttentionBackward {
+                num_heads,
+                head_dim,
+                mask_kind,
+                wrt,
+            } => match mask_kind {
+                MaskKind::None => write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},nomask)"),
+                MaskKind::Causal => write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},causal)"),
+                MaskKind::SlidingWindow(w) => {
+                    write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},sw={w})")
+                }
+                MaskKind::Custom => write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},custom)"),
+                MaskKind::Bias => write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},bias)"),
+            },
             Op::FusedMatMulBiasAct { activation } => {
                 write!(f, "fused_mm_bias")?;
                 if let Some(a) = activation {
@@ -1620,10 +2005,24 @@ impl std::fmt::Display for Op {
                 }
                 write!(f, "_ln(eps={eps})")
             }
-            Op::FusedSwiGLU { cast_to } => match cast_to {
-                Some(dt) => write!(f, "fused_swiglu(cast={dt})"),
-                None => write!(f, "fused_swiglu"),
-            },
+            Op::FusedResidualRmsNorm { has_bias, eps } => {
+                write!(f, "fused_residual")?;
+                if *has_bias {
+                    write!(f, "_bias")?;
+                }
+                write!(f, "_rms(eps={eps})")
+            }
+            Op::FusedSwiGLU { cast_to, gate_first } => {
+                let mut s = match cast_to {
+                    Some(dt) => format!("fused_swiglu(cast={dt}"),
+                    None => "fused_swiglu(".to_string(),
+                };
+                if *gate_first {
+                    s.push_str(",gate_first");
+                }
+                s.push(')');
+                write!(f, "{s}")
+            }
             Op::FusedAttentionBlock {
                 num_heads,
                 head_dim,
@@ -1724,6 +2123,75 @@ impl std::fmt::Display for Op {
             Op::LayerNormBackwardGamma { eps, .. } => {
                 write!(f, "layer_norm_backward_gamma(eps={eps})")
             }
+            Op::RmsNormBackwardInput { eps, .. } => write!(f, "rms_norm_backward_input(eps={eps})"),
+            Op::RmsNormBackwardGamma { eps, .. } => write!(f, "rms_norm_backward_gamma(eps={eps})"),
+            Op::RmsNormBackwardBeta { eps, .. } => write!(f, "rms_norm_backward_beta(eps={eps})"),
+            Op::RopeBackward { head_dim, n_rot } => {
+                write!(f, "rope_backward(d={head_dim},n_rot={n_rot})")
+            }
+            Op::GroupNormBackwardInput { num_groups, eps } => {
+                write!(f, "group_norm_backward_input(g={num_groups},eps={eps})")
+            }
+            Op::GroupNormBackwardGamma { num_groups, eps } => {
+                write!(f, "group_norm_backward_gamma(g={num_groups},eps={eps})")
+            }
+            Op::GroupNormBackwardBeta { num_groups, eps } => {
+                write!(f, "group_norm_backward_beta(g={num_groups},eps={eps})")
+            }
+            Op::CumsumBackward { axis, exclusive } => {
+                write!(f, "cumsum_backward(axis={axis},exclusive={exclusive})")
+            }
+            Op::GatherBackward { axis } => write!(f, "gather_backward(axis={axis})"),
+            Op::GaussianSplatRender {
+                width,
+                height,
+                tile_size,
+                radius_scale,
+                alpha_cutoff,
+                max_splat_steps,
+                transmittance_threshold,
+                max_list_entries,
+            } => write!(
+                f,
+                "gaussian_splat_render({width}x{height},tile={tile_size},r={radius_scale},a={alpha_cutoff},steps={max_splat_steps},t={transmittance_threshold},list={max_list_entries})"
+            ),
+            Op::GaussianSplatRenderBackward {
+                width,
+                height,
+                loss_grad_clip,
+                sh_band,
+                ..
+            } => write!(
+                f,
+                "gaussian_splat_render_bwd({width}x{height},clip={loss_grad_clip},sh={sh_band})"
+            ),
+            Op::GaussianSplatPrepare {
+                width,
+                height,
+                tile_size,
+                radius_scale,
+                alpha_cutoff,
+                max_splat_steps,
+                transmittance_threshold,
+                max_list_entries,
+                ..
+            } => write!(
+                f,
+                "gaussian_splat_prepare({width}x{height},tile={tile_size},r={radius_scale},a={alpha_cutoff},steps={max_splat_steps},t={transmittance_threshold},list={max_list_entries})"
+            ),
+            Op::GaussianSplatRasterize {
+                width,
+                height,
+                tile_size,
+                alpha_cutoff,
+                max_splat_steps,
+                transmittance_threshold,
+                max_list_entries,
+                ..
+            } => write!(
+                f,
+                "gaussian_splat_rasterize({width}x{height},tile={tile_size},a={alpha_cutoff},steps={max_splat_steps},t={transmittance_threshold},list={max_list_entries})"
+            ),
             Op::Custom {
                 name,
                 num_inputs,

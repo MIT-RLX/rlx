@@ -38,6 +38,9 @@
 
 use crate::{CompiledGraph, Device, Session};
 use rlx_ir::Graph;
+use rlx_ir::DimBinding;
+use rlx_ir::hir::HirModule;
+use rlx_opt::CompileResult;
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -86,15 +89,24 @@ impl CompileCache {
         key: u64,
         build: F,
     ) -> &mut CompiledGraph {
+        self.get_or_compile_with_options(key, build, &crate::CompileOptions::new())
+    }
+
+    /// Like [`Self::get_or_compile`] with explicit [`CompileOptions`].
+    pub fn get_or_compile_with_options<F: FnOnce() -> Graph>(
+        &mut self,
+        key: u64,
+        build: F,
+        options: &crate::CompileOptions,
+    ) -> &mut CompiledGraph {
         if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
             return &mut self.entries[idx].1;
         }
-        // Cache miss: compile, applying the cache's policy if any.
         let mut session = Session::new(self.device);
         if let Some(p) = &self.policy {
             session = session.with_policy(p.clone());
         }
-        let compiled = session.compile(build());
+        let compiled = session.compile_with(build(), options);
 
         // Evict FIFO if at capacity.
         if self.entries.len() >= self.capacity
@@ -272,6 +284,16 @@ impl BucketedCompileCache {
         key: u64,
         build: F,
     ) -> Option<(u64, &mut CompiledGraph)> {
+        self.get_or_compile_with_options(key, build, &crate::CompileOptions::new())
+    }
+
+    /// Like [`Self::get_or_compile`] with explicit [`CompileOptions`].
+    pub fn get_or_compile_with_options<F: FnOnce(u64) -> Graph>(
+        &mut self,
+        key: u64,
+        build: F,
+        options: &crate::CompileOptions,
+    ) -> Option<(u64, &mut CompiledGraph)> {
         let idx = self.bucket_for(key)?;
         let upper = self.buckets[idx].range.end - 1;
         if self.buckets[idx].compiled.is_none() {
@@ -279,7 +301,39 @@ impl BucketedCompileCache {
             if let Some(p) = &self.policy {
                 session = session.with_policy(p.clone());
             }
-            self.buckets[idx].compiled = Some(session.compile(build(upper)));
+            self.buckets[idx].compiled = Some(session.compile_with(build(upper), options));
+        }
+        Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
+    }
+
+    /// Like [`Self::get_or_compile`] but builds and compiles HIR directly
+    /// through the fusion-first pipeline (`Session::compile_hir`).
+    pub fn get_or_compile_hir<F: FnOnce(u64) -> HirModule>(
+        &mut self,
+        key: u64,
+        build: F,
+    ) -> Option<(u64, &mut CompiledGraph)> {
+        self.get_or_compile_hir_with_options(key, build, &crate::CompileOptions::new())
+    }
+
+    /// Like [`Self::get_or_compile_hir`] with explicit [`CompileOptions`] (tier-1 profile, fusion target, …).
+    pub fn get_or_compile_hir_with_options<F: FnOnce(u64) -> HirModule>(
+        &mut self,
+        key: u64,
+        build: F,
+        options: &crate::CompileOptions,
+    ) -> Option<(u64, &mut CompiledGraph)> {
+        let idx = self.bucket_for(key)?;
+        let upper = self.buckets[idx].range.end - 1;
+        if self.buckets[idx].compiled.is_none() {
+            let mut session = Session::new(self.device);
+            if let Some(p) = &self.policy {
+                session = session.with_policy(p.clone());
+            }
+            let compiled = session
+                .compile_hir_with(build(upper), options)
+                .expect("HIR lower/compile in bucketed cache");
+            self.buckets[idx].compiled = Some(compiled);
         }
         Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
     }
@@ -364,6 +418,150 @@ impl BucketedCompileCache {
             .collect();
 
         Some((upper, outs))
+    }
+}
+
+// ── Dynamic-dim cache (plan #54) ──────────────────────────────────────
+//
+// Compile HIR once through the fusion pipeline (graph may contain
+// `Dim::Dynamic` symbols), then specialize to concrete shapes per cache
+// key and backend-compile the resulting LIR.
+
+/// Compile-once / specialize-at-runtime cache for symbolic HIR modules.
+pub struct DynamicDimCompileCache {
+    device: Device,
+    policy: Option<rlx_opt::PrecisionPolicy>,
+    capacity: usize,
+    template: Option<CompileResult>,
+    entries: Vec<(u64, CompiledGraph)>,
+    order: VecDeque<u64>,
+}
+
+impl DynamicDimCompileCache {
+    pub fn new(device: Device, capacity: usize) -> Self {
+        Self::with_policy(device, capacity, None)
+    }
+
+    pub fn with_policy(
+        device: Device,
+        capacity: usize,
+        policy: Option<rlx_opt::PrecisionPolicy>,
+    ) -> Self {
+        assert!(capacity > 0, "DynamicDimCompileCache capacity must be ≥ 1");
+        Self {
+            device,
+            policy,
+            capacity,
+            template: None,
+            entries: Vec::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    pub fn compile_device(&self) -> Device {
+        self.device
+    }
+
+    /// Return a backend-compiled graph specialized for `binding`.
+    /// `build_hir` runs at most once to populate the dynamic template.
+    pub fn get_or_specialize<F: FnOnce() -> HirModule>(
+        &mut self,
+        key: u64,
+        binding: &DimBinding,
+        build_hir: F,
+        options: &crate::CompileOptions,
+    ) -> Result<&mut CompiledGraph, rlx_ir::hir::LowerError> {
+        if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
+            return Ok(&mut self.entries[idx].1);
+        }
+        if self.template.is_none() {
+            let mut template_opts = options.clone();
+            template_opts.dim_binding = None;
+            let pipe = crate::stages::pipeline_for(self.device, &template_opts);
+            self.template = Some(pipe.compile_hir(build_hir())?);
+        }
+        let template = self.template.as_ref().expect("template just set");
+        let mut spec_opts = options.clone();
+        spec_opts.dim_binding = None;
+        let pipe = crate::stages::pipeline_for(self.device, &spec_opts);
+        let specialized = template.specialize(&pipe, binding);
+        let backend = crate::registry::backend_for(self.device).expect("backend registered");
+        let mut compile_opts = options.clone();
+        compile_opts.dim_binding = None;
+        if compile_opts.policy.is_none() {
+            if let Some(p) = &self.policy {
+                compile_opts = compile_opts.policy(p.clone());
+            }
+        }
+        let executable = backend.compile_lir(specialized.lir, &compile_opts);
+        let compiled = CompiledGraph::new(executable, self.device);
+
+        if self.entries.len() >= self.capacity
+            && let Some(evict_key) = self.order.pop_front()
+        {
+            self.entries.retain(|(k, _)| *k != evict_key);
+        }
+        self.entries.push((key, compiled));
+        self.order.push_back(key);
+        Ok(&mut self.entries.last_mut().unwrap().1)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn contains(&self, key: u64) -> bool {
+        self.entries.iter().any(|(k, _)| *k == key)
+    }
+
+    pub fn has_template(&self) -> bool {
+        self.template.is_some()
+    }
+
+    /// Build the symbolic template once (no specialization).
+    pub fn ensure_template<F: FnOnce() -> HirModule>(
+        &mut self,
+        build_hir: F,
+        options: &crate::CompileOptions,
+    ) -> Result<&CompileResult, rlx_ir::hir::LowerError> {
+        if self.template.is_none() {
+            let mut opts = options.clone();
+            opts.dim_binding = None;
+            let pipe = crate::stages::pipeline_for(self.device, &opts);
+            self.template = Some(pipe.compile_hir(build_hir())?);
+        }
+        Ok(self.template.as_ref().expect("template set"))
+    }
+
+    pub fn template_result(&self) -> Option<&CompileResult> {
+        self.template.as_ref()
+    }
+
+    /// Specialize via on-disk LIR cache ([`CompilationMode::Aot`]).
+    /// Disk-backed specialize ([`rlx_ir::CompilationMode::Aot`]).
+    pub fn get_or_specialize_aot<F: FnOnce() -> HirModule>(
+        &mut self,
+        aot: &crate::AotCache,
+        disk_base: &str,
+        key: u64,
+        binding: &rlx_ir::DimBinding,
+        build_hir: F,
+        options: &crate::CompileOptions,
+    ) -> Result<&mut CompiledGraph, crate::AotCacheError> {
+        if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
+            return Ok(&mut self.entries[idx].1);
+        }
+        let device = self.device.clone();
+        let template = self.ensure_template(build_hir, options)?;
+        let mut compiled = aot.specialize_cached(disk_base, binding, device, template, options)?;
+        if self.entries.len() >= self.capacity
+            && let Some(evict_key) = self.order.pop_front()
+        {
+            self.entries.retain(|(k, _)| *k != evict_key);
+        }
+        self.entries.push((key, compiled));
+        self.order.push_back(key);
+        Ok(&mut self.entries.last_mut().unwrap().1)
     }
 }
 
@@ -1107,5 +1305,50 @@ mod tests {
         // First 5 = relu of input, tail 10 = relu(0) = 0.
         assert_eq!(&outs[0][..5], &[1.0, 0.0, 2.0, 0.0, 3.0]);
         assert!(outs[0][5..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn dynamic_dim_cache_specializes_per_key() {
+        use rlx_ir::DType;
+        use rlx_ir::Shape;
+        use rlx_ir::hir::HirModule;
+        use rlx_ir::sym;
+
+        let mut cache = DynamicDimCompileCache::new(Device::Cpu, 4);
+        let opts = crate::CompileOptions::new();
+        {
+            let _short = cache
+                .get_or_specialize(
+                    8,
+                    &rlx_ir::DimBinding::batch_seq(1, 8),
+                    || {
+                        let mut hir = HirModule::new("dyn_cache");
+                        let x = hir.input_batch_seq("x", sym::BATCH, sym::SEQ, 4, DType::F32);
+                        let w = hir.param("w", Shape::new(&[4, 2], DType::F32));
+                        let y = hir.linear(
+                            x,
+                            w,
+                            None,
+                            None,
+                            Shape::batch_seq(sym::BATCH, sym::SEQ, 2, DType::F32),
+                        );
+                        hir.set_outputs(vec![y]);
+                        hir
+                    },
+                    &opts,
+                )
+                .expect("specialize short");
+        }
+        assert!(cache.has_template());
+        assert_eq!(cache.len(), 1);
+        cache
+            .get_or_specialize(
+                128,
+                &rlx_ir::DimBinding::batch_seq(1, 128),
+                || panic!("HIR builder must not run twice"),
+                &opts,
+            )
+            .expect("specialize long");
+        assert_eq!(cache.len(), 2);
     }
 }

@@ -33,13 +33,20 @@
 //! dispatch wired up — `is_available()` always returns `false`,
 //! `RocmExecutable::compile()` panics with a clear message. The
 //! intent is to ship the structural skeleton (workspace member,
-//! IR plumbing, kernel-source plumbing, smoke-test harness) so we
+//! IR plumbing, kernel-source plumbing, basic-test harness) so we
 //! can iterate the real HIP runtime bindings + dispatch path as
 //! drop-in additions, the same way `rlx-cuda` started.
 
 pub mod arena;
 pub mod backend;
 pub mod device;
+pub mod gdn_host;
+pub mod llada2_gate_host;
+pub mod gguf_host;
+pub mod splat_host;
+#[cfg(feature = "native-splat")]
+pub mod splat_native;
+pub mod training_bwd_host;
 pub mod hip;
 pub mod hipblas;
 pub mod hipblaslt;

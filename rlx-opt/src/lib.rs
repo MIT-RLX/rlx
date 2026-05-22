@@ -13,80 +13,174 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! RLX graph optimizer — transforms IR graphs for maximum performance.
+//! RLX optimizer facade — re-exports [`rlx_fusion`], [`rlx_autodiff`], and
+//! [`rlx_compile`] for backward-compatible `rlx_opt::` paths.
 //!
-//! Passes are composable and run in sequence on a [`rlx_ir::Graph`]. Each pass
-//! produces a new graph (functional style, no in-place mutation) for
-//! easy debugging and pass composition.
+//! # Crates
 //!
-//! # Default pass pipeline (run by every backend)
+//! | Crate | Role |
+//! |-------|------|
+//! | [`rlx_fusion`] | Fusion passes + [`rlx_fusion::unfuse_fused_for_autodiff`] |
+//! | [`rlx_autodiff`] | `grad_with_loss`, `jvp`, `vmap`, [`prepare_graph_for_ad`] (feature `training`) |
+//! | [`rlx_compile`] | [`CompilePipeline`], memory plan, legalization (feature `compile`) |
 //!
-//! 1. **Const-fold** (`ConstantFolding`) — fold constant subgraphs.
-//! 2. **Fusion** (`fusion::*`) — matmul+bias+act, residual+LN, QKV
-//!    concat, SwiGLU concat, attention block.
-//! 3. **Mark elementwise regions** (`MarkElementwiseRegions`) — collapse
-//!    elementwise chains into a single region op.
-//! 4. **Legalize for backend** (`legalize_for_backend`) — reject ops
-//!    the target backend can't lower. Catches missing op coverage at
-//!    compile time instead of runtime.
-//! 5. **Memory planning** (`memory::*`) — liveness analysis → arena
-//!    buffer assignment.
+//! # Features
 //!
-//! # Opt-in passes
-//!
-//! Run by specific backends or user code; not in the default flow.
-//!
-//! * [`LegalizeBroadcast`] — materialize non-trailing broadcasts via
-//!   `Op::Expand`. Required for TPU (HLO needs explicit broadcasts)
-//!   and cortexm; CPU/Metal handle modulo broadcasts inline.
-//! * [`insert_q_dq`] — post-training quantization Q/DQ insertion.
-//!   Caller supplies a `CalibrationRecord` from a calibration run.
-//! * [`LowerControlFlow`] / [`LowerDotGeneral`] — lower XLA-shaped
-//!   primitives to the standard op set. Run by backends that prefer
-//!   primitive ops.
-//!
-//! # Transforms (JAX-shaped)
-//!
-//! * [`autodiff`] — reverse-mode AD (`grad_with_loss`).
-//! * [`jvp`] / [`hvp`] — forward-mode AD.
-//! * [`vmap()`] — batched function transform (the function; the same
-//!   name is reused for the module that defines it).
+//! - `compile` (default) — HIR → MIR → LIR pipeline
+//! - `training` (default) — autodiff transforms
+//! - `full` — both
 
-pub mod autodiff;
-pub mod autodiff_fwd;
-pub mod const_fold;
-pub mod control_flow;
-pub mod dce;
-pub mod fusion;
-pub mod inline;
-pub mod lower_dot_general;
-pub mod memory;
-pub mod pass;
-pub mod precision;
-pub mod promote_params;
-pub mod svg;
-pub mod vmap;
+pub use rlx_fusion;
 
-pub use autodiff_fwd::{hvp, jvp};
-pub use control_flow::LowerControlFlow;
-pub use inline::inline_into;
-pub use promote_params::promote_params_to_inputs;
-pub use vmap::vmap;
+#[cfg(feature = "training")]
+pub use rlx_autodiff;
 
-pub use const_fold::ConstantFolding;
-pub use dce::DeadCodeElimination;
-pub use fusion::{
-    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseSharedInputMatMul, FuseSwiGLU,
-    MarkElementwiseRegions, UnfuseElementwiseRegions,
+#[cfg(feature = "compile")]
+pub use rlx_compile;
+
+// ── Backward-compatible module paths ─────────────────────────────
+
+pub use rlx_fusion::control_flow;
+pub use rlx_fusion::fusion;
+pub use rlx_fusion::fusion_report;
+pub use rlx_fusion::lower_dot_general;
+pub use rlx_fusion::pass;
+pub use rlx_fusion::unfuse;
+
+#[cfg(feature = "training")]
+pub mod autodiff {
+    pub use rlx_autodiff::autodiff::*;
+    pub use rlx_autodiff::prepare_ad::*;
+}
+
+#[cfg(feature = "training")]
+pub mod autodiff_fwd {
+    pub use rlx_autodiff::autodiff_fwd::*;
+}
+
+#[cfg(feature = "training")]
+pub mod prepare_ad {
+    pub use rlx_autodiff::prepare_ad::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod compiler {
+    pub use rlx_compile::compiler::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod memory {
+    pub use rlx_compile::memory::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod fusion_pipeline {
+    pub use rlx_compile::fusion_pipeline::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod inspect {
+    pub use rlx_compile::inspect::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod legalize {
+    pub use rlx_compile::legalize::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod legalize_broadcast {
+    pub use rlx_compile::legalize_broadcast::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod const_fold {
+    pub use rlx_compile::const_fold::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod dce {
+    pub use rlx_compile::dce::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod precision {
+    pub use rlx_compile::precision::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod quant_insert {
+    pub use rlx_compile::quant_insert::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod quant_propagate {
+    pub use rlx_compile::quant_propagate::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod promote_params {
+    pub use rlx_compile::promote_params::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod inline {
+    pub use rlx_compile::inline::*;
+}
+
+#[cfg(feature = "compile")]
+pub mod svg {
+    pub use rlx_compile::svg::*;
+}
+
+#[cfg(feature = "training")]
+pub mod vmap {
+    pub use rlx_autodiff::vmap::*;
+}
+
+// ── Root re-exports (legacy `use rlx_opt::…`) ─────────────────────
+
+pub use rlx_fusion::{
+    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm,
+    FuseRmsNormReshape, FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul,
+    FusionReport, LowerControlFlow, LowerDotGeneral, MarkElementwiseRegions, MissReason,
+    MissedFusion, Pass, UnfuseElementwiseRegions, inline_if, inline_subgraph_into,
+    run_passes, unroll_while, unfuse_fused_for_autodiff,
 };
-pub use lower_dot_general::LowerDotGeneral;
-pub use pass::{Pass, run_passes};
-pub use precision::{AutoMixedPrecision, CastConfig, OpKind, Precision, PrecisionPolicy};
-pub mod legalize;
-pub use legalize::{LegalizeResult, format_legalize_error, legalize_for_backend};
-pub mod legalize_broadcast;
-pub use legalize_broadcast::LegalizeBroadcast;
-pub mod quant_insert;
-pub use quant_insert::{CalibrationEntry, CalibrationRecord, insert_q_dq};
-pub mod quant_propagate;
-pub use memory::is_pure_view;
+
+#[cfg(feature = "training")]
+pub use rlx_autodiff::{
+    AutodiffError, MirAutodiffExt, PrepareForAutodiff, grad, grad_with_loss,
+    grad_with_loss_module, hvp, jvp, jvp_module, prepare_graph_for_ad, prepare_mir_for_ad,
+    prepare_module_for_ad, quantized_weight_bits,
+};
+
+#[cfg(feature = "training")]
+pub use rlx_autodiff::vmap::vmap;
+
+#[cfg(feature = "training")]
+pub use rlx_autodiff::autodiff::{convert_scans_for_ad, inline_custom_fn_for_autodiff};
+
+#[cfg(all(feature = "compile", feature = "training"))]
+pub use rlx_compile::{
+    TrainingCompileError, TrainingCompileResult, backward_cleanup_passes,
+};
+
+#[cfg(feature = "compile")]
+pub use rlx_compile::{
+    AutoMixedPrecision, CalibrationEntry, CalibrationRecord, CastConfig, CompilePipeline,
+    CompileResult, ConstantFolding, DeadCodeElimination, FusionLimits, FusionOptions, FusionTarget,
+    LegalizeBroadcast, LegalizeResult, OpKind, PipelineInspect, Precision, PrecisionPolicy,
+    format_legalize_error, fusion_limits_for_target, fusion_passes, fusion_passes_for_supported,
+    inline_into,
+    inspect_compiled, inspect_fusion, inspect_pipeline, insert_q_dq, is_pure_view,
+    plan_memory_backward, plan_memory_with_options, MemoryPlanOptions, SharedWeightLayout,
+    WeightSlot,
+    KernelDispatchConfig, KernelDispatchPolicy, legalize_for_backend,
+    legalize_or_rewrite_for_backend, legalize_or_rewrite_for_backend_with_config,
+    legalize_or_rewrite_for_backend_with_dispatch, maybe_dump_pipeline, promote_params_to_inputs,
+    rewrite_for_backend, rewrite_for_backend_with_config, rewrite_for_backend_with_dispatch,
+    supported_for_target, supports_op, DispatchPath, KernelDispatchReport, KindDispatchSummary,
+    analyze_dispatch, format_dispatch_report, maybe_log_dispatch_report,
+    prepare_graph_for_backend_with_report,
+};

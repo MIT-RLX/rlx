@@ -84,11 +84,26 @@ pub fn slice(a: &Array, start: &[i32], stop: &[i32]) -> Result<Array, MlxError> 
     if start.len() != stop.len() {
         return Err(MlxError("slice: start/stop length mismatch".into()));
     }
+    let shape = a.shape().unwrap_or_default();
+    if shape.len() != start.len() {
+        return Err(MlxError(format!(
+            "slice: rank mismatch — array rank {} shape={shape:?}, got {} index pairs (start={start:?}, stop={stop:?})",
+            shape.len(),
+            start.len(),
+        )));
+    }
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe {
         ffi::rlx_mlx_op_slice(a.ptr, start.as_ptr(), stop.as_ptr(), start.len(), &mut out)
     };
-    check(rc)?;
+    if rc != 0 {
+        let mlx_err = check(rc).unwrap_err();
+        return Err(MlxError(format!(
+            "slice on rank-{} array with {} indices (shape={shape:?}, start={start:?}, stop={stop:?}): {mlx_err}",
+            shape.len(),
+            start.len(),
+        )));
+    }
     Ok(Array::from_raw(out))
 }
 

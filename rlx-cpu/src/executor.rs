@@ -124,6 +124,48 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 });
             }
 
+            // ── Fused residual + RMSNorm (parallel) ─────────────────
+            Op::FusedResidualRmsNorm { has_bias, eps } => {
+                let x_id = node.inputs[0];
+                let residual_id = node.inputs[1];
+                let h = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                let zero_bias = vec![0f32; h];
+                let (gamma_id, beta_id, bias_slice) = if *has_bias {
+                    let b = get_data(arena, external, node.inputs[2]);
+                    (node.inputs[3], node.inputs[4], b)
+                } else {
+                    (node.inputs[2], node.inputs[3], zero_bias.as_slice())
+                };
+
+                let x = get_data(arena, external, x_id);
+                let residual = get_data(arena, external, residual_id);
+                let gamma = get_data(arena, external, gamma_id);
+                let beta = get_data(arena, external, beta_id);
+                let output = get_output(arena, node_id);
+
+                let n = x.len() / h;
+
+                let x_ptr = x.as_ptr() as usize;
+                let r_ptr = residual.as_ptr() as usize;
+                let o_ptr = output.as_mut_ptr() as usize;
+                let bi_ptr = bias_slice.as_ptr() as usize;
+                let g_ptr = gamma.as_ptr() as usize;
+                let b_ptr = beta.as_ptr() as usize;
+                let e = *eps;
+                crate::pool::par_for(n, 4, &|off, cnt| unsafe {
+                    let x_s =
+                        std::slice::from_raw_parts((x_ptr as *const f32).add(off * h), cnt * h);
+                    let r_s =
+                        std::slice::from_raw_parts((r_ptr as *const f32).add(off * h), cnt * h);
+                    let o_s =
+                        std::slice::from_raw_parts_mut((o_ptr as *mut f32).add(off * h), cnt * h);
+                    let bi = std::slice::from_raw_parts(bi_ptr as *const f32, h);
+                    let g = std::slice::from_raw_parts(g_ptr as *const f32, h);
+                    let b = std::slice::from_raw_parts(b_ptr as *const f32, h);
+                    kernels::residual_bias_rms_norm(x_s, r_s, bi, g, b, o_s, cnt, h, e);
+                });
+            }
+
             // ── Plain matmul ────────────────────────────────────────
             Op::MatMul => {
                 let lhs = get_data(arena, external, node.inputs[0]);
@@ -376,6 +418,80 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 }
             }
 
+            Op::GroupNorm {
+                num_groups,
+                eps,
+            } => {
+                let input = get_data(arena, external, node.inputs[0]);
+                let gamma = get_data(arena, external, node.inputs[1]);
+                let beta = get_data(arena, external, node.inputs[2]);
+                let output = get_output(arena, node_id);
+                let n = node.shape.dim(0).unwrap_static();
+                let c = node.shape.dim(1).unwrap_static();
+                let h = node.shape.dim(2).unwrap_static();
+                let w = node.shape.dim(3).unwrap_static();
+                kernels::group_norm_nchw(
+                    input,
+                    gamma,
+                    beta,
+                    output,
+                    n,
+                    c,
+                    h,
+                    w,
+                    *num_groups,
+                    *eps,
+                );
+            }
+
+            Op::ResizeNearest2x => {
+                let input = get_data(arena, external, node.inputs[0]);
+                let output = get_output(arena, node_id);
+                let n = node.shape.dim(0).unwrap_static();
+                let c = node.shape.dim(1).unwrap_static();
+                let h = node.shape.dim(2).unwrap_static() / 2;
+                let w = node.shape.dim(3).unwrap_static() / 2;
+                let in_plane = c * h * w;
+                let out_plane = c * h * 2 * w * 2;
+                for ni in 0..n {
+                    kernels::resize_nearest_2x_nchw(
+                        &input[ni * in_plane..(ni + 1) * in_plane],
+                        &mut output[ni * out_plane..(ni + 1) * out_plane],
+                        c,
+                        h,
+                        w,
+                    );
+                }
+            }
+
+            Op::AxialRope2d {
+                end_x,
+                end_y,
+                head_dim,
+                num_heads,
+                theta,
+                repeat_factor,
+            } => {
+                let input = get_data(arena, external, node.inputs[0]);
+                let output = get_output(arena, node_id);
+                let batch = node.shape.dim(0).unwrap_static();
+                let seq = node.shape.dim(1).unwrap_static();
+                let plane = seq * node.shape.dim(2).unwrap_static();
+                for bi in 0..batch {
+                    let rotated = rlx_ir::ops::axial_rope2d::apply_axial_rope2d(
+                        &input[bi * plane..(bi + 1) * plane],
+                        *num_heads,
+                        seq,
+                        *head_dim,
+                        *end_x,
+                        *end_y,
+                        *theta,
+                        *repeat_factor,
+                    );
+                    output[bi * plane..(bi + 1) * plane].copy_from_slice(&rotated);
+                }
+            }
+
             // ── Softmax ─────────────────────────────────────────────
             Op::Softmax { axis } => {
                 let input = get_data(arena, external, node.inputs[0]);
@@ -615,41 +731,36 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
             }
 
             // ── Rotary position embedding ────────────────────────────
-            Op::Rope { head_dim } => {
+            Op::Rope { head_dim, n_rot } => {
+                let head_dim = *head_dim;
+                let n_rot = *n_rot;
                 let x = get_data(arena, external, node.inputs[0]);
                 let cos_cache = get_data(arena, external, node.inputs[1]);
                 let sin_cache = get_data(arena, external, node.inputs[2]);
                 let output = get_output(arena, node_id);
                 output.copy_from_slice(x);
 
-                // x layout: [batch*heads, seq, head_dim] or [batch, seq, heads*head_dim]
-                // cos/sin layout: [max_seq, half_dim]
-                let half = head_dim / 2;
+                let rot_half = n_rot / 2;
+                let tab_half = head_dim / 2;
                 let total = output.len();
-                let _sdh = total / (total / head_dim); // total elements / head_dim = num positions
-
-                // Determine seq from cos cache shape
-                // Apply rotation: x[i] = x[i]*cos - x[half+i]*sin, x[half+i] = x[half+i]*cos + x[i]*sin
-                // Process in chunks of head_dim
                 let num_chunks = total / head_dim;
                 for chunk in 0..num_chunks {
-                    let off = chunk * *head_dim;
-                    // Position index: which sequence position is this chunk?
-                    // For [B, S, H] layout: pos = chunk % S (where S*H fits)
-                    // Simple: use chunk index modulo sequence length
-                    // cos_cache has shape [max_seq, half], so we index by position
+                    let off = chunk * head_dim;
                     let cos_len = cos_cache.len();
-                    let max_seq = cos_len / half;
+                    let max_seq = cos_len / tab_half;
                     let pos = chunk % max_seq;
-                    let cos_off = pos * half;
+                    let cos_off = pos * tab_half;
 
-                    for i in 0..half {
+                    for i in 0..rot_half {
                         let cos_v = cos_cache[cos_off + i];
                         let sin_v = sin_cache[cos_off + i];
                         let x1 = output[off + i];
-                        let x2 = output[off + half + i];
+                        let x2 = output[off + rot_half + i];
                         output[off + i] = x1 * cos_v - x2 * sin_v;
-                        output[off + half + i] = x2 * cos_v + x1 * sin_v;
+                        output[off + rot_half + i] = x2 * cos_v + x1 * sin_v;
+                    }
+                    for j in n_rot..head_dim {
+                        output[off + j] = x[off + j];
                     }
                 }
             }
@@ -754,7 +865,7 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
             // `cast_to` is currently advisory: rlx-cpu always operates in
             // f32, so backends that distinguish dtypes apply the cast; the
             // CPU executor stores the f32 result regardless.
-            Op::FusedSwiGLU { cast_to: _ } => {
+            Op::FusedSwiGLU { cast_to: _, .. } => {
                 let input = get_data(arena, external, node.inputs[0]);
                 let output = get_output(arena, node_id);
                 // n = last-dim half (read from the node's own shape, NOT
@@ -779,14 +890,46 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 }
             }
 
-            // ── DenseSolve: lowering deferred to f64 plumbing step ──
+            // ── DenseSolve: x = A⁻¹ b (F32 / F64 via LAPACK) ────────
             Op::DenseSolve => {
-                panic!(
-                    "DenseSolve execution not yet implemented in rlx-cpu \
-                        executor; lowering lands with f64 dispatch (Step 2). \
-                        IR + AD support is in tree so the gradient graph \
-                        can be built and inspected."
-                );
+                let a_shape = &graph.node(node.inputs[0]).shape;
+                let n = a_shape.dim(0).unwrap_static();
+                let b_elems = node.shape.num_elements().unwrap();
+                let nrhs = b_elems / n.max(1);
+                match node.shape.dtype() {
+                    rlx_ir::DType::F32 => {
+                        let a = get_data(arena, external, node.inputs[0]);
+                        let b = get_data(arena, external, node.inputs[1]);
+                        let x = get_output(arena, node_id);
+                        let mut a_scratch = a.to_vec();
+                        let mut x_buf = b.to_vec();
+                        let info = crate::blas::sgesv(&mut a_scratch, &mut x_buf, n, nrhs);
+                        if info != 0 {
+                            panic!("DenseSolve: singular matrix (info={info})");
+                        }
+                        x[..x_buf.len()].copy_from_slice(&x_buf);
+                    }
+                    rlx_ir::DType::F64 => {
+                        let (a_ptr, a_len) = arena.raw_ptr(node.inputs[0]);
+                        let (b_ptr, b_len) = arena.raw_ptr(node.inputs[1]);
+                        let (x_ptr, x_len) = arena.raw_ptr(node_id);
+                        unsafe {
+                            let a_src =
+                                std::slice::from_raw_parts(a_ptr as *const f64, a_len / 8);
+                            let b_src =
+                                std::slice::from_raw_parts(b_ptr as *const f64, b_len / 8);
+                            let mut a_scratch = a_src.to_vec();
+                            let mut x_buf = b_src.to_vec();
+                            let info = crate::blas::dgesv(&mut a_scratch, &mut x_buf, n, nrhs);
+                            if info != 0 {
+                                panic!("DenseSolve: singular matrix (info={info})");
+                            }
+                            std::slice::from_raw_parts_mut(x_ptr as *mut f64, x_len / 8)
+                                .copy_from_slice(&x_buf);
+                        }
+                    }
+                    other => panic!("DenseSolve executor: unsupported dtype {other:?}"),
+                }
             }
 
             // ── Passthrough for unimplemented ops ───────────────────

@@ -35,7 +35,7 @@ use crate::hip::HipKernel;
 /// to disable caching.
 fn hsaco_cache_dir() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
-    if let Ok(p) = std::env::var("RLX_ROCM_HSACO_CACHE") {
+    if let Some(p) = rlx_ir::env::var("RLX_ROCM_HSACO_CACHE") {
         return Some(PathBuf::from(p));
     }
     let base = std::env::var("XDG_CACHE_HOME")
@@ -138,11 +138,18 @@ kernel_cache!(
     "fused_residual_ln"
 );
 kernel_cache!(GATHER, gather_kernel, GATHER_CU, "gather");
+kernel_cache!(GATHER_AXIS, gather_axis_kernel, GATHER_AXIS_CU, "gather_axis");
 kernel_cache!(NARROW, narrow_kernel, NARROW_CU, "narrow");
 kernel_cache!(CONCAT, concat_kernel, CONCAT_CU, "concat");
 kernel_cache!(TRANSPOSE, transpose_kernel, TRANSPOSE_CU, "transpose");
 kernel_cache!(EXPAND, expand_kernel, EXPAND_CU, "expand");
 kernel_cache!(ATTENTION, attention_kernel, ATTENTION_CU, "attention");
+kernel_cache!(
+    ATTENTION_BWD,
+    attention_bwd_kernel,
+    ATTENTION_BWD_CU,
+    "attention_bwd"
+);
 kernel_cache!(ARGMAX, argmax_kernel, ARGMAX_CU, "argmax");
 kernel_cache!(ROPE, rope_kernel, ROPE_CU, "rope");
 kernel_cache!(CUMSUM, cumsum_kernel, CUMSUM_CU, "cumsum");
@@ -190,9 +197,27 @@ kernel_cache!(
     ELEMENTWISE_REGION_CU,
     "elementwise_region"
 );
+kernel_cache!(
+    GAUSSIAN_SPLAT_RASTERIZE,
+    gaussian_splat_rasterize_kernel,
+    GAUSSIAN_SPLAT_RASTERIZE_CU,
+    "gaussian_splat_rasterize"
+);
 
 pub fn dispatch_grid_1d(n: u32, block_x: u32) -> (u32, u32) {
     (n.div_ceil(block_x), block_x)
+}
+
+pub fn dispatch_grid_2d(
+    width: u32,
+    height: u32,
+    block_x: u32,
+    block_y: u32,
+) -> ((u32, u32, u32), (u32, u32, u32)) {
+    (
+        (width.div_ceil(block_x), height.div_ceil(block_y), 1),
+        (block_x, block_y, 1),
+    )
 }
 
 /// AOT pre-warm: force-compile every kernel up-front. Mirrors
@@ -211,11 +236,13 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = layernorm_kernel(ctx);
     let _ = fused_residual_ln_kernel(ctx);
     let _ = gather_kernel(ctx);
+    let _ = gather_axis_kernel(ctx);
     let _ = narrow_kernel(ctx);
     let _ = concat_kernel(ctx);
     let _ = transpose_kernel(ctx);
     let _ = expand_kernel(ctx);
     let _ = attention_kernel(ctx);
+    let _ = attention_bwd_kernel(ctx);
     let _ = argmax_kernel(ctx);
     let _ = rope_kernel(ctx);
     let _ = cumsum_kernel(ctx);

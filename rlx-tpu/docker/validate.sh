@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, version 3.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
 # rlx-tpu/docker/validate.sh — drive the off-TPU validation harness.
 #
 # Two layers of validation, picked by flag:
@@ -72,17 +86,6 @@ if [[ "$NUMERICAL" -eq 1 ]]; then
     #      under both AlwaysF32 and the TPU-default AutoMixedBf16
     #      policies. Catches IR-level dtype/shape regressions that
     #      single-op tests miss.
-    # The real-model test (tpu_real_minilm) downloads ~22 MB from HF
-    # Hub on first run and is opt-in via RLX_REAL_MODEL=1 (passed
-    # through to the container below). When opted in, the host's HF
-    # cache is mounted into the container so repeat runs hit the
-    # cache and don't re-download.
-    REAL_MODEL_TEST=""
-    if [[ -n "${RLX_REAL_MODEL:-}" ]]; then
-        REAL_MODEL_TEST="cargo test -p rlx-models --release \
-            --features tpu,hf-download \
-            --test tpu_real_minilm -- --test-threads=1 --nocapture"
-    fi
     DEFAULT_CMD=(bash -c "
         set -e
         cargo test -p rlx-tpu --release -- --test-threads=1 --nocapture
@@ -94,7 +97,6 @@ if [[ "$NUMERICAL" -eq 1 ]]; then
             --test tpu_cpu_speed -- --test-threads=1 --nocapture
         cargo test -p rlx-runtime --release --features cpu,tpu \
             --test cpu_perf_diag -- --test-threads=1 --nocapture
-        $REAL_MODEL_TEST
     ")
 else
     build_if_missing "$PARSE_IMAGE"  "$DOCKERFILE"     "$REBUILD"
@@ -110,8 +112,7 @@ fi
 
 echo "[validate.sh] running: ${CMD[*]} (image=$IMAGE)"
 
-# Pass through bench / real-model knobs so the opt-in tests run
-# inside the container when the user sets them on the host.
+# Pass through bench knobs so opt-in tests run inside the container.
 ENV_FLAGS=()
 if [[ -n "${RLX_TPU_BENCH:-}" ]]; then
     ENV_FLAGS+=(-e "RLX_TPU_BENCH=${RLX_TPU_BENCH}")
@@ -119,18 +120,7 @@ fi
 if [[ -n "${RLX_TPU_BENCH_SWEEP:-}" ]]; then
     ENV_FLAGS+=(-e "RLX_TPU_BENCH_SWEEP=${RLX_TPU_BENCH_SWEEP}")
 fi
-# Real-model E2E test (tpu_real_minilm) needs HF Hub access. Mount
-# the host's HF cache so weights persist across runs and the
-# initial download isn't repeated. Default cache dir matches what
-# `hf-hub` and `transformers` use (~/.cache/huggingface). Override
-# with HF_HOME on the host.
 HF_VOLUME_FLAGS=()
-if [[ -n "${RLX_REAL_MODEL:-}" ]]; then
-    ENV_FLAGS+=(-e "RLX_REAL_MODEL=${RLX_REAL_MODEL}")
-    HF_HOST_CACHE="${HF_HOME:-${HOME}/.cache/huggingface}"
-    mkdir -p "$HF_HOST_CACHE"
-    HF_VOLUME_FLAGS+=(-v "$HF_HOST_CACHE:/root/.cache/huggingface")
-fi
 
 exec docker run --rm \
     -v "$REPO_ROOT:/work" \

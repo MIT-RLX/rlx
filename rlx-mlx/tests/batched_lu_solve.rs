@@ -2,7 +2,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
-//! End-to-end smoke test for the batched LU+solve Metal kernel.
+//! End-to-end basic test for the batched LU+solve Metal kernel.
 //!
 //! Builds two diagonally-dominant 3x3 systems, dispatches the custom
 //! kernel via `MlxKernel::execute`, checks per-batch results match a

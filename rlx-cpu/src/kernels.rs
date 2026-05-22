@@ -471,6 +471,35 @@ pub fn residual_bias_layer_norm(
     }
 }
 
+/// Fused residual + bias + RMSNorm on [n, h] buffers.
+/// Computes: output[row] = RmsNorm(a[row] + b[row] + bias, gamma, beta)
+pub fn residual_bias_rms_norm(
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    output: &mut [f32],
+    n: usize,
+    h: usize,
+    eps: f32,
+) {
+    let inv_h = 1.0 / h as f32;
+    for row in 0..n {
+        let base = row * h;
+        let mut sumsq = 0f32;
+        for i in 0..h {
+            let v = a[base + i] + b[base + i] + bias[i];
+            sumsq += v * v;
+        }
+        let inv_rms = (sumsq * inv_h + eps).sqrt().recip();
+        for i in 0..h {
+            let v = a[base + i] + b[base + i] + bias[i];
+            output[base + i] = v * inv_rms * gamma[i] + beta[i];
+        }
+    }
+}
+
 /// Parallel residual + bias + LayerNorm.
 pub fn par_residual_bias_ln(
     a: &[f32],
@@ -958,6 +987,185 @@ fn scalar_erf(x: f32) -> f32 {
         * (0.254_829_6
             + t * (-0.284_496_72 + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
     sign * (1.0 - y * (-xa * xa).exp())
+}
+
+/// NCHW LayerNorm2d (candle / SAM semantics): normalize across channels at
+/// each spatial position. `gamma`/`beta` are per-channel `[C]`.
+pub fn layer_norm2d_nchw(
+    input: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    output: &mut [f32],
+    batch: usize,
+    channels: usize,
+    h: usize,
+    w: usize,
+    eps: f32,
+) {
+    let spatial = h * w;
+    for b in 0..batch {
+        for i in 0..spatial {
+            let mut mean = 0.0f32;
+            for c in 0..channels {
+                mean += input[((b * channels + c) * spatial) + i];
+            }
+            mean /= channels as f32;
+            let mut var = 0.0f32;
+            for c in 0..channels {
+                let d = input[((b * channels + c) * spatial) + i] - mean;
+                var += d * d;
+            }
+            var /= channels as f32;
+            let inv = 1.0 / (var + eps).sqrt();
+            for c in 0..channels {
+                let v = (input[((b * channels + c) * spatial) + i] - mean) * inv;
+                output[((b * channels + c) * spatial) + i] = v * gamma[c] + beta[c];
+            }
+        }
+    }
+}
+
+/// NCHW transposed convolution (PyTorch `ConvTranspose2d`, no bias).
+/// Weight layout `[C_in, C_out/groups, kH, kW]`.
+pub fn conv_transpose2d_nchw(
+    input: &[f32],
+    weight: &[f32],
+    output: &mut [f32],
+    n: usize,
+    c_in: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    h_out: usize,
+    w_out: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    dh: usize,
+    dw: usize,
+    groups: usize,
+) {
+    output.fill(0.0);
+    let c_in_per_g = c_in / groups;
+    let c_out_per_g = c_out / groups;
+    for ni in 0..n {
+        for ic in 0..c_in {
+            let g = ic / c_in_per_g;
+            let ic_off = ic % c_in_per_g;
+            for iy in 0..h {
+                for ix in 0..w {
+                    let v = input[((ni * c_in + ic) * h + iy) * w + ix];
+                    if v == 0.0 {
+                        continue;
+                    }
+                    for ky in 0..kh {
+                        let oy = iy * sh + ky * dh;
+                        if oy < ph || oy >= h_out + ph {
+                            continue;
+                        }
+                        let oy = oy - ph;
+                        if oy >= h_out {
+                            continue;
+                        }
+                        for kx in 0..kw {
+                            let ox = ix * sw + kx * dw;
+                            if ox < pw || ox >= w_out + pw {
+                                continue;
+                            }
+                            let ox = ox - pw;
+                            if ox >= w_out {
+                                continue;
+                            }
+                            for oc_off in 0..c_out_per_g {
+                                let oc = g * c_out_per_g + oc_off;
+                                let w_idx = ((ic * c_out_per_g + oc_off) * kh + ky) * kw + kx;
+                                let wt = weight[w_idx];
+                                output[((ni * c_out + oc) * h_out + oy) * w_out + ox] += v * wt;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// NCHW group normalization: normalizes each `(C/G)×H×W` group.
+pub fn group_norm_nchw(
+    input: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    output: &mut [f32],
+    batch: usize,
+    channels: usize,
+    h: usize,
+    w: usize,
+    num_groups: usize,
+    eps: f32,
+) {
+    let cpg = channels / num_groups;
+    let spatial = h * w;
+    let n = (cpg * spatial) as f32;
+    for b in 0..batch {
+        for g in 0..num_groups {
+            let c0 = g * cpg;
+            let mut mean = 0.0f32;
+            for c in 0..cpg {
+                let plane = &input[((b * channels + c0 + c) * spatial)..((b * channels + c0 + c + 1) * spatial)];
+                mean += plane.iter().sum::<f32>();
+            }
+            mean /= n;
+            let mut var = 0.0f32;
+            for c in 0..cpg {
+                let plane = &input[((b * channels + c0 + c) * spatial)..((b * channels + c0 + c + 1) * spatial)];
+                for &v in plane {
+                    let d = v - mean;
+                    var += d * d;
+                }
+            }
+            var /= n;
+            let inv = 1.0 / (var + eps).sqrt();
+            for c in 0..cpg {
+                let gi = c0 + c;
+                let gamm = gamma[gi];
+                let bet = beta[gi];
+                let src = &input[((b * channels + gi) * spatial)..((b * channels + gi + 1) * spatial)];
+                let dst = &mut output[((b * channels + gi) * spatial)..((b * channels + gi + 1) * spatial)];
+                for (d, &s) in dst.iter_mut().zip(src) {
+                    *d = (s - mean) * inv * gamm + bet;
+                }
+            }
+        }
+    }
+}
+
+/// Nearest-neighbor 2× upsample on planar NCHW.
+pub fn resize_nearest_2x_nchw(
+    input: &[f32],
+    output: &mut [f32],
+    channels: usize,
+    h: usize,
+    w: usize,
+) {
+    let h2 = h * 2;
+    let w2 = w * 2;
+    for c in 0..channels {
+        let plane = &input[c * h * w..(c + 1) * h * w];
+        let dst = &mut output[c * h2 * w2..(c + 1) * h2 * w2];
+        for y in 0..h {
+            for x in 0..w {
+                let v = plane[y * w + x];
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        dst[(y * 2 + dy) * w2 + (x * 2 + dx)] = v;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

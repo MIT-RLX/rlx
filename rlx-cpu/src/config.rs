@@ -17,7 +17,8 @@
 //!
 //! Compile-time: target arch/OS sets optimal defaults (cache line, SIMD strategy).
 //! Runtime: sysctl/cpuid refines values (P-core count, L1/L2 sizes).
-//! Env vars: `RLX_*` overrides for manual tuning.
+//! Env vars: `RLX_*` overrides for manual tuning — or set the same keys in
+//! code via [`rlx_ir::env::set`] / [`RuntimeConfig::install`].
 //!
 //! ```bash
 //! RLX_WORKERS=8           # thread pool size (0 = auto)
@@ -223,27 +224,27 @@ impl RuntimeConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::auto_detect();
 
-        if let Ok(v) = std::env::var("RLX_WORKERS")
+        if let Some(v) = rlx_ir::env::var("RLX_WORKERS")
             && let Ok(n) = v.parse::<usize>()
         {
             cfg.pool_workers = if n == 0 { cfg.pool_workers } else { n.min(15) };
         }
-        if let Ok(v) = std::env::var("RLX_PAR_THRESHOLD")
+        if let Some(v) = rlx_ir::env::var("RLX_PAR_THRESHOLD")
             && let Ok(n) = v.parse()
         {
             cfg.par_threshold = n;
         }
-        if let Ok(v) = std::env::var("RLX_SDPA_THRESHOLD")
+        if let Some(v) = rlx_ir::env::var("RLX_SDPA_THRESHOLD")
             && let Ok(n) = v.parse()
         {
             cfg.sdpa_seq_threshold = n;
         }
-        if let Ok(v) = std::env::var("RLX_ARENA_ALIGN")
+        if let Some(v) = rlx_ir::env::var("RLX_ARENA_ALIGN")
             && let Ok(n) = v.parse()
         {
             cfg.arena_alignment = n;
         }
-        if let Ok(v) = std::env::var("RLX_VERBOSE")
+        if let Some(v) = rlx_ir::env::var("RLX_VERBOSE")
             && let Ok(n) = v.parse()
         {
             cfg.verbose = n;
@@ -266,6 +267,16 @@ impl RuntimeConfig {
         }
 
         cfg
+    }
+
+    /// Push this config into the global [`rlx_ir::env`] override map so all
+    /// RLX backends see the same knobs without setting process env vars.
+    pub fn install(&self) {
+        rlx_ir::env::set("RLX_WORKERS", self.pool_workers.to_string());
+        rlx_ir::env::set("RLX_PAR_THRESHOLD", self.par_threshold.to_string());
+        rlx_ir::env::set("RLX_SDPA_THRESHOLD", self.sdpa_seq_threshold.to_string());
+        rlx_ir::env::set("RLX_ARENA_ALIGN", self.arena_alignment.to_string());
+        rlx_ir::env::set("RLX_VERBOSE", self.verbose.to_string());
     }
 
     /// Get or initialize the global singleton config.

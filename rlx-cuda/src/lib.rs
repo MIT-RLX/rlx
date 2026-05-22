@@ -41,6 +41,15 @@
 pub mod arena;
 pub mod backend;
 pub mod device;
+pub mod gdn_host;
+pub mod llada2_gate_host;
+pub mod gguf_gpu;
+pub mod gguf_host;
+pub mod splat_host;
+#[cfg(feature = "native-splat")]
+pub mod splat_native;
+pub mod training_bwd_host;
+pub mod sam_ops_host;
 pub mod kernels;
 pub mod unfuse;
 

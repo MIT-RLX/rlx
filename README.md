@@ -6,7 +6,7 @@ backend-specific kernels for CPU, Apple Silicon (Metal / MLX), NVIDIA
 (CUDA), AMD (ROCm), Google TPU, cross-platform GPU (wgpu), and
 microcontrollers (Cortex-M).
 
-> Status: **0.1.0**, Apple-Silicon-first. The CPU and Apple GPU paths
+> Status: **0.2.0**, Apple-Silicon-first. The CPU and Apple GPU paths
 > are mature; CUDA / ROCm / TPU / WGPU work but have seen less mileage;
 > Cortex-M is a separate INT8 product.
 
@@ -29,7 +29,7 @@ the IR, optimizer, runtime, and re-exports the common types:
 
 ```toml
 [dependencies]
-rlx = { version = "0.1", features = ["cpu"] }
+rlx = { version = "0.2", features = ["cpu"] }
 ```
 
 For Apple Silicon GPU acceleration (note: `mlx` is git-only for 0.1.0
@@ -68,11 +68,11 @@ Off by default; enable per workload:
 
 | feature   | what                                                     |
 |-----------|----------------------------------------------------------|
-| `models`  | BERT / Nomic / vision graph builders                     |
 | `gguf`    | GGUF v1 / v2 / v3 parser + dequant                       |
 | `bench`   | uniform benchmark harness                                |
 | `sparse`  | sparse linear algebra (custom-op scaffold)               |
 | `linalg`  | dense linalg via LAPACK (custom-op scaffold)             |
+| `splat`   | 3D Gaussian splatting (CPU reference render custom op)   |
 
 ### Specialty crates
 
@@ -86,8 +86,7 @@ exposed through the prelude:
 ## Quickstart
 
 A single `use rlx::prelude::*;` covers the common surface: graph
-types, `Session`, `Device`, ops + activations, `Result`, the model
-runners (Qwen3 / SAM / DINOv2) under the `models` feature.
+types, `Session`, `Device`, ops + activations, and `Result`.
 
 ```rust
 use rlx::prelude::*;
@@ -104,51 +103,24 @@ let out = compiled.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
 ```
 
 Domain-specific namespaces if you want narrower star-imports:
-`rlx::ops::*` (IR helper enums), `rlx::quant::*`, `rlx::weights::*`,
-`rlx::autodiff::*`, `rlx::run::*`. Or the full per-crate surface
+`rlx::ops::*` (IR helper enums), `rlx::quant::*`, `rlx::autodiff::*`.
+Or the full per-crate surface
 via `rlx::ir::…` / `rlx::opt::…` / `rlx::runtime::…` etc. — every
 workspace crate is reachable as a module on `rlx`.
 
 Or depend on each crate directly (`rlx-ir`, `rlx-opt`, `rlx-runtime`,
 …) for the smallest possible dep tree.
 
-### Running a model (Qwen3, SAM 1/2/3) in one call
-
-With the `models` feature, the `rlx::run` namespace exposes a
-builder-style runner. Format / config / dtype histogram are
-auto-detected from the weights file:
-
-```rust
-use rlx::run::{Qwen3Runner, Qwen3Precision};
-use rlx::Device;
-
-let mut runner = Qwen3Runner::builder()
-    .weights("Qwen3-0.6B-Q4_K_M.gguf")  // .safetensors or .gguf
-    .device(Device::Metal)
-    .max_seq(128)
-    .precision(Qwen3Precision::F16LmHead)  // optional; default F32
-    .max_memory_gb(16.0)                    // soft cap
-    .stream(true)
-    .build()?;
-
-runner.generate(&prompt_ids, 32, |tok| print!(" {tok}"))?;
-```
-
-The same surface is wired into a `rlx-run` CLI:
-
-```sh
-cargo run --release -p rlx-models --bin rlx-run --features metal -- \
-    qwen3 --weights model.gguf --device metal --max-tokens 32 \
-          --max-seq 128 --prompt-ids 1,17,42,314
-cargo run --release -p rlx-models --bin rlx-run -- inspect model.gguf
-```
-
 ## Workspace layout
 
 ```
 rlx            prelude — re-exports framework crates + common types
-rlx-ir         leaf — types, shape, op enum, autodiff hooks
-rlx-opt        graph rewrites: fusion, precision, memory plan, AD, vmap
+rlx-ir         leaf — types, shape, op enum, verifier, HIR hooks
+rlx-flow       block assembly-line API for model builders
+rlx-fusion     MIR fusion passes + unfuse for AD
+rlx-autodiff   grad / jvp / hvp / vmap on MIR
+rlx-compile    CompilePipeline, legalization, memory plan, precision
+rlx-opt        facade — re-exports fusion + autodiff + compile
 rlx-driver     Device enum + cross-cutting types
 rlx-cpu        CPU kernels (NEON / AVX / Accelerate / OpenBLAS)
 rlx-metal      Apple Metal native (MSL + MPSGraph + ICB)
@@ -160,12 +132,12 @@ rlx-wgpu       Cross-platform GPU via wgpu
 rlx-cortexm    ARMv7E-M INT8 kernels (no_std)
 rlx-fpga       IR → Verilog → bitstream
 rlx-runtime    user-facing Session / CompiledGraph
-rlx-models     concrete model graph builders (BERT, Nomic, vision, Qwen3, SAM/2/3, DINOv2)
 rlx-gguf       standalone GGUF parser + dequant (incl. Q4_K / Q5_K / Q6_K / Q8_K)
 rlx-macros     #[rlx_model] AOT macro
 rlx-bench      benchmark harness
 rlx-sparse     downstream: CSR LU / mat-vec / CG (custom-op scaffold)
 rlx-linalg     downstream: dense linalg via LAPACK (custom-op scaffold)
+rlx-splat      downstream: 3D Gaussian splatting (self-contained; `rlx_splat::register()`)
 pyrlx          Python bindings via PyO3
 ```
 
@@ -186,8 +158,67 @@ For Apple Silicon, MLX is vendored as a git submodule:
 git submodule update --init
 ```
 
+## Kernel dispatch and transparency
+
+RLX keeps **native fast paths** as the default while still allowing
+**transparent fallback** when a backend has not wired an op yet.
+
+| Path | When | Effect |
+|------|------|--------|
+| **Native** | `OpKind` is in the backend's `supported_ops` claim | Backend thunk (MSL, CUDA, CPU ref, …) |
+| **Common IR** | Registered logical kernel, not in `supported_ops` | Lowered to primitive MIR (`MatMul`, `Reduce`, …) — portable, often slower |
+| **Rewritten** | Structural unfuse / lower (e.g. fused matmul → primitives) | Same semantics, different graph shape |
+| **Unsupported** | Still illegal after rewrite | Compile fails with a diagnostic report |
+
+Policy (default `PreferNative`): native if claimed, else common IR.
+Override globally with `RLX_KERNEL_DISPATCH=common|native`, or per compile
+via [`CompileOptions::kernel_dispatch`](rlx-runtime/src/options.rs) and
+`force_common_kinds` / `force_native_kinds`.
+
+**See what a compile will do** — set `RLX_DISPATCH_REPORT=1` or
+`RLX_VERBOSE=1` before `Session::compile`; the runtime prints a per-kind
+summary (native / common-ir / rewritten / missing). On failure, the error
+includes both legalization details and the dispatch report.
+
+```rust
+use rlx::prelude::*;
+use rlx::runtime::{
+    dispatch_report_for_device, legalize_graph_for_device_with_options, CompileOptions,
+    ModelReflection,
+};
+use rlx::opt::format_dispatch_report;
+use rlx_flow::ModelExecutionConfig;
+use rlx_ir::CompilationMode;
+
+// Unified component (variant + dispatch + eager/lazy/AOT + profile + layer stack)
+let config = ModelExecutionConfig::qwen35_prefill(1, 512)
+    .with_compilation_mode(CompilationMode::Lazy);
+let _key = config.cache_key();
+
+// Static probe (common-ir kinds only; no unfuse)
+let report = dispatch_report_for_device(&graph, Device::Metal)?;
+eprintln!("{}", format_dispatch_report(&report));
+
+// Full rewrite + legalize probe (same path as compile)
+let opts = CompileOptions::new(); // or compile_options_for_device(&config, Device::Metal)
+let (graph, report) =
+    legalize_graph_for_device_with_options(graph, Device::Metal, &opts)?;
+```
+
+[`supports_graph`](rlx-runtime/src/device_ext.rs) uses the backend
+`supported_ops` claim set when a backend is registered, so device
+picking stays aligned with compile rather than hand-maintained op tables.
+
+More detail: [`rlx-ir/README-logical-kernels.md`](rlx-ir/README-logical-kernels.md)
+(registered logical kernels, splat example, API table).
+
+To speed up a workload: implement the native thunk, add the `OpKind` to
+that backend's `supported_ops`, and re-run with `RLX_DISPATCH_REPORT=1`
+until the kind moves from **common-ir** to **native**.
+
 ## Development workflow
 
+- **Fast local gate**: `just ci` (build, workspace tests, lint, pyrlx pytest).
 - **Always gate benches on throttle.** `scripts/check-throttle.sh` refuses
   to proceed under thermal pressure (`pmset -g therm`). Silent 10×
   slowdowns are a real failure mode on Macs. `--warn` mode for CI;
@@ -198,7 +229,8 @@ git submodule update --init
   (op.rs, infer.rs, graph.rs, verify.rs), every backend's thunks +
   cost models (rlx-cpu, rlx-metal, rlx-mlx, rlx-cuda, rlx-rocm, rlx-tpu,
   rlx-wgpu — sister-crate ports are usually mechanical), the optimizer
-  fusion patterns, and ideally a parity test in burnembed.
+  fusion patterns, and ideally a parity test in burnembed. Use
+  `RLX_DISPATCH_REPORT=1` after compile to confirm native vs common-ir.
 - **Bench every change in burnembed.** The integration testbed at
   `/Users/Shared/burnembed` is the canonical bench loop:
   `cargo run --release --example bench_rlx_single --features ndarray,blas-accelerate,rlx,hf-download -- --model minilm6`.
@@ -239,7 +271,6 @@ new ops land. Pin exact versions in production until 1.0.
 | QAT (PTQ + STE + LSQ)        | Complete: EMA, Fixed, PerBatch, propagation   |
 | Qwen3 LM (safetensors + GGUF)| End-to-end on Metal: 100% top-1 parity vs HF; matches/beats Python MPS on most prefill shapes. Q4_K_M GGUF loads + runs |
 | Op::DequantMatMul GGUF schemes | CPU: Q4_K / Q5_K / Q6_K / Q8_K supported (dequant scratch + sgemm — keeps arena packed). Metal: TBD; the per-op thunk path dequants to F32 once at load |
-| `rlx::run` runner DX | Qwen3 + SAM 1/2/3 builders with autodetected weight format, device pick, memory ceiling, streaming. `rlx-run` CLI tool ships in `rlx-models` |
 
 ## Authors
 

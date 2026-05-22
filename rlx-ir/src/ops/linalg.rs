@@ -56,9 +56,8 @@ impl Graph {
         self.push(Op::LoraMatMul { scale }, vec![x, w, a, b], shape, None)
     }
 
-    /// Fused dequant + matmul. Inputs: x \[m,k\] f32, w_q \[k,n\]
-    /// packed quantized bytes, scale [k/block,n] f32, zp same shape.
-    /// Output: \[m,n\] f32. Supports int8 blockwise schemes today.
+    /// Fused dequant + matmul. See [`Op::DequantMatMul`] for per-scheme
+    /// input layout (4 inputs for legacy/NVFP4, 2 for GGUF).
     pub fn dequant_matmul(
         &mut self,
         x: NodeId,
@@ -73,6 +72,46 @@ impl Graph {
             vec![x, w_q, scale, zp],
             shape,
             None,
+        )
+    }
+
+    /// GGUF / K-quant packed weights — `[x, packed_w_bytes]` only.
+    pub fn dequant_matmul_packed(
+        &mut self,
+        x: NodeId,
+        packed_w: NodeId,
+        scheme: QuantScheme,
+        shape: Shape,
+    ) -> NodeId {
+        debug_assert!(
+            scheme.is_gguf(),
+            "dequant_matmul_packed requires a GGUF QuantScheme"
+        );
+        self.push(
+            Op::DequantMatMul { scheme },
+            vec![x, packed_w],
+            shape,
+            None,
+        )
+    }
+
+    /// NVFP4 (E2M1) block matmul — group size 16, FP8 block scales,
+    /// optional f32 global scale (defaults to 1.0 when unset at runtime).
+    pub fn dequant_matmul_nvfp4(
+        &mut self,
+        x: NodeId,
+        w_q: NodeId,
+        block_scales: NodeId,
+        global_scale: NodeId,
+        shape: Shape,
+    ) -> NodeId {
+        self.dequant_matmul(
+            x,
+            w_q,
+            block_scales,
+            global_scale,
+            QuantScheme::Nvfp4Block,
+            shape,
         )
     }
 

@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! HIP-CPU validation smoke tests for rlx-rocm.
+//! HIP-CPU validation basic tests for rlx-rocm.
 //!
 //! Only compiled with `cargo test -p rlx-rocm --features hip-cpu-validate`.
 //!

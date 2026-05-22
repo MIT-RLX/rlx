@@ -57,6 +57,9 @@ pub struct MetalExecutable {
     /// every op in the graph is supported by the lowerer. Replaces the
     /// per-op thunk path with one compiled MPSGraph for the whole forward.
     mps_plan: Option<crate::mps_graph_lower::MpsGraphPlan>,
+    /// Hybrid MPSGraph + thunk schedule when whole-graph lowering fails
+    /// (Qwen3.5 decode: matmul/norm/attn via MPS, GDN via thunks).
+    mps_hybrid: Option<Vec<crate::mps_graph_hybrid::HybridStep>>,
     /// ICB segments — populated when `RLX_USE_ICB=1`. One segment per
     /// maximal run of ICB-compatible thunks in the schedule. Each segment
     /// pre-encodes its run into an `MTLIndirectCommandBuffer` at compile
@@ -81,6 +84,11 @@ pub struct MetalExecutable {
     /// `freeze_params_to_mps_constants`. Subsequent runs skip the
     /// (idempotent but not free) re-lower.
     mps_params_frozen: bool,
+    /// Arena tail reserved for ephemeral GatedDeltaNet state when
+    /// `Op::GatedDeltaNet` runs without carry (state input absent).
+    gdn_scratch_off: usize,
+    /// Arena tail scratch for GPU GGUF dequant before matmul (reused per op).
+    dequant_scratch_off: usize,
 }
 
 unsafe impl Send for MetalExecutable {}
@@ -91,8 +99,7 @@ impl MetalExecutable {
         // F16 compilation requires every kernel in the graph to have an f16
         // variant. Until they do, transparently fall back to F32 with a note.
         let effective = if precision == MetalPrecision::F16 {
-            let verbose = std::env::var("RLX_VERBOSE")
-                .ok()
+            let verbose = rlx_ir::env::var("RLX_VERBOSE")
                 .and_then(|v| v.parse::<u8>().ok())
                 .unwrap_or(0)
                 >= 1;
@@ -111,19 +118,38 @@ impl MetalExecutable {
     }
 
     pub fn compile(graph: Graph) -> Self {
-        Self::compile_inner(graph, None)
+        Self::compile_inner(graph, None, None, false)
     }
 
     /// Compile with an optional `PrecisionPolicy`. The pass runs *after*
     /// fusion to avoid breaking pattern-match-based fusion via interleaved
     /// Cast nodes.
-    pub fn compile_with_policy(graph: Graph, policy: Option<rlx_opt::PrecisionPolicy>) -> Self {
-        Self::compile_inner(graph, policy)
+    pub fn compile_with_policy(
+        graph: Graph,
+        policy: Option<rlx_opt::PrecisionPolicy>,
+        supported_ops: Option<&'static [rlx_ir::OpKind]>,
+    ) -> Self {
+        Self::compile_inner(graph, policy, supported_ops, false)
     }
 
-    fn compile_inner(graph: Graph, policy: Option<rlx_opt::PrecisionPolicy>) -> Self {
-        let verbose = std::env::var("RLX_VERBOSE")
-            .ok()
+    /// Compile a graph that already went through the fusion pipeline
+    /// (e.g. from [`rlx_ir::LirModule`]). Skips re-fusion so backends
+    /// invoked via `Backend::compile_lir` do not undo fused ops.
+    pub fn compile_from_fused(
+        graph: Graph,
+        policy: Option<rlx_opt::PrecisionPolicy>,
+        supported_ops: Option<&'static [rlx_ir::OpKind]>,
+    ) -> Self {
+        Self::compile_inner(graph, policy, supported_ops, true)
+    }
+
+    fn compile_inner(
+        graph: Graph,
+        policy: Option<rlx_opt::PrecisionPolicy>,
+        supported_ops: Option<&'static [rlx_ir::OpKind]>,
+        skip_fusion: bool,
+    ) -> Self {
+        let verbose = rlx_ir::env::var("RLX_VERBOSE")
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(0)
             >= 1;
@@ -141,23 +167,25 @@ impl MetalExecutable {
         // produces NaN outputs.
         crate::mps_blas::invalidate_caches();
 
-        // Run fusion passes (shared with CPU backend — device-agnostic)
-        let passes: Vec<&dyn rlx_opt::pass::Pass> = vec![
-            // Lower DotGeneral first so the rest of the fusion pipeline only
-            // sees MatMul (mirrors the CPU backend's pass list).
-            &rlx_opt::LowerDotGeneral,
-            &rlx_opt::fusion::FuseMatMulBiasAct,
-            &rlx_opt::fusion::FuseResidualLN,
-            &rlx_opt::fusion::FuseSharedInputMatMul,
-            // Match silu(narrow)*narrow → FusedSwiGLU after the shared-input
-            // matmul pass has produced the narrow pair.
-            &rlx_opt::fusion::FuseSwiGLU,
-            // PLAN L2: Metal has a native ElementwiseRegion thunk
-            // (interpreted-chain MSL kernel) — collapse leftover
-            // element-wise chains AFTER the big pattern fusions.
-            &rlx_opt::MarkElementwiseRegions,
-        ];
-        let fused = rlx_opt::run_passes(graph, &passes, verbose);
+        // Backend-aware fusion: only emit fused ops Metal can lower.
+        let fused = if skip_fusion {
+            graph
+        } else {
+            let mut pipe = rlx_opt::CompilePipeline::new(rlx_opt::FusionTarget::Metal)
+                .with_assert_fusion_clean(false);
+            if let Some(ops) = supported_ops {
+                pipe = pipe.with_supported_ops(ops);
+            }
+            let compile_result = pipe.compile_graph(graph);
+            if verbose {
+                eprintln!(
+                    "[rlx-metal] fusion: {} → {} nodes",
+                    compile_result.fusion.nodes_before,
+                    compile_result.fusion.nodes_after
+                );
+            }
+            compile_result.lir.into_graph()
+        };
 
         // AutoMixedPrecision runs AFTER fusion: Cast nodes interleave between
         // the (now flattened) ops without breaking earlier pattern matchers.
@@ -178,7 +206,39 @@ impl MetalExecutable {
         }
 
         // Memory plan with GPU-aligned cache lines (128B on Apple Silicon)
-        let plan = memory::plan_memory_aligned(&fused, 128);
+        let gdn_scratch = gdn_ephemeral_state_bytes(&fused);
+        let dequant_scratch = dequant_gguf_scratch_bytes(&fused);
+        let mut plan = memory::plan_memory_aligned(&fused, 128);
+        let mut tail = plan.arena_size;
+        let gdn_scratch_off = if gdn_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + gdn_scratch;
+            off
+        } else {
+            0
+        };
+        let dequant_scratch_off = if dequant_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + dequant_scratch;
+            off
+        } else {
+            0
+        };
+        plan.arena_size = tail;
+        if verbose && gdn_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] GatedDeltaNet scratch: {} bytes @ offset {}",
+                gdn_scratch, gdn_scratch_off
+            );
+        }
+        if verbose && dequant_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] DequantMatMul scratch: {} bytes @ offset {}",
+                dequant_scratch, dequant_scratch_off
+            );
+        }
         if verbose {
             eprintln!(
                 "[rlx-metal] arena: {} bytes, {} buffers",
@@ -273,7 +333,7 @@ impl MetalExecutable {
         // outperform our per-op MSL encoder across the qwen3 prefill
         // range once RmsNorm + SDPA are wired (see mps_graph.rs).
         // Opt out with RLX_DISABLE_MPSGRAPH=1.
-        let mps_plan = if std::env::var("RLX_DISABLE_MPSGRAPH").is_ok() {
+        let mps_plan = if rlx_ir::env::flag("RLX_DISABLE_MPSGRAPH") {
             None
         } else {
             let plan = crate::mps_graph_lower::try_lower(&fused);
@@ -287,13 +347,26 @@ impl MetalExecutable {
             }
             plan
         };
+        let mps_hybrid = if mps_plan.is_none()
+            && rlx_ir::env::is_unset("RLX_DISABLE_MPSGRAPH")
+            && rlx_ir::env::is_unset("RLX_DISABLE_MPSGRAPH_HYBRID")
+        {
+            crate::mps_graph_hybrid::build_hybrid_plan(&fused, None).filter(|steps| {
+                crate::mps_graph_hybrid::hybrid_has_mps(steps)
+            })
+        } else {
+            None
+        };
+        if verbose && mps_hybrid.is_some() {
+            eprintln!("[rlx-metal] MPSGraph hybrid lowering: enabled");
+        }
 
         // Optional ICB pre-encoding: opt-in via env var. Pre-encodes the
         // ICB-compatible thunks (small element-wise / norm / copy ops) into
         // an IndirectCommandBuffer at compile time so encode_and_run can
         // issue them as one `executeCommandsInBuffer` call instead of N
         // individual `set_pipeline + set_buffer + dispatch` round-trips.
-        let icb_segments = if std::env::var("RLX_USE_ICB").is_ok() {
+        let icb_segments = if rlx_ir::env::flag("RLX_USE_ICB") {
             let dev_ref = metal_device().expect("Metal device required");
             let segs =
                 crate::icb::compile_segments(&schedule.thunks, &arena.buffer, &dev_ref.device);
@@ -322,11 +395,14 @@ impl MetalExecutable {
             output_slots,
             precision: MetalPrecision::F32,
             mps_plan,
+            mps_hybrid,
             icb_segments,
             pending_cmd_bufs: Vec::new(),
             active_extent: None,
             max_matmul_flops,
             mps_params_frozen: false,
+            gdn_scratch_off,
+            dequant_scratch_off,
         };
         // Bind the MPSGraph executable's input/output arrays to the
         // arena once. After this, run_cached() avoids all per-call
@@ -348,7 +424,7 @@ impl MetalExecutable {
     /// N → freeze → run × M). Triggered automatically on the first
     /// `run()` unless disabled with `RLX_DISABLE_MPSGRAPH_PARAM_CONST=1`.
     pub fn freeze_params_to_mps_constants(&mut self) {
-        if self.mps_plan.is_none() {
+        if self.mps_plan.is_none() && self.mps_hybrid.is_none() {
             return;
         }
 
@@ -366,30 +442,50 @@ impl MetalExecutable {
         // projections, small enough to skip the LM head & token
         // embedding tables. Override with RLX_MPSGRAPH_PARAM_CONST_CAP=N
         // (bytes; 0 disables the cap).
-        let cap_bytes = std::env::var("RLX_MPSGRAPH_PARAM_CONST_CAP")
-            .ok()
+        let cap_bytes = rlx_ir::env::var("RLX_MPSGRAPH_PARAM_CONST_CAP")
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(4 * 1024 * 1024);
         let arena_ptr = self.arena.buffer.contents() as *const u8;
         let mut param_bytes: HashMap<String, Vec<u8>> = HashMap::new();
         for (name, id) in &self.param_ids {
             let node = self.graph.node(*id);
-            if !matches!(node.shape.dtype(), rlx_ir::DType::F32) {
+            if matches!(node.shape.dtype(), rlx_ir::DType::F32) {
+                let n_elem = match node.shape.num_elements() {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let len_bytes = n_elem * 4;
+                if cap_bytes != 0 && len_bytes > cap_bytes {
+                    continue;
+                }
+                let off = self.arena.byte_offset(*id);
+                let bytes: Vec<u8> = unsafe {
+                    std::slice::from_raw_parts(arena_ptr.add(off), len_bytes).to_vec()
+                };
+                param_bytes.insert(name.clone(), bytes);
                 continue;
             }
-            let n_elem = match node.shape.num_elements() {
+            if !matches!(node.shape.dtype(), rlx_ir::DType::U8) {
+                continue;
+            }
+            let Some((k, n, scheme)) = gguf_dequant_dims_for_param(&self.graph, *id) else {
+                continue;
+            };
+            let u8_len = match node.shape.num_elements() {
                 Some(n) => n,
                 None => continue,
             };
-            let len_bytes = n_elem * 4;
-            if cap_bytes != 0 && len_bytes > cap_bytes {
+            let f32_len = k * n * 4;
+            if cap_bytes != 0 && f32_len > cap_bytes {
                 continue;
             }
             let off = self.arena.byte_offset(*id);
-            let bytes: Vec<u8> = unsafe {
-                std::slice::from_raw_parts(arena_ptr.add(off), len_bytes).to_vec()
-            };
-            param_bytes.insert(name.clone(), bytes);
+            let u8_slice: &[u8] =
+                unsafe { std::slice::from_raw_parts(arena_ptr.add(off), u8_len) };
+            let dequant =
+                rlx_cpu::dequant_cache::gguf_weight_f32(off, u8_slice, k, n, scheme);
+            let kn_bytes = transpose_nk_to_kn_bytes(&dequant, n, k);
+            param_bytes.insert(name.clone(), kn_bytes);
         }
 
         // Re-run lowering with the params marked as constants. Old
@@ -401,8 +497,15 @@ impl MetalExecutable {
         );
         if let Some(plan) = new_plan {
             self.mps_plan = Some(plan);
+            self.mps_hybrid = None;
             // Re-bind the (now much smaller) feed list to the arena.
             self.bind_mps_executable_to_arena();
+        } else if self.mps_plan.is_none() {
+            self.mps_hybrid = crate::mps_graph_hybrid::build_hybrid_plan(
+                &self.graph,
+                Some(&param_bytes),
+            )
+            .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps));
         }
     }
 
@@ -531,7 +634,7 @@ impl MetalExecutable {
         // reading until sync_pending() AND for tolerating intermediate
         // commits stomping the output region. Use run_pipelined() if you
         // need outputs from each individual commit.
-        if let Some(cmd_buf) = self.encode_commit(false, None) {
+        if let Some(cmd_buf) = self.encode_commit(false, None, None) {
             self.pending_cmd_bufs.push(cmd_buf);
         }
     }
@@ -577,7 +680,7 @@ impl MetalExecutable {
             // unified memory (no GPU→CPU copy).
             let dests: Vec<metal::Buffer> =
                 out_sizes.iter().map(|&b| dev.alloc_shared(b)).collect();
-            if let Some(cmd_buf) = self.encode_commit(false, Some(&dests)) {
+            if let Some(cmd_buf) = self.encode_commit(false, Some(&dests), None) {
                 pending.push((cmd_buf, dests));
             }
         }
@@ -619,6 +722,14 @@ impl MetalExecutable {
         {
             // Converts to f16 if the param node's dtype is F16.
             self.arena.write_from_f32(id, data);
+        }
+    }
+
+    pub fn set_param_bytes(&mut self, name: &str, data: &[u8]) {
+        if let Some(&id) = self.param_ids.get(name)
+            && self.arena.has_buffer(id)
+        {
+            self.arena.write_bytes(id, data);
         }
     }
 
@@ -686,8 +797,8 @@ impl MetalExecutable {
         // `RLX_MPSGRAPH_PARAM_CONST_CAP` knob lets callers tune the
         // per-param byte ceiling once they've opted in.
         if !self.mps_params_frozen
-            && self.mps_plan.is_some()
-            && std::env::var("RLX_MPSGRAPH_PARAM_CONST").is_ok()
+            && (self.mps_plan.is_some() || self.mps_hybrid.is_some())
+            && rlx_ir::env::flag("RLX_MPSGRAPH_PARAM_CONST")
         {
             self.freeze_params_to_mps_constants();
             self.mps_params_frozen = true;
@@ -705,9 +816,8 @@ impl MetalExecutable {
             // single-matmul graphs (~<1 MFLOP). Default-on whenever
             // the plan exists; override via RLX_MPSGRAPH_MIN_FLOPS or
             // RLX_MPSGRAPH_FORCE=1.
-            let force = std::env::var("RLX_MPSGRAPH_FORCE").is_ok();
-            let threshold = std::env::var("RLX_MPSGRAPH_MIN_FLOPS")
-                .ok()
+            let force = rlx_ir::env::flag("RLX_MPSGRAPH_FORCE");
+            let threshold = rlx_ir::env::var("RLX_MPSGRAPH_MIN_FLOPS")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(1_000_000);
             if force || self.estimated_max_flops() >= threshold {
@@ -715,9 +825,25 @@ impl MetalExecutable {
                 return;
             }
         }
+        if !active_safe
+            && self.mps_plan.is_none()
+            && self
+                .mps_hybrid
+                .as_ref()
+                .is_some_and(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps))
+        {
+            let force = rlx_ir::env::flag("RLX_MPSGRAPH_FORCE");
+            let threshold = rlx_ir::env::var("RLX_MPSGRAPH_MIN_FLOPS")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1_000_000);
+            if force || self.estimated_max_flops() >= threshold {
+                self.run_via_mps_hybrid();
+                return;
+            }
+        }
         // wait=true: synchronous, drop the buffer immediately after wait.
         // ICB segments (if any) are dispatched inline by encode_commit.
-        let _ = self.encode_commit(true, None);
+        let _ = self.encode_commit(true, None, None);
     }
 
     /// Encode + commit. When `wait=true`, also waits for completion and
@@ -740,8 +866,79 @@ impl MetalExecutable {
         &mut self,
         wait: bool,
         blit_outputs: Option<&[metal::Buffer]>,
+        thunk_range: Option<std::ops::Range<usize>>,
     ) -> Option<metal::CommandBuffer> {
-        let trace = std::env::var("RLX_METAL_TRACE").is_ok();
+        /// Host-side thunk queued between GPU segments (unified-memory arena).
+        enum DeferredHostOp {
+            GatedDeltaNet {
+                q: usize,
+                k_off: usize,
+                v: usize,
+                g: usize,
+                beta: usize,
+                state_byte: usize,
+                dst: usize,
+                batch: u32,
+                seq: u32,
+                heads: u32,
+                state_size: u32,
+                f16: bool,
+            },
+            DequantMatMulGguf {
+                x: usize,
+                w_q: usize,
+                dst: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+                scheme: rlx_ir::quant::QuantScheme,
+            },
+            DequantGroupedMatMulGguf {
+                input: usize,
+                w_q: usize,
+                expert_idx: usize,
+                dst: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+                num_experts: usize,
+                scheme: rlx_ir::quant::QuantScheme,
+            },
+            DequantMatMulInt4 {
+                x: usize,
+                w_q: usize,
+                scale: usize,
+                zp: usize,
+                dst: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+                block_size: u32,
+                is_asymmetric: bool,
+            },
+            DequantMatMulFp8 {
+                x: usize,
+                w_q: usize,
+                scale: usize,
+                dst: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+                e5m2: bool,
+            },
+            DequantMatMulNvfp4 {
+                x: usize,
+                w_q: usize,
+                scale: usize,
+                global_scale: usize,
+                dst: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+            },
+        }
+
+        let trace = rlx_ir::env::flag("RLX_METAL_TRACE");
         let t_run_start = if trace {
             Some(std::time::Instant::now())
         } else {
@@ -766,9 +963,168 @@ impl MetalExecutable {
         // releases the encoder fully, after which `cmd_buf` is freely
         // reassignable.
         let mut enc: Option<metal::ComputeCommandEncoder> = None;
+        let mut deferred_host: Vec<DeferredHostOp> = Vec::new();
+
+        let flush_deferred_host =
+            |cmd_buf: &mut metal::CommandBuffer,
+             enc: &mut Option<metal::ComputeCommandEncoder>,
+             deferred: &mut Vec<DeferredHostOp>| {
+                if deferred.is_empty() {
+                    return;
+                }
+                if let Some(active) = enc.take() {
+                    active.end_encoding();
+                }
+                cmd_buf.commit();
+                cmd_buf.wait_until_completed();
+                let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                for op in deferred.drain(..) {
+                    match op {
+                        DeferredHostOp::GatedDeltaNet {
+                            q,
+                            k_off,
+                            v,
+                            g,
+                            beta,
+                            state_byte,
+                            dst,
+                            batch,
+                            seq,
+                            heads,
+                            state_size,
+                            f16,
+                        } => unsafe {
+                            if f16 {
+                                rlx_cpu::thunk::execute_gated_delta_net_f16(
+                                    q,
+                                    k_off,
+                                    v,
+                                    g,
+                                    beta,
+                                    state_byte,
+                                    dst,
+                                    batch as usize,
+                                    seq as usize,
+                                    heads as usize,
+                                    state_size as usize,
+                                    arena_ptr,
+                                );
+                            } else {
+                                rlx_cpu::thunk::execute_gated_delta_net_f32(
+                                    q,
+                                    k_off,
+                                    v,
+                                    g,
+                                    beta,
+                                    state_byte,
+                                    dst,
+                                    batch as usize,
+                                    seq as usize,
+                                    heads as usize,
+                                    state_size as usize,
+                                    arena_ptr,
+                                );
+                            }
+                        },
+                        DeferredHostOp::DequantMatMulGguf {
+                            x,
+                            w_q,
+                            dst,
+                            m,
+                            k,
+                            n,
+                            scheme,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_dequant_matmul_gguf_f32(
+                                x, w_q, dst, m, k, n, scheme, arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::DequantGroupedMatMulGguf {
+                            input,
+                            w_q,
+                            expert_idx,
+                            dst,
+                            m,
+                            k,
+                            n,
+                            num_experts,
+                            scheme,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_dequant_grouped_matmul_gguf_f32(
+                                input,
+                                w_q,
+                                expert_idx,
+                                dst,
+                                m,
+                                k,
+                                n,
+                                num_experts,
+                                scheme,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::DequantMatMulInt4 {
+                            x,
+                            w_q,
+                            scale,
+                            zp,
+                            dst,
+                            m,
+                            k,
+                            n,
+                            block_size,
+                            is_asymmetric,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_dequant_matmul_int4_f32(
+                                x,
+                                w_q,
+                                scale,
+                                zp,
+                                dst,
+                                m,
+                                k,
+                                n,
+                                block_size,
+                                is_asymmetric,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::DequantMatMulFp8 {
+                            x,
+                            w_q,
+                            scale,
+                            dst,
+                            m,
+                            k,
+                            n,
+                            e5m2,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_dequant_matmul_fp8_f32(
+                                x, w_q, scale, dst, m, k, n, e5m2, arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::DequantMatMulNvfp4 {
+                            x,
+                            w_q,
+                            scale,
+                            global_scale,
+                            dst,
+                            m,
+                            k,
+                            n,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_dequant_matmul_nvfp4_f32(
+                                x, w_q, scale, global_scale, dst, m, k, n, arena_ptr,
+                            );
+                        },
+                    }
+                }
+                *cmd_buf = dev.queue.new_command_buffer().to_owned();
+            };
 
         macro_rules! e {
             () => {{
+                flush_deferred_host(&mut cmd_buf, &mut enc, &mut deferred_host);
                 if enc.is_none() {
                     enc = Some(
                         cmd_buf
@@ -783,6 +1139,7 @@ impl MetalExecutable {
         }
         macro_rules! end_msl {
             () => {{
+                flush_deferred_host(&mut cmd_buf, &mut enc, &mut deferred_host);
                 if let Some(active) = enc.take() {
                     active.end_encoding();
                 }
@@ -810,8 +1167,9 @@ impl MetalExecutable {
         let segments = &self.icb_segments;
         let thunks = &self.schedule.thunks;
         let mut seg_iter = segments.iter().peekable();
-        let mut i = 0usize;
-        while i < thunks.len() {
+        let loop_end = thunk_range.as_ref().map(|r| r.end).unwrap_or(thunks.len());
+        let mut i = thunk_range.as_ref().map(|r| r.start).unwrap_or(0);
+        while i < loop_end {
             if active.is_none()
                 && let Some(range) = seg_iter.peek()
                 && range.start == i
@@ -915,6 +1273,10 @@ impl MetalExecutable {
                         Some(Activation::Silu) => crate::blas::FusedAct::Silu,
                         _ => crate::blas::FusedAct::None,
                     };
+                    let kernel_applies_act = matches!(
+                        act,
+                        Some(Activation::Gelu) | Some(Activation::Silu)
+                    );
                     let m_scaled = scale(*m);
                     if m_scaled == 0 {
                         continue;
@@ -972,6 +1334,17 @@ impl MetalExecutable {
                             nu,
                             fa,
                         );
+                        if let Some(activation) = act.filter(|_| !kernel_applies_act) {
+                            encode_activation(
+                                e!(),
+                                k,
+                                &self.arena.buffer,
+                                *c,
+                                m_scaled * *n,
+                                activation,
+                                *dt,
+                            );
+                        }
                     } else {
                         crate::blas::metal_sgemm_bias(
                             e!(),
@@ -985,6 +1358,17 @@ impl MetalExecutable {
                             nu,
                             fa,
                         );
+                        if let Some(activation) = act.filter(|_| !kernel_applies_act) {
+                            encode_activation(
+                                e!(),
+                                k,
+                                &self.arena.buffer,
+                                *c,
+                                m_scaled * *n,
+                                activation,
+                                *dt,
+                            );
+                        }
                     }
                 }
                 Thunk::ActivationInPlace { data, len, act, dt } => {
@@ -1020,6 +1404,146 @@ impl MetalExecutable {
                         *h,
                         *eps,
                         *dt,
+                    );
+                }
+                Thunk::GroupNorm {
+                    src,
+                    g,
+                    b,
+                    dst,
+                    n,
+                    c,
+                    h,
+                    w,
+                    num_groups,
+                    eps,
+                    dt: _,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_group_norm(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *g,
+                        *b,
+                        *dst,
+                        n,
+                        *c,
+                        *h,
+                        *w,
+                        *num_groups,
+                        *eps,
+                    );
+                }
+                Thunk::LayerNorm2d {
+                    src,
+                    g,
+                    b,
+                    dst,
+                    n,
+                    c,
+                    h,
+                    w,
+                    eps,
+                    dt: _,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_layer_norm2d(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *g,
+                        *b,
+                        *dst,
+                        n,
+                        *c,
+                        *h,
+                        *w,
+                        *eps,
+                    );
+                }
+                Thunk::ConvTranspose2d {
+                    src,
+                    weight,
+                    dst,
+                    n,
+                    c_in,
+                    h,
+                    w_in,
+                    c_out,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw,
+                    groups,
+                    dt: _,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_conv_transpose2d(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *weight,
+                        *dst,
+                        n,
+                        *c_in,
+                        *h,
+                        *w_in,
+                        *c_out,
+                        *h_out,
+                        *w_out,
+                        *kh,
+                        *kw,
+                        *sh,
+                        *sw,
+                        *ph,
+                        *pw,
+                        *dh,
+                        *dw,
+                        *groups,
+                    );
+                }
+                Thunk::ResizeNearest2x {
+                    src,
+                    dst,
+                    n,
+                    c,
+                    h,
+                    w,
+                    dt: _,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_resize_nearest_2x(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *dst,
+                        n,
+                        *c,
+                        *h,
+                        *w,
                     );
                 }
                 Thunk::RmsNorm {
@@ -1259,6 +1783,39 @@ impl MetalExecutable {
                         *dt,
                     );
                 }
+                Thunk::FusedResidualRmsNorm {
+                    x,
+                    res,
+                    bias,
+                    g,
+                    b,
+                    out,
+                    rows,
+                    h,
+                    eps,
+                    has_bias,
+                    dt,
+                } => {
+                    let _ = (bias, has_bias);
+                    let rows = scale(*rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_fused_residual_rms_norm(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *res,
+                        *g,
+                        *b,
+                        *out,
+                        rows,
+                        *h,
+                        *eps,
+                        *dt,
+                    );
+                }
                 Thunk::Gather {
                     table,
                     idx,
@@ -1316,6 +1873,267 @@ impl MetalExecutable {
                     }
                     encode_copy(e!(), k, &self.arena.buffer, *src, *dst, len, *dt);
                 }
+                Thunk::AttentionBackward {
+                    q,
+                    k: kk,
+                    v,
+                    dy,
+                    mask,
+                    out,
+                    batch,
+                    seq,
+                    kv_seq,
+                    heads,
+                    head_dim,
+                    mask_kind,
+                    window,
+                    wrt,
+                    bhsd,
+                } => {
+                    use rlx_ir::op::{AttentionBwdWrt, MaskKind};
+                    let b = *batch as usize;
+                    let nh = *heads as usize;
+                    let sq = scale(*seq) as usize;
+                    let sk = scale(*kv_seq) as usize;
+                    let dh = *head_dim as usize;
+                    if sq == 0 || sk == 0 {
+                        continue;
+                    }
+                    let bhsd = *bhsd != 0;
+                    let q_len = if bhsd {
+                        b * nh * sq * dh
+                    } else {
+                        b * sq * nh * dh
+                    };
+                    let k_len = if bhsd {
+                        b * nh * sk * dh
+                    } else {
+                        b * sk * nh * dh
+                    };
+                    let mask_kind_ir = match *mask_kind {
+                        0 => MaskKind::None,
+                        1 => MaskKind::Causal,
+                        2 => MaskKind::Custom,
+                        3 => MaskKind::SlidingWindow(*window as usize),
+                        4 => MaskKind::Bias,
+                        _ => MaskKind::None,
+                    };
+                    let wrt_ir = match *wrt {
+                        0 => AttentionBwdWrt::Query,
+                        1 => AttentionBwdWrt::Key,
+                        _ => AttentionBwdWrt::Value,
+                    };
+                    unsafe {
+                        let base = self.arena.buffer.contents() as *mut u8;
+                        let f32_at = |byte_off: usize, len: usize| -> &[f32] {
+                            std::slice::from_raw_parts(base.add(byte_off) as *const f32, len)
+                        };
+                        let f32_at_mut = |byte_off: usize, len: usize| -> &mut [f32] {
+                            std::slice::from_raw_parts_mut(
+                                base.add(byte_off) as *mut f32,
+                                len,
+                            )
+                        };
+                        let q_data = f32_at(*q, q_len);
+                        let k_data = f32_at(*kk, k_len);
+                        let v_data = f32_at(*v, k_len);
+                        let dy_data = f32_at(*dy, q_len);
+                        let out_len = if *wrt == 0 { q_len } else { k_len };
+                        let out_data = f32_at_mut(*out, out_len);
+                        let mask_data: &[f32] = if *mask_kind == 2 || *mask_kind == 4 {
+                            let ml = if *mask_kind == 2 {
+                                b * sk
+                            } else {
+                                b * nh * sq * sk
+                            };
+                            f32_at(*mask, ml)
+                        } else {
+                            &[]
+                        };
+                        rlx_cpu::attention_bwd::attention_backward(
+                            wrt_ir,
+                            q_data,
+                            k_data,
+                            v_data,
+                            dy_data,
+                            out_data,
+                            b,
+                            nh,
+                            sq,
+                            sk,
+                            dh,
+                            mask_kind_ir,
+                            mask_data,
+                            bhsd,
+                        );
+                    }
+                }
+                Thunk::RmsNormBackwardInput {
+                    x,
+                    gamma,
+                    beta,
+                    dy,
+                    dx,
+                    rows,
+                    h,
+                    eps,
+                } => {
+                    let rows = scale(*rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_rms_norm_bwd_input(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *gamma,
+                        *beta,
+                        *dy,
+                        *dx,
+                        rows,
+                        *h,
+                        *eps,
+                    );
+                }
+                Thunk::RmsNormBackwardGamma {
+                    x,
+                    gamma,
+                    beta,
+                    dy,
+                    dgamma,
+                    rows,
+                    h,
+                    eps,
+                } => {
+                    let rows = scale(*rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_rms_norm_bwd_param(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *gamma,
+                        *beta,
+                        *dy,
+                        *dgamma,
+                        rows,
+                        *h,
+                        *eps,
+                        1,
+                    );
+                }
+                Thunk::RmsNormBackwardBeta {
+                    x,
+                    gamma,
+                    beta,
+                    dy,
+                    dbeta,
+                    rows,
+                    h,
+                    eps,
+                } => {
+                    let rows = scale(*rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_rms_norm_bwd_param(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *gamma,
+                        *beta,
+                        *dy,
+                        *dbeta,
+                        rows,
+                        *h,
+                        *eps,
+                        2,
+                    );
+                }
+                Thunk::RopeBackward {
+                    dy,
+                    cos,
+                    sin,
+                    dx,
+                    batch,
+                    seq,
+                    hidden,
+                    head_dim,
+                    n_rot,
+                    cos_len,
+                } => {
+                    let seq = scale(*seq);
+                    if seq == 0 {
+                        continue;
+                    }
+                    encode_rope_bwd(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *dy,
+                        *cos,
+                        *sin,
+                        *dx,
+                        *batch,
+                        seq,
+                        *hidden,
+                        *head_dim,
+                        *n_rot,
+                        *cos_len,
+                    );
+                }
+                Thunk::CumsumBackward {
+                    dy,
+                    dx,
+                    rows,
+                    cols,
+                    exclusive,
+                } => {
+                    let rows = scale(*rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_cumsum_bwd(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *dy,
+                        *dx,
+                        rows,
+                        *cols,
+                        *exclusive,
+                    );
+                }
+                Thunk::GatherBackward {
+                    dy,
+                    indices,
+                    dst,
+                    outer,
+                    axis_dim,
+                    num_idx,
+                    trailing,
+                } => {
+                    let outer = scale(*outer);
+                    if outer == 0 {
+                        continue;
+                    }
+                    encode_gather_bwd(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *dy,
+                        *indices,
+                        *dst,
+                        outer,
+                        *axis_dim,
+                        *num_idx,
+                        *trailing,
+                    );
+                }
                 Thunk::Attention {
                     q,
                     k: kk,
@@ -1368,6 +2186,7 @@ impl MetalExecutable {
                     seq,
                     hidden,
                     head_dim,
+                    n_rot,
                     dt,
                     src_row_stride,
                 } => {
@@ -1391,6 +2210,7 @@ impl MetalExecutable {
                         seq,
                         *hidden,
                         *head_dim,
+                        *n_rot,
                         *dt,
                         *src_row_stride,
                         seq_stride,
@@ -1415,6 +2235,7 @@ impl MetalExecutable {
                     total,
                     src_dt,
                     dst_dt,
+                    gate_first,
                 } => {
                     let total = scale(*total);
                     if total == 0 {
@@ -1430,6 +2251,7 @@ impl MetalExecutable {
                         total,
                         *src_dt,
                         *dst_dt,
+                        *gate_first,
                     );
                 }
                 Thunk::Concat {
@@ -1857,6 +2679,329 @@ impl MetalExecutable {
                     cmd_buf = dev.queue.new_command_buffer().to_owned();
                 }
 
+                Thunk::GaussianSplatRender {
+                    positions_off,
+                    positions_len,
+                    scales_off,
+                    scales_len,
+                    rotations_off,
+                    rotations_len,
+                    opacities_off,
+                    opacities_len,
+                    colors_off,
+                    colors_len,
+                    sh_coeffs_off,
+                    sh_coeffs_len,
+                    meta_off,
+                    dst_off,
+                    dst_len,
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    unsafe {
+                        #[cfg(all(feature = "native-splat", target_os = "macos"))]
+                        {
+                            crate::splat_native::execute_gaussian_splat_render_native(
+                                *positions_off,
+                                *positions_len,
+                                *scales_off,
+                                *scales_len,
+                                *rotations_off,
+                                *rotations_len,
+                                *opacities_off,
+                                *opacities_len,
+                                *colors_off,
+                                *colors_len,
+                                *sh_coeffs_off,
+                                *sh_coeffs_len,
+                                *meta_off,
+                                *dst_off,
+                                *dst_len,
+                                *width,
+                                *height,
+                                *tile_size,
+                                *radius_scale,
+                                *alpha_cutoff,
+                                *max_splat_steps,
+                                *transmittance_threshold,
+                                *max_list_entries,
+                                arena_ptr,
+                                &self.arena.buffer,
+                            );
+                        }
+                        #[cfg(not(all(feature = "native-splat", target_os = "macos")))]
+                        rlx_cpu::splat::execute_gaussian_splat_render(
+                            *positions_off,
+                            *positions_len,
+                            *scales_off,
+                            *scales_len,
+                            *rotations_off,
+                            *rotations_len,
+                            *opacities_off,
+                            *opacities_len,
+                            *colors_off,
+                            *colors_len,
+                            *sh_coeffs_off,
+                            *sh_coeffs_len,
+                            *meta_off,
+                            *dst_off,
+                            *dst_len,
+                            *width,
+                            *height,
+                            *tile_size,
+                            *radius_scale,
+                            *alpha_cutoff,
+                            *max_splat_steps,
+                            *transmittance_threshold,
+                            *max_list_entries,
+                            arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+
+                Thunk::GaussianSplatRenderBackward {
+                    positions_off,
+                    positions_len,
+                    scales_off,
+                    scales_len,
+                    rotations_off,
+                    rotations_len,
+                    opacities_off,
+                    opacities_len,
+                    colors_off,
+                    colors_len,
+                    sh_coeffs_off,
+                    sh_coeffs_len,
+                    meta_off,
+                    d_loss_off,
+                    d_loss_len,
+                    packed_off,
+                    packed_len,
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                    loss_grad_clip,
+                    sh_band,
+                    max_anisotropy,
+                } => {
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    unsafe {
+                        rlx_cpu::splat::execute_gaussian_splat_render_backward(
+                            *positions_off,
+                            *positions_len,
+                            *scales_off,
+                            *scales_len,
+                            *rotations_off,
+                            *rotations_len,
+                            *opacities_off,
+                            *opacities_len,
+                            *colors_off,
+                            *colors_len,
+                            *sh_coeffs_off,
+                            *sh_coeffs_len,
+                            *meta_off,
+                            *d_loss_off,
+                            *d_loss_len,
+                            *packed_off,
+                            *packed_len,
+                            *width,
+                            *height,
+                            *tile_size,
+                            *radius_scale,
+                            *alpha_cutoff,
+                            *max_splat_steps,
+                            *transmittance_threshold,
+                            *max_list_entries,
+                            *loss_grad_clip,
+                            *sh_band,
+                            *max_anisotropy,
+                            arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+
+                Thunk::GaussianSplatPrepare {
+                    positions_off,
+                    positions_len,
+                    scales_off,
+                    scales_len,
+                    rotations_off,
+                    rotations_len,
+                    opacities_off,
+                    opacities_len,
+                    colors_off,
+                    colors_len,
+                    sh_coeffs_off,
+                    sh_coeffs_len,
+                    meta_off,
+                    meta_len,
+                    prep_off,
+                    prep_len,
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    unsafe {
+                        rlx_cpu::splat::execute_gaussian_splat_prepare(
+                            *positions_off,
+                            *positions_len,
+                            *scales_off,
+                            *scales_len,
+                            *rotations_off,
+                            *rotations_len,
+                            *opacities_off,
+                            *opacities_len,
+                            *colors_off,
+                            *colors_len,
+                            *sh_coeffs_off,
+                            *sh_coeffs_len,
+                            *meta_off,
+                            *meta_len,
+                            *prep_off,
+                            *prep_len,
+                            *width,
+                            *height,
+                            *tile_size,
+                            *radius_scale,
+                            *alpha_cutoff,
+                            *max_splat_steps,
+                            *transmittance_threshold,
+                            *max_list_entries,
+                            arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+
+                Thunk::GaussianSplatRasterize {
+                    prep_off,
+                    prep_len,
+                    meta_off,
+                    meta_len,
+                    dst_off,
+                    dst_len,
+                    count,
+                    width,
+                    height,
+                    tile_size,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    unsafe {
+                        #[cfg(all(feature = "native-splat", target_os = "macos"))]
+                        {
+                            crate::splat_native::execute_gaussian_splat_rasterize_native(
+                                *prep_off,
+                                *prep_len,
+                                *meta_off,
+                                *meta_len,
+                                *dst_off,
+                                *dst_len,
+                                *count,
+                                *width,
+                                *height,
+                                *tile_size,
+                                *alpha_cutoff,
+                                *max_splat_steps,
+                                *transmittance_threshold,
+                                *max_list_entries,
+                                arena_ptr,
+                                &self.arena.buffer,
+                            );
+                        }
+                        #[cfg(not(all(feature = "native-splat", target_os = "macos")))]
+                        rlx_cpu::splat::execute_gaussian_splat_rasterize(
+                            *prep_off,
+                            *prep_len,
+                            *meta_off,
+                            *meta_len,
+                            *dst_off,
+                            *dst_len,
+                            *count,
+                            *width,
+                            *height,
+                            *tile_size,
+                            *alpha_cutoff,
+                            *max_splat_steps,
+                            *transmittance_threshold,
+                            *max_list_entries,
+                            arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+
+                Thunk::AxialRope2dHost {
+                    src,
+                    dst,
+                    batch,
+                    seq,
+                    hidden,
+                    end_x,
+                    end_y,
+                    head_dim,
+                    num_heads,
+                    theta,
+                    repeat_factor,
+                } => {
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    unsafe {
+                        rlx_cpu::thunk::execute_axial_rope2d_f32(
+                            *src,
+                            *dst,
+                            *batch as usize,
+                            *seq as usize,
+                            *hidden as usize,
+                            *end_x as usize,
+                            *end_y as usize,
+                            *head_dim as usize,
+                            *num_heads as usize,
+                            *theta,
+                            *repeat_factor as usize,
+                            arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+
                 Thunk::Fft1d {
                     src,
                     dst,
@@ -1872,7 +3017,7 @@ impl MetalExecutable {
                     // future PR. Set RLX_METAL_FFT_HOST_FALLBACK=1 to
                     // force the host path for debugging.
                     let force_host =
-                        std::env::var("RLX_METAL_FFT_HOST_FALLBACK").is_ok();
+                        rlx_ir::env::flag("RLX_METAL_FFT_HOST_FALLBACK");
                     let n = *n_complex as usize;
                     let can_native = !force_host
                         && matches!(dtype, rlx_ir::DType::F32)
@@ -1941,6 +3086,244 @@ impl MetalExecutable {
                         }
                         cmd_buf = dev.queue.new_command_buffer().to_owned();
                     }
+                }
+
+                Thunk::GatedDeltaNet {
+                    q,
+                    k: k_off,
+                    v,
+                    g,
+                    beta,
+                    state,
+                    dst,
+                    batch,
+                    seq,
+                    heads,
+                    state_size,
+                    f16,
+                } => {
+                    // Native MSL kernel supports f32 with n ≤ 128 (qwen35 uses 128).
+                    // f16 tensors and RLX_METAL_GDN_HOST_FALLBACK=1 use the CPU path.
+                    let force_host =
+                        rlx_ir::env::flag("RLX_METAL_GDN_HOST_FALLBACK");
+                    let prefer_cpu_blas =
+                        !rlx_ir::env::flag("RLX_METAL_GDN_GPU");
+                    let use_carry = *state != 0;
+                    let state_byte = if use_carry {
+                        *state
+                    } else {
+                        self.gdn_scratch_off
+                    };
+                    let can_native = !force_host
+                        && !prefer_cpu_blas
+                        && !*f16
+                        && *state_size <= 128
+                        && (!use_carry || state_byte != 0);
+                    if can_native {
+                        let enc = e!();
+                        encode_gated_delta_net(
+                            &enc,
+                            k,
+                            &self.arena.buffer,
+                            *q,
+                            *k_off,
+                            *v,
+                            *g,
+                            *beta,
+                            state_byte,
+                            *dst,
+                            *batch,
+                            *seq,
+                            *heads,
+                            *state_size,
+                            use_carry,
+                        );
+                    } else {
+                        deferred_host.push(DeferredHostOp::GatedDeltaNet {
+                            q: *q,
+                            k_off: *k_off,
+                            v: *v,
+                            g: *g,
+                            beta: *beta,
+                            state_byte,
+                            dst: *dst,
+                            batch: *batch,
+                            seq: *seq,
+                            heads: *heads,
+                            state_size: *state_size,
+                            f16: *f16,
+                        });
+                    }
+                }
+
+                Thunk::DequantMatMulGguf {
+                    x,
+                    w_q,
+                    dst,
+                    m,
+                    k: kk,
+                    n,
+                    scheme,
+                } => {
+                    let m_u = *m as usize;
+                    let k_u = *kk as usize;
+                    let n_u = *n as usize;
+                    let use_gpu_dequant = rlx_ir::env::flag("RLX_METAL_DEQUANT_GPU");
+                    if !use_gpu_dequant || self.dequant_scratch_off == 0 {
+                        deferred_host.push(DeferredHostOp::DequantMatMulGguf {
+                            x: *x,
+                            w_q: *w_q,
+                            dst: *dst,
+                            m: m_u,
+                            k: k_u,
+                            n: n_u,
+                            scheme: *scheme,
+                        });
+                    } else {
+                        let enc = e!();
+                        encode_dequant_gguf(
+                            &enc,
+                            k,
+                            &self.arena.buffer,
+                            *w_q,
+                            self.dequant_scratch_off,
+                            *scheme,
+                            k_u,
+                            n_u,
+                        );
+                        end_msl!();
+                        // B is [n,k] row-major in scratch; use MPS with B^T.
+                        crate::mps_blas::encode_mps_sgemm_bt(
+                            &cmd_buf,
+                            &self.arena.buffer,
+                            *x,
+                            self.dequant_scratch_off,
+                            *dst,
+                            m_u,
+                            k_u,
+                            n_u,
+                        );
+                    }
+                }
+
+                Thunk::DequantGroupedMatMulGguf {
+                    input,
+                    w_q,
+                    expert_idx,
+                    dst,
+                    m,
+                    k_dim: kk,
+                    n,
+                    num_experts,
+                    scheme,
+                } => {
+                    let m_u = *m as usize;
+                    let k_u = *kk as usize;
+                    let n_u = *n as usize;
+                    let ne = *num_experts as usize;
+                    let use_gpu_dequant = rlx_ir::env::flag("RLX_METAL_DEQUANT_GPU");
+                    if !use_gpu_dequant || self.dequant_scratch_off == 0 {
+                        deferred_host.push(DeferredHostOp::DequantGroupedMatMulGguf {
+                            input: *input,
+                            w_q: *w_q,
+                            expert_idx: *expert_idx,
+                            dst: *dst,
+                            m: m_u,
+                            k: k_u,
+                            n: n_u,
+                            num_experts: ne,
+                            scheme: *scheme,
+                        });
+                    } else {
+                        let enc = e!();
+                        encode_dequant_grouped_matmul_gguf(
+                            &cmd_buf,
+                            enc,
+                            k,
+                            &self.arena.buffer,
+                            self.dequant_scratch_off,
+                            *input,
+                            *w_q,
+                            *expert_idx,
+                            *dst,
+                            m_u,
+                            k_u,
+                            n_u,
+                            ne,
+                            *scheme,
+                        );
+                        end_msl!();
+                    }
+                }
+
+                Thunk::DequantMatMulInt4 {
+                    x,
+                    w_q,
+                    scale,
+                    zp,
+                    dst,
+                    m,
+                    k: kk,
+                    n,
+                    block_size,
+                    is_asymmetric,
+                } => {
+                    deferred_host.push(DeferredHostOp::DequantMatMulInt4 {
+                        x: *x,
+                        w_q: *w_q,
+                        scale: *scale,
+                        zp: *zp,
+                        dst: *dst,
+                        m: *m as usize,
+                        k: *kk as usize,
+                        n: *n as usize,
+                        block_size: *block_size,
+                        is_asymmetric: *is_asymmetric,
+                    });
+                }
+
+                Thunk::DequantMatMulFp8 {
+                    x,
+                    w_q,
+                    scale,
+                    dst,
+                    m,
+                    k: kk,
+                    n,
+                    e5m2,
+                } => {
+                    deferred_host.push(DeferredHostOp::DequantMatMulFp8 {
+                        x: *x,
+                        w_q: *w_q,
+                        scale: *scale,
+                        dst: *dst,
+                        m: *m as usize,
+                        k: *kk as usize,
+                        n: *n as usize,
+                        e5m2: *e5m2,
+                    });
+                }
+
+                Thunk::DequantMatMulNvfp4 {
+                    x,
+                    w_q,
+                    scale,
+                    global_scale,
+                    dst,
+                    m,
+                    k: kk,
+                    n,
+                } => {
+                    deferred_host.push(DeferredHostOp::DequantMatMulNvfp4 {
+                        x: *x,
+                        w_q: *w_q,
+                        scale: *scale,
+                        global_scale: *global_scale,
+                        dst: *dst,
+                        m: *m as usize,
+                        k: *kk as usize,
+                        n: *n as usize,
+                    });
                 }
             }
         }
@@ -2029,56 +3412,100 @@ impl MetalExecutable {
     /// callers) see them as if a thunk schedule had run.
     fn run_via_mps_graph(&mut self) {
         let plan = self.mps_plan.as_ref().expect("plan present");
-        let dev = metal_device().expect("Metal device");
+        self.dispatch_mps_plan(plan, None, None);
+    }
 
-        // Build feed lists: graph inputs + params, in the order the plan
-        // captured them. For each, the arena offset is known via input_ids /
-        // param_ids and the underlying graph node.
+    /// Interleaved MPS sub-graph + thunk dispatch for Qwen3.5 decode.
+    fn run_via_mps_hybrid(&mut self) {
+        let n = self.mps_hybrid.as_ref().expect("hybrid plan present").len();
+        for i in 0..n {
+            if let crate::mps_graph_hybrid::HybridStep::Thunks(range) =
+                &self.mps_hybrid.as_ref().unwrap()[i]
+            {
+                let r = range.clone();
+                let _ = self.encode_commit(true, None, Some(r));
+                continue;
+            }
+            if let crate::mps_graph_hybrid::HybridStep::SubGraph {
+                plan,
+                boundary_parent_ids,
+                output_parent_ids,
+                ..
+            } = &self.mps_hybrid.as_ref().unwrap()[i]
+            {
+                self.dispatch_mps_plan(
+                    plan,
+                    Some(boundary_parent_ids),
+                    Some(output_parent_ids),
+                );
+            }
+        }
+    }
+
+    fn dispatch_mps_plan(
+        &self,
+        plan: &crate::mps_graph_lower::MpsGraphPlan,
+        boundary_parent_ids: Option<&HashMap<String, NodeId>>,
+        output_parent_ids: Option<&[(NodeId, NodeId)]>,
+    ) {
+        let dev = metal_device().expect("Metal device");
         let arena_buf = &self.arena.buffer;
 
-        let mut feed_tensors: Vec<&crate::mps_graph::MpsTensor> = Vec::new();
         let mut feed_buffers: Vec<&metal::Buffer> = Vec::new();
         let mut feed_offsets: Vec<usize> = Vec::new();
         let mut feed_shapes: Vec<Vec<usize>> = Vec::new();
         let mut feed_dtypes: Vec<u32> = Vec::new();
 
-        for (name, t, shape, dt) in &plan.inputs {
-            let id = self.input_ids.get(name).expect("input id");
-            let off = self.arena.byte_offset(*id);
-            feed_tensors.push(t);
+        for (name, _t, shape, dt) in &plan.inputs {
+            let off = if name.starts_with("__boundary_") {
+                let parent = boundary_parent_ids
+                    .and_then(|m| m.get(name))
+                    .expect("hybrid boundary input");
+                self.arena.byte_offset(*parent)
+            } else {
+                let id = self.input_ids.get(name).expect("input id");
+                self.arena.byte_offset(*id)
+            };
             feed_buffers.push(arena_buf);
             feed_offsets.push(off);
             feed_shapes.push(shape.clone());
             feed_dtypes.push(*dt);
         }
-        for (name, t, shape, dt) in &plan.params {
+        for (name, _t, shape, dt) in &plan.params {
             let id = self.param_ids.get(name).expect("param id");
-            let off = self.arena.byte_offset(*id);
-            feed_tensors.push(t);
             feed_buffers.push(arena_buf);
-            feed_offsets.push(off);
+            feed_offsets.push(self.arena.byte_offset(*id));
             feed_shapes.push(shape.clone());
             feed_dtypes.push(*dt);
         }
 
-        // Result outputs: write back into the arena at each output's offset.
-        let mut out_tensors: Vec<&crate::mps_graph::MpsTensor> = Vec::new();
         let mut out_buffers: Vec<&metal::Buffer> = Vec::new();
         let mut out_offsets: Vec<usize> = Vec::new();
         let mut out_shapes: Vec<Vec<usize>> = Vec::new();
         let mut out_dtypes: Vec<u32> = Vec::new();
-        for (id, t, shape, dt) in &plan.outputs {
-            let off = self.arena.byte_offset(*id);
-            out_tensors.push(t);
-            out_buffers.push(arena_buf);
-            out_offsets.push(off);
-            out_shapes.push(shape.clone());
-            out_dtypes.push(*dt);
+        if let Some(out_map) = output_parent_ids {
+            for (sub_id, parent_id) in out_map {
+                let off = self.arena.byte_offset(*parent_id);
+                let (_, _t, shape, dt) = plan
+                    .outputs
+                    .iter()
+                    .find(|(id, _, _, _)| id == sub_id)
+                    .expect("hybrid output id");
+                out_buffers.push(arena_buf);
+                out_offsets.push(off);
+                out_shapes.push(shape.clone());
+                out_dtypes.push(*dt);
+            }
+        } else {
+            for (id, _t, shape, dt) in &plan.outputs {
+                out_buffers.push(arena_buf);
+                out_offsets.push(self.arena.byte_offset(*id));
+                out_shapes.push(shape.clone());
+                out_dtypes.push(*dt);
+            }
         }
 
         if let Some(exec) = plan.executable.as_ref() {
-            // bind_arena ran at compile — hot path is a single ObjC
-            // dispatch with no per-call allocation.
             if exec.has_cached_binding() {
                 exec.run_cached(&dev.queue);
                 return;
@@ -2096,6 +3523,15 @@ impl MetalExecutable {
             );
             return;
         }
+
+        let feed_tensors: Vec<&crate::mps_graph::MpsTensor> = plan
+            .inputs
+            .iter()
+            .map(|(_, t, _, _)| t)
+            .chain(plan.params.iter().map(|(_, t, _, _)| t))
+            .collect();
+        let out_tensors: Vec<&crate::mps_graph::MpsTensor> =
+            plan.outputs.iter().map(|(_, t, _, _)| t).collect();
         plan.graph.run_jit(
             &dev.queue,
             &feed_tensors,
@@ -2144,6 +3580,35 @@ fn max_matmul_flops_in(graph: &Graph) -> u64 {
         }
     }
     best
+}
+
+fn gguf_dequant_dims_for_param(
+    graph: &Graph,
+    param_id: NodeId,
+) -> Option<(usize, usize, rlx_ir::quant::QuantScheme)> {
+    for node in graph.nodes() {
+        if let Op::DequantMatMul { scheme } = &node.op
+            && node.inputs.get(1) == Some(&param_id)
+        {
+            let n = node.shape.dim(node.shape.rank().saturating_sub(1)).unwrap_static();
+            let out_total = node.shape.num_elements()?;
+            let m = out_total / n.max(1);
+            let a_total = graph.node(node.inputs[0]).shape.num_elements()?;
+            let k = a_total / m.max(1);
+            return Some((k, n, *scheme));
+        }
+    }
+    None
+}
+
+fn transpose_nk_to_kn_bytes(dequant: &[f32], n: usize, k: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(k * n * 4);
+    for p in 0..k {
+        for j in 0..n {
+            out.extend_from_slice(&dequant[j * k + p].to_le_bytes());
+        }
+    }
+    out
 }
 
 // ── Host-side shape-aware broadcast (Apple Silicon unified memory) ──
@@ -2679,6 +4144,55 @@ fn encode_fused_residual_ln(
     enc.dispatch_thread_groups(tg_count, tg);
 }
 
+fn encode_fused_residual_rms_norm(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    res: usize,
+    g: usize,
+    b: usize,
+    out: usize,
+    rows: u32,
+    h: u32,
+    eps: f32,
+    dt: crate::thunk::HalfFlag,
+) {
+    use crate::thunk::HalfFlag;
+    let pipeline = match dt {
+        HalfFlag::F32 => &k.fused_residual_rms_norm,
+        HalfFlag::F16 => &k.fused_residual_rms_norm_h,
+    };
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), res as u64);
+    enc.set_buffer(2, Some(buffer), g as u64);
+    enc.set_buffer(3, Some(buffer), b as u64);
+    enc.set_buffer(4, Some(buffer), out as u64);
+    enc.set_bytes(
+        5,
+        std::mem::size_of::<u32>() as u64,
+        &h as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        6,
+        std::mem::size_of::<f32>() as u64,
+        &eps as *const f32 as *const _,
+    );
+    let tg_w = 256u64.min(h as u64);
+    let tg = metal::MTLSize {
+        width: tg_w,
+        height: 1,
+        depth: 1,
+    };
+    let tg_count = metal::MTLSize {
+        width: rows as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(tg_count, tg);
+}
+
 fn encode_sdpa(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -2701,13 +4215,16 @@ fn encode_sdpa(
     use crate::thunk::HalfFlag;
     // The two-pass `sdpa` / `sdpa_h` kernels store an [seq, seq] scores
     // matrix in threadgroup memory (`scores[64*64]`); they're correct
-    // only for seq ≤ 64. For longer sequences (e.g. NomicVision's seq=257
+    // only for self-attention prefill where Lq == Lk and seq ≤ 64.
+    // For longer sequences (e.g. NomicVision's seq=257
     // = 256 patches + 1 CLS) we route to `sdpa_long`, an online-softmax
     // FA-v1 variant that's O(D) memory per query row and scales to any
-    // seq length. F16 input/output isn't supported by sdpa_long yet —
+    // seq length. Also route decode steps (Lq=1, Lk=past+1) through
+    // `sdpa_long` — the square kernel cannot index K/V past Lq.
+    // F16 input/output isn't supported by sdpa_long yet —
     // that path falls through and would hit the seq-64 ceiling; today
     // no f16-tagged graph hits seq>64 in production.
-    if seq > 64 && matches!(dt, HalfFlag::F32) {
+    if matches!(dt, HalfFlag::F32) && (seq > 64 || kv_seq > 64) {
         // Pick between the scalar online-softmax (`sdpa_long`) and the
         // tile-based flash-attention (`sdpa_fa_f32`). FA amortizes K/V
         // reads across an 8-query tile via threadgroup memory, so it
@@ -2717,7 +4234,7 @@ fn encode_sdpa(
         // simdgroup_float8x8 internally; opt-in via `RLX_METAL_FA=1`
         // for benchmarking until the kernel is upgraded to use
         // simdgroup matrix primitives.
-        let use_fa = kv_seq >= 256 && head_dim <= 32 && std::env::var("RLX_METAL_FA").is_ok();
+        let use_fa = kv_seq >= 256 && head_dim <= 32 && rlx_ir::env::flag("RLX_METAL_FA");
         let pipeline = if use_fa { &k.sdpa_fa_f32 } else { &k.sdpa_long };
         enc.set_compute_pipeline_state(pipeline);
         enc.set_buffer(0, Some(buffer), q as u64);
@@ -2836,6 +4353,16 @@ fn encode_sdpa(
         std::mem::size_of::<u32>() as u64,
         &mask_kind as *const u32 as *const _,
     );
+    enc.set_bytes(
+        11,
+        std::mem::size_of::<u32>() as u64,
+        &kv_seq as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        12,
+        std::mem::size_of::<u32>() as u64,
+        &kv_stride as *const u32 as *const _,
+    );
     let tg_count = metal::MTLSize {
         width: (batch * heads) as u64,
         height: 1,
@@ -2861,6 +4388,7 @@ fn encode_rope(
     seq: u32,
     hidden: u32,
     head_dim: u32,
+    n_rot: u32,
     dt: crate::thunk::HalfFlag,
     src_row_stride: u32,
     seq_stride: u32,
@@ -2905,15 +4433,19 @@ fn encode_rope(
         std::mem::size_of::<u32>() as u64,
         &seq_stride as *const u32 as *const _,
     );
+    enc.set_bytes(
+        10,
+        std::mem::size_of::<u32>() as u64,
+        &n_rot as *const u32 as *const _,
+    );
     let nh = hidden / head_dim;
-    let half = head_dim / 2;
     let grid = metal::MTLSize {
-        width: half as u64,
+        width: head_dim as u64,
         height: nh as u64,
         depth: (batch * seq) as u64,
     };
     let tg = metal::MTLSize {
-        width: half.min(16) as u64,
+        width: head_dim.min(16) as u64,
         height: nh.min(8) as u64,
         depth: 1,
     };
@@ -2968,6 +4500,435 @@ fn encode_rms_norm(
     enc.dispatch_threads(grid, tg);
 }
 
+fn encode_rms_norm_bwd_input(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    gamma: usize,
+    beta: usize,
+    dy: usize,
+    dx: usize,
+    rows: u32,
+    h: u32,
+    eps: f32,
+) {
+    enc.set_compute_pipeline_state(&k.rms_norm_bwd);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), gamma as u64);
+    enc.set_buffer(2, Some(buffer), beta as u64);
+    enc.set_buffer(3, Some(buffer), dy as u64);
+    enc.set_buffer(4, Some(buffer), dx as u64);
+    enc.set_bytes(5, 4, &h as *const u32 as *const _);
+    enc.set_bytes(6, 4, &eps as *const f32 as *const _);
+    let wrt: u32 = 0;
+    enc.set_bytes(7, 4, &wrt as *const u32 as *const _);
+    let tg_w = 256u64.min(h as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: tg_w * rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn encode_rms_norm_bwd_param(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    gamma: usize,
+    beta: usize,
+    dy: usize,
+    out: usize,
+    rows: u32,
+    h: u32,
+    eps: f32,
+    wrt: u32,
+) {
+    enc.set_compute_pipeline_state(&k.rms_norm_bwd_param);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), gamma as u64);
+    enc.set_buffer(2, Some(buffer), beta as u64);
+    enc.set_buffer(3, Some(buffer), dy as u64);
+    enc.set_buffer(4, Some(buffer), out as u64);
+    enc.set_bytes(5, 4, &rows as *const u32 as *const _);
+    enc.set_bytes(6, 4, &h as *const u32 as *const _);
+    enc.set_bytes(7, 4, &eps as *const f32 as *const _);
+    enc.set_bytes(8, 4, &wrt as *const u32 as *const _);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn encode_rope_bwd(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    dy: usize,
+    cos: usize,
+    sin: usize,
+    dx: usize,
+    batch: u32,
+    seq: u32,
+    hidden: u32,
+    head_dim: u32,
+    n_rot: u32,
+    cos_len: u32,
+) {
+    enc.set_compute_pipeline_state(&k.rope_bwd);
+    enc.set_buffer(0, Some(buffer), dy as u64);
+    enc.set_buffer(1, Some(buffer), cos as u64);
+    enc.set_buffer(2, Some(buffer), sin as u64);
+    enc.set_buffer(3, Some(buffer), dx as u64);
+    enc.set_bytes(4, 4, &batch as *const u32 as *const _);
+    enc.set_bytes(5, 4, &seq as *const u32 as *const _);
+    enc.set_bytes(6, 4, &hidden as *const u32 as *const _);
+    enc.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+    enc.set_bytes(8, 4, &n_rot as *const u32 as *const _);
+    enc.set_bytes(9, 4, &cos_len as *const u32 as *const _);
+    let nh = hidden / head_dim.max(1);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: head_dim as u64,
+            height: nh as u64,
+            depth: (batch * seq) as u64,
+        },
+        metal::MTLSize {
+            width: head_dim.min(16) as u64,
+            height: nh.min(8) as u64,
+            depth: 1,
+        },
+    );
+}
+
+fn encode_cumsum_bwd(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    dy: usize,
+    dx: usize,
+    rows: u32,
+    cols: u32,
+    exclusive: bool,
+) {
+    enc.set_compute_pipeline_state(&k.cumsum_bwd);
+    enc.set_buffer(0, Some(buffer), dy as u64);
+    enc.set_buffer(1, Some(buffer), dx as u64);
+    enc.set_bytes(2, 4, &cols as *const u32 as *const _);
+    let ex: u32 = if exclusive { 1 } else { 0 };
+    enc.set_bytes(3, 4, &ex as *const u32 as *const _);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn encode_gather_bwd(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    dy: usize,
+    indices: usize,
+    dst: usize,
+    outer: u32,
+    axis_dim: u32,
+    num_idx: u32,
+    trailing: u32,
+) {
+    let n = outer * axis_dim * trailing;
+    if n > 0 {
+        enc.set_compute_pipeline_state(&k.gather_bwd_zero);
+        enc.set_buffer(0, Some(buffer), dst as u64);
+        enc.set_bytes(1, 4, &n as *const u32 as *const _);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: n as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    enc.set_compute_pipeline_state(&k.gather_bwd_acc);
+    enc.set_buffer(0, Some(buffer), dy as u64);
+    enc.set_buffer(1, Some(buffer), indices as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 4, &outer as *const u32 as *const _);
+    enc.set_bytes(4, 4, &axis_dim as *const u32 as *const _);
+    enc.set_bytes(5, 4, &num_idx as *const u32 as *const _);
+    enc.set_bytes(6, 4, &trailing as *const u32 as *const _);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: outer as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
+    let mut max = 0usize;
+    for node in graph.nodes() {
+        if let Op::DequantMatMul { scheme } = &node.op
+            && scheme.is_gguf()
+        {
+            let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+            let total = node.shape.num_elements().unwrap();
+            let m = total / n.max(1);
+            let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+            let k = x_total / m.max(1);
+            max = max.max(k * n * std::mem::size_of::<f32>());
+        }
+        if let Op::DequantGroupedMatMul { .. } = &node.op {
+            let in_shape = &graph.node(node.inputs[0]).shape;
+            let m = in_shape.dim(in_shape.rank() - 2).unwrap_static();
+            let k = in_shape.dim(in_shape.rank() - 1).unwrap_static();
+            let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+            max = max.max(k * n * 4 + m * k * 4 + m * n * 4);
+        }
+    }
+    max
+}
+
+pub(crate) fn gguf_scheme_id(scheme: rlx_ir::quant::QuantScheme) -> u32 {
+    use rlx_ir::quant::QuantScheme;
+    match scheme {
+        QuantScheme::GgufQ4K => 0,
+        QuantScheme::GgufQ5K => 1,
+        QuantScheme::GgufQ6K => 2,
+        QuantScheme::GgufQ8K => 3,
+        QuantScheme::GgufQ2K => 4,
+        QuantScheme::GgufQ3K => 5,
+        other => panic!("gguf_scheme_id: unsupported {other:?}"),
+    }
+}
+
+pub(crate) fn encode_dequant_gguf(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    w_q: usize,
+    dst: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    let block_elems = scheme.gguf_block_size() as usize;
+    let total = k_dim * n_dim;
+    let num_blocks = total / block_elems.max(1);
+    let scheme_id = gguf_scheme_id(scheme);
+    let dst_f32 = (dst / 4) as u32;
+    enc.set_compute_pipeline_state(&k.dequant_gguf);
+    enc.set_buffer(0, Some(buffer), 0);
+    let w_u = w_q as u32;
+    enc.set_bytes(1, 4, &w_u as *const u32 as *const _);
+    enc.set_bytes(2, 4, &dst_f32 as *const u32 as *const _);
+    enc.set_bytes(3, 4, &scheme_id as *const u32 as *const _);
+    let nb = num_blocks as u32;
+    enc.set_bytes(4, 4, &nb as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: num_blocks as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(num_blocks) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+fn encode_dequant_grouped_matmul_gguf(
+    cmd_buf: &metal::CommandBufferRef,
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    scratch_off: usize,
+    input: usize,
+    w_q: usize,
+    expert_idx: usize,
+    dst: usize,
+    m: usize,
+    k_dim: usize,
+    n: usize,
+    num_experts: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+) {
+    let block_elems = scheme.gguf_block_size() as usize;
+    let block_bytes = scheme.gguf_block_bytes() as usize;
+    let slab_bytes = (k_dim * n) / block_elems * block_bytes;
+
+    let base = buffer.contents() as *const u8;
+    unsafe {
+        let x_host =
+            std::slice::from_raw_parts(base.add(input) as *const f32, m * k_dim);
+        let idx_host =
+            std::slice::from_raw_parts(base.add(expert_idx) as *const f32, m);
+        let (packed_in, original_pos, offsets) =
+            rlx_cpu::gguf_matmul::grouped_moe_sort_plan(x_host, idx_host, m, k_dim, num_experts);
+
+        let dequant_off = scratch_off;
+        let pack_in_off = scratch_off + k_dim * n * 4;
+        let pack_out_off = scratch_off + (k_dim * n + m * k_dim) * 4;
+
+        std::ptr::copy_nonoverlapping(
+            packed_in.as_ptr(),
+            base.add(pack_in_off) as *mut f32,
+            packed_in.len(),
+        );
+
+        for e in 0..num_experts {
+            let count = offsets[e + 1] - offsets[e];
+            if count == 0 {
+                continue;
+            }
+            encode_dequant_gguf(
+                enc,
+                k,
+                buffer,
+                w_q + e * slab_bytes,
+                dequant_off,
+                scheme,
+                k_dim,
+                n,
+            );
+            let in_start = offsets[e];
+            crate::mps_blas::encode_mps_sgemm_bt(
+                cmd_buf,
+                buffer,
+                pack_in_off + in_start * k_dim * 4,
+                dequant_off,
+                pack_out_off + in_start * n * 4,
+                count,
+                k_dim,
+                n,
+            );
+        }
+
+        let pack_out_host =
+            std::slice::from_raw_parts(base.add(pack_out_off) as *const f32, m * n);
+        let mut out_host = vec![0f32; m * n];
+        rlx_cpu::gguf_matmul::grouped_moe_unpermute_out(
+            pack_out_host,
+            &original_pos,
+            &mut out_host,
+            m,
+            n,
+        );
+        std::ptr::copy_nonoverlapping(
+            out_host.as_ptr(),
+            base.add(dst) as *mut f32,
+            out_host.len(),
+        );
+    }
+}
+
+fn gdn_ephemeral_state_bytes(graph: &Graph) -> usize {
+    let mut max = 0usize;
+    for node in graph.nodes() {
+        if let Op::GatedDeltaNet {
+            carry_state,
+            state_size,
+            ..
+        } = &node.op
+            && !*carry_state
+        {
+            let q_shape = &graph.node(node.inputs[0]).shape;
+            let elems = q_shape.dim(0).unwrap_static()
+                * q_shape.dim(2).unwrap_static()
+                * state_size
+                * state_size;
+            max = max.max(elems * std::mem::size_of::<f32>());
+        }
+    }
+    max
+}
+
+fn encode_gated_delta_net(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    q: usize,
+    k_off: usize,
+    v: usize,
+    g: usize,
+    beta: usize,
+    state: usize,
+    dst: usize,
+    batch: u32,
+    seq: u32,
+    heads: u32,
+    state_size: u32,
+    use_carry: bool,
+) {
+    let f32_idx = |byte_off: usize| -> u32 { (byte_off / 4) as u32 };
+    enc.set_compute_pipeline_state(&k.gated_delta_net);
+    enc.set_buffer(0, Some(buffer), 0);
+    let q_u = f32_idx(q);
+    let k_u = f32_idx(k_off);
+    let v_u = f32_idx(v);
+    let g_u = f32_idx(g);
+    let beta_u = f32_idx(beta);
+    let state_u = f32_idx(state);
+    let dst_u = f32_idx(dst);
+    enc.set_bytes(1, 4, &q_u as *const u32 as *const _);
+    enc.set_bytes(2, 4, &k_u as *const u32 as *const _);
+    enc.set_bytes(3, 4, &v_u as *const u32 as *const _);
+    enc.set_bytes(4, 4, &g_u as *const u32 as *const _);
+    enc.set_bytes(5, 4, &beta_u as *const u32 as *const _);
+    enc.set_bytes(6, 4, &state_u as *const u32 as *const _);
+    enc.set_bytes(7, 4, &dst_u as *const u32 as *const _);
+    let dims = [batch, seq, heads, state_size];
+    enc.set_bytes(8, 16, dims.as_ptr() as *const _);
+    let use_carry_u: u32 = if use_carry { 1 } else { 0 };
+    enc.set_bytes(9, 4, &use_carry_u as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: (batch * heads) as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: state_size as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
 fn encode_conv2d(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -2997,6 +4958,159 @@ fn encode_conv2d(
     let kshape: [u32; 4] = [kh, kw, sh, sw];
     let padd: [u32; 4] = [ph, pw, dh, dw];
     enc.set_compute_pipeline_state(&k.conv2d);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), weight as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 16, nch.as_ptr() as *const _);
+    enc.set_bytes(4, 16, out_dims.as_ptr() as *const _);
+    enc.set_bytes(5, 16, kshape.as_ptr() as *const _);
+    enc.set_bytes(6, 16, padd.as_ptr() as *const _);
+    let grid = metal::MTLSize {
+        width: w_out as u64,
+        height: h_out as u64,
+        depth: (n * c_out) as u64,
+    };
+    let tg = metal::MTLSize {
+        width: 8.min(w_out as u64),
+        height: 8.min(h_out as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+fn encode_group_norm(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    g: usize,
+    b: usize,
+    dst: usize,
+    n: u32,
+    c: u32,
+    h: u32,
+    w: u32,
+    num_groups: u32,
+    eps: f32,
+) {
+    let nchw: [u32; 4] = [n, c, h, w];
+    enc.set_compute_pipeline_state(&k.group_norm);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), g as u64);
+    enc.set_buffer(2, Some(buffer), b as u64);
+    enc.set_buffer(3, Some(buffer), dst as u64);
+    enc.set_bytes(4, 16, nchw.as_ptr() as *const _);
+    enc.set_bytes(5, 4, &num_groups as *const u32 as *const _);
+    enc.set_bytes(6, 4, &eps as *const f32 as *const _);
+    let groups = (n * num_groups) as u64;
+    let tg = metal::MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let grid = metal::MTLSize {
+        width: 1,
+        height: 1,
+        depth: groups.max(1),
+    };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
+fn encode_resize_nearest_2x(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    dst: usize,
+    n: u32,
+    c: u32,
+    h: u32,
+    w: u32,
+) {
+    let nchw: [u32; 4] = [n, c, h, w];
+    let w2 = w * 2;
+    let h2 = h * 2;
+    enc.set_compute_pipeline_state(&k.resize_nearest_2x);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), dst as u64);
+    enc.set_bytes(2, 16, nchw.as_ptr() as *const _);
+    let grid = metal::MTLSize {
+        width: w2 as u64,
+        height: h2 as u64,
+        depth: (n * c) as u64,
+    };
+    let tg = metal::MTLSize {
+        width: 8.min(w2 as u64),
+        height: 8.min(h2 as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+fn encode_layer_norm2d(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    g: usize,
+    b: usize,
+    dst: usize,
+    n: u32,
+    c: u32,
+    h: u32,
+    w: u32,
+    eps: f32,
+) {
+    let nchw: [u32; 4] = [n, c, h, w];
+    enc.set_compute_pipeline_state(&k.layer_norm2d);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), g as u64);
+    enc.set_buffer(2, Some(buffer), b as u64);
+    enc.set_buffer(3, Some(buffer), dst as u64);
+    enc.set_bytes(4, 16, nchw.as_ptr() as *const _);
+    enc.set_bytes(5, 4, &eps as *const f32 as *const _);
+    let grid = metal::MTLSize {
+        width: w as u64,
+        height: h as u64,
+        depth: n as u64,
+    };
+    let tg = metal::MTLSize {
+        width: 8.min(w as u64),
+        height: 8.min(h as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+fn encode_conv_transpose2d(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    weight: usize,
+    dst: usize,
+    n: u32,
+    c_in: u32,
+    h: u32,
+    w: u32,
+    c_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    ph: u32,
+    pw: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+) {
+    let nch: [u32; 4] = [n, c_in, h, w];
+    let out_dims: [u32; 4] = [c_out, h_out, w_out, groups];
+    let kshape: [u32; 4] = [kh, kw, sh, sw];
+    let padd: [u32; 4] = [ph, pw, dh, dw];
+    enc.set_compute_pipeline_state(&k.conv_transpose2d);
     enc.set_buffer(0, Some(buffer), src as u64);
     enc.set_buffer(1, Some(buffer), weight as u64);
     enc.set_buffer(2, Some(buffer), dst as u64);
@@ -3541,8 +5655,10 @@ fn encode_fused_swiglu(
     total: u32,
     src_dt: crate::thunk::HalfFlag,
     dst_dt: crate::thunk::HalfFlag,
+    gate_first: bool,
 ) {
     use crate::thunk::HalfFlag;
+    let gate_first_u32 = u32::from(gate_first);
     let pipeline = match (src_dt, dst_dt) {
         (HalfFlag::F32, HalfFlag::F32) => &k.fused_swiglu,
         (HalfFlag::F16, HalfFlag::F16) => &k.fused_swiglu_h,
@@ -3561,6 +5677,11 @@ fn encode_fused_swiglu(
         3,
         std::mem::size_of::<u32>() as u64,
         &total as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        4,
+        std::mem::size_of::<u32>() as u64,
+        &gate_first_u32 as *const u32 as *const _,
     );
     let tg_w = pipeline.thread_execution_width().min(total as u64);
     enc.dispatch_threads(

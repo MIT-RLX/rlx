@@ -4,7 +4,7 @@
 #
 #   1. **Linux build cleanliness** — `cargo test -p rlx-tpu` runs the
 #      host-agnostic suite (proto encoder, HLO builder, lowering walker,
-#      smoke graphs). The PJRT round-trip tests skip cleanly without
+#      check graphs). The PJRT round-trip tests skip cleanly without
 #      LIBTPU_PATH.
 #
 #   2. **HLO structural validity** — `validate_hlo.py` deserializes the

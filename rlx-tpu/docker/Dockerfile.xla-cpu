@@ -72,7 +72,7 @@ RUN echo /usr/local/lib > /etc/ld.so.conf.d/pjrt.conf && ldconfig
 
 ENV LIBTPU_PATH=/usr/local/lib/libpjrt_c_cpu.so
 
-# Smoke check: dlopen the plugin and resolve GetPjrtApi. Catches
+# check check: dlopen the plugin and resolve GetPjrtApi. Catches
 # missing-symbol issues at image-build time rather than during a
 # rlx-tpu test pass.
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \

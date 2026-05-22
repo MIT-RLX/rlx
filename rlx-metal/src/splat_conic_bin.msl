@@ -1,0 +1,553 @@
+// Conic ellipse projection + scanline tile emit (matches rlx_splat::reference/binning.rs).
+
+constant float kEllipseEps = 1e-6f;
+constant float kMinConicDet = 1e-12f;
+constant float kEllipseRadiusPadPx = 1.0f;
+
+inline float4 quat_conj_msl(float4 q) {
+    return float4(q.x, -q.y, -q.z, -q.w);
+}
+
+inline float3 world_to_camera_msl(float3 cam_to_world, constant SplatProjectParams& pr) {
+    return float3(
+        dot(cam_to_world, float3(pr.view_right_x, pr.view_right_y, pr.view_right_z)),
+        dot(cam_to_world, float3(pr.view_up_x, pr.view_up_y, pr.view_up_z)),
+        dot(cam_to_world, float3(pr.view_forward_x, pr.view_forward_y, pr.view_forward_z)));
+}
+
+inline float2 project_camera_to_screen_msl(float3 cam_pos, constant SplatProjectParams& pr) {
+    float depth = cam_pos.z;
+    if (!isfinite(depth) || depth <= 1e-12f) {
+        return float2(0.0f);
+    }
+    return float2(
+        cam_pos.x / depth * pr.focal_x + pr.principal_x,
+        cam_pos.y / depth * pr.focal_y + pr.principal_y);
+}
+
+inline bool project_world_to_screen_msl(
+    float3 world,
+    constant SplatProjectParams& pr,
+    thread float2& screen)
+{
+    float3 cam_pos = float3(pr.cam_px, pr.cam_py, pr.cam_pz);
+    float3 to_splat = world - cam_pos;
+    float3 cam = world_to_camera_msl(to_splat, pr);
+    screen = project_camera_to_screen_msl(cam, pr);
+    return isfinite(screen.x) && isfinite(screen.y);
+}
+
+inline void init_fullscreen_fallback_ellipse(
+    constant SplatProjectParams& pr,
+    thread float2& center,
+    thread float& radius,
+    thread float3& conic)
+{
+    float r = float(max(pr.image_width, pr.image_height));
+    float inv_r2 = 1.0f / max(r * r, kEllipseEps);
+    center = float2(0.5f * float(pr.image_width), 0.5f * float(pr.image_height));
+    radius = r;
+    conic = float3(inv_r2, 0.0f, inv_r2);
+}
+
+inline bool solve_conic_renorm_msl(
+    float p0x, float p0y, float p1x, float p1y,
+    float p2x, float p2y, float p3x, float p3y, float p4x, float p4y,
+    float eps,
+    thread float3& conic_out,
+    thread float2& linear_out)
+{
+    float sx = p0x - p1x;
+    float sy = p1y - p0y;
+    if (abs(sx) <= eps || abs(sy) <= eps) {
+        return false;
+    }
+    float inv_sx = 1.0f / sx;
+    float inv_sy = 1.0f / sy;
+    float offset_x = p1x;
+    float offset_y = p0y;
+    float2 uv0 = float2((p2x - offset_x) * inv_sx, (p2y - offset_y) * inv_sy);
+    float2 uv1 = float2((p3x - offset_x) * inv_sx, (p3y - offset_y) * inv_sy);
+    float2 uv2 = float2((p4x - offset_x) * inv_sx, (p4y - offset_y) * inv_sy);
+
+    float m00 = uv0.x * uv0.x - uv0.x;
+    float m01 = 2.0f * uv0.x * uv0.y;
+    float m02 = uv0.y * uv0.y - uv0.y;
+    float r0 = uv0.x + uv0.y - 1.0f;
+    float m10 = uv1.x * uv1.x - uv1.x;
+    float m11 = 2.0f * uv1.x * uv1.y;
+    float m12 = uv1.y * uv1.y - uv1.y;
+    float r1 = uv1.x + uv1.y - 1.0f;
+    float m20 = uv2.x * uv2.x - uv2.x;
+    float m21 = 2.0f * uv2.x * uv2.y;
+    float m22 = uv2.y * uv2.y - uv2.y;
+    float r2 = uv2.x + uv2.y - 1.0f;
+
+    if (abs(m00) <= eps) {
+        return false;
+    }
+    float inv_m00 = 1.0f / m00;
+    m01 *= inv_m00;
+    m02 *= inv_m00;
+    r0 *= inv_m00;
+    m11 -= m10 * m01;
+    m12 -= m10 * m02;
+    r1 -= m10 * r0;
+    m21 -= m20 * m01;
+    m22 -= m20 * m02;
+    r2 -= m20 * r0;
+    if (abs(m11) <= eps) {
+        return false;
+    }
+    float inv_m11 = 1.0f / m11;
+    m12 *= inv_m11;
+    r1 *= inv_m11;
+    m22 -= m21 * m12;
+    r2 -= m21 * r1;
+    if (abs(m22) <= eps) {
+        return false;
+    }
+    float conic_c = r2 / m22;
+    float conic_b = r1 - m12 * conic_c;
+    float conic_a = r0 - m01 * conic_b - m02 * conic_c;
+    float conic_d = -(conic_a + 1.0f);
+    float conic_e = -(conic_c + 1.0f);
+    float inv_sx2 = inv_sx * inv_sx;
+    float inv_sy2 = inv_sy * inv_sy;
+    float coeff_a = conic_a * inv_sx2;
+    float coeff_b = conic_b * inv_sx * inv_sy;
+    float coeff_c = conic_c * inv_sy2;
+    float coeff_d = -2.0f * coeff_a * offset_x - 2.0f * coeff_b * offset_y + conic_d * inv_sx;
+    float coeff_e = -2.0f * coeff_b * offset_x - 2.0f * coeff_c * offset_y + conic_e * inv_sy;
+    float coeff_f = coeff_a * offset_x * offset_x + 2.0f * coeff_b * offset_x * offset_y + coeff_c * offset_y * offset_y
+        - conic_d * inv_sx * offset_x - conic_e * inv_sy * offset_y + 1.0f;
+    if (abs(coeff_f) <= eps) {
+        return false;
+    }
+    float inv_f = -1.0f / coeff_f;
+    conic_out = float3(coeff_a * inv_f, coeff_b * inv_f, coeff_c * inv_f);
+    linear_out = float2(coeff_d * inv_f, coeff_e * inv_f);
+    return true;
+}
+
+inline bool support_sphere_intersects_frustum_msl(float3 camera_center, constant SplatProjectParams& pr, float support_radius) {
+    if (!isfinite(camera_center.x) || !isfinite(camera_center.y) || !isfinite(camera_center.z) || support_radius <= 0.0f) {
+        return false;
+    }
+    if (camera_center.z + support_radius <= 1e-4f) {
+        return false;
+    }
+    float4 planes[4] = {
+        float4(pr.focal_x, 0.0f, pr.principal_x, 0.0f),
+        float4(-pr.focal_x, 0.0f, float(pr.image_width) - pr.principal_x, 0.0f),
+        float4(0.0f, pr.focal_y, pr.principal_y, 0.0f),
+        float4(0.0f, -pr.focal_y, float(pr.image_height) - pr.principal_y, 0.0f),
+    };
+    for (uint i = 0u; i < 4u; ++i) {
+        float dotp = planes[i].x * camera_center.x + planes[i].y * camera_center.y + planes[i].z * camera_center.z;
+        float norm = length(planes[i].xyz);
+        if (dotp < -support_radius * norm) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool compute_outline_ellipse_msl(
+    float3 world_pos,
+    float3 inv_scale,
+    float4 rotation,
+    constant SplatProjectParams& pr,
+    thread float2& center_px,
+    thread float& radius_px,
+    thread float3& conic)
+{
+    float2 screen_center = float2(0.0f);
+    bool screen_ok = project_world_to_screen_msl(world_pos, pr, screen_center);
+    float3 scale = float3(1.0f / max(inv_scale.x, 1e-12f), 1.0f / max(inv_scale.y, 1e-12f), 1.0f / max(inv_scale.z, 1e-12f));
+    float3 to_splat = world_pos - float3(pr.cam_px, pr.cam_py, pr.cam_pz);
+    float3 camera_center = world_to_camera_msl(to_splat, pr);
+    float support_radius = max(scale.x, max(scale.y, scale.z));
+    bool support_intersects = support_sphere_intersects_frustum_msl(camera_center, pr, support_radius);
+    if (!screen_ok && !support_intersects) {
+        return false;
+    }
+    float3 delta = float3(pr.cam_px, pr.cam_py, pr.cam_pz) - world_pos;
+    float3 rotated_delta = quat_rotate_msl(delta, rotation);
+    float3 view_origin_local = float3(
+        rotated_delta.x * inv_scale.x,
+        rotated_delta.y * inv_scale.y,
+        rotated_delta.z * inv_scale.z);
+    float view_distance = length(view_origin_local);
+    if (view_distance <= 1.0f + kEllipseEps) {
+        if (support_intersects) {
+            init_fullscreen_fallback_ellipse(pr, center_px, radius_px, conic);
+            return true;
+        }
+        return false;
+    }
+    float3 view_dir_local = view_origin_local / view_distance;
+    float3 tangent_circle_center = view_dir_local / view_distance;
+    float tangent_circle_radius = sqrt(max(0.0f, 1.0f - 1.0f / (view_distance * view_distance)));
+    float3 tangent_axis = (abs(view_dir_local.z) < 0.999f) ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
+    float3 tangent_basis_u = cross(tangent_axis, view_dir_local);
+    float u_norm = length(tangent_basis_u);
+    if (u_norm <= kEllipseEps) {
+        return false;
+    }
+    tangent_basis_u /= u_norm;
+    float3 tangent_basis_v = cross(view_dir_local, tangent_basis_u);
+    float v_norm = length(tangent_basis_v);
+    if (v_norm <= kEllipseEps) {
+        return false;
+    }
+    tangent_basis_v /= v_norm;
+
+    float4 q_inv = quat_conj_msl(rotation);
+    float outline_min[2] = {1e30f, 1e30f};
+    float outline_max[2] = {-1e30f, -1e30f};
+    float outline_pts[10];
+    for (uint index = 0u; index < 5u; ++index) {
+        float theta = 2.0f * M_PI_F * float(index) / 5.0f;
+        float3 local_point = tangent_circle_center
+            + tangent_circle_radius * (cos(theta) * tangent_basis_u + sin(theta) * tangent_basis_v);
+        float3 scaled = local_point * scale;
+        float3 rotated = quat_rotate_msl(scaled, q_inv);
+        float3 world_point = world_pos + rotated;
+        float2 screen_point = float2(0.0f);
+        if (!project_world_to_screen_msl(world_point, pr, screen_point)) {
+            if (support_intersects) {
+                init_fullscreen_fallback_ellipse(pr, center_px, radius_px, conic);
+                return true;
+            }
+            return false;
+        }
+        outline_pts[index * 2u] = screen_point.x;
+        outline_pts[index * 2u + 1u] = screen_point.y;
+        outline_min[0] = min(outline_min[0], screen_point.x);
+        outline_min[1] = min(outline_min[1], screen_point.y);
+        outline_max[0] = max(outline_max[0], screen_point.x);
+        outline_max[1] = max(outline_max[1], screen_point.y);
+    }
+    if (screen_ok) {
+        outline_min[0] = min(outline_min[0], screen_center.x);
+        outline_min[1] = min(outline_min[1], screen_center.y);
+        outline_max[0] = max(outline_max[0], screen_center.x);
+        outline_max[1] = max(outline_max[1], screen_center.y);
+    }
+    if (outline_max[0] < 0.0f || outline_min[0] >= float(pr.image_width)
+        || outline_max[1] < 0.0f || outline_min[1] >= float(pr.image_height)) {
+        return false;
+    }
+    float bbox_center[2] = {0.5f * (outline_min[0] + outline_max[0]), 0.5f * (outline_min[1] + outline_max[1])};
+    float bbox_half[2] = {
+        max(0.5f * (outline_max[0] - outline_min[0]), kEllipseEps),
+        max(0.5f * (outline_max[1] - outline_min[1]), kEllipseEps),
+    };
+    float n0x = (outline_pts[0] - bbox_center[0]) / bbox_half[0];
+    float n0y = (outline_pts[1] - bbox_center[1]) / bbox_half[1];
+    float n1x = (outline_pts[2] - bbox_center[0]) / bbox_half[0];
+    float n1y = (outline_pts[3] - bbox_center[1]) / bbox_half[1];
+    float n2x = (outline_pts[4] - bbox_center[0]) / bbox_half[0];
+    float n2y = (outline_pts[5] - bbox_center[1]) / bbox_half[1];
+    float n3x = (outline_pts[6] - bbox_center[0]) / bbox_half[0];
+    float n3y = (outline_pts[7] - bbox_center[1]) / bbox_half[1];
+    float n4x = (outline_pts[8] - bbox_center[0]) / bbox_half[0];
+    float n4y = (outline_pts[9] - bbox_center[1]) / bbox_half[1];
+    float3 conic_norm = float3(0.0f);
+    float2 linear = float2(0.0f);
+    if (!solve_conic_renorm_msl(n0x, n0y, n1x, n1y, n2x, n2y, n3x, n3y, n4x, n4y, kEllipseEps, conic_norm, linear)) {
+        return false;
+    }
+    float det_a = conic_norm.x * conic_norm.z - conic_norm.y * conic_norm.y;
+    if (det_a <= kEllipseEps || conic_norm.x <= kEllipseEps || conic_norm.z <= kEllipseEps) {
+        return false;
+    }
+    float2 ellipse_center = float2(
+        0.5f * (conic_norm.y * linear.y - conic_norm.z * linear.x) / det_a,
+        0.5f * (conic_norm.y * linear.x - conic_norm.x * linear.y) / det_a);
+    float center_scale = 1.0f + ellipse_center.x * (conic_norm.x * ellipse_center.x + conic_norm.y * ellipse_center.y)
+        + ellipse_center.y * (conic_norm.y * ellipse_center.x + conic_norm.z * ellipse_center.y);
+    if (center_scale <= kEllipseEps) {
+        return false;
+    }
+    conic_norm /= center_scale;
+    linear /= center_scale;
+    det_a = conic_norm.x * conic_norm.z - conic_norm.y * conic_norm.y;
+    float trace = conic_norm.x + conic_norm.z;
+    float disc = sqrt(max(0.0f, 0.25f * trace * trace - det_a));
+    float axis0 = 1.0f / sqrt(max(kEllipseEps, 0.5f * trace + disc));
+    float axis1 = 1.0f / sqrt(max(kEllipseEps, 0.5f * trace - disc));
+    center_px = float2(
+        bbox_center[0] + ellipse_center.x * bbox_half[0],
+        bbox_center[1] + ellipse_center.y * bbox_half[1]);
+    radius_px = max(axis0 * bbox_half[0], axis1 * bbox_half[1]);
+    float hx2 = max(bbox_half[0] * bbox_half[0], kEllipseEps);
+    float hy2 = max(bbox_half[1] * bbox_half[1], kEllipseEps);
+    conic = float3(conic_norm.x / hx2, conic_norm.y / sqrt(hx2 * hy2), conic_norm.z / hy2);
+    return isfinite(center_px.x) && isfinite(center_px.y) && isfinite(radius_px) && isfinite(conic.x);
+}
+
+/// Screen-space ellipse + center/radius (after pos_local project).
+kernel void gaussian_splat_project_screen_ellipse(
+    device const float* positions [[buffer(0)]],
+    device const float* scales [[buffer(1)]],
+    device const float* rotations [[buffer(2)]],
+    device const float* opacities [[buffer(3)]],
+    device float* center_radius_depth [[buffer(4)]],
+    device float* ellipse_conic [[buffer(5)]],
+    device uint* valid [[buffer(6)]],
+    constant SplatProjectParams& pr [[buffer(7)]],
+    uint sid [[thread_position_in_grid]]
+) {
+    if (sid >= pr.splat_count || valid[sid] == 0u) {
+        return;
+    }
+    float3 world = float3(positions[sid * 3u], positions[sid * 3u + 1u], positions[sid * 3u + 2u]);
+    float4 q = float4(rotations[sid * 4u], rotations[sid * 4u + 1u], rotations[sid * 4u + 2u], rotations[sid * 4u + 3u]);
+    float3 sigma = float3(scales[sid * 3u], scales[sid * 3u + 1u], scales[sid * 3u + 2u]);
+    float o = clamp(opacities[sid], 0.0f, 1.0f);
+    float support_sigma = sqrt(max(0.0f, -2.0f * log(pr.alpha_cutoff / max(o, pr.alpha_cutoff))));
+    float3 outline_inv_scale = float3(
+        1.0f / max(exp(sigma.x) * pr.radius_scale * support_sigma, 1e-6f),
+        1.0f / max(exp(sigma.y) * pr.radius_scale * support_sigma, 1e-6f),
+        1.0f / max(exp(sigma.z) * pr.radius_scale * support_sigma, 1e-6f));
+    float2 center = float2(0.0f);
+    float radius = 0.0f;
+    float3 conic = float3(0.0f);
+    if (!compute_outline_ellipse_msl(world, outline_inv_scale, q, pr, center, radius, conic)) {
+        float cx = center_radius_depth[sid * 4u];
+        float cy = center_radius_depth[sid * 4u + 1u];
+        float r = max(center_radius_depth[sid * 4u + 2u], 1.0f);
+        float inv_r2 = 1.0f / max(r * r, kEllipseEps);
+        center = float2(cx, cy);
+        radius = r;
+        conic = float3(inv_r2, 0.0f, inv_r2);
+    }
+    radius = max(radius + kEllipseRadiusPadPx, 1.0f);
+    center_radius_depth[sid * 4u] = center.x;
+    center_radius_depth[sid * 4u + 1u] = center.y;
+    center_radius_depth[sid * 4u + 2u] = radius;
+    float3 to_splat = world - float3(pr.cam_px, pr.cam_py, pr.cam_pz);
+    float3 vf = float3(pr.view_forward_x, pr.view_forward_y, pr.view_forward_z);
+    center_radius_depth[sid * 4u + 3u] = dot(to_splat, vf);
+    ellipse_conic[sid * 3u] = conic.x;
+    ellipse_conic[sid * 3u + 1u] = conic.y;
+    ellipse_conic[sid * 3u + 2u] = conic.z;
+    // Keep `valid` from project_training; screen ellipse only refines conic/center for binning.
+}
+
+inline bool try_prepare_conic_binning_msl(float3 conic, float radius, float half_tile, thread float2& bbox_extent) {
+    float det = conic.x * conic.z - conic.y * conic.y;
+    bbox_extent = float2(radius, radius);
+    if (!isfinite(conic.x) || !isfinite(conic.y) || !isfinite(conic.z) || conic.x <= 1e-10f || conic.z <= 1e-10f || det <= kMinConicDet) {
+        return false;
+    }
+    float trace = conic.x + conic.z;
+    float disc = sqrt(max(0.0f, 0.25f * trace * trace - det));
+    float eig_min = 0.5f * trace - disc;
+    float eig_max = 0.5f * trace + disc;
+    float max_axis = 1.0f / sqrt(max(eig_min, 1e-20f));
+    float min_axis = 1.0f / sqrt(max(eig_max, 1e-20f));
+    float axis_limit = max(radius, 1.0f) * 2.0f + half_tile;
+    if (!isfinite(max_axis) || !isfinite(min_axis) || eig_min <= 0.0f || eig_max <= 0.0f || max_axis > axis_limit || min_axis < 0.125f) {
+        return false;
+    }
+    float2 extent = float2(sqrt(max(conic.z / det, 0.0f)), sqrt(max(conic.x / det, 0.0f)));
+    if (!isfinite(extent.x) || !isfinite(extent.y)) {
+        return false;
+    }
+    bbox_extent = float2(clamp(extent.x, 1e-4f, radius), clamp(extent.y, 1e-4f, radius));
+    return true;
+}
+
+inline float eval_conic_msl(float3 conic, float x, float y) {
+    return conic.x * x * x + 2.0f * conic.y * x * y + conic.z * y * y;
+}
+
+inline float min_conic_over_tile_box_msl(float3 conic, float x0, float x1, float y0, float y1) {
+    float v0 = eval_conic_msl(conic, x0, y0);
+    float v1 = eval_conic_msl(conic, x1, y0);
+    float v2 = eval_conic_msl(conic, x0, y1);
+    float v3 = eval_conic_msl(conic, x1, y1);
+    float m = min(min(v0, v1), min(v2, v3));
+    if (x0 <= 0.0f && 0.0f <= x1 && y0 <= 0.0f && 0.0f <= y1) {
+        return 0.0f;
+    }
+    if (conic.z > 1e-12f) {
+        for (uint i = 0u; i < 2u; ++i) {
+            float x = (i == 0u) ? x0 : x1;
+            float y = clamp(-conic.y * x / conic.z, y0, y1);
+            m = min(m, eval_conic_msl(conic, x, y));
+        }
+    }
+    if (conic.x > 1e-12f) {
+        for (uint i = 0u; i < 2u; ++i) {
+            float y = (i == 0u) ? y0 : y1;
+            float x = clamp(-conic.y * y / conic.x, x0, x1);
+            m = min(m, eval_conic_msl(conic, x, y));
+        }
+    }
+    return m;
+}
+
+inline void tile_box_msl(
+    float2 center,
+    bool scan_along_x,
+    float ts,
+    int line_tile,
+    int minor_tile,
+    thread float& x0,
+    thread float& x1,
+    thread float& y0,
+    thread float& y1)
+{
+    float major_x = scan_along_x ? float(minor_tile) : float(line_tile);
+    float major_y = scan_along_x ? float(line_tile) : float(minor_tile);
+    x0 = major_x * ts - center.x;
+    x1 = (major_x + 1.0f) * ts - center.x;
+    y0 = major_y * ts - center.y;
+    y1 = (major_y + 1.0f) * ts - center.y;
+}
+
+inline bool tile_intersects_ellipse_msl(
+    float2 center,
+    float3 conic,
+    bool scan_along_x,
+    float ts,
+    int line_tile,
+    int minor_tile)
+{
+    float x0, x1, y0, y1;
+    tile_box_msl(center, scan_along_x, ts, line_tile, minor_tile, x0, x1, y0, y1);
+    return min_conic_over_tile_box_msl(conic, x0, x1, y0, y1) <= 1.0f + kEllipseEps;
+}
+
+inline bool compute_scanline_tile_span_msl(
+    float2 center,
+    float3 conic,
+    bool scan_along_x,
+    float ts,
+    int line_tile,
+    int minor_lo,
+    int minor_hi,
+    thread int& minor_start,
+    thread int& span_count)
+{
+    int first = -1;
+    int last = -1;
+    for (int minor = max(minor_lo, 0); minor <= minor_hi; ++minor) {
+        if (tile_intersects_ellipse_msl(center, conic, scan_along_x, ts, line_tile, minor)) {
+            if (first < 0) {
+                first = minor;
+            }
+            last = minor;
+        }
+    }
+    if (first < 0) {
+        return false;
+    }
+    minor_start = first;
+    span_count = last - first + 1;
+    return true;
+}
+
+/// Scanline conic tile emit (depth-sorted splat order via depth_sorted_ids).
+kernel void gaussian_splat_emit_tile_keys_conic(
+    device const float* center_radius [[buffer(0)]],
+    device const float* ellipse_conic [[buffer(1)]],
+    device const uint* valid [[buffer(2)]],
+    device const uint* depth_sorted_ids [[buffer(3)]],
+    device uint* keys [[buffer(4)]],
+    device uint* values [[buffer(5)]],
+    device atomic_uint* counter [[buffer(6)]],
+    constant SplatBinParams& bp [[buffer(7)]],
+    constant uint& emit_count [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= emit_count) {
+        return;
+    }
+    uint sid = depth_sorted_ids[gid];
+    if (valid[sid] == 0u) {
+        return;
+    }
+    float cx = center_radius[sid * 4u];
+    float cy = center_radius[sid * 4u + 1u];
+    float radius = center_radius[sid * 4u + 2u];
+    float3 conic = float3(
+        ellipse_conic[sid * 3u],
+        ellipse_conic[sid * 3u + 1u],
+        ellipse_conic[sid * 3u + 2u]);
+    float2 bbox_extent = float2(0.0f);
+    float half_tile = 0.5f * float(bp.tile_size);
+    if (!try_prepare_conic_binning_msl(conic, radius, half_tile, bbox_extent)) {
+        float r = radius + float(bp.tile_size);
+        float ts = float(bp.tile_size);
+        int min_x = int(floor((cx - r) / ts));
+        int max_x = int(ceil((cx + r) / ts));
+        int min_y = int(floor((cy - r) / ts));
+        int max_y = int(ceil((cy + r) / ts));
+        min_x = clamp(min_x, 0, int(bp.tile_width) - 1);
+        max_x = clamp(max_x, 0, int(bp.tile_width) - 1);
+        min_y = clamp(min_y, 0, int(bp.tile_height) - 1);
+        max_y = clamp(max_y, 0, int(bp.tile_height) - 1);
+        for (int ty = min_y; ty <= max_y; ++ty) {
+            for (int tx = min_x; tx <= max_x; ++tx) {
+                uint idx = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+                if (idx >= bp.max_list_entries) {
+                    return;
+                }
+                keys[idx] = uint(ty) * bp.tile_width + uint(tx);
+                values[idx] = sid;
+            }
+        }
+        return;
+    }
+    float2 extent = bbox_extent + float2(half_tile, half_tile);
+    float ts = float(bp.tile_size);
+    int min_x = int(floor((cx - extent.x) / ts));
+    int max_x = int(ceil((cx + extent.x) / ts));
+    int min_y = int(floor((cy - extent.y) / ts));
+    int max_y = int(ceil((cy + extent.y) / ts));
+    min_x = clamp(min_x, 0, int(bp.tile_width) - 1);
+    max_x = clamp(max_x, 0, int(bp.tile_width) - 1);
+    min_y = clamp(min_y, 0, int(bp.tile_height) - 1);
+    max_y = clamp(max_y, 0, int(bp.tile_height) - 1);
+    if (min_x > max_x || min_y > max_y) {
+        return;
+    }
+    bool scan_along_x = (bbox_extent.x > bbox_extent.y)
+        || (abs(bbox_extent.x - bbox_extent.y) < 1e-6f && (max_x - min_x) >= (max_y - min_y));
+    int primary_lo, primary_hi, minor_lo, minor_hi;
+    if (scan_along_x) {
+        primary_lo = min_y;
+        primary_hi = max_y;
+        minor_lo = min_x;
+        minor_hi = max_x;
+    } else {
+        primary_lo = min_x;
+        primary_hi = max_x;
+        minor_lo = min_y;
+        minor_hi = max_y;
+    }
+    float2 center = float2(cx, cy);
+    for (int primary = primary_lo; primary <= primary_hi; ++primary) {
+        int minor_start = 0;
+        int span_count = 0;
+        if (!compute_scanline_tile_span_msl(center, conic, scan_along_x, ts, primary, minor_lo, minor_hi, minor_start, span_count)) {
+            continue;
+        }
+        for (int off = 0; off < span_count; ++off) {
+            int minor = minor_start + off;
+            int tile_x = scan_along_x ? minor : primary;
+            int tile_y = scan_along_x ? primary : minor;
+            uint idx = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+            if (idx >= bp.max_list_entries) {
+                return;
+            }
+            keys[idx] = uint(tile_y) * bp.tile_width + uint(tile_x);
+            values[idx] = sid;
+        }
+    }
+}

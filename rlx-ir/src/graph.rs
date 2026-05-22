@@ -21,7 +21,10 @@
 
 use crate::{Op, Shape};
 
+use crate::provenance::NodeOrigin;
+
 /// Stable identifier for a node in the graph. Indices are never reused.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 
@@ -32,6 +35,7 @@ impl std::fmt::Display for NodeId {
 }
 
 /// A single node in the computation graph.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct Node {
     pub id: NodeId,
@@ -43,6 +47,8 @@ pub struct Node {
     pub shape: Shape,
     /// Human-readable name for debugging.
     pub name: Option<String>,
+    /// Cross-stage provenance (HIR block, fusion pass, …).
+    pub origin: Option<NodeOrigin>,
 }
 
 /// A computation graph — the core IR data structure.
@@ -65,6 +71,7 @@ pub struct Node {
 /// assert_eq!(g.len(), 5);
 /// println!("{g}");
 /// ```
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
 pub struct Graph {
     pub name: String,
@@ -130,16 +137,46 @@ impl Graph {
         self.nodes[id.0 as usize].inputs = inputs;
     }
 
+    pub fn node_mut(&mut self, id: NodeId) -> &mut Node {
+        &mut self.nodes[id.0 as usize]
+    }
+
+    pub fn nodes_mut(&mut self) -> &mut [Node] {
+        &mut self.nodes
+    }
+
     // ── Node constructors ───────────────────────────────────────
 
     /// Append a node to the graph. `pub(crate)` so per-op builder
     /// files in `rlx_ir::ops::*` can call it (plan #53).
+    /// Append a node for backend graph slicing (e.g. TPU HLO segments).
+    pub fn append_node(
+        &mut self,
+        op: Op,
+        inputs: Vec<NodeId>,
+        shape: Shape,
+        name: Option<String>,
+    ) -> NodeId {
+        self.push(op, inputs, shape, name)
+    }
+
     pub(crate) fn push(
         &mut self,
         op: Op,
         inputs: Vec<NodeId>,
         shape: Shape,
         name: Option<String>,
+    ) -> NodeId {
+        self.push_ext(op, inputs, shape, name, None)
+    }
+
+    pub(crate) fn push_ext(
+        &mut self,
+        op: Op,
+        inputs: Vec<NodeId>,
+        shape: Shape,
+        name: Option<String>,
+        origin: Option<NodeOrigin>,
     ) -> NodeId {
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(Node {
@@ -148,6 +185,7 @@ impl Graph {
             inputs,
             shape,
             name,
+            origin,
         });
         id
     }
@@ -179,6 +217,69 @@ impl Graph {
     /// Reverse topological order (outputs first).
     pub fn reverse_topo(&self) -> impl Iterator<Item = NodeId> + '_ {
         (0..self.nodes.len()).rev().map(|i| NodeId(i as u32))
+    }
+
+    // ── HIR / MIR / LIR pipeline (higher-order DX) ─────────────────
+
+    /// Fusion-first model definition at HIR level.
+    ///
+    /// Returns a [`GraphModule`] at HIR stage; call [`GraphModule::lower`]
+    /// or pass to [`rlx_opt::CompilePipeline::compile_module`].
+    pub fn define(
+        name: impl Into<String>,
+        build: impl FnOnce(&mut crate::hir::HirModule) -> crate::hir::HirNodeId,
+    ) -> crate::GraphModule {
+        crate::GraphModule::define(name, build)
+    }
+
+    /// Start an empty HIR-stage [`GraphModule`].
+    pub fn hir(name: impl Into<String>) -> crate::GraphModule {
+        crate::GraphModule::hir(name)
+    }
+
+    /// Wrap this MIR graph in a [`GraphModule`] for pipeline operations.
+    pub fn module(self) -> crate::GraphModule {
+        crate::GraphModule::from_graph(self)
+    }
+
+    /// Lower a HIR module to a MIR graph.
+    pub fn from_hir(hir: crate::hir::HirModule) -> Result<Self, crate::hir::LowerError> {
+        hir.lower_to_mir().map(|m| m.into_graph())
+    }
+
+    /// View as [`MirModule`].
+    pub fn to_mir(self) -> crate::MirModule {
+        crate::MirModule::from_graph(self)
+    }
+
+    /// Extract the MIR graph from optimized LIR.
+    pub fn from_lir(lir: crate::LirModule) -> Self {
+        lir.into_graph()
+    }
+
+    /// Annotated text dump ([`inspect_graph`]).
+    pub fn inspect(&self) -> String {
+        crate::inspect_graph(self)
+    }
+
+    /// True if any node shape uses a [`Dim::Dynamic`] symbol.
+    pub fn has_dynamic_dims(&self) -> bool {
+        crate::dynamic::has_dynamic_dims(self)
+    }
+
+    /// All dynamic symbols referenced in this graph.
+    pub fn dynamic_symbols(&self) -> Vec<u32> {
+        crate::dynamic::collect_dynamic_symbols(self)
+    }
+
+    /// Specialize symbolic dims to concrete sizes.
+    pub fn bind(&self, bindings: &crate::DimBinding) -> Self {
+        crate::dynamic::bind_graph(self, bindings)
+    }
+
+    /// Stage-aware dump when wrapped in [`GraphModule`].
+    pub fn inspect_module(module: &crate::GraphModule) -> String {
+        module.inspect()
     }
 }
 

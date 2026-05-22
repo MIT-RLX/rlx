@@ -66,8 +66,8 @@ pub fn metal_sgemm(
             // variant directly. Fall back to simd_4x4 if a caller bypasses it.
             enc.set_compute_pipeline_state(&kk.sgemm_simd_4x4);
             let tg_count = MTLSize {
-                width: (n / 32) as u64,
-                height: (m / 32) as u64,
+                width: n.div_ceil(32) as u64,
+                height: m.div_ceil(32) as u64,
                 depth: 1,
             };
             enc.dispatch_thread_groups(
@@ -82,8 +82,8 @@ pub fn metal_sgemm(
         SgemmVariant::Simd4x4 => {
             enc.set_compute_pipeline_state(&kk.sgemm_simd_4x4);
             let tg_count = MTLSize {
-                width: (n / 32) as u64,
-                height: (m / 32) as u64,
+                width: n.div_ceil(32) as u64,
+                height: m.div_ceil(32) as u64,
                 depth: 1,
             };
             enc.dispatch_thread_groups(
@@ -98,8 +98,8 @@ pub fn metal_sgemm(
         SgemmVariant::Simd => {
             enc.set_compute_pipeline_state(&kk.sgemm_simd);
             let tg_count = MTLSize {
-                width: (n / 8) as u64,
-                height: (m / 8) as u64,
+                width: n.div_ceil(8) as u64,
+                height: m.div_ceil(8) as u64,
                 depth: 1,
             };
             enc.dispatch_thread_groups(
@@ -208,8 +208,8 @@ pub fn metal_sgemm_bias(
             enc.set_bytes(7, 4, &act_u as *const _ as *const _);
             enc.set_compute_pipeline_state(&kk.sgemm_simd_4x4_bias);
             let tg_count = MTLSize {
-                width: (n / 32) as u64,
-                height: (m / 32) as u64,
+                width: n.div_ceil(32) as u64,
+                height: m.div_ceil(32) as u64,
                 depth: 1,
             };
             enc.dispatch_thread_groups(
@@ -232,8 +232,8 @@ pub fn metal_sgemm_bias(
             enc.set_bytes(7, 4, &act_u as *const _ as *const _);
             enc.set_compute_pipeline_state(&kk.sgemm_simd_bias);
             let tg_count = MTLSize {
-                width: (n / 8) as u64,
-                height: (m / 8) as u64,
+                width: n.div_ceil(8) as u64,
+                height: m.div_ceil(8) as u64,
                 depth: 1,
             };
             enc.dispatch_thread_groups(

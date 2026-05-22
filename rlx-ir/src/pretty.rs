@@ -72,6 +72,9 @@ pub fn pretty_print(g: &Graph) -> String {
             write!(out, ")").unwrap();
         }
         write!(out, " : {}", n.shape).unwrap();
+        if let Some(ref o) = n.origin {
+            write!(out, "  // {}", o).unwrap();
+        }
         if g.outputs.contains(&n.id) {
             write!(out, "  ← output").unwrap();
         }
@@ -95,7 +98,7 @@ pub fn pretty_stats(g: &Graph) -> String {
     format!("{}\n{}", header_line(g), op_kinds_line(g))
 }
 
-fn header_line(g: &Graph) -> String {
+pub(crate) fn header_line(g: &Graph) -> String {
     let arena_bytes: usize = g.nodes().iter().filter_map(|n| n.shape.size_bytes()).sum();
     format!(
         "graph @{} ({} nodes, {} outputs, {} arena)",
@@ -106,7 +109,7 @@ fn header_line(g: &Graph) -> String {
     )
 }
 
-fn op_kinds_line(g: &Graph) -> String {
+pub(crate) fn op_kinds_line(g: &Graph) -> String {
     let mut hist: BTreeMap<String, usize> = BTreeMap::new();
     for n in g.nodes() {
         *hist.entry(format!("{:?}", n.op.kind())).or_insert(0) += 1;
@@ -152,14 +155,14 @@ mod tests {
     use crate::{DType, Graph, Shape, op::BinaryOp};
 
     #[test]
-    fn pretty_print_smoke() {
-        let mut g = Graph::new("smoke");
+    fn pretty_print_basic() {
+        let mut g = Graph::new("basic");
         let x = g.input("x", Shape::new(&[4, 4], DType::F32));
         let y = g.input("y", Shape::new(&[4, 4], DType::F32));
         let z = g.binary(BinaryOp::Add, x, y, Shape::new(&[4, 4], DType::F32));
         g.set_outputs(vec![z]);
         let s = pretty_print(&g);
-        assert!(s.contains("graph @smoke"));
+        assert!(s.contains("graph @basic"));
         assert!(s.contains("nodes"));
         assert!(s.contains("Input=2"));
         assert!(s.contains("Binary=1"));

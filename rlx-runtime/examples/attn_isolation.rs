@@ -69,18 +69,14 @@ fn main() {
 
     let run_with = |use_mpsgraph: bool, dev: Device| -> Vec<f32> {
         if use_mpsgraph {
-            unsafe {
-                std::env::set_var("RLX_USE_MPSGRAPH", "1");
-            }
-            unsafe {
-                std::env::set_var("RLX_MPSGRAPH_ATTENTION", "1");
-            }
+            rlx_ir::env::set("RLX_USE_MPSGRAPH", "1")
+            rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
         } else {
             unsafe {
-                std::env::remove_var("RLX_USE_MPSGRAPH");
+                rlx_ir::env::unset("RLX_USE_MPSGRAPH");
             }
             unsafe {
-                std::env::remove_var("RLX_MPSGRAPH_ATTENTION");
+                rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
             }
         }
         let session = Session::new(dev);

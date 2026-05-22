@@ -14,8 +14,6 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Quantization metadata as graph annotations (plan #57).
-//!
-//! Borrowed from MAX's `quantization.py` pattern: quantization scheme
 //! lives as per-tensor metadata on the IR rather than spawning a
 //! parallel "quantized graph" type. Ops can read the scheme and
 //! dispatch to fused-dequant kernels (the eventual #5 win) when
@@ -36,6 +34,7 @@ use std::collections::HashMap;
 /// Each variant carries the parameters the dequantizer needs to read
 /// at runtime — scale, zero-point, block size. Where these live in
 /// the actual weight tensor is up to the loader (#56).
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QuantScheme {
     /// Symmetric int8 with one scale per `block_size` elements.
@@ -64,6 +63,14 @@ pub enum QuantScheme {
     /// i8 quants and a 32-byte sum-of-blocks table that's only used
     /// by Q8_K × Q8_K matmul accumulation paths.
     GgufQ8K,
+    /// GGUF Q2_K (256 / 84 bytes). 2-bit quants with per-sub-block scale/min.
+    GgufQ2K,
+    /// GGUF Q3_K (256 / 110 bytes). 3-bit quants with hmask high bit plane.
+    GgufQ3K,
+    /// NVIDIA FP4 (E2M1) block — fixed 16-element groups, FP8 E4M3 block
+    /// scales, optional f32 global scale on input 3 (legacy `zp` slot).
+    /// Used by FLUX.2 / MLX `nvfp4` checkpoints.
+    Nvfp4Block,
 }
 
 impl QuantScheme {
@@ -79,6 +86,9 @@ impl QuantScheme {
             Self::GgufQ5K => 55,  // 176 / 256 × 8 ≈ 5.5
             Self::GgufQ6K => 66,  // 210 / 256 × 8 ≈ 6.5625 → 66 (rounded)
             Self::GgufQ8K => 91,  // 292 / 256 × 8 ≈ 9.125 → 91
+            Self::GgufQ2K => 26,  // 84 / 256 × 8 ≈ 2.625 → 26
+            Self::GgufQ3K => 34,  // 110 / 256 × 8 ≈ 3.4375 → 34
+            Self::Nvfp4Block => 40,
         }
     }
 
@@ -93,7 +103,21 @@ impl QuantScheme {
         matches!(
             self,
             Self::Int8Block { .. } | Self::Int8BlockAsym { .. } | Self::Int4Block { .. }
+                | Self::Nvfp4Block
         )
+    }
+
+    /// True for NVFP4 block scales stored as FP8 E4M3 bytes (not f32).
+    pub const fn scale_is_fp8(self) -> bool {
+        matches!(self, Self::Nvfp4Block)
+    }
+
+    /// Fixed NVFP4 group size along K (0 for other schemes).
+    pub const fn nvfp4_group_size(self) -> u32 {
+        match self {
+            Self::Nvfp4Block => crate::nvfp4::NVFP4_GROUP_SIZE as u32,
+            _ => 0,
+        }
     }
 
     /// True if this scheme requires a per-block zero-point.
@@ -105,7 +129,8 @@ impl QuantScheme {
     /// non-GGUF schemes (returns 0).
     pub const fn gguf_block_size(self) -> u32 {
         match self {
-            Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K | Self::GgufQ8K => 256,
+            Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K | Self::GgufQ8K | Self::GgufQ2K
+            | Self::GgufQ3K => 256,
             _ => 0,
         }
     }
@@ -117,6 +142,8 @@ impl QuantScheme {
             Self::GgufQ5K => 176, // + 32-byte high-bit plane
             Self::GgufQ6K => 210, // 128 ql + 64 qh + 16 i8 scales + f16 d
             Self::GgufQ8K => 292, // f32 d + 256 i8 + 16 i16 bsums = 4 + 256 + 32
+            Self::GgufQ2K => 84,  // f16 d + f16 dmin + 16 scales + 64 qs
+            Self::GgufQ3K => 110, // f16 d + 12 scales + 32 hmask + 64 qs
             _ => 0,
         }
     }
@@ -128,7 +155,8 @@ impl QuantScheme {
     pub const fn is_gguf(self) -> bool {
         matches!(
             self,
-            Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K | Self::GgufQ8K
+            Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K | Self::GgufQ8K | Self::GgufQ2K
+            | Self::GgufQ3K
         )
     }
 }
@@ -145,6 +173,9 @@ impl std::fmt::Display for QuantScheme {
             Self::GgufQ5K => write!(f, "gguf_q5k"),
             Self::GgufQ6K => write!(f, "gguf_q6k"),
             Self::GgufQ8K => write!(f, "gguf_q8k"),
+            Self::GgufQ2K => write!(f, "gguf_q2k"),
+            Self::GgufQ3K => write!(f, "gguf_q3k"),
+            Self::Nvfp4Block => write!(f, "nvfp4/16"),
         }
     }
 }

@@ -20,7 +20,14 @@ rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
 # unified memory lets us run them against the Metal arena pointer
 # with no copies. A native Metal FFT kernel will replace this when a
 # real workload justifies the .metal kernel work.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.0" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", features = ["splat"] }
+bytemuck = { version = "1", features = ["derive"] }
+rlx-splat = { path = "../rlx-splat", version = "0.2.0", optional = true, default-features = false, features = ["reference", "metal"] }
+
+[features]
+default = []
+# Native MSL raster via `rlx-splat` + `splat.msl` (no `rlx-runtime` on `rlx-splat` — no cycle).
+native-splat = ["dep:rlx-splat"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.30"
@@ -30,6 +37,7 @@ core-graphics-types = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 half = "2"
+
 
 [lints]
 workspace = true

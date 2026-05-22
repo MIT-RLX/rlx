@@ -3,7 +3,11 @@ resolver = "2"
 members = [
     # Core (no backend dependencies)
     "rlx-ir",          # Tensor IR: types, shapes, ops, graph, verifier
-    "rlx-opt",         # Graph optimizer: fusion passes, memory planner
+    "rlx-flow",        # Block assembly-line API for model builders
+    "rlx-fusion",      # MIR fusion passes + fused-op unfuse
+    "rlx-autodiff",    # Reverse/forward-mode AD on MIR
+    "rlx-compile",     # HIR → MIR → LIR pipeline
+    "rlx-opt",         # Facade: re-exports fusion + autodiff + compile
 
     # Driver layer (devices, arenas, buffers, streams)
     "rlx-driver",
@@ -32,8 +36,6 @@ members = [
     # "rlx-directx",   # DirectX 12 compute
     # "rlx-webgpu",    # WebGPU/WASM
 
-    # Model loading
-    "rlx-models",      # Config parsing, safetensors loading, graph builders
     "rlx-gguf",        # GGUF parser + dequant (standalone, format-only)
 
     # Proc macros
@@ -49,6 +51,10 @@ members = [
     # Downstream packages (registered against the custom-op scaffold)
     "rlx-sparse",      # Sparse linear algebra (CSR LU/MatVec/CG) — JAX-style downstream
     "rlx-linalg",      # Dense linalg (eigh/svd/qr/cholesky/solve_triangular) via LAPACK
+    "rlx-splat",       # 3D Gaussian splatting (CPU reference render custom op)
+    "rlx-fdm",         # Force density method — pin-jointed form-finding (jax_fdm port)
+    "rlx-rl",          # Flow-map policies + FMQ / QGBS (offline-to-online RL)
+    "rlx-bbo",         # Black-box + trust-region Q-guidance / QGBS (domain-agnostic f64)
 
     # Benchmark framework (PLAN L5)
     "rlx-bench",       # BenchmarkPattern + per-backend timing harness

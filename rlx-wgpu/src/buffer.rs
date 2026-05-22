@@ -247,4 +247,50 @@ impl Arena {
         staging.unmap();
         out
     }
+
+    /// Read a byte range from the arena (used for packed GGUF weights).
+    pub fn read_bytes_range(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        byte_off: usize,
+        len: usize,
+    ) -> Vec<u8> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rlx-wgpu readback bytes"),
+            size: len as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rlx-wgpu readback bytes enc"),
+        });
+        enc.copy_buffer_to_buffer(&self.buffer, byte_off as u64, &staging, 0, len as u64);
+        queue.submit(std::iter::once(enc.finish()));
+
+        let slice = staging.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = sender.send(r);
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        receiver.recv().unwrap().unwrap();
+
+        let view = slice.get_mapped_range();
+        let out = view.to_vec();
+        drop(view);
+        staging.unmap();
+        out
+    }
+
+    /// Write raw bytes into the arena at `byte_off`.
+    pub fn write_bytes_range(&self, queue: &wgpu::Queue, byte_off: usize, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        queue.write_buffer(&self.buffer, byte_off as u64, data);
+    }
 }

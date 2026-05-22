@@ -25,6 +25,8 @@ through every backend. `rlx-ir` owns:
   optimizer pass in debug builds (plan #50).
 - **`OpExtension` / `op_registry`** — the custom-op scaffold downstream
   crates register against (see [`rlx-sparse`], [`rlx-linalg`]).
+- **Logical kernels** — one `OpKind`, native or common-IR lowering; see
+  [README-logical-kernels.md](README-logical-kernels.md).
 - **`Tick`** — `CNTVCT_EL0`-direct cycle counter for sub-millisecond
   measurement on Apple Silicon. Falls back to `Instant`. Use
   `Tick::now()` / `tick.elapsed_ns(start)` for any sub-ms measurement.
@@ -39,16 +41,38 @@ rlx-ir = "0.1"
 Most users should depend on the [`rlx`](https://crates.io/crates/rlx)
 prelude crate instead, which re-exports `rlx_ir` as `rlx::ir`.
 
+## IR levels (HIR / MIR / LIR)
+
+| Level | Module | Role |
+|-------|--------|------|
+| **HIR** | `rlx_ir::hir` | Block ops for model builders (`SwiGLU`, `Linear`, …) |
+| **MIR** | `rlx_ir::mir` | Fused tensor DAG — optimizer input (`Graph` alias) |
+| **LIR** | `rlx_ir::lir` | MIR + arena buffer plan — backend input |
+
+[`GraphModule`] tracks which stage you are in. Use [`Graph::define`] for
+fusion-first HIR builders; use [`GraphModule::mir`] for primitive MIR.
+
+Pipeline: `CompilePipeline::compile_module(module)` in `rlx_opt`.
+
 ## Quickstart
 
 ```rust
-use rlx_ir::{DType, Graph, Shape};
+use rlx_ir::{DType, Graph, GraphModule, Shape};
 
+// Fusion-first (recommended)
+let module = Graph::define("layer", |m| {
+    let x = m.input("x", Shape::new(&[2, 128], DType::F32));
+    let w = m.param("w", Shape::new(&[128, 128], DType::F32));
+    m.linear(x, w, None, None, Shape::new(&[2, 128], DType::F32))
+});
+
+// Primitive MIR (legacy)
 let mut g = Graph::new("hello");
 let x = g.input("x", Shape::new(&[1, 4], DType::F32));
 let w = g.param("w", Shape::new(&[4, 2], DType::F32));
 let y = g.matmul(x, w, Shape::new(&[1, 2], DType::F32));
 g.set_outputs(vec![y]);
+let module = g.module();
 ```
 
 ## Build / test

@@ -43,6 +43,36 @@ unsafe extern "C" {
         c: *mut f32,
         ldc: i32,
     );
+
+    fn cblas_sgemv(
+        order: i32,
+        trans: i32,
+        m: i32,
+        n: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        x: *const f32,
+        incx: i32,
+        beta: f32,
+        y: *mut f32,
+        incy: i32,
+    );
+
+    fn cblas_sger(
+        order: i32,
+        m: i32,
+        n: i32,
+        alpha: f32,
+        x: *const f32,
+        incx: i32,
+        y: *const f32,
+        incy: i32,
+        a: *mut f32,
+        lda: i32,
+    );
+
+    fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, incx: i32);
 }
 
 #[cfg(not(feature = "blas"))]
@@ -95,6 +125,85 @@ unsafe fn cblas_sgemm(
             unsafe {
                 *cp = alpha * acc + beta * *cp;
             }
+        }
+    }
+}
+
+#[cfg(not(feature = "blas"))]
+#[allow(non_snake_case, clippy::too_many_arguments)]
+#[inline]
+unsafe fn cblas_sgemv(
+    _order: i32,
+    trans: i32,
+    m: i32,
+    n: i32,
+    alpha: f32,
+    a: *const f32,
+    lda: i32,
+    x: *const f32,
+    _incx: i32,
+    beta: f32,
+    y: *mut f32,
+    _incy: i32,
+) {
+    let m = m as usize;
+    let n = n as usize;
+    let lda = lda as usize;
+    let trans_a = trans != NO_TRANS;
+    for i in 0..m {
+        let mut acc = 0f32;
+        for j in 0..n {
+            let av = if trans_a {
+                unsafe { *a.add(j * lda + i) }
+            } else {
+                unsafe { *a.add(i * lda + j) }
+            };
+            acc += av * unsafe { *x.add(j) };
+        }
+        let yp = unsafe { y.add(i) };
+        unsafe {
+            *yp = alpha * acc + beta * *yp;
+        }
+    }
+}
+
+#[cfg(not(feature = "blas"))]
+#[allow(non_snake_case, clippy::too_many_arguments)]
+#[inline]
+unsafe fn cblas_sger(
+    _order: i32,
+    m: i32,
+    n: i32,
+    alpha: f32,
+    x: *const f32,
+    _incx: i32,
+    y: *const f32,
+    _incy: i32,
+    a: *mut f32,
+    lda: i32,
+) {
+    let m = m as usize;
+    let n = n as usize;
+    let lda = lda as usize;
+    for i in 0..m {
+        let xi = unsafe { *x.add(i) };
+        for j in 0..n {
+            let yj = unsafe { *y.add(j) };
+            let ap = unsafe { a.add(i * lda + j) };
+            unsafe {
+                *ap += alpha * xi * yj;
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "blas"))]
+#[inline]
+unsafe fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, _incx: i32) {
+    for i in 0..n as usize {
+        let xp = unsafe { x.add(i) };
+        unsafe {
+            *xp *= alpha;
         }
     }
 }
@@ -1093,6 +1202,57 @@ pub fn sgemm_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
             c.as_mut_ptr(),
             n as i32,
         );
+    }
+}
+
+/// `y = alpha * A^T @ x + beta * y` with `A` stored row-major `[n,n]`.
+#[inline]
+pub fn sgemv_at(a: &[f32], x: &[f32], y: &mut [f32], n: usize, alpha: f32, beta: f32) {
+    unsafe {
+        cblas_sgemv(
+            ROW_MAJOR,
+            TRANS,
+            n as i32,
+            n as i32,
+            alpha,
+            a.as_ptr(),
+            n as i32,
+            x.as_ptr(),
+            1,
+            beta,
+            y.as_mut_ptr(),
+            1,
+        );
+    }
+}
+
+/// Rank-1 update: `A += alpha * x @ y^T`, `A` row-major `[n,n]`.
+#[inline]
+pub fn sger(a: &mut [f32], x: &[f32], y: &[f32], n: usize, alpha: f32) {
+    unsafe {
+        cblas_sger(
+            ROW_MAJOR,
+            n as i32,
+            n as i32,
+            alpha,
+            x.as_ptr(),
+            1,
+            y.as_ptr(),
+            1,
+            a.as_mut_ptr(),
+            n as i32,
+        );
+    }
+}
+
+/// In-place scale: `x *= alpha`.
+#[inline]
+pub fn sscal(x: &mut [f32], alpha: f32) {
+    if x.is_empty() {
+        return;
+    }
+    unsafe {
+        cblas_sscal(x.len() as i32, alpha, x.as_mut_ptr(), 1);
     }
 }
 

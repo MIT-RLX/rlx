@@ -15,7 +15,7 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 ### Added
 
-- **`rlx::run` runner API** (`rlx-models/src/run.rs`):
+- **`rlx::run` runner API** (`model builders` crate, `run` module):
   builder-style entry points for the supported model families,
   re-exported in the prelude under the `models` cargo feature.
   - `Qwen3Runner::builder()` — `.weights(p)`, `.device(d)`,
@@ -28,7 +28,7 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
     per-arch `Sam{,2,3}::from_safetensors_on` + forward call.
   - Helpers `open_loader(path)`, `list_mtp_keys(path)`,
     `debug_resolve_name(hf_name)`.
-- **`rlx-run` CLI** (`rlx-models/src/bin/rlx_run.rs`): subcommands
+- **`rlx-run` CLI** (`model builders` crate, `rlx-run` binary): subcommands
   `qwen3`, `sam1`, `sam2`, `sam3`, `inspect`, `help`. Hand-rolled
   arg parser — no clap dep. Mirrors the builder API 1:1.
 - **`Op::DequantMatMul` GGUF schemes** (`rlx-ir/src/quant.rs`):
@@ -41,13 +41,13 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 - **GGUF K-quant decoders** (`rlx-gguf`): Q4_K, Q5_K, Q6_K, Q8_K
   block decoders, mirroring llama.cpp's `ggml-quants.c` reference.
   Made `pub` so `rlx-cpu`'s `DequantMatMul` GGUF arm can call them.
-- **`GgufLoader`** (`rlx-models::weight_loader`): pluggable
+- **`GgufLoader`** (`model builders::weight_loader`): pluggable
   `WeightLoader` for `.gguf` files with transparent
   HF↔GGUF name resolution (`hf_to_gguf_name` /
   `gguf_to_hf_name`), MTP-head isolation (`is_mtp_weight`,
   `mtp_keys`), and shape normalization (innermost-first GGUF dims
   reversed to safetensors order without byte movement).
-- **Qwen3 graph builder** (`rlx-models/src/qwen3/`): GQA via
+- **Qwen3 graph builder** (`model builders` crate, `qwen3`): GQA via
   graph-level KV head repetition, QK-norm, RoPE, SwiGLU,
   tied-embedding LM head with build-time weight pre-transpose
   (eliminates 600 MB per-call Transpose op), prefill + cached
@@ -70,7 +70,7 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 - **F16 LM-head path** (opt-in via `RLX_QWEN3_F16_LM_HEAD=1`): casts
   hidden + lm-head weight to F16 before the final matmul. Wins
   1.3-1.45× on B≥2, L≥64 `last` cells.
-- **Examples per model family** (`rlx-models/examples/`):
+- **Examples per model family** (`model builders` repo `examples/`):
   `run_qwen3_safetensors.rs`, `run_qwen3_gguf.rs`, `run_sam1.rs`,
   `run_sam2.rs`, `run_sam3.rs`, plus `qwen3_gguf_inference.rs` and
   `gguf_qwen3_probe.rs` for deeper walk-throughs.
@@ -110,7 +110,7 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
   this fix alone.
 - **MPSGraph lowering is opt-out** (was opt-in). Env-var name
   changed from `RLX_USE_MPSGRAPH=1` to **`RLX_DISABLE_MPSGRAPH=1`**.
-  The matrix harness `examples/qwen3_matrix.rs` no longer needs to
+  The matrix harness `model builders` example `qwen3_matrix.rs` no longer needs to
   set anything to engage the fast path.
 - `WeightFormat::from_path` / `ConfigSource` / `Precision` /
   `SamArch` enums + the runner builders are re-exported as
@@ -131,7 +131,7 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 - **`Op::DequantMatMul` `scheme` field** is now used by the
   CPU lowerer to dispatch to the right kernel; previously the
   GGUF schemes panicked with "scheme not implemented".
-- Three pre-existing `rlx-models` warnings (unused
+- Three pre-existing `model builders` warnings (unused
   `multihead_attention` import in `sam3/detector_decoder.rs`,
   unused `data` arg in `sam3/detector_encoder_ir.rs:add_param`,
   dead `sigmoid` fn in `sam3/tensor.rs`) cleaned up so the
@@ -149,7 +149,7 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 ### Docs
 
 - New `CHANGELOG.md` (this file).
-- `rlx-models/README.md`: added a Qwen3 section, runner DX section,
+- `model builders` repo README: added a Qwen3 section, runner DX section,
   per-example table, env-var matrix for the MPSGraph fast path.
 - `rlx-ir/README.md`: added a `QuantScheme` table covering legacy
   Int8 + new GGUF schemes, and a Gotchas note about
@@ -168,7 +168,7 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
   Qwen3-0.6B Q4_K_M: arena drops from 2.22 GB → 1.42 GB end-to-end
   with **bit-exact parity** against the F32-load path (cosine
   1.00000, max\|Δ\| 0.000, top-1 match). End-to-end example at
-  `rlx-models/examples/qwen3_packed_inference.rs`; set
+  `model builders` example `qwen3_packed_inference.rs`; set
   `RLX_QWEN3_PARITY=1` to also build the F32 reference for the
   same file and report cosine.
 - **`Qwen3RunnerBuilder::packed_weights(true)`** + CLI `--packed`
@@ -219,7 +219,7 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
     L2-norm → GQA-repeat → `Op::GatedDeltaNet` → silu(z)-gated
     norm → `ssm_out`) + every-`full_attention_interval` standard
     attention block (joint Q+gate, sigmoid-gated attn output) +
-    optional MTP head. 2/2 smoke tests green (graph builds,
+    optional MTP head. 2/2 basic tests green (graph builds,
     executes, produces finite logits on both trunk + MTP outputs).
   - `Qwen35Runner` / `Qwen35RunnerBuilder` — mirrors the
     `Qwen3Runner` API; `.packed_weights(true)` opts into the K-

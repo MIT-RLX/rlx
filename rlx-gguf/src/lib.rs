@@ -15,8 +15,8 @@
 
 //! GGUF (GGML Universal Format) parser + dequantization to f32.
 //!
-//! Standalone: no `rlx-*` dependencies. The `WeightLoader` adapter
-//! lives in `rlx-models` so this crate stays portable.
+//! Standalone: no `rlx-*` dependencies. Higher-level `WeightLoader` /
+//! HF name mapping lives in the separate model-builders repo (see root README).
 //!
 //! Supports GGUF v1, v2, v3 (the live formats). Tensor dtypes
 //! decoded today: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1.
@@ -312,6 +312,8 @@ impl GgufFile {
             GgmlType::Q5K => dequant_q5_k(bytes, n)?,
             GgmlType::Q6K => dequant_q6_k(bytes, n)?,
             GgmlType::Q8K => dequant_q8_k(bytes, n)?,
+            GgmlType::Q2K => dequant_q2_k(bytes, n)?,
+            GgmlType::Q3K => dequant_q3_k(bytes, n)?,
             other => bail!("dequant for {other:?} not implemented yet (tensor {name})"),
         };
         Ok((data, t.shape.clone()))
@@ -349,7 +351,8 @@ const QK5_1: usize = 32;
 /// Super-block size shared by every K-quant format. Per llama.cpp's
 /// `ggml-quants.h`. Tensors quantized with `Q{4,5,6,8}_K` must have
 /// an element count divisible by 256.
-const QK_K: usize = 256;
+/// Super-block size for K-quant formats (256 elements).
+pub const QK_K: usize = 256;
 /// Byte size of the packed scales+mins region in `block_q4_K` /
 /// `block_q5_K` — 8 sub-blocks × 12 bits (6 bits scale + 6 bits min)
 /// = 96 bits = 12 bytes. Same layout in both formats.
@@ -375,6 +378,8 @@ fn bytes_for(dtype: GgmlType, n: usize) -> Option<usize> {
         GgmlType::Q5K => blk(QK_K, 2 + 2 + K_SCALE_SIZE + QK_K / 8 + QK_K / 2), // + 32 high bits
         GgmlType::Q6K => blk(QK_K, QK_K / 2 + QK_K / 4 + QK_K / 16 + 2), // ql + qh + scales(i8) + d
         GgmlType::Q8K => blk(QK_K, 4 + QK_K + (QK_K / 16) * 2), // f32 d + 256 i8 + 16 i16 bsums
+        GgmlType::Q2K => blk(QK_K, 2 + 2 + QK_K / 16 + QK_K / 4), // d + dmin + 16 scales + 64 qs
+        GgmlType::Q3K => blk(QK_K, 2 + K_SCALE_SIZE + QK_K / 8 + QK_K / 4), // d + 12 scales + 32 hmask + 64 qs
         // Anything else: not yet supported. dequant_f32 will reject
         // these too; tensor_bytes returns None to stay consistent.
         _ => None,
@@ -697,6 +702,225 @@ fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
         let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
         (d, m)
     }
+}
+
+/// Dequantize one Q4_K super-block (144 bytes) into `out` (256 f32s).
+pub fn dequant_q4_k_block(block: &[u8], out: &mut [f32; QK_K]) {
+    let d = read_f16_le(&block[0..2]);
+    let dmin = read_f16_le(&block[2..4]);
+    let scales = &block[4..4 + K_SCALE_SIZE];
+    let qs = &block[4 + K_SCALE_SIZE..];
+    let mut is = 0usize;
+    let mut out_i = 0usize;
+    for j in (0..8).step_by(2) {
+        let (sc0, m0) = get_scale_min_k4(j, scales);
+        let (sc1, m1) = get_scale_min_k4(j + 1, scales);
+        let d0 = d * sc0 as f32;
+        let m0f = dmin * m0 as f32;
+        let d1 = d * sc1 as f32;
+        let m1f = dmin * m1 as f32;
+        for l in 0..32 {
+            let q = qs[is + l];
+            out[out_i] = d0 * (q & 0x0F) as f32 - m0f;
+            out_i += 1;
+        }
+        for l in 0..32 {
+            let q = qs[is + l];
+            out[out_i] = d1 * (q >> 4) as f32 - m1f;
+            out_i += 1;
+        }
+        is += 32;
+    }
+}
+
+/// Dequantize one Q5_K super-block (176 bytes) into `out`.
+pub fn dequant_q5_k_block(block: &[u8], out: &mut [f32; QK_K]) {
+    let d = read_f16_le(&block[0..2]);
+    let dmin = read_f16_le(&block[2..4]);
+    let scales = &block[4..4 + K_SCALE_SIZE];
+    let qh = &block[4 + K_SCALE_SIZE..4 + K_SCALE_SIZE + QK_K / 8];
+    let qs = &block[4 + K_SCALE_SIZE + QK_K / 8..];
+    let mut is = 0usize;
+    let mut out_i = 0usize;
+    let mut u1: u8 = 1;
+    let mut u2: u8 = 2;
+    for j in (0..8).step_by(2) {
+        let (sc0, m0) = get_scale_min_k4(j, scales);
+        let (sc1, m1) = get_scale_min_k4(j + 1, scales);
+        let d0 = d * sc0 as f32;
+        let m0f = dmin * m0 as f32;
+        let d1 = d * sc1 as f32;
+        let m1f = dmin * m1 as f32;
+        for l in 0..32 {
+            let lo = qs[is + l] & 0x0F;
+            let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
+            out[out_i] = d0 * (lo + hi) as f32 - m0f;
+            out_i += 1;
+        }
+        for l in 0..32 {
+            let lo = qs[is + l] >> 4;
+            let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
+            out[out_i] = d1 * (lo + hi) as f32 - m1f;
+            out_i += 1;
+        }
+        is += 32;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+/// Dequantize one Q6_K super-block (210 bytes) into `out`.
+pub fn dequant_q6_k_block(block: &[u8], out: &mut [f32; QK_K]) {
+    let ql_len = QK_K / 2;
+    let qh_len = QK_K / 4;
+    let sc_len = QK_K / 16;
+    let ql = &block[0..ql_len];
+    let qh = &block[ql_len..ql_len + qh_len];
+    let sc = &block[ql_len + qh_len..ql_len + qh_len + sc_len];
+    let d = read_f16_le(&block[ql_len + qh_len + sc_len..]);
+    for h in 0..2 {
+        let dst_base = h * 128;
+        let ql_off = h * 64;
+        let qh_off_h = h * 32;
+        let sc_off = h * 8;
+        for l in 0..32 {
+            let is = l / 16;
+            let qh_b = qh[qh_off_h + l];
+            let q1 = ((ql[ql_off + l] & 0x0F) | (((qh_b >> 0) & 3) << 4)) as i32 - 32;
+            let q2 = ((ql[ql_off + l + 32] & 0x0F) | (((qh_b >> 2) & 3) << 4)) as i32 - 32;
+            let q3 = ((ql[ql_off + l] >> 4) | (((qh_b >> 4) & 3) << 4)) as i32 - 32;
+            let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh_b >> 6) & 3) << 4)) as i32 - 32;
+            out[dst_base + l] = d * sc[sc_off + is] as f32 * q1 as f32;
+            out[dst_base + l + 32] = d * sc[sc_off + is + 2] as f32 * q2 as f32;
+            out[dst_base + l + 64] = d * sc[sc_off + is + 4] as f32 * q3 as f32;
+            out[dst_base + l + 96] = d * sc[sc_off + is + 6] as f32 * q4 as f32;
+        }
+    }
+}
+
+/// Dequantize one Q8_K super-block (276 bytes) into `out`.
+pub fn dequant_q8_k_block(block: &[u8], out: &mut [f32; QK_K]) {
+    let d = f32::from_le_bytes(block[0..4].try_into().unwrap());
+    let qs = &block[4..4 + QK_K];
+    for i in 0..QK_K {
+        out[i] = d * qs[i] as i8 as f32;
+    }
+}
+
+/// Dequantize one Q2_K super-block (84 bytes) into `out`.
+pub fn dequant_q2_k_block(block: &[u8], out: &mut [f32; QK_K]) {
+    let d = read_f16_le(&block[0..2]);
+    let min = read_f16_le(&block[2..4]);
+    let mut q = &block[4 + QK_K / 16..];
+    let mut is = 0usize;
+    let mut out_i = 0usize;
+    for _ in 0..(QK_K / 128) {
+        let mut shift = 0u32;
+        for _ in 0..4 {
+            let sc = block[4 + is];
+            is += 1;
+            let dl = d * (sc & 0xF) as f32;
+            let ml = min * (sc >> 4) as f32;
+            for l in 0..16 {
+                out[out_i] = dl * ((q[l] >> shift) & 3) as f32 - ml;
+                out_i += 1;
+            }
+            let sc = block[4 + is];
+            is += 1;
+            let dl = d * (sc & 0xF) as f32;
+            let ml = min * (sc >> 4) as f32;
+            for l in 0..16 {
+                out[out_i] = dl * ((q[l + 16] >> shift) & 3) as f32 - ml;
+                out_i += 1;
+            }
+            shift += 2;
+        }
+        q = &q[32..];
+    }
+}
+
+/// Dequantize one Q3_K super-block (110 bytes) into `out`.
+pub fn dequant_q3_k_block(block: &[u8], out: &mut [f32; QK_K]) {
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    let d_all = read_f16_le(&block[0..2]);
+    let hm = &block[2 + K_SCALE_SIZE..2 + K_SCALE_SIZE + QK_K / 8];
+    let mut q = &block[2 + K_SCALE_SIZE + QK_K / 8..];
+    let mut aux = [0u32; 4];
+    aux[0] = u32::from_le_bytes(block[2..6].try_into().unwrap());
+    aux[1] = u32::from_le_bytes(block[6..10].try_into().unwrap());
+    aux[2] = u32::from_le_bytes(block[10..14].try_into().unwrap());
+    let tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+    aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+    aux[0] = (aux[0] & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+    aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+    let scales: &[i8; 16] = unsafe { &*(aux.as_ptr() as *const [i8; 16]) };
+    let mut is = 0usize;
+    let mut m: u8 = 1;
+    let mut out_i = 0usize;
+    for _ in 0..(QK_K / 128) {
+        let mut shift = 0u32;
+        for _ in 0..4 {
+            let dl = d_all * (scales[is] - 32) as f32;
+            is += 1;
+            for l in 0..16 {
+                let h = if hm[l] & m != 0 { 0 } else { 4 };
+                out[out_i] = dl * (((q[l] >> shift) & 3) as i8 - h) as f32;
+                out_i += 1;
+            }
+            let dl = d_all * (scales[is] - 32) as f32;
+            is += 1;
+            for l in 0..16 {
+                let h = if hm[l + 16] & m != 0 { 0 } else { 4 };
+                out[out_i] = dl * (((q[l + 16] >> shift) & 3) as i8 - h) as f32;
+                out_i += 1;
+            }
+            shift += 2;
+            m <<= 1;
+        }
+        q = &q[32..];
+    }
+}
+
+pub fn dequant_q2_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+    if !n.is_multiple_of(QK_K) {
+        bail!("Q2_K: n={n} not divisible by {QK_K}");
+    }
+    let nb = n / QK_K;
+    let blk = 2 + 2 + QK_K / 16 + QK_K / 4;
+    if bytes.len() != nb * blk {
+        bail!("Q2_K: bad byte count");
+    }
+    let mut out = vec![0f32; n];
+    for i in 0..nb {
+        let off = i * blk;
+        dequant_q2_k_block(
+            &bytes[off..off + blk],
+            (&mut out[i * QK_K..(i + 1) * QK_K]).try_into().unwrap(),
+        );
+    }
+    Ok(out)
+}
+
+pub fn dequant_q3_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+    if !n.is_multiple_of(QK_K) {
+        bail!("Q3_K: n={n} not divisible by {QK_K}");
+    }
+    let nb = n / QK_K;
+    let blk = 2 + K_SCALE_SIZE + QK_K / 8 + QK_K / 4;
+    if bytes.len() != nb * blk {
+        bail!("Q3_K: bad byte count");
+    }
+    let mut out = vec![0f32; n];
+    for i in 0..nb {
+        let off = i * blk;
+        dequant_q3_k_block(
+            &bytes[off..off + blk],
+            (&mut out[i * QK_K..(i + 1) * QK_K]).try_into().unwrap(),
+        );
+    }
+    Ok(out)
 }
 
 /// Q4_K block: 144 bytes / 256 elements (4.5 bits/element).
@@ -1022,6 +1246,34 @@ mod tests {
         for v in &out {
             assert!(v.abs() < 1e-5, "Q6K decode mismatch: {v}");
         }
+    }
+
+    #[test]
+    fn dequant_q2_k_block_constant_value() {
+        // Q2_K: d=1, min=0, all scales encode sc=1/min=0, all 2-bit quants = 3.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes()); // d
+        bytes.extend_from_slice(&half::f16::from_f32(0.0).to_le_bytes()); // min
+        for _ in 0..(QK_K / 16) {
+            bytes.push(0x01); // sc=1, min=0
+        }
+        for _ in 0..(QK_K / 4) {
+            bytes.push(0xFF); // all 2-bit fields = 3
+        }
+        let out = dequant_q2_k(&bytes, QK_K).unwrap();
+        assert_eq!(out.len(), QK_K);
+        for v in &out {
+            assert!((v - 3.0).abs() < 1e-4, "Q2K decode mismatch: {v}");
+        }
+    }
+
+    #[test]
+    fn dequant_q3_k_check() {
+        let blk = 2 + K_SCALE_SIZE + QK_K / 8 + QK_K / 4;
+        let bytes = vec![0u8; blk];
+        let out = dequant_q3_k(&bytes, QK_K).unwrap();
+        assert_eq!(out.len(), QK_K);
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 
     #[test]

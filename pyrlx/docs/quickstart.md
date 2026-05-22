@@ -8,7 +8,7 @@ Build with the backends you care about, then run a graph.
 uv venv && source .venv/bin/activate
 uv pip install maturin
 uv pip install -e . --no-build-isolation \
-  --config-settings=build-args='--features cpu,blas-accelerate,metal,embed,hf-download'
+  --config-settings=build-args='--features cpu,blas-accelerate,metal'
 ```
 
 ## 2. Confirm what shipped

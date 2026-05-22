@@ -110,9 +110,8 @@ impl Graph {
     /// Qwen3-Next, Kimi-Linear). See [`Op::GatedDeltaNet`] for the
     /// recurrence math. All five inputs are `f32`. Shapes:
     /// `q,k,v`: `[b, s, h_v, n]`; `g,beta`: `[b, s, h_v]`. Output:
-    /// `[b, s, h_v, n]`. State is implicit (reset per batch).
-    /// Caller is responsible for L2-normalizing `q`/`k` and for
-    /// GQA-repeating `k` to match `h_v` when `h_k < h_v`.
+    /// `[b, s, h_v, n]`. State is implicit (reset per batch) unless
+    /// `carry_state` is set — then pass `state` as a sixth input.
     pub fn gated_delta_net(
         &mut self,
         q: NodeId,
@@ -124,8 +123,35 @@ impl Graph {
         shape: Shape,
     ) -> NodeId {
         self.push(
-            Op::GatedDeltaNet { state_size },
+            Op::GatedDeltaNet {
+                state_size,
+                carry_state: false,
+            },
             vec![q, k, v, g, beta],
+            shape,
+            None,
+        )
+    }
+
+    /// Same as [`Self::gated_delta_net`] but threads `state`
+    /// `[b, h_v, n, n]` in/out for decode-mode recurrence.
+    pub fn gated_delta_net_carry(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        g: NodeId,
+        beta: NodeId,
+        state: NodeId,
+        state_size: usize,
+        shape: Shape,
+    ) -> NodeId {
+        self.push(
+            Op::GatedDeltaNet {
+                state_size,
+                carry_state: true,
+            },
+            vec![q, k, v, g, beta, state],
             shape,
             None,
         )

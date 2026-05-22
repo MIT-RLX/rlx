@@ -25,6 +25,8 @@ blas = []
 # throughput for byte-equivalent output — useful for parity tests
 # and reproducibility-critical workloads.
 parity-gemm = ["dep:gemm"]
+# 3D Gaussian splat (`Op::GaussianSplatRender*`) — executors registered from `rlx-splat`.
+splat = []
 
 [dependencies]
 rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
@@ -37,6 +39,9 @@ rlx-gguf = { path = "../rlx-gguf", version = "0.2.0" }
 # half-precision kernel work). Already in the workspace via
 # rlx-runtime / rlx-metal.
 half = "2"
+# Work-stealing parallelism for elementwise kernels, BLAS tiling, and
+# Qwen3.5 `Op::GatedDeltaNet` head scans.
+rayon = "1.10"
 # Optional same-as-candle CPU sgemm; gated behind `parity-gemm`.
 gemm = { version = "0.19", optional = true }
 

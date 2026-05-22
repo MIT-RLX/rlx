@@ -55,12 +55,10 @@ fn main() {
 
     let run = |use_icb: bool, dev: Device| -> Vec<f32> {
         if use_icb {
-            unsafe {
-                std::env::set_var("RLX_USE_ICB", "1");
-            }
+            rlx_ir::env::set("RLX_USE_ICB", "1")
         } else {
             unsafe {
-                std::env::remove_var("RLX_USE_ICB");
+                rlx_ir::env::unset("RLX_USE_ICB");
             }
         }
         let session = Session::new(dev);

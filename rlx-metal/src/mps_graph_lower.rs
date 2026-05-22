@@ -116,7 +116,7 @@ pub fn try_lower_with_constants(
     let mut inputs = Vec::new();
     let mut params = Vec::new();
 
-    let trace = std::env::var("RLX_MPSGRAPH_TRACE").is_ok();
+    let trace = rlx_ir::env::flag("RLX_MPSGRAPH_TRACE");
     for node in graph.nodes() {
         let dt = dtype_to_mps(node.shape.dtype())?;
         let dims = shape_dims(graph, node.id)?;
@@ -224,6 +224,27 @@ pub fn try_lower_with_constants(
                 let last = (node.shape.rank() - 1) as i32;
                 mg.layer_norm(&pre, gamma, beta, &[last], *eps)
             }
+            Op::FusedResidualRmsNorm { has_bias, eps } => {
+                let x = node_to_tensor.get(&node.inputs[0])?;
+                let res = node_to_tensor.get(&node.inputs[1])?;
+                let (bias_t, gamma, beta) = if *has_bias {
+                    let bias = node_to_tensor.get(&node.inputs[2])?;
+                    let gamma = node_to_tensor.get(&node.inputs[3])?;
+                    let beta = node_to_tensor.get(&node.inputs[4])?;
+                    (Some(bias), gamma, beta)
+                } else {
+                    let gamma = node_to_tensor.get(&node.inputs[2])?;
+                    let beta = node_to_tensor.get(&node.inputs[3])?;
+                    (None, gamma, beta)
+                };
+                let pre = mg.add(x, res);
+                let pre = match bias_t {
+                    Some(b) => mg.add(&pre, b),
+                    None => pre,
+                };
+                let last = (node.shape.rank() - 1) as i32;
+                mg.rms_norm(&pre, gamma, beta, &[last], *eps)
+            }
             Op::Reshape { .. } => {
                 let x = node_to_tensor.get(&node.inputs[0])?;
                 mg.reshape(x, &dims)
@@ -257,7 +278,7 @@ pub fn try_lower_with_constants(
                 let x = node_to_tensor.get(&node.inputs[0])?;
                 mg.slice(x, *axis as u64, *start as i64, *len as i64)
             }
-            Op::FusedSwiGLU { cast_to } => {
+            Op::FusedSwiGLU { cast_to, .. } => {
                 // Input layout: last axis holds [gate || up] of width 2n.
                 // SwiGLU = silu(gate) * up, optionally cast.
                 let x = node_to_tensor.get(&node.inputs[0])?;
@@ -386,22 +407,23 @@ pub fn try_lower_with_constants(
                     return None;
                 }
                 let (b, s) = (q_shape[0], q_shape[1]);
+                let k_shape = shape_dims(graph, node.inputs[1])?;
+                let kv_seq = k_shape[1];
                 match mask_kind {
+                    rlx_ir::op::MaskKind::None => mg.attention_unmasked(
+                        q,
+                        k,
+                        v,
+                        b,
+                        s,
+                        kv_seq,
+                        *num_heads,
+                        *head_dim,
+                    ),
                     rlx_ir::op::MaskKind::Causal => {
                         mg.attention_causal(q, k, v, b, s, *num_heads, *head_dim)
                     }
                     rlx_ir::op::MaskKind::Custom => {
-                        // Custom mask path stays opt-in pending the
-                        // multi-day slice-of-computed parity work.
-                        if std::env::var("RLX_MPSGRAPH_ATTENTION").is_err() {
-                            if trace {
-                                eprintln!(
-                                    "[mpsgraph] bail attention custom-mask gate: node {}",
-                                    node.id
-                                );
-                            }
-                            return None;
-                        }
                         let mask = node_to_tensor.get(&node.inputs[3])?;
                         mg.attention(q, k, v, mask, b, s, *num_heads, *head_dim)
                     }
@@ -416,7 +438,7 @@ pub fn try_lower_with_constants(
                     }
                 }
             }
-            Op::Rope { head_dim } => {
+            Op::Rope { head_dim, n_rot } => {
                 let x = node_to_tensor.get(&node.inputs[0])?;
                 let cos_t = node_to_tensor.get(&node.inputs[1])?;
                 let sin_t = node_to_tensor.get(&node.inputs[2])?;
@@ -426,11 +448,39 @@ pub fn try_lower_with_constants(
                 }
                 let (b, s) = (x_shape[0], x_shape[1]);
                 let nh = x_shape[2] / *head_dim;
-                mg.rope(x, cos_t, sin_t, b, s, nh, *head_dim)
+                mg.rope(x, cos_t, sin_t, b, s, nh, *head_dim, *n_rot)
+            }
+            Op::DequantMatMul { scheme } => {
+                if !scheme.is_gguf() {
+                    return None;
+                }
+                let w_id = node.inputs[1];
+                let Op::Param { name } = &graph.node(w_id).op else {
+                    return None;
+                };
+                let w_bytes = params_as_constants.and_then(|m| m.get(name))?;
+                let x_shape = shape_dims(graph, node.inputs[0])?;
+                let out_shape = shape_dims(graph, node.id)?;
+                let k = *x_shape.last()?;
+                let n = *out_shape.last()?;
+                if w_bytes.len() != k * n * 4 {
+                    if trace {
+                        eprintln!(
+                            "[mpsgraph] bail dequant_matmul bytes: node {} len={} want {}",
+                            node.id,
+                            w_bytes.len(),
+                            k * n * 4
+                        );
+                    }
+                    return None;
+                }
+                let w = mg.constant_from_bytes(w_bytes, &[k, n], F32_DT);
+                let x = node_to_tensor.get(&node.inputs[0])?;
+                mg.matmul(x, &w)
             }
             // Unsupported ops — bail out so caller falls back to thunks.
             _ => {
-                if std::env::var("RLX_MPSGRAPH_TRACE").is_ok() {
+                if rlx_ir::env::flag("RLX_MPSGRAPH_TRACE") {
                     eprintln!("[mpsgraph] unsupported: node {} op {:?}", node.id, node.op);
                 }
                 return None;
@@ -472,7 +522,7 @@ pub fn try_lower_with_constants(
     // ObjC call instead of JIT analysis + dict-key lookup. ~2× win on
     // small graphs (B=1, L=8 prefill). Opt out with
     // RLX_DISABLE_MPSGRAPH_EXECUTABLE=1.
-    let executable = if std::env::var("RLX_DISABLE_MPSGRAPH_EXECUTABLE").is_ok() {
+    let executable = if rlx_ir::env::flag("RLX_DISABLE_MPSGRAPH_EXECUTABLE") {
         None
     } else {
         mg.compile_executable(

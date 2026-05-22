@@ -34,8 +34,7 @@ fn main() {
     use std::time::Instant;
 
     let warmup = 5usize;
-    let iters: usize = std::env::var("RLX_BENCH_ITERS")
-        .ok()
+    let iters: usize = rlx_ir::env::var("RLX_BENCH_ITERS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
 

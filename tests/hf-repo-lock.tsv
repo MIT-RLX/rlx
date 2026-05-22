@@ -1,7 +1,7 @@
 # RLX/burnembed HF revision lockfile (plan #62).
 #
 # Mirrors MAX's max/tests/integration/hf-repo-lock.tsv pattern. Every
-# HF model used in burnembed benches and rlx-models tests should be
+# HF models used in burnembed benches should be
 # resolved to a specific commit SHA so an upstream publisher's
 # silent edit can't break our tests.
 #
@@ -15,7 +15,7 @@
 #
 # Bench / test code reads this with read_lock(repo_id) → revision
 # and passes it to hf_hub::api::sync::Api::repo(Repo::with_revision(...)).
-# The wrapper lives in rlx-models or burnembed (TBD).
+# The wrapper lives in burnembed (TBD).
 
 sentence-transformers/all-MiniLM-L6-v2	main	2026-04-28	burnembed minilm6 bench
 sentence-transformers/all-MiniLM-L12-v2	main	2026-04-28	burnembed minilm12 bench

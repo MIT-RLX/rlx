@@ -1,3 +1,17 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, version 3.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
 """pyrlx — Python bindings for the RLX ML compiler.
 
 >>> import pyrlx as rlx
@@ -11,8 +25,6 @@ Layered API
 - ``rlx.Graph`` — minimal graph builder over ``rlx_ir::Graph``.
 - ``rlx.Session(device, precision)`` + ``rlx.CompiledGraph`` —
   the hot-path execution surface, with NumPy I/O.
-- ``rlx.Embed`` — load BERT / NomicBERT / NomicVision and run on
-  any registered backend (requires the ``embed`` cargo feature).
 
 See ``pyrlx/README.md`` for installation, backend feature combos,
 troubleshooting, and a side-by-side comparison with PyTorch / JAX.
@@ -43,35 +55,8 @@ __all__ = [
     "Graph",
     "Session",
     "CompiledGraph",
-    "Embed",
     "__version__",
 ]
-
-
-def _check_embed_feature() -> None:
-    """Raise a helpful error when the `embed` cargo feature is off
-    and the user reaches for `Embed`."""
-    raise RuntimeError(
-        "pyrlx.Embed requires the 'embed' cargo feature.\n"
-        "Reinstall pyrlx with, e.g.:\n"
-        "  uv pip install -e . --no-build-isolation \\\n"
-        "      --config-settings=build-args='--features cpu,blas-accelerate,metal,embed,hf-download'\n"
-        "  # or: maturin develop --features cpu,embed,hf-download"
-    )
-
-
-try:
-    from ._pyrlx import Embed  # type: ignore[attr-defined]
-except ImportError:
-    class Embed:  # type: ignore[no-redef]
-        """Stub when pyrlx was built without the `embed` feature."""
-        @staticmethod
-        def from_pretrained(*_args, **_kwargs):  # noqa: D401, ANN001
-            _check_embed_feature()
-
-        @staticmethod
-        def from_dir(*_args, **_kwargs):  # noqa: D401, ANN001
-            _check_embed_feature()
 
 
 # ── Python-side helpers built atop the native bindings ──────────────

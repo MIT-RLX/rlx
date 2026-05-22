@@ -24,8 +24,8 @@ garbage.
 The K-quant decoders mirror llama.cpp's `ggml-quants.c` reference
 implementation byte-for-byte (verified against the upstream block
 layout and a known-good Qwen3-0.6B Q4_K_M GGUF — see
-`rlx-models/examples/qwen3_gguf_inference.rs` for the end-to-end
-parity check against safetensors F32).
+downstream GGUF inference examples for end-to-end parity against
+safetensors F32).
 
 ## Install
 
@@ -43,20 +43,12 @@ let f = GgufFile::from_path("model.gguf")?;
 let (data, shape) = f.dequant_f32("token_embd.weight")?;
 // `shape` is in GGUF order — innermost dim first. Reverse for
 // safetensors / PyTorch convention; the byte layout is identical
-// row-major in both. (`rlx-models::weight_loader::GgufLoader`
-// applies this convention swap automatically for HF-named lookups.)
+// row-major in both.
 ```
 
-For HF-name lookup + MTP-head isolation, use the higher-level
-`GgufLoader` in `rlx-models`:
-
-```rust
-use rlx_models::weight_loader::GgufLoader;
-
-let mut loader = GgufLoader::from_file("Qwen3-0.6B-Q4_K_M.gguf")?;
-let (data, shape) = loader.take("model.embed_tokens.weight")?;
-// shape returned as [vocab, hidden] (safetensors convention)
-```
+For HF-name lookup + MTP-head isolation, use the `GgufLoader` adapter in the
+separate model-builders repo (see root README; applies the safetensors convention
+swap automatically for HF-named keys).
 
 ## Build / test
 

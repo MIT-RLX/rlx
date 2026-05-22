@@ -6,7 +6,7 @@ build-backend = "maturin"
 name            = "pyrlx"
 # Single source of truth — must match `Cargo.toml` `[package].version`.
 version         = "0.1.0"
-description     = "Run RLX (Rust ML compiler) graphs and HuggingFace models on any backend — CPU, Metal, MLX, CUDA, ROCm, wgpu — from Python."
+description     = "Run RLX (Rust ML compiler) graphs on any backend — CPU, Metal, MLX, CUDA, ROCm, wgpu — from Python."
 readme          = "README.md"
 license         = { text = "GPL-3.0-only" }
 requires-python = ">=3.9"
@@ -76,20 +76,20 @@ include             = [
 #
 #   # uv / pip — full Apple Silicon stack
 #   uv pip install -e . --no-build-isolation \
-#       --config-settings=build-args='--features cpu,blas-accelerate,metal,embed,hf-download'
+#       --config-settings=build-args='--features cpu,blas-accelerate,metal'
 #
 #   # NVIDIA
 #   uv pip install -e . --no-build-isolation \
-#       --config-settings=build-args='--features cpu,cuda,embed,hf-download'
+#       --config-settings=build-args='--features cpu,cuda'
 #
 #   # AMD
 #   uv pip install -e . --no-build-isolation \
-#       --config-settings=build-args='--features cpu,rocm,embed,hf-download'
+#       --config-settings=build-args='--features cpu,rocm'
 #
 #   # Cross-platform GPU only (Vulkan / DX12 / WebGPU via wgpu)
 #   uv pip install -e . --no-build-isolation \
-#       --config-settings=build-args='--features cpu,gpu,embed,hf-download'
+#       --config-settings=build-args='--features cpu,gpu'
 #
 # Or, with maturin directly:
 #   maturin develop --release \
-#       --features cpu,blas-accelerate,metal,embed,hf-download
+#       --features cpu,blas-accelerate,metal

@@ -18,9 +18,11 @@
 //! Takes a fused + memory-planned IR graph and executes it using:
 //! - BLAS (Accelerate/MKL/OpenBLAS) for matmul
 //! - NEON/AVX SIMD kernels for element-wise ops
-//! - Persistent thread pool for parallelism
+//! - Persistent Rayon thread pool for parallelism
 //! - Arena allocator for zero per-call allocation
 
+pub mod attention_bwd;
+pub mod training_bwd;
 pub mod arena;
 pub mod asm_check;
 pub mod autotune;
@@ -28,13 +30,21 @@ pub mod blas;
 pub mod calibrate;
 pub mod config;
 pub mod cost;
+pub mod dequant_cache;
 pub mod dispatch;
 pub mod executor;
+pub mod gdn;
+pub mod gguf_matmul;
+pub mod llada2_gate;
+pub mod lm_head;
+pub mod moe_residency;
+pub mod moe_topk_capture;
 pub mod intrinsics;
 pub mod kernel_config;
 pub mod kernels;
 pub mod naive;
 pub mod op_registry;
 pub mod pool;
+pub mod splat;
 pub mod thunk;
 pub mod tile;

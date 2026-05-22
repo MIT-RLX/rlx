@@ -520,7 +520,7 @@ fn custom_op_accepts_i32_host_inputs_via_run_typed() {
     }
 }
 
-// ── Smoke test for the F16 dispatcher arm ──────────────────────────
+// ── basic test for the F16 dispatcher arm ──────────────────────────
 //
 // Validates the dispatcher's "every DType has an arm" property
 // using F16 as the witness — same arm shape as BF16/I8/I16/U8/U32/Bool,

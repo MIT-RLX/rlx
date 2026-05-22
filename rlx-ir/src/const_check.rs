@@ -112,7 +112,7 @@ mod tests {
     static_assert!(matmul_compat(8, 16, 16, 32));
     static_assert!(!matmul_compat(8, 16, 32, 16));
 
-    // Runtime smoke tests too — the const fns are also useful at
+    // Runtime basic tests too — the const fns are also useful at
     // runtime for shape-inference helpers.
     #[test]
     fn const_helpers_at_runtime() {

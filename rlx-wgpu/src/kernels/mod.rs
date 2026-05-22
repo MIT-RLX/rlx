@@ -38,6 +38,10 @@ pub const WHERE_WGSL: &str = include_str!("where.wgsl");
 pub const REDUCE_WGSL: &str = include_str!("reduce.wgsl");
 pub const SOFTMAX_WGSL: &str = include_str!("softmax.wgsl");
 pub const LAYERNORM_WGSL: &str = include_str!("layernorm.wgsl");
+pub const RMS_NORM_BWD_WGSL: &str = include_str!("rms_norm_backward.wgsl");
+pub const CUMSUM_BWD_WGSL: &str = include_str!("cumsum_backward.wgsl");
+pub const ROPE_BWD_WGSL: &str = include_str!("rope_backward.wgsl");
+pub const GATHER_BWD_WGSL: &str = include_str!("gather_backward.wgsl");
 pub const CUMSUM_WGSL: &str = include_str!("cumsum.wgsl");
 pub const FFT_WGSL: &str = include_str!("fft.wgsl");
 pub const COPY_WGSL: &str = include_str!("copy.wgsl");
@@ -46,7 +50,9 @@ pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
 pub const NARROW_WGSL: &str = include_str!("narrow.wgsl");
 pub const CONCAT_WGSL: &str = include_str!("concat.wgsl");
 pub const GATHER_WGSL: &str = include_str!("gather.wgsl");
+pub const GATHER_AXIS_WGSL: &str = include_str!("gather_axis.wgsl");
 pub const ATTENTION_WGSL: &str = include_str!("attention.wgsl");
+pub const ATTENTION_BWD_WGSL: &str = include_str!("attention_bwd.wgsl");
 pub const ROPE_WGSL: &str = include_str!("rope.wgsl");
 pub const EXPAND_WGSL: &str = include_str!("expand.wgsl");
 pub const ARGMAX_WGSL: &str = include_str!("argmax.wgsl");
@@ -172,6 +178,62 @@ pub struct LayerNormParams {
     pub op: u32,       // 0=LayerNorm, 1=RmsNorm
 }
 
+/// RMSNorm backward kernel params (f32 element offsets). `wrt`: 0=dx, 1=dgamma, 2=dbeta.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct RmsNormBwdParams {
+    pub outer: u32,
+    pub inner: u32,
+    pub x_off: u32,
+    pub gamma_off: u32,
+    pub beta_off: u32,
+    pub dy_off: u32,
+    pub out_off: u32,
+    pub eps_bits: u32,
+    pub wrt: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct CumsumBwdParams {
+    pub outer: u32,
+    pub inner: u32,
+    pub dy_off: u32,
+    pub dx_off: u32,
+    pub exclusive: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct RopeBwdParams {
+    pub batch: u32,
+    pub seq: u32,
+    pub hidden: u32,
+    pub head_dim: u32,
+    pub n_rot: u32,
+    pub dy_off: u32,
+    pub cos_off: u32,
+    pub sin_off: u32,
+    pub dx_off: u32,
+    pub cos_len: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GatherBwdParams {
+    pub outer: u32,
+    pub axis_dim: u32,
+    pub num_idx: u32,
+    pub trailing: u32,
+    pub dy_off: u32,
+    pub idx_off: u32,
+    pub dst_off: u32,
+    pub _p0: u32,
+}
+
 /// Layout for cumsum. 32 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -286,6 +348,20 @@ pub struct GatherParams {
     pub _p0: u32,
 }
 
+/// Layout for gather along a non-zero axis.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GatherAxisParams {
+    pub total: u32,
+    pub outer: u32,
+    pub axis_dim: u32,
+    pub num_idx: u32,
+    pub trailing: u32,
+    pub table_off: u32,
+    pub idx_off: u32,
+    pub out_off: u32,
+}
+
 /// Layout for fused SDPA.
 ///
 /// Per-tensor (Q, K, V, output) strides are passed explicitly so the
@@ -353,6 +429,50 @@ pub struct AttentionParams {
     pub v_seq_stride: u32,
     pub _pad_v: u32,
 
+    pub o_batch_stride: u32,
+    pub o_head_stride: u32,
+    pub o_seq_stride: u32,
+    pub _pad_o: u32,
+}
+
+/// Layout for [`attention_bwd.wgsl`] — forward strides + `dy_off` + `wrt`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct AttentionBwdParams {
+    pub batch: u32,
+    pub heads: u32,
+    pub seq_q: u32,
+    pub seq_k: u32,
+    pub head_dim: u32,
+    pub q_off: u32,
+    pub k_off: u32,
+    pub v_off: u32,
+    pub dy_off: u32,
+    pub out_off: u32,
+    pub mask_off: u32,
+    pub mask_kind: u32,
+    pub scale_bits: u32,
+    pub window: u32,
+    pub wrt: u32,
+    pub seq_q_stride: u32,
+    pub seq_k_stride: u32,
+    pub mask_batch_stride: u32,
+    pub mask_head_stride: u32,
+    pub _pad_mask_0: u32,
+    pub _pad_mask_1: u32,
+    pub _pad_mask_2: u32,
+    pub q_batch_stride: u32,
+    pub q_head_stride: u32,
+    pub q_seq_stride: u32,
+    pub _pad_q: u32,
+    pub k_batch_stride: u32,
+    pub k_head_stride: u32,
+    pub k_seq_stride: u32,
+    pub _pad_k: u32,
+    pub v_batch_stride: u32,
+    pub v_head_stride: u32,
+    pub v_seq_stride: u32,
+    pub _pad_v: u32,
     pub o_batch_stride: u32,
     pub o_head_stride: u32,
     pub o_seq_stride: u32,
@@ -940,6 +1060,12 @@ static WHEREK: OnceLock<Kernel> = OnceLock::new();
 static REDUCE: OnceLock<Kernel> = OnceLock::new();
 static SOFTMAX: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM: OnceLock<Kernel> = OnceLock::new();
+static RMS_NORM_BWD: OnceLock<Kernel> = OnceLock::new();
+static RMS_NORM_BWD_PARAM: OnceLock<Kernel> = OnceLock::new();
+static CUMSUM_BWD: OnceLock<Kernel> = OnceLock::new();
+static ROPE_BWD: OnceLock<Kernel> = OnceLock::new();
+static GATHER_BWD_ZERO: OnceLock<Kernel> = OnceLock::new();
+static GATHER_BWD_ACC: OnceLock<Kernel> = OnceLock::new();
 static CUMSUM: OnceLock<Kernel> = OnceLock::new();
 static FFT: OnceLock<Kernel> = OnceLock::new();
 static COPY: OnceLock<Kernel> = OnceLock::new();
@@ -948,7 +1074,9 @@ static TRANSPOSE: OnceLock<Kernel> = OnceLock::new();
 static NARROW: OnceLock<Kernel> = OnceLock::new();
 static CONCAT: OnceLock<Kernel> = OnceLock::new();
 static GATHER: OnceLock<Kernel> = OnceLock::new();
+static GATHER_AXIS: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION: OnceLock<Kernel> = OnceLock::new();
+static ATTENTION_BWD: OnceLock<Kernel> = OnceLock::new();
 static ROPE: OnceLock<Kernel> = OnceLock::new();
 static EXPAND: OnceLock<Kernel> = OnceLock::new();
 static ARGMAX: OnceLock<Kernel> = OnceLock::new();
@@ -1093,6 +1221,44 @@ pub fn softmax_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn layernorm_kernel(device: &wgpu::Device) -> &'static Kernel {
     LAYERNORM.get_or_init(|| build_kernel(device, "rlx-wgpu layernorm", LAYERNORM_WGSL, "norm"))
 }
+pub fn rms_norm_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
+    RMS_NORM_BWD.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu rms_norm_bwd",
+            RMS_NORM_BWD_WGSL,
+            "rms_norm_bwd",
+        )
+    })
+}
+pub fn rms_norm_backward_param_kernel(device: &wgpu::Device) -> &'static Kernel {
+    RMS_NORM_BWD_PARAM.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu rms_norm_bwd_param",
+            RMS_NORM_BWD_WGSL,
+            "rms_norm_bwd_param",
+        )
+    })
+}
+pub fn cumsum_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CUMSUM_BWD.get_or_init(|| {
+        build_kernel(device, "rlx-wgpu cumsum_bwd", CUMSUM_BWD_WGSL, "cumsum_bwd")
+    })
+}
+pub fn rope_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ROPE_BWD.get_or_init(|| build_kernel(device, "rlx-wgpu rope_bwd", ROPE_BWD_WGSL, "rope_bwd"))
+}
+pub fn gather_backward_zero_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GATHER_BWD_ZERO.get_or_init(|| {
+        build_kernel(device, "rlx-wgpu gather_bwd_zero", GATHER_BWD_WGSL, "gather_bwd_zero")
+    })
+}
+pub fn gather_backward_acc_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GATHER_BWD_ACC.get_or_init(|| {
+        build_kernel(device, "rlx-wgpu gather_bwd_acc", GATHER_BWD_WGSL, "gather_bwd_acc")
+    })
+}
 pub fn cumsum_kernel(device: &wgpu::Device) -> &'static Kernel {
     CUMSUM.get_or_init(|| build_kernel(device, "rlx-wgpu cumsum", CUMSUM_WGSL, "cumsum"))
 }
@@ -1181,9 +1347,29 @@ pub fn concat_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn gather_kernel(device: &wgpu::Device) -> &'static Kernel {
     GATHER.get_or_init(|| build_kernel(device, "rlx-wgpu gather", GATHER_WGSL, "gather"))
 }
+pub fn gather_axis_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GATHER_AXIS.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu gather_axis",
+            GATHER_AXIS_WGSL,
+            "gather_axis",
+        )
+    })
+}
 pub fn attention_kernel(device: &wgpu::Device) -> &'static Kernel {
     ATTENTION
         .get_or_init(|| build_kernel(device, "rlx-wgpu attention", ATTENTION_WGSL, "attention"))
+}
+pub fn attention_bwd_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ATTENTION_BWD.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu attention_bwd",
+            ATTENTION_BWD_WGSL,
+            "attention_bwd",
+        )
+    })
 }
 pub fn rope_kernel(device: &wgpu::Device) -> &'static Kernel {
     ROPE.get_or_init(|| build_kernel(device, "rlx-wgpu rope", ROPE_WGSL, "rope"))

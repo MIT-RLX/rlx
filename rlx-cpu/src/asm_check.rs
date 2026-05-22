@@ -162,7 +162,7 @@ impl std::error::Error for AsmCheckError {}
 mod tests {
     use super::*;
 
-    /// Smoke test: disassembly works at all. Marked `#[ignore]`
+    /// basic test: disassembly works at all. Marked `#[ignore]`
     /// because objdump isn't always around in CI (in which case
     /// we'd want to log-and-skip rather than fail).
     #[test]

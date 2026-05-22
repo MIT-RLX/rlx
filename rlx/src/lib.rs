@@ -43,39 +43,6 @@
 //! let out = compiled.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
 //! ```
 //!
-//! ### 2. Run a model by name (Qwen3, SAM 1/2/3, DINOv2)
-//!
-//! Requires the `models` feature.
-//!
-//! ```ignore
-//! use rlx::prelude::*;
-//!
-//! let mut runner = Qwen3Runner::builder()
-//!     .weights("Qwen3-0.6B-Q4_K_M.gguf")   // safetensors or gguf
-//!     .device(Device::Metal)
-//!     .max_seq(128)
-//!     .build()?;
-//! runner.generate(&prompt_ids, 32, |tok| print!(" {tok}"))?;
-//! ```
-//!
-//! ### 3. Plug your own runner into the CLI / dispatch surface
-//!
-//! ```ignore
-//! use rlx::prelude::*;
-//!
-//! struct WhisperRunner;
-//! impl ModelRunner for WhisperRunner {
-//!     fn name(&self) -> &'static str { "whisper" }
-//!     fn description(&self) -> &'static str { "OpenAI Whisper" }
-//!     fn run(&self, args: &[String]) -> Result<()> { /* … */ Ok(()) }
-//! }
-//!
-//! fn main() -> Result<()> {
-//!     register_runner(Box::new(WhisperRunner));
-//!     dispatch(&std::env::args().skip(1).collect::<Vec<_>>())
-//! }
-//! ```
-//!
 //! ## Module map
 //!
 //! Every workspace crate is reachable as a module on `rlx`:
@@ -83,14 +50,14 @@
 //! | path            | crate           | what                                                                            |
 //! |-----------------|-----------------|---------------------------------------------------------------------------------|
 //! | `rlx::ir`       | `rlx-ir`        | IR types, ops, graph builder                                                    |
-//! | `rlx::opt`      | `rlx-opt`       | passes, autodiff, vmap                                                          |
+//! | `rlx::opt`      | `rlx-opt`       | facade: `rlx-fusion` + `rlx-autodiff` + `rlx-compile`                           |
 //! | `rlx::driver`   | `rlx-driver`    | `Device` enum, registries                                                       |
 //! | `rlx::runtime`  | `rlx-runtime`   | `Session`, `CompiledGraph`                                                      |
 //! | `rlx::macros`   | `rlx-macros`    | `#[rlx_model]` proc macro                                                       |
-//! | `rlx::models`   | `rlx-models`    | Qwen3 / SAM / DINOv2 / BERT / Nomic builders *(feature `models`)*               |
 //! | `rlx::gguf`     | `rlx-gguf`      | GGUF parser + dequant *(feature `gguf`)*                                        |
 //! | `rlx::bench`    | `rlx-bench`     | benchmark harness *(feature `bench`)*                                           |
 //! | `rlx::sparse`   | `rlx-sparse`    | downstream: sparse linalg *(feature `sparse`)*                                  |
+//! | `rlx::splat`    | `rlx-splat`     | 3D Gaussian splatting *(feature `splat`)* — `register()`, decomposed IR ops      |
 //! | `rlx::linalg`   | `rlx-linalg`    | downstream: dense linalg via LAPACK *(feature `linalg`)*                        |
 //! | `rlx::cortexm`  | `rlx-cortexm`   | INT8 ARMv7E-M kernels *(feature `cortexm`)* — no `Backend` impl, kernels only   |
 //! | `rlx::fpga`     | `rlx-fpga`      | IR → SystemVerilog datapath synthesis *(feature `fpga`)* — no `Backend` impl    |
@@ -104,8 +71,6 @@
 //! |----------------------|-------------------------------------------------------------------------------|
 //! | [`rlx::quant`]       | `QuantScheme`, `QuantMap` (IR quantization metadata)                          |
 //! | [`rlx::ops`]         | `Activation`, `BinaryOp`, `CmpOp`, `MaskKind`, `ChainStep`, `ChainOperand`    |
-//! | [`rlx::weights`]     | `WeightLoader`, `WeightMap`, `GgufLoader`, HF↔GGUF name mappers *(`models`)*  |
-//! | [`rlx::run`]         | `Qwen3Runner`, `SamRunner`, `DinoV2Runner` + dispatch / registry *(`models`)* |
 //! | [`rlx::autodiff`]    | `jvp`, `hvp`, `vmap` + the autodiff entry points                              |
 //! | [`rlx::prelude`]     | star-import target covering the 95% case                                      |
 //!
@@ -137,7 +102,7 @@
 //! | `apple-silicon`   | `cpu` + `metal` + `blas-accelerate`         |
 //! | `nvidia`          | `cpu` + `cuda`                              |
 //! | `edge`            | `cpu` + `cortexm`                           |
-//! | `all-cpu`         | `cpu` + `models` + `gguf` + `linalg`        |
+//! | `all-cpu`         | `cpu` + `gguf` + `linalg`                   |
 //!
 //! `mlx` and `rocm` aren't in any aggregate because their crates
 //! aren't on crates.io (vendor-bundled submodule / workspace-
@@ -172,11 +137,6 @@ pub use rlx_runtime as runtime;
 /// See [`rlx-macros`](https://crates.io/crates/rlx-macros).
 pub use rlx_macros as macros;
 
-#[cfg(feature = "models")]
-/// Qwen3 / SAM / DINOv2 / BERT / Nomic / vision builders.
-/// See [`rlx-models`](https://crates.io/crates/rlx-models).
-pub use rlx_models as models;
-
 #[cfg(feature = "gguf")]
 /// GGUF v1 / v2 / v3 parser + dequant.
 /// See [`rlx-gguf`](https://crates.io/crates/rlx-gguf).
@@ -196,6 +156,11 @@ pub use rlx_sparse as sparse;
 /// Downstream: dense linalg via LAPACK (custom-op scaffold).
 /// See [`rlx-linalg`](https://crates.io/crates/rlx-linalg).
 pub use rlx_linalg as linalg;
+
+#[cfg(feature = "splat")]
+/// Downstream: 3D Gaussian splatting (CPU reference render custom op).
+/// See [`rlx-splat`](https://crates.io/crates/rlx-splat).
+pub use rlx_splat as splat;
 
 #[cfg(feature = "cortexm")]
 /// `no_std` ARMv7E-M INT8 kernels (Cortex-M4F / M7). Doesn't
@@ -232,8 +197,20 @@ pub type Error = anyhow::Error;
 
 pub use rlx_driver::Device;
 pub use rlx_ir::quant::QuantScheme;
-pub use rlx_ir::{DType, Element, Graph, Node, NodeId, Op, OpKind, Shape, Tick};
-pub use rlx_opt::{CalibrationRecord, Pass, Precision, PrecisionPolicy, hvp, jvp, vmap};
+pub use rlx_ir::{
+    DType, Element, FusionPolicy, Graph, GraphModule, GraphStage, HirModule, HirOp, LirModule,
+    MirModule, Node, NodeId, Op, OpKind, Shape, Tick,
+};
+pub use rlx_ir::{
+    inspect_graph, inspect_graph_diff, inspect_hir, inspect_hir_stats, inspect_lir, inspect_mir,
+    inspect_mir_diff, inspect_mir_stats, node_label, NodeOrigin,
+};
+pub use rlx_opt::{
+    CalibrationRecord, CompilePipeline, CompileResult, FusionOptions, FusionReport, FusionTarget,
+    MissReason, MissedFusion, Pass, PipelineInspect, Precision, PrecisionPolicy, fusion_passes,
+    fusion_passes_for_supported, supports_op, supported_for_target,
+    hvp, inspect_pipeline, maybe_dump_pipeline, jvp, vmap,
+};
 pub use rlx_runtime::{CompiledGraph, Session};
 
 // ── Grouped namespaces ──────────────────────────────────────────
@@ -286,63 +263,10 @@ pub mod autodiff {
     pub use rlx_opt::{hvp, jvp, vmap};
 }
 
-/// Weight loaders — pluggable `WeightLoader` trait plus the two
-/// built-in adapters (`WeightMap` for safetensors, `GgufLoader`
-/// for `.gguf`), the HF↔GGUF tensor-name mapper, and the MTP-head
-/// detection helper. Available only with the `models` feature.
-///
-/// ```ignore
-/// use rlx::weights::{GgufLoader, hf_to_gguf_name};
-///
-/// let mut wm = GgufLoader::from_file("model.gguf")?;
-/// let (bytes, shape) = wm.take("model.embed_tokens.weight")?;
-/// assert_eq!(hf_to_gguf_name("lm_head.weight").as_deref(), Some("output.weight"));
-/// ```
-#[cfg(feature = "models")]
-pub mod weights {
-    pub use rlx_models::weight_loader::{
-        GgufLoader, WeightLoader, gguf_to_hf_name, hf_to_gguf_name, is_mtp_weight,
-        load_from_path,
-    };
-    pub use rlx_models::weight_map::WeightMap;
-}
-
-// ── High-level model runners + dispatch registry ────────────────
-//
-// The `rlx::run` namespace re-exports the builder-style entry points
-// from `rlx_models::run` plus the `ModelRunner` plug-in registry.
-// Lets a user do:
-//
-//   use rlx::run::{Qwen3Runner, Qwen3Precision};
-//   let r = Qwen3Runner::builder()
-//       .weights("model.gguf")
-//       .device(rlx::Device::Metal)
-//       .precision(Qwen3Precision::F16LmHead)
-//       .build()?;
-//   r.generate(&prompt_ids, 32, |tok| print!(" {tok}"))?;
-//
-// `Precision` is renamed to `Qwen3Precision` here to avoid clashing
-// with `rlx::Precision` (the autodiff precision policy). The other
-// runner types — `Qwen3Runner` etc. — keep their original names.
-//
-// Gated behind the `models` cargo feature (default-off in the
-// minimum prelude build; enabled by `default-features`).
-#[cfg(feature = "models")]
-pub mod run {
-    pub use rlx_models::run::{
-        ConfigSource, DinoV2Output, DinoV2Runner, DinoV2RunnerBuilder, DinoV2Variant,
-        ModelRunner, Precision as Qwen3Precision, Qwen3Runner, Qwen3RunnerBuilder, SamArch,
-        SamPredictionAny, SamRunner, SamRunnerBuilder, WeightFormat, debug_resolve_name,
-        dispatch, dispatch_help, list_mtp_keys, open_loader, register_runner,
-        registered_runners, run_registered,
-    };
-}
-
 // ── Prelude — single `use rlx::prelude::*;` for the 95% case ────
 //
 // Includes the graph-building / runtime types, common IR helper
-// enums, autodiff entry points, and (when the `models` feature is
-// on) every runner + the plug-in registry. Skips less-common
+// enums, and autodiff entry points. Skips less-common
 // types — those stay reachable via the module re-exports above.
 
 /// Star-import target covering the 95% case:
@@ -358,17 +282,12 @@ pub mod run {
 /// let mut compiled = Session::new(Device::Cpu).compile(g);
 /// let out = compiled.run(&[("x", &[1.0; 4])]);
 ///
-/// // (with models feature) high-level runner
-/// let mut runner = Qwen3Runner::builder()
-///     .weights("model.gguf")
-///     .device(Device::Metal)
-///     .build()?;
 /// ```
 pub mod prelude {
     // Core graph + runtime
     pub use crate::{
-        CompiledGraph, DType, Device, Element, Error, Graph, Node, NodeId, Op, OpKind, Result,
-        Session, Shape, Tick,
+        CompiledGraph, DType, Device, Element, Error, Graph, GraphModule, GraphStage, Node,
+        NodeId, Op, OpKind, Result, Session, Shape, Tick,
     };
     // IR builder helpers
     pub use crate::ops::{Activation, BinaryOp, CmpOp, MaskKind};
@@ -378,16 +297,19 @@ pub mod prelude {
     pub use crate::{hvp, jvp, vmap};
     // Optimizer types — useful when configuring passes / precision
     pub use crate::{CalibrationRecord, Pass, Precision, PrecisionPolicy};
+    pub use crate::ir::env::{self, RlxEnv, RuntimeOverrides, flag, set, unset, var};
 
-    // Model runners + plug-in registry
-    #[cfg(feature = "models")]
-    pub use crate::run::{
-        DinoV2Output, DinoV2Runner, DinoV2Variant, ModelRunner, Qwen3Precision, Qwen3Runner,
-        SamArch, SamPredictionAny, SamRunner, WeightFormat, dispatch, dispatch_help,
-        register_runner, registered_runners,
+    // 3D Gaussian splatting (`rlx-splat` — call `register()` once per process)
+    #[cfg(feature = "splat")]
+    pub use crate::splat::{
+        gaussian_splat_render_common_ir, gaussian_splat_render_decomposed,
+        gaussian_splat_render_reference, register,
     };
-
-    // Weight loaders
-    #[cfg(feature = "models")]
-    pub use crate::weights::{GgufLoader, WeightLoader, WeightMap, hf_to_gguf_name};
+    #[cfg(feature = "splat")]
+    pub use rlx_ir::ops::splat::{
+        gaussian_splat_prep_packed_len, gaussian_splat_tile_count, GaussianSplatInputs,
+        GaussianSplatRenderParams,
+    };
+    #[cfg(feature = "splat")]
+    pub use rlx_splat::prep_layout::{prep_packed_len, tile_count};
 }

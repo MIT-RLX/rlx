@@ -36,7 +36,7 @@
 //! sequence-to-page mapping, and the batch packing logic. Kernel
 //! integration (gather KV bytes from pages into the attention
 //! input) is per-attention-kernel work that lands when an
-//! autoregressive LLM enters `rlx-models`.
+//! autoregressive LLM model runners.
 
 use std::collections::{BTreeSet, VecDeque};
 

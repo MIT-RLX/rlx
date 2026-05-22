@@ -21,7 +21,7 @@
 //! paths produce the same shape: a name → byte-slice lookup.
 //!
 //! `WeightLoader` is the contract. Concrete implementations live in
-//! `rlx-models` (mmap-based) and here (`BytesWeightLoader` — works on
+//! in-tree model loaders (mmap-based) and here (`BytesWeightLoader` — works on
 //! every target including WASM).
 
 /// A name-keyed view of weight tensor bytes.
@@ -44,7 +44,7 @@ pub trait WeightLoader {
 /// works on every target including WASM.
 ///
 /// Construct via `BytesWeightLoader::from_safetensors(bytes)` once
-/// `rlx-models` integrates. For now the bare struct lets external callers
+/// model builders integrate. For now the bare struct lets external callers
 /// build their own name → bytes mapping.
 pub struct BytesWeightLoader {
     /// `(name, start_offset, len)` triples into `data`.

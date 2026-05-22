@@ -27,16 +27,11 @@
 //! * `Graph` — builder over `rlx_ir::Graph` for hand-rolled test graphs.
 //! * `Session(device, precision)` — backend selection at construction.
 //! * `CompiledGraph.set_param/run` — the hot-path execution surface.
-//! * `Embed` (feature `embed`) — load BERT / NomicBERT / NomicVision and
-//!   run on any registered backend.
-
 use pyo3::prelude::*;
 
 mod autodiff;
 mod device;
 mod dtype;
-#[cfg(feature = "embed")]
-mod embed;
 mod graph;
 mod session;
 
@@ -52,9 +47,6 @@ fn _pyrlx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<graph::PyGraph>()?;
     m.add_class::<session::PySession>()?;
     m.add_class::<session::PyCompiled>()?;
-
-    #[cfg(feature = "embed")]
-    m.add_class::<embed::PyEmbed>()?;
 
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

@@ -33,13 +33,25 @@ build-all:
 build-mlx:
     cargo build --release -p rlx-mlx
 
-# Run rlx-mlx tests (matmul+add parity smoke, both eager and lazy modes).
+# Run rlx-mlx tests (matmul+add parity check, both eager and lazy modes).
 test-mlx:
     cargo test --release -p rlx-mlx
 
 # Run all unit tests.
 test:
     cargo test --release
+
+# pyrlx: build extension into pyrlx/.venv (first run) and run pytest.
+test-pyrlx:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{justfile_directory()}}/pyrlx"
+    if [[ ! -d .venv ]]; then
+        python3 -m venv .venv
+        .venv/bin/pip install -q maturin numpy pytest
+        .venv/bin/maturin develop --features cpu
+    fi
+    .venv/bin/python -m pytest tests/ -q
 
 # Run a specific filter; use as `just testf narrow_attention`.
 testf FILTER:
@@ -76,8 +88,8 @@ bench-nomic-metal:
 run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
-# Quick smoke test of the workspace: build + test + lint.
-ci: build test lint
+# Quick basic test of the workspace: build + test + lint + fast smokes.
+ci: build test lint test-pyrlx
 
 # Update the Cargo.lock (pinned dep refresh; commit the lockfile).
 update-lock:

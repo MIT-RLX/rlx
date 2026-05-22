@@ -56,11 +56,13 @@ pub const LAYERNORM_CU: &str = include_str!("../../../rlx-cuda/src/kernels/layer
 pub const FUSED_RESIDUAL_LN_CU: &str =
     include_str!("../../../rlx-cuda/src/kernels/fused_residual_ln.cu");
 pub const GATHER_CU: &str = include_str!("../../../rlx-cuda/src/kernels/gather.cu");
+pub const GATHER_AXIS_CU: &str = include_str!("../../../rlx-cuda/src/kernels/gather_axis.cu");
 pub const NARROW_CU: &str = include_str!("../../../rlx-cuda/src/kernels/narrow.cu");
 pub const CONCAT_CU: &str = include_str!("../../../rlx-cuda/src/kernels/concat.cu");
 pub const TRANSPOSE_CU: &str = include_str!("../../../rlx-cuda/src/kernels/transpose.cu");
 pub const EXPAND_CU: &str = include_str!("../../../rlx-cuda/src/kernels/expand.cu");
 pub const ATTENTION_CU: &str = include_str!("../../../rlx-cuda/src/kernels/attention.cu");
+pub const ATTENTION_BWD_CU: &str = include_str!("../../../rlx-cuda/src/kernels/attention_bwd.cu");
 pub const ARGMAX_CU: &str = include_str!("../../../rlx-cuda/src/kernels/argmax.cu");
 pub const ROPE_CU: &str = include_str!("../../../rlx-cuda/src/kernels/rope.cu");
 pub const CUMSUM_CU: &str = include_str!("../../../rlx-cuda/src/kernels/cumsum.cu");
@@ -78,6 +80,8 @@ pub const CONV2D_CU: &str = include_str!("../../../rlx-cuda/src/kernels/conv2d.c
 pub const CONV3D_CU: &str = include_str!("../../../rlx-cuda/src/kernels/conv3d.cu");
 pub const ELEMENTWISE_REGION_CU: &str =
     include_str!("../../../rlx-cuda/src/kernels/elementwise_region.cu");
+pub const GAUSSIAN_SPLAT_RASTERIZE_CU: &str =
+    include_str!("../../../rlx-cuda/src/kernels/gaussian_splat_rasterize.cu");
 
 /// Total number of kernel entry points the HIP backend will need to
 /// compile (= rlx-cuda's count minus matmul_wmma which doesn't port
