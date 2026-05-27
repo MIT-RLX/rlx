@@ -83,7 +83,11 @@ pub fn leaf_order(graph: &Graph) -> Vec<(NodeId, LeafKey)> {
 
 /// Expand scalar host buffers to match a batched graph leaf when vmap
 /// left a shared `[1]` binding but the lifted node is `[B, …]`.
-pub(crate) fn broadcast_leaf_data(name: &str, data: &[f32], shape: &[usize]) -> Result<Vec<f32>, MlxError> {
+pub(crate) fn broadcast_leaf_data(
+    name: &str,
+    data: &[f32],
+    shape: &[usize],
+) -> Result<Vec<f32>, MlxError> {
     let product: usize = shape.iter().product();
     if data.len() == product {
         return Ok(data.to_vec());
@@ -686,7 +690,8 @@ pub fn lower_with_env(
                 let x = lookup(&env, node.inputs[0])?;
                 let graph_shape = node_input_shape(graph, node.inputs[0]);
                 let runtime_shape: Vec<i32> = x.shape()?.iter().map(|&d| d as i32).collect();
-                let axis_rt = map_graph_axis_to_runtime(*axis, graph_shape.len(), runtime_shape.len());
+                let axis_rt =
+                    map_graph_axis_to_runtime(*axis, graph_shape.len(), runtime_shape.len());
                 let mut s_start = vec![0i32; runtime_shape.len()];
                 let mut s_stop = runtime_shape.clone();
                 s_start[axis_rt] = *start as i32;
@@ -842,7 +847,11 @@ pub fn lower_with_env(
                         } else {
                             m.clone_handle()?
                         };
-                        (MlxMask::Custom, Some(normalize_mask(&m_cast, &m_shape)?), None)
+                        (
+                            MlxMask::Custom,
+                            Some(normalize_mask(&m_cast, &m_shape)?),
+                            None,
+                        )
                     }
                 };
                 let m_ref: Option<&Array> = mask.as_ref().or(mask_owned.as_ref());
@@ -951,14 +960,12 @@ pub fn lower_with_env(
 
                 let last = *x_shape.last().unwrap() as usize;
                 if last < *n_rot {
-                    return Err(MlxError(format!(
-                        "Rope: x last dim {last} < n_rot {n_rot}"
-                    )));
+                    return Err(MlxError(format!("Rope: x last dim {last} < n_rot {n_rot}")));
                 }
                 let heads_in_last = (last / *head_dim) as i32;
                 let multi_head_packed =
-                    heads_in_last > 1 && last % *head_dim == 0 && n >= 3;
-                let has_tail = last % *head_dim != 0;
+                    heads_in_last > 1 && last.is_multiple_of(*head_dim) && n >= 3;
+                let has_tail = !last.is_multiple_of(*head_dim);
 
                 let rotate = |x_rot: &Array,
                               rot_shape: &[i32],
@@ -1130,9 +1137,7 @@ pub fn lower_with_env(
                 groups,
             } => {
                 if kernel_size.len() != 2 {
-                    return Err(MlxError(
-                        "ConvTranspose2d on MLX: 2D NCHW only".into(),
-                    ));
+                    return Err(MlxError("ConvTranspose2d on MLX: 2D NCHW only".into()));
                 }
                 let x = lookup(&env, node.inputs[0])?;
                 let w = lookup(&env, node.inputs[1])?;
@@ -1270,9 +1275,8 @@ pub fn lower_with_env(
                 let n_elem: usize = out_shape.iter().product::<i32>() as usize;
                 let zeros = vec![0.0_f32; n_elem];
                 let out_shape_usize: Vec<usize> = out_shape.iter().map(|d| *d as usize).collect();
-                let zero_target = crate::array::Array::from_f32_slice(
-                    &zeros, &out_shape_usize, DType::F32,
-                )?;
+                let zero_target =
+                    crate::array::Array::from_f32_slice(&zeros, &out_shape_usize, DType::F32)?;
                 ops::scatter_add(&zero_target, indices, updates, 0)?
             }
             Op::GroupedMatMul => {
@@ -1325,7 +1329,7 @@ pub fn lower_with_env(
                 if scheme.is_gguf() {
                     let x = lookup(&env, node.inputs[0])?;
                     let wq = lookup(&env, node.inputs[1])?;
-                    let w_shape = graph.node(node.inputs[1]).shape.clone();
+                    let _w_shape = graph.node(node.inputs[1]).shape.clone();
                     let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
                     let total = node.shape.num_elements().unwrap();
                     let m = total / n.max(1);
@@ -1342,7 +1346,12 @@ pub fn lower_with_env(
                         n,
                         *scheme,
                     );
-                    let out_shape: Vec<usize> = node.shape.dims().iter().map(|d| d.unwrap_static()).collect();
+                    let out_shape: Vec<usize> = node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
                     Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
                 } else if matches!(scheme, rlx_ir::QuantScheme::Nvfp4Block) {
                     let x = lookup(&env, node.inputs[0])?;
@@ -1369,8 +1378,12 @@ pub fn lower_with_env(
                         k,
                         n,
                     );
-                    let out_shape: Vec<usize> =
-                        node.shape.dims().iter().map(|d| d.unwrap_static()).collect();
+                    let out_shape: Vec<usize> = node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
                     Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
                 } else {
                     // Inputs: [x, w_q, scale, zp]. Map to MLX's
@@ -2052,7 +2065,7 @@ pub fn lower_with_env(
                 // path relies on.
                 let init = lookup(&env, node.inputs[0])?;
                 let bcasts: Vec<&Array> = (0..*num_bcast as usize)
-                    .map(|i| lookup(&env, node.inputs[1 + i]).map(|a| a))
+                    .map(|i| lookup(&env, node.inputs[1 + i]))
                     .collect::<Result<Vec<_>, _>>()?;
                 let xs: Vec<&Array> = (0..*num_xs as usize)
                     .map(|i| lookup(&env, node.inputs[1 + *num_bcast as usize + i]))
@@ -2094,7 +2107,7 @@ pub fn lower_with_env(
                         captures.push(row_squeezed);
                     }
                     let capture_refs: Vec<&Array> = captures.iter().collect();
-                    let body_outs = lower_subgraph(body, &capture_refs, &params, &params_typed)?;
+                    let body_outs = lower_subgraph(body, &capture_refs, params, params_typed)?;
                     if body_outs.is_empty() {
                         return Err(MlxError("Op::Scan: body produced no outputs".into()));
                     }
@@ -2787,15 +2800,7 @@ pub fn lower_with_env(
                 };
                 let mask_ref = mask_additive.as_ref();
                 let grad = crate::attention_bwd::attention_backward_bhsd(
-                    *wrt,
-                    &q,
-                    &k,
-                    &v,
-                    &dy,
-                    hd,
-                    *mask_kind,
-                    mask_ref,
-                    window,
+                    *wrt, &q, &k, &v, &dy, hd, *mask_kind, mask_ref, window,
                 )?;
                 if need_split {
                     let b = q_shape[0];
@@ -2880,12 +2885,8 @@ pub fn lower_with_env(
                     dy.clone_handle()?
                 } else {
                     let reduce_axes: Vec<i32> = (0..last).collect();
-                    let summed = ops::reduce(
-                        dy,
-                        MlxReduce::Sum,
-                        &reduce_axes,
-                        /*keep_dim=*/ false,
-                    )?;
+                    let summed =
+                        ops::reduce(dy, MlxReduce::Sum, &reduce_axes, /*keep_dim=*/ false)?;
                     let want: Vec<i32> = node
                         .shape
                         .dims()
@@ -2908,10 +2909,10 @@ pub fn lower_with_env(
                 let dy = lookup(&env, node.inputs[3])?;
                 let x_shape = node_input_shape(graph, node.inputs[0]);
                 let dtype = node.shape.dtype();
-                let n = x_shape[0] as i32;
-                let c = x_shape[1] as i32;
-                let h = x_shape[2] as i32;
-                let w = x_shape[3] as i32;
+                let n = x_shape[0];
+                let c = x_shape[1];
+                let h = x_shape[2];
+                let w = x_shape[3];
                 let g = *num_groups as i32;
                 let cpg = c / g;
                 let inner = cpg * h * w;
@@ -2934,10 +2935,7 @@ pub fn lower_with_env(
                 let m_sy = ops::reduce(&dy_g, MlxReduce::Mean, &[2], true)?;
                 let dy_gxh = ops::mul(&dy_g, &x_hat)?;
                 let m_sxh = ops::reduce(&dy_gxh, MlxReduce::Mean, &[2], true)?;
-                let term = ops::sub(
-                    &dy_g,
-                    &ops::add(&m_sy, &ops::mul(&x_hat, &m_sxh)?)?,
-                )?;
+                let term = ops::sub(&dy_g, &ops::add(&m_sy, &ops::mul(&x_hat, &m_sxh)?)?)?;
                 let dx3 = ops::mul(&inv_std, &term)?;
                 let dx5 = ops::reshape(&dx3, &[n, g, cpg, h, w])?;
                 ops::reshape(&dx5, &[n, c, h, w])?
@@ -2947,10 +2945,10 @@ pub fn lower_with_env(
                 let x = lookup(&env, node.inputs[0])?;
                 let dy = lookup(&env, node.inputs[1])?;
                 let x_shape = node_input_shape(graph, node.inputs[0]);
-                let n = x_shape[0] as i32;
-                let c = x_shape[1] as i32;
-                let h = x_shape[2] as i32;
-                let w = x_shape[3] as i32;
+                let n = x_shape[0];
+                let c = x_shape[1];
+                let h = x_shape[2];
+                let w = x_shape[3];
                 let g = *num_groups as i32;
                 let cpg = c / g;
                 let inner = cpg * h * w;
@@ -2984,7 +2982,10 @@ pub fn lower_with_env(
                 }
             }
 
-            Op::GroupNormBackwardBeta { num_groups: _, eps: _ } => {
+            Op::GroupNormBackwardBeta {
+                num_groups: _,
+                eps: _,
+            } => {
                 let dy = lookup(&env, node.inputs[1])?;
                 let summed = ops::reduce(dy, MlxReduce::Sum, &[0, 2, 3], false)?;
                 let want: Vec<i32> = node
@@ -3005,7 +3006,7 @@ pub fn lower_with_env(
             Op::CumsumBackward { axis, exclusive } => {
                 let dy = lookup(&env, node.inputs[0])?;
                 let axis_pos = if *axis < 0 {
-                    (node_input_shape(graph, node.inputs[0]).len() as i32 + *axis) as i32
+                    node_input_shape(graph, node.inputs[0]).len() as i32 + *axis
                 } else {
                     *axis
                 };
@@ -3029,18 +3030,15 @@ pub fn lower_with_env(
                     .map(|d| d.unwrap_static() as i32)
                     .collect();
                 let axis_pos = if *axis < 0 {
-                    (out_shape.len() as i32 + *axis) as i32
+                    out_shape.len() as i32 + *axis
                 } else {
                     *axis
                 };
                 let n_elem: usize = out_shape.iter().product::<i32>() as usize;
                 let zeros = vec![0.0_f32; n_elem];
                 let out_shape_usize: Vec<usize> = out_shape.iter().map(|d| *d as usize).collect();
-                let zero_target = crate::array::Array::from_f32_slice(
-                    &zeros,
-                    &out_shape_usize,
-                    DType::F32,
-                )?;
+                let zero_target =
+                    crate::array::Array::from_f32_slice(&zeros, &out_shape_usize, DType::F32)?;
                 ops::scatter_add_axis(&zero_target, indices, dy, axis_pos)?
             }
 
@@ -3535,7 +3533,6 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::GatedDeltaNet { .. }
             | Op::GroupedMatMul
             | Op::Pool { .. }
-            | Op::ResizeNearest2x
             | Op::Conv { .. }
             | Op::ConvTranspose2d { .. }
             | Op::FusedTransformerLayer { .. }
@@ -3743,6 +3740,7 @@ fn quant_scheme_to_mlx(scheme: &rlx_ir::QuantScheme) -> Result<(i32, i32), MlxEr
     Ok((bits, gs))
 }
 
+#[allow(dead_code)]
 fn dequant_gguf_weight(
     w_bytes: &[u8],
     k: usize,

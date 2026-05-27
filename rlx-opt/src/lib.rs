@@ -141,18 +141,18 @@ pub mod vmap {
 // ── Root re-exports (legacy `use rlx_opt::…`) ─────────────────────
 
 pub use rlx_fusion::{
-    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm,
-    FuseRmsNormReshape, FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul,
-    FusionReport, LowerControlFlow, LowerDotGeneral, MarkElementwiseRegions, MissReason,
-    MissedFusion, Pass, UnfuseElementwiseRegions, inline_if, inline_subgraph_into,
-    run_passes, unroll_while, unfuse_fused_for_autodiff,
+    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
+    FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul, FusionReport, LowerControlFlow,
+    LowerDotGeneral, MarkElementwiseRegions, MissReason, MissedFusion, Pass,
+    UnfuseElementwiseRegions, inline_if, inline_subgraph_into, run_passes,
+    unfuse_fused_for_autodiff, unroll_while,
 };
 
 #[cfg(feature = "training")]
 pub use rlx_autodiff::{
-    AutodiffError, MirAutodiffExt, PrepareForAutodiff, grad, grad_with_loss,
-    grad_with_loss_module, hvp, jvp, jvp_module, prepare_graph_for_ad, prepare_mir_for_ad,
-    prepare_module_for_ad, quantized_weight_bits,
+    AutodiffError, MirAutodiffExt, PrepareForAutodiff, grad, grad_with_loss, grad_with_loss_module,
+    hvp, jvp, jvp_module, prepare_graph_for_ad, prepare_mir_for_ad, prepare_module_for_ad,
+    quantized_weight_bits,
 };
 
 #[cfg(feature = "training")]
@@ -162,25 +162,21 @@ pub use rlx_autodiff::vmap::vmap;
 pub use rlx_autodiff::autodiff::{convert_scans_for_ad, inline_custom_fn_for_autodiff};
 
 #[cfg(all(feature = "compile", feature = "training"))]
-pub use rlx_compile::{
-    TrainingCompileError, TrainingCompileResult, backward_cleanup_passes,
-};
+pub use rlx_compile::{TrainingCompileError, TrainingCompileResult, backward_cleanup_passes};
 
 #[cfg(feature = "compile")]
 pub use rlx_compile::{
     AutoMixedPrecision, CalibrationEntry, CalibrationRecord, CastConfig, CompilePipeline,
-    CompileResult, ConstantFolding, DeadCodeElimination, FusionLimits, FusionOptions, FusionTarget,
-    LegalizeBroadcast, LegalizeResult, OpKind, PipelineInspect, Precision, PrecisionPolicy,
-    format_legalize_error, fusion_limits_for_target, fusion_passes, fusion_passes_for_supported,
-    inline_into,
-    inspect_compiled, inspect_fusion, inspect_pipeline, insert_q_dq, is_pure_view,
-    plan_memory_backward, plan_memory_with_options, MemoryPlanOptions, SharedWeightLayout,
-    WeightSlot,
-    KernelDispatchConfig, KernelDispatchPolicy, legalize_for_backend,
-    legalize_or_rewrite_for_backend, legalize_or_rewrite_for_backend_with_config,
-    legalize_or_rewrite_for_backend_with_dispatch, maybe_dump_pipeline, promote_params_to_inputs,
-    rewrite_for_backend, rewrite_for_backend_with_config, rewrite_for_backend_with_dispatch,
-    supported_for_target, supports_op, DispatchPath, KernelDispatchReport, KindDispatchSummary,
-    analyze_dispatch, format_dispatch_report, maybe_log_dispatch_report,
-    prepare_graph_for_backend_with_report,
+    CompileResult, ConstantFolding, DeadCodeElimination, DispatchPath, FusionLimits, FusionOptions,
+    FusionTarget, KernelDispatchConfig, KernelDispatchPolicy, KernelDispatchReport,
+    KindDispatchSummary, LegalizeBroadcast, LegalizeResult, MemoryPlanOptions, OpKind,
+    PipelineInspect, Precision, PrecisionPolicy, SharedWeightLayout, WeightSlot, analyze_dispatch,
+    format_dispatch_report, format_legalize_error, fusion_limits_for_target, fusion_passes,
+    fusion_passes_for_supported, inline_into, insert_q_dq, inspect_compiled, inspect_fusion,
+    inspect_pipeline, is_pure_view, legalize_for_backend, legalize_or_rewrite_for_backend,
+    legalize_or_rewrite_for_backend_with_config, legalize_or_rewrite_for_backend_with_dispatch,
+    maybe_dump_pipeline, maybe_log_dispatch_report, plan_memory_backward, plan_memory_with_options,
+    prepare_graph_for_backend_with_report, promote_params_to_inputs, rewrite_for_backend,
+    rewrite_for_backend_with_config, rewrite_for_backend_with_dispatch, supported_for_target,
+    supports_op,
 };

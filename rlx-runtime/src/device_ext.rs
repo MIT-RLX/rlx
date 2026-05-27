@@ -21,7 +21,6 @@
 //! one-way dep direction (driver doesn't know about engine).
 
 use rlx_driver::Device;
-use rlx_ir::logical_kernel::KernelDispatchConfig;
 use rlx_ir::{Graph, Op};
 
 use crate::CompileOptions;
@@ -248,9 +247,8 @@ pub fn dispatch_report_for_device_with_options(
     device: Device,
     options: &CompileOptions,
 ) -> Result<rlx_opt::KernelDispatchReport, String> {
-    let backend = crate::registry::backend_for(device).ok_or_else(|| {
-        format!("no backend registered for {device:?}")
-    })?;
+    let backend = crate::registry::backend_for(device)
+        .ok_or_else(|| format!("no backend registered for {device:?}"))?;
     Ok(rlx_opt::analyze_dispatch(
         graph,
         device.name(),
@@ -283,11 +281,7 @@ pub fn first_unsupported_op_with_options<'a>(
             options.kernel_dispatch,
         );
         if let Some((id, kind)) = report.still_unsupported.first() {
-            let idx = graph
-                .nodes()
-                .iter()
-                .position(|n| n.id == *id)
-                .unwrap_or(0);
+            let idx = graph.nodes().iter().position(|n| n.id == *id).unwrap_or(0);
             let op = graph
                 .nodes()
                 .iter()

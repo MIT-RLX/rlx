@@ -16,9 +16,9 @@
 //! Nonlinear equilibrium iteration (jax_fdm `solver_forward` / `equilibrium_iterative_xyz`).
 
 use crate::equilibrium::{EquilibriumModel, FdmError};
-use crate::loads::{nodes_load_at_mesh, LoadState};
+use crate::loads::{LoadState, nodes_load_at_mesh};
 use crate::mesh::MeshStructure;
-use crate::sparse::{nodes_free_positions_auto, SparseStiffnessFast};
+use crate::sparse::{SparseStiffnessFast, nodes_free_positions_auto};
 use crate::structure::Structure;
 
 /// Fixed-point iteration controls (`tmax`, `eta` in jax_fdm).
@@ -80,12 +80,7 @@ pub fn config_for_implicit_adjoint(config: &IterativeConfig) -> IterativeConfig 
 }
 
 /// Anderson acceleration: `x_{k+1} = g + Σ_j γ_j (x_j − g)` with γ from secant residuals.
-fn anderson_mix(
-    x: &[f64],
-    g: &[f64],
-    x_hist: &[Vec<f64>],
-    f_hist: &[Vec<f64>],
-) -> Vec<f64> {
+fn anderson_mix(x: &[f64], g: &[f64], x_hist: &[Vec<f64>], f_hist: &[Vec<f64>]) -> Vec<f64> {
     let n = x.len();
     let mut f_cur = vec![0.0; n];
     for i in 0..n {
@@ -305,8 +300,14 @@ pub fn equilibrium_iterative_trajectory(
     for _ in 0..adj_cfg.tmax.saturating_sub(1) {
         let prev = xyz_free.clone();
         let loads = nodes_load_at_mesh(&xyz_full, load_state, structure, edges, mesh);
-        let g_step =
-            solve_free_step(q, xyz_fixed, &loads, structure, &adj_cfg, sparse_pat.as_ref())?;
+        let g_step = solve_free_step(
+            q,
+            xyz_fixed,
+            &loads,
+            structure,
+            &adj_cfg,
+            sparse_pat.as_ref(),
+        )?;
         xyz_free = if depth == 0 {
             g_step
         } else {

@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
@@ -23,11 +23,7 @@ impl LayerScaleStage {
 }
 
 impl BlockStage for LayerScaleStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let gamma = ctx.load_param(&self.gamma_key, false)?;
         let mut gb = HirMut::new(ctx.hir());
         let out = gb.mul(input.id, gamma);

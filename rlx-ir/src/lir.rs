@@ -20,8 +20,8 @@
 //! Backends lower LIR to device thunks/kernels without re-running the
 //! optimizer or memory planner when the embedded plan is still valid.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::mir::MirModule;
@@ -113,8 +113,7 @@ impl LirBufferPlan {
     }
 
     pub fn bytes_saved(&self) -> usize {
-        self.total_unshared_bytes()
-            .saturating_sub(self.arena_size)
+        self.total_unshared_bytes().saturating_sub(self.arena_size)
     }
 
     pub fn slot(&self, id: NodeId) -> Option<&LirBufferSlot> {

@@ -143,10 +143,8 @@ fn fft_metal_native_kernel_f32_pow2_matches_cpu() {
             g.set_outputs(vec![y]);
             g
         };
-        let cpu =
-            bytes_to_f32s(&Session::new(Device::Cpu).compile(build()).run_typed(&[])[0].0);
-        let mtl =
-            bytes_to_f32s(&Session::new(Device::Metal).compile(build()).run_typed(&[])[0].0);
+        let cpu = bytes_to_f32s(&Session::new(Device::Cpu).compile(build()).run_typed(&[])[0].0);
+        let mtl = bytes_to_f32s(&Session::new(Device::Metal).compile(build()).run_typed(&[])[0].0);
         assert_eq!(cpu.len(), mtl.len());
         // f32 trig-per-butterfly accumulates more error than the CPU
         // path's f64 recurrence — scale tolerance with N (each stage

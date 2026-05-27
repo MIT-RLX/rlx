@@ -34,8 +34,7 @@ impl MeshStructure {
     pub fn from_network_and_faces(network: &Network, faces: Vec<Vec<usize>>) -> Self {
         let base = Structure::from_network(network);
         let edges_faces = edges_faces_from_mesh(&faces, &network.edges);
-        let face_vertex_weights =
-            face_vertex_matrix(&faces, base.num_nodes);
+        let face_vertex_weights = face_vertex_matrix(&faces, base.num_nodes);
         Self {
             base,
             faces,
@@ -86,7 +85,10 @@ fn face_vertex_matrix(faces: &[Vec<usize>], num_nodes: usize) -> Vec<f64> {
     f
 }
 
-fn edges_faces_from_mesh(faces: &[Vec<usize>], edges: &[(usize, usize)]) -> Vec<[Option<usize>; 2]> {
+fn edges_faces_from_mesh(
+    faces: &[Vec<usize>],
+    edges: &[(usize, usize)],
+) -> Vec<[Option<usize>; 2]> {
     let mut out = vec![[None, None]; edges.len()];
     for (fi, face) in faces.iter().enumerate() {
         let loopv: Vec<usize> = face

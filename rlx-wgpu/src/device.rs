@@ -6,8 +6,8 @@
 //! [`wgpu_device`] returns a process-global singleton. [`select_vulkan_backend`]
 //! routes subsequent calls to a Vulkan-only instance (for [`Device::Vulkan`]).
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 const PREF_DEFAULT: u8 = 0;
 const PREF_VULKAN: u8 = 1;

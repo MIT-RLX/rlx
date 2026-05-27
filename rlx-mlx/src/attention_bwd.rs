@@ -95,8 +95,8 @@ pub fn attention_backward_bhsd(
 ) -> Result<Array, MlxError> {
     let scale = 1.0 / (head_dim as f32).sqrt();
     let sh = q.shape()?;
-    let sq = sh[2] as usize;
-    let sk = k.shape()?[2] as usize;
+    let sq = sh[2];
+    let sk = k.shape()?[2];
     let dtype = DType::F32;
     let scale_a = Array::from_f32_slice(&[scale], &[1], dtype)?;
 

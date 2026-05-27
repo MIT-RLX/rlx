@@ -14,13 +14,11 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Multi-parameter design vector (support Z + q).
 
-use rlx_fdm::{
-    constrained_fdm, fdm, DesignParam, Goal, Network, OptimizeConfig, OptimizerKind,
-};
+use rlx_fdm::{DesignParam, Goal, Network, OptimizeConfig, OptimizerKind, constrained_fdm, fdm};
 
 #[test]
 fn support_z_parameter_moves_arch() {
-    let mut net = Network::arch_chain(4.0, 8, -1.0, -0.15);
+    let net = Network::arch_chain(4.0, 8, -1.0, -0.15);
     let eq0 = fdm(&net).expect("eq");
     let z_mid = eq0.xyz[4 * 3 + 2];
 

@@ -46,7 +46,7 @@ fn dequant_matmul_q8k_matches_dequant_then_matmul() {
     // output column n). Each block has scale=0.0625 and qs[i]=i-128
     // (covers the full i8 range).
     let k = 256;
-    let n = 4;
+    let _n = 4;
     let scale = 0.0625f32;
     let qs: [i8; QK_K] = std::array::from_fn(|i| (i as i32 - 128) as i8);
 
@@ -139,9 +139,7 @@ fn dequant_matmul_q6k_runs_without_panicking() {
     let mut packed = Vec::with_capacity(ql_len + qh_len + sc_len + 2);
     packed.resize(ql_len, 0u8); // low nibbles = 0
     packed.resize(ql_len + qh_len, 0xAAu8); // high 2 bits = 2 each
-    for _ in 0..sc_len {
-        packed.push(1u8);
-    }
+    packed.extend(std::iter::repeat_n(1u8, sc_len));
     packed.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
 
     // [k=256, n=1] @ [k=256] = [m=1, n=1]
@@ -259,9 +257,7 @@ fn run_q4k_case(device: Device) {
         *s = 0x01;
     }
     packed.extend_from_slice(&scales);
-    for _ in 0..(QK_K / 2) {
-        packed.push(0x77);
-    }
+    packed.extend(std::iter::repeat_n(0x77u8, QK_K / 2));
 
     let k = 256;
     let n = 1;
@@ -297,7 +293,12 @@ fn run_q4k_case(device: Device) {
     let actual = compiled.run(&[("x", x.as_slice())]).pop().unwrap();
     for i in 0..actual.len() {
         let rel = (actual[i] - expected[i]).abs() / expected[i].abs().max(1.0);
-        assert!(rel < 1e-3, "{device:?} q4k mismatch at {i}: {} vs {}", actual[i], expected[i]);
+        assert!(
+            rel < 1e-3,
+            "{device:?} q4k mismatch at {i}: {} vs {}",
+            actual[i],
+            expected[i]
+        );
     }
 }
 

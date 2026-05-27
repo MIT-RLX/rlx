@@ -34,7 +34,10 @@ pub fn run_splat_render(graph: &Graph, node: NodeId, env: &mut HostTensors) {
         max_list_entries,
     } = &n.op
     else {
-        panic!("run_splat_render: expected GaussianSplatRender, got {:?}", n.op);
+        panic!(
+            "run_splat_render: expected GaussianSplatRender, got {:?}",
+            n.op
+        );
     };
 
     let get = |id: NodeId| -> &[f32] {

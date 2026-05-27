@@ -23,11 +23,11 @@ mod critic;
 mod mlp;
 
 pub use actor::{
-    build_actor_graphs, init_actor_weights, ActorGraphBundle, ActorTrainGraph, CompiledFlowMapAgent,
-    WeightStore,
+    ActorGraphBundle, ActorTrainGraph, CompiledFlowMapAgent, WeightStore, build_actor_graphs,
+    init_actor_weights,
 };
 pub use critic::{
-    build_critic_graphs, init_critic_weights, CompiledTwinCritic, CriticGraphBundle, CriticQGradGraph,
-    CriticTrainGraph,
+    CompiledTwinCritic, CriticGraphBundle, CriticQGradGraph, CriticTrainGraph, build_critic_graphs,
+    init_critic_weights,
 };
 pub use mlp::ParamSlot;

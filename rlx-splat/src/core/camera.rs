@@ -65,12 +65,9 @@ impl Camera {
             .unwrap_or_else(|| 0.5 * height as f32 / (0.5 * self.fov_y_degrees.to_radians()).tan())
     }
 
-    pub fn focal_pixels_xy(&self, width: u32, height: u32) -> (f32, f32) {
+    pub fn focal_pixels_xy(&self, _width: u32, height: u32) -> (f32, f32) {
         let focal_y = self.focal_pixels(height);
-        (
-            self.fx.unwrap_or(focal_y),
-            self.fy.unwrap_or(focal_y),
-        )
+        (self.fx.unwrap_or(focal_y), self.fy.unwrap_or(focal_y))
     }
 
     pub fn principal_point(&self, width: u32, height: u32) -> (f32, f32) {
@@ -144,7 +141,10 @@ impl Camera {
         let (fx, fy) = self.focal_pixels_xy(width, height);
         let (cx, cy) = self.principal_point(width, height);
         let uv = Self::distort_normalized(
-            [camera_pos[0] as f64 / depth as f64, camera_pos[1] as f64 / depth as f64],
+            [
+                camera_pos[0] as f64 / depth as f64,
+                camera_pos[1] as f64 / depth as f64,
+            ],
             self.distortion_params(),
         );
         let screen = [uv[0] * fx + cx, uv[1] * fy + cy];
@@ -313,10 +313,15 @@ impl Camera {
         for _ in 0..DISTORTION_NEWTON_ITERS {
             let error = {
                 let distorted = Self::distort_normalized_with_params(estimate, params);
-                [distorted[0] - uv_distorted[0], distorted[1] - uv_distorted[1]]
+                [
+                    distorted[0] - uv_distorted[0],
+                    distorted[1] - uv_distorted[1],
+                ]
             };
-            if dot3([error[0] as f32, error[1] as f32, 0.0], [error[0] as f32, error[1] as f32, 0.0])
-                <= (DISTORTION_EPS * DISTORTION_EPS) as f32
+            if dot3(
+                [error[0] as f32, error[1] as f32, 0.0],
+                [error[0] as f32, error[1] as f32, 0.0],
+            ) <= (DISTORTION_EPS * DISTORTION_EPS) as f32
             {
                 break;
             }

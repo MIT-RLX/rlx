@@ -2,15 +2,15 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
+use rlx_ir::HirGraphExt;
 use rlx_ir::hir::HirMut;
 use rlx_ir::op::MaskKind;
 use rlx_ir::shape;
-use rlx_ir::HirGraphExt;
 
 use std::sync::{Arc, Mutex};
 
-use super::self_attn::repeat_kv;
 use super::BlockStage;
+use super::self_attn::repeat_kv;
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
 
@@ -55,11 +55,7 @@ impl Qwen3DecoderStage {
 }
 
 impl BlockStage for Qwen3DecoderStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let lp = &self.layer_prefix;
         let spec = &self.spec;
         let nh = spec.num_heads;

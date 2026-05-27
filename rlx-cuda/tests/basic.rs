@@ -256,7 +256,9 @@ fn layer_norm2d_matches_cpu_reference() {
     let c = 4usize;
     let h = 3usize;
     let w = 3usize;
-    let x: Vec<f32> = (0..n * c * h * w).map(|i| (i as f32) * 0.01 - 0.1).collect();
+    let x: Vec<f32> = (0..n * c * h * w)
+        .map(|i| (i as f32) * 0.01 - 0.1)
+        .collect();
     let gamma: Vec<f32> = (0..c).map(|i| 1.0 + 0.05 * i as f32).collect();
     let beta: Vec<f32> = (0..c).map(|i| -0.02 * i as f32).collect();
     let mut want = vec![0f32; x.len()];
@@ -304,35 +306,31 @@ fn conv_transpose2d_stride2_k2_matches_cpu_reference() {
     let groups = 1usize;
     let h_out = (h - 1) * sh - 2 * ph + dh * (kh - 1) + 1;
     let w_out = (w_in - 1) * sw - 2 * pw + dw * (kw - 1) + 1;
-    let x: Vec<f32> = (0..n * c_in * h * w_in).map(|i| (i as f32) * 0.02 - 0.2).collect();
-    let weight: Vec<f32> = (0..c_in * c_out * kh * kw).map(|i| 0.1 + 0.01 * (i as f32)).collect();
+    let x: Vec<f32> = (0..n * c_in * h * w_in)
+        .map(|i| (i as f32) * 0.02 - 0.2)
+        .collect();
+    let weight: Vec<f32> = (0..c_in * c_out * kh * kw)
+        .map(|i| 0.1 + 0.01 * (i as f32))
+        .collect();
     let mut want = vec![0f32; n * c_out * h_out * w_out];
     rlx_cpu::kernels::conv_transpose2d_nchw(
-        &x,
-        &weight,
-        &mut want,
-        n,
-        c_in,
-        h,
-        w_in,
-        c_out,
-        h_out,
-        w_out,
-        kh,
-        kw,
-        sh,
-        sw,
-        ph,
-        pw,
-        dh,
-        dw,
-        groups,
+        &x, &weight, &mut want, n, c_in, h, w_in, c_out, h_out, w_out, kh, kw, sh, sw, ph, pw, dh,
+        dw, groups,
     );
 
     let mut g = Graph::new("conv_t2d");
     let x_in = g.input("x", Shape::new(&[n, c_in, h, w_in], DType::F32));
     let w_p = g.param("w", Shape::new(&[c_in, c_out, kh, kw], DType::F32));
-    let y = g.conv_transpose2d(x_in, w_p, [kh, kw], [sh, sw], [ph, pw], [dh, dw], [0, 0], groups);
+    let y = g.conv_transpose2d(
+        x_in,
+        w_p,
+        [kh, kw],
+        [sh, sw],
+        [ph, pw],
+        [dh, dw],
+        [0, 0],
+        groups,
+    );
     g.set_outputs(vec![y]);
     let mut exe = CudaExecutable::compile(g);
     exe.set_param("w", &weight);
@@ -358,13 +356,13 @@ fn group_norm_matches_cpu_reference() {
     let h = 4usize;
     let w = 4usize;
     let num_groups = 2usize;
-    let x: Vec<f32> = (0..n * c * h * w).map(|i| (i as f32) * 0.01 - 0.2).collect();
+    let x: Vec<f32> = (0..n * c * h * w)
+        .map(|i| (i as f32) * 0.01 - 0.2)
+        .collect();
     let gamma: Vec<f32> = (0..c).map(|i| 1.0 + 0.02 * i as f32).collect();
     let beta: Vec<f32> = (0..c).map(|i| -0.01 * i as f32).collect();
     let mut want = vec![0f32; x.len()];
-    rlx_cpu::kernels::group_norm_nchw(
-        &x, &gamma, &beta, &mut want, n, c, h, w, num_groups, 1e-5,
-    );
+    rlx_cpu::kernels::group_norm_nchw(&x, &gamma, &beta, &mut want, n, c, h, w, num_groups, 1e-5);
 
     let mut g = Graph::new("gn");
     let x_in = g.input("x", Shape::new(&[n, c, h, w], DType::F32));

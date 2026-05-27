@@ -3,7 +3,7 @@
 
 //! SAM2-style axial 2-D RoPE on `[batch, seq, num_heads * head_dim]`.
 
-use crate::{Graph, NodeId, Op, Shape};
+use crate::{Graph, NodeId, Op};
 
 /// Apply axial 2-D RoPE on flattened `[nh, n_tokens, head_dim]` layout.
 pub fn apply_axial_rope2d(
@@ -61,7 +61,6 @@ pub fn apply_axial_rope2d(
     let hs = num_heads * head_dim;
     let mut out = x.to_vec();
     for tok in 0..n_tokens {
-        let pos = tok / repeat;
         for h in 0..num_heads {
             let base = tok * hs + h * head_dim;
             for c in 0..q4 {

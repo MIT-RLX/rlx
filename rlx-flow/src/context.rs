@@ -83,11 +83,7 @@ impl FlowCtx<'_> {
             .clone())
     }
 
-    pub fn load_param(
-        &mut self,
-        key: &str,
-        transpose: bool,
-    ) -> Result<HirNodeId> {
+    pub fn load_param(&mut self, key: &str, transpose: bool) -> Result<HirNodeId> {
         let cache_key = param_cache_key(key, transpose);
         if let Some(&id) = self.state.loaded_params.get(&cache_key) {
             return Ok(id);

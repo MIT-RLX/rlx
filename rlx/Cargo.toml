@@ -47,9 +47,8 @@ fpga    = ["dep:rlx-fpga"]
 # ── Convenience aggregates ──────────────────────────────────────
 # Single-flag setups for common platforms. Each composes the
 # fragments most users want for that target. Aggregates only
-# include features that resolve from crates.io — `mlx` and `rocm`
-# are git-only (vendor-bundled; see README) and must be opted into
-# explicitly when using a git source.
+# Aggregates only include features that resolve from crates.io.
+# `mlx` needs `rlx-mlx-sys` (vendored MLX submodule) on the index.
 apple-silicon = ["cpu", "metal", "blas-accelerate"]
 nvidia        = ["cpu", "cuda"]
 edge          = ["cpu", "cortexm"]

@@ -98,43 +98,54 @@ pub fn resolve_current(op: OpClass) -> KernelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    fn fresh() {
+    /// Serialize tests — `resolve` reads a process-global override table.
+    static DISPATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_clean_table(f: impl FnOnce()) {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .expect("dispatch test lock poisoned");
         clear_overrides_for_tests();
+        f();
     }
 
     #[test]
     fn defaults_pass_through() {
-        fresh();
-        let arch = CpuArch::AppleSilicon;
-        let op = OpClass::Matmul;
-        let resolved = resolve(arch, op);
-        let default = kernel_config_for(arch, op);
-        assert_eq!(resolved.neon_seq_threshold, default.neon_seq_threshold);
-        assert_eq!(resolved.par_threshold, default.par_threshold);
+        with_clean_table(|| {
+            let arch = CpuArch::AppleSilicon;
+            let op = OpClass::Matmul;
+            let resolved = resolve(arch, op);
+            let default = kernel_config_for(arch, op);
+            assert_eq!(resolved.neon_seq_threshold, default.neon_seq_threshold);
+            assert_eq!(resolved.par_threshold, default.par_threshold);
+        });
     }
 
     #[test]
     fn override_replaces_field() {
-        fresh();
-        let arch = CpuArch::AppleSilicon;
-        let op = OpClass::Matmul;
-        set_override(arch, op, Override::NeonSeqThreshold(7));
-        let r = resolve(arch, op);
-        assert_eq!(r.neon_seq_threshold, 7);
-        // Other fields untouched.
-        let d = kernel_config_for(arch, op);
-        assert_eq!(r.par_threshold, d.par_threshold);
+        with_clean_table(|| {
+            let arch = CpuArch::AppleSilicon;
+            let op = OpClass::Matmul;
+            set_override(arch, op, Override::NeonSeqThreshold(7));
+            let r = resolve(arch, op);
+            assert_eq!(r.neon_seq_threshold, 7);
+            // Other fields untouched.
+            let d = kernel_config_for(arch, op);
+            assert_eq!(r.par_threshold, d.par_threshold);
+        });
     }
 
     #[test]
     fn override_for_one_field_replaces_just_that() {
-        fresh();
-        let arch = CpuArch::X86_64;
-        let op = OpClass::Attention;
-        set_override(arch, op, Override::NeonSeqThreshold(5));
-        set_override(arch, op, Override::NeonSeqThreshold(9)); // replaces
-        let r = resolve(arch, op);
-        assert_eq!(r.neon_seq_threshold, 9);
+        with_clean_table(|| {
+            let arch = CpuArch::X86_64;
+            let op = OpClass::Attention;
+            set_override(arch, op, Override::NeonSeqThreshold(5));
+            set_override(arch, op, Override::NeonSeqThreshold(9)); // replaces
+            let r = resolve(arch, op);
+            assert_eq!(r.neon_seq_threshold, 9);
+        });
     }
 }

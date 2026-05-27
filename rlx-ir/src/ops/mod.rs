@@ -36,5 +36,5 @@ pub mod linalg;
 pub mod normalization;
 pub mod reduction;
 pub mod shape_ops;
-pub mod splat;
 pub mod special;
+pub mod splat;

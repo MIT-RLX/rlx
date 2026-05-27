@@ -12,7 +12,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-use rlx_fdm::{fdm, goals_loss_with_structure, Goal, Network};
+use rlx_fdm::{Goal, Network, fdm, goals_loss_with_structure};
 
 #[test]
 fn extended_goals_compile_and_loss_finite() {

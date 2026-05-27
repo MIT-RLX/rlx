@@ -21,9 +21,10 @@ use crate::state::EquilibriumState;
 use crate::structure::Structure;
 
 /// How to aggregate per-goal errors (jax_fdm `SquaredError`, `LogMaxError`, …).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ErrorKind {
     /// `Σ w (pred − target)²`
+    #[default]
     Squared,
     /// `Σ w (pred − target)² / n_goals`
     MeanSquared,
@@ -35,12 +36,6 @@ pub enum ErrorKind {
     Prediction,
     /// `Σ w · log1p(max(0, pred − bound))` for upper-bound constraints
     LogMax,
-}
-
-impl Default for ErrorKind {
-    fn default() -> Self {
-        Self::Squared
-    }
 }
 
 /// Weighted goals with a shared error metric.
@@ -111,5 +106,8 @@ pub fn losses_total(
     is_support: &[bool],
     mesh: Option<&MeshStructure>,
 ) -> f64 {
-    losses.iter().map(|l| l.scalar(state, structure, is_support, mesh)).sum()
+    losses
+        .iter()
+        .map(|l| l.scalar(state, structure, is_support, mesh))
+        .sum()
 }

@@ -54,9 +54,15 @@ impl std::fmt::Display for HirNodeId {
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirOp {
-    Input { name: String },
-    Param { name: String },
-    Constant { data: Vec<u8> },
+    Input {
+        name: String,
+    },
+    Param {
+        name: String,
+    },
+    Constant {
+        data: Vec<u8>,
+    },
 
     /// `matmul → add(bias)? → activation?`
     /// Inputs: `[x, weight]` or `[x, weight, bias]`.
@@ -73,7 +79,9 @@ pub enum HirOp {
 
     /// Two matmuls sharing the same input (QKV / SwiGLU gate+up).
     /// Inputs: `[x, w_first, w_second]`. `slot` selects which output.
-    SharedLinearPair { slot: u8 },
+    SharedLinearPair {
+        slot: u8,
+    },
 
     /// Full SwiGLU FFN.
     /// Inputs: `[x, up_w, gate_w, down_w]`.
@@ -81,7 +89,9 @@ pub enum HirOp {
 
     /// `add(x, residual)` then RMSNorm.
     /// Inputs: `[x, residual, gamma, beta]`.
-    ResidualRmsNorm { eps: f32 },
+    ResidualRmsNorm {
+        eps: f32,
+    },
 
     /// Scaled dot-product attention.
     /// Inputs: `[q, k, v, mask?]` — mask omitted when `mask == None`.
@@ -99,7 +109,9 @@ pub enum HirOp {
 
     /// Fused dequant + matmul. GGUF schemes take `[x, packed_w]`; legacy
     /// Int8/NVFP4 schemes take `[x, w_q, scale, zp]`.
-    DequantMatMul { scheme: QuantScheme },
+    DequantMatMul {
+        scheme: QuantScheme,
+    },
 
     /// Gated DeltaNet linear-attention scan (Qwen3.5 trunk).
     /// Inputs: `[q, k, v, g, beta]` or with carry `[…, state]`.
@@ -115,7 +127,9 @@ pub enum HirOp {
     },
 
     /// RMS normalization without residual. Inputs: `[x, gamma, beta]`.
-    RmsNorm { eps: f32 },
+    RmsNorm {
+        eps: f32,
+    },
 
     /// LLaMA-style pre-norm decoder block: attn (GQA) + SwiGLU FFN.
     /// Inputs (causal): `[x, ln1_g, ln1_b, q_w, k_w, v_w, o_w, ln2_g, ln2_b,
@@ -188,6 +202,10 @@ impl HirModule {
         self.nodes.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
     pub fn nodes(&self) -> &[HirNode] {
         &self.nodes
     }
@@ -241,14 +259,7 @@ impl HirModule {
     }
 
     pub fn input(&mut self, name: impl Into<String>, shape: Shape) -> HirNodeId {
-        self.push(
-            HirOp::Input {
-                name: name.into(),
-            },
-            vec![],
-            shape,
-            None,
-        )
+        self.push(HirOp::Input { name: name.into() }, vec![], shape, None)
     }
 
     /// `[batch, seq, hidden]` input with symbolic leading axes.
@@ -322,12 +333,7 @@ impl HirModule {
             out_shape.clone(),
             None,
         );
-        let second = self.push_block(
-            HirOp::SharedLinearPair { slot: 1 },
-            inputs,
-            out_shape,
-            None,
-        );
+        let second = self.push_block(HirOp::SharedLinearPair { slot: 1 }, inputs, out_shape, None);
         (first, second)
     }
 
@@ -427,12 +433,7 @@ impl HirModule {
             inputs.push(scale.expect("DequantMatMul: scale required for non-GGUF schemes"));
             inputs.push(zp.expect("DequantMatMul: zp required for non-GGUF schemes"));
         }
-        self.push_block(
-            HirOp::DequantMatMul { scheme },
-            inputs,
-            out_shape,
-            None,
-        )
+        self.push_block(HirOp::DequantMatMul { scheme }, inputs, out_shape, None)
     }
 
     /// Gated DeltaNet without carry state (prefill / reset per batch).
@@ -587,8 +588,27 @@ impl HirModule {
         out_shape: Shape,
     ) -> HirNodeId {
         let id = self.llama_decoder_block(
-            x, ln1_g, ln1_b, q_w, k_w, v_w, o_w, ln2_g, ln2_b, gate_w, up_w, down_w, cos, sin,
-            mask, num_heads, head_dim, num_kv_heads, eps, mask_kind, out_shape,
+            x,
+            ln1_g,
+            ln1_b,
+            q_w,
+            k_w,
+            v_w,
+            o_w,
+            ln2_g,
+            ln2_b,
+            gate_w,
+            up_w,
+            down_w,
+            cos,
+            sin,
+            mask,
+            num_heads,
+            head_dim,
+            num_kv_heads,
+            eps,
+            mask_kind,
+            out_shape,
         );
         self.node_mut(id).name = Some("transformer_block".into());
         id
@@ -733,8 +753,7 @@ pub(crate) fn default_hir_block_label(op: &HirOp) -> Option<String> {
         HirOp::DepthwiseConv1dCausal { .. } => "depthwise_conv1d_causal".into(),
         HirOp::DequantMatMul { scheme } => format!("dequant_matmul({scheme})"),
         HirOp::GatedDeltaNet {
-            carry_state: true,
-            ..
+            carry_state: true, ..
         } => "gated_delta_net_carry".into(),
         HirOp::GatedDeltaNet { .. } => "gated_delta_net".into(),
         HirOp::RoPE { .. } => "rope".into(),
@@ -858,13 +877,18 @@ mod tests {
         let g = hir.lower_to_mir().expect("lower").into_graph();
         assert!(g.nodes().iter().any(|n| matches!(
             n.op,
-            Op::GatedDeltaNet { carry_state: false, .. }
+            Op::GatedDeltaNet {
+                carry_state: false,
+                ..
+            }
         )));
         assert!(g.nodes().iter().any(|n| matches!(n.op, Op::Rope { .. })));
         assert!(g.nodes().iter().any(|n| matches!(n.op, Op::RmsNorm { .. })));
         assert!(g.nodes().iter().any(|n| matches!(
             n.op,
-            Op::DequantMatMul { scheme: QuantScheme::GgufQ4K }
+            Op::DequantMatMul {
+                scheme: QuantScheme::GgufQ4K
+            }
         )));
     }
 }

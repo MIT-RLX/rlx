@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::hir::{default_hir_block_label, HirModule, HirNodeId, HirOp};
+use crate::hir::{HirModule, HirNodeId, HirOp, default_hir_block_label};
 use crate::infer::GraphExt;
 use crate::mir::MirModule;
 use crate::provenance::NodeOrigin;
@@ -39,11 +39,9 @@ pub enum LowerError {
 impl std::fmt::Display for LowerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WrongInputCount {
-                op,
-                expected,
-                got,
-            } => write!(f, "{op}: expected {expected} inputs, got {got}"),
+            Self::WrongInputCount { op, expected, got } => {
+                write!(f, "{op}: expected {expected} inputs, got {got}")
+            }
             Self::MissingBias { op } => write!(f, "{op}: bias input required"),
         }
     }
@@ -115,14 +113,10 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
                     });
                 }
                 let key = (node.inputs[0], node.inputs[1], node.inputs[2]);
-                let pair = *shared_pairs.entry(key).or_insert_with(|| {
-                    g.shared_matmul_pair(inputs[0], inputs[1], inputs[2])
-                });
-                if *slot == 0 {
-                    pair.0
-                } else {
-                    pair.1
-                }
+                let pair = *shared_pairs
+                    .entry(key)
+                    .or_insert_with(|| g.shared_matmul_pair(inputs[0], inputs[1], inputs[2]));
+                if *slot == 0 { pair.0 } else { pair.1 }
             }
 
             HirOp::SwiGLU => {
@@ -150,13 +144,7 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
                 }
                 if policy.is_direct() {
                     g.fused_residual_rms_norm(
-                        inputs[0],
-                        inputs[1],
-                        None,
-                        inputs[2],
-                        inputs[3],
-                        *eps,
-                        node.shape,
+                        inputs[0], inputs[1], None, inputs[2], inputs[3], *eps, node.shape,
                     )
                 } else {
                     let summed = g.add(inputs[0], inputs[1]);
@@ -190,15 +178,9 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
                     MaskKind::Custom => {
                         g.attention(q, k, v, inputs[3], *num_heads, *head_dim, node.shape)
                     }
-                    MaskKind::Bias => g.attention_bias(
-                        q,
-                        k,
-                        v,
-                        inputs[3],
-                        *num_heads,
-                        *head_dim,
-                        node.shape,
-                    ),
+                    MaskKind::Bias => {
+                        g.attention_bias(q, k, v, inputs[3], *num_heads, *head_dim, node.shape)
+                    }
                     other => g.attention_kind(q, k, v, *num_heads, *head_dim, *other, node.shape),
                 }
             }
@@ -234,12 +216,7 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
                     g.dequant_matmul_packed(inputs[0], inputs[1], *scheme, node.shape)
                 } else {
                     g.dequant_matmul(
-                        inputs[0],
-                        inputs[1],
-                        inputs[2],
-                        inputs[3],
-                        *scheme,
-                        node.shape,
+                        inputs[0], inputs[1], inputs[2], inputs[3], *scheme, node.shape,
                     )
                 }
             }

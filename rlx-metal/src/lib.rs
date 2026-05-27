@@ -52,9 +52,9 @@ pub mod mps_blas;
 #[cfg(target_os = "macos")]
 pub mod mps_graph;
 
+pub mod mps_graph_hybrid;
 #[cfg(target_os = "macos")]
 pub mod mps_graph_lower;
-pub mod mps_graph_hybrid;
 
 #[cfg(target_os = "macos")]
 pub mod icb;
@@ -78,11 +78,11 @@ pub mod thunk;
 pub mod backend;
 
 #[cfg(all(feature = "native-splat", target_os = "macos"))]
+pub mod splat_adam;
+#[cfg(all(feature = "native-splat", target_os = "macos"))]
 pub mod splat_native;
 #[cfg(all(feature = "native-splat", target_os = "macos"))]
 pub mod splat_training;
-#[cfg(all(feature = "native-splat", target_os = "macos"))]
-pub mod splat_adam;
 #[cfg(all(feature = "native-splat", target_os = "macos"))]
 pub mod splat_training_pipeline;
 

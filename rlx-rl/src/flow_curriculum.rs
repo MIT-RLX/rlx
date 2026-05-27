@@ -37,7 +37,8 @@ pub fn sample_r_t(
         let dist = t_max - t_min;
 
         let anneal_duration = (anneal_end_step.saturating_sub(warmup_steps)).max(1);
-        let progress = ((step.saturating_sub(warmup_steps)) as f32 / anneal_duration as f32).clamp(0.0, 1.0);
+        let progress =
+            ((step.saturating_sub(warmup_steps)) as f32 / anneal_duration as f32).clamp(0.0, 1.0);
         let max_step_size = if step < warmup_steps { 0.0 } else { progress };
 
         let ri = mid - max_step_size * dist * 0.5;

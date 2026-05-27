@@ -20,14 +20,14 @@
 use crate::device::metal_device;
 use crate::kernels::kernels;
 use rlx_splat::backends::metal_training::{
-    dispatch_training_backward, read_color_alpha_grad, raster_linear_traced_to_vec,
-    GpuTrainingTraceBuffers, SplatRasterBwdParams,
+    GpuTrainingTraceBuffers, SplatRasterBwdParams, dispatch_training_backward,
+    raster_linear_traced_to_vec, read_color_alpha_grad,
 };
 use rlx_splat::core::{Camera, GaussianScene};
 use rlx_splat::reference::{
-    backprop_scene_grads_with_color_alpha_grad, build_training_prepare, linearize_background,
-    prepared_raster_from_training, scene_grads_to_packed, training_forward_from_parts,
-    traces_from_gpu_buffers, SceneGrads, TrainingForward,
+    SceneGrads, TrainingForward, backprop_scene_grads_with_color_alpha_grad,
+    build_training_prepare, linearize_background, prepared_raster_from_training,
+    scene_grads_to_packed, traces_from_gpu_buffers, training_forward_from_parts,
 };
 
 /// GPU trace buffers from forward — reuse in backward (no second raster forward).

@@ -13,7 +13,9 @@ use crate::stage::FlowStage;
 pub fn llama_prefill_layer_fused(layer_idx: usize, spec: LlamaDecoderSpec) -> FlowStage {
     FlowStage::Named {
         name: format!("layer{layer_idx}"),
-        inner: Arc::new(FlowStage::LlamaDecoder(LlamaDecoderStage::layer(layer_idx, spec))),
+        inner: Arc::new(FlowStage::LlamaDecoder(LlamaDecoderStage::layer(
+            layer_idx, spec,
+        ))),
     }
 }
 
@@ -32,7 +34,10 @@ pub fn llama_prefill_layer_composed(layer_idx: usize, spec: LlamaDecoderSpec) ->
         .linear(format!("{prefix}.self_attn.o_proj.weight"), true)
         .residual_add()
         .residual_save()
-        .rms_norm(format!("{prefix}.post_attention_layernorm.weight"), spec.eps)
+        .rms_norm(
+            format!("{prefix}.post_attention_layernorm.weight"),
+            spec.eps,
+        )
         .swiglu_hf_mlp(&prefix)
         .residual_add()
         .build()

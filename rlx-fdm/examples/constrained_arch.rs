@@ -18,9 +18,7 @@
 //! cargo run -p rlx-fdm --example constrained_arch
 //! ```
 
-use rlx_fdm::{
-    constrained_fdm, Constraint, Goal, Network, OptimizeConfig,
-};
+use rlx_fdm::{Constraint, Goal, Network, OptimizeConfig, constrained_fdm};
 
 fn main() {
     let num_segments = 10;

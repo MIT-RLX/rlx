@@ -85,11 +85,8 @@ impl MoeExpertStore {
         if n == 0 {
             return false;
         }
-        let refresh = pools[0].should_refresh(
-            crate::MoEExecMode::Reuse,
-            decode_step,
-            is_prefill_block,
-        );
+        let refresh =
+            pools[0].should_refresh(crate::MoEExecMode::Reuse, decode_step, is_prefill_block);
         if !refresh {
             return false;
         }
@@ -107,10 +104,7 @@ impl MoeExpertStore {
                 &format!("blk.{il}.ffn_gate_exps.weight"),
                 layer.gate.as_slice(),
             );
-            compiled.set_param(
-                &format!("blk.{il}.ffn_up_exps.weight"),
-                layer.up.as_slice(),
-            );
+            compiled.set_param(&format!("blk.{il}.ffn_up_exps.weight"), layer.up.as_slice());
             compiled.set_param(
                 &format!("blk.{il}.ffn_down_exps.weight"),
                 layer.down.as_slice(),
@@ -118,4 +112,3 @@ impl MoeExpertStore {
         }
     }
 }
-

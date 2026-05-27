@@ -3416,8 +3416,12 @@ impl Kernels {
             gather_bwd_acc: pipeline("gather_bwd_acc"),
             gaussian_splat_rasterize: pipeline("gaussian_splat_rasterize"),
             gaussian_splat_rasterize_linear: pipeline("gaussian_splat_rasterize_linear"),
-            gaussian_splat_rasterize_linear_traced: pipeline("gaussian_splat_rasterize_linear_traced"),
-            gaussian_splat_rasterize_backward_linear: pipeline("gaussian_splat_rasterize_backward_linear"),
+            gaussian_splat_rasterize_linear_traced: pipeline(
+                "gaussian_splat_rasterize_linear_traced",
+            ),
+            gaussian_splat_rasterize_backward_linear: pipeline(
+                "gaussian_splat_rasterize_backward_linear",
+            ),
             gaussian_splat_adam_step: pipeline("gaussian_splat_adam_step"),
             gaussian_splat_mse_loss_grad: pipeline("gaussian_splat_mse_loss_grad"),
             gaussian_splat_ssim_stats: pipeline("gaussian_splat_ssim_stats"),
@@ -3427,7 +3431,9 @@ impl Kernels {
             gaussian_splat_scene_grad_projection: pipeline("gaussian_splat_scene_grad_projection"),
             gaussian_splat_splat_color_backward: pipeline("gaussian_splat_splat_color_backward"),
             gaussian_splat_emit_tile_keys: pipeline("gaussian_splat_emit_tile_keys"),
-            gaussian_splat_project_screen_ellipse: pipeline("gaussian_splat_project_screen_ellipse"),
+            gaussian_splat_project_screen_ellipse: pipeline(
+                "gaussian_splat_project_screen_ellipse",
+            ),
             gaussian_splat_emit_tile_keys_conic: pipeline("gaussian_splat_emit_tile_keys_conic"),
             gaussian_splat_bin_histogram: pipeline("gaussian_splat_bin_histogram"),
             gaussian_splat_bin_copy_counts: pipeline("gaussian_splat_bin_copy_counts"),

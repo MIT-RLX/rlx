@@ -69,8 +69,8 @@ pub const GAUSSIAN_SPLAT_PREP_RASTER_PARAMS_FLOATS: usize = 11;
 
 /// Tile count for a framebuffer (matches `rlx_splat::prep_layout::tile_count`).
 pub fn gaussian_splat_tile_count(width: u32, height: u32, tile_size: u32) -> u32 {
-    let tw = (width + tile_size - 1) / tile_size;
-    let th = (height + tile_size - 1) / tile_size;
+    let tw = width.div_ceil(tile_size);
+    let th = height.div_ceil(tile_size);
     tw * th
 }
 

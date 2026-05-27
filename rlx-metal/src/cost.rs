@@ -294,8 +294,6 @@ mod tests {
         assert_eq!(hw.pick_sgemm(8, 16, 16), SgemmVariant::Simd);
         assert_eq!(hw.pick_sgemm(6, 768, 2304), SgemmVariant::SimdPadded);
         assert_eq!(hw.pick_sgemm(6, 7, 7), SgemmVariant::Naive);
-        unsafe {
-            rlx_ir::env::unset("RLX_DISABLE_MPS");
-        }
+        rlx_ir::env::unset("RLX_DISABLE_MPS");
     }
 }

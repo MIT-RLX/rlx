@@ -22,7 +22,11 @@ pub const TRAINING_HIT_META_FLOATS: usize = 6;
 pub fn trace_buffer_sizes(width: u32, height: u32, max_splat_steps: u32) -> (usize, usize, usize) {
     let pixels = (width * height) as usize;
     let cap = max_splat_steps.max(1) as usize;
-    (pixels, pixels * cap, pixels * cap * TRAINING_HIT_META_FLOATS)
+    (
+        pixels,
+        pixels * cap,
+        pixels * cap * TRAINING_HIT_META_FLOATS,
+    )
 }
 
 /// Rebuild per-pixel traces from GPU readback (for geometry backprop on CPU).

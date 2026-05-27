@@ -16,13 +16,13 @@
 
 use anyhow::{Result, bail};
 
-use super::types::{ColmapReconstruction, GaussianInitHyperParams};
 use super::point_tables;
+use super::types::{ColmapReconstruction, GaussianInitHyperParams};
 
 const MIN_SCALE: f32 = 1e-4;
 const INIT_BASE_SCALE_SPACING_RATIO: f32 = 0.25;
 /// `1 / sqrt(12)` — uniform jitter RMS for unit spacing.
-const INIT_JITTER_SPACING_RATIO: f32 = 0.2886751345948129;
+const INIT_JITTER_SPACING_RATIO: f32 = 0.288_675_13;
 const INIT_REPLACEMENT_JITTER_BOOST: f32 = 1.5;
 const INIT_SCALE_JITTER_BASE: f32 = 0.03;
 const INIT_SCALE_JITTER_VARIABILITY: f32 = 0.10;
@@ -81,7 +81,10 @@ fn estimate_point_spacing(points: &[[f32; 3]]) -> (f32, f32) {
 }
 
 /// Suggest init hyperparameters from a point table (Nx3 positions).
-pub fn suggest_points_init_hparams(points: &[[f32; 3]], max_gaussians: i32) -> Result<GaussianInitHyperParams> {
+pub fn suggest_points_init_hparams(
+    points: &[[f32; 3]],
+    max_gaussians: i32,
+) -> Result<GaussianInitHyperParams> {
     if points.is_empty() {
         bail!("point initialization requires a non-empty point table");
     }
@@ -132,13 +135,9 @@ fn resolve_init_hparams(
         return suggested.clone();
     };
     GaussianInitHyperParams {
-        position_jitter_std: over
-            .position_jitter_std
-            .or(suggested.position_jitter_std),
+        position_jitter_std: over.position_jitter_std.or(suggested.position_jitter_std),
         base_scale: over.base_scale.or(suggested.base_scale),
-        scale_jitter_ratio: over
-            .scale_jitter_ratio
-            .or(suggested.scale_jitter_ratio),
+        scale_jitter_ratio: over.scale_jitter_ratio.or(suggested.scale_jitter_ratio),
         initial_opacity: over.initial_opacity.or(suggested.initial_opacity),
         color_jitter_std: over.color_jitter_std.or(suggested.color_jitter_std),
     }
@@ -152,22 +151,24 @@ pub fn suggest_colmap_init_hparams(
 ) -> Result<GaussianInitHyperParams> {
     let (xyz, _) = point_tables(recon, min_track_length);
     if xyz.is_empty() {
-        return Err(anyhow::anyhow!("{}", min_track_length_error(min_track_length)));
+        return Err(anyhow::anyhow!(
+            "{}",
+            min_track_length_error(min_track_length)
+        ));
     }
     let count = xyz.len() / 3;
     let mut points = Vec::with_capacity(count);
     for i in 0..count {
-        let p = [
-            xyz[i * 3],
-            xyz[i * 3 + 1],
-            xyz[i * 3 + 2],
-        ];
+        let p = [xyz[i * 3], xyz[i * 3 + 1], xyz[i * 3 + 2]];
         if p[0].is_finite() && p[1].is_finite() && p[2].is_finite() {
             points.push(p);
         }
     }
     if points.is_empty() {
-        return Err(anyhow::anyhow!("{}", min_track_length_error(min_track_length)));
+        return Err(anyhow::anyhow!(
+            "{}",
+            min_track_length_error(min_track_length)
+        ));
     }
     suggest_points_init_hparams(&points, max_gaussians)
 }
@@ -188,9 +189,7 @@ pub(crate) fn min_track_length_error(min_track_length: i32) -> String {
     if threshold <= 0 {
         "COLMAP reconstruction has no 3D points.".to_string()
     } else {
-        format!(
-            "COLMAP reconstruction has no 3D points observed by at least {threshold} cameras."
-        )
+        format!("COLMAP reconstruction has no 3D points observed by at least {threshold} cameras.")
     }
 }
 

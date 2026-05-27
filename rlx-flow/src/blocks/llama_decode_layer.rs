@@ -2,16 +2,14 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
+use rlx_ir::HirGraphExt;
 use rlx_ir::hir::HirMut;
 use rlx_ir::op::MaskKind;
 use rlx_ir::shape;
-use rlx_ir::HirGraphExt;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
-use crate::weight::WeightSource;
-
 #[derive(Debug, Clone)]
 pub struct LlamaDecodeLayerSpec {
     pub num_heads: usize,
@@ -47,11 +45,7 @@ impl LlamaDecodeLayerStage {
 }
 
 impl BlockStage for LlamaDecodeLayerStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let decode = ctx
             .state
             .decode
@@ -111,7 +105,15 @@ impl BlockStage for LlamaDecodeLayerStage {
             let mask = decode
                 .mask
                 .ok_or_else(|| anyhow::anyhow!("custom mask requested but not bound"))?;
-            gb.attention(q_rope, k_rep, v_rep, mask, spec.num_heads, spec.head_dim, attn_shape)
+            gb.attention(
+                q_rope,
+                k_rep,
+                v_rep,
+                mask,
+                spec.num_heads,
+                spec.head_dim,
+                attn_shape,
+            )
         } else {
             gb.attention_kind(
                 q_rope,

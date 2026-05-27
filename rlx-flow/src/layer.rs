@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use crate::blocks::{
-    GatherAddStage, LayerNormStage, LinearStage, ResidualAddStage, ResidualSaveStage,
-    RmsNormStage, SelfAttnPrefillSpec, SelfAttnPrefillStage, SwiGluStage,
+    GatherAddStage, LayerNormStage, LinearStage, ResidualAddStage, ResidualSaveStage, RmsNormStage,
+    SelfAttnPrefillSpec, SelfAttnPrefillStage, SwiGluStage,
 };
 use crate::stage::FlowStage;
 
@@ -36,8 +36,9 @@ impl LayerStack {
         beta_key: impl Into<String>,
         eps: f32,
     ) -> Self {
-        self.stages
-            .push(FlowStage::LayerNorm(LayerNormStage::new(gamma_key, beta_key, eps)));
+        self.stages.push(FlowStage::LayerNorm(LayerNormStage::new(
+            gamma_key, beta_key, eps,
+        )));
         self
     }
 
@@ -46,8 +47,9 @@ impl LayerStack {
         input_name: impl Into<String>,
         weight_key: impl Into<String>,
     ) -> Self {
-        self.stages
-            .push(FlowStage::GatherAdd(GatherAddStage::new(input_name, weight_key, 0)));
+        self.stages.push(FlowStage::GatherAdd(GatherAddStage::new(
+            input_name, weight_key, 0,
+        )));
         self
     }
 

@@ -17,9 +17,7 @@
 pub use crate::io_format::*;
 
 use crate::core::GaussianScene;
-use crate::graph::scene_graph_inputs;
 use crate::reference::RenderParams;
-use rlx_ir::infer::GraphExt;
 use rlx_ir::ops::splat::GaussianSplatInputs;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
@@ -33,7 +31,11 @@ fn f32_constant(g: &mut Graph, data: &[f32]) -> NodeId {
 }
 
 /// Build [`GaussianSplatInputs`] from host scene buffers and camera meta.
-pub fn scene_host_inputs(g: &mut Graph, scene: &GaussianScene, meta: NodeId) -> GaussianSplatInputs {
+pub fn scene_host_inputs(
+    g: &mut Graph,
+    scene: &GaussianScene,
+    meta: NodeId,
+) -> GaussianSplatInputs {
     GaussianSplatInputs {
         positions: f32_constant(g, &scene.positions),
         scales: f32_constant(g, &scene.scales),

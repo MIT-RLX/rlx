@@ -18,10 +18,10 @@
 //! arXiv:2605.12416 — adapted for black-box **minimization** of `f(x)` with optional
 //! offline reference `x_ref`.
 
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
-use crate::{Bbox, BboSolution};
+use crate::{BboSolution, Bbox};
 
 /// Stability constant for normalized gradient steps (paper κ₁).
 pub const DEFAULT_KAPPA: f64 = 1e-8;
@@ -308,14 +308,7 @@ where
         if n_evals_used >= n_evals {
             break;
         }
-        let x_step = trust_region_q_step(
-            &x_best,
-            &grad,
-            bbox,
-            eta,
-            cfg.eta_scale_width,
-            cfg.kappa,
-        );
+        let x_step = trust_region_q_step(&x_best, &grad, bbox, eta, cfg.eta_scale_width, cfg.kappa);
         let v = f(&x_step);
         n_evals_used += 1;
         if v < best_v {

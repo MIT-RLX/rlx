@@ -12,7 +12,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-use rlx_fdm::{fdm, fdm_with_options, Network, FdmOptions};
+use rlx_fdm::{FdmOptions, Network, fdm, fdm_with_options};
 
 #[test]
 fn edge_follower_load_changes_equilibrium() {
@@ -38,7 +38,7 @@ fn edge_follower_load_changes_equilibrium() {
 fn nonlinear_converges_in_one_step_without_edge_loads() {
     let net = Network::arch_chain(5.0, 10, -1.0, -0.2);
     let once = fdm(&net).expect("once");
-    let mut opts = FdmOptions::nonlinear(20, 1e-8, false);
+    let opts = FdmOptions::nonlinear(20, 1e-8, false);
     let many = fdm_with_options(&net, &opts).expect("many");
     let dz = (once.xyz[3 * 5 + 2] - many.xyz[3 * 5 + 2]).abs();
     assert!(dz < 1e-10, "nodal-only loads: extra iters noop, dz={dz}");

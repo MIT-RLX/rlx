@@ -15,8 +15,8 @@
 //! Constrained form-finding via [`rlx_fdm::constrained_fdm`].
 
 use rlx_fdm::{
-    constrained_fdm, edge_length_error, fdm, network_loadpath, Constraint, Goal, Network,
-    OptimizeConfig, OptimizerKind,
+    Constraint, Goal, Network, OptimizeConfig, OptimizerKind, constrained_fdm, edge_length_error,
+    fdm, network_loadpath,
 };
 
 #[test]
@@ -51,7 +51,10 @@ fn constrained_fdm_reduces_loadpath_goal() {
             <= res.loss_history.first().copied().unwrap_or(0.0) + 1e-6,
         "total loss should not increase over the run"
     );
-    assert!(lp1 <= lp0 + 0.05, "loadpath should not blow up: {lp0} -> {lp1}");
+    assert!(
+        lp1 <= lp0 + 0.05,
+        "loadpath should not blow up: {lp0} -> {lp1}"
+    );
     for &qi in &res.network.q {
         assert!(qi >= -50.0 && qi <= -0.5, "q bounds violated: {qi}");
     }

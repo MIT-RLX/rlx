@@ -16,9 +16,9 @@
 
 use anyhow::{Result, ensure};
 
-use crate::core::math::quaternion_from_rotation_matrix;
-use crate::core::sh::{pad_sh_coeffs, rgb_to_sh0, SUPPORTED_SH_COEFF_COUNT};
 use crate::core::GaussianScene;
+use crate::core::math::quaternion_from_rotation_matrix;
+use crate::core::sh::{SUPPORTED_SH_COEFF_COUNT, pad_sh_coeffs, rgb_to_sh0};
 
 use super::colmap::GaussianInitHyperParams;
 
@@ -33,7 +33,10 @@ pub fn build_scene_from_positions_colors(
     init_hparams: Option<&GaussianInitHyperParams>,
 ) -> Result<GaussianScene> {
     let count = positions.len() / 3;
-    ensure!(count > 0 && colors.len() == count * 3, "position/color count mismatch");
+    ensure!(
+        count > 0 && colors.len() == count * 3,
+        "position/color count mismatch"
+    );
     let mut rng = Rng::new(seed);
     if let Some(h) = init_hparams {
         if let Some(std) = h.position_jitter_std {
@@ -97,11 +100,7 @@ fn median_max_axis(scales: &[f32]) -> f32 {
         return 1.0;
     }
     let mut vals: Vec<f32> = (0..count)
-        .map(|s| {
-            scales[s * 3]
-                .max(scales[s * 3 + 1])
-                .max(scales[s * 3 + 2])
-        })
+        .map(|s| scales[s * 3].max(scales[s * 3 + 1]).max(scales[s * 3 + 2]))
         .collect();
     vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
     vals[vals.len() / 2]
@@ -112,10 +111,7 @@ fn point_local_gaussian_axes(positions: &[f32], count: usize) -> (Vec<f32>, Vec<
         return (Vec::new(), Vec::new());
     }
     if count == 1 {
-        return (
-            vec![MIN_SCALE; 3],
-            vec![1.0, 0.0, 0.0, 0.0],
-        );
+        return (vec![MIN_SCALE; 3], vec![1.0, 0.0, 0.0, 0.0]);
     }
     let (axis_scales, rotation_mats, nearest_scales) =
         point_local_covariance_frames(positions, count, NEIGHBOR_COUNT);
@@ -133,9 +129,21 @@ fn point_local_gaussian_axes(positions: &[f32], count: usize) -> (Vec<f32>, Vec<
         scales[splat * 3 + 1] = clipped[1] * factor;
         scales[splat * 3 + 2] = clipped[2] * factor;
         let rot = [
-            [rotation_mats[splat * 9], rotation_mats[splat * 9 + 1], rotation_mats[splat * 9 + 2]],
-            [rotation_mats[splat * 9 + 3], rotation_mats[splat * 9 + 4], rotation_mats[splat * 9 + 5]],
-            [rotation_mats[splat * 9 + 6], rotation_mats[splat * 9 + 7], rotation_mats[splat * 9 + 8]],
+            [
+                rotation_mats[splat * 9],
+                rotation_mats[splat * 9 + 1],
+                rotation_mats[splat * 9 + 2],
+            ],
+            [
+                rotation_mats[splat * 9 + 3],
+                rotation_mats[splat * 9 + 4],
+                rotation_mats[splat * 9 + 5],
+            ],
+            [
+                rotation_mats[splat * 9 + 6],
+                rotation_mats[splat * 9 + 7],
+                rotation_mats[splat * 9 + 8],
+            ],
         ];
         rotations[splat * 4..splat * 4 + 4].copy_from_slice(&quaternion_from_rotation_matrix(rot));
     }
@@ -157,12 +165,18 @@ fn point_local_covariance_frames(
             .filter(|&j| j != i)
             .map(|j| {
                 let pj = [positions[j * 3], positions[j * 3 + 1], positions[j * 3 + 2]];
-                let d = ((pi[0] - pj[0]).powi(2) + (pi[1] - pj[1]).powi(2) + (pi[2] - pj[2]).powi(2)).sqrt();
+                let d =
+                    ((pi[0] - pj[0]).powi(2) + (pi[1] - pj[1]).powi(2) + (pi[2] - pj[2]).powi(2))
+                        .sqrt();
                 (d, j)
             })
             .collect();
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        nearest_scales[i] = dists.first().map(|d| d.0).unwrap_or(MIN_SCALE).clamp(MIN_SCALE, MAX_SCALE);
+        nearest_scales[i] = dists
+            .first()
+            .map(|d| d.0)
+            .unwrap_or(MIN_SCALE)
+            .clamp(MIN_SCALE, MAX_SCALE);
         let neighbors: Vec<[f32; 3]> = dists
             .iter()
             .take(k)
@@ -262,10 +276,7 @@ impl Rng {
     }
 
     fn next_u32(&mut self) -> u32 {
-        self.state = self
-            .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
         (self.state >> 32) as u32
     }
 

@@ -462,12 +462,7 @@ pub fn leading_flatten_fused_shape(input: &Shape) -> Option<Shape> {
     };
     let leading = &input.dims()[..input.rank() - 1];
     let lead_dim = if leading.iter().all(|d| d.is_static()) {
-        Dim::Static(
-            leading
-                .iter()
-                .map(|d| d.unwrap_static())
-                .product::<usize>(),
-        )
+        Dim::Static(leading.iter().map(|d| d.unwrap_static()).product::<usize>())
     } else {
         let mut syms: Vec<u32> = leading
             .iter()
@@ -479,12 +474,7 @@ pub fn leading_flatten_fused_shape(input: &Shape) -> Option<Shape> {
         syms.sort();
         syms.dedup();
         match syms.len() {
-            0 => Dim::Static(
-                leading
-                    .iter()
-                    .map(|d| d.unwrap_static())
-                    .product::<usize>(),
-            ),
+            0 => Dim::Static(leading.iter().map(|d| d.unwrap_static()).product::<usize>()),
             1 => Dim::Dynamic(syms[0]),
             _ => Dim::Dynamic(crate::dynamic::sym::ROWS),
         }
@@ -538,7 +528,11 @@ pub fn conv2d_spatial_output(
     dilation: usize,
 ) -> usize {
     let dil_k = dilation.saturating_mul(kernel.saturating_sub(1));
-    (in_size + 2 * padding).saturating_sub(dil_k).saturating_sub(1) / stride + 1
+    (in_size + 2 * padding)
+        .saturating_sub(dil_k)
+        .saturating_sub(1)
+        / stride
+        + 1
 }
 
 /// Spatial output size for NCHW `Op::ConvTranspose2d`.
@@ -604,7 +598,9 @@ pub fn conv_transpose2d_output_shape(
     let w_cin = weight.dim(0).unwrap_static();
     let c_out_per_g = weight.dim(1).unwrap_static();
     if w_cin != c_in {
-        return Err(format!("conv_transpose2d weight C_in={w_cin} != input C={c_in}"));
+        return Err(format!(
+            "conv_transpose2d weight C_in={w_cin} != input C={c_in}"
+        ));
     }
     let h_out = conv_transpose2d_spatial_output(
         h,

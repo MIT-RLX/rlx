@@ -17,10 +17,10 @@
 #![cfg(feature = "execute")]
 
 use crate::core::Camera;
-use crate::prep_layout::{pack_prepared, tile_count, unpack_prepared, SPLAT_RASTER_PARAMS_FLOATS};
-use crate::reference::native_prep::{camera_and_background_from_meta, prepare_raster_from_slices};
+use crate::prep_layout::{pack_prepared, unpack_prepared};
 use crate::reference::ProjectedSplats;
-use crate::reference::{backward_packed_arena, rasterize, render_reference, RenderParams};
+use crate::reference::native_prep::{camera_and_background_from_meta, prepare_raster_from_slices};
+use crate::reference::{RenderParams, backward_packed_arena, rasterize, render_reference};
 use rlx_cpu::splat::{
     ArenaPrepareArgs, ArenaRasterizeArgs, ArenaRenderArgs, ArenaRenderBwdArgs, HostBackwardArgs,
     HostRenderArgs,
@@ -228,10 +228,11 @@ unsafe fn execute_gaussian_splat_render_inner(
     max_list_entries: u32,
     base: *mut u8,
 ) {
-    let sl =
-        |off: usize, len: usize| -> &[f32] { std::slice::from_raw_parts((base as *const u8).add(off) as *const f32, len) };
+    let sl = |off: usize, len: usize| -> &[f32] {
+        std::slice::from_raw_parts((base as *const u8).add(off) as *const f32, len)
+    };
     let sl_mut = |off: usize, len: usize| -> &mut [f32] {
-        std::slice::from_raw_parts_mut((base as *mut u8).add(off) as *mut f32, len)
+        std::slice::from_raw_parts_mut(base.add(off) as *mut f32, len)
     };
 
     let image = render_host_slices(
@@ -362,7 +363,6 @@ pub unsafe fn execute_gaussian_splat_prepare(a: ArenaPrepareArgs) {
     let sl = |off: usize, len: usize| -> &[f32] {
         std::slice::from_raw_parts((b as *const u8).add(off) as *const f32, len)
     };
-    let count = a.positions_len / 3;
     let prep = prepare_raster_from_slices(
         sl(a.positions_off, a.positions_len),
         sl(a.scales_off, a.scales_len),
@@ -380,7 +380,7 @@ pub unsafe fn execute_gaussian_splat_prepare(a: ArenaPrepareArgs) {
         a.transmittance_threshold,
         a.max_list_entries,
     );
-    let out = std::slice::from_raw_parts_mut((b as *mut u8).add(a.prep_off) as *mut f32, a.prep_len);
+    let out = std::slice::from_raw_parts_mut(b.add(a.prep_off) as *mut f32, a.prep_len);
     pack_prepared(out, &prep, a.max_list_entries);
 }
 
@@ -391,7 +391,7 @@ pub unsafe fn execute_gaussian_splat_rasterize(a: ArenaRasterizeArgs) {
         std::slice::from_raw_parts((b as *const u8).add(off) as *const f32, len)
     };
     let sl_mut = |off: usize, len: usize| -> &mut [f32] {
-        std::slice::from_raw_parts_mut((b as *mut u8).add(off) as *mut f32, len)
+        std::slice::from_raw_parts_mut(b.add(off) as *mut f32, len)
     };
     let prep = unpack_prepared(
         sl(a.prep_off, a.prep_len),
@@ -430,4 +430,3 @@ pub unsafe fn execute_gaussian_splat_rasterize(a: ArenaRasterizeArgs) {
     assert_eq!(out.len(), image.len());
     out.copy_from_slice(&image);
 }
-

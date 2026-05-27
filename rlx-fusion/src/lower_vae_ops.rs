@@ -99,11 +99,7 @@ fn lower_group_norm(
     eps: f32,
 ) -> NodeId {
     let dtype = out_shape.dtype();
-    let dims: Vec<usize> = out_shape
-        .dims()
-        .iter()
-        .map(|d| d.unwrap_static())
-        .collect();
+    let dims: Vec<usize> = out_shape.dims().iter().map(|d| d.unwrap_static()).collect();
     let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
     let cpg = c / num_groups;
 
@@ -167,7 +163,11 @@ impl Pass for LowerResizeNearest2x {
     }
 
     fn run(&self, graph: Graph) -> Graph {
-        if !graph.nodes().iter().any(|n| matches!(n.op, Op::ResizeNearest2x)) {
+        if !graph
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::ResizeNearest2x))
+        {
             return graph;
         }
 
@@ -219,7 +219,12 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n.op, Op::GroupNorm { .. }))
         );
-        assert!(lowered.nodes().iter().any(|n| matches!(n.op, Op::Reduce { .. })));
+        assert!(
+            lowered
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Reduce { .. }))
+        );
     }
 
     #[test]
@@ -227,11 +232,7 @@ mod tests {
         let f = DType::F32;
         let mut g = Graph::new("up");
         let x = g.input("x", Shape::new(&[1, 2, 2, 2], f));
-        let out = g.add_node(
-            Op::ResizeNearest2x,
-            vec![x],
-            Shape::new(&[1, 2, 4, 4], f),
-        );
+        let out = g.add_node(Op::ResizeNearest2x, vec![x], Shape::new(&[1, 2, 4, 4], f));
         g.set_outputs(vec![out]);
 
         let lowered = LowerResizeNearest2x.run(g);
@@ -241,6 +242,11 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n.op, Op::ResizeNearest2x))
         );
-        assert!(lowered.nodes().iter().any(|n| matches!(n.op, Op::Concat { .. })));
+        assert!(
+            lowered
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Concat { .. }))
+        );
     }
 }

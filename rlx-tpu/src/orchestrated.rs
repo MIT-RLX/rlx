@@ -172,17 +172,13 @@ impl Drop for OrchestratedExecutable {
                         destroy_buffer(ctx, b);
                     }
                     if !executable.is_null() {
-                        use crate::libtpu::{
-                            PJRT_LoadedExecutable_Destroy_Args, error_to_string,
-                        };
+                        use crate::libtpu::{PJRT_LoadedExecutable_Destroy_Args, error_to_string};
                         let mut args = PJRT_LoadedExecutable_Destroy_Args {
                             struct_size: std::mem::size_of::<PJRT_LoadedExecutable_Destroy_Args>(),
                             extension_start: std::ptr::null_mut(),
                             executable: *executable,
                         };
-                        let err = unsafe {
-                            (ctx.runtime.fns.loaded_executable_destroy)(&mut args)
-                        };
+                        let err = unsafe { (ctx.runtime.fns.loaded_executable_destroy)(&mut args) };
                         let _ = unsafe { error_to_string(&ctx.runtime.fns, err) };
                         *executable = std::ptr::null_mut();
                     }
@@ -195,7 +191,7 @@ impl Drop for OrchestratedExecutable {
 fn run_hlo_segment(
     module: &HloModule,
     executable: *mut crate::libtpu::PjrtLoadedExecutable,
-    param_buffers: &mut Vec<*mut crate::libtpu::PjrtBuffer>,
+    param_buffers: &mut [*mut crate::libtpu::PjrtBuffer],
     params_uploaded: &mut bool,
     params: &HashMap<String, Vec<u8>>,
     param_dtypes: &HashMap<String, DType>,
@@ -207,14 +203,10 @@ fn run_hlo_segment(
 
     if !*params_uploaded {
         for (i, name) in module.param_names.iter().enumerate() {
-            let dtype = *param_dtypes
-                .get(name)
-                .unwrap_or(&module.param_dtypes[i]);
+            let dtype = *param_dtypes.get(name).unwrap_or(&module.param_dtypes[i]);
             let dims = module.param_shapes[i].clone();
             let bytes = params.get(name).unwrap_or_else(|| {
-                panic!(
-                    "rlx-tpu: parameter '{name}' was never set; call set_param before run"
-                )
+                panic!("rlx-tpu: parameter '{name}' was never set; call set_param before run")
             });
             param_buffers[i] = upload_buffer(ctx, bytes, dtype, &dims);
         }
@@ -249,16 +241,16 @@ fn run_hlo_segment(
     all_args.extend_from_slice(&input_buffers);
     all_args.extend_from_slice(param_buffers);
     let inner_args_ptr = all_args.as_ptr();
-    let device_args_ptr = std::ptr::from_ref(&inner_args_ptr).cast::<*const *mut crate::libtpu::PjrtBuffer>();
+    let device_args_ptr =
+        std::ptr::from_ref(&inner_args_ptr).cast::<*const *mut crate::libtpu::PjrtBuffer>();
 
     let n_outputs = module.output_lens.len();
-    let mut output_buffers: Vec<*mut crate::libtpu::PjrtBuffer> = vec![std::ptr::null_mut(); n_outputs];
+    let mut output_buffers: Vec<*mut crate::libtpu::PjrtBuffer> =
+        vec![std::ptr::null_mut(); n_outputs];
     let device_outputs_ptr = output_buffers.as_mut_ptr();
     let device_outputs_outer = std::ptr::from_ref(&device_outputs_ptr);
 
-    use crate::libtpu::{
-        PJRT_ExecuteOptions, PJRT_LoadedExecutable_Execute_Args, error_to_string,
-    };
+    use crate::libtpu::{PJRT_ExecuteOptions, PJRT_LoadedExecutable_Execute_Args, error_to_string};
     let exec_options = PJRT_ExecuteOptions {
         struct_size: std::mem::size_of::<PJRT_ExecuteOptions>(),
         extension_start: std::ptr::null_mut(),

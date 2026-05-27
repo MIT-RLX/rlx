@@ -150,11 +150,7 @@ pub fn adam_step_metal(
     cmd.wait_until_completed();
 
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            params_buf.contents() as *const f32,
-            params.as_mut_ptr(),
-            n,
-        );
+        std::ptr::copy_nonoverlapping(params_buf.contents() as *const f32, params.as_mut_ptr(), n);
         let mom_ptr = moments_buf.contents() as *const f32;
         for (i, m) in moments.iter_mut().enumerate() {
             m[0] = *mom_ptr.add(i * 2);

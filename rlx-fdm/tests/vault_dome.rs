@@ -19,8 +19,8 @@
 use std::path::PathBuf;
 
 use rlx_fdm::{
-    constrained_fdm, fdm, io::from_json_str, losses_total, ErrorKind, Goal, Loss, Network,
-    OptimizeConfig, OptimizerKind,
+    ErrorKind, Goal, Loss, Network, OptimizeConfig, OptimizerKind, constrained_fdm, fdm,
+    io::from_json_str, losses_total,
 };
 
 fn arch_network() -> Network {

@@ -122,9 +122,7 @@ pub fn make_parity_scene() -> GaussianScene {
     for i in 0..count {
         rotations[i * 4] = 1.0;
     }
-    let opacities: Vec<f32> = (0..count)
-        .map(|i| 0.25 + 0.5 * (i as f32) / 17.0)
-        .collect();
+    let opacities: Vec<f32> = (0..count).map(|i| 0.25 + 0.5 * (i as f32) / 17.0).collect();
     let colors: Vec<f32> = (0..count)
         .flat_map(|i| {
             let t = i as f32 / 17.0;
@@ -133,13 +131,7 @@ pub fn make_parity_scene() -> GaussianScene {
         .collect();
     let sh_coeffs = vec![0.0f32; count * 3];
     GaussianScene::new(
-        positions,
-        scales,
-        rotations,
-        opacities,
-        colors,
-        sh_coeffs,
-        1,
+        positions, scales, rotations, opacities, colors, sh_coeffs, 1,
     )
 }
 
@@ -171,15 +163,9 @@ pub fn make_scene(count: usize, seed: u64) -> GaussianScene {
         colors[i * 3 + 1] = rng.uniform(0.0, 1.0);
         colors[i * 3 + 2] = rng.uniform(0.0, 1.0);
     }
-    let sh_coeffs = vec![0.0f32; count * 1 * 3];
+    let sh_coeffs = vec![0.0f32; count * 3];
     GaussianScene::new(
-        positions,
-        scales,
-        rotations,
-        opacities,
-        colors,
-        sh_coeffs,
-        1,
+        positions, scales, rotations, opacities, colors, sh_coeffs, 1,
     )
 }
 
@@ -193,10 +179,7 @@ impl LcgRng {
     }
 
     fn next_u32(&mut self) -> u32 {
-        self.state = self
-            .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
         (self.state >> 32) as u32
     }
 

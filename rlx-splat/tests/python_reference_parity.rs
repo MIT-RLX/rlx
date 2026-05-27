@@ -15,8 +15,8 @@
 //! Strict f32 parity vs `slang-splat/tools/parity_baseline.py` → `reference_cpu.py`.
 
 use rlx_splat::{
-    assert_parity_exact, core::make_parity_scene, parity_camera, parity_tiny_render_params,
-    reference::render_reference, PARITY_BACKGROUND,
+    PARITY_BACKGROUND, assert_parity_exact, core::make_parity_scene, parity_camera,
+    parity_tiny_render_params, reference::render_reference,
 };
 
 #[test]
@@ -29,7 +29,10 @@ fn tiny_render_matches_slang_splat_reference_cpu() {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../slang-splat-rs/tools/parity_baseline.py");
     if !root.is_dir() {
-        eprintln!("skip: SLANG_SPLAT_ROOT / sibling slang-splat not found at {}", root.display());
+        eprintln!(
+            "skip: SLANG_SPLAT_ROOT / sibling slang-splat not found at {}",
+            root.display()
+        );
         return;
     }
     if !script.is_file() {
@@ -68,6 +71,9 @@ fn tiny_render_matches_slang_splat_reference_cpu() {
 
     assert_parity_exact(&actual, &expected).unwrap_or_else(|e| {
         let (mad, idx) = rlx_splat::max_abs_diff(&actual, &expected);
-        panic!("{e}; max_abs={mad:.9e} @ {idx} rust={} py={}", actual[idx], expected[idx]);
+        panic!(
+            "{e}; max_abs={mad:.9e} @ {idx} rust={} py={}",
+            actual[idx], expected[idx]
+        );
     });
 }

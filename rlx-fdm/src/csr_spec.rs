@@ -54,10 +54,7 @@ impl CsrAssemblySpec {
             let re = pat.row_ptr[row + 1] as usize;
             for k in rs..re {
                 if pat.col_idx[k] as usize == row {
-                    diag_overrides.push((
-                        k as u32,
-                        edges.iter().map(|&e| e as u32).collect(),
-                    ));
+                    diag_overrides.push((k as u32, edges.iter().map(|&e| e as u32).collect()));
                     break;
                 }
             }

@@ -16,7 +16,7 @@
 //! Constrained form-finding (jax_fdm `constrained_fdm` + GD / L-BFGS).
 
 use crate::constraints::{
-    constraints_grad_xyz_free, constraints_have_nonlinear, constraints_penalty, Constraint,
+    Constraint, constraints_grad_xyz_free, constraints_have_nonlinear, constraints_penalty,
 };
 use crate::equilibrium::{EquilibriumModel, FdmError};
 use crate::implicit::AdjointSolveConfig;
@@ -25,9 +25,9 @@ use crate::loads::LoadState;
 use crate::losses::{Loss, losses_total};
 use crate::mesh::MeshStructure;
 use crate::network::Network;
-use crate::objective::{goals_report, Goal, GoalReport};
-use crate::parameters::{loss_grad_xyz_free, DesignParam, DesignVector};
-use crate::reference::{apply_equilibrium, fdm_with_structure, FdmOptions};
+use crate::objective::{Goal, GoalReport, goals_report};
+use crate::parameters::{DesignParam, DesignVector, loss_grad_xyz_free};
+use crate::reference::{FdmOptions, apply_equilibrium, fdm_with_structure};
 use crate::slsqp::Slsqp;
 use crate::state::EquilibriumState;
 use crate::structure::Structure;
@@ -164,7 +164,12 @@ impl OptWorkspace {
     }
 
     /// Equilibrium at trial `q` with fixed supports / anchor geometry from `network`.
-    pub fn solve_q(&self, q: &[f64], network: &Network, fdm: &FdmOptions) -> Result<EquilibriumState, FdmError> {
+    pub fn solve_q(
+        &self,
+        q: &[f64],
+        network: &Network,
+        fdm: &FdmOptions,
+    ) -> Result<EquilibriumState, FdmError> {
         let mut iterative = fdm.iterative.clone();
         iterative.use_sparse = fdm.sparse;
         EquilibriumModel::equilibrium_with_config(
@@ -181,8 +186,6 @@ impl OptWorkspace {
     pub fn pack_xyz_free(&self, eq: &EquilibriumState) -> Vec<f64> {
         EquilibriumModel::pack_xyz_free(&eq.xyz, &self.structure)
     }
-
-
 }
 
 /// Constrained inverse form-finding: minimize goals subject to soft/hard constraints on `q`.
@@ -198,7 +201,9 @@ pub fn constrained_fdm(
 ) -> Result<OptimizeResult, FdmError> {
     #[cfg(feature = "ir")]
     if config.fuse_mir {
-        if let Some(result) = crate::fuse::try_constrained_fdm_fused(network, goals, constraints, config)? {
+        if let Some(result) =
+            crate::fuse::try_constrained_fdm_fused(network, goals, constraints, config)?
+        {
             return Ok(result);
         }
     }
@@ -241,13 +246,24 @@ pub(crate) fn constrained_fdm_host(
             design.x.len(),
             fdm.sparse
         );
-        if config.force_dense_with_constraints && constraints_have_nonlinear(constraints) && config.fdm.sparse {
+        if config.force_dense_with_constraints
+            && constraints_have_nonlinear(constraints)
+            && config.fdm.sparse
+        {
             eprintln!("  note: jax_fdm uses dense FDM when constraints are active");
         }
     }
 
     let mut eq = solve_equilibrium(&ws, &net, config, &fdm, &mut fused_runner)?;
-    let mut total = eval_total(&loss_terms, constraints, &eq, &ws.structure, &net, mesh, config);
+    let mut total = eval_total(
+        &loss_terms,
+        constraints,
+        &eq,
+        &ws.structure,
+        &net,
+        mesh,
+        config,
+    );
     loss_history.push(total);
 
     let mut lbfgs = Lbfgs::default();
@@ -263,7 +279,8 @@ pub(crate) fn constrained_fdm_host(
         let penalty = constraints_penalty(constraints, &eq, &net.q);
         total = goal_loss + penalty + q_l2_loss(&net.q, config.q_l2_weight);
 
-        let mut loss_grad = loss_grad_xyz_free(&[], &eq, &ws.structure, &net.edges, &net.is_support, mesh);
+        let mut loss_grad =
+            loss_grad_xyz_free(&[], &eq, &ws.structure, &net.edges, &net.is_support, mesh);
         for loss in &loss_terms {
             let lg = loss_grad_xyz_free(
                 &loss.goals,
@@ -373,14 +390,8 @@ pub(crate) fn constrained_fdm_host(
                         let mut trial = net.clone();
                         apply_design(&design, x, &mut trial);
                         let teq = ws.solve(&trial, &fdm).expect("eq grad");
-                        let lg = combined_loss_grad(
-                            &loss_terms,
-                            constraints,
-                            &teq,
-                            &ws,
-                            &trial,
-                            mesh,
-                        );
+                        let lg =
+                            combined_loss_grad(&loss_terms, constraints, &teq, &ws, &trial, mesh);
                         let sub = design
                             .gradient(
                                 &trial,
@@ -407,7 +418,15 @@ pub(crate) fn constrained_fdm_host(
         project_q_constraints(constraints, &mut design, &mut net);
 
         eq = solve_equilibrium(&ws, &net, config, &fdm, &mut fused_runner)?;
-        total = eval_total(&loss_terms, constraints, &eq, &ws.structure, &net, mesh, config);
+        total = eval_total(
+            &loss_terms,
+            constraints,
+            &eq,
+            &ws.structure,
+            &net,
+            mesh,
+            config,
+        );
         loss_history.push(total);
 
         if matches!(opt, OptimizerKind::Lbfgs) {
@@ -460,7 +479,7 @@ fn project_q(q: &mut [f64], constraints: &[Constraint]) {
     }
     for qi in q.iter_mut() {
         if qi.abs() < 1e-4 {
-            *qi = qi.signum().max(-1.0).min(1.0) * 1e-4;
+            *qi = qi.signum().clamp(-1.0, 1.0) * 1e-4;
         }
     }
 }
@@ -535,7 +554,15 @@ fn eval_objective_at(
     let mut trial = net.clone();
     design.apply_x_to_network(x, &mut trial);
     let teq = ws.solve(&trial, fdm).expect("trial equilibrium");
-    eval_total(losses, constraints, &teq, &ws.structure, &trial, mesh, config)
+    eval_total(
+        losses,
+        constraints,
+        &teq,
+        &ws.structure,
+        &trial,
+        mesh,
+        config,
+    )
 }
 
 fn apply_design(design: &DesignVector, x: &[f64], net: &mut Network) {
@@ -572,11 +599,7 @@ fn combined_loss_grad(
     loss_grad
 }
 
-fn project_q_constraints(
-    constraints: &[Constraint],
-    design: &mut DesignVector,
-    net: &mut Network,
-) {
+fn project_q_constraints(constraints: &[Constraint], design: &mut DesignVector, net: &mut Network) {
     design.apply_to_network(net);
     project_q(&mut net.q, constraints);
     design.sync_from_network(net);

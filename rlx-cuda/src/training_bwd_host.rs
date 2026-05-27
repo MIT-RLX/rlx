@@ -24,14 +24,14 @@ fn run_on_arena(
     f: impl FnOnce(*mut u8),
 ) {
     let n_f32 = arena_size_bytes / 4;
-    stream.synchronize().expect("rlx-cuda: training_bwd pre-sync failed");
+    stream
+        .synchronize()
+        .expect("rlx-cuda: training_bwd pre-sync failed");
     let mut host = vec![0f32; n_f32];
     stream
         .memcpy_dtoh(&buffer.slice(..), &mut host)
         .expect("rlx-cuda: training_bwd arena dtoh failed");
-    unsafe {
-        f(host.as_mut_ptr() as *mut u8);
-    }
+    f(host.as_mut_ptr() as *mut u8);
     stream
         .memcpy_htod(&host, &mut buffer.slice_mut(..))
         .expect("rlx-cuda: training_bwd arena htod failed");

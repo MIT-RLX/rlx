@@ -22,16 +22,16 @@
 
 use rlx_ir::OpKind;
 
-use rlx_fusion::limits::FusionLimits;
-use rlx_fusion::fusion::{
-    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm,
-    FuseRmsNormReshape, FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul,
-    MarkElementwiseRegions, UnfuseElementwiseRegions,
-};
+use crate::DeadCodeElimination;
 use rlx_fusion::control_flow::LowerControlFlow;
+use rlx_fusion::fusion::{
+    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
+    FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul, MarkElementwiseRegions,
+    UnfuseElementwiseRegions,
+};
+use rlx_fusion::limits::FusionLimits;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
 use rlx_fusion::pass::Pass;
-use crate::DeadCodeElimination;
 
 /// Compile target that selects a fusion pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,7 @@ pub enum FusionTarget {
 }
 
 /// Per-target fusion toggles (env-driven on Metal today).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FusionOptions {
     /// Skip all pattern fusions (Metal: `RLX_METAL_NO_FUSION`).
     pub skip_fusion: bool,
@@ -54,16 +54,6 @@ pub struct FusionOptions {
     pub unfuse_elementwise_regions: bool,
     /// Caps for fused elementwise chains (encoder / scratch limits).
     pub fusion_limits: FusionLimits,
-}
-
-impl Default for FusionOptions {
-    fn default() -> Self {
-        Self {
-            skip_fusion: false,
-            unfuse_elementwise_regions: false,
-            fusion_limits: FusionLimits::default(),
-        }
-    }
 }
 
 impl FusionOptions {
@@ -101,7 +91,7 @@ pub fn fusion_limits_for_target(target: FusionTarget) -> FusionLimits {
 /// True when `supported` is empty (no claim) or contains `kind`.
 #[inline]
 pub fn supports_op(supported: &[OpKind], kind: OpKind) -> bool {
-    supported.is_empty() || supported.iter().any(|k| *k == kind)
+    supported.is_empty() || supported.contains(&kind)
 }
 
 /// Return the ordered fusion passes allowed for `supported`.
@@ -149,8 +139,8 @@ pub fn fusion_passes_for_supported(
     // Mark eligible element-wise chains. Backends that don't lower
     // ElementwiseRegion natively unfuse immediately afterward.
     passes.push(&MarkElementwiseRegions);
-    let keep_regions = supports_op(supported, OpKind::ElementwiseRegion)
-        && !opts.unfuse_elementwise_regions;
+    let keep_regions =
+        supports_op(supported, OpKind::ElementwiseRegion) && !opts.unfuse_elementwise_regions;
     if !keep_regions {
         passes.push(&UnfuseElementwiseRegions);
     }
@@ -159,10 +149,7 @@ pub fn fusion_passes_for_supported(
 }
 
 /// Return the ordered fusion passes for `target`.
-pub fn fusion_passes(
-    target: FusionTarget,
-    opts: FusionOptions,
-) -> Vec<&'static dyn Pass> {
+pub fn fusion_passes(target: FusionTarget, opts: FusionOptions) -> Vec<&'static dyn Pass> {
     let mut opts = opts;
     if matches!(target, FusionTarget::Cpu) && !opts.unfuse_elementwise_regions {
         opts.unfuse_elementwise_regions = true;

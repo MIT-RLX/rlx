@@ -2,11 +2,11 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 
-use super::attn_mask::ATTN_MASK;
 use super::BlockStage;
+use super::attn_mask::ATTN_MASK;
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
 
@@ -44,7 +44,11 @@ impl VitSelfAttnStage {
         })
     }
 
-    pub fn nomic_vision(layer_prefix: impl Into<String>, hidden_size: usize, num_heads: usize) -> Self {
+    pub fn nomic_vision(
+        layer_prefix: impl Into<String>,
+        hidden_size: usize,
+        num_heads: usize,
+    ) -> Self {
         let p = layer_prefix.into();
         Self::new(VitSelfAttnSpec {
             qkv_weight: format!("{p}.attn.Wqkv.weight"),
@@ -59,11 +63,7 @@ impl VitSelfAttnStage {
 }
 
 impl BlockStage for VitSelfAttnStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let mask = ctx
             .state
             .named

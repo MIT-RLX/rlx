@@ -62,15 +62,7 @@ pub fn run_dequant_matmul_gguf(
     let w_host = arena.read_bytes_range(device, queue, w_byte_off, total_bytes);
 
     let mut out_host = vec![0f32; m * n];
-    rlx_cpu::gguf_matmul::gguf_matmul_bt(
-        &x_host,
-        &w_host,
-        &mut out_host,
-        m,
-        k,
-        n,
-        scheme,
-    );
+    rlx_cpu::gguf_matmul::gguf_matmul_bt(&x_host, &w_host, &mut out_host, m, k, n, scheme);
 
     let out_bytes: Vec<u8> = out_host.iter().flat_map(|v| v.to_le_bytes()).collect();
     arena.write_bytes_range(queue, out_byte_off, &out_bytes);

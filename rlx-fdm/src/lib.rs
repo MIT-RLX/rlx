@@ -50,8 +50,8 @@ pub mod network;
 pub mod objective;
 pub mod optimize;
 pub mod parameters;
-pub mod slsqp;
 pub mod reference;
+pub mod slsqp;
 pub mod solve;
 pub mod sparse;
 pub mod sparse_fast;
@@ -67,57 +67,54 @@ pub mod rlx_op;
 pub mod io;
 
 #[cfg(feature = "ir")]
+pub mod fuse;
+#[cfg(feature = "ir")]
 pub mod graph;
 #[cfg(all(feature = "ir", feature = "rlx-sparse"))]
 pub mod graph_sparse;
 #[cfg(feature = "ir")]
 pub mod mir_opt;
-#[cfg(feature = "ir")]
-pub mod fuse;
 
-pub use equilibrium::{EquilibriumModel, FdmError};
-pub use implicit::{
-    accumulate_dq_from_lambda, accumulate_dxf_from_lambda, grad_loss_wrt_q, grad_loss_wrt_q_fd,
-    grad_loss_wrt_q_fixedpoint, grad_loss_wrt_q_linear, grad_loss_wrt_q_linear_with_solver,
-    grad_loss_wrt_xyz_fixed_linear, AdjointSolveConfig, QGradient, XFixedGradient,
-};
-pub use loads::{
-    transpose_edge_loads_jacobian, transpose_face_loads_jacobian,
-    transpose_face_loads_jacobian_fd,
-};
 pub use constraints::{
-    constraints_grad_xyz_free, constraints_have_nonlinear, constraints_penalty,
-    nonlinear_ineq_values, Constraint,
+    Constraint, constraints_grad_xyz_free, constraints_have_nonlinear, constraints_penalty,
+    nonlinear_ineq_values,
 };
-pub use losses::{losses_total, ErrorKind, Loss};
-pub use parameters::{loss_grad_xyz_free, DesignParam, DesignVector};
-pub use slsqp::Slsqp;
+pub use equilibrium::{EquilibriumModel, FdmError};
+#[cfg(feature = "fuse")]
+pub use fuse::FusedAutodiffFormFinding;
+#[cfg(feature = "ir")]
+pub use fuse::{
+    FusedEquilibriumRunner, FusedMirLoss, can_fuse_equilibrium, try_constrained_fdm_fused,
+};
 pub use goals::{
     edge_length_error, grad_edge_length_error_wrt_xyz_free, grad_mean_edge_length_wrt_xyz_free,
     grad_residual_wrt_xyz_free, mean_edge_length, network_loadpath, total_loadpath_proxy,
 };
-pub use objective::{
-    goals_grad_xyz_free, goals_loss, goals_loss_with_structure, goals_report, CoordAxis, Goal,
-    GoalReport,
+pub use implicit::{
+    AdjointSolveConfig, QGradient, XFixedGradient, accumulate_dq_from_lambda,
+    accumulate_dxf_from_lambda, grad_loss_wrt_q, grad_loss_wrt_q_fd, grad_loss_wrt_q_fixedpoint,
+    grad_loss_wrt_q_linear, grad_loss_wrt_q_linear_with_solver, grad_loss_wrt_xyz_fixed_linear,
+};
+pub use iterative::{
+    IterativeConfig, config_for_implicit_adjoint, equilibrium_iterative,
+    equilibrium_iterative_trajectory,
 };
 pub use lbfgs::Lbfgs;
-pub use optimize::{
-    constrained_fdm, OptWorkspace, OptimizeConfig, OptimizeResult, OptimizerKind,
-};
-#[cfg(feature = "ir")]
-pub use fuse::{
-    can_fuse_equilibrium, try_constrained_fdm_fused, FusedEquilibriumRunner, FusedMirLoss,
-};
-#[cfg(feature = "fuse")]
-pub use fuse::FusedAutodiffFormFinding;
-pub use iterative::{
-    config_for_implicit_adjoint, equilibrium_iterative, equilibrium_iterative_trajectory,
-    IterativeConfig,
-};
 pub use loads::LoadState;
+pub use loads::{
+    transpose_edge_loads_jacobian, transpose_face_loads_jacobian, transpose_face_loads_jacobian_fd,
+};
+pub use losses::{ErrorKind, Loss, losses_total};
 pub use mesh::{MeshStructure, edges_from_faces};
 pub use network::Network;
-pub use reference::{apply_equilibrium, fdm, fdm_with_options, FdmOptions};
+pub use objective::{
+    CoordAxis, Goal, GoalReport, goals_grad_xyz_free, goals_loss, goals_loss_with_structure,
+    goals_report,
+};
+pub use optimize::{OptWorkspace, OptimizeConfig, OptimizeResult, OptimizerKind, constrained_fdm};
+pub use parameters::{DesignParam, DesignVector, loss_grad_xyz_free};
+pub use reference::{FdmOptions, apply_equilibrium, fdm, fdm_with_options};
+pub use slsqp::Slsqp;
 pub use sparse::{SparseStiffness, pattern_fast};
 pub use sparse_fast::SparseStiffnessFast;
 pub use state::EquilibriumState;
@@ -125,25 +122,23 @@ pub use structure::Structure;
 
 #[cfg(feature = "rlx-sparse")]
 pub use csr_spec::CsrAssemblySpec;
-#[cfg(feature = "rlx-sparse")]
-pub use rlx_op::{
-    assemble_csr_values_graph, register_fdm_ops, register_rlx_sparse, FdmCsr, pcg_solve_graph,
-};
 #[cfg(all(feature = "ir", feature = "rlx-sparse"))]
 pub use graph_sparse::{
-    fdm_sparse_pcg_graph, pack_csr_values, use_sparse_pcg_graph, FdmSparsePcgGraph,
-    PcgGraphConfig,
+    FdmSparsePcgGraph, PcgGraphConfig, fdm_sparse_pcg_graph, pack_csr_values, use_sparse_pcg_graph,
+};
+#[cfg(feature = "rlx-sparse")]
+pub use rlx_op::{
+    FdmCsr, assemble_csr_values_graph, pcg_solve_graph, register_fdm_ops, register_rlx_sparse,
 };
 
 #[cfg(feature = "io")]
 pub use io::{
-    from_json_path, from_json_str, merge_mesh, mesh_from_json_path, mesh_from_json_str,
-    to_json_path, to_json_str, MeshDocument,
+    MeshDocument, from_json_path, from_json_str, merge_mesh, mesh_from_json_path,
+    mesh_from_json_str, to_json_path, to_json_str,
 };
 
 #[cfg(feature = "ir")]
 pub use mir_opt::{
-    build_grad_q_custom_fn, goals_grad_wrt_q, set_grad_q_param, FdmEquilibriumGraph, FdmGradMode,
-    FdmGradQSignature,
-    FdmMirOptimizer,
+    FdmEquilibriumGraph, FdmGradMode, FdmGradQSignature, FdmMirOptimizer, build_grad_q_custom_fn,
+    goals_grad_wrt_q, set_grad_q_param,
 };

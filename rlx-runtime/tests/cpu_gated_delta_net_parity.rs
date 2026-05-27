@@ -215,11 +215,7 @@ fn cpu_gated_delta_net_resets_state_between_batches() {
             "batch0 row {i}: multi={m0} single={s0}"
         );
     }
-    for (i, (m1, s0)) in multi_y[nqkv_1..]
-        .iter()
-        .zip(single_y.iter())
-        .enumerate()
-    {
+    for (i, (m1, s0)) in multi_y[nqkv_1..].iter().zip(single_y.iter()).enumerate() {
         assert!(
             (m1 - s0).abs() < 1e-6,
             "batch1 row {i} (should equal batch0): multi={m1} single={s0}"

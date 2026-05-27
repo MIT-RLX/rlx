@@ -7,8 +7,6 @@ use anyhow::Result;
 use rlx_ir::hir::{HirModule, HirNodeId, HirOp};
 
 use crate::context::{DecodeBindings, FlowCtx};
-use crate::weight::WeightSource;
-
 #[derive(Debug, Clone)]
 pub struct BindDecodeInputsStage {
     pub num_layers: usize,

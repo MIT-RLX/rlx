@@ -127,10 +127,7 @@ impl FusionReport {
     }
 
     pub fn missed_swiglu(&self) -> usize {
-        self.missed
-            .iter()
-            .filter(|m| m.pattern == "swiglu")
-            .count()
+        self.missed.iter().filter(|m| m.pattern == "swiglu").count()
     }
 
     pub fn missed_shared_matmul(&self) -> usize {
@@ -241,16 +238,12 @@ fn fusion_hint(reason: &MissReason) -> String {
         MissReason::MultiConsumer => {
             "single-consumer chain required — clone input or use HirOp::LinearFused".into()
         }
-        MissReason::NonAddBiasConsumer => {
-            "use linear+bias or HirModule::linear_fused".into()
-        }
+        MissReason::NonAddBiasConsumer => "use linear+bias or HirModule::linear_fused".into(),
         MissReason::BiasRankTooHigh { .. } => "bias must be rank-1".into(),
         MissReason::UnsupportedEpilogueActivation(_) => {
             "FuseMatMulBiasAct supports Gelu/Silu only".into()
         }
-        MissReason::SharedMatmulCount { .. } => {
-            "use shared_linear_pair or HirOp::SwiGLU".into()
-        }
+        MissReason::SharedMatmulCount { .. } => "use shared_linear_pair or HirOp::SwiGLU".into(),
         MissReason::SwigluGateBeforeUp => "pass up_w before gate_w in swiglu_ffn".into(),
         MissReason::SwigluNotSharedInput => "gate and up must share the same input".into(),
         MissReason::NotFused => "check inspect_pipeline / RLX_FUSION_REPORT=1".into(),
@@ -348,10 +341,7 @@ fn scan_missed_shared_matmul(graph: &Graph) -> Vec<MissedFusion> {
             let b = graph.node(matmuls[1]);
             let w1 = graph.shape(a.inputs[1]);
             let w2 = graph.shape(b.inputs[1]);
-            if w1.rank() == 2
-                && w2.rank() == 2
-                && w1.dim(0) == w2.dim(0)
-            {
+            if w1.rank() == 2 && w2.rank() == 2 && w1.dim(0) == w2.dim(0) {
                 out.push(missed_entry(
                     graph,
                     "shared_input_matmul",
@@ -409,12 +399,7 @@ fn scan_missed_swiglu(graph: &Graph) -> Vec<MissedFusion> {
             .nodes()
             .iter()
             .position(|n| n.id == up_side.id)
-            .zip(
-                graph
-                    .nodes()
-                    .iter()
-                    .position(|n| n.id == gate_mm.id),
-            )
+            .zip(graph.nodes().iter().position(|n| n.id == gate_mm.id))
             .is_some_and(|(up_idx, gate_idx)| gate_idx < up_idx)
         {
             out.push(missed_entry(
@@ -432,8 +417,8 @@ fn scan_missed_swiglu(graph: &Graph) -> Vec<MissedFusion> {
 mod tests {
     use super::*;
     use rlx_ir::DType;
-    use rlx_ir::infer::GraphExt;
     use rlx_ir::Shape;
+    use rlx_ir::infer::GraphExt;
 
     fn f32_shape(dims: &[usize]) -> Shape {
         Shape::new(dims, DType::F32)
@@ -475,9 +460,11 @@ mod tests {
 
         let report = FusionReport::scan(&g);
         assert!(report.missed_swiglu() >= 1);
-        assert!(report
-            .missed
-            .iter()
-            .any(|m| m.reason == MissReason::SwigluGateBeforeUp));
+        assert!(
+            report
+                .missed
+                .iter()
+                .any(|m| m.reason == MissReason::SwigluGateBeforeUp)
+        );
     }
 }

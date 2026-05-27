@@ -14,10 +14,10 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Host-side GGUF K-quant `Op::DequantMatMul` for ROCm device arenas.
 
+use crate::device::RocmContext;
 use crate::hip::HipBuffer;
 use rlx_ir::quant::QuantScheme;
 use std::sync::Arc;
-use crate::device::RocmContext;
 
 pub fn gguf_scheme_id(scheme: QuantScheme) -> u32 {
     match scheme {
@@ -46,11 +46,7 @@ fn dtoh_bytes(rt: &Arc<crate::hip::HipRuntime>, ptr: u64, byte_off: usize, len: 
     let mut words = vec![0f32; end_f32 - start_f32];
     let src = ptr + (start_f32 as u64) * 4;
     unsafe {
-        let _ = (rt.hip_memcpy_dtoh)(
-            words.as_mut_ptr() as *mut _,
-            src,
-            words.len() * 4,
-        );
+        let _ = (rt.hip_memcpy_dtoh)(words.as_mut_ptr() as *mut _, src, words.len() * 4);
     }
     let mut raw = vec![0u8; words.len() * 4];
     for (i, w) in words.iter().enumerate() {
@@ -66,11 +62,7 @@ fn htod_bytes(rt: &Arc<crate::hip::HipRuntime>, ptr: u64, byte_off: usize, data:
     let mut words = vec![0f32; end_f32 - start_f32];
     let src = ptr + (start_f32 as u64) * 4;
     unsafe {
-        let _ = (rt.hip_memcpy_dtoh)(
-            words.as_mut_ptr() as *mut _,
-            src,
-            words.len() * 4,
-        );
+        let _ = (rt.hip_memcpy_dtoh)(words.as_mut_ptr() as *mut _, src, words.len() * 4);
     }
     let mut raw = vec![0u8; words.len() * 4];
     for (i, w) in words.iter().enumerate() {
@@ -82,11 +74,7 @@ fn htod_bytes(rt: &Arc<crate::hip::HipRuntime>, ptr: u64, byte_off: usize, data:
     }
     let dst = ptr + (start_f32 as u64) * 4;
     unsafe {
-        let _ = (rt.hip_memcpy_htod)(
-            dst,
-            words.as_ptr() as *const _,
-            words.len() * 4,
-        );
+        let _ = (rt.hip_memcpy_htod)(dst, words.as_ptr() as *const _, words.len() * 4);
     }
 }
 
@@ -123,15 +111,7 @@ pub fn run_dequant_matmul_gguf(
 
     let w_host = dtoh_bytes(rt, buffer.ptr, w_byte_off, total_bytes);
     let mut out_host = vec![0f32; m * n];
-    rlx_cpu::gguf_matmul::gguf_matmul_bt(
-        &x_host,
-        &w_host,
-        &mut out_host,
-        m,
-        k,
-        n,
-        scheme,
-    );
+    rlx_cpu::gguf_matmul::gguf_matmul_bt(&x_host, &w_host, &mut out_host, m, k, n, scheme);
 
     let out_f32_off = out_byte_off / 4;
     unsafe {
@@ -213,6 +193,11 @@ pub fn run_dequant_grouped_matmul_gguf(
     }
 }
 
-pub fn upload_param_bytes(ctx: &RocmContext, buffer: &mut HipBuffer<f32>, byte_off: usize, data: &[u8]) {
+pub fn upload_param_bytes(
+    ctx: &RocmContext,
+    buffer: &mut HipBuffer<f32>,
+    byte_off: usize,
+    data: &[u8],
+) {
     htod_bytes(&ctx.runtime, buffer.ptr, byte_off, data);
 }

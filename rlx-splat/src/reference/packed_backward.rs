@@ -17,8 +17,8 @@
 use crate::core::Camera;
 
 use super::{
-    backprop_scene_grads_with_color_alpha_grad, rasterize_backward, render_training_forward,
-    RenderParams, SceneGrads, TrainingForward,
+    SceneGrads, TrainingForward, backprop_scene_grads_with_color_alpha_grad, rasterize_backward,
+    render_training_forward,
 };
 
 fn pixel_rgb_grad_from_d_loss_rgba(d_loss_rgba: &[f32], pixel_count: usize) -> Vec<f32> {
@@ -89,7 +89,7 @@ fn f32_at_mut<'a>(base: *mut u8, byte_off: usize, len: usize) -> &'a mut [f32] {
 
 /// Concatenate [`SceneGrads`] into RLX [`unpack_gaussian_splat_packed_grads`] layout.
 pub fn scene_grads_to_packed(grads: &SceneGrads, sh_coeff_count: usize) -> Vec<f32> {
-    let sh_coeff_count = sh_coeff_count.max(1);
+    let _sh_coeff_count = sh_coeff_count.max(1);
     let mut out = Vec::with_capacity(
         grads.positions.len()
             + grads.scales.len()
@@ -185,7 +185,7 @@ pub unsafe fn backward_packed_arena(
             loss_grad_clip,
         )
     } else {
-        let tile_width = (width + tile_size - 1) / tile_size;
+        let tile_width = width.div_ceil(tile_size);
         let forward = render_training_forward(
             &scene,
             &camera,
@@ -284,7 +284,7 @@ pub fn backward_packed_host_slices(
             loss_grad_clip,
         );
     }
-    let tile_width = (width + tile_size - 1) / tile_size;
+    let tile_width = width.div_ceil(tile_size);
     let forward = render_training_forward(
         &scene,
         &camera,

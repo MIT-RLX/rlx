@@ -19,8 +19,8 @@
 //! ```
 
 use rlx_fdm::{
-    apply_equilibrium, edge_length_error, fdm, grad_edge_length_error_wrt_xyz_free,
-    grad_loss_wrt_q, EquilibriumModel, IterativeConfig, Network, Structure,
+    EquilibriumModel, IterativeConfig, Network, Structure, apply_equilibrium, edge_length_error,
+    fdm, grad_edge_length_error_wrt_xyz_free, grad_loss_wrt_q,
 };
 
 fn main() {
@@ -103,7 +103,8 @@ fn main() {
         "inverse design did not reach target length: {final_len}"
     );
     assert!(
-        loss_hist.last().copied().unwrap_or(f64::INFINITY) < loss_hist.first().copied().unwrap_or(0.0),
+        loss_hist.last().copied().unwrap_or(f64::INFINITY)
+            < loss_hist.first().copied().unwrap_or(0.0),
         "loss should decrease"
     );
 }

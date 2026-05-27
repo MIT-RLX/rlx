@@ -82,12 +82,12 @@ impl QuantScheme {
             Self::Int4Block { .. } => 40,
             Self::Fp8E4m3 | Self::Fp8E5m2 => 80,
             // GGUF K-quants: header + per-element bits over a 256-element block.
-            Self::GgufQ4K => 45,  // 144 bytes / 256 elems × 8 = 4.5 bpe
-            Self::GgufQ5K => 55,  // 176 / 256 × 8 ≈ 5.5
-            Self::GgufQ6K => 66,  // 210 / 256 × 8 ≈ 6.5625 → 66 (rounded)
-            Self::GgufQ8K => 91,  // 292 / 256 × 8 ≈ 9.125 → 91
-            Self::GgufQ2K => 26,  // 84 / 256 × 8 ≈ 2.625 → 26
-            Self::GgufQ3K => 34,  // 110 / 256 × 8 ≈ 3.4375 → 34
+            Self::GgufQ4K => 45, // 144 bytes / 256 elems × 8 = 4.5 bpe
+            Self::GgufQ5K => 55, // 176 / 256 × 8 ≈ 5.5
+            Self::GgufQ6K => 66, // 210 / 256 × 8 ≈ 6.5625 → 66 (rounded)
+            Self::GgufQ8K => 91, // 292 / 256 × 8 ≈ 9.125 → 91
+            Self::GgufQ2K => 26, // 84 / 256 × 8 ≈ 2.625 → 26
+            Self::GgufQ3K => 34, // 110 / 256 × 8 ≈ 3.4375 → 34
             Self::Nvfp4Block => 40,
         }
     }
@@ -102,7 +102,9 @@ impl QuantScheme {
     pub const fn has_scale(self) -> bool {
         matches!(
             self,
-            Self::Int8Block { .. } | Self::Int8BlockAsym { .. } | Self::Int4Block { .. }
+            Self::Int8Block { .. }
+                | Self::Int8BlockAsym { .. }
+                | Self::Int4Block { .. }
                 | Self::Nvfp4Block
         )
     }
@@ -129,7 +131,11 @@ impl QuantScheme {
     /// non-GGUF schemes (returns 0).
     pub const fn gguf_block_size(self) -> u32 {
         match self {
-            Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K | Self::GgufQ8K | Self::GgufQ2K
+            Self::GgufQ4K
+            | Self::GgufQ5K
+            | Self::GgufQ6K
+            | Self::GgufQ8K
+            | Self::GgufQ2K
             | Self::GgufQ3K => 256,
             _ => 0,
         }
@@ -155,8 +161,12 @@ impl QuantScheme {
     pub const fn is_gguf(self) -> bool {
         matches!(
             self,
-            Self::GgufQ4K | Self::GgufQ5K | Self::GgufQ6K | Self::GgufQ8K | Self::GgufQ2K
-            | Self::GgufQ3K
+            Self::GgufQ4K
+                | Self::GgufQ5K
+                | Self::GgufQ6K
+                | Self::GgufQ8K
+                | Self::GgufQ2K
+                | Self::GgufQ3K
         )
     }
 }

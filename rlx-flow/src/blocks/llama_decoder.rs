@@ -7,8 +7,6 @@ use rlx_ir::op::MaskKind;
 use super::BlockStage;
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
-use crate::weight::WeightSource;
-
 #[derive(Debug, Clone)]
 pub struct LlamaDecoderStage {
     pub layer_prefix: String,
@@ -45,11 +43,7 @@ pub struct LlamaDecoderSpec {
 }
 
 impl BlockStage for LlamaDecoderStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let lp = &self.layer_prefix;
         let zero_beta = ctx
             .state

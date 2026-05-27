@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
 use rlx_ir::Shape;
+use rlx_ir::hir::HirMut;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
@@ -62,11 +62,7 @@ impl BertEncoderLayerStage {
 }
 
 impl BlockStage for BertEncoderLayerStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let spec = &self.spec;
         let h = spec.hidden_size;
         let nh = spec.num_heads;

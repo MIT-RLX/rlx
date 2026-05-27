@@ -18,7 +18,7 @@
 
 use crate::op::*;
 use crate::shape;
-use crate::{Graph, Node, Shape};
+use crate::{DType, Graph, Node, Shape};
 
 /// Infer the output shape of `node` from its op and input shapes.
 ///
@@ -34,14 +34,14 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::Compare(_) => shape::compare_shape(in_shape(0), in_shape(1)).ok(),
         Op::Where => shape::binary_shape(in_shape(1), in_shape(2)).ok(),
 
-        Op::Activation(_) | Op::ReluBackward | Op::Conjugate | Op::ComplexNormSq => {
+        Op::Activation(_) | Op::ReluBackward | Op::Conjugate => {
             Some(shape::unary_shape(in_shape(0)))
         }
+        Op::ComplexNormSq => Some(Shape::from_dims(in_shape(0).dims(), DType::F32)),
+        Op::ComplexNormSqBackward => Some(shape::unary_shape(in_shape(0))),
         Op::Cast { to } => Some(shape::cast_shape(in_shape(0), *to)),
 
-        Op::Reduce { axes, keep_dim, .. } => {
-            shape::reduce_shape(in_shape(0), axes, *keep_dim).ok()
-        }
+        Op::Reduce { axes, keep_dim, .. } => shape::reduce_shape(in_shape(0), axes, *keep_dim).ok(),
         Op::Softmax { .. } => Some(shape::softmax_shape(in_shape(0))),
         Op::Cumsum { .. } => Some(shape::unary_shape(in_shape(0))),
 
@@ -52,9 +52,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             let inputs: Vec<&Shape> = node.inputs.iter().map(|&id| graph.shape(id)).collect();
             shape::concat_shape(&inputs, *axis).ok()
         }
-        Op::Gather { axis } => {
-            shape::gather_shape(in_shape(0), in_shape(1), *axis).ok()
-        }
+        Op::Gather { axis } => shape::gather_shape(in_shape(0), in_shape(1), *axis).ok(),
         Op::Expand { target_shape } => {
             if target_shape.iter().any(|&d| d < 0) {
                 return None;
@@ -103,9 +101,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::Rope { .. } => Some(shape::unary_shape(in_shape(0))),
         Op::AxialRope2d { .. } => Some(shape::unary_shape(in_shape(0))),
 
-        Op::FusedMatMulBiasAct { .. } => {
-            shape::matmul_shape(in_shape(0), in_shape(1)).ok()
-        }
+        Op::FusedMatMulBiasAct { .. } => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
         Op::FusedSwiGLU { .. } => None,
         Op::FusedResidualLN { .. } | Op::FusedResidualRmsNorm { .. } => {
             Some(shape::unary_shape(in_shape(0)))

@@ -55,7 +55,7 @@ fn main() {
 
     let run = |use_icb: bool, dev: Device| -> Vec<f32> {
         if use_icb {
-            rlx_ir::env::set("RLX_USE_ICB", "1")
+            rlx_ir::env::set("RLX_USE_ICB", "1");
         } else {
             unsafe {
                 rlx_ir::env::unset("RLX_USE_ICB");

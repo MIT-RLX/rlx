@@ -50,7 +50,7 @@ fn main() {
 
     let run_with = |use_mpsgraph: bool| -> Vec<f32> {
         if use_mpsgraph {
-            rlx_ir::env::set("RLX_USE_MPSGRAPH", "1")
+            rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
         } else {
             unsafe {
                 rlx_ir::env::unset("RLX_USE_MPSGRAPH");

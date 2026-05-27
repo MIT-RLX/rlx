@@ -4,9 +4,9 @@
 //! Gated DeltaNet scan — generic op wrapper (Qwen3.5 trunk, …).
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
 use rlx_ir::Shape;
+use rlx_ir::hir::HirMut;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
@@ -39,15 +39,10 @@ impl GdnScanStage {
 }
 
 impl BlockStage for GdnScanStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let slots = ctx
             .state
             .gdn
-            .clone()
             .ok_or_else(|| anyhow::anyhow!("GdnScan requires gdn inputs in FlowState"))?;
         let carry_state = if self.carry_state {
             let key = self

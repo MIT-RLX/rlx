@@ -47,7 +47,10 @@ pub fn build_training_frames_from_root_with_options(
 ) -> Result<Vec<ColmapFrame>> {
     let images_root = images_root.as_ref().canonicalize().context("images root")?;
     if !images_root.is_dir() {
-        bail!("COLMAP image directory does not exist: {}", images_root.display());
+        bail!(
+            "COLMAP image directory does not exist: {}",
+            images_root.display()
+        );
     }
     let selected: std::collections::HashSet<i32> = selected_camera_ids.iter().copied().collect();
     let mut frames = Vec::new();
@@ -80,12 +83,7 @@ pub fn build_training_frames(
     recon: &ColmapReconstruction,
     images_subdir: &str,
 ) -> Result<Vec<ColmapFrame>> {
-    build_training_frames_with_options(
-        recon,
-        images_subdir,
-        FrameDownscaleConfig::default(),
-        &[],
-    )
+    build_training_frames_with_options(recon, images_subdir, FrameDownscaleConfig::default(), &[])
 }
 
 pub fn build_training_frames_with_options(
@@ -95,7 +93,13 @@ pub fn build_training_frames_with_options(
     selected_camera_ids: &[i32],
 ) -> Result<Vec<ColmapFrame>> {
     let roots: Vec<PathBuf> = std::iter::once(recon.root.clone())
-        .chain(std::iter::once(recon.sparse_dir.parent().unwrap_or(&recon.root).to_path_buf()))
+        .chain(std::iter::once(
+            recon
+                .sparse_dir
+                .parent()
+                .unwrap_or(&recon.root)
+                .to_path_buf(),
+        ))
         .collect();
     let subdirs: Vec<&str> = if images_subdir == "images_4" {
         vec!["images_4", "images", "."]
@@ -133,8 +137,7 @@ fn build_training_frame(
 ) -> Result<ColmapFrame> {
     let reader = ImageReader::open(image_path)?;
     let (src_width, src_height) = reader.into_dimensions()?;
-    let (width, height) =
-        resolve_training_frame_image_size(src_width, src_height, downscale)?;
+    let (width, height) = resolve_training_frame_image_size(src_width, src_height, downscale)?;
     let sx = width as f64 / camera.width as f64;
     let sy = height as f64 / camera.height as f64;
     Ok(ColmapFrame {
@@ -171,7 +174,8 @@ pub fn initialize_scene_from_colmap_points(
     if xyz.is_empty() {
         bail!("{}", min_track_length_error(min_track_length));
     }
-    let resolved = resolve_colmap_init_hparams(recon, max_gaussians, init_hparams, min_track_length)?;
+    let resolved =
+        resolve_colmap_init_hparams(recon, max_gaussians, init_hparams, min_track_length)?;
     let count = xyz.len() / 3;
     let chosen = if max_gaussians <= 0 {
         count

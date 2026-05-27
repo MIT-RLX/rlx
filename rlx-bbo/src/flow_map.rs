@@ -18,7 +18,7 @@ use crate::Bbox;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::trajectory::{diagonal_flow_pairs, load_jsonl, TrajectoryRecord};
+use crate::trajectory::{TrajectoryRecord, diagonal_flow_pairs, load_jsonl};
 
 /// One-step flow map X_{0,1}(a₀) = a₀ + W·a₀ + b (linear MVP analogue).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,7 +113,11 @@ pub fn train_from_jsonl(
         let mut err = 0.0;
         let mut n = 0usize;
         for (a1, v_star) in pairs {
-            if let Some(a0) = recs.iter().find(|r| r.action == a1).and_then(|r| r.noise.clone()) {
+            if let Some(a0) = recs
+                .iter()
+                .find(|r| r.action == a1)
+                .and_then(|r| r.noise.clone())
+            {
                 let pred = fm.one_step(&a0);
                 for d in 0..v_star.len().min(pred.len()).min(a0.len()) {
                     let v_pred = pred[d] - a0[d];
@@ -128,7 +132,8 @@ pub fn train_from_jsonl(
 }
 
 pub fn save_flow_map(path: &Path, fm: &LinearFlowMap) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(fm).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_string_pretty(fm)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(path, json)
 }
 

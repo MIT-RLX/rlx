@@ -66,4 +66,3 @@ impl<S: BlockStage + Send + Sync> LayerStage for BlockAsLayer<S> {
         ))
     }
 }
-

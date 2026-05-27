@@ -14,11 +14,11 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Cached training forward avoids a second forward inside backward.
 
+use rlx_splat::core::{Camera, GaussianScene};
 use rlx_splat::reference::{
     backward_packed_from_training_forward, backward_packed_host_slices,
     clear_training_forward_cache, render_training_forward, set_training_forward_cache,
 };
-use rlx_splat::core::{Camera, GaussianScene};
 
 #[test]
 fn cached_backward_matches_rerun_forward() {
@@ -32,7 +32,14 @@ fn cached_backward_matches_rerun_forward() {
         vec![0.0; 6],
         1,
     );
-    let camera = Camera::look_at([0.0, 0.0, 4.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 60.0, 0.1, 20.0);
+    let camera = Camera::look_at(
+        [0.0, 0.0, 4.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        60.0,
+        0.1,
+        20.0,
+    );
     let background = [0.1, 0.15, 0.2];
     let width = 32u32;
     let height = 32u32;
@@ -89,7 +96,31 @@ fn cached_backward_matches_rerun_forward() {
         &scene.opacities,
         &scene.colors,
         &scene.sh_coeffs,
-        &[camera.position[0], camera.position[1], camera.position[2], camera.target[0], camera.target[1], camera.target[2], camera.up[0], camera.up[1], camera.up[2], camera.fov_y_degrees, camera.near, camera.far, background[0], background[1], background[2], width as f32, height as f32, tile_size as f32, 1.6, 1.0 / 255.0, 8.0, 0.01, (32 * 32 * 16) as f32],
+        &[
+            camera.position[0],
+            camera.position[1],
+            camera.position[2],
+            camera.target[0],
+            camera.target[1],
+            camera.target[2],
+            camera.up[0],
+            camera.up[1],
+            camera.up[2],
+            camera.fov_y_degrees,
+            camera.near,
+            camera.far,
+            background[0],
+            background[1],
+            background[2],
+            width as f32,
+            height as f32,
+            tile_size as f32,
+            1.6,
+            1.0 / 255.0,
+            8.0,
+            0.01,
+            (32 * 32 * 16) as f32,
+        ],
         &d_loss,
         width,
         height,
@@ -112,7 +143,31 @@ fn cached_backward_matches_rerun_forward() {
         &scene.opacities,
         &scene.colors,
         &scene.sh_coeffs,
-        &[camera.position[0], camera.position[1], camera.position[2], camera.target[0], camera.target[1], camera.target[2], camera.up[0], camera.up[1], camera.up[2], camera.fov_y_degrees, camera.near, camera.far, background[0], background[1], background[2], width as f32, height as f32, tile_size as f32, 1.6, 1.0 / 255.0, 8.0, 0.01, (32 * 32 * 16) as f32],
+        &[
+            camera.position[0],
+            camera.position[1],
+            camera.position[2],
+            camera.target[0],
+            camera.target[1],
+            camera.target[2],
+            camera.up[0],
+            camera.up[1],
+            camera.up[2],
+            camera.fov_y_degrees,
+            camera.near,
+            camera.far,
+            background[0],
+            background[1],
+            background[2],
+            width as f32,
+            height as f32,
+            tile_size as f32,
+            1.6,
+            1.0 / 255.0,
+            8.0,
+            0.01,
+            (32 * 32 * 16) as f32,
+        ],
         &d_loss,
         width,
         height,
@@ -130,7 +185,10 @@ fn cached_backward_matches_rerun_forward() {
     assert_eq!(cached.len(), via_cache.len());
     assert_eq!(cached.len(), rerun.len());
     for (a, b) in cached.iter().zip(&via_cache) {
-        assert_eq!(a, b, "cached host backward must match direct cached backward");
+        assert_eq!(
+            a, b,
+            "cached host backward must match direct cached backward"
+        );
     }
     for (a, b) in cached.iter().zip(&rerun) {
         assert!(

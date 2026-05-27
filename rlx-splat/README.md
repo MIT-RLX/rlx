@@ -43,7 +43,7 @@ g.set_outputs(vec![rgba]);
 let out = Session::new(Device::Cpu).compile(g).run(&bindings);
 ```
 
-Example: `cargo run -p rlx-splat --example decomposed_session --features test-support`
+Example: `cargo run -p rlx-runtime --example splat_decomposed_session --features cpu`
 
 Packed prepare size is shared with the IR:
 

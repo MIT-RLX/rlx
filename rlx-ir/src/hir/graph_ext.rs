@@ -122,8 +122,7 @@ pub trait HirGraphExt {
         groups: usize,
         out_shape: Shape,
     ) -> HirNodeId;
-    fn rms_norm(&mut self, x: HirNodeId, gamma: HirNodeId, beta: HirNodeId, eps: f32)
-        -> HirNodeId;
+    fn rms_norm(&mut self, x: HirNodeId, gamma: HirNodeId, beta: HirNodeId, eps: f32) -> HirNodeId;
 
     fn sum(&mut self, x: HirNodeId, axes: Vec<usize>, keep_dim: bool) -> HirNodeId;
     fn mean(&mut self, x: HirNodeId, axes: Vec<usize>, keep_dim: bool) -> HirNodeId;
@@ -159,8 +158,7 @@ pub trait HirGraphExt {
         shape: Shape,
     ) -> HirNodeId;
 
-    fn rope(&mut self, x: HirNodeId, cos: HirNodeId, sin: HirNodeId, head_dim: usize)
-        -> HirNodeId;
+    fn rope(&mut self, x: HirNodeId, cos: HirNodeId, sin: HirNodeId, head_dim: usize) -> HirNodeId;
     fn rope_n(
         &mut self,
         x: HirNodeId,
@@ -234,86 +232,49 @@ impl HirGraphExt for HirMut<'_> {
 
     fn gelu(&mut self, x: HirNodeId) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::Activation(Activation::Gelu),
-            vec![x],
-            s,
-        )
+        self.0.mir(Op::Activation(Activation::Gelu), vec![x], s)
     }
 
     fn gelu_approx(&mut self, x: HirNodeId) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::Activation(Activation::GeluApprox),
-            vec![x],
-            s,
-        )
+        self.0
+            .mir(Op::Activation(Activation::GeluApprox), vec![x], s)
     }
 
     fn silu(&mut self, x: HirNodeId) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::Activation(Activation::Silu),
-            vec![x],
-            s,
-        )
+        self.0.mir(Op::Activation(Activation::Silu), vec![x], s)
     }
 
     fn relu(&mut self, x: HirNodeId) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::Activation(Activation::Relu),
-            vec![x],
-            s,
-        )
+        self.0.mir(Op::Activation(Activation::Relu), vec![x], s)
     }
 
     fn exp(&mut self, x: HirNodeId) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::Activation(Activation::Exp),
-            vec![x],
-            s,
-        )
+        self.0.mir(Op::Activation(Activation::Exp), vec![x], s)
     }
 
     fn sqrt(&mut self, x: HirNodeId) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::Activation(Activation::Sqrt),
-            vec![x],
-            s,
-        )
+        self.0.mir(Op::Activation(Activation::Sqrt), vec![x], s)
     }
 
     fn neg(&mut self, x: HirNodeId) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::Activation(Activation::Neg),
-            vec![x],
-            s,
-        )
+        self.0.mir(Op::Activation(Activation::Neg), vec![x], s)
     }
 
     fn tanh(&mut self, x: HirNodeId) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::Activation(Activation::Tanh),
-            vec![x],
-            s,
-        )
+        self.0.mir(Op::Activation(Activation::Tanh), vec![x], s)
     }
 
     fn ln(&mut self, x: HirNodeId, gamma: HirNodeId, beta: HirNodeId, eps: f32) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::LayerNorm {
-                axis: -1,
-                eps,
-            },
-            vec![x, gamma, beta],
-            s,
-        )
+        self.0
+            .mir(Op::LayerNorm { axis: -1, eps }, vec![x, gamma, beta], s)
     }
 
     fn group_norm(
@@ -325,11 +286,8 @@ impl HirGraphExt for HirMut<'_> {
         eps: f32,
     ) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::GroupNorm { num_groups, eps },
-            vec![x, gamma, beta],
-            s,
-        )
+        self.0
+            .mir(Op::GroupNorm { num_groups, eps }, vec![x, gamma, beta], s)
     }
 
     fn layer_norm2d(
@@ -406,19 +364,10 @@ impl HirGraphExt for HirMut<'_> {
         )
     }
 
-    fn rms_norm(
-        &mut self,
-        x: HirNodeId,
-        gamma: HirNodeId,
-        beta: HirNodeId,
-        eps: f32,
-    ) -> HirNodeId {
+    fn rms_norm(&mut self, x: HirNodeId, gamma: HirNodeId, beta: HirNodeId, eps: f32) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
-        self.0.mir(
-            Op::RmsNorm { axis: -1, eps },
-            vec![x, gamma, beta],
-            s,
-        )
+        self.0
+            .mir(Op::RmsNorm { axis: -1, eps }, vec![x, gamma, beta], s)
     }
 
     fn sum(&mut self, x: HirNodeId, axes: Vec<usize>, keep_dim: bool) -> HirNodeId {
@@ -466,11 +415,7 @@ impl HirGraphExt for HirMut<'_> {
 
     fn narrow_(&mut self, x: HirNodeId, axis: usize, start: usize, len: usize) -> HirNodeId {
         let s = shape::narrow_shape(self.shape(x), axis, len).expect("narrow shape inference");
-        self.0.mir(
-            Op::Narrow { axis, start, len },
-            vec![x],
-            s,
-        )
+        self.0.mir(Op::Narrow { axis, start, len }, vec![x], s)
     }
 
     fn concat_(&mut self, inputs: Vec<HirNodeId>, axis: usize) -> HirNodeId {
@@ -487,20 +432,12 @@ impl HirGraphExt for HirMut<'_> {
 
     fn eq(&mut self, lhs: HirNodeId, rhs: HirNodeId) -> HirNodeId {
         let s = shape::binary_shape(self.shape(lhs), self.shape(rhs)).expect("eq shape inference");
-        self.0.mir(
-            Op::Compare(CmpOp::Eq),
-            vec![lhs, rhs],
-            s,
-        )
+        self.0.mir(Op::Compare(CmpOp::Eq), vec![lhs, rhs], s)
     }
 
     fn lt(&mut self, lhs: HirNodeId, rhs: HirNodeId) -> HirNodeId {
         let s = shape::binary_shape(self.shape(lhs), self.shape(rhs)).expect("lt shape inference");
-        self.0.mir(
-            Op::Compare(CmpOp::Lt),
-            vec![lhs, rhs],
-            s,
-        )
+        self.0.mir(Op::Compare(CmpOp::Lt), vec![lhs, rhs], s)
     }
 
     fn attention_(

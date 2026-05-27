@@ -17,7 +17,7 @@
 use rand::SeedableRng;
 
 use crate::q_guidance::{eta_eff_twin, finite_diff_grad, trust_region_q_step};
-use crate::{Bbox, BboSolution, QSteerConfig};
+use crate::{BboSolution, Bbox, QSteerConfig};
 
 /// Q-steered search with twin objectives: `cheap` (e.g. prescreen) and `expensive` (e.g. ngspice).
 ///
@@ -69,11 +69,7 @@ where
         } else {
             finite_diff_grad(&mut expensive, &x_best, bbox, cfg.fd_eps_frac)
         };
-        if !prescreen_grad {
-            n_evals_used += x_best.len().saturating_mul(2);
-        } else {
-            n_evals_used += x_best.len().saturating_mul(2);
-        }
+        n_evals_used += x_best.len().saturating_mul(2);
 
         let q_cheap = cheap(&x_best);
         let q_exp = expensive(&x_best);
@@ -84,14 +80,7 @@ where
         if n_evals_used >= n_evals {
             break;
         }
-        let x_step = trust_region_q_step(
-            &x_best,
-            &grad,
-            bbox,
-            eta,
-            cfg.eta_scale_width,
-            cfg.kappa,
-        );
+        let x_step = trust_region_q_step(&x_best, &grad, bbox, eta, cfg.eta_scale_width, cfg.kappa);
         let v = expensive(&x_step);
         n_evals_used += 1;
         if v < best_v {

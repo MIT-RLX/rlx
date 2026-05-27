@@ -15,8 +15,8 @@
 //! Gradients w.r.t. support (fixed) coordinates.
 
 use rlx_fdm::{
-    grad_loss_wrt_q_fd, grad_loss_wrt_xyz_fixed_linear, AdjointSolveConfig, EquilibriumModel,
-    IterativeConfig, Network, Structure,
+    AdjointSolveConfig, EquilibriumModel, IterativeConfig, Network, Structure, grad_loss_wrt_q_fd,
+    grad_loss_wrt_xyz_fixed_linear,
 };
 
 #[test]
@@ -34,8 +34,7 @@ fn grad_wrt_support_z_matches_fd() {
     let nf = s.num_free();
     let mut loss_grad = vec![0.0; nf * 3];
     loss_grad[2] = 1.0;
-    let xyz_free =
-        EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("x");
+    let xyz_free = EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("x");
 
     let analytic = grad_loss_wrt_xyz_fixed_linear(
         &net.q,

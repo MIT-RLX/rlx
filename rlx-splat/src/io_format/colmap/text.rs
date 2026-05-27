@@ -128,7 +128,10 @@ pub fn load_images_txt(path: &Path) -> Result<BTreeMap<i32, ColmapImage>> {
         let (points2d_xy, points2d_point3d_ids) = if point_tokens.is_empty() {
             (Vec::new(), Vec::new())
         } else {
-            ensure!(point_tokens.len() % 3 == 0, "malformed observation line");
+            ensure!(
+                point_tokens.len().is_multiple_of(3),
+                "malformed observation line"
+            );
             let mut xy = Vec::new();
             let mut ids = Vec::new();
             for chunk in point_tokens.chunks(3) {
@@ -164,11 +167,7 @@ pub fn load_points3d_txt(path: &Path) -> Result<BTreeMap<u64, ColmapPoint3D>> {
         let tokens: Vec<&str> = trimmed.split_whitespace().collect();
         ensure!(tokens.len() >= 8, "malformed points3D.txt line");
         let point_id: u64 = tokens[0].parse()?;
-        let xyz = [
-            tokens[1].parse()?,
-            tokens[2].parse()?,
-            tokens[3].parse()?,
-        ];
+        let xyz = [tokens[1].parse()?, tokens[2].parse()?, tokens[3].parse()?];
         let rgb = [
             tokens[4].parse::<u8>()? as f32 / 255.0,
             tokens[5].parse::<u8>()? as f32 / 255.0,
@@ -176,7 +175,7 @@ pub fn load_points3d_txt(path: &Path) -> Result<BTreeMap<u64, ColmapPoint3D>> {
         ];
         let error: f64 = tokens[7].parse()?;
         let track_tokens = &tokens[8..];
-        ensure!(track_tokens.len() % 2 == 0, "malformed track");
+        ensure!(track_tokens.len().is_multiple_of(2), "malformed track");
         points.insert(
             point_id,
             ColmapPoint3D {

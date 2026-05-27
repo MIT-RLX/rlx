@@ -180,8 +180,7 @@ impl MetalExecutable {
             if verbose {
                 eprintln!(
                     "[rlx-metal] fusion: {} → {} nodes",
-                    compile_result.fusion.nodes_before,
-                    compile_result.fusion.nodes_after
+                    compile_result.fusion.nodes_before, compile_result.fusion.nodes_after
                 );
             }
             compile_result.lir.into_graph()
@@ -351,9 +350,8 @@ impl MetalExecutable {
             && rlx_ir::env::is_unset("RLX_DISABLE_MPSGRAPH")
             && rlx_ir::env::is_unset("RLX_DISABLE_MPSGRAPH_HYBRID")
         {
-            crate::mps_graph_hybrid::build_hybrid_plan(&fused, None).filter(|steps| {
-                crate::mps_graph_hybrid::hybrid_has_mps(steps)
-            })
+            crate::mps_graph_hybrid::build_hybrid_plan(&fused, None)
+                .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps))
         } else {
             None
         };
@@ -459,9 +457,8 @@ impl MetalExecutable {
                     continue;
                 }
                 let off = self.arena.byte_offset(*id);
-                let bytes: Vec<u8> = unsafe {
-                    std::slice::from_raw_parts(arena_ptr.add(off), len_bytes).to_vec()
-                };
+                let bytes: Vec<u8> =
+                    unsafe { std::slice::from_raw_parts(arena_ptr.add(off), len_bytes).to_vec() };
                 param_bytes.insert(name.clone(), bytes);
                 continue;
             }
@@ -480,10 +477,8 @@ impl MetalExecutable {
                 continue;
             }
             let off = self.arena.byte_offset(*id);
-            let u8_slice: &[u8] =
-                unsafe { std::slice::from_raw_parts(arena_ptr.add(off), u8_len) };
-            let dequant =
-                rlx_cpu::dequant_cache::gguf_weight_f32(off, u8_slice, k, n, scheme);
+            let u8_slice: &[u8] = unsafe { std::slice::from_raw_parts(arena_ptr.add(off), u8_len) };
+            let dequant = rlx_cpu::dequant_cache::gguf_weight_f32(off, u8_slice, k, n, scheme);
             let kn_bytes = transpose_nk_to_kn_bytes(&dequant, n, k);
             param_bytes.insert(name.clone(), kn_bytes);
         }
@@ -491,27 +486,27 @@ impl MetalExecutable {
         // Re-run lowering with the params marked as constants. Old
         // plan is dropped, which releases the old executable and
         // cached arrays.
-        let new_plan = crate::mps_graph_lower::try_lower_with_constants(
-            &self.graph,
-            Some(&param_bytes),
-        );
+        let new_plan =
+            crate::mps_graph_lower::try_lower_with_constants(&self.graph, Some(&param_bytes));
         if let Some(plan) = new_plan {
             self.mps_plan = Some(plan);
             self.mps_hybrid = None;
             // Re-bind the (now much smaller) feed list to the arena.
             self.bind_mps_executable_to_arena();
         } else if self.mps_plan.is_none() {
-            self.mps_hybrid = crate::mps_graph_hybrid::build_hybrid_plan(
-                &self.graph,
-                Some(&param_bytes),
-            )
-            .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps));
+            self.mps_hybrid =
+                crate::mps_graph_hybrid::build_hybrid_plan(&self.graph, Some(&param_bytes))
+                    .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps));
         }
     }
 
     fn bind_mps_executable_to_arena(&mut self) {
-        let Some(plan) = self.mps_plan.as_mut() else { return };
-        let Some(exec) = plan.executable.as_mut() else { return };
+        let Some(plan) = self.mps_plan.as_mut() else {
+            return;
+        };
+        let Some(exec) = plan.executable.as_mut() else {
+            return;
+        };
         let arena_buf = &self.arena.buffer;
 
         let mut feed_buffers: Vec<&metal::Buffer> = Vec::new();
@@ -1114,7 +1109,15 @@ impl MetalExecutable {
                             n,
                         } => unsafe {
                             rlx_cpu::thunk::execute_dequant_matmul_nvfp4_f32(
-                                x, w_q, scale, global_scale, dst, m, k, n, arena_ptr,
+                                x,
+                                w_q,
+                                scale,
+                                global_scale,
+                                dst,
+                                m,
+                                k,
+                                n,
+                                arena_ptr,
                             );
                         },
                     }
@@ -1273,10 +1276,8 @@ impl MetalExecutable {
                         Some(Activation::Silu) => crate::blas::FusedAct::Silu,
                         _ => crate::blas::FusedAct::None,
                     };
-                    let kernel_applies_act = matches!(
-                        act,
-                        Some(Activation::Gelu) | Some(Activation::Silu)
-                    );
+                    let kernel_applies_act =
+                        matches!(act, Some(Activation::Gelu) | Some(Activation::Silu));
                     let m_scaled = scale(*m);
                     if m_scaled == 0 {
                         continue;
@@ -1730,8 +1731,8 @@ impl MetalExecutable {
                         cmd_buf.commit();
                         cmd_buf.wait_until_completed();
                         let arena_ptr = self.arena.buffer.contents() as *mut u8;
-                        let lhs_len_in = inferred_input_len(&lhs_strides, &out_dims);
-                        let rhs_len_in = inferred_input_len(&rhs_strides, &out_dims);
+                        let lhs_len_in = inferred_input_len(lhs_strides, out_dims);
+                        let rhs_len_in = inferred_input_len(rhs_strides, out_dims);
                         unsafe {
                             binary_broadcast_host::<half::f16>(
                                 arena_ptr.add(*lhs) as *const half::f16,
@@ -1929,10 +1930,7 @@ impl MetalExecutable {
                             std::slice::from_raw_parts(base.add(byte_off) as *const f32, len)
                         };
                         let f32_at_mut = |byte_off: usize, len: usize| -> &mut [f32] {
-                            std::slice::from_raw_parts_mut(
-                                base.add(byte_off) as *mut f32,
-                                len,
-                            )
+                            std::slice::from_raw_parts_mut(base.add(byte_off) as *mut f32, len)
                         };
                         let q_data = f32_at(*q, q_len);
                         let k_data = f32_at(*kk, k_len);
@@ -3016,8 +3014,7 @@ impl MetalExecutable {
                     // and a Bluestein Metal kernel would be its own
                     // future PR. Set RLX_METAL_FFT_HOST_FALLBACK=1 to
                     // force the host path for debugging.
-                    let force_host =
-                        rlx_ir::env::flag("RLX_METAL_FFT_HOST_FALLBACK");
+                    let force_host = rlx_ir::env::flag("RLX_METAL_FFT_HOST_FALLBACK");
                     let n = *n_complex as usize;
                     let can_native = !force_host
                         && matches!(dtype, rlx_ir::DType::F32)
@@ -3104,10 +3101,8 @@ impl MetalExecutable {
                 } => {
                     // Native MSL kernel supports f32 with n ≤ 128 (qwen35 uses 128).
                     // f16 tensors and RLX_METAL_GDN_HOST_FALLBACK=1 use the CPU path.
-                    let force_host =
-                        rlx_ir::env::flag("RLX_METAL_GDN_HOST_FALLBACK");
-                    let prefer_cpu_blas =
-                        !rlx_ir::env::flag("RLX_METAL_GDN_GPU");
+                    let force_host = rlx_ir::env::flag("RLX_METAL_GDN_HOST_FALLBACK");
+                    let prefer_cpu_blas = !rlx_ir::env::flag("RLX_METAL_GDN_GPU");
                     let use_carry = *state != 0;
                     let state_byte = if use_carry {
                         *state
@@ -3122,7 +3117,7 @@ impl MetalExecutable {
                     if can_native {
                         let enc = e!();
                         encode_gated_delta_net(
-                            &enc,
+                            enc,
                             k,
                             &self.arena.buffer,
                             *q,
@@ -3182,7 +3177,7 @@ impl MetalExecutable {
                     } else {
                         let enc = e!();
                         encode_dequant_gguf(
-                            &enc,
+                            enc,
                             k,
                             &self.arena.buffer,
                             *w_q,
@@ -3433,11 +3428,7 @@ impl MetalExecutable {
                 ..
             } = &self.mps_hybrid.as_ref().unwrap()[i]
             {
-                self.dispatch_mps_plan(
-                    plan,
-                    Some(boundary_parent_ids),
-                    Some(output_parent_ids),
-                );
+                self.dispatch_mps_plan(plan, Some(boundary_parent_ids), Some(output_parent_ids));
             }
         }
     }
@@ -3590,7 +3581,10 @@ fn gguf_dequant_dims_for_param(
         if let Op::DequantMatMul { scheme } = &node.op
             && node.inputs.get(1) == Some(&param_id)
         {
-            let n = node.shape.dim(node.shape.rank().saturating_sub(1)).unwrap_static();
+            let n = node
+                .shape
+                .dim(node.shape.rank().saturating_sub(1))
+                .unwrap_static();
             let out_total = node.shape.num_elements()?;
             let m = out_total / n.max(1);
             let a_total = graph.node(node.inputs[0]).shape.num_elements()?;
@@ -4285,7 +4279,7 @@ fn encode_sdpa(
         if use_fa {
             // FA kernel: 1 TG per (q_tile, head, batch), 64 threads, Br=8.
             const BR: u32 = 8;
-            let q_tiles = (seq + BR - 1) / BR;
+            let q_tiles = seq.div_ceil(BR);
             let grid = metal::MTLSize {
                 width: q_tiles as u64,
                 height: heads as u64,
@@ -4794,10 +4788,8 @@ fn encode_dequant_grouped_matmul_gguf(
 
     let base = buffer.contents() as *const u8;
     unsafe {
-        let x_host =
-            std::slice::from_raw_parts(base.add(input) as *const f32, m * k_dim);
-        let idx_host =
-            std::slice::from_raw_parts(base.add(expert_idx) as *const f32, m);
+        let x_host = std::slice::from_raw_parts(base.add(input) as *const f32, m * k_dim);
+        let idx_host = std::slice::from_raw_parts(base.add(expert_idx) as *const f32, m);
         let (packed_in, original_pos, offsets) =
             rlx_cpu::gguf_matmul::grouped_moe_sort_plan(x_host, idx_host, m, k_dim, num_experts);
 
@@ -4839,8 +4831,7 @@ fn encode_dequant_grouped_matmul_gguf(
             );
         }
 
-        let pack_out_host =
-            std::slice::from_raw_parts(base.add(pack_out_off) as *const f32, m * n);
+        let pack_out_host = std::slice::from_raw_parts(base.add(pack_out_off) as *const f32, m * n);
         let mut out_host = vec![0f32; m * n];
         rlx_cpu::gguf_matmul::grouped_moe_unpermute_out(
             pack_out_host,
@@ -4849,11 +4840,7 @@ fn encode_dequant_grouped_matmul_gguf(
             m,
             n,
         );
-        std::ptr::copy_nonoverlapping(
-            out_host.as_ptr(),
-            base.add(dst) as *mut f32,
-            out_host.len(),
-        );
+        std::ptr::copy_nonoverlapping(out_host.as_ptr(), base.add(dst) as *mut f32, out_host.len());
     }
 }
 

@@ -29,15 +29,15 @@
 use rlx_ir::mir::MirModule;
 use rlx_ir::{GraphModule, GraphStage, NodeId};
 
+use crate::DeadCodeElimination;
+use crate::compiler::lir_buffer_plan_from_memory;
 use crate::compiler::{CompilePipeline, CompileResult};
 use crate::memory::{
-    plan_memory_backward, plan_memory_with_options, MemoryPlanOptions, SharedWeightLayout,
+    MemoryPlanOptions, SharedWeightLayout, plan_memory_backward, plan_memory_with_options,
 };
-use crate::compiler::lir_buffer_plan_from_memory;
 use rlx_fusion::fusion_report::FusionReport;
-use rlx_fusion::pass::{run_passes, Pass};
+use rlx_fusion::pass::{Pass, run_passes};
 use rlx_ir::lir::LirModule;
-use crate::DeadCodeElimination;
 
 /// Forward + backward LIR with a single shared weight region.
 #[derive(Debug, Clone)]
@@ -71,11 +71,7 @@ impl CompilePipeline {
     }
 
     /// MIR → forward LIR (fused) + backward LIR (AD + cleanup), shared weights.
-    pub fn compile_training_mir(
-        &self,
-        mir: MirModule,
-        wrt: &[NodeId],
-    ) -> TrainingCompileResult {
+    pub fn compile_training_mir(&self, mir: MirModule, wrt: &[NodeId]) -> TrainingCompileResult {
         let (fwd_mir, fusion) = self.optimize_with_report(mir);
         let fwd_graph = fwd_mir.as_graph().clone();
         let fwd_plan = plan_memory_with_options(
@@ -124,7 +120,6 @@ impl CompilePipeline {
         let graph = run_passes(mir.into_graph(), &passes, false);
         MirModule::from_graph(self.legalize_after_fusion(graph))
     }
-
 }
 
 /// Error from [`CompilePipeline::compile_training`].
@@ -169,7 +164,7 @@ pub fn backward_cleanup_passes() -> Vec<&'static dyn Pass> {
 mod tests {
     use super::*;
     use rlx_ir::op::ReduceOp;
-    use rlx_ir::{DType, Graph, GraphExt, Op, Shape};
+    use rlx_ir::{DType, Graph, Op, Shape};
 
     fn f32_shape(d: &[usize]) -> Shape {
         Shape::new(d, DType::F32)
@@ -181,7 +176,13 @@ mod tests {
         let x = fwd.input("x", f32_shape(&[2, 8]));
         let w = fwd.param("w", f32_shape(&[8, 8]));
         let mm = fwd.matmul(x, w, f32_shape(&[2, 8]));
-        let loss = fwd.reduce(mm, ReduceOp::Sum, vec![0, 1], false, Shape::new(&[], DType::F32));
+        let loss = fwd.reduce(
+            mm,
+            ReduceOp::Sum,
+            vec![0, 1],
+            false,
+            Shape::new(&[], DType::F32),
+        );
         fwd.set_outputs(vec![loss]);
 
         let fwd_plan = plan_memory_with_options(&fwd, 64, MemoryPlanOptions::inference());
@@ -197,8 +198,7 @@ mod tests {
             .map(|n| n.id)
             .expect("bwd w");
         assert_eq!(
-            bwd_plan.assignments[&bwd_w].offset,
-            fwd_plan.assignments[&w].offset,
+            bwd_plan.assignments[&bwd_w].offset, fwd_plan.assignments[&w].offset,
             "backward param should alias forward weight offset"
         );
         assert!(bwd_plan.arena_size >= weights.arena_size);

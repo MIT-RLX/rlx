@@ -1485,11 +1485,11 @@ impl ThunkSchedule {
                     let (mask_kind_u32, mask_off, window) = match mask_kind {
                         rlx_ir::op::MaskKind::None => (0u32, off(node.inputs[0]), 0u32),
                         rlx_ir::op::MaskKind::Causal => (1u32, off(node.inputs[0]), 0u32),
-                        rlx_ir::op::MaskKind::Custom => {
-                            (2u32, off(node.inputs[4]), 0u32)
-                        }
+                        rlx_ir::op::MaskKind::Custom => (2u32, off(node.inputs[4]), 0u32),
                         rlx_ir::op::MaskKind::Bias => (4u32, off(node.inputs[4]), 0u32),
-                        rlx_ir::op::MaskKind::SlidingWindow(w) => (3u32, off(node.inputs[0]), *w as u32),
+                        rlx_ir::op::MaskKind::SlidingWindow(w) => {
+                            (3u32, off(node.inputs[0]), *w as u32)
+                        }
                     };
                     let q_shape = &graph.node(node.inputs[0]).shape;
                     let k_shape = &graph.node(node.inputs[1]).shape;
@@ -2014,7 +2014,10 @@ impl ThunkSchedule {
                     }
                 }
 
-                Op::FusedSwiGLU { cast_to, gate_first } => {
+                Op::FusedSwiGLU {
+                    cast_to,
+                    gate_first,
+                } => {
                     // Output last dim = n_half; total output elements = product of all dims.
                     let n_half = node.shape.dim(node.shape.rank() - 1).unwrap_static();
                     let total = node.shape.num_elements().unwrap();
@@ -2046,9 +2049,8 @@ impl ThunkSchedule {
                     transmittance_threshold,
                     max_list_entries,
                 } => {
-                    let elem_len = |id: NodeId| -> usize {
-                        graph.node(id).shape.num_elements().unwrap_or(0)
-                    };
+                    let elem_len =
+                        |id: NodeId| -> usize { graph.node(id).shape.num_elements().unwrap_or(0) };
                     Thunk::GaussianSplatRender {
                         positions_off: off(node.inputs[0]),
                         positions_len: elem_len(node.inputs[0]),
@@ -2089,9 +2091,8 @@ impl ThunkSchedule {
                     sh_band,
                     max_anisotropy,
                 } => {
-                    let elem_len = |id: NodeId| -> usize {
-                        graph.node(id).shape.num_elements().unwrap_or(0)
-                    };
+                    let elem_len =
+                        |id: NodeId| -> usize { graph.node(id).shape.num_elements().unwrap_or(0) };
                     Thunk::GaussianSplatRenderBackward {
                         positions_off: off(node.inputs[0]),
                         positions_len: elem_len(node.inputs[0]),
@@ -2134,9 +2135,8 @@ impl ThunkSchedule {
                     transmittance_threshold,
                     max_list_entries,
                 } => {
-                    let elem_len = |id: NodeId| -> usize {
-                        graph.node(id).shape.num_elements().unwrap_or(0)
-                    };
+                    let elem_len =
+                        |id: NodeId| -> usize { graph.node(id).shape.num_elements().unwrap_or(0) };
                     Thunk::GaussianSplatPrepare {
                         positions_off: off(node.inputs[0]),
                         positions_len: elem_len(node.inputs[0]),
@@ -2174,9 +2174,8 @@ impl ThunkSchedule {
                     transmittance_threshold,
                     max_list_entries,
                 } => {
-                    let elem_len = |id: NodeId| -> usize {
-                        graph.node(id).shape.num_elements().unwrap_or(0)
-                    };
+                    let elem_len =
+                        |id: NodeId| -> usize { graph.node(id).shape.num_elements().unwrap_or(0) };
                     let prep_id = node.inputs[0];
                     let count = match &graph.node(prep_id).op {
                         rlx_ir::Op::GaussianSplatPrepare { .. } => {
@@ -2259,11 +2258,7 @@ impl ThunkSchedule {
                 } => {
                     let q_shape = &graph.node(node.inputs[0]).shape;
                     let q_f16 = matches!(q_shape.dtype(), rlx_ir::DType::F16);
-                    let state_off = if *carry_state {
-                        off(node.inputs[5])
-                    } else {
-                        0
-                    };
+                    let state_off = if *carry_state { off(node.inputs[5]) } else { 0 };
                     Thunk::GatedDeltaNet {
                         q: off(node.inputs[0]),
                         k: off(node.inputs[1]),
@@ -2309,20 +2304,18 @@ impl ThunkSchedule {
                                 k: k as u32,
                                 n: n as u32,
                             },
-                            QuantScheme::Int4Block { block_size } => {
-                                Thunk::DequantMatMulInt4 {
-                                    x: off(node.inputs[0]),
-                                    w_q: off(node.inputs[1]),
-                                    scale: off(node.inputs[2]),
-                                    zp: off(node.inputs[3]),
-                                    dst: off(node.id),
-                                    m: m as u32,
-                                    k: k as u32,
-                                    n: n as u32,
-                                    block_size: *block_size,
-                                    is_asymmetric: false,
-                                }
-                            }
+                            QuantScheme::Int4Block { block_size } => Thunk::DequantMatMulInt4 {
+                                x: off(node.inputs[0]),
+                                w_q: off(node.inputs[1]),
+                                scale: off(node.inputs[2]),
+                                zp: off(node.inputs[3]),
+                                dst: off(node.id),
+                                m: m as u32,
+                                k: k as u32,
+                                n: n as u32,
+                                block_size: *block_size,
+                                is_asymmetric: false,
+                            },
                             QuantScheme::Fp8E4m3 => Thunk::DequantMatMulFp8 {
                                 x: off(node.inputs[0]),
                                 w_q: off(node.inputs[1]),
@@ -2416,7 +2409,11 @@ impl ThunkSchedule {
                             dy_shape.dim(2).unwrap_static(),
                         )
                     } else {
-                        (1, dy_shape.dim(0).unwrap_static(), dy_shape.dim(1).unwrap_static())
+                        (
+                            1,
+                            dy_shape.dim(0).unwrap_static(),
+                            dy_shape.dim(1).unwrap_static(),
+                        )
                     };
                     let cos_len = graph.node(node.inputs[1]).shape.num_elements().unwrap();
                     Thunk::RopeBackward {
@@ -2627,7 +2624,9 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         } => vec![*x, *res, *bias, *g, *b],
         Thunk::Softmax { data, .. } => vec![*data],
         Thunk::Attention { q, k, v, mask, .. } => vec![*q, *k, *v, *mask],
-        Thunk::AttentionBackward { q, k, v, dy, mask, .. } => {
+        Thunk::AttentionBackward {
+            q, k, v, dy, mask, ..
+        } => {
             let mut v = vec![*q, *k, *v, *dy];
             if *mask != *q {
                 v.push(*mask);
@@ -2635,13 +2634,19 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             v
         }
         Thunk::Rope { src, cos, sin, .. } => vec![*src, *cos, *sin],
-        Thunk::RmsNormBackwardInput { x, gamma, beta, dy, .. } => {
+        Thunk::RmsNormBackwardInput {
+            x, gamma, beta, dy, ..
+        } => {
             vec![*x, *gamma, *beta, *dy]
         }
-        Thunk::RmsNormBackwardGamma { x, gamma, beta, dy, .. } => {
+        Thunk::RmsNormBackwardGamma {
+            x, gamma, beta, dy, ..
+        } => {
             vec![*x, *gamma, *beta, *dy]
         }
-        Thunk::RmsNormBackwardBeta { x, gamma, beta, dy, .. } => {
+        Thunk::RmsNormBackwardBeta {
+            x, gamma, beta, dy, ..
+        } => {
             vec![*x, *gamma, *beta, *dy]
         }
         Thunk::RopeBackward { dy, cos, sin, .. } => vec![*dy, *cos, *sin],

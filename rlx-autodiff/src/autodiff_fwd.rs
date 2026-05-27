@@ -279,10 +279,11 @@ fn jvp_rule(
                     // ∂y/∂b = 1 if b<a else 0. → Where(a<b, t_a, t_b).
                     let zero = scalar_const(0.0, &out_shape, bwd);
                     let bool_shape = Shape::from_dims(out_shape.dims(), DType::Bool);
-                    let cond =
-                        bwd.add_node(Op::Compare(CmpOp::Lt), vec![a_p, b_p], bool_shape);
+                    let cond = bwd.add_node(Op::Compare(CmpOp::Lt), vec![a_p, b_p], bool_shape);
                     let cond_f = bwd.add_node(
-                        Op::Cast { to: out_shape.dtype() },
+                        Op::Cast {
+                            to: out_shape.dtype(),
+                        },
                         vec![cond],
                         out_shape.clone(),
                     );
@@ -296,10 +297,11 @@ fn jvp_rule(
                     // reading the args swapped is identical).
                     let zero = scalar_const(0.0, &out_shape, bwd);
                     let bool_shape = Shape::from_dims(out_shape.dims(), DType::Bool);
-                    let cond =
-                        bwd.add_node(Op::Compare(CmpOp::Lt), vec![b_p, a_p], bool_shape);
+                    let cond = bwd.add_node(Op::Compare(CmpOp::Lt), vec![b_p, a_p], bool_shape);
                     let cond_f = bwd.add_node(
-                        Op::Cast { to: out_shape.dtype() },
+                        Op::Cast {
+                            to: out_shape.dtype(),
+                        },
                         vec![cond],
                         out_shape.clone(),
                     );
@@ -316,24 +318,20 @@ fn jvp_rule(
                         let one = scalar_const(1.0, &out_shape, bwd);
                         let exp = bwd.binary(BinaryOp::Sub, b_p, one, out_shape.clone());
                         let apow = bwd.binary(BinaryOp::Pow, a_p, exp, out_shape.clone());
-                        let apow_ta =
-                            bwd.binary(BinaryOp::Mul, apow, t_a, out_shape.clone());
-                        let term =
-                            bwd.binary(BinaryOp::Mul, b_p, apow_ta, out_shape.clone());
+                        let apow_ta = bwd.binary(BinaryOp::Mul, apow, t_a, out_shape.clone());
+                        let term = bwd.binary(BinaryOp::Mul, b_p, apow_ta, out_shape.clone());
                         terms.push(term);
                     }
                     if let Some(t_b) = tb {
                         let ln_a = bwd.activation(Activation::Log, a_p, out_shape.clone());
                         let apow = bwd.binary(BinaryOp::Pow, a_p, b_p, out_shape.clone());
-                        let ln_t_b =
-                            bwd.binary(BinaryOp::Mul, ln_a, t_b, out_shape.clone());
-                        let term =
-                            bwd.binary(BinaryOp::Mul, apow, ln_t_b, out_shape.clone());
+                        let ln_t_b = bwd.binary(BinaryOp::Mul, ln_a, t_b, out_shape.clone());
+                        let term = bwd.binary(BinaryOp::Mul, apow, ln_t_b, out_shape.clone());
                         terms.push(term);
                     }
-                    return terms.into_iter().reduce(|a, b| {
-                        bwd.binary(BinaryOp::Add, a, b, out_shape.clone())
-                    });
+                    terms
+                        .into_iter()
+                        .reduce(|a, b| bwd.binary(BinaryOp::Add, a, b, out_shape.clone()))
                 }
             }
         }
@@ -816,7 +814,7 @@ fn jvp_rule(
                 keep_shape.clone(),
             );
             let diff = bwd.binary(BinaryOp::Sub, x, mean, x_shape.clone());
-            let diff_sq = bwd.binary(BinaryOp::Mul, diff.clone(), diff, x_shape.clone());
+            let diff_sq = bwd.binary(BinaryOp::Mul, diff, diff, x_shape.clone());
             let var = bwd.add_node(
                 Op::Reduce {
                     op: ReduceOp::Mean,
@@ -884,21 +882,42 @@ fn jvp_rule(
             let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
             let cpg = c / num_groups;
             let inner = (cpg * h * w) as i64;
-            let x5 = bwd.reshape_(x, vec![n as i64, *num_groups as i64, cpg as i64, h as i64, w as i64]);
-            let t_x5 = bwd.reshape_(t_x, vec![n as i64, *num_groups as i64, cpg as i64, h as i64, w as i64]);
+            let x5 = bwd.reshape_(
+                x,
+                vec![n as i64, *num_groups as i64, cpg as i64, h as i64, w as i64],
+            );
+            let t_x5 = bwd.reshape_(
+                t_x,
+                vec![n as i64, *num_groups as i64, cpg as i64, h as i64, w as i64],
+            );
             let inner_u = inner as usize;
             let x3 = bwd.reshape_(x5, vec![n as i64, *num_groups as i64, inner]);
             let _t_x3 = bwd.reshape_(t_x5, vec![n as i64, *num_groups as i64, inner]);
             let keep_shape = Shape::new(&[n, *num_groups, 1], dtype);
-            let xsq = bwd.binary(BinaryOp::Mul, x3, x3, Shape::new(&[n, *num_groups, inner_u], dtype));
+            let xsq = bwd.binary(
+                BinaryOp::Mul,
+                x3,
+                x3,
+                Shape::new(&[n, *num_groups, inner_u], dtype),
+            );
             let r_sq = bwd.mean(xsq, vec![2], true);
             let eps_c = scalar_const(*eps as f64, &keep_shape, bwd);
             let r_sq_eps = bwd.binary(BinaryOp::Add, r_sq, eps_c, keep_shape.clone());
             let inv_r = bwd.activation(Activation::Rsqrt, r_sq_eps, keep_shape);
             let inv_r5 = bwd.reshape_(inv_r, vec![n as i64, *num_groups as i64, 1, 1, 1]);
             let gamma5 = bwd.reshape_(gamma, vec![1, *num_groups as i64, cpg as i64, 1, 1]);
-            let t_scaled = bwd.binary(BinaryOp::Mul, t_x5, gamma5, Shape::new(&[n, *num_groups, cpg, h, w], dtype));
-            let t_out5 = bwd.binary(BinaryOp::Mul, t_scaled, inv_r5, Shape::new(&[n, *num_groups, cpg, h, w], dtype));
+            let t_scaled = bwd.binary(
+                BinaryOp::Mul,
+                t_x5,
+                gamma5,
+                Shape::new(&[n, *num_groups, cpg, h, w], dtype),
+            );
+            let t_out5 = bwd.binary(
+                BinaryOp::Mul,
+                t_scaled,
+                inv_r5,
+                Shape::new(&[n, *num_groups, cpg, h, w], dtype),
+            );
             Some(bwd.reshape_(t_out5, vec![n as i64, c as i64, h as i64, w as i64]))
         }
 

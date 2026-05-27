@@ -18,10 +18,10 @@
 
 use crate::kernels::{dispatch_grid_2d, gaussian_splat_rasterize_kernel};
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig};
-use slang_splat_ref::native_prep::{
-    camera_and_background_from_meta, prepare_raster, scene_from_slices, PreparedRaster,
-};
 use slang_splat_ref::RenderParams;
+use slang_splat_ref::native_prep::{
+    PreparedRaster, camera_and_background_from_meta, prepare_raster, scene_from_slices,
+};
 use std::sync::Arc;
 
 fn dispatch_prepared(
@@ -51,7 +51,9 @@ fn dispatch_prepared(
     let d_ranges = stream
         .memcpy_stod(&prep.tile_ranges)
         .expect("splat native: stod ranges");
-    let d_rays = stream.memcpy_stod(&prep.rays).expect("splat native: stod rays");
+    let d_rays = stream
+        .memcpy_stod(&prep.rays)
+        .expect("splat native: stod rays");
     let params = prep.params;
 
     let kernel = gaussian_splat_rasterize_kernel(stream.context());

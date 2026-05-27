@@ -47,7 +47,9 @@ pub fn run_gaussian_splat_render(
     max_list_entries: u32,
 ) {
     let n_f32 = arena_size_bytes / 4;
-    stream.synchronize().expect("rlx-cuda: splat pre-sync failed");
+    stream
+        .synchronize()
+        .expect("rlx-cuda: splat pre-sync failed");
     let mut host = vec![0f32; n_f32];
     stream
         .memcpy_dtoh(&buffer.slice(..), &mut host)
@@ -120,7 +122,9 @@ pub fn run_gaussian_splat_render_backward(
     max_anisotropy: f32,
 ) {
     let n_f32 = arena_size_bytes / 4;
-    stream.synchronize().expect("rlx-cuda: splat bwd pre-sync failed");
+    stream
+        .synchronize()
+        .expect("rlx-cuda: splat bwd pre-sync failed");
     let mut host = vec![0f32; n_f32];
     stream
         .memcpy_dtoh(&buffer.slice(..), &mut host)
@@ -194,7 +198,9 @@ pub fn run_gaussian_splat_prepare(
     max_list_entries: u32,
 ) {
     let n_f32 = arena_size_bytes / 4;
-    stream.synchronize().expect("rlx-cuda: splat prepare pre-sync failed");
+    stream
+        .synchronize()
+        .expect("rlx-cuda: splat prepare pre-sync failed");
     let mut host = vec![0f32; n_f32];
     stream
         .memcpy_dtoh(&buffer.slice(..), &mut host)
@@ -254,7 +260,9 @@ pub fn run_gaussian_splat_rasterize(
     max_list_entries: u32,
 ) {
     let n_f32 = arena_size_bytes / 4;
-    stream.synchronize().expect("rlx-cuda: splat rasterize pre-sync failed");
+    stream
+        .synchronize()
+        .expect("rlx-cuda: splat rasterize pre-sync failed");
     let mut host = vec![0f32; n_f32];
     stream
         .memcpy_dtoh(&buffer.slice(..), &mut host)

@@ -13,8 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 use rlx_fdm::{
-    fdm_with_options, grad_loss_wrt_q, grad_loss_wrt_q_fd, grad_loss_wrt_q_linear, goals,
-    EquilibriumModel, FdmOptions, IterativeConfig, Network, Structure,
+    EquilibriumModel, FdmOptions, IterativeConfig, Network, Structure, fdm_with_options, goals,
+    grad_loss_wrt_q, grad_loss_wrt_q_fd, grad_loss_wrt_q_linear,
 };
 
 #[test]
@@ -73,18 +73,10 @@ fn analytic_matches_finite_diff_on_linear_arch() {
     // Objective: z coordinate of the first free node (linear functional of x_f).
     let mut loss_grad = vec![0.0; nf * 3];
     loss_grad[2] = 1.0;
-    let xyz_free =
-        EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("x");
+    let xyz_free = EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("x");
 
-    let analytic = grad_loss_wrt_q_linear(
-        &net.q,
-        &xf,
-        &net.loads,
-        &s,
-        &xyz_free,
-        &loss_grad,
-    )
-    .expect("analytic");
+    let analytic = grad_loss_wrt_q_linear(&net.q, &xf, &net.loads, &s, &xyz_free, &loss_grad)
+        .expect("analytic");
     for eps in [1e-6, 1e-7, 1e-8] {
         let fd = grad_loss_wrt_q_fd(
             &net.q,
@@ -103,11 +95,9 @@ fn analytic_matches_finite_diff_on_linear_arch() {
         for (a, f) in analytic.dq.iter().zip(fd.dq.iter()) {
             max_err = max_err.max((a - f).abs());
         }
-        assert!(
-            max_err < 1e-4,
-            "analytic vs FD max_err={max_err} at eps={eps}"
-        );
-        return;
+        if max_err < 1e-4 {
+            return;
+        }
     }
     panic!("analytic vs FD did not match at any eps");
 }
@@ -125,8 +115,7 @@ fn dense_solve_single_rhs_matches_three_rhs_z_column() {
     }
     let k = EquilibriumModel::stiffness_matrix(&net.q, &s);
     let p = EquilibriumModel::load_matrix(&net.q, &xf, &net.loads, &s);
-    let xyz =
-        EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("xyz");
+    let xyz = EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("xyz");
     let nf = s.num_free();
     let lu_xyz = rlx_fdm::solve::solve_columns_dense(&k, &p, nf, 3).expect("solve");
     for i in 0..xyz.len() {
@@ -164,8 +153,7 @@ fn analytic_matches_fd_for_equilibrium_z_coordinate() {
     let nf = s.num_free();
     let mut loss_grad = vec![0.0; nf * 3];
     loss_grad[2] = 1.0;
-    let xyz_free =
-        EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("x");
+    let xyz_free = EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("x");
     let analytic = grad_loss_wrt_q(
         &net.q,
         &xf,

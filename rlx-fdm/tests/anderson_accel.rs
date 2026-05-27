@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use rlx_fdm::{equilibrium_iterative, IterativeConfig, Network};
+use rlx_fdm::{IterativeConfig, Network, equilibrium_iterative};
 
 #[test]
 fn anderson_accelerated_edge_load_solve_converges() {

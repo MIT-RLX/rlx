@@ -12,7 +12,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-use rlx_fdm::{fdm_with_options, sparse, Network, FdmOptions, IterativeConfig};
+use rlx_fdm::{FdmOptions, Network, fdm_with_options, sparse};
 
 #[test]
 fn sparse_matches_dense_on_arch() {
@@ -29,9 +29,19 @@ fn sparse_matches_dense_on_arch() {
     assert!(diff < 1e-8, "dense/sparse diff {diff}");
 
     let dense = fdm_with_options(&net, &FdmOptions::default()).expect("dense");
-    let mut opt = FdmOptions::default();
-    opt.sparse = true;
-    let sparse_eq = fdm_with_options(&net, &opt).expect("sparse");
+    let sparse_eq = fdm_with_options(
+        &net,
+        &FdmOptions {
+            sparse: true,
+            ..Default::default()
+        },
+    )
+    .expect("sparse");
     let dz = (dense.xyz[3 * 5 + 2] - sparse_eq.xyz[3 * 5 + 2]).abs();
-    assert!(dz < 1e-8, "mid z dense={} sparse={}", dense.xyz[3 * 5 + 2], sparse_eq.xyz[3 * 5 + 2]);
+    assert!(
+        dz < 1e-8,
+        "mid z dense={} sparse={}",
+        dense.xyz[3 * 5 + 2],
+        sparse_eq.xyz[3 * 5 + 2]
+    );
 }

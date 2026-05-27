@@ -1713,10 +1713,10 @@ impl Op {
             Op::FakeQuantizeLSQ { .. } => 2, // x, scale (learned param)
             Op::FakeQuantizeLSQBackwardX { .. } | Op::FakeQuantizeLSQBackwardScale { .. } => 3, // x, scale, dy
             Op::Binary(_) | Op::Compare(_) | Op::Gather { .. } | Op::MatMul | Op::ScatterAdd => 2,
-            Op::GroupedMatMul => 3,        // input, weight, expert_idx
+            Op::GroupedMatMul => 3,               // input, weight, expert_idx
             Op::DequantGroupedMatMul { .. } => 3, // input, packed_w, expert_idx
             Op::DequantMoEWeights { .. } => 1,    // packed_w
-            Op::LoraMatMul { .. } => 4,    // x, w, a, b
+            Op::LoraMatMul { .. } => 4,           // x, w, a, b
             // x, w_q, scale, zp — or x, packed_w_bytes for GGUF
             // schemes (their scales/mins live inside the packed bytes,
             // see `QuantScheme::is_gguf`).
@@ -1741,13 +1741,13 @@ impl Op {
                 MaskKind::Custom | MaskKind::Bias => 5, // q, k, v, dy, mask
                 _ => 4,                                 // q, k, v, dy
             },
-            Op::Rope { .. } => 3,                            // x, cos, sin
+            Op::Rope { .. } => 3, // x, cos, sin
             Op::AxialRope2d { .. } => 1,
             Op::LayerNorm { .. }
             | Op::LayerNorm2d { .. }
             | Op::GroupNorm { .. }
             | Op::RmsNorm { .. } => 3, // input, gamma, beta
-            Op::FusedMatMulBiasAct { .. } => 3,              // input, weight, bias
+            Op::FusedMatMulBiasAct { .. } => 3, // input, weight, bias
             Op::FusedResidualLN { has_bias: true, .. } => 5, // x, residual, bias, gamma, beta
             Op::FusedResidualLN {
                 has_bias: false, ..
@@ -1766,14 +1766,14 @@ impl Op {
             Op::Conjugate => 1,                     // z (C64)
             Op::LayerNormBackwardInput { .. } => 3, // x, gamma, dy
             Op::LayerNormBackwardGamma { .. } => 2, // x, dy
-            Op::RmsNormBackwardInput { .. } => 4,  // x, gamma, beta, dy
+            Op::RmsNormBackwardInput { .. } => 4,   // x, gamma, beta, dy
             Op::RmsNormBackwardGamma { .. } => 4,
             Op::RmsNormBackwardBeta { .. } => 4,
-            Op::RopeBackward { .. } => 3,            // dy, cos, sin
-            Op::GroupNormBackwardInput { .. } => 4,  // x, gamma, beta, dy
-            Op::GroupNormBackwardGamma { .. } => 2,  // x, dy
+            Op::RopeBackward { .. } => 3,           // dy, cos, sin
+            Op::GroupNormBackwardInput { .. } => 4, // x, gamma, beta, dy
+            Op::GroupNormBackwardGamma { .. } => 2, // x, dy
             Op::GroupNormBackwardBeta { .. } => 2,
-            Op::CumsumBackward { .. } => 1,          // dy
+            Op::CumsumBackward { .. } => 1,         // dy
             Op::GatherBackward { .. } => 2,         // dy, indices
             Op::MaxPool2dBackward { .. } => 2,      // x, dy
             Op::Conv2dBackwardInput { .. } => 2,    // dy, w
@@ -1847,10 +1847,10 @@ impl std::fmt::Display for Op {
             },
             Op::FakeQuantizeLSQBackwardX { bits, .. } => {
                 write!(f, "fake_quant_lsq_bwd_x(bits={bits})")
-            },
+            }
             Op::FakeQuantizeLSQBackwardScale { bits, .. } => {
                 write!(f, "fake_quant_lsq_bwd_s(bits={bits})")
-            },
+            }
             Op::Cast { to } => write!(f, "cast({to})"),
             Op::Binary(op) => write!(f, "{op:?}"),
             Op::Compare(op) => write!(f, "{op:?}"),
@@ -1984,11 +1984,15 @@ impl std::fmt::Display for Op {
                 wrt,
             } => match mask_kind {
                 MaskKind::None => write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},nomask)"),
-                MaskKind::Causal => write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},causal)"),
+                MaskKind::Causal => {
+                    write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},causal)")
+                }
                 MaskKind::SlidingWindow(w) => {
                     write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},sw={w})")
                 }
-                MaskKind::Custom => write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},custom)"),
+                MaskKind::Custom => {
+                    write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},custom)")
+                }
                 MaskKind::Bias => write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},bias)"),
             },
             Op::FusedMatMulBiasAct { activation } => {
@@ -2012,7 +2016,10 @@ impl std::fmt::Display for Op {
                 }
                 write!(f, "_rms(eps={eps})")
             }
-            Op::FusedSwiGLU { cast_to, gate_first } => {
+            Op::FusedSwiGLU {
+                cast_to,
+                gate_first,
+            } => {
                 let mut s = match cast_to {
                     Some(dt) => format!("fused_swiglu(cast={dt}"),
                     None => "fused_swiglu(".to_string(),

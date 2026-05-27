@@ -50,10 +50,7 @@ fn try_prepare_conic_for_binning(conic: [f32; 3], radius: f32, half_tile: f32) -
     if !extent[0].is_finite() || !extent[1].is_finite() {
         return (false, bbox);
     }
-    bbox = [
-        extent[0].clamp(1e-4, radius),
-        extent[1].clamp(1e-4, radius),
-    ];
+    bbox = [extent[0].clamp(1e-4, radius), extent[1].clamp(1e-4, radius)];
     (true, bbox)
 }
 
@@ -130,7 +127,14 @@ fn compute_scanline_tile_span(
 ) -> (bool, i32, i32) {
     let mut hits = Vec::new();
     for minor in min_minor_tile.max(0)..=max_minor_tile {
-        if tile_intersects_ellipse(center, conic, scan_along_x, tile_size, line_coord_tile, minor) {
+        if tile_intersects_ellipse(
+            center,
+            conic,
+            scan_along_x,
+            tile_size,
+            line_coord_tile,
+            minor,
+        ) {
             hits.push(minor);
         }
     }
@@ -217,7 +221,8 @@ pub fn build_tile_key_value_pairs(
             continue;
         }
         let scan_along_x = bbox_extent[0] > bbox_extent[1]
-            || ((bbox_extent[0] - bbox_extent[1]).abs() < 1e-6 && (max_x - min_x) >= (max_y - min_y));
+            || ((bbox_extent[0] - bbox_extent[1]).abs() < 1e-6
+                && (max_x - min_x) >= (max_y - min_y));
         let (primary_lo, primary_hi, minor_lo, minor_hi) = if scan_along_x {
             (min_y, max_y, min_x, max_x)
         } else {

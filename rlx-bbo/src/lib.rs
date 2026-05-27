@@ -23,20 +23,19 @@ mod surrogate;
 mod trajectory;
 mod twin;
 
-pub use cmaes::{cmaes, CmaesConfig};
+pub use cmaes::{CmaesConfig, cmaes};
 pub use flow_map::{
-    fmq_surrogate_step, load_flow_map, save_flow_map, train_from_jsonl, LinearFlowMap,
+    LinearFlowMap, fmq_surrogate_step, load_flow_map, save_flow_map, train_from_jsonl,
 };
 pub use q_guidance::{
-    eta_eff_twin, finite_diff_grad, q_guided_beam_search, q_steered_search,
-    q_steered_search_with_grad, search_by_method, trust_region_q_step, QSteerConfig, QgbsConfig,
-    DEFAULT_KAPPA,
+    DEFAULT_KAPPA, QSteerConfig, QgbsConfig, eta_eff_twin, finite_diff_grad, q_guided_beam_search,
+    q_steered_search, q_steered_search_with_grad, search_by_method, trust_region_q_step,
 };
 pub use surrogate::{
-    fit_from_trajectory_jsonl, fit_linear_surrogate, load_surrogate, save_surrogate,
-    LinearSurrogate,
+    LinearSurrogate, fit_from_trajectory_jsonl, fit_linear_surrogate, load_surrogate,
+    save_surrogate,
 };
-pub use trajectory::{append_jsonl, diagonal_flow_pairs, load_jsonl, TrajectoryRecord};
+pub use trajectory::{TrajectoryRecord, append_jsonl, diagonal_flow_pairs, load_jsonl};
 pub use twin::q_steered_search_twin;
 
 use rand::distributions::Distribution;
@@ -138,7 +137,9 @@ where
 {
     let n = bbox.dim();
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut positions: Vec<Vec<f64>> = (0..cfg.n_particles).map(|_| bbox.sample(&mut rng)).collect();
+    let mut positions: Vec<Vec<f64>> = (0..cfg.n_particles)
+        .map(|_| bbox.sample(&mut rng))
+        .collect();
     let mut velocities: Vec<Vec<f64>> = (0..cfg.n_particles)
         .map(|_| {
             (0..n)

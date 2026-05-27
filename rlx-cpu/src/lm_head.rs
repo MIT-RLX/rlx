@@ -198,7 +198,12 @@ pub fn gguf_tied_lm_topk(
 }
 
 /// Argmax over rows of `embed` `[n_vocab × n_embd]` row-major: `hidden @ embed^T`.
-pub fn f32_tied_lm_argmax(hidden: &[f32], embed: &[f32], n_embd: usize, n_vocab: usize) -> (u32, f32) {
+pub fn f32_tied_lm_argmax(
+    hidden: &[f32],
+    embed: &[f32],
+    n_embd: usize,
+    n_vocab: usize,
+) -> (u32, f32) {
     assert_eq!(hidden.len(), n_embd);
     assert!(embed.len() >= n_vocab * n_embd);
     let mut best_idx = 0u32;
@@ -253,16 +258,13 @@ mod tests {
         let n = 32;
         let hidden: Vec<f32> = (0..k).map(|i| 0.01 * i as f32).collect();
         let embed: Vec<f32> = (0..n * k)
-            .map(|i| ((i as f32) * 0.003 + (i % 11) as f32 * 1e-4))
+            .map(|i| (i as f32) * 0.003 + (i % 11) as f32 * 1e-4)
             .collect();
         let top = f32_tied_lm_topk(&hidden, &embed, k, n, 8);
         let mut full: Vec<(u32, f32)> = (0..n)
             .map(|j| {
                 let row = &embed[j * k..(j + 1) * k];
-                (
-                    j as u32,
-                    hidden.iter().zip(row).map(|(a, b)| a * b).sum(),
-                )
+                (j as u32, hidden.iter().zip(row).map(|(a, b)| a * b).sum())
             })
             .collect();
         full.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -319,15 +321,7 @@ mod tests {
         }
         let hidden: Vec<f32> = (0..k).map(|i| 0.01 * i as f32).collect();
         let mut logits = vec![0f32; n];
-        gguf_matmul_bt(
-            &hidden,
-            &packed,
-            &mut logits,
-            1,
-            k,
-            n,
-            QuantScheme::GgufQ8K,
-        );
+        gguf_matmul_bt(&hidden, &packed, &mut logits, 1, k, n, QuantScheme::GgufQ8K);
         let (idx, val) = gguf_tied_lm_argmax(&hidden, &packed, k, n, QuantScheme::GgufQ8K);
         let ref_idx = logits
             .iter()

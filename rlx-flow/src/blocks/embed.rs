@@ -2,14 +2,12 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
-use crate::weight::WeightSource;
-
 #[derive(Debug, Clone)]
 pub struct EmbedStage {
     pub weight_key: String,
@@ -26,11 +24,7 @@ impl EmbedStage {
 }
 
 impl BlockStage for EmbedStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let embed_w = ctx.load_param(&self.weight_key, false)?;
         ctx.state.embed_weight = Some(embed_w);
         let out_shape = {

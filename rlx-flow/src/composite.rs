@@ -15,14 +15,9 @@ use crate::stage::FlowStage;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayerComposition {
     /// Single named stage.
-    Single {
-        name: String,
-    },
+    Single { name: String },
     /// `count` identical layers (homogeneous array).
-    Homogeneous {
-        layer_name: String,
-        count: usize,
-    },
+    Homogeneous { layer_name: String, count: usize },
     /// Heterogeneous head + tail (pair).
     Pair {
         head: Box<LayerComposition>,
@@ -32,9 +27,7 @@ pub enum LayerComposition {
 
 impl LayerComposition {
     pub fn single(name: impl Into<String>) -> Self {
-        Self::Single {
-            name: name.into(),
-        }
+        Self::Single { name: name.into() }
     }
 
     pub fn homogeneous(layer_name: impl Into<String>, count: usize) -> Self {
@@ -83,11 +76,9 @@ impl LayerComposition {
             Self::Single { name } => build_layer(name, 0),
             Self::Homogeneous { layer_name, count } => {
                 let stages: Vec<_> = (0..*count)
-                    .map(|i| {
-                        FlowStage::Named {
-                            name: format!("{layer_name}{i}"),
-                            inner: Arc::new(build_layer(layer_name, i)),
-                        }
+                    .map(|i| FlowStage::Named {
+                        name: format!("{layer_name}{i}"),
+                        inner: Arc::new(build_layer(layer_name, i)),
                     })
                     .collect();
                 FlowStage::Sequence(stages)
@@ -122,15 +113,11 @@ mod tests {
 
     #[test]
     fn pair_expands_two_stages() {
-        let comp = LayerComposition::pair(
-            LayerComposition::single("a"),
-            LayerComposition::single("b"),
-        );
-        let stage = comp.to_flow_stage(&|name, _| {
-            FlowStage::Named {
-                name: name.into(),
-                inner: Arc::new(FlowStage::Sequence(vec![])),
-            }
+        let comp =
+            LayerComposition::pair(LayerComposition::single("a"), LayerComposition::single("b"));
+        let stage = comp.to_flow_stage(&|name, _| FlowStage::Named {
+            name: name.into(),
+            inner: Arc::new(FlowStage::Sequence(vec![])),
         });
         assert!(matches!(stage, FlowStage::Sequence(s) if s.len() == 2));
     }

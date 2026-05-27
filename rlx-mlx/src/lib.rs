@@ -26,14 +26,16 @@
 //! globally via the `RLX_MLX_MODE=eager|lazy|compiled` env var.
 //!
 //! Layout mirrors rlx-cpu / rlx-metal:
-//! - `ffi`     — raw `extern "C"` declarations for the C++ shim
+//! - `ffi`     — re-export of [`rlx_mlx_sys::ffi`] (C++ shim in `rlx-mlx-sys`)
 //! - `array`   — RAII `Array` wrapper + `MlxError`
 //! - `ops`     — typed wrappers around shim ops
 //! - `lower`   — rlx-ir Graph → MLX op chain
 //! - `backend` — `MlxExecutable` (set_param / run / handles)
 
 #[cfg(target_os = "macos")]
-mod ffi;
+pub(crate) mod ffi {
+    pub use rlx_mlx_sys::ffi::*;
+}
 
 #[cfg(target_os = "macos")]
 pub mod array;
@@ -46,6 +48,9 @@ pub mod attention_bwd;
 
 #[cfg(target_os = "macos")]
 pub mod lower;
+
+#[cfg(target_os = "macos")]
+pub(crate) mod sync;
 
 #[cfg(target_os = "macos")]
 pub mod backend;

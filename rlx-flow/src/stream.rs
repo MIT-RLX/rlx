@@ -138,6 +138,7 @@ impl LoadStreamStage {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn stream_snapshot(state: &crate::context::FlowState) -> HashMap<String, FlowValue> {
     state.streams.clone()
 }
@@ -147,9 +148,9 @@ pub fn dual_stream_stage(
     stream_a: impl Into<String>,
     stream_b: impl Into<String>,
     f: impl Fn(&mut Emit<'_>, FlowValue, FlowValue) -> Result<(FlowValue, FlowValue)>
-        + Send
-        + Sync
-        + 'static,
+    + Send
+    + Sync
+    + 'static,
 ) -> FlowStage {
     FlowStage::DualStream(DualStreamStage::new(name, stream_a, stream_b, f))
 }

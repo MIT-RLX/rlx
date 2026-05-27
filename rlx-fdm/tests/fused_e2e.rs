@@ -17,8 +17,8 @@
 //! Fused MIR equilibrium path matches host optimization on arch loadpath.
 
 use rlx_fdm::{
-    constrained_fdm, fdm, network_loadpath, try_constrained_fdm_fused, Constraint, Goal, Network,
-    OptimizeConfig,
+    Constraint, Goal, Network, OptimizeConfig, constrained_fdm, fdm, network_loadpath,
+    try_constrained_fdm_fused,
 };
 
 #[test]
@@ -35,7 +35,12 @@ fn fused_runner_matches_host_equilibrium() {
     };
     let fused = constrained_fdm(&net, &[], &[], &cfg).expect("fused");
     let mut max_diff = 0.0f64;
-    for (a, b) in host.equilibrium.xyz.iter().zip(fused.equilibrium.xyz.iter()) {
+    for (a, b) in host
+        .equilibrium
+        .xyz
+        .iter()
+        .zip(fused.equilibrium.xyz.iter())
+    {
         max_diff = max_diff.max((a - b).abs());
     }
     assert!(

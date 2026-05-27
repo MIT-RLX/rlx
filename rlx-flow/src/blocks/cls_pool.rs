@@ -23,11 +23,7 @@ impl ClsTokenPoolStage {
 }
 
 impl BlockStage for ClsTokenPoolStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let mut gb = HirMut::new(ctx.hir());
         let cls = gb.narrow_(input.id, 1, 0, 1);
         let flat = gb.reshape_(cls, vec![self.batch as i64, self.hidden as i64]);

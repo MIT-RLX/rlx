@@ -42,10 +42,7 @@ impl ToyGoalEnv {
         let dx = self.state[2] - self.state[0];
         let dy = self.state[3] - self.state[1];
         let n = (dx * dx + dy * dy).sqrt().max(1e-6);
-        [
-            (dx / n).clamp(-1.0, 1.0),
-            (dy / n).clamp(-1.0, 1.0),
-        ]
+        [(dx / n).clamp(-1.0, 1.0), (dy / n).clamp(-1.0, 1.0)]
     }
 
     pub fn collect_expert_episodes(n_episodes: usize, max_steps: usize) -> Vec<Transition> {

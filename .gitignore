@@ -2,10 +2,10 @@
 /models
 *.bak
 
-# rig.sh — local remote CUDA rig (see rig.sh, scripts/rig/local.env.example)
+# rig.sh — local remote CUDA rig (see rig.sh; config under scripts/rig/)
 rig.sh
 scripts/.host
-scripts/rig/local.env
+scripts/rig/
 
 # local-only docs (not in repo history)
 PLAN.md

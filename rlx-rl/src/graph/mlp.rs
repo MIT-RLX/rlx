@@ -128,7 +128,13 @@ pub fn concat_features(g: &mut Graph, parts: Vec<NodeId>) -> NodeId {
     g.concat_(parts, 1)
 }
 
-pub fn init_mat(w: &mut crate::graph::actor::WeightStore, name: &str, rows: usize, cols: usize, seed: &mut u64) {
+pub fn init_mat(
+    w: &mut crate::graph::actor::WeightStore,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    seed: &mut u64,
+) {
     let scale = (2.0 / (rows + cols) as f32).sqrt();
     let n = rows * cols;
     let mut v = vec![0.0f32; n];

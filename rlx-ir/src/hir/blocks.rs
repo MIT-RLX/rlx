@@ -62,17 +62,11 @@ pub fn lower_llama_decoder_block(
 
     let attn_shape = shape::attention_shape(g.shape(q_rope));
     let attn = match mask {
-        MaskKind::Custom => {
-            g.attention(q_rope, k_rep, v_rep, inputs[14], num_heads, head_dim, attn_shape)
-        }
+        MaskKind::Custom => g.attention(
+            q_rope, k_rep, v_rep, inputs[14], num_heads, head_dim, attn_shape,
+        ),
         MaskKind::Bias => g.attention_bias(
-            q_rope,
-            k_rep,
-            v_rep,
-            inputs[14],
-            num_heads,
-            head_dim,
-            attn_shape,
+            q_rope, k_rep, v_rep, inputs[14], num_heads, head_dim, attn_shape,
         ),
         other => g.attention_kind(q_rope, k_rep, v_rep, num_heads, head_dim, other, attn_shape),
     };
@@ -179,7 +173,7 @@ pub fn lower_qwen35_mtp_head(
         seq_dim.unwrap_static()
     };
     let f = DType::F32;
-    let q_gate_cols = num_heads * head_dim * 2;
+    let _q_gate_cols = num_heads * head_dim * 2;
     let kv_cols = num_kv_heads * head_dim;
     let kv_dim = num_heads * head_dim;
     let rows = batch * seq.max(1);
@@ -220,12 +214,7 @@ pub fn lower_qwen35_mtp_head(
     let q_gate_4d = g.reshape_(
         q_gate,
         if dynamic_seq {
-            vec![
-                batch as i64,
-                -1,
-                num_heads as i64,
-                (head_dim * 2) as i64,
-            ]
+            vec![batch as i64, -1, num_heads as i64, (head_dim * 2) as i64]
         } else {
             vec![
                 batch as i64,
@@ -274,7 +263,16 @@ pub fn lower_qwen35_mtp_head(
     );
 
     let q_normed = per_head_rms_graph(
-        g, q_packed, q_norm_w, q_norm_b, batch, seq, num_heads, head_dim, eps, dynamic_seq,
+        g,
+        q_packed,
+        q_norm_w,
+        q_norm_b,
+        batch,
+        seq,
+        num_heads,
+        head_dim,
+        eps,
+        dynamic_seq,
     );
     let k_normed = per_head_rms_graph(
         g,
@@ -303,10 +301,18 @@ pub fn lower_qwen35_mtp_head(
         repeat_heads_packed_graph(g, v_packed, batch, seq, num_kv_heads, head_dim, group)
     };
 
-    let gate_sig = g.activation(Activation::Sigmoid, gate_packed, g.shape(gate_packed).clone());
+    let gate_sig = g.activation(
+        Activation::Sigmoid,
+        gate_packed,
+        g.shape(gate_packed).clone(),
+    );
     let attn_shape = if dynamic_seq {
         Shape::from_dims(
-            &[Dim::Static(batch), Dim::Dynamic(sym::SEQ), Dim::Static(kv_dim)],
+            &[
+                Dim::Static(batch),
+                Dim::Dynamic(sym::SEQ),
+                Dim::Static(kv_dim),
+            ],
             f,
         )
     } else {
@@ -400,8 +406,8 @@ fn per_head_rms_graph(
 fn repeat_heads_packed_graph(
     g: &mut Graph,
     x: NodeId,
-    batch: usize,
-    seq: usize,
+    _batch: usize,
+    _seq: usize,
     in_heads: usize,
     head_dim: usize,
     factor: usize,
@@ -428,7 +434,7 @@ fn swiglu_ffn_graph(
     batch: usize,
     seq: usize,
     n_embd: usize,
-    n_ff: usize,
+    _n_ff: usize,
     eps: f32,
     dynamic_seq: bool,
 ) -> NodeId {

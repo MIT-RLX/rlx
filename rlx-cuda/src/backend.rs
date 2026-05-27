@@ -37,17 +37,16 @@ use crate::arena::{Arena, plan_f32_uniform};
 use crate::device::{cuda_blas, cuda_blas_lt_handle, cuda_context, cuda_dnn_handle};
 use crate::kernels::{
     argmax_kernel, attention_bwd_kernel, attention_kernel, binary_kernel, compare_kernel,
-    concat_kernel, conv1d_kernel,
-    conv2d_kernel, conv3d_kernel, conv_transpose2d_kernel, cumsum_kernel, dequant_matmul_kernel,
-    dispatch_grid_1d, group_norm_kernel, layer_norm2d_kernel, resize_nearest_2x_kernel,
+    concat_kernel, conv_transpose2d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dispatch_grid_1d,
     elementwise_region_kernel, expand_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
-    gather_axis_kernel, gather_kernel, grouped_matmul_kernel, layernorm_kernel, matmul_epilogue_kernel, matmul_kernel,
-    cumsum_backward_kernel, gather_backward_kernel, rms_norm_backward_kernel,
-    rms_norm_bwd_zero_kernel, rope_backward_kernel,
-    matmul_wmma_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
-    rope_kernel, sample_kernel, scatter_add_acc_kernel, scatter_add_zero_kernel,
-    selective_scan_kernel, softmax_kernel, topk_kernel, transpose_kernel, unary_kernel,
-    where_kernel,
+    gather_axis_kernel, gather_backward_kernel, gather_kernel, group_norm_kernel,
+    grouped_matmul_kernel, layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel,
+    matmul_kernel, matmul_wmma_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
+    reduce_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel, rms_norm_bwd_zero_kernel,
+    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_acc_kernel,
+    scatter_add_zero_kernel, selective_scan_kernel, softmax_kernel, topk_kernel, transpose_kernel,
+    unary_kernel, where_kernel,
 };
 
 /// Opt-in WMMA Tensor Core matmul. Reads `RLX_CUDA_WMMA=1` from env at
@@ -1941,10 +1940,7 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             w_byte_off,
             out_byte_off,
             ..
-        } => (
-            vec![x_byte_off / 4, w_byte_off / 4],
-            vec![out_byte_off / 4],
-        ),
+        } => (vec![x_byte_off / 4, w_byte_off / 4], vec![out_byte_off / 4]),
         Step::DequantGroupedMatmulGguf {
             x_byte_off,
             w_byte_off,
@@ -2166,10 +2162,7 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             b_off,
             dst_off,
             ..
-        } => (
-            vec![*src_off, *g_off, *b_off],
-            vec![*dst_off],
-        ),
+        } => (vec![*src_off, *g_off, *b_off], vec![*dst_off]),
         Step::ConvTranspose2d {
             src_off,
             w_off,
@@ -2182,14 +2175,9 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             b_off,
             dst_off,
             ..
-        } => (
-            vec![*src_off, *g_off, *b_off],
-            vec![*dst_off],
-        ),
+        } => (vec![*src_off, *g_off, *b_off], vec![*dst_off]),
         Step::ResizeNearest2x {
-            src_off,
-            dst_off,
-            ..
+            src_off, dst_off, ..
         } => (vec![*src_off], vec![*dst_off]),
         Step::FusedBinaryUnary {
             a_off,
@@ -2234,82 +2222,6 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dst_off,
             ..
         } => (vec![prep_off / 4, meta_off / 4], vec![dst_off / 4]),
-        Step::RmsNormBackwardInput {
-            x_byte_off,
-            gamma_byte_off,
-            beta_byte_off,
-            dy_byte_off,
-            dx_byte_off,
-            ..
-        } => (
-            vec![
-                *x_byte_off / 4,
-                *gamma_byte_off / 4,
-                *beta_byte_off / 4,
-                *dy_byte_off / 4,
-            ],
-            vec![*dx_byte_off / 4],
-        ),
-        Step::RmsNormBackwardGamma {
-            x_byte_off,
-            gamma_byte_off,
-            beta_byte_off,
-            dy_byte_off,
-            dgamma_byte_off,
-            ..
-        } => (
-            vec![
-                *x_byte_off / 4,
-                *gamma_byte_off / 4,
-                *beta_byte_off / 4,
-                *dy_byte_off / 4,
-            ],
-            vec![*dgamma_byte_off / 4],
-        ),
-        Step::RmsNormBackwardBeta {
-            x_byte_off,
-            gamma_byte_off,
-            beta_byte_off,
-            dy_byte_off,
-            dbeta_byte_off,
-            ..
-        } => (
-            vec![
-                *x_byte_off / 4,
-                *gamma_byte_off / 4,
-                *beta_byte_off / 4,
-                *dy_byte_off / 4,
-            ],
-            vec![*dbeta_byte_off / 4],
-        ),
-        Step::RopeBackward {
-            dy_byte_off,
-            cos_byte_off,
-            sin_byte_off,
-            dx_byte_off,
-            ..
-        } => (
-            vec![
-                *dy_byte_off / 4,
-                *cos_byte_off / 4,
-                *sin_byte_off / 4,
-            ],
-            vec![*dx_byte_off / 4],
-        ),
-        Step::CumsumBackward {
-            dy_byte_off,
-            dx_byte_off,
-            ..
-        } => (vec![*dy_byte_off / 4], vec![*dx_byte_off / 4]),
-        Step::GatherBackward {
-            dy_byte_off,
-            indices_byte_off,
-            dst_byte_off,
-            ..
-        } => (
-            vec![*dy_byte_off / 4, *indices_byte_off / 4],
-            vec![*dst_byte_off / 4],
-        ),
     }
 }
 
@@ -3000,9 +2912,7 @@ impl CudaExecutable {
                     let (mask_kind_id, mask_off, window) = match mask_kind {
                         MaskKind::None => (0u32, 0u32, 0u32),
                         MaskKind::Causal => (1u32, 0u32, 0u32),
-                        MaskKind::Custom => {
-                            (2u32, (arena.offset(node.inputs[4]) / 4) as u32, 0u32)
-                        }
+                        MaskKind::Custom => (2u32, (arena.offset(node.inputs[4]) / 4) as u32, 0u32),
                         MaskKind::SlidingWindow(w) => (3u32, 0u32, *w as u32),
                         MaskKind::Bias => (4u32, (arena.offset(node.inputs[4]) / 4) as u32, 0u32),
                     };
@@ -3191,9 +3101,7 @@ impl CudaExecutable {
                             QuantScheme::Fp8E4m3 => (1, 3u32),
                             QuantScheme::Fp8E5m2 => (1, 4u32),
                             QuantScheme::Nvfp4Block => (rlx_ir::NVFP4_GROUP_SIZE as u32, 5u32),
-                            other => panic!(
-                                "rlx-cuda DequantMatMul: unsupported scheme {other:?}"
-                            ),
+                            other => panic!("rlx-cuda DequantMatMul: unsupported scheme {other:?}"),
                         };
                         let scale_id = node.inputs[2];
                         let zp_id = node.inputs[3];
@@ -3727,8 +3635,7 @@ impl CudaExecutable {
                 | Op::RmsNormBackwardBeta { eps, .. } => {
                     let x_shape = &graph.node(node.inputs[0]).shape;
                     let h = x_shape.dim(x_shape.rank() - 1).unwrap_static() as u32;
-                    let rows =
-                        (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
+                    let rows = (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
                     let eps_bits = eps.to_bits();
                     let off = |i: usize| arena.offset(node.inputs[i]) as u32;
                     let common = (off(0), off(1), off(2), off(3), rows, h, eps_bits);
@@ -3787,8 +3694,7 @@ impl CudaExecutable {
                             dy_shape.dim(1).unwrap_static() as u32,
                         )
                     };
-                    let cos_len =
-                        graph.node(node.inputs[1]).shape.num_elements().unwrap() as u32;
+                    let cos_len = graph.node(node.inputs[1]).shape.num_elements().unwrap() as u32;
                     schedule.push(Step::RopeBackward {
                         dy_byte_off: arena.offset(node.inputs[0]) as u32,
                         cos_byte_off: arena.offset(node.inputs[1]) as u32,
@@ -3805,8 +3711,7 @@ impl CudaExecutable {
                 Op::CumsumBackward { exclusive, .. } => {
                     let dy_shape = &graph.node(node.inputs[0]).shape;
                     let cols = dy_shape.dim(dy_shape.rank() - 1).unwrap_static() as u32;
-                    let rows =
-                        (dy_shape.num_elements().unwrap() / cols.max(1) as usize) as u32;
+                    let rows = (dy_shape.num_elements().unwrap() / cols.max(1) as usize) as u32;
                     schedule.push(Step::CumsumBackward {
                         dy_byte_off: arena.offset(node.inputs[0]) as u32,
                         dx_byte_off: arena.offset(node.id) as u32,
@@ -3956,12 +3861,7 @@ impl CudaExecutable {
         {
             let byte_off = self.arena.offset(id);
             let stream = self.ctx.default_stream();
-            crate::gguf_host::upload_param_bytes(
-                &stream,
-                &mut self.arena.buffer,
-                byte_off,
-                data,
-            );
+            crate::gguf_host::upload_param_bytes(&stream, &mut self.arena.buffer, byte_off, data);
         }
     }
 
@@ -6764,7 +6664,7 @@ fn launch_gather_bwd(
     }
     let kernel = gather_backward_kernel(ctx);
     let cfg = LaunchConfig {
-        grid_dim: (outer, (num_idx * trailing + 255) / 256, 1),
+        grid_dim: (outer, (num_idx * trailing).div_ceil(256), 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };

@@ -19,13 +19,7 @@ use crate::{Graph, NodeId, Op, Shape};
 
 impl Graph {
     /// LayerNorm2d on NCHW (normalize across channels at each spatial position).
-    pub fn layer_norm2d(
-        &mut self,
-        input: NodeId,
-        gamma: NodeId,
-        beta: NodeId,
-        eps: f32,
-    ) -> NodeId {
+    pub fn layer_norm2d(&mut self, input: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId {
         let shape = self.node(input).shape.clone();
         self.push(
             Op::LayerNorm2d { eps },

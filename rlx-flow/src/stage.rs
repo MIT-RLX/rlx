@@ -9,18 +9,16 @@ use anyhow::Result;
 
 use crate::blocks::{
     AttnMaskStage, BertEncoderLayerStage, BindDecodeInputsStage, BlockStage, ClsTokenPoolStage,
-    CustomStage, EmbedStage, GatherAddStage, GatherFromInputStage, GeluFfnStage, GdnScanStage,
-    GatherLastTokenStage, LayerNormStage, LayerScaleStage, LinearStage, LlamaDecodeLayerStage,
-    LlamaDecoderStage, LlamaKvTapStage, LmHeadStage, NomicEncoderLayerStage,
+    CustomStage, EmbedStage, GatherAddStage, GatherFromInputStage, GatherLastTokenStage,
+    GdnScanStage, GeluFfnStage, LayerNormStage, LayerScaleStage, LinearStage,
+    LlamaDecodeLayerStage, LlamaDecoderStage, LlamaKvTapStage, LmHeadStage, NomicEncoderLayerStage,
     Qwen3DecodeLayerStage, Qwen3DecoderStage, RepeatStage, ResidualAddStage, ResidualSaveStage,
     RmsNormStage, RopeTablesStage, SelfAttnPrefillStage, SwiGluStage, VisionSwiGluFfnStage,
     VitSelfAttnStage,
 };
-use crate::stream::{DualStreamStage, LoadStreamStage, StoreStreamStage};
 use crate::context::FlowCtx;
+use crate::stream::{DualStreamStage, LoadStreamStage, StoreStreamStage};
 use crate::value::FlowValue;
-use rlx_ir::Shape;
-
 /// One stage in a model flow. Model authors compose these — not HIR ops.
 #[derive(Debug, Clone)]
 pub enum FlowStage {
@@ -29,10 +27,7 @@ pub enum FlowStage {
     /// Precomputed RoPE sin/cos tables as params.
     RopeTables(RopeTablesStage),
     /// Ensure a rank-1 zero vector exists for RMSNorm beta slots.
-    ZeroBeta {
-        name: String,
-        len: usize,
-    },
+    ZeroBeta { name: String, len: usize },
     /// Bind decode inputs (RoPE slice, past K/V, mask) into flow state.
     BindDecodeInputs(BindDecodeInputsStage),
     /// Bind or synthesize vision attention mask (all-ones).
@@ -46,10 +41,7 @@ pub enum FlowStage {
     /// Repeat an inner stage `count` times with a per-index name prefix.
     Repeat(RepeatStage),
     /// Named nested scope (fusion/debug labeling).
-    Named {
-        name: String,
-        inner: Arc<FlowStage>,
-    },
+    Named { name: String, inner: Arc<FlowStage> },
     /// Run stages in order; side-effect stages may leave the main tensor unchanged.
     Sequence(Vec<FlowStage>),
     /// Final RMSNorm before LM head.
@@ -136,7 +128,8 @@ impl FlowStage {
                 Ok(input)
             }
             FlowStage::LlamaDecodeLayer(s) => {
-                let input = input.ok_or_else(|| anyhow::anyhow!("LlamaDecodeLayer requires input"))?;
+                let input =
+                    input.ok_or_else(|| anyhow::anyhow!("LlamaDecodeLayer requires input"))?;
                 s.emit(ctx, input)
             }
             FlowStage::LlamaDecoder(s) => {
@@ -168,7 +161,8 @@ impl FlowStage {
                 s.emit(ctx, input)
             }
             FlowStage::GatherLastToken(s) => {
-                let input = input.ok_or_else(|| anyhow::anyhow!("GatherLastToken requires input"))?;
+                let input =
+                    input.ok_or_else(|| anyhow::anyhow!("GatherLastToken requires input"))?;
                 s.emit(ctx, input)
             }
             FlowStage::LmHead(s) => {
@@ -192,7 +186,8 @@ impl FlowStage {
                 s.emit(ctx, input)
             }
             FlowStage::SelfAttnPrefill(s) => {
-                let input = input.ok_or_else(|| anyhow::anyhow!("SelfAttnPrefill requires input"))?;
+                let input =
+                    input.ok_or_else(|| anyhow::anyhow!("SelfAttnPrefill requires input"))?;
                 s.emit(ctx, input)
             }
             FlowStage::GdnScan(s) => {
@@ -204,11 +199,13 @@ impl FlowStage {
             FlowStage::DualStream(s) => s.emit(ctx, input),
             FlowStage::Custom(s) => s.emit(ctx, input),
             FlowStage::BertEncoderLayer(s) => {
-                let input = input.ok_or_else(|| anyhow::anyhow!("BertEncoderLayer requires input"))?;
+                let input =
+                    input.ok_or_else(|| anyhow::anyhow!("BertEncoderLayer requires input"))?;
                 s.emit(ctx, input)
             }
             FlowStage::NomicEncoderLayer(s) => {
-                let input = input.ok_or_else(|| anyhow::anyhow!("NomicEncoderLayer requires input"))?;
+                let input =
+                    input.ok_or_else(|| anyhow::anyhow!("NomicEncoderLayer requires input"))?;
                 s.emit(ctx, input)
             }
             FlowStage::Qwen3Decoder(s) => {
@@ -216,7 +213,8 @@ impl FlowStage {
                 s.emit(ctx, input)
             }
             FlowStage::Qwen3DecodeLayer(s) => {
-                let input = input.ok_or_else(|| anyhow::anyhow!("Qwen3DecodeLayer requires input"))?;
+                let input =
+                    input.ok_or_else(|| anyhow::anyhow!("Qwen3DecodeLayer requires input"))?;
                 s.emit(ctx, input)
             }
             FlowStage::VitSelfAttn(s) => {
@@ -228,7 +226,8 @@ impl FlowStage {
                 s.emit(ctx, input)
             }
             FlowStage::VisionSwiGluFfn(s) => {
-                let input = input.ok_or_else(|| anyhow::anyhow!("VisionSwiGluFfn requires input"))?;
+                let input =
+                    input.ok_or_else(|| anyhow::anyhow!("VisionSwiGluFfn requires input"))?;
                 s.emit(ctx, input)
             }
             FlowStage::ClsTokenPool(s) => {
@@ -244,7 +243,8 @@ impl FlowStage {
                 s.emit(ctx, input)
             }
             FlowStage::GatherFromInput(s) => {
-                let input = input.ok_or_else(|| anyhow::anyhow!("GatherFromInput requires input"))?;
+                let input =
+                    input.ok_or_else(|| anyhow::anyhow!("GatherFromInput requires input"))?;
                 s.emit(ctx, input)
             }
             FlowStage::GatherAdd(s) => {

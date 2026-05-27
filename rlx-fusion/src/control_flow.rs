@@ -44,7 +44,7 @@
 //! to `captures[i]` when inlined into the parent.
 
 use crate::pass::Pass;
-use rlx_ir::op::BinaryOp;
+use rlx_ir::op::{BinaryOp, CmpOp, ReduceOp};
 use rlx_ir::shape::Dim;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use std::collections::HashMap;
@@ -110,7 +110,6 @@ pub fn unroll_while(g: Graph) -> Graph {
     let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
     let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
     let scalar_f32 = Shape::new(&[1], DType::F32);
-    let scalar_bool = Shape::new(&[1], DType::Bool);
 
     for node in &nodes {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
@@ -138,11 +137,7 @@ pub fn unroll_while(g: Graph) -> Graph {
                 let mut carried = new_inputs;
                 for _ in 0..*n {
                     let cond_out = inline_subgraph_into(cond, &carried, &mut out);
-                    let cond_f = out.add_node(
-                        Op::Cast { to: DType::F32 },
-                        vec![cond_out],
-                        scalar_f32.clone(),
-                    );
+                    let cond_f = cond_to_scalar_f32(cond_out, &mut out, &scalar_f32);
                     active = out.binary(BinaryOp::Mul, active, cond_f, scalar_f32.clone());
 
                     let body_outs = inline_subgraph_into_outputs(body, &carried, &mut out);
@@ -151,19 +146,11 @@ pub fn unroll_while(g: Graph) -> Graph {
                         carried.len(),
                         "Op::While: body output count must match loop-carried arity"
                     );
-                    let active_bool = out.add_node(
-                        Op::Cast { to: DType::Bool },
-                        vec![active],
-                        scalar_bool.clone(),
-                    );
                     let mut next = Vec::with_capacity(carried.len());
                     for (body_out, &prev) in body_outs.iter().zip(carried.iter()) {
                         let shape = out.node(prev).shape.clone();
-                        let merged = out.add_node(
-                            Op::Where,
-                            vec![active_bool, *body_out, prev],
-                            shape,
-                        );
+                        let mask = expand_to_shape(active, &shape, &mut out);
+                        let merged = out.add_node(Op::Where, vec![mask, *body_out, prev], shape);
                         next.push(merged);
                     }
                     carried = next;
@@ -189,6 +176,54 @@ pub fn unroll_while(g: Graph) -> Graph {
     let new_outputs: Vec<NodeId> = g.outputs.iter().map(|i| id_map[i]).collect();
     out.set_outputs(new_outputs);
     out
+}
+
+/// Fold a cond-subgraph output into a scalar f32 loop flag for `active`.
+/// Vector conds are reduced with min(nonzero) so every element must be
+/// truthy for the loop to keep running (matches treating 0 as false).
+fn cond_to_scalar_f32(cond_out: NodeId, out: &mut Graph, scalar_f32: &Shape) -> NodeId {
+    let cond_shape = out.node(cond_out).shape.clone();
+    let n = cond_shape
+        .dims()
+        .iter()
+        .filter_map(|d| match d {
+            Dim::Static(n) => Some(*n),
+            _ => None,
+        })
+        .product::<usize>();
+    let as_f32 = if cond_shape.dtype() == DType::F32 {
+        cond_out
+    } else {
+        out.add_node(
+            Op::Cast { to: DType::F32 },
+            vec![cond_out],
+            cond_shape.with_dtype(DType::F32),
+        )
+    };
+    if n <= 1 {
+        return as_f32;
+    }
+    let as_f32_shape = out.node(as_f32).shape.clone();
+    let rank = as_f32_shape.rank();
+    let zero = out.add_node(
+        Op::Constant {
+            data: 0.0_f32.to_le_bytes().to_vec(),
+        },
+        vec![],
+        scalar_f32.clone(),
+    );
+    let nonzero = out.add_node(
+        Op::Compare(CmpOp::Ne),
+        vec![as_f32, zero],
+        as_f32_shape.clone().with_dtype(DType::Bool),
+    );
+    let nonzero_f = out.add_node(
+        Op::Cast { to: DType::F32 },
+        vec![nonzero],
+        as_f32_shape.with_dtype(DType::F32),
+    );
+    let axes: Vec<usize> = (0..rank).collect();
+    out.reduce(nonzero_f, ReduceOp::Min, axes, true, scalar_f32.clone())
 }
 
 /// Expand a tensor up to `target` via `Op::Expand` if its shape
@@ -290,10 +325,7 @@ pub fn inline_subgraph_into_outputs(
         input_idx,
         captures.len()
     );
-    sub.outputs
-        .iter()
-        .map(|o| sub_to_parent[o])
-        .collect()
+    sub.outputs.iter().map(|o| sub_to_parent[o]).collect()
 }
 
 /// Helper: copy `sub`'s nodes into `out`, mapping each Op::Input
@@ -365,7 +397,8 @@ mod tests {
             !has_if && !has_while,
             "LowerControlFlow should erase both If and While"
         );
-        // Where introduced for If; body's Mul appears twice (N=2).
+        // 1 Where from If; While unroll adds 1 Where per iteration per
+        // carry (MLX semantics, see `unroll_while`).
         let n_where = lowered
             .nodes()
             .iter()
@@ -376,8 +409,14 @@ mod tests {
             .iter()
             .filter(|n| matches!(n.op, Op::Binary(BinaryOp::Mul)))
             .count();
-        assert_eq!(n_where, 1, "expected 1 Where from If lowering");
-        assert_eq!(n_mul, 2, "expected 2 Mul from While unroll (N=2)");
+        assert_eq!(
+            n_where, 3,
+            "expected 1 Where from If + 2 from While (N=2, 1 carry)"
+        );
+        assert_eq!(
+            n_mul, 4,
+            "expected 2 body Mul + 2 active*cond_f Mul from While (N=2)"
+        );
     }
 
     #[test]
@@ -431,7 +470,10 @@ mod tests {
 
         let lowered = unroll_while(g);
         assert!(
-            !lowered.nodes().iter().any(|n| matches!(n.op, Op::While { .. })),
+            !lowered
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::While { .. })),
             "While should be erased"
         );
         let n_where = lowered

@@ -57,9 +57,9 @@ pub mod io;
 pub mod parity;
 pub mod parity_config;
 
-pub use parity::*;
-pub use parity_config::{parity_camera, parity_tiny_render_params, PARITY_BACKGROUND};
 pub use core::{make_parity_scene, make_scene};
+pub use parity::*;
+pub use parity_config::{PARITY_BACKGROUND, parity_camera, parity_tiny_render_params};
 
 #[cfg(feature = "cpu")]
 pub use ops::*;
@@ -87,7 +87,9 @@ pub fn register() {
                 cpu_exec::execute_gaussian_splat_render_backward(a)
             }),
             Box::new(|a: ArenaPrepareArgs| unsafe { cpu_exec::execute_gaussian_splat_prepare(a) }),
-            Box::new(|a: ArenaRasterizeArgs| unsafe { cpu_exec::execute_gaussian_splat_rasterize(a) }),
+            Box::new(|a: ArenaRasterizeArgs| unsafe {
+                cpu_exec::execute_gaussian_splat_rasterize(a)
+            }),
             Box::new(|a: HostRenderArgs| cpu_exec::render_host_slices_args(a)),
             Box::new(|a: HostBackwardArgs| cpu_exec::backward_host_slices_args(a)),
         );

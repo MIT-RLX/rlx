@@ -13,8 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 use rlx_fdm::{
-    grad_loss_wrt_q, grad_loss_wrt_q_fd, grad_loss_wrt_q_fixedpoint, goals, EquilibriumModel,
-    FdmOptions, IterativeConfig, Network,
+    EquilibriumModel, FdmOptions, IterativeConfig, Network, goals, grad_loss_wrt_q,
+    grad_loss_wrt_q_fd, grad_loss_wrt_q_fixedpoint,
 };
 
 #[test]
@@ -38,8 +38,7 @@ fn fixedpoint_adjoint_matches_fd_on_edge_loads() {
     let nf = s.num_free();
     let mut loss_grad = vec![0.0; nf * 3];
     loss_grad[2] = 1.0;
-    let xyz_free =
-        EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("x");
+    let _xyz_free = EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("x");
     let _ = goals::mean_edge_length(&eq);
 
     let analytic = grad_loss_wrt_q_fixedpoint(
@@ -86,8 +85,10 @@ fn grad_loss_wrt_q_uses_fixedpoint_for_edge_loads() {
     let xf = vec![0.0; s.num_fixed() * 3];
     let nf = s.num_free();
     let loss_grad = vec![0.0; nf * 3];
-    let mut cfg = IterativeConfig::default();
-    cfg.tmax = 30;
+    let cfg = IterativeConfig {
+        tmax: 30,
+        ..Default::default()
+    };
     let xyz = EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).unwrap();
     let auto = grad_loss_wrt_q(
         &net.q,
@@ -119,7 +120,10 @@ fn grad_loss_wrt_q_uses_fixedpoint_for_edge_loads() {
     for (a, b) in auto.dq.iter().zip(fp.dq.iter()) {
         max_err = max_err.max((a - b).abs());
     }
-    assert!(max_err < 1e-10, "router should select fixedpoint, err={max_err}");
+    assert!(
+        max_err < 1e-10,
+        "router should select fixedpoint, err={max_err}"
+    );
 }
 
 #[test]
@@ -286,8 +290,7 @@ fn fixedpoint_adjoint_matches_fd_on_local_face_loads() {
 #[test]
 fn transpose_face_jacobian_matches_fd() {
     use rlx_fdm::{
-        mesh::edges_from_faces, transpose_face_loads_jacobian,
-        transpose_face_loads_jacobian_fd,
+        mesh::edges_from_faces, transpose_face_loads_jacobian, transpose_face_loads_jacobian_fd,
     };
 
     let faces = vec![vec![0, 1, 2], vec![0, 2, 3]];
@@ -316,48 +319,23 @@ fn transpose_face_jacobian_matches_fd() {
     let nf = s.num_free();
     let lambda: Vec<f64> = (0..nf * 3).map(|i| (i as f64 + 1.0) * 0.01).collect();
 
-    let ana = transpose_face_loads_jacobian(
-        &xyz,
-        &face_loads,
-        &mesh,
-        &s,
-        &net.edges,
-        &lambda,
-        true,
-    );
-    let fd = transpose_face_loads_jacobian_fd(
-        &xyz,
-        &face_loads,
-        &mesh,
-        &s,
-        &net.edges,
-        &lambda,
-        true,
-    );
+    let ana =
+        transpose_face_loads_jacobian(&xyz, &face_loads, &mesh, &s, &net.edges, &lambda, true);
+    let fd =
+        transpose_face_loads_jacobian_fd(&xyz, &face_loads, &mesh, &s, &net.edges, &lambda, true);
     let mut max_err: f64 = 0.0;
     for (a, b) in ana.iter().zip(fd.iter()) {
         max_err = max_err.max((a - b).abs());
     }
-    assert!(max_err < 0.12, "local face transpose vs FD max_err={max_err}");
+    assert!(
+        max_err < 0.12,
+        "local face transpose vs FD max_err={max_err}"
+    );
 
-    let ana_g = transpose_face_loads_jacobian(
-        &xyz,
-        &face_loads,
-        &mesh,
-        &s,
-        &net.edges,
-        &lambda,
-        false,
-    );
-    let fd_g = transpose_face_loads_jacobian_fd(
-        &xyz,
-        &face_loads,
-        &mesh,
-        &s,
-        &net.edges,
-        &lambda,
-        false,
-    );
+    let ana_g =
+        transpose_face_loads_jacobian(&xyz, &face_loads, &mesh, &s, &net.edges, &lambda, false);
+    let fd_g =
+        transpose_face_loads_jacobian_fd(&xyz, &face_loads, &mesh, &s, &net.edges, &lambda, false);
     let mut max_g = 0.0_f64;
     for (a, b) in ana_g.iter().zip(fd_g.iter()) {
         max_g = max_g.max((a - b).abs());

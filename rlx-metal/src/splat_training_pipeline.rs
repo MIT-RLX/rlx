@@ -20,10 +20,10 @@ use crate::device::metal_device;
 use crate::kernels::kernels;
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 use rlx_splat::backends::metal_training::{GpuTrainingTraceBuffers, SplatRasterBwdParams};
-use rlx_splat::reference::native_prep::SplatRasterParams;
 use rlx_splat::core::{Camera, GaussianScene};
+use rlx_splat::reference::native_prep::SplatRasterParams;
 use rlx_splat::reference::{
-    build_training_prepare, linearize_background, prepared_raster_from_training, TrainingPrepare,
+    TrainingPrepare, build_training_prepare, linearize_background, prepared_raster_from_training,
 };
 
 const BIN_SORT_THREADS: u64 = 256;
@@ -286,10 +286,8 @@ impl MetalFusedTraining {
             )
         };
         let mk_z = |n: usize| -> Buffer {
-            dev.device.new_buffer(
-                (n * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
+            dev.device
+                .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared)
         };
         let n_pix = (width * height * 4) as usize;
         let n_grad = count * 4;
@@ -374,7 +372,9 @@ impl MetalFusedTraining {
 
     pub fn read_pixel_rgb_grad(&self) -> Vec<f32> {
         let n = (self.width * self.height * 3) as usize;
-        unsafe { std::slice::from_raw_parts(self.pixel_rgb_grad.contents() as *const f32, n).to_vec() }
+        unsafe {
+            std::slice::from_raw_parts(self.pixel_rgb_grad.contents() as *const f32, n).to_vec()
+        }
     }
 
     pub fn read_bin_list_count(&self) -> u32 {
@@ -382,7 +382,8 @@ impl MetalFusedTraining {
     }
 
     pub fn count_valid_splats(&self) -> u32 {
-        let valid = unsafe { std::slice::from_raw_parts(self.valid.contents() as *const u32, self.count) };
+        let valid =
+            unsafe { std::slice::from_raw_parts(self.valid.contents() as *const u32, self.count) };
         valid.iter().filter(|&&v| v != 0).count() as u32
     }
 
@@ -530,8 +531,9 @@ impl MetalFusedTraining {
         if n == 0 {
             return 0;
         }
-        let crd =
-            unsafe { std::slice::from_raw_parts(self.center_radius_depth.contents() as *const f32, n * 4) };
+        let crd = unsafe {
+            std::slice::from_raw_parts(self.center_radius_depth.contents() as *const f32, n * 4)
+        };
         let valid = unsafe { std::slice::from_raw_parts(self.valid.contents() as *const u32, n) };
         let out = unsafe {
             std::slice::from_raw_parts_mut(self.depth_sorted_ids.contents() as *mut u32, n)
@@ -575,9 +577,8 @@ impl MetalFusedTraining {
         pr: &SplatProjectParams,
     ) {
         let k = kernels();
-        let (groups, tg) = self.splat_thread_groups(
-            k.gaussian_splat_project_training.thread_execution_width(),
-        );
+        let (groups, tg) =
+            self.splat_thread_groups(k.gaussian_splat_project_training.thread_execution_width());
         enc.set_compute_pipeline_state(&k.gaussian_splat_project_training);
         enc.set_buffer(0, Some(&self.positions), 0);
         enc.set_buffer(1, Some(&self.scales), 0);
@@ -614,7 +615,10 @@ impl MetalFusedTraining {
         pr: &SplatProjectParams,
     ) {
         let k = kernels();
-        let tg = k.gaussian_splat_project_screen_ellipse.thread_execution_width().max(1);
+        let tg = k
+            .gaussian_splat_project_screen_ellipse
+            .thread_execution_width()
+            .max(1);
         let groups = (self.count as u64 + tg as u64 - 1) / tg as u64;
         enc.set_compute_pipeline_state(&k.gaussian_splat_project_screen_ellipse);
         enc.set_buffer(0, Some(&self.positions), 0);
@@ -624,17 +628,18 @@ impl MetalFusedTraining {
         enc.set_buffer(4, Some(&self.center_radius_depth), 0);
         enc.set_buffer(5, Some(&self.ellipse_conic), 0);
         enc.set_buffer(6, Some(&self.valid), 0);
-        enc.set_bytes(7, std::mem::size_of::<SplatProjectParams>() as u64, pr as *const _ as *const _);
+        enc.set_bytes(
+            7,
+            std::mem::size_of::<SplatProjectParams>() as u64,
+            pr as *const _ as *const _,
+        );
         enc.dispatch_thread_groups(
             metal::MTLSize::new(groups, 1, 1),
             metal::MTLSize::new(tg, 1, 1),
         );
     }
 
-    fn dispatch_bin_sort_pipeline(
-        &self,
-        enc: &metal::ComputeCommandEncoderRef,
-    ) {
+    fn dispatch_bin_sort_pipeline(&self, enc: &metal::ComputeCommandEncoderRef) {
         let k = kernels();
         let list_dispatch = bin_list_dispatch_groups(self.max_list_entries);
         let tile_count = self.tile_count;
@@ -685,16 +690,19 @@ impl MetalFusedTraining {
         bp: &SplatBinParams,
     ) {
         let k = kernels();
-        let (groups, tg) = self.splat_thread_groups(
-            k.gaussian_splat_emit_tile_keys.thread_execution_width(),
-        );
+        let (groups, tg) =
+            self.splat_thread_groups(k.gaussian_splat_emit_tile_keys.thread_execution_width());
         enc.set_compute_pipeline_state(&k.gaussian_splat_emit_tile_keys);
         enc.set_buffer(0, Some(&self.center_radius_depth), 0);
         enc.set_buffer(1, Some(&self.valid), 0);
         enc.set_buffer(2, Some(&self.bin_keys), 0);
         enc.set_buffer(3, Some(&self.bin_values), 0);
         enc.set_buffer(4, Some(&self.bin_counter), 0);
-        enc.set_bytes(5, std::mem::size_of::<SplatBinParams>() as u64, bp as *const _ as *const _);
+        enc.set_bytes(
+            5,
+            std::mem::size_of::<SplatBinParams>() as u64,
+            bp as *const _ as *const _,
+        );
         enc.dispatch_thread_groups(
             metal::MTLSize::new(groups, 1, 1),
             metal::MTLSize::new(tg, 1, 1),
@@ -708,7 +716,10 @@ impl MetalFusedTraining {
         emit_count: u32,
     ) {
         let k = kernels();
-        let tg = k.gaussian_splat_emit_tile_keys_conic.thread_execution_width().max(1);
+        let tg = k
+            .gaussian_splat_emit_tile_keys_conic
+            .thread_execution_width()
+            .max(1);
         unsafe {
             *(self.emit_count_buf.contents() as *mut u32) = emit_count;
         }
@@ -721,7 +732,11 @@ impl MetalFusedTraining {
         enc.set_buffer(4, Some(&self.bin_keys), 0);
         enc.set_buffer(5, Some(&self.bin_values), 0);
         enc.set_buffer(6, Some(&self.bin_counter), 0);
-        enc.set_bytes(7, std::mem::size_of::<SplatBinParams>() as u64, bp as *const _ as *const _);
+        enc.set_bytes(
+            7,
+            std::mem::size_of::<SplatBinParams>() as u64,
+            bp as *const _ as *const _,
+        );
         enc.set_buffer(8, Some(&self.emit_count_buf), 0);
         enc.dispatch_thread_groups(
             metal::MTLSize::new(emit_groups.max(1), 1, 1),
@@ -865,11 +880,7 @@ impl MetalFusedTraining {
         Self::zero_buffer(&self.pixel_rgb_grad);
         Self::zero_buffer(&self.loss_atomic);
         Self::zero_buffer(&self.ssim_sum_atomic);
-        let loss_tg = metal::MTLSize::new(
-            8.min(self.width as u64),
-            8.min(self.height as u64),
-            1,
-        );
+        let loss_tg = metal::MTLSize::new(8.min(self.width as u64), 8.min(self.height as u64), 1);
         let loss_threads = metal::MTLSize::new(self.width as u64, self.height as u64, 1);
         if loss_p.ssim_weight > 0.0 {
             enc.set_compute_pipeline_state(&k.gaussian_splat_ssim_stats);
@@ -947,9 +958,15 @@ impl MetalFusedTraining {
         enc.set_buffer(1, Some(&self.grad_opacities), 0);
         enc.set_buffer(2, Some(&self.color_alpha_grad), 0);
         enc.set_buffer(3, Some(&self.opacities), 0);
-        let tg2 = k.gaussian_splat_splat_color_backward.thread_execution_width().max(1);
+        let tg2 = k
+            .gaussian_splat_splat_color_backward
+            .thread_execution_width()
+            .max(1);
         let g2 = (self.count as u64 + tg2 as u64 - 1) / tg2 as u64;
-        enc.dispatch_thread_groups(metal::MTLSize::new(g2, 1, 1), metal::MTLSize::new(tg2, 1, 1));
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(g2, 1, 1),
+            metal::MTLSize::new(tg2, 1, 1),
+        );
 
         // Geometry backward (projected)
         enc.set_compute_pipeline_state(&k.gaussian_splat_geometry_backward);
@@ -1016,7 +1033,11 @@ impl MetalFusedTraining {
             enc.set_buffer(4, Some(&self.grad_opacities), 0);
             enc.set_buffer(5, Some(&self.grad_colors), 0);
             enc.set_buffer(6, Some(&self.opacities), 0);
-            enc.set_bytes(7, std::mem::size_of::<PackGradParams>() as u64, &pg as *const _ as *const _);
+            enc.set_bytes(
+                7,
+                std::mem::size_of::<PackGradParams>() as u64,
+                &pg as *const _ as *const _,
+            );
             enc.dispatch_thread_groups(
                 metal::MTLSize::new(g2, 1, 1),
                 metal::MTLSize::new(tg2, 1, 1),
@@ -1069,8 +1090,7 @@ impl MetalFusedTraining {
     }
 
     pub fn read_scene_grads(&self, sh_coeff_count: usize) -> rlx_splat::reference::SceneGrads {
-        let mut grads =
-            rlx_splat::reference::SceneGrads::zeroed(self.count, sh_coeff_count);
+        let mut grads = rlx_splat::reference::SceneGrads::zeroed(self.count, sh_coeff_count);
         unsafe {
             std::slice::from_raw_parts_mut(grads.positions.as_mut_ptr(), grads.positions.len())
                 .copy_from_slice(std::slice::from_raw_parts(

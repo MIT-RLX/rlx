@@ -24,9 +24,9 @@ pub use control_flow::{
     LowerControlFlow, inline_if, inline_subgraph_into, inline_subgraph_into_outputs, unroll_while,
 };
 pub use fusion::{
-    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm,
-    FuseRmsNormReshape, FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul,
-    MarkElementwiseRegions, UnfuseElementwiseRegions, clip_elementwise_regions,
+    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
+    FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul, MarkElementwiseRegions,
+    UnfuseElementwiseRegions, clip_elementwise_regions,
 };
 pub use fusion_report::{FusionReport, MissReason, MissedFusion};
 pub use limits::{FusionLimits, active_fusion_limits, with_fusion_limits};

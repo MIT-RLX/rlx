@@ -92,7 +92,12 @@ pub fn assert_parity_exact(a: &[f32], b: &[f32]) -> Result<(), String> {
     }
 }
 
-pub fn assert_parity(a: &[f32], b: &[f32], max_mean_abs: f32, max_cosine: f64) -> Result<(), String> {
+pub fn assert_parity(
+    a: &[f32],
+    b: &[f32],
+    max_mean_abs: f32,
+    max_cosine: f64,
+) -> Result<(), String> {
     let mae = mean_abs_error(a, b);
     let cos = cosine_distance(a, b);
     if mae > max_mean_abs || cos > max_cosine {

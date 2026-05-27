@@ -15,7 +15,7 @@
 // RLX — host-side action selection (one-step flow map or optional QGBS).
 
 use crate::graph::{CompiledFlowMapAgent, CompiledTwinCritic};
-use crate::qgbs::{qgbs_select_action, QgbsConfig};
+use crate::qgbs::{QgbsConfig, qgbs_select_action};
 use crate::spec::RlSpec;
 
 /// Inference-time options. Default is a single flow-map step (no search).

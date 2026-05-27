@@ -14,8 +14,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Metal training forward (traced) + raster backward.
 
-use crate::reference::native_prep::{PreparedRaster, SplatRasterParams};
 use crate::reference::TRAINING_HIT_META_FLOATS;
+use crate::reference::native_prep::{PreparedRaster, SplatRasterParams};
 use metal::{CommandQueue, ComputePipelineState, Device, MTLResourceOptions};
 
 #[repr(C)]
@@ -47,10 +47,8 @@ impl GpuTrainingTraceBuffers {
         let pixels = (width * height) as usize;
         let cap = max_splat_steps.max(1) as usize;
         Self {
-            hit_counts: device.new_buffer(
-                (pixels * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            ),
+            hit_counts: device
+                .new_buffer((pixels * 4) as u64, MTLResourceOptions::StorageModeShared),
             hit_splat_ids: device.new_buffer(
                 (pixels * cap * 4) as u64,
                 MTLResourceOptions::StorageModeShared,
@@ -80,11 +78,9 @@ impl GpuTrainingTraceBuffers {
         let pixels = (width * height) as usize;
         let cap = self.max_splat_steps.max(1) as usize;
         unsafe {
-            let counts = std::slice::from_raw_parts(
-                self.hit_counts.contents() as *const u32,
-                pixels,
-            )
-            .to_vec();
+            let counts =
+                std::slice::from_raw_parts(self.hit_counts.contents() as *const u32, pixels)
+                    .to_vec();
             let ids = std::slice::from_raw_parts(
                 self.hit_splat_ids.contents() as *const u32,
                 pixels * cap,
@@ -182,10 +178,7 @@ pub fn raster_linear_traced_to_vec(
     traces: &GpuTrainingTraceBuffers,
 ) -> Vec<f32> {
     let n = (prep.params.width * prep.params.height * 4) as usize;
-    let dst = device.new_buffer(
-        (n * 4) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let dst = device.new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);
     dispatch_training_forward_traced(device, queue, pipeline, prep, &dst, traces);
     unsafe { std::slice::from_raw_parts(dst.contents() as *const f32, n) }.to_vec()
 }
@@ -203,7 +196,11 @@ pub fn dispatch_training_backward(
     height: u32,
 ) {
     unsafe {
-        std::ptr::write_bytes(color_alpha_grad.contents(), 0, color_alpha_grad.length() as usize);
+        std::ptr::write_bytes(
+            color_alpha_grad.contents(),
+            0,
+            color_alpha_grad.length() as usize,
+        );
     }
     let grad_buf = shared_buffer_f32(device, pixel_rgb_grad);
     let cmd_buf = queue.new_command_buffer();

@@ -65,7 +65,8 @@ fn fusion_clean_hir_linear() {
         m.linear_fused(x, w, b, None, f32_shape(&[4, 32]))
     });
     let pipe = CompilePipeline::new(FusionTarget::Cpu).with_assert_fusion_clean(true);
-    pipe.compile_module(module).expect("linear_fused should be fusion-clean");
+    pipe.compile_module(module)
+        .expect("linear_fused should be fusion-clean");
 }
 
 #[test]
@@ -88,8 +89,10 @@ fn rewrite_unfuses_for_strict_backend() {
     ];
     let rewritten = rewrite_for_backend(g, strict);
     assert!(verify_all(&rewritten).is_empty());
-    assert!(!rewritten
-        .nodes()
-        .iter()
-        .any(|n| matches!(n.op, Op::FusedMatMulBiasAct { .. })));
+    assert!(
+        !rewritten
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::FusedMatMulBiasAct { .. }))
+    );
 }

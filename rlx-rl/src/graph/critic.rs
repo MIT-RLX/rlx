@@ -14,12 +14,12 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 // RLX — twin critic graphs.
 
+use rlx_compile::legalize_broadcast;
 use rlx_ir::infer::GraphExt;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
-use rlx_compile::legalize_broadcast;
 
 use crate::graph::actor::WeightStore;
-use crate::graph::mlp::{concat_features, init_mat, init_vec, mlp_trunk, ParamSlot};
+use crate::graph::mlp::{ParamSlot, concat_features, init_mat, init_vec, mlp_trunk};
 use crate::spec::RlSpec;
 
 #[derive(Debug, Clone)]
@@ -86,16 +86,18 @@ impl CompiledTwinCritic {
     }
 
     pub fn action_grad(&mut self, state: &[f32], action: &[f32]) -> Vec<f32> {
-        let outs = self
-            .q_grad
-            .run(&[("state", state), ("action", action), ("d_output", &[1.0f32])]);
+        let outs = self.q_grad.run(&[
+            ("state", state),
+            ("action", action),
+            ("d_output", &[1.0f32]),
+        ]);
         outs.into_iter().nth(1).unwrap_or_default()
     }
 }
 
 pub fn init_critic_weights(spec: &RlSpec, seed: u64) -> WeightStore {
     let mut w = WeightStore::default();
-    let mut s = seed.wrapping_add(0xC17_1C);
+    let mut s = seed.wrapping_add(0x000C_171C);
     let mut in_d = spec.critic_in_dim();
     for (li, &hd) in spec.hidden.iter().enumerate() {
         init_mat(&mut w, &format!("critic_w{li}"), in_d, hd, &mut s);

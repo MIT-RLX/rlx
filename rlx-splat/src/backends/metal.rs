@@ -89,10 +89,7 @@ pub fn raster_linear_to_vec(
     prep: &PreparedRaster,
 ) -> Vec<f32> {
     let n = (prep.params.width * prep.params.height * 4) as usize;
-    let dst = device.new_buffer(
-        (n * 4) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let dst = device.new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);
     dispatch_prepared_raster_impl(device, queue, pipeline, prep, &dst, 0);
     let ptr = dst.contents() as *const f32;
     unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()

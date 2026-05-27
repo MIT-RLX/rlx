@@ -37,6 +37,8 @@ members = [
     # "rlx-webgpu",    # WebGPU/WASM
 
     "rlx-gguf",        # GGUF parser + dequant (standalone, format-only)
+    "rlx-gpu-kernels", # Shared CUDA/HIP .cu sources for rlx-cuda + rlx-rocm
+    "rlx-mlx-sys",     # Vendored MLX C++ + rlx_mlx_shim C ABI
 
     # Proc macros
     "rlx-macros",      # #[rlx_model] AOT compilation macro

@@ -12,7 +12,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-use rlx_fdm::{sparse, Structure, Network};
+use rlx_fdm::{Network, Structure, sparse};
 
 #[test]
 fn fast_assembly_matches_naive_sparse() {
@@ -29,7 +29,8 @@ fn fast_assembly_matches_naive_sparse() {
     assert!(diff < 1e-8, "naive sparse diff {diff}");
 
     let fast = rlx_fdm::SparseStiffnessFast::pattern(&s);
-    let dense = rlx_fdm::EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("d");
+    let dense =
+        rlx_fdm::EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("d");
     let p = rlx_fdm::EquilibriumModel::load_matrix(&net.q, &xf, &net.loads, &s);
     let sf = fast.solve_xyz(&net.q, &p, 8000, 1e-10).expect("f");
     let mut m = 0.0f64;

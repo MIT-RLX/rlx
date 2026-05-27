@@ -5,9 +5,7 @@
 
 use anyhow::Result;
 
-use super::{
-    BlockStage, LlamaDecodeLayerStage, Qwen3DecodeLayerStage, SelfAttnPrefillStage,
-};
+use super::{BlockStage, LlamaDecodeLayerStage, Qwen3DecodeLayerStage, SelfAttnPrefillStage};
 use crate::context::FlowCtx;
 use crate::stage_contract::{LayerStage, StageArtifacts};
 use crate::stage_interfaces::{AttentionStage, KvCacheContract};

@@ -17,8 +17,8 @@
 
 use crate::equilibrium::EquilibriumModel;
 use crate::geometry;
-use crate::network::Vec3;
 use crate::mesh::MeshStructure;
+use crate::network::Vec3;
 use crate::structure::Structure;
 
 /// Nodal + optional edge / face follower loads (jax_fdm `EquilibriumParametersState`).
@@ -123,13 +123,7 @@ fn face_loads_global(
     for f in 0..nf {
         let verts: Vec<Vec3> = mesh.faces[f]
             .iter()
-            .map(|&vi| {
-                [
-                    xyz[vi * 3],
-                    xyz[vi * 3 + 1],
-                    xyz[vi * 3 + 2],
-                ]
-            })
+            .map(|&vi| [xyz[vi * 3], xyz[vi * 3 + 1], xyz[vi * 3 + 2]])
             .collect();
         let load = face_loads.get(f).copied().unwrap_or([0.0; 3]);
         out[f] = if local {
@@ -192,7 +186,9 @@ pub fn transpose_edge_loads_jacobian(
         for c in 0..3 {
             dx[c] = xyz[u * 3 + c] - xyz[v * 3 + c];
         }
-        let l = (dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]).sqrt().max(1e-12);
+        let l = (dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2])
+            .sqrt()
+            .max(1e-12);
         let cu = structure.c(e, u).abs();
         let cv = structure.c(e, v).abs();
         let pu = free_index(structure, u);
@@ -238,21 +234,14 @@ pub fn transpose_face_loads_jacobian(
             .map(|fi| {
                 let verts: Vec<Vec3> = mesh.faces[fi]
                     .iter()
-                    .map(|&vi| {
-                        [
-                            xyz[vi * 3],
-                            xyz[vi * 3 + 1],
-                            xyz[vi * 3 + 2],
-                        ]
-                    })
+                    .map(|&vi| [xyz[vi * 3], xyz[vi * 3 + 1], xyz[vi * 3 + 2]])
                     .collect();
                 if verts.len() < 3 {
                     return None;
                 }
                 let load = face_loads.get(fi).copied().unwrap_or([0.0; 3]);
                 Some(geometry::jacobian_face_load_global_wrt_polygon(
-                    &verts,
-                    load,
+                    &verts, load,
                 ))
             })
             .collect()
@@ -402,6 +391,26 @@ fn free_index(structure: &Structure, node: usize) -> Option<usize> {
     structure.indices_free.iter().position(|&n| n == node)
 }
 
+fn accumulate_edge_loads_to_nodes(
+    nodes_load: &mut [f64],
+    edge_loads: &[f64],
+    structure: &Structure,
+) {
+    let n = structure.num_nodes;
+    let ne = structure.num_edges;
+    for e in 0..ne {
+        for node in 0..n {
+            let c = structure.c(e, node).abs();
+            if c == 0.0 {
+                continue;
+            }
+            for comp in 0..3 {
+                nodes_load[node * 3 + comp] += 0.5 * c * edge_loads[e * 3 + comp];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,26 +444,10 @@ mod tests {
             let ls = net.load_state();
             let loads = nodes_load_at_mesh(&xyz, &ls, &s, &edges, Some(&mesh));
             assert!(
-                loads[3 * 1 + 2] < -0.1,
+                loads[3 + 2] < -0.1,
                 "local={local} nodal z load {}",
-                loads[3 * 1 + 2]
+                loads[3 + 2]
             );
-        }
-    }
-}
-
-fn accumulate_edge_loads_to_nodes(nodes_load: &mut [f64], edge_loads: &[f64], structure: &Structure) {
-    let n = structure.num_nodes;
-    let ne = structure.num_edges;
-    for e in 0..ne {
-        for node in 0..n {
-            let c = structure.c(e, node).abs();
-            if c == 0.0 {
-                continue;
-            }
-            for comp in 0..3 {
-                nodes_load[node * 3 + comp] += 0.5 * c * edge_loads[e * 3 + comp];
-            }
         }
     }
 }

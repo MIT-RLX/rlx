@@ -14,12 +14,11 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 // RLX — flow-map actor graphs.
 
-use rlx_ir::infer::GraphExt;
-use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_compile::legalize_broadcast;
+use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
 use crate::graph::mlp::{
-    concat_features, flow_map_jump, init_mat, init_vec, mlp_layers, mse_mean, ParamSlot,
+    ParamSlot, concat_features, flow_map_jump, init_mat, init_vec, mlp_layers, mse_mean,
 };
 use crate::spec::RlSpec;
 
@@ -96,12 +95,7 @@ impl CompiledFlowMapAgent {
     /// Average velocity \(u_{r,t}(a_r|s)\) (Python `actor_bc_flow` output).
     pub fn velocity(&mut self, state: &[f32], a_r: &[f32], r: f32, t: f32) -> Vec<f32> {
         self.velocity
-            .run(&[
-                ("state", state),
-                ("a_r", a_r),
-                ("r", &[r]),
-                ("t", &[t]),
-            ])
+            .run(&[("state", state), ("a_r", a_r), ("r", &[r]), ("t", &[t])])
             .into_iter()
             .next()
             .unwrap_or_default()

@@ -1,0 +1,31 @@
+[package]
+name = "rlx-mlx-sys"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Low-level MLX C++ build + C ABI shim for RLX (vendored mlx, NVRTC-free)."
+authors.workspace      = true
+license.workspace      = true
+keywords = ["mlx", "apple", "metal", "ffi", "rlx"]
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+links                  = "mlx"
+
+[lib]
+# Empty Rust surface; native code is linked via build.rs. Dependents use
+# `rlx_mlx_sys::ffi` or their own `extern "C"` against the shim symbols.
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"
+
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets        = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+
+[lints]
+workspace = true

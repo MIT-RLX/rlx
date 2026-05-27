@@ -29,8 +29,9 @@ fn fused_autodiff_gd_steps_on_sum_z() {
         target: -0.5,
         weight: 1.0,
     };
-    let mut fused =
-        FusedAutodiffFormFinding::try_new(&mir, &net, &loss).expect("build").expect("sparse");
+    let mut fused = FusedAutodiffFormFinding::try_new(&mir, &net, &loss)
+        .expect("build")
+        .expect("sparse");
 
     let (loss0, gq) = fused.loss_and_grad_q(&net).expect("eval");
     assert!(loss0.is_finite() && loss0 > 0.0);

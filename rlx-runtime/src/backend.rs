@@ -20,9 +20,9 @@
 //! rather than as new trait methods.
 
 use crate::CompileOptions;
+use rlx_ir::Graph;
 use rlx_ir::hir::HirModule;
 use rlx_ir::lir::LirModule;
-use rlx_ir::{Graph, Op};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -427,8 +427,9 @@ pub trait Backend: Send + Sync {
 
 /// Prepare a fused MIR graph from LIR for backend executable construction.
 /// Skips the fusion pipeline — LIR must come from `compile_*_stages`.
+#[allow(dead_code)]
 fn prepare_fused_graph(
-    mut graph: Graph,
+    graph: Graph,
     options: &CompileOptions,
     supported_ops: &[rlx_ir::OpKind],
     backend_name: &str,
@@ -505,11 +506,9 @@ pub fn compile_with_precision(
 /// pipeline placement. Modern code: pass the policy via CompileOptions
 /// and let the backend handle ordering.
 fn _legacy_apply_policy(graph: Graph, policy: Option<rlx_opt::PrecisionPolicy>) -> Graph {
+    use rlx_opt::pass::Pass as _;
     match policy {
-        Some(p) => {
-            use rlx_opt::pass::Pass;
-            rlx_opt::AutoMixedPrecision::new(p).run(graph)
-        }
+        Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
         None => graph,
     }
 }
@@ -522,8 +521,6 @@ pub mod cpu_backend {
     use rlx_cpu::{arena::Arena, thunk};
     use rlx_ir::{DType, NodeId, Op};
     use rlx_opt::memory::{self, MemoryPlan};
-    use rlx_opt::pass::Pass;
-
     // Arena typed read/write helpers live in `crate::arena` so every
     // backend (CPU, Metal, future CUDA/wgpu/WASM) shares one implementation.
     use rlx_driver::arena::{read_typed_to_f32, write_typed_from_f32};
@@ -706,7 +703,11 @@ pub mod cpu_backend {
             Box::new(build_cpu_executable(fused, plan))
         }
 
-        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+        fn compile_lir(
+            &self,
+            lir: LirModule,
+            options: &CompileOptions,
+        ) -> Box<dyn ExecutableGraph> {
             let alignment = lir.buffers.alignment.max(options.arena_alignment);
             let embedded: MemoryPlan = (&lir.buffers).into();
             let mut graph = lir.into_graph();
@@ -1316,13 +1317,12 @@ pub mod wgpu_backend {
             })
         }
 
-        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-            let graph = prepare_fused_graph(
-                lir.into_graph(),
-                options,
-                WGPU_SUPPORTED_OPS,
-                "wgpu",
-            );
+        fn compile_lir(
+            &self,
+            lir: LirModule,
+            options: &CompileOptions,
+        ) -> Box<dyn ExecutableGraph> {
+            let graph = prepare_fused_graph(lir.into_graph(), options, WGPU_SUPPORTED_OPS, "wgpu");
             Box::new(WgpuExecutableWrapper {
                 inner: WgpuExecutable::compile(graph),
             })
@@ -1650,16 +1650,15 @@ pub mod mlx_backend {
             self.compile_lir(compile_result.lir, options)
         }
 
-        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+        fn compile_lir(
+            &self,
+            lir: LirModule,
+            options: &CompileOptions,
+        ) -> Box<dyn ExecutableGraph> {
             use rlx_opt::pass::Pass as _;
             let mut graph = lir.into_graph();
             graph = rlx_opt::LowerControlFlow.run(graph);
-            let graph = prepare_fused_graph(
-                graph,
-                options,
-                MLX_SUPPORTED_OPS,
-                "mlx",
-            );
+            let graph = prepare_fused_graph(graph, options, MLX_SUPPORTED_OPS, "mlx");
             Box::new(build_mlx_executable(graph))
         }
     }
@@ -1887,7 +1886,11 @@ pub mod metal_backend {
             })
         }
 
-        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+        fn compile_lir(
+            &self,
+            lir: LirModule,
+            options: &CompileOptions,
+        ) -> Box<dyn ExecutableGraph> {
             use rlx_opt::pass::Pass as _;
             let mut graph = lir.into_graph();
             graph = rlx_opt::LowerControlFlow.run(graph);
@@ -2121,7 +2124,11 @@ pub mod cuda_backend {
             })
         }
 
-        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+        fn compile_lir(
+            &self,
+            lir: LirModule,
+            options: &CompileOptions,
+        ) -> Box<dyn ExecutableGraph> {
             let graph = prepare_fused_graph(
                 rlx_cuda::unfuse::unfuse(lir.into_graph()),
                 options,
@@ -2301,13 +2308,12 @@ pub mod rocm_backend {
             })
         }
 
-        fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-            let graph = prepare_fused_graph(
-                lir.into_graph(),
-                options,
-                ROCM_SUPPORTED_OPS,
-                "rocm",
-            );
+        fn compile_lir(
+            &self,
+            lir: LirModule,
+            options: &CompileOptions,
+        ) -> Box<dyn ExecutableGraph> {
+            let graph = prepare_fused_graph(lir.into_graph(), options, ROCM_SUPPORTED_OPS, "rocm");
             Box::new(RocmExecutableWrapper {
                 inner: RocmExecutable::compile(graph),
             })

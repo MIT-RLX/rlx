@@ -48,7 +48,7 @@ pub fn write_model_weights(model: &QuantizedModel, path: &Path) -> Result<(), St
         "// fp32 test accuracy at training: {:.4}\n",
         model.fp32_test_accuracy
     ));
-    s.push_str("#![allow(clippy::approx_constant)]\n\n");
+    s.push_str("#![allow(clippy::approx_constant, clippy::excessive_precision)]\n\n");
 
     let layout = crate::blob::Layout::for_model(model);
 
@@ -124,9 +124,8 @@ fn push_typed_slice(s: &mut String, name: &str, ty: &str, sl: crate::blob::Slice
     // (no alignment requirement). `byte_len == n_elems * elem_size`
     // for these types so reading n_elems is correct.
     s.push_str(&format!(
-        "pub static {name}: &[{ty}] = unsafe {{ \
-            core::slice::from_raw_parts(BLOB.as_ptr().add({off}) as *const {ty}, {n}) \
-        }};\n",
+        "pub static {name}: &[{ty}] =\n\
+             unsafe {{ core::slice::from_raw_parts(BLOB.as_ptr().add({off}) as *const {ty}, {n}) }};\n",
         off = sl.byte_off,
         n = sl.n_elems,
     ));
@@ -138,9 +137,8 @@ fn push_typed_slice(s: &mut String, name: &str, ty: &str, sl: crate::blob::Slice
 /// `read_weight(w, idx, WEIGHT_BITS)` which translates to byte+lane.
 fn push_packed_slice(s: &mut String, name: &str, sl: crate::blob::SliceLoc) {
     s.push_str(&format!(
-        "pub static {name}: &[i8] = unsafe {{ \
-            core::slice::from_raw_parts(BLOB.as_ptr().add({off}) as *const i8, {n}) \
-        }};\n",
+        "pub static {name}: &[i8] =\n\
+             unsafe {{ core::slice::from_raw_parts(BLOB.as_ptr().add({off}) as *const i8, {n}) }};\n",
         off = sl.byte_off,
         n = sl.byte_len,
     ));

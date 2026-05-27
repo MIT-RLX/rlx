@@ -2,10 +2,10 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
+use rlx_ir::HirGraphExt;
 use rlx_ir::hir::HirMut;
 use rlx_ir::op::MaskKind;
 use rlx_ir::shape;
-use rlx_ir::HirGraphExt;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
@@ -23,7 +23,12 @@ pub struct SelfAttnPrefillSpec {
 }
 
 impl SelfAttnPrefillSpec {
-    pub fn hf_layer(prefix: impl Into<String>, num_heads: usize, head_dim: usize, num_kv_heads: usize) -> Self {
+    pub fn hf_layer(
+        prefix: impl Into<String>,
+        num_heads: usize,
+        head_dim: usize,
+        num_kv_heads: usize,
+    ) -> Self {
         let p = prefix.into();
         Self {
             q_key: format!("{p}.self_attn.q_proj.weight"),
@@ -49,11 +54,7 @@ impl SelfAttnPrefillStage {
 }
 
 impl BlockStage for SelfAttnPrefillStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let cos = ctx
             .state
             .rope_cos

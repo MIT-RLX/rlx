@@ -14,13 +14,13 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Sanity: initialized flow-map forward is finite.
 
+use rlx_rl::FmqTrainer;
 use rlx_rl::dataset::OfflineDataset;
 use rlx_rl::env::RlEnv;
-use rlx_rl::graph::{build_actor_graphs, init_actor_weights, CompiledFlowMapAgent};
+use rlx_rl::graph::{CompiledFlowMapAgent, build_actor_graphs, init_actor_weights};
 use rlx_rl::policy::EvalConfig;
 use rlx_rl::spec::RlSpec;
 use rlx_rl::toy_goal::ToyGoalEnv;
-use rlx_rl::FmqTrainer;
 use rlx_runtime::{Device, Session};
 
 #[test]

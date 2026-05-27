@@ -23,11 +23,7 @@ use rlx_runtime::stages::compile_graph_stages_for_backend;
 use rlx_runtime::{CompileOptions, Device};
 
 fn count_op_kind(graph: &Graph, kind: OpKind) -> usize {
-    graph
-        .nodes()
-        .iter()
-        .filter(|n| n.op.kind() == kind)
-        .count()
+    graph.nodes().iter().filter(|n| n.op.kind() == kind).count()
 }
 
 #[test]

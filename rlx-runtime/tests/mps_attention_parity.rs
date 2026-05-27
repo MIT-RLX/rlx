@@ -117,7 +117,7 @@ fn cpu_vs_metal_attention_no_mask_unpadded() {
     // Force MPSGraph attention path so we exercise the lowering we're
     // trying to validate.
     rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
-        rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
+    rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
     unsafe {
         rlx_ir::env::unset("RLX_USE_MPSGRAPH");
@@ -149,7 +149,7 @@ fn cpu_vs_metal_attention_multi_head_unpadded() {
 
     let cpu_out = run_on(Device::Cpu, b, s, nh, dh, &qkv, &mask);
     rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
-        rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
+    rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
     unsafe {
         rlx_ir::env::unset("RLX_USE_MPSGRAPH");
@@ -249,7 +249,7 @@ fn cpu_vs_metal_full_block_unpadded() {
 
     // Metal with MPSGraph
     rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
-        rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
+    rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
     let session_mtl = Session::new(Device::Metal);
     let mut mtl = session_mtl.compile_with(g, &CompileOptions::default());
     mtl.set_param("qkv_w", &qkv_w_data);
@@ -298,7 +298,7 @@ fn bisect(
     let cpu_out = cpu.run(inputs).into_iter().next().unwrap();
 
     rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
-        rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
+    rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
     let session_mtl = Session::new(Device::Metal);
     let mut mtl = session_mtl.compile_with(g, &opts);
     for (n, d) in params {
@@ -813,7 +813,7 @@ fn cpu_vs_metal_attention_with_padding() {
 
     let cpu_out = run_on(Device::Cpu, b, s, nh, dh, &qkv, &mask);
     rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
-        rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1")
+    rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
     unsafe {
         rlx_ir::env::unset("RLX_USE_MPSGRAPH");

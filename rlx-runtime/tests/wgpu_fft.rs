@@ -32,7 +32,7 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 
 #[test]
 fn fft_wgpu_native_matches_cpu_pow2() {
-for &n in &[2usize, 4, 8, 16, 64, 256, 1024] {
+    for &n in &[2usize, 4, 8, 16, 64, 256, 1024] {
         let mut re: Vec<f32> = Vec::with_capacity(n);
         let mut im: Vec<f32> = Vec::with_capacity(n);
         for i in 0..n {
@@ -50,10 +50,8 @@ for &n in &[2usize, 4, 8, 16, 64, 256, 1024] {
             g.set_outputs(vec![y]);
             g
         };
-        let cpu =
-            bytes_to_f32s(&Session::new(Device::Cpu).compile(build()).run_typed(&[])[0].0);
-        let wgpu =
-            bytes_to_f32s(&Session::new(Device::Gpu).compile(build()).run_typed(&[])[0].0);
+        let cpu = bytes_to_f32s(&Session::new(Device::Cpu).compile(build()).run_typed(&[])[0].0);
+        let wgpu = bytes_to_f32s(&Session::new(Device::Gpu).compile(build()).run_typed(&[])[0].0);
         assert_eq!(cpu.len(), wgpu.len(), "N={n}");
         let tol = 1e-4 * (n as f32).sqrt();
         for k in 0..cpu.len() {
@@ -70,7 +68,7 @@ for &n in &[2usize, 4, 8, 16, 64, 256, 1024] {
 
 #[test]
 fn fft_wgpu_round_trip_f32_pow2() {
-let n: usize = 32;
+    let n: usize = 32;
     let re: Vec<f32> = (0..n).map(|i| (i as f32 * 0.3).sin()).collect();
     let im: Vec<f32> = (0..n).map(|i| (i as f32 * 0.7).cos()).collect();
     let mut x = Vec::with_capacity(2 * n);

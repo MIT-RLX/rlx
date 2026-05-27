@@ -2,14 +2,12 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
-use crate::weight::WeightSource;
-
 #[derive(Debug, Clone)]
 pub struct RmsNormStage {
     pub weight_key: String,
@@ -26,11 +24,7 @@ impl RmsNormStage {
 }
 
 impl BlockStage for RmsNormStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let gamma = ctx.load_param(&self.weight_key, false)?;
         let zero_beta = ctx
             .state

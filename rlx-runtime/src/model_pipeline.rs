@@ -14,7 +14,7 @@ use rlx_ir::{BindingManifest, DimBinding, ModelComponent};
 use rlx_opt::CompileResult;
 
 use crate::stages;
-use crate::{CompiledGraph, CompileOptions, Device};
+use crate::{CompileOptions, CompiledGraph, Device};
 
 /// Compile-once / specialize-per-variant pipeline with optional FIFO cache.
 pub struct ModelCompilePipeline {
@@ -171,6 +171,10 @@ impl ModelCompilePipeline {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Symbolic template from [`Self::build_template`] / [`Self::get_or_compile`].
     pub fn template_result(&self) -> Option<&CompileResult> {
         self.template.as_ref()
@@ -198,7 +202,7 @@ impl ModelCompilePipeline {
         if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
             return Ok(&mut self.entries[idx].1);
         }
-        let device = self.device.clone();
+        let device = self.device;
         let template = self.ensure_template(build_hir, options)?;
         let compiled = aot.specialize_cached(disk_base, binding, device, template, options)?;
         if self.entries.len() >= self.capacity

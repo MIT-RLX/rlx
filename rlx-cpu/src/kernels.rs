@@ -798,7 +798,7 @@ const ACTIVATION_PAR_MIN: usize = 1 << 20;
 /// erf form (also PyTorch-default in some newer builds).
 #[inline]
 pub fn scalar_gelu_approx(x: f32) -> f32 {
-    const C: f32 = 0.797_884_56; // √(2/π)
+    const C: f32 = 0.797_884_6; // √(2/π)
     const A: f32 = 0.044_715;
     0.5 * x * (1.0 + (C * (x + A * x * x * x)).tanh())
 }
@@ -1054,7 +1054,7 @@ pub fn conv_transpose2d_nchw(
     for ni in 0..n {
         for ic in 0..c_in {
             let g = ic / c_in_per_g;
-            let ic_off = ic % c_in_per_g;
+            let _ic_off = ic % c_in_per_g;
             for iy in 0..h {
                 for ix in 0..w {
                     let v = input[((ni * c_in + ic) * h + iy) * w + ix];
@@ -1114,13 +1114,15 @@ pub fn group_norm_nchw(
             let c0 = g * cpg;
             let mut mean = 0.0f32;
             for c in 0..cpg {
-                let plane = &input[((b * channels + c0 + c) * spatial)..((b * channels + c0 + c + 1) * spatial)];
+                let plane = &input
+                    [((b * channels + c0 + c) * spatial)..((b * channels + c0 + c + 1) * spatial)];
                 mean += plane.iter().sum::<f32>();
             }
             mean /= n;
             let mut var = 0.0f32;
             for c in 0..cpg {
-                let plane = &input[((b * channels + c0 + c) * spatial)..((b * channels + c0 + c + 1) * spatial)];
+                let plane = &input
+                    [((b * channels + c0 + c) * spatial)..((b * channels + c0 + c + 1) * spatial)];
                 for &v in plane {
                     let d = v - mean;
                     var += d * d;
@@ -1132,8 +1134,10 @@ pub fn group_norm_nchw(
                 let gi = c0 + c;
                 let gamm = gamma[gi];
                 let bet = beta[gi];
-                let src = &input[((b * channels + gi) * spatial)..((b * channels + gi + 1) * spatial)];
-                let dst = &mut output[((b * channels + gi) * spatial)..((b * channels + gi + 1) * spatial)];
+                let src =
+                    &input[((b * channels + gi) * spatial)..((b * channels + gi + 1) * spatial)];
+                let dst = &mut output
+                    [((b * channels + gi) * spatial)..((b * channels + gi + 1) * spatial)];
                 for (d, &s) in dst.iter_mut().zip(src) {
                     *d = (s - mean) * inv * gamm + bet;
                 }

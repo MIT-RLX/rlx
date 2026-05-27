@@ -12,7 +12,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-use rlx_fdm::{fdm_with_options, mesh::edges_from_faces, Network, FdmOptions};
+use rlx_fdm::{FdmOptions, Network, fdm_with_options, mesh::edges_from_faces};
 
 #[test]
 fn quad_mesh_face_load_sags() {
@@ -40,9 +40,9 @@ fn quad_mesh_face_load_sags() {
     let opts = FdmOptions::nonlinear(30, 1e-5, false);
     let eq = fdm_with_options(&net, &opts).expect("fdm");
     assert!(
-        eq.xyz[3 * 1 + 2] < -0.001,
+        eq.xyz[5] < -0.001,
         "interior node 1 should sag under face load, z={}",
-        eq.xyz[3 * 1 + 2]
+        eq.xyz[5]
     );
 }
 
@@ -67,12 +67,11 @@ fn quad_mesh_local_face_load_sags() {
         faces_load: Some(vec![[0.0, 0.0, -10.0], [0.0, 0.0, -10.0]]),
         faces_load_local: true,
     };
-    let mut opts = FdmOptions::nonlinear(5, 1e-4, false);
-    opts.iterative.tmax = 5;
+    let opts = FdmOptions::nonlinear(5, 1e-4, false);
     let eq = fdm_with_options(&net, &opts).expect("fdm");
     assert!(
-        eq.xyz[3 * 1 + 2] < -0.001,
+        eq.xyz[5] < -0.001,
         "local LCS face load should sag interior (short iter), z={}",
-        eq.xyz[3 * 1 + 2]
+        eq.xyz[5]
     );
 }

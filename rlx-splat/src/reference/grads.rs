@@ -87,7 +87,11 @@ pub fn compute_grad_norms(scene_grads: &SceneGrads, count: usize) -> Vec<f32> {
     norms
 }
 
-pub fn compute_packed_grad_norms(packed_grads: &[f32], count: u32, packed_param_count: u32) -> Vec<f32> {
+pub fn compute_packed_grad_norms(
+    packed_grads: &[f32],
+    count: u32,
+    packed_param_count: u32,
+) -> Vec<f32> {
     let mut norms = vec![0.0f32; count as usize];
     for splat in 0..count {
         let mut sum = 0.0f32;

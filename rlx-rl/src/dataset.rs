@@ -133,12 +133,7 @@ impl OfflineDataset {
     }
 
     /// Legacy CFM batch (diagonal only).
-    pub fn sample_cfm_batch(
-        &self,
-        spec: &RlSpec,
-        indices: &[usize],
-        rng: &mut u64,
-    ) -> CfmBatch {
+    pub fn sample_cfm_batch(&self, spec: &RlSpec, indices: &[usize], rng: &mut u64) -> CfmBatch {
         let batch = self.sample_diag_batch(spec, indices, rng);
         CfmBatch {
             state: batch.state,

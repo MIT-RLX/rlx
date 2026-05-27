@@ -443,12 +443,18 @@ fn expand_fab(
         let v4 = to_bhsd(out, v);
 
         q4 = out.add_node(
-            Op::Rope { head_dim, n_rot: head_dim },
+            Op::Rope {
+                head_dim,
+                n_rot: head_dim,
+            },
             vec![q4, inputs[cos_idx], inputs[sin_idx]],
             bhsd_shape.clone(),
         );
         k4 = out.add_node(
-            Op::Rope { head_dim, n_rot: head_dim },
+            Op::Rope {
+                head_dim,
+                n_rot: head_dim,
+            },
             vec![k4, inputs[cos_idx], inputs[sin_idx]],
             bhsd_shape.clone(),
         );

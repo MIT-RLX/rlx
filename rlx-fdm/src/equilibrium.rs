@@ -15,13 +15,13 @@
 
 //! FDM equilibrium linear algebra (jax_fdm `EquilibriumModel`).
 
-use crate::loads::{nodes_load_at_mesh, LoadState};
+use crate::iterative::{IterativeConfig, equilibrium_iterative};
+use crate::loads::{LoadState, nodes_load_at_mesh};
 use crate::mesh::MeshStructure;
 use crate::solve::solve_columns_dense;
+use crate::sparse::nodes_free_positions_auto;
 use crate::state::EquilibriumState;
 use crate::structure::Structure;
-use crate::iterative::{equilibrium_iterative, IterativeConfig};
-use crate::sparse::nodes_free_positions_auto;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FdmError {
@@ -62,11 +62,7 @@ impl EquilibriumModel {
     }
 
     /// Fixed-node contribution to the load vector: `R_fixed = C_fᵀ diag(q) C_a X_a`.
-    pub fn residual_fixed_matrix(
-        q: &[f64],
-        xyz_fixed: &[f64],
-        structure: &Structure,
-    ) -> Vec<f64> {
+    pub fn residual_fixed_matrix(q: &[f64], xyz_fixed: &[f64], structure: &Structure) -> Vec<f64> {
         let nf = structure.num_free();
         let na = structure.num_fixed();
         let ne = structure.num_edges;
@@ -103,8 +99,7 @@ impl EquilibriumModel {
         for a in 0..nf {
             let node = structure.indices_free[a];
             for comp in 0..3 {
-                p[a * 3 + comp] =
-                    loads_nodes[node * 3 + comp] - r_fixed[a * 3 + comp];
+                p[a * 3 + comp] = loads_nodes[node * 3 + comp] - r_fixed[a * 3 + comp];
             }
         }
         p
@@ -153,14 +148,7 @@ impl EquilibriumModel {
             )?
         } else {
             equilibrium_iterative(
-                q,
-                &xyz_fixed,
-                load_state,
-                structure,
-                edges,
-                xyz_anchor,
-                config,
-                mesh,
+                q, &xyz_fixed, load_state, structure, edges, xyz_anchor, config, mesh,
             )?
         };
         let xyz = Self::nodes_positions(&xyz_free, &xyz_fixed, structure);
@@ -181,11 +169,7 @@ impl EquilibriumModel {
     }
 
     /// Pack free then fixed coordinates and permute to natural node order.
-    pub fn nodes_positions(
-        xyz_free: &[f64],
-        xyz_fixed: &[f64],
-        structure: &Structure,
-    ) -> Vec<f64> {
+    pub fn nodes_positions(xyz_free: &[f64], xyz_fixed: &[f64], structure: &Structure) -> Vec<f64> {
         let n = structure.num_nodes;
         let mut packed = vec![0.0; (structure.num_free() + structure.num_fixed()) * 3];
         packed[..xyz_free.len()].copy_from_slice(xyz_free);
@@ -303,22 +287,14 @@ mod tests {
 
     #[test]
     fn three_node_chain_interior_sags_negative_z() {
-        let mut net = Network::from_polyline(
-            &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-            -1.0,
-        );
+        let mut net =
+            Network::from_polyline(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], -1.0);
         net.anchor_nodes(&[0, 2]);
         net.loads_on_free([0.0, 0.0, -1.0]);
         let s = Structure::from_network(&net);
-        let eq = super::EquilibriumModel::equilibrium(
-            &net.q,
-            &net.xyz,
-            &net.loads,
-            &s,
-            &net.edges,
-        )
-        .expect("eq");
-        assert!(eq.xyz[3 * 1 + 2] < -0.01, "z={}", eq.xyz[3 * 1 + 2]);
+        let eq = super::EquilibriumModel::equilibrium(&net.q, &net.xyz, &net.loads, &s, &net.edges)
+            .expect("eq");
+        assert!(eq.xyz[3 + 2] < -0.01, "z={}", eq.xyz[3 + 2]);
     }
 
     #[test]

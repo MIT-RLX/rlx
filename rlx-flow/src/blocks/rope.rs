@@ -5,8 +5,6 @@ use anyhow::Result;
 use rlx_ir::{DType, Shape};
 
 use crate::context::FlowCtx;
-use crate::weight::WeightSource;
-
 #[derive(Debug, Clone)]
 pub struct RopeTablesStage {
     pub cos_key: String,

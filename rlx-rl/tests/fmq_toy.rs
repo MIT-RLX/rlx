@@ -36,7 +36,10 @@ fn fmq_toy_offline_then_online() {
     let after = trainer.eval_rollout(&mut env, &EvalConfig::one_step());
 
     eprintln!("toy return before={before:.3} after={after:.3}");
-    assert!(before.is_finite() && after.is_finite(), "returns must be finite");
+    assert!(
+        before.is_finite() && after.is_finite(),
+        "returns must be finite"
+    );
 }
 
 #[test]

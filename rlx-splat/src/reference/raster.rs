@@ -12,8 +12,10 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-use super::project::{project_splat_index, project_splats, ProjectedSplats, SplatProjectOverride};
-use crate::core::{Camera, GaussianScene, GAUSSIAN_SUPPORT_SIGMA_RADIUS, OUTPUT_GAMMA, quat_rotate};
+use super::project::{ProjectedSplats, SplatProjectOverride, project_splat_index, project_splats};
+use crate::core::{
+    Camera, GAUSSIAN_SUPPORT_SIGMA_RADIUS, GaussianScene, OUTPUT_GAMMA, quat_rotate,
+};
 
 pub fn ray_splat_intersection_alpha(
     projected: &ProjectedSplats,
@@ -25,8 +27,9 @@ pub fn ray_splat_intersection_alpha(
     if opacity < alpha_cutoff {
         return 0.0;
     }
-    let support_sigma_radius =
-        (-2.0 * (alpha_cutoff / opacity.max(alpha_cutoff)).ln()).max(0.0).sqrt();
+    let support_sigma_radius = (-2.0 * (alpha_cutoff / opacity.max(alpha_cutoff)).ln())
+        .max(0.0)
+        .sqrt();
     if support_sigma_radius <= 1e-10 {
         return 0.0;
     }
@@ -55,16 +58,14 @@ pub fn ray_splat_intersection_alpha(
             rotated[2] * inv[2] * support_scale,
         ]
     };
-    let denom = ray_local[0] * ray_local[0]
-        + ray_local[1] * ray_local[1]
-        + ray_local[2] * ray_local[2];
+    let denom =
+        ray_local[0] * ray_local[0] + ray_local[1] * ray_local[1] + ray_local[2] * ray_local[2];
     if denom <= 1e-10 {
         return 0.0;
     }
-    let t_closest = -(ray_local[0] * ro_local[0]
-        + ray_local[1] * ro_local[1]
-        + ray_local[2] * ro_local[2])
-        / denom;
+    let t_closest =
+        -(ray_local[0] * ro_local[0] + ray_local[1] * ro_local[1] + ray_local[2] * ro_local[2])
+            / denom;
     if t_closest <= 0.0 {
         return 0.0;
     }
@@ -73,11 +74,13 @@ pub fn ray_splat_intersection_alpha(
         ro_local[1] + ray_local[1] * t_closest,
         ro_local[2] + ray_local[2] * t_closest,
     ];
-    let rho2 = (closest[0] * closest[0] + closest[1] * closest[1] + closest[2] * closest[2]).max(0.0);
+    let rho2 =
+        (closest[0] * closest[0] + closest[1] * closest[1] + closest[2] * closest[2]).max(0.0);
     opacity * (-0.5 * support_sigma_radius * support_sigma_radius * rho2).exp()
 }
 
 /// Numeric backprop of intersection alpha w.r.t. scene parameters for one ray hit.
+#[allow(dead_code)]
 pub fn backprop_ray_hit_alpha_numeric(
     scene: &GaussianScene,
     splat: usize,
@@ -96,7 +99,6 @@ pub fn backprop_ray_hit_alpha_numeric(
     let mut d_pos = [0.0f32; 3];
     let mut d_scale = [0.0f32; 3];
     let mut d_rot = [0.0f32; 4];
-    let mut d_opacity = 0.0f32;
 
     let alpha_at = |temp: &GaussianScene| -> f32 {
         let projected = project_splats(temp, camera, width, height, radius_scale, alpha_cutoff);
@@ -138,7 +140,7 @@ pub fn backprop_ray_hit_alpha_numeric(
     let plus = loss(alpha_at(&temp));
     temp.opacities[splat] -= 2.0 * eps;
     let minus = loss(alpha_at(&temp));
-    d_opacity = (plus - minus) / (2.0 * eps);
+    let d_opacity = (plus - minus) / (2.0 * eps);
 
     (d_pos, d_scale, d_rot, d_opacity)
 }
@@ -163,7 +165,6 @@ pub fn backprop_ray_hit_alpha_numeric_projected(
     let mut d_pos = [0.0f32; 3];
     let mut d_scale = [0.0f32; 3];
     let mut d_rot = [0.0f32; 4];
-    let mut d_opacity = 0.0f32;
 
     let mut alpha_at = |ov: SplatProjectOverride| -> f32 {
         project_splat_index(
@@ -238,9 +239,9 @@ pub fn backprop_ray_hit_alpha_numeric_projected(
         opacity: Some(opacity - eps),
         ..Default::default()
     }));
-    d_opacity = (plus - minus) / (2.0 * eps);
+    let d_opacity = (plus - minus) / (2.0 * eps);
 
-    let _ = project_splat_index(
+    project_splat_index(
         splat,
         scene,
         camera,

@@ -34,50 +34,27 @@ pub struct PipelineInspect {
     pub fusion: String,
 }
 
-impl PipelineInspect {
-    /// Concatenate all sections with banners (suitable for `-o dump.txt`).
-    pub fn to_string(&self) -> String {
-        let mut out = String::new();
-        banner(&mut out, "HIR");
-        out.push_str(&self.hir);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        banner(&mut out, "MIR (lowered)");
-        out.push_str(&self.mir_lowered);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
+impl std::fmt::Display for PipelineInspect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln_section(f, "HIR", &self.hir)?;
+        writeln_section(f, "MIR (lowered)", &self.mir_lowered)?;
         if !self.mir_diff.is_empty() {
-            banner(&mut out, "MIR (fusion diff)");
-            out.push_str(&self.mir_diff);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
+            writeln_section(f, "MIR (fusion diff)", &self.mir_diff)?;
         }
-        banner(&mut out, "MIR (optimized)");
-        out.push_str(&self.mir_optimized);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        banner(&mut out, "FUSION");
-        out.push_str(&self.fusion);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        banner(&mut out, "LIR");
-        out.push_str(&self.lir);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out
+        writeln_section(f, "MIR (optimized)", &self.mir_optimized)?;
+        writeln_section(f, "FUSION", &self.fusion)?;
+        writeln_section(f, "LIR", &self.lir)
     }
 }
 
-impl std::fmt::Display for PipelineInspect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+fn writeln_section(f: &mut std::fmt::Formatter<'_>, title: &str, body: &str) -> std::fmt::Result {
+    let mut header = String::new();
+    banner(&mut header, title);
+    write!(f, "{header}{body}")?;
+    if !body.ends_with('\n') {
+        writeln!(f)?;
     }
+    Ok(())
 }
 
 /// Inspect every lowering stage for `hir` through `pipeline`.

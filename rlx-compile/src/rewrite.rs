@@ -23,10 +23,10 @@ use std::collections::HashSet;
 use rlx_fusion::control_flow::LowerControlFlow;
 use rlx_fusion::fusion::UnfuseElementwiseRegions;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
+use rlx_fusion::lower_logical_kernels;
 use rlx_fusion::lower_vae_ops::{LowerGroupNorm, LowerResizeNearest2x};
 use rlx_fusion::pass::Pass;
 use rlx_fusion::unfuse::unfuse_fused_for_autodiff;
-use rlx_fusion::lower_logical_kernels;
 use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
 use rlx_ir::{Graph, OpKind};
 
@@ -185,14 +185,13 @@ mod tests {
 
         let rewritten = rewrite_for_backend(g, supported);
         assert!(legalize_for_backend(&rewritten, supported).is_ok());
-        assert!(rewritten
-            .nodes()
-            .iter()
-            .any(|n| matches!(n.op, Op::MatMul)));
-        assert!(rewritten
-            .nodes()
-            .iter()
-            .all(|n| !matches!(n.op, Op::FusedMatMulBiasAct { .. })));
+        assert!(rewritten.nodes().iter().any(|n| matches!(n.op, Op::MatMul)));
+        assert!(
+            rewritten
+                .nodes()
+                .iter()
+                .all(|n| !matches!(n.op, Op::FusedMatMulBiasAct { .. }))
+        );
     }
 
     #[test]
@@ -398,7 +397,12 @@ mod tests {
         );
         g.set_outputs(vec![out]);
 
-        let full = &[OpKind::GaussianSplatRender, OpKind::Input, OpKind::Reshape, OpKind::Reduce];
+        let full = &[
+            OpKind::GaussianSplatRender,
+            OpKind::Input,
+            OpKind::Reshape,
+            OpKind::Reduce,
+        ];
         let config = KernelDispatchConfig {
             policy: KernelDispatchPolicy::PreferNative,
             force_common_kinds: &[OpKind::GaussianSplatRender],
@@ -462,7 +466,10 @@ mod tests {
         };
         let lowered = rewrite_for_backend_with_config(g.clone(), &[], config);
         assert!(
-            !lowered.nodes().iter().any(|n| matches!(n.op, Op::GaussianSplatRender { .. })),
+            !lowered
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::GaussianSplatRender { .. })),
             "empty supported + force_common: {:?}",
             lowered
                 .nodes()
@@ -470,19 +477,29 @@ mod tests {
                 .map(|n| format!("{:?}", n.op.kind()))
                 .collect::<Vec<_>>()
         );
-        let lowered_full = rewrite_for_backend_with_config(g, &[OpKind::GaussianSplatRender, OpKind::Input, OpKind::Reshape, OpKind::Reduce], config);
+        let lowered_full = rewrite_for_backend_with_config(
+            g,
+            &[
+                OpKind::GaussianSplatRender,
+                OpKind::Input,
+                OpKind::Reshape,
+                OpKind::Reduce,
+            ],
+            config,
+        );
         assert!(
-            !lowered_full.nodes().iter().any(|n| matches!(n.op, Op::GaussianSplatRender { .. }))
+            !lowered_full
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::GaussianSplatRender { .. }))
         );
 
         let (mir, _) = pipe.optimize_with_report(MirModule::from_graph(lowered));
-        assert!(
-            !mir.as_graph().nodes().iter().any(|n| {
-                matches!(
-                    n.op,
-                    Op::GaussianSplatRender { .. } | Op::GaussianSplatRenderBackward { .. }
-                )
-            })
-        );
+        assert!(!mir.as_graph().nodes().iter().any(|n| {
+            matches!(
+                n.op,
+                Op::GaussianSplatRender { .. } | Op::GaussianSplatRenderBackward { .. }
+            )
+        }));
     }
 }

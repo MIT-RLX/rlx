@@ -79,32 +79,16 @@ pub fn run_gaussian_splat_render(
     #[cfg(not(feature = "native-splat"))]
     {
         let f32_bytes = |n: usize| n * 4;
-        let positions = arena.read_bytes_range(
-            device,
-            queue,
-            positions_byte_off,
-            f32_bytes(positions_len),
-        );
+        let positions =
+            arena.read_bytes_range(device, queue, positions_byte_off, f32_bytes(positions_len));
         let scales = arena.read_bytes_range(device, queue, scales_byte_off, f32_bytes(scales_len));
-        let rotations = arena.read_bytes_range(
-            device,
-            queue,
-            rotations_byte_off,
-            f32_bytes(rotations_len),
-        );
-        let opacities = arena.read_bytes_range(
-            device,
-            queue,
-            opacities_byte_off,
-            f32_bytes(opacities_len),
-        );
+        let rotations =
+            arena.read_bytes_range(device, queue, rotations_byte_off, f32_bytes(rotations_len));
+        let opacities =
+            arena.read_bytes_range(device, queue, opacities_byte_off, f32_bytes(opacities_len));
         let colors = arena.read_bytes_range(device, queue, colors_byte_off, f32_bytes(colors_len));
-        let sh_coeffs = arena.read_bytes_range(
-            device,
-            queue,
-            sh_coeffs_byte_off,
-            f32_bytes(sh_coeffs_len),
-        );
+        let sh_coeffs =
+            arena.read_bytes_range(device, queue, sh_coeffs_byte_off, f32_bytes(sh_coeffs_len));
         let meta = arena.read_bytes_range(device, queue, meta_byte_off, f32_bytes(23));
 
         let image = rlx_cpu::splat::render_host_slices(

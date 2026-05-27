@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 
 use super::{BlockStage, VitSelfAttnStage};
 use crate::context::FlowCtx;
@@ -30,11 +30,7 @@ impl VisionSwiGluFfnStage {
 }
 
 impl BlockStage for VisionSwiGluFfnStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let lp = &self.layer_prefix;
         let fc11_w = ctx.load_param(&format!("{lp}.mlp.fc11.weight"), true)?;
         let fc11_b = ctx.load_param(&format!("{lp}.mlp.fc11.bias"), false)?;
@@ -89,7 +85,9 @@ pub fn nomic_vision_layer_fused(
                     format!("{lp}.norm2.bias"),
                     eps,
                 )
-                .stage(FlowStage::VisionSwiGluFfn(VisionSwiGluFfnStage::new(&lp, eps)))
+                .stage(FlowStage::VisionSwiGluFfn(VisionSwiGluFfnStage::new(
+                    &lp, eps,
+                )))
                 .residual_add()
                 .build()
                 .unwrap_sequence(),

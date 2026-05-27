@@ -104,7 +104,11 @@ impl KernelDispatchConfig {
 }
 
 /// Whether `kind` should be common-lowered for this backend claim set and config.
-pub fn should_lower_to_common(kind: OpKind, supported: &[OpKind], config: KernelDispatchConfig) -> bool {
+pub fn should_lower_to_common(
+    kind: OpKind,
+    supported: &[OpKind],
+    config: KernelDispatchConfig,
+) -> bool {
     if !registered_logical_kernels().iter().any(|e| e.kind == kind) {
         return false;
     }

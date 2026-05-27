@@ -21,10 +21,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::dynamic::{
-    bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding,
-};
 use rlx_ir::shape::DimBinding;
 use rlx_ir::{Graph, NodeId, Op};
 
@@ -32,23 +30,22 @@ use crate::buffer::{Arena, plan_f32_uniform};
 use crate::device::wgpu_device;
 use crate::kernels::{
     ArgmaxParams, AttentionBwdParams, AttentionParams, BinaryParams, Conv1dParams, Conv2dParams,
-    Conv3dParams,
-    CopyParams, CumsumParams, DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FftParams,
-    FusedResidualLnParams, FusedResidualLnTeeParams, GatherAxisParams, GatherParams, GroupedMatmulParams, Kernel,
-    CumsumBwdParams, GatherBwdParams, LayerNormParams, MatmulParams, MatmulQkvParams,
-    NarrowConcatParams, Pool1dParams, Pool2dParams, RmsNormBwdParams, RopeBwdParams,
-    Pool3dParams, ReduceParams, RopeParams, SampleParams, ScatterAddParams, SelectiveScanParams,
-    SoftmaxParams, TopKParams, TransposeParams, UnaryParams, WhereParams, argmax_kernel,
-    attention_bwd_kernel, attention_kernel, binary_kernel, cast_f32_to_f16_kernel, compare_kernel,
-    concat_kernel,
-    conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel, cumsum_kernel, dequant_matmul_kernel, fft_kernel,
-    elementwise_region_kernel, expand_kernel, fused_residual_ln_kernel,
-    fused_residual_ln_tee_kernel, gather_axis_kernel, gather_kernel, grouped_matmul_kernel, layernorm_kernel,
-    cumsum_backward_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel,
-    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rope_backward_kernel,
-    matmul_coop_f32_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel, matmul_f16w_kernel,
-    matmul_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_kernel,
-    narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel, rope_kernel,
+    Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
+    ElementwiseRegionParams, ExpandParams, FftParams, FusedResidualLnParams,
+    FusedResidualLnTeeParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupedMatmulParams,
+    Kernel, LayerNormParams, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams,
+    Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RopeBwdParams, RopeParams,
+    SampleParams, ScatterAddParams, SelectiveScanParams, SoftmaxParams, TopKParams,
+    TransposeParams, UnaryParams, WhereParams, argmax_kernel, attention_bwd_kernel,
+    attention_kernel, binary_kernel, cast_f32_to_f16_kernel, compare_kernel, concat_kernel,
+    conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel,
+    cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel, expand_kernel, fft_kernel,
+    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, gather_axis_kernel,
+    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel, grouped_matmul_kernel,
+    layernorm_kernel, matmul_coop_f32_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
+    matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
+    matmul_wide_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
+    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rope_backward_kernel, rope_kernel,
     sample_kernel, scatter_add_kernel, selective_scan_kernel, softmax_kernel, topk_kernel,
     transpose_kernel, unary_kernel, where_kernel,
 };
@@ -2664,8 +2661,8 @@ impl WgpuExecutable {
                         .dims()
                         .last()
                         .expect("Op::Fft input has zero rank")
-                        .unwrap_static() as usize;
-                    if last % 2 != 0 {
+                        .unwrap_static();
+                    if !last.is_multiple_of(2) {
                         panic!(
                             "rlx-wgpu Op::Fft: last axis must be even (2N real-block layout), got {last}"
                         );
@@ -2683,11 +2680,7 @@ impl WgpuExecutable {
                              (max N=1024 for the current kernel). Pin to Device::Cpu."
                         );
                     }
-                    let total: usize = in_shape
-                        .dims()
-                        .iter()
-                        .map(|d| d.unwrap_static() as usize)
-                        .product();
+                    let total: usize = in_shape.dims().iter().map(|d| d.unwrap_static()).product();
                     let outer = (total / last) as u32;
                     let log2n = (n as u32).trailing_zeros();
                     let p = FftParams {
@@ -2783,10 +2776,8 @@ impl WgpuExecutable {
                     if gguf_host_pad.is_none() {
                         let bk = binary_kernel(&dev.device);
                         let u = emit_uniform(256);
-                        gguf_host_pad = Some((
-                            u.clone(),
-                            bind_two(&dev.device, bk, &arena.buffer, &u),
-                        ));
+                        gguf_host_pad =
+                            Some((u.clone(), bind_two(&dev.device, bk, &arena.buffer, &u)));
                     }
                     let (u, bg) = gguf_host_pad.as_ref().unwrap();
                     uniforms.push(u.clone());
@@ -2866,10 +2857,8 @@ impl WgpuExecutable {
                     if gguf_host_pad.is_none() {
                         let bk = binary_kernel(&dev.device);
                         let u = emit_uniform(256);
-                        gguf_host_pad = Some((
-                            u.clone(),
-                            bind_two(&dev.device, bk, &arena.buffer, &u),
-                        ));
+                        gguf_host_pad =
+                            Some((u.clone(), bind_two(&dev.device, bk, &arena.buffer, &u)));
                     }
                     let (u, bg) = gguf_host_pad.as_ref().unwrap();
                     uniforms.push(u.clone());
@@ -3004,10 +2993,8 @@ impl WgpuExecutable {
                         if gguf_host_pad.is_none() {
                             let bk = binary_kernel(&dev.device);
                             let u = emit_uniform(256);
-                            gguf_host_pad = Some((
-                                u.clone(),
-                                bind_two(&dev.device, bk, &arena.buffer, &u),
-                            ));
+                            gguf_host_pad =
+                                Some((u.clone(), bind_two(&dev.device, bk, &arena.buffer, &u)));
                         }
                         let (u, bg) = gguf_host_pad.as_ref().unwrap();
                         uniforms.push(u.clone());
@@ -3020,9 +3007,7 @@ impl WgpuExecutable {
                             QuantScheme::Fp8E4m3 => (1, 3u32),
                             QuantScheme::Fp8E5m2 => (1, 4u32),
                             QuantScheme::Nvfp4Block => (rlx_ir::NVFP4_GROUP_SIZE as u32, 5u32),
-                            other => panic!(
-                                "rlx-wgpu DequantMatMul: unsupported scheme {other:?}"
-                            ),
+                            other => panic!("rlx-wgpu DequantMatMul: unsupported scheme {other:?}"),
                         };
                         let scale_id = node.inputs[2];
                         let zp_id = node.inputs[3];
@@ -3053,8 +3038,7 @@ impl WgpuExecutable {
                 | Op::RmsNormBackwardBeta { eps, .. } => {
                     let x_shape = &graph.node(node.inputs[0]).shape;
                     let h = x_shape.dim(x_shape.rank() - 1).unwrap_static() as u32;
-                    let rows =
-                        (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
+                    let rows = (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
                     let foff = |i: usize| (arena.offset(node.inputs[i]) / 4) as u32;
                     let wrt = match &node.op {
                         Op::RmsNormBackwardInput { .. } => 0u32,
@@ -3133,8 +3117,7 @@ impl WgpuExecutable {
                 Op::CumsumBackward { exclusive, .. } => {
                     let dy_shape = &graph.node(node.inputs[0]).shape;
                     let cols = dy_shape.dim(dy_shape.rank() - 1).unwrap_static() as u32;
-                    let rows =
-                        (dy_shape.num_elements().unwrap() / cols.max(1) as usize) as u32;
+                    let rows = (dy_shape.num_elements().unwrap() / cols.max(1) as usize) as u32;
                     let p = CumsumBwdParams {
                         outer: rows,
                         inner: cols,
@@ -3844,10 +3827,7 @@ impl WgpuExecutable {
                     Step::DequantMatmulGguf { .. }
                     | Step::DequantGroupedMatmulGguf { .. }
                     | Step::GatedDeltaNet { .. }
-            | Step::Llada2GroupLimitedGate { .. }
-                    | Step::RopeBackward { .. }
-                    | Step::CumsumBackward { .. }
-                    | Step::GatherBackward { .. } => {}
+                    | Step::Llada2GroupLimitedGate { .. } => {}
                     Step::FusedResidualLn { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
@@ -3910,600 +3890,602 @@ impl WgpuExecutable {
                     // env var RLX_TRACE_PERFETTO unset.
                     let _perf = rlx_ir::perfetto::TraceSpan::new(step_name(step), "wgpu");
                     match step {
-                    Step::CastF32ToF16 { params } => {
-                        // Pre-pass for matmul_coop16: mirror f32 arena
-                        // region into f16 shadow buffer so the matmul
-                        // kernel can read A as f16. One thread per
-                        // element; 64-thread workgroups.
-                        if let Some(cast_k) = mm_cast {
-                            pass.set_pipeline(&cast_k.pipeline);
+                        Step::CastF32ToF16 { params } => {
+                            // Pre-pass for matmul_coop16: mirror f32 arena
+                            // region into f16 shadow buffer so the matmul
+                            // kernel can read A as f16. One thread per
+                            // element; 64-thread workgroups.
+                            if let Some(cast_k) = mm_cast {
+                                pass.set_pipeline(&cast_k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                                let (gx, gy, gz) = dispatch_dims(params.len, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                        }
+                        Step::Matmul {
+                            m,
+                            n,
+                            batch,
+                            b_is_param,
+                            compute_precision,
+                            ..
+                        } =>
+                        // The dispatch branches below use a chain of
+                        // `is_some() && …unwrap()` to pick a pipeline
+                        // because each variant cares about a different
+                        // Option<Pipeline>. `if let Some(p) = …` chains
+                        // would require nesting per variant; the flat
+                        // form is the readable shape here.
+                        {
+                            #[allow(clippy::unnecessary_unwrap)]
+                            // Safe at any batch (see safe_for_active_extent
+                            // comment); scale m, output rows past m_s per
+                            // batch retain prior values via c_batch_stride.
+                            let m_s = scale(*m);
+                            if m_s == 0 {
+                                continue;
+                            }
                             pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                            let (gx, gy, gz) = dispatch_dims(params.len, 64);
+                            // Kernel selection priority:
+                            //   1. compute_precision == F16 + b_is_param +
+                            //      SHADER_F16 → matmul_f16_compute
+                            //      (f16 multiply, f32 acc — 2× ALU on Apple)
+                            //   2. legacy RLX_WGPU_F16_WEIGHTS opt-in →
+                            //      matmul_f16w (storage-only f16; experimental,
+                            //      currently regresses on Apple)
+                            //   3. wide-N (m≥32, n≥64)   → matmul_wide
+                            //   4. otherwise            → matmul (small/skinny)
+                            let f16w_opt_in = rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS");
+                            if let Some(coop) = mm_coop.as_ref()
+                                && *b_is_param
+                                && *compute_precision == MatmulCompute::Coop16
+                            {
+                                // Hardware GEMM via simdgroup_matrix /
+                                // KHR_cooperative_matrix. 32×32 output tile
+                                // per workgroup (16 hardware-GEMM ops with
+                                // shared A/B loads). Caller guaranteed m, n,
+                                // k are multiples of 32/32/8.
+                                pass.set_pipeline(&coop.pipeline);
+                                pass.dispatch_workgroups(n / 32, m_s.div_ceil(32), *batch);
+                            } else if let Some(coop_f32) = mm_coop_f32.as_ref()
+                                && *b_is_param
+                                && *compute_precision == MatmulCompute::CoopF32
+                            {
+                                // Pure-f32 cooperative-matrix path
+                                // (`simdgroup_float8x8` on Apple). Same tile
+                                // shape as Coop16; no precision loss.
+                                pass.set_pipeline(&coop_f32.pipeline);
+                                pass.dispatch_workgroups(n / 32, m_s.div_ceil(32), *batch);
+                            } else if let Some(f16c) = mm_f16c.as_ref()
+                                && *b_is_param
+                                && *compute_precision == MatmulCompute::F16
+                            {
+                                pass.set_pipeline(&f16c.pipeline);
+                                pass.dispatch_workgroups(n.div_ceil(32), m_s.div_ceil(32), *batch);
+                            } else if let Some(f16w) = mm_f16w.as_ref()
+                                && *b_is_param
+                                && f16w_opt_in
+                            {
+                                pass.set_pipeline(&f16w.pipeline);
+                                pass.dispatch_workgroups(n.div_ceil(32), m_s.div_ceil(32), *batch);
+                            } else if m_s >= 32 && *n >= 64 {
+                                pass.set_pipeline(&mm_w.pipeline);
+                                pass.dispatch_workgroups(n.div_ceil(64), m_s.div_ceil(32), *batch);
+                            } else {
+                                pass.set_pipeline(&mm_k.pipeline);
+                                pass.dispatch_workgroups(n.div_ceil(32), m_s.div_ceil(32), *batch);
+                            }
+                        }
+                        Step::Binary { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            pass.set_pipeline(&bk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
-                    }
-                    Step::Matmul {
-                        m,
-                        n,
-                        batch,
-                        b_is_param,
-                        compute_precision,
-                        ..
-                    } =>
-                    // The dispatch branches below use a chain of
-                    // `is_some() && …unwrap()` to pick a pipeline
-                    // because each variant cares about a different
-                    // Option<Pipeline>. `if let Some(p) = …` chains
-                    // would require nesting per variant; the flat
-                    // form is the readable shape here.
-                    {
-                        #[allow(clippy::unnecessary_unwrap)]
-                        // Safe at any batch (see safe_for_active_extent
-                        // comment); scale m, output rows past m_s per
-                        // batch retain prior values via c_batch_stride.
-                        let m_s = scale(*m);
-                        if m_s == 0 {
-                            continue;
-                        }
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        // Kernel selection priority:
-                        //   1. compute_precision == F16 + b_is_param +
-                        //      SHADER_F16 → matmul_f16_compute
-                        //      (f16 multiply, f32 acc — 2× ALU on Apple)
-                        //   2. legacy RLX_WGPU_F16_WEIGHTS opt-in →
-                        //      matmul_f16w (storage-only f16; experimental,
-                        //      currently regresses on Apple)
-                        //   3. wide-N (m≥32, n≥64)   → matmul_wide
-                        //   4. otherwise            → matmul (small/skinny)
-                        let f16w_opt_in = rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS");
-                        if let Some(coop) = mm_coop.as_ref()
-                            && *b_is_param
-                            && *compute_precision == MatmulCompute::Coop16
-                        {
-                            // Hardware GEMM via simdgroup_matrix /
-                            // KHR_cooperative_matrix. 32×32 output tile
-                            // per workgroup (16 hardware-GEMM ops with
-                            // shared A/B loads). Caller guaranteed m, n,
-                            // k are multiples of 32/32/8.
-                            pass.set_pipeline(&coop.pipeline);
-                            pass.dispatch_workgroups(n / 32, m_s.div_ceil(32), *batch);
-                        } else if let Some(coop_f32) = mm_coop_f32.as_ref()
-                            && *b_is_param
-                            && *compute_precision == MatmulCompute::CoopF32
-                        {
-                            // Pure-f32 cooperative-matrix path
-                            // (`simdgroup_float8x8` on Apple). Same tile
-                            // shape as Coop16; no precision loss.
-                            pass.set_pipeline(&coop_f32.pipeline);
-                            pass.dispatch_workgroups(n / 32, m_s.div_ceil(32), *batch);
-                        } else if let Some(f16c) = mm_f16c.as_ref()
-                            && *b_is_param
-                            && *compute_precision == MatmulCompute::F16
-                        {
-                            pass.set_pipeline(&f16c.pipeline);
-                            pass.dispatch_workgroups(n.div_ceil(32), m_s.div_ceil(32), *batch);
-                        } else if let Some(f16w) = mm_f16w.as_ref()
-                            && *b_is_param
-                            && f16w_opt_in
-                        {
-                            pass.set_pipeline(&f16w.pipeline);
-                            pass.dispatch_workgroups(n.div_ceil(32), m_s.div_ceil(32), *batch);
-                        } else if m_s >= 32 && *n >= 64 {
-                            pass.set_pipeline(&mm_w.pipeline);
-                            pass.dispatch_workgroups(n.div_ceil(64), m_s.div_ceil(32), *batch);
-                        } else {
-                            pass.set_pipeline(&mm_k.pipeline);
-                            pass.dispatch_workgroups(n.div_ceil(32), m_s.div_ceil(32), *batch);
-                        }
-                    }
-                    Step::Binary { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        pass.set_pipeline(&bk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Compare { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        pass.set_pipeline(&ck.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Unary { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        pass.set_pipeline(&uk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Where { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        pass.set_pipeline(&wk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Reduce { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
-                        }
-                        let rk = reduce_kernel(&dev.device);
-                        pass.set_pipeline(&rk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Softmax { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
-                        }
-                        let sk = softmax_kernel(&dev.device);
-                        pass.set_pipeline(&sk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::LayerNorm { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
-                        }
-                        let lk = layernorm_kernel(&dev.device);
-                        pass.set_pipeline(&lk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::RmsNormBackwardInput { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
-                        }
-                        let rk = rms_norm_backward_kernel(&dev.device);
-                        pass.set_pipeline(&rk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        pass.dispatch_workgroups(outer_s, 1, 1);
-                    }
-                    Step::RmsNormBackwardGamma { params } | Step::RmsNormBackwardBeta { params } => {
-                        if params.inner == 0 {
-                            continue;
-                        }
-                        let rk = rms_norm_backward_param_kernel(&dev.device);
-                        pass.set_pipeline(&rk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        pass.dispatch_workgroups(1, 1, 1);
-                    }
-                    Step::CumsumBackward { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
-                        }
-                        let ck = cumsum_backward_kernel(&dev.device);
-                        pass.set_pipeline(&ck.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::RopeBackward { params } => {
-                        let seq_s = scale(params.seq);
-                        if seq_s == 0 {
-                            continue;
-                        }
-                        let rk = rope_backward_kernel(&dev.device);
-                        pass.set_pipeline(&rk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let total = params.batch * seq_s * params.hidden;
-                        let (gx, gy, gz) = dispatch_dims(total, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::GatherBackward { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
-                        }
-                        let total = outer_s * params.axis_dim * params.trailing;
-                        if total > 0 {
-                            let zk = gather_backward_zero_kernel(&dev.device);
-                            pass.set_pipeline(&zk.pipeline);
+                        Step::Compare { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            pass.set_pipeline(&ck.pipeline);
                             pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                            let (gx, _, _) = dispatch_dims(total, 256);
-                            pass.dispatch_workgroups(gx, 1, 1);
-                        }
-                        let ak = gather_backward_acc_kernel(&dev.device);
-                        pass.set_pipeline(&ak.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        pass.dispatch_workgroups(outer_s, 1, 1);
-                    }
-                    Step::Cumsum { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
-                        }
-                        let ck2 = cumsum_kernel(&dev.device);
-                        pass.set_pipeline(&ck2.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Fft { outer, .. } => {
-                        // One workgroup per row, 256 threads per WG.
-                        // No active-extent scaling — FFT operates on
-                        // the full input each call.
-                        if *outer == 0 {
-                            continue;
-                        }
-                        let ck = fft_kernel(&dev.device);
-                        pass.set_pipeline(&ck.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        pass.dispatch_workgroups(*outer, 1, 1);
-                    }
-                    Step::Copy { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        let ck2 = copy_kernel(&dev.device);
-                        pass.set_pipeline(&ck2.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::ElementwiseRegion { params } => {
-                        let len_s = scale(params.len);
-                        if len_s == 0 {
-                            continue;
-                        }
-                        let ek = elementwise_region_kernel(&dev.device);
-                        pass.set_pipeline(&ek.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(len_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Transpose { params, .. } => {
-                        // Compute scaled grid count to match the
-                        // uniform's scaled out_total when bucket axis
-                        // is outermost.
-                        let total_s = if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
-                            let scaled_d0 = scale(params.out_dim_0);
-                            let inner = params.out_total / params.out_dim_0;
-                            scaled_d0 * inner
-                        } else {
-                            params.out_total
-                        };
-                        if total_s == 0 {
-                            continue;
-                        }
-                        let tk = transpose_kernel(&dev.device);
-                        pass.set_pipeline(&tk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Narrow { params } => {
-                        let total_s = scale(params.total);
-                        if total_s == 0 {
-                            continue;
-                        }
-                        let nk = narrow_kernel(&dev.device);
-                        pass.set_pipeline(&nk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Concat { params } => {
-                        let total_s = scale(params.total);
-                        if total_s == 0 {
-                            continue;
-                        }
-                        let cck = concat_kernel(&dev.device);
-                        pass.set_pipeline(&cck.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Gather { params } => {
-                        let n_out_s = scale(params.n_out);
-                        if n_out_s == 0 {
-                            continue;
-                        }
-                        let gk = gather_kernel(&dev.device);
-                        pass.set_pipeline(&gk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(n_out_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::GatherAxis { params } => {
-                        let total_s = scale(params.total);
-                        if total_s == 0 {
-                            continue;
-                        }
-                        let gk = gather_axis_kernel(&dev.device);
-                        pass.set_pipeline(&gk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Attention { params, .. } => {
-                        // Scale seq_q for grid dim; per-head strides
-                        // come from seq_q_stride / seq_k_stride (full
-                        // extent) inside the WGSL.
-                        let seq_q_s = scale(params.seq_q);
-                        if seq_q_s == 0 {
-                            continue;
-                        }
-                        let ak = attention_kernel(&dev.device);
-                        pass.set_pipeline(&ak.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let total = params.batch * params.heads * seq_q_s;
-                        let (gx, gy, gz) = dispatch_dims(total, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::AttentionBackward { params, .. } => {
-                        let axis = if params.wrt == 0 {
-                            params.seq_q
-                        } else {
-                            params.seq_k
-                        };
-                        let axis_s = scale(axis);
-                        if axis_s == 0 {
-                            continue;
-                        }
-                        let ak = attention_bwd_kernel(&dev.device);
-                        pass.set_pipeline(&ak.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let total = params.batch * params.heads * axis_s;
-                        let (gx, gy, gz) = dispatch_dims(total, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Rope { params } => {
-                        // Multi-batch via stride-field WGSL fix:
-                        // iterate `batch * scaled_seq * last_dim` items.
-                        let s_active = scale(params.seq);
-                        let total_s = params.batch * s_active * params.last_dim;
-                        if total_s == 0 {
-                            continue;
-                        }
-                        let rk = rope_kernel(&dev.device);
-                        pass.set_pipeline(&rk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Expand { params, .. } => {
-                        let total_s = if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
-                            let scaled_d0 = scale(params.out_dim_0);
-                            let inner = params.out_total / params.out_dim_0;
-                            scaled_d0 * inner
-                        } else {
-                            params.out_total
-                        };
-                        if total_s == 0 {
-                            continue;
-                        }
-                        let ek = expand_kernel(&dev.device);
-                        pass.set_pipeline(&ek.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Argmax { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
-                        }
-                        let amk = argmax_kernel(&dev.device);
-                        pass.set_pipeline(&amk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Pool2d { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        let pk = pool2d_kernel(&dev.device);
-                        pass.set_pipeline(&pk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let total = n_s * params.c * params.h_out * params.w_out;
-                        let (gx, gy, gz) = dispatch_dims(total, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Conv2d { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        let ck2 = conv2d_kernel(&dev.device);
-                        pass.set_pipeline(&ck2.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let total = n_s * params.c_out * params.h_out * params.w_out;
-                        let (gx, gy, gz) = dispatch_dims(total, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Pool1d { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        let pk = pool1d_kernel(&dev.device);
-                        pass.set_pipeline(&pk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let total = n_s * params.c * params.l_out;
-                        let (gx, gy, gz) = dispatch_dims(total, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Pool3d { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        let pk = pool3d_kernel(&dev.device);
-                        pass.set_pipeline(&pk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let total = n_s * params.c * params.d_out * params.h_out * params.w_out;
-                        let (gx, gy, gz) = dispatch_dims(total, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Conv1d { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        let ck = conv1d_kernel(&dev.device);
-                        pass.set_pipeline(&ck.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let total = n_s * params.c_out * params.l_out;
-                        let (gx, gy, gz) = dispatch_dims(total, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::Conv3d { params } => {
-                        let n_s = scale(params.n);
-                        if n_s == 0 {
-                            continue;
-                        }
-                        let ck = conv3d_kernel(&dev.device);
-                        pass.set_pipeline(&ck.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let total = n_s * params.c_out * params.d_out * params.h_out * params.w_out;
-                        let (gx, gy, gz) = dispatch_dims(total, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::ScatterAdd { params } => {
-                        let sk = scatter_add_kernel(&dev.device);
-                        pass.set_pipeline(&sk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        // Phase 0 zeros the FULL output (preserves
-                        // accumulator semantics). Phase 1 scatters first
-                        // num_updates_active updates only; serial single
-                        // workgroup either way (atomic CAS unsupported in
-                        // naga's MSL emitter — see scatter_add.wgsl).
-                        if params.op == 0 {
-                            let (gx, gy, gz) = dispatch_dims(params.out_total, 64);
+                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
-                        } else {
+                        }
+                        Step::Unary { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            pass.set_pipeline(&uk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Where { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            pass.set_pipeline(&wk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Reduce { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let rk = reduce_kernel(&dev.device);
+                            pass.set_pipeline(&rk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Softmax { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let sk = softmax_kernel(&dev.device);
+                            pass.set_pipeline(&sk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::LayerNorm { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let lk = layernorm_kernel(&dev.device);
+                            pass.set_pipeline(&lk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::RmsNormBackwardInput { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let rk = rms_norm_backward_kernel(&dev.device);
+                            pass.set_pipeline(&rk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.dispatch_workgroups(outer_s, 1, 1);
+                        }
+                        Step::RmsNormBackwardGamma { params }
+                        | Step::RmsNormBackwardBeta { params } => {
+                            if params.inner == 0 {
+                                continue;
+                            }
+                            let rk = rms_norm_backward_param_kernel(&dev.device);
+                            pass.set_pipeline(&rk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
                             pass.dispatch_workgroups(1, 1, 1);
                         }
-                    }
-                    Step::TopK { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
+                        Step::CumsumBackward { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let ck = cumsum_backward_kernel(&dev.device);
+                            pass.set_pipeline(&ck.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
                         }
-                        let tk = topk_kernel(&dev.device);
-                        pass.set_pipeline(&tk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::GroupedMatmul { params } => {
-                        let m_s = scale(params.m);
-                        if m_s == 0 {
-                            continue;
+                        Step::RopeBackward { params } => {
+                            let seq_s = scale(params.seq);
+                            if seq_s == 0 {
+                                continue;
+                            }
+                            let rk = rope_backward_kernel(&dev.device);
+                            pass.set_pipeline(&rk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let total = params.batch * seq_s * params.hidden;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
                         }
-                        let gk = grouped_matmul_kernel(&dev.device);
-                        pass.set_pipeline(&gk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
-                    }
-                    Step::Sample { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
+                        Step::GatherBackward { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let total = outer_s * params.axis_dim * params.trailing;
+                            if total > 0 {
+                                let zk = gather_backward_zero_kernel(&dev.device);
+                                pass.set_pipeline(&zk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                                let (gx, _, _) = dispatch_dims(total, 256);
+                                pass.dispatch_workgroups(gx, 1, 1);
+                            }
+                            let ak = gather_backward_acc_kernel(&dev.device);
+                            pass.set_pipeline(&ak.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.dispatch_workgroups(outer_s, 1, 1);
                         }
-                        let sk = sample_kernel(&dev.device);
-                        pass.set_pipeline(&sk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::SelectiveScan { params } => {
-                        // Predicate-gated to batch=1; the seq scaling
-                        // happens inside the kernel (uniform sees scaled
-                        // seq). Dispatch grid here is per-(batch, hidden);
-                        // unaffected by seq scaling.
-                        let ssk = selective_scan_kernel(&dev.device);
-                        pass.set_pipeline(&ssk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let total = params.batch * params.hidden;
-                        let (gx, gy, gz) = dispatch_dims(total, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::DequantMatmul { params } => {
-                        let m_s = scale(params.m);
-                        if m_s == 0 {
-                            continue;
+                        Step::Cumsum { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let ck2 = cumsum_kernel(&dev.device);
+                            pass.set_pipeline(&ck2.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
                         }
-                        let dk = dequant_matmul_kernel(&dev.device);
-                        pass.set_pipeline(&dk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
-                    }
-                    Step::FusedResidualLn { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
+                        Step::Fft { outer, .. } => {
+                            // One workgroup per row, 256 threads per WG.
+                            // No active-extent scaling — FFT operates on
+                            // the full input each call.
+                            if *outer == 0 {
+                                continue;
+                            }
+                            let ck = fft_kernel(&dev.device);
+                            pass.set_pipeline(&ck.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.dispatch_workgroups(*outer, 1, 1);
                         }
-                        let frk = fused_residual_ln_kernel(&dev.device);
-                        pass.set_pipeline(&frk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::FusedResidualLnTee { params } => {
-                        let outer_s = scale(params.outer);
-                        if outer_s == 0 {
-                            continue;
+                        Step::Copy { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let ck2 = copy_kernel(&dev.device);
+                            pass.set_pipeline(&ck2.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
                         }
-                        let frtk = fused_residual_ln_tee_kernel(&dev.device);
-                        pass.set_pipeline(&frtk.pipeline);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
-                    }
-                    Step::MatmulQkv { params, coop } => {
-                        let m_s = scale(params.m);
-                        if m_s == 0 {
-                            continue;
+                        Step::ElementwiseRegion { params } => {
+                            let len_s = scale(params.len);
+                            if len_s == 0 {
+                                continue;
+                            }
+                            let ek = elementwise_region_kernel(&dev.device);
+                            pass.set_pipeline(&ek.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(len_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
                         }
-                        // Both kernels write to the same 32×32 output tile
-                        // grid; only the inner GEMM strategy differs.
-                        let pipe = if *coop {
-                            &matmul_qkv_coop_f32_kernel(&dev.device)
-                                .expect("coop matmul_qkv kernel missing")
-                                .pipeline
-                        } else {
-                            &matmul_qkv_kernel(&dev.device).pipeline
-                        };
-                        pass.set_pipeline(pipe);
-                        pass.set_bind_group(0, &self.bind_groups[i], &[]);
-                        pass.dispatch_workgroups(params.n.div_ceil(32), m_s.div_ceil(32), 1);
+                        Step::Transpose { params, .. } => {
+                            // Compute scaled grid count to match the
+                            // uniform's scaled out_total when bucket axis
+                            // is outermost.
+                            let total_s = if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
+                                let scaled_d0 = scale(params.out_dim_0);
+                                let inner = params.out_total / params.out_dim_0;
+                                scaled_d0 * inner
+                            } else {
+                                params.out_total
+                            };
+                            if total_s == 0 {
+                                continue;
+                            }
+                            let tk = transpose_kernel(&dev.device);
+                            pass.set_pipeline(&tk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Narrow { params } => {
+                            let total_s = scale(params.total);
+                            if total_s == 0 {
+                                continue;
+                            }
+                            let nk = narrow_kernel(&dev.device);
+                            pass.set_pipeline(&nk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Concat { params } => {
+                            let total_s = scale(params.total);
+                            if total_s == 0 {
+                                continue;
+                            }
+                            let cck = concat_kernel(&dev.device);
+                            pass.set_pipeline(&cck.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Gather { params } => {
+                            let n_out_s = scale(params.n_out);
+                            if n_out_s == 0 {
+                                continue;
+                            }
+                            let gk = gather_kernel(&dev.device);
+                            pass.set_pipeline(&gk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(n_out_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::GatherAxis { params } => {
+                            let total_s = scale(params.total);
+                            if total_s == 0 {
+                                continue;
+                            }
+                            let gk = gather_axis_kernel(&dev.device);
+                            pass.set_pipeline(&gk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Attention { params, .. } => {
+                            // Scale seq_q for grid dim; per-head strides
+                            // come from seq_q_stride / seq_k_stride (full
+                            // extent) inside the WGSL.
+                            let seq_q_s = scale(params.seq_q);
+                            if seq_q_s == 0 {
+                                continue;
+                            }
+                            let ak = attention_kernel(&dev.device);
+                            pass.set_pipeline(&ak.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let total = params.batch * params.heads * seq_q_s;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::AttentionBackward { params, .. } => {
+                            let axis = if params.wrt == 0 {
+                                params.seq_q
+                            } else {
+                                params.seq_k
+                            };
+                            let axis_s = scale(axis);
+                            if axis_s == 0 {
+                                continue;
+                            }
+                            let ak = attention_bwd_kernel(&dev.device);
+                            pass.set_pipeline(&ak.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let total = params.batch * params.heads * axis_s;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Rope { params } => {
+                            // Multi-batch via stride-field WGSL fix:
+                            // iterate `batch * scaled_seq * last_dim` items.
+                            let s_active = scale(params.seq);
+                            let total_s = params.batch * s_active * params.last_dim;
+                            if total_s == 0 {
+                                continue;
+                            }
+                            let rk = rope_kernel(&dev.device);
+                            pass.set_pipeline(&rk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Expand { params, .. } => {
+                            let total_s = if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
+                                let scaled_d0 = scale(params.out_dim_0);
+                                let inner = params.out_total / params.out_dim_0;
+                                scaled_d0 * inner
+                            } else {
+                                params.out_total
+                            };
+                            if total_s == 0 {
+                                continue;
+                            }
+                            let ek = expand_kernel(&dev.device);
+                            pass.set_pipeline(&ek.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Argmax { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let amk = argmax_kernel(&dev.device);
+                            pass.set_pipeline(&amk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Pool2d { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let pk = pool2d_kernel(&dev.device);
+                            pass.set_pipeline(&pk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let total = n_s * params.c * params.h_out * params.w_out;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Conv2d { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let ck2 = conv2d_kernel(&dev.device);
+                            pass.set_pipeline(&ck2.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let total = n_s * params.c_out * params.h_out * params.w_out;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Pool1d { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let pk = pool1d_kernel(&dev.device);
+                            pass.set_pipeline(&pk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let total = n_s * params.c * params.l_out;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Pool3d { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let pk = pool3d_kernel(&dev.device);
+                            pass.set_pipeline(&pk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let total = n_s * params.c * params.d_out * params.h_out * params.w_out;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Conv1d { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let ck = conv1d_kernel(&dev.device);
+                            pass.set_pipeline(&ck.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let total = n_s * params.c_out * params.l_out;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Conv3d { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let ck = conv3d_kernel(&dev.device);
+                            pass.set_pipeline(&ck.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let total =
+                                n_s * params.c_out * params.d_out * params.h_out * params.w_out;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::ScatterAdd { params } => {
+                            let sk = scatter_add_kernel(&dev.device);
+                            pass.set_pipeline(&sk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            // Phase 0 zeros the FULL output (preserves
+                            // accumulator semantics). Phase 1 scatters first
+                            // num_updates_active updates only; serial single
+                            // workgroup either way (atomic CAS unsupported in
+                            // naga's MSL emitter — see scatter_add.wgsl).
+                            if params.op == 0 {
+                                let (gx, gy, gz) = dispatch_dims(params.out_total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            } else {
+                                pass.dispatch_workgroups(1, 1, 1);
+                            }
+                        }
+                        Step::TopK { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let tk = topk_kernel(&dev.device);
+                            pass.set_pipeline(&tk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::GroupedMatmul { params } => {
+                            let m_s = scale(params.m);
+                            if m_s == 0 {
+                                continue;
+                            }
+                            let gk = grouped_matmul_kernel(&dev.device);
+                            pass.set_pipeline(&gk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
+                        }
+                        Step::Sample { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let sk = sample_kernel(&dev.device);
+                            pass.set_pipeline(&sk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::SelectiveScan { params } => {
+                            // Predicate-gated to batch=1; the seq scaling
+                            // happens inside the kernel (uniform sees scaled
+                            // seq). Dispatch grid here is per-(batch, hidden);
+                            // unaffected by seq scaling.
+                            let ssk = selective_scan_kernel(&dev.device);
+                            pass.set_pipeline(&ssk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let total = params.batch * params.hidden;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::DequantMatmul { params } => {
+                            let m_s = scale(params.m);
+                            if m_s == 0 {
+                                continue;
+                            }
+                            let dk = dequant_matmul_kernel(&dev.device);
+                            pass.set_pipeline(&dk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
+                        }
+                        Step::FusedResidualLn { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let frk = fused_residual_ln_kernel(&dev.device);
+                            pass.set_pipeline(&frk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::FusedResidualLnTee { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let frtk = fused_residual_ln_tee_kernel(&dev.device);
+                            pass.set_pipeline(&frtk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::MatmulQkv { params, coop } => {
+                            let m_s = scale(params.m);
+                            if m_s == 0 {
+                                continue;
+                            }
+                            // Both kernels write to the same 32×32 output tile
+                            // grid; only the inner GEMM strategy differs.
+                            let pipe = if *coop {
+                                &matmul_qkv_coop_f32_kernel(&dev.device)
+                                    .expect("coop matmul_qkv kernel missing")
+                                    .pipeline
+                            } else {
+                                &matmul_qkv_kernel(&dev.device).pipeline
+                            };
+                            pass.set_pipeline(pipe);
+                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.dispatch_workgroups(params.n.div_ceil(32), m_s.div_ceil(32), 1);
+                        }
+                        Step::DequantMatmulGguf { .. }
+                        | Step::DequantGroupedMatmulGguf { .. }
+                        | Step::GatedDeltaNet { .. }
+                        | Step::Llada2GroupLimitedGate { .. } => {}
+                        #[cfg(feature = "splat")]
+                        Step::GaussianSplatRender { .. }
+                        | Step::GaussianSplatRenderBackward { .. }
+                        | Step::GaussianSplatPrepare { .. }
+                        | Step::GaussianSplatRasterize { .. } => {}
                     }
-                    Step::DequantMatmulGguf { .. }
-                    | Step::DequantGroupedMatmulGguf { .. }
-                    | Step::GatedDeltaNet { .. }
-            | Step::Llada2GroupLimitedGate { .. } => {}
-                    #[cfg(feature = "splat")]
-                    | Step::GaussianSplatRender { .. }
-                    | Step::GaussianSplatRenderBackward { .. }
-                    | Step::GaussianSplatPrepare { .. }
-                    | Step::GaussianSplatRasterize { .. } => {}
-                }
                     step_i += 1;
                 }
             }

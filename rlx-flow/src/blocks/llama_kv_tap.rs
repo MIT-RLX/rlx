@@ -2,15 +2,13 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 
 use std::sync::{Arc, Mutex};
 
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
-use crate::weight::WeightSource;
-
 /// Export RoPE(K) and V projections as side outputs for KV-cache prefill.
 #[derive(Debug, Clone)]
 pub struct LlamaKvTapStage {
@@ -35,11 +33,7 @@ impl LlamaKvTapStage {
         }
     }
 
-    pub fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<()> {
+    pub fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<()> {
         let lp = &self.layer_prefix;
         let zero_beta = ctx
             .state

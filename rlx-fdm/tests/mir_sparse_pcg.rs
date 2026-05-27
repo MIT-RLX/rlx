@@ -15,7 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use rlx_fdm::mir_opt::{FdmEquilibriumGraph, FdmMirOptimizer};
-use rlx_fdm::{register_rlx_sparse, Network};
+use rlx_fdm::{Network, register_rlx_sparse};
 use rlx_runtime::{Device, Session};
 
 #[test]

@@ -30,7 +30,7 @@ layered crates.
   lowering, ICB-batched dispatch. Mirrors the CPU's Narrow→Rope
   fusion via stride-aware MSL kernels.
 - `rlx-mlx` — Apple MLX. Hand-rolled C++ shim driving MLX's lazy
-  graph + eager modes. Submodule at `vendor/mlx`.
+  graph + eager modes. Submodule at `rlx-mlx-sys/vendor/mlx` (`rlx-mlx-sys` crate).
 - `rlx-wgpu` — cross-platform GPU via wgpu (Metal/Vulkan/DX12/WebGPU).
   Single-pass online-softmax attention (FlashAttention-v1 style).
 - `rlx-cuda` — NVIDIA via `cudarc`. cuBLAS + NVRTC kernels. 5-tier

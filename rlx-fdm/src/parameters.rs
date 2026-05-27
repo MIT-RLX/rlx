@@ -17,12 +17,12 @@
 
 use crate::equilibrium::FdmError;
 use crate::implicit::{
-    grad_loss_wrt_q, grad_loss_wrt_xyz_fixed_linear, solve_adjoint_columns, AdjointSolveConfig,
+    AdjointSolveConfig, grad_loss_wrt_q, grad_loss_wrt_xyz_fixed_linear, solve_adjoint_columns,
 };
 use crate::loads::LoadState;
 use crate::mesh::MeshStructure;
 use crate::network::Network;
-use crate::objective::{goals_grad_xyz_free, Goal};
+use crate::objective::{Goal, goals_grad_xyz_free};
 use crate::state::EquilibriumState;
 use crate::structure::Structure;
 
@@ -47,9 +47,21 @@ impl DesignParam {
 
 #[derive(Clone, Debug)]
 enum Slot {
-    EdgeQ { edge: usize, low: f64, up: f64 },
-    SupportCoord { node: usize, axis: usize },
-    FreeLoad { node: usize, axis: usize },
+    EdgeQ {
+        edge: usize,
+        #[allow(dead_code)]
+        low: f64,
+        #[allow(dead_code)]
+        up: f64,
+    },
+    SupportCoord {
+        node: usize,
+        axis: usize,
+    },
+    FreeLoad {
+        node: usize,
+        axis: usize,
+    },
 }
 
 /// Packed design vector `x` with box bounds.
@@ -63,7 +75,10 @@ pub struct DesignVector {
 
 impl DesignVector {
     pub fn from_network_q(network: &Network) -> Self {
-        Self::from_network(network, &[DesignParam::all_edge_q(f64::NEG_INFINITY, f64::INFINITY)])
+        Self::from_network(
+            network,
+            &[DesignParam::all_edge_q(f64::NEG_INFINITY, f64::INFINITY)],
+        )
     }
 
     pub fn from_network(network: &Network, params: &[DesignParam]) -> Self {
@@ -85,7 +100,11 @@ impl DesignVector {
                         });
                     }
                 }
-                DesignParam::EdgeQ { edge, low: lo, up: hi } => {
+                DesignParam::EdgeQ {
+                    edge,
+                    low: lo,
+                    up: hi,
+                } => {
                     if *edge < network.q.len() {
                         x.push(network.q[*edge]);
                         low.push(*lo);
@@ -98,10 +117,7 @@ impl DesignVector {
                     }
                 }
                 DesignParam::SupportCoord { node, axis } => {
-                    if *node < network.xyz.len() / 3
-                        && network.is_support[*node]
-                        && *axis < 3
-                    {
+                    if *node < network.xyz.len() / 3 && network.is_support[*node] && *axis < 3 {
                         x.push(network.xyz[*node * 3 + *axis]);
                         low.push(f64::NEG_INFINITY);
                         up.push(f64::INFINITY);
@@ -112,10 +128,7 @@ impl DesignVector {
                     }
                 }
                 DesignParam::FreeLoad { node, axis } => {
-                    if *node < network.loads.len() / 3
-                        && !network.is_support[*node]
-                        && *axis < 3
-                    {
+                    if *node < network.loads.len() / 3 && !network.is_support[*node] && *axis < 3 {
                         x.push(network.loads[*node * 3 + *axis]);
                         low.push(f64::NEG_INFINITY);
                         up.push(f64::INFINITY);

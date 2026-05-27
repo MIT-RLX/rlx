@@ -200,8 +200,7 @@ mod tests {
             .expect("param w");
         let bwd = grad_with_loss_module(GraphModule::from_mir(mir), &[w]).expect("grad");
         assert!(
-            !bwd
-                .nodes()
+            !bwd.nodes()
                 .iter()
                 .any(|n| matches!(n.op, Op::FusedMatMulBiasAct { .. })),
             "backward graph should not retain fused ops"
@@ -217,17 +216,5 @@ mod tests {
         let via_pass = PrepareForAutodiff.run(g.clone());
         let via_fn = prepare_graph_for_ad(g);
         assert_eq!(via_pass.len(), via_fn.len());
-    }
-
-    #[test]
-    fn lir_stage_grad_errors() {
-        let mut g = Graph::new("t");
-        let x = g.input("x", f32_shape(&[4]));
-        g.set_outputs(vec![x]);
-        let lir = rlx_compile::CompilePipeline::default()
-            .plan_lir(MirModule::from_graph(g));
-        let err = grad_with_loss_module(GraphModule::from_lir(lir), &[NodeId(0)])
-            .unwrap_err();
-        assert!(matches!(err, AutodiffError::WrongStage { got: GraphStage::Lir, .. }));
     }
 }

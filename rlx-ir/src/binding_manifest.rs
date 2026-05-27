@@ -96,12 +96,7 @@ impl BindingManifest {
         let mut blocks: std::collections::HashMap<String, Vec<IoBindingEntry>> =
             std::collections::HashMap::new();
         for p in &self.params {
-            let block = p
-                .name
-                .split('.')
-                .next()
-                .unwrap_or(&p.name)
-                .to_string();
+            let block = p.name.split('.').next().unwrap_or(&p.name).to_string();
             blocks.entry(block).or_default().push(p.clone());
         }
         let mut out: Vec<WeightBlock> = blocks
@@ -165,8 +160,8 @@ fn entry_for_node(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lir::{LirBufferPlan, LirBufferSlot, LirIoManifest};
     use crate::Graph;
+    use crate::lir::{LirBufferPlan, LirBufferSlot, LirIoManifest};
 
     #[test]
     fn manifest_lists_params_with_sizes() {
@@ -176,11 +171,31 @@ mod tests {
         let mm = g.matmul(x, w, Shape::new(&[2, 3], DType::F32));
         g.set_outputs(vec![mm]);
 
-        let mut plan = LirBufferPlan::default();
-        plan.io = LirIoManifest::collect(&g);
-        plan.assignments.insert(x, LirBufferSlot { offset: 0, size: 32 });
-        plan.assignments.insert(w, LirBufferSlot { offset: 32, size: 48 });
-        plan.assignments.insert(mm, LirBufferSlot { offset: 80, size: 24 });
+        let mut plan = LirBufferPlan {
+            io: LirIoManifest::collect(&g),
+            ..Default::default()
+        };
+        plan.assignments.insert(
+            x,
+            LirBufferSlot {
+                offset: 0,
+                size: 32,
+            },
+        );
+        plan.assignments.insert(
+            w,
+            LirBufferSlot {
+                offset: 32,
+                size: 48,
+            },
+        );
+        plan.assignments.insert(
+            mm,
+            LirBufferSlot {
+                offset: 80,
+                size: 24,
+            },
+        );
         plan.arena_size = 104;
 
         let lir = LirModule::new(crate::MirModule::from_graph(g), plan);

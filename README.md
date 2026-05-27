@@ -152,10 +152,11 @@ cargo build --release --features metal,mlx    # apple silicon GPU
 cargo test  --release --workspace             # 865 tests
 ```
 
-For Apple Silicon, MLX is vendored as a git submodule:
+For Apple Silicon, MLX is a git submodule under `rlx-mlx-sys`:
 
 ```sh
-git submodule update --init
+git submodule update --init rlx-mlx-sys/vendor/mlx
+# or: git clone --recurse-submodules …
 ```
 
 ## Kernel dispatch and transparency

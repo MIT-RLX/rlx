@@ -55,7 +55,8 @@ impl TrajectoryRecord {
 }
 
 pub fn append_jsonl(path: &Path, rec: &TrajectoryRecord) -> std::io::Result<()> {
-    let line = serde_json::to_string(rec).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let line = serde_json::to_string(rec)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{line}")?;
     Ok(())

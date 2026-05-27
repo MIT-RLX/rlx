@@ -52,6 +52,7 @@ impl Rewriter {
 
     /// True iff every old NodeId in `ids` has already been mapped — used by fusion
     /// patterns to gate a rewrite on its inputs being live in the new graph.
+    #[allow(dead_code)]
     fn all_mapped(&self, ids: &[NodeId]) -> bool {
         ids.iter().all(|id| self.id_map.contains_key(id))
     }
@@ -186,10 +187,7 @@ impl Pass for FuseMatMulBiasAct {
                                 add_node.shape.clone()
                             };
 
-                            rw.ensure_mapped(
-                                &graph,
-                                &[node.inputs[0], node.inputs[1], bias_id],
-                            );
+                            rw.ensure_mapped(&graph, &[node.inputs[0], node.inputs[1], bias_id]);
                             let fused_id = rw.add_fused(
                                 Op::FusedMatMulBiasAct { activation },
                                 &[node.inputs[0], node.inputs[1], bias_id],
@@ -499,13 +497,7 @@ impl FuseSwiGLUDualMatmul {
         if graph.use_count(silu_id) != 1 {
             return None;
         }
-        Some((
-            mul_node.id,
-            gate_mm.id,
-            up_mm.id,
-            up_mm.inputs[0],
-            silu_id,
-        ))
+        Some((mul_node.id, gate_mm.id, up_mm.id, up_mm.inputs[0], silu_id))
     }
 }
 
@@ -519,7 +511,8 @@ impl Pass for FuseSwiGLUDualMatmul {
         let mut consumed: HashMap<NodeId, ()> = HashMap::new();
 
         for node in graph.nodes() {
-            if let Some((mul_id, gate_mm, up_mm, _, silu_id)) = Self::match_dual_swiglu(&graph, node)
+            if let Some((mul_id, gate_mm, up_mm, _, silu_id)) =
+                Self::match_dual_swiglu(&graph, node)
             {
                 matches.push((mul_id, gate_mm, up_mm, graph.node(up_mm).inputs[0], silu_id));
                 consumed.insert(gate_mm, ());
@@ -558,20 +551,15 @@ impl Pass for FuseSwiGLUDualMatmul {
 
                 // Up weights first → canonical FusedSwiGLU layout (gate_first=false).
                 let concat_shape = Shape::new(&[k, n_up + n_gate], wu_shape.dtype());
-                let concat_w =
-                    rw.add_fused(Op::Concat { axis: 1 }, &[wu, wg], concat_shape);
+                let concat_w = rw.add_fused(Op::Concat { axis: 1 }, &[wu, wg], concat_shape);
 
                 let out_rank = up.shape.rank();
-                let mut mm_dims: Vec<Dim> = (0..out_rank)
-                    .map(|i| up.shape.dim(i))
-                    .collect();
+                let mut mm_dims: Vec<Dim> = (0..out_rank).map(|i| up.shape.dim(i)).collect();
                 mm_dims[out_rank - 1] = Dim::Static(n_up + n_gate);
                 let cat_shape = Shape::from_dims(&mm_dims, up.shape.dtype());
-                let cat_id = rw.new_graph.add_node(
-                    Op::MatMul,
-                    vec![rw.map(input_id), concat_w],
-                    cat_shape,
-                );
+                let cat_id =
+                    rw.new_graph
+                        .add_node(Op::MatMul, vec![rw.map(input_id), concat_w], cat_shape);
 
                 let fused_id = rw.new_graph.add_node(
                     Op::FusedSwiGLU {
@@ -656,10 +644,8 @@ impl Pass for FuseSharedInputMatMul {
             return graph;
         }
 
-        let group_by_first: HashMap<NodeId, &FuseGroup> = groups
-            .iter()
-            .map(|g| (g.matmul_ids[0], g))
-            .collect();
+        let group_by_first: HashMap<NodeId, &FuseGroup> =
+            groups.iter().map(|g| (g.matmul_ids[0], g)).collect();
 
         let mut fused_away: HashMap<NodeId, ()> = HashMap::new();
         for g in &groups {
@@ -675,11 +661,7 @@ impl Pass for FuseSharedInputMatMul {
             }
 
             if let Some(group) = group_by_first.get(&node.id) {
-                let matmuls: Vec<_> = group
-                    .matmul_ids
-                    .iter()
-                    .map(|&id| graph.node(id))
-                    .collect();
+                let matmuls: Vec<_> = group.matmul_ids.iter().map(|&id| graph.node(id)).collect();
                 let weight_ids: Vec<NodeId> = matmuls.iter().map(|m| m.inputs[1]).collect();
                 rw.ensure_mapped(&graph, std::slice::from_ref(&group.input_id));
                 rw.ensure_mapped(&graph, &weight_ids);
@@ -693,13 +675,11 @@ impl Pass for FuseSharedInputMatMul {
                 let combined_n: usize = ns.iter().sum();
 
                 let concat_shape = Shape::new(&[k, combined_n], w0_shape.dtype());
-                let concat_id =
-                    rw.add_fused(Op::Concat { axis: 1 }, &weight_ids, concat_shape);
+                let concat_id = rw.add_fused(Op::Concat { axis: 1 }, &weight_ids, concat_shape);
 
                 let out_rank = matmuls[0].shape.rank();
-                let mut mm_dims: Vec<Dim> = (0..out_rank)
-                    .map(|i| matmuls[0].shape.dim(i))
-                    .collect();
+                let mut mm_dims: Vec<Dim> =
+                    (0..out_rank).map(|i| matmuls[0].shape.dim(i)).collect();
                 mm_dims[out_rank - 1] = Dim::Static(combined_n);
                 let mm_shape = Shape::from_dims(&mm_dims, matmuls[0].shape.dtype());
                 let mm_id = rw.new_graph.add_node(
@@ -827,7 +807,7 @@ impl Pass for FuseSwiGLU {
             let n = up_len;
             // Canonical: up @ 0, gate @ N. Swapped (gate-first builders): gate @ 0, up @ N.
             let gate_first = up_start == n && g_start == 0;
-            if !(up_start == 0 && g_start == n) && !gate_first {
+            if !(gate_first || (up_start == 0 && g_start == n)) {
                 continue;
             }
 
@@ -1564,12 +1544,13 @@ pub fn clip_elementwise_regions(graph: Graph, limits: crate::limits::FusionLimit
                 ChainOperand::Step(i) => step_dt[i as usize],
             }
         };
-        let shape_of = |op: &ChainOperand, ins: &[NodeId], step_ids: &[NodeId], rw: &Rewriter| -> Shape {
-            match *op {
-                ChainOperand::Input(i) => rw.new_graph.node(ins[i as usize]).shape.clone(),
-                ChainOperand::Step(i) => rw.new_graph.node(step_ids[i as usize]).shape.clone(),
-            }
-        };
+        let shape_of =
+            |op: &ChainOperand, ins: &[NodeId], step_ids: &[NodeId], rw: &Rewriter| -> Shape {
+                match *op {
+                    ChainOperand::Input(i) => rw.new_graph.node(ins[i as usize]).shape.clone(),
+                    ChainOperand::Step(i) => rw.new_graph.node(step_ids[i as usize]).shape.clone(),
+                }
+            };
         for step in chain {
             let resolve = |op: &ChainOperand| -> NodeId {
                 match *op {
@@ -1584,14 +1565,20 @@ pub fn clip_elementwise_regions(graph: Graph, limits: crate::limits::FusionLimit
                     let src_shape = shape_of(src, &region_inputs, &step_ids, &rw);
                     let dims: Vec<_> = src_shape.dims().to_vec();
                     let shape = Shape::from_dims(&dims, dt);
-                    (rw.new_graph.add_node(Op::Activation(*a), vec![s], shape), dt)
+                    (
+                        rw.new_graph.add_node(Op::Activation(*a), vec![s], shape),
+                        dt,
+                    )
                 }
                 ChainStep::Cast(to, src) => {
                     let s = resolve(src);
                     let src_shape = shape_of(src, &region_inputs, &step_ids, &rw);
                     let dims: Vec<_> = src_shape.dims().to_vec();
                     let shape = Shape::from_dims(&dims, *to);
-                    (rw.new_graph.add_node(Op::Cast { to: *to }, vec![s], shape), *to)
+                    (
+                        rw.new_graph.add_node(Op::Cast { to: *to }, vec![s], shape),
+                        *to,
+                    )
                 }
                 ChainStep::Binary(op, lhs, rhs) => {
                     let l = resolve(lhs);
@@ -1604,7 +1591,10 @@ pub fn clip_elementwise_regions(graph: Graph, limits: crate::limits::FusionLimit
                         .unwrap_or_else(|e| panic!("clip_elementwise_regions: {e}"));
                     let dims: Vec<_> = bcast.dims().to_vec();
                     let shape = Shape::from_dims(&dims, dt);
-                    (rw.new_graph.add_node(Op::Binary(*op), vec![l, r], shape), dt)
+                    (
+                        rw.new_graph.add_node(Op::Binary(*op), vec![l, r], shape),
+                        dt,
+                    )
                 }
                 ChainStep::Compare(op, lhs, rhs) => {
                     let l = resolve(lhs);
@@ -1616,7 +1606,10 @@ pub fn clip_elementwise_regions(graph: Graph, limits: crate::limits::FusionLimit
                         .unwrap_or_else(|e| panic!("clip_elementwise_regions: {e}"));
                     let dims: Vec<_> = bcast.dims().to_vec();
                     let shape = Shape::from_dims(&dims, rlx_ir::DType::U8);
-                    (rw.new_graph.add_node(Op::Compare(*op), vec![l, r], shape), rlx_ir::DType::U8)
+                    (
+                        rw.new_graph.add_node(Op::Compare(*op), vec![l, r], shape),
+                        rlx_ir::DType::U8,
+                    )
                 }
                 ChainStep::Where(cond, x, y) => {
                     let cn = resolve(cond);
@@ -1634,14 +1627,19 @@ pub fn clip_elementwise_regions(graph: Graph, limits: crate::limits::FusionLimit
                     });
                     let dims: Vec<_> = bcast.dims().to_vec();
                     let shape = Shape::from_dims(&dims, dt);
-                    (rw.new_graph.add_node(Op::Where, vec![cn, xn, yn], shape), dt)
+                    (
+                        rw.new_graph.add_node(Op::Where, vec![cn, xn, yn], shape),
+                        dt,
+                    )
                 }
             };
             step_ids.push(new_id);
             step_dtypes.push(dt);
         }
         let _ = (region_dtype, region_dims);
-        let last = *step_ids.last().expect("oversize region has non-empty chain");
+        let last = *step_ids
+            .last()
+            .expect("oversize region has non-empty chain");
         rw.replace(node.id, last);
     }
     rw.finish(&graph.outputs)
@@ -1813,7 +1811,11 @@ mod tests {
         g.set_outputs(vec![q, k, v]);
 
         let fused = FuseSharedInputMatMul.run(g);
-        assert_eq!(fused.len(), 9, "x + 3 weights + concat + mm + 3 narrows = 9");
+        assert_eq!(
+            fused.len(),
+            9,
+            "x + 3 weights + concat + mm + 3 narrows = 9"
+        );
         for &out in &fused.outputs {
             assert!(matches!(fused.node(out).op, Op::Narrow { .. }));
         }

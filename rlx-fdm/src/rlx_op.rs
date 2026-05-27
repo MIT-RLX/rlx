@@ -54,13 +54,7 @@ pub struct FdmCsr {
 }
 
 /// `x = K⁻¹ b` with Jacobi PCG (`rlx_sparse.pcg_solve`).
-pub fn pcg_solve_graph(
-    g: &mut Graph,
-    csr: &FdmCsr,
-    b: NodeId,
-    max_iter: u32,
-    tol: f64,
-) -> NodeId {
+pub fn pcg_solve_graph(g: &mut Graph, csr: &FdmCsr, b: NodeId, max_iter: u32, tol: f64) -> NodeId {
     let v = const_f64(g, &csr.values);
     let ci = const_i32(g, &csr.col_idx);
     let rp = const_i32(g, &csr.row_ptr);
@@ -91,7 +85,9 @@ impl OpExtension for AssembleCsrExt {
             Op::Custom { attrs, .. } => attrs.clone(),
             _ => Vec::new(),
         };
-        let dq = ctx.bwd.custom_op(FDM_ASSEMBLE_CSR_VJP, attrs, vec![ctx.upstream]);
+        let dq = ctx
+            .bwd
+            .custom_op(FDM_ASSEMBLE_CSR_VJP, attrs, vec![ctx.upstream]);
         vec![(0, dq)]
     }
 }
