@@ -22,7 +22,7 @@ use rlx_ir::{Node, NodeId, OpExtension, Shape, VjpContext, register_op};
 use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_kernel};
 
 use crate::core::Camera;
-use crate::reference::{render_reference, RenderParams};
+use crate::reference::{RenderParams, render_reference};
 
 /// Canonical op name for new RLX graphs.
 pub const RENDER_REFERENCE: &str = "rlx_splat.render_reference";
@@ -158,11 +158,7 @@ pub fn encode_render_attrs(width: u32, height: u32) -> Vec<u8> {
     attrs
 }
 
-pub fn build_render_meta(
-    camera: &Camera,
-    background: [f32; 3],
-    params: &RenderParams,
-) -> Vec<f32> {
+pub fn build_render_meta(camera: &Camera, background: [f32; 3], params: &RenderParams) -> Vec<f32> {
     vec![
         camera.position[0],
         camera.position[1],

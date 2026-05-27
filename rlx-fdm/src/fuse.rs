@@ -24,7 +24,7 @@ use crate::loads::nodes_load_at_mesh;
 use crate::mir_opt::{FdmEquilibriumGraph, FdmMirOptimizer};
 use crate::network::Network;
 use crate::objective::Goal;
-use crate::optimize::{constrained_fdm_host, OptimizeConfig, OptimizeResult};
+use crate::optimize::{OptimizeConfig, OptimizeResult, constrained_fdm_host};
 use crate::state::EquilibriumState;
 use crate::structure::Structure;
 
@@ -49,7 +49,10 @@ pub struct FusedEquilibriumRunner {
 
 impl FusedEquilibriumRunner {
     /// Build a fused forward graph when linear FDM + MIR are applicable.
-    pub fn try_new(optimizer: &FdmMirOptimizer, network: &Network) -> Result<Option<Self>, FdmError> {
+    pub fn try_new(
+        optimizer: &FdmMirOptimizer,
+        network: &Network,
+    ) -> Result<Option<Self>, FdmError> {
         if !can_fuse_equilibrium(optimizer, network) {
             return Ok(None);
         }
@@ -206,7 +209,13 @@ fn emit_fused_loss(g: &mut Graph, xyz_free: NodeId, nf: usize, loss: &FusedMirLo
         FusedMirLoss::SumFreeZ { target, weight } => {
             let z_col = g.narrow_(xyz_free, 1, 2, 1);
             let z_vec = g.reshape_(z_col, vec![nf as i64]);
-            let sum_z = g.reduce(z_vec, ReduceOp::Sum, vec![0], false, Shape::scalar(DType::F64));
+            let sum_z = g.reduce(
+                z_vec,
+                ReduceOp::Sum,
+                vec![0],
+                false,
+                Shape::scalar(DType::F64),
+            );
             let target_c = f64_scalar(g, *target);
             let diff = g.sub(sum_z, target_c);
             let sq = g.mul(diff, diff);

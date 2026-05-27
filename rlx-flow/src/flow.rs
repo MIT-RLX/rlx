@@ -92,8 +92,8 @@ impl ModelFlow {
     }
 
     pub fn build(self, weights: &mut dyn WeightSource) -> Result<BuiltModel> {
-        let mut module = GraphModule::hir(&self.name)
-            .with_fusion_policy(self.profile.fusion_policy());
+        let mut module =
+            GraphModule::hir(&self.name).with_fusion_policy(self.profile.fusion_policy());
         let mut params = HashMap::new();
         let mut state = FlowState::default();
         let mut ctx = FlowCtx {
@@ -107,9 +107,7 @@ impl ModelFlow {
         let mut value: Option<FlowValue> = None;
         for (i, (name, shape)) in self.inputs.iter().enumerate() {
             let id = ctx.input(name, shape.clone());
-            ctx.state
-                .inputs
-                .insert(name.clone(), (id, shape.clone()));
+            ctx.state.inputs.insert(name.clone(), (id, shape.clone()));
             if i == 0 {
                 value = Some(ctx.wrap(id, shape.clone()));
             }
@@ -238,11 +236,7 @@ impl BuiltModel {
 
     /// Append side outputs after the primary output node.
     pub fn with_extra_hir_outputs(mut self, extra: impl IntoIterator<Item = HirNodeId>) -> Self {
-        let primary = self
-            .module
-            .as_hir()
-            .expect("HIR stage")
-            .outputs[0];
+        let primary = self.module.as_hir().expect("HIR stage").outputs[0];
         let mut outputs = vec![primary];
         outputs.extend(extra);
         self.module.set_outputs(outputs);
@@ -262,8 +256,6 @@ impl BuiltModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::EmbedStage;
-    use crate::escape::Emit;
     use crate::layer::LayerStack;
     use crate::weight::MapWeights;
     use rlx_ir::{DType, Shape};

@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
@@ -17,11 +17,7 @@ pub struct LayerNormStage {
 }
 
 impl LayerNormStage {
-    pub fn new(
-        gamma_key: impl Into<String>,
-        beta_key: impl Into<String>,
-        eps: f32,
-    ) -> Self {
+    pub fn new(gamma_key: impl Into<String>, beta_key: impl Into<String>, eps: f32) -> Self {
         Self {
             gamma_key: gamma_key.into(),
             beta_key: beta_key.into(),
@@ -35,11 +31,7 @@ impl LayerNormStage {
 }
 
 impl BlockStage for LayerNormStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let gamma = ctx.load_param(&self.gamma_key, false)?;
         let beta = ctx.load_param(&self.beta_key, false)?;
         let mut gb = HirMut::new(ctx.hir());

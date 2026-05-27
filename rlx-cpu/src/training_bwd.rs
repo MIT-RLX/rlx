@@ -7,7 +7,7 @@
 pub fn rms_norm_backward_row(
     x: &[f32],
     gamma: &[f32],
-    beta: &[f32],
+    _beta: &[f32],
     dy: &[f32],
     dx: &mut [f32],
     dgamma: &mut [f32],
@@ -76,9 +76,7 @@ pub fn rope_backward_row(
         dx[i] = y1 * cv + y2 * sv;
         dx[rot_half + i] = -y1 * sv + y2 * cv;
     }
-    for j in n_rot..head_dim {
-        dx[j] = dy[j];
-    }
+    dx[n_rot..head_dim].copy_from_slice(&dy[n_rot..head_dim]);
     let _ = tab_half;
 }
 

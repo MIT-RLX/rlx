@@ -8,7 +8,12 @@ use crate::layer::LayerStack;
 use crate::stage::FlowStage;
 
 /// Fused DINOv2 ViT encoder block (pre-norm + LayerScale + tanh-approx GELU FFN).
-pub fn dinov2_layer_fused(layer_idx: usize, hidden_size: usize, num_heads: usize, eps: f32) -> FlowStage {
+pub fn dinov2_layer_fused(
+    layer_idx: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    eps: f32,
+) -> FlowStage {
     let lp = format!("blocks.{layer_idx}");
     FlowStage::Named {
         name: format!("layer{layer_idx}"),

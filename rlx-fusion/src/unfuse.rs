@@ -740,22 +740,14 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
                 }
 
                 let bh = b_dim * h_dim;
-                let bhnn = IrShape::from_dims(
-                    &[Dim::Static(bh), Dim::Static(n), Dim::Static(n)],
-                    dtype,
-                );
-                let bh1n = IrShape::from_dims(
-                    &[Dim::Static(bh), Dim::Static(1), Dim::Static(n)],
-                    dtype,
-                );
-                let bh11 = IrShape::from_dims(
-                    &[Dim::Static(bh), Dim::Static(1), Dim::Static(1)],
-                    dtype,
-                );
-                let bh_n1 = IrShape::from_dims(
-                    &[Dim::Static(bh), Dim::Static(n), Dim::Static(1)],
-                    dtype,
-                );
+                let bhnn =
+                    IrShape::from_dims(&[Dim::Static(bh), Dim::Static(n), Dim::Static(n)], dtype);
+                let bh1n =
+                    IrShape::from_dims(&[Dim::Static(bh), Dim::Static(1), Dim::Static(n)], dtype);
+                let bh11 =
+                    IrShape::from_dims(&[Dim::Static(bh), Dim::Static(1), Dim::Static(1)], dtype);
+                let bh_n1 =
+                    IrShape::from_dims(&[Dim::Static(bh), Dim::Static(n), Dim::Static(1)], dtype);
                 let bhnn_i64 = vec![bh as i64, n as i64, n as i64];
                 let bh1n_i64 = vec![bh as i64, 1, n as i64];
 
@@ -768,7 +760,12 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
                     dtype,
                 );
                 let b1hn = IrShape::from_dims(
-                    &[Dim::Static(b_dim), Dim::Static(1), Dim::Static(h_dim), Dim::Static(n)],
+                    &[
+                        Dim::Static(b_dim),
+                        Dim::Static(1),
+                        Dim::Static(h_dim),
+                        Dim::Static(n),
+                    ],
                     dtype,
                 );
                 let bhnn4 = IrShape::from_dims(
@@ -864,11 +861,7 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
                             dtype,
                         ),
                     );
-                    let gt_bh11 = out.reshape(
-                        gt_bhn,
-                        vec![bh as i64, 1, 1],
-                        bh11.clone(),
-                    );
+                    let gt_bh11 = out.reshape(gt_bhn, vec![bh as i64, 1, 1], bh11.clone());
                     let gt_bhnn = out.add_node(
                         Op::Expand {
                             target_shape: bhnn_i64.clone(),
@@ -878,11 +871,8 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
                     );
                     let exp_g = out.activation(Activation::Exp, gt_bhnn, bhnn.clone());
 
-                    let state_bhnn = out.reshape(
-                        state,
-                        vec![bh as i64, n as i64, n as i64],
-                        bhnn.clone(),
-                    );
+                    let state_bhnn =
+                        out.reshape(state, vec![bh as i64, n as i64, n as i64], bhnn.clone());
                     let damped = out.binary(BinaryOp::Mul, exp_g, state_bhnn, bhnn.clone());
                     state = out.reshape(
                         damped,
@@ -890,21 +880,10 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
                         bhnn4.clone(),
                     );
 
-                    let kt_bh1n = out.reshape(
-                        kt_b1hn,
-                        vec![bh as i64, 1, n as i64],
-                        bh1n.clone(),
-                    );
-                    let vt_bh1n = out.reshape(
-                        vt_b1hn,
-                        vec![bh as i64, 1, n as i64],
-                        bh1n.clone(),
-                    );
-                    let state_bhnn = out.reshape(
-                        state,
-                        vec![bh as i64, n as i64, n as i64],
-                        bhnn.clone(),
-                    );
+                    let kt_bh1n = out.reshape(kt_b1hn, vec![bh as i64, 1, n as i64], bh1n.clone());
+                    let vt_bh1n = out.reshape(vt_b1hn, vec![bh as i64, 1, n as i64], bh1n.clone());
+                    let state_bhnn =
+                        out.reshape(state, vec![bh as i64, n as i64, n as i64], bhnn.clone());
 
                     let mut sk = out.matmul(kt_bh1n, state_bhnn, bh1n.clone());
                     sk = out.binary(BinaryOp::Sub, vt_bh1n, sk, bh1n.clone());
@@ -935,33 +914,18 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
                     let kt_bhn1 = out.reshape(kt_bhn, vec![bh as i64, n as i64, 1], bh_n1.clone());
                     let sk_bh1 = out.reshape(sk, vec![bh as i64, 1, n as i64], bh1n.clone());
                     let outer = out.binary(BinaryOp::Mul, kt_bhn1, sk_bh1, bhnn.clone());
-                    let state_bhnn = out.reshape(
-                        state,
-                        vec![bh as i64, n as i64, n as i64],
-                        bhnn.clone(),
-                    );
-                    state = out.binary(
-                        BinaryOp::Add,
-                        state_bhnn,
-                        outer,
-                        bhnn.clone(),
-                    );
+                    let state_bhnn =
+                        out.reshape(state, vec![bh as i64, n as i64, n as i64], bhnn.clone());
+                    state = out.binary(BinaryOp::Add, state_bhnn, outer, bhnn.clone());
                     state = out.reshape(
                         state,
                         vec![b_dim as i64, h_dim as i64, n as i64, n as i64],
                         bhnn4.clone(),
                     );
 
-                    let qt_bh1n = out.reshape(
-                        qt_b1hn,
-                        vec![bh as i64, 1, n as i64],
-                        bh1n.clone(),
-                    );
-                    let state_bhnn = out.reshape(
-                        state,
-                        vec![bh as i64, n as i64, n as i64],
-                        bhnn.clone(),
-                    );
+                    let qt_bh1n = out.reshape(qt_b1hn, vec![bh as i64, 1, n as i64], bh1n.clone());
+                    let state_bhnn =
+                        out.reshape(state, vec![bh as i64, n as i64, n as i64], bhnn.clone());
                     let mut out_t = out.matmul(qt_bh1n, state_bhnn, bh1n.clone());
                     out_t = out.binary(BinaryOp::Mul, out_t, scale_bh1n, bh1n.clone());
                     let out_b1hn = out.reshape(

@@ -7,29 +7,28 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::blocks::{
-    AttnMaskStage, BertEncoderLayerSpec, BertEncoderLayerStage, BertQkvStyle, BindDecodeInputsStage,
-    ClsTokenPoolStage, CustomStage, EmbedStage, GatherAddStage, GatherFromInputStage,
-    GatherLastTokenStage, GeluFfnStage, GdnScanStage, LayerNormStage, LinearStage,
-    LlamaDecodeLayerStage, LlamaDecoderSpec, LlamaDecoderStage, LlamaKvTapStage,
-    dinov2_layer_fused, llama_prefill_layer_composed, llama_prefill_layer_fused,
-    nomic_vision_layer_fused, LmHeadStage, NomicEncoderLayerSpec, NomicEncoderLayerStage,
-    RepeatStage, ResidualAddStage, ResidualSaveStage, RmsNormStage, RopeTablesStage,
-    SelfAttnPrefillSpec, SelfAttnPrefillStage, SwiGluStage,
+    AttnMaskStage, BertEncoderLayerSpec, BertEncoderLayerStage, BertQkvStyle,
+    BindDecodeInputsStage, ClsTokenPoolStage, CustomStage, EmbedStage, GatherAddStage,
+    GatherFromInputStage, GatherLastTokenStage, GeluFfnStage, LayerNormStage, LinearStage,
+    LlamaDecodeLayerStage, LlamaDecoderSpec, LlamaDecoderStage, LlamaKvTapStage, LmHeadStage,
+    NomicEncoderLayerSpec, NomicEncoderLayerStage, RepeatStage, ResidualAddStage,
+    ResidualSaveStage, RmsNormStage, RopeTablesStage, SelfAttnPrefillSpec, SelfAttnPrefillStage,
+    SwiGluStage, dinov2_layer_fused, llama_prefill_layer_composed, llama_prefill_layer_fused,
+    nomic_vision_layer_fused,
 };
 use crate::escape::Emit;
 use crate::flow::ModelFlow;
 use crate::layer::LayerStack;
-use crate::stream::{DualStreamStage, LoadStreamStage, StoreStreamStage};
 use crate::profile::CompileProfile;
 use crate::side::SideOutputs;
 use crate::stage::FlowStage;
+use crate::stream::{DualStreamStage, LoadStreamStage, StoreStreamStage};
 use crate::value::FlowValue;
 
 impl ModelFlow {
     /// Load tier-1 profile from a `*.rlx.toml` file (falls back to default on error).
     pub fn profile_file(mut self, path: impl AsRef<Path>, default: fn() -> CompileProfile) -> Self {
-        self.profile = CompileProfile::from_toml_path(path.as_ref())
-            .unwrap_or_else(|_| default());
+        self.profile = CompileProfile::from_toml_path(path.as_ref()).unwrap_or_else(|_| default());
         self
     }
 
@@ -45,11 +44,10 @@ impl ModelFlow {
         input_name: impl Into<String>,
         weight_key: impl Into<String>,
     ) -> Self {
-        self.stages.push(FlowStage::GatherFromInput(GatherFromInputStage::new(
-            input_name,
-            weight_key,
-            0,
-        )));
+        self.stages
+            .push(FlowStage::GatherFromInput(GatherFromInputStage::new(
+                input_name, weight_key, 0,
+            )));
         self
     }
 
@@ -59,8 +57,9 @@ impl ModelFlow {
         input_name: impl Into<String>,
         weight_key: impl Into<String>,
     ) -> Self {
-        self.stages
-            .push(FlowStage::GatherAdd(GatherAddStage::new(input_name, weight_key, 0)));
+        self.stages.push(FlowStage::GatherAdd(GatherAddStage::new(
+            input_name, weight_key, 0,
+        )));
         self
     }
 
@@ -71,8 +70,9 @@ impl ModelFlow {
         beta_key: impl Into<String>,
         eps: f32,
     ) -> Self {
-        self.stages
-            .push(FlowStage::LayerNorm(LayerNormStage::new(gamma_key, beta_key, eps)));
+        self.stages.push(FlowStage::LayerNorm(LayerNormStage::new(
+            gamma_key, beta_key, eps,
+        )));
         self
     }
 
@@ -92,32 +92,32 @@ impl ModelFlow {
         head_dim: usize,
         eps: f32,
     ) -> Self {
-        self.repeat_layers(count, move |i| {
-            FlowStage::Named {
-                name: format!("layer{i}"),
-                inner: std::sync::Arc::new(FlowStage::NomicEncoderLayer(
-                    NomicEncoderLayerStage::new(NomicEncoderLayerSpec::hf(
-                        format!("encoder.layers.{i}"),
-                        hidden_size,
-                        num_heads,
-                        head_dim,
-                        eps,
-                    )),
-                )),
-            }
+        self.repeat_layers(count, move |i| FlowStage::Named {
+            name: format!("layer{i}"),
+            inner: std::sync::Arc::new(FlowStage::NomicEncoderLayer(NomicEncoderLayerStage::new(
+                NomicEncoderLayerSpec::hf(
+                    format!("encoder.layers.{i}"),
+                    hidden_size,
+                    num_heads,
+                    head_dim,
+                    eps,
+                ),
+            ))),
         })
     }
 
     /// BERT-style encoder layer (fused QKV + padding-mask attention + GELU FFN).
     pub fn bert_encoder_layer(mut self, spec: BertEncoderLayerSpec) -> Self {
         self.stages
-            .push(FlowStage::BertEncoderLayer(BertEncoderLayerStage::new(spec)));
+            .push(FlowStage::BertEncoderLayer(BertEncoderLayerStage::new(
+                spec,
+            )));
         self
     }
 
     /// Repeat BERT encoder layers with auto-named prefixes.
     pub fn repeat_bert_layers(
-        mut self,
+        self,
         count: usize,
         prefix: impl Into<String>,
         qkv_style: BertQkvStyle,
@@ -149,9 +149,8 @@ impl ModelFlow {
 
     /// Synthesize an all-ones attention mask for vision encoders (no padding).
     pub fn attn_mask_ones(mut self, batch: usize, seq: usize) -> Self {
-        self.stages.push(FlowStage::AttnMask(AttnMaskStage::ones(
-            batch, seq,
-        )));
+        self.stages
+            .push(FlowStage::AttnMask(AttnMaskStage::ones(batch, seq)));
         self
     }
 
@@ -184,7 +183,9 @@ impl ModelFlow {
     /// Pool CLS token: `[batch, seq, hidden]` → `[batch, hidden]`.
     pub fn cls_token_pool(mut self, batch: usize, hidden: usize) -> Self {
         self.stages
-            .push(FlowStage::ClsTokenPool(ClsTokenPoolStage::new(batch, hidden)));
+            .push(FlowStage::ClsTokenPool(ClsTokenPoolStage::new(
+                batch, hidden,
+            )));
         self
     }
 
@@ -233,10 +234,11 @@ impl ModelFlow {
 
     /// Bind decode inputs (call after declaring `rope_cos`, `past_k_*`, …).
     pub fn bind_decode_inputs(mut self, num_layers: usize, custom_mask: bool) -> Self {
-        self.stages.push(FlowStage::BindDecodeInputs(BindDecodeInputsStage {
-            num_layers,
-            use_custom_mask: custom_mask,
-        }));
+        self.stages
+            .push(FlowStage::BindDecodeInputs(BindDecodeInputsStage {
+                num_layers,
+                use_custom_mask: custom_mask,
+            }));
         self
     }
 
@@ -261,7 +263,11 @@ impl ModelFlow {
     }
 
     /// Build a named layer from a [`LayerStack`] closure.
-    pub fn layer(self, name: impl Into<String>, build: impl FnOnce(LayerStack) -> LayerStack) -> Self {
+    pub fn layer(
+        self,
+        name: impl Into<String>,
+        build: impl FnOnce(LayerStack) -> LayerStack,
+    ) -> Self {
         self.raw_stage(build(LayerStack::named(name)).build())
     }
 
@@ -297,13 +303,15 @@ impl ModelFlow {
         up_key: impl Into<String>,
         down_key: impl Into<String>,
     ) -> Self {
-        self.stages
-            .push(FlowStage::SwiGlu(SwiGluStage::new(gate_key, up_key, down_key)));
+        self.stages.push(FlowStage::SwiGlu(SwiGluStage::new(
+            gate_key, up_key, down_key,
+        )));
         self
     }
 
     pub fn swiglu_hf_mlp(mut self, prefix: impl Into<String>) -> Self {
-        self.stages.push(FlowStage::SwiGlu(SwiGluStage::hf_mlp(prefix)));
+        self.stages
+            .push(FlowStage::SwiGlu(SwiGluStage::hf_mlp(prefix)));
         self
     }
 
@@ -344,8 +352,9 @@ impl ModelFlow {
         self.stages.push(FlowStage::Custom(CustomStage::named(
             "bind_inputs_to_streams",
             move |emit, primary| {
-                let primary = primary
-                    .ok_or_else(|| anyhow::anyhow!("bind_inputs_to_streams requires primary input"))?;
+                let primary = primary.ok_or_else(|| {
+                    anyhow::anyhow!("bind_inputs_to_streams requires primary input")
+                })?;
                 for (input_name, stream_name) in &pairs {
                     let value = emit.flow_input(input_name)?;
                     emit.state.streams.insert(stream_name.clone(), value);
@@ -393,13 +402,12 @@ impl ModelFlow {
             + Sync
             + 'static,
     {
-        self.stages
-            .push(crate::plugin::plugin_named(name, f));
+        self.stages.push(crate::plugin::plugin_named(name, f));
         self
     }
 
     /// Hidden states output (no LM head).
-    pub fn hidden_states(mut self) -> Self {
+    pub fn hidden_states(self) -> Self {
         self.output("hidden")
     }
 
@@ -440,12 +448,13 @@ impl ModelFlow {
         eps: f32,
         sink: &SideOutputs,
     ) -> Self {
-        self.stages.push(FlowStage::LlamaKvTap(LlamaKvTapStage::layer(
-            layer_idx,
-            head_dim,
-            eps,
-            sink.inner(),
-        )));
+        self.stages
+            .push(FlowStage::LlamaKvTap(LlamaKvTapStage::layer(
+                layer_idx,
+                head_dim,
+                eps,
+                sink.inner(),
+            )));
         self
     }
 
@@ -462,9 +471,10 @@ impl ModelFlow {
 
     /// Gather last token (dynamic `last_token_idx` input).
     pub fn gather_last_token_dynamic(mut self, batch: usize) -> Self {
-        self.stages.push(FlowStage::GatherLastToken(
-            GatherLastTokenStage::dynamic(batch),
-        ));
+        self.stages
+            .push(FlowStage::GatherLastToken(GatherLastTokenStage::dynamic(
+                batch,
+            )));
         self
     }
 

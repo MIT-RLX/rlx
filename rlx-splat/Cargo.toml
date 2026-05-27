@@ -55,30 +55,21 @@ metal = { version = "0.30", optional = true }
 rayon = { version = "1.10", optional = true }
 
 [dev-dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", features = ["splat"] }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.0", default-features = false, features = ["cpu"] }
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.0" }
 anyhow = "1"
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-[[example]]
-name = "render_ply_session"
-required-features = ["io", "test-support"]
-
-
-[[example]]
-name = "common_splat_session"
-required-features = ["cpu", "reference"]
-
-[[example]]
-name = "decomposed_session"
-required-features = ["test-support"]
-
 [[test]]
 name = "colmap_loader"
 required-features = ["io"]
+
+[[test]]
+name = "training_forward_cache"
+required-features = ["test-support"]
+
+[[test]]
+name = "register_smoke"
+required-features = ["test-support"]
 
 [lints]
 workspace = true

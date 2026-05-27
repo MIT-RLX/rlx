@@ -23,7 +23,14 @@ use rlx_splat::reference::render_training_forward;
 fn metal_training_forward_matches_cpu_reference() {
     rlx_splat::register();
     let scene = rlx_splat::make_parity_scene();
-    let camera = Camera::look_at([0.0, 0.0, 4.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 60.0, 0.1, 20.0);
+    let camera = Camera::look_at(
+        [0.0, 0.0, 4.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        60.0,
+        0.1,
+        20.0,
+    );
     let bg = [0.1, 0.15, 0.2];
     let w = 64u32;
     let h = 64u32;
@@ -74,8 +81,5 @@ fn metal_training_forward_matches_cpu_reference() {
         nb += (*b as f64) * (*b as f64);
     }
     let cos = dot / (na.sqrt() * nb.sqrt());
-    assert!(
-        cos > 0.999,
-        "Metal training forward cosine vs CPU = {cos}"
-    );
+    assert!(cos > 0.999, "Metal training forward cosine vs CPU = {cos}");
 }

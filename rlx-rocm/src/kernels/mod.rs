@@ -138,7 +138,12 @@ kernel_cache!(
     "fused_residual_ln"
 );
 kernel_cache!(GATHER, gather_kernel, GATHER_CU, "gather");
-kernel_cache!(GATHER_AXIS, gather_axis_kernel, GATHER_AXIS_CU, "gather_axis");
+kernel_cache!(
+    GATHER_AXIS,
+    gather_axis_kernel,
+    GATHER_AXIS_CU,
+    "gather_axis"
+);
 kernel_cache!(NARROW, narrow_kernel, NARROW_CU, "narrow");
 kernel_cache!(CONCAT, concat_kernel, CONCAT_CU, "concat");
 kernel_cache!(TRANSPOSE, transpose_kernel, TRANSPOSE_CU, "transpose");

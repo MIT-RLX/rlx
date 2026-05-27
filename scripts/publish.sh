@@ -29,9 +29,17 @@
 #     just-uploaded version appears. Until that happens, the next
 #     crate's `cargo publish` would either 404 on dep resolution or
 #     get stale metadata.
-#   * Exponential backoff on HTTP 429 ("Too Many Requests") from
-#     `cargo publish` itself — we never burst past the limit, but if
-#     we ever did the script self-throttles and retries.
+#   * Skip published: before each upload, check the sparse index for
+#     the workspace version; if it is already there, skip (no
+#     `cargo publish`, no rate-limit sleep). Use `--no-skip-published`
+#     to force an upload attempt anyway.
+#   * Registry HTTP errors (429, 408, 5xx, timeouts): parse cargo output as
+#     it finishes, sleep until crates.io's "try again after <GMT>" when
+#     present (+ pad), else status-specific backoff — then retry the same
+#     crate automatically until it uploads. --max-retries 0 (default) never
+#     gives up on retryable codes.
+#   * Missing registry deps: poll the sparse index for the dependency,
+#     then retry (no manual --start-crate for index lag).
 #
 # Crates.io documented limits (as of 2026-05):
 #   * New crates:        1 per minute   (10 per 10 min)
@@ -50,9 +58,8 @@
 #      before issuing the next publish. After the last crate of a
 #      tier the loop additionally sleeps `BETWEEN_DELAY` to let
 #      downstream crates' dep resolution catch up.
-#   4. Crates marked `publish = false` (rlx-mlx, rlx-rocm, pyrlx,
-#      rlx-cortexm-trainer) are skipped automatically by cargo —
-#      this script doesn't list them.
+#   4. Crates marked `publish = false` (pyrlx, rlx-cortexm-trainer) are
+#      skipped automatically by cargo — this script lists the rest.
 #
 # Usage:
 #
@@ -66,7 +73,9 @@
 #   scripts/publish.sh --between-delay 120          # between-tier extra (sec)
 #   scripts/publish.sh --poll-interval 10           # index-poll interval
 #   scripts/publish.sh --poll-timeout 600           # index-poll cap (sec)
-#   scripts/publish.sh --max-retries 3              # 429 retries per crate
+#   scripts/publish.sh --max-retries 5              # cap 429 backoff retries (0 = unlimited)
+#   scripts/publish.sh --rate-limit-pad 15          # pad after server retry-after
+#   scripts/publish.sh --no-skip-published          # upload even if version exists
 #   scripts/publish.sh --no-verify                  # skip cargo's local rebuild
 #   scripts/publish.sh --no-poll                    # disable index polling
 #
@@ -84,8 +93,10 @@
 #   the new version. The script's --dry-run mode handles this by
 #   recording the resolution-failure crates separately at the end —
 #   metadata + packaging are still validated for them. The only
-#   pre-publish step that can fully dry-run is the leaf tier (tier 0
-#   in this workspace: rlx-ir, rlx-gguf, rlx-macros, rlx-cortexm).
+#   pre-publish step that can fully dry-run is tier 0 (no RLX path
+#   deps). Run `scripts/publish.sh --list` to print the full tier
+#   order; `validate_publish_order` checks every `[dependencies]` and
+#   `[dev-dependencies]` path dep against that order before publishing.
 #
 # Environment:
 #
@@ -99,26 +110,45 @@ LIST_ONLY=0
 NO_GATE=0
 NO_VERIFY=0
 NO_POLL=0
+SKIP_PUBLISHED=1
 ASSUME_YES=0
 MIN_INTERVAL=65          # rate-limit safety floor (sec)
 BETWEEN_DELAY=90         # extra sleep at tier boundaries (sec)
 POLL_INTERVAL=10         # index poll cadence (sec)
 POLL_TIMEOUT=600         # max time we'll wait for the index (sec)
-MAX_RETRIES=3            # `cargo publish` retries on 429
+MAX_RETRIES=0            # 429 backoff cap when retry-after unparsed (0 = unlimited)
+RATE_LIMIT_PAD=15        # extra seconds after server "try again after" time
 START_TIER=0
 START_CRATE=""
+LAST_PUBLISH_ERR=""      # temp log from the last failed publish attempt
+
+# Crates with `publish = false` in their Cargo.toml (cargo skips them;
+# listed here for tier-coverage validation only).
+SKIPPED=(
+    pyrlx
+    rlx-cortexm-trainer
+)
 
 # Tier definitions. Each array entry is a single tier; space-separated
-# crate names within. Order within a tier doesn't matter for
-# correctness (tier members don't depend on each other), but we
-# publish in this order for determinism.
+# crate names within. Order within a tier matters when one member
+# depends on another in the same tier (e.g. rlx-ir before rlx-flow).
+# Publish order: `cargo publish` resolves every path dep in `[dependencies]`
+# and `[dev-dependencies]` (including optional) against crates.io. Within
+# a tier, list deps before dependents (e.g. rlx-cpu before rlx-splat).
 TIERS=(
-    "rlx-ir rlx-gguf rlx-macros rlx-cortexm"
-    "rlx-driver"
+    "rlx-ir rlx-gguf rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-bbo"
+    "rlx-flow rlx-fusion rlx-driver"
+    "rlx-autodiff"
+    "rlx-compile"
     "rlx-opt"
-    "rlx-cpu rlx-metal rlx-wgpu rlx-cuda rlx-tpu rlx-fpga"
+    "rlx-cpu rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-tpu rlx-fpga"
+    "rlx-splat"
+    "rlx-metal"
+    "rlx-sparse rlx-linalg"
     "rlx-runtime"
-    "rlx rlx-bench rlx-sparse rlx-linalg"
+    "rlx-fdm rlx-bench"
+    "rlx-rl"
+    "rlx"
 )
 
 usage() {
@@ -133,12 +163,14 @@ while (( $# > 0 )); do
         --no-gate)        NO_GATE=1; shift ;;
         --no-verify)      NO_VERIFY=1; shift ;;
         --no-poll)        NO_POLL=1; shift ;;
+        --no-skip-published) SKIP_PUBLISHED=0; shift ;;
         --yes|-y)         ASSUME_YES=1; shift ;;
         --min-interval)   MIN_INTERVAL="$2"; shift 2 ;;
         --between-delay)  BETWEEN_DELAY="$2"; shift 2 ;;
         --poll-interval)  POLL_INTERVAL="$2"; shift 2 ;;
         --poll-timeout)   POLL_TIMEOUT="$2"; shift 2 ;;
         --max-retries)    MAX_RETRIES="$2"; shift 2 ;;
+        --rate-limit-pad) RATE_LIMIT_PAD="$2"; shift 2 ;;
         --start-tier)     START_TIER="$2"; shift 2 ;;
         --start-crate)    START_CRATE="$2"; shift 2 ;;
         --help|-h)        usage ;;
@@ -154,6 +186,146 @@ while (( $# > 0 )); do
 done
 
 cd "$(dirname "$0")/.."
+
+# Fail fast if TIERS drift from [workspace] members (needs `jq`).
+validate_tier_coverage() {
+    local -a listed=() missing=() extra=()
+    local name tier c s
+
+    for tier in "${TIERS[@]}"; do
+        for c in $tier; do
+            listed+=("$c")
+        done
+    done
+
+    if ! command -v jq >/dev/null 2>&1; then
+        yellow "jq not found — skipping tier coverage check (install jq to enable)."
+        return 0
+    fi
+
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        for s in "${SKIPPED[@]}"; do
+            if [[ "$name" == "$s" ]]; then
+                continue 2
+            fi
+        done
+        local found=0
+        for c in "${listed[@]}"; do
+            if [[ "$name" == "$c" ]]; then
+                found=1
+                break
+            fi
+        done
+        if (( ! found )); then
+            missing+=("$name")
+        fi
+    done < <(
+        cargo metadata --no-deps --format-version 1 2>/dev/null \
+            | jq -r '.workspace_members[] as $m | .packages[] | select(.id == $m) | .name'
+    )
+
+    for c in "${listed[@]}"; do
+        local found=0
+        while IFS= read -r name; do
+            [[ "$name" == "$c" ]] && found=1 && break
+        done < <(
+            cargo metadata --no-deps --format-version 1 2>/dev/null \
+                | jq -r '.workspace_members[] as $m | .packages[] | select(.id == $m) | .name'
+        )
+        if (( ! found )); then
+            extra+=("$c")
+        fi
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+        red "publish.sh TIERS missing workspace crates: ${missing[*]}"
+        exit 1
+    fi
+    if (( ${#extra[@]} > 0 )); then
+        red "publish.sh TIERS list unknown workspace crates: ${extra[*]}"
+        exit 1
+    fi
+}
+
+validate_tier_coverage
+
+# Every rlx-* path dep in [dependencies] / [dev-dependencies] must appear
+# in an earlier tier (or the same tier, listed before this crate).
+validate_publish_order() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        yellow "python3 not found — skipping publish-order check (install python3 to enable)."
+        return 0
+    fi
+    local err
+    err="$(python3 - "$PWD" <<'PY'
+import re, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+script = (root / "scripts/publish.sh").read_text()
+m = re.search(r'TIERS=\(\n((?:\s+"[^"]+"\n)+)\)', script)
+if not m:
+    print("could not parse TIERS from publish.sh", file=sys.stderr)
+    sys.exit(2)
+tier_lines = re.findall(r'"([^"]+)"', m.group(1))
+crate_tier = {}
+for i, line in enumerate(tier_lines):
+    for j, c in enumerate(line.split()):
+        crate_tier[c] = (i, j)
+
+def parse_rlx_deps(toml_path: Path) -> set[str]:
+    text = toml_path.read_text()
+    deps: set[str] = set()
+    for section in ("dependencies", "dev-dependencies"):
+        sm = re.search(rf"\[{section}\](.*?)(?=\n\[|\Z)", text, re.S)
+        if not sm:
+            continue
+        for line in sm.group(1).splitlines():
+            m2 = re.match(r"^(rlx-[a-z0-9-]+)\s*=", line.strip())
+            if m2:
+                deps.add(m2.group(1))
+    return deps
+
+violations: list[str] = []
+for toml in sorted(root.glob("rlx-*/Cargo.toml")):
+    name = toml.parent.name
+    if name.endswith("-trainer"):
+        continue
+    if re.search(r"^publish\s*=\s*false", toml.read_text(), re.M):
+        continue
+    if name not in crate_tier:
+        violations.append(f"{name} is publishable but missing from TIERS")
+        continue
+    my_tier, my_pos = crate_tier[name]
+    for dep in sorted(parse_rlx_deps(toml)):
+        if dep not in crate_tier:
+            violations.append(f"{name}: path dep {dep} is not listed in TIERS")
+            continue
+        dep_tier, dep_pos = crate_tier[dep]
+        if dep_tier > my_tier or (dep_tier == my_tier and dep_pos >= my_pos):
+            violations.append(
+                f"{name} (tier {dep_tier} pos {dep_pos} needs {dep} before it): "
+                f"publish {dep} before {name}"
+            )
+
+if violations:
+    for v in violations:
+        print(v, file=sys.stderr)
+    sys.exit(1)
+PY
+)" || true
+    if [[ -n "$err" ]]; then
+        red "Publish tier order does not match Cargo.toml path dependencies:"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && red "  $line"
+        done <<< "$err"
+        red "Fix scripts/publish.sh TIERS (or remove path deps from dev-dependencies)."
+        exit 1
+    fi
+}
+
+validate_publish_order
 
 # Extract the workspace version once so the index-readiness check
 # knows what to look for. Stops at the next `[…]` header so we don't
@@ -194,12 +366,20 @@ list_tiers() {
     done
     echo
     bold "Skipped (publish = false):"
-    echo "  - rlx-mlx                  (build.rs reads ../vendor/mlx)"
-    echo "  - rlx-rocm                 (include_str! to ../../rlx-cuda)"
-    echo "  - pyrlx                    (PyPI via maturin)"
-    echo "  - rlx-cortexm-trainer      (binary tool; nested workspace member"
-    echo "                              under rlx-cortexm/trainer)"
-    echo "  - rlx-cortexm-firmware     (no_std firmware binary; ships from git)"
+    for s in "${SKIPPED[@]}"; do
+        case "$s" in
+            pyrlx)
+                echo "  - pyrlx                    (PyPI via maturin)"
+                ;;
+            rlx-cortexm-trainer)
+                echo "  - rlx-cortexm-trainer      (binary tool; nested under rlx-cortexm/trainer)"
+                ;;
+            *)
+                echo "  - $s"
+                ;;
+        esac
+    done
+    echo "  - rlx-cortexm-firmware     (no_std firmware binary; not a workspace member)"
 }
 
 if (( LIST_ONLY )); then
@@ -234,7 +414,17 @@ else
     else
         yellow "Index polling:         every ${POLL_INTERVAL}s, hard cap ${POLL_TIMEOUT}s per crate."
     fi
-    yellow "429 retries per crate: ${MAX_RETRIES} (exponential backoff)."
+    if (( MAX_RETRIES == 0 )); then
+        yellow "Registry retries:        auto-wait + retry until success (unlimited)."
+    else
+        yellow "Registry retries:        up to ${MAX_RETRIES} backoff attempts per crate."
+    fi
+    yellow "Retry-after parsing:     HTTP-date + status-specific backoff (+${RATE_LIMIT_PAD}s pad)."
+    if (( SKIP_PUBLISHED )); then
+        yellow "Already on crates.io:    skip (no upload, no rate-limit wait)."
+    else
+        yellow "Already on crates.io:    still attempt upload (--no-skip-published)."
+    fi
     if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
         # cargo will use ~/.cargo/credentials if no env var.
         yellow "CARGO_REGISTRY_TOKEN not set — relying on \`cargo login\` credentials."
@@ -272,6 +462,11 @@ sparse_index_path() {
     elif (( n == 3 )); then printf '3/%s/%s\n'  "${name:0:1}" "$name"
     else                    printf '%s/%s/%s\n' "${name:0:2}" "${name:2:2}" "$name"
     fi
+}
+
+# Returns 0 if <crate>@<version> is already on the sparse index.
+version_on_crates_io() {
+    check_index "$1" "$2"
 }
 
 # Returns 0 if the sparse index serves <version> for <crate>, 1 if
@@ -320,6 +515,130 @@ wait_for_index() {
     return 0
 }
 
+# True when a path dep was rewritten for publish but is not on crates.io yet.
+is_missing_registry_dep_error() {
+    local err_file="$1"
+    [[ -f "$err_file" ]] || return 1
+    grep -qE 'no matching package named|location searched: crates\.io index' "$err_file"
+}
+
+missing_registry_dep_name() {
+    local err_file="$1"
+    grep -oE 'no matching package named `[^`]+`' "$err_file" 2>/dev/null \
+        | head -1 \
+        | sed -E 's/no matching package named `([^`]+)`/\1/'
+}
+
+# True when cargo says this version was uploaded already.
+is_already_exists_error() {
+    local err_file="$1"
+    [[ -f "$err_file" ]] || return 1
+    grep -qiE 'already exists on crates\.io|already exists on the registry' "$err_file"
+}
+
+# Last HTTP status from a `status NNN` line in cargo/crates.io output (e.g. 429).
+registry_http_status_from_log() {
+    local err_file="$1"
+    [[ -f "$err_file" ]] || return 0
+    grep -oiE 'status [0-9]{3}' "$err_file" 2>/dev/null \
+        | tail -1 \
+        | grep -oE '[0-9]{3}' \
+        || true
+}
+
+# Transient registry / network failures — retry after a computed wait.
+is_retryable_registry_error() {
+    local err_file="$1"
+    [[ -f "$err_file" ]] || return 1
+    local status
+    status="$(registry_http_status_from_log "$err_file")"
+    case "$status" in
+        408|429|500|502|503|504) return 0 ;;
+    esac
+    grep -qiE \
+        'Too Many Requests|rate.?limit|published too many new crates|try again after|temporarily unavailable|service unavailable|bad gateway|gateway timeout|timed out|connection reset|connection refused|unexpected eof|broken pipe|error sending request|operation timed out|dns error' \
+        "$err_file"
+}
+
+# Convert crates.io HTTP-date ("Wed, 27 May 2026 11:09:09 GMT") → epoch.
+http_date_to_epoch() {
+    local when="$1"
+    if [[ "$(uname -s)" == Darwin ]]; then
+        date -j -u -f '%a, %d %b %Y %H:%M:%S GMT' "$when" '+%s' 2>/dev/null
+    else
+        date -u -d "$when" '+%s' 2>/dev/null
+    fi
+}
+
+# Default backoff when no explicit retry window is in the log.
+registry_status_default_wait() {
+    local status="$1"
+    case "$status" in
+        429) echo $(( MIN_INTERVAL * 2 )) ;;
+        408) echo 60 ;;
+        500|502|503|504) echo 90 ;;
+        *) echo "$MIN_INTERVAL" ;;
+    esac
+}
+
+# Seconds to wait before retrying a registry error.
+# Prints: wait_seconds parsed_flag http_status
+#   parsed_flag=1 → wait derived from server retry window or status default
+registry_retry_wait_seconds() {
+    local err_file="$1"
+    local when epoch now wait parsed=0 status
+    status="$(registry_http_status_from_log "$err_file")"
+    wait="$(registry_status_default_wait "$status")"
+
+    when="$(
+        grep -oiE '(please )?try again after [A-Za-z]{3}, [0-9]+ [A-Za-z]+ [0-9]+ [0-9:]+ GMT' \
+            "$err_file" 2>/dev/null \
+            | tail -1 \
+            | sed -E 's/^[Pp]lease [Tt]ry again after //; s/^[Tt]ry again after //'
+    )"
+    if [[ -n "$when" ]]; then
+        epoch="$(http_date_to_epoch "$when" || true)"
+        if [[ -n "${epoch:-}" ]]; then
+            now="$(date -u '+%s')"
+            wait=$(( epoch - now + RATE_LIMIT_PAD ))
+            parsed=1
+            if (( wait < MIN_INTERVAL )); then
+                wait=$MIN_INTERVAL
+            fi
+            if (( wait > 86400 )); then
+                wait=86400
+            fi
+            echo "$wait $parsed ${status:-0}"
+            return 0
+        fi
+        if grep -qiE 'try again after|published too many new crates' "$err_file"; then
+            wait=$(( MIN_INTERVAL * 2 ))
+            parsed=1
+            echo "$wait $parsed ${status:-0}"
+            return 0
+        fi
+    fi
+
+    local retry_after
+    retry_after="$(
+        grep -oiE 'retry-after: *[0-9]+' "$err_file" 2>/dev/null \
+            | tail -1 \
+            | grep -oE '[0-9]+' \
+            || true
+    )"
+    if [[ -n "$retry_after" ]]; then
+        wait=$(( retry_after + RATE_LIMIT_PAD ))
+        parsed=1
+        echo "$wait $parsed ${status:-0}"
+        return 0
+    fi
+
+    if is_retryable_registry_error "$err_file"; then
+        parsed=1
+    fi
+    echo "$wait $parsed ${status:-0}"
+}
+
 # Sleep with a single live countdown line — easier to watch than
 # silent waits during long publishes.
 sleep_with_countdown() {
@@ -337,6 +656,8 @@ sleep_with_countdown() {
 # ── Walk tiers ──────────────────────────────────────────────────
 DRY_RUN_PASS=()
 DRY_RUN_FAIL=()
+ALREADY_ON_CRATES_IO=()
+PUBLISHED_THIS_RUN=()
 
 publish_one_attempt() {
     local crate="$1"
@@ -349,54 +670,137 @@ publish_one_attempt() {
         args+=("--no-verify")
     fi
     bold ">> cargo publish ${args[*]}"
-    # Capture stderr so we can detect HTTP 429 ("Too Many Requests")
-    # without losing the user-visible output.
     local tmp_err
     tmp_err="$(mktemp)"
-    if cargo publish "${args[@]}" 2> >(tee "$tmp_err" >&2); then
+    LAST_PUBLISH_ERR=""
+    # Do not trust cargo's exit code alone — crates.io 429 often returns 0.
+    set +e
+    cargo publish "${args[@]}" 2>&1 | tee "$tmp_err"
+    local rc=${PIPESTATUS[0]}
+    set -e
+
+    if is_already_exists_error "$tmp_err"; then
+        rm -f "$tmp_err"
+        return 43
+    fi
+
+    if is_retryable_registry_error "$tmp_err"; then
+        LAST_PUBLISH_ERR="$tmp_err"
+        return 42
+    fi
+
+    if is_missing_registry_dep_error "$tmp_err"; then
+        LAST_PUBLISH_ERR="$tmp_err"
+        return 44
+    fi
+
+    if (( rc == 0 )) && ! grep -qE 'error(\[[0-9]+\])?: failed|error(\[[0-9]+\])?: failed to publish' "$tmp_err"; then
         rm -f "$tmp_err"
         return 0
     fi
-    local rc=$?
-    if grep -qE "429|Too Many Requests|rate.?limit" "$tmp_err"; then
-        rm -f "$tmp_err"
-        return 42  # special: signals rate-limit, caller will back off
-    fi
-    rm -f "$tmp_err"
-    return $rc
+
+    LAST_PUBLISH_ERR="$tmp_err"
+    return 1
 }
 
+# 0 = published (or dry-run ok), 1 = hard failure, 2 = already on crates.io
 publish_one() {
     local crate="$1"
     local attempt=1
     local backoff=$MIN_INTERVAL
+    local missing_dep_attempts=0
     while true; do
-        if publish_one_attempt "$crate"; then
+        # `|| rc=$?` keeps `set -e` from aborting on non-zero returns (42/44).
+        local rc=0
+        publish_one_attempt "$crate" || rc=$?
+        if (( rc == 0 )); then
+            rm -f "${LAST_PUBLISH_ERR:-}"
+            LAST_PUBLISH_ERR=""
             if (( DRY_RUN )); then
                 DRY_RUN_PASS+=("$crate")
             fi
             return 0
         fi
-        local rc=$?
+        if (( rc == 43 )); then
+            green "  $crate@$WORKSPACE_VERSION already on crates.io (cargo confirmed) — skip."
+            return 2
+        fi
         if (( DRY_RUN )); then
-            # Non-leaf crates can't fully dry-run; record + continue.
             DRY_RUN_FAIL+=("$crate")
             yellow "  (dry-run: dep resolution failed — expected for non-leaf crates pre-publish)"
+            rm -f "${LAST_PUBLISH_ERR:-}"
+            LAST_PUBLISH_ERR=""
             return 0
         fi
-        if (( rc == 42 )); then
-            if (( attempt > MAX_RETRIES )); then
-                red "Publish failed for $crate after $MAX_RETRIES retries (still rate-limited)."
-                red "Re-run with --start-crate $crate to resume later."
-                exit 1
+        if (( rc == 44 )); then
+            local missing=""
+            if [[ -n "${LAST_PUBLISH_ERR:-}" && -f "$LAST_PUBLISH_ERR" ]]; then
+                missing="$(missing_registry_dep_name "$LAST_PUBLISH_ERR")"
             fi
-            yellow "  crates.io returned 429 / rate-limit (attempt $attempt/$MAX_RETRIES)."
-            sleep_with_countdown "$backoff" "    backoff"
-            backoff=$(( backoff * 2 ))
-            attempt=$(( attempt + 1 ))
+            if [[ -n "$missing" ]]; then
+                missing_dep_attempts=$(( missing_dep_attempts + 1 ))
+                yellow "  $crate: waiting for $missing@$WORKSPACE_VERSION on sparse index (attempt $missing_dep_attempts), then retry."
+                wait_for_index "$missing" "$WORKSPACE_VERSION"
+                rm -f "${LAST_PUBLISH_ERR:-}"
+                LAST_PUBLISH_ERR=""
+                sleep_with_countdown "$POLL_INTERVAL" "index settle after $missing"
+                continue
+            fi
+            red "Publish blocked for $crate: dependency not on crates.io yet."
+            red "  Check scripts/publish.sh tier order."
+            exit 1
+        fi
+        if (( rc == 42 )); then
+            local wait_sec=$MIN_INTERVAL parsed=0 http_status=0 when_human=""
+            if [[ -n "${LAST_PUBLISH_ERR:-}" && -f "$LAST_PUBLISH_ERR" ]]; then
+                read -r wait_sec parsed http_status < <(registry_retry_wait_seconds "$LAST_PUBLISH_ERR")
+                if grep -qiE 'try again after' "$LAST_PUBLISH_ERR"; then
+                    when_human="$(
+                        grep -oiE '(please )?try again after [A-Za-z]{3}, [0-9]+ [A-Za-z]+ [0-9]+ [0-9:]+ GMT' \
+                            "$LAST_PUBLISH_ERR" 2>/dev/null \
+                            | tail -1 \
+                            | sed -E 's/^[Pp]lease [Tt]ry again after //; s/^[Tt]ry again after //'
+                    )"
+                fi
+                rm -f "$LAST_PUBLISH_ERR"
+                LAST_PUBLISH_ERR=""
+            fi
+            if (( parsed )); then
+                if (( http_status > 0 )); then
+                    yellow "  crates.io HTTP $http_status for $crate — waiting ${wait_sec}s then retry (automatic)."
+                else
+                    yellow "  registry transient error for $crate — waiting ${wait_sec}s then retry (automatic)."
+                fi
+                if [[ -n "$when_human" ]]; then
+                    yellow "    server window ends: $when_human (+${RATE_LIMIT_PAD}s pad)"
+                fi
+                attempt=1
+                backoff=$MIN_INTERVAL
+            else
+                if (( MAX_RETRIES > 0 && attempt > MAX_RETRIES )); then
+                    red "Publish failed for $crate after $MAX_RETRIES registry retries."
+                    red "Re-run with --start-crate $crate to resume later."
+                    exit 1
+                fi
+                wait_sec=$backoff
+                if (( MAX_RETRIES > 0 )); then
+                    yellow "  registry retry for $crate (attempt $attempt/$MAX_RETRIES) — backoff ${wait_sec}s."
+                else
+                    yellow "  registry retry for $crate (attempt $attempt) — backoff ${wait_sec}s."
+                fi
+                backoff=$(( backoff * 2 ))
+                if (( backoff > 600 )); then
+                    backoff=600
+                fi
+                attempt=$(( attempt + 1 ))
+            fi
+            sleep_with_countdown "$wait_sec" "crates.io registry cooldown"
             continue
         fi
-        red "Publish failed for $crate (cargo exit $rc)."
+        if [[ -n "${LAST_PUBLISH_ERR:-}" && -f "$LAST_PUBLISH_ERR" ]]; then
+            red "  last cargo log: $LAST_PUBLISH_ERR"
+        fi
+        red "Publish failed for $crate (non-retryable, exit $rc)."
         red "Re-run with --start-crate $crate (or a later one) to resume."
         exit 1
     done
@@ -413,7 +817,7 @@ for tier_idx in "${!TIERS[@]}"; do
     tier="${TIERS[$tier_idx]}"
     bold "── Tier $tier_idx ────────────────────────────────────────"
 
-    in_tier=0
+    published_in_tier=0
     for crate in $tier; do
         # Skip past --start-crate if specified.
         if [[ -n "$skip_until_crate" ]]; then
@@ -424,16 +828,32 @@ for tier_idx in "${!TIERS[@]}"; do
             skip_until_crate=""
         fi
 
-        # Pre-publish floor: between any two publishes (within or
-        # across tiers) we wait at least MIN_INTERVAL. The first
-        # crate of a tier already had its delay paid during the
-        # previous tier's BETWEEN_DELAY (or is the very first
-        # publish, which needs no upstream wait).
-        if (( in_tier > 0 )) && (( ! DRY_RUN )); then
+        # Already on crates.io — no upload, no rate-limit sleep.
+        if (( SKIP_PUBLISHED )) && (( ! DRY_RUN )); then
+            if version_on_crates_io "$crate" "$WORKSPACE_VERSION"; then
+                green "  skip $crate@$WORKSPACE_VERSION (already on crates.io)"
+                ALREADY_ON_CRATES_IO+=("$crate")
+                continue
+            fi
+        fi
+
+        # Rate-limit floor only between actual uploads (not after skips).
+        if (( published_in_tier > 0 )) && (( ! DRY_RUN )); then
             sleep_with_countdown "$MIN_INTERVAL" "rate-limit floor"
         fi
 
         publish_one "$crate"
+        pub_rc=$?
+        if (( pub_rc == 2 )); then
+            ALREADY_ON_CRATES_IO+=("$crate")
+            continue
+        fi
+        if (( pub_rc != 0 )); then
+            exit 1
+        fi
+
+        PUBLISHED_THIS_RUN+=("$crate")
+        published_in_tier=$(( published_in_tier + 1 ))
 
         # Post-publish: poll the index until the new version is
         # actually queryable, so the *next* crate's dep resolution
@@ -441,14 +861,10 @@ for tier_idx in "${!TIERS[@]}"; do
         if (( ! DRY_RUN )); then
             wait_for_index "$crate" "$WORKSPACE_VERSION"
         fi
-        ((in_tier++))
     done
 
-    # Between-tier extra delay (downstream tiers tend to resolve
-    # multiple just-published crates at once, and the sparse index
-    # can serve a name while not yet serving all its sibling
-    # crates' latest versions).
-    if (( ! DRY_RUN )) && (( tier_idx + 1 < ${#TIERS[@]} )) && (( in_tier > 0 )); then
+    # Between-tier extra delay only when this tier uploaded something.
+    if (( ! DRY_RUN )) && (( tier_idx + 1 < ${#TIERS[@]} )) && (( published_in_tier > 0 )); then
         sleep_with_countdown "$BETWEEN_DELAY" "between-tier (let crates.io index settle)"
     fi
 done
@@ -467,5 +883,20 @@ if (( DRY_RUN )); then
         yellow "in tier order will succeed."
     fi
 else
-    green "All tiers published successfully."
+    echo
+    if (( ${#PUBLISHED_THIS_RUN[@]} > 0 )); then
+        green "Published this run (${#PUBLISHED_THIS_RUN[@]}):"
+        for c in "${PUBLISHED_THIS_RUN[@]}"; do echo "    ✓ $c"; done
+    fi
+    if (( ${#ALREADY_ON_CRATES_IO[@]} > 0 )); then
+        yellow "Already on crates.io — skipped (${#ALREADY_ON_CRATES_IO[@]}):"
+        for c in "${ALREADY_ON_CRATES_IO[@]}"; do echo "    ○ $c"; done
+    fi
+    if (( ${#PUBLISHED_THIS_RUN[@]} == 0 )) && (( ${#ALREADY_ON_CRATES_IO[@]} > 0 )); then
+        green "Nothing left to publish — all listed crates already have $WORKSPACE_VERSION."
+    elif (( ${#PUBLISHED_THIS_RUN[@]} > 0 )); then
+        green "Publish run finished."
+    else
+        green "All tiers processed."
+    fi
 fi

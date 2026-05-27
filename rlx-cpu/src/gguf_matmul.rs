@@ -212,8 +212,7 @@ pub fn grouped_moe_unpermute_out(
 ) {
     for packed_idx in 0..m {
         let i = original_pos[packed_idx];
-        out[i * n..(i + 1) * n]
-            .copy_from_slice(&packed_out[packed_idx * n..(packed_idx + 1) * n]);
+        out[i * n..(i + 1) * n].copy_from_slice(&packed_out[packed_idx * n..(packed_idx + 1) * n]);
     }
 }
 
@@ -254,15 +253,7 @@ mod tests {
         let w_ref = rlx_gguf::dequant_q8_k(&packed, k * n).unwrap();
         let x: Vec<f32> = (0..m * k).map(|i| 0.01 * i as f32).collect();
         let mut fused = vec![0f32; m * n];
-        gguf_matmul_bt(
-            &x,
-            &packed,
-            &mut fused,
-            m,
-            k,
-            n,
-            QuantScheme::GgufQ8K,
-        );
+        gguf_matmul_bt(&x, &packed, &mut fused, m, k, n, QuantScheme::GgufQ8K);
         let mut expected = vec![0f32; m * n];
         for r in 0..m {
             for c in 0..n {
@@ -319,8 +310,7 @@ mod tests {
         let mut expected = vec![0f32; m * n];
         for row in 0..m {
             let e = expert_idx[row] as usize;
-            let w_ref =
-                rlx_gguf::dequant_q8_k(&packed[e * slab..(e + 1) * slab], k * n).unwrap();
+            let w_ref = rlx_gguf::dequant_q8_k(&packed[e * slab..(e + 1) * slab], k * n).unwrap();
             for col in 0..n {
                 let mut acc = 0f32;
                 for i in 0..k {

@@ -19,8 +19,8 @@
 
 use crate::lower_vae_ops::{LowerGroupNorm, LowerResizeNearest2x};
 use crate::pass::Pass;
-use rlx_ir::logical_kernel::{self, KernelDispatchConfig};
 use rlx_ir::logical_kernel::splat_common;
+use rlx_ir::logical_kernel::{self, KernelDispatchConfig};
 use rlx_ir::{Graph, NodeId, Op, OpKind};
 use std::collections::HashMap;
 
@@ -129,11 +129,12 @@ fn lower_gaussian_splat_nodes<F>(graph: Graph, mut lower_one: F) -> Graph
 where
     F: FnMut(&mut Graph, &rlx_ir::Node) -> NodeId,
 {
-    if !graph
-        .nodes()
-        .iter()
-        .any(|n| matches!(n.op, Op::GaussianSplatRender { .. } | Op::GaussianSplatRenderBackward { .. }))
-    {
+    if !graph.nodes().iter().any(|n| {
+        matches!(
+            n.op,
+            Op::GaussianSplatRender { .. } | Op::GaussianSplatRenderBackward { .. }
+        )
+    }) {
         return graph;
     }
 

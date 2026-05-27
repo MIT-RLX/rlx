@@ -188,10 +188,9 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 if batches == 1 {
                     matmul(lhs, rhs, output, out_m_inner, k, n);
                 } else {
-                    let lhs_batched = lhs_shape.num_elements().unwrap_or(0)
-                        == batches * out_m_inner * k;
-                    let rhs_batched =
-                        rhs_shape.num_elements().unwrap_or(0) == batches * k * n;
+                    let lhs_batched =
+                        lhs_shape.num_elements().unwrap_or(0) == batches * out_m_inner * k;
+                    let rhs_batched = rhs_shape.num_elements().unwrap_or(0) == batches * k * n;
                     for b in 0..batches {
                         let l_off = if lhs_batched { b * out_m_inner * k } else { 0 };
                         let r_off = if rhs_batched { b * k * n } else { 0 };
@@ -418,10 +417,7 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 }
             }
 
-            Op::GroupNorm {
-                num_groups,
-                eps,
-            } => {
+            Op::GroupNorm { num_groups, eps } => {
                 let input = get_data(arena, external, node.inputs[0]);
                 let gamma = get_data(arena, external, node.inputs[1]);
                 let beta = get_data(arena, external, node.inputs[2]);
@@ -430,18 +426,7 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 let c = node.shape.dim(1).unwrap_static();
                 let h = node.shape.dim(2).unwrap_static();
                 let w = node.shape.dim(3).unwrap_static();
-                kernels::group_norm_nchw(
-                    input,
-                    gamma,
-                    beta,
-                    output,
-                    n,
-                    c,
-                    h,
-                    w,
-                    *num_groups,
-                    *eps,
-                );
+                kernels::group_norm_nchw(input, gamma, beta, output, n, c, h, w, *num_groups, *eps);
             }
 
             Op::ResizeNearest2x => {
@@ -759,9 +744,8 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                         output[off + i] = x1 * cos_v - x2 * sin_v;
                         output[off + rot_half + i] = x2 * cos_v + x1 * sin_v;
                     }
-                    for j in n_rot..head_dim {
-                        output[off + j] = x[off + j];
-                    }
+                    output[(n_rot + off)..(head_dim + off)]
+                        .copy_from_slice(&x[(n_rot + off)..(head_dim + off)]);
                 }
             }
 
@@ -914,10 +898,8 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                         let (b_ptr, b_len) = arena.raw_ptr(node.inputs[1]);
                         let (x_ptr, x_len) = arena.raw_ptr(node_id);
                         unsafe {
-                            let a_src =
-                                std::slice::from_raw_parts(a_ptr as *const f64, a_len / 8);
-                            let b_src =
-                                std::slice::from_raw_parts(b_ptr as *const f64, b_len / 8);
+                            let a_src = std::slice::from_raw_parts(a_ptr as *const f64, a_len / 8);
+                            let b_src = std::slice::from_raw_parts(b_ptr as *const f64, b_len / 8);
                             let mut a_scratch = a_src.to_vec();
                             let mut x_buf = b_src.to_vec();
                             let info = crate::blas::dgesv(&mut a_scratch, &mut x_buf, n, nrhs);

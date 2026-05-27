@@ -21,10 +21,10 @@ pub mod pca;
 pub mod text;
 pub mod types;
 
-pub use dataset::{load_colmap_training_bundle, ColmapTrainConfig, ColmapTrainingBundle};
+pub use dataset::{ColmapTrainConfig, ColmapTrainingBundle, load_colmap_training_bundle};
 pub use downscale::{
-    parse_downscale_mode, resolve_training_frame_image_size, FrameDownscaleConfig,
-    FrameDownscaleMode,
+    FrameDownscaleConfig, FrameDownscaleMode, parse_downscale_mode,
+    resolve_training_frame_image_size,
 };
 pub use init_hparams::{
     resolve_colmap_init_hparams, suggest_colmap_init_hparams, suggest_points_init_hparams,
@@ -43,7 +43,10 @@ pub fn load_colmap_reconstruction(
     root: impl AsRef<Path>,
     sparse_subdir: &str,
 ) -> Result<ColmapReconstruction> {
-    let root_path = root.as_ref().canonicalize().context("resolve COLMAP root")?;
+    let root_path = root
+        .as_ref()
+        .canonicalize()
+        .context("resolve COLMAP root")?;
     let sparse_subdir_text = sparse_subdir.trim();
     let mut candidates: Vec<PathBuf> = Vec::new();
     if !sparse_subdir_text.is_empty() {

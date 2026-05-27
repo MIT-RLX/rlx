@@ -1242,21 +1242,30 @@ pub fn rms_norm_backward_param_kernel(device: &wgpu::Device) -> &'static Kernel 
     })
 }
 pub fn cumsum_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
-    CUMSUM_BWD.get_or_init(|| {
-        build_kernel(device, "rlx-wgpu cumsum_bwd", CUMSUM_BWD_WGSL, "cumsum_bwd")
-    })
+    CUMSUM_BWD
+        .get_or_init(|| build_kernel(device, "rlx-wgpu cumsum_bwd", CUMSUM_BWD_WGSL, "cumsum_bwd"))
 }
 pub fn rope_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
     ROPE_BWD.get_or_init(|| build_kernel(device, "rlx-wgpu rope_bwd", ROPE_BWD_WGSL, "rope_bwd"))
 }
 pub fn gather_backward_zero_kernel(device: &wgpu::Device) -> &'static Kernel {
     GATHER_BWD_ZERO.get_or_init(|| {
-        build_kernel(device, "rlx-wgpu gather_bwd_zero", GATHER_BWD_WGSL, "gather_bwd_zero")
+        build_kernel(
+            device,
+            "rlx-wgpu gather_bwd_zero",
+            GATHER_BWD_WGSL,
+            "gather_bwd_zero",
+        )
     })
 }
 pub fn gather_backward_acc_kernel(device: &wgpu::Device) -> &'static Kernel {
     GATHER_BWD_ACC.get_or_init(|| {
-        build_kernel(device, "rlx-wgpu gather_bwd_acc", GATHER_BWD_WGSL, "gather_bwd_acc")
+        build_kernel(
+            device,
+            "rlx-wgpu gather_bwd_acc",
+            GATHER_BWD_WGSL,
+            "gather_bwd_acc",
+        )
     })
 }
 pub fn cumsum_kernel(device: &wgpu::Device) -> &'static Kernel {

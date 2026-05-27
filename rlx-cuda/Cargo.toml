@@ -13,6 +13,7 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
+rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.0" }
 rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
 rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", features = ["splat"] }
@@ -51,7 +52,7 @@ path = "src/lib.rs"
 
 # ── Dev-only validation features ────────────────────────────────
 #
-# `hip-cpu-validate` compiles the same `.cu` kernel sources via HIP-CPU
+# Kernel sources live in `rlx-gpu-kernels`. `hip-cpu-validate` compiles them via HIP-CPU
 # headers and runs them on CPU threads instead of via cudarc + libcuda.
 # Off by default. Never enabled in workspace `cargo build` / production
 # builds. Only useful for `cargo test --features hip-cpu-validate` on
@@ -64,6 +65,7 @@ path = "src/lib.rs"
 # crate and called via Rust FFI.
 [features]
 default = []
+native-splat = []
 # Opt-in: enable cudarc's nvtx feature + the per-step `scoped_range`
 # call in `backend.rs`. CUDA 13 removed `nvToolsExt.dll`, so leaving
 # this off by default keeps builds runnable on modern installs. Turn

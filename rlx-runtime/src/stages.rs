@@ -134,7 +134,8 @@ pub fn compile_hir_stages(
     options: &CompileOptions,
 ) -> Result<CompileResult, rlx_ir::hir::LowerError> {
     let pipe = pipeline_for(device, options);
-    pipe.compile_hir(hir).map(|r| maybe_specialize(r, &pipe, options))
+    pipe.compile_hir(hir)
+        .map(|r| maybe_specialize(r, &pipe, options))
 }
 
 /// Compile a [`GraphModule`] (HIR, MIR, or LIR stage) through the pipeline.

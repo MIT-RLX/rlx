@@ -71,7 +71,7 @@ fn main() {
 
     let run_with = |use_mpsg: bool, dev: Device| -> Vec<f32> {
         if use_mpsg {
-            rlx_ir::env::set("RLX_USE_MPSGRAPH", "1")
+            rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
         } else {
             unsafe {
                 rlx_ir::env::unset("RLX_USE_MPSGRAPH");

@@ -17,14 +17,21 @@
 #![cfg(all(feature = "native-splat", target_os = "macos"))]
 
 use rlx_splat::core::Camera;
-use rlx_splat::reference::render_training_forward;
 use rlx_splat::make_parity_scene;
+use rlx_splat::reference::render_training_forward;
 
 #[test]
 fn gpu_raster_backward_matches_cpu() {
     rlx_splat::register();
     let scene = make_parity_scene();
-    let camera = Camera::look_at([0.0, 0.0, 4.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 60.0, 0.1, 20.0);
+    let camera = Camera::look_at(
+        [0.0, 0.0, 4.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        60.0,
+        0.1,
+        20.0,
+    );
     let bg = [0.1, 0.15, 0.2];
     let w = 64u32;
     let h = 64u32;
@@ -69,14 +76,8 @@ fn gpu_raster_backward_matches_cpu() {
         trans,
         max_list,
     );
-    let cpu_ca = rlx_splat::reference::rasterize_backward(
-        &cpu_forward,
-        &pixel_rgb_grad,
-        bg,
-        w,
-        h,
-        1.0,
-    );
+    let cpu_ca =
+        rlx_splat::reference::rasterize_backward(&cpu_forward, &pixel_rgb_grad, bg, w, h, 1.0);
     let gpu_ca = rlx_metal::splat_training::training_raster_backward_metal_ca_grad(
         &scene,
         &cache,

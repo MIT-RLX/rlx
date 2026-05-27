@@ -15,7 +15,6 @@
 //! Decomposed splat is fused to monolithic render before AD.
 
 use rlx_autodiff::prepare_graph_for_ad;
-use rlx_ir::infer::GraphExt;
 use rlx_ir::ops::splat::{GaussianSplatInputs, GaussianSplatRenderParams};
 use rlx_ir::{DType, Graph, Op, Shape};
 

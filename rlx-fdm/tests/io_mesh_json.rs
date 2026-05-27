@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use rlx_fdm::{from_json_str, mesh_from_json_str, merge_mesh, to_json_str, Network};
+use rlx_fdm::{Network, from_json_str, merge_mesh, mesh_from_json_str, to_json_str};
 
 #[test]
 fn quad_mesh_json_roundtrip_and_solve() {
@@ -38,7 +38,12 @@ fn mesh_sidecar_merge() {
     }"#;
     let mesh = mesh_from_json_str(mesh_json).expect("mesh");
     let mut net = Network::from_polyline(
-        &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        &[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
         -1.0,
     );
     net.anchor_nodes(&[0, 2]);

@@ -33,11 +33,7 @@ pub fn run_llada2_group_limited_gate(
 
     unsafe {
         let _ = (rt.hip_stream_sync)(ctx.default_stream);
-        let _ = (rt.hip_memcpy_dtoh)(
-            host.as_mut_ptr() as *mut _,
-            buffer.ptr,
-            n_f32 * 4,
-        );
+        let _ = (rt.hip_memcpy_dtoh)(host.as_mut_ptr() as *mut _, buffer.ptr, n_f32 * 4);
     }
 
     rlx_cpu::llada2_gate::execute_gate_in_f32_arena(
@@ -51,10 +47,6 @@ pub fn run_llada2_group_limited_gate(
     .expect("rlx-rocm: llada2 gate execute failed");
 
     unsafe {
-        let _ = (rt.hip_memcpy_htod)(
-            buffer.ptr,
-            host.as_ptr() as *const _,
-            n_f32 * 4,
-        );
+        let _ = (rt.hip_memcpy_htod)(buffer.ptr, host.as_ptr() as *const _, n_f32 * 4);
     }
 }

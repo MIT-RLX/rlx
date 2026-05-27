@@ -170,8 +170,7 @@ pub fn prepare_graph_for_backend_with_report(
     let still_unsupported = legalize_for_backend(&rewritten, supported)
         .err()
         .unwrap_or_default();
-    let unsupported_set: HashSet<OpKind> =
-        still_unsupported.iter().map(|(_, k)| *k).collect();
+    let unsupported_set: HashSet<OpKind> = still_unsupported.iter().map(|(_, k)| *k).collect();
 
     let mut summaries: Vec<KindDispatchSummary> = before
         .iter()
@@ -214,9 +213,7 @@ pub fn format_dispatch_report(report: &KernelDispatchReport) -> String {
     let _ = writeln!(
         s,
         "rlx dispatch report — backend {:?}, policy {:?}, supported_ops claim={}",
-        report.backend_name,
-        report.policy,
-        report.supported_claim_count
+        report.backend_name, report.policy, report.supported_claim_count
     );
     if report.supported_claim_count == 0 {
         let _ = writeln!(
@@ -262,11 +259,7 @@ pub fn format_dispatch_report(report: &KernelDispatchReport) -> String {
                 .logical_name
                 .map(|n| format!(" logical={n}"))
                 .unwrap_or_default();
-            let _ = writeln!(
-                s,
-                "    - {:?} ×{} nodes{extra}",
-                e.kind, e.node_count
-            );
+            let _ = writeln!(s, "    - {:?} ×{} nodes{extra}", e.kind, e.node_count);
         }
     }
 
@@ -301,7 +294,6 @@ pub fn maybe_log_dispatch_report(report: &KernelDispatchReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rlx_ir::infer::GraphExt;
     use rlx_ir::*;
 
     #[test]
@@ -337,13 +329,17 @@ mod tests {
 
         let supported = &[OpKind::Input, OpKind::Param, OpKind::MatMul];
         let report = analyze_dispatch(&g, "test", supported, KernelDispatchConfig::default());
-        assert!(report
-            .common_lowered_kinds
-            .contains(&OpKind::GaussianSplatRender));
-        assert!(report
-            .summaries
-            .iter()
-            .any(|s| s.kind == OpKind::GaussianSplatRender && s.path == DispatchPath::CommonIr));
+        assert!(
+            report
+                .common_lowered_kinds
+                .contains(&OpKind::GaussianSplatRender)
+        );
+        assert!(
+            report
+                .summaries
+                .iter()
+                .any(|s| s.kind == OpKind::GaussianSplatRender && s.path == DispatchPath::CommonIr)
+        );
     }
 
     #[test]
@@ -371,10 +367,12 @@ mod tests {
             KernelDispatchConfig::default(),
         );
         assert!(report.compile_ready);
-        assert!(!rewritten
-            .nodes()
-            .iter()
-            .any(|n| n.op.kind() == OpKind::FusedMatMulBiasAct));
+        assert!(
+            !rewritten
+                .nodes()
+                .iter()
+                .any(|n| n.op.kind() == OpKind::FusedMatMulBiasAct)
+        );
         assert!(report.summaries.iter().any(|s| {
             s.kind == OpKind::FusedMatMulBiasAct && s.path == DispatchPath::Rewritten
         }));

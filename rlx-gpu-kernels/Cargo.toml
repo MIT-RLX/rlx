@@ -1,0 +1,22 @@
+[package]
+name = "rlx-gpu-kernels"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Shared CUDA/HIP C++ kernel sources for RLX GPU backends (NVRTC / hipRTC)."
+authors.workspace      = true
+license.workspace      = true
+keywords = ["cuda", "hip", "gpu", "rlx", "kernels"]
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[features]
+default = []
+# AMD-only rocWMMA matmul (`kernels/rocm/matmul_mfma.cu`).
+rocm = []
+
+[lints]
+workspace = true

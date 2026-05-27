@@ -31,20 +31,20 @@ use rlx_ir::mir::MirModule;
 use rlx_ir::phase::derive_phases;
 use rlx_ir::{Graph, GraphModule, GraphStage};
 
+use crate::DeadCodeElimination;
 use crate::debug_assert_graph;
 use crate::fusion_pipeline::{
     FusionOptions, FusionTarget, fusion_limits_for_target, fusion_passes_for_supported,
     supported_for_target,
 };
-use rlx_fusion::{clip_elementwise_regions, with_fusion_limits};
-use rlx_fusion::fusion_report::FusionReport;
 use crate::legalize::{format_legalize_error, legalize_for_backend};
-use crate::rewrite::rewrite_for_backend_with_config;
-use rlx_ir::logical_kernel::KernelDispatchConfig;
 use crate::memory::{self, MemoryPlan};
+use crate::rewrite::rewrite_for_backend_with_config;
+use rlx_fusion::fusion_report::FusionReport;
 use rlx_fusion::pass::run_passes;
-use crate::DeadCodeElimination;
+use rlx_fusion::{clip_elementwise_regions, with_fusion_limits};
 use rlx_ir::OpKind;
+use rlx_ir::logical_kernel::KernelDispatchConfig;
 
 /// End-to-end compiler output: optimized LIR + fusion diagnostics.
 #[derive(Debug, Clone)]
@@ -141,7 +141,10 @@ impl CompilePipeline {
         self
     }
 
-    pub fn with_kernel_dispatch(mut self, policy: rlx_ir::logical_kernel::KernelDispatchPolicy) -> Self {
+    pub fn with_kernel_dispatch(
+        mut self,
+        policy: rlx_ir::logical_kernel::KernelDispatchPolicy,
+    ) -> Self {
         self.kernel_dispatch.policy = policy;
         self
     }
@@ -201,10 +204,7 @@ impl CompilePipeline {
         }
         let graph = rewrite_for_backend_with_config(graph, supported, self.kernel_dispatch);
         if let Err(errors) = legalize_for_backend(&graph, supported) {
-            panic!(
-                "{}",
-                format_legalize_error(self.backend_name(), &errors)
-            );
+            panic!("{}", format_legalize_error(self.backend_name(), &errors));
         }
         graph
     }
@@ -235,7 +235,9 @@ impl CompilePipeline {
 
     /// Bind symbolic dims and re-run buffer planning on specialized MIR.
     pub fn specialize_lir(&self, lir: &LirModule, binding: &rlx_ir::DimBinding) -> LirModule {
-        use rlx_ir::dynamic::{bind_graph, sync_concat_shapes, sync_graph_shapes, sync_narrow_ops, sync_reshape_ops};
+        use rlx_ir::dynamic::{
+            bind_graph, sync_concat_shapes, sync_graph_shapes, sync_narrow_ops, sync_reshape_ops,
+        };
         let mut bound = bind_graph(lir.as_graph(), binding);
         sync_reshape_ops(&mut bound);
         sync_concat_shapes(&mut bound);
@@ -283,7 +285,10 @@ impl CompilePipeline {
     }
 
     /// Unified entry for [`GraphModule`] at any pipeline stage.
-    pub fn compile_module(&self, module: GraphModule) -> Result<CompileResult, rlx_ir::hir::LowerError> {
+    pub fn compile_module(
+        &self,
+        module: GraphModule,
+    ) -> Result<CompileResult, rlx_ir::hir::LowerError> {
         match module.stage() {
             GraphStage::Hir => {
                 let hir = module
@@ -357,15 +362,7 @@ pub(crate) fn lir_buffer_plan_from_memory(
 ) -> LirBufferPlan {
     let view_aliases = memory::collect_view_aliases(graph)
         .into_iter()
-        .map(|(id, (root, byte_offset))| {
-            (
-                id,
-                LirViewAlias {
-                    root,
-                    byte_offset,
-                },
-            )
-        })
+        .map(|(id, (root, byte_offset))| (id, LirViewAlias { root, byte_offset }))
         .collect();
     LirBufferPlan {
         arena_size: plan.arena_size,
@@ -439,10 +436,7 @@ mod tests {
                 .any(|n| matches!(n.op, Op::FusedSwiGLU { .. })),
             "direct HIR SwiGLU should lower to FusedSwiGLU"
         );
-        assert!(
-            result.fusion.missed_matmul_bias_act() == 0
-                || result.fusion.fused_swiglu >= 1
-        );
+        assert!(result.fusion.missed_matmul_bias_act() == 0 || result.fusion.fused_swiglu >= 1);
     }
 
     #[test]
@@ -505,15 +499,12 @@ mod tests {
 
     #[test]
     fn dynamic_graph_compiles_and_specializes() {
+        use rlx_ir::DimBinding;
         use rlx_ir::infer::GraphExt as _;
         use rlx_ir::sym;
-        use rlx_ir::DimBinding;
 
         let mut g = Graph::new("dyn");
-        let x = g.input(
-            "x",
-            Shape::batch_seq_2d(sym::BATCH, sym::SEQ, DType::F32),
-        );
+        let x = g.input("x", Shape::batch_seq_2d(sym::BATCH, sym::SEQ, DType::F32));
         let w = g.param("w", Shape::new(&[4, 8], DType::F32));
         let y = g.mm(x, w);
         g.set_outputs(vec![y]);

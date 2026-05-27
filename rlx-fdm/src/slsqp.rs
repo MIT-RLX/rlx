@@ -54,7 +54,8 @@ impl Slsqp {
         gradient(x, &mut g);
         nonlinear_fd_grad(x, &mut g, &mut nonlinear, self.penalty_weight, self.fd_eps);
         let dir = self.lbfgs.direction(&g);
-        let eval = |trial: &[f64]| augmented(&mut objective, &mut nonlinear, trial, self.penalty_weight);
+        let eval =
+            |trial: &[f64]| augmented(&mut objective, &mut nonlinear, trial, self.penalty_weight);
         let (x_new, _) = self.lbfgs.line_search(x, &dir, f0, &g, eval);
         x.copy_from_slice(&x_new);
         for (xi, (lo, hi)) in x.iter_mut().zip(low.iter().zip(up.iter())) {

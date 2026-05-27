@@ -235,7 +235,14 @@ impl GraphExt for Graph {
         groups: usize,
     ) -> NodeId {
         Graph::conv2d(
-            self, input, weight, kernel_size, stride, padding, dilation, groups,
+            self,
+            input,
+            weight,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
         )
     }
 

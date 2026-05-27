@@ -57,8 +57,7 @@ impl MlxKernel for Llada2GateMlx {
             .collect();
         let out_elems: usize = out_dims.iter().product();
         let mut out = vec![0f32; out_elems];
-        rlx_cpu::llada2_gate::execute_gate_f32(&sig, &route, &mut out, attrs)
-            .map_err(MlxError)?;
+        rlx_cpu::llada2_gate::execute_gate_f32(&sig, &route, &mut out, attrs).map_err(MlxError)?;
         Array::from_f32_slice(&out, &out_dims, output_shape.dtype())
     }
 }

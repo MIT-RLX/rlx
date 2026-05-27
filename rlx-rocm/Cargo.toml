@@ -12,16 +12,8 @@ readme                 = "README.md"
 repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
-# Not on crates.io (vendor-bundled): src/kernels/sources.rs uses
-# `include_str!("../../../rlx-cuda/src/kernels/*.cu")` to share kernel
-# sources with rlx-cuda. Those workspace-relative paths aren't in the
-# published `.crate` tarball. Distributed via the workspace git tree
-# only — depend on it via `git = "https://github.com/MIT-RLX/rlx"`.
-# When the kernel sources are copied into rlx-rocm/src/kernels/ (or
-# rlx-cuda's are exposed via a re-export), flip this back.
-publish = false
-
 [dependencies]
+rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.0", features = ["rocm"] }
 rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
 rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", features = ["splat"] }
@@ -60,12 +52,11 @@ path = "src/lib.rs"
 # without an AMD driver) to validate the kernel logic without paying
 # for cloud-GPU time.
 #
-# The .cu kernel sources are shared with rlx-cuda (pulled in via
-# relative `include_str!`), so this harness reuses rlx-cuda's
-# `cpp/cpu_dispatch.cpp` wrapper layer (single-line proxy `#include`)
-# and the same HIP-CPU submodule at `rlx-cuda/vendor/HIP-CPU`.
+# Kernel sources live in `rlx-gpu-kernels`. This harness reuses
+# rlx-cuda's `cpp/cpu_dispatch.cpp` and HIP-CPU at `rlx-cuda/vendor/HIP-CPU`.
 [features]
 default = []
+native-splat = []
 hip-cpu-validate = ["dep:cc"]
 
 [build-dependencies]

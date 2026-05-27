@@ -22,11 +22,11 @@ use crate::distillation::esd_regression_target;
 use crate::env::RlEnv;
 use crate::flow_curriculum::sample_r_t;
 use crate::graph::{
-    build_actor_graphs, build_critic_graphs, init_actor_weights, init_critic_weights,
-    CompiledFlowMapAgent, CompiledTwinCritic, ParamSlot, WeightStore,
+    CompiledFlowMapAgent, CompiledTwinCritic, ParamSlot, WeightStore, build_actor_graphs,
+    build_critic_graphs, init_actor_weights, init_critic_weights,
 };
 use crate::guidance::{clip_action, fmq_eta_effective, normalize_grad};
-use crate::policy::{select_action, sample_noise, EvalConfig};
+use crate::policy::{EvalConfig, sample_noise, select_action};
 use crate::spec::RlSpec;
 
 /// Flow-map FMQ trainer.
@@ -123,7 +123,8 @@ impl FmqTrainer {
                 0.0
             };
             if esd_weight > 0.0 {
-                let inputs = dataset.sample_esd_inputs(&self.spec, &indices, self.train_step, &mut self.rng);
+                let inputs =
+                    dataset.sample_esd_inputs(&self.spec, &indices, self.train_step, &mut self.rng);
                 let esd = self.build_esd_batch(&inputs);
                 self.actor_offline_step(&esd, esd_weight);
             }
@@ -132,7 +133,7 @@ impl FmqTrainer {
             self.train_step += 1;
             self.sync_actor();
 
-            if self.train_step % 50 == 0 {
+            if self.train_step.is_multiple_of(50) {
                 eprintln!("offline step {}", self.train_step);
             }
         }
@@ -179,8 +180,12 @@ impl FmqTrainer {
             }
 
             self.train_step += 1;
-            if self.train_step % 100 == 0 {
-                eprintln!("online step {} replay={}", self.train_step, self.replay.len());
+            if self.train_step.is_multiple_of(100) {
+                eprintln!(
+                    "online step {} replay={}",
+                    self.train_step,
+                    self.replay.len()
+                );
             }
         }
     }
@@ -390,8 +395,7 @@ impl FmqTrainer {
 
         let u_off = self.agent_anchor.velocity(state, &a_r, r, 1.0);
         let a1_off = clip_action(
-            &a_r
-                .iter()
+            &a_r.iter()
                 .zip(u_off.iter())
                 .map(|(&ar, &u)| ar + omr * u)
                 .collect::<Vec<_>>(),
@@ -400,8 +404,7 @@ impl FmqTrainer {
 
         let u_theta = self.agent_infer.velocity(state, &a_r, r, 1.0);
         let a1_online = clip_action(
-            &a_r
-                .iter()
+            &a_r.iter()
                 .zip(u_theta.iter())
                 .map(|(&ar, &u)| ar + omr * u)
                 .collect::<Vec<_>>(),

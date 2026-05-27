@@ -58,23 +58,23 @@ pub mod compile_cache;
 pub mod compiled;
 pub mod cost;
 pub mod device_ext;
+pub mod expert_pool;
 pub mod jacfwd;
 pub mod kernel_trace;
 pub mod lora_scheduler;
-pub mod expert_pool;
-pub mod moe_expert_store;
 pub mod memory_estimate;
 pub mod model_pipeline;
-pub mod reflect;
+pub mod moe_expert_store;
 pub mod op_registry;
 pub mod options;
 pub mod paged_kv;
 pub mod precision;
 pub mod record_replay;
+pub mod reflect;
 pub mod registry;
 pub mod router;
-pub mod stages;
 pub mod session;
+pub mod stages;
 pub mod subgraph;
 pub mod trace;
 pub mod weight_registry;
@@ -105,47 +105,46 @@ pub use rlx_driver::{
     CollectiveError, LocalTransport, Rank, SymmetricBuffer, SymmetricHeap, SymmetricTransport,
 };
 // Collective ops (plan #12).
-pub use backend::{Backend, ExecutableGraph, compile_hir, compile_module};
-pub use stages::{
-    compile_graph_stages, compile_graph_stages_for_backend, compile_hir_stages,
-    compile_module_stages, fusion_target_for, graph_from_lir, maybe_log_fusion,
-    options_with_supported_ops, pipeline_for,
-};
 pub use aot_cache::{AotCache, AotCacheError};
-pub use compile_cache::{BucketedCompileCache, CompileCache, DynamicDimCompileCache, pad_rows, slice_rows};
-pub use model_pipeline::ModelCompilePipeline;
-pub use reflect::{load_hir_template_with_extensions, specialize_entry, ModelReflection};
+pub use backend::{Backend, ExecutableGraph, compile_hir, compile_module};
+pub use compile_cache::{
+    BucketedCompileCache, CompileCache, DynamicDimCompileCache, pad_rows, slice_rows,
+};
 pub use compiled::CompiledGraph;
 #[cfg(feature = "apple")]
 pub use device_ext::available_apple_devices;
 pub use device_ext::{
     available_devices, dispatch_report_for_device, dispatch_report_for_device_with_options,
     first_unsupported_op, first_unsupported_op_with_options, full_name, is_available,
-    legalize_graph_for_device,
-    legalize_graph_for_device_with_options, legalize_graph_for_device_with_report, supports,
-    supports_graph, supports_graph_with_options,
+    legalize_graph_for_device, legalize_graph_for_device_with_options,
+    legalize_graph_for_device_with_report, supports, supports_graph, supports_graph_with_options,
 };
-pub use options::CompileOptions;
-pub use rlx_ir::env::{self, RlxEnv, RuntimeOverrides};
-pub use precision::Precision;
-pub use registry::{BackendFactory, backend_for, register_backend, registered_devices};
-pub use rlx_driver::{ReduceKind, all_gather, all_reduce, reduce_scatter};
-pub use session::Session;
-pub use subgraph::{SubgraphCache, run_if, run_while};
 pub use expert_pool::{
     ExpertPool, ExpertPoolConfig, ExpertPoolStats, ExpertRefreshPolicy, ExpertRefreshResult,
     MoEExecMode, gpu_expert_budget_from_vram,
 };
 pub use memory_estimate::{MoeOffloadEstimate, estimate_moe_offload};
-#[cfg(feature = "cpu")]
-pub use rlx_cpu::moe_topk_capture::MoeTopkCapture;
+pub use model_pipeline::ModelCompilePipeline;
+pub use options::CompileOptions;
+pub use precision::Precision;
+pub use reflect::{ModelReflection, load_hir_template_with_extensions, specialize_entry};
+pub use registry::{BackendFactory, backend_for, register_backend, registered_devices};
 #[cfg(feature = "cpu")]
 pub use rlx_cpu::moe_residency::MoeResidencyStats;
+#[cfg(feature = "cpu")]
+pub use rlx_cpu::moe_topk_capture::MoeTopkCapture;
+pub use rlx_driver::{ReduceKind, all_gather, all_reduce, reduce_scatter};
+pub use rlx_ir::env::{self, RlxEnv, RuntimeOverrides};
+pub use session::Session;
+pub use stages::{
+    compile_graph_stages, compile_graph_stages_for_backend, compile_hir_stages,
+    compile_module_stages, fusion_target_for, graph_from_lir, maybe_log_fusion,
+    options_with_supported_ops, pipeline_for,
+};
+pub use subgraph::{SubgraphCache, run_if, run_while};
 
 pub use expert_pool::{merged_resident_mask, per_layer_resident_masks};
-pub use moe_expert_store::{
-    ExpertStackF32, LayerMoeWeights, MoeExpertStore,
-};
+pub use moe_expert_store::{ExpertStackF32, LayerMoeWeights, MoeExpertStore};
 pub use weight_registry::{WeightEntry, WeightHandle, WeightKind, WeightRegistry};
 pub use weights::{BytesWeightLoader, WeightLoader};
 
@@ -156,19 +155,19 @@ pub use rlx_ir::{AsyncCopy, BarrierToken, DoubleBuffer, SyncCopy};
 pub use rlx_ir::{CacheBuster, Tick, time_ns};
 
 // Re-export precision policy from rlx-opt for convenience
-pub use rlx_opt::{OpKind, PrecisionPolicy};
 pub use rlx_ir::{
     inspect_graph, inspect_hir, inspect_hir_stats, inspect_lir, inspect_mir, inspect_mir_stats,
 };
-pub use rlx_opt::{inspect_pipeline, PipelineInspect};
+pub use rlx_opt::{OpKind, PrecisionPolicy};
+pub use rlx_opt::{PipelineInspect, inspect_pipeline};
 
 // Re-export IR types for convenience
-pub use rlx_ir::op;
 pub use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
+pub use rlx_ir::op;
 pub use rlx_ir::{
-    apply_hir_extensions, register_hir_extension, registered_hir_extensions, BindingManifest,
-    CompilationMode, DType, Graph, HirExtensionFn, HirReflection, IoBindingEntry, ManifestDiff,
-    ModelComponent, ModelPhase, ModelVariant, Node, NodeId, Op, Shape, WeightBlock,
+    BindingManifest, CompilationMode, DType, Graph, HirExtensionFn, HirReflection, IoBindingEntry,
+    ManifestDiff, ModelComponent, ModelPhase, ModelVariant, Node, NodeId, Op, Shape, WeightBlock,
+    apply_hir_extensions, register_hir_extension, registered_hir_extensions,
 };
 
 // Re-export proc macro

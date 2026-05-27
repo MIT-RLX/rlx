@@ -44,6 +44,20 @@ pub const SCENE_INPUT_NAMES: [&str; 6] = [
     "sh_coeffs",
 ];
 
+impl SceneGraphInputs {
+    /// Bind a [`GaussianScene`] to the graph's [`Op::Input`] names for [`Session::run`].
+    pub fn run_args<'a>(&self, scene: &'a GaussianScene) -> [(&'static str, &'a [f32]); 6] {
+        [
+            ("positions", &scene.positions),
+            ("scales", &scene.scales),
+            ("rotations", &scene.rotations),
+            ("opacities", &scene.opacities),
+            ("colors", &scene.colors),
+            ("sh_coeffs", &scene.sh_coeffs),
+        ]
+    }
+}
+
 pub fn scene_graph_inputs(g: &mut Graph, scene: &GaussianScene) -> SceneGraphInputs {
     let count = scene.count();
     let sh_coeff_count = scene.sh_coeff_count;

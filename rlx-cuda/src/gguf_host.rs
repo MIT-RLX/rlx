@@ -56,10 +56,7 @@ fn dtoh_bytes(
     let end_f32 = end_byte.div_ceil(4);
     let mut words = vec![0f32; end_f32 - start_f32];
     stream
-        .memcpy_dtoh(
-            &buffer.slice(start_f32..end_f32),
-            &mut words,
-        )
+        .memcpy_dtoh(&buffer.slice(start_f32..end_f32), &mut words)
         .expect("rlx-cuda: gguf dtoh failed");
     let mut raw = vec![0u8; words.len() * 4];
     for (i, w) in words.iter().enumerate() {
@@ -68,21 +65,13 @@ fn dtoh_bytes(
     raw[byte_off % 4..byte_off % 4 + len].to_vec()
 }
 
-fn htod_bytes(
-    stream: &Arc<CudaStream>,
-    buffer: &mut CudaSlice<f32>,
-    byte_off: usize,
-    data: &[u8],
-) {
+fn htod_bytes(stream: &Arc<CudaStream>, buffer: &mut CudaSlice<f32>, byte_off: usize, data: &[u8]) {
     let start_f32 = byte_off / 4;
     let end_byte = byte_off + data.len();
     let end_f32 = end_byte.div_ceil(4);
     let mut words = vec![0f32; end_f32 - start_f32];
     stream
-        .memcpy_dtoh(
-            &buffer.slice(start_f32..end_f32),
-            &mut words,
-        )
+        .memcpy_dtoh(&buffer.slice(start_f32..end_f32), &mut words)
         .expect("rlx-cuda: gguf htod staging dtoh failed");
     let mut raw = vec![0u8; words.len() * 4];
     for (i, w) in words.iter().enumerate() {
@@ -114,29 +103,20 @@ pub fn run_dequant_matmul_gguf(
     let block_elems = scheme.gguf_block_size() as usize;
     let total_bytes = (k * n) / block_elems * block_bytes;
 
-    stream.synchronize().expect("rlx-cuda: gguf pre-sync failed");
+    stream
+        .synchronize()
+        .expect("rlx-cuda: gguf pre-sync failed");
 
     let x_f32_off = x_byte_off / 4;
     let mut x_host = vec![0f32; m * k];
     stream
-        .memcpy_dtoh(
-            &buffer.slice(x_f32_off..x_f32_off + m * k),
-            &mut x_host,
-        )
+        .memcpy_dtoh(&buffer.slice(x_f32_off..x_f32_off + m * k), &mut x_host)
         .expect("rlx-cuda: gguf x dtoh failed");
 
     let w_host = dtoh_bytes(stream, buffer, w_byte_off, total_bytes);
 
     let mut out_host = vec![0f32; m * n];
-    rlx_cpu::gguf_matmul::gguf_matmul_bt(
-        &x_host,
-        &w_host,
-        &mut out_host,
-        m,
-        k,
-        n,
-        scheme,
-    );
+    rlx_cpu::gguf_matmul::gguf_matmul_bt(&x_host, &w_host, &mut out_host, m, k, n, scheme);
 
     let out_f32_off = out_byte_off / 4;
     stream
@@ -167,15 +147,14 @@ pub fn run_dequant_grouped_matmul_gguf(
     let slab_bytes = (k * n) / block_elems * block_bytes;
     let total_bytes = num_experts * slab_bytes;
 
-    stream.synchronize().expect("rlx-cuda: grouped gguf pre-sync failed");
+    stream
+        .synchronize()
+        .expect("rlx-cuda: grouped gguf pre-sync failed");
 
     let x_f32_off = x_byte_off / 4;
     let mut x_host = vec![0f32; m * k];
     stream
-        .memcpy_dtoh(
-            &buffer.slice(x_f32_off..x_f32_off + m * k),
-            &mut x_host,
-        )
+        .memcpy_dtoh(&buffer.slice(x_f32_off..x_f32_off + m * k), &mut x_host)
         .expect("rlx-cuda: grouped gguf x dtoh failed");
 
     let w_host = dtoh_bytes(stream, buffer, w_byte_off, total_bytes);
@@ -183,10 +162,7 @@ pub fn run_dequant_grouped_matmul_gguf(
     let idx_f32_off = idx_byte_off / 4;
     let mut idx_host = vec![0f32; m];
     stream
-        .memcpy_dtoh(
-            &buffer.slice(idx_f32_off..idx_f32_off + m),
-            &mut idx_host,
-        )
+        .memcpy_dtoh(&buffer.slice(idx_f32_off..idx_f32_off + m), &mut idx_host)
         .expect("rlx-cuda: grouped gguf idx dtoh failed");
 
     let mut out_host = vec![0f32; m * n];

@@ -112,12 +112,7 @@ fn incidence_matrix(num_edges: usize, num_nodes: usize, edges: &[(usize, usize)]
     c
 }
 
-fn submatrix_columns(
-    full: &[f64],
-    rows: usize,
-    cols: usize,
-    col_indices: &[usize],
-) -> Vec<f64> {
+fn submatrix_columns(full: &[f64], rows: usize, cols: usize, col_indices: &[usize]) -> Vec<f64> {
     let sub_cols = col_indices.len();
     let mut out = vec![0.0; rows * sub_cols];
     for r in 0..rows {

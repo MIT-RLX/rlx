@@ -53,10 +53,7 @@ impl MeshDocument {
     /// Build a pin-jointed network from faces (edges deduced from face loops).
     pub fn to_network(&self, xyz: Vec<f64>, is_support: Vec<bool>, loads: Vec<f64>) -> Network {
         let edges = edges_from_faces(&self.faces);
-        let q = self
-            .q
-            .clone()
-            .unwrap_or_else(|| vec![-1.0; edges.len()]);
+        let q = self.q.clone().unwrap_or_else(|| vec![-1.0; edges.len()]);
         let net = Network {
             xyz,
             is_support,

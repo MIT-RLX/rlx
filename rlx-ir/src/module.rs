@@ -126,13 +126,10 @@ impl GraphModule {
     pub fn set_outputs(&mut self, outputs: Vec<HirNodeId>) {
         match &mut self.stage {
             Stage::Hir(h) => h.set_outputs(outputs),
-            Stage::Mir(m) => {
-                m.set_outputs(outputs.into_iter().map(|h| NodeId(h.0)).collect())
-            }
-            Stage::Lir(l) => {
-                l.mir
-                    .set_outputs(outputs.into_iter().map(|h| NodeId(h.0)).collect())
-            }
+            Stage::Mir(m) => m.set_outputs(outputs.into_iter().map(|h| NodeId(h.0)).collect()),
+            Stage::Lir(l) => l
+                .mir
+                .set_outputs(outputs.into_iter().map(|h| NodeId(h.0)).collect()),
         }
     }
 
@@ -189,7 +186,8 @@ impl GraphModule {
         activation: Option<Activation>,
         out_shape: Shape,
     ) -> HirNodeId {
-        self.hir_mut().linear(x, weight, bias, activation, out_shape)
+        self.hir_mut()
+            .linear(x, weight, bias, activation, out_shape)
     }
 
     pub fn linear_fused(
@@ -251,16 +249,8 @@ impl GraphModule {
         mask_kind: MaskKind,
         out_shape: Shape,
     ) -> HirNodeId {
-        self.hir_mut().attention(
-            q,
-            k,
-            v,
-            mask,
-            num_heads,
-            head_dim,
-            mask_kind,
-            out_shape,
-        )
+        self.hir_mut()
+            .attention(q, k, v, mask, num_heads, head_dim, mask_kind, out_shape)
     }
 
     pub fn depthwise_conv1d_causal(
@@ -313,9 +303,8 @@ impl GraphModule {
         state_size: usize,
         out_shape: Shape,
     ) -> HirNodeId {
-        self.hir_mut().gated_delta_net_carry(
-            q, k, v, g, beta, state, state_size, out_shape,
-        )
+        self.hir_mut()
+            .gated_delta_net_carry(q, k, v, g, beta, state, state_size, out_shape)
     }
 
     pub fn rope(
@@ -327,8 +316,7 @@ impl GraphModule {
         n_rot: usize,
         out_shape: Shape,
     ) -> HirNodeId {
-        self.hir_mut()
-            .rope(x, cos, sin, head_dim, n_rot, out_shape)
+        self.hir_mut().rope(x, cos, sin, head_dim, n_rot, out_shape)
     }
 
     pub fn rms_norm(
@@ -545,14 +533,7 @@ mod tests {
         let mut module = GraphModule::hir("layer");
         let x = module.input("x", f32_shape(&[2, 128]));
         let w = module.param("w", f32_shape(&[128, 128]));
-        let y = module.dequant_matmul(
-            x,
-            w,
-            None,
-            None,
-            QuantScheme::GgufQ4K,
-            f32_shape(&[2, 128]),
-        );
+        let y = module.dequant_matmul(x, w, None, None, QuantScheme::GgufQ4K, f32_shape(&[2, 128]));
         module.set_outputs(vec![y]);
         assert_eq!(module.stage(), GraphStage::Hir);
 

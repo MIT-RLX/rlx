@@ -17,7 +17,7 @@
 use crate::core::{Camera, GaussianScene, OUTPUT_GAMMA};
 
 use super::{
-    build_tile_key_value_pairs, build_tile_ranges, project_splats, sort_key_values, RenderParams,
+    RenderParams, build_tile_key_value_pairs, build_tile_ranges, project_splats, sort_key_values,
 };
 
 /// Uniform / constant params for the per-pixel raster kernel (all backends).

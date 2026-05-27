@@ -163,6 +163,7 @@ impl MlxExecutable {
     /// run). Useful when callers want to pay the trace cost up front.
     /// No-op for non-Compiled modes.
     pub fn warm_compile(&mut self) -> Result<(), MlxError> {
+        let _guard = crate::sync::runtime_guard();
         if self.mode != MlxMode::Compiled || self.compiled.is_some() {
             return Ok(());
         }
@@ -195,7 +196,8 @@ impl MlxExecutable {
     /// each output's native dtype. Combines with `set_param_typed`
     /// for a true zero-widen path through the backend.
     pub fn run_typed(&mut self, inputs: &[(&str, &[u8], DType)]) -> Vec<(Vec<u8>, DType)> {
-        self.sync_pending();
+        let _guard = crate::sync::runtime_guard();
+        self.sync_pending_inner();
 
         // Stash typed inputs so run_compiled / lower_and_run_typed
         // can read them. Cleared at the end so the executable doesn't
@@ -287,7 +289,8 @@ impl MlxExecutable {
     /// them via `arena_ptr().add(offset)` without per-output
     /// allocations.
     pub fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
-        self.sync_pending();
+        let _guard = crate::sync::runtime_guard();
+        self.sync_pending_inner();
 
         // Build a name→data map by zipping positional inputs against
         // the captured input_names. Anything beyond what was supplied
@@ -344,8 +347,9 @@ impl MlxExecutable {
     }
 
     pub fn commit_no_wait(&mut self, inputs: &[(&str, &[f32])]) {
+        let _guard = crate::sync::runtime_guard();
         // Drain any prior in-flight work so we don't accumulate.
-        self.sync_pending();
+        self.sync_pending_inner();
         let mut input_map: HashMap<String, Vec<f32>> = self.handles.clone();
         for &(name, data) in inputs {
             input_map.insert(name.to_string(), data.to_vec());
@@ -382,6 +386,11 @@ impl MlxExecutable {
     }
 
     pub fn sync_pending(&mut self) {
+        let _guard = crate::sync::runtime_guard();
+        self.sync_pending_inner();
+    }
+
+    fn sync_pending_inner(&mut self) {
         if self.pending.is_empty() {
             return;
         }
@@ -457,13 +466,12 @@ impl MlxExecutable {
         for node in self.graph.nodes() {
             if let rlx_ir::Op::Input { name: n } = &node.op {
                 if n == name {
-                    return Ok(
-                        node.shape
-                            .dims()
-                            .iter()
-                            .map(|d| d.unwrap_static())
-                            .collect(),
-                    );
+                    return Ok(node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect());
                 }
             }
         }
@@ -480,15 +488,16 @@ impl MlxExecutable {
         Ok(())
     }
 
-    fn run_internal(&mut self, inputs: &[(&str, &[f32])], readback_outputs: bool) -> Result<Vec<Vec<f32>>, MlxError> {
-        self.sync_pending();
+    fn run_internal(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        readback_outputs: bool,
+    ) -> Result<Vec<Vec<f32>>, MlxError> {
+        let _guard = crate::sync::runtime_guard();
+        self.sync_pending_inner();
         let mut input_map: HashMap<String, Vec<f32>> = self.handles.clone();
         for &(name, data) in inputs {
-            if !self.gpu_handles.contains_key(name) {
-                input_map.insert(name.to_string(), data.to_vec());
-            } else {
-                input_map.insert(name.to_string(), data.to_vec());
-            }
+            input_map.insert(name.to_string(), data.to_vec());
         }
 
         let outs = if self.mode == MlxMode::Compiled {

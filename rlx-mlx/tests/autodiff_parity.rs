@@ -398,10 +398,7 @@ fn attention_backward_query_matches_reference() {
     );
 
     let got = run(g, &[("q", &qv), ("k", &kv), ("v", &vv), ("dy", &dyv)]);
-    assert!(
-        close(&got, &want, 2e-3),
-        "AttentionBackward Query: max err"
-    );
+    assert!(close(&got, &want, 2e-3), "AttentionBackward Query: max err");
 }
 
 #[test]
@@ -437,7 +434,10 @@ fn rms_norm_backward_input_matches_reference() {
             eps,
         );
     }
-    let got = run(g, &[("x", &xs), ("gamma", &gs), ("beta", &bs), ("dy", &dys)]);
+    let got = run(
+        g,
+        &[("x", &xs), ("gamma", &gs), ("beta", &bs), ("dy", &dys)],
+    );
     assert!(
         close(&got, &want, 5e-5),
         "RmsNormBackwardInput: got {got:?} want {want:?}"
@@ -477,7 +477,10 @@ fn rms_norm_backward_gamma_matches_reference() {
             eps,
         );
     }
-    let got = run(g, &[("x", &xs), ("gamma", &gs), ("beta", &bs), ("dy", &dys)]);
+    let got = run(
+        g,
+        &[("x", &xs), ("gamma", &gs), ("beta", &bs), ("dy", &dys)],
+    );
     assert!(close(&got, &want, 5e-4), "RmsNormBackwardGamma");
 }
 
@@ -514,7 +517,10 @@ fn rms_norm_backward_beta_matches_reference() {
             eps,
         );
     }
-    let got = run(g, &[("x", &xs), ("gamma", &gs), ("beta", &bs), ("dy", &dys)]);
+    let got = run(
+        g,
+        &[("x", &xs), ("gamma", &gs), ("beta", &bs), ("dy", &dys)],
+    );
     assert!(close(&got, &want, 5e-4), "RmsNormBackwardBeta");
 }
 
@@ -598,7 +604,10 @@ fn group_norm_backward_input_matches_reference() {
     rlx_cpu::training_bwd::group_norm_backward_input_nchw(
         &xv, &gv, &dys, &mut want, n, c, h, w, 2, eps,
     );
-    let got = run(g, &[("x", &xv), ("gamma", &gv), ("beta", &bv), ("dy", &dys)]);
+    let got = run(
+        g,
+        &[("x", &xv), ("gamma", &gv), ("beta", &bv), ("dy", &dys)],
+    );
     assert!(close(&got, &want, 5e-3), "GroupNormBackwardInput");
 }
 

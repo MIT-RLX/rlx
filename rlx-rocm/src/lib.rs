@@ -22,8 +22,8 @@
 // signal warnings.
 //!
 //! Sister crate to `rlx-cuda`. The CUDA C++ kernel sources in
-//! `rlx-cuda/src/kernels/*.cu` are HIP-compatible — we reuse them
-//! verbatim through `include_str!` (no copying). The dispatch
+//! Kernel sources live in `rlx-gpu-kernels` (CUDA/HIP-compatible `.cu`
+//! files). The dispatch
 //! ladder mirrors `rlx-cuda`'s: hipBLASLt → hipBLAS → MIOpen-conv
 //! → custom kernels via hipRTC, falling through on any setup error.
 //!
@@ -41,19 +41,19 @@ pub mod arena;
 pub mod backend;
 pub mod device;
 pub mod gdn_host;
-pub mod llada2_gate_host;
 pub mod gguf_host;
-pub mod splat_host;
-#[cfg(feature = "native-splat")]
-pub mod splat_native;
-pub mod training_bwd_host;
 pub mod hip;
 pub mod hipblas;
 pub mod hipblaslt;
 pub mod kernels;
 pub mod launch;
+pub mod llada2_gate_host;
 pub mod miopen;
 pub mod roctx;
+pub mod splat_host;
+#[cfg(feature = "native-splat")]
+pub mod splat_native;
+pub mod training_bwd_host;
 pub mod unfuse;
 
 // Dev-only HIP-CPU validation FFI. Bindings are reused verbatim from

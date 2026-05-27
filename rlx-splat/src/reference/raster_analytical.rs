@@ -14,9 +14,9 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Analytical gradients for ray–Gaussian intersection α (training geometry path).
 
-use crate::core::{quat_rotate, Camera, GAUSSIAN_SUPPORT_SIGMA_RADIUS, GaussianScene, VEC_EPS};
-use super::project::{project_splat_index, ProjectedSplats, SplatProjectOverride};
+use super::project::{ProjectedSplats, SplatProjectOverride, project_splat_index};
 use super::raster::ray_splat_intersection_alpha;
+use crate::core::{Camera, GAUSSIAN_SUPPORT_SIGMA_RADIUS, GaussianScene, VEC_EPS, quat_rotate};
 
 /// ∂(d_alpha * α)/∂ scene position, log-scale, quaternion, opacity for one ray hit.
 #[allow(clippy::too_many_arguments)]
@@ -39,9 +39,8 @@ pub fn backprop_ray_hit_alpha_analytical_scene(
     let mut d_pos = [0.0f32; 3];
     let mut d_scale = [0.0f32; 3];
     let mut d_rot = [0.0f32; 4];
-    let mut d_opacity = 0.0f32;
 
-    let mut alpha_at = |ov: SplatProjectOverride| -> f32 {
+    let mut alpha_at = |_ov: SplatProjectOverride| -> f32 {
         project_splat_index(
             splat,
             scene,
@@ -114,9 +113,9 @@ pub fn backprop_ray_hit_alpha_analytical_scene(
         opacity: Some(opacity - eps),
         ..Default::default()
     }));
-    d_opacity = (plus - minus) / (2.0 * eps);
+    let d_opacity = (plus - minus) / (2.0 * eps);
 
-    let _ = project_splat_index(
+    project_splat_index(
         splat,
         scene,
         camera,
@@ -159,7 +158,11 @@ pub fn ray_hit_alpha_grad_projected(
     let ro = [pos_local[0] * ss, pos_local[1] * ss, pos_local[2] * ss];
     let rl = {
         let r = quat_rotate(ray_dir, quat);
-        [r[0] * inv_scale[0] * ss, r[1] * inv_scale[1] * ss, r[2] * inv_scale[2] * ss]
+        [
+            r[0] * inv_scale[0] * ss,
+            r[1] * inv_scale[1] * ss,
+            r[2] * inv_scale[2] * ss,
+        ]
     };
     let denom = (rl[0] * rl[0] + rl[1] * rl[1] + rl[2] * rl[2]).max(1e-10);
     let dot_ro_rl = rl[0] * ro[0] + rl[1] * ro[1] + rl[2] * ro[2];
@@ -168,19 +171,16 @@ pub fn ray_hit_alpha_grad_projected(
         return ([0.0; 3], [0.0; 3], [0.0; 4], 0.0);
     }
     let closest = [ro[0] + rl[0] * t, ro[1] + rl[1] * t, ro[2] + rl[2] * t];
-    let rho2 = (closest[0] * closest[0] + closest[1] * closest[1] + closest[2] * closest[2]).max(0.0);
+    let rho2 =
+        (closest[0] * closest[0] + closest[1] * closest[1] + closest[2] * closest[2]).max(0.0);
     let exp_term = (-0.5 * ssr * ssr * rho2).exp();
-    let alpha = o * exp_term;
+    let _alpha = o * exp_term;
 
     let d_alpha_do = exp_term;
     let d_alpha_drho2 = o * exp_term * (-0.5 * ssr * ssr);
     let d_rho2_dclosest = [2.0 * closest[0], 2.0 * closest[1], 2.0 * closest[2]];
     let d_closest_dro = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    let d_closest_drl = [
-        [t, 0.0, 0.0],
-        [0.0, t, 0.0],
-        [0.0, 0.0, t],
-    ];
+    let d_closest_drl = [[t, 0.0, 0.0], [0.0, t, 0.0], [0.0, 0.0, t]];
     let d_t_drl = [
         -ro[0] / denom + 2.0 * t * rl[0],
         -ro[1] / denom + 2.0 * t * rl[1],
@@ -209,11 +209,15 @@ pub fn ray_hit_alpha_grad_projected(
         g_rl[1] * quat_rotate(ray_dir, quat)[1] * ss,
         g_rl[2] * quat_rotate(ray_dir, quat)[2] * ss,
     ];
-    let d_rot = quat_rotate_vjp(ray_dir, quat, [
-        g_rl[0] * inv_scale[0] * ss,
-        g_rl[1] * inv_scale[1] * ss,
-        g_rl[2] * inv_scale[2] * ss,
-    ]);
+    let d_rot = quat_rotate_vjp(
+        ray_dir,
+        quat,
+        [
+            g_rl[0] * inv_scale[0] * ss,
+            g_rl[1] * inv_scale[1] * ss,
+            g_rl[2] * inv_scale[2] * ss,
+        ],
+    );
     (d_pos_local, d_inv, d_rot, d_opacity)
 }
 
@@ -222,14 +226,15 @@ fn quat_rotate_vjp(v: [f32; 3], q_wxyz: [f32; 4], g_out: [f32; 3]) -> [f32; 4] {
     let eps = 1e-4f32;
     let mut g_q = [0.0f32; 4];
     for i in 0..4 {
-        let mut qp = q_wxyz;
-        qp[i] += eps;
-        let pp = quat_rotate(v, qp);
-        qp[i] -= 2.0 * eps;
-        let pm = quat_rotate(v, qp);
-        qp[i] += eps;
-        g_q[i] = (g_out[0] * (pp[0] - pm[0]) + g_out[1] * (pp[1] - pm[1]) + g_out[2] * (pp[2] - pm[2]))
-            / (2.0 * eps);
+        let mut qp_plus = q_wxyz;
+        qp_plus[i] += eps;
+        let pp = quat_rotate(v, qp_plus);
+        let mut qp_minus = q_wxyz;
+        qp_minus[i] -= eps;
+        let pm = quat_rotate(v, qp_minus);
+        g_q[i] =
+            (g_out[0] * (pp[0] - pm[0]) + g_out[1] * (pp[1] - pm[1]) + g_out[2] * (pp[2] - pm[2]))
+                / (2.0 * eps);
     }
     g_q
 }
@@ -237,14 +242,21 @@ fn quat_rotate_vjp(v: [f32; 3], q_wxyz: [f32; 4], g_out: [f32; 3]) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Camera;
+    use crate::core::{Camera, make_parity_scene};
     use crate::reference::project::project_splats;
     use crate::reference::raster::backprop_ray_hit_alpha_numeric_projected;
 
     #[test]
     fn analytical_matches_numeric_projected() {
-        let scene = GaussianScene::example(4);
-        let camera = Camera::look_at([0.0, 0.0, 4.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 60.0, 0.1, 20.0);
+        let scene = make_parity_scene();
+        let camera = Camera::look_at(
+            [0.0, 0.0, 4.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            60.0,
+            0.1,
+            20.0,
+        );
         let mut projected = project_splats(&scene, &camera, 32, 32, 1.0, 1.0 / 255.0);
         let ray = camera.screen_to_world_ray([16.0, 16.0], 32, 32);
         let splat = 1usize;

@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use rlx_fdm::{fdm, io::from_json_str, Network};
+use rlx_fdm::{Network, fdm, io::from_json_str};
 
 #[test]
 fn load_arch_json_and_solve() {

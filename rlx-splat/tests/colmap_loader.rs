@@ -17,8 +17,7 @@
 use std::io::Write;
 
 use rlx_splat::io_format::{
-    build_training_frames_from_root, initialize_scene_from_colmap_points,
-    load_colmap_reconstruction, resolve_colmap_init_hparams,
+    initialize_scene_from_colmap_points, load_colmap_reconstruction, resolve_colmap_init_hparams,
     suggest_colmap_init_hparams,
 };
 use tempfile::tempdir;
@@ -55,11 +54,11 @@ fn write_points3d_bin(path: &std::path::Path) {
     let mut file = std::fs::File::create(path).unwrap();
     file.write_all(&2u64.to_le_bytes()).unwrap();
     for (point_id, xyz, rgb) in [
-        (11u64, (1.0, 2.0, 3.0), (255u8, 128, 64)),
-        (12, (-1.0, 0.0, 2.0), (12, 34, 56)),
+        (11u64, (1.0_f64, 2.0, 3.0), (255u8, 128, 64)),
+        (12, (-1.0_f64, 0.0, 2.0), (12, 34, 56)),
     ] {
         file.write_all(&point_id.to_le_bytes()).unwrap();
-        for v in [xyz.0 as f64, xyz.1 as f64, xyz.2 as f64] {
+        for v in [xyz.0, xyz.1, xyz.2] {
             file.write_all(&v.to_le_bytes()).unwrap();
         }
         file.write_all(&[rgb.0, rgb.1, rgb.2]).unwrap();

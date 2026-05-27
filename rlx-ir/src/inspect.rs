@@ -252,9 +252,7 @@ pub fn inspect_buffer_plan(plan: &LirBufferPlan) -> String {
         let view = plan
             .view_aliases
             .get(&id)
-            .map(|LirViewAlias { root, byte_offset }| {
-                format!(" view→{root}+{byte_offset}")
-            })
+            .map(|LirViewAlias { root, byte_offset }| format!(" view→{root}+{byte_offset}"))
             .unwrap_or_default();
         let phase = plan
             .phases
@@ -297,10 +295,7 @@ fn hir_op_kinds_line(hir: &HirModule) -> String {
     for node in hir.nodes() {
         *hist.entry(hir_op_kind(&node.op)).or_insert(0) += 1;
     }
-    let parts: Vec<String> = hist
-        .into_iter()
-        .map(|(k, c)| format!("{k}={c}"))
-        .collect();
+    let parts: Vec<String> = hist.into_iter().map(|(k, c)| format!("{k}={c}")).collect();
     format!("  block ops: {}", parts.join(", "))
 }
 
@@ -398,9 +393,7 @@ fn format_hir_op(op: &HirOp) -> String {
             head_dim,
             mtp_vocab,
             ..
-        } => format!(
-            "qwen35_mtp_head(heads={num_heads}, dim={head_dim}, vocab={mtp_vocab})"
-        ),
+        } => format!("qwen35_mtp_head(heads={num_heads}, dim={head_dim}, vocab={mtp_vocab})"),
         HirOp::Mir(inner) => format!("mir({inner})"),
     }
 }
@@ -504,9 +497,15 @@ mod tests {
         let mir = hir.lower_to_mir().expect("lower");
         let plan = LirBufferPlan {
             arena_size: 16,
-            assignments: [(NodeId(0), LirBufferSlot { offset: 0, size: 16 })]
-                .into_iter()
-                .collect(),
+            assignments: [(
+                NodeId(0),
+                LirBufferSlot {
+                    offset: 0,
+                    size: 16,
+                },
+            )]
+            .into_iter()
+            .collect(),
             schedule: vec![NodeId(0)],
             io: LirIoManifest {
                 inputs: vec![("x".into(), NodeId(0))],

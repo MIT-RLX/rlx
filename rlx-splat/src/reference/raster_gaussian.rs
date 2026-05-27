@@ -15,8 +15,8 @@
 //! Cached raster Gaussian layout (`RasterGaussian` / 13 floats per splat).
 
 use crate::core::{
-    evaluate_sh0_sh1, quat_rotate, resolve_supported_sh_coeffs, Camera, GaussianScene,
-    GAUSSIAN_SUPPORT_SIGMA_RADIUS, VEC_EPS,
+    Camera, GAUSSIAN_SUPPORT_SIGMA_RADIUS, GaussianScene, VEC_EPS, evaluate_sh0_sh1, quat_rotate,
+    resolve_supported_sh_coeffs,
 };
 
 use crate::core::RASTER_CACHE_PARAM_COUNT;
@@ -190,7 +190,6 @@ pub fn backprop_build_raster_gaussian(
     let mut d_pos = [0.0f32; 3];
     let mut d_scale = [0.0f32; 3];
     let mut d_rot = [0.0f32; 4];
-    let mut d_raw_opacity = 0.0f32;
 
     let base = build_raster_gaussian(scene, splat, camera, radius_scale, max_anisotropy, sh_band);
     let loss = |g: &CachedRasterGaussian| -> f32 {
@@ -213,27 +212,33 @@ pub fn backprop_build_raster_gaussian(
     for axis in 0..3 {
         let idx = splat * 3 + axis;
         temp.positions[idx] += eps;
-        let plus = build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
+        let plus =
+            build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
         temp.positions[idx] -= 2.0 * eps;
-        let minus = build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
+        let minus =
+            build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
         temp.positions[idx] += eps;
         d_pos[axis] = (loss(&plus) - loss(&minus)) / (2.0 * eps);
     }
     for axis in 0..3 {
         let idx = splat * 3 + axis;
         temp.scales[idx] += eps;
-        let plus = build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
+        let plus =
+            build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
         temp.scales[idx] -= 2.0 * eps;
-        let minus = build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
+        let minus =
+            build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
         temp.scales[idx] += eps;
         d_scale[axis] = (loss(&plus) - loss(&minus)) / (2.0 * eps);
     }
     for axis in 0..4 {
         let idx = splat * 4 + axis;
         temp.rotations[idx] += eps;
-        let plus = build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
+        let plus =
+            build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
         temp.rotations[idx] -= 2.0 * eps;
-        let minus = build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
+        let minus =
+            build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
         temp.rotations[idx] += eps;
         d_rot[axis] = (loss(&plus) - loss(&minus)) / (2.0 * eps);
     }
@@ -241,7 +246,7 @@ pub fn backprop_build_raster_gaussian(
     let plus = build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
     temp.opacities[splat] -= 2.0 * eps;
     let minus = build_raster_gaussian(&temp, splat, camera, radius_scale, max_anisotropy, sh_band);
-    d_raw_opacity = (loss(&plus) - loss(&minus)) / (2.0 * eps);
+    let d_raw_opacity = (loss(&plus) - loss(&minus)) / (2.0 * eps);
 
     (d_pos, d_scale, d_rot, d_raw_opacity)
 }

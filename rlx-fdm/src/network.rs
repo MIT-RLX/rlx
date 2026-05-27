@@ -78,11 +78,7 @@ impl Network {
 
     /// Node coordinate slice.
     pub fn node_xyz(&self, i: usize) -> Vec3 {
-        [
-            self.xyz[3 * i],
-            self.xyz[3 * i + 1],
-            self.xyz[3 * i + 2],
-        ]
+        [self.xyz[3 * i], self.xyz[3 * i + 1], self.xyz[3 * i + 2]]
     }
 
     pub fn set_node_xyz(&mut self, i: usize, p: Vec3) {
@@ -192,7 +188,7 @@ impl Network {
         if !self.is_support.iter().any(|&s| s) {
             return Err("network has no supports".into());
         }
-        if self.q.iter().any(|&qi| qi == 0.0) {
+        if self.q.contains(&0.0) {
             return Err("network has edges with zero force density".into());
         }
         if self.xyz.len() != n * 3 || self.loads.len() != n * 3 {

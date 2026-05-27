@@ -13,8 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 use crate::core::{
-    ALPHA_CUTOFF_DEFAULT, Camera, ELLIPSE_EPS, ELLIPSE_RADIUS_PAD_PX, GAUSSIAN_SUPPORT_SIGMA_RADIUS,
-    GaussianScene, quat_conj, quat_rotate,
+    ALPHA_CUTOFF_DEFAULT, Camera, ELLIPSE_EPS, ELLIPSE_RADIUS_PAD_PX,
+    GAUSSIAN_SUPPORT_SIGMA_RADIUS, GaussianScene, quat_conj, quat_rotate,
 };
 use crate::core::{evaluate_sh0_sh1, resolve_supported_sh_coeffs};
 
@@ -52,15 +52,15 @@ fn solve_conic_renorm(points: &[[f32; 2]; 5], eps: f64) -> Option<[f32; 5]> {
         uv[i][0] = (points[2 + i][0] as f64 - offset_x) * inv_sx;
         uv[i][1] = (points[2 + i][1] as f64 - offset_y) * inv_sy;
     }
-    let mut m00 = uv[0][0] * uv[0][0] - uv[0][0];
+    let m00 = uv[0][0] * uv[0][0] - uv[0][0];
     let mut m01 = 2.0 * uv[0][0] * uv[0][1];
     let mut m02 = uv[0][1] * uv[0][1] - uv[0][1];
     let mut r0 = uv[0][0] + uv[0][1] - 1.0;
-    let mut m10 = uv[1][0] * uv[1][0] - uv[1][0];
+    let m10 = uv[1][0] * uv[1][0] - uv[1][0];
     let mut m11 = 2.0 * uv[1][0] * uv[1][1];
     let mut m12 = uv[1][1] * uv[1][1] - uv[1][1];
     let mut r1 = uv[1][0] + uv[1][1] - 1.0;
-    let mut m20 = uv[2][0] * uv[2][0] - uv[2][0];
+    let m20 = uv[2][0] * uv[2][0] - uv[2][0];
     let mut m21 = 2.0 * uv[2][0] * uv[2][1];
     let mut m22 = uv[2][1] * uv[2][1] - uv[2][1];
     let mut r2 = uv[2][0] + uv[2][1] - 1.0;
@@ -155,9 +155,8 @@ fn support_sphere_intersects_view_frustum(
         [0.0, -fy, h - cy],
     ];
     for plane in planes {
-        let dot = plane[0] * camera_center[0]
-            + plane[1] * camera_center[1]
-            + plane[2] * camera_center[2];
+        let dot =
+            plane[0] * camera_center[0] + plane[1] * camera_center[1] + plane[2] * camera_center[2];
         let norm = (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
         if dot < -support_radius * norm {
             return false;
@@ -226,8 +225,9 @@ fn compute_outline_ellipse(
         view_dir_local[1] / view_distance,
         view_dir_local[2] / view_distance,
     ];
-    let tangent_circle_radius =
-        (1.0 - 1.0 / (view_distance * view_distance)).max(0.0).sqrt();
+    let tangent_circle_radius = (1.0 - 1.0 / (view_distance * view_distance))
+        .max(0.0)
+        .sqrt();
     let tangent_axis = if view_dir_local[2].abs() < 0.999 {
         [0.0, 0.0, 1.0]
     } else {
@@ -267,11 +267,14 @@ fn compute_outline_ellipse(
         let theta = 2.0 * std::f32::consts::PI * index as f32 / 5.0;
         let local_point = [
             tangent_circle_center[0]
-                + tangent_circle_radius * (theta.cos() * tangent_basis_u[0] + theta.sin() * tangent_basis_v[0]),
+                + tangent_circle_radius
+                    * (theta.cos() * tangent_basis_u[0] + theta.sin() * tangent_basis_v[0]),
             tangent_circle_center[1]
-                + tangent_circle_radius * (theta.cos() * tangent_basis_u[1] + theta.sin() * tangent_basis_v[1]),
+                + tangent_circle_radius
+                    * (theta.cos() * tangent_basis_u[1] + theta.sin() * tangent_basis_v[1]),
             tangent_circle_center[2]
-                + tangent_circle_radius * (theta.cos() * tangent_basis_u[2] + theta.sin() * tangent_basis_v[2]),
+                + tangent_circle_radius
+                    * (theta.cos() * tangent_basis_u[2] + theta.sin() * tangent_basis_v[2]),
         ];
         let scaled = [
             local_point[0] * scale[0],
@@ -343,7 +346,8 @@ fn compute_outline_ellipse(
         conic_norm[0] * ellipse_center[0] + conic_norm[1] * ellipse_center[1],
         conic_norm[1] * ellipse_center[0] + conic_norm[2] * ellipse_center[1],
     ];
-    let center_scale = 1.0 + ellipse_center[0] * center_times_a[0] + ellipse_center[1] * center_times_a[1];
+    let center_scale =
+        1.0 + ellipse_center[0] * center_times_a[0] + ellipse_center[1] * center_times_a[1];
     if center_scale <= ELLIPSE_EPS as f64 {
         return None;
     }
@@ -354,7 +358,9 @@ fn compute_outline_ellipse(
     ];
     let trace = conic_norm[0] + conic_norm[2];
     det_a = conic_norm[0] * conic_norm[2] - conic_norm[1] * conic_norm[1];
-    if det_a <= ELLIPSE_EPS as f64 || conic_norm[0] <= ELLIPSE_EPS as f64 || conic_norm[2] <= ELLIPSE_EPS as f64
+    if det_a <= ELLIPSE_EPS as f64
+        || conic_norm[0] <= ELLIPSE_EPS as f64
+        || conic_norm[2] <= ELLIPSE_EPS as f64
     {
         return None;
     }
@@ -365,8 +371,8 @@ fn compute_outline_ellipse(
         bbox_center[0] + ellipse_center[0] as f32 * bbox_half_extent[0],
         bbox_center[1] + ellipse_center[1] as f32 * bbox_half_extent[1],
     ];
-    let radius_px = (axis0 * bbox_half_extent[0] as f64)
-        .max(axis1 * bbox_half_extent[1] as f64) as f32;
+    let radius_px =
+        (axis0 * bbox_half_extent[0] as f64).max(axis1 * bbox_half_extent[1] as f64) as f32;
     let conic = [
         (conic_norm[0]
             / (bbox_half_extent[0] as f64 * bbox_half_extent[0] as f64).max(ELLIPSE_EPS as f64))
@@ -454,8 +460,9 @@ pub fn project_splat_index(
     if opacity < alpha_cutoff {
         return;
     }
-    let support_sigma_radius =
-        (-2.0 * (alpha_cutoff / opacity.max(alpha_cutoff)).ln()).max(0.0).sqrt();
+    let support_sigma_radius = (-2.0 * (alpha_cutoff / opacity.max(alpha_cutoff)).ln())
+        .max(0.0)
+        .sqrt();
     let outline_scale = [
         (sigma[0].exp() * radius_scale * support_sigma_radius).max(1e-6),
         (sigma[1].exp() * radius_scale * support_sigma_radius).max(1e-6),
@@ -511,12 +518,8 @@ pub fn project_splats(
         view_dirs[i * 3 + 1] = camera.position[1] - pos[1];
         view_dirs[i * 3 + 2] = camera.position[2] - pos[2];
     }
-    let resolved_sh = resolve_supported_sh_coeffs(
-        &scene.sh_coeffs,
-        &scene.colors,
-        count,
-        scene.sh_coeff_count,
-    );
+    let resolved_sh =
+        resolve_supported_sh_coeffs(&scene.sh_coeffs, &scene.colors, count, scene.sh_coeff_count);
     let colors = evaluate_sh0_sh1(&resolved_sh, &view_dirs, count);
     let mut color_alpha = vec![0.0f32; count * 4];
     for i in 0..count {
@@ -561,6 +564,7 @@ pub fn project_splats(
     }
 }
 
+#[allow(dead_code)]
 pub fn default_alpha_cutoff() -> f32 {
     ALPHA_CUTOFF_DEFAULT
 }

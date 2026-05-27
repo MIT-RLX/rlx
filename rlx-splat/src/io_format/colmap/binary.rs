@@ -45,12 +45,28 @@ pub fn camera_intrinsics(
     params: &[f64],
 ) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
     match model_id {
-        COLMAP_SIMPLE_PINHOLE_MODEL_ID => (params[0], params[0], params[1], params[2], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-        COLMAP_PINHOLE_MODEL_ID => (params[0], params[1], params[2], params[3], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-        COLMAP_SIMPLE_RADIAL_MODEL_ID => (params[0], params[0], params[1], params[2], params[3], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-        COLMAP_RADIAL_MODEL_ID => (params[0], params[0], params[1], params[2], params[3], params[4], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-        COLMAP_OPENCV_MODEL_ID => (params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7], 0.0, 0.0, 0.0, 0.0),
-        COLMAP_FULL_OPENCV_MODEL_ID => (params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7], params[8], params[9], params[10], params[11]),
+        COLMAP_SIMPLE_PINHOLE_MODEL_ID => (
+            params[0], params[0], params[1], params[2], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ),
+        COLMAP_PINHOLE_MODEL_ID => (
+            params[0], params[1], params[2], params[3], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ),
+        COLMAP_SIMPLE_RADIAL_MODEL_ID => (
+            params[0], params[0], params[1], params[2], params[3], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0,
+        ),
+        COLMAP_RADIAL_MODEL_ID => (
+            params[0], params[0], params[1], params[2], params[3], params[4], 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0,
+        ),
+        COLMAP_OPENCV_MODEL_ID => (
+            params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7],
+            0.0, 0.0, 0.0, 0.0,
+        ),
+        COLMAP_FULL_OPENCV_MODEL_ID => (
+            params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7],
+            params[8], params[9], params[10], params[11],
+        ),
         _ => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     }
 }

@@ -91,6 +91,21 @@ pub fn verify(graph: &Graph) -> Vec<VerifyError> {
     errors
 }
 
+/// True when `declared` and `inferred` describe the same logical tensor.
+fn shapes_compatible(declared: &crate::Shape, inferred: &crate::Shape) -> bool {
+    if declared == inferred {
+        return true;
+    }
+    if declared.dtype() != inferred.dtype() {
+        return false;
+    }
+    // Scalar conventions: rank-0 `[]` and rank-1 `[1]` both mean one element.
+    matches!(
+        (declared.num_elements(), inferred.num_elements()),
+        (Some(1), Some(1))
+    )
+}
+
 /// Re-derive output shapes from inputs and diff against declared shapes.
 pub fn verify_shapes(graph: &Graph) -> Vec<VerifyError> {
     let mut errors = Vec::new();
@@ -98,7 +113,7 @@ pub fn verify_shapes(graph: &Graph) -> Vec<VerifyError> {
         let Some(expected) = infer_shape::infer_output_shape(graph, node) else {
             continue;
         };
-        if expected != node.shape {
+        if !shapes_compatible(&node.shape, &expected) {
             errors.push(VerifyError {
                 node: Some(node.id),
                 message: format!(
@@ -155,6 +170,26 @@ mod tests {
         let errs = verify_shapes(&g);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].message.contains("shape mismatch"));
+    }
+
+    #[test]
+    fn scalar_rank0_and_rank1_are_compatible() {
+        let mut g = Graph::new("scalar");
+        let x = g.input("x", Shape::new(&[3], DType::F32));
+        let loss = g.add_node(
+            Op::Reduce {
+                op: crate::op::ReduceOp::Sum,
+                axes: vec![0],
+                keep_dim: false,
+            },
+            vec![x],
+            Shape::new(&[1], DType::F32),
+        );
+        g.set_outputs(vec![loss]);
+        assert!(
+            verify_shapes(&g).is_empty(),
+            "[] inferred vs [1] declared should match for a scalar"
+        );
     }
 
     #[test]

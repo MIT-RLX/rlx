@@ -14,7 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Arch chain equilibrium (jax_fdm `examples/arch/arch.py` setup).
 
-use rlx_fdm::{fdm, goals, Network};
+use rlx_fdm::{Network, fdm, goals};
 
 #[test]
 fn arch_chain_sags_and_equilibrates() {
@@ -22,7 +22,11 @@ fn arch_chain_sags_and_equilibrates() {
     let eq = fdm(&net).expect("fdm");
 
     // Interior free nodes move down under gravity-like load.
-    assert!(eq.xyz[3 * 5 + 2] < -0.01, "mid-span should sag, z={}", eq.xyz[3 * 5 + 2]);
+    assert!(
+        eq.xyz[3 * 5 + 2] < -0.01,
+        "mid-span should sag, z={}",
+        eq.xyz[3 * 5 + 2]
+    );
 
     let r = eq.max_free_residual_norm(&net.is_support);
     assert!(r < 1e-8, "free-node residual {r}");

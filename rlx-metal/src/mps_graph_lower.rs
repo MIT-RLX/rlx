@@ -324,9 +324,7 @@ pub fn try_lower_with_constants(
                             steps: &[MpsTensor]|
                  -> Option<MpsTensor> {
                     match op {
-                        ChainOperand::Input(i) => {
-                            Some(copy_tensor(inputs_t.get(i as usize)?))
-                        }
+                        ChainOperand::Input(i) => Some(copy_tensor(inputs_t.get(i as usize)?)),
                         ChainOperand::Step(i) => Some(copy_tensor(steps.get(i as usize)?)),
                     }
                 };
@@ -410,16 +408,9 @@ pub fn try_lower_with_constants(
                 let k_shape = shape_dims(graph, node.inputs[1])?;
                 let kv_seq = k_shape[1];
                 match mask_kind {
-                    rlx_ir::op::MaskKind::None => mg.attention_unmasked(
-                        q,
-                        k,
-                        v,
-                        b,
-                        s,
-                        kv_seq,
-                        *num_heads,
-                        *head_dim,
-                    ),
+                    rlx_ir::op::MaskKind::None => {
+                        mg.attention_unmasked(q, k, v, b, s, kv_seq, *num_heads, *head_dim)
+                    }
                     rlx_ir::op::MaskKind::Causal => {
                         mg.attention_causal(q, k, v, b, s, *num_heads, *head_dim)
                     }

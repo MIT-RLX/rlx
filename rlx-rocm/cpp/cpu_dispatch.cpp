@@ -17,9 +17,7 @@
 //
 // Compiled only when `cargo build --features hip-cpu-validate`.
 //
-// The .cu kernel sources are shared with rlx-cuda (rlx-rocm's
-// `kernels::sources` module pulls them in via relative `include_str!`
-// from `rlx-cuda/src/kernels/`). Rather than duplicate the 358-line
+// Kernel sources live in `rlx-gpu-kernels/kernels/`. Rather than duplicate the 358-line
 // `launch_<kernel>` wrapper layer here, we just pull in rlx-cuda's
 // `cpu_dispatch.cpp` directly. The wrappers it defines compile into
 // `rlx_rocm_cpu_dispatch.a` exactly the same way they compile into

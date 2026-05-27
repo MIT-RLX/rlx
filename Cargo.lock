@@ -1696,13 +1696,8 @@ dependencies = [
 name = "rlx-autodiff"
 version = "0.2.0"
 dependencies = [
- "rlx-compile",
- "rlx-cpu",
  "rlx-fusion",
  "rlx-ir",
- "rlx-opt",
- "rlx-runtime",
- "rlx-wgpu",
 ]
 
 [[package]]
@@ -1772,6 +1767,7 @@ dependencies = [
  "cc",
  "cudarc",
  "rlx-cpu",
+ "rlx-gpu-kernels",
  "rlx-ir",
  "rlx-opt",
 ]
@@ -1836,6 +1832,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-gpu-kernels"
+version = "0.2.0"
+
+[[package]]
 name = "rlx-ir"
 version = "0.2.0"
 dependencies = [
@@ -1883,15 +1883,22 @@ dependencies = [
 name = "rlx-mlx"
 version = "0.2.0"
 dependencies = [
- "cc",
- "cmake",
  "half",
  "rlx-cpu",
  "rlx-gguf",
  "rlx-ir",
+ "rlx-mlx-sys",
  "rlx-opt",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rlx-mlx-sys"
+version = "0.2.0"
+dependencies = [
+ "cc",
+ "cmake",
 ]
 
 [[package]]
@@ -1922,6 +1929,7 @@ dependencies = [
  "cc",
  "libloading 0.8.9",
  "rlx-cpu",
+ "rlx-gpu-kernels",
  "rlx-ir",
  "rlx-opt",
 ]
@@ -1930,7 +1938,10 @@ dependencies = [
 name = "rlx-runtime"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "half",
+ "rlx-autodiff",
+ "rlx-compile",
  "rlx-cpu",
  "rlx-cuda",
  "rlx-driver",
@@ -1943,6 +1954,7 @@ dependencies = [
  "rlx-opt",
  "rlx-rocm",
  "rlx-sparse",
+ "rlx-splat",
  "rlx-tpu",
  "rlx-wgpu",
  "serde",
@@ -1968,10 +1980,8 @@ dependencies = [
  "image",
  "metal",
  "rayon",
- "rlx-autodiff",
  "rlx-cpu",
  "rlx-ir",
- "rlx-runtime",
  "tempfile",
 ]
 

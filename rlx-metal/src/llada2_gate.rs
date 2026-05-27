@@ -37,7 +37,10 @@ impl MetalKernel for Llada2GateMetal {
         let sig_bytes = inputs[0].0;
         let route_bytes = inputs[1].0;
         let out_bytes = output.0;
-        if sig_bytes.len() % 4 != 0 || route_bytes.len() % 4 != 0 || out_bytes.len() % 4 != 0 {
+        if !sig_bytes.len().is_multiple_of(4)
+            || !route_bytes.len().is_multiple_of(4)
+            || !out_bytes.len().is_multiple_of(4)
+        {
             return Err("gate: non-f32-aligned buffers".into());
         }
         let sig = bytemuck::cast_slice::<u8, f32>(sig_bytes);

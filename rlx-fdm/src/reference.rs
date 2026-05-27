@@ -17,7 +17,6 @@
 
 use crate::equilibrium::{EquilibriumModel, FdmError};
 use crate::iterative::IterativeConfig;
-use crate::loads::LoadState;
 use crate::network::Network;
 use crate::state::EquilibriumState;
 use crate::structure::Structure;
@@ -61,7 +60,10 @@ pub fn fdm(network: &Network) -> Result<EquilibriumState, FdmError> {
 }
 
 /// `fdm` with sparse / nonlinear controls.
-pub fn fdm_with_options(network: &Network, options: &FdmOptions) -> Result<EquilibriumState, FdmError> {
+pub fn fdm_with_options(
+    network: &Network,
+    options: &FdmOptions,
+) -> Result<EquilibriumState, FdmError> {
     network.validate().map_err(FdmError::Validation)?;
     let structure = Structure::from_network(network);
     fdm_with_structure(network, &structure, options)

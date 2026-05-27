@@ -142,12 +142,7 @@ fn build_hlo_segment_graph(graph: &Graph, batch: &[NodeId]) -> (Graph, Vec<NodeI
                     .unwrap_or_else(|| panic!("rlx-tpu segment: missing remap for {i:?}"))
             })
             .collect();
-        let new_id = seg.append_node(
-            n.op.clone(),
-            new_inputs,
-            n.shape.clone(),
-            n.name.clone(),
-        );
+        let new_id = seg.append_node(n.op.clone(), new_inputs, n.shape.clone(), n.name.clone());
         orig_to_seg.insert(orig, new_id);
     }
 
@@ -167,8 +162,8 @@ fn build_hlo_segment_graph(graph: &Graph, batch: &[NodeId]) -> (Graph, Vec<NodeI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rlx_ir::ops::splat::GaussianSplatRenderParams;
     use rlx_ir::op::BinaryOp;
+    use rlx_ir::ops::splat::GaussianSplatRenderParams;
     use rlx_ir::{DType, Shape, ops::splat::GaussianSplatInputs};
 
     #[test]

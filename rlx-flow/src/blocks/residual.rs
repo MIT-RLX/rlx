@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
@@ -14,11 +14,7 @@ use crate::value::FlowValue;
 pub struct ResidualSaveStage;
 
 impl BlockStage for ResidualSaveStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         ctx.state.residual_skip = Some(input.id);
         ctx.state.residual_shape = Some(input.shape.clone());
         Ok(Some(input))
@@ -30,11 +26,7 @@ impl BlockStage for ResidualSaveStage {
 pub struct ResidualAddStage;
 
 impl BlockStage for ResidualAddStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let skip = ctx
             .state
             .residual_skip

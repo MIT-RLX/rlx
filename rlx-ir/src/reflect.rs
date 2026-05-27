@@ -6,13 +6,13 @@
 //! Host code can introspect unspecialized templates (Slang front-end / reflection API)
 //! and specialized layouts independently of backend codegen.
 
+use crate::Shape;
 use crate::binding_manifest::BindingManifest;
 use crate::component::ModelComponent;
 use crate::hir::{HirModule, HirNodeId, HirOp};
 use crate::lir::LirModule;
 use crate::mir::MirModule;
 use crate::shape::DimBinding;
-use crate::Shape;
 
 /// Introspection of an unspecialized [`HirModule`] (loadModule analogue).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +32,10 @@ impl HirReflection {
         let mut params = Vec::new();
         let mut block_labels = Vec::new();
         for node in hir.nodes().iter() {
-            let label = node.name.clone().unwrap_or_else(|| format!("{:?}", node.op));
+            let label = node
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", node.op));
             match &node.op {
                 HirOp::Input { name } => inputs.push((name.clone(), node.shape.clone())),
                 HirOp::Param { name } => params.push((name.clone(), node.shape.clone())),
@@ -135,7 +138,10 @@ pub struct SpecializeBlockRecord {
 }
 
 /// Probe which HIR blocks would take a given specialization (static; no MIR mutate).
-pub fn probe_block_specialization(hir: &HirModule, choice: BlockSpecialization) -> Vec<SpecializeBlockRecord> {
+pub fn probe_block_specialization(
+    hir: &HirModule,
+    choice: BlockSpecialization,
+) -> Vec<SpecializeBlockRecord> {
     hir.nodes()
         .iter()
         .filter_map(|node| {
@@ -146,14 +152,13 @@ pub fn probe_block_specialization(hir: &HirModule, choice: BlockSpecialization) 
             if !fused {
                 return None;
             }
-            let effective = match choice {
-                BlockSpecialization::Default => BlockSpecialization::Default,
-                BlockSpecialization::FusedTransformerLayer => BlockSpecialization::FusedTransformerLayer,
-                BlockSpecialization::UnfusedPrimitives => BlockSpecialization::UnfusedPrimitives,
-            };
+            let effective = choice;
             Some(SpecializeBlockRecord {
                 node: node.id,
-                label: node.name.clone().unwrap_or_else(|| format!("{:?}", node.op)),
+                label: node
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?}", node.op)),
                 choice: effective,
             })
         })

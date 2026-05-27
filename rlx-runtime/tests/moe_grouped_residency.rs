@@ -59,9 +59,6 @@ fn grouped_matmul_same_output_all_vs_partial_residency() {
 
     assert_eq!(out_all.len(), out_part.len());
     for (i, (a, b)) in out_all.iter().zip(out_part.iter()).enumerate() {
-        assert!(
-            (a - b).abs() < 1e-5,
-            "mismatch at {i}: all={a} partial={b}"
-        );
+        assert!((a - b).abs() < 1e-5, "mismatch at {i}: all={a} partial={b}");
     }
 }

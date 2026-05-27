@@ -132,7 +132,15 @@ impl SparseStiffnessFast {
     ) -> Result<Vec<f64>, FdmError> {
         let values = self.assemble(q);
         let mut x = vec![0.0; self.n];
-        pcg_solve(&values, &self.col_idx, &self.row_ptr, b, &mut x, max_iter, tol)?;
+        pcg_solve(
+            &values,
+            &self.col_idx,
+            &self.row_ptr,
+            b,
+            &mut x,
+            max_iter,
+            tol,
+        )?;
         Ok(x)
     }
 

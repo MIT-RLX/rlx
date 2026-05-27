@@ -136,14 +136,15 @@ impl RlxEnv {
     }
 
     pub fn set(mut self, key: impl AsRef<str>, value: impl Into<String>) -> Self {
-        self.pairs
-            .push((normalize_key(key.as_ref()), value.into()));
+        self.pairs.push((normalize_key(key.as_ref()), value.into()));
         self
     }
 
     pub fn flag(mut self, key: impl AsRef<str>, on: bool) -> Self {
-        self.pairs
-            .push((normalize_key(key.as_ref()), if on { "1" } else { "0" }.into()));
+        self.pairs.push((
+            normalize_key(key.as_ref()),
+            if on { "1" } else { "0" }.into(),
+        ));
         self
     }
 
@@ -166,10 +167,7 @@ impl RuntimeOverrides {
         let mut saved = Vec::new();
         for (key, value) in pairs {
             let key = normalize_key(key.as_ref());
-            let prev = map()
-                .read()
-                .ok()
-                .and_then(|g| g.get(&key).cloned());
+            let prev = map().read().ok().and_then(|g| g.get(&key).cloned());
             saved.push((key.clone(), prev));
             set(&key, value);
         }
@@ -191,31 +189,44 @@ impl Drop for RuntimeOverrides {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Env tests share the process-global override map.
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_clean_overrides(f: impl FnOnce()) {
+        let _guard = ENV_TEST_LOCK.lock().expect("env test lock poisoned");
+        clear_overrides();
+        f();
+        clear_overrides();
+    }
 
     #[test]
     fn code_override_wins_over_process_env() {
-        clear_overrides();
-        let _g = RuntimeOverrides::install([("VERBOSE", "2")]);
-        assert_eq!(var("RLX_VERBOSE"), Some("2".into()));
-        assert!(flag("RLX_VERBOSE"));
+        with_clean_overrides(|| {
+            let _g = RuntimeOverrides::install([("VERBOSE", "2")]);
+            assert_eq!(var("RLX_VERBOSE"), Some("2".into()));
+            assert!(flag("RLX_VERBOSE"));
+        });
     }
 
     #[test]
     fn flag_parses_falsy_override() {
-        clear_overrides();
-        set("RLX_DISABLE_MPSGRAPH", "0");
-        assert!(!flag("RLX_DISABLE_MPSGRAPH"));
+        with_clean_overrides(|| {
+            set("RLX_DISABLE_MPSGRAPH", "0");
+            assert!(!flag("RLX_DISABLE_MPSGRAPH"));
+        });
     }
 
     #[test]
     fn rlx_env_bulk_apply() {
-        clear_overrides();
-        RlxEnv::new()
-            .set("MPSGRAPH_MIN_FLOPS", "42")
-            .flag("USE_ICB", true)
-            .apply();
-        assert_eq!(parse_or("RLX_MPSGRAPH_MIN_FLOPS", 0u64), 42);
-        assert!(flag("RLX_USE_ICB"));
-        clear_overrides();
+        with_clean_overrides(|| {
+            RlxEnv::new()
+                .set("MPSGRAPH_MIN_FLOPS", "42")
+                .flag("USE_ICB", true)
+                .apply();
+            assert_eq!(parse_or("RLX_MPSGRAPH_MIN_FLOPS", 0u64), 42);
+            assert!(flag("RLX_USE_ICB"));
+        });
     }
 }

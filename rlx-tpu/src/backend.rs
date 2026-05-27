@@ -184,7 +184,11 @@ impl TpuExecutable {
     /// calling here.
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
         match &mut self.inner {
-            ExecInner::Single { params, param_dtypes, .. } => {
+            ExecInner::Single {
+                params,
+                param_dtypes,
+                ..
+            } => {
                 let bytes = unsafe {
                     std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
                 }
@@ -199,7 +203,11 @@ impl TpuExecutable {
     /// Stash a parameter's host bytes with a non-f32 dtype.
     pub fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: DType) {
         match &mut self.inner {
-            ExecInner::Single { params, param_dtypes, .. } => {
+            ExecInner::Single {
+                params,
+                param_dtypes,
+                ..
+            } => {
                 params.insert(name.to_string(), data.to_vec());
                 param_dtypes.insert(name.to_string(), dtype);
             }
@@ -231,9 +239,7 @@ impl TpuExecutable {
         // 1. Upload params on the first run.
         if !*params_uploaded {
             for (i, name) in module.param_names.iter().enumerate() {
-                let dtype = *param_dtypes
-                    .get(name)
-                    .unwrap_or(&module.param_dtypes[i]);
+                let dtype = *param_dtypes.get(name).unwrap_or(&module.param_dtypes[i]);
                 let dims = module.param_shapes[i].clone();
                 let bytes = params.get(name).unwrap_or_else(|| {
                     panic!(
@@ -359,7 +365,7 @@ pub(crate) fn compile_pjrt_executable(bytes: &[u8]) -> *mut PjrtLoadedExecutable
     });
     const COMPILE_OPTIONS: [u8; 6] = [0x1a, 0x04, 0x20, 0x01, 0x28, 0x01];
     let format = PJRT_PROGRAM_FORMAT_HLO;
-    let mut program = PJRT_Program {
+    let program = PJRT_Program {
         struct_size: std::mem::size_of::<PJRT_Program>(),
         extension_start: std::ptr::null_mut(),
         code: bytes.as_ptr() as *mut u8,

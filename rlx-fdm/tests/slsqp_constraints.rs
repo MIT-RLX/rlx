@@ -14,9 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! SLSQP-style penalty optimizer with nonlinear angle constraints.
 
-use rlx_fdm::{
-    constrained_fdm, fdm, Constraint, Goal, Network, OptimizeConfig, OptimizerKind,
-};
+use rlx_fdm::{Constraint, Goal, Network, OptimizeConfig, OptimizerKind, constrained_fdm, fdm};
 
 #[test]
 fn slsqp_respects_edge_angle_band() {

@@ -15,7 +15,7 @@
 //! Training forward/backward on the CPU reference raster path (linear radiance).
 
 use super::binning::{build_tile_key_value_pairs, build_tile_ranges, sort_key_values};
-use super::project::{project_splats, ProjectedSplats};
+use super::project::{ProjectedSplats, project_splats};
 use super::raster::ray_splat_intersection_alpha;
 use crate::core::{Camera, GaussianScene, OUTPUT_GAMMA};
 
@@ -70,7 +70,7 @@ pub fn build_training_prepare(
     max_list_entries: u32,
 ) -> TrainingPrepare {
     let projected = project_splats(scene, camera, width, height, radius_scale, alpha_cutoff);
-    let tile_height = (height + tile_size - 1) / tile_size;
+    let tile_height = height.div_ceil(tile_size);
     let tile_count = tile_width * tile_height;
     let (keys, values, generated) = build_tile_key_value_pairs(
         &projected,
@@ -130,8 +130,7 @@ pub fn capture_training_traces(
                 if projected.valid[splat_id] == 0 {
                     continue;
                 }
-                let alpha =
-                    ray_splat_intersection_alpha(projected, splat_id, ray, alpha_cutoff);
+                let alpha = ray_splat_intersection_alpha(projected, splat_id, ray, alpha_cutoff);
                 if alpha < alpha_cutoff {
                     continue;
                 }
@@ -209,8 +208,7 @@ pub fn raster_training_linear_cpu(
                 if projected.valid[splat_id] == 0 {
                     continue;
                 }
-                let alpha =
-                    ray_splat_intersection_alpha(&projected, splat_id, ray, alpha_cutoff);
+                let alpha = ray_splat_intersection_alpha(projected, splat_id, ray, alpha_cutoff);
                 if alpha < alpha_cutoff {
                     continue;
                 }
@@ -344,10 +342,8 @@ pub fn rasterize_backward(
                 for ch in 0..3 {
                     color_alpha_grad[base + ch] += d_ld_rgb[ch] * t * alpha;
                 }
-                let mut d_ld_alpha = t
-                    * (d_ld_rgb[0] * color[0]
-                        + d_ld_rgb[1] * color[1]
-                        + d_ld_rgb[2] * color[2]);
+                let mut d_ld_alpha =
+                    t * (d_ld_rgb[0] * color[0] + d_ld_rgb[1] * color[1] + d_ld_rgb[2] * color[2]);
                 d_ld_alpha += d_ld_trans * (-t / one_minus_alpha);
                 color_alpha_grad[base + 3] += d_ld_alpha.clamp(-clip, clip);
 
@@ -418,7 +414,14 @@ pub fn backprop_scene_grads_with_color_alpha_grad(
     loss_grad_clip: f32,
 ) -> SceneGrads {
     let count = scene.count();
-    let mut grads = SceneGrads::zeroed(count, if scene.sh_coeff_count > 0 { scene.sh_coeff_count } else { 0 });
+    let mut grads = SceneGrads::zeroed(
+        count,
+        if scene.sh_coeff_count > 0 {
+            scene.sh_coeff_count
+        } else {
+            0
+        },
+    );
 
     backprop_splat_color_grads(
         scene,
@@ -497,15 +500,16 @@ fn accumulate_one_splat_color_grad(
         }
     }
     let d_raster = super::grads::color_alpha_grad_to_raster_grad(color_alpha_grad, splat);
-    let (d_pos_r, d_scale_r, d_rot_r, d_raw) = super::raster_gaussian::backprop_build_raster_gaussian(
-        scene,
-        splat,
-        camera,
-        radius_scale,
-        max_anisotropy,
-        sh_band,
-        &d_raster,
-    );
+    let (d_pos_r, d_scale_r, d_rot_r, d_raw) =
+        super::raster_gaussian::backprop_build_raster_gaussian(
+            scene,
+            splat,
+            camera,
+            radius_scale,
+            max_anisotropy,
+            sh_band,
+            &d_raster,
+        );
     for axis in 0..3 {
         grads.positions[splat * 3 + axis] += d_pos_r[axis];
         grads.scales[splat * 3 + axis] += d_scale_r[axis];
@@ -514,8 +518,7 @@ fn accumulate_one_splat_color_grad(
         grads.rotations[splat * 4 + axis] += d_rot_r[axis];
     }
     let alpha = scene.opacities[splat];
-    grads.opacities[splat] +=
-        d_raw.max(color_alpha_grad[base + 3] * alpha * (1.0 - alpha));
+    grads.opacities[splat] += d_raw.max(color_alpha_grad[base + 3] * alpha * (1.0 - alpha));
 }
 
 fn accumulate_geometry_grads_from_traces(
@@ -533,14 +536,13 @@ fn accumulate_geometry_grads_from_traces(
 ) {
     let bg_linear = linearize_background(background);
     let clip = loss_grad_clip.max(1e-8);
-    let sh_coeff_count = if scene.sh_coeff_count > 0 {
-        scene.sh_coeff_count
-    } else {
-        0
-    };
-
     #[cfg(feature = "parallel")]
     {
+        let sh_coeff_count = if scene.sh_coeff_count > 0 {
+            scene.sh_coeff_count
+        } else {
+            0
+        };
         use rayon::prelude::*;
         let partials: Vec<_> = (0..height)
             .into_par_iter()
@@ -569,26 +571,28 @@ fn accumulate_geometry_grads_from_traces(
         for p in partials {
             grads.merge_from(&p);
         }
-        return;
     }
 
-    let mut projected = forward.projected.clone();
-    accumulate_geometry_rows(
-        scene,
-        camera,
-        &forward.traces,
-        pixel_rgb_grad,
-        bg_linear,
-        width,
-        height,
-        0,
-        height,
-        radius_scale,
-        alpha_cutoff,
-        clip,
-        &mut projected,
-        grads,
-    );
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut projected = forward.projected.clone();
+        accumulate_geometry_rows(
+            scene,
+            camera,
+            &forward.traces,
+            pixel_rgb_grad,
+            bg_linear,
+            width,
+            height,
+            0,
+            height,
+            radius_scale,
+            alpha_cutoff,
+            clip,
+            &mut projected,
+            grads,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -635,10 +639,8 @@ fn accumulate_geometry_rows(
                 let color = hit.color;
                 let one_minus_alpha = (1.0 - alpha).max(1e-8);
 
-                let mut d_ld_alpha = t
-                    * (d_ld_rgb[0] * color[0]
-                        + d_ld_rgb[1] * color[1]
-                        + d_ld_rgb[2] * color[2]);
+                let mut d_ld_alpha =
+                    t * (d_ld_rgb[0] * color[0] + d_ld_rgb[1] * color[1] + d_ld_rgb[2] * color[2]);
                 d_ld_alpha += d_ld_trans * (-t / one_minus_alpha);
                 d_ld_alpha = d_ld_alpha.clamp(-clip, clip);
 

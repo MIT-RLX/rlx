@@ -19,7 +19,10 @@ use image::{DynamicImage, RgbaImage};
 
 use super::colmap::ColmapFrame;
 
-pub fn load_rgba8_image(path: impl AsRef<Path>, target_size: Option<(u32, u32)>) -> Result<Vec<u8>> {
+pub fn load_rgba8_image(
+    path: impl AsRef<Path>,
+    target_size: Option<(u32, u32)>,
+) -> Result<Vec<u8>> {
     let path = path.as_ref();
     let img = image::open(path).with_context(|| format!("opening image {}", path.display()))?;
     let rgba = resize_rgba(img, target_size);

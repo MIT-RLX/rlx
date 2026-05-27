@@ -20,11 +20,9 @@ globally via `RLX_MLX_MODE=eager|lazy|compiled` (default lazy).
 
 ## What's here
 
-- `cpp/rlx_mlx_shim.{h,cpp}` — C ABI over `mlx::core::*`. Catches every
-  C++ exception and surfaces it through thread-local `last_error`.
-- `build.rs` — drives MLX's CMake (vendored at `../vendor/mlx`) into a
-  static `libmlx.a`, then `cc::Build`-compiles the shim and links them.
-- `src/ffi.rs` — raw `extern "C"` declarations matching the header.
+- [`rlx-mlx-sys`](../rlx-mlx-sys) — vendored MLX (`vendor/mlx`), CMake
+  build, and `cpp/rlx_mlx_shim.{h,cpp}` C ABI over `mlx::core::*`.
+- `src/` — re-exports `rlx_mlx_sys::ffi`; RAII wrappers and lowering:
 - `src/array.rs` — RAII `Array` wrapper, `MlxError`, top-level `eval`.
 - `src/ops.rs` — typed wrappers: matmul / add / mul / sub / div /
   softmax / gelu / silu / cast / layer_norm.
@@ -38,23 +36,18 @@ globally via `RLX_MLX_MODE=eager|lazy|compiled` (default lazy).
 
 ## Install
 
-> **Not on crates.io for 0.1.0.** `build.rs` reads `../vendor/mlx`,
-> which sits outside the rlx-mlx crate boundary and isn't included in
-> a `cargo publish` tarball. Until the submodule is relocated under
-> `rlx-mlx/vendor/mlx/` or the build script learns to fetch MLX at
-> build time, depend on it via the workspace git tree:
+Native MLX lives in **`rlx-mlx-sys`** (submodule + `build.rs`). After clone:
+
+```sh
+git submodule update --init rlx-mlx-sys/vendor/mlx
+```
 
 ```toml
 [dependencies]
-rlx = { git = "https://github.com/MIT-RLX/rlx", features = ["mlx"] }
+rlx = { version = "0.2", features = ["mlx"] }
 # or directly:
-rlx-mlx = { git = "https://github.com/MIT-RLX/rlx" }
-```
-
-`vendor/mlx` is a git submodule — initialize after clone:
-
-```sh
-git submodule update --init
+rlx-mlx = "0.2"
+rlx-mlx-sys = "0.2"
 ```
 
 The first build compiles MLX from source — minutes, not seconds.

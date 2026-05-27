@@ -18,6 +18,9 @@
 //! At compile time, the graph is lowered into a flat `Vec<Thunk>` where each
 //! thunk holds pre-computed arena offsets, dimensions, and kernel type.
 //! At runtime, the executor just iterates thunks and calls kernels directly.
+
+// Edition 2024: bodies of `unsafe fn` are safe by default; `sl`/`sl_mut` stay `unsafe fn`.
+#![allow(unsafe_op_in_unsafe_fn)]
 //! No match dispatch, no HashMap lookup, no dimension computation.
 
 use crate::arena::Arena;
@@ -160,11 +163,7 @@ pub enum Thunk {
     },
     /// Element-wise C64 conjugate: writes `[re_i, -im_i]` per element.
     /// Layout matches the rest of C64 here ([re,im] interleaved f32).
-    ConjugateC64 {
-        src: usize,
-        dst: usize,
-        len: u32,
-    },
+    ConjugateC64 { src: usize, dst: usize, len: u32 },
     /// C64 element-wise activation. Only kinds with well-defined
     /// complex extensions are supported: Neg, Exp, Log, Sqrt.
     /// Everything else (Sigmoid, Tanh, Relu, Abs, Sin/Cos/Tan/Atan,
@@ -665,9 +664,9 @@ pub enum Thunk {
     /// but the dequant itself happens per matmul. A future fully
     /// fused tile-streaming kernel would close the compute gap.
     DequantMatMulGguf {
-        x: usize,        // f32 activations [m, k]
-        w_q: usize,      // packed weight bytes (k*n elements packed)
-        dst: usize,      // f32 output [m, n]
+        x: usize,   // f32 activations [m, k]
+        w_q: usize, // packed weight bytes (k*n elements packed)
+        dst: usize, // f32 output [m, n]
         m: u32,
         k: u32,
         n: u32,
@@ -1750,14 +1749,24 @@ fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         } => vec![*x, *w_q, *scale, *zp],
         Thunk::DequantMatMulFp8 { x, w_q, scale, .. } => vec![*x, *w_q, *scale],
         Thunk::DequantMatMulNvfp4 {
-            x, w_q, scale, global_scale, ..
+            x,
+            w_q,
+            scale,
+            global_scale,
+            ..
         } => vec![*x, *w_q, *scale, *global_scale],
         Thunk::Conv2D1x1 { src, weight, .. } => vec![*src, *weight],
         Thunk::SelectiveScan {
             x, delta, a, b, c, ..
         } => vec![*x, *delta, *a, *b, *c],
         Thunk::GatedDeltaNet {
-            q, k, v, g, beta, state, ..
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state,
+            ..
         } => {
             let mut v = vec![*q, *k, *v, *g, *beta];
             if *state != 0 {
@@ -1766,7 +1775,9 @@ fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             v
         }
         Thunk::Attention { q, k, v, mask, .. } => vec![*q, *k, *v, *mask],
-        Thunk::AttentionBackward { q, k, v, dy, mask, .. } => {
+        Thunk::AttentionBackward {
+            q, k, v, dy, mask, ..
+        } => {
             let mut v = vec![*q, *k, *v, *dy];
             if *mask != 0 {
                 v.push(*mask);
@@ -1927,7 +1938,11 @@ fn dequant_matmul_fp8(
     n: usize,
     e5m2: bool,
 ) {
-    let dequant = if e5m2 { fp8_e5m2_to_f32 } else { fp8_e4m3_to_f32 };
+    let dequant = if e5m2 {
+        fp8_e5m2_to_f32
+    } else {
+        fp8_e4m3_to_f32
+    };
     for i in 0..m {
         for j in 0..n {
             let mut acc = 0f32;
@@ -1952,7 +1967,7 @@ pub fn dequant_matmul_nvfp4(
     k: usize,
     n: usize,
 ) {
-    use rlx_ir::{fp4_e2m1_to_f32, fp8_e4m3_scale_to_f32, NVFP4_GROUP_SIZE};
+    use rlx_ir::{NVFP4_GROUP_SIZE, fp4_e2m1_to_f32, fp8_e4m3_scale_to_f32};
     let gs = NVFP4_GROUP_SIZE;
     for i in 0..m {
         for j in 0..n {
@@ -2081,9 +2096,7 @@ fn apply_synthetic_mask(
     let neg = crate::config::RuntimeConfig::global().attn_mask_neg_inf;
     let q_offset = k_seq.saturating_sub(q_seq);
     match kind {
-        rlx_ir::op::MaskKind::None
-        | rlx_ir::op::MaskKind::Custom
-        | rlx_ir::op::MaskKind::Bias => {}
+        rlx_ir::op::MaskKind::None | rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::Bias => {}
         rlx_ir::op::MaskKind::Causal => {
             for qi in 0..q_seq {
                 let abs_q = q_offset + qi;
@@ -2205,9 +2218,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                         // All leading dims (everything except last 2) match.
                         let mut ok = true;
                         for d in 0..a_shape.rank() - 2 {
-                            if a_shape.dim(d) != b_shape.dim(d)
-                                || a_shape.dim(d) != shape.dim(d)
-                            {
+                            if a_shape.dim(d) != b_shape.dim(d) || a_shape.dim(d) != shape.dim(d) {
                                 ok = false;
                                 break;
                             }
@@ -3422,7 +3433,10 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                 }
             }
 
-            Op::FusedSwiGLU { cast_to: _, gate_first } => {
+            Op::FusedSwiGLU {
+                cast_to: _,
+                gate_first,
+            } => {
                 let n_half = node.shape.dim(node.shape.rank() - 1).unwrap_static();
                 let total = node.shape.num_elements().unwrap();
                 Thunk::FusedSwiGLU {
@@ -3876,15 +3890,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                 let h = x_shape.dim(x_shape.rank() - 1).unwrap_static();
                 let rows = (x_shape.num_elements().unwrap() / h) as u32;
                 let off = |i: usize| node_offset(arena, node.inputs[i]);
-                let common = (
-                    off(0),
-                    off(1),
-                    off(2),
-                    off(3),
-                    rows,
-                    h as u32,
-                    *eps,
-                );
+                let common = (off(0), off(1), off(2), off(3), rows, h as u32, *eps);
                 match &node.op {
                     Op::RmsNormBackwardInput { .. } => Thunk::RmsNormBackwardInput {
                         x: common.0,
@@ -3929,7 +3935,11 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                         dy_shape.dim(2).unwrap_static(),
                     )
                 } else {
-                    (1, dy_shape.dim(0).unwrap_static(), dy_shape.dim(1).unwrap_static())
+                    (
+                        1,
+                        dy_shape.dim(0).unwrap_static(),
+                        dy_shape.dim(1).unwrap_static(),
+                    )
                 };
                 let cos_shape = &graph.node(node.inputs[1]).shape;
                 let cos_len = cos_shape.num_elements().unwrap();
@@ -4900,9 +4910,8 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                 transmittance_threshold,
                 max_list_entries,
             } => {
-                let elem_len = |id: NodeId| -> usize {
-                    graph.node(id).shape.num_elements().unwrap_or(0)
-                };
+                let elem_len =
+                    |id: NodeId| -> usize { graph.node(id).shape.num_elements().unwrap_or(0) };
                 Thunk::GaussianSplatRender {
                     positions_off: node_offset(arena, node.inputs[0]),
                     positions_len: elem_len(node.inputs[0]),
@@ -4943,9 +4952,8 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                 sh_band,
                 max_anisotropy,
             } => {
-                let elem_len = |id: NodeId| -> usize {
-                    graph.node(id).shape.num_elements().unwrap_or(0)
-                };
+                let elem_len =
+                    |id: NodeId| -> usize { graph.node(id).shape.num_elements().unwrap_or(0) };
                 Thunk::GaussianSplatRenderBackward {
                     positions_off: node_offset(arena, node.inputs[0]),
                     positions_len: elem_len(node.inputs[0]),
@@ -4988,9 +4996,8 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                 transmittance_threshold,
                 max_list_entries,
             } => {
-                let elem_len = |id: NodeId| -> usize {
-                    graph.node(id).shape.num_elements().unwrap_or(0)
-                };
+                let elem_len =
+                    |id: NodeId| -> usize { graph.node(id).shape.num_elements().unwrap_or(0) };
                 Thunk::GaussianSplatPrepare {
                     positions_off: node_offset(arena, node.inputs[0]),
                     positions_len: elem_len(node.inputs[0]),
@@ -5028,9 +5035,8 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                 transmittance_threshold,
                 max_list_entries,
             } => {
-                let elem_len = |id: NodeId| -> usize {
-                    graph.node(id).shape.num_elements().unwrap_or(0)
-                };
+                let elem_len =
+                    |id: NodeId| -> usize { graph.node(id).shape.num_elements().unwrap_or(0) };
                 let prep_id = node.inputs[0];
                 let count = match &graph.node(prep_id).op {
                     rlx_ir::Op::GaussianSplatPrepare { .. } => {
@@ -5398,7 +5404,9 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     dst_stride,
                     inner,
                     elem_bytes,
-                } => narrow_thunk_closure(src, dst, outer, src_stride, dst_stride, inner, elem_bytes),
+                } => {
+                    narrow_thunk_closure(src, dst, outer, src_stride, dst_stride, inner, elem_bytes)
+                }
 
                 Thunk::Copy { src, dst, len } => {
                     let len = len as usize;
@@ -5525,14 +5533,10 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     let total_bytes = (k * n) / block_elems * block_bytes;
                     Arc::new(move |base: *mut u8| unsafe {
                         let xs = sl(x, base, m * k);
-                        let w_bytes = std::slice::from_raw_parts(
-                            base.add(w_q) as *const u8,
-                            total_bytes,
-                        );
+                        let w_bytes =
+                            std::slice::from_raw_parts(base.add(w_q) as *const u8, total_bytes);
                         let out = sl_mut(dst, base, m * n);
-                        crate::gguf_matmul::gguf_matmul_bt(
-                            xs, w_bytes, out, m, k, n, scheme,
-                        );
+                        crate::gguf_matmul::gguf_matmul_bt(xs, w_bytes, out, m, k, n, scheme);
                     })
                 }
 
@@ -5552,8 +5556,10 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     let n_blocks = k.div_ceil(bs);
                     Arc::new(move |base: *mut u8| unsafe {
                         let xs = sl(x, base, m * k);
-                        let w_bytes =
-                            std::slice::from_raw_parts(base.add(w_q) as *const u8, (k * n + 1) / 2);
+                        let w_bytes = std::slice::from_raw_parts(
+                            base.add(w_q) as *const u8,
+                            (k * n).div_ceil(2),
+                        );
                         let scales = sl(scale, base, n_blocks * n);
                         let zps = if is_asymmetric {
                             sl(zp, base, n_blocks * n)
@@ -5562,7 +5568,16 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                         };
                         let out = sl_mut(dst, base, m * n);
                         dequant_matmul_int4(
-                            xs, w_bytes, scales, zps, out, m, k, n, bs, is_asymmetric,
+                            xs,
+                            w_bytes,
+                            scales,
+                            zps,
+                            out,
+                            m,
+                            k,
+                            n,
+                            bs,
+                            is_asymmetric,
                         );
                     })
                 }
@@ -5580,8 +5595,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     let (m, k, n) = (m as usize, k as usize, n as usize);
                     Arc::new(move |base: *mut u8| unsafe {
                         let xs = sl(x, base, m * k);
-                        let w_bytes =
-                            std::slice::from_raw_parts(base.add(w_q) as *const u8, k * n);
+                        let w_bytes = std::slice::from_raw_parts(base.add(w_q) as *const u8, k * n);
                         let scales = sl(scale, base, n);
                         let out = sl_mut(dst, base, m * n);
                         dequant_matmul_fp8(xs, w_bytes, scales, out, m, k, n, e5m2);
@@ -5604,7 +5618,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                         let xs = sl(x, base, m * k);
                         let w_bytes = std::slice::from_raw_parts(
                             base.add(w_q) as *const u8,
-                            (k * n + 1) / 2,
+                            (k * n).div_ceil(2),
                         );
                         let scale_bytes =
                             std::slice::from_raw_parts(base.add(scale) as *const u8, n_scale);
@@ -7085,7 +7099,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     *max_list_entries,
                     base,
                 );
-            }
+            },
 
             Thunk::GaussianSplatRenderBackward {
                 positions_off,
@@ -7148,7 +7162,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     *max_anisotropy,
                     base,
                 );
-            }
+            },
 
             Thunk::GaussianSplatPrepare {
                 positions_off,
@@ -7203,7 +7217,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     *max_list_entries,
                     base,
                 );
-            }
+            },
 
             Thunk::GaussianSplatRasterize {
                 prep_off,
@@ -7238,7 +7252,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     *max_list_entries,
                     base,
                 );
-            }
+            },
 
             Thunk::Fft1d {
                 src,
@@ -7407,14 +7421,11 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let b_full = sl(*b, base, b_ * b_stride);
                     let x_full = sl_mut(*x, base, b_ * b_stride);
                     for bi in 0..b_ {
-                        let mut a_scratch =
-                            a_full[bi * a_stride..(bi + 1) * a_stride].to_vec();
+                        let mut a_scratch = a_full[bi * a_stride..(bi + 1) * a_stride].to_vec();
                         let mut x_buf = b_full[bi * b_stride..(bi + 1) * b_stride].to_vec();
                         let info = crate::blas::sgesv(&mut a_scratch, &mut x_buf, n_, nrhs_);
                         if info != 0 {
-                            panic!(
-                                "BatchedDenseSolveF32: slice {bi} singular (info={info})"
-                            );
+                            panic!("BatchedDenseSolveF32: slice {bi} singular (info={info})");
                         }
                         x_full[bi * b_stride..(bi + 1) * b_stride].copy_from_slice(&x_buf);
                     }
@@ -8639,12 +8650,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 num_groups,
                 eps,
             } => {
-                let (n, c, h, w) = (
-                    *n as usize,
-                    *c as usize,
-                    *h as usize,
-                    *w as usize,
-                );
+                let (n, c, h, w) = (*n as usize, *c as usize, *h as usize, *w as usize);
                 let plane = c * h * w;
                 unsafe {
                     for ni in 0..n {
@@ -8686,9 +8692,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let gamma = sl(*g, base, c);
                     let beta = sl(*b, base, c);
                     let output = sl_mut(*dst, base, n * plane);
-                    crate::kernels::layer_norm2d_nchw(
-                        input, gamma, beta, output, n, c, h, w, *eps,
-                    );
+                    crate::kernels::layer_norm2d_nchw(input, gamma, beta, output, n, c, h, w, *eps);
                 }
             }
 
@@ -8760,12 +8764,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 h,
                 w,
             } => {
-                let (n, c, h, w) = (
-                    *n as usize,
-                    *c as usize,
-                    *h as usize,
-                    *w as usize,
-                );
+                let (n, c, h, w) = (*n as usize, *c as usize, *h as usize, *w as usize);
                 let in_plane = c * h * w;
                 let out_plane = c * h * 2 * w * 2;
                 unsafe {
@@ -8920,24 +8919,22 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 seq,
                 heads,
                 state_size,
-            } => {
-                unsafe {
-                    execute_gated_delta_net_f32(
-                        *q,
-                        *k,
-                        *v,
-                        *g,
-                        *beta,
-                        *state,
-                        *dst,
-                        *batch as usize,
-                        *seq as usize,
-                        *heads as usize,
-                        *state_size as usize,
-                        base,
-                    );
-                }
-            }
+            } => unsafe {
+                execute_gated_delta_net_f32(
+                    *q,
+                    *k,
+                    *v,
+                    *g,
+                    *beta,
+                    *state,
+                    *dst,
+                    *batch as usize,
+                    *seq as usize,
+                    *heads as usize,
+                    *state_size as usize,
+                    base,
+                );
+            },
 
             Thunk::SelectiveScan {
                 x,
@@ -9036,11 +9033,13 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 n,
                 scheme,
             } => {
-                use rlx_ir::quant::QuantScheme;
                 let (m, k, n) = (*m as usize, *k as usize, *n as usize);
                 let block_bytes = scheme.gguf_block_bytes() as usize;
                 let block_elems = scheme.gguf_block_size() as usize;
-                debug_assert!(block_bytes > 0 && block_elems > 0, "non-GGUF scheme in GGUF arm");
+                debug_assert!(
+                    block_bytes > 0 && block_elems > 0,
+                    "non-GGUF scheme in GGUF arm"
+                );
                 debug_assert!(
                     (k * n).is_multiple_of(block_elems),
                     "k*n={} not aligned to GGUF block size {}",
@@ -9073,8 +9072,10 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let n_blocks = k.div_ceil(bs);
                 unsafe {
                     let xs = sl(*x, base, m * k);
-                    let w_bytes =
-                        std::slice::from_raw_parts(base.add(*w_q) as *const u8, (k * n + 1) / 2);
+                    let w_bytes = std::slice::from_raw_parts(
+                        base.add(*w_q) as *const u8,
+                        (k * n).div_ceil(2),
+                    );
                     let scales = sl(*scale, base, n_blocks * n);
                     let zps = if *is_asymmetric {
                         sl(*zp, base, n_blocks * n)
@@ -9122,7 +9123,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let xs = sl(*x, base, m * k);
                     let w_bytes = std::slice::from_raw_parts(
                         base.add(*w_q) as *const u8,
-                        (k * n + 1) / 2,
+                        (k * n).div_ceil(2),
                     );
                     let scale_bytes =
                         std::slice::from_raw_parts(base.add(*scale) as *const u8, n_scale);
@@ -9468,8 +9469,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     rlx_ir::op::MaskKind::Bias => {
                                         // Per-head additive bias slice.
                                         let bias = std::slice::from_raw_parts(
-                                            (m_addr as *const f32)
-                                                .add((bi * nh + hi) * q_s * k_s),
+                                            (m_addr as *const f32).add((bi * nh + hi) * q_s * k_s),
                                             q_s * k_s,
                                         );
                                         for i in 0..q_s * k_s {
@@ -9561,20 +9561,8 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         &[]
                     };
                     crate::attention_bwd::attention_backward(
-                        *wrt,
-                        q_data,
-                        k_data,
-                        v_data,
-                        dy_data,
-                        out_data,
-                        b,
-                        nh,
-                        q_s,
-                        k_s,
-                        dh,
-                        *mask_kind,
-                        mask_data,
-                        *bhsd,
+                        *wrt, q_data, k_data, v_data, dy_data, out_data, b, nh, q_s, k_s, dh,
+                        *mask_kind, mask_data, *bhsd,
                     );
                 }
             }
@@ -10561,16 +10549,16 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         let in_slice = &packed_in[in_start * k_dim..(in_start + count) * k_dim];
                         let w_slab: &[f32] =
                             if !crate::moe_residency::expert_on_device_for_layer(moe_layer, e) {
-                            if let Some(ptr) =
-                                crate::moe_residency::host_expert_weight_ptr(gmm_ord, e)
-                            {
-                                std::slice::from_raw_parts(ptr, expert_stride)
+                                if let Some(ptr) =
+                                    crate::moe_residency::host_expert_weight_ptr(gmm_ord, e)
+                                {
+                                    std::slice::from_raw_parts(ptr, expert_stride)
+                                } else {
+                                    &wt[e * expert_stride..(e + 1) * expert_stride]
+                                }
                             } else {
                                 &wt[e * expert_stride..(e + 1) * expert_stride]
-                            }
-                        } else {
-                            &wt[e * expert_stride..(e + 1) * expert_stride]
-                        };
+                            };
                         let out_slice = &mut packed_out[in_start * n..(in_start + count) * n];
                         crate::blas::sgemm(in_slice, w_slab, out_slice, count, k_dim, n);
                     }
@@ -11776,12 +11764,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 num_groups,
                 eps,
             } => {
-                let (n, c, h, w) = (
-                    *n as usize,
-                    *c as usize,
-                    *h as usize,
-                    *w as usize,
-                );
+                let (n, c, h, w) = (*n as usize, *c as usize, *h as usize, *w as usize);
                 let plane = c * h * w;
                 unsafe {
                     let xs = sl(*x, base, n * plane);
@@ -11814,12 +11797,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 num_groups,
                 eps,
             } => {
-                let (n, c, h, w) = (
-                    *n as usize,
-                    *c as usize,
-                    *h as usize,
-                    *w as usize,
-                );
+                let (n, c, h, w) = (*n as usize, *c as usize, *h as usize, *w as usize);
                 let plane = c * h * w;
                 unsafe {
                     let xs = sl(*x, base, n * plane);
@@ -11847,24 +11825,12 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 h,
                 w,
             } => {
-                let (n, c, h, w) = (
-                    *n as usize,
-                    *c as usize,
-                    *h as usize,
-                    *w as usize,
-                );
+                let (n, c, h, w) = (*n as usize, *c as usize, *h as usize, *w as usize);
                 let plane = c * h * w;
                 unsafe {
                     let dys = sl(*dy, base, n * plane);
                     let out = sl_mut(*dbeta, base, c);
-                    crate::training_bwd::group_norm_backward_beta_nchw(
-                        dys,
-                        out,
-                        n,
-                        c,
-                        h,
-                        w,
-                    );
+                    crate::training_bwd::group_norm_backward_beta_nchw(dys, out, n, c, h, w);
                 }
             }
 
@@ -12633,11 +12599,7 @@ pub unsafe fn execute_gated_delta_net_f32(
             for ti in 0..s {
                 let qkv_step = bi * s * hs_n + ti * hs_n + hi * n;
                 let gb_step = bi * s * h + ti * h + hi;
-                let out_row = sl_mut(
-                    dst + qkv_step * std::mem::size_of::<f32>(),
-                    arena.get(),
-                    n,
-                );
+                let out_row = sl_mut(dst + qkv_step * std::mem::size_of::<f32>(), arena.get(), n);
                 crate::gdn::gdn_step_blas(
                     s_mat,
                     &qs[qkv_step..qkv_step + n],
@@ -12660,7 +12622,8 @@ pub unsafe fn execute_gated_delta_net_f32(
                 (0..h).into_par_iter().for_each(|hi| {
                     let mut sk_buf = [0f32; crate::gdn::GDN_MAX_STATE];
                     let sk = &mut sk_buf[..n];
-                    let mut local_state = [0f32; crate::gdn::GDN_MAX_STATE * crate::gdn::GDN_MAX_STATE];
+                    let mut local_state =
+                        [0f32; crate::gdn::GDN_MAX_STATE * crate::gdn::GDN_MAX_STATE];
                     let s_mat = &mut local_state[..n * n];
                     s_mat.fill(0.0);
                     run_head(bi, hi, s_mat, sk);
@@ -12941,7 +12904,15 @@ pub unsafe fn execute_dequant_grouped_matmul_gguf_f32(
         let ids = sl(expert_idx, base, m);
         let out = sl_mut(dst, base, m * n);
         crate::gguf_matmul::gguf_grouped_matmul_bt(
-            xs, w_bytes, ids, out, m, k, n, num_experts, scheme,
+            xs,
+            w_bytes,
+            ids,
+            out,
+            m,
+            k,
+            n,
+            num_experts,
+            scheme,
         );
     }
 }
@@ -12964,7 +12935,7 @@ pub unsafe fn execute_dequant_matmul_int4_f32(
     let n_blocks = k.div_ceil(bs);
     unsafe {
         let xs = sl(x, base, m * k);
-        let w_bytes = std::slice::from_raw_parts(base.add(w_q) as *const u8, (k * n + 1) / 2);
+        let w_bytes = std::slice::from_raw_parts(base.add(w_q) as *const u8, (k * n).div_ceil(2));
         let scales = sl(scale, base, n_blocks * n);
         let zps = if is_asymmetric {
             sl(zp, base, n_blocks * n)
@@ -13012,7 +12983,7 @@ pub unsafe fn execute_dequant_matmul_nvfp4_f32(
     let n_scale = k.div_ceil(rlx_ir::NVFP4_GROUP_SIZE) * n;
     unsafe {
         let xs = sl(x, base, m * k);
-        let w_bytes = std::slice::from_raw_parts(base.add(w_q) as *const u8, (k * n + 1) / 2);
+        let w_bytes = std::slice::from_raw_parts(base.add(w_q) as *const u8, (k * n).div_ceil(2));
         let scale_bytes = std::slice::from_raw_parts(base.add(scale) as *const u8, n_scale);
         let gs = sl(global_scale, base, 1)[0];
         let out = sl_mut(dst, base, m * n);
@@ -13044,7 +13015,7 @@ pub unsafe fn execute_gated_delta_net_f16(
                 .collect()
         };
         let write_f16 = |off: usize, data: &[f32]| {
-            let out = std::slice::from_raw_parts_mut(base.add(off) as *mut u8, data.len() * 2);
+            let out = std::slice::from_raw_parts_mut(base.add(off), data.len() * 2);
             for (i, &v) in data.iter().enumerate() {
                 let le = f16::from_f32(v).to_le_bytes();
                 out[i * 2] = le[0];
@@ -13153,20 +13124,8 @@ pub unsafe fn execute_group_norm_nchw_f32(
         let input = unsafe { sl(src + ni * plane * std::mem::size_of::<f32>(), base, plane) };
         let gamma = unsafe { sl(g, base, c) };
         let beta = unsafe { sl(b, base, c) };
-        let output =
-            unsafe { sl_mut(dst + ni * plane * std::mem::size_of::<f32>(), base, plane) };
-        crate::kernels::group_norm_nchw(
-            input,
-            gamma,
-            beta,
-            output,
-            1,
-            c,
-            h,
-            w,
-            num_groups,
-            eps,
-        );
+        let output = unsafe { sl_mut(dst + ni * plane * std::mem::size_of::<f32>(), base, plane) };
+        crate::kernels::group_norm_nchw(input, gamma, beta, output, 1, c, h, w, num_groups, eps);
     }
 }
 
@@ -13491,7 +13450,11 @@ impl BluesteinScratchF64 {
     fn build(n: usize, inverse: bool) -> Self {
         // M = next power of two ≥ 2N - 1 keeps the inner FFT on the
         // fast radix-2 path. For N=1 fall back to M=1 (no-op convolution).
-        let m = if n <= 1 { 1 } else { (2 * n - 1).next_power_of_two() };
+        let m = if n <= 1 {
+            1
+        } else {
+            (2 * n - 1).next_power_of_two()
+        };
 
         // Chirp arg reduced via k² mod 2N — without this, large N
         // bleeds precision into the trig call (n² grows quadratically).
@@ -13622,7 +13585,11 @@ impl BluesteinScratchF32 {
     }
 
     fn build(n: usize, inverse: bool) -> Self {
-        let m = if n <= 1 { 1 } else { (2 * n - 1).next_power_of_two() };
+        let m = if n <= 1 {
+            1
+        } else {
+            (2 * n - 1).next_power_of_two()
+        };
 
         let mod_2n = (2 * n) as u64;
         let sign = if inverse { 1.0_f64 } else { -1.0_f64 };
@@ -19808,7 +19775,7 @@ mod tests {
 
         // Deterministic data.
         let lhs_data: Vec<f32> = (0..bh * h * w * h * w).map(|i| i as f32 * 0.01).collect();
-        let rhs_data: Vec<f32> = (0..bh * h * w * 1 * w)
+        let rhs_data: Vec<f32> = (0..bh * h * w * w)
             .map(|i| (i as f32 + 100.0) * 0.01)
             .collect();
 
@@ -19821,7 +19788,7 @@ mod tests {
                         for wk in 0..w {
                             let li = (((b_ * h + hq) * w + wq) * h + hk) * w + wk;
                             // rhs has hk dim = 1, so it's always index 0 there.
-                            let ri = (((b_ * h + hq) * w + wq) * 1 + 0) * w + wk;
+                            let ri = ((b_ * h + hq) * w + wq) * w + wk;
                             expected[li] = lhs_data[li] + rhs_data[ri];
                         }
                     }

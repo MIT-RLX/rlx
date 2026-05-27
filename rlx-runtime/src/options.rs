@@ -31,8 +31,8 @@
 //! ```
 
 use crate::Precision;
-use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
 use rlx_ir::OpKind;
+use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
 use rlx_opt::{FusionOptions, FusionTarget, PrecisionPolicy};
 
 /// All knobs the compile pipeline understands.

@@ -19,8 +19,8 @@
 
 #![cfg(feature = "cpu")]
 
-use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
 use rlx_ir::OpKind;
+use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
 
 /// `supported_ops` claim set that forces splat to lower to primitive MIR (no native splat thunk).
 pub const PRIMITIVE_SPLAT_SUPPORTED_OPS: &[OpKind] = &[

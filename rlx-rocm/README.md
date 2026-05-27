@@ -16,16 +16,15 @@ CUDA driver API.
 
 ## Install
 
-> **Not on crates.io for 0.1.0.** `src/kernels/sources.rs` does
-> `include_str!("../../../rlx-cuda/src/kernels/*.cu")` to share kernel
-> sources with rlx-cuda — the workspace-relative paths aren't in a
-> published `.crate`. Distributed via the workspace git tree:
+Kernel sources ship in [`rlx-gpu-kernels`](../rlx-gpu-kernels) on crates.io.
+`rlx-rocm` depends on it (with the `rocm` feature for `matmul_mfma.cu`).
 
 ```toml
 [dependencies]
-rlx = { git = "https://github.com/MIT-RLX/rlx", features = ["rocm"] }
+rlx = { version = "0.2", features = ["rocm"] }
 # or directly:
-rlx-rocm = { git = "https://github.com/MIT-RLX/rlx" }
+rlx-rocm = "0.2"
+rlx-gpu-kernels = { version = "0.2", features = ["rocm"] }
 ```
 
 A working ROCm install (libhipruntime / libhipblas / libMIOpen) must be
@@ -137,7 +136,7 @@ bindings are **all shared with rlx-cuda** rather than duplicated:
 
 | Layer | Source of truth | rlx-rocm reference |
 |---|---|---|
-| `.cu` kernels | `rlx-cuda/src/kernels/*.cu` | `kernels::sources` via `include_str!` |
+| `.cu` kernels | `rlx-gpu-kernels/kernels/*.cu` | `rlx-gpu-kernels` (`rocm` feature for MFMA) |
 | C++ wrapper layer (`launch_*` fns) | `rlx-cuda/cpp/cpu_dispatch.cpp` | `cpp/cpu_dispatch.cpp` (one-line `#include`) |
 | Rust FFI bindings (`run_*` fns) | `rlx-cuda/src/cpu_dispatch.rs` | `src/cpu_dispatch.rs` (one-line `#[path]`) |
 | HIP-CPU headers | `rlx-cuda/vendor/HIP-CPU` (submodule) | reused — single submodule, both crates |

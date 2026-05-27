@@ -9,11 +9,8 @@ use anyhow::Result;
 use crate::context::FlowCtx;
 use crate::escape::Emit;
 use crate::value::FlowValue;
-use crate::weight::WeightSource;
-
-type CustomFn = Arc<
-    dyn Fn(&mut Emit<'_>, Option<FlowValue>) -> Result<Option<FlowValue>> + Send + Sync,
->;
+type CustomFn =
+    Arc<dyn Fn(&mut Emit<'_>, Option<FlowValue>) -> Result<Option<FlowValue>> + Send + Sync>;
 
 /// User-defined stage — tier-2 escape hatch for novel subgraphs.
 #[derive(Clone)]

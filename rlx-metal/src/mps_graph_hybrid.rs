@@ -71,9 +71,7 @@ pub fn extract_subgraph(full: &Graph, segment_nodes: &[NodeId]) -> ExtractedSubg
             Op::Input { name: n } => sub.input(n.clone(), bn.shape.clone()),
             Op::Param { name: n } => sub.param(n.clone(), bn.shape.clone()),
             Op::Constant { data } => sub.add_node(
-                Op::Constant {
-                    data: data.clone(),
-                },
+                Op::Constant { data: data.clone() },
                 vec![],
                 bn.shape.clone(),
             ),
@@ -164,8 +162,8 @@ pub fn build_hybrid_plan(
     let mut thunk_idx = 0usize;
 
     let flush_mps = |pending: &mut Vec<NodeId>,
-                         steps: &mut Vec<HybridStep>,
-                         thunk_idx: usize|
+                     steps: &mut Vec<HybridStep>,
+                     thunk_idx: usize|
      -> Option<usize> {
         if pending.is_empty() {
             return Some(thunk_idx);
@@ -185,12 +183,9 @@ pub fn build_hybrid_plan(
 
     for &id in &schedulable {
         let op = &graph.node(id).op;
-        if matches!(op, Op::GatedDeltaNet { .. }) {
-            thunk_idx = flush_mps(&mut pending, &mut steps, thunk_idx)?;
-            steps.push(HybridStep::Thunks(thunk_idx..thunk_idx + 1));
-            thunk_idx += 1;
-        } else if matches!(op, Op::DequantMatMul { .. })
-            && !can_lower_dequant_in_mps(graph, id, params_as_constants)
+        if matches!(op, Op::GatedDeltaNet { .. })
+            || (matches!(op, Op::DequantMatMul { .. })
+                && !can_lower_dequant_in_mps(graph, id, params_as_constants))
         {
             thunk_idx = flush_mps(&mut pending, &mut steps, thunk_idx)?;
             steps.push(HybridStep::Thunks(thunk_idx..thunk_idx + 1));
@@ -199,7 +194,7 @@ pub fn build_hybrid_plan(
             pending.push(id);
         }
     }
-    thunk_idx = flush_mps(&mut pending, &mut steps, thunk_idx)?;
+    let _ = flush_mps(&mut pending, &mut steps, thunk_idx)?;
 
     if steps.iter().all(|s| matches!(s, HybridStep::Thunks(_))) {
         return None;

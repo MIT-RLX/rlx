@@ -23,9 +23,8 @@ use crate::core::GaussianScene;
 use super::downscale::FrameDownscaleConfig;
 use super::types::{ColmapFrame, ColmapReconstruction, GaussianInitHyperParams};
 use super::{
-    build_training_frames_with_options, initialize_scene_from_colmap_points,
+    DEFAULT_COLMAP_IMPORT_MIN_TRACK_LENGTH, initialize_scene_from_colmap_points,
     load_colmap_reconstruction, transform_colmap_reconstruction_pca,
-    DEFAULT_COLMAP_IMPORT_MIN_TRACK_LENGTH,
 };
 
 /// Configuration for loading a COLMAP dataset into RLX training types.

@@ -19,11 +19,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
-use crate::core::sh::{
-    pad_sh_coeffs, sh_coeffs_to_display_colors, SUPPORTED_SH_COEFF_COUNT,
-};
 use crate::core::GaussianScene;
+use crate::core::sh::{SUPPORTED_SH_COEFF_COUNT, pad_sh_coeffs, sh_coeffs_to_display_colors};
+use anyhow::{Context, Result, bail, ensure};
 
 const LOGIT_EPS: f32 = 1e-6;
 
@@ -47,11 +45,7 @@ pub fn load_gaussian_ply(path: impl AsRef<Path>) -> Result<GaussianScene> {
         header.elements.iter().any(|e| e.name == "vertex"),
         "PLY file does not contain a vertex element"
     );
-    let vertex = header
-        .elements
-        .iter()
-        .find(|e| e.name == "vertex")
-        .unwrap();
+    let vertex = header.elements.iter().find(|e| e.name == "vertex").unwrap();
     let n = vertex.count;
     let props: Vec<String> = vertex.properties.iter().map(|p| p.name.clone()).collect();
     let mut columns: HashMap<String, Vec<f32>> = HashMap::new();
@@ -89,17 +83,13 @@ pub fn load_gaussian_ply(path: impl AsRef<Path>) -> Result<GaussianScene> {
     let opacities = sigmoid(column_or_zeros(&columns, "opacity", n));
     let scales = stack_sorted_prefix(&columns, "scale_", n, 3);
     let rotations = normalize_rotations(stack_sorted_prefix(&columns, "rot", n, 4));
-    let f_dc = stack_columns(
-        &columns,
-        &["f_dc_0", "f_dc_1", "f_dc_2"],
-        n,
-    )?;
+    let f_dc = stack_columns(&columns, &["f_dc_0", "f_dc_1", "f_dc_2"], n)?;
     let rest_names = sorted_props(&props, "f_rest_");
     let coeff_count = if rest_names.is_empty() {
         1
     } else {
         ensure!(
-            rest_names.len() % 3 == 0,
+            rest_names.len().is_multiple_of(3),
             "expected multiple-of-3 f_rest_* properties"
         );
         1 + rest_names.len() / 3
@@ -209,7 +199,9 @@ pub fn save_gaussian_ply(
         file.write_all(&scale[1].to_le_bytes())?;
         file.write_all(&scale[2].to_le_bytes())?;
         let mut rot = scene.rotation(splat);
-        let norm = (rot[0] * rot[0] + rot[1] * rot[1] + rot[2] * rot[2] + rot[3] * rot[3]).sqrt().max(1e-8);
+        let norm = (rot[0] * rot[0] + rot[1] * rot[1] + rot[2] * rot[2] + rot[3] * rot[3])
+            .sqrt()
+            .max(1e-8);
         for q in &mut rot {
             *q /= norm;
         }
@@ -221,7 +213,10 @@ pub fn save_gaussian_ply(
 }
 
 fn sigmoid(values: Vec<f32>) -> Vec<f32> {
-    values.into_iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect()
+    values
+        .into_iter()
+        .map(|v| 1.0 / (1.0 + (-v).exp()))
+        .collect()
 }
 
 fn logit(alpha: f32) -> f32 {

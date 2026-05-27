@@ -882,7 +882,8 @@ impl MpsGraph {
     ) -> Option<MpsGraphExecutable> {
         unsafe {
             let dev = crate::device::metal_device()?;
-            let sel = sel!(compileWithDevice:feeds:targetTensors:targetOperations:compilationDescriptor:);
+            let sel =
+                sel!(compileWithDevice:feeds:targetTensors:targetOperations:compilationDescriptor:);
             let responds: bool = msg_send![self.obj, respondsToSelector: sel];
             if !responds {
                 return None;

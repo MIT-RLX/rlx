@@ -8,15 +8,15 @@
 
 use rlx_ir::hir::HirModule;
 use rlx_ir::{
-    apply_hir_extensions, BindingManifest, HirReflection, ManifestDiff, MirReflection,
-    ModelComponent, layout_from_lir,
+    BindingManifest, HirReflection, ManifestDiff, MirReflection, ModelComponent,
+    apply_hir_extensions, layout_from_lir,
 };
 use rlx_opt::CompileResult;
 
+use crate::Device;
 use crate::model_pipeline::ModelCompilePipeline;
 use crate::options::CompileOptions;
 use crate::stages;
-use crate::Device;
 
 /// Loaded template + HIR reflection (front-end load).
 pub struct ModelReflection {
@@ -132,8 +132,8 @@ mod tests {
             hir.set_outputs(vec![y]);
             hir
         };
-        let refl = ModelReflection::load_hir_template(device, hir(), &CompileOptions::new())
-            .unwrap();
+        let refl =
+            ModelReflection::load_hir_template(device, hir(), &CompileOptions::new()).unwrap();
         assert!(refl.has_template());
         let layout = refl.template_layout().unwrap();
         assert_eq!(layout.params[0].name, "w");

@@ -19,10 +19,10 @@
 use crate::device::RocmContext;
 use crate::hip::HipBuffer;
 use crate::kernels::gaussian_splat_rasterize_kernel;
-use slang_splat_ref::native_prep::{
-    camera_and_background_from_meta, prepare_raster, scene_from_slices, PreparedRaster,
-};
 use slang_splat_ref::RenderParams;
+use slang_splat_ref::native_prep::{
+    PreparedRaster, camera_and_background_from_meta, prepare_raster, scene_from_slices,
+};
 use std::sync::Arc;
 
 fn dispatch_prepared(
@@ -33,21 +33,29 @@ fn dispatch_prepared(
     dst_off: u32,
 ) {
     let rt = &ctx.runtime;
-    let mut d_ca = HipBuffer::<f32>::alloc_zeros(rt, prep.color_alpha.len())
-        .expect("splat native: alloc ca");
-    d_ca.copy_from_host(&prep.color_alpha).expect("splat native: h2d ca");
-    let mut d_valid = HipBuffer::<u32>::alloc_zeros(rt, prep.valid.len())
-        .expect("splat native: alloc valid");
-    d_valid.copy_from_host(&prep.valid).expect("splat native: h2d valid");
-    let mut d_pl = HipBuffer::<f32>::alloc_zeros(rt, prep.pos_local.len())
-        .expect("splat native: alloc pl");
-    d_pl.copy_from_host(&prep.pos_local).expect("splat native: h2d pl");
-    let mut d_inv = HipBuffer::<f32>::alloc_zeros(rt, prep.inv_scale.len())
-        .expect("splat native: alloc inv");
-    d_inv.copy_from_host(&prep.inv_scale).expect("splat native: h2d inv");
-    let mut d_quat = HipBuffer::<f32>::alloc_zeros(rt, prep.quat.len())
-        .expect("splat native: alloc quat");
-    d_quat.copy_from_host(&prep.quat).expect("splat native: h2d quat");
+    let mut d_ca =
+        HipBuffer::<f32>::alloc_zeros(rt, prep.color_alpha.len()).expect("splat native: alloc ca");
+    d_ca.copy_from_host(&prep.color_alpha)
+        .expect("splat native: h2d ca");
+    let mut d_valid =
+        HipBuffer::<u32>::alloc_zeros(rt, prep.valid.len()).expect("splat native: alloc valid");
+    d_valid
+        .copy_from_host(&prep.valid)
+        .expect("splat native: h2d valid");
+    let mut d_pl =
+        HipBuffer::<f32>::alloc_zeros(rt, prep.pos_local.len()).expect("splat native: alloc pl");
+    d_pl.copy_from_host(&prep.pos_local)
+        .expect("splat native: h2d pl");
+    let mut d_inv =
+        HipBuffer::<f32>::alloc_zeros(rt, prep.inv_scale.len()).expect("splat native: alloc inv");
+    d_inv
+        .copy_from_host(&prep.inv_scale)
+        .expect("splat native: h2d inv");
+    let mut d_quat =
+        HipBuffer::<f32>::alloc_zeros(rt, prep.quat.len()).expect("splat native: alloc quat");
+    d_quat
+        .copy_from_host(&prep.quat)
+        .expect("splat native: h2d quat");
     let mut d_sorted = HipBuffer::<u32>::alloc_zeros(rt, prep.sorted_values.len())
         .expect("splat native: alloc sorted");
     d_sorted
@@ -58,9 +66,11 @@ fn dispatch_prepared(
     d_ranges
         .copy_from_host(&prep.tile_ranges)
         .expect("splat native: h2d ranges");
-    let mut d_rays = HipBuffer::<f32>::alloc_zeros(rt, prep.rays.len())
-        .expect("splat native: alloc rays");
-    d_rays.copy_from_host(&prep.rays).expect("splat native: h2d rays");
+    let mut d_rays =
+        HipBuffer::<f32>::alloc_zeros(rt, prep.rays.len()).expect("splat native: alloc rays");
+    d_rays
+        .copy_from_host(&prep.rays)
+        .expect("splat native: h2d rays");
     let params = prep.params;
 
     let kernel = gaussian_splat_rasterize_kernel(ctx);
@@ -144,7 +154,13 @@ pub fn run_gaussian_splat_render_native(
         max_list_entries,
     };
     let prep = prepare_raster(&scene, &camera, background, &render_params);
-    dispatch_prepared(ctx, ctx.default_stream, buffer.ptr as *mut f32, &prep, dst_off as u32);
+    dispatch_prepared(
+        ctx,
+        ctx.default_stream,
+        buffer.ptr as *mut f32,
+        &prep,
+        dst_off as u32,
+    );
     unsafe {
         let _ = (rt.hip_stream_sync)(ctx.default_stream);
     }

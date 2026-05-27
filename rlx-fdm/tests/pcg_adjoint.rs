@@ -15,8 +15,8 @@
 //! PCG adjoint parity with dense LU (`solve_adjoint_columns`).
 
 use rlx_fdm::{
-    grad_loss_wrt_q_linear, grad_loss_wrt_q_linear_with_solver, AdjointSolveConfig, EquilibriumModel,
-    Network, Structure,
+    AdjointSolveConfig, EquilibriumModel, Network, Structure, grad_loss_wrt_q_linear,
+    grad_loss_wrt_q_linear_with_solver,
 };
 
 fn arch_grad(num_segments: usize) -> (Network, Structure, Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -32,8 +32,7 @@ fn arch_grad(num_segments: usize) -> (Network, Structure, Vec<f64>, Vec<f64>, Ve
     let nf = s.num_free();
     let mut loss_grad = vec![0.0; nf * 3];
     loss_grad[2] = 1.0;
-    let xyz_free =
-        EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("x");
+    let xyz_free = EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("x");
     (net, s, xf, loss_grad, xyz_free)
 }
 
@@ -42,15 +41,8 @@ fn pcg_adjoint_matches_dense_on_large_arch() {
     let (net, s, xf, loss_grad, xyz_free) = arch_grad(40);
     assert!(s.num_free() >= 32, "need sparse threshold");
 
-    let dense = grad_loss_wrt_q_linear(
-        &net.q,
-        &xf,
-        &net.loads,
-        &s,
-        &xyz_free,
-        &loss_grad,
-    )
-    .expect("dense");
+    let dense =
+        grad_loss_wrt_q_linear(&net.q, &xf, &net.loads, &s, &xyz_free, &loss_grad).expect("dense");
 
     let pcg = grad_loss_wrt_q_linear_with_solver(
         &net.q,
@@ -71,8 +63,5 @@ fn pcg_adjoint_matches_dense_on_large_arch() {
     for (a, b) in dense.dq.iter().zip(pcg.dq.iter()) {
         max_err = max_err.max((a - b).abs());
     }
-    assert!(
-        max_err < 1e-5,
-        "PCG adjoint vs dense LU max_err={max_err}"
-    );
+    assert!(max_err < 1e-5, "PCG adjoint vs dense LU max_err={max_err}");
 }

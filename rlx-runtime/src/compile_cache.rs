@@ -37,8 +37,8 @@
 //! ```
 
 use crate::{CompiledGraph, Device, Session};
-use rlx_ir::Graph;
 use rlx_ir::DimBinding;
+use rlx_ir::Graph;
 use rlx_ir::hir::HirModule;
 use rlx_opt::CompileResult;
 use std::collections::VecDeque;
@@ -510,6 +510,10 @@ impl DynamicDimCompileCache {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn contains(&self, key: u64) -> bool {
         self.entries.iter().any(|(k, _)| *k == key)
     }
@@ -551,9 +555,9 @@ impl DynamicDimCompileCache {
         if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
             return Ok(&mut self.entries[idx].1);
         }
-        let device = self.device.clone();
+        let device = self.device;
         let template = self.ensure_template(build_hir, options)?;
-        let mut compiled = aot.specialize_cached(disk_base, binding, device, template, options)?;
+        let compiled = aot.specialize_cached(disk_base, binding, device, template, options)?;
         if self.entries.len() >= self.capacity
             && let Some(evict_key) = self.order.pop_front()
         {

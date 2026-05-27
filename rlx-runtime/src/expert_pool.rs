@@ -161,7 +161,12 @@ impl ExpertPool {
     }
 
     /// TIDE `generate`: `refresh_experts = prefill_block || (offload && step % τ == 0)`.
-    pub fn should_refresh(&self, mode: MoEExecMode, denoise_step: usize, is_prefill_block: bool) -> bool {
+    pub fn should_refresh(
+        &self,
+        mode: MoEExecMode,
+        denoise_step: usize,
+        is_prefill_block: bool,
+    ) -> bool {
         if !self.offload_enabled() {
             return false;
         }
@@ -173,9 +178,10 @@ impl ExpertPool {
                 }
                 match self.refresh {
                     ExpertRefreshPolicy::EveryForward => true,
-                    ExpertRefreshPolicy::EveryDecodeSteps(n) | ExpertRefreshPolicy::EveryDenoiseSteps(n) => {
+                    ExpertRefreshPolicy::EveryDecodeSteps(n)
+                    | ExpertRefreshPolicy::EveryDenoiseSteps(n) => {
                         let interval = n.max(1);
-                        denoise_step % interval == 0
+                        denoise_step.is_multiple_of(interval)
                     }
                 }
             }
@@ -308,8 +314,16 @@ mod tests {
 
     #[test]
     fn per_layer_masks_differ_from_merged_union() {
-        let mut p0 = ExpertPool::new(ExpertPoolConfig::new(4, 2, ExpertRefreshPolicy::EveryForward));
-        let mut p1 = ExpertPool::new(ExpertPoolConfig::new(4, 2, ExpertRefreshPolicy::EveryForward));
+        let mut p0 = ExpertPool::new(ExpertPoolConfig::new(
+            4,
+            2,
+            ExpertRefreshPolicy::EveryForward,
+        ));
+        let mut p1 = ExpertPool::new(ExpertPoolConfig::new(
+            4,
+            2,
+            ExpertRefreshPolicy::EveryForward,
+        ));
         p0.refresh_from_indices(&[0, 1]);
         p1.refresh_from_indices(&[2, 3]);
         let pools = [p0, p1];
@@ -336,7 +350,11 @@ mod tests {
 
     #[test]
     fn paired_swap_limits_demotions() {
-        let mut pool = ExpertPool::new(ExpertPoolConfig::new(8, 2, ExpertRefreshPolicy::EveryForward));
+        let mut pool = ExpertPool::new(ExpertPoolConfig::new(
+            8,
+            2,
+            ExpertRefreshPolicy::EveryForward,
+        ));
         pool.resident = [0, 1].into_iter().collect();
         let r = pool.apply_target_placement(&[6, 7]);
         assert_eq!(r.promotions, 2);
@@ -346,7 +364,11 @@ mod tests {
 
     #[test]
     fn paired_swap_keeps_extra_residents() {
-        let mut pool = ExpertPool::new(ExpertPoolConfig::new(8, 4, ExpertRefreshPolicy::EveryForward));
+        let mut pool = ExpertPool::new(ExpertPoolConfig::new(
+            8,
+            4,
+            ExpertRefreshPolicy::EveryForward,
+        ));
         pool.resident = [0, 1, 2, 3].into_iter().collect();
         // Target overlaps heavily — paired demotion leaves one former GPU expert
         // on device (matches TIDE `can_demote[len(to_promote):]`).

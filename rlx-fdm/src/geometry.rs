@@ -19,7 +19,7 @@ use crate::network::Vec3;
 
 const WORLD_X: [f64; 3] = [1.0, 0.0, 0.0];
 const WORLD_Y: [f64; 3] = [0.0, 1.0, 0.0];
-const WORLD_Z: [f64; 3] = [0.0, 0.0, 1.0];
+const _WORLD_Z: [f64; 3] = [0.0, 0.0, 1.0];
 
 pub fn length(v: Vec3) -> f64 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
@@ -278,11 +278,7 @@ mod tests {
 
     #[test]
     fn face_load_global_jacobian_matches_fd() {
-        let poly = [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.5, 1.0, 0.2],
-        ];
+        let poly = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.2]];
         let load = [0.0, 0.0, -1.0];
         let j = jacobian_face_load_global_wrt_polygon(&poly, load);
         let eps = 1e-7;

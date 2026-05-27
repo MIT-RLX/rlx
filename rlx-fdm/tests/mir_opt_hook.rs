@@ -15,10 +15,10 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use rlx_fdm::mir_opt::{
-    build_grad_q_custom_fn, goals_grad_wrt_q, set_grad_q_param, FdmEquilibriumGraph, FdmGradMode,
-    FdmGradQSignature, FdmMirOptimizer,
+    FdmEquilibriumGraph, FdmGradMode, FdmGradQSignature, FdmMirOptimizer, build_grad_q_custom_fn,
+    goals_grad_wrt_q, set_grad_q_param,
 };
-use rlx_fdm::{fdm, goals_grad_xyz_free, Goal, Network};
+use rlx_fdm::{Goal, Network, fdm, goals_grad_xyz_free};
 use rlx_runtime::{Device, Session};
 
 #[test]
@@ -45,7 +45,10 @@ fn custom_fn_grad_q_builds() {
         num_edges: net.num_edges(),
         num_free: s.num_free(),
     };
-    let loss_grad = g.param("loss_grad", rlx_ir::Shape::new(&[s.num_free() * 3], rlx_ir::DType::F64));
+    let loss_grad = g.param(
+        "loss_grad",
+        rlx_ir::Shape::new(&[s.num_free() * 3], rlx_ir::DType::F64),
+    );
     let FdmEquilibriumGraph::Dense(dense) = &built else {
         panic!("small arch should use dense graph");
     };

@@ -15,8 +15,10 @@
 //! GPU GGUF K-quant dequant + cuBLAS matmul for `Op::DequantMatMul` and
 //! grouped MoE `Op::DequantGroupedMatMul`.
 
-use cudarc::cublas::{result as cublas_result, sys as cublas_sys, CudaBlas};
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtrMut, LaunchConfig, PushKernelArg};
+use cudarc::cublas::{CudaBlas, result as cublas_result, sys as cublas_sys};
+use cudarc::driver::{
+    CudaContext, CudaSlice, CudaStream, DevicePtrMut, LaunchConfig, PushKernelArg,
+};
 use rlx_ir::{Graph, Op};
 use std::sync::{Arc, Mutex};
 
@@ -157,24 +159,20 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
     let slab_bytes = slab_bytes_for(scheme, k, n);
     let num_blocks = (k * n) / scheme.gguf_block_size() as usize;
 
-    stream.synchronize().expect("rlx-cuda: grouped gguf pre-sync failed");
+    stream
+        .synchronize()
+        .expect("rlx-cuda: grouped gguf pre-sync failed");
 
     let x_f32_off = x_byte_off / 4;
     let mut x_host = vec![0f32; m * k];
     stream
-        .memcpy_dtoh(
-            &buffer.slice(x_f32_off..x_f32_off + m * k),
-            &mut x_host,
-        )
+        .memcpy_dtoh(&buffer.slice(x_f32_off..x_f32_off + m * k), &mut x_host)
         .expect("rlx-cuda: grouped gguf x dtoh failed");
 
     let idx_f32_off = idx_byte_off / 4;
     let mut idx_host = vec![0f32; m];
     stream
-        .memcpy_dtoh(
-            &buffer.slice(idx_f32_off..idx_f32_off + m),
-            &mut idx_host,
-        )
+        .memcpy_dtoh(&buffer.slice(idx_f32_off..idx_f32_off + m), &mut idx_host)
         .expect("rlx-cuda: grouped gguf idx dtoh failed");
 
     let (packed_in, original_pos, offsets) =
@@ -264,7 +262,13 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
         .expect("rlx-cuda: grouped gguf pack_out dtoh failed");
 
     let mut out_host = vec![0f32; m * n];
-    rlx_cpu::gguf_matmul::grouped_moe_unpermute_out(&packed_out, &original_pos, &mut out_host, m, n);
+    rlx_cpu::gguf_matmul::grouped_moe_unpermute_out(
+        &packed_out,
+        &original_pos,
+        &mut out_host,
+        m,
+        n,
+    );
 
     let out_f32_off = out_byte_off / 4;
     stream

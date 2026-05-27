@@ -15,19 +15,8 @@ pub fn legalize_multi_axis_reduce(mut g: Graph) -> Graph {
         .nodes()
         .iter()
         .filter_map(|n| {
-            if let Op::Reduce {
-                op,
-                axes,
-                keep_dim,
-            } = &n.op
-            {
-                (axes.len() > 1).then_some((
-                    n.id,
-                    *op,
-                    axes.clone(),
-                    *keep_dim,
-                    n.shape.clone(),
-                ))
+            if let Op::Reduce { op, axes, keep_dim } = &n.op {
+                (axes.len() > 1).then_some((n.id, *op, axes.clone(), *keep_dim, n.shape.clone()))
             } else {
                 None
             }
@@ -67,7 +56,13 @@ pub fn legalize_multi_axis_reduce(mut g: Graph) -> Graph {
                     Dim::Dynamic(_) => -1,
                 })
                 .collect();
-            cur = g.add_node(Op::Reshape { new_shape: new_shape_dims }, vec![cur], final_shape);
+            cur = g.add_node(
+                Op::Reshape {
+                    new_shape: new_shape_dims,
+                },
+                vec![cur],
+                final_shape,
+            );
         }
         remap.insert(id, cur);
     }

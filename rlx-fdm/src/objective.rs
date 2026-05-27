@@ -16,14 +16,13 @@
 //! Form-finding objectives (jax_fdm `goals` + `losses.errors`).
 
 use crate::goals::{
-    accumulate_edge_length_grad, edge_force, grad_edge_force_wrt_xyz_free,
+    EdgeIndex, GoalIndex, accumulate_edge_length_grad, edge_force, grad_edge_force_wrt_xyz_free,
     grad_edge_lengths_wrt_xyz_free, grad_mesh_laplacian_wrt_xyz_free,
     grad_mesh_mean_face_rectangular_wrt_xyz_free, grad_mesh_mean_planarity_wrt_xyz_free,
     grad_mesh_total_area_wrt_xyz_free, grad_min_free_z_wrt_xyz_free, grad_node_coord_wrt_xyz_free,
-    grad_residual_wrt_xyz_free,
-    mean_edge_force, mean_edge_length, mesh_laplacian_energy, mesh_mean_face_rectangular,
-    mesh_mean_planarity, mesh_total_area, min_free_z, network_loadpath, node_coord, packed_free_dim,
-    residual_loss, EdgeIndex, GoalIndex,
+    grad_residual_wrt_xyz_free, mean_edge_force, mean_edge_length, mesh_laplacian_energy,
+    mesh_mean_face_rectangular, mesh_mean_planarity, mesh_total_area, min_free_z, network_loadpath,
+    node_coord, packed_free_dim, residual_loss,
 };
 use crate::mesh::MeshStructure;
 use crate::state::EquilibriumState;
@@ -155,9 +154,7 @@ impl Goal {
             Self::MeanEdgeLength { .. } => mean_edge_length(state),
             Self::EdgeForce { edge, .. } => edge_force(state, edge.0),
             Self::MeanEdgeForce { .. } => mean_edge_force(state),
-            Self::NodeCoord { node, axis, .. } => {
-                node_coord(state, *node, *axis as usize)
-            }
+            Self::NodeCoord { node, axis, .. } => node_coord(state, *node, *axis as usize),
             Self::MinFreeZ { .. } => {
                 let mut min_z = f64::INFINITY;
                 for (i, &sup) in is_support.iter().enumerate() {
@@ -185,9 +182,7 @@ impl Goal {
     ) -> f64 {
         match self {
             Self::MinFreeZ { .. } => min_free_z(state, structure),
-            Self::MeshArea { .. } => mesh
-                .map(|m| mesh_total_area(m, &state.xyz))
-                .unwrap_or(0.0),
+            Self::MeshArea { .. } => mesh.map(|m| mesh_total_area(m, &state.xyz)).unwrap_or(0.0),
             Self::MeshPlanarity { .. } => mesh
                 .map(|m| mesh_mean_planarity(m, &state.xyz))
                 .unwrap_or(0.0),
@@ -280,7 +275,12 @@ impl Goal {
                 }
             }
             Self::MeanEdgeLength { .. } => {
-                let gg = grad_edge_lengths_wrt_xyz_free(state, structure, edges, scale / edges.len() as f64);
+                let gg = grad_edge_lengths_wrt_xyz_free(
+                    state,
+                    structure,
+                    edges,
+                    scale / edges.len() as f64,
+                );
                 for (a, b) in g.iter_mut().zip(gg.iter()) {
                     *a += *b;
                 }
@@ -296,8 +296,7 @@ impl Goal {
             }
             Self::MeanEdgeForce { .. } => {
                 for e in 0..edges.len() {
-                    let qeff = state.forces[e]
-                        / state.lengths[e].max(1e-12);
+                    let qeff = state.forces[e] / state.lengths[e].max(1e-12);
                     let gg = grad_edge_force_wrt_xyz_free(
                         state,
                         structure,

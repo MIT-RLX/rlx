@@ -6,8 +6,6 @@ use anyhow::Result;
 use crate::context::FlowCtx;
 use crate::stage::FlowStage;
 use crate::value::FlowValue;
-use crate::weight::WeightSource;
-
 pub struct RepeatStage {
     pub count: usize,
     pub stage_for_index: std::sync::Arc<dyn Fn(usize) -> FlowStage + Send + Sync>,
@@ -22,7 +20,10 @@ impl std::fmt::Debug for RepeatStage {
 }
 
 impl RepeatStage {
-    pub fn new(count: usize, stage_for_index: impl Fn(usize) -> FlowStage + Send + Sync + 'static) -> Self {
+    pub fn new(
+        count: usize,
+        stage_for_index: impl Fn(usize) -> FlowStage + Send + Sync + 'static,
+    ) -> Self {
         Self {
             count,
             stage_for_index: std::sync::Arc::new(stage_for_index),

@@ -431,7 +431,10 @@ fn rope_identity_passes_through() {
     let cos = g.input("cos", Shape::new(&[1, 2], DType::F32));
     let sin = g.input("sin", Shape::new(&[1, 2], DType::F32));
     let y = g.add_node(
-        Op::Rope { head_dim: 4, n_rot: 4 },
+        Op::Rope {
+            head_dim: 4,
+            n_rot: 4,
+        },
         vec![x, cos, sin],
         Shape::new(&[1, 1, 1, 4], DType::F32),
     );
@@ -458,7 +461,10 @@ fn rope_90_degree_rotation_matches_reference() {
     let cos = g.input("cos", Shape::new(&[1, 2], DType::F32));
     let sin = g.input("sin", Shape::new(&[1, 2], DType::F32));
     let y = g.add_node(
-        Op::Rope { head_dim: 4, n_rot: 4 },
+        Op::Rope {
+            head_dim: 4,
+            n_rot: 4,
+        },
         vec![x, cos, sin],
         Shape::new(&[1, 1, 1, 4], DType::F32),
     );
@@ -787,7 +793,10 @@ fn fused_swiglu_matches_unfused_reference() {
     let mut g = Graph::new("swg");
     let x = g.input("x", Shape::new(&[2, 4], DType::F32));
     let y = g.add_node(
-        Op::FusedSwiGLU { cast_to: None, gate_first: false },
+        Op::FusedSwiGLU {
+            cast_to: None,
+            gate_first: false,
+        },
         vec![x],
         Shape::new(&[2, 2], DType::F32),
     );
@@ -1305,14 +1314,14 @@ fn dequant_matmul_nvfp4_matches_reference() {
     if !rlx_wgpu::is_available() {
         return;
     }
-    use rlx_ir::{fp4_e2m1_to_f32, fp8_e4m3_scale_to_f32, NVFP4_GROUP_SIZE};
+    use rlx_ir::{NVFP4_GROUP_SIZE, fp4_e2m1_to_f32, fp8_e4m3_scale_to_f32};
     let m = 1usize;
     let k = NVFP4_GROUP_SIZE;
     let n = 4usize;
     let n_scale = k.div_ceil(NVFP4_GROUP_SIZE) * n;
     let mut g = Graph::new("nvfp4");
     let x = g.input("x", Shape::new(&[m, k], DType::F32));
-    let wq = g.param("wq", Shape::new(&[(k * n + 1) / 2], DType::U8));
+    let wq = g.param("wq", Shape::new(&[(k * n).div_ceil(2)], DType::U8));
     let sc = g.param("sc", Shape::new(&[n_scale], DType::U8));
     let gs = g.param("gs", Shape::new(&[1], DType::F32));
     let y = g.dequant_matmul_nvfp4(x, wq, sc, gs, Shape::new(&[m, n], DType::F32));
@@ -1323,7 +1332,7 @@ fn dequant_matmul_nvfp4_matches_reference() {
     let codes: Vec<u8> = (0..k * n)
         .map(|i| if i % 2 == 0 { 2u8 } else { 4u8 })
         .collect();
-    let mut packed = vec![0u8; (k * n + 1) / 2];
+    let mut packed = vec![0u8; (k * n).div_ceil(2)];
     for (i, chunk) in codes.chunks(2).enumerate() {
         packed[i] = chunk[0] | (chunk[1] << 4);
     }

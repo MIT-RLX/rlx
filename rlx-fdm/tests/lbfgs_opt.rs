@@ -13,8 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 use rlx_fdm::{
-    constrained_fdm, fdm, network_loadpath, Constraint, Goal, Network, OptimizeConfig,
-    OptimizerKind,
+    Constraint, Goal, Network, OptimizeConfig, OptimizerKind, constrained_fdm, fdm,
+    network_loadpath,
 };
 
 #[test]

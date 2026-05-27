@@ -26,12 +26,7 @@ use crate::{Graph, NodeId, Op, Shape};
 
 impl Graph {
     /// Dense linear layer: `matmul(input, weight)` with optional rank-1 bias.
-    pub fn linear_bias(
-        &mut self,
-        input: NodeId,
-        weight: NodeId,
-        bias: Option<NodeId>,
-    ) -> NodeId {
+    pub fn linear_bias(&mut self, input: NodeId, weight: NodeId, bias: Option<NodeId>) -> NodeId {
         let mm = self.mm(input, weight);
         match bias {
             Some(b) => self.add(mm, b),

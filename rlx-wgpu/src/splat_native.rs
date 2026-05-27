@@ -18,7 +18,7 @@
 
 use crate::buffer::Arena;
 use bytemuck::{Pod, Zeroable};
-use slang_splat_ref::native_prep::{prepare_raster_from_slices, PreparedRaster, SplatRasterParams};
+use slang_splat_ref::native_prep::{PreparedRaster, SplatRasterParams, prepare_raster_from_slices};
 use std::sync::OnceLock;
 
 #[repr(C)]
@@ -258,12 +258,16 @@ pub fn run_gaussian_splat_render_native(
     max_list_entries: u32,
 ) {
     let f32_bytes = |n: usize| n * 4;
-    let positions = arena.read_bytes_range(device, queue, positions_byte_off, f32_bytes(positions_len));
+    let positions =
+        arena.read_bytes_range(device, queue, positions_byte_off, f32_bytes(positions_len));
     let scales = arena.read_bytes_range(device, queue, scales_byte_off, f32_bytes(scales_len));
-    let rotations = arena.read_bytes_range(device, queue, rotations_byte_off, f32_bytes(rotations_len));
-    let opacities = arena.read_bytes_range(device, queue, opacities_byte_off, f32_bytes(opacities_len));
+    let rotations =
+        arena.read_bytes_range(device, queue, rotations_byte_off, f32_bytes(rotations_len));
+    let opacities =
+        arena.read_bytes_range(device, queue, opacities_byte_off, f32_bytes(opacities_len));
     let colors = arena.read_bytes_range(device, queue, colors_byte_off, f32_bytes(colors_len));
-    let sh_coeffs = arena.read_bytes_range(device, queue, sh_coeffs_byte_off, f32_bytes(sh_coeffs_len));
+    let sh_coeffs =
+        arena.read_bytes_range(device, queue, sh_coeffs_byte_off, f32_bytes(sh_coeffs_len));
     let meta = arena.read_bytes_range(device, queue, meta_byte_off, f32_bytes(23));
 
     let prep = prepare_raster_from_slices(

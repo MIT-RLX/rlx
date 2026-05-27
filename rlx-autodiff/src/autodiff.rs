@@ -1183,8 +1183,7 @@ fn vjp(
             let indices_bwd = fwd_map[&node.inputs[1]];
             let table_shape = bwd.node(table_bwd).shape.clone();
             if *axis == 0 {
-                let dtable =
-                    bwd.add_node(Op::ScatterAdd, vec![upstream, indices_bwd], table_shape);
+                let dtable = bwd.add_node(Op::ScatterAdd, vec![upstream, indices_bwd], table_shape);
                 vec![(0, dtable)]
             } else {
                 let dtable = bwd.gather_backward(
@@ -1343,8 +1342,7 @@ fn vjp(
             let gamma_shape = bwd.node(gamma).shape.clone();
             let beta_shape = bwd.node(beta).shape.clone();
             let dx = bwd.group_norm_backward_input(x, gamma, beta, upstream, *num_groups, *eps);
-            let dgamma =
-                bwd.group_norm_backward_gamma(x, upstream, gamma_shape, *num_groups, *eps);
+            let dgamma = bwd.group_norm_backward_gamma(x, upstream, gamma_shape, *num_groups, *eps);
             let dbeta = bwd.group_norm_backward_beta(x, upstream, beta_shape, *num_groups, *eps);
             vec![(0, dx), (1, dgamma), (2, dbeta)]
         }
@@ -1362,16 +1360,8 @@ fn vjp(
                 MaskKind::Custom | MaskKind::Bias => Some(fwd_map[&node.inputs[3]]),
                 _ => None,
             };
-            let (dq, dk, dv) = bwd.attention_backward_all(
-                q,
-                k,
-                v,
-                upstream,
-                *num_heads,
-                *head_dim,
-                *mask_kind,
-                mask,
-            );
+            let (dq, dk, dv) = bwd
+                .attention_backward_all(q, k, v, upstream, *num_heads, *head_dim, *mask_kind, mask);
             vec![(0, dq), (1, dk), (2, dv)]
         }
 
@@ -1474,11 +1464,7 @@ fn vjp(
             let dtype = upstream_shape.dtype();
 
             let bool_shape = Shape::from_dims(upstream_shape.dims(), DType::Bool);
-            let mask_pred = bwd.add_node(
-                Op::Compare(CmpOp::Eq),
-                vec![a_bwd, y_bwd],
-                bool_shape,
-            );
+            let mask_pred = bwd.add_node(Op::Compare(CmpOp::Eq), vec![a_bwd, y_bwd], bool_shape);
             let mask_f32 = bwd.add_node(
                 Op::Cast { to: dtype },
                 vec![mask_pred],
@@ -1699,15 +1685,8 @@ fn vjp(
             let expert_bwd = fwd_map[&node.inputs[2]];
             let x_shape = bwd.node(x_bwd).shape.clone();
             let w_shape = bwd.node(w_bwd).shape.clone();
-            let (dx, dw) = grouped_matmul_vjp(
-                bwd,
-                upstream,
-                x_bwd,
-                w_bwd,
-                expert_bwd,
-                &x_shape,
-                &w_shape,
-            );
+            let (dx, dw) =
+                grouped_matmul_vjp(bwd, upstream, x_bwd, w_bwd, expert_bwd, &x_shape, &w_shape);
             vec![(0, dx), (1, dw)]
         }
 
@@ -1736,7 +1715,9 @@ fn vjp(
             let block_elems = scheme.gguf_block_size() as usize;
             let block_bytes = scheme.gguf_block_bytes() as usize;
             let slab_bytes = (k_static * n_static) / block_elems * block_bytes;
-            let total_bytes = w_packed_shape.num_elements().expect("DequantGroupedMatMul VJP: dyn packed");
+            let total_bytes = w_packed_shape
+                .num_elements()
+                .expect("DequantGroupedMatMul VJP: dyn packed");
             let e_static = total_bytes / slab_bytes.max(1);
             let w_shape = Shape::from_dims(
                 &[
@@ -1751,15 +1732,8 @@ fn vjp(
                 vec![w_packed],
                 w_shape.clone(),
             );
-            let (dx, _dw) = grouped_matmul_vjp(
-                bwd,
-                upstream,
-                x_bwd,
-                w_dq,
-                expert_bwd,
-                &x_shape,
-                &w_shape,
-            );
+            let (dx, _dw) =
+                grouped_matmul_vjp(bwd, upstream, x_bwd, w_dq, expert_bwd, &x_shape, &w_shape);
             vec![(0, dx)]
         }
 
@@ -2043,8 +2017,8 @@ fn vjp(
             ..
         } => {
             use rlx_ir::ops::splat::{
-                unpack_gaussian_splat_packed_grads, GaussianSplatBackwardParams, GaussianSplatInputs,
-                GaussianSplatRenderParams,
+                GaussianSplatBackwardParams, GaussianSplatInputs, GaussianSplatRenderParams,
+                unpack_gaussian_splat_packed_grads,
             };
             let render = GaussianSplatRenderParams {
                 width: *width,
@@ -2514,10 +2488,10 @@ pub fn convert_scans_for_ad(g: Graph) -> Graph {
     out
 }
 
-/// Pre-AD pass: inline `Op::CustomFn` nodes that have no `vjp_body`
-/// by expanding their `fwd_body` into the parent graph. After this
-/// rewrite the reverse walk sees only primitive ops and can apply
-/// the per-op VJP rules recursively.
+/// Pre-AD pass: inline `Op::CustomFn` nodes that have neither a
+/// `vjp_body` nor a `jvp_body` by expanding their `fwd_body` into the
+/// parent graph. When either override body is present, keep the
+/// `CustomFn` wrapper so reverse- / forward-mode AD can dispatch to it.
 pub fn inline_custom_fn_for_autodiff(g: Graph) -> Graph {
     use rlx_fusion::control_flow::inline_subgraph_into;
 
@@ -2530,6 +2504,7 @@ pub fn inline_custom_fn_for_autodiff(g: Graph) -> Graph {
         let new_id = match &node.op {
             Op::CustomFn {
                 vjp_body: None,
+                jvp_body: None,
                 fwd_body,
                 num_inputs,
                 ..
@@ -2550,10 +2525,6 @@ pub fn inline_custom_fn_for_autodiff(g: Graph) -> Graph {
     out.set_outputs(new_outputs);
     out
 }
-
-/// expand / exp for the SSM unroll). Mirrors the HLO emission
-/// decomposition in `rlx-tpu/src/unfuse.rs` and the MLX
-/// `lower.rs` SelectiveScan composition.
 
 /// Inverse of `unbroadcast`: broadcast a small tensor up to a target
 /// shape via `Op::Expand`. Convenience wrapper for the few VJPs that
@@ -3259,10 +3230,7 @@ mod tests {
             .iter()
             .filter(|n| matches!(n.op, Op::Binary(BinaryOp::Mul)))
             .count();
-        assert!(
-            mul_count >= 2,
-            "expected Mul-based VJP for x², got\n{bwd}"
-        );
+        assert!(mul_count >= 2, "expected Mul-based VJP for x², got\n{bwd}");
     }
 
     #[test]

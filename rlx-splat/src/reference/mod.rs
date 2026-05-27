@@ -15,52 +15,48 @@
 //! CPU reference pipeline ported from `reference_impls/reference_cpu.py`.
 
 mod binning;
-pub mod native_prep;
 mod grads;
+pub mod native_prep;
+mod packed_backward;
 mod project;
 mod projection_debug;
 mod raster;
 mod raster_analytical;
 mod raster_gaussian;
-mod packed_backward;
 mod training;
 mod training_cache;
 mod training_trace_gpu;
 
+pub use crate::core::RASTER_CACHE_PARAM_COUNT;
 pub use binning::{build_tile_key_value_pairs, build_tile_ranges, sort_key_values};
 pub use grads::{
-    color_alpha_grad_to_raster_grad, compute_grad_norms, compute_packed_grad_norms, GradStats,
-    GRAD_STATS_STRIDE,
+    GRAD_STATS_STRIDE, GradStats, color_alpha_grad_to_raster_grad, compute_grad_norms,
+    compute_packed_grad_norms,
+};
+pub use native_prep::prepared_raster_from_training;
+pub use packed_backward::{
+    backward_packed_arena, backward_packed_from_training_forward, backward_packed_host_slices,
+    scene_grads_to_packed,
 };
 pub use project::{ProjectedSplats, project_splats};
-pub use projection_debug::{
-    projection_debug_buffers, projected_from_debug,
-};
+pub use projection_debug::{projected_from_debug, projection_debug_buffers};
 pub use raster::{rasterize, ray_splat_intersection_alpha};
 pub use raster_analytical::{
     backprop_ray_hit_alpha_analytical_scene, ray_hit_alpha_grad_projected,
 };
 pub use raster_gaussian::{
-    backprop_build_raster_gaussian, build_raster_gaussian, flat_to_raster_gaussian,
-    raster_gaussian_to_flat, CachedRasterGaussian, CachedRasterGrad,
-};
-pub use crate::core::RASTER_CACHE_PARAM_COUNT;
-pub use packed_backward::{
-    backward_packed_arena, backward_packed_from_training_forward, backward_packed_host_slices,
-    scene_grads_to_packed,
+    CachedRasterGaussian, CachedRasterGrad, backprop_build_raster_gaussian, build_raster_gaussian,
+    flat_to_raster_gaussian, raster_gaussian_to_flat,
 };
 pub use training::{
-    backprop_scene_grads, backprop_scene_grads_with_color_alpha_grad, build_training_prepare,
-    capture_training_traces, linearize_background, raster_training_linear_cpu,
-    rasterize_backward, render_training_forward, training_forward_from_parts, SceneGrads,
-    TrainingForward, TrainingPrepare,
+    SceneGrads, TrainingForward, TrainingPrepare, backprop_scene_grads,
+    backprop_scene_grads_with_color_alpha_grad, build_training_prepare, capture_training_traces,
+    linearize_background, raster_training_linear_cpu, rasterize_backward, render_training_forward,
+    training_forward_from_parts,
 };
+pub use training_cache::{clear_training_forward_cache, set_training_forward_cache};
 pub use training_trace_gpu::{
-    trace_buffer_sizes, traces_from_gpu_buffers, TRAINING_HIT_META_FLOATS,
-};
-pub use native_prep::prepared_raster_from_training;
-pub use training_cache::{
-    clear_training_forward_cache, set_training_forward_cache,
+    TRAINING_HIT_META_FLOATS, trace_buffer_sizes, traces_from_gpu_buffers,
 };
 
 use crate::core::{Camera, GaussianScene};
@@ -94,11 +90,11 @@ impl Default for RenderParams {
 
 impl RenderParams {
     pub fn tile_width(&self) -> u32 {
-        (self.width + self.tile_size - 1) / self.tile_size
+        self.width.div_ceil(self.tile_size)
     }
 
     pub fn tile_height(&self) -> u32 {
-        (self.height + self.tile_size - 1) / self.tile_size
+        self.height.div_ceil(self.tile_size)
     }
 
     pub fn tile_count(&self) -> u32 {

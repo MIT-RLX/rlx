@@ -119,8 +119,8 @@ fn backward_f64_n1_times_1s_matches_finite_diff() {
     // ∂loss/∂a[k] = S · b̄  (sum of all b's)
     // ∂loss/∂b[k] = N · ā  (sum of all a's)
     // Verify both AD output and the analytic identities.
-    let a_init = vec![1.5_f64, -2.0, 0.25, 4.0];
-    let b_init = vec![3.0_f64, -1.5, 2.5];
+    let a_init = [1.5_f64, -2.0, 0.25, 4.0];
+    let b_init = [3.0_f64, -1.5, 2.5];
 
     let mut g = Graph::new("bidir_bcast_grad");
     let a_in = g.input("a", Shape::new(&[N, 1], DType::F64));

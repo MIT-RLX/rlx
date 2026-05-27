@@ -786,7 +786,7 @@ pub fn dequant_q6_k_block(block: &[u8], out: &mut [f32; QK_K]) {
         for l in 0..32 {
             let is = l / 16;
             let qh_b = qh[qh_off_h + l];
-            let q1 = ((ql[ql_off + l] & 0x0F) | (((qh_b >> 0) & 3) << 4)) as i32 - 32;
+            let q1 = ((ql[ql_off + l] & 0x0F) | ((qh_b & 3) << 4)) as i32 - 32;
             let q2 = ((ql[ql_off + l + 32] & 0x0F) | (((qh_b >> 2) & 3) << 4)) as i32 - 32;
             let q3 = ((ql[ql_off + l] >> 4) | (((qh_b >> 4) & 3) << 4)) as i32 - 32;
             let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh_b >> 6) & 3) << 4)) as i32 - 32;
@@ -853,7 +853,7 @@ pub fn dequant_q3_k_block(block: &[u8], out: &mut [f32; QK_K]) {
     let tmp = aux[2];
     aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
     aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
-    aux[0] = (aux[0] & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+    aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
     aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
     let scales: &[i8; 16] = unsafe { &*(aux.as_ptr() as *const [i8; 16]) };
     let mut is = 0usize;
@@ -1051,7 +1051,7 @@ pub fn dequant_q6_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
             for l in 0..32 {
                 let is = l / 16;
                 let qh_b = qh[qh_off_h + l];
-                let q1 = (((ql[ql_off + l] & 0x0F) | (((qh_b >> 0) & 3) << 4)) as i32 - 32) as f32;
+                let q1 = (((ql[ql_off + l] & 0x0F) | ((qh_b & 3) << 4)) as i32 - 32) as f32;
                 let q2 =
                     (((ql[ql_off + l + 32] & 0x0F) | (((qh_b >> 2) & 3) << 4)) as i32 - 32) as f32;
                 let q3 = (((ql[ql_off + l] >> 4) | (((qh_b >> 4) & 3) << 4)) as i32 - 32) as f32;
@@ -1203,9 +1203,7 @@ mod tests {
         // sub-blocks identical — just verify the j<4 sub-blocks decode to 7.
         bytes.extend_from_slice(&scales);
         // qs[128]: every nibble = 7 → byte = 0x77.
-        for _ in 0..(QK_K / 2) {
-            bytes.push(0x77);
-        }
+        bytes.extend(std::iter::repeat_n(0x77u8, QK_K / 2));
         let out = dequant_q4_k(&bytes, QK_K).unwrap();
         assert_eq!(out.len(), QK_K);
         // First 4 sub-blocks (128 elements at positions 0..32, 64..96, 128..160, 192..224)
@@ -1235,9 +1233,7 @@ mod tests {
         // Pattern: 0b10_10_10_10 = 0xAA.
         bytes.resize(ql_len + qh_len, 0xAAu8);
         // sc: 16 i8 scales, all = 1.
-        for _ in 0..sc_len {
-            bytes.push(1u8);
-        }
+        bytes.extend(std::iter::repeat_n(1u8, sc_len));
         // d = 1.0
         bytes.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
 
@@ -1254,12 +1250,8 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes()); // d
         bytes.extend_from_slice(&half::f16::from_f32(0.0).to_le_bytes()); // min
-        for _ in 0..(QK_K / 16) {
-            bytes.push(0x01); // sc=1, min=0
-        }
-        for _ in 0..(QK_K / 4) {
-            bytes.push(0xFF); // all 2-bit fields = 3
-        }
+        bytes.extend(std::iter::repeat_n(0x01u8, QK_K / 16)); // sc=1, min=0
+        bytes.extend(std::iter::repeat_n(0xFFu8, QK_K / 4)); // all 2-bit fields = 3
         let out = dequant_q2_k(&bytes, QK_K).unwrap();
         assert_eq!(out.len(), QK_K);
         for v in &out {
@@ -1280,7 +1272,7 @@ mod tests {
     fn dequant_q8_k_block() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0.25f32.to_le_bytes());
-        let qs: [i8; QK_K] = std::array::from_fn(|i| ((i as i32 - 128) as i8));
+        let qs: [i8; QK_K] = std::array::from_fn(|i| (i as i32 - 128) as i8);
         for q in qs {
             bytes.push(q as u8);
         }

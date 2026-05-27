@@ -15,7 +15,7 @@
 //! Projection-stage debug buffers aligned with `GaussianRenderer.debug_pipeline_data`.
 
 use crate::core::{
-    Camera, GaussianScene, ProjectionDebugBuffers, GAUSSIAN_SUPPORT_SIGMA_RADIUS,
+    Camera, GAUSSIAN_SUPPORT_SIGMA_RADIUS, GaussianScene, ProjectionDebugBuffers,
     RASTER_CACHE_PARAM_COUNT,
 };
 

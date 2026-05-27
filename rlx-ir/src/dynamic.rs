@@ -318,10 +318,7 @@ mod tests {
         let batch = sym::BATCH;
         let seq = sym::SEQ;
         let mut g = Graph::new("dyn");
-        let x = g.input(
-            "x",
-            Shape::batch_seq(batch, seq, 4, DType::F32),
-        );
+        let x = g.input("x", Shape::batch_seq(batch, seq, 4, DType::F32));
         let w = g.param("w", Shape::new(&[4, 8], DType::F32));
         let y = g.mm(x, w);
         g.set_outputs(vec![y]);
@@ -348,11 +345,8 @@ mod tests {
         );
         g.set_outputs(vec![x]);
 
-        let b = infer_bindings_from_f32_inputs(
-            &g,
-            &[("x", &vec![0.0f32; 3 * 128 * 64])],
-        )
-        .expect("infer");
+        let b = infer_bindings_from_f32_inputs(&g, &[("x", &vec![0.0f32; 3 * 128 * 64])])
+            .expect("infer");
         assert_eq!(b.get(sym::SEQ), Some(128));
     }
 }

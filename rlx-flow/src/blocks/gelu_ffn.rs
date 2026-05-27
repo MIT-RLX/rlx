@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
@@ -59,11 +59,7 @@ impl GeluFfnStage {
 }
 
 impl BlockStage for GeluFfnStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let int_w = ctx.load_param(&self.intermediate_w, true)?;
         let int_b = ctx.load_param(&self.intermediate_b, false)?;
         let out_w = ctx.load_param(&self.output_w, true)?;

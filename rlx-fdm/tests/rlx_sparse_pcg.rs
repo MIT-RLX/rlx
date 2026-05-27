@@ -14,9 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use rlx_fdm::{
-    pattern_fast, register_rlx_sparse, EquilibriumModel, FdmCsr, Network, Structure,
-};
+use rlx_fdm::{EquilibriumModel, FdmCsr, Network, Structure, pattern_fast, register_rlx_sparse};
 use rlx_runtime::{Device, Session};
 
 #[test]
@@ -34,8 +32,7 @@ fn rlx_sparse_pcg_matches_reference() {
         }
     }
     let p = EquilibriumModel::load_matrix(&net.q, &xf, &net.loads, &s);
-    let xyz_ref =
-        EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("ref");
+    let xyz_ref = EquilibriumModel::nodes_free_positions(&net.q, &xf, &net.loads, &s).expect("ref");
     let ref_z = xyz_ref[2];
     let mut bz = vec![0.0; n];
     for a in 0..n {

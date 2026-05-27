@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
@@ -18,11 +18,7 @@ pub struct GatherFromInputStage {
 }
 
 impl GatherFromInputStage {
-    pub fn new(
-        input_name: impl Into<String>,
-        weight_key: impl Into<String>,
-        axis: usize,
-    ) -> Self {
+    pub fn new(input_name: impl Into<String>, weight_key: impl Into<String>, axis: usize) -> Self {
         Self {
             input_name: input_name.into(),
             weight_key: weight_key.into(),
@@ -32,11 +28,7 @@ impl GatherFromInputStage {
 }
 
 impl BlockStage for GatherFromInputStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        _input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, _input: FlowValue) -> Result<Option<FlowValue>> {
         let (indices_id, indices_shape) = ctx
             .state
             .inputs
@@ -64,11 +56,7 @@ pub struct GatherAddStage {
 }
 
 impl GatherAddStage {
-    pub fn new(
-        input_name: impl Into<String>,
-        weight_key: impl Into<String>,
-        axis: usize,
-    ) -> Self {
+    pub fn new(input_name: impl Into<String>, weight_key: impl Into<String>, axis: usize) -> Self {
         Self {
             input_name: input_name.into(),
             weight_key: weight_key.into(),
@@ -78,11 +66,7 @@ impl GatherAddStage {
 }
 
 impl BlockStage for GatherAddStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let (indices_id, indices_shape) = ctx
             .state
             .inputs

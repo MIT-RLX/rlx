@@ -18,22 +18,21 @@
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
 use crate::equilibrium::{EquilibriumModel, FdmError};
-use crate::graph::{fdm_dense_graph, pack_load_rhs, pack_stiffness, FdmDenseGraph};
+use crate::graph::{FdmDenseGraph, fdm_dense_graph, pack_load_rhs, pack_stiffness};
 use crate::implicit::{
-    grad_loss_wrt_q, grad_loss_wrt_q_fixedpoint, grad_loss_wrt_q_linear_with_solver,
-    AdjointSolveConfig, QGradient,
+    AdjointSolveConfig, QGradient, grad_loss_wrt_q, grad_loss_wrt_q_fixedpoint,
+    grad_loss_wrt_q_linear_with_solver,
 };
 use crate::iterative::IterativeConfig;
 use crate::network::Network;
-use crate::objective::{goals_grad_xyz_free, Goal};
-use crate::optimize::{constrained_fdm, OptimizeConfig, OptimizeResult};
+use crate::objective::{Goal, goals_grad_xyz_free};
+use crate::optimize::{OptimizeConfig, OptimizeResult, constrained_fdm};
 use crate::reference::FdmOptions;
 use crate::structure::Structure;
 
 #[cfg(all(feature = "ir", feature = "rlx-sparse"))]
 use crate::graph_sparse::{
-    fdm_sparse_pcg_graph, use_sparse_pcg_graph, FdmSparsePcgGraph,
-    PcgGraphConfig,
+    FdmSparsePcgGraph, PcgGraphConfig, fdm_sparse_pcg_graph, use_sparse_pcg_graph,
 };
 
 /// MIR equilibrium graph: dense `Op::DenseSolve` or CSR PCG (`rlx-sparse`).
@@ -153,20 +152,12 @@ impl FdmMirOptimizer {
                     &f64_bytes(&pack_stiffness(network)?),
                     DType::F64,
                 );
-                compiled.set_param_typed(
-                    "fdm_P",
-                    &f64_bytes(&pack_load_rhs(network)?),
-                    DType::F64,
-                );
+                compiled.set_param_typed("fdm_P", &f64_bytes(&pack_load_rhs(network)?), DType::F64);
             }
             #[cfg(all(feature = "ir", feature = "rlx-sparse"))]
             FdmEquilibriumGraph::SparsePcg(_) => {
                 compiled.set_param_typed("fdm_q", &f64_bytes(&network.q), DType::F64);
-                compiled.set_param_typed(
-                    "fdm_P",
-                    &f64_bytes(&pack_load_rhs(network)?),
-                    DType::F64,
-                );
+                compiled.set_param_typed("fdm_P", &f64_bytes(&pack_load_rhs(network)?), DType::F64);
             }
         }
         Ok(())

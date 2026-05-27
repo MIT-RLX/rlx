@@ -20,7 +20,7 @@ use rlx_ir::hir::HirModule;
 use rlx_opt::CompileResult;
 
 use crate::stages;
-use crate::{CompiledGraph, CompileOptions, Device};
+use crate::{CompileOptions, CompiledGraph, Device};
 
 /// Errors from [`AotCache`] disk / compile operations.
 #[derive(Debug)]

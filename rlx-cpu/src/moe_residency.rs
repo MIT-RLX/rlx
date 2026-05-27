@@ -67,7 +67,7 @@ struct MoeResidencyCtx {
 }
 
 thread_local! {
-    static CTX: RefCell<Option<MoeResidencyCtx>> = RefCell::new(None);
+    static CTX: RefCell<Option<MoeResidencyCtx>> = const { RefCell::new(None) };
 }
 
 /// Install merged (union) residency mask for the current thread until [`clear_mask`].

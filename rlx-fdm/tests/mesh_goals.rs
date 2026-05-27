@@ -13,11 +13,12 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 use rlx_fdm::{
-    fdm,
+    Goal, Network, fdm,
     goals::{
         mesh_laplacian_energy, mesh_mean_face_rectangular, mesh_mean_planarity, mesh_total_area,
     },
-    goals_loss_with_structure, mesh::edges_from_faces, Goal, Network,
+    goals_loss_with_structure,
+    mesh::edges_from_faces,
 };
 
 #[test]
@@ -47,7 +48,10 @@ fn mesh_area_and_planarity_goals_finite() {
     let plan = mesh_mean_planarity(&mesh, &net.xyz);
     assert!(area > 0.9 && area < 1.1, "quad area ~1, got {area}");
     let eq = fdm(&net).expect("fdm");
-    assert!(plan >= 0.0 && plan < 0.5, "planarity should be modest: {plan}");
+    assert!(
+        plan >= 0.0 && plan < 0.5,
+        "planarity should be modest: {plan}"
+    );
 
     let rect = mesh_mean_face_rectangular(&mesh, &net.xyz);
     let lap = mesh_laplacian_energy(&mesh, &net.xyz);

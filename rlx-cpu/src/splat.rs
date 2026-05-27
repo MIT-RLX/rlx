@@ -219,25 +219,23 @@ pub fn render_host_slices(
 ) -> Vec<f32> {
     HOST_RENDER
         .get()
-        .expect("call `rlx_splat::register()` before host splat render")(
-        HostRenderArgs {
-            positions: positions.to_vec(),
-            scales: scales.to_vec(),
-            rotations: rotations.to_vec(),
-            opacities: opacities.to_vec(),
-            colors: colors.to_vec(),
-            sh_coeffs: sh_coeffs.to_vec(),
-            meta: meta.to_vec(),
-            width,
-            height,
-            tile_size,
-            radius_scale,
-            alpha_cutoff,
-            max_splat_steps,
-            transmittance_threshold,
-            max_list_entries,
-        },
-    )
+        .expect("call `rlx_splat::register()` before host splat render")(HostRenderArgs {
+        positions: positions.to_vec(),
+        scales: scales.to_vec(),
+        rotations: rotations.to_vec(),
+        opacities: opacities.to_vec(),
+        colors: colors.to_vec(),
+        sh_coeffs: sh_coeffs.to_vec(),
+        meta: meta.to_vec(),
+        width,
+        height,
+        tile_size,
+        radius_scale,
+        alpha_cutoff,
+        max_splat_steps,
+        transmittance_threshold,
+        max_list_entries,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,7 +314,9 @@ pub unsafe fn execute_gaussian_splat_prepare(
     max_list_entries: u32,
     base: *mut u8,
 ) {
-    PREPARE.get().expect("call `rlx_splat::register()` before GaussianSplatPrepare")(ArenaPrepareArgs {
+    PREPARE
+        .get()
+        .expect("call `rlx_splat::register()` before GaussianSplatPrepare")(ArenaPrepareArgs {
         positions_off,
         positions_len,
         scales_off,
@@ -366,23 +366,25 @@ pub unsafe fn execute_gaussian_splat_rasterize(
 ) {
     RASTERIZE
         .get()
-        .expect("call `rlx_splat::register()` before GaussianSplatRasterize")(ArenaRasterizeArgs {
-        prep_off,
-        prep_len,
-        meta_off,
-        meta_len,
-        dst_off,
-        dst_len,
-        count,
-        width,
-        height,
-        tile_size,
-        alpha_cutoff,
-        max_splat_steps,
-        transmittance_threshold,
-        max_list_entries,
-        base,
-    });
+        .expect("call `rlx_splat::register()` before GaussianSplatRasterize")(
+        ArenaRasterizeArgs {
+            prep_off,
+            prep_len,
+            meta_off,
+            meta_len,
+            dst_off,
+            dst_len,
+            count,
+            width,
+            height,
+            tile_size,
+            alpha_cutoff,
+            max_splat_steps,
+            transmittance_threshold,
+            max_list_entries,
+            base,
+        },
+    );
 }
 
 /// Execute [`Op::GaussianSplatRender`] against the arena `base` pointer.

@@ -14,8 +14,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Separable CMA-ES (diagonal covariance) — Hansen-style sep-CMA-ES.
 
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 
 use crate::{BboSolution, Bbox};
@@ -76,8 +76,7 @@ where
         .iter()
         .map(|&(lo, hi)| 0.5 * (lo + hi))
         .collect();
-    let mean_width: f64 =
-        bbox.bounds.iter().map(|&(lo, hi)| hi - lo).sum::<f64>() / n as f64;
+    let mean_width: f64 = bbox.bounds.iter().map(|&(lo, hi)| hi - lo).sum::<f64>() / n as f64;
     let mut sigma = mean_width * cfg.sigma0_frac;
     let mut diag: Vec<f64> = vec![1.0; n];
     let mut ps = vec![0.0; n];
@@ -171,7 +170,6 @@ mod tests {
         let cfg = CmaesConfig {
             max_evals: 500,
             sigma0_frac: 0.3,
-            ..CmaesConfig::default()
         };
         let sol = cmaes(&b, &cfg, 99, sphere);
         assert!(sol.value < 0.1, "got {}", sol.value);

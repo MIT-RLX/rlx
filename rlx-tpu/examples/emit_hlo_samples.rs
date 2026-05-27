@@ -228,7 +228,10 @@ fn main() {
         let cos = g.input("cos", Shape::new(&[4, 4], f));
         let sin = g.input("sin", Shape::new(&[4, 4], f));
         let out = g.add_node(
-            rlx_ir::Op::Rope { head_dim: 8, n_rot: 8 },
+            rlx_ir::Op::Rope {
+                head_dim: 8,
+                n_rot: 8,
+            },
             vec![x, cos, sin],
             Shape::new(&[1, 2, 4, 8], f),
         );

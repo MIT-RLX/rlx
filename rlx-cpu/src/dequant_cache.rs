@@ -71,7 +71,7 @@ fn cache_enabled() -> bool {
 
 /// Return dense `[k×n]` weights (GGUF row-major `[n,k]` layout) for `w_bytes`.
 pub fn gguf_weight_f32(
-    w_off: usize,
+    _w_off: usize,
     w_bytes: &[u8],
     k: usize,
     n: usize,
@@ -122,16 +122,17 @@ mod tests {
             *s = 0x01;
         }
         packed.extend_from_slice(&scales);
-        for _ in 0..(QK_K / 2) {
-            packed.push(0x77);
-        }
+        packed.extend(std::iter::repeat_n(0x77u8, QK_K / 2));
         let k = 256;
         let n = 1;
         let w_off = 4096;
         let hash = weight_bytes_hash(&packed);
         let a = gguf_weight_f32(w_off, &packed, k, n, QuantScheme::GgufQ4K);
         let b = gguf_weight_f32(w_off + 999, &packed, k, n, QuantScheme::GgufQ4K);
-        assert!(Arc::ptr_eq(&a, &b), "same bytes at different offsets should hit");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "same bytes at different offsets should hit"
+        );
         let mut other = packed.clone();
         other[0] ^= 0x01;
         let c = gguf_weight_f32(w_off, &other, k, n, QuantScheme::GgufQ4K);

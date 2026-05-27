@@ -23,7 +23,11 @@ use rlx_runtime::{
 fn refresh_matches_topk_by_hit_count() {
     // 4 tokens, top_k=2 style flat indices (duplicate experts allowed).
     let flat: Vec<u32> = vec![1, 1, 0, 2];
-    let mut pool = ExpertPool::new(ExpertPoolConfig::new(4, 2, ExpertRefreshPolicy::EveryForward));
+    let mut pool = ExpertPool::new(ExpertPoolConfig::new(
+        4,
+        2,
+        ExpertRefreshPolicy::EveryForward,
+    ));
     let ExpertRefreshResult { target_gpu, .. } = pool.refresh_from_indices(&flat);
     assert_eq!(target_gpu, vec![1, 0]); // expert 1: 2 hits, expert 0: 1 hit
 }

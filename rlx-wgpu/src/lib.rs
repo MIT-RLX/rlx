@@ -32,15 +32,15 @@ pub mod backend;
 pub mod buffer;
 pub mod device;
 pub mod gdn_host;
-pub mod llada2_gate_host;
 pub mod gguf_host;
-pub mod training_bwd_host;
 pub mod kernels;
-pub mod unfuse;
+pub mod llada2_gate_host;
 #[cfg(feature = "splat")]
 pub mod splat;
 #[cfg(feature = "native-splat")]
 pub mod splat_native;
+pub mod training_bwd_host;
+pub mod unfuse;
 
 /// True if a wgpu adapter is reachable on this system. Always
 /// available at the crate level; the runtime registry only registers

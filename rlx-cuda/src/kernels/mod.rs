@@ -15,64 +15,16 @@
 
 //! CUDA C++ kernel sources + NVRTC compilation cache.
 //!
-//! Each `.cu` file is embedded as a `&'static str`, compiled to PTX
-//! via NVRTC the first time it's needed, then loaded into a `cuModule`
-//! and cached in a `OnceLock` for the rest of the process. Pure
-//! NVRTC — no nvcc at workspace build time.
+//! Sources live in [`rlx_gpu_kernels`]; this module JIT-compiles them to
+//! PTX via NVRTC on first use, then caches `cuModule` handles for the
+//! rest of the process. Pure NVRTC — no nvcc at workspace build time.
+
+pub use rlx_gpu_kernels::*;
 
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule};
-
-pub const BINARY_CU: &str = include_str!("binary.cu");
-pub const FUSED_BINARY_UNARY_CU: &str = include_str!("fused_binary_unary.cu");
-pub const CAST_F32_TO_HALF_CU: &str = include_str!("cast_f32_to_half.cu");
-pub const UNARY_CU: &str = include_str!("unary.cu");
-pub const COPY_CU: &str = include_str!("copy.cu");
-pub const MATMUL_CU: &str = include_str!("matmul.cu");
-pub const MATMUL_EPILOGUE_CU: &str = include_str!("matmul_epilogue.cu");
-pub const MATMUL_WMMA_CU: &str = include_str!("matmul_wmma.cu");
-pub const COMPARE_CU: &str = include_str!("compare.cu");
-pub const WHERE_CU: &str = include_str!("where_select.cu");
-pub const REDUCE_CU: &str = include_str!("reduce.cu");
-pub const SOFTMAX_CU: &str = include_str!("softmax.cu");
-pub const LAYERNORM_CU: &str = include_str!("layernorm.cu");
-pub const RMS_NORM_BWD_CU: &str = include_str!("rms_norm_backward.cu");
-pub const CUMSUM_BWD_CU: &str = include_str!("cumsum_backward.cu");
-pub const ROPE_BWD_CU: &str = include_str!("rope_backward.cu");
-pub const GATHER_BWD_CU: &str = include_str!("gather_backward.cu");
-pub const FUSED_RESIDUAL_LN_CU: &str = include_str!("fused_residual_ln.cu");
-pub const GATHER_CU: &str = include_str!("gather.cu");
-pub const GATHER_AXIS_CU: &str = include_str!("gather_axis.cu");
-pub const NARROW_CU: &str = include_str!("narrow.cu");
-pub const CONCAT_CU: &str = include_str!("concat.cu");
-pub const TRANSPOSE_CU: &str = include_str!("transpose.cu");
-pub const EXPAND_CU: &str = include_str!("expand.cu");
-pub const ATTENTION_CU: &str = include_str!("attention.cu");
-pub const ATTENTION_BWD_CU: &str = include_str!("attention_bwd.cu");
-pub const ARGMAX_CU: &str = include_str!("argmax.cu");
-pub const ROPE_CU: &str = include_str!("rope.cu");
-pub const CUMSUM_CU: &str = include_str!("cumsum.cu");
-pub const TOPK_CU: &str = include_str!("topk.cu");
-pub const GROUPED_MATMUL_CU: &str = include_str!("grouped_matmul.cu");
-pub const SCATTER_ADD_CU: &str = include_str!("scatter_add.cu");
-pub const DEQUANT_MATMUL_CU: &str = include_str!("dequant_matmul.cu");
-pub const DEQUANT_GGUF_CU: &str = include_str!("dequant_gguf.cu");
-pub const SAMPLE_CU: &str = include_str!("sample.cu");
-pub const SELECTIVE_SCAN_CU: &str = include_str!("selective_scan.cu");
-pub const POOL1D_CU: &str = include_str!("pool1d.cu");
-pub const POOL2D_CU: &str = include_str!("pool2d.cu");
-pub const POOL3D_CU: &str = include_str!("pool3d.cu");
-pub const CONV1D_CU: &str = include_str!("conv1d.cu");
-pub const CONV2D_CU: &str = include_str!("conv2d.cu");
-pub const CONV3D_CU: &str = include_str!("conv3d.cu");
-pub const LAYER_NORM2D_CU: &str = include_str!("layer_norm2d.cu");
-pub const CONV_TRANSPOSE2D_CU: &str = include_str!("conv_transpose2d.cu");
-pub const GROUP_NORM_CU: &str = include_str!("group_norm.cu");
-pub const RESIZE_NEAREST_2X_CU: &str = include_str!("resize_nearest_2x.cu");
-pub const ELEMENTWISE_REGION_CU: &str = include_str!("elementwise_region.cu");
-pub const GAUSSIAN_SPLAT_RASTERIZE_CU: &str = include_str!("gaussian_splat_rasterize.cu");
 
 /// One compiled NVRTC module + the function handle we use from it.
 pub struct CudaKernel {
@@ -206,9 +158,19 @@ kernel_cache!(
     RMS_NORM_BWD_CU,
     "rlx_zero_f32"
 );
-kernel_cache!(CUMSUM_BWD, cumsum_backward_kernel, CUMSUM_BWD_CU, "rlx_cumsum_bwd");
+kernel_cache!(
+    CUMSUM_BWD,
+    cumsum_backward_kernel,
+    CUMSUM_BWD_CU,
+    "rlx_cumsum_bwd"
+);
 kernel_cache!(ROPE_BWD, rope_backward_kernel, ROPE_BWD_CU, "rlx_rope_bwd");
-kernel_cache!(GATHER_BWD, gather_backward_kernel, GATHER_BWD_CU, "rlx_gather_axis_bwd");
+kernel_cache!(
+    GATHER_BWD,
+    gather_backward_kernel,
+    GATHER_BWD_CU,
+    "rlx_gather_axis_bwd"
+);
 kernel_cache!(
     FUSED_RESIDUAL_LN,
     fused_residual_ln_kernel,
@@ -216,7 +178,12 @@ kernel_cache!(
     "fused_residual_ln"
 );
 kernel_cache!(GATHER, gather_kernel, GATHER_CU, "gather");
-kernel_cache!(GATHER_AXIS, gather_axis_kernel, GATHER_AXIS_CU, "gather_axis");
+kernel_cache!(
+    GATHER_AXIS,
+    gather_axis_kernel,
+    GATHER_AXIS_CU,
+    "gather_axis"
+);
 kernel_cache!(NARROW, narrow_kernel, NARROW_CU, "narrow");
 kernel_cache!(CONCAT, concat_kernel, CONCAT_CU, "concat");
 kernel_cache!(TRANSPOSE, transpose_kernel, TRANSPOSE_CU, "transpose");

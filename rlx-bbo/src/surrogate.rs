@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::trajectory::{load_jsonl, TrajectoryRecord};
+use crate::trajectory::{TrajectoryRecord, load_jsonl};
 
 /// Affine Q(x) ≈ b + w·x trained by ridge regression on logged trajectories.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,7 +67,11 @@ pub fn fit_linear_surrogate(
         let mut gw = vec![0.0; dim];
         let mut gb = 0.0;
         for r in &rows {
-            let pred = b + w.iter().zip(r.action.iter()).map(|(a, x)| a * x).sum::<f64>();
+            let pred = b + w
+                .iter()
+                .zip(r.action.iter())
+                .map(|(a, x)| a * x)
+                .sum::<f64>();
             let err = pred - r.loss;
             for d in 0..dim {
                 gw[d] += 2.0 * err * r.action[d] / n as f64 + 2.0 * lambda * w[d] / n as f64;
@@ -89,13 +93,18 @@ pub fn fit_linear_surrogate(
     })
 }
 
-pub fn fit_from_trajectory_jsonl(path: &Path, topology: &str, lambda: f64) -> Option<LinearSurrogate> {
+pub fn fit_from_trajectory_jsonl(
+    path: &Path,
+    topology: &str,
+    lambda: f64,
+) -> Option<LinearSurrogate> {
     let recs = load_jsonl(path).ok()?;
     fit_linear_surrogate(&recs, topology, lambda)
 }
 
 pub fn save_surrogate(path: &Path, s: &LinearSurrogate) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_string_pretty(s)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(path, json)
 }
 

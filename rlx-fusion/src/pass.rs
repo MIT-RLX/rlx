@@ -43,10 +43,7 @@ pub fn run_passes(mut graph: Graph, passes: &[&dyn Pass], verbose: bool) -> Grap
         }
         graph = pass.run(graph);
         rlx_ir::stamp_pass_origins(&mut graph, pass.name());
-        rlx_ir::debug_assert_valid!(
-            &graph,
-            format!("after pass `{}`", pass.name())
-        );
+        rlx_ir::debug_assert_valid!(&graph, format!("after pass `{}`", pass.name()));
     }
     if verbose {
         eprintln!("--- final ---\n{graph}");

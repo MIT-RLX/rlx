@@ -802,7 +802,10 @@ fn rope_partial_dim_passes_tail_through() {
     let cos = g.input("cos", Shape::new(&[1, 2], DType::F32));
     let sin = g.input("sin", Shape::new(&[1, 2], DType::F32));
     let y = g.add_node(
-        Op::Rope { head_dim: 4, n_rot: 4 },
+        Op::Rope {
+            head_dim: 4,
+            n_rot: 4,
+        },
         vec![x, cos, sin],
         Shape::new(&[1, 1, 1, 6], DType::F32),
     );
@@ -1378,7 +1381,10 @@ fn rope_matches_reference() {
     let cos = g.input("cos", Shape::new(&[2, 2], DType::F32));
     let sin = g.input("sin", Shape::new(&[2, 2], DType::F32));
     let y = g.add_node(
-        Op::Rope { head_dim: 4, n_rot: 4 },
+        Op::Rope {
+            head_dim: 4,
+            n_rot: 4,
+        },
         vec![x, cos, sin],
         Shape::new(&[1, 1, 2, 4], DType::F32),
     );
@@ -1671,7 +1677,10 @@ fn fused_swiglu_matches_reference() {
     let mut g = Graph::new("swi");
     let x = g.input("x", Shape::new(&[1, 4], DType::F32)); // [up0, up1, g0, g1]
     let y = g.add_node(
-        Op::FusedSwiGLU { cast_to: None, gate_first: false },
+        Op::FusedSwiGLU {
+            cast_to: None,
+            gate_first: false,
+        },
         vec![x],
         Shape::new(&[1, 2], DType::F32),
     );

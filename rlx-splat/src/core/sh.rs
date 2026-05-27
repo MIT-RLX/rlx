@@ -14,6 +14,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Spherical harmonics helpers aligned with `src/scene/sh_utils.py`.
 
+#![allow(clippy::excessive_precision)]
+
 pub const SH_C0: f32 = 0.28209479177387814;
 pub const SH_C1: f32 = 0.4886025119029199;
 pub const SH_C2: [f32; 5] = [
@@ -45,7 +47,6 @@ pub fn rgb_to_sh0(colors: [f32; 3]) -> [f32; 3] {
 pub fn pad_sh_coeffs(sh_coeffs: &[f32], count: usize, coeff_count: usize) -> Vec<f32> {
     let target = coeff_count.max(1);
     let mut padded = vec![0.0f32; count * target * 3];
-    let copy_count = sh_coeffs.len() / (count * 3).max(1);
     let src_coeffs = sh_coeffs.len() / (count * 3);
     let copy_coeffs = src_coeffs.min(target);
     for splat in 0..count {
@@ -110,7 +111,11 @@ pub fn resolve_supported_sh_coeffs(
     resolved
 }
 
-pub fn sh_coeffs_to_display_colors(sh_coeffs: &[f32], count: usize, coeff_count: usize) -> Vec<f32> {
+pub fn sh_coeffs_to_display_colors(
+    sh_coeffs: &[f32],
+    count: usize,
+    coeff_count: usize,
+) -> Vec<f32> {
     let mut colors = vec![0.0f32; count * 3];
     for splat in 0..count {
         let base = splat * coeff_count * 3;

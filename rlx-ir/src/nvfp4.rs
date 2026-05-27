@@ -44,7 +44,7 @@ pub fn fp8_e4m3_scale_to_f32(byte: u8) -> f32 {
 /// Packed weight bytes for `[k, n]` FP4 weights (two nibbles per byte).
 #[inline]
 pub const fn nvfp4_weight_bytes(k: usize, n: usize) -> usize {
-    (k * n + 1) / 2
+    (k * n).div_ceil(2)
 }
 
 /// Block-scale bytes for `[k, n]` with groups along K (`[k/16, n]` FP8 scales).

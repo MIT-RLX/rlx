@@ -16,11 +16,18 @@
 fn register_and_render_reference_smoke() {
     rlx_splat::register();
 
-    use rlx_splat::core::{make_parity_scene, Camera};
-    use rlx_splat::reference::{render_reference, RenderParams};
+    use rlx_splat::core::{Camera, make_parity_scene};
+    use rlx_splat::reference::{RenderParams, render_reference};
 
     let scene = make_parity_scene();
-    let camera = Camera::look_at([0.0, 0.0, 4.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 60.0, 0.1, 20.0);
+    let camera = Camera::look_at(
+        [0.0, 0.0, 4.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        60.0,
+        0.1,
+        20.0,
+    );
     let params = RenderParams {
         width: 64,
         height: 64,

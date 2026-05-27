@@ -51,10 +51,7 @@ pub fn fdm_dense_graph(g: &mut Graph, network: &Network) -> Result<FdmDenseGraph
     }
     let p_mat = EquilibriumModel::load_matrix(
         &network.q,
-        &xyz_fixed
-            .iter()
-            .map(|&x| x as f64)
-            .collect::<Vec<_>>(),
+        &xyz_fixed.iter().map(|&x| x as f64).collect::<Vec<_>>(),
         &network.loads,
         &structure,
     );
@@ -63,10 +60,7 @@ pub fn fdm_dense_graph(g: &mut Graph, network: &Network) -> Result<FdmDenseGraph
     let p_shape = Shape::new(&[nf, 3], DType::F64);
     let out_shape = Shape::new(&[nf, 3], DType::F64);
 
-    let k = g.param(
-        "fdm_K",
-        k_shape,
-    );
+    let k = g.param("fdm_K", k_shape);
     let p = g.param("fdm_P", p_shape);
     let xyz_free = g.dense_solve(k, p, out_shape);
 

@@ -101,10 +101,7 @@ impl Session {
     }
 
     /// Compile a fusion-first HIR module through HIR → MIR → LIR.
-    pub fn compile_hir(
-        &self,
-        hir: HirModule,
-    ) -> Result<CompiledGraph, rlx_ir::hir::LowerError> {
+    pub fn compile_hir(&self, hir: HirModule) -> Result<CompiledGraph, rlx_ir::hir::LowerError> {
         self.compile_hir_with(hir, &self.default_options())
     }
 

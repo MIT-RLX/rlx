@@ -29,15 +29,15 @@
 
 use crate::equilibrium::{EquilibriumModel, FdmError};
 use crate::iterative::{
-    config_for_implicit_adjoint, equilibrium_iterative, equilibrium_iterative_trajectory,
-    IterativeConfig,
+    IterativeConfig, config_for_implicit_adjoint, equilibrium_iterative,
+    equilibrium_iterative_trajectory,
 };
 use crate::loads::{
-    nodes_load_at_mesh, transpose_edge_loads_jacobian, transpose_face_loads_jacobian, LoadState,
+    LoadState, nodes_load_at_mesh, transpose_edge_loads_jacobian, transpose_face_loads_jacobian,
 };
 use crate::mesh::MeshStructure;
-use crate::sparse::pattern_fast;
 use crate::solve::solve_columns_dense;
+use crate::sparse::pattern_fast;
 use crate::structure::Structure;
 
 /// Gradient of a loss that depends on packed free coordinates w.r.t. `q`.
@@ -164,7 +164,7 @@ pub fn grad_loss_wrt_q_linear_with_solver(
 pub fn grad_loss_wrt_xyz_fixed_linear(
     q: &[f64],
     structure: &Structure,
-    xyz_star: &[f64],
+    _xyz_star: &[f64],
     loss_grad_xyz_free: &[f64],
     adjoint: &AdjointSolveConfig,
 ) -> Result<XFixedGradient, FdmError> {
@@ -271,14 +271,7 @@ pub fn grad_loss_wrt_q_fixedpoint(
                 &load_state.nodes,
                 structure,
                 &equilibrium_iterative(
-                    q,
-                    xyz_fixed,
-                    load_state,
-                    structure,
-                    edges,
-                    xyz_anchor,
-                    config,
-                    mesh,
+                    q, xyz_fixed, load_state, structure, edges, xyz_anchor, config, mesh,
                 )?,
                 loss_grad_xyz_free,
             );
@@ -299,17 +292,9 @@ pub fn grad_loss_wrt_q_fixedpoint(
 
     let traj_cfg = config_for_implicit_adjoint(config);
     let traj = equilibrium_iterative_trajectory(
-        q,
-        xyz_fixed,
-        load_state,
-        structure,
-        edges,
-        xyz_anchor,
-        &traj_cfg,
-        mesh,
+        q, xyz_fixed, load_state, structure, edges, xyz_anchor, &traj_cfg, mesh,
     )?;
     let adjoint = AdjointSolveConfig::from(config);
-    let nf = structure.num_free();
     let ne = structure.num_edges;
     let mut dq = vec![0.0; ne];
     let mut v = loss_grad_xyz_free.to_vec();
@@ -439,24 +424,10 @@ pub fn grad_loss_wrt_q_fd(
         qp[i] += eps;
         qm[i] -= eps;
         let xp = solve_equilibrium(
-            &qp,
-            xyz_fixed,
-            load_state,
-            structure,
-            edges,
-            xyz_anchor,
-            config,
-            mesh,
+            &qp, xyz_fixed, load_state, structure, edges, xyz_anchor, config, mesh,
         )?;
         let xm = solve_equilibrium(
-            &qm,
-            xyz_fixed,
-            load_state,
-            structure,
-            edges,
-            xyz_anchor,
-            config,
-            mesh,
+            &qm, xyz_fixed, load_state, structure, edges, xyz_anchor, config, mesh,
         )?;
         let mut g = 0.0;
         for j in 0..loss_grad_xyz_free.len() {
@@ -491,13 +462,6 @@ fn solve_equilibrium(
         );
     }
     equilibrium_iterative(
-        q,
-        xyz_fixed,
-        load_state,
-        structure,
-        edges,
-        xyz_anchor,
-        &adj_cfg,
-        mesh,
+        q, xyz_fixed, load_state, structure, edges, xyz_anchor, &adj_cfg, mesh,
     )
 }

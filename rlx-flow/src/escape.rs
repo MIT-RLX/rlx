@@ -67,7 +67,11 @@ impl<'a> Emit<'a> {
     }
 
     pub fn synth_zeros(&mut self, name: &str, len: usize) -> HirNodeId {
-        self.synth_param(name, vec![0f32; len], Shape::new(&[len], rlx_ir::DType::F32))
+        self.synth_param(
+            name,
+            vec![0f32; len],
+            Shape::new(&[len], rlx_ir::DType::F32),
+        )
     }
 
     pub fn hir_and_params(&mut self) -> (&mut HirModule, &mut HashMap<String, Vec<f32>>) {

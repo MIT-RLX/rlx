@@ -87,12 +87,7 @@ impl Graph {
             scheme.is_gguf(),
             "dequant_matmul_packed requires a GGUF QuantScheme"
         );
-        self.push(
-            Op::DequantMatMul { scheme },
-            vec![x, packed_w],
-            shape,
-            None,
-        )
+        self.push(Op::DequantMatMul { scheme }, vec![x, packed_w], shape, None)
     }
 
     /// NVFP4 (E2M1) block matmul — group size 16, FP8 block scales,

@@ -14,7 +14,6 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Strict RLX IR splat pipeline — decomposed graph builders and common-IR baseline.
 
-use rlx_ir::infer::GraphExt;
 use rlx_ir::logical_kernel::splat_common;
 use rlx_ir::ops::splat::{GaussianSplatInputs, GaussianSplatRenderParams};
 use rlx_ir::{Graph, NodeId, Shape};

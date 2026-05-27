@@ -16,10 +16,38 @@
 
 use crate::reference::native_prep::{PreparedRaster, SplatRasterParams};
 
-pub use rlx_ir::ops::splat::{
-    gaussian_splat_prep_packed_len as prep_packed_len, gaussian_splat_tile_count as tile_count,
-    GAUSSIAN_SPLAT_PREP_RASTER_PARAMS_FLOATS as SPLAT_RASTER_PARAMS_FLOATS,
-};
+/// Must stay in sync with `rlx_ir::ops::splat::GAUSSIAN_SPLAT_PREP_RASTER_PARAMS_FLOATS`.
+pub const SPLAT_RASTER_PARAMS_FLOATS: usize = 11;
+
+/// Must stay in sync with `rlx_ir::ops::splat::gaussian_splat_tile_count`.
+pub fn tile_count(width: u32, height: u32, tile_size: u32) -> u32 {
+    let tw = width.div_ceil(tile_size);
+    let th = height.div_ceil(tile_size);
+    tw * th
+}
+
+/// Must stay in sync with `rlx_ir::ops::splat::gaussian_splat_prep_packed_len`.
+pub fn prep_packed_len(
+    count: usize,
+    max_list_entries: u32,
+    width: u32,
+    height: u32,
+    tile_size: u32,
+) -> usize {
+    let n = count.max(1);
+    let max_list = max_list_entries as usize;
+    let tiles = tile_count(width, height, tile_size) as usize;
+    let pixels = (width as usize).saturating_mul(height as usize).max(1);
+    n * 4
+        + n
+        + n * 3
+        + n * 3
+        + n * 4
+        + max_list
+        + tiles * 2
+        + pixels * 3
+        + SPLAT_RASTER_PARAMS_FLOATS
+}
 
 fn copy_f32(out: &mut [f32], o: &mut usize, data: &[f32]) {
     let len = data.len();
@@ -29,13 +57,16 @@ fn copy_f32(out: &mut [f32], o: &mut usize, data: &[f32]) {
 
 pub fn pack_prepared(out: &mut [f32], prep: &PreparedRaster, max_list_entries: u32) {
     let n = prep.valid.len().max(1);
-    assert!(out.len() >= prep_packed_len(
-        n,
-        max_list_entries,
-        prep.params.width,
-        prep.params.height,
-        prep.params.tile_size,
-    ));
+    assert!(
+        out.len()
+            >= prep_packed_len(
+                n,
+                max_list_entries,
+                prep.params.width,
+                prep.params.height,
+                prep.params.tile_size,
+            )
+    );
 
     let mut o = 0usize;
     copy_f32(out, &mut o, &prep.color_alpha);
@@ -76,7 +107,14 @@ pub fn pack_prepared(out: &mut [f32], prep: &PreparedRaster, max_list_entries: u
     ]);
 }
 
-pub fn unpack_prepared(packed: &[f32], count: usize, max_list_entries: u32, width: u32, height: u32, tile_size: u32) -> PreparedRaster {
+pub fn unpack_prepared(
+    packed: &[f32],
+    count: usize,
+    max_list_entries: u32,
+    width: u32,
+    height: u32,
+    tile_size: u32,
+) -> PreparedRaster {
     let n = count.max(1);
     let max_list = max_list_entries as usize;
     let tiles = tile_count(width, height, tile_size) as usize;

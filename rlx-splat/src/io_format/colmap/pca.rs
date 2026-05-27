@@ -12,8 +12,11 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-use crate::core::math::{mat3_transpose_mul_vec3, normalize3, quaternion_from_rotation_matrix, rotation_matrix_from_quaternion_wxyz};
 use crate::core::constants::VEC_EPS;
+use crate::core::math::{
+    mat3_transpose_mul_vec3, normalize3, quaternion_from_rotation_matrix,
+    rotation_matrix_from_quaternion_wxyz,
+};
 
 use super::types::{ColmapImage, ColmapReconstruction};
 
@@ -39,7 +42,11 @@ pub fn transform_poses_pca(poses: &[Mat4], rescale: bool) -> (Vec<Mat4>, Mat4) {
 
     let mut cov = [[0.0f32; 3]; 3];
     for pose in &transformed {
-        let d = [pose[0][3] - mean[0], pose[1][3] - mean[1], pose[2][3] - mean[2]];
+        let d = [
+            pose[0][3] - mean[0],
+            pose[1][3] - mean[1],
+            pose[2][3] - mean[2],
+        ];
         for i in 0..3 {
             for j in 0..3 {
                 cov[i][j] += d[i] * d[j];
@@ -63,7 +70,10 @@ pub fn transform_poses_pca(poses: &[Mat4], rescale: bool) -> (Vec<Mat4>, Mat4) {
         transform[i][3] =
             rotation[i][0] * (-mean[0]) + rotation[i][1] * (-mean[1]) + rotation[i][2] * (-mean[2]);
     }
-    transformed = transformed.into_iter().map(|p| mat4_mul(transform, p)).collect();
+    transformed = transformed
+        .into_iter()
+        .map(|p| mat4_mul(transform, p))
+        .collect();
 
     let mean_y2 = transformed.iter().map(|p| p[2][1]).sum::<f32>() / count;
     if mean_y2 < 0.0 {
@@ -85,9 +95,15 @@ pub fn transform_poses_pca(poses: &[Mat4], rescale: bool) -> (Vec<Mat4>, Mat4) {
         [0.0, 0.0, 0.0, 1.0],
     ];
     transform = mat4_mul(aligned2colmap, transform);
-    transformed = transformed.into_iter().map(|p| mat4_mul(aligned2colmap, p)).collect();
+    transformed = transformed
+        .into_iter()
+        .map(|p| mat4_mul(aligned2colmap, p))
+        .collect();
     let inv_colmap2opengl = diag4([1.0, -1.0, -1.0, 1.0]);
-    transformed = transformed.into_iter().map(|p| mat4_mul(p, inv_colmap2opengl)).collect();
+    transformed = transformed
+        .into_iter()
+        .map(|p| mat4_mul(p, inv_colmap2opengl))
+        .collect();
     (transformed, transform)
 }
 
@@ -166,9 +182,18 @@ fn world_to_camera_from_pose(pose: &Mat4) -> ([[f32; 3]; 3], [f32; 3]) {
 
 fn transform_point3(transform: Mat4, xyz: [f32; 3]) -> [f32; 3] {
     [
-        transform[0][0] * xyz[0] + transform[0][1] * xyz[1] + transform[0][2] * xyz[2] + transform[0][3],
-        transform[1][0] * xyz[0] + transform[1][1] * xyz[1] + transform[1][2] * xyz[2] + transform[1][3],
-        transform[2][0] * xyz[0] + transform[2][1] * xyz[1] + transform[2][2] * xyz[2] + transform[2][3],
+        transform[0][0] * xyz[0]
+            + transform[0][1] * xyz[1]
+            + transform[0][2] * xyz[2]
+            + transform[0][3],
+        transform[1][0] * xyz[0]
+            + transform[1][1] * xyz[1]
+            + transform[1][2] * xyz[2]
+            + transform[1][3],
+        transform[2][0] * xyz[0]
+            + transform[2][1] * xyz[1]
+            + transform[2][2] * xyz[2]
+            + transform[2][3],
     ]
 }
 
@@ -187,7 +212,10 @@ fn rescale_poses_to_unit_cube(poses: &[Mat4], transform: Mat4) -> (Vec<Mat4>, Ma
     scale_transform[0][0] = scale;
     scale_transform[1][1] = scale;
     scale_transform[2][2] = scale;
-    let scaled = poses.iter().map(|p| mat4_mul(scale_transform, *p)).collect();
+    let scaled = poses
+        .iter()
+        .map(|p| mat4_mul(scale_transform, *p))
+        .collect();
     (scaled, mat4_mul(scale_transform, transform))
 }
 
@@ -213,10 +241,8 @@ fn mat4_mul(a: Mat4, b: Mat4) -> Mat4 {
     let mut out = identity4();
     for i in 0..4 {
         for j in 0..4 {
-            out[i][j] = a[i][0] * b[0][j]
-                + a[i][1] * b[1][j]
-                + a[i][2] * b[2][j]
-                + a[i][3] * b[3][j];
+            out[i][j] =
+                a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + a[i][3] * b[3][j];
         }
     }
     out
@@ -240,7 +266,11 @@ fn orthonormalize_rotation(m: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
     let mut u = [m[0], m[1], m[2]];
     u[0] = normalize3(u[0], VEC_EPS);
     let dot01 = u[1][0] * u[0][0] + u[1][1] * u[0][1] + u[1][2] * u[0][2];
-    u[1] = [u[1][0] - dot01 * u[0][0], u[1][1] - dot01 * u[0][1], u[1][2] - dot01 * u[0][2]];
+    u[1] = [
+        u[1][0] - dot01 * u[0][0],
+        u[1][1] - dot01 * u[0][1],
+        u[1][2] - dot01 * u[0][2],
+    ];
     u[1] = normalize3(u[1], VEC_EPS);
     u[2] = normalize3(
         [

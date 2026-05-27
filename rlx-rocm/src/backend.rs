@@ -886,10 +886,7 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             w_byte_off,
             out_byte_off,
             ..
-        } => (
-            vec![x_byte_off / 4, w_byte_off / 4],
-            vec![out_byte_off / 4],
-        ),
+        } => (vec![x_byte_off / 4, w_byte_off / 4], vec![out_byte_off / 4]),
         Step::DequantGroupedMatmulGguf {
             x_byte_off,
             w_byte_off,
@@ -1114,6 +1111,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             let n = (*num_inputs as usize).min(input_offs.len());
             (input_offs[..n].to_vec(), vec![*dst_off])
         }
+        Step::Llada2GroupLimitedGate {
+            sig_off,
+            route_off,
+            out_off,
+            ..
+        } => (vec![*sig_off, *route_off], vec![*out_off]),
     }
 }
 
@@ -1725,8 +1728,8 @@ impl RocmExecutable {
                         Activation::Round => 12,
                         Activation::Sin => 13,
                         Activation::Cos => 14,
-        Activation::Tan => 15,
-        Activation::Atan => 16,
+                        Activation::Tan => 15,
+                        Activation::Atan => 16,
                     };
                     let bin_sub = |b: BinaryOp| match b {
                         BinaryOp::Add => 0u32,
@@ -2130,9 +2133,7 @@ impl RocmExecutable {
                     let (mask_kind_id, mask_off, window) = match mask_kind {
                         MaskKind::None => (0u32, 0u32, 0u32),
                         MaskKind::Causal => (1u32, 0u32, 0u32),
-                        MaskKind::Custom => {
-                            (2u32, (arena.offset(node.inputs[4]) / 4) as u32, 0u32)
-                        }
+                        MaskKind::Custom => (2u32, (arena.offset(node.inputs[4]) / 4) as u32, 0u32),
                         MaskKind::SlidingWindow(w) => (3u32, 0u32, *w as u32),
                         MaskKind::Bias => (4u32, (arena.offset(node.inputs[4]) / 4) as u32, 0u32),
                     };
@@ -2295,9 +2296,7 @@ impl RocmExecutable {
                             QuantScheme::Fp8E4m3 => (1, 3u32),
                             QuantScheme::Fp8E5m2 => (1, 4u32),
                             QuantScheme::Nvfp4Block => (rlx_ir::NVFP4_GROUP_SIZE as u32, 5u32),
-                            other => panic!(
-                                "rlx-rocm DequantMatMul: unsupported scheme {other:?}"
-                            ),
+                            other => panic!("rlx-rocm DequantMatMul: unsupported scheme {other:?}"),
                         };
                         let scale_id = node.inputs[2];
                         let zp_id = node.inputs[3];
@@ -2695,8 +2694,7 @@ impl RocmExecutable {
                 | Op::RmsNormBackwardBeta { eps, .. } => {
                     let x_shape = &graph.node(node.inputs[0]).shape;
                     let h = x_shape.dim(x_shape.rank() - 1).unwrap_static() as u32;
-                    let rows =
-                        (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
+                    let rows = (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
                     let eps_bits = eps.to_bits();
                     let off = |i: usize| arena.offset(node.inputs[i]) as u32;
                     let common = (off(0), off(1), off(2), off(3), rows, h, eps_bits);
@@ -2755,8 +2753,7 @@ impl RocmExecutable {
                             dy_shape.dim(1).unwrap_static() as u32,
                         )
                     };
-                    let cos_len =
-                        graph.node(node.inputs[1]).shape.num_elements().unwrap() as u32;
+                    let cos_len = graph.node(node.inputs[1]).shape.num_elements().unwrap() as u32;
                     schedule.push(Step::RopeBackward {
                         dy_byte_off: arena.offset(node.inputs[0]) as u32,
                         cos_byte_off: arena.offset(node.inputs[1]) as u32,
@@ -2773,8 +2770,7 @@ impl RocmExecutable {
                 Op::CumsumBackward { exclusive, .. } => {
                     let dy_shape = &graph.node(node.inputs[0]).shape;
                     let cols = dy_shape.dim(dy_shape.rank() - 1).unwrap_static() as u32;
-                    let rows =
-                        (dy_shape.num_elements().unwrap() / cols.max(1) as usize) as u32;
+                    let rows = (dy_shape.num_elements().unwrap() / cols.max(1) as usize) as u32;
                     schedule.push(Step::CumsumBackward {
                         dy_byte_off: arena.offset(node.inputs[0]) as u32,
                         dx_byte_off: arena.offset(node.id) as u32,
@@ -2918,12 +2914,7 @@ impl RocmExecutable {
             && self.arena.has(id)
         {
             let byte_off = self.arena.offset(id);
-            crate::gguf_host::upload_param_bytes(
-                &self.ctx,
-                &mut self.arena.buffer,
-                byte_off,
-                data,
-            );
+            crate::gguf_host::upload_param_bytes(&self.ctx, &mut self.arena.buffer, byte_off, data);
         }
     }
 

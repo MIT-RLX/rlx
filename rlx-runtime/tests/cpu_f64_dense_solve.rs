@@ -220,7 +220,7 @@ fn f64_hello_resistor_gradient_via_run_typed() {
         x,
         ReduceOp::Sum,
         vec![0],
-        false,
+        true,
         Shape::new(&[1], DType::F64),
     );
     g.set_outputs(vec![loss]);

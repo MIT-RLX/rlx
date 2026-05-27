@@ -2,15 +2,13 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 use rlx_ir::{DType, Shape};
 
 use super::BlockStage;
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
-use crate::weight::WeightSource;
-
 #[derive(Debug, Clone)]
 pub struct LmHeadStage {
     pub weight_key: Option<String>,
@@ -43,11 +41,7 @@ impl LmHeadStage {
 }
 
 impl BlockStage for LmHeadStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let lm_head_w = if self.tie_word_embeddings {
             let embed_key = "model.embed_tokens.weight";
             let embed = ctx

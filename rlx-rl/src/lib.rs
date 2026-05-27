@@ -29,8 +29,8 @@ pub mod dataset;
 pub mod distillation;
 pub mod env;
 pub mod flow_curriculum;
-pub mod guidance;
 pub mod graph;
+pub mod guidance;
 pub mod policy;
 pub mod qgbs;
 pub mod spec;
@@ -44,16 +44,15 @@ pub mod trainer;
 pub use buffer::{ReplayBuffer, Transition};
 pub use dataset::OfflineDataset;
 pub use env::RlEnv;
-pub use guidance::{eta_effective, q_guided_project};
+pub use flow_curriculum::sample_r_t;
 pub use graph::{
-    build_actor_graphs, build_critic_graphs, init_actor_weights, init_critic_weights,
     ActorGraphBundle, CompiledFlowMapAgent, CompiledTwinCritic, CriticGraphBundle, ParamSlot,
-    WeightStore,
+    WeightStore, build_actor_graphs, build_critic_graphs, init_actor_weights, init_critic_weights,
 };
-pub use policy::{select_action, sample_noise, EvalConfig};
+pub use guidance::{eta_effective, q_guided_project};
+pub use policy::{EvalConfig, sample_noise, select_action};
 pub use qgbs::{QgbsConfig, qgbs_select_action};
 pub use spec::{DistillationType, RlSpec};
-pub use flow_curriculum::sample_r_t;
 
 #[cfg(feature = "compile")]
 pub use trainer::FmqTrainer;

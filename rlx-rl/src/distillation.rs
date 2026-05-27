@@ -52,7 +52,10 @@ pub fn esd_lsd_sample(
     let u = agent.velocity(state, a_r, r, t);
     let dt = t - r;
     let x_su = clip_action(
-        &a_r.iter().zip(u.iter()).map(|(&a, &v)| a + dt * v).collect::<Vec<_>>(),
+        &a_r.iter()
+            .zip(u.iter())
+            .map(|(&a, &v)| a + dt * v)
+            .collect::<Vec<_>>(),
         clip,
     );
     let d_x_du = jvp_jump_wrt_end_time(agent, state, a_r, r, t);
@@ -73,8 +76,7 @@ pub fn esd_teacher_psd(
     let v_sw = agent.velocity(state, a_r, r, w);
     let dt_sw = w - r;
     let x_sw = clip_action(
-        &a_r
-            .iter()
+        &a_r.iter()
             .zip(v_sw.iter())
             .map(|(&a, &v)| a + dt_sw * v)
             .collect::<Vec<_>>(),
@@ -119,7 +121,8 @@ pub fn esd_regression_target(
         }
         DistillationType::Lsd => esd_lsd_sample(agent, state, a_r, r, t, spec.action_clip),
         DistillationType::Psd => {
-            let (_student, teacher) = esd_teacher_psd(agent, state, a_r, r, t, gamma, spec.action_clip);
+            let (_student, teacher) =
+                esd_teacher_psd(agent, state, a_r, r, t, gamma, spec.action_clip);
             (a_r.to_vec(), r, t, teacher)
         }
     }

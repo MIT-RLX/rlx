@@ -137,7 +137,11 @@ impl SparseStiffness {
     ) -> Result<Vec<f64>, FdmError> {
         let nf = self.n;
         if p.len() != nf * 3 {
-            return Err(FdmError::Dimension(format!("P len {} != {}*3", p.len(), nf)));
+            return Err(FdmError::Dimension(format!(
+                "P len {} != {}*3",
+                p.len(),
+                nf
+            )));
         }
         let mut out = vec![0.0; nf * 3];
         for comp in 0..3 {
@@ -174,7 +178,8 @@ pub fn max_abs_diff_dense_sparse(
 ) -> Result<f64, FdmError> {
     let dense = EquilibriumModel::nodes_free_positions(q, xyz_fixed, loads_nodes, structure)?;
     let pat = SparseStiffness::pattern(structure);
-    let sparse = nodes_free_positions_sparse(&pat, q, xyz_fixed, loads_nodes, structure, 4000, 1e-10)?;
+    let sparse =
+        nodes_free_positions_sparse(&pat, q, xyz_fixed, loads_nodes, structure, 4000, 1e-10)?;
     let mut m: f64 = 0.0;
     for (a, b) in dense.iter().zip(sparse.iter()) {
         m = m.max((a - b).abs());
@@ -224,7 +229,15 @@ pub fn nodes_free_positions_auto(
         EquilibriumModel::nodes_free_positions(q, xyz_fixed, loads_nodes, structure)
     } else {
         let pat = SparseStiffnessFast::pattern(structure);
-        nodes_free_positions_sparse_fast(&pat, q, xyz_fixed, loads_nodes, structure, pcg_max_iter, pcg_tol)
+        nodes_free_positions_sparse_fast(
+            &pat,
+            q,
+            xyz_fixed,
+            loads_nodes,
+            structure,
+            pcg_max_iter,
+            pcg_tol,
+        )
     }
 }
 

@@ -56,7 +56,10 @@ impl Lbfgs {
             alpha[i] = self.rho_hist[i] * dot(&self.s_hist[i], &q);
             q = sub_scaled(&q, &self.y_hist[i], alpha[i]);
         }
-        let mut r = scale(g, ys_dot(&self.y_hist[m - 1], &self.s_hist[m - 1]).max(1e-14));
+        let mut r = scale(
+            g,
+            ys_dot(&self.y_hist[m - 1], &self.s_hist[m - 1]).max(1e-14),
+        );
         for i in 0..m {
             let beta = self.rho_hist[i] * dot(&self.y_hist[i], &r);
             r = add_scaled(&r, &self.s_hist[i], alpha[i] - beta);
@@ -79,7 +82,11 @@ impl Lbfgs {
         let mut step = 1.0;
         let gdot = dot(g0, d);
         for _ in 0..self.max_line_iter {
-            let x_try: Vec<f64> = x.iter().zip(d.iter()).map(|(&xi, &di)| xi + step * di).collect();
+            let x_try: Vec<f64> = x
+                .iter()
+                .zip(d.iter())
+                .map(|(&xi, &di)| xi + step * di)
+                .collect();
             let f_try = f(&x_try);
             if f_try <= f0 + self.c1 * step * gdot {
                 return (x_try, f_try);
@@ -89,7 +96,11 @@ impl Lbfgs {
                 break;
             }
         }
-        let x_try: Vec<f64> = x.iter().zip(d.iter()).map(|(&xi, &di)| xi + step * di).collect();
+        let x_try: Vec<f64> = x
+            .iter()
+            .zip(d.iter())
+            .map(|(&xi, &di)| xi + step * di)
+            .collect();
         let loss = f(&x_try);
         (x_try, loss)
     }

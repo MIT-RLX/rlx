@@ -202,14 +202,14 @@ pub use rlx_ir::{
     MirModule, Node, NodeId, Op, OpKind, Shape, Tick,
 };
 pub use rlx_ir::{
-    inspect_graph, inspect_graph_diff, inspect_hir, inspect_hir_stats, inspect_lir, inspect_mir,
-    inspect_mir_diff, inspect_mir_stats, node_label, NodeOrigin,
+    NodeOrigin, inspect_graph, inspect_graph_diff, inspect_hir, inspect_hir_stats, inspect_lir,
+    inspect_mir, inspect_mir_diff, inspect_mir_stats, node_label,
 };
 pub use rlx_opt::{
     CalibrationRecord, CompilePipeline, CompileResult, FusionOptions, FusionReport, FusionTarget,
     MissReason, MissedFusion, Pass, PipelineInspect, Precision, PrecisionPolicy, fusion_passes,
-    fusion_passes_for_supported, supports_op, supported_for_target,
-    hvp, inspect_pipeline, maybe_dump_pipeline, jvp, vmap,
+    fusion_passes_for_supported, hvp, inspect_pipeline, jvp, maybe_dump_pipeline,
+    supported_for_target, supports_op, vmap,
 };
 pub use rlx_runtime::{CompiledGraph, Session};
 
@@ -247,9 +247,7 @@ pub mod quant {
 /// g.set_outputs(vec![r]);
 /// ```
 pub mod ops {
-    pub use rlx_ir::op::{
-        Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind,
-    };
+    pub use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind};
 }
 
 /// Autodiff + transforms — re-exports the public entry points from
@@ -286,8 +284,8 @@ pub mod autodiff {
 pub mod prelude {
     // Core graph + runtime
     pub use crate::{
-        CompiledGraph, DType, Device, Element, Error, Graph, GraphModule, GraphStage, Node,
-        NodeId, Op, OpKind, Result, Session, Shape, Tick,
+        CompiledGraph, DType, Device, Element, Error, Graph, GraphModule, GraphStage, Node, NodeId,
+        Op, OpKind, Result, Session, Shape, Tick,
     };
     // IR builder helpers
     pub use crate::ops::{Activation, BinaryOp, CmpOp, MaskKind};
@@ -296,8 +294,8 @@ pub mod prelude {
     // Autodiff
     pub use crate::{hvp, jvp, vmap};
     // Optimizer types — useful when configuring passes / precision
-    pub use crate::{CalibrationRecord, Pass, Precision, PrecisionPolicy};
     pub use crate::ir::env::{self, RlxEnv, RuntimeOverrides, flag, set, unset, var};
+    pub use crate::{CalibrationRecord, Pass, Precision, PrecisionPolicy};
 
     // 3D Gaussian splatting (`rlx-splat` — call `register()` once per process)
     #[cfg(feature = "splat")]
@@ -307,8 +305,8 @@ pub mod prelude {
     };
     #[cfg(feature = "splat")]
     pub use rlx_ir::ops::splat::{
-        gaussian_splat_prep_packed_len, gaussian_splat_tile_count, GaussianSplatInputs,
-        GaussianSplatRenderParams,
+        GaussianSplatInputs, GaussianSplatRenderParams, gaussian_splat_prep_packed_len,
+        gaussian_splat_tile_count,
     };
     #[cfg(feature = "splat")]
     pub use rlx_splat::prep_layout::{prep_packed_len, tile_count};

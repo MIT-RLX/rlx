@@ -1227,7 +1227,11 @@ fn vmap_op(
             batched.insert(x);
             batched.insert(idx);
             let x_shape = out.node(x).shape.clone();
-            assert_eq!(x_shape.rank(), 3, "vmap DequantGroupedMatMul: expected 3-D x");
+            assert_eq!(
+                x_shape.rank(),
+                3,
+                "vmap DequantGroupedMatMul: expected 3-D x"
+            );
             let m_orig = match x_shape.dim(1) {
                 Dim::Static(v) => v,
                 _ => panic!("dynamic M"),
@@ -1246,10 +1250,7 @@ fn vmap_op(
                     new_shape: vec![bm as i64, k],
                 },
                 vec![x],
-                Shape::from_dims(
-                    &[Dim::Static(bm), x_shape.dim(2)],
-                    orig_shape.dtype(),
-                ),
+                Shape::from_dims(&[Dim::Static(bm), x_shape.dim(2)], orig_shape.dtype()),
             );
             let idx_flat = out.add_node(
                 Op::Reshape {
@@ -1269,7 +1270,9 @@ fn vmap_op(
             let mut final_dims: Vec<i64> = vec![batch_size as i64, m_orig as i64];
             final_dims.push(n);
             out.add_node(
-                Op::Reshape { new_shape: final_dims },
+                Op::Reshape {
+                    new_shape: final_dims,
+                },
                 vec![y_flat],
                 batched_shape(),
             )
@@ -1280,7 +1283,9 @@ fn vmap_op(
              vmap the downstream GroupedMatMul / DequantGroupedMatMul instead.",
         ),
 
-        Op::FusedSwiGLU { .. } | Op::FusedMatMulBiasAct { .. } | Op::FusedResidualLN { .. }
+        Op::FusedSwiGLU { .. }
+        | Op::FusedMatMulBiasAct { .. }
+        | Op::FusedResidualLN { .. }
         | Op::FusedResidualRmsNorm { .. } => {
             panic!(
                 "vmap: {:?} is fused — decompose first via \

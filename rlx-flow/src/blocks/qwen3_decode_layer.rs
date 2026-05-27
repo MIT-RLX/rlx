@@ -2,16 +2,16 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
+use rlx_ir::HirGraphExt;
 use rlx_ir::hir::HirMut;
 use rlx_ir::op::MaskKind;
 use rlx_ir::shape;
-use rlx_ir::HirGraphExt;
 
 use std::sync::{Arc, Mutex};
 
+use super::BlockStage;
 use super::qwen3_decoder::per_head_rms;
 use super::self_attn::repeat_kv;
-use super::BlockStage;
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
 
@@ -51,11 +51,7 @@ impl Qwen3DecodeLayerStage {
 }
 
 impl BlockStage for Qwen3DecodeLayerStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let decode = ctx
             .state
             .decode
@@ -132,20 +128,8 @@ impl BlockStage for Qwen3DecodeLayerStage {
         self.kv_out.lock().expect("kv out").push(new_k);
         self.kv_out.lock().expect("kv out").push(new_v);
 
-        let k_rep = repeat_kv(
-            &mut gb,
-            new_k,
-            nkv,
-            dh,
-            spec.kv_group_size,
-        );
-        let v_rep = repeat_kv(
-            &mut gb,
-            new_v,
-            nkv,
-            dh,
-            spec.kv_group_size,
-        );
+        let k_rep = repeat_kv(&mut gb, new_k, nkv, dh, spec.kv_group_size);
+        let v_rep = repeat_kv(&mut gb, new_v, nkv, dh, spec.kv_group_size);
 
         let attn_shape = shape::attention_shape(gb.shape(q_rope));
         let attn = if spec.use_custom_mask {
@@ -154,15 +138,7 @@ impl BlockStage for Qwen3DecodeLayerStage {
                 .ok_or_else(|| anyhow::anyhow!("custom mask requested but not bound"))?;
             gb.attention(q_rope, k_rep, v_rep, mask, nh, dh, attn_shape)
         } else {
-            gb.attention_kind(
-                q_rope,
-                k_rep,
-                v_rep,
-                nh,
-                dh,
-                MaskKind::Causal,
-                attn_shape,
-            )
+            gb.attention_kind(q_rope, k_rep, v_rep, nh, dh, MaskKind::Causal, attn_shape)
         };
 
         let attn_out = gb.mm(attn, o_w);

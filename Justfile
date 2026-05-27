@@ -29,7 +29,7 @@ build-all:
     cargo build --release -p rlx-runtime --features "cpu,metal,kernel-trace,nan-check,blas-accelerate"
 
 # Build rlx-mlx. First build compiles MLX from source (~minutes).
-# Requires `git submodule update --init` for vendor/mlx.
+# Requires `git submodule update --init rlx-mlx-sys/vendor/mlx`.
 build-mlx:
     cargo build --release -p rlx-mlx
 

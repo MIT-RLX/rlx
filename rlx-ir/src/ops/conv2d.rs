@@ -3,7 +3,7 @@
 
 //! NCHW convolution builders (`conv2d`, `conv_transpose2d`).
 
-use crate::{Graph, NodeId, Op, Shape};
+use crate::{Graph, NodeId, Op};
 
 impl Graph {
     /// 2D convolution on NCHW tensors (`Op::Conv`). Weight `[C_out, C_in/g, kH, kW]`.

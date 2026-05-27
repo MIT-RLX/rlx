@@ -28,7 +28,9 @@ pub fn run_llada2_group_limited_gate(
     attrs: &[u8],
 ) {
     let n_f32 = arena_size_bytes / 4;
-    stream.synchronize().expect("rlx-cuda: llada2 gate pre-sync failed");
+    stream
+        .synchronize()
+        .expect("rlx-cuda: llada2 gate pre-sync failed");
 
     let mut host = vec![0f32; n_f32];
     stream

@@ -15,16 +15,14 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use rlx_fdm::graph::{fdm_dense_graph, pack_load_rhs, pack_stiffness};
-use rlx_fdm::{fdm, Network};
+use rlx_fdm::{Network, fdm};
 use rlx_ir::GraphExt;
 use rlx_runtime::{Device, Session};
 
 #[test]
 fn dense_solve_graph_matches_reference() {
-    let mut net = Network::from_polyline(
-        &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-        -1.0,
-    );
+    let mut net =
+        Network::from_polyline(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], -1.0);
     net.anchor_nodes(&[0, 2]);
     net.loads_on_free([0.0, 0.0, -1.0]);
     let ref_eq = fdm(&net).expect("ref");
@@ -43,10 +41,7 @@ fn dense_solve_graph_matches_reference() {
     let outs = session.run_typed(&[]);
     let z_ir = f64::from_le_bytes(outs[0].0[16..24].try_into().unwrap());
     let z_ref = ref_eq.xyz[3 * 1 + 2];
-    assert!(
-        (z_ref - z_ir).abs() < 1e-4,
-        "ref z={z_ref} ir z={z_ir}"
-    );
+    assert!((z_ref - z_ir).abs() < 1e-4, "ref z={z_ref} ir z={z_ir}");
 }
 
 #[test]

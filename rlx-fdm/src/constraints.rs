@@ -16,7 +16,7 @@
 //! Soft constraints for constrained form-finding (jax_fdm `constraints` + `LogMaxError`).
 
 use crate::geometry::{angle_vectors, cross, normalize};
-use crate::goals::{accumulate_edge_length_grad, packed_free_dim, EdgeIndex};
+use crate::goals::{EdgeIndex, accumulate_edge_length_grad, packed_free_dim};
 use crate::mesh::MeshStructure;
 use crate::network::Vec3;
 use crate::state::EquilibriumState;
@@ -173,9 +173,15 @@ impl Constraint {
                 }
                 weight * log1p_violation_above(state.forces[e].abs(), *up)
             }
-            Self::EdgeAngle { low, up, weight, .. }
-            | Self::NodeTangent { low, up, weight, .. }
-            | Self::NodeNormalAngle { low, up, weight, .. } => {
+            Self::EdgeAngle {
+                low, up, weight, ..
+            }
+            | Self::NodeTangent {
+                low, up, weight, ..
+            }
+            | Self::NodeNormalAngle {
+                low, up, weight, ..
+            } => {
                 let ang = self.constraint_angle(state, None, &[]);
                 weight * (log1p_violation_above(ang, *up) + log1p_violation_above(*low, ang))
             }
@@ -214,7 +220,12 @@ impl Constraint {
     }
 
     /// Nonlinear constraint values `g(x)` for SLSQP (`g ≤ 0` feasible).
-    pub fn nonlinear_ineq(&self, state: &EquilibriumState, mesh: Option<&MeshStructure>, edges: &[(usize, usize)]) -> Vec<f64> {
+    pub fn nonlinear_ineq(
+        &self,
+        state: &EquilibriumState,
+        mesh: Option<&MeshStructure>,
+        edges: &[(usize, usize)],
+    ) -> Vec<f64> {
         if !self.is_nonlinear() {
             return vec![];
         }
@@ -254,7 +265,11 @@ impl Constraint {
                     accumulate_edge_length_grad(&mut g, state, structure, edges, e, scale);
                 }
             }
-            Self::EdgeQ { .. } | Self::EdgeForceMax { .. } | Self::EdgeAngle { .. } | Self::NodeTangent { .. } | Self::NodeNormalAngle { .. } => {}
+            Self::EdgeQ { .. }
+            | Self::EdgeForceMax { .. }
+            | Self::EdgeAngle { .. }
+            | Self::NodeTangent { .. }
+            | Self::NodeNormalAngle { .. } => {}
         }
         g
     }
@@ -292,10 +307,7 @@ fn log_barrier_above(v: f64, up: f64) -> f64 {
 }
 
 pub fn constraints_penalty(constraints: &[Constraint], state: &EquilibriumState, q: &[f64]) -> f64 {
-    constraints
-        .iter()
-        .map(|c| c.penalty(state, q))
-        .sum()
+    constraints.iter().map(|c| c.penalty(state, q)).sum()
 }
 
 pub fn constraints_have_nonlinear(constraints: &[Constraint]) -> bool {

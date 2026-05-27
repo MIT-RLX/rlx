@@ -114,9 +114,7 @@ pub fn lower_gaussian_splat_render_backward(
     } else {
         (sh_len / (count * 3)).max(1)
     };
-    let pixels = (width as usize)
-        .saturating_mul(height as usize)
-        .max(1);
+    let pixels = (width as usize).saturating_mul(height as usize).max(1);
 
     // Forward intermediates (same as `lower_gaussian_splat_render`).
     let colors2 = g.reshape_(colors, vec![count as i64, 3]);

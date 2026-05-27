@@ -167,7 +167,8 @@ fn op_kind(op: &Op) -> OpKind {
         | Op::TopK { .. }
         | Op::ScatterAdd
         | Op::MaxPool2dBackward { .. }
-        | Op::ResizeNearest2x | Op::AxialRope2d { .. } => OpKind::DataMovement,
+        | Op::ResizeNearest2x
+        | Op::AxialRope2d { .. } => OpKind::DataMovement,
         Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => OpKind::Boundary,
         // Control flow: treated as data movement (the inner sub-graph
         // gets its own precision policy applied separately).

@@ -50,15 +50,17 @@ fn build_hip_cpu() {
         );
     }
 
+    let kernels_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rlx-gpu-kernels/kernels");
+
     println!("cargo:rerun-if-changed=cpp/cpu_dispatch.cpp");
-    println!("cargo:rerun-if-changed=src/kernels");
+    println!("cargo:rerun-if-changed={}", kernels_dir.display());
 
     cc::Build::new()
         .cpp(true)
         .std("c++17")
         .file("cpp/cpu_dispatch.cpp")
         .include(hip_cpu_include)
-        .include("src/kernels")
+        .include(&kernels_dir)
         // HIP-CPU runtime mode — selects the CPU thread-pool backend
         // instead of any GPU runtime.
         .define("__HIP_CPU_RT__", None)

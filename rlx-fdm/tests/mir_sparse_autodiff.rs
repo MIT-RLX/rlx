@@ -19,7 +19,7 @@
 use rlx_autodiff::grad_with_loss;
 use rlx_fdm::mir_opt::FdmMirOptimizer;
 use rlx_fdm::{
-    assemble_csr_values_graph, register_rlx_sparse, CsrAssemblySpec, Network, Structure,
+    CsrAssemblySpec, Network, Structure, assemble_csr_values_graph, register_rlx_sparse,
 };
 use rlx_ir::op::ReduceOp;
 use rlx_ir::{DType, GraphExt, Shape};
@@ -36,7 +36,13 @@ fn assemble_csr_ad_matches_fd() {
     let mut fwd = rlx_ir::Graph::new("assemble_csr");
     let q = fwd.param("fdm_q", Shape::new(&[ne], DType::F64));
     let values = assemble_csr_values_graph(&mut fwd, q, &spec);
-    let loss = fwd.reduce(values, ReduceOp::Sum, vec![0], false, Shape::scalar(DType::F64));
+    let loss = fwd.reduce(
+        values,
+        ReduceOp::Sum,
+        vec![0],
+        false,
+        Shape::scalar(DType::F64),
+    );
     fwd.set_outputs(vec![loss]);
 
     let bwd = grad_with_loss(&fwd, &[q]);
@@ -57,7 +63,8 @@ fn assemble_csr_ad_matches_fd() {
 
     let mut bwd_sess = Session::new(Device::Cpu).compile(bwd);
     bwd_sess.set_param_typed("fdm_q", &f64_bytes(&net.q), DType::F64);
-    let gq = bytes_to_f64(&bwd_sess.run_typed(&[("d_output", &f64_bytes(&[1.0]), DType::F64)])[1].0);
+    let gq =
+        bytes_to_f64(&bwd_sess.run_typed(&[("d_output", &f64_bytes(&[1.0]), DType::F64)])[1].0);
     let mut max_err = 0.0f64;
     for (a, b) in gq.iter().zip(fd.iter()) {
         max_err = max_err.max((a - b).abs());
@@ -91,7 +98,13 @@ fn sparse_mir_dq_matches_fd_on_z_sum() {
         .expect("equilibrium graph");
     let z_col = fwd.narrow_(built.xyz_free(), 1, 2, 1);
     let z_vec = fwd.reshape_(z_col, vec![nf as i64]);
-    let loss = fwd.reduce(z_vec, ReduceOp::Sum, vec![0], false, Shape::scalar(DType::F64));
+    let loss = fwd.reduce(
+        z_vec,
+        ReduceOp::Sum,
+        vec![0],
+        false,
+        Shape::scalar(DType::F64),
+    );
     fwd.set_outputs(vec![loss]);
 
     let q = find_param(&fwd, "fdm_q");

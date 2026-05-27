@@ -2,15 +2,13 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 
 use anyhow::Result;
-use rlx_ir::hir::HirMut;
 use rlx_ir::HirGraphExt;
+use rlx_ir::hir::HirMut;
 use rlx_ir::{DType, Shape};
 
 use super::BlockStage;
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
-use crate::weight::WeightSource;
-
 #[derive(Debug, Clone)]
 pub struct GatherLastTokenStage {
     pub batch: usize,
@@ -34,11 +32,7 @@ impl GatherLastTokenStage {
 }
 
 impl BlockStage for GatherLastTokenStage {
-    fn emit(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<Option<FlowValue>> {
+    fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let id = if self.input_name.starts_with("__static_last_") {
             let seq: usize = self
                 .input_name
@@ -48,10 +42,7 @@ impl BlockStage for GatherLastTokenStage {
             let mut gb = HirMut::new(ctx.hir());
             gb.narrow_(input.id, 1, seq - 1, 1)
         } else {
-            let idx = ctx.input(
-                &self.input_name,
-                Shape::new(&[self.batch], DType::F32),
-            );
+            let idx = ctx.input(&self.input_name, Shape::new(&[self.batch], DType::F32));
             let mut gb = HirMut::new(ctx.hir());
             let idx_2d = gb.reshape_(idx, vec![self.batch as i64, 1]);
             gb.gather_(input.id, idx_2d, 1)

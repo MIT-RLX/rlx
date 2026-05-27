@@ -110,8 +110,8 @@ impl ModelComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logical_kernel::KernelDispatchPolicy;
     use crate::ModelVariant;
+    use crate::logical_kernel::KernelDispatchPolicy;
 
     #[test]
     fn cache_key_changes_with_mode_and_profile() {

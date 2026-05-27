@@ -18,7 +18,12 @@
 use crate::equilibrium::FdmError;
 
 /// Solve `K x = b` for `nrhs` right-hand sides stored column-major (`b[i*nrhs + c]`).
-pub fn solve_columns_dense(k: &[f64], b: &[f64], n: usize, nrhs: usize) -> Result<Vec<f64>, FdmError> {
+pub fn solve_columns_dense(
+    k: &[f64],
+    b: &[f64],
+    n: usize,
+    nrhs: usize,
+) -> Result<Vec<f64>, FdmError> {
     if k.len() != n * n || b.len() != n * nrhs {
         return Err(FdmError::Dimension(format!(
             "K is {n}×{n}, b len {}",

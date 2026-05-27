@@ -15,7 +15,7 @@
 //! Residual goal gradient through equilibrium adjoint.
 
 use rlx_fdm::{
-    grad_residual_wrt_xyz_free, goals_grad_xyz_free, EquilibriumModel, Goal, Network, Structure,
+    EquilibriumModel, Goal, Network, Structure, goals_grad_xyz_free, grad_residual_wrt_xyz_free,
 };
 
 #[test]
@@ -24,14 +24,7 @@ fn residual_goal_grad_nonzero_on_arch() {
     let structure = Structure::from_network(&net);
     let eq = rlx_fdm::fdm(&net).expect("eq");
     let goals = vec![Goal::residual(1.0)];
-    let g_goals = goals_grad_xyz_free(
-        &goals,
-        &eq,
-        &structure,
-        &net.edges,
-        &net.is_support,
-        None,
-    );
+    let g_goals = goals_grad_xyz_free(&goals, &eq, &structure, &net.edges, &net.is_support, None);
     let g_res = grad_residual_wrt_xyz_free(&eq, &structure);
     let pred = goals[0].prediction_with_structure(&eq, &structure, &net.is_support, None);
     let scale = 2.0 * goals[0].weight() * (pred - goals[0].target());

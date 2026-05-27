@@ -18,8 +18,8 @@
 
 #[test]
 fn ply_roundtrip_and_graph_inputs() -> anyhow::Result<()> {
-    use rlx_splat::{scene_graph_inputs, save_gaussian_ply, SavePlyOptions};
     use rlx_splat::core::make_parity_scene;
+    use rlx_splat::{SavePlyOptions, save_gaussian_ply, scene_graph_inputs};
 
     let scene = make_parity_scene();
     let dir = std::env::temp_dir().join("rlx_splat_io_smoke");
