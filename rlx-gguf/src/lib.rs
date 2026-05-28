@@ -207,6 +207,36 @@ impl GgufFile {
         Self::from_reader(&mut f)
     }
 
+    /// Merge a multi-part GGUF split (`split.count` > 1) into one in-memory file.
+    pub fn from_split_paths(paths: &[impl AsRef<Path>]) -> Result<Self> {
+        if paths.is_empty() {
+            bail!("from_split_paths: empty path list");
+        }
+        if paths.len() == 1 {
+            return Self::from_path(paths[0].as_ref());
+        }
+        let mut parts: Vec<Self> = paths
+            .iter()
+            .map(|p| Self::from_path(p.as_ref()))
+            .collect::<Result<_>>()?;
+        let mut merged = parts.remove(0);
+        for part in parts {
+            let base = merged.data.len() as u64;
+            for (name, mut t) in part.tensors {
+                t.offset = t.offset.saturating_add(base);
+                if merged.tensors.insert(name, t).is_some() {
+                    bail!("from_split_paths: duplicate tensor name in split merge");
+                }
+            }
+            merged.data.extend_from_slice(&part.data);
+        }
+        merged
+            .metadata
+            .insert("split.count".into(), MetaValue::U32(1));
+        merged.metadata.remove("split.no");
+        Ok(merged)
+    }
+
     pub fn from_reader<R: Read + Seek>(r: &mut R) -> Result<Self> {
         let magic = read_u32(r)?;
         if magic != GGUF_MAGIC {
@@ -343,8 +373,10 @@ impl GgufFile {
 
 // ─── byte-count helpers ───────────────────────────────────────────
 
-const QK8_0: usize = 32;
-const QK4_0: usize = 32;
+/// Legacy Q8_0 block size (32 elements).
+pub const QK8_0: usize = 32;
+/// Legacy Q4_0 block size (32 elements).
+pub const QK4_0: usize = 32;
 const QK4_1: usize = 32;
 const QK5_0: usize = 32;
 const QK5_1: usize = 32;
@@ -538,7 +570,34 @@ fn read_f16_le(b: &[u8]) -> f32 {
     half::f16::from_le_bytes([b[0], b[1]]).to_f32()
 }
 
-fn dequant_q8_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+/// Dequant one Q8_0 block (`2 + QK8_0` bytes → `QK8_0` f32 values).
+pub fn dequant_q8_0_block(block: &[u8], out: &mut [f32]) {
+    assert!(block.len() >= 2 + QK8_0 && out.len() >= QK8_0);
+    let d = read_f16_le(&block[..2]);
+    let qs = &block[2..2 + QK8_0];
+    for (o, &q) in out.iter_mut().zip(qs.iter()).take(QK8_0) {
+        *o = d * (q as i8) as f32;
+    }
+}
+
+/// Dequant one Q4_0 block (`2 + QK4_0/2` bytes → `QK4_0` f32 values).
+pub fn dequant_q4_0_block(block: &[u8], out: &mut [f32]) {
+    assert!(block.len() >= 2 + QK4_0 / 2 && out.len() >= QK4_0);
+    let d = read_f16_le(&block[..2]);
+    let qs = &block[2..2 + QK4_0 / 2];
+    // Layout: low nibbles → first half of block, high nibbles → second half.
+    for j in 0..QK4_0 / 2 {
+        let v0 = (qs[j] & 0x0F) as i32 - 8;
+        out[j] = d * v0 as f32;
+    }
+    for j in 0..QK4_0 / 2 {
+        let v1 = (qs[j] >> 4) as i32 - 8;
+        out[QK4_0 / 2 + j] = d * v1 as f32;
+    }
+}
+
+/// Full-tensor Q8_0 dequant (element count must be a multiple of [`QK8_0`]).
+pub fn dequant_q8_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if !n.is_multiple_of(QK8_0) {
         bail!("Q8_0: n={n} not divisible by {QK8_0}");
     }
@@ -547,19 +606,16 @@ fn dequant_q8_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if bytes.len() != nb * blk {
         bail!("Q8_0: bad byte count");
     }
-    let mut out = Vec::with_capacity(n);
+    let mut out = vec![0f32; n];
     for i in 0..nb {
         let off = i * blk;
-        let d = read_f16_le(&bytes[off..off + 2]);
-        let qs = &bytes[off + 2..off + 2 + QK8_0];
-        for &q in qs {
-            out.push(d * (q as i8) as f32);
-        }
+        dequant_q8_0_block(&bytes[off..off + blk], &mut out[i * QK8_0..(i + 1) * QK8_0]);
     }
     Ok(out)
 }
 
-fn dequant_q4_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+/// Full-tensor Q4_0 dequant (element count must be a multiple of [`QK4_0`]).
+pub fn dequant_q4_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if !n.is_multiple_of(QK4_0) {
         bail!("Q4_0: n={n} not divisible by {QK4_0}");
     }
@@ -568,20 +624,10 @@ fn dequant_q4_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if bytes.len() != nb * blk {
         bail!("Q4_0: bad byte count");
     }
-    let mut out = Vec::with_capacity(n);
+    let mut out = vec![0f32; n];
     for i in 0..nb {
         let off = i * blk;
-        let d = read_f16_le(&bytes[off..off + 2]);
-        let qs = &bytes[off + 2..off + 2 + QK4_0 / 2];
-        // Layout: low nibbles → first half of block, high nibbles → second half.
-        for j in 0..QK4_0 / 2 {
-            let v0 = (qs[j] & 0x0F) as i32 - 8;
-            out.push(d * v0 as f32);
-        }
-        for j in 0..QK4_0 / 2 {
-            let v1 = (qs[j] >> 4) as i32 - 8;
-            out.push(d * v1 as f32);
-        }
+        dequant_q4_0_block(&bytes[off..off + blk], &mut out[i * QK4_0..(i + 1) * QK4_0]);
     }
     Ok(out)
 }

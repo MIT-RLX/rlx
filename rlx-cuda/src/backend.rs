@@ -2846,6 +2846,8 @@ impl CudaExecutable {
                     num_heads,
                     head_dim,
                     mask_kind,
+                    score_scale: _,
+                    attn_logit_softcap: _,
                 } => {
                     // Rank-3 inputs already promoted by unfuse; here we only
                     // see rank-4 [B, H, S, D].

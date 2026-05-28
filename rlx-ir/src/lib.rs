@@ -107,6 +107,7 @@ pub use op_registry::{
     JvpContext, OpExtension, OpRegistry, VjpContext, VmapContext, global_registry, lookup_op,
     register_op,
 };
+pub use ops::attention::attention_kind_op;
 pub use phase::{Phase, PhaseSchedule, derive_phases};
 pub use provenance::{NodeOrigin, node_label, stamp_pass_origins};
 pub use quant::{QuantMap, QuantScheme};

@@ -13,10 +13,10 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.0", features = ["rocm"] }
-rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", features = ["splat"] }
+rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.1", features = ["rocm"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.1", features = ["splat"] }
 
 # libloading dlopens libamdhip64 / libhiprtc at runtime so the crate
 # compiles + tests cleanly on hosts that don't have HIP installed

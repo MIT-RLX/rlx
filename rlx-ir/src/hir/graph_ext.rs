@@ -51,11 +51,13 @@ impl<'a> HirMut<'a> {
         shape: Shape,
     ) -> HirNodeId {
         self.0.mir(
-            Op::Attention {
+            crate::ops::attention::attention_kind_op(
                 num_heads,
                 head_dim,
-                mask_kind: MaskKind::Custom,
-            },
+                MaskKind::Custom,
+                None,
+                None,
+            ),
             vec![q, k, v, mask],
             shape,
         )
@@ -156,6 +158,21 @@ pub trait HirGraphExt {
         head_dim: usize,
         mask_kind: MaskKind,
         shape: Shape,
+    ) -> HirNodeId {
+        self.attention_kind_opts(q, k, v, num_heads, head_dim, mask_kind, shape, None, None)
+    }
+
+    fn attention_kind_opts(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        v: HirNodeId,
+        num_heads: usize,
+        head_dim: usize,
+        mask_kind: MaskKind,
+        shape: Shape,
+        score_scale: Option<f32>,
+        attn_logit_softcap: Option<f32>,
     ) -> HirNodeId;
 
     fn rope(&mut self, x: HirNodeId, cos: HirNodeId, sin: HirNodeId, head_dim: usize) -> HirNodeId;
@@ -463,12 +480,29 @@ impl HirGraphExt for HirMut<'_> {
         mask_kind: MaskKind,
         shape: Shape,
     ) -> HirNodeId {
+        self.attention_kind_opts(q, k, v, num_heads, head_dim, mask_kind, shape, None, None)
+    }
+
+    fn attention_kind_opts(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        v: HirNodeId,
+        num_heads: usize,
+        head_dim: usize,
+        mask_kind: MaskKind,
+        shape: Shape,
+        score_scale: Option<f32>,
+        attn_logit_softcap: Option<f32>,
+    ) -> HirNodeId {
         self.0.mir(
-            Op::Attention {
+            crate::ops::attention::attention_kind_op(
                 num_heads,
                 head_dim,
                 mask_kind,
-            },
+                score_scale,
+                attn_logit_softcap,
+            ),
             vec![q, k, v],
             shape,
         )

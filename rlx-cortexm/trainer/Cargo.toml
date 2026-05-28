@@ -21,10 +21,10 @@ name = "train-mnist"
 path = "src/main.rs"
 
 [dependencies]
-rlx-ir = { path = "../../rlx-ir", version = "0.2.0" }
-rlx-opt = { path = "../../rlx-opt", version = "0.2.0" }
-rlx-autodiff = { path = "../../rlx-autodiff", version = "0.2.0" }
-rlx-cpu = { path = "../../rlx-cpu", version = "0.2.0" }
+rlx-ir = { path = "../../rlx-ir", version = "0.2.1" }
+rlx-opt = { path = "../../rlx-opt", version = "0.2.1" }
+rlx-autodiff = { path = "../../rlx-autodiff", version = "0.2.1" }
+rlx-cpu = { path = "../../rlx-cpu", version = "0.2.1" }
 
 [lints]
 workspace = true

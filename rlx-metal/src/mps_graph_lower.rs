@@ -390,6 +390,8 @@ pub fn try_lower_with_constants(
                 num_heads,
                 head_dim,
                 mask_kind,
+                score_scale: _,
+                attn_logit_softcap: _,
             } => {
                 let q = node_to_tensor.get(&node.inputs[0])?;
                 let k = node_to_tensor.get(&node.inputs[1])?;

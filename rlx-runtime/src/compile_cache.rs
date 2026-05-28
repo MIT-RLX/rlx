@@ -41,8 +41,17 @@ use rlx_ir::DimBinding;
 use rlx_ir::Graph;
 use rlx_ir::hir::HirModule;
 use rlx_opt::CompileResult;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ops::Range;
+
+/// Named runtime input for [`BucketedCompileCache::run_padded_mixed`].
+pub struct CacheRunInput<'a> {
+    pub name: &'a str,
+    pub data: &'a [f32],
+    /// Row inner stride for [`pad_rows`]; `None` = use data as-is (no padding).
+    pub row_inner: Option<usize>,
+}
 
 pub struct CompileCache {
     device: Device,
@@ -404,6 +413,101 @@ impl BucketedCompileCache {
         // default trait impl is a no-op, so other backends just process
         // full extent and the slice_rows below still gives the user
         // correct outputs.
+        compiled.set_active_extent(Some((actual_rows, upper as usize)));
+        let raw_outputs = compiled.run(&pairs);
+        compiled.set_active_extent(None);
+
+        let outs = raw_outputs
+            .into_iter()
+            .enumerate()
+            .map(|(i, out)| match output_inners.get(i).copied() {
+                Some(0) | None => out,
+                Some(inner) => slice_rows(&out, inner, actual_rows),
+            })
+            .collect();
+
+        Some((upper, outs))
+    }
+
+    /// Like [`Self::get_or_compile_with_options`] but also uploads `params` on first compile.
+    pub fn ensure_graph_with_params<F>(
+        &mut self,
+        key: u64,
+        build: F,
+        options: &crate::CompileOptions,
+    ) -> Option<(u64, &mut CompiledGraph)>
+    where
+        F: FnOnce(u64) -> (Graph, HashMap<String, Vec<f32>>),
+    {
+        let idx = self.bucket_for(key)?;
+        let upper = self.buckets[idx].range.end - 1;
+        if self.buckets[idx].compiled.is_none() {
+            let (graph, params) = build(upper);
+            let mut session = Session::new(self.device);
+            if let Some(p) = &self.policy {
+                session = session.with_policy(p.clone());
+            }
+            let mut compiled = session.compile_with(graph, options);
+            for (name, data) in params {
+                compiled.set_param(&name, &data);
+            }
+            self.buckets[idx].compiled = Some(compiled);
+        }
+        Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
+    }
+
+    /// HIR variant of [`Self::ensure_graph_with_params`].
+    pub fn ensure_hir_with_params<F>(
+        &mut self,
+        key: u64,
+        build: F,
+        options: &crate::CompileOptions,
+    ) -> Option<(u64, &mut CompiledGraph)>
+    where
+        F: FnOnce(u64) -> (HirModule, HashMap<String, Vec<f32>>),
+    {
+        let idx = self.bucket_for(key)?;
+        let upper = self.buckets[idx].range.end - 1;
+        if self.buckets[idx].compiled.is_none() {
+            let (hir, params) = build(upper);
+            let mut session = Session::new(self.device);
+            if let Some(p) = &self.policy {
+                session = session.with_policy(p.clone());
+            }
+            let mut compiled = session
+                .compile_hir_with(hir, options)
+                .expect("HIR lower/compile in ensure_hir_with_params");
+            for (name, data) in params {
+                compiled.set_param(&name, &data);
+            }
+            self.buckets[idx].compiled = Some(compiled);
+        }
+        Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
+    }
+
+    /// [`Self::run_padded`] with per-input optional row padding (`CacheRunInput`).
+    pub fn run_padded_mixed<F>(
+        &mut self,
+        key: u64,
+        actual_rows: usize,
+        build: F,
+        inputs: &[CacheRunInput<'_>],
+        output_inners: &[usize],
+    ) -> Option<(u64, Vec<Vec<f32>>)>
+    where
+        F: FnOnce(u64) -> Graph,
+    {
+        let (upper, compiled) = self.get_or_compile(key, build)?;
+
+        let padded: Vec<(&str, Vec<f32>)> = inputs
+            .iter()
+            .map(|inp| match inp.row_inner {
+                Some(inner) => (inp.name, pad_rows(inp.data, inner, upper)),
+                None => (inp.name, inp.data.to_vec()),
+            })
+            .collect();
+        let pairs: Vec<(&str, &[f32])> = padded.iter().map(|(n, d)| (*n, d.as_slice())).collect();
+
         compiled.set_active_extent(Some((actual_rows, upper as usize)));
         let raw_outputs = compiled.run(&pairs);
         compiled.set_active_extent(None);

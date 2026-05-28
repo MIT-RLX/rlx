@@ -13,6 +13,12 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 **`rlx-run`** CLI, and **GGUF K-quant dequantization** baked into
 `Op::DequantMatMul`.
 
+## [0.2.1] — 2026-05
+
+### Changed
+
+- Workspace/crate version bump only.
+
 ### Added
 
 - **`rlx::run` runner API** (`model builders` crate, `run` module):

@@ -3197,6 +3197,8 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                 num_heads,
                 head_dim,
                 mask_kind,
+                score_scale: _,
+                attn_logit_softcap: _,
             } => {
                 // Layout dispatch: rank-4 input could be either
                 // `[B, S, H, D]` (CPU's historical convention) or

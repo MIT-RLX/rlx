@@ -745,6 +745,8 @@ pub fn lower_with_env(
                 num_heads,
                 head_dim,
                 mask_kind,
+                score_scale: _,
+                attn_logit_softcap: _,
             } => {
                 // MLX's fast::scaled_dot_product_attention expects Q/K/V
                 // as rank-4 [B, H, S, D]. rlx callers may hand us either

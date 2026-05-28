@@ -2069,6 +2069,8 @@ impl RocmExecutable {
                     num_heads,
                     head_dim,
                     mask_kind,
+                    score_scale: _,
+                    attn_logit_softcap: _,
                 } => {
                     let q_id = node.inputs[0];
                     let k_id = node.inputs[1];

@@ -113,7 +113,7 @@
 //! rlx = { git = "https://github.com/MIT-RLX/rlx", features = ["apple-silicon", "mlx"] }
 //! ```
 
-#![doc(html_root_url = "https://docs.rs/rlx/0.2.0")]
+#![doc(html_root_url = "https://docs.rs/rlx/0.2.1")]
 
 // ── Module re-exports ───────────────────────────────────────────
 

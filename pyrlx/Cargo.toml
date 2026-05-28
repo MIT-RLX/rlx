@@ -40,8 +40,8 @@ rocm            = ["rlx-runtime/rocm"]
 pyo3      = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 numpy     = "0.22"
 
-rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.0", default-features = false }
+rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.1", default-features = false }
 [lints]
 workspace = true

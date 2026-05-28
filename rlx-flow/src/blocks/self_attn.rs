@@ -20,6 +20,8 @@ pub struct SelfAttnPrefillSpec {
     pub head_dim: usize,
     pub num_kv_heads: usize,
     pub mask: MaskKind,
+    pub score_scale: Option<f32>,
+    pub attn_logit_softcap: Option<f32>,
 }
 
 impl SelfAttnPrefillSpec {
@@ -38,6 +40,8 @@ impl SelfAttnPrefillSpec {
             head_dim,
             num_kv_heads,
             mask: MaskKind::Causal,
+            score_scale: None,
+            attn_logit_softcap: None,
         }
     }
 }
@@ -81,7 +85,7 @@ impl BlockStage for SelfAttnPrefillStage {
         let v_rep = repeat_kv(&mut gb, v, spec.num_kv_heads, spec.head_dim, group);
 
         let attn_shape = shape::attention_shape(gb.shape(q_rope));
-        let attn = gb.attention_kind(
+        let attn = gb.attention_kind_opts(
             q_rope,
             k_rep,
             v_rep,
@@ -89,6 +93,8 @@ impl BlockStage for SelfAttnPrefillStage {
             spec.head_dim,
             spec.mask,
             attn_shape,
+            spec.score_scale,
+            spec.attn_logit_softcap,
         );
         Ok(Some(ctx.wrap(attn, input.shape.clone())))
     }

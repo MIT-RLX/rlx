@@ -23,6 +23,10 @@ pub struct Qwen3DecoderSpec {
     pub hidden_shape: rlx_ir::Shape,
     pub batch: usize,
     pub seq: usize,
+    /// Per-head Q/K RMSNorm before RoPE (Qwen3); Qwen2 skips.
+    pub qk_norm: bool,
+    /// Explicit Q/K/V bias vectors (Qwen2); Qwen3 typically false.
+    pub attention_bias: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -86,47 +90,73 @@ impl BlockStage for Qwen3DecoderStage {
         let q_w = ctx.load_param(&format!("{lp}.self_attn.q_proj.weight"), true)?;
         let k_w = ctx.load_param(&format!("{lp}.self_attn.k_proj.weight"), true)?;
         let v_w = ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?;
-        let q_norm_g = ctx.load_param(&format!("{lp}.self_attn.q_norm.weight"), false)?;
-        let k_norm_g = ctx.load_param(&format!("{lp}.self_attn.k_norm.weight"), false)?;
         let o_w = ctx.load_param(&format!("{lp}.self_attn.o_proj.weight"), true)?;
         let post_ln_g = ctx.load_param(&format!("{lp}.post_attention_layernorm.weight"), false)?;
         let gate_w = ctx.load_param(&format!("{lp}.mlp.gate_proj.weight"), true)?;
         let up_w = ctx.load_param(&format!("{lp}.mlp.up_proj.weight"), true)?;
         let down_w = ctx.load_param(&format!("{lp}.mlp.down_proj.weight"), true)?;
+        let (q_bias, k_bias, v_bias) = if spec.attention_bias {
+            (
+                Some(ctx.load_param(&format!("{lp}.self_attn.q_proj.bias"), false)?),
+                Some(ctx.load_param(&format!("{lp}.self_attn.k_proj.bias"), false)?),
+                Some(ctx.load_param(&format!("{lp}.self_attn.v_proj.bias"), false)?),
+            )
+        } else {
+            (None, None, None)
+        };
+        let (q_norm_g, k_norm_g) = if spec.qk_norm {
+            (
+                Some(ctx.load_param(&format!("{lp}.self_attn.q_norm.weight"), false)?),
+                Some(ctx.load_param(&format!("{lp}.self_attn.k_norm.weight"), false)?),
+            )
+        } else {
+            (None, None)
+        };
 
         let mut gb = HirMut::new(ctx.hir());
         let skip = input.id;
 
         let normed_in = gb.rms_norm(skip, in_ln_g, zero_beta_h, spec.eps);
-        let q = gb.mm(normed_in, q_w);
-        let k = gb.mm(normed_in, k_w);
-        let v = gb.mm(normed_in, v_w);
+        let mut q = gb.mm(normed_in, q_w);
+        let mut k = gb.mm(normed_in, k_w);
+        let mut v = gb.mm(normed_in, v_w);
 
-        let q_normed = per_head_rms(
-            &mut gb,
-            q,
-            q_norm_g,
-            zero_beta_dh,
-            spec.batch,
-            spec.seq,
-            nh,
-            dh,
-            spec.eps,
-        );
-        let k_normed = per_head_rms(
-            &mut gb,
-            k,
-            k_norm_g,
-            zero_beta_dh,
-            spec.batch,
-            spec.seq,
-            nkv,
-            dh,
-            spec.eps,
-        );
+        if let (Some(qb), Some(kb), Some(vb)) = (q_bias, k_bias, v_bias) {
+            q = gb.add(q, qb);
+            k = gb.add(k, kb);
+            v = gb.add(v, vb);
+        }
 
-        let q_rope = gb.rope(q_normed, cos, sin, dh);
-        let k_rope = gb.rope(k_normed, cos, sin, dh);
+        let (q_rope_in, k_rope_in) = if let (Some(qng), Some(kng)) = (q_norm_g, k_norm_g) {
+            let q_normed = per_head_rms(
+                &mut gb,
+                q,
+                qng,
+                zero_beta_dh,
+                spec.batch,
+                spec.seq,
+                nh,
+                dh,
+                spec.eps,
+            );
+            let k_normed = per_head_rms(
+                &mut gb,
+                k,
+                kng,
+                zero_beta_dh,
+                spec.batch,
+                spec.seq,
+                nkv,
+                dh,
+                spec.eps,
+            );
+            (q_normed, k_normed)
+        } else {
+            (q, k)
+        };
+
+        let q_rope = gb.rope(q_rope_in, cos, sin, dh);
+        let k_rope = gb.rope(k_rope_in, cos, sin, dh);
         if let Some(ref sink) = self.kv_sink {
             sink.lock().expect("qwen3 kv sink").push(k_rope);
             sink.lock().expect("qwen3 kv sink").push(v);

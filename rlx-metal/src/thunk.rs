@@ -1421,6 +1421,8 @@ impl ThunkSchedule {
                     num_heads,
                     head_dim,
                     mask_kind,
+                    score_scale: _,
+                    attn_logit_softcap: _,
                 } => {
                     let mask_kind_u32: u32 = match mask_kind {
                         rlx_ir::op::MaskKind::None => 0,

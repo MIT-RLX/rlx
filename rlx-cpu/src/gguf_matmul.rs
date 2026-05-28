@@ -30,6 +30,8 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
         QuantScheme::GgufQ8K => rlx_gguf::dequant_q8_k_block(block, out),
         QuantScheme::GgufQ2K => rlx_gguf::dequant_q2_k_block(block, out),
         QuantScheme::GgufQ3K => rlx_gguf::dequant_q3_k_block(block, out),
+        QuantScheme::GgufQ4_0 => rlx_gguf::dequant_q4_0_block(block, &mut out[..rlx_gguf::QK4_0]),
+        QuantScheme::GgufQ8_0 => rlx_gguf::dequant_q8_0_block(block, &mut out[..rlx_gguf::QK8_0]),
         other => panic!("gguf_matmul: unsupported scheme {other:?}"),
     }
 }

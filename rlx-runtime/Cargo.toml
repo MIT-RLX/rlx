@@ -80,37 +80,37 @@ directx = []                       # DirectX 12 compute (Windows)
 webgpu = []                        # WebGPU (WASM target)
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.0", features = ["serialize"] }
-rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
-rlx-driver = { path = "../rlx-driver", version = "0.2.0" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", optional = true }
-rlx-metal = { path = "../rlx-metal", version = "0.2.0", optional = true }
-rlx-mlx = { path = "../rlx-mlx", version = "0.2.0", optional = true }
-rlx-wgpu = { path = "../rlx-wgpu", version = "0.2.0", optional = true }
-rlx-cuda = { path = "../rlx-cuda", version = "0.2.0", optional = true }
-rlx-rocm = { path = "../rlx-rocm", version = "0.2.0", optional = true }
-rlx-tpu = { path = "../rlx-tpu", version = "0.2.0", optional = true }
-rlx-macros = { path = "../rlx-macros", version = "0.2.0" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.1", features = ["serialize"] }
+rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
+rlx-driver = { path = "../rlx-driver", version = "0.2.1" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.1", optional = true }
+rlx-metal = { path = "../rlx-metal", version = "0.2.1", optional = true }
+rlx-mlx = { path = "../rlx-mlx", version = "0.2.1", optional = true }
+rlx-wgpu = { path = "../rlx-wgpu", version = "0.2.1", optional = true }
+rlx-cuda = { path = "../rlx-cuda", version = "0.2.1", optional = true }
+rlx-rocm = { path = "../rlx-rocm", version = "0.2.1", optional = true }
+rlx-tpu = { path = "../rlx-tpu", version = "0.2.1", optional = true }
+rlx-macros = { path = "../rlx-macros", version = "0.2.1" }
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# rlx-gpu = { path = "../rlx-gpu", version = "0.2.0", optional = true }
-# rlx-cuda = { path = "../rlx-cuda", version = "0.2.0", optional = true }
+# rlx-gpu = { path = "../rlx-gpu", version = "0.2.1", optional = true }
+# rlx-cuda = { path = "../rlx-cuda", version = "0.2.1", optional = true }
 
 [dev-dependencies]
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.0" }
-rlx-compile = { path = "../rlx-compile", version = "0.2.0", features = ["training"] }
-rlx-splat = { path = "../rlx-splat", version = "0.2.0", default-features = false, features = ["test-support", "io"] }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.1" }
+rlx-compile = { path = "../rlx-compile", version = "0.2.1", features = ["training"] }
+rlx-splat = { path = "../rlx-splat", version = "0.2.1", default-features = false, features = ["test-support", "io"] }
 # Downstream demonstration packages used in integration tests.
 # Enable both `metal` and `mlx` features so the per-backend tests
 # can register rlx-sparse's per-backend kernels. On non-macOS these
 # are no-ops (each kernels module is cfg-gated to target_os = "macos").
-rlx-sparse = { path = "../rlx-sparse", version = "0.2.0", default-features = false, features = ["cpu"] }
-rlx-linalg = { path = "../rlx-linalg", version = "0.2.0" }
+rlx-sparse = { path = "../rlx-sparse", version = "0.2.1", default-features = false, features = ["cpu"] }
+rlx-linalg = { path = "../rlx-linalg", version = "0.2.1" }
 # Used by dequant_matmul_gguf.rs to construct reference GGUF block
 # bytes and verify the in-graph Op::DequantMatMul (GGUF schemes)
 # matches a manual dequant+sgemm.
-rlx-gguf = { path = "../rlx-gguf", version = "0.2.0" }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.1" }
 anyhow = "1"
 half = "2"
 
