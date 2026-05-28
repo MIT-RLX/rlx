@@ -180,6 +180,19 @@ impl ModelFlow {
         })
     }
 
+    /// Compatibility shim: repeat SigLIP-style vision layers.
+    pub fn repeat_siglip_layers(
+        self,
+        count: usize,
+        hidden_size: usize,
+        num_heads: usize,
+        eps: f32,
+    ) -> Self {
+        self.repeat_layers(count, move |i| {
+            nomic_vision_layer_fused(i, hidden_size, num_heads, eps)
+        })
+    }
+
     /// Pool CLS token: `[batch, seq, hidden]` → `[batch, hidden]`.
     pub fn cls_token_pool(mut self, batch: usize, hidden: usize) -> Self {
         self.stages

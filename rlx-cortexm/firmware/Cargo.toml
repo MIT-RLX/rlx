@@ -5,7 +5,7 @@
 
 [package]
 name = "rlx-cortexm-firmware"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "MNIST-on-nRF52840 firmware demo for rlx-cortexm"
 license = "GPL-3.0-only"

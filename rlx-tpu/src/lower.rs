@@ -505,6 +505,8 @@ impl<'a> LowerCtx<'a> {
                 num_heads,
                 head_dim,
                 mask_kind,
+                score_scale: _,
+                attn_logit_softcap: _,
             } => self.lower_attention(&n.inputs, *num_heads, *head_dim, *mask_kind, out_shape),
 
             Op::Rope { head_dim, n_rot: _ } => {
@@ -2144,6 +2146,9 @@ impl<'a> LowerCtx<'a> {
             | QuantScheme::Int4Block { block_size } => block_size as i64,
             // Fp8 schemes are per-tensor; treat as one-block-of-K.
             QuantScheme::Fp8E4m3 | QuantScheme::Fp8E5m2 => k,
+            QuantScheme::GgufQ4_0 | QuantScheme::GgufQ8_0 => panic!(
+                "rlx-tpu: GGUF / NVFP4 quant schemes have no HLO lowering — dequantize on CPU first."
+            ),
             QuantScheme::GgufQ4K
             | QuantScheme::GgufQ5K
             | QuantScheme::GgufQ6K

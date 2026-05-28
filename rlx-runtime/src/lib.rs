@@ -53,6 +53,7 @@
 // live in rlx-driver as of plan #58; re-exported below so
 // existing callers compile unchanged.
 pub mod aot_cache;
+pub mod attn_mask;
 pub mod backend;
 pub mod compile_cache;
 pub mod compiled;
@@ -61,6 +62,7 @@ pub mod device_ext;
 pub mod expert_pool;
 pub mod jacfwd;
 pub mod kernel_trace;
+pub mod kv_cache;
 pub mod lora_scheduler;
 pub mod memory_estimate;
 pub mod model_pipeline;
@@ -108,7 +110,7 @@ pub use rlx_driver::{
 pub use aot_cache::{AotCache, AotCacheError};
 pub use backend::{Backend, ExecutableGraph, compile_hir, compile_module};
 pub use compile_cache::{
-    BucketedCompileCache, CompileCache, DynamicDimCompileCache, pad_rows, slice_rows,
+    BucketedCompileCache, CacheRunInput, CompileCache, DynamicDimCompileCache, pad_rows, slice_rows,
 };
 pub use compiled::CompiledGraph;
 #[cfg(feature = "apple")]
@@ -123,6 +125,7 @@ pub use expert_pool::{
     ExpertPool, ExpertPoolConfig, ExpertPoolStats, ExpertRefreshPolicy, ExpertRefreshResult,
     MoEExecMode, gpu_expert_budget_from_vram,
 };
+pub use kv_cache::LayerKvCache;
 pub use memory_estimate::{MoeOffloadEstimate, estimate_moe_offload};
 pub use model_pipeline::ModelCompilePipeline;
 pub use options::CompileOptions;

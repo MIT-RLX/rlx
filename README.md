@@ -6,7 +6,7 @@ backend-specific kernels for CPU, Apple Silicon (Metal / MLX), NVIDIA
 (CUDA), AMD (ROCm), Google TPU, cross-platform GPU (wgpu), and
 microcontrollers (Cortex-M).
 
-> Status: **0.2.0**, Apple-Silicon-first. The CPU and Apple GPU paths
+> Status: **0.2.1**, Apple-Silicon-first. The CPU and Apple GPU paths
 > are mature; CUDA / ROCm / TPU / WGPU work but have seen less mileage;
 > Cortex-M is a separate INT8 product.
 

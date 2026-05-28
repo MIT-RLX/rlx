@@ -39,6 +39,8 @@ fn build_attn_forward(mask_kind: MaskKind) -> AttnFwd {
             num_heads: H,
             head_dim: D,
             mask_kind,
+            score_scale: None,
+            attn_logit_softcap: None,
         },
         inputs,
         Shape::new(&[B, H, S, D], f),

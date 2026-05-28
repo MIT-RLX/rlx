@@ -67,6 +67,10 @@ pub enum QuantScheme {
     GgufQ2K,
     /// GGUF Q3_K (256 / 110 bytes). 3-bit quants with hmask high bit plane.
     GgufQ3K,
+    /// GGUF Q4_0 (32 / 18 bytes). Legacy llama.cpp block: f16 scale + nibbles.
+    GgufQ4_0,
+    /// GGUF Q8_0 (32 / 34 bytes). Legacy block: f16 scale + 32×i8 quants.
+    GgufQ8_0,
     /// NVIDIA FP4 (E2M1) block — fixed 16-element groups, FP8 E4M3 block
     /// scales, optional f32 global scale on input 3 (legacy `zp` slot).
     /// Used by FLUX.2 / MLX `nvfp4` checkpoints.
@@ -82,12 +86,14 @@ impl QuantScheme {
             Self::Int4Block { .. } => 40,
             Self::Fp8E4m3 | Self::Fp8E5m2 => 80,
             // GGUF K-quants: header + per-element bits over a 256-element block.
-            Self::GgufQ4K => 45, // 144 bytes / 256 elems × 8 = 4.5 bpe
-            Self::GgufQ5K => 55, // 176 / 256 × 8 ≈ 5.5
-            Self::GgufQ6K => 66, // 210 / 256 × 8 ≈ 6.5625 → 66 (rounded)
-            Self::GgufQ8K => 91, // 292 / 256 × 8 ≈ 9.125 → 91
-            Self::GgufQ2K => 26, // 84 / 256 × 8 ≈ 2.625 → 26
-            Self::GgufQ3K => 34, // 110 / 256 × 8 ≈ 3.4375 → 34
+            Self::GgufQ4K => 45,  // 144 bytes / 256 elems × 8 = 4.5 bpe
+            Self::GgufQ5K => 55,  // 176 / 256 × 8 ≈ 5.5
+            Self::GgufQ6K => 66,  // 210 / 256 × 8 ≈ 6.5625 → 66 (rounded)
+            Self::GgufQ8K => 91,  // 292 / 256 × 8 ≈ 9.125 → 91
+            Self::GgufQ2K => 26,  // 84 / 256 × 8 ≈ 2.625 → 26
+            Self::GgufQ3K => 34,  // 110 / 256 × 8 ≈ 3.4375 → 34
+            Self::GgufQ4_0 => 45, // 18 / 32 × 8 = 4.5 bpe
+            Self::GgufQ8_0 => 85, // 34 / 32 × 8 = 8.5 bpe
             Self::Nvfp4Block => 40,
         }
     }
@@ -137,6 +143,7 @@ impl QuantScheme {
             | Self::GgufQ8K
             | Self::GgufQ2K
             | Self::GgufQ3K => 256,
+            Self::GgufQ4_0 | Self::GgufQ8_0 => 32,
             _ => 0,
         }
     }
@@ -150,6 +157,8 @@ impl QuantScheme {
             Self::GgufQ8K => 292, // f32 d + 256 i8 + 16 i16 bsums = 4 + 256 + 32
             Self::GgufQ2K => 84,  // f16 d + f16 dmin + 16 scales + 64 qs
             Self::GgufQ3K => 110, // f16 d + 12 scales + 32 hmask + 64 qs
+            Self::GgufQ4_0 => 18, // f16 d + 16 packed nibbles
+            Self::GgufQ8_0 => 34, // f16 d + 32 i8 quants
             _ => 0,
         }
     }
@@ -167,6 +176,8 @@ impl QuantScheme {
                 | Self::GgufQ8K
                 | Self::GgufQ2K
                 | Self::GgufQ3K
+                | Self::GgufQ4_0
+                | Self::GgufQ8_0
         )
     }
 }
@@ -185,6 +196,8 @@ impl std::fmt::Display for QuantScheme {
             Self::GgufQ8K => write!(f, "gguf_q8k"),
             Self::GgufQ2K => write!(f, "gguf_q2k"),
             Self::GgufQ3K => write!(f, "gguf_q3k"),
+            Self::GgufQ4_0 => write!(f, "gguf_q4_0"),
+            Self::GgufQ8_0 => write!(f, "gguf_q8_0"),
             Self::Nvfp4Block => write!(f, "nvfp4/16"),
         }
     }

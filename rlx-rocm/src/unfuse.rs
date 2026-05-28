@@ -138,6 +138,8 @@ pub fn unfuse(graph: Graph) -> Graph {
                 num_heads,
                 head_dim,
                 mask_kind,
+                score_scale: _,
+                attn_logit_softcap: _,
             } => {
                 let q_dims = graph.node(node.inputs[0]).shape.dims();
                 if q_dims.len() == 3 {
@@ -447,6 +449,8 @@ fn expand_fab(
             num_heads,
             head_dim,
             mask_kind: rlx_ir::op::MaskKind::Custom,
+            score_scale: None,
+            attn_logit_softcap: None,
         },
         vec![q4, k4, v4, inputs[3]],
         bhsd_shape.clone(),
@@ -627,6 +631,8 @@ fn expand_ftl(
             num_heads,
             head_dim,
             mask_kind: rlx_ir::op::MaskKind::Custom,
+            score_scale: None,
+            attn_logit_softcap: None,
         },
         vec![q, k, v, mask],
         bhsd.clone(),
@@ -1008,6 +1014,8 @@ fn expand_attention_rank3(
             num_heads,
             head_dim,
             mask_kind,
+            score_scale: None,
+            attn_logit_softcap: None,
         },
         attn_inputs,
         bhsd.clone(),

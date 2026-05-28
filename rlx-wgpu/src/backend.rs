@@ -1624,6 +1624,8 @@ impl WgpuExecutable {
                     num_heads,
                     head_dim,
                     mask_kind,
+                    score_scale: _,
+                    attn_logit_softcap: _,
                 } => {
                     // v5: rank-4 [B, H, S, D] inputs only. SlidingWindow
                     // synthesizes a Custom mask host-side.

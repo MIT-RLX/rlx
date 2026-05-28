@@ -9,12 +9,13 @@ use anyhow::Result;
 
 use crate::blocks::{
     AttnMaskStage, BertEncoderLayerStage, BindDecodeInputsStage, BlockStage, ClsTokenPoolStage,
-    CustomStage, EmbedStage, GatherAddStage, GatherFromInputStage, GatherLastTokenStage,
-    GdnScanStage, GeluFfnStage, LayerNormStage, LayerScaleStage, LinearStage,
-    LlamaDecodeLayerStage, LlamaDecoderStage, LlamaKvTapStage, LmHeadStage, NomicEncoderLayerStage,
-    Qwen3DecodeLayerStage, Qwen3DecoderStage, RepeatStage, ResidualAddStage, ResidualSaveStage,
-    RmsNormStage, RopeTablesStage, SelfAttnPrefillStage, SwiGluStage, VisionSwiGluFfnStage,
-    VitSelfAttnStage,
+    CustomStage, DecodeRopeParamsStage, EmbedScaleStage, EmbedStage, GatherAddStage,
+    GatherFromInputStage, GatherLastTokenStage, GdnScanStage, GeGluStage, GeluFfnStage,
+    GemmaDecodeLayerStage, GemmaKvTapStage, GemmaRmsNormStage, LayerNormStage, LayerScaleStage,
+    LinearStage, LlamaDecodeLayerStage, LlamaDecoderStage, LlamaKvTapStage, LmHeadStage,
+    LogitSoftcapStage, NomicEncoderLayerStage, Qwen3DecodeLayerStage, Qwen3DecoderStage,
+    RepeatStage, ResidualAddStage, ResidualSaveStage, RmsNormStage, RopeTablesStage,
+    SelfAttnPrefillStage, SwiGluStage, VisionSwiGluFfnStage, VitSelfAttnStage,
 };
 use crate::context::FlowCtx;
 use crate::stream::{DualStreamStage, LoadStreamStage, StoreStreamStage};
@@ -94,6 +95,20 @@ pub enum FlowStage {
     GatherFromInput(GatherFromInputStage),
     /// Add gather-from-side-input embedding to active hidden tensor.
     GatherAdd(GatherAddStage),
+    /// Gemma embedding scale (`sqrt(hidden)`).
+    EmbedScale(EmbedScaleStage),
+    /// Gemma RMSNorm (`1 + weight`).
+    GemmaRmsNorm(GemmaRmsNormStage),
+    /// Gemma 2 logit softcap.
+    LogitSoftcap(LogitSoftcapStage),
+    /// Static decode RoPE tables (params in flow state).
+    DecodeRopeParams(DecodeRopeParamsStage),
+    /// Gemma KV-cache decode layer.
+    GemmaDecodeLayer(GemmaDecodeLayerStage),
+    /// Gemma prefill K/V side export.
+    GemmaKvTap(GemmaKvTapStage),
+    /// Gemma GeGLU FFN.
+    GeGlu(GeGluStage),
 }
 
 impl FlowStage {
@@ -249,6 +264,35 @@ impl FlowStage {
             }
             FlowStage::GatherAdd(s) => {
                 let input = input.ok_or_else(|| anyhow::anyhow!("GatherAdd requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::EmbedScale(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("EmbedScale requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::GemmaRmsNorm(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("GemmaRmsNorm requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::LogitSoftcap(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("LogitSoftcap requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::DecodeRopeParams(s) => {
+                s.emit(ctx)?;
+                Ok(input)
+            }
+            FlowStage::GemmaDecodeLayer(s) => {
+                let input =
+                    input.ok_or_else(|| anyhow::anyhow!("GemmaDecodeLayer requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::GemmaKvTap(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("GemmaKvTap requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::GeGlu(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("GeGlu requires input"))?;
                 s.emit(ctx, input)
             }
         }

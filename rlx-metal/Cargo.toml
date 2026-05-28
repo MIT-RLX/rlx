@@ -13,16 +13,16 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.0" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.0" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
 # rlx-cpu is pulled in solely for its FFT host-fallback kernels
 # (`execute_fft1d_f32` / `execute_fft1d_f64`) — Apple Silicon's
 # unified memory lets us run them against the Metal arena pointer
 # with no copies. A native Metal FFT kernel will replace this when a
 # real workload justifies the .metal kernel work.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.0", features = ["splat"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.1", features = ["splat"] }
 bytemuck = { version = "1", features = ["derive"] }
-rlx-splat = { path = "../rlx-splat", version = "0.2.0", optional = true, default-features = false, features = ["reference", "metal"] }
+rlx-splat = { path = "../rlx-splat", version = "0.2.1", optional = true, default-features = false, features = ["reference", "metal"] }
 
 [features]
 default = []

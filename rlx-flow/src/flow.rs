@@ -129,10 +129,22 @@ impl ModelFlow {
         Ok(BuiltModel {
             module,
             params,
+            typed_params: Vec::new(),
             profile: self.profile,
             output_names: self.output_names,
             primary_shape: primary.shape,
         })
+    }
+
+    /// Compatibility shim: older callers passed GGUF packed matmul params.
+    ///
+    /// The current flow builder ignores packed params; packed lowering lives in model crates.
+    pub fn build_with(
+        self,
+        weights: &mut dyn WeightSource,
+        _gguf_packed: Option<&crate::GgufPackedParams>,
+    ) -> Result<BuiltModel> {
+        self.build(weights)
     }
 }
 
@@ -141,6 +153,8 @@ impl ModelFlow {
 pub struct BuiltModel {
     pub module: GraphModule,
     pub params: HashMap<String, Vec<f32>>,
+    /// Packed U8 params (GGUF quant blobs) attached after compile via `set_param_typed`.
+    pub typed_params: Vec<(String, Vec<u8>, rlx_ir::DType)>,
     pub profile: CompileProfile,
     output_names: Vec<String>,
     primary_shape: Shape,
@@ -164,6 +178,7 @@ impl BuiltModel {
         Ok(Self {
             module: GraphModule::from_hir(hir),
             params,
+            typed_params: Vec::new(),
             profile: CompileProfile::default(),
             output_names: vec!["output".into()],
             primary_shape,
@@ -181,6 +196,7 @@ impl BuiltModel {
         Ok(Self {
             module: GraphModule::from_graph(graph),
             params,
+            typed_params: Vec::new(),
             profile: CompileProfile::default(),
             output_names: vec!["output".into()],
             primary_shape,

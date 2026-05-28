@@ -70,6 +70,16 @@ impl CompileProfile {
         Self::llama32_decode()
     }
 
+    /// Gemma 2 / Gemma 3 causal LM prefill (GQA + RMSNorm + softcap).
+    pub fn gemma_prefill() -> Self {
+        Self::llama32_prefill()
+    }
+
+    /// Gemma decode — fusable policy for bucketed KV-cache graphs.
+    pub fn gemma_decode() -> Self {
+        Self::llama32_decode()
+    }
+
     /// FLUX.2 diffusion transformer + VAE/text-encoder graphs.
     pub fn flux2() -> Self {
         Self::encoder()

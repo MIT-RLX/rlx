@@ -54,3 +54,27 @@ pub use stream::{
 };
 pub use value::FlowValue;
 pub use weight::{MapWeights, WeightSource};
+
+use std::collections::HashMap;
+
+/// Compatibility shim: packed GGUF matmul weights (used by some model loaders).
+#[derive(Debug, Clone, Default)]
+pub struct GgufPackedParams {
+    pub linears: HashMap<String, GgufPackedLinear>,
+}
+
+impl GgufPackedParams {
+    pub fn get_linear(&self, key: &str) -> Option<&GgufPackedLinear> {
+        self.linears.get(key)
+    }
+}
+
+/// One packed linear weight: quantized bytes + bias.
+#[derive(Debug, Clone)]
+pub struct GgufPackedLinear {
+    pub w_q: Vec<u8>,
+    pub scheme: rlx_ir::quant::QuantScheme,
+    pub in_dim: usize,
+    pub out_dim: usize,
+    pub bias: Vec<f32>,
+}

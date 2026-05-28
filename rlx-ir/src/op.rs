@@ -584,10 +584,17 @@ pub enum Op {
     /// the 4th input tensor; `None` / `Causal` / `SlidingWindow` skip the
     /// mask load and apply the mask directly in the inner loop. See
     /// `MaskKind` for the rationale.
+    ///
+    /// `score_scale`: when `Some(s)`, dot-product scores are multiplied by
+    /// `s` instead of the default `1/sqrt(head_dim)` (Gemma uses `head_dim^-0.5`
+    /// explicitly in config). `attn_logit_softcap`: when `Some(c)`, applies
+    /// `c * tanh(s/c)` to scores before softmax (Gemma 2).
     Attention {
         num_heads: usize,
         head_dim: usize,
         mask_kind: MaskKind,
+        score_scale: Option<f32>,
+        attn_logit_softcap: Option<f32>,
     },
 
     /// Rotary position embedding applied to one tensor: x, cos, sin → x_rotated.
@@ -1869,15 +1876,26 @@ impl std::fmt::Display for Op {
                 num_heads,
                 head_dim,
                 mask_kind,
-            } => match mask_kind {
-                MaskKind::Custom => write!(f, "attention(h={num_heads},d={head_dim})"),
-                MaskKind::None => write!(f, "attention(h={num_heads},d={head_dim},nomask)"),
-                MaskKind::Causal => write!(f, "attention(h={num_heads},d={head_dim},causal)"),
-                MaskKind::SlidingWindow(w) => {
-                    write!(f, "attention(h={num_heads},d={head_dim},sw={w})")
+                score_scale,
+                attn_logit_softcap,
+            } => {
+                let mut s = match mask_kind {
+                    MaskKind::Custom => format!("attention(h={num_heads},d={head_dim})"),
+                    MaskKind::None => format!("attention(h={num_heads},d={head_dim},nomask)"),
+                    MaskKind::Causal => format!("attention(h={num_heads},d={head_dim},causal)"),
+                    MaskKind::SlidingWindow(w) => {
+                        format!("attention(h={num_heads},d={head_dim},sw={w})")
+                    }
+                    MaskKind::Bias => format!("attention(h={num_heads},d={head_dim},bias)"),
+                };
+                if let Some(sc) = score_scale {
+                    s.push_str(&format!(",scale={sc}"));
                 }
-                MaskKind::Bias => write!(f, "attention(h={num_heads},d={head_dim},bias)"),
-            },
+                if let Some(cap) = attn_logit_softcap {
+                    s.push_str(&format!(",softcap={cap}"));
+                }
+                write!(f, "{s}")
+            }
             Op::Rope { head_dim, n_rot } => write!(f, "rope(d={head_dim}, n_rot={n_rot})"),
             Op::AxialRope2d {
                 end_x,

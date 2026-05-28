@@ -12,7 +12,7 @@ use crate::hir::LowerError;
 use crate::infer::GraphExt;
 use crate::op::{Activation, MaskKind};
 use crate::shape::{self, Dim};
-use crate::{DType, Graph, NodeId, Op, Shape};
+use crate::{DType, Graph, NodeId, Shape};
 
 /// Lower [`super::HirOp::LlamaDecoderBlock`].
 pub fn lower_llama_decoder_block(
@@ -319,11 +319,7 @@ pub fn lower_qwen35_mtp_head(
         Shape::new(&[batch, seq, kv_dim], f)
     };
     let attn_out = g.add_node(
-        Op::Attention {
-            num_heads,
-            head_dim,
-            mask_kind: MaskKind::Causal,
-        },
+        crate::ops::attention::attention_kind_op(num_heads, head_dim, MaskKind::Causal, None, None),
         vec![q_rot, k_full, v_full],
         attn_shape,
     );

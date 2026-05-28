@@ -498,6 +498,8 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 num_heads,
                 head_dim,
                 mask_kind,
+                score_scale,
+                attn_logit_softcap,
             } => {
                 let q = get_data(arena, external, node.inputs[0]);
                 let k = get_data(arena, external, node.inputs[1]);
@@ -518,7 +520,7 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 let q_shape = &graph.node(node.inputs[0]).shape;
                 let k_shape = &graph.node(node.inputs[1]).shape;
                 let hs = num_heads * head_dim;
-                let scale = (*head_dim as f32).powf(-0.5);
+                let scale = score_scale.unwrap_or((*head_dim as f32).powf(-0.5));
                 let (batch_size, s_q) = if q_shape.rank() >= 3 {
                     (
                         q_shape.dim(0).unwrap_static(),
@@ -658,6 +660,13 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                                     for i in 0..per_bh {
                                         scores[i] += b[i];
                                     }
+                                }
+                            }
+                        }
+                        if let Some(cap) = attn_logit_softcap {
+                            if *cap > 0.0 {
+                                for s in scores.iter_mut() {
+                                    *s = cap * (*s / cap).tanh();
                                 }
                             }
                         }

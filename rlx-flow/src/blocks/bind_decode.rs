@@ -15,8 +15,16 @@ pub struct BindDecodeInputsStage {
 
 impl BindDecodeInputsStage {
     pub fn emit(&self, ctx: &mut FlowCtx<'_>) -> Result<()> {
-        let cos = find_input(ctx.hir(), "rope_cos")?;
-        let sin = find_input(ctx.hir(), "rope_sin")?;
+        let cos = ctx
+            .state
+            .rope_cos
+            .or_else(|| find_input(ctx.hir(), "rope_cos").ok())
+            .ok_or_else(|| anyhow::anyhow!("decode flow missing rope_cos"))?;
+        let sin = ctx
+            .state
+            .rope_sin
+            .or_else(|| find_input(ctx.hir(), "rope_sin").ok())
+            .ok_or_else(|| anyhow::anyhow!("decode flow missing rope_sin"))?;
         let mask = if self.use_custom_mask {
             Some(find_input(ctx.hir(), "mask")?)
         } else {

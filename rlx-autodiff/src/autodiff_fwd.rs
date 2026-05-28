@@ -925,6 +925,8 @@ fn jvp_rule(
             num_heads,
             head_dim,
             mask_kind,
+            score_scale,
+            attn_logit_softcap,
         } => {
             if t_inputs[1].is_some() || t_inputs[2].is_some() {
                 panic!("jvp: Attention tangent only supported for Query");
@@ -944,6 +946,8 @@ fn jvp_rule(
                     num_heads: *num_heads,
                     head_dim: *head_dim,
                     mask_kind: *mask_kind,
+                    score_scale: *score_scale,
+                    attn_logit_softcap: *attn_logit_softcap,
                 },
                 inputs,
                 node.shape.clone(),
