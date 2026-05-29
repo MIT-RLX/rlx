@@ -64,12 +64,14 @@ pub const CONV1D_WGSL: &str = include_str!("conv1d.wgsl");
 pub const CONV3D_WGSL: &str = include_str!("conv3d.wgsl");
 pub const SCATTER_ADD_WGSL: &str = include_str!("scatter_add.wgsl");
 pub const TOPK_WGSL: &str = include_str!("topk.wgsl");
+pub const UMAP_KNN_WGSL: &str = include_str!("umap_knn.wgsl");
 pub const GROUPED_MATMUL_WGSL: &str = include_str!("grouped_matmul.wgsl");
 pub const SAMPLE_WGSL: &str = include_str!("sample.wgsl");
 pub const SELECTIVE_SCAN_WGSL: &str = include_str!("selective_scan.wgsl");
 pub const DEQUANT_MATMUL_WGSL: &str = include_str!("dequant_matmul.wgsl");
 pub const FUSED_RESIDUAL_LN_WGSL: &str = include_str!("fused_residual_ln.wgsl");
 pub const FUSED_RESIDUAL_LN_TEE_WGSL: &str = include_str!("fused_residual_ln_tee.wgsl");
+pub const FUSED_RESIDUAL_RMS_NORM_WGSL: &str = include_str!("fused_residual_rms_norm.wgsl");
 pub const MATMUL_QKV_WGSL: &str = include_str!("matmul_qkv.wgsl");
 pub const MATMUL_QKV_COOP_F32_WGSL: &str = include_str!("matmul_qkv_coop_f32.wgsl");
 
@@ -714,6 +716,9 @@ pub struct MatmulQkvParams {
     pub _p4: u32,
 }
 
+/// Layout for FusedResidualRmsNorm (same bind layout as FusedResidualLN).
+pub type FusedResidualRmsNormParams = FusedResidualLnParams;
+
 /// Layout for FusedResidualLN. 48 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -797,6 +802,19 @@ pub struct TopKParams {
     pub inner: u32,
     pub k: u32,
     pub in_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+}
+
+/// Layout for UMAP k-NN on a pairwise `[n, n]` matrix. 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct UmapKnnParams {
+    pub n: u32,
+    pub k: u32,
+    pub pw_off: u32,
     pub out_off: u32,
     pub _p0: u32,
     pub _p1: u32,
@@ -1088,12 +1106,14 @@ static CONV1D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D: OnceLock<Kernel> = OnceLock::new();
 static SCATTER_ADD: OnceLock<Kernel> = OnceLock::new();
 static TOPK: OnceLock<Kernel> = OnceLock::new();
+static UMAP_KNN: OnceLock<Kernel> = OnceLock::new();
 static GROUPED_MATMUL: OnceLock<Kernel> = OnceLock::new();
 static SAMPLE: OnceLock<Kernel> = OnceLock::new();
 static SELECTIVE_SCAN: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_MATMUL: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN_TEE: OnceLock<Kernel> = OnceLock::new();
+static FUSED_RESIDUAL_RMS_NORM: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_QKV: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_QKV_COOP_F32: OnceLock<Kernel> = OnceLock::new();
 
@@ -1420,6 +1440,9 @@ pub fn scatter_add_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn topk_kernel(device: &wgpu::Device) -> &'static Kernel {
     TOPK.get_or_init(|| build_kernel(device, "rlx-wgpu topk", TOPK_WGSL, "topk"))
 }
+pub fn umap_knn_kernel(device: &wgpu::Device) -> &'static Kernel {
+    UMAP_KNN.get_or_init(|| build_kernel(device, "rlx-wgpu umap_knn", UMAP_KNN_WGSL, "umap_knn"))
+}
 pub fn grouped_matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
     GROUPED_MATMUL.get_or_init(|| {
         build_kernel(
@@ -1470,6 +1493,16 @@ pub fn fused_residual_ln_tee_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu fused_residual_ln_tee",
             FUSED_RESIDUAL_LN_TEE_WGSL,
             "fused_residual_ln_tee",
+        )
+    })
+}
+pub fn fused_residual_rms_norm_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FUSED_RESIDUAL_RMS_NORM.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fused_residual_rms_norm",
+            FUSED_RESIDUAL_RMS_NORM_WGSL,
+            "fused_residual_rms_norm",
         )
     })
 }

@@ -37,6 +37,7 @@ bench   = ["dep:rlx-bench"]
 sparse  = ["dep:rlx-sparse"]
 linalg  = ["dep:rlx-linalg"]
 splat   = ["dep:rlx-splat"]
+umap    = ["dep:rlx-umap"]
 # Specialty targets that don't fit the `Backend` trait (no
 # `Session::compile` path through the runtime) — exposed as
 # `rlx::cortexm::*` and `rlx::fpga::*` for users who want their
@@ -65,6 +66,7 @@ rlx-bench   = { path = "../rlx-bench",   version = "0.2.1", optional = true }
 rlx-sparse  = { path = "../rlx-sparse",  version = "0.2.1", optional = true }
 rlx-linalg  = { path = "../rlx-linalg",  version = "0.2.1", optional = true }
 rlx-splat   = { path = "../rlx-splat",   version = "0.2.1", optional = true, default-features = false, features = ["cpu", "core"] }
+rlx-umap    = { path = "../rlx-umap",    version = "0.2.1", optional = true, default-features = false, features = ["cpu", "graph"] }
 # rlx-cortexm is `no_std` by default; we want the host-side parity
 # kernels (the `std` feature) when re-exported from the prelude.
 rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.1", optional = true, default-features = false, features = ["std"] }

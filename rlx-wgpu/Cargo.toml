@@ -1,6 +1,6 @@
 [package]
 name = "rlx-wgpu"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Cross-platform GPU backend for RLX via wgpu (Metal/Vulkan/DX12/WebGPU)"

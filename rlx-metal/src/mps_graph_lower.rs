@@ -414,11 +414,15 @@ pub fn try_lower_with_constants(
                         mg.attention_unmasked(q, k, v, b, s, kv_seq, *num_heads, *head_dim)
                     }
                     rlx_ir::op::MaskKind::Causal => {
-                        mg.attention_causal(q, k, v, b, s, *num_heads, *head_dim)
+                        if kv_seq == s {
+                            mg.attention_causal(q, k, v, b, s, *num_heads, *head_dim)
+                        } else {
+                            mg.attention_unmasked(q, k, v, b, s, kv_seq, *num_heads, *head_dim)
+                        }
                     }
                     rlx_ir::op::MaskKind::Custom => {
                         let mask = node_to_tensor.get(&node.inputs[3])?;
-                        mg.attention(q, k, v, mask, b, s, *num_heads, *head_dim)
+                        mg.attention(q, k, v, mask, b, s, kv_seq, *num_heads, *head_dim)
                     }
                     _ => {
                         if trace {

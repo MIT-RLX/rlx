@@ -356,6 +356,12 @@ pub(crate) enum Step {
         n_elems: u32,
         attrs: [u8; 20],
     },
+    UmapKnn {
+        pairwise_off: u32,
+        out_off: u32,
+        n: u32,
+        k: u32,
+    },
     GaussianSplatRender {
         positions_off: u32,
         positions_len: u32,
@@ -690,6 +696,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::SelectiveScan { .. } => "rlx::SelectiveScan",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Llada2GroupLimitedGate { .. } => "rlx::Llada2GroupLimitedGate",
+        Step::UmapKnn { .. } => "rlx::UmapKnn",
         Step::GaussianSplatRender { .. } => "rlx::GaussianSplatRender",
         Step::GaussianSplatRenderBackward { .. } => "rlx::GaussianSplatRenderBackward",
         Step::RmsNormBackwardInput { .. } => "rlx::RmsNormBackwardInput",
@@ -1117,6 +1124,11 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             out_off,
             ..
         } => (vec![*sig_off, *route_off], vec![*out_off]),
+        Step::UmapKnn {
+            pairwise_off,
+            out_off,
+            ..
+        } => (vec![*pairwise_off], vec![*out_off]),
     }
 }
 
@@ -2397,24 +2409,35 @@ impl RocmExecutable {
                         use_carry: *carry_state,
                     });
                 }
-                Op::Custom { name, attrs, .. } => {
-                    if name != "llada2.group_limited_gate" {
-                        panic!("rlx-rocm: unsupported Op::Custom('{name}')");
+                Op::Custom { name, attrs, .. } => match name.as_str() {
+                    "llada2.group_limited_gate" => {
+                        let sig_id = node.inputs[0];
+                        let route_id = node.inputs[1];
+                        let n_elems = graph.node(sig_id).shape.num_elements().unwrap() as u32;
+                        let mut attr_buf = [0u8; 20];
+                        let n = attrs.len().min(20);
+                        attr_buf[..n].copy_from_slice(&attrs[..n]);
+                        schedule.push(Step::Llada2GroupLimitedGate {
+                            sig_off: (arena.offset(sig_id) / 4) as u32,
+                            route_off: (arena.offset(route_id) / 4) as u32,
+                            out_off: (arena.offset(node.id) / 4) as u32,
+                            n_elems,
+                            attrs: attr_buf,
+                        });
                     }
-                    let sig_id = node.inputs[0];
-                    let route_id = node.inputs[1];
-                    let n_elems = graph.node(sig_id).shape.num_elements().unwrap() as u32;
-                    let mut attr_buf = [0u8; 20];
-                    let n = attrs.len().min(20);
-                    attr_buf[..n].copy_from_slice(&attrs[..n]);
-                    schedule.push(Step::Llada2GroupLimitedGate {
-                        sig_off: (arena.offset(sig_id) / 4) as u32,
-                        route_off: (arena.offset(route_id) / 4) as u32,
-                        out_off: (arena.offset(node.id) / 4) as u32,
-                        n_elems,
-                        attrs: attr_buf,
-                    });
-                }
+                    "umap.knn" => {
+                        let pw_id = node.inputs[0];
+                        let n = graph.node(pw_id).shape.dims()[0].unwrap_static() as u32;
+                        let k = u32::from_le_bytes(attrs[..4].try_into().unwrap());
+                        schedule.push(Step::UmapKnn {
+                            pairwise_off: (arena.offset(pw_id) / 4) as u32,
+                            out_off: (arena.offset(node.id) / 4) as u32,
+                            n,
+                            k,
+                        });
+                    }
+                    other => panic!("rlx-rocm: unsupported Op::Custom('{other}')"),
+                },
 
                 Op::GaussianSplatRender {
                     width,
@@ -4268,6 +4291,22 @@ impl RocmExecutable {
                         *out_off as usize,
                         *n_elems as usize,
                         attrs,
+                    );
+                }
+                Step::UmapKnn {
+                    pairwise_off,
+                    out_off,
+                    n,
+                    k,
+                } => {
+                    crate::umap_knn_host::run_umap_knn(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        *pairwise_off as usize,
+                        *out_off as usize,
+                        *n as usize,
+                        *k as usize,
                     );
                 }
                 Step::GaussianSplatRender {

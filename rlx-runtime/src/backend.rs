@@ -1274,13 +1274,12 @@ pub mod wgpu_backend {
         }
 
         fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-            // PLAN L4: legalize against the backend's claimed op set
-            // BEFORE running fusion passes (so the diagnostic points
-            // at the user's IR, not at a fused-away node).
-            if let Err(errors) = rlx_opt::legalize_for_backend(&graph, WGPU_SUPPORTED_OPS) {
-                panic!("{}", rlx_opt::format_legalize_error("wgpu", &errors));
-            }
             use rlx_opt::pass::Pass as _;
+            let graph = rlx_opt::LowerControlFlow.run(graph);
+            let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, WGPU_SUPPORTED_OPS)
+                .unwrap_or_else(|errors| {
+                    panic!("{}", rlx_opt::format_legalize_error("wgpu", &errors));
+                });
             // Cleanup passes upstream of wgpu's pipeline.
             let graph = if options.dce {
                 rlx_opt::DeadCodeElimination.run(graph)
@@ -2091,10 +2090,10 @@ pub mod cuda_backend {
             // Decompose FusedSwiGLU / FAB / etc. before legalization (CudaExecutable
             // unfuses again; this pass is idempotent).
             let graph = rlx_cuda::unfuse::unfuse(graph);
-            let graph = rlx_opt::rewrite_for_backend(graph, CUDA_SUPPORTED_OPS);
-            if let Err(errors) = rlx_opt::legalize_for_backend(&graph, CUDA_SUPPORTED_OPS) {
-                panic!("{}", rlx_opt::format_legalize_error("cuda", &errors));
-            }
+            let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, CUDA_SUPPORTED_OPS)
+                .unwrap_or_else(|errors| {
+                    panic!("{}", rlx_opt::format_legalize_error("cuda", &errors));
+                });
             use rlx_opt::pass::Pass as _;
             let graph = if options.dce {
                 rlx_opt::DeadCodeElimination.run(graph)
