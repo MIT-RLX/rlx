@@ -30,7 +30,7 @@ mlx = ["dep:rlx-mlx", "cpu"]
 
 [dependencies]
 rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.1", optional = true }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.2", optional = true }
 rlx-metal = { path = "../rlx-metal", version = "0.2.1", optional = true }
 rlx-mlx = { path = "../rlx-mlx", version = "0.2.1", optional = true }
 
