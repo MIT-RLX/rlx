@@ -20,7 +20,7 @@ rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
 # unified memory lets us run them against the Metal arena pointer
 # with no copies. A native Metal FFT kernel will replace this when a
 # real workload justifies the .metal kernel work.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.1", features = ["splat"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.2", features = ["splat"] }
 bytemuck = { version = "1", features = ["derive"] }
 rlx-splat = { path = "../rlx-splat", version = "0.2.1", optional = true, default-features = false, features = ["reference", "metal"] }
 

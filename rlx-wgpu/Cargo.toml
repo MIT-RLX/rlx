@@ -21,7 +21,7 @@ splat = ["rlx-cpu/splat"]
 [dependencies]
 rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.1", features = ["splat"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.2", features = ["splat"] }
 
 # wgpu 29: brings naga WGSL parser support for `enable f16;` and the
 # `f16` type, which unlocks the half-precision storage matmul path.

@@ -1,6 +1,6 @@
 [package]
 name = "rlx-cpu"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "CPU backend for RLX — SIMD kernels, BLAS dispatch, thread pool, arena executor"
