@@ -303,6 +303,15 @@ int rlx_mlx_op_cumsum(
     int exclusive,
     rlx_mlx_array_t** out);
 
+// 1D FFT along the last axis (2N real-block f32/f64 or complex64).
+// `inverse` non-zero selects ifft. `norm_tag` matches rlx_ir::FftNorm
+// (0=Backward, 1=Forward, 2=Ortho).
+int rlx_mlx_op_fft(
+    rlx_mlx_array_t* a,
+    int inverse,
+    int norm_tag,
+    rlx_mlx_array_t** out);
+
 // ── PR2: norms + attention ───────────────────────────────────────
 
 // RMSNorm with explicit weight (gamma) and eps. Maps Op::RmsNorm.

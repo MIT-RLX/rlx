@@ -1,6 +1,6 @@
 [package]
 name = "rlx-cpu"
-version                = "0.2.2"
+version                = "0.2.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "CPU backend for RLX — SIMD kernels, BLAS dispatch, thread pool, arena executor"
@@ -29,8 +29,8 @@ parity-gemm = ["dep:gemm"]
 splat = []
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.2" }
 # GGUF K-quant block decoders — used by Op::DequantMatMul's GGUF
 # schemes so packed weight bytes can stay in the arena until matmul
 # time instead of round-tripping through f32 at load.

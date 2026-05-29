@@ -31,16 +31,16 @@ use crate::device::wgpu_device;
 use crate::kernels::{
     ArgmaxParams, AttentionBwdParams, AttentionParams, BinaryParams, Conv1dParams, Conv2dParams,
     Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
-    ElementwiseRegionParams, ExpandParams, FftParams, FusedResidualLnParams,
-    FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupedMatmulParams, Kernel, LayerNormParams, MatmulParams, MatmulQkvParams,
+    ElementwiseRegionParams, ExpandParams, FusedResidualLnParams, FusedResidualLnTeeParams,
+    FusedResidualRmsNormParams, GatherAxisParams, GatherBwdParams, GatherParams,
+    GroupedMatmulParams, Kernel, LayerNormParams, MatmulParams, MatmulQkvParams,
     NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams,
     RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SelectiveScanParams, SoftmaxParams,
     TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WhereParams, argmax_kernel,
     attention_bwd_kernel, attention_kernel, binary_kernel, cast_f32_to_f16_kernel, compare_kernel,
     concat_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
     cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel,
-    expand_kernel, fft_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    expand_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
     fused_residual_rms_norm_kernel, gather_axis_kernel, gather_backward_acc_kernel,
     gather_backward_zero_kernel, gather_kernel, grouped_matmul_kernel, layernorm_kernel,
     matmul_coop_f32_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel, matmul_f16w_kernel,
@@ -158,9 +158,25 @@ enum Step {
     Cumsum {
         params: CumsumParams,
     },
-    Fft {
-        params: FftParams,
+    /// Native multi-kernel f32 FFT (gpu-fft dispatch strategy).
+    FftGpu {
+        src_off: u32,
+        dst_off: u32,
         outer: u32,
+        n: u32,
+        inverse: u32,
+        norm_scale: f32,
+    },
+    /// Explicit host FFT (D2H → rlx-cpu → H2D). Used when the native
+    /// WGSL kernel cannot handle dtype / size / non-pow-2 constraints.
+    FftHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        n_complex: u32,
+        inverse: bool,
+        norm_tag: u32,
+        dtype_tag: u32,
     },
     Copy {
         params: CopyParams,
@@ -484,6 +500,8 @@ pub struct WgpuExecutable {
     /// schedule) skip the entire uniform-write loop. `None` ⇒ never
     /// written; `Some(x)` ⇒ uniforms hold params for active_extent=x.
     uniforms_active_extent: Option<Option<(usize, usize)>>,
+    /// Per-`FftGpu` step: isolated uniform buffers + bind groups (one vec entry per op).
+    fft_gpu_steps: Vec<crate::fft_dispatch::FftGpuResources>,
 }
 
 impl Step {
@@ -531,7 +549,7 @@ impl Step {
             // scaling. Marking true so a graph that mixes FFT with
             // active-extent-safe ops still gets the optimization for
             // the rest of the schedule.
-            Step::Fft { .. } => true,
+            Step::FftGpu { .. } | Step::FftHost { .. } => true,
             // Matmul: c_batch_stride is set at compile time at full m,
             // independent of params.m. With scaled m, threads with
             // global_row >= m early-return; per-batch output offsets
@@ -599,6 +617,24 @@ impl Step {
 
 /// Static-string label for each Step variant — used by the Perfetto
 /// trace layer (PLAN L3) to mark per-step events without allocating.
+fn fft_dtype_tag(dtype: rlx_ir::DType) -> u32 {
+    match dtype {
+        rlx_ir::DType::F32 => 0,
+        rlx_ir::DType::F64 => 1,
+        rlx_ir::DType::C64 => 2,
+        other => panic!("rlx-wgpu Op::Fft: unsupported dtype {other:?}"),
+    }
+}
+
+fn fft_dtype_from_tag(tag: u32) -> rlx_ir::DType {
+    match tag {
+        0 => rlx_ir::DType::F32,
+        1 => rlx_ir::DType::F64,
+        2 => rlx_ir::DType::C64,
+        other => panic!("rlx-wgpu Op::Fft: bad dtype tag {other}"),
+    }
+}
+
 fn step_name(step: &Step) -> &'static str {
     match step {
         Step::CastF32ToF16 { .. } => "cast_f32_to_f16",
@@ -611,7 +647,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::Softmax { .. } => "softmax",
         Step::LayerNorm { .. } => "layer_norm",
         Step::Cumsum { .. } => "cumsum",
-        Step::Fft { .. } => "fft",
+        Step::FftGpu { .. } => "fft_gpu",
+        Step::FftHost { .. } => "fft_host",
         Step::Copy { .. } => "copy",
         Step::Transpose { .. } => "transpose",
         Step::Narrow { .. } => "narrow",
@@ -669,7 +706,8 @@ fn step_runs_on_host(step: &Step) -> bool {
         | Step::DequantGroupedMatmulGguf { .. }
         | Step::GatedDeltaNet { .. }
         | Step::Llada2GroupLimitedGate { .. }
-        | Step::UmapKnnHost { .. } => true,
+        | Step::UmapKnnHost { .. }
+        | Step::FftHost { .. } => true,
         #[cfg(feature = "splat")]
         Step::GaussianSplatRender { .. }
         | Step::GaussianSplatRenderBackward { .. }
@@ -849,6 +887,7 @@ impl WgpuExecutable {
             pending_param_bytes: HashMap::new(),
             active_extent: None,
             uniforms_active_extent: None,
+            fft_gpu_steps: Vec::new(),
         }
     }
 
@@ -929,6 +968,7 @@ impl WgpuExecutable {
         let mut schedule = Vec::new();
         let mut uniforms = Vec::new();
         let mut bind_groups = Vec::new();
+        let mut fft_gpu_steps: Vec<crate::fft_dispatch::FftGpuResources> = Vec::new();
         let mut gguf_host_pad: Option<(wgpu::Buffer, wgpu::BindGroup)> = None;
         let mut meta_buffers: Vec<wgpu::Buffer> = Vec::new();
 
@@ -2660,62 +2700,38 @@ impl WgpuExecutable {
                     uniforms.push(u);
                     bind_groups.push(bg);
                 }
-                Op::Fft { inverse } => {
-                    // Native WGSL kernel: f32, power-of-2, N ≤ 1024.
-                    // Anything else panics with a "pin to CPU" hint —
-                    // WGPU has no unified memory, so silent host
-                    // fallback would mean real GPU↔CPU copies.
+                Op::Fft { inverse, norm } => {
                     let in_id = node.inputs[0];
                     let in_shape = graph.node(in_id).shape.clone();
-                    if in_shape.dtype() != rlx_ir::DType::F32 {
-                        panic!(
-                            "rlx-wgpu Op::Fft: only DType::F32 supported (got {:?}). \
-                             Pin this subgraph to Device::Cpu.",
-                            in_shape.dtype()
-                        );
+                    let meta = rlx_ir::fft::fft_meta(&in_shape);
+                    let dtype = in_shape.dtype();
+                    let use_gpu = rlx_ir::fft::gpu_fft_native_eligible(dtype, meta.n_complex)
+                        && meta.n_complex >= 2;
+                    let scale = norm.output_scale(meta.n_complex, *inverse) as f32;
+                    if use_gpu {
+                        schedule.push(Step::FftGpu {
+                            src_off: (arena.offset(in_id) / 4) as u32,
+                            dst_off: (arena.offset(node.id) / 4) as u32,
+                            outer: meta.outer as u32,
+                            n: meta.n_complex as u32,
+                            inverse: if *inverse { 1 } else { 0 },
+                            norm_scale: scale,
+                        });
+                        fft_gpu_steps.push(crate::fft_dispatch::FftGpuResources::new(
+                            &dev.device,
+                            &arena.buffer,
+                        ));
+                    } else {
+                        schedule.push(Step::FftHost {
+                            src_byte_off: arena.offset(in_id) as u32,
+                            dst_byte_off: arena.offset(node.id) as u32,
+                            outer: meta.outer as u32,
+                            n_complex: meta.n_complex as u32,
+                            inverse: *inverse,
+                            norm_tag: norm.tag(),
+                            dtype_tag: fft_dtype_tag(dtype),
+                        });
                     }
-                    let last = in_shape
-                        .dims()
-                        .last()
-                        .expect("Op::Fft input has zero rank")
-                        .unwrap_static();
-                    if !last.is_multiple_of(2) {
-                        panic!(
-                            "rlx-wgpu Op::Fft: last axis must be even (2N real-block layout), got {last}"
-                        );
-                    }
-                    let n = last / 2;
-                    if n == 0 || !n.is_power_of_two() {
-                        panic!(
-                            "rlx-wgpu Op::Fft: complex axis size N={n} must be a power of two. \
-                             Pin non-pow2 FFT subgraphs to Device::Cpu (Bluestein WGSL is future work)."
-                        );
-                    }
-                    if n > 1024 {
-                        panic!(
-                            "rlx-wgpu Op::Fft: N={n} exceeds the workgroup-memory budget \
-                             (max N=1024 for the current kernel). Pin to Device::Cpu."
-                        );
-                    }
-                    let total: usize = in_shape.dims().iter().map(|d| d.unwrap_static()).product();
-                    let outer = (total / last) as u32;
-                    let log2n = (n as u32).trailing_zeros();
-                    let p = FftParams {
-                        src_off: (arena.offset(in_id) / 4) as u32,
-                        dst_off: (arena.offset(node.id) / 4) as u32,
-                        n: n as u32,
-                        log2n,
-                        inverse: if *inverse { 1 } else { 0 },
-                        _p0: 0,
-                        _p1: 0,
-                        _p2: 0,
-                    };
-                    schedule.push(Step::Fft { params: p, outer });
-                    let ck = fft_kernel(&dev.device);
-                    let u = emit_uniform(std::mem::size_of::<FftParams>());
-                    let bg = bind_two(&dev.device, ck, &arena.buffer, &u);
-                    uniforms.push(u);
-                    bind_groups.push(bg);
                 }
                 Op::SelectiveScan { state_size } => {
                     if *state_size > 256 {
@@ -2831,8 +2847,8 @@ impl WgpuExecutable {
                             let p = UmapKnnParams {
                                 n,
                                 k,
-                                pw_off: (pw_off / 4) as u32,
-                                out_off: (out_off / 4) as u32,
+                                pw_off: pw_off / 4,
+                                out_off: out_off / 4,
                                 _p0: 0,
                                 _p1: 0,
                                 _p2: 0,
@@ -3449,15 +3465,22 @@ impl WgpuExecutable {
             }
         }
 
-        if rlx_ir::env::flag("RLX_WGPU_SCHEDULE") {
+        if rlx_ir::env::flag("RLX_WGPU_SCHEDULE") || rlx_ir::env::flag("RLX_DISPATCH_REPORT") {
             let mut counts: std::collections::BTreeMap<&'static str, usize> =
                 std::collections::BTreeMap::new();
+            let mut fft_gpu = 0usize;
+            let mut fft_host = 0usize;
             for s in &schedule {
                 *counts.entry(step_name(s)).or_insert(0) += 1;
+                match s {
+                    Step::FftGpu { .. } => fft_gpu += 1,
+                    Step::FftHost { .. } => fft_host += 1,
+                    _ => {}
+                }
             }
             let arena_mb = arena.size as f64 / (1u64 << 20) as f64;
             eprintln!(
-                "[rlx-wgpu] schedule: {} steps, arena={arena_mb:.1} MiB",
+                "[rlx-wgpu] schedule: {} steps, arena={arena_mb:.1} MiB, fft_gpu={fft_gpu}, fft_host={fft_host}",
                 schedule.len()
             );
             for (n, c) in &counts {
@@ -3480,6 +3503,7 @@ impl WgpuExecutable {
             pending_param_bytes: HashMap::new(),
             active_extent: None,
             uniforms_active_extent: None,
+            fft_gpu_steps,
         }
     }
 
@@ -3725,18 +3749,7 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
-                    Step::Fft { params, .. } => {
-                        // FFT is one workgroup per row; nothing inside
-                        // the params needs scaling at active-extent
-                        // time (`outer` lives outside the struct as a
-                        // dispatch count). Re-upload as-is to keep the
-                        // uniform layout consistent with other steps.
-                        dev.queue.write_buffer(
-                            &self.uniforms[gpu_ui],
-                            0,
-                            bytemuck::bytes_of(params),
-                        );
-                    }
+                    Step::FftGpu { .. } => {}
                     Step::Copy { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
@@ -3926,7 +3939,8 @@ impl WgpuExecutable {
                     | Step::DequantGroupedMatmulGguf { .. }
                     | Step::GatedDeltaNet { .. }
                     | Step::Llada2GroupLimitedGate { .. }
-                    | Step::UmapKnnHost { .. } => {}
+                    | Step::UmapKnnHost { .. }
+                    | Step::FftHost { .. } => {}
                     Step::FusedResidualLn { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
@@ -3957,7 +3971,9 @@ impl WgpuExecutable {
                     | Step::GaussianSplatPrepare { .. }
                     | Step::GaussianSplatRasterize { .. } => {}
                 }
-                gpu_ui += 1;
+                if !matches!(step, Step::FftGpu { .. }) {
+                    gpu_ui += 1;
+                }
             }
             self.uniforms_active_extent = Some(active);
         }
@@ -3976,6 +3992,7 @@ impl WgpuExecutable {
         let wk = where_kernel(&dev.device);
         let mut step_i = 0;
         let mut gpu_bi = 0usize;
+        let mut fft_i = 0usize;
         while step_i < self.schedule.len() {
             let mut enc = dev
                 .device
@@ -4227,17 +4244,28 @@ impl WgpuExecutable {
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
-                        Step::Fft { outer, .. } => {
-                            // One workgroup per row, 256 threads per WG.
-                            // No active-extent scaling — FFT operates on
-                            // the full input each call.
-                            if *outer == 0 {
-                                continue;
-                            }
-                            let ck = fft_kernel(&dev.device);
-                            pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(*outer, 1, 1);
+                        Step::FftGpu {
+                            src_off,
+                            dst_off,
+                            outer,
+                            n,
+                            inverse,
+                            norm_scale,
+                        } => {
+                            let res = &self.fft_gpu_steps[fft_i];
+                            fft_i += 1;
+                            crate::fft_dispatch::dispatch_fft_gpu_in_pass(
+                                &dev.device,
+                                &dev.queue,
+                                &mut pass,
+                                res,
+                                *src_off,
+                                *dst_off,
+                                *outer,
+                                *n,
+                                *inverse != 0,
+                                *norm_scale,
+                            );
                         }
                         Step::Copy { params } => {
                             let n_s = scale(params.n);
@@ -4608,14 +4636,17 @@ impl WgpuExecutable {
                         | Step::DequantGroupedMatmulGguf { .. }
                         | Step::GatedDeltaNet { .. }
                         | Step::Llada2GroupLimitedGate { .. }
-                        | Step::UmapKnnHost { .. } => {}
+                        | Step::UmapKnnHost { .. }
+                        | Step::FftHost { .. } => {}
                         #[cfg(feature = "splat")]
                         Step::GaussianSplatRender { .. }
                         | Step::GaussianSplatRenderBackward { .. }
                         | Step::GaussianSplatPrepare { .. }
                         | Step::GaussianSplatRasterize { .. } => {}
                     }
-                    gpu_bi += 1;
+                    if !matches!(step, Step::FftGpu { .. }) {
+                        gpu_bi += 1;
+                    }
                     step_i += 1;
                 }
             }
@@ -4737,6 +4768,28 @@ impl WgpuExecutable {
                         *out_byte_off as usize,
                         *n as usize,
                         *k as usize,
+                    );
+                }
+                Step::FftHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    outer,
+                    n_complex,
+                    inverse,
+                    norm_tag,
+                    dtype_tag,
+                } => {
+                    crate::fft_host::run_fft1d(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *n_complex as usize,
+                        *inverse,
+                        *norm_tag,
+                        fft_dtype_from_tag(*dtype_tag),
                     );
                 }
                 #[cfg(feature = "splat")]
@@ -5018,7 +5071,14 @@ impl WgpuExecutable {
         self.graph
             .outputs
             .iter()
-            .map(|&id| self.arena.read_f32(&dev.device, &dev.queue, id))
+            .map(|&id| {
+                if rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") {
+                    let n = self.graph.node(id).shape.num_elements().unwrap_or(0);
+                    vec![0.0; n]
+                } else {
+                    self.arena.read_f32(&dev.device, &dev.queue, id)
+                }
+            })
             .collect()
     }
 }

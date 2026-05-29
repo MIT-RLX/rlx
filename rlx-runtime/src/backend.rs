@@ -1620,16 +1620,11 @@ pub mod mlx_backend {
             // registered `MlxKernel` and calls its `execute` method
             // to produce the lazy MLX `Array` for this node.
             Custom,
+            Fft,
             GaussianSplatRender,
             GaussianSplatRenderBackward,
-            // Op::Fft on MLX: NOT supported. Host-fallback was tried
-            // and rejected — MLX's compile callback forbids `eval`,
-            // and `Array::to_bytes` requires eval, so we can't
-            // materialize/transform/rematerialize inside the lower
-            // pass. Pin FFT subgraphs to Device::Cpu (or Device::Metal,
-            // which has a working unified-memory host-fallback). Real
-            // MLX support needs a native `mlx::fft::fft` FFI shim;
-            // tracked in PLAN.md.
+            // Op::Fft on MLX: native `mlx::fft::fft` via rlx_mlx_op_fft shim.
+            // 2N real-block f32/f64 and complex64 inputs supported.
         ]
     };
 
@@ -2078,6 +2073,7 @@ pub mod cuda_backend {
             GaussianSplatPrepare,
             GaussianSplatRasterize,
             Custom,
+            Fft,
         ]
     };
 
@@ -2266,6 +2262,7 @@ pub mod rocm_backend {
             GaussianSplatPrepare,
             GaussianSplatRasterize,
             Custom,
+            Fft,
         ]
     };
 
@@ -2446,6 +2443,7 @@ pub mod tpu_backend {
             FusedMatMulBiasAct,
             FusedResidualLN,
             FusedResidualRmsNorm,
+            Fft,
             // Splat: no on-chip kernel — lowered to common primitive MIR via logical_kernel.
         ]
     };

@@ -46,6 +46,7 @@ fn kernel_sources_are_reachable() {
     assert!(!BINARY_CU.is_empty());
     assert!(!MATMUL_CU.is_empty());
     assert!(!ATTENTION_CU.is_empty());
-    assert_eq!(KERNEL_COUNT, 33);
+    assert!(!FFT_CU.is_empty());
+    assert_eq!(KERNEL_COUNT, 38);
     assert!(!ELEMENTWISE_REGION_CU.is_empty());
 }

@@ -794,18 +794,15 @@ pub enum Thunk {
         repeat_factor: u32,
     },
     /// 1D FFT on the 2N-real-block layout, lowered from `Op::Fft`.
-    /// v1 is a host fallback against the unified-memory arena: same
-    /// sync pattern as `CustomOp` (commit, wait, run, restart). On
-    /// Apple Silicon `Buffer::contents()` is host-addressable for
-    /// shared-storage buffers, so this is sync overhead only — no
-    /// copy. A native Metal compute kernel will replace this when a
-    /// workload makes the GPU/CPU sync the bottleneck.
+    /// f32 pow-2 uses native multi-kernel MSL (`fft_dispatch`); f64/C64
+    /// and non-pow2 use a host fallback against the unified-memory arena.
     Fft1d {
         src: usize,
         dst: usize,
         outer: u32,
         n_complex: u32,
         inverse: bool,
+        norm_tag: u32,
         dtype: rlx_ir::DType,
     },
 }
@@ -2232,24 +2229,24 @@ impl ThunkSchedule {
                     }
                 }
 
-                Op::Fft { inverse } => {
-                    // Host-fallback FFT — see Thunk::Fft1d doc.
+                Op::Fft { inverse, norm } => {
                     let shape = &node.shape;
-                    let last = shape.dim(shape.rank() - 1).unwrap_static();
-                    let n_complex = (last / 2) as u32;
-                    let total = shape.num_elements().unwrap_or(0);
-                    let outer = (total / last) as u32;
+                    let meta = rlx_ir::fft::fft_meta(shape);
                     let dtype = shape.dtype();
                     assert!(
-                        matches!(dtype, rlx_ir::DType::F32 | rlx_ir::DType::F64),
-                        "rlx-metal Op::Fft host fallback requires F32/F64, got {dtype:?}"
+                        matches!(
+                            dtype,
+                            rlx_ir::DType::F32 | rlx_ir::DType::F64 | rlx_ir::DType::C64
+                        ),
+                        "rlx-metal Op::Fft requires F32, F64, or C64, got {dtype:?}"
                     );
                     Thunk::Fft1d {
                         src: off(node.inputs[0]),
                         dst: off(node.id),
-                        outer,
-                        n_complex,
+                        outer: meta.outer as u32,
+                        n_complex: meta.n_complex as u32,
                         inverse: *inverse,
+                        norm_tag: norm.tag(),
                         dtype,
                     }
                 }

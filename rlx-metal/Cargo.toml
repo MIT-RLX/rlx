@@ -1,6 +1,6 @@
 [package]
 name = "rlx-metal"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Metal backend for RLX — Apple Silicon GPU via Metal Performance Shaders + custom MSL kernels"
@@ -13,14 +13,14 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.2" }
 # rlx-cpu is pulled in solely for its FFT host-fallback kernels
 # (`execute_fft1d_f32` / `execute_fft1d_f64`) — Apple Silicon's
 # unified memory lets us run them against the Metal arena pointer
 # with no copies. A native Metal FFT kernel will replace this when a
 # real workload justifies the .metal kernel work.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.2", features = ["splat"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.3", features = ["splat"] }
 bytemuck = { version = "1", features = ["derive"] }
 rlx-splat = { path = "../rlx-splat", version = "0.2.1", optional = true, default-features = false, features = ["reference", "metal"] }
 

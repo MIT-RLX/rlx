@@ -1,6 +1,6 @@
 [package]
 name = "rlx-gpu-kernels"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Shared CUDA/HIP C++ kernel sources for RLX GPU backends (NVRTC / hipRTC)."

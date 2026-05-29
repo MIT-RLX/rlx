@@ -30,6 +30,8 @@ globally via `RLX_MLX_MODE=eager|lazy|compiled` (default lazy).
   arrays for each node. Rebuilds the graph fresh each `run()` (see the
   comment in lower.rs for why).
 - `src/backend.rs` — `MlxExecutable` (set_param / run / handles).
+- **FFT** — native `mlx::fft::fft` via `rlx_mlx_shim` for `Op::Fft`;
+  graph helpers (`rfft`, `irfft`, …) lower through the same path.
 - Tier-1 / Tier-2 / Tier-3 backward op parity with `rlx-cpu` for
   reverse-mode autodiff (relu, activation, softmax cross-entropy, layer
   norm, conv2d, max-pool, fake-quantize).

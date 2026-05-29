@@ -48,7 +48,7 @@ pub use legalize::{LegalizeResult, format_legalize_error, legalize_for_backend};
 pub use legalize_broadcast::LegalizeBroadcast;
 pub use memory::{
     MemoryPlanOptions, SharedWeightLayout, WeightSlot, is_pure_view, plan_memory_backward,
-    plan_memory_with_options,
+    plan_memory_f32_uniform, plan_memory_with_options,
 };
 pub use precision::{AutoMixedPrecision, CastConfig, OpKind, Precision, PrecisionPolicy};
 pub use promote_params::promote_params_to_inputs;

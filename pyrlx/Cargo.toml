@@ -1,6 +1,6 @@
 [package]
 name = "pyrlx"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Python bindings for rlx — run RLX graphs and HF models on any RLX backend"
@@ -40,8 +40,8 @@ rocm            = ["rlx-runtime/rocm"]
 pyo3      = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 numpy     = "0.22"
 
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.1", default-features = false }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.2" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.2", default-features = false }
 [lints]
 workspace = true

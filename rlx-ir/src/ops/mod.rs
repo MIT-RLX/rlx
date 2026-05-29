@@ -31,6 +31,7 @@ pub mod backward;
 pub mod blocks;
 pub mod conv2d;
 pub mod elementwise;
+pub mod fft_ops;
 pub mod io;
 pub mod linalg;
 pub mod normalization;

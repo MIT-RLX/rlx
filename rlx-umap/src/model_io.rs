@@ -214,7 +214,7 @@ mod safe {
         }
 
         serialize_to_file(tensors, Some(meta), path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     pub fn load_file(path: &Path) -> std::io::Result<(WeightStore, HashMap<String, String>)> {

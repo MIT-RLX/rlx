@@ -1,6 +1,6 @@
 [package]
 name = "rlx"
-version.workspace       = true
+version                = "0.2.2"
 edition.workspace       = true
 rust-version.workspace = true
 description = "RLX — small ML compiler + runtime for transformer inference and training. JAX-shaped IR, autodiff, vmap, on top of CPU / Apple Silicon (Metal / MLX) / NVIDIA / AMD / TPU / wgpu backends. This is the prelude crate; pulls in rlx-ir / rlx-opt / rlx-runtime and re-exports the common types."
@@ -56,13 +56,13 @@ edge          = ["cpu", "cortexm"]
 all-cpu       = ["cpu", "gguf", "linalg"]
 
 [dependencies]
-rlx-ir      = { path = "../rlx-ir",      version = "0.2.1" }
-rlx-opt     = { path = "../rlx-opt",     version = "0.2.1" }
+rlx-ir      = { path = "../rlx-ir",      version = "0.2.2" }
+rlx-opt     = { path = "../rlx-opt",     version = "0.2.2" }
 rlx-driver  = { path = "../rlx-driver",  version = "0.2.1" }
 rlx-macros  = { path = "../rlx-macros",  version = "0.2.1" }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.1", default-features = false }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.2", default-features = false }
 rlx-gguf     = { path = "../rlx-gguf",    version = "0.2.1", optional = true }
-rlx-bench   = { path = "../rlx-bench",   version = "0.2.1", optional = true }
+rlx-bench   = { path = "../rlx-bench",   version = "0.2.2", optional = true }
 rlx-sparse  = { path = "../rlx-sparse",  version = "0.2.1", optional = true }
 rlx-linalg  = { path = "../rlx-linalg",  version = "0.2.1", optional = true }
 rlx-splat   = { path = "../rlx-splat",   version = "0.2.1", optional = true, default-features = false, features = ["cpu", "core"] }

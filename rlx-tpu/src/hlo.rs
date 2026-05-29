@@ -425,6 +425,10 @@ pub struct Instr {
     // copy it across in to_proto.
     // DynamicSlice carries the per-dim slice sizes here.
     pub dynamic_slice_sizes: Vec<i64>,
+
+    /// XLA FFT fields (`fft_type`, `fft_length`, transform axes in `dimensions`).
+    pub fft_type: i32,
+    pub fft_length: Vec<i64>,
 }
 
 impl Default for Shape {
@@ -509,6 +513,8 @@ impl Instr {
                 0
             },
             dynamic_slice_sizes: self.dynamic_slice_sizes.clone(),
+            fft_type: self.fft_type,
+            fft_length: self.fft_length.clone(),
             ..Default::default()
         }
     }
@@ -657,6 +663,22 @@ impl Computation {
         let mut i = Instr::new(0, "transpose".into(), "transpose", shape);
         i.operand_ids = vec![x];
         i.dimensions = perm.to_vec();
+        self.add_instr(i)
+    }
+
+    pub fn fft(
+        &self,
+        x: i64,
+        fft_type: i32,
+        fft_length: &[i64],
+        axes: &[i64],
+        shape: Shape,
+    ) -> i64 {
+        let mut i = Instr::new(0, "fft".into(), "fft", shape);
+        i.operand_ids = vec![x];
+        i.fft_type = fft_type;
+        i.fft_length = fft_length.to_vec();
+        i.dimensions = axes.to_vec();
         self.add_instr(i)
     }
 

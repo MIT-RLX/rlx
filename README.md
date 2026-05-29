@@ -6,7 +6,7 @@ backend-specific kernels for CPU, Apple Silicon (Metal / MLX), NVIDIA
 (CUDA), AMD (ROCm), Google TPU, cross-platform GPU (wgpu), and
 microcontrollers (Cortex-M).
 
-> Status: **0.2.1**, Apple-Silicon-first. The CPU and Apple GPU paths
+> Status: **0.2.2**, Apple-Silicon-first. The CPU and Apple GPU paths
 > are mature; CUDA / ROCm / TPU / WGPU work but have seen less mileage;
 > Cortex-M is a separate INT8 product.
 
@@ -107,6 +107,24 @@ Domain-specific namespaces if you want narrower star-imports:
 Or the full per-crate surface
 via `rlx::ir::…` / `rlx::opt::…` / `rlx::runtime::…` etc. — every
 workspace crate is reachable as a module on `rlx`.
+
+### FFT (0.2.2)
+
+`Op::Fft` is a first-class IR primitive with CPU, Metal, MLX, CUDA,
+ROCm, wgpu, and TPU lowering. Graph helpers in `rlx_ir::Graph` cover
+real-input spectra and signal-processing workflows:
+
+- `fft_real` / `rfft` / `irfft` — Hermitian `irfft` mirrors the conjugate half
+- `fftfreq` / `rfftfreq` — sample-frequency constants
+- `psd` / `psd_real` — power spectral density
+- `stft`, `fft_conv1d` — short-time FFT and frequency-domain convolution
+
+Pow-2 f32 transforms use native GPU kernels on CUDA / ROCm / wgpu / Metal;
+non-pow2 and f64 / C64 fall back to partial host sync. Bench with
+`cargo run -p rlx-bench --release --example bench_fft --features metal,gpu`.
+Python bindings: `pyrlx.Graph.fft`, `.rfft`, `.irfft`, `.fftfreq` (see
+`pyrlx/tests/test_fft.py`).
+
 
 Or depend on each crate directly (`rlx-ir`, `rlx-opt`, `rlx-runtime`,
 …) for the smallest possible dep tree.

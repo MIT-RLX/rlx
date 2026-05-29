@@ -338,6 +338,17 @@ enum Step {
         c_off: u32,
         out_off: u32,
     },
+    /// 1D FFT — native GPU (f32 pow2) or host fallback.
+    Fft {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        n_complex: u32,
+        inverse: bool,
+        norm_tag: u32,
+        dtype_tag: u32,
+        use_gpu: bool,
+    },
     /// Gated-DeltaNet — host scan between GPU segments (qwen35 linear layers).
     GatedDeltaNet {
         q_byte_off: u32,
@@ -1641,6 +1652,24 @@ fn log_fallback(tier: &str, err: impl std::fmt::Debug) {
 /// Stable, profiler-friendly name for an NVTX range covering a Step
 /// dispatch. Matches the variant name; nsight-systems / nvprof show
 /// these as range boundaries in the timeline.
+fn fft_dtype_tag(dtype: rlx_ir::DType) -> u32 {
+    match dtype {
+        rlx_ir::DType::F32 => 0,
+        rlx_ir::DType::F64 => 1,
+        rlx_ir::DType::C64 => 2,
+        other => panic!("rlx-cuda Op::Fft: unsupported dtype {other:?}"),
+    }
+}
+
+fn fft_dtype_from_tag(tag: u32) -> rlx_ir::DType {
+    match tag {
+        0 => rlx_ir::DType::F32,
+        1 => rlx_ir::DType::F64,
+        2 => rlx_ir::DType::C64,
+        other => panic!("rlx-cuda Op::Fft: bad dtype tag {other}"),
+    }
+}
+
 fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Matmul { .. } => "rlx::Matmul",
@@ -1672,6 +1701,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::DequantGroupedMatmulGguf { .. } => "rlx::DequantGroupedMatmulGguf",
         Step::Sample { .. } => "rlx::Sample",
         Step::SelectiveScan { .. } => "rlx::SelectiveScan",
+        Step::Fft { .. } => "rlx::Fft",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Llada2GroupLimitedGate { .. } => "rlx::Llada2GroupLimitedGate",
         Step::UmapKnn { .. } => "rlx::UmapKnn",
@@ -1970,6 +2000,11 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![*x_off, *delta_off, *a_off, *b_off, *c_off],
             vec![*out_off],
         ),
+        Step::Fft {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
         Step::GatedDeltaNet {
             q_byte_off,
             k_byte_off,
@@ -3154,6 +3189,25 @@ impl CudaExecutable {
                         b_off: (arena.offset(b_id) / 4) as u32,
                         c_off: (arena.offset(c_id) / 4) as u32,
                         out_off: (arena.offset(node.id) / 4) as u32,
+                    });
+                }
+                Op::Fft { inverse, norm } => {
+                    let in_id = node.inputs[0];
+                    let in_shape = graph.node(in_id).shape.clone();
+                    let meta = rlx_ir::fft::fft_meta(&in_shape);
+                    let dtype = in_shape.dtype();
+                    let use_gpu = matches!(dtype, rlx_ir::DType::F32)
+                        && meta.n_complex.is_power_of_two()
+                        && meta.n_complex >= 2;
+                    schedule.push(Step::Fft {
+                        src_byte_off: arena.offset(in_id) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        outer: meta.outer as u32,
+                        n_complex: meta.n_complex as u32,
+                        inverse: *inverse,
+                        norm_tag: norm.tag(),
+                        dtype_tag: fft_dtype_tag(dtype),
+                        use_gpu,
                     });
                 }
                 Op::GatedDeltaNet {
@@ -5468,6 +5522,45 @@ impl CudaExecutable {
                         launcher
                             .launch(cfg)
                             .expect("rlx-cuda: selective_scan launch failed");
+                    }
+                }
+                Step::Fft {
+                    src_byte_off,
+                    dst_byte_off,
+                    outer,
+                    n_complex,
+                    inverse,
+                    norm_tag,
+                    dtype_tag,
+                    use_gpu,
+                } => {
+                    if *use_gpu {
+                        let norm = rlx_ir::fft::FftNorm::from_tag(*norm_tag);
+                        let scale = norm.output_scale(*n_complex as usize, *inverse) as f32;
+                        crate::fft_dispatch::run_fft_gpu(
+                            &self.ctx,
+                            &stream,
+                            &mut self.arena.buffer,
+                            *src_byte_off / 4,
+                            *dst_byte_off / 4,
+                            *outer,
+                            *n_complex,
+                            *inverse,
+                            scale,
+                        );
+                    } else {
+                        crate::fft_host::run_fft1d(
+                            &stream,
+                            &mut self.arena.buffer,
+                            self.arena.size,
+                            *src_byte_off as usize,
+                            *dst_byte_off as usize,
+                            *outer as usize,
+                            *n_complex as usize,
+                            *inverse,
+                            *norm_tag,
+                            fft_dtype_from_tag(*dtype_tag),
+                        );
                     }
                 }
                 Step::GatedDeltaNet {

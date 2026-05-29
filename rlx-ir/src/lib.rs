@@ -41,6 +41,7 @@ pub mod const_check;
 pub mod dtype;
 pub mod dynamic;
 pub mod env;
+pub mod fft;
 pub mod graph;
 pub mod hir;
 pub mod infer;
@@ -84,6 +85,7 @@ pub use dynamic::{
     sync_narrow_ops, sync_reshape_ops,
 };
 pub use env::{RlxEnv, RuntimeOverrides, flag, is_unset, parse_or, set, unset, var, var_os};
+pub use fft::{FftGpuPlan, FftMeta, FftNorm, fft_meta, fftn_axes_all, normalize_fftn_axes};
 pub use graph::{Graph, Node, NodeId};
 pub use hir::{FusionPolicy, HirGraphExt, HirModule, HirMut, HirNode, HirNodeId, HirOp};
 pub use infer::GraphExt;

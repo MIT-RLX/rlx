@@ -23,7 +23,7 @@
 
 use crate::{BenchmarkPattern, Tier};
 use rlx_ir::infer::GraphExt;
-use rlx_ir::{DType, Graph, Shape};
+use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
 /// **L1 — single matmul.** `out = x @ w` with x: `[m, k]`, w: `[k, n]`.
 /// Plain BLAS / kernel dispatch — no fusion. Use to measure raw
@@ -140,4 +140,70 @@ impl BenchmarkPattern for MatmulBiasReluPattern {
             ("b".to_string(), b),
         ]
     }
+}
+
+/// **L1 — batched 1D FFT (`Op::Fft`).**
+///
+/// Input is a constant 2N real-block tensor `[batch, 2·n]` so timed
+/// iterations measure dispatch + kernel only (no host input upload).
+/// `n` must be a power of two ≥ 2 for GPU native paths.
+pub struct FftPattern {
+    pub batch: usize,
+    pub n: usize,
+    pub inverse: bool,
+}
+
+impl FftPattern {
+    pub fn label(&self) -> String {
+        format!(
+            "fft_b{}_n{}{}",
+            self.batch,
+            self.n,
+            if self.inverse { "_inv" } else { "" }
+        )
+    }
+
+    /// Bytes read+written per iteration (src copy + dst write, 2N f32 rows).
+    pub fn traffic_bytes(&self) -> u64 {
+        (self.batch * self.n * 2 * 2) as u64 * 4
+    }
+}
+
+impl BenchmarkPattern for FftPattern {
+    fn name(&self) -> &str {
+        "fft"
+    }
+
+    fn tier(&self) -> Tier {
+        Tier::L1
+    }
+
+    fn build_graph(&self) -> Graph {
+        let mut g = Graph::new("fft_bench");
+        let x = fft_const_block(&mut g, self.batch, self.n);
+        let y = g.fft(x, self.inverse);
+        g.set_outputs(vec![y]);
+        g
+    }
+
+    fn input_data(&self) -> Vec<(String, Vec<f32>)> {
+        Vec::new()
+    }
+}
+
+fn fft_const_block(g: &mut Graph, batch: usize, n: usize) -> NodeId {
+    let len = batch * n * 2;
+    let mut data: Vec<f32> = Vec::with_capacity(len);
+    for i in 0..len {
+        data.push((i as f32 * 0.013).sin());
+    }
+    let mut bytes = Vec::with_capacity(len * 4);
+    for v in &data {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    g.add_node(
+        Op::Constant { data: bytes },
+        vec![],
+        Shape::new(&[batch, n * 2], DType::F32),
+    )
 }

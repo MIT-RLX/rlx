@@ -1,6 +1,6 @@
 [package]
 name = "rlx-cuda"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "NVIDIA CUDA backend — cuBLAS for matmul + NVRTC-compiled kernels for everything else, via the pure-Rust `cudarc` crate."
@@ -13,10 +13,10 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.1" }
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.2", features = ["splat"] }
+rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.2" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.2" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.3", features = ["splat"] }
 
 # `dynamic-loading` lets the crate compile and link on hosts without a
 # CUDA SDK installed — libcuda is dlopen()'d at runtime. That's what

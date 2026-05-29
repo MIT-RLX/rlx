@@ -202,6 +202,25 @@ pub fn run_benchmark<P: BenchmarkPattern>(
     }
 }
 
+/// Like [`run_benchmark`] but sets `RLX_BENCH_DISPATCH_ONLY=1` so wgpu skips
+/// output readback (measures dispatch + kernel time more closely).
+pub fn run_benchmark_dispatch_only<P: BenchmarkPattern>(
+    pattern: &P,
+    device: Device,
+    n_warmup: usize,
+    n_runs: usize,
+) -> BenchResult {
+    // SAFETY: bench harness toggles process-local env for the duration of this call.
+    unsafe {
+        std::env::set_var("RLX_BENCH_DISPATCH_ONLY", "1");
+    }
+    let r = run_benchmark(pattern, device, n_warmup, n_runs);
+    unsafe {
+        std::env::remove_var("RLX_BENCH_DISPATCH_ONLY");
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -74,14 +74,14 @@ nn-descent = []
 serde = ["dep:serde"]
 
 [dependencies]
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.2" }
-rlx-ir = { path = "../rlx-ir", version = "0.2.1", optional = true }
-rlx-metal = { path = "../rlx-metal", version = "0.2.1", optional = true }
-rlx-mlx = { path = "../rlx-mlx", version = "0.2.1", optional = true }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.1", default-features = false, optional = true }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.3" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2", optional = true }
+rlx-metal = { path = "../rlx-metal", version = "0.2.2", optional = true }
+rlx-mlx = { path = "../rlx-mlx", version = "0.2.2", optional = true }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.2", default-features = false, optional = true }
 rlx-driver = { path = "../rlx-driver", version = "0.2.1", optional = true }
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.1", optional = true }
-rlx-compile = { path = "../rlx-compile", version = "0.2.1", optional = true }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.2", optional = true }
+rlx-compile = { path = "../rlx-compile", version = "0.2.2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 rand = { version = "0.9", optional = true }
@@ -94,11 +94,11 @@ rlx-gguf = { path = "../rlx-gguf", version = "0.2.1", optional = true }
 [dev-dependencies]
 tempfile = "3.10"
 mnist = { version = "0.6.0", git = "https://github.com/eugenehp/mnist.git", features = ["download"] }
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
 rlx-driver = { path = "../rlx-driver", version = "0.2.1" }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.1", default-features = false, features = ["cpu"] }
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.1" }
-rlx-compile = { path = "../rlx-compile", version = "0.2.1" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.2", default-features = false, features = ["cpu"] }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.2" }
+rlx-compile = { path = "../rlx-compile", version = "0.2.2" }
 
 [[test]]
 name = "knn_reference"

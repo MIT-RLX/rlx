@@ -330,6 +330,13 @@ unsafe extern "C" {
         out: *mut *mut mlx_array_t,
     ) -> c_int;
 
+    pub fn rlx_mlx_op_fft(
+        a: *mut mlx_array_t,
+        inverse: c_int,
+        norm_tag: c_int,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+
     pub fn rlx_mlx_op_rmsnorm(
         x: *mut mlx_array_t,
         gamma: *mut mlx_array_t,

@@ -175,8 +175,8 @@ pub use rlx_compile::{
     fusion_passes_for_supported, inline_into, insert_q_dq, inspect_compiled, inspect_fusion,
     inspect_pipeline, is_pure_view, legalize_for_backend, legalize_or_rewrite_for_backend,
     legalize_or_rewrite_for_backend_with_config, legalize_or_rewrite_for_backend_with_dispatch,
-    maybe_dump_pipeline, maybe_log_dispatch_report, plan_memory_backward, plan_memory_with_options,
-    prepare_graph_for_backend_with_report, promote_params_to_inputs, rewrite_for_backend,
-    rewrite_for_backend_with_config, rewrite_for_backend_with_dispatch, supported_for_target,
-    supports_op,
+    maybe_dump_pipeline, maybe_log_dispatch_report, plan_memory_backward, plan_memory_f32_uniform,
+    plan_memory_with_options, prepare_graph_for_backend_with_report, promote_params_to_inputs,
+    rewrite_for_backend, rewrite_for_backend_with_config, rewrite_for_backend_with_dispatch,
+    supported_for_target, supports_op,
 };

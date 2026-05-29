@@ -2834,85 +2834,6 @@ kernel void elementwise_region(
     arena[dst_off + gid] = scratch[last_idx];
 }
 
-// ── 1D FFT (radix-2 Cooley-Tukey, f32, in-place per-row) ─────────────
-// One threadgroup per row of `outer` independent FFTs. Layout matches
-// the CPU kernel exactly: each row is 2N f32 with first N real, then
-// N imag along the contiguous axis. The host caps N at 2048 (TG memory
-// budget = 16KB = 4096 floats); larger N falls back to the host path.
-// Twiddle factors recomputed per butterfly via direct cos/sin — Apple
-// GPUs have a fast trig unit, and the iterative recurrence used on CPU
-// doesn't parallelize cleanly across butterflies in the same stage.
-kernel void fft_radix2_f32(
-    device float* arena         [[buffer(0)]],
-    constant uint& src_off      [[buffer(1)]],
-    constant uint& dst_off      [[buffer(2)]],
-    constant uint& n            [[buffer(3)]],   // complex points per row
-    constant uint& log2n        [[buffer(4)]],   // ceil_log2(n)
-    constant uint& inverse      [[buffer(5)]],   // 0 = forward, 1 = inverse
-    uint  row     [[threadgroup_position_in_grid]],
-    uint  tid     [[thread_position_in_threadgroup]],
-    uint  tg_size [[threads_per_threadgroup]]
-) {
-    // Fixed-size TG memory: 2 * N_MAX floats (real + imag halves).
-    // N_MAX = 2048 → 16KB. Apple supports up to 32KB per threadgroup
-    // but we leave headroom for any future register-spill workspace.
-    threadgroup float sre[2048];
-    threadgroup float sim[2048];
-
-    uint row_base = row * 2u * n;
-
-    // Load with bit-reverse permutation so the in-place butterflies
-    // produce naturally-ordered output. reverse_bits is a 32-bit
-    // hardware op; shift right by (32 - log2n) to discard the high
-    // bits we don't care about.
-    uint k = tid;
-    while (k < n) {
-        uint rev = reverse_bits(k) >> (32u - log2n);
-        sre[rev] = arena[src_off + row_base + k];
-        sim[rev] = arena[src_off + row_base + n + k];
-        k += tg_size;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float sign = (inverse != 0u) ? 1.0f : -1.0f;
-    float two_pi = 6.28318530717958647692f;
-
-    // Cooley-Tukey butterflies: log2(n) stages, length doubles each
-    // stage. Each thread iterates over (n/2)/tg_size butterflies per
-    // stage. Twiddle theta is direct cos/sin per butterfly (cheap on
-    // Apple GPUs; avoids per-stage recurrence state).
-    for (uint len = 2u; len <= n; len <<= 1u) {
-        uint h2 = len >> 1u;
-        float theta_base = sign * two_pi / float(len);
-        for (uint b = tid; b < n / 2u; b += tg_size) {
-            uint group = b / h2;
-            uint k_in  = b % h2;
-            uint i_lo  = group * len + k_in;
-            uint i_hi  = i_lo + h2;
-            float theta = theta_base * float(k_in);
-            float wre = cos(theta);
-            float wim = sin(theta);
-            float t_re = wre * sre[i_hi] - wim * sim[i_hi];
-            float t_im = wre * sim[i_hi] + wim * sre[i_hi];
-            float u_re = sre[i_lo];
-            float u_im = sim[i_lo];
-            sre[i_lo] = u_re + t_re;
-            sim[i_lo] = u_im + t_im;
-            sre[i_hi] = u_re - t_re;
-            sim[i_hi] = u_im - t_im;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Store result to dst (may equal src — load already pulled into TG).
-    k = tid;
-    while (k < n) {
-        arena[dst_off + row_base + k]     = sre[k];
-        arena[dst_off + row_base + n + k] = sim[k];
-        k += tg_size;
-    }
-}
-
 // ── Gated DeltaNet scan (f32) ───────────────────────────────────────
 // One threadgroup per (batch, head), `n` threads parallelize the state
 // dimension (n ≤ 128). Matches `execute_gated_delta_net_f32` on CPU.
@@ -3171,12 +3092,13 @@ kernel void gather_bwd_acc(
 "#;
 
 const RLX_KERNELS_MSL_DEQUANT: &str = include_str!("dequant_gguf.msl");
+const RLX_KERNELS_MSL_FFT_GPU: &str = include_str!("fft_gpu.msl");
 const RLX_KERNELS_MSL_SPLAT: &str = include_str!("splat.msl");
 const RLX_KERNELS_MSL_SPLAT_CONIC: &str = include_str!("splat_conic_bin.msl");
 
 fn msl_source() -> String {
     format!(
-        "{RLX_KERNELS_MSL}\n{RLX_KERNELS_MSL_DEQUANT}\n{RLX_KERNELS_MSL_SPLAT}\n{RLX_KERNELS_MSL_SPLAT_CONIC}"
+        "{RLX_KERNELS_MSL}\n{RLX_KERNELS_MSL_DEQUANT}\n{RLX_KERNELS_MSL_FFT_GPU}\n{RLX_KERNELS_MSL_SPLAT}\n{RLX_KERNELS_MSL_SPLAT_CONIC}"
     )
 }
 
@@ -3268,7 +3190,11 @@ pub struct Kernels {
     pub tan_inplace: ComputePipelineState,
     pub atan_inplace: ComputePipelineState,
     pub softmax_lastax: ComputePipelineState,
-    pub fft_radix2_f32: ComputePipelineState,
+    pub fft_radix2_full_f32: ComputePipelineState,
+    pub fft_bit_reverse_f32: ComputePipelineState,
+    pub fft_inner_f32: ComputePipelineState,
+    pub fft_outer_r4_f32: ComputePipelineState,
+    pub fft_outer_r2_f32: ComputePipelineState,
     pub gated_delta_net: ComputePipelineState,
     pub dequant_gguf: ComputePipelineState,
     pub rms_norm_bwd: ComputePipelineState,
@@ -3405,7 +3331,11 @@ impl Kernels {
             tan_inplace: pipeline("tan_inplace"),
             atan_inplace: pipeline("atan_inplace"),
             softmax_lastax: pipeline("softmax_lastax"),
-            fft_radix2_f32: pipeline("fft_radix2_f32"),
+            fft_radix2_full_f32: pipeline("fft_radix2_full_f32"),
+            fft_bit_reverse_f32: pipeline("fft_bit_reverse_f32"),
+            fft_inner_f32: pipeline("fft_inner_f32"),
+            fft_outer_r4_f32: pipeline("fft_outer_r4_f32"),
+            fft_outer_r2_f32: pipeline("fft_outer_r2_f32"),
             gated_delta_net: pipeline("gated_delta_net"),
             dequant_gguf: pipeline("dequant_gguf"),
             rms_norm_bwd: pipeline("rms_norm_bwd"),

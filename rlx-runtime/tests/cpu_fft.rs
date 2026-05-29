@@ -567,3 +567,447 @@ fn fft_jvp_matches_forward_of_tangent() {
         );
     }
 }
+
+fn bytes_to_c64_pairs(bytes: &[u8]) -> Vec<(f32, f32)> {
+    bytes
+        .chunks_exact(8)
+        .map(|c| {
+            (
+                f32::from_le_bytes(c[..4].try_into().unwrap()),
+                f32::from_le_bytes(c[4..].try_into().unwrap()),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn fft2_c64_round_trip() {
+    // 2×2 complex field stored as C64 [H, W].
+    let h = 2usize;
+    let w = 2usize;
+    let mut re_vals = Vec::new();
+    let mut im_vals = Vec::new();
+    for row in 0..h {
+        for col in 0..w {
+            re_vals.push((row + 1) as f32 * 0.5 + col as f32 * 0.1);
+            im_vals.push((col + 1) as f32 * 0.25 - row as f32 * 0.05);
+        }
+    }
+
+    let mut g = Graph::new("fft2_c64");
+    let x = {
+        let mut bytes = Vec::with_capacity(h * w * 8);
+        for i in 0..(h * w) {
+            bytes.extend_from_slice(&re_vals[i].to_le_bytes());
+            bytes.extend_from_slice(&im_vals[i].to_le_bytes());
+        }
+        g.add_node(
+            Op::Constant { data: bytes },
+            vec![],
+            Shape::new(&[h, w], DType::C64),
+        )
+    };
+    let y = g.fftn(x, &[0, 1], false);
+    let z = g.fftn(y, &[0, 1], true);
+    g.set_outputs(vec![z]);
+
+    let mut compiled = Session::new(Device::Cpu).compile(g);
+    let outs = compiled.run(&[]);
+    let out_bytes: Vec<u8> = outs[0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let got = bytes_to_c64_pairs(&out_bytes);
+    let scale = (h * w) as f32;
+    for (i, ((gr, gi), (&xr, &xi))) in got
+        .iter()
+        .zip(re_vals.iter().zip(im_vals.iter()))
+        .enumerate()
+    {
+        assert!(
+            (gr - xr * scale).abs() < 1e-4,
+            "re[{i}]: got {gr} vs expected {}",
+            xr * scale
+        );
+        assert!(
+            (gi - xi * scale).abs() < 1e-4,
+            "im[{i}]: got {gi} vs expected {}",
+            xi * scale
+        );
+    }
+}
+
+#[test]
+fn fftn_single_axis_matches_fft() {
+    let n = 8usize;
+    let re = [1.0_f64, 0.5, -2.0, 0.25, 0.0, 1.5, -0.75, 3.0];
+    let im = [0.5_f64, -1.0, 0.0, 2.0, -0.5, 0.25, 1.0, -1.5];
+    let x_block: Vec<f64> = re.iter().chain(im.iter()).copied().collect();
+
+    let mut g1 = Graph::new("fft");
+    let x1 = g1.input("x", Shape::new(&[2 * n], DType::F64));
+    let y1 = g1.fft(x1, false);
+    g1.set_outputs(vec![y1]);
+
+    let mut g2 = Graph::new("fftn");
+    let x2 = g2.input("x", Shape::new(&[2 * n], DType::F64));
+    let y2 = g2.fftn(x2, &[0], false);
+    g2.set_outputs(vec![y2]);
+
+    let mut c1 = Session::new(Device::Cpu).compile(g1);
+    let mut c2 = Session::new(Device::Cpu).compile(g2);
+    let o1 = c1.run_typed(&[("x", &f64s_to_bytes(&x_block), DType::F64)]);
+    let o2 = c2.run_typed(&[("x", &f64s_to_bytes(&x_block), DType::F64)]);
+    assert_eq!(bytes_to_f64s(&o1[0].0), bytes_to_f64s(&o2[0].0));
+}
+
+fn const_f32(g: &mut Graph, xs: &[f32]) -> NodeId {
+    let mut bytes = Vec::with_capacity(xs.len() * 4);
+    for &x in xs {
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    g.add_node(
+        Op::Constant { data: bytes },
+        vec![],
+        Shape::new(&[xs.len()], DType::F32),
+    )
+}
+
+#[test]
+fn fft_real_pads_to_pow2_and_splits_spectrum() {
+    let signal = [1.0_f32, 2.0, 3.0]; // pads to N=4
+    let mut g = Graph::new("fft_real");
+    let x = const_f32(&mut g, &signal);
+    let (re, im) = g.fft_real(x, rlx_ir::FftNorm::Backward);
+    g.set_outputs(vec![re, im]);
+
+    let mut compiled = Session::new(Device::Cpu).compile(g);
+    let outs = compiled.run_typed(&[]);
+    let re_out = bytes_to_f32s(&outs[0].0);
+    let im_out = bytes_to_f32s(&outs[1].0);
+    assert_eq!(re_out.len(), 4);
+    assert_eq!(im_out.len(), 4);
+
+    let (exp_re, exp_im) = {
+        let mut re = [0.0_f32; 4];
+        re[0] = 1.0;
+        re[1] = 2.0;
+        re[2] = 3.0;
+        let im = [0.0_f32; 4];
+        let mut out_re = [0.0_f32; 4];
+        let mut out_im = [0.0_f32; 4];
+        for k in 0..4 {
+            for nn in 0..4 {
+                let theta = -2.0 * std::f64::consts::PI * (nn as f64) * (k as f64) / 4.0;
+                let c = theta.cos() as f32;
+                let s = theta.sin() as f32;
+                out_re[k] += re[nn] * c - im[nn] * s;
+                out_im[k] += re[nn] * s + im[nn] * c;
+            }
+        }
+        (out_re, out_im)
+    };
+    for k in 0..4 {
+        assert!((re_out[k] - exp_re[k]).abs() < 1e-5, "re[{k}]");
+        assert!((im_out[k] - exp_im[k]).abs() < 1e-5, "im[{k}]");
+    }
+}
+
+#[test]
+fn ifft_spectrum_forward_norm_round_trip() {
+    let signal = [1.0_f32, 0.0, 0.0, 0.0];
+    let mut g = Graph::new("ifft_real");
+    let x = const_f32(&mut g, &signal);
+    let (re, im) = g.fft_real(x, rlx_ir::FftNorm::Forward);
+    let recovered = g.ifft_spectrum(re, im, rlx_ir::FftNorm::Forward);
+    g.set_outputs(vec![recovered]);
+
+    let mut compiled = Session::new(Device::Cpu).compile(g);
+    let outs = compiled.run_typed(&[]);
+    let got = bytes_to_f32s(&outs[0].0);
+    for (i, (&g, &s)) in got.iter().zip(signal.iter()).enumerate() {
+        assert!((g - s).abs() < 1e-5, "sample {i}: got {g} vs {s}");
+    }
+}
+
+#[test]
+fn psd_matches_squared_magnitude_over_n() {
+    let re = [3.0_f32, 0.0, 4.0, 0.0];
+    let im = [0.0_f32, 1.0, 0.0, 2.0];
+    let mut g = Graph::new("psd");
+    let re_n = const_f32(&mut g, &re);
+    let im_n = const_f32(&mut g, &im);
+    let p = g.psd(re_n, im_n);
+    g.set_outputs(vec![p]);
+
+    let mut compiled = Session::new(Device::Cpu).compile(g);
+    let outs = compiled.run_typed(&[]);
+    let got = bytes_to_f32s(&outs[0].0);
+    let n = 4.0_f32;
+    for k in 0..4 {
+        let want = (re[k] * re[k] + im[k] * im[k]) / n;
+        assert!((got[k] - want).abs() < 1e-6, "psd[{k}]");
+    }
+}
+
+#[test]
+fn fft_batch_real_matches_sequential() {
+    let batch = [[1.0_f32, 0.0, 0.0, 0.0], [0.0_f32, 1.0, 0.0, 0.0]];
+    let flat: Vec<f32> = batch.iter().flat_map(|s| s.iter().copied()).collect();
+
+    let mut g_batch = Graph::new("batch");
+    let x = const_f32(&mut g_batch, &flat);
+    let x = g_batch.reshape(x, vec![2, 4], Shape::new(&[2, 4], DType::F32));
+    let (re_b, im_b) = g_batch.fft_batch_real(x, rlx_ir::FftNorm::Backward);
+    g_batch.set_outputs(vec![re_b, im_b]);
+
+    let mut compiled = Session::new(Device::Cpu).compile(g_batch);
+    let outs = compiled.run_typed(&[]);
+    let re_all = bytes_to_f32s(&outs[0].0);
+    let im_all = bytes_to_f32s(&outs[1].0);
+    assert_eq!(re_all.len(), 8);
+    assert_eq!(im_all.len(), 8);
+
+    for row in 0..2 {
+        let mut g1 = Graph::new("one");
+        let row_sig = const_f32(&mut g1, &batch[row]);
+        let (re, im) = g1.fft_real(row_sig, rlx_ir::FftNorm::Backward);
+        g1.set_outputs(vec![re, im]);
+        let mut c1 = Session::new(Device::Cpu).compile(g1);
+        let o1 = c1.run_typed(&[]);
+        let re1 = bytes_to_f32s(&o1[0].0);
+        let im1 = bytes_to_f32s(&o1[1].0);
+        for k in 0..4 {
+            assert!((re_all[row * 4 + k] - re1[k]).abs() < 1e-5);
+            assert!((im_all[row * 4 + k] - im1[k]).abs() < 1e-5);
+        }
+    }
+}
+
+#[test]
+fn fft_forward_norm_round_trip_is_identity() {
+    let n: usize = 16;
+    let re: Vec<f64> = (0..n).map(|i| (i as f64 * 0.3 - 1.0).sin()).collect();
+    let im: Vec<f64> = (0..n).map(|i| (i as f64 * 0.7).cos() * 0.5).collect();
+    let x_block: Vec<f64> = re.iter().chain(im.iter()).copied().collect();
+
+    let mut g = Graph::new("fft_forward_norm");
+    let x = g.input("x", Shape::new(&[2 * n], DType::F64));
+    let y = g.fft_norm(x, false, rlx_ir::FftNorm::Forward);
+    let z = g.fft_norm(y, true, rlx_ir::FftNorm::Forward);
+    g.set_outputs(vec![z]);
+
+    let mut compiled = Session::new(Device::Cpu).compile(g);
+    let outs = compiled.run_typed(&[("x", &f64s_to_bytes(&x_block), DType::F64)]);
+    let z_got = bytes_to_f64s(&outs[0].0);
+    for k in 0..n {
+        assert!(
+            (z_got[k] - re[k]).abs() < 1e-9,
+            "Forward round-trip re[{k}]: got {} vs {}",
+            z_got[k],
+            re[k]
+        );
+        assert!(
+            (z_got[n + k] - im[k]).abs() < 1e-9,
+            "Forward round-trip im[{k}]: got {} vs {}",
+            z_got[n + k],
+            im[k]
+        );
+    }
+}
+
+#[test]
+fn fft_ortho_norm_round_trip_is_identity() {
+    let n: usize = 16;
+    let re: Vec<f64> = (0..n).map(|i| (i as f64 * 0.2).sin()).collect();
+    let im: Vec<f64> = (0..n).map(|i| (i as f64 * 0.4).cos()).collect();
+    let x_block: Vec<f64> = re.iter().chain(im.iter()).copied().collect();
+
+    let mut g = Graph::new("fft_ortho_norm");
+    let x = g.input("x", Shape::new(&[2 * n], DType::F64));
+    let y = g.fft_norm(x, false, rlx_ir::FftNorm::Ortho);
+    let z = g.fft_norm(y, true, rlx_ir::FftNorm::Ortho);
+    g.set_outputs(vec![z]);
+
+    let mut compiled = Session::new(Device::Cpu).compile(g);
+    let outs = compiled.run_typed(&[("x", &f64s_to_bytes(&x_block), DType::F64)]);
+    let z_got = bytes_to_f64s(&outs[0].0);
+    for k in 0..n {
+        assert!((z_got[k] - re[k]).abs() < 1e-9, "Ortho round-trip re[{k}]");
+        assert!(
+            (z_got[n + k] - im[k]).abs() < 1e-9,
+            "Ortho round-trip im[{k}]"
+        );
+    }
+}
+
+#[test]
+fn fft_forward_norm_vjp_matches_scaled_inverse() {
+    let n: usize = 8;
+    let re = [1.0_f64, 0.5, -2.0, 0.25, 0.0, 1.5, -0.75, 3.0];
+    let im = [0.5_f64, -1.0, 0.0, 2.0, -0.5, 0.25, 1.0, -1.5];
+    let x_block: Vec<f64> = re.iter().chain(im.iter()).copied().collect();
+
+    let mut g = Graph::new("fft_forward_vjp");
+    let x = g.input("x", Shape::new(&[2 * n], DType::F64));
+    let y = g.fft_norm(x, false, rlx_ir::FftNorm::Forward);
+    let y_re = g.narrow_(y, 0, 0, n);
+    let y_re_sq = g.binary(
+        rlx_ir::op::BinaryOp::Mul,
+        y_re,
+        y_re,
+        Shape::new(&[n], DType::F64),
+    );
+    let loss = g.sum(y_re_sq, vec![0], false);
+    g.set_outputs(vec![loss]);
+
+    let bwd = grad_with_loss(&g, &[x]);
+    let mut compiled = Session::new(Device::Cpu).compile(bwd);
+    let outs = compiled.run_typed(&[
+        ("x", &f64s_to_bytes(&x_block), DType::F64),
+        ("d_output", &f64s_to_bytes(&[1.0]), DType::F64),
+    ]);
+    let dx = bytes_to_f64s(&outs[1].0);
+
+    let (y_re_ref, _y_im_ref) = dft_reference(&re, &im, false);
+    let dl_dy_re: Vec<f64> = y_re_ref.iter().map(|v| 2.0 * v).collect();
+    let dl_dy_im: Vec<f64> = vec![0.0; n];
+    let scale = rlx_ir::FftNorm::Forward.output_scale(n, false);
+    let mut dl_dy_block = dl_dy_re.clone();
+    dl_dy_block.extend(dl_dy_im.iter().copied());
+    for v in dl_dy_block.iter_mut() {
+        *v *= scale;
+    }
+    let (dl_dx_re_ref, dl_dx_im_ref) = dft_reference(&dl_dy_block[..n], &dl_dy_block[n..], true);
+    for k in 0..n {
+        assert!(
+            (dx[k] - dl_dx_re_ref[k]).abs() < 5e-8,
+            "Forward VJP re[{k}]: got {} vs ref={}",
+            dx[k],
+            dl_dx_re_ref[k]
+        );
+        assert!(
+            (dx[n + k] - dl_dx_im_ref[k]).abs() < 5e-8,
+            "Forward VJP im[{k}]: got {} vs ref={}",
+            dx[n + k],
+            dl_dx_im_ref[k]
+        );
+    }
+}
+
+#[test]
+fn fft_ortho_norm_jvp_matches_forward_of_tangent() {
+    let n: usize = 8;
+    let re = [1.0_f64, 0.5, -2.0, 0.25, 0.0, 1.5, -0.75, 3.0];
+    let im = [0.5_f64, -1.0, 0.0, 2.0, -0.5, 0.25, 1.0, -1.5];
+    let dx_re = [0.1_f64, -0.2, 0.05, 0.3, -0.4, 0.0, 0.25, -0.15];
+    let dx_im = [0.0_f64, 0.5, -0.5, 0.1, 0.2, -0.3, 0.4, -0.1];
+    let x_block: Vec<f64> = re.iter().chain(im.iter()).copied().collect();
+    let dx_block: Vec<f64> = dx_re.iter().chain(dx_im.iter()).copied().collect();
+
+    let mut g = Graph::new("fft_ortho_jvp");
+    let x = g.input("x", Shape::new(&[2 * n], DType::F64));
+    let y = g.fft_norm(x, false, rlx_ir::FftNorm::Ortho);
+    g.set_outputs(vec![y]);
+
+    let jvp_graph = jvp(&g, &[x]);
+    let mut compiled = Session::new(Device::Cpu).compile(jvp_graph);
+    let outs = compiled.run_typed(&[
+        ("x", &f64s_to_bytes(&x_block), DType::F64),
+        ("tangent_x", &f64s_to_bytes(&dx_block), DType::F64),
+    ]);
+    let tangent = bytes_to_f64s(&outs[1].0);
+
+    let (t_re_ref, t_im_ref) = dft_reference(&dx_re, &dx_im, false);
+    let scale = rlx_ir::FftNorm::Ortho.output_scale(n, false);
+    for k in 0..n {
+        assert!(
+            (tangent[k] - t_re_ref[k] * scale).abs() < 1e-6,
+            "Ortho JVP re[{k}]: got {} vs {}",
+            tangent[k],
+            t_re_ref[k] * scale
+        );
+        assert!(
+            (tangent[n + k] - t_im_ref[k] * scale).abs() < 1e-6,
+            "Ortho JVP im[{k}]: got {} vs {}",
+            tangent[n + k],
+            t_im_ref[k] * scale
+        );
+    }
+}
+
+#[test]
+fn rfft_irfft_forward_round_trip() {
+    let signal = [1.0_f32, 2.0, 3.0, 0.5];
+    let mut g = Graph::new("rfft_round_trip");
+    let x = const_f32(&mut g, &signal);
+    let (re, im) = g.rfft(x, rlx_ir::FftNorm::Forward);
+    let recovered = g.irfft(re, im, signal.len(), rlx_ir::FftNorm::Forward);
+    g.set_outputs(vec![recovered]);
+
+    let mut compiled = Session::new(Device::Cpu).compile(g);
+    let outs = compiled.run_typed(&[]);
+    let got = bytes_to_f32s(&outs[0].0);
+    for (i, (&g, &s)) in got.iter().zip(signal.iter()).enumerate() {
+        assert!((g - s).abs() < 1e-4, "sample {i}: got {g} vs {s}");
+    }
+}
+
+#[test]
+fn stft_single_frame_matches_rfft() {
+    let frame = [0.0_f32, 1.0, 0.0, -1.0];
+    let mut g1 = Graph::new("stft");
+    let x = const_f32(&mut g1, &frame);
+    let st = g1.stft(x, 4, 4, rlx_ir::FftNorm::Forward);
+    g1.set_outputs(vec![st]);
+
+    let mut g2 = Graph::new("rfft_only");
+    let x2 = const_f32(&mut g2, &frame);
+    let (re, im) = g2.rfft(x2, rlx_ir::FftNorm::Forward);
+    let block = g2.concat_(vec![re, im], 0);
+    let block = g2.reshape_(block, vec![1, 6]);
+    g2.set_outputs(vec![block]);
+
+    let mut c1 = Session::new(Device::Cpu).compile(g1);
+    let mut c2 = Session::new(Device::Cpu).compile(g2);
+    let o1 = bytes_to_f32s(&c1.run_typed(&[])[0].0);
+    let o2 = bytes_to_f32s(&c2.run_typed(&[])[0].0);
+    assert_eq!(o1.len(), o2.len());
+    for (a, b) in o1.iter().zip(o2.iter()) {
+        assert!((a - b).abs() < 1e-4, "stft vs rfft mismatch: {a} vs {b}");
+    }
+}
+
+#[test]
+fn fft_prime_factors_small_composite() {
+    assert_eq!(rlx_ir::fft::prime_factors(12), vec![2, 2, 3]);
+    assert_eq!(rlx_ir::fft::prime_factors(7), vec![7]);
+}
+
+#[test]
+fn rfft_half_spectrum_length() {
+    let signal = [1.0_f32, 2.0, 3.0, 0.5];
+    let mut g = Graph::new("rfft_len");
+    let x = const_f32(&mut g, &signal);
+    let (re, im) = g.rfft(x, rlx_ir::FftNorm::Forward);
+    g.set_outputs(vec![re, im]);
+
+    let mut compiled = Session::new(Device::Cpu).compile(g);
+    let outs = compiled.run_typed(&[]);
+    let re_out = bytes_to_f32s(&outs[0].0);
+    let im_out = bytes_to_f32s(&outs[1].0);
+    assert_eq!(re_out.len(), 3);
+    assert_eq!(im_out.len(), 3);
+}
+
+#[test]
+fn fftfreq_matches_numpy_convention() {
+    let n = 8usize;
+    let freqs = rlx_ir::fft::fftfreq(n);
+    assert_eq!(freqs.len(), n);
+    assert!((freqs[0] - 0.0).abs() < 1e-12);
+    assert!((freqs[1] - 0.125).abs() < 1e-12);
+    assert!((freqs[n - 1] + 0.125).abs() < 1e-12);
+
+    let rf = rlx_ir::fft::rfftfreq(n);
+    assert_eq!(rf.len(), n / 2 + 1);
+    assert!((rf[0] - 0.0).abs() < 1e-12);
+    assert!((rf[1] - 0.125).abs() < 1e-12);
+}

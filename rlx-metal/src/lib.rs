@@ -63,6 +63,9 @@ pub mod icb;
 pub mod kernels;
 
 #[cfg(target_os = "macos")]
+pub mod fft_dispatch;
+
+#[cfg(target_os = "macos")]
 pub mod llada2_gate;
 
 #[cfg(target_os = "macos")]

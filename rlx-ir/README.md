@@ -16,6 +16,10 @@ through every backend. `rlx-ir` owns:
   op set (`*Backward` variants). Adding an op means: this file,
   `infer.rs`, `graph.rs` builder, both backends' thunks, MPSGraph
   lowering, fusion patterns, cost model. ~6 files per new op.
+- **`fft`** — shared `FftNorm`, GPU launch plans, and NumPy-shaped helpers
+  (`fftfreq`, `gpu_fft_native_eligible`, …). Graph builders in
+  `ops::fft_ops` compose `rfft`, `irfft`, `stft`, `psd_real`, and
+  `fft_conv1d` from primitive ops.
 - **`MaskKind`** — attention mask kind (None / Causal / SlidingWindow /
   Custom). Added Apr 2026 per plan #20.
 - **`Graph`** — DAG builder + topo iterator.
@@ -35,7 +39,7 @@ through every backend. `rlx-ir` owns:
 
 ```toml
 [dependencies]
-rlx-ir = "0.1"
+rlx-ir = "0.2"
 ```
 
 Most users should depend on the [`rlx`](https://crates.io/crates/rlx)

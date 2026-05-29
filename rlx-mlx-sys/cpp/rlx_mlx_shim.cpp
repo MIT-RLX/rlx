@@ -27,6 +27,7 @@
 #include "mlx/device.h"
 #include "mlx/dtype.h"
 #include "mlx/fast.h"
+#include "mlx/fft.h"
 #include "mlx/linalg.h"
 #include "mlx/ops.h"
 #include "mlx/random.h"
@@ -36,6 +37,7 @@
 
 #include <cstring>
 #include <exception>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <vector>
@@ -787,6 +789,92 @@ int rlx_mlx_op_cumsum(
         // mlx's cumsum has `inclusive` (the inverse of rlx's `exclusive`).
         bool inclusive = (exclusive == 0);
         *out = wrap(mc::cumsum(unwrap(a), axis, /*reverse=*/false, inclusive));
+    });
+}
+
+int rlx_mlx_op_fft(
+    rlx_mlx_array_t* a,
+    int inverse,
+    int norm_tag,
+    rlx_mlx_array_t** out)
+{
+    return guarded([&] {
+        auto x = unwrap(a);
+        const auto sh = x.shape();
+        if (sh.empty()) {
+            throw std::invalid_argument("[rlx_mlx_op_fft] input must have rank >= 1");
+        }
+        const int nd = static_cast<int>(sh.size());
+        const int axis = nd - 1;
+        const bool inv = inverse != 0;
+
+        auto rlx_output_scale = [&](int64_t n) -> double {
+            const double nd = static_cast<double>(n);
+            switch (norm_tag) {
+                case 0:
+                    return 1.0;
+                case 1:
+                    return inv ? 1.0 / nd : 1.0;
+                case 2:
+                    return 1.0 / std::sqrt(nd);
+                default:
+                    throw std::invalid_argument(
+                        "[rlx_mlx_op_fft] invalid norm_tag (expected 0, 1, or 2)");
+            }
+        };
+
+        auto mlx_effective_scale = [&](int64_t n) -> double {
+            // MLX FFTNorm::Backward applies 1/N on ifft only.
+            return inv ? 1.0 / static_cast<double>(n) : 1.0;
+        };
+
+        auto apply_norm = [&](mc::array y, int64_t n) {
+            const double corr =
+                rlx_output_scale(n) / mlx_effective_scale(n);
+            if (std::abs(corr - 1.0) > 1e-12) {
+                y = mc::multiply(y, mc::array(static_cast<float>(corr)));
+            }
+            return y;
+        };
+
+        const bool real_block = x.dtype() != mc::complex64;
+        if (real_block) {
+            const int64_t last = sh.back();
+            if (last % 2 != 0) {
+                throw std::invalid_argument(
+                    "[rlx_mlx_op_fft] last axis must be even (2N real-block layout)");
+            }
+            const int64_t n = last / 2;
+            mc::Shape starts(sh.size(), 0);
+            mc::Shape stops = sh;
+            mc::Shape re_st = starts;
+            mc::Shape re_sp = stops;
+            re_sp.back() = n;
+            mc::Shape im_st = starts;
+            mc::Shape im_sp = stops;
+            im_st.back() = n;
+            auto re = mc::slice(x, re_st, re_sp);
+            auto im = mc::slice(x, im_st, im_sp);
+            mc::array cx = mc::add(
+                mc::astype(re, mc::complex64),
+                mc::multiply(
+                    mc::astype(im, mc::complex64),
+                    mc::array(mc::complex64_t{0.0f, 1.0f})));
+            mc::array y = inv
+                ? mc::fft::ifft(cx, axis, mc::fft::FFTNorm::Backward)
+                : mc::fft::fft(cx, axis, mc::fft::FFTNorm::Backward);
+            y = apply_norm(y, n);
+            auto y_re = mc::real(y);
+            auto y_im = mc::imag(y);
+            *out = wrap(mc::concatenate({y_re, y_im}, axis));
+        } else {
+            mc::array y = inv
+                ? mc::fft::ifft(x, axis, mc::fft::FFTNorm::Backward)
+                : mc::fft::fft(x, axis, mc::fft::FFTNorm::Backward);
+            const int64_t n = sh[axis];
+            y = apply_norm(y, n);
+            *out = wrap(y);
+        }
     });
 }
 

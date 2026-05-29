@@ -1,6 +1,6 @@
 [package]
 name = "rlx-ir"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Tensor IR for the RLX ML compiler — standalone, serializable, optimizable"

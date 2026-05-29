@@ -1,6 +1,6 @@
 [package]
 name = "rlx-bench"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "PLAN L5 — uniform benchmark harness for RLX backends + patterns"
@@ -13,9 +13,9 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.1", features = ["cpu"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.2" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.2", features = ["cpu"] }
 rlx-driver = { path = "../rlx-driver", version = "0.2.1" }
 
 [features]

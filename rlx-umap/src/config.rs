@@ -79,18 +79,13 @@ pub fn fit_ab(min_dist: f32, spread: f32) -> (f32, f32) {
     any(feature = "serde", feature = "full"),
     derive(Serialize, Deserialize)
 )]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Metric {
+    #[default]
     Euclidean,
     Cosine,
     Manhattan,
     Minkowski,
-}
-
-impl Default for Metric {
-    fn default() -> Self {
-        Self::Euclidean
-    }
 }
 
 impl fmt::Display for Metric {

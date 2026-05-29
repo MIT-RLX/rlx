@@ -22,7 +22,7 @@ fn main() -> std::io::Result<()> {
         ..Default::default()
     };
 
-    let mut fitted = Umap::new(config).fit(data.clone());
+    let fitted = Umap::new(config).fit(data.clone());
     let path = model_path(std::env::temp_dir(), "rlx_umap_demo");
     fitted.save(&path)?;
     println!("saved full model to {}", path.display());

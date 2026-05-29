@@ -40,6 +40,8 @@
 pub mod arena;
 pub mod backend;
 pub mod device;
+pub mod fft_dispatch;
+pub mod fft_host;
 pub mod gdn_host;
 pub mod gguf_host;
 pub mod hip;
