@@ -30,8 +30,6 @@ const LOSS_READBACK_INTERVAL: usize = 5;
 struct EdgeBatch {
     head: Vec<f32>,
     tail: Vec<f32>,
-    n_pos: usize,
-    n_neg: usize,
 }
 
 /// Per-epoch training progress (fast-umap compatible).
@@ -342,10 +340,5 @@ fn sample_edge_batch(
         tail.push(j as f32);
     }
 
-    EdgeBatch {
-        head,
-        tail,
-        n_pos,
-        n_neg,
-    }
+    EdgeBatch { head, tail }
 }

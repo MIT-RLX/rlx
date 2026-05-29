@@ -35,7 +35,7 @@ pub fn build_pca_warmstart_graph(spec: &ModelSpec) -> PcaWarmstartGraph {
             p
         })
         .collect();
-    let loss = remap[&loss_node];
+    let _loss = remap[&loss_node];
     let wrt: Vec<NodeId> = params.iter().map(|p| p.param).collect();
     let bwd = grad_with_loss(&g, &wrt);
     let d_output = bwd

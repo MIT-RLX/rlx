@@ -40,7 +40,7 @@ fn unary_log(g: &mut Graph, x: NodeId) -> NodeId {
     g.activation(Activation::Log, x, s)
 }
 
-fn clamp_min(g: &mut Graph, x: NodeId, eps: f32, eps_node: NodeId) -> NodeId {
+fn clamp_min(g: &mut Graph, x: NodeId, _eps: f32, eps_node: NodeId) -> NodeId {
     let s = rlx_ir::shape::binary_shape(g.shape(x), g.shape(eps_node)).unwrap();
     g.binary(BinaryOp::Max, x, eps_node, s)
 }
