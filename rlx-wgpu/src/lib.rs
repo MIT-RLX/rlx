@@ -40,6 +40,7 @@ pub mod splat;
 #[cfg(feature = "native-splat")]
 pub mod splat_native;
 pub mod training_bwd_host;
+pub mod umap_knn_host;
 pub mod unfuse;
 
 /// True if a wgpu adapter is reachable on this system. Always

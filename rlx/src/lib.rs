@@ -162,6 +162,10 @@ pub use rlx_linalg as linalg;
 /// See [`rlx-splat`](https://crates.io/crates/rlx-splat).
 pub use rlx_splat as splat;
 
+#[cfg(feature = "umap")]
+/// Downstream: UMAP / fast-umap custom ops (k-NN from pairwise distances).
+pub use rlx_umap as umap;
+
 #[cfg(feature = "cortexm")]
 /// `no_std` ARMv7E-M INT8 kernels (Cortex-M4F / M7). Doesn't
 /// implement `Backend` — call the kernels (`dense`, `conv2d`,

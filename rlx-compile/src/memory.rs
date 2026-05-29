@@ -344,12 +344,19 @@ pub fn plan_memory_with_options(
     alignment: usize,
     opts: MemoryPlanOptions,
 ) -> MemoryPlan {
-    plan_memory_aligned_inner(graph, alignment, opts, None)
+    plan_memory_aligned_inner(graph, alignment, opts, None, false)
 }
 
 /// Plan memory with custom alignment (inference defaults).
 pub fn plan_memory_aligned(graph: &Graph, alignment: usize) -> MemoryPlan {
-    plan_memory_aligned_inner(graph, alignment, MemoryPlanOptions::default(), None)
+    plan_memory_aligned_inner(graph, alignment, MemoryPlanOptions::default(), None, false)
+}
+
+/// Liveness-aware planning with every slot sized as `num_elements * 4`
+/// bytes (wgpu / uniform-f32 arenas). Reuses dead tensor slots so large
+/// `[n, n]` pairwise graphs stay under WebGPU's 128 MiB binding cap.
+pub fn plan_memory_f32_uniform(graph: &Graph, alignment: usize) -> MemoryPlan {
+    plan_memory_aligned_inner(graph, alignment, MemoryPlanOptions::default(), None, true)
 }
 
 /// Plan backward activations, then alias params onto `weights`.
@@ -363,7 +370,17 @@ pub fn plan_memory_backward(
         alignment,
         MemoryPlanOptions::backward_activations_only(),
         Some(weights),
+        false,
     )
+}
+
+#[inline]
+fn node_slot_bytes(node: &rlx_ir::Node, f32_uniform: bool) -> usize {
+    if f32_uniform {
+        node.shape.num_elements().unwrap_or(0) * 4
+    } else {
+        node.shape.size_bytes().unwrap_or(0)
+    }
 }
 
 fn plan_memory_aligned_inner(
@@ -371,6 +388,7 @@ fn plan_memory_aligned_inner(
     alignment: usize,
     opts: MemoryPlanOptions,
     weights: Option<&SharedWeightLayout>,
+    f32_uniform: bool,
 ) -> MemoryPlan {
     let ranges = compute_live_ranges(graph);
 
@@ -389,8 +407,8 @@ fn plan_memory_aligned_inner(
         if pure_view_offset(graph, node).is_some() {
             continue;
         }
-        if let Some(size) = node.shape.size_bytes()
-            && size > 0
+        let size = node_slot_bytes(node, f32_uniform);
+        if size > 0
             && let Some(&(birth, death)) = ranges.get(&node.id)
             && plans_boundary_buffer(&node.op, opts)
         {
@@ -470,7 +488,7 @@ fn plan_memory_aligned_inner(
         if pure_view_offset(graph, node).is_some() {
             let (root, off) = resolve_view_root(graph, node.id);
             if let Some(root_slot) = assignments.get(&root).cloned() {
-                let view_size = node.shape.size_bytes().unwrap_or(0);
+                let view_size = node_slot_bytes(node, f32_uniform);
                 assignments.insert(
                     node.id,
                     BufferSlot {

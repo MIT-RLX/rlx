@@ -22,13 +22,15 @@ use std::collections::HashSet;
 
 use rlx_fusion::control_flow::LowerControlFlow;
 use rlx_fusion::fusion::UnfuseElementwiseRegions;
+use rlx_fusion::lower_backward_ops::LowerBackwardOps;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
 use rlx_fusion::lower_logical_kernels;
+use rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
 use rlx_fusion::lower_vae_ops::{LowerGroupNorm, LowerResizeNearest2x};
 use rlx_fusion::pass::Pass;
 use rlx_fusion::unfuse::unfuse_fused_for_autodiff;
 use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
-use rlx_ir::{Graph, OpKind};
+use rlx_ir::{Graph, Op, OpKind};
 
 use crate::legalize::legalize_for_backend;
 
@@ -109,6 +111,21 @@ pub fn rewrite_for_backend_with_config(
         }
         if bad.contains(&OpKind::ElementwiseRegion) {
             graph = UnfuseElementwiseRegions.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::ReluBackward) || bad.contains(&OpKind::ActivationBackward) {
+            graph = LowerBackwardOps.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::Reduce)
+            || graph.nodes().iter().any(|n| {
+                matches!(&n.op, Op::Reduce { axes, .. } if {
+                    let rank = graph.shape(n.inputs[0]).rank();
+                    axes.len() > 1 || (rank > 0 && axes.as_slice() != [rank - 1])
+                })
+            })
+        {
+            graph = LowerNonLastAxisReduce.run(graph);
             changed = true;
         }
         if needs_unfuse(&bad) {
@@ -230,6 +247,31 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n.op, Op::GroupNorm { .. }))
         );
+    }
+
+    #[test]
+    fn rewrite_lowers_relu_backward_for_metal_primitives() {
+        use rlx_ir::{DType, Graph, Shape};
+
+        let f = DType::F32;
+        let mut g = Graph::new("rb");
+        let x = g.input("x", Shape::new(&[4], f));
+        let dy = g.input("dy", Shape::new(&[4], f));
+        let dx = g.relu_backward(x, dy);
+        g.set_outputs(vec![dx]);
+
+        let metal_supported = &[
+            OpKind::Input,
+            OpKind::Constant,
+            OpKind::Expand,
+            OpKind::Compare,
+            OpKind::Where,
+            OpKind::Binary,
+            OpKind::Activation,
+        ];
+        assert!(legalize_for_backend(&g, metal_supported).is_err());
+        let lowered = rewrite_for_backend(g, metal_supported);
+        assert!(legalize_for_backend(&lowered, metal_supported).is_ok());
     }
 
     #[test]

@@ -48,3 +48,4 @@ pub mod splat;
 pub mod thunk;
 pub mod tile;
 pub mod training_bwd;
+pub mod umap_knn;

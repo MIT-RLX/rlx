@@ -51,6 +51,7 @@ pub mod splat_host;
 #[cfg(feature = "native-splat")]
 pub mod splat_native;
 pub mod training_bwd_host;
+pub mod umap_knn_host;
 pub mod unfuse;
 
 pub use backend::{CompileMode, CudaExecutable, ExecMode};

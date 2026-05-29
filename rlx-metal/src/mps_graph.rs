@@ -398,7 +398,10 @@ impl MpsGraph {
     /// receive `−1e10` and valid positions receive `0` — matching the
     /// CPU `Op::Attention` thunk's mask semantics exactly.
     ///
-    /// Returns `[B, S, NH*DH]`.
+    /// Returns `[B, seq_q, NH*DH]`.
+    ///
+    /// `mask` is `[B, seq_kv]` (1.0 = valid key position). Supports decode
+    /// when `seq_q != seq_kv` (e.g. one new query token over a longer KV cache).
     pub fn attention(
         &self,
         q: &MpsTensor,
@@ -406,7 +409,8 @@ impl MpsGraph {
         v: &MpsTensor,
         mask: &MpsTensor,
         batch: usize,
-        seq: usize,
+        seq_q: usize,
+        seq_kv: usize,
         num_heads: usize,
         head_dim: usize,
     ) -> MpsTensor {
@@ -461,18 +465,18 @@ impl MpsGraph {
         // attention as its own MPSGraph with Q/K/V as fresh
         // placeholders. Bypasses the slice-of-computed pattern
         // entirely. Multi-day refactor — deferred.
-        let r4 = |t: &MpsTensor| {
+        let r4 = |t: &MpsTensor, seq: usize| {
             let r = self.reshape(t, &[batch, seq, num_heads, head_dim]);
             self.transpose(&r, 1, 2) // (0,1,2,3) → (0,2,1,3)
         };
-        let q4 = r4(q);
-        let k4 = r4(k);
-        let v4 = r4(v);
+        let q4 = r4(q, seq_q);
+        let k4 = r4(k, seq_kv);
+        let v4 = r4(v, seq_kv);
 
-        // K^T over last two axes: [B, NH, S, DH] → [B, NH, DH, S]
+        // K^T over last two axes: [B, NH, seq_kv, DH] → [B, NH, DH, seq_kv]
         let k4_t = self.transpose(&k4, 2, 3);
 
-        // scores = Q @ K^T → [B, NH, S, S]
+        // scores = Q @ K^T → [B, NH, seq_q, seq_kv]
         let scores = self.matmul(&q4, &k4_t);
 
         // Scale by 1/sqrt(d_h)
@@ -480,7 +484,7 @@ impl MpsGraph {
         let scores = self.mul(&scores, &scale);
 
         // Additive mask: (mask - 1) * 1e9 → 0 for valid, -1e9 for pad.
-        let mask_bc = self.reshape(mask, &[batch, 1, 1, seq]);
+        let mask_bc = self.reshape(mask, &[batch, 1, seq_q, seq_kv]);
         let neg_one = self.constant_scalar(-1.0);
         let large_pos = self.constant_scalar(1.0e9);
         let mask_minus = self.add(&mask_bc, &neg_one);
@@ -490,11 +494,11 @@ impl MpsGraph {
         // softmax along last axis
         let weights = self.softmax(&scores, 4 - 1);
 
-        // out = weights @ V → [B, NH, S, DH]
+        // out = weights @ V → [B, NH, seq_q, DH]
         let out4 = self.matmul(&weights, &v4);
-        // Transpose back to [B, S, NH, DH] then reshape to [B, S, NH*DH].
+        // Transpose back to [B, seq_q, NH, DH] then reshape to [B, seq_q, NH*DH].
         let out_perm = self.transpose(&out4, 1, 2);
-        self.reshape(&out_perm, &[batch, seq, num_heads * head_dim])
+        self.reshape(&out_perm, &[batch, seq_q, num_heads * head_dim])
     }
 
     /// Unmasked multi-head SDPA. Supports cross-attention when `seq_kv != seq_q`.

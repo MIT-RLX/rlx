@@ -1261,7 +1261,7 @@ pub fn lower_with_env(
                 // MLX's scatter_add takes a base array and writes onto
                 // it — we feed it a zero base of the right shape.
                 let updates = lookup(&env, node.inputs[0])?;
-                let indices = lookup(&env, node.inputs[1])?;
+                let indices_in = lookup(&env, node.inputs[1])?.clone_handle()?;
                 let out_shape: Vec<i32> = node
                     .shape
                     .dims()
@@ -1279,7 +1279,20 @@ pub fn lower_with_env(
                 let out_shape_usize: Vec<usize> = out_shape.iter().map(|d| *d as usize).collect();
                 let zero_target =
                     crate::array::Array::from_f32_slice(&zeros, &out_shape_usize, DType::F32)?;
-                ops::scatter_add(&zero_target, indices, updates, 0)?
+                let upd_shape = node_input_shape(graph, node.inputs[0]);
+                let idx_shape = node_input_shape(graph, node.inputs[1]);
+                // Gather axis-0 VJP: updates `[n_edges, d]`, indices `[n_edges]` → table `[n, d]`.
+                // MLX scatter expects index rank to match the scattered array rank.
+                let indices = if upd_shape.len() > 1 && idx_shape.len() == 1 {
+                    ops::reshape(&indices_in, &[idx_shape[0], 1])?
+                } else {
+                    indices_in
+                };
+                if upd_shape.len() > 1 {
+                    ops::scatter_add_axis(&zero_target, &indices, updates, 0)?
+                } else {
+                    ops::scatter_add(&zero_target, &indices, updates, 0)?
+                }
             }
             Op::GroupedMatMul => {
                 // Inputs: [input, weight, expert_idx].
@@ -3024,7 +3037,7 @@ pub fn lower_with_env(
 
             Op::GatherBackward { axis } => {
                 let dy = lookup(&env, node.inputs[0])?;
-                let indices = lookup(&env, node.inputs[1])?;
+                let indices_in = lookup(&env, node.inputs[1])?.clone_handle()?;
                 let out_shape: Vec<i32> = node
                     .shape
                     .dims()
@@ -3036,12 +3049,19 @@ pub fn lower_with_env(
                 } else {
                     *axis
                 };
+                let dy_shape = node_input_shape(graph, node.inputs[0]);
+                let idx_shape = node_input_shape(graph, node.inputs[1]);
                 let n_elem: usize = out_shape.iter().product::<i32>() as usize;
                 let zeros = vec![0.0_f32; n_elem];
                 let out_shape_usize: Vec<usize> = out_shape.iter().map(|d| *d as usize).collect();
                 let zero_target =
                     crate::array::Array::from_f32_slice(&zeros, &out_shape_usize, DType::F32)?;
-                ops::scatter_add_axis(&zero_target, indices, dy, axis_pos)?
+                let indices = if dy_shape.len() > 1 && idx_shape.len() == 1 {
+                    ops::reshape(&indices_in, &[idx_shape[0], 1])?
+                } else {
+                    indices_in
+                };
+                ops::scatter_add_axis(&zero_target, &indices, dy, axis_pos)?
             }
 
             Op::RopeBackward { head_dim, n_rot } => {

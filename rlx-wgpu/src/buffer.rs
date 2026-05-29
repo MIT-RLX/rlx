@@ -23,7 +23,7 @@
 //! level (unlike Metal where `StorageModeShared` matters). On Apple
 //! Silicon wgpu's Metal backend gives us unified memory automatically.
 
-use rlx_ir::{Graph, NodeId, Op};
+use rlx_ir::{Graph, NodeId};
 use rlx_opt::memory::MemoryPlan;
 use std::collections::HashMap;
 
@@ -50,52 +50,10 @@ pub struct Arena {
     pub size: usize,
 }
 
-/// Plan memory using f32-sized slots regardless of declared IR dtype.
-/// The wgpu backend keeps every tensor as f32 in the arena (Bool / I32
-/// /etc. get widened on access), so dtype-aware sizing in
-/// `rlx_opt::memory::plan_memory_aligned` would under-allocate slots
-/// for non-f32 nodes — Bool\[4\] would get 4 bytes when our kernels need
-/// 16. This planner side-steps the issue with a simple sequential
-/// allocator (no slot reuse). Memory pressure stays modest because
-/// activations dominate and they're already f32 in the IR.
+/// Plan memory using f32-sized slots regardless of declared IR dtype,
+/// with liveness-aware slot reuse (see `rlx_opt::memory::plan_memory_f32_uniform`).
 pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
-    use rlx_opt::memory::BufferSlot;
-    let mut assignments: HashMap<NodeId, BufferSlot> = HashMap::new();
-    let mut schedule = Vec::with_capacity(graph.nodes().len());
-    let mut cursor = 0usize;
-    for node in graph.nodes() {
-        // Reshape and Cast are pure relabels in our row-major f32-uniform
-        // arena — element count is unchanged, every dtype occupies 4 bytes.
-        // Alias the output slot to the input's offset/size and skip the
-        // copy kernel emission downstream. Saves one dispatch + one
-        // arena round-trip per Reshape/Cast.
-        if matches!(node.op, Op::Reshape { .. } | Op::Cast { .. })
-            && let Some(in_id) = node.inputs.first()
-            && let Some(slot) = assignments.get(in_id)
-        {
-            let aliased = slot.clone();
-            assignments.insert(node.id, aliased);
-            schedule.push(node.id);
-            continue;
-        }
-        let elems = node.shape.num_elements().unwrap_or(0);
-        let bytes = elems * 4;
-        let aligned = bytes.div_ceil(align) * align;
-        assignments.insert(
-            node.id,
-            BufferSlot {
-                offset: cursor,
-                size: aligned,
-            },
-        );
-        schedule.push(node.id);
-        cursor += aligned;
-    }
-    MemoryPlan {
-        arena_size: cursor,
-        assignments,
-        schedule,
-    }
+    rlx_opt::memory::plan_memory_f32_uniform(graph, align)
 }
 
 impl Arena {
@@ -103,22 +61,15 @@ impl Arena {
     /// sized to fit every node's offset+length.
     pub fn from_plan(device: &wgpu::Device, plan: &MemoryPlan) -> Self {
         let size = plan.arena_size.max(1); // wgpu hates zero-sized allocs
-        // WebGPU spec caps `max_storage_buffer_binding_size` at 32-bit
-        // offsets (4 GiB - 4 B). Apple Metal's adapter limit is exactly
-        // that. When the planned arena exceeds it, every bind group
-        // creation will fail with a cryptic "binding range exceeds
-        // limit" error deep in wgpu-core. Detect early and panic with a
-        // useful message; the long-term fix is multi-bind-group arena
-        // partitioning (deferred — substantial restructuring).
+        // WebGPU caps each storage binding at `max_storage_buffer_binding_size`
+        // (128 MiB on most adapters). Liveness-aware `plan_memory_f32_uniform`
+        // keeps typical UMAP `[n,n]` graphs under this; if not, fail early.
         let max_binding = device.limits().max_storage_buffer_binding_size;
         if (size as u64) > max_binding {
             panic!(
-                "rlx-wgpu: planned arena size {} bytes ({} GiB) exceeds the \
-                    adapter's max_storage_buffer_binding_size of {} bytes \
-                    ({} GiB). This is the WebGPU 32-bit binding offset cap on \
-                    Apple Metal / Vulkan; supporting larger arenas requires \
-                    multi-bind-group partitioning. Workaround: reduce batch \
-                    size or compile with a smaller (batch, seq) shape.",
+                "rlx-wgpu: planned arena size {} bytes ({:.3} GiB) exceeds \
+                    max_storage_buffer_binding_size {} bytes ({:.3} GiB). \
+                    Reduce batch/sequence size or split the graph.",
                 size,
                 size as f64 / (1u64 << 30) as f64,
                 max_binding,

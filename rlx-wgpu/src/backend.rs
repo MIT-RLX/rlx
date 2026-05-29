@@ -32,22 +32,23 @@ use crate::kernels::{
     ArgmaxParams, AttentionBwdParams, AttentionParams, BinaryParams, Conv1dParams, Conv2dParams,
     Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
     ElementwiseRegionParams, ExpandParams, FftParams, FusedResidualLnParams,
-    FusedResidualLnTeeParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupedMatmulParams,
-    Kernel, LayerNormParams, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams,
-    Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RopeBwdParams, RopeParams,
-    SampleParams, ScatterAddParams, SelectiveScanParams, SoftmaxParams, TopKParams,
-    TransposeParams, UnaryParams, WhereParams, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, binary_kernel, cast_f32_to_f16_kernel, compare_kernel, concat_kernel,
-    conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel,
-    cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel, expand_kernel, fft_kernel,
-    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, gather_axis_kernel,
-    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel, grouped_matmul_kernel,
-    layernorm_kernel, matmul_coop_f32_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
-    matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
-    matmul_wide_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
+    FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatherAxisParams, GatherBwdParams,
+    GatherParams, GroupedMatmulParams, Kernel, LayerNormParams, MatmulParams, MatmulQkvParams,
+    NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams,
+    RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SelectiveScanParams, SoftmaxParams,
+    TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WhereParams, argmax_kernel,
+    attention_bwd_kernel, attention_kernel, binary_kernel, cast_f32_to_f16_kernel, compare_kernel,
+    concat_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel,
+    expand_kernel, fft_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    fused_residual_rms_norm_kernel, gather_axis_kernel, gather_backward_acc_kernel,
+    gather_backward_zero_kernel, gather_kernel, grouped_matmul_kernel, layernorm_kernel,
+    matmul_coop_f32_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel, matmul_f16w_kernel,
+    matmul_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_kernel,
+    narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
     rms_norm_backward_kernel, rms_norm_backward_param_kernel, rope_backward_kernel, rope_kernel,
     sample_kernel, scatter_add_kernel, selective_scan_kernel, softmax_kernel, topk_kernel,
-    transpose_kernel, unary_kernel, where_kernel,
+    transpose_kernel, umap_knn_kernel, unary_kernel, where_kernel,
 };
 use rlx_ir::op::{ChainOperand, ChainStep};
 
@@ -286,6 +287,16 @@ enum Step {
         n_elems: u32,
         attrs: [u8; 20],
     },
+    UmapKnn {
+        params: UmapKnnParams,
+    },
+    /// Small-`n` host k-NN (partial arena read/write; avoids GPU launch overhead).
+    UmapKnnHost {
+        pairwise_byte_off: u32,
+        out_byte_off: u32,
+        n: u32,
+        k: u32,
+    },
     /// 3D Gaussian splat forward (CPU reference between segments).
     #[cfg(feature = "splat")]
     GaussianSplatRender {
@@ -427,6 +438,9 @@ enum Step {
     FusedResidualLnTee {
         params: FusedResidualLnTeeParams,
     },
+    FusedResidualRmsNorm {
+        params: FusedResidualRmsNormParams,
+    },
 }
 
 pub struct WgpuExecutable {
@@ -489,6 +503,7 @@ impl Step {
             | Step::LayerNorm { .. }
             | Step::FusedResidualLn { .. }
             | Step::FusedResidualLnTee { .. }
+            | Step::FusedResidualRmsNorm { .. }
             | Step::Cumsum { .. }
             | Step::Copy { .. }
             | Step::ElementwiseRegion { .. }
@@ -503,6 +518,8 @@ impl Step {
             | Step::DequantGroupedMatmulGguf { .. }
             | Step::GatedDeltaNet { .. }
             | Step::Llada2GroupLimitedGate { .. }
+            | Step::UmapKnn { .. }
+            | Step::UmapKnnHost { .. }
             | Step::Conv1d { .. }
             | Step::Conv2d { .. }
             | Step::Conv3d { .. }
@@ -622,6 +639,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::DequantGroupedMatmulGguf { .. } => "dequant_grouped_matmul_gguf",
         Step::GatedDeltaNet { .. } => "gated_delta_net",
         Step::Llada2GroupLimitedGate { .. } => "llada2_group_limited_gate",
+        Step::UmapKnn { .. } => "umap_knn",
+        Step::UmapKnnHost { .. } => "umap_knn_host",
         #[cfg(feature = "splat")]
         Step::GaussianSplatRender { .. } => "gaussian_splat_render",
         #[cfg(feature = "splat")]
@@ -638,6 +657,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::GatherBackward { .. } => "gather_backward",
         Step::FusedResidualLn { .. } => "fused_residual_ln",
         Step::FusedResidualLnTee { .. } => "fused_residual_ln_tee",
+        Step::FusedResidualRmsNorm { .. } => "fused_residual_rms_norm",
         Step::MatmulQkv { .. } => "matmul_qkv",
         Step::ElementwiseRegion { .. } => "elementwise_region",
     }
@@ -648,7 +668,8 @@ fn step_runs_on_host(step: &Step) -> bool {
         Step::DequantMatmulGguf { .. }
         | Step::DequantGroupedMatmulGguf { .. }
         | Step::GatedDeltaNet { .. }
-        | Step::Llada2GroupLimitedGate { .. } => true,
+        | Step::Llada2GroupLimitedGate { .. }
+        | Step::UmapKnnHost { .. } => true,
         #[cfg(feature = "splat")]
         Step::GaussianSplatRender { .. }
         | Step::GaussianSplatRenderBackward { .. }
@@ -853,10 +874,7 @@ impl WgpuExecutable {
         // throughput here.
         let graph = crate::unfuse::unfuse(graph);
 
-        // Memory plan + arena. We use f32-uniform sizing instead of
-        // rlx-opt's dtype-aware planner because every tensor lives as
-        // f32 in our arena (Bool/I32/etc. widen on access). Dtype
-        // sizing would under-allocate non-f32 slots.
+        // f32-uniform slots + liveness reuse (pairwise `[n,n]` graphs).
         let plan = plan_f32_uniform(&graph, 16);
         let mut arena = Arena::from_plan(&dev.device, &plan);
         // Override slot lengths with the actual elem*4 byte counts so
@@ -1456,10 +1474,7 @@ impl WgpuExecutable {
                 }
 
                 Op::Reshape { .. } | Op::Cast { .. } => {
-                    // No-op: `plan_f32_uniform` aliased this node's slot
-                    // to its input's offset, so consumers reading from
-                    // node.id automatically read the input bytes. No
-                    // copy kernel needed in our f32-uniform arena.
+                    // No-op: memory planner view-aliased this slot.
                 }
 
                 Op::Transpose { perm } => {
@@ -2785,24 +2800,60 @@ impl WgpuExecutable {
                     uniforms.push(u.clone());
                     bind_groups.push(bg.clone());
                 }
-                Op::Custom { name, attrs, .. } => {
-                    if name != "llada2.group_limited_gate" {
-                        panic!("rlx-wgpu: unsupported Op::Custom('{name}')");
+                Op::Custom { name, attrs, .. } => match name.as_str() {
+                    "llada2.group_limited_gate" => {
+                        let sig_id = node.inputs[0];
+                        let route_id = node.inputs[1];
+                        let n_elems = graph.node(sig_id).shape.num_elements().unwrap() as u32;
+                        let mut attr_buf = [0u8; 20];
+                        let n = attrs.len().min(20);
+                        attr_buf[..n].copy_from_slice(&attrs[..n]);
+                        schedule.push(Step::Llada2GroupLimitedGate {
+                            sig_byte_off: arena.offset(sig_id) as u32,
+                            route_byte_off: arena.offset(route_id) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                            n_elems,
+                            attrs: attr_buf,
+                        });
                     }
-                    let sig_id = node.inputs[0];
-                    let route_id = node.inputs[1];
-                    let n_elems = graph.node(sig_id).shape.num_elements().unwrap() as u32;
-                    let mut attr_buf = [0u8; 20];
-                    let n = attrs.len().min(20);
-                    attr_buf[..n].copy_from_slice(&attrs[..n]);
-                    schedule.push(Step::Llada2GroupLimitedGate {
-                        sig_byte_off: arena.offset(sig_id) as u32,
-                        route_byte_off: arena.offset(route_id) as u32,
-                        out_byte_off: arena.offset(node.id) as u32,
-                        n_elems,
-                        attrs: attr_buf,
-                    });
-                }
+                    "umap.knn" => {
+                        let pw_id = node.inputs[0];
+                        let pw_shape = graph.node(pw_id).shape.dims();
+                        let n = pw_shape[0].unwrap_static() as u32;
+                        let k = if attrs.len() >= 4 {
+                            u32::from_le_bytes(attrs[..4].try_into().unwrap())
+                        } else {
+                            panic!("rlx-wgpu: umap.knn attrs missing k");
+                        };
+                        let pw_off = arena.offset(pw_id) as u32;
+                        let out_off = arena.offset(node.id) as u32;
+                        if n as usize >= crate::umap_knn_host::UMAP_KNN_GPU_MIN_N {
+                            let p = UmapKnnParams {
+                                n,
+                                k,
+                                pw_off: (pw_off / 4) as u32,
+                                out_off: (out_off / 4) as u32,
+                                _p0: 0,
+                                _p1: 0,
+                                _p2: 0,
+                            };
+                            schedule.push(Step::UmapKnn { params: p });
+                            let uk = umap_knn_kernel(&dev.device);
+                            let u = emit_uniform(std::mem::size_of::<UmapKnnParams>());
+                            let bg = bind_two(&dev.device, uk, &arena.buffer, &u);
+                            uniforms.push(u);
+                            bind_groups.push(bg);
+                        } else {
+                            schedule.push(Step::UmapKnnHost {
+                                pairwise_byte_off: pw_off,
+                                out_byte_off: out_off,
+                                n,
+                                k,
+                            });
+                        }
+                    }
+                    other => panic!("rlx-wgpu: unsupported Op::Custom('{other}')"),
+                },
                 Op::GroupedMatMul => {
                     // Inputs: input [M, K], weight [E, K, N], expert_idx [M]
                     let in_id = node.inputs[0];
@@ -2969,6 +3020,39 @@ impl WgpuExecutable {
                     schedule.push(Step::FusedResidualLn { params: p });
                     let frk = fused_residual_ln_kernel(&dev.device);
                     let u = emit_uniform(std::mem::size_of::<FusedResidualLnParams>());
+                    let bg = bind_two(&dev.device, frk, &arena.buffer, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
+                Op::FusedResidualRmsNorm { has_bias, eps } => {
+                    let x_id = node.inputs[0];
+                    let r_id = node.inputs[1];
+                    let (bias_id, g_id, b_id) = if *has_bias {
+                        (node.inputs[2], node.inputs[3], node.inputs[4])
+                    } else {
+                        (x_id, node.inputs[2], node.inputs[3])
+                    };
+                    let in_dims = node.shape.dims();
+                    let inner = in_dims[in_dims.len() - 1].unwrap_static() as u32;
+                    let total: u32 = in_dims.iter().map(|d| d.unwrap_static() as u32).product();
+                    let outer = total / inner.max(1);
+                    let p = FusedResidualRmsNormParams {
+                        outer,
+                        inner,
+                        in_off: (arena.offset(x_id) / 4) as u32,
+                        residual_off: (arena.offset(r_id) / 4) as u32,
+                        bias_off: (arena.offset(bias_id) / 4) as u32,
+                        gamma_off: (arena.offset(g_id) / 4) as u32,
+                        beta_off: (arena.offset(b_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        eps_bits: eps.to_bits(),
+                        has_bias: if *has_bias { 1 } else { 0 },
+                        _p0: 0,
+                        _p1: 0,
+                    };
+                    schedule.push(Step::FusedResidualRmsNorm { params: p });
+                    let frk = fused_residual_rms_norm_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<FusedResidualRmsNormParams>());
                     let bg = bind_two(&dev.device, frk, &arena.buffer, &u);
                     uniforms.push(u);
                     bind_groups.push(bg);
@@ -3520,13 +3604,16 @@ impl WgpuExecutable {
         // saving milliseconds of staging-copy overhead.
         let need_uniform_writes = self.uniforms_active_extent != Some(active);
         if need_uniform_writes {
-            for (i, step) in self.schedule.iter().enumerate() {
+            let mut gpu_ui = 0usize;
+            for step in self.schedule.iter() {
+                if step_runs_on_host(step) {
+                    continue;
+                }
                 match step {
                     Step::CastF32ToF16 { .. } => {
                         // Params are static for this step (offset+len), so the
                         // pre-pass write at compile time is sufficient. No
                         // active-extent scaling — len is the full element count.
-                        let _ = i;
                     }
                     Step::Matmul {
                         m,
@@ -3568,43 +3655,43 @@ impl WgpuExecutable {
                             _pad2: 0,
                         };
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Binary { params } | Step::Compare { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Unary { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Where { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Reduce { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Softmax { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::LayerNorm { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::RmsNormBackwardInput { params }
                     | Step::RmsNormBackwardGamma { params }
@@ -3612,31 +3699,31 @@ impl WgpuExecutable {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::CumsumBackward { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::RopeBackward { params } => {
                         let mut p = *params;
                         p.seq = scale(p.seq);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::GatherBackward { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Cumsum { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Fft { params, .. } => {
                         // FFT is one workgroup per row; nothing inside
@@ -3644,21 +3731,24 @@ impl WgpuExecutable {
                         // time (`outer` lives outside the struct as a
                         // dispatch count). Re-upload as-is to keep the
                         // uniform layout consistent with other steps.
-                        dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(params));
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
                     }
                     Step::Copy { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::ElementwiseRegion { params } => {
                         // Active-extent: scale element count.
                         let mut p = *params;
                         p.len = scale(p.len);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Transpose { params, .. } => {
                         // PLAN L1: when bucket_outermost == 1, scale
@@ -3672,31 +3762,31 @@ impl WgpuExecutable {
                             p.out_total = scaled_d0 * inner;
                         }
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Narrow { params } => {
                         let mut p = *params;
                         p.total = scale(p.total);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Concat { params } => {
                         let mut p = *params;
                         p.total = scale(p.total);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Gather { params } => {
                         let mut p = *params;
                         p.n_out = scale(p.n_out);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::GatherAxis { params } => {
                         let mut p = *params;
                         p.total = scale(p.total);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Attention { params, .. } => {
                         // PLAN L1: scale seq_q + seq_k. Stride fields
@@ -3707,7 +3797,7 @@ impl WgpuExecutable {
                         p.seq_q = scale(p.seq_q);
                         p.seq_k = scale(p.seq_k);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::AttentionBackward { params, .. } => {
                         let mut p = *params;
@@ -3717,7 +3807,7 @@ impl WgpuExecutable {
                             p.seq_k = scale(p.seq_k);
                         }
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Rope { params } => {
                         // PLAN L1: scale `seq` and `n_total` proportionally.
@@ -3729,7 +3819,7 @@ impl WgpuExecutable {
                         p.seq = s_active;
                         p.n_total = p.batch * s_active * p.last_dim;
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Expand { params, .. } => {
                         // PLAN L1: same pattern as Transpose.
@@ -3740,49 +3830,49 @@ impl WgpuExecutable {
                             p.out_total = scaled_d0 * inner;
                         }
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Argmax { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Pool2d { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Conv2d { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Pool1d { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Pool3d { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Conv1d { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Conv3d { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::ScatterAdd { params } => {
                         // Two-phase: phase 0 zeros the FULL output (preserves
@@ -3793,60 +3883,73 @@ impl WgpuExecutable {
                             p.num_updates = scale(p.num_updates);
                         }
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::TopK { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::UmapKnn { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::GroupedMatmul { params } => {
                         let mut p = *params;
                         p.m = scale(p.m);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Sample { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::SelectiveScan { params } => {
                         // Predicate-gated to batch=1: scale seq.
                         let mut p = *params;
                         p.seq = scale(p.seq);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::DequantMatmul { params } => {
                         let mut p = *params;
                         p.m = scale(p.m);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::DequantMatmulGguf { .. }
                     | Step::DequantGroupedMatmulGguf { .. }
                     | Step::GatedDeltaNet { .. }
-                    | Step::Llada2GroupLimitedGate { .. } => {}
+                    | Step::Llada2GroupLimitedGate { .. }
+                    | Step::UmapKnnHost { .. } => {}
                     Step::FusedResidualLn { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::FusedResidualLnTee { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::FusedResidualRmsNorm { params } => {
+                        let mut p = *params;
+                        p.outer = scale(p.outer);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::MatmulQkv { params, coop: _ } => {
                         let mut p = *params;
                         p.m = scale(p.m);
                         dev.queue
-                            .write_buffer(&self.uniforms[i], 0, bytemuck::bytes_of(&p));
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     #[cfg(feature = "splat")]
                     Step::GaussianSplatRender { .. }
@@ -3854,6 +3957,7 @@ impl WgpuExecutable {
                     | Step::GaussianSplatPrepare { .. }
                     | Step::GaussianSplatRasterize { .. } => {}
                 }
+                gpu_ui += 1;
             }
             self.uniforms_active_extent = Some(active);
         }
@@ -3871,6 +3975,7 @@ impl WgpuExecutable {
         let ck = compare_kernel(&dev.device);
         let wk = where_kernel(&dev.device);
         let mut step_i = 0;
+        let mut gpu_bi = 0usize;
         while step_i < self.schedule.len() {
             let mut enc = dev
                 .device
@@ -3886,8 +3991,7 @@ impl WgpuExecutable {
                     if step_runs_on_host(&self.schedule[step_i]) {
                         break;
                     }
-                    let i = step_i;
-                    let step = &self.schedule[i];
+                    let step = &self.schedule[step_i];
                     // PLAN L3: per-step Perfetto trace span; no-op when
                     // env var RLX_TRACE_PERFETTO unset.
                     let _perf = rlx_ir::perfetto::TraceSpan::new(step_name(step), "wgpu");
@@ -3899,7 +4003,7 @@ impl WgpuExecutable {
                             // element; 64-thread workgroups.
                             if let Some(cast_k) = mm_cast {
                                 pass.set_pipeline(&cast_k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 let (gx, gy, gz) = dispatch_dims(params.len, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
@@ -3927,7 +4031,7 @@ impl WgpuExecutable {
                             if m_s == 0 {
                                 continue;
                             }
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             // Kernel selection priority:
                             //   1. compute_precision == F16 + b_is_param +
                             //      SHADER_F16 → matmul_f16_compute
@@ -3984,7 +4088,7 @@ impl WgpuExecutable {
                                 continue;
                             }
                             pass.set_pipeline(&bk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(n_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -3994,7 +4098,7 @@ impl WgpuExecutable {
                                 continue;
                             }
                             pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(n_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4004,7 +4108,7 @@ impl WgpuExecutable {
                                 continue;
                             }
                             pass.set_pipeline(&uk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(n_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4014,7 +4118,7 @@ impl WgpuExecutable {
                                 continue;
                             }
                             pass.set_pipeline(&wk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(n_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4025,7 +4129,7 @@ impl WgpuExecutable {
                             }
                             let rk = reduce_kernel(&dev.device);
                             pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4036,7 +4140,7 @@ impl WgpuExecutable {
                             }
                             let sk = softmax_kernel(&dev.device);
                             pass.set_pipeline(&sk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4047,7 +4151,7 @@ impl WgpuExecutable {
                             }
                             let lk = layernorm_kernel(&dev.device);
                             pass.set_pipeline(&lk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4058,7 +4162,7 @@ impl WgpuExecutable {
                             }
                             let rk = rms_norm_backward_kernel(&dev.device);
                             pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             pass.dispatch_workgroups(outer_s, 1, 1);
                         }
                         Step::RmsNormBackwardGamma { params }
@@ -4068,7 +4172,7 @@ impl WgpuExecutable {
                             }
                             let rk = rms_norm_backward_param_kernel(&dev.device);
                             pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             pass.dispatch_workgroups(1, 1, 1);
                         }
                         Step::CumsumBackward { params } => {
@@ -4078,7 +4182,7 @@ impl WgpuExecutable {
                             }
                             let ck = cumsum_backward_kernel(&dev.device);
                             pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4089,7 +4193,7 @@ impl WgpuExecutable {
                             }
                             let rk = rope_backward_kernel(&dev.device);
                             pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let total = params.batch * seq_s * params.hidden;
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
@@ -4103,13 +4207,13 @@ impl WgpuExecutable {
                             if total > 0 {
                                 let zk = gather_backward_zero_kernel(&dev.device);
                                 pass.set_pipeline(&zk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 let (gx, _, _) = dispatch_dims(total, 256);
                                 pass.dispatch_workgroups(gx, 1, 1);
                             }
                             let ak = gather_backward_acc_kernel(&dev.device);
                             pass.set_pipeline(&ak.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             pass.dispatch_workgroups(outer_s, 1, 1);
                         }
                         Step::Cumsum { params } => {
@@ -4119,7 +4223,7 @@ impl WgpuExecutable {
                             }
                             let ck2 = cumsum_kernel(&dev.device);
                             pass.set_pipeline(&ck2.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4132,7 +4236,7 @@ impl WgpuExecutable {
                             }
                             let ck = fft_kernel(&dev.device);
                             pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             pass.dispatch_workgroups(*outer, 1, 1);
                         }
                         Step::Copy { params } => {
@@ -4142,7 +4246,7 @@ impl WgpuExecutable {
                             }
                             let ck2 = copy_kernel(&dev.device);
                             pass.set_pipeline(&ck2.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(n_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4153,7 +4257,7 @@ impl WgpuExecutable {
                             }
                             let ek = elementwise_region_kernel(&dev.device);
                             pass.set_pipeline(&ek.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(len_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4173,7 +4277,7 @@ impl WgpuExecutable {
                             }
                             let tk = transpose_kernel(&dev.device);
                             pass.set_pipeline(&tk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(total_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4184,7 +4288,7 @@ impl WgpuExecutable {
                             }
                             let nk = narrow_kernel(&dev.device);
                             pass.set_pipeline(&nk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(total_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4195,7 +4299,7 @@ impl WgpuExecutable {
                             }
                             let cck = concat_kernel(&dev.device);
                             pass.set_pipeline(&cck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(total_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4206,7 +4310,7 @@ impl WgpuExecutable {
                             }
                             let gk = gather_kernel(&dev.device);
                             pass.set_pipeline(&gk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(n_out_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4217,7 +4321,7 @@ impl WgpuExecutable {
                             }
                             let gk = gather_axis_kernel(&dev.device);
                             pass.set_pipeline(&gk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(total_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4231,7 +4335,7 @@ impl WgpuExecutable {
                             }
                             let ak = attention_kernel(&dev.device);
                             pass.set_pipeline(&ak.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let total = params.batch * params.heads * seq_q_s;
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
@@ -4248,7 +4352,7 @@ impl WgpuExecutable {
                             }
                             let ak = attention_bwd_kernel(&dev.device);
                             pass.set_pipeline(&ak.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let total = params.batch * params.heads * axis_s;
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
@@ -4263,7 +4367,7 @@ impl WgpuExecutable {
                             }
                             let rk = rope_kernel(&dev.device);
                             pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(total_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4280,7 +4384,7 @@ impl WgpuExecutable {
                             }
                             let ek = expand_kernel(&dev.device);
                             pass.set_pipeline(&ek.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(total_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4291,7 +4395,7 @@ impl WgpuExecutable {
                             }
                             let amk = argmax_kernel(&dev.device);
                             pass.set_pipeline(&amk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4302,7 +4406,7 @@ impl WgpuExecutable {
                             }
                             let pk = pool2d_kernel(&dev.device);
                             pass.set_pipeline(&pk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let total = n_s * params.c * params.h_out * params.w_out;
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
@@ -4314,7 +4418,7 @@ impl WgpuExecutable {
                             }
                             let ck2 = conv2d_kernel(&dev.device);
                             pass.set_pipeline(&ck2.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let total = n_s * params.c_out * params.h_out * params.w_out;
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
@@ -4326,7 +4430,7 @@ impl WgpuExecutable {
                             }
                             let pk = pool1d_kernel(&dev.device);
                             pass.set_pipeline(&pk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let total = n_s * params.c * params.l_out;
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
@@ -4338,7 +4442,7 @@ impl WgpuExecutable {
                             }
                             let pk = pool3d_kernel(&dev.device);
                             pass.set_pipeline(&pk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let total = n_s * params.c * params.d_out * params.h_out * params.w_out;
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
@@ -4350,7 +4454,7 @@ impl WgpuExecutable {
                             }
                             let ck = conv1d_kernel(&dev.device);
                             pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let total = n_s * params.c_out * params.l_out;
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
@@ -4362,7 +4466,7 @@ impl WgpuExecutable {
                             }
                             let ck = conv3d_kernel(&dev.device);
                             pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let total =
                                 n_s * params.c_out * params.d_out * params.h_out * params.w_out;
                             let (gx, gy, gz) = dispatch_dims(total, 64);
@@ -4371,7 +4475,7 @@ impl WgpuExecutable {
                         Step::ScatterAdd { params } => {
                             let sk = scatter_add_kernel(&dev.device);
                             pass.set_pipeline(&sk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             // Phase 0 zeros the FULL output (preserves
                             // accumulator semantics). Phase 1 scatters first
                             // num_updates_active updates only; serial single
@@ -4391,8 +4495,19 @@ impl WgpuExecutable {
                             }
                             let tk = topk_kernel(&dev.device);
                             pass.set_pipeline(&tk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::UmapKnn { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let uk = umap_knn_kernel(&dev.device);
+                            pass.set_pipeline(&uk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
                         Step::GroupedMatmul { params } => {
@@ -4402,7 +4517,7 @@ impl WgpuExecutable {
                             }
                             let gk = grouped_matmul_kernel(&dev.device);
                             pass.set_pipeline(&gk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
                         }
                         Step::Sample { params } => {
@@ -4412,7 +4527,7 @@ impl WgpuExecutable {
                             }
                             let sk = sample_kernel(&dev.device);
                             pass.set_pipeline(&sk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4423,7 +4538,7 @@ impl WgpuExecutable {
                             // unaffected by seq scaling.
                             let ssk = selective_scan_kernel(&dev.device);
                             pass.set_pipeline(&ssk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let total = params.batch * params.hidden;
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
@@ -4435,7 +4550,7 @@ impl WgpuExecutable {
                             }
                             let dk = dequant_matmul_kernel(&dev.device);
                             pass.set_pipeline(&dk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
                         }
                         Step::FusedResidualLn { params } => {
@@ -4445,7 +4560,7 @@ impl WgpuExecutable {
                             }
                             let frk = fused_residual_ln_kernel(&dev.device);
                             pass.set_pipeline(&frk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4456,7 +4571,18 @@ impl WgpuExecutable {
                             }
                             let frtk = fused_residual_ln_tee_kernel(&dev.device);
                             pass.set_pipeline(&frtk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::FusedResidualRmsNorm { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let frk = fused_residual_rms_norm_kernel(&dev.device);
+                            pass.set_pipeline(&frk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
@@ -4475,19 +4601,21 @@ impl WgpuExecutable {
                                 &matmul_qkv_kernel(&dev.device).pipeline
                             };
                             pass.set_pipeline(pipe);
-                            pass.set_bind_group(0, &self.bind_groups[i], &[]);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             pass.dispatch_workgroups(params.n.div_ceil(32), m_s.div_ceil(32), 1);
                         }
                         Step::DequantMatmulGguf { .. }
                         | Step::DequantGroupedMatmulGguf { .. }
                         | Step::GatedDeltaNet { .. }
-                        | Step::Llada2GroupLimitedGate { .. } => {}
+                        | Step::Llada2GroupLimitedGate { .. }
+                        | Step::UmapKnnHost { .. } => {}
                         #[cfg(feature = "splat")]
                         Step::GaussianSplatRender { .. }
                         | Step::GaussianSplatRenderBackward { .. }
                         | Step::GaussianSplatPrepare { .. }
                         | Step::GaussianSplatRasterize { .. } => {}
                     }
+                    gpu_bi += 1;
                     step_i += 1;
                 }
             }
@@ -4593,6 +4721,22 @@ impl WgpuExecutable {
                         *out_byte_off as usize,
                         *n_elems as usize,
                         attrs,
+                    );
+                }
+                Step::UmapKnnHost {
+                    pairwise_byte_off,
+                    out_byte_off,
+                    n,
+                    k,
+                } => {
+                    crate::umap_knn_host::run_umap_knn(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *pairwise_byte_off as usize,
+                        *out_byte_off as usize,
+                        *n as usize,
+                        *k as usize,
                     );
                 }
                 #[cfg(feature = "splat")]

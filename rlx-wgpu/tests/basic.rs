@@ -787,6 +787,41 @@ fn fused_residual_ln_matches_unfused_reference() {
 }
 
 #[test]
+fn fused_residual_rms_norm_matches_unfused_reference() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    let mut g = Graph::new("frrms");
+    let x = g.input("x", Shape::new(&[2, 4], DType::F32));
+    let r = g.input("r", Shape::new(&[2, 4], DType::F32));
+    let ga = g.param("g", Shape::new(&[4], DType::F32));
+    let be = g.param("b", Shape::new(&[4], DType::F32));
+    let y = g.fused_residual_rms_norm(x, r, None, ga, be, 1e-5, Shape::new(&[2, 4], DType::F32));
+    g.set_outputs(vec![y]);
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("g", &[1.0, 1.0, 1.0, 1.0]);
+    exe.set_param("b", &[0.0, 0.0, 0.0, 0.0]);
+    let xv = vec![1.0, 2.0, 3.0, 4.0, 0.0, 1.0, 2.0, 3.0];
+    let rv = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+    let out = exe.run(&[("x", &xv), ("r", &rv)]);
+    let mut want = vec![0f32; 8];
+    for row in 0..2 {
+        let off = row * 4;
+        let s: Vec<f32> = (0..4).map(|i| xv[off + i] + rv[off + i]).collect();
+        let mean_sq = s.iter().map(|v| v * v).sum::<f32>() / 4.0;
+        let inv_rms = 1.0 / (mean_sq + 1e-5).sqrt();
+        for i in 0..4 {
+            want[off + i] = s[i] * inv_rms;
+        }
+    }
+    assert!(
+        close(&out[0], &want, 1e-3),
+        "FusedResidualRmsNorm mismatch: got {:?} want {want:?}",
+        out[0]
+    );
+}
+
+#[test]
 fn fused_swiglu_matches_unfused_reference() {
     if !rlx_wgpu::is_available() {
         return;

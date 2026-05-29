@@ -122,22 +122,15 @@ pub fn extract_subgraph(full: &Graph, segment_nodes: &[NodeId]) -> ExtractedSubg
 }
 
 fn can_lower_dequant_in_mps(
-    graph: &Graph,
-    node_id: NodeId,
-    params_as_constants: Option<&HashMap<String, Vec<u8>>>,
+    _graph: &Graph,
+    _node_id: NodeId,
+    _params_as_constants: Option<&HashMap<String, Vec<u8>>>,
 ) -> bool {
-    let Some(params) = params_as_constants else {
-        return false;
-    };
-    let node = graph.node(node_id);
-    let Op::DequantMatMul { .. } = &node.op else {
-        return false;
-    };
-    let w_id = node.inputs[1];
-    let Op::Param { name } = &graph.node(w_id).op else {
-        return false;
-    };
-    params.contains_key(name)
+    // Never lower GGUF packed weights through MPSGraph: `mps_graph_lower` only
+    // supports pre-dequantized F32 (`w_bytes.len() == k*n*4`), not K-quant U8.
+    // Packed `Op::DequantMatMul` must use `Thunk::DequantMatMulGguf` (fused MSL
+    // dequant+matmul on Metal when enabled).
+    false
 }
 
 /// Build a hybrid plan when whole-graph lowering fails (typical Qwen3.5 decode).

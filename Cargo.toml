@@ -57,6 +57,7 @@ members = [
     "rlx-fdm",         # Force density method — pin-jointed form-finding (jax_fdm port)
     "rlx-rl",          # Flow-map policies + FMQ / QGBS (offline-to-online RL)
     "rlx-bbo",         # Black-box + trust-region Q-guidance / QGBS (domain-agnostic f64)
+    "rlx-umap",        # UMAP / fast-umap custom ops (k-NN from pairwise distances, …)
 
     # Benchmark framework (PLAN L5)
     "rlx-bench",       # BenchmarkPattern + per-backend timing harness
