@@ -1464,32 +1464,25 @@ pub enum Op {
 
     /// 1D Fast Fourier Transform along the last axis.
     ///
-    /// Convention: complex tensors are represented as 2N real-block
-    /// — the input shape is `[..., 2N]` along the last axis, with
-    /// the first N elements the real part and the second N the
-    /// imaginary part. Output shape matches the input. Last axis
-    /// length must be even (and a power of 2 for the v1 radix-2
-    /// kernel; other sizes will eventually go through mixed-radix).
+    /// **Layouts**
+    /// - `F32` / `F64`: 2N real-block — last axis is `[re₀…re_{N-1}, im₀…im_{N-1}]`.
+    /// - `C64`: interleaved `[re, im]` pairs per complex element along the last axis.
     ///
-    /// Both forward and inverse are **unnormalized** (no 1/N scale):
+    /// **ND transforms** — use `Graph::fftn` / `Graph::ifftn`, which compose
+    /// `fft_axis` (transpose → Fft → transpose). Multi-axis `fftn` requires
+    /// `DType::C64`; the 2N-block layout describes a single complex axis.
+    ///
+    /// Default (`FftNorm::Backward`) is **unnormalized** on both directions:
     ///   `fft(x)[k] = Σ x[n]·exp(-2πi·nk/N)`
     ///   `ifft(y)[n] = Σ y[k]·exp(+2πi·nk/N)`
-    /// so `ifft(fft(x)) = N·x`. Users dividing by N for round-trip
-    /// identity matches numpy's `fft.fft` / `fft.ifft·N` convention.
+    /// so `ifft(fft(x)) = N·x`. Use `FftNorm::Forward` for gpu-fft-style
+    /// `1/N` scaling on inverse, or `FftNorm::Ortho` for unitary scaling.
     ///
-    /// The unnormalized choice keeps both AD rules free of scaling:
-    ///   * reverse-mode VJP: `VJP(fft) = ifft`, `VJP(ifft) = fft`
-    ///     (transpose of the DFT matrix over the 2N-real-block view
-    ///     equals the unnormalized inverse).
-    ///   * forward-mode JVP: same op, same direction — FFT is linear,
-    ///     so the JVP is the linear map itself, not its transpose.
-    ///
-    /// CPU paths exist for both `DType::F32` and `DType::F64` on the
-    /// 2N-real-block layout. Native `DType::C64` and non-power-of-two
-    /// sizes (Bluestein / mixed-radix) are not implemented; ND FFT
-    /// and non-CPU backend lowerings are deferred.
+    /// AD: VJP(`fft`) = `ifft`, VJP(`ifft`) = `fft` when `norm=Backward`;
+    /// other norms apply the chain rule via output scaling.
     Fft {
         inverse: bool,
+        norm: crate::fft::FftNorm,
     },
 
     /// User-defined sub-graph with optional override AD rules.
@@ -2232,7 +2225,9 @@ impl std::fmt::Display for Op {
                 let j = if jvp_body.is_some() { ",jvp" } else { "" };
                 write!(f, "custom_fn(in={num_inputs}{v}{j})")
             }
-            Op::Fft { inverse } => write!(f, "fft(inverse={inverse})"),
+            Op::Fft { inverse, norm } => {
+                write!(f, "fft(inverse={inverse}, norm={norm:?})")
+            }
         }
     }
 }

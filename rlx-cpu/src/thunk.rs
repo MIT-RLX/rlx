@@ -1617,6 +1617,7 @@ pub enum Thunk {
         outer: u32,
         n_complex: u32,
         inverse: bool,
+        norm_tag: u32,
         dtype: rlx_ir::DType,
     },
 }
@@ -5091,30 +5092,24 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                 }
             }
 
-            Op::Fft { inverse } => {
-                // Last axis carries the 2N real-block layout; complex
-                // points = N = last_dim / 2. `outer` is the product
-                // of all preceding axes — the kernel iterates one
-                // batch-row at a time. f32 and f64 share the same
-                // radix-2 structure but use separate scratch buffers;
-                // the dtype is captured here so the closure dispatches
-                // without per-row branching.
+            Op::Fft { inverse, norm } => {
                 let shape = &node.shape;
-                let last = shape.dim(shape.rank() - 1).unwrap_static();
-                let n_complex = (last / 2) as u32;
-                let total = shape.num_elements().unwrap_or(0);
-                let outer = (total / last) as u32;
+                let meta = rlx_ir::fft::fft_meta(shape);
                 let dtype = shape.dtype();
                 assert!(
-                    matches!(dtype, rlx_ir::DType::F32 | rlx_ir::DType::F64),
-                    "Op::Fft on CPU requires F32 or F64, got {dtype:?}"
+                    matches!(
+                        dtype,
+                        rlx_ir::DType::F32 | rlx_ir::DType::F64 | rlx_ir::DType::C64
+                    ),
+                    "Op::Fft on CPU requires F32, F64, or C64, got {dtype:?}"
                 );
                 Thunk::Fft1d {
                     src: node_offset(arena, node.inputs[0]),
                     dst: node_offset(arena, node.id),
-                    outer,
-                    n_complex,
+                    outer: meta.outer as u32,
+                    n_complex: meta.n_complex as u32,
                     inverse: *inverse,
+                    norm_tag: norm.tag(),
                     dtype,
                 }
             }
@@ -6154,6 +6149,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     outer,
                     n_complex,
                     inverse,
+                    norm_tag,
                     dtype,
                 } => {
                     let f: Arc<dyn Fn(*mut u8) + Send + Sync> = match dtype {
@@ -6164,6 +6160,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                                 outer as usize,
                                 n_complex as usize,
                                 inverse,
+                                norm_tag,
                                 base,
                             );
                         }),
@@ -6174,10 +6171,22 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                                 outer as usize,
                                 n_complex as usize,
                                 inverse,
+                                norm_tag,
                                 base,
                             );
                         }),
-                        other => panic!("Op::Fft on CPU requires F32/F64, got {other:?}"),
+                        rlx_ir::DType::C64 => Arc::new(move |base: *mut u8| unsafe {
+                            execute_fft1d_c64(
+                                src,
+                                dst,
+                                outer as usize,
+                                n_complex as usize,
+                                inverse,
+                                norm_tag,
+                                base,
+                            );
+                        }),
+                        other => panic!("Op::Fft on CPU requires F32/F64/C64, got {other:?}"),
                     };
                     f
                 }
@@ -7262,6 +7271,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 outer,
                 n_complex,
                 inverse,
+                norm_tag,
                 dtype,
             } => unsafe {
                 match dtype {
@@ -7271,6 +7281,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         *outer as usize,
                         *n_complex as usize,
                         *inverse,
+                        *norm_tag,
                         base,
                     ),
                     rlx_ir::DType::F32 => execute_fft1d_f32(
@@ -7279,9 +7290,19 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         *outer as usize,
                         *n_complex as usize,
                         *inverse,
+                        *norm_tag,
                         base,
                     ),
-                    other => panic!("Op::Fft on CPU requires F32/F64, got {other:?}"),
+                    rlx_ir::DType::C64 => execute_fft1d_c64(
+                        *src,
+                        *dst,
+                        *outer as usize,
+                        *n_complex as usize,
+                        *inverse,
+                        *norm_tag,
+                        base,
+                    ),
+                    other => panic!("Op::Fft on CPU requires F32/F64/C64, got {other:?}"),
                 }
             },
 
@@ -12510,14 +12531,17 @@ pub unsafe fn execute_fft1d_f64(
     outer: usize,
     n_complex: usize,
     inverse: bool,
+    norm_tag: u32,
     base: *mut u8,
 ) {
     let row_elems = 2 * n_complex;
     let mut re = vec![0f64; n_complex];
     let mut im = vec![0f64; n_complex];
+    let norm = rlx_ir::fft::FftNorm::from_tag(norm_tag);
+    let scale = norm.output_scale(n_complex, inverse);
     // Scratch reused across rows for the Bluestein path. Empty when
     // we're on the radix-2 fast path.
-    let mut scratch = if n_complex.is_power_of_two() {
+    let mut scratch = if n_complex.is_power_of_two() || n_complex <= 16 {
         BluesteinScratchF64::empty()
     } else {
         BluesteinScratchF64::build(n_complex, inverse)
@@ -12529,8 +12553,14 @@ pub unsafe fn execute_fft1d_f64(
         im.copy_from_slice(&s[n_complex..]);
         if n_complex.is_power_of_two() {
             fft_radix2_inplace_f64(&mut re, &mut im, inverse);
+        } else if n_complex <= 16 {
+            fft_naive_inplace_f64(&mut re, &mut im, inverse);
         } else {
             fft_bluestein_inplace_f64(&mut re, &mut im, inverse, &mut scratch);
+        }
+        if scale != 1.0 {
+            re.iter_mut().for_each(|v| *v *= scale);
+            im.iter_mut().for_each(|v| *v *= scale);
         }
         let dst_offset = dst + o * row_elems * std::mem::size_of::<f64>();
         let d = unsafe { sl_mut_f64(dst_offset, base, row_elems) };
@@ -13265,12 +13295,15 @@ pub unsafe fn execute_fft1d_f32(
     outer: usize,
     n_complex: usize,
     inverse: bool,
+    norm_tag: u32,
     base: *mut u8,
 ) {
     let row_elems = 2 * n_complex;
     let mut re = vec![0f32; n_complex];
     let mut im = vec![0f32; n_complex];
-    let mut scratch = if n_complex.is_power_of_two() {
+    let norm = rlx_ir::fft::FftNorm::from_tag(norm_tag);
+    let scale = norm.output_scale(n_complex, inverse) as f32;
+    let mut scratch = if n_complex.is_power_of_two() || n_complex <= 16 {
         BluesteinScratchF32::empty()
     } else {
         BluesteinScratchF32::build(n_complex, inverse)
@@ -13282,13 +13315,105 @@ pub unsafe fn execute_fft1d_f32(
         im.copy_from_slice(&s[n_complex..]);
         if n_complex.is_power_of_two() {
             fft_radix2_inplace_f32(&mut re, &mut im, inverse);
+        } else if n_complex <= 16 {
+            fft_naive_inplace_f32(&mut re, &mut im, inverse);
         } else {
             fft_bluestein_inplace_f32(&mut re, &mut im, inverse, &mut scratch);
+        }
+        if scale != 1.0 {
+            re.iter_mut().for_each(|v| *v *= scale);
+            im.iter_mut().for_each(|v| *v *= scale);
         }
         let dst_offset = dst + o * row_elems * std::mem::size_of::<f32>();
         let d = unsafe { sl_mut(dst_offset, base, row_elems) };
         d[..n_complex].copy_from_slice(&re);
         d[n_complex..].copy_from_slice(&im);
+    }
+}
+
+/// C64 interleaved layout: each complex element is `[re: f32, im: f32]`.
+pub unsafe fn execute_fft1d_c64(
+    src: usize,
+    dst: usize,
+    outer: usize,
+    n_complex: usize,
+    inverse: bool,
+    norm_tag: u32,
+    base: *mut u8,
+) {
+    let row_bytes = n_complex * 8;
+    let mut re = vec![0f32; n_complex];
+    let mut im = vec![0f32; n_complex];
+    let norm = rlx_ir::fft::FftNorm::from_tag(norm_tag);
+    let scale = norm.output_scale(n_complex, inverse) as f32;
+    let mut scratch = if n_complex.is_power_of_two() || n_complex <= 16 {
+        BluesteinScratchF32::empty()
+    } else {
+        BluesteinScratchF32::build(n_complex, inverse)
+    };
+    for o in 0..outer {
+        let row_offset = src + o * row_bytes;
+        for i in 0..n_complex {
+            let elem_off = row_offset + i * 8;
+            re[i] = f32::from_le_bytes([
+                *base.add(elem_off),
+                *base.add(elem_off + 1),
+                *base.add(elem_off + 2),
+                *base.add(elem_off + 3),
+            ]);
+            im[i] = f32::from_le_bytes([
+                *base.add(elem_off + 4),
+                *base.add(elem_off + 5),
+                *base.add(elem_off + 6),
+                *base.add(elem_off + 7),
+            ]);
+        }
+        if n_complex.is_power_of_two() {
+            fft_radix2_inplace_f32(&mut re, &mut im, inverse);
+        } else if n_complex <= 16 {
+            fft_naive_inplace_f32(&mut re, &mut im, inverse);
+        } else {
+            fft_bluestein_inplace_f32(&mut re, &mut im, inverse, &mut scratch);
+        }
+        if scale != 1.0 {
+            re.iter_mut().for_each(|v| *v *= scale);
+            im.iter_mut().for_each(|v| *v *= scale);
+        }
+        let dst_row = dst + o * row_bytes;
+        for i in 0..n_complex {
+            let elem_off = dst_row + i * 8;
+            let re_b = re[i].to_le_bytes();
+            let im_b = im[i].to_le_bytes();
+            for j in 0..4 {
+                *base.add(elem_off + j) = re_b[j];
+                *base.add(elem_off + 4 + j) = im_b[j];
+            }
+        }
+    }
+}
+
+/// Dtype-dispatching host entry for `Op::Fft` (shared by GPU host fallbacks).
+pub unsafe fn execute_fft1d(
+    src: usize,
+    dst: usize,
+    outer: usize,
+    n_complex: usize,
+    inverse: bool,
+    norm_tag: u32,
+    dtype: rlx_ir::DType,
+    base: *mut u8,
+) {
+    match dtype {
+        rlx_ir::DType::F32 => {
+            execute_fft1d_f32(src, dst, outer, n_complex, inverse, norm_tag, base)
+        }
+        rlx_ir::DType::F64 => {
+            execute_fft1d_f64(src, dst, outer, n_complex, inverse, norm_tag, base)
+        }
+        rlx_ir::DType::C64 => {
+            execute_fft1d_c64(src, dst, outer, n_complex, inverse, norm_tag, base)
+        }
+        other => panic!("execute_fft1d: unsupported dtype {other:?}"),
     }
 }
 
@@ -13499,6 +13624,49 @@ impl BluesteinScratchF64 {
             ai: vec![0.0_f64; m],
         }
     }
+}
+
+/// Direct O(N²) DFT for small non-pow2 N (faster than Bluestein setup).
+fn fft_naive_inplace_f64(re: &mut [f64], im: &mut [f64], inverse: bool) {
+    let n = re.len();
+    if n <= 1 {
+        return;
+    }
+    let sign = if inverse { 1.0 } else { -1.0 };
+    let mut out_re = vec![0.0_f64; n];
+    let mut out_im = vec![0.0_f64; n];
+    for k in 0..n {
+        for nn in 0..n {
+            let theta = sign * 2.0 * std::f64::consts::PI * (nn as f64) * (k as f64) / (n as f64);
+            let c = theta.cos();
+            let s = theta.sin();
+            out_re[k] += re[nn] * c - im[nn] * s;
+            out_im[k] += re[nn] * s + im[nn] * c;
+        }
+    }
+    re.copy_from_slice(&out_re);
+    im.copy_from_slice(&out_im);
+}
+
+fn fft_naive_inplace_f32(re: &mut [f32], im: &mut [f32], inverse: bool) {
+    let n = re.len();
+    if n <= 1 {
+        return;
+    }
+    let sign = if inverse { 1.0f32 } else { -1.0f32 };
+    let mut out_re = vec![0.0_f32; n];
+    let mut out_im = vec![0.0_f32; n];
+    for k in 0..n {
+        for nn in 0..n {
+            let theta = sign * 2.0 * std::f32::consts::PI * (nn as f32) * (k as f32) / (n as f32);
+            let c = theta.cos();
+            let s = theta.sin();
+            out_re[k] += re[nn] * c - im[nn] * s;
+            out_im[k] += re[nn] * s + im[nn] * c;
+        }
+    }
+    re.copy_from_slice(&out_re);
+    im.copy_from_slice(&out_im);
 }
 
 /// Bluestein (chirp-z) FFT for arbitrary N. Identity used:

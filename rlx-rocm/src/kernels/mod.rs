@@ -203,6 +203,21 @@ kernel_cache!(
     "elementwise_region"
 );
 kernel_cache!(
+    FFT_RADIX2_FULL,
+    fft_radix2_full_kernel,
+    FFT_CU,
+    "fft_radix2_full"
+);
+kernel_cache!(
+    FFT_BIT_REVERSE,
+    fft_bit_reverse_kernel,
+    FFT_CU,
+    "fft_bit_reverse"
+);
+kernel_cache!(FFT_INNER, fft_inner_kernel, FFT_CU, "fft_inner");
+kernel_cache!(FFT_OUTER_R4, fft_outer_r4_kernel, FFT_CU, "fft_outer_r4");
+kernel_cache!(FFT_OUTER_R2, fft_outer_r2_kernel, FFT_CU, "fft_outer_r2");
+kernel_cache!(
     GAUSSIAN_SPLAT_RASTERIZE,
     gaussian_splat_rasterize_kernel,
     GAUSSIAN_SPLAT_RASTERIZE_CU,
@@ -265,4 +280,9 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = conv2d_kernel(ctx);
     let _ = conv3d_kernel(ctx);
     let _ = elementwise_region_kernel(ctx);
+    let _ = fft_radix2_full_kernel(ctx);
+    let _ = fft_bit_reverse_kernel(ctx);
+    let _ = fft_inner_kernel(ctx);
+    let _ = fft_outer_r4_kernel(ctx);
+    let _ = fft_outer_r2_kernel(ctx);
 }

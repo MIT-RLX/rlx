@@ -123,9 +123,8 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 
 #[test]
 fn fft_metal_native_kernel_f32_pow2_matches_cpu() {
-    // f32 + power-of-two + N ≤ 2048 → native MSL `fft_radix2_f32`
-    // kernel runs. Compare against CPU reference at f32 tolerance.
-    for &n in &[2usize, 4, 8, 16, 64, 256, 1024, 2048] {
+    // f32 + power-of-two → native multi-kernel MSL path (any N≥2).
+    for &n in &[2usize, 4, 8, 16, 64, 256, 1024, 2048, 4096] {
         let mut re: Vec<f32> = Vec::with_capacity(n);
         let mut im: Vec<f32> = Vec::with_capacity(n);
         for i in 0..n {

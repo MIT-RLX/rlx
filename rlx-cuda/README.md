@@ -25,7 +25,7 @@ the loader path. The crate is feature-gated in `rlx-runtime`:
 
 ```toml
 [dependencies]
-rlx = { version = "0.1", features = ["cuda"] }
+rlx = { version = "0.2", features = ["cuda"] }
 ```
 
 ## Mac-side iteration
@@ -67,6 +67,9 @@ self-hosted Linux box.
 - `kernels/mod.rs` — NVRTC compile + module/function loader.
 - `backend.rs` — `CudaExecutable`. Full IR coverage via the dispatch
   tier ladder below.
+- **FFT** — `fft_dispatch.rs` runs the shared `rlx-gpu-kernels` FFT plan
+  on pow-2 f32; `fft_host.rs` handles partial sync for other shapes/dtypes.
+  Multi-stage row copies use a dtod copy kernel (no D2H/H2D staging).
 
 ## Matmul dispatch tier decision tree
 

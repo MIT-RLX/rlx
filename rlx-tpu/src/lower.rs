@@ -553,6 +553,8 @@ impl<'a> LowerCtx<'a> {
                 self.lower_cumsum(n.inputs[0], *axis, *exclusive, out_shape)
             }
 
+            Op::Fft { inverse, norm } => self.lower_fft(n.inputs[0], *inverse, *norm, out_shape),
+
             Op::Conv {
                 kernel_size,
                 stride,
@@ -710,10 +712,9 @@ impl<'a> LowerCtx<'a> {
             | Op::ScanBackward { .. }
             | Op::ScanBackwardXs { .. }
             | Op::BatchedDenseSolve
-            | Op::CustomFn { .. }
-            | Op::Fft { .. } => panic!(
+            | Op::CustomFn { .. } => panic!(
                 "rlx-tpu: Op::Scan / Scan-backward / BatchedDenseSolve / \
-                 CustomFn / Fft have no TPU lowering yet — use Device::Cpu.",
+                 CustomFn have no TPU lowering yet — use Device::Cpu.",
             ),
 
             Op::GaussianSplatRender { .. } | Op::GaussianSplatRenderBackward { .. } => panic!(
@@ -1650,6 +1651,85 @@ impl<'a> LowerCtx<'a> {
         let x2c = self.entry.binary("multiply", x2, cos_b, half_shape.clone());
         let r2 = self.entry.binary("add", x1s, x2c, half_shape);
         self.entry.concat(&[r1, r2], last as i64, out)
+    }
+
+    // ── FFT ────────────────────────────────────────────────────
+
+    fn lower_fft(
+        &mut self,
+        x_id: NodeId,
+        inverse: bool,
+        norm: rlx_ir::fft::FftNorm,
+        out: Shape,
+    ) -> i64 {
+        let x = self.hlo(x_id);
+        let dtype = self.dtype(x_id);
+        let prim_ty = prim_of(dtype);
+        match dtype {
+            DType::F32 | DType::F64 => {}
+            DType::C64 => {
+                let dims = self.ir_shape_dims(x_id);
+                let rank = dims.len();
+                assert!(rank >= 1);
+                let n = dims[rank - 1];
+                let ax = (rank - 1) as i64;
+                let fft_type = if inverse { 1 } else { 0 };
+                let out_shape = out.clone();
+                let y = self.entry.fft(x, fft_type, &[n], &[ax], out_shape.clone());
+                if norm.output_scale(n as usize, inverse) != 1.0 {
+                    let scale = norm.output_scale(n as usize, inverse) as f32;
+                    let s = self.const_scalar_f32(scale);
+                    return self.entry.binary("multiply", y, s, out_shape);
+                }
+                return y;
+            }
+            other => panic!("rlx-tpu: Op::Fft unsupported dtype {other:?}"),
+        }
+        let dims = self.ir_shape_dims(x_id);
+        let rank = dims.len();
+        assert!(rank >= 1, "rlx-tpu: Op::Fft input must have rank >= 1");
+        let last = dims[rank - 1];
+        assert!(
+            last % 2 == 0,
+            "rlx-tpu: Op::Fft last axis {last} must be even (2N real-block layout)"
+        );
+        let n = last / 2;
+        let ax = (rank - 1) as i64;
+
+        let mut prefix = dims.clone();
+        prefix.pop();
+        prefix.push(n);
+        let plane = Shape::array(prim_ty, &prefix);
+        let cx_ty = Shape::tuple(vec![plane.clone(), plane.clone()]);
+
+        let starts0 = vec![0i64; rank];
+        let mut limit_re = dims.clone();
+        limit_re[rank - 1] = n;
+        let re = self
+            .entry
+            .slice(x, &starts0, &limit_re, &vec![1i64; rank], plane.clone());
+
+        let mut start_im = vec![0i64; rank];
+        start_im[rank - 1] = n;
+        let im = self
+            .entry
+            .slice(x, &start_im, &dims, &vec![1i64; rank], plane.clone());
+
+        let cx = self.entry.tuple(&[re, im], cx_ty.clone());
+        let fft_type = if inverse { 1 } else { 0 };
+        let y = self.entry.fft(cx, fft_type, &[n], &[ax], cx_ty);
+        let mut y_re = self.entry.get_tuple_element(y, 0, plane.clone());
+        let mut y_im = self.entry.get_tuple_element(y, 1, plane.clone());
+        let scale = norm.output_scale(n as usize, inverse);
+        if scale != 1.0 {
+            let mut s = self.const_scalar_f32(scale as f32);
+            if dtype == DType::F64 {
+                s = self.entry.convert(s, Shape::scalar(prim_ty));
+            }
+            y_re = self.entry.binary("multiply", y_re, s, plane.clone());
+            y_im = self.entry.binary("multiply", y_im, s, plane.clone());
+        }
+        self.entry.concat(&[y_re, y_im], ax, out)
     }
 
     // ── Gather ─────────────────────────────────────────────────

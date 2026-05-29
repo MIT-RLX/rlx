@@ -40,6 +40,8 @@ A host-side HIP-CPU shim is bundled for off-GPU validation; see
   HIP API + 7 hipRTC functions we need at runtime so the crate
   compiles + tests cleanly on hosts without HIP installed.
   `HipRuntime::load()` returns `None` cleanly on missing libs.
+* **FFT** — same `rlx-gpu-kernels/fft.cu` plan as CUDA; `fft_host.rs`
+  for partial sync on non-native shapes/dtypes.
 * **`HipBuffer<T>` / `HipKernel`** wrapper types matching cudarc's
   `CudaSlice<T>` / `CudaKernel` shape: owned device memory with
   RAII `hipFree` on drop, kernel modules with `hipModuleUnload`.

@@ -27,6 +27,27 @@ use rlx_ir::{Graph, NodeId};
 use rlx_opt::memory::MemoryPlan;
 use std::collections::HashMap;
 
+/// Byte end (exclusive) of an f16 shadow write for a slot starting at
+/// `f32_byte_offset` with `f32_byte_len` bytes of f32 payload.
+/// wgpu requires `queue.write_buffer` sizes to be 4-byte aligned; odd
+/// f16 element counts are zero-padded by two bytes in `write_f32`.
+fn f16_shadow_write_end(f32_byte_offset: usize, f32_byte_len: usize) -> usize {
+    let f16_off = f32_byte_offset / 2;
+    let f16_bytes = (f32_byte_len / 4) * 2;
+    let padded = (f16_bytes + 3) & !3;
+    f16_off + padded
+}
+
+/// Size the f16 side buffer so every planned slot's padded upload fits.
+fn f16_shadow_arena_size(plan: &MemoryPlan) -> usize {
+    plan.assignments
+        .values()
+        .map(|a| f16_shadow_write_end(a.offset, a.size))
+        .max()
+        .unwrap_or(0)
+        .max(1)
+}
+
 /// One contiguous arena buffer + per-node byte offsets. Lives for the
 /// entire executable graph's lifetime.
 pub struct Arena {
@@ -51,9 +72,9 @@ pub struct Arena {
 }
 
 /// Plan memory using f32-sized slots regardless of declared IR dtype,
-/// with liveness-aware slot reuse (see `rlx_opt::memory::plan_memory_f32_uniform`).
+/// with liveness-aware slot reuse (see `rlx_compile::memory::plan_memory_f32_uniform`).
 pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
-    rlx_opt::memory::plan_memory_f32_uniform(graph, align)
+    rlx_compile::memory::plan_memory_f32_uniform(graph, align)
 }
 
 impl Arena {
@@ -86,10 +107,13 @@ impl Arena {
         });
         // Mirror f16 shadow buffer: half the byte size since each f32
         // slot maps to an f16 slot at the same logical element index.
+        // Add per-slot COPY_BUFFER_ALIGNMENT padding (see
+        // `f16_shadow_write_end`).
         let f16_buffer = if device.features().contains(wgpu::Features::SHADER_F16) {
+            let f16_size = f16_shadow_arena_size(plan);
             Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rlx-wgpu arena f16"),
-                size: size.div_ceil(2) as u64, // bytes — each f32 slot = 2 f16 bytes
+                size: f16_size as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }))
@@ -243,5 +267,34 @@ impl Arena {
             return;
         }
         queue.write_buffer(&self.buffer, byte_off as u64, data);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlx_ir::NodeId;
+    use rlx_opt::memory::{BufferSlot, MemoryPlan};
+    use std::collections::HashMap;
+
+    #[test]
+    fn f16_shadow_arena_accounts_for_copy_alignment_padding() {
+        // Three f32 elements → six f16 bytes, padded to eight for wgpu
+        // COPY_BUFFER_ALIGNMENT. The old `arena_size / 2` sizing was two
+        // bytes short at this slot boundary.
+        let mut assignments = HashMap::new();
+        assignments.insert(
+            NodeId(0),
+            BufferSlot {
+                offset: 32,
+                size: 12,
+            },
+        );
+        let plan = MemoryPlan {
+            arena_size: 44,
+            assignments,
+            schedule: vec![],
+        };
+        assert_eq!(f16_shadow_arena_size(&plan), 24);
     }
 }

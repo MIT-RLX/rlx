@@ -29,10 +29,12 @@
 #     just-uploaded version appears. Until that happens, the next
 #     crate's `cargo publish` would either 404 on dep resolution or
 #     get stale metadata.
-#   * Skip published: before each upload, check the sparse index for
-#     the workspace version; if it is already there, skip (no
-#     `cargo publish`, no rate-limit sleep). Use `--no-skip-published`
-#     to force an upload attempt anyway.
+#   * Skip published: before each upload, resolve that crate's effective
+#     version from its Cargo.toml (`version = "…"` or
+#     `version.workspace = true` → workspace.package). Skip only when
+#     *that* version is already on the sparse index — so a crate bumped
+#     to 0.2.2 is still published even when 0.2.1 is on crates.io.
+#     Use `--no-skip-published` to force an upload attempt anyway.
 #   * Registry HTTP errors (429, 408, 5xx, timeouts): parse cargo output as
 #     it finishes, sleep until crates.io's "try again after <GMT>" when
 #     present (+ pad), else status-specific backoff — then retry the same
@@ -64,7 +66,8 @@
 # Usage:
 #
 #   scripts/publish.sh --dry-run                    # safe — no upload
-#   scripts/publish.sh --list                       # print tier order, exit
+#   scripts/publish.sh --list                       # tier order + per-crate versions
+#   scripts/publish.sh --plan                       # crates needing publish only
 #   scripts/publish.sh --no-gate                    # skip fmt/clippy/test
 #   scripts/publish.sh --yes                        # skip confirm prompt
 #   scripts/publish.sh --start-tier 3               # resume from tier 3
@@ -107,6 +110,7 @@ set -euo pipefail
 
 DRY_RUN=0
 LIST_ONLY=0
+PLAN_ONLY=0
 NO_GATE=0
 NO_VERIFY=0
 NO_POLL=0
@@ -144,8 +148,8 @@ TIERS=(
     "rlx-cpu rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-tpu rlx-fpga"
     "rlx-splat"
     "rlx-metal"
-    "rlx-sparse rlx-linalg"
     "rlx-runtime"
+    "rlx-sparse rlx-linalg rlx-umap"
     "rlx-fdm rlx-bench"
     "rlx-rl"
     "rlx"
@@ -160,6 +164,7 @@ while (( $# > 0 )); do
     case "$1" in
         --dry-run)        DRY_RUN=1; shift ;;
         --list)           LIST_ONLY=1; shift ;;
+        --plan)           PLAN_ONLY=1; shift ;;
         --no-gate)        NO_GATE=1; shift ;;
         --no-verify)      NO_VERIFY=1; shift ;;
         --no-poll)        NO_POLL=1; shift ;;
@@ -187,7 +192,11 @@ done
 
 cd "$(dirname "$0")/.."
 
-# Fail fast if TIERS drift from [workspace] members (needs `jq`).
+red()    { printf "\033[31m%s\033[0m\n" "$*"; }
+green()  { printf "\033[32m%s\033[0m\n" "$*"; }
+yellow() { printf "\033[33m%s\033[0m\n" "$*"; }
+bold()   { printf "\033[1m%s\033[0m\n" "$*"; }
+
 validate_tier_coverage() {
     local -a listed=() missing=() extra=()
     local name tier c s
@@ -349,18 +358,124 @@ if [[ -z "$WORKSPACE_VERSION" ]]; then
     exit 1
 fi
 
-red()    { printf "\033[31m%s\033[0m\n" "$*"; }
-green()  { printf "\033[32m%s\033[0m\n" "$*"; }
-yellow() { printf "\033[33m%s\033[0m\n" "$*"; }
-bold()   { printf "\033[1m%s\033[0m\n" "$*"; }
+# ── Sparse-index helpers (needed for per-crate skip/plan checks) ─
+sparse_index_path() {
+    local name="$1"
+    local n="${#name}"
+    if   (( n == 1 )); then printf '1/%s\n'     "$name"
+    elif (( n == 2 )); then printf '2/%s\n'     "$name"
+    elif (( n == 3 )); then printf '3/%s/%s\n'  "${name:0:1}" "$name"
+    else                    printf '%s/%s/%s\n' "${name:0:2}" "${name:2:2}" "$name"
+    fi
+}
+
+# Returns 0 if the sparse index serves <version> for <crate>, 1 if
+# the version isn't there yet, or 2 if the crate itself isn't in the
+# index at all (pre-first-publish — perfectly fine, just means we
+# should keep polling).
+check_index() {
+    local crate="$1"
+    local version="$2"
+    local url="https://index.crates.io/$(sparse_index_path "$crate")"
+    local body
+    body="$(curl -fsS --max-time 10 "$url" 2>/dev/null || true)"
+    if [[ -z "$body" ]]; then
+        return 2
+    fi
+    if printf '%s' "$body" | grep -Fq "\"vers\":\"$version\""; then
+        return 0
+    fi
+    return 1
+}
+
+# Returns 0 if <crate>@<version> is already on the sparse index.
+version_on_crates_io() {
+    check_index "$1" "$2"
+}
+
+# Per-crate effective publish versions (explicit `version =` or workspace default).
+CRATE_VERSIONS_FILE=""
+
+load_crate_versions() {
+    local all_crates="" tier c
+    for tier in "${TIERS[@]}"; do
+        for c in $tier; do
+            all_crates+="$c "
+        done
+    done
+
+    CRATE_VERSIONS_FILE="$(mktemp)"
+    python3 - "$PWD" "$WORKSPACE_VERSION" "$all_crates" <<'PY' > "$CRATE_VERSIONS_FILE"
+import re, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+workspace_version = sys.argv[2]
+crates = sys.argv[3].split()
+
+def effective_version(crate: str) -> str:
+    toml = root / crate / "Cargo.toml"
+    if not toml.is_file():
+        raise SystemExit(f"could not find Cargo.toml for {crate}")
+    text = toml.read_text()
+    if re.search(r"^version\.workspace\s*=\s*true", text, re.M):
+        return workspace_version
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    if m:
+        return m.group(1)
+    raise SystemExit(f"could not parse version in {toml}")
+
+for crate in crates:
+    print(f"{crate}\t{effective_version(crate)}")
+PY
+}
+
+crate_version() {
+    local crate="$1"
+    local ver
+    ver="$(awk -F'\t' -v c="$crate" '$1 == c { print $2; exit }' "$CRATE_VERSIONS_FILE")"
+    if [[ -z "$ver" ]]; then
+        red "unknown crate in version map: $crate" >&2
+        exit 1
+    fi
+    echo "$ver"
+}
+
+load_crate_versions
+trap 'rm -f "${CRATE_VERSIONS_FILE:-}"' EXIT
+
+# Crates whose effective local version is not yet on the sparse index.
+crates_needing_publish() {
+    local tier c ver
+    for tier in "${TIERS[@]}"; do
+        for c in $tier; do
+            ver="$(crate_version "$c")"
+            if ! version_on_crates_io "$c" "$ver"; then
+                echo "$c@$ver"
+            fi
+        done
+    done
+}
 
 list_tiers() {
-    bold "Publish order (workspace version $WORKSPACE_VERSION):"
-    local i=0
+    local check_index="${1:-0}"
+    bold "Publish order ([workspace.package] version $WORKSPACE_VERSION):"
+    local i=0 tier c ver suffix
     for tier in "${TIERS[@]}"; do
         echo "  tier $i:"
         for c in $tier; do
-            echo "    - $c"
+            ver="$(crate_version "$c")"
+            suffix=""
+            if (( check_index )); then
+                if version_on_crates_io "$c" "$ver"; then
+                    suffix="  (on crates.io)"
+                else
+                    suffix="  (needs publish)"
+                fi
+            elif [[ "$ver" != "$WORKSPACE_VERSION" ]]; then
+                suffix="  (explicit version)"
+            fi
+            echo "    - $c@$ver$suffix"
         done
         ((i++))
     done
@@ -382,8 +497,34 @@ list_tiers() {
     echo "  - rlx-cortexm-firmware     (no_std firmware binary; not a workspace member)"
 }
 
+print_publish_plan() {
+    local -a need=()
+    local entry
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        need+=("$entry")
+    done < <(crates_needing_publish)
+
+    if (( ${#need[@]} == 0 )); then
+        green "Nothing to publish — every listed crate is already at its local version on crates.io."
+        return 0
+    fi
+
+    bold "Crates needing publish (${#need[@]}):"
+    for entry in "${need[@]}"; do
+        echo "  - $entry"
+    done
+}
+
 if (( LIST_ONLY )); then
-    list_tiers
+    list_tiers 1
+    echo
+    print_publish_plan
+    exit 0
+fi
+
+if (( PLAN_ONLY )); then
+    print_publish_plan
     exit 0
 fi
 
@@ -401,7 +542,9 @@ if (( ! NO_GATE )); then
 fi
 
 # ── Confirmation ────────────────────────────────────────────────
-list_tiers
+list_tiers 1
+echo
+print_publish_plan
 echo
 if (( DRY_RUN )); then
     yellow "Mode: DRY RUN — no actual uploads, no rate-limit sleeps, no index polling."
@@ -421,7 +564,7 @@ else
     fi
     yellow "Retry-after parsing:     HTTP-date + status-specific backoff (+${RATE_LIMIT_PAD}s pad)."
     if (( SKIP_PUBLISHED )); then
-        yellow "Already on crates.io:    skip (no upload, no rate-limit wait)."
+        yellow "Already on crates.io:    skip when local version matches index."
     else
         yellow "Already on crates.io:    still attempt upload (--no-skip-published)."
     fi
@@ -454,43 +597,8 @@ fi
 #
 # Names are always lower-case and hyphens are kept verbatim. See
 # https://doc.rust-lang.org/cargo/reference/registry-index.html
-sparse_index_path() {
-    local name="$1"
-    local n="${#name}"
-    if   (( n == 1 )); then printf '1/%s\n'     "$name"
-    elif (( n == 2 )); then printf '2/%s\n'     "$name"
-    elif (( n == 3 )); then printf '3/%s/%s\n'  "${name:0:1}" "$name"
-    else                    printf '%s/%s/%s\n' "${name:0:2}" "${name:2:2}" "$name"
-    fi
-}
-
-# Returns 0 if <crate>@<version> is already on the sparse index.
-version_on_crates_io() {
-    check_index "$1" "$2"
-}
-
-# Returns 0 if the sparse index serves <version> for <crate>, 1 if
-# the version isn't there yet, or 2 if the crate itself isn't in the
-# index at all (pre-first-publish — perfectly fine, just means we
-# should keep polling).
-check_index() {
-    local crate="$1"
-    local version="$2"
-    local url="https://index.crates.io/$(sparse_index_path "$crate")"
-    local body
-    # `curl -fsS` exits non-zero on 4xx/5xx; 404 means "crate doesn't
-    # exist on the index yet" which is fine — keep polling.
-    body="$(curl -fsS --max-time 10 "$url" 2>/dev/null || true)"
-    if [[ -z "$body" ]]; then
-        return 2
-    fi
-    # Index lines are NDJSON. Match `"vers":"<version>"` anywhere in
-    # the file. `grep -F` keeps the dots from being regex-interpreted.
-    if printf '%s' "$body" | grep -Fq "\"vers\":\"$version\""; then
-        return 0
-    fi
-    return 1
-}
+# (sparse_index_path, check_index, version_on_crates_io are defined
+# above for per-crate skip/plan checks.)
 
 # Block until check_index says we're good or the timeout trips.
 wait_for_index() {
@@ -664,7 +772,7 @@ publish_one_attempt() {
     local args=()
     args+=("--package" "$crate")
     if (( DRY_RUN )); then
-        args+=("--dry-run")
+        args+=("--dry-run" "--allow-dirty")
     fi
     if (( NO_VERIFY )); then
         args+=("--no-verify")
@@ -706,6 +814,8 @@ publish_one_attempt() {
 # 0 = published (or dry-run ok), 1 = hard failure, 2 = already on crates.io
 publish_one() {
     local crate="$1"
+    local version
+    version="$(crate_version "$crate")"
     local attempt=1
     local backoff=$MIN_INTERVAL
     local missing_dep_attempts=0
@@ -722,7 +832,7 @@ publish_one() {
             return 0
         fi
         if (( rc == 43 )); then
-            green "  $crate@$WORKSPACE_VERSION already on crates.io (cargo confirmed) — skip."
+            green "  $crate@$version already on crates.io (cargo confirmed) — skip."
             return 2
         fi
         if (( DRY_RUN )); then
@@ -738,9 +848,11 @@ publish_one() {
                 missing="$(missing_registry_dep_name "$LAST_PUBLISH_ERR")"
             fi
             if [[ -n "$missing" ]]; then
+                local missing_ver
+                missing_ver="$(crate_version "$missing")"
                 missing_dep_attempts=$(( missing_dep_attempts + 1 ))
-                yellow "  $crate: waiting for $missing@$WORKSPACE_VERSION on sparse index (attempt $missing_dep_attempts), then retry."
-                wait_for_index "$missing" "$WORKSPACE_VERSION"
+                yellow "  $crate: waiting for $missing@$missing_ver on sparse index (attempt $missing_dep_attempts), then retry."
+                wait_for_index "$missing" "$missing_ver"
                 rm -f "${LAST_PUBLISH_ERR:-}"
                 LAST_PUBLISH_ERR=""
                 sleep_with_countdown "$POLL_INTERVAL" "index settle after $missing"
@@ -819,6 +931,9 @@ for tier_idx in "${!TIERS[@]}"; do
 
     published_in_tier=0
     for crate in $tier; do
+        local version
+        version="$(crate_version "$crate")"
+
         # Skip past --start-crate if specified.
         if [[ -n "$skip_until_crate" ]]; then
             if [[ "$crate" != "$skip_until_crate" ]]; then
@@ -828,11 +943,11 @@ for tier_idx in "${!TIERS[@]}"; do
             skip_until_crate=""
         fi
 
-        # Already on crates.io — no upload, no rate-limit sleep.
+        # Already on crates.io at this crate's local version — no upload.
         if (( SKIP_PUBLISHED )) && (( ! DRY_RUN )); then
-            if version_on_crates_io "$crate" "$WORKSPACE_VERSION"; then
-                green "  skip $crate@$WORKSPACE_VERSION (already on crates.io)"
-                ALREADY_ON_CRATES_IO+=("$crate")
+            if version_on_crates_io "$crate" "$version"; then
+                green "  skip $crate@$version (already on crates.io)"
+                ALREADY_ON_CRATES_IO+=("$crate@$version")
                 continue
             fi
         fi
@@ -845,21 +960,21 @@ for tier_idx in "${!TIERS[@]}"; do
         publish_one "$crate"
         pub_rc=$?
         if (( pub_rc == 2 )); then
-            ALREADY_ON_CRATES_IO+=("$crate")
+            ALREADY_ON_CRATES_IO+=("$crate@$version")
             continue
         fi
         if (( pub_rc != 0 )); then
             exit 1
         fi
 
-        PUBLISHED_THIS_RUN+=("$crate")
+        PUBLISHED_THIS_RUN+=("$crate@$version")
         published_in_tier=$(( published_in_tier + 1 ))
 
         # Post-publish: poll the index until the new version is
         # actually queryable, so the *next* crate's dep resolution
         # doesn't 404. Dry runs skip this entirely.
         if (( ! DRY_RUN )); then
-            wait_for_index "$crate" "$WORKSPACE_VERSION"
+            wait_for_index "$crate" "$version"
         fi
     done
 
@@ -893,7 +1008,7 @@ else
         for c in "${ALREADY_ON_CRATES_IO[@]}"; do echo "    ○ $c"; done
     fi
     if (( ${#PUBLISHED_THIS_RUN[@]} == 0 )) && (( ${#ALREADY_ON_CRATES_IO[@]} > 0 )); then
-        green "Nothing left to publish — all listed crates already have $WORKSPACE_VERSION."
+        green "Nothing left to publish — every listed crate is already at its local version on crates.io."
     elif (( ${#PUBLISHED_THIS_RUN[@]} > 0 )); then
         green "Publish run finished."
     else

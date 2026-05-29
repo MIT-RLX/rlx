@@ -106,6 +106,8 @@ Lowered to HLO directly:
 - Conv (1D / 2D / 3D, HLO `convolution`)
 - Pool (max / mean / etc., HLO `reduce-window`)
 - ScatterAdd (HLO `scatter`)
+- Fft — native HLO `fft` for `DType::C64`; F32/F64 use the 2N real-block
+  decompose path (complex tuple + slice). Forward / inverse + norm scale.
 - FusedMatMulBiasAct
 
 Tier-3 ops (all lowered, full parity with rlx-cuda / rlx-rocm):

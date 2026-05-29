@@ -110,6 +110,9 @@ pub fn try_lower_with_constants(
     if !mps_graph_supported() {
         return None;
     }
+    if graph.nodes().iter().any(|n| matches!(n.op, Op::Fft { .. })) {
+        return None;
+    }
 
     let mg = MpsGraph::new();
     let mut node_to_tensor: HashMap<NodeId, MpsTensor> = HashMap::new();

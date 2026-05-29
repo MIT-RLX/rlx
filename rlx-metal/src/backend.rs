@@ -3006,48 +3006,33 @@ impl MetalExecutable {
                     outer,
                     n_complex,
                     inverse,
+                    norm_tag,
                     dtype,
                 } => {
-                    // Native MSL kernel is f32 + power-of-2 + N ≤ 2048
-                    // (TG memory budget). Anything else falls through to
-                    // the host fallback below — Apple GPUs have no f64,
-                    // and a Bluestein Metal kernel would be its own
-                    // future PR. Set RLX_METAL_FFT_HOST_FALLBACK=1 to
-                    // force the host path for debugging.
+                    // Native multi-kernel MSL path: f32 + power-of-2 N≥2.
+                    // f64/C64 and non-pow2 fall through to host CPU FFT.
+                    // Set RLX_METAL_FFT_HOST_FALLBACK=1 to force host path.
                     let force_host = rlx_ir::env::flag("RLX_METAL_FFT_HOST_FALLBACK");
                     let n = *n_complex as usize;
                     let can_native = !force_host
                         && matches!(dtype, rlx_ir::DType::F32)
                         && n.is_power_of_two()
-                        && n <= 2048
                         && n >= 2;
                     if can_native {
                         let enc = e!();
-                        enc.set_compute_pipeline_state(&k.fft_radix2_f32);
-                        enc.set_buffer(0, Some(&self.arena.buffer), 0);
-                        let src_u32 = (*src as u64 / 4) as u32; // f32 index
-                        let dst_u32 = (*dst as u64 / 4) as u32;
-                        let n_u32 = n as u32;
-                        let log2n: u32 = n.trailing_zeros();
-                        let inv_u32 = if *inverse { 1u32 } else { 0u32 };
-                        enc.set_bytes(1, 4, &src_u32 as *const u32 as *const _);
-                        enc.set_bytes(2, 4, &dst_u32 as *const u32 as *const _);
-                        enc.set_bytes(3, 4, &n_u32 as *const u32 as *const _);
-                        enc.set_bytes(4, 4, &log2n as *const u32 as *const _);
-                        enc.set_bytes(5, 4, &inv_u32 as *const u32 as *const _);
-                        // One TG per row, TG size = min(N/2, 1024).
-                        let tg_w = (n as u64 / 2).clamp(1, 1024);
-                        let grid = metal::MTLSize {
-                            width: *outer as u64 * tg_w,
-                            height: 1,
-                            depth: 1,
-                        };
-                        let tg = metal::MTLSize {
-                            width: tg_w,
-                            height: 1,
-                            depth: 1,
-                        };
-                        enc.dispatch_threads(grid, tg);
+                        let norm = rlx_ir::fft::FftNorm::from_tag(*norm_tag);
+                        let norm_scale = norm.output_scale(n, *inverse) as f32;
+                        crate::fft_dispatch::run_fft_gpu(
+                            k,
+                            enc,
+                            &self.arena.buffer,
+                            (*src as u64 / 4) as u32,
+                            (*dst as u64 / 4) as u32,
+                            *outer,
+                            n as u32,
+                            *inverse,
+                            norm_scale,
+                        );
                     } else {
                         // Host fallback — same sync pattern as
                         // Thunk::CustomOp: flush the GPU, run the
@@ -3066,6 +3051,7 @@ impl MetalExecutable {
                                     *outer as usize,
                                     n,
                                     *inverse,
+                                    *norm_tag,
                                     arena_ptr,
                                 ),
                                 rlx_ir::DType::F64 => rlx_cpu::thunk::execute_fft1d_f64(
@@ -3074,6 +3060,16 @@ impl MetalExecutable {
                                     *outer as usize,
                                     n,
                                     *inverse,
+                                    *norm_tag,
+                                    arena_ptr,
+                                ),
+                                rlx_ir::DType::C64 => rlx_cpu::thunk::execute_fft1d_c64(
+                                    *src,
+                                    *dst,
+                                    *outer as usize,
+                                    n,
+                                    *inverse,
+                                    *norm_tag,
                                     arena_ptr,
                                 ),
                                 other => panic!(

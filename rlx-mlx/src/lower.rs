@@ -736,6 +736,10 @@ pub fn lower_with_env(
                 let x = lookup(&env, node.inputs[0])?;
                 ops::cumsum(x, *axis, *exclusive)?
             }
+            Op::Fft { inverse, norm } => {
+                let x = lookup(&env, node.inputs[0])?;
+                ops::fft(x, *inverse, norm.tag())?
+            }
             Op::RmsNorm { eps, .. } => {
                 let x = lookup(&env, node.inputs[0])?;
                 let g = lookup(&env, node.inputs[1])?;
@@ -3604,8 +3608,8 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             // to full extent for graphs that contain them. (Op::Custom
             // is already rejected in the conservatively-unsafe arm.)
             Op::CustomFn { .. } => return false,
-            // FFT not yet lowered to MLX — pin to Device::Cpu for now.
-            Op::Fft { .. } => return false,
+            // FFT lowered natively via `mlx::fft::fft` FFI shim.
+            Op::Fft { .. } => return true,
             // C64 ops are CPU-only today; pin to Device::Cpu.
             Op::ComplexNormSq | Op::ComplexNormSqBackward | Op::Conjugate => return false,
             _ => return false,

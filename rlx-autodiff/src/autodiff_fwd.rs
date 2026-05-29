@@ -586,9 +586,17 @@ fn jvp_rule(
         // Mirrors the reverse-mode rule (VJP(fft)=ifft, VJP(ifft)=fft)
         // but without the flag flip — forward-mode propagates tangents
         // along the same linear map, not its transpose.
-        Op::Fft { inverse } => {
+        Op::Fft { inverse, norm } => {
             let t_x = t_inputs[0]?;
-            Some(bwd.fft(t_x, *inverse))
+            let n = rlx_ir::fft::fft_meta(bwd.shape(node.inputs[0])).n_complex;
+            let s = norm.output_scale(n, *inverse) as f32;
+            let t_y = bwd.fft(t_x, *inverse);
+            if s != 1.0 {
+                let sc = scalar_const(s as f64, &node.shape, bwd);
+                Some(bwd.mul(t_y, sc))
+            } else {
+                Some(t_y)
+            }
         }
 
         // Complex conjugate is R-linear (not C-linear), but under the

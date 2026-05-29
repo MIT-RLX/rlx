@@ -33,6 +33,10 @@ and the device handle.
 - **`trace.rs`** — runtime tracing (verbose env-gated).
 - **`cost.rs`** — heterogeneous cost model that picks Cpu vs. Metal vs.
   MLX per graph.
+- **FFT dispatch** — `Op::Fft` on CPU / Metal / MLX / CUDA / ROCm / wgpu /
+  TPU. Pow-2 f32 uses native GPU kernels where available; other shapes and
+  dtypes use partial host sync. Graph helpers (`rfft`, `irfft`, `stft`, …)
+  live in `rlx_ir::ops::fft_ops`.
 - **`stream.rs`** — async command stream (Metal-side; CPU is sync).
 - **`paged_kv`** — paged KV cache + continuous batching primitives.
 
@@ -58,7 +62,7 @@ sub-ms timing in the user-facing layer.
 
 ```toml
 [dependencies]
-rlx-runtime = { version = "0.1", features = ["cpu"] }
+rlx-runtime = { version = "0.2", features = ["cpu"] }
 ```
 
 > **Heads-up.** The `mlx` and `rocm` features pull in `rlx-mlx` and

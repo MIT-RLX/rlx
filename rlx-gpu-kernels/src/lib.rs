@@ -67,6 +67,7 @@ pub const RESIZE_NEAREST_2X_CU: &str = include_str!("../kernels/resize_nearest_2
 pub const ELEMENTWISE_REGION_CU: &str = include_str!("../kernels/elementwise_region.cu");
 pub const GAUSSIAN_SPLAT_RASTERIZE_CU: &str =
     include_str!("../kernels/gaussian_splat_rasterize.cu");
+pub const FFT_CU: &str = include_str!("../kernels/fft.cu");
 
 /// AMD rocWMMA / MFMA matmul (`RLX_ROCM_MFMA=1`). Not used on CUDA.
 #[cfg(feature = "rocm")]

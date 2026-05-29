@@ -1,6 +1,6 @@
 [package]
 name = "rlx-autodiff"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "JAX-shaped transforms for RLX MIR — autodiff, JVP/HVP, vmap"
@@ -14,8 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-fusion = { path = "../rlx-fusion", version = "0.2.1" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-fusion = { path = "../rlx-fusion", version = "0.2.2" }
 
 [features]
 default = []

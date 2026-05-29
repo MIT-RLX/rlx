@@ -29,7 +29,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rlx_ir::infer::GraphExt;
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::{Graph, NodeId, Op, Shape};
+use rlx_ir::{Graph, NodeId, Op, Shape, fft::FftNorm};
 
 use crate::dtype::parse_dtype;
 
@@ -105,6 +105,19 @@ fn reduce_from_str(s: &str) -> PyResult<ReduceOp> {
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown reduction '{other}'"
+            )));
+        }
+    })
+}
+
+fn fft_norm_from_str(s: &str) -> PyResult<FftNorm> {
+    Ok(match s.trim().to_ascii_lowercase().as_str() {
+        "backward" | "none" => FftNorm::Backward,
+        "forward" => FftNorm::Forward,
+        "ortho" | "orthonormal" => FftNorm::Ortho,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown fft norm '{other}' (expected backward, forward, or ortho)"
             )));
         }
     })
@@ -474,6 +487,58 @@ impl PyGraph {
 
     fn cast(&mut self, x: u32, to: &str) -> PyResult<u32> {
         Ok(self.g()?.cast(NodeId(x), parse_dtype(to)?).0)
+    }
+
+    // ── FFT ─────────────────────────────────────────────────
+
+    #[pyo3(signature = (x, inverse = false))]
+    fn fft(&mut self, x: u32, inverse: bool) -> PyResult<u32> {
+        Ok(self.g()?.fft(NodeId(x), inverse).0)
+    }
+
+    #[pyo3(signature = (x, inverse = false, norm = "backward"))]
+    fn fft_norm(&mut self, x: u32, inverse: bool, norm: &str) -> PyResult<u32> {
+        Ok(self
+            .g()?
+            .fft_norm(NodeId(x), inverse, fft_norm_from_str(norm)?)
+            .0)
+    }
+
+    #[pyo3(signature = (x, norm = "backward"))]
+    fn fft_real(&mut self, x: u32, norm: &str) -> PyResult<(u32, u32)> {
+        let (re, im) = self.g()?.fft_real(NodeId(x), fft_norm_from_str(norm)?);
+        Ok((re.0, im.0))
+    }
+
+    #[pyo3(signature = (x, norm = "backward"))]
+    fn rfft(&mut self, x: u32, norm: &str) -> PyResult<(u32, u32)> {
+        let (re, im) = self.g()?.rfft(NodeId(x), fft_norm_from_str(norm)?);
+        Ok((re.0, im.0))
+    }
+
+    #[pyo3(signature = (re, im, n, norm = "backward"))]
+    fn irfft(&mut self, re: u32, im: u32, n: usize, norm: &str) -> PyResult<u32> {
+        Ok(self
+            .g()?
+            .irfft(NodeId(re), NodeId(im), n, fft_norm_from_str(norm)?)
+            .0)
+    }
+
+    fn fftfreq(&mut self, n: usize) -> PyResult<u32> {
+        Ok(self.g()?.fftfreq_tensor(n).0)
+    }
+
+    fn rfftfreq(&mut self, n: usize) -> PyResult<u32> {
+        Ok(self.g()?.rfftfreq_tensor(n).0)
+    }
+
+    fn psd(&mut self, re: u32, im: u32) -> PyResult<u32> {
+        Ok(self.g()?.psd(NodeId(re), NodeId(im)).0)
+    }
+
+    #[pyo3(signature = (x, norm = "backward"))]
+    fn psd_real(&mut self, x: u32, norm: &str) -> PyResult<u32> {
+        Ok(self.g()?.psd_real(NodeId(x), fft_norm_from_str(norm)?).0)
     }
 
     // ── Normalization ───────────────────────────────────────

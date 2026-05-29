@@ -43,7 +43,7 @@ pub const CUMSUM_BWD_WGSL: &str = include_str!("cumsum_backward.wgsl");
 pub const ROPE_BWD_WGSL: &str = include_str!("rope_backward.wgsl");
 pub const GATHER_BWD_WGSL: &str = include_str!("gather_backward.wgsl");
 pub const CUMSUM_WGSL: &str = include_str!("cumsum.wgsl");
-pub const FFT_WGSL: &str = include_str!("fft.wgsl");
+pub const FFT_GPU_WGSL: &str = include_str!("fft_gpu.wgsl");
 pub const COPY_WGSL: &str = include_str!("copy.wgsl");
 pub const ELEMENTWISE_REGION_WGSL: &str = include_str!("elementwise_region.wgsl");
 pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
@@ -259,9 +259,25 @@ pub struct FftParams {
     pub n: u32,
     pub log2n: u32,
     pub inverse: u32,
-    pub _p0: u32,
+    pub norm_scale: f32,
     pub _p1: u32,
     pub _p2: u32,
+}
+
+/// Uniform block for multi-kernel FFT (`fft_gpu.wgsl::Params`). 48 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct FftGpuParams {
+    pub off: u32,
+    pub dst_off: u32,
+    pub n: u32,
+    pub log2n: u32,
+    pub inverse: u32,
+    pub norm_scale: f32,
+    pub outer: u32,
+    pub tile: u32,
+    pub inner_stages: u32,
+    pub q_or_hs: u32,
 }
 
 /// PLAN L2 — interpreted N-ary element-wise region. Chain encoded
@@ -873,6 +889,30 @@ pub struct Kernel {
     pub bgl: wgpu::BindGroupLayout,
 }
 
+impl Kernel {
+    pub fn bind_two(
+        &self,
+        device: &wgpu::Device,
+        arena: &wgpu::Buffer,
+        uniform: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rlx-wgpu fft gpu bg"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: arena.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        })
+    }
+}
+
 /// Build a 4-binding compute kernel: storage(rw) / uniform / storage(ro)
 /// / storage(ro). Currently unused — `matmul_coop16` switched to a
 /// 3-binding layout (A is staged from arena through workgroup memory
@@ -1085,7 +1125,11 @@ static ROPE_BWD: OnceLock<Kernel> = OnceLock::new();
 static GATHER_BWD_ZERO: OnceLock<Kernel> = OnceLock::new();
 static GATHER_BWD_ACC: OnceLock<Kernel> = OnceLock::new();
 static CUMSUM: OnceLock<Kernel> = OnceLock::new();
-static FFT: OnceLock<Kernel> = OnceLock::new();
+static FFT_GPU_RADIX2: OnceLock<Kernel> = OnceLock::new();
+static FFT_GPU_BITREV: OnceLock<Kernel> = OnceLock::new();
+static FFT_GPU_INNER: OnceLock<Kernel> = OnceLock::new();
+static FFT_GPU_OUTER_R4: OnceLock<Kernel> = OnceLock::new();
+static FFT_GPU_OUTER_R2: OnceLock<Kernel> = OnceLock::new();
 static COPY: OnceLock<Kernel> = OnceLock::new();
 static ELEMENTWISE_REGION: OnceLock<Kernel> = OnceLock::new();
 static TRANSPOSE: OnceLock<Kernel> = OnceLock::new();
@@ -1291,8 +1335,49 @@ pub fn gather_backward_acc_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn cumsum_kernel(device: &wgpu::Device) -> &'static Kernel {
     CUMSUM.get_or_init(|| build_kernel(device, "rlx-wgpu cumsum", CUMSUM_WGSL, "cumsum"))
 }
-pub fn fft_kernel(device: &wgpu::Device) -> &'static Kernel {
-    FFT.get_or_init(|| build_kernel(device, "rlx-wgpu fft", FFT_WGSL, "fft_radix2"))
+pub fn fft_gpu_radix2_full_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_RADIX2.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_radix2_full",
+            FFT_GPU_WGSL,
+            "fft_radix2_full",
+        )
+    })
+}
+pub fn fft_gpu_bit_reverse_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_BITREV.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_bit_reverse",
+            FFT_GPU_WGSL,
+            "fft_bit_reverse",
+        )
+    })
+}
+pub fn fft_gpu_inner_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_INNER
+        .get_or_init(|| build_kernel(device, "rlx-wgpu fft_inner", FFT_GPU_WGSL, "fft_inner"))
+}
+pub fn fft_gpu_outer_r4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_OUTER_R4.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_outer_r4",
+            FFT_GPU_WGSL,
+            "fft_outer_r4",
+        )
+    })
+}
+pub fn fft_gpu_outer_r2_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_OUTER_R2.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_outer_r2",
+            FFT_GPU_WGSL,
+            "fft_outer_r2",
+        )
+    })
 }
 pub fn copy_kernel(device: &wgpu::Device) -> &'static Kernel {
     COPY.get_or_init(|| build_kernel(device, "rlx-wgpu copy", COPY_WGSL, "copy"))

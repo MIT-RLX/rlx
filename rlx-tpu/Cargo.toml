@@ -1,6 +1,6 @@
 [package]
 name = "rlx-tpu"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Google TPU backend — drives libtpu's PJRT plugin from Rust."
@@ -15,9 +15,9 @@ documentation.workspace = true
 build = "build.rs"
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.2", features = ["splat"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.2" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.3", features = ["splat"] }
 
 # libloading dlopens libtpu.so at runtime so the crate compiles + tests
 # cleanly on Mac/Windows hosts that don't have it installed.

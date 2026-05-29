@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name            = "pyrlx"
 # Single source of truth — must match `Cargo.toml` `[package].version`.
-version         = "0.1.0"
+version         = "0.2.2"
 description     = "Run RLX (Rust ML compiler) graphs on any backend — CPU, Metal, MLX, CUDA, ROCm, wgpu — from Python."
 readme          = "README.md"
 license         = { text = "GPL-3.0-only" }

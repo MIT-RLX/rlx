@@ -32,6 +32,9 @@ throughput unlock — Phase H made matmul-interleaved schedules use it.
 - **`device.rs` / `arena.rs`** — Metal device + buffer arena.
 - **`op_registry`** — `MetalKernel` trait + `register_metal_kernel` for
   downstream custom ops.
+- **FFT** — `fft_gpu.msl` multi-kernel pow-2 path + `Op::Fft` thunk /
+  host fallback. MPSGraph skips graphs containing `Op::Fft`; `fft_real`
+  subgraphs route through thunks automatically.
 
 ## Cargo features
 

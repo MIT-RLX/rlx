@@ -13,6 +13,7 @@ Depends on [`rlx-ir`] and [`rlx-fusion`] (unfuse fused ops before AD when needed
 - **`prepare_ad`** — `prepare_graph_for_ad`, MIR/module preparation.
 - **`vmap`** — batched function transform.
 - **`legalize_reduce`** — reduce legalization helpers for training graphs.
+- **FFT AD** — VJP/JVP rules for `Op::Fft` (unitary / norm-aware).
 
 ## Feature
 

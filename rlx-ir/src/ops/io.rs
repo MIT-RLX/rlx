@@ -130,49 +130,29 @@ impl Graph {
         )
     }
 
-    /// 1D FFT along the last axis of the 2N real-block complex layout.
-    /// Last axis size must be even (so the 2N real-block layout
-    /// resolves to an integer number of complex points). Output shape
-    /// == input shape.
+    /// 1D FFT along the last axis.
     ///
-    /// The CPU kernel uses radix-2 Cooley-Tukey when the complex
-    /// length `N = last/2` is a power of two, and Bluestein's
-    /// algorithm (chirp z-transform) otherwise. There is no
-    /// size restriction beyond `last` being even.
+    /// * **F32 / F64** — 2N real-block layout: last axis is `[re…, im…]`.
+    /// * **C64** — interleaved `[re, im]` pairs per complex element.
     ///
-    /// See `Op::Fft` for the normalization convention
-    /// (unnormalized; ifft(fft(x)) = N·x).
+    /// Output shape matches input. Radix-2 when `N` is a power of two,
+    /// Bluestein otherwise. Default normalization is unnormalized
+    /// (`FftNorm::Backward`; `ifft(fft(x)) = N·x`).
     pub fn fft(&mut self, x: NodeId, inverse: bool) -> NodeId {
-        let s = self.shape(x).clone();
-        assert!(s.rank() >= 1, "fft: tensor must have at least 1 axis");
-        let last = s.rank() - 1;
-        match s.dim(last) {
-            crate::shape::Dim::Static(n) => {
-                assert!(
-                    n % 2 == 0,
-                    "fft: last axis size {n} must be even (2N real-block layout)"
-                );
-            }
-            _ => panic!("fft: dynamic last-axis size not supported"),
-        }
-        self.push(Op::Fft { inverse }, vec![x], s, None)
+        self.fft_norm(x, inverse, crate::fft::FftNorm::Backward)
     }
 
-    /// 1D FFT along an arbitrary axis (not just the last). Lowers to
-    /// `Transpose(axis ↔ last) → Fft(last) → Transpose(last ↔ axis)`
-    /// — the 2N-real-block convention is intrinsic to whichever axis
-    /// the FFT runs along, and `Op::Transpose` is a pure permutation,
-    /// so semantics transport correctly.
+    /// 1D FFT with explicit normalization mode.
+    pub fn fft_norm(&mut self, x: NodeId, inverse: bool, norm: crate::fft::FftNorm) -> NodeId {
+        let s = self.shape(x).clone();
+        crate::fft::fft_meta(&s);
+        self.push(Op::Fft { inverse, norm }, vec![x], s, None)
+    }
+
+    /// 1D FFT along an arbitrary axis. Lowers to
+    /// `Transpose(axis ↔ last) → Fft(last) → Transpose(last ↔ axis)`.
     ///
-    /// Limitation: this still describes a tensor with a *single*
-    /// complex axis. True ND `fftn` (e.g. 2D FFT of a 2D-complex
-    /// array, where two axes are independently complex) cannot be
-    /// expressed in the 2N-real-block layout — it needs native
-    /// `DType::C64` to keep the real/imag split off the axis grid.
-    /// See PLAN.md for the deferred C64 workstream.
-    ///
-    /// AD is free: Transpose and Fft both have VJP and JVP rules,
-    /// so the composition differentiates automatically.
+    /// AD is free: both `Op::Transpose` and `Op::Fft` have VJP/JVP rules.
     pub fn fft_axis(&mut self, x: NodeId, axis: usize, inverse: bool) -> NodeId {
         use crate::infer::GraphExt as _;
         let rank = self.shape(x).rank();
@@ -182,16 +162,45 @@ impl Graph {
         );
         let last = rank - 1;
         if axis == last {
-            // Fast path — no transpose needed.
             return self.fft(x, inverse);
         }
-        // perm = identity with `axis` ↔ `last` swapped. Same perm in
-        // both directions because it's a transposition (its own inverse).
         let mut perm: Vec<usize> = (0..rank).collect();
         perm.swap(axis, last);
 
         let x_t = self.transpose_(x, perm.clone());
         let y_t = self.fft(x_t, inverse);
         self.transpose_(y_t, perm)
+    }
+
+    /// N-dimensional FFT along `axes` (NumPy `fftn` semantics).
+    ///
+    /// Applies a 1D FFT along each listed axis in ascending order.
+    /// Empty `axes` is a no-op. For multi-axis transforms on tensors
+    /// with more than one spatial dimension, use `DType::C64`; the
+    /// F32/F64 2N-block layout only describes a single complex axis.
+    pub fn fftn(&mut self, x: NodeId, axes: &[usize], inverse: bool) -> NodeId {
+        let rank = self.shape(x).rank();
+        let axes = crate::fft::normalize_fftn_axes(rank, axes);
+        if axes.is_empty() {
+            return x;
+        }
+        if axes.len() > 1 && !self.shape(x).dtype().is_complex() {
+            panic!(
+                "fftn: multi-axis FFT on {:?} requires DType::C64; \
+                 the F32/F64 2N real-block layout supports only one complex axis — \
+                 call fft_axis for a single transform",
+                self.shape(x).dtype()
+            );
+        }
+        let mut y = x;
+        for axis in axes {
+            y = self.fft_axis(y, axis, inverse);
+        }
+        y
+    }
+
+    /// Inverse N-dimensional FFT — alias for `fftn(..., inverse: true)`.
+    pub fn ifftn(&mut self, x: NodeId, axes: &[usize]) -> NodeId {
+        self.fftn(x, axes, true)
     }
 }

@@ -1625,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "pyrlx"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "numpy",
  "pyo3",
@@ -1829,7 +1829,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rlx"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "rlx-bench",
@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-autodiff"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rlx-fusion",
  "rlx-ir",
@@ -1868,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bench"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rlx-driver",
  "rlx-ir",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-compile"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rlx-autodiff",
  "rlx-fusion",
@@ -1901,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cpu"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "criterion",
  "gemm",
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cuda"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytemuck",
  "cc",
@@ -1971,7 +1971,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fusion"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rlx-ir",
 ]
@@ -1988,11 +1988,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-kernels"
-version = "0.2.1"
+version = "0.2.2"
 
 [[package]]
 name = "rlx-ir"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2018,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-metal"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytemuck",
  "core-graphics-types",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "half",
  "rlx-cpu",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-sys"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cc",
  "cmake",
@@ -2058,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-opt"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -2079,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-rocm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cc",
  "libloading 0.8.9",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "half",
@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tpu"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libloading 0.8.9",
  "prost",
@@ -2180,11 +2180,12 @@ dependencies = [
 
 [[package]]
 name = "rlx-wgpu"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytemuck",
  "half",
  "pollster",
+ "rlx-compile",
  "rlx-cpu",
  "rlx-ir",
  "rlx-opt",

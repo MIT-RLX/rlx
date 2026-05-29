@@ -1,6 +1,6 @@
 [package]
 name = "rlx-runtime"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "RLX runtime — feature-gated backends, session API, compile+execute pipeline"
@@ -80,26 +80,26 @@ directx = []                       # DirectX 12 compute (Windows)
 webgpu = []                        # WebGPU (WASM target)
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.1", features = ["serialize"] }
-rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2", features = ["serialize"] }
+rlx-opt = { path = "../rlx-opt", version = "0.2.2" }
 rlx-driver = { path = "../rlx-driver", version = "0.2.1" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.2", optional = true }
-rlx-metal = { path = "../rlx-metal", version = "0.2.1", optional = true }
-rlx-mlx = { path = "../rlx-mlx", version = "0.2.1", optional = true }
-rlx-wgpu = { path = "../rlx-wgpu", version = "0.2.2", optional = true }
-rlx-cuda = { path = "../rlx-cuda", version = "0.2.1", optional = true }
-rlx-rocm = { path = "../rlx-rocm", version = "0.2.1", optional = true }
-rlx-tpu = { path = "../rlx-tpu", version = "0.2.1", optional = true }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.3", optional = true }
+rlx-metal = { path = "../rlx-metal", version = "0.2.2", optional = true }
+rlx-mlx = { path = "../rlx-mlx", version = "0.2.2", optional = true }
+rlx-wgpu = { path = "../rlx-wgpu", version = "0.2.3", optional = true }
+rlx-cuda = { path = "../rlx-cuda", version = "0.2.2", optional = true }
+rlx-rocm = { path = "../rlx-rocm", version = "0.2.2", optional = true }
+rlx-tpu = { path = "../rlx-tpu", version = "0.2.2", optional = true }
 rlx-macros = { path = "../rlx-macros", version = "0.2.1" }
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # rlx-gpu = { path = "../rlx-gpu", version = "0.2.1", optional = true }
-# rlx-cuda = { path = "../rlx-cuda", version = "0.2.1", optional = true }
+# rlx-cuda = { path = "../rlx-cuda", version = "0.2.2", optional = true }
 
 [dev-dependencies]
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.1" }
-rlx-compile = { path = "../rlx-compile", version = "0.2.1", features = ["training"] }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.2" }
+rlx-compile = { path = "../rlx-compile", version = "0.2.2", features = ["training"] }
 rlx-splat = { path = "../rlx-splat", version = "0.2.1", default-features = false, features = ["test-support", "io"] }
 # Downstream demonstration packages used in integration tests.
 # Enable both `metal` and `mlx` features so the per-backend tests

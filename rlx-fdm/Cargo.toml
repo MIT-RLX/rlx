@@ -40,16 +40,16 @@ fuse = ["ir", "rlx-sparse", "dep:rlx-autodiff"]
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-rlx-ir = { path = "../rlx-ir", version = "0.2.1", optional = true }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.1", default-features = false, features = ["cpu"], optional = true }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2", optional = true }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.2", default-features = false, features = ["cpu"], optional = true }
 rlx-sparse = { path = "../rlx-sparse", version = "0.2.1", default-features = false, features = ["cpu"], optional = true }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.2", optional = true }
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.1", optional = true }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.3", optional = true }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.2", optional = true }
 
 [dev-dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.1" }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.1", default-features = false, features = ["cpu"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.2" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.2", default-features = false, features = ["cpu"] }
 bytemuck = "1"
 
 [[test]]

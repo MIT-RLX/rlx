@@ -153,6 +153,20 @@ pub fn cumsum(a: &Array, axis: i32, exclusive: bool) -> Result<Array, MlxError> 
     Ok(Array::from_raw(out))
 }
 
+pub fn fft(a: &Array, inverse: bool, norm_tag: u32) -> Result<Array, MlxError> {
+    let mut out: *mut mlx_array_t = ptr::null_mut();
+    let rc = unsafe {
+        ffi::rlx_mlx_op_fft(
+            a.ptr,
+            if inverse { 1 } else { 0 },
+            norm_tag as i32,
+            &mut out,
+        )
+    };
+    check(rc)?;
+    Ok(Array::from_raw(out))
+}
+
 pub fn rms_norm(x: &Array, gamma: &Array, eps: f32) -> Result<Array, MlxError> {
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_rmsnorm(x.ptr, gamma.ptr, eps, &mut out) };

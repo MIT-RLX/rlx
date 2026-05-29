@@ -3,10 +3,9 @@
 //
 // Licensed under the GNU General Public License, version 3.
 
-//! WGPU-backend `Op::Fft` native compute-shader dispatch test.
+//! WGPU-backend `Op::Fft` native multi-kernel compute-shader dispatch test.
 //!
-//! Validates: f32 + power-of-two + N ≤ 1024 → native WGSL kernel
-//! (`fft_radix2`) runs and matches the CPU reference.
+//! Validates f32 + power-of-two N (including N > 1024) against CPU reference.
 
 #![cfg(all(feature = "cpu", feature = "gpu"))]
 
@@ -32,7 +31,7 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 
 #[test]
 fn fft_wgpu_native_matches_cpu_pow2() {
-    for &n in &[2usize, 4, 8, 16, 64, 256, 1024] {
+    for &n in &[2usize, 4, 8, 16, 64, 256, 1024, 2048, 4096] {
         let mut re: Vec<f32> = Vec::with_capacity(n);
         let mut im: Vec<f32> = Vec::with_capacity(n);
         for i in 0..n {

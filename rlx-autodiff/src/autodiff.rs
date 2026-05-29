@@ -2209,8 +2209,16 @@ fn vjp(
         //   VJP(ifft) = fft(upstream)
         // No scaling — the choice to leave both directions unnormalized
         // makes the chain rule a flag flip and nothing else.
-        Op::Fft { inverse } => {
-            let dx = bwd.fft(upstream, !*inverse);
+        Op::Fft { inverse, norm } => {
+            let n = rlx_ir::fft::fft_meta(bwd.shape(node.inputs[0])).n_complex;
+            let s = norm.output_scale(n, *inverse) as f32;
+            let z = if s != 1.0 {
+                let sc = scalar_const(s, bwd);
+                bwd.mul(upstream, sc)
+            } else {
+                upstream
+            };
+            let dx = bwd.fft(z, !*inverse);
             vec![(0, dx)]
         }
 

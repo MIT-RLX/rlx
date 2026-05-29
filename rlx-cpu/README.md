@@ -27,6 +27,9 @@ Keep both paths in sync when changing a Thunk variant.
   primitive.
 - Reverse-mode AD support: thunks for every backward op
   `rlx_opt::autodiff` emits.
+- **FFT** — `Op::Fft` for F32 / F64 / C64 (2N real-block or native C64).
+  Stockham radix-2 for pow-2; naive DFT for small composite N (≤16);
+  Bluestein for other non-pow-2. Host entry shared with GPU fallbacks.
 
 ## What's here
 

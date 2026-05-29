@@ -1,6 +1,6 @@
 [package]
 name = "rlx-wgpu"
-version                = "0.2.2"
+version                = "0.2.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Cross-platform GPU backend for RLX via wgpu (Metal/Vulkan/DX12/WebGPU)"
@@ -19,9 +19,10 @@ native-splat = []
 splat = ["rlx-cpu/splat"]
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.1" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.2", features = ["splat"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.2", default-features = false, features = ["compile"] }
+rlx-compile = { path = "../rlx-compile", version = "0.2.2" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.3", features = ["splat"] }
 
 # wgpu 29: brings naga WGSL parser support for `enable f16;` and the
 # `f16` type, which unlocks the half-precision storage matmul path.

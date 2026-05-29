@@ -20,4 +20,4 @@ pub use rlx_gpu_kernels::*;
 pub use rlx_gpu_kernels::rocm::MATMUL_MFMA_CU;
 
 /// HIP entry points compiled from shared sources (+ `matmul_mfma`).
-pub const KERNEL_COUNT: usize = 33;
+pub const KERNEL_COUNT: usize = 38;

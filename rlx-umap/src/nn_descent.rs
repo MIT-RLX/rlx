@@ -105,7 +105,7 @@ pub fn nn_descent(data: &[f32], n: usize, d: usize, k: usize) -> (Vec<i32>, Vec<
         }
 
         let frac = total_updates as f64 / (n * k) as f64;
-        if frac < min_updates_frac as f64 {
+        if frac < min_updates_frac {
             break;
         }
     }

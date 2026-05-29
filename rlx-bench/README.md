@@ -14,12 +14,24 @@ PrecisionPolicy Y?"
 - **Examples**:
   - `bench_all` — sweep every (pattern × device × policy) cell.
   - `bench_autodiff` — measure reverse-mode AD overhead per op.
+  - `bench_fft` — batch × N sweep across backends; set
+    `RLX_BENCH_DISPATCH_ONLY=1` on wgpu to skip readback and isolate
+    dispatch time.
 
 ## Install
 
 ```toml
 [dependencies]
-rlx-bench = "0.1"
+rlx-bench = "0.2"
+```
+
+## FFT benchmark
+
+```sh
+just throttle
+cargo run -p rlx-bench --release --example bench_fft --features metal,gpu
+RLX_BENCH_DISPATCH_ONLY=1 cargo run -p rlx-bench --release --example bench_fft --features gpu
+./scripts/bench_fft_rig.sh   # remote CUDA rig (Windows + WSL)
 ```
 
 ## Run

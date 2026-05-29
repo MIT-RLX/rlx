@@ -273,6 +273,21 @@ kernel_cache!(
     GAUSSIAN_SPLAT_RASTERIZE_CU,
     "gaussian_splat_rasterize"
 );
+kernel_cache!(
+    FFT_RADIX2_FULL,
+    fft_radix2_full_kernel,
+    FFT_CU,
+    "fft_radix2_full"
+);
+kernel_cache!(
+    FFT_BIT_REVERSE,
+    fft_bit_reverse_kernel,
+    FFT_CU,
+    "fft_bit_reverse"
+);
+kernel_cache!(FFT_INNER, fft_inner_kernel, FFT_CU, "fft_inner");
+kernel_cache!(FFT_OUTER_R4, fft_outer_r4_kernel, FFT_CU, "fft_outer_r4");
+kernel_cache!(FFT_OUTER_R2, fft_outer_r2_kernel, FFT_CU, "fft_outer_r2");
 
 /// Dispatch grid for a 1-D workload of `n` threads with workgroup
 /// size `block_x`. CUDA's per-grid-dim limit is 2^31-1 on the X axis,

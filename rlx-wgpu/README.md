@@ -24,6 +24,10 @@ no FFI, no submodules.
 - **`backend.rs`** — `WgpuExecutable`. Anything not in the supported op
   set panics at compile time with a clear "fall back to CPU/Metal/MLX"
   diagnostic.
+- **FFT** — `fft_gpu.wgsl` multi-kernel pow-2 dispatch (in-pass with
+  per-op uniforms). Non-pow2 / f64 / C64 use `fft_host.rs` partial sync.
+  `RLX_BENCH_DISPATCH_ONLY=1` skips output readback for micro-benchmarks.
+  `RLX_DISPATCH_REPORT=1` logs `fft_gpu` vs `fft_host` step counts.
 
 ## Op coverage
 
@@ -40,7 +44,7 @@ dispatch in `run`. PRs welcome.
 
 ```toml
 [dependencies]
-rlx-wgpu = "0.1"
+rlx-wgpu = "0.2"
 ```
 
 Or via [`rlx`](https://crates.io/crates/rlx)'s `gpu` feature.

@@ -1,0 +1,266 @@
+// Multi-kernel f32 FFT (gpu-fft strategy), RLX 2N real-block layout.
+// Grid builtins are scalar-only (Metal requires uniform vector width per kernel).
+
+inline float fft_re(device float* arena, uint base, uint k, uint n) {
+    return arena[base + k];
+}
+inline float fft_im(device float* arena, uint base, uint k, uint n) {
+    return arena[base + n + k];
+}
+inline void fft_set_re(device float* arena, uint base, uint k, uint n, float v) {
+    arena[base + k] = v;
+}
+inline void fft_set_im(device float* arena, uint base, uint k, uint n, float v) {
+    arena[base + n + k] = v;
+}
+
+kernel void fft_radix2_full_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& src_off [[buffer(1)]],
+    constant uint& dst_off [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& log2n [[buffer(4)]],
+    constant uint& inverse [[buffer(5)]],
+    constant float& norm_scale [[buffer(6)]],
+    constant uint& outer [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float sre[1024];
+    threadgroup float sim[1024];
+    if (row >= outer) return;
+    uint src_base = src_off + row * 2u * n;
+    uint dst_base = dst_off + row * 2u * n;
+
+    uint k = tid;
+    while (k < n) {
+        uint rev = reverse_bits(k) >> (32u - log2n);
+        sre[rev] = fft_re(arena, src_base, k, n);
+        sim[rev] = fft_im(arena, src_base, k, n);
+        k += tg_size;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sign = (inverse != 0u) ? 1.0f : -1.0f;
+    float two_pi = 6.28318530717958647692f;
+    for (uint len = 2u; len <= n; len <<= 1u) {
+        uint h2 = len >> 1u;
+        float theta_base = sign * two_pi / float(len);
+        for (uint b = tid; b < n / 2u; b += tg_size) {
+            uint group = b / h2;
+            uint k_in = b % h2;
+            uint i_lo = group * len + k_in;
+            uint i_hi = i_lo + h2;
+            float theta = theta_base * float(k_in);
+            float wre = cos(theta);
+            float wim = sin(theta);
+            float t_re = wre * sre[i_hi] - wim * sim[i_hi];
+            float t_im = wre * sim[i_hi] + wim * sre[i_hi];
+            float u_re = sre[i_lo];
+            float u_im = sim[i_lo];
+            sre[i_lo] = u_re + t_re;
+            sim[i_lo] = u_im + t_im;
+            sre[i_hi] = u_re - t_re;
+            sim[i_hi] = u_im - t_im;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    k = tid;
+    while (k < n) {
+        fft_set_re(arena, dst_base, k, n, sre[k] * norm_scale);
+        fft_set_im(arena, dst_base, k, n, sim[k] * norm_scale);
+        k += tg_size;
+    }
+}
+
+kernel void fft_bit_reverse_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& off [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& log2n [[buffer(3)]],
+    constant uint& outer [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tpg [[threadgroup_position_in_grid]]
+) {
+    uint row = tpg.y;
+    if (row >= outer) return;
+    uint k = gid.x;
+    if (k >= n) return;
+    uint base = off + row * 2u * n;
+    uint rev = reverse_bits(k) >> (32u - log2n);
+    if (k >= rev) return;
+    float tr = fft_re(arena, base, k, n);
+    float ti = fft_im(arena, base, k, n);
+    fft_set_re(arena, base, k, n, fft_re(arena, base, rev, n));
+    fft_set_im(arena, base, k, n, fft_im(arena, base, rev, n));
+    fft_set_re(arena, base, rev, n, tr);
+    fft_set_im(arena, base, rev, n, ti);
+}
+
+kernel void fft_inner_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& off [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& tile [[buffer(3)]],
+    constant uint& inner_stages [[buffer(4)]],
+    constant uint& inverse [[buffer(5)]],
+    constant float& norm_scale [[buffer(6)]],
+    constant uint& outer [[buffer(7)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint local [[thread_index_in_threadgroup]]
+) {
+    uint num_tiles = (n + tile - 1u) / tile;
+    uint row = tg_id / num_tiles;
+    uint tile_id = tg_id % num_tiles;
+    if (row >= outer) return;
+    uint half_tile = tile / 2u;
+    if (tile_id >= num_tiles) return;
+    if (local >= half_tile) return;
+
+    threadgroup float sre[1024];
+    threadgroup float sim[1024];
+    uint row_base = off + row * 2u * n;
+    uint tile_base = tile_id * tile;
+
+    if (tile_base + local < n) {
+        sre[local] = fft_re(arena, row_base, tile_base + local, n);
+        sim[local] = fft_im(arena, row_base, tile_base + local, n);
+    }
+    if (tile_base + local + half_tile < n) {
+        sre[local + half_tile] = fft_re(arena, row_base, tile_base + local + half_tile, n);
+        sim[local + half_tile] = fft_im(arena, row_base, tile_base + local + half_tile, n);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sign = (inverse != 0u) ? 1.0f : -1.0f;
+    float pi = 3.14159265358979323846f;
+    for (uint s = 0u; s < inner_stages; ++s) {
+        uint hs = 1u << s;
+        uint k = local % hs;
+        uint i = (local / hs) * (hs * 2u) + k;
+        uint j = i + hs;
+        float angle = sign * pi * float(k) / float(hs);
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+        float ur = sre[i], ui = sim[i];
+        float vr = cos_a * sre[j] - sin_a * sim[j];
+        float vi = sin_a * sre[j] + cos_a * sim[j];
+        sre[i] = ur + vr; sim[i] = ui + vi;
+        sre[j] = ur - vr; sim[j] = ui - vi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float scale = norm_scale;
+    if (tile_base + local < n) {
+        fft_set_re(arena, row_base, tile_base + local, n, sre[local] * scale);
+        fft_set_im(arena, row_base, tile_base + local, n, sim[local] * scale);
+    }
+    if (tile_base + local + half_tile < n) {
+        fft_set_re(arena, row_base, tile_base + local + half_tile, n, sre[local + half_tile] * scale);
+        fft_set_im(arena, row_base, tile_base + local + half_tile, n, sim[local + half_tile] * scale);
+    }
+}
+
+kernel void fft_outer_r4_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& off [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& q [[buffer(3)]],
+    constant uint& inverse [[buffer(4)]],
+    constant float& norm_scale [[buffer(5)]],
+    constant uint& outer [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tpg [[threadgroup_position_in_grid]]
+) {
+    uint row = tpg.y;
+    if (row >= outer) return;
+    uint tid = gid.x;
+    if (tid >= n / 4u) return;
+    uint base = off + row * 2u * n;
+    uint k = tid % q;
+    uint group = tid / q;
+    uint p = group * (q * 4u) + k;
+
+    float ar = fft_re(arena, base, p, n);
+    float ai = fft_im(arena, base, p, n);
+    float br = fft_re(arena, base, p + q, n);
+    float bi = fft_im(arena, base, p + q, n);
+    float cr = fft_re(arena, base, p + q * 2u, n);
+    float ci = fft_im(arena, base, p + q * 2u, n);
+    float dr = fft_re(arena, base, p + q * 3u, n);
+    float di = fft_im(arena, base, p + q * 3u, n);
+
+    float sign = (inverse != 0u) ? 1.0f : -1.0f;
+    float neg_sign = (inverse != 0u) ? -1.0f : 1.0f;
+    float angle1 = sign * 3.14159265358979323846f * float(k) / float(q);
+    float cos1 = cos(angle1);
+    float sin1 = sin(angle1);
+    float w1b_r = cos1 * br - sin1 * bi;
+    float w1b_i = sin1 * br + cos1 * bi;
+    float w1d_r = cos1 * dr - sin1 * di;
+    float w1d_i = sin1 * dr + cos1 * di;
+
+    float u0r = ar + w1b_r, u0i = ai + w1b_i;
+    float u1r = ar - w1b_r, u1i = ai - w1b_i;
+    float u2r = cr + w1d_r, u2i = ci + w1d_i;
+    float u3r = cr - w1d_r, u3i = ci - w1d_i;
+
+    float angle2a = sign * 3.14159265358979323846f * float(k) / float(q * 2u);
+    float cos2a = cos(angle2a);
+    float sin2a = sin(angle2a);
+    float cos2b = neg_sign * sin2a;
+    float sin2b = sign * cos2a;
+
+    float w2a_u2r = cos2a * u2r - sin2a * u2i;
+    float w2a_u2i = sin2a * u2r + cos2a * u2i;
+    float w2b_u3r = cos2b * u3r - sin2b * u3i;
+    float w2b_u3i = sin2b * u3r + cos2b * u3i;
+
+    float scale = norm_scale;
+    fft_set_re(arena, base, p, n, (u0r + w2a_u2r) * scale);
+    fft_set_im(arena, base, p, n, (u0i + w2a_u2i) * scale);
+    fft_set_re(arena, base, p + q * 2u, n, (u0r - w2a_u2r) * scale);
+    fft_set_im(arena, base, p + q * 2u, n, (u0i - w2a_u2i) * scale);
+    fft_set_re(arena, base, p + q, n, (u1r + w2b_u3r) * scale);
+    fft_set_im(arena, base, p + q, n, (u1i + w2b_u3i) * scale);
+    fft_set_re(arena, base, p + q * 3u, n, (u1r - w2b_u3r) * scale);
+    fft_set_im(arena, base, p + q * 3u, n, (u1i - w2b_u3i) * scale);
+}
+
+kernel void fft_outer_r2_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& off [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& half_stride [[buffer(3)]],
+    constant uint& inverse [[buffer(4)]],
+    constant float& norm_scale [[buffer(5)]],
+    constant uint& outer [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tpg [[threadgroup_position_in_grid]]
+) {
+    uint row = tpg.y;
+    if (row >= outer) return;
+    uint tid = gid.x;
+    if (tid >= n / 2u) return;
+    uint base = off + row * 2u * n;
+    uint k = tid % half_stride;
+    uint i = (tid / half_stride) * (half_stride * 2u) + k;
+    uint j = i + half_stride;
+
+    float sign = (inverse != 0u) ? 1.0f : -1.0f;
+    float angle = sign * 3.14159265358979323846f * float(k) / float(half_stride);
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+
+    float ur = fft_re(arena, base, i, n);
+    float ui = fft_im(arena, base, i, n);
+    float vr = cos_a * fft_re(arena, base, j, n) - sin_a * fft_im(arena, base, j, n);
+    float vi = sin_a * fft_re(arena, base, j, n) + cos_a * fft_im(arena, base, j, n);
+    float scale = norm_scale;
+    fft_set_re(arena, base, i, n, (ur + vr) * scale);
+    fft_set_im(arena, base, i, n, (ui + vi) * scale);
+    fft_set_re(arena, base, j, n, (ur - vr) * scale);
+    fft_set_im(arena, base, j, n, (ui - vi) * scale);
+}

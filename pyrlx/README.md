@@ -9,6 +9,8 @@ Python bindings for RLX via [PyO3](https://pyo3.rs/) +
   `rlx_ir::Graph`.
 - **Compile + run on any backend** — `Session(device="cpu" | "metal" |
   "mlx" | …)`.
+- **FFT helpers** — `fft`, `fft_norm`, `rfft`, `irfft`, `fftfreq`,
+  `rfftfreq`, `psd_real` on `Graph` (see `pyrlx/tests/test_fft.py`).
 - **Autodiff** — `pyrlx.grad(graph, wrt=[…])` returns the backward
   graph, ready to compile.
 - **JVP / vmap** — `pyrlx.jvp` + `pyrlx.vmap` for forward-mode AD and
@@ -62,7 +64,7 @@ out = compiled.run({"x": [1.0, 2.0, 3.0, 4.0]})
 ## Status
 
 Surface follows the Rust crates closely; ergonomics layer is minimal at
-0.1.0 — expect more `__repr__`, NumPy interop, and dunder support to
+0.2.2 — expect more `__repr__`, NumPy interop, and dunder support to
 land in subsequent minor versions.
 
 ## License

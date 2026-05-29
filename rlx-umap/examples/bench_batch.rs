@@ -154,11 +154,13 @@ impl KnnExe {
 }
 
 /// MLX: pairwise on device, k-NN on CPU from precomputed pairwise buffer.
+#[cfg(all(feature = "mlx", target_os = "macos"))]
 struct MlxSplitExe {
     pw: PwExe,
     knn_cpu: CompiledGraph,
 }
 
+#[cfg(all(feature = "mlx", target_os = "macos"))]
 impl MlxSplitExe {
     fn compile(n: usize, d: usize, k: u32) -> Self {
         let mut g_knn = Graph::new("mlx_knn_cpu");

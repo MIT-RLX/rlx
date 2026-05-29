@@ -1,6 +1,6 @@
 [package]
 name = "rlx-compile"
-version.workspace      = true
+version                = "0.2.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "HIR → MIR → LIR compile pipeline for RLX"
@@ -18,12 +18,12 @@ default = []
 training = ["dep:rlx-autodiff"]
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.1" }
-rlx-fusion = { path = "../rlx-fusion", version = "0.2.1" }
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.1", optional = true }
+rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-fusion = { path = "../rlx-fusion", version = "0.2.2" }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.2", optional = true }
 
 [dev-dependencies]
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.1" }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.2" }
 
 [lints]
 workspace = true
