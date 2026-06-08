@@ -1,13 +1,25 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Named parameter tensors for compiled UMAP graphs.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Parameter name → row-major f32 weights.
 #[derive(Debug, Clone, Default)]
-pub struct WeightStore(pub HashMap<String, Vec<f32>>);
+pub struct WeightStore(pub BTreeMap<String, Vec<f32>>);
 
 impl WeightStore {
     pub fn apply(&self, exec: &mut rlx_runtime::CompiledGraph) {

@@ -24,6 +24,7 @@ use rlx_runtime::{CompiledGraph, Precision, Session};
 
 use crate::device::{device_label, parse_device};
 use crate::dtype::{dtype_label, parse_dtype};
+use crate::fusion_options::{PyFusionOptions, build_compile_options};
 use crate::graph::PyGraph;
 
 fn parse_precision(s: &str) -> PyResult<Precision> {
@@ -39,6 +40,11 @@ fn parse_precision(s: &str) -> PyResult<Precision> {
     })
 }
 
+/// Compile-time binding to one RLX backend + precision.
+///
+/// Construct with a device string (`"cpu"`, `"metal"`, `"cuda"`, …) present in
+/// `available_devices()`. `compile` / `compile_with` take ownership of the
+/// input `Graph`.
 #[pyclass(name = "Session", module = "pyrlx._pyrlx")]
 pub(crate) struct PySession {
     inner: Session,
@@ -96,10 +102,42 @@ impl PySession {
             .collect::<Vec<_>>();
 
         let compiled = self.inner.compile(g);
-        Ok(PyCompiled {
-            inner: compiled,
-            output_shapes: outputs.into_iter().map(|(_, dims)| dims).collect(),
-        })
+        Ok(PyCompiled::from_compiled(
+            compiled,
+            outputs.into_iter().map(|(_, dims)| dims).collect(),
+        ))
+    }
+
+    /// Compile with explicit fusion / kernel-dispatch options.
+    ///
+    /// `kernel_dispatch` may be `"native"`, `"common"`, or omitted (env default).
+    #[pyo3(signature = (graph, fusion_options=None, kernel_dispatch=None))]
+    fn compile_with(
+        &self,
+        graph: &Bound<'_, PyGraph>,
+        fusion_options: Option<PyRef<PyFusionOptions>>,
+        kernel_dispatch: Option<&str>,
+    ) -> PyResult<PyCompiled> {
+        let g: Graph = graph.borrow_mut().inner.take().ok_or_else(|| {
+            PyRuntimeError::new_err("graph already consumed — Session.compile takes ownership")
+        })?;
+
+        let outputs = g
+            .outputs
+            .iter()
+            .map(|id| {
+                let s = g.shape(*id);
+                (*id, shape_to_static_dims(s))
+            })
+            .collect::<Vec<_>>();
+
+        let opts = build_compile_options(self.inner.precision(), fusion_options, kernel_dispatch)?;
+
+        let compiled = self.inner.compile_with(g, &opts);
+        Ok(PyCompiled::from_compiled(
+            compiled,
+            outputs.into_iter().map(|(_, dims)| dims).collect(),
+        ))
     }
 
     fn __repr__(&self) -> String {
@@ -112,8 +150,7 @@ impl PySession {
 }
 
 /// Resolve a Shape into a concrete `Vec<usize>` for numpy reshape.
-/// Dynamic dims fall back to 0 — caller must reshape themselves.
-fn shape_to_static_dims(shape: &Shape) -> Vec<usize> {
+pub(crate) fn shape_to_static_dims(shape: &Shape) -> Vec<usize> {
     shape
         .dims()
         .iter()
@@ -124,11 +161,26 @@ fn shape_to_static_dims(shape: &Shape) -> Vec<usize> {
         .collect()
 }
 
+/// Executable artifact from `Session.compile`.
+///
+/// Params are uploaded by name; inputs are passed per `run` call. The f32
+/// `run` / `set_param` path expects C-contiguous `float32` ndarrays and
+/// reshapes outputs to the graph's declared static shapes. Use `run_typed` /
+/// `set_param_typed` for f64 and other dtypes (bytes + dtype label).
 #[pyclass(name = "CompiledGraph", module = "pyrlx._pyrlx")]
 pub(crate) struct PyCompiled {
     inner: CompiledGraph,
     /// One Vec<usize> per graph output — used to reshape flat results.
     output_shapes: Vec<Vec<usize>>,
+}
+
+impl PyCompiled {
+    pub(crate) fn from_compiled(compiled: CompiledGraph, output_shapes: Vec<Vec<usize>>) -> Self {
+        Self {
+            inner: compiled,
+            output_shapes,
+        }
+    }
 }
 
 #[pymethods]

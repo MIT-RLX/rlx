@@ -49,7 +49,9 @@ pub mod symmetric;
 pub use arena::DeviceArena;
 pub use buffer::Buffer;
 pub use collective::{ReduceKind, all_gather, all_reduce, reduce_scatter};
-pub use device::Device;
+pub use device::{
+    BackendSupport, Device, DeviceFromStrError, STANDARD_DEVICES, StandardBackends, validate_device,
+};
 pub use handle::BufferHandle;
 pub use stream::{CommandStream, SyncStream};
 pub use symmetric::{

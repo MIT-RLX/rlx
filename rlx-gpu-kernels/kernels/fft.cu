@@ -1,4 +1,19 @@
 // RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+// RLX — versatile ML compiler + runtime.
 // Port of gpu-fft butterfly kernels for RLX 2N real-block layout:
 // each row is [re[0..n) | im[0..n)] in the arena (f32 elements).
 // Use ____cosf/____sinf so NVRTC does not need a host math.h include path.

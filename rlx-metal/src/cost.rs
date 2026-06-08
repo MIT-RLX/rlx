@@ -166,26 +166,31 @@ impl MetalHwModel {
     /// Pick the best sgemm variant for these dimensions.
     /// Higher-throughput variants have stricter alignment requirements.
     pub fn pick_sgemm(&self, m: usize, k: usize, n: usize) -> SgemmVariant {
-        let aligned_32 = m.is_multiple_of(32) && k.is_multiple_of(32) && n.is_multiple_of(32);
+        if let Some(forced) = sgemm_variant_override() {
+            return forced;
+        }
+
         let aligned_8 = m.is_multiple_of(8) && k.is_multiple_of(8) && n.is_multiple_of(8);
 
-        // MPS path: Apple's tuned matmul wins above ~16 MFLOPs because their
-        // private knowledge of the tensor-unit fabric beats our hand-rolled
-        // 32×32 simd kernel. Below the threshold the ~5–20µs objc bridging
-        // cost dominates and we stay on the in-encoder MSL path.
-        // Override via env var for A/B benchmarking.
+        // MPS pays encoder end + objc bridging per call. On backward graphs with
+        // hundreds of matmuls that cost dominates even when compute would win.
+        // Opt in with RLX_METAL_SGEMM_MPS=1; RLX_MPS_THRESHOLD_FLOP still applies.
+        let mps_enabled = rlx_ir::env::flag("RLX_METAL_SGEMM_MPS");
         let mps_disabled = rlx_ir::env::var("RLX_DISABLE_MPS")
             .map(|v| v == "1")
             .unwrap_or(false);
         let flop = (m as u64) * (k as u64) * (n as u64);
-        if !mps_disabled
+        if mps_enabled
+            && !mps_disabled
             && crate::mps_blas::mps_supports_matmul()
             && flop >= self.mps_threshold_flop
         {
             return SgemmVariant::Mps;
         }
 
-        if aligned_32 && m >= 32 && n >= 32 {
+        if k.is_multiple_of(32) && n.is_multiple_of(32) {
+            // Transformer weight dims are 32-aligned; arena rows are padded.
+            // simd4x4 uses M.div_ceil(32) threadgroups — valid for small M (decode / narrow batch).
             SgemmVariant::Simd4x4
         } else if aligned_8 && m >= 8 && n >= 8 {
             SgemmVariant::Simd
@@ -267,6 +272,41 @@ impl MetalHwModel {
     }
 }
 
+/// Force a specific sgemm kernel for A/B tuning.
+///
+/// Env vars consulted (in order; first match wins):
+///
+/// - **`RLX_METAL_SGEMM_VARIANT`** — explicit variant by name. Accepts
+///   `mps | simd4x4 | simd | padded | tiled | naive`.
+/// - **`RLX_METAL_PRECISE`** — when set to `1` / `true`, forces the
+///   scalar fp32 `naive` variant for every matmul. Apple Silicon's
+///   `simdgroup_float8x8` tensor units use reduced-precision internal
+///   accumulators (~fp16 class), which is fine for production
+///   inference but produces ~1e-1 absolute error vs CPU on small
+///   parity tests. Set this for precision-critical work; leave unset
+///   for production where the 10–100× throughput of the SIMD path
+///   wins.
+fn sgemm_variant_override() -> Option<SgemmVariant> {
+    if let Some(raw) = rlx_ir::env::var("RLX_METAL_SGEMM_VARIANT") {
+        match raw.to_ascii_lowercase().as_str() {
+            "mps" => return Some(SgemmVariant::Mps),
+            "simd4x4" | "simd_4x4" | "4x4" => return Some(SgemmVariant::Simd4x4),
+            "simd" | "simd8" | "simd_8" => return Some(SgemmVariant::Simd),
+            "padded" | "simd_padded" | "simdpadded" => return Some(SgemmVariant::SimdPadded),
+            "tiled" => return Some(SgemmVariant::Tiled),
+            "naive" => return Some(SgemmVariant::Naive),
+            _ => {}
+        }
+    }
+    if let Some(raw) = rlx_ir::env::var("RLX_METAL_PRECISE") {
+        match raw.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return Some(SgemmVariant::Naive),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Global hardware model singleton.
 pub fn hw_model() -> &'static MetalHwModel {
     static MODEL: OnceLock<MetalHwModel> = OnceLock::new();
@@ -289,10 +329,14 @@ mod tests {
         // Force the in-encoder MSL path so the threshold logic doesn't shadow
         // the alignment routing (these dims would otherwise hit Mps).
         rlx_ir::env::set("RLX_DISABLE_MPS", "1");
+        rlx_ir::env::unset("RLX_METAL_SGEMM_VARIANT");
         let hw = MetalHwModel::detect();
         assert_eq!(hw.pick_sgemm(64, 768, 2304), SgemmVariant::Simd4x4);
+        assert_eq!(hw.pick_sgemm(750, 768, 2304), SgemmVariant::Simd4x4);
         assert_eq!(hw.pick_sgemm(8, 16, 16), SgemmVariant::Simd);
-        assert_eq!(hw.pick_sgemm(6, 768, 2304), SgemmVariant::SimdPadded);
+        // k,n are 32-aligned (transformer weights); simd4x4 handles small M via div_ceil(32).
+        assert_eq!(hw.pick_sgemm(6, 768, 2304), SgemmVariant::Simd4x4);
+        assert_eq!(hw.pick_sgemm(6, 768, 2300), SgemmVariant::SimdPadded);
         assert_eq!(hw.pick_sgemm(6, 7, 7), SgemmVariant::Naive);
         rlx_ir::env::unset("RLX_DISABLE_MPS");
     }

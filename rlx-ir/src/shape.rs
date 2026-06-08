@@ -106,7 +106,13 @@ impl Shape {
         &self.dims
     }
     pub fn dim(&self, i: usize) -> Dim {
-        self.dims[i]
+        self.dims.get(i).copied().unwrap_or_else(|| {
+            let dims: Vec<_> = self.dims.iter().map(|d| d.unwrap_static()).collect();
+            panic!(
+                "Shape::dim({i}) out of bounds for rank {} dims={dims:?}",
+                self.rank()
+            );
+        })
     }
 
     /// Set of dynamic dim symbols this shape references. Useful for
@@ -272,6 +278,18 @@ pub fn matmul_shape(lhs: &Shape, rhs: &Shape) -> Result<Shape, String> {
     })
 }
 
+/// ONNX Expand: broadcast `input` to `target` (numpy-style).
+pub fn expand_shape(input: &Shape, target: &[i64]) -> Result<Shape, String> {
+    if target.iter().any(|&d| d < 0) {
+        return Err("expand target has negative dim".into());
+    }
+    let target_s = Shape::new(
+        &target.iter().map(|&d| d as usize).collect::<Vec<_>>(),
+        input.dtype(),
+    );
+    broadcast(input, &target_s)
+}
+
 /// Binary element-wise shape (broadcast).
 pub fn binary_shape(lhs: &Shape, rhs: &Shape) -> Result<Shape, String> {
     broadcast(lhs, rhs)
@@ -351,7 +369,8 @@ pub fn concat_shape(inputs: &[&Shape], axis: usize) -> Result<Shape, String> {
                 base.rank()
             ));
         }
-        match s.dims[axis] {
+        let ax = axis.min(s.rank().saturating_sub(1));
+        match s.dims[ax] {
             Dim::Static(n) => static_sum += n,
             Dim::Dynamic(sym) => {
                 if let Some(prev) = dyn_sym {
@@ -375,7 +394,8 @@ pub fn concat_shape(inputs: &[&Shape], axis: usize) -> Result<Shape, String> {
             Dim::Dynamic(sym)
         }
     };
-    Ok(base.clone().with_dim(axis, out_dim))
+    let out_axis = axis.min(base.rank().saturating_sub(1));
+    Ok(base.clone().with_dim(out_axis, out_dim))
 }
 
 /// Gather (embedding lookup): table\[V,D\] + indices\[B,S\] → \[B,S,D\].
@@ -561,7 +581,7 @@ pub fn conv2d_output_shape(
     if input.rank() != 4 || weight.rank() != 4 {
         return Err("conv2d requires NCHW input and 4-D weight".into());
     }
-    let n = input.dim(0).unwrap_static();
+    let n = input.dim(0);
     let c_in = input.dim(1).unwrap_static();
     let h = input.dim(2).unwrap_static();
     let w = input.dim(3).unwrap_static();
@@ -574,7 +594,46 @@ pub fn conv2d_output_shape(
     }
     let h_out = conv2d_spatial_output(h, kernel_size[0], stride[0], padding[0], dilation[0]);
     let w_out = conv2d_spatial_output(w, kernel_size[1], stride[1], padding[1], dilation[1]);
-    Ok(Shape::new(&[n, c_out, h_out, w_out], input.dtype()))
+    Ok(Shape::from_dims(
+        &[
+            n,
+            Dim::Static(c_out),
+            Dim::Static(h_out),
+            Dim::Static(w_out),
+        ],
+        input.dtype(),
+    ))
+}
+
+/// Output shape for NCHW `Op::Im2Col`: `[M, C·kH·kW]` with
+/// `M = N · H_out · W_out`. Dynamic batch maps to [`dynamic::sym::ROWS`].
+pub fn im2col_output_shape(
+    input: &Shape,
+    kernel_size: [usize; 2],
+    stride: [usize; 2],
+    padding: [usize; 2],
+    dilation: [usize; 2],
+) -> Result<Shape, String> {
+    if input.rank() != 4 {
+        return Err("im2col requires NCHW input".into());
+    }
+    let c_in = input.dim(1).unwrap_static();
+    let h = input.dim(2).unwrap_static();
+    let w = input.dim(3).unwrap_static();
+    let kh = kernel_size[0];
+    let kw = kernel_size[1];
+    let h_out = conv2d_spatial_output(h, kh, stride[0], padding[0], dilation[0]);
+    let w_out = conv2d_spatial_output(w, kw, stride[1], padding[1], dilation[1]);
+    let k = c_in * kh * kw;
+    let spatial = h_out * w_out;
+    let m = match input.dim(0) {
+        Dim::Static(n) => Dim::Static(n * spatial),
+        Dim::Dynamic(crate::dynamic::sym::BATCH) | Dim::Dynamic(crate::dynamic::sym::ROWS) => {
+            Dim::Dynamic(crate::dynamic::sym::ROWS)
+        }
+        Dim::Dynamic(_) => Dim::Dynamic(crate::dynamic::sym::ROWS),
+    };
+    Ok(Shape::from_dims(&[m, Dim::Static(k)], input.dtype()))
 }
 
 /// Output shape for `conv_transpose2d` (weight `[C_in, C_out/g, kH, kW]`).

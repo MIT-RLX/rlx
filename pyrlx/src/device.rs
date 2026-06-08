@@ -14,56 +14,24 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! String <-> Device parsing and availability lookup.
-//!
-//! Python users pass devices as strings ("cpu", "metal", "cuda", ...);
-//! this module is the single point of conversion to `rlx_driver::Device`.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use rlx_runtime::Device;
+use rlx_runtime::cost::fastest_device_for_with_policy;
+use rlx_runtime::{
+    Device, DevicePolicy, device_label as runtime_device_label, device_report, fastest_device_for,
+    parse_device as runtime_parse_device,
+};
 
-/// Map a string identifier to a Device. Accepts the lower-case names
-/// used in cargo features (cpu, metal, mlx, ane, cuda, rocm, gpu/wgpu,
-/// vulkan, opengl, directx, webgpu) plus a handful of aliases.
+use crate::graph::{PyGraph, graph_ref};
+use crate::graph_devices::{PyDeviceCandidate, PyDevicePolicy};
+
 pub(crate) fn parse_device(s: &str) -> PyResult<Device> {
-    let key = s.trim().to_ascii_lowercase();
-    let dev = match key.as_str() {
-        "cpu" => Device::Cpu,
-        "metal" | "mtl" => Device::Metal,
-        "mlx" => Device::Mlx,
-        "ane" | "neural-engine" => Device::Ane,
-        "cuda" | "nvidia" => Device::Cuda,
-        "rocm" | "hip" | "amd" => Device::Rocm,
-        "gpu" | "wgpu" => Device::Gpu,
-        "vulkan" | "vk" => Device::Vulkan,
-        "opengl" | "gl" => Device::OpenGl,
-        "directx" | "dx12" | "d3d12" => Device::DirectX,
-        "webgpu" => Device::WebGpu,
-        "tpu" => Device::Tpu,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown device '{other}' (try: cpu, metal, mlx, cuda, rocm, gpu, vulkan)"
-            )));
-        }
-    };
-    Ok(dev)
+    runtime_parse_device(s).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 pub(crate) fn device_label(d: Device) -> &'static str {
-    match d {
-        Device::Cpu => "cpu",
-        Device::Metal => "metal",
-        Device::Mlx => "mlx",
-        Device::Ane => "ane",
-        Device::Cuda => "cuda",
-        Device::Rocm => "rocm",
-        Device::Gpu => "gpu",
-        Device::Vulkan => "vulkan",
-        Device::OpenGl => "opengl",
-        Device::DirectX => "directx",
-        Device::WebGpu => "webgpu",
-        Device::Tpu => "tpu",
-    }
+    runtime_device_label(d)
 }
 
 /// `pyrlx.available_devices()` — list of devices that have a backend
@@ -80,4 +48,51 @@ pub(crate) fn available_devices() -> Vec<&'static str> {
 #[pyfunction]
 pub(crate) fn is_available(name: &str) -> PyResult<bool> {
     Ok(rlx_runtime::is_available(parse_device(name)?))
+}
+
+/// `pyrlx.parse_device("metal")` → `"metal"` (raises on unknown names).
+#[pyfunction]
+pub(crate) fn parse_device_py(name: &str) -> PyResult<&'static str> {
+    Ok(device_label(parse_device(name)?))
+}
+
+/// `pyrlx.backends_manifest()` — JSON of Cargo features compiled into this wheel.
+#[pyfunction]
+pub(crate) fn backends_manifest() -> String {
+    rlx_runtime::BackendsManifest::json().to_string()
+}
+
+/// Cost-model pick for a graph without building a `GraphDevices` runner.
+#[pyfunction]
+#[pyo3(signature = (graph, policy=None))]
+pub(crate) fn fastest_device_for_py(
+    graph: &Bound<'_, PyGraph>,
+    policy: Option<PyRef<PyDevicePolicy>>,
+) -> PyResult<&'static str> {
+    let binding = graph.borrow();
+    let g = graph_ref(&binding)?;
+    let device = match policy {
+        Some(p) => fastest_device_for_with_policy(g, &p.to_policy()),
+        None => fastest_device_for(g),
+    };
+    Ok(device_label(device))
+}
+
+/// Per-backend viability report for a graph (blockers + recommended pick).
+#[pyfunction]
+#[pyo3(signature = (graph, policy=None))]
+pub(crate) fn device_report_py(
+    graph: &Bound<'_, PyGraph>,
+    policy: Option<PyRef<PyDevicePolicy>>,
+) -> PyResult<Vec<PyDeviceCandidate>> {
+    let binding = graph.borrow();
+    let g = graph_ref(&binding)?;
+    let policy = match policy {
+        Some(p) => p.to_policy(),
+        None => DevicePolicy::all(),
+    };
+    Ok(device_report(g, &policy)
+        .into_iter()
+        .map(PyDeviceCandidate::from)
+        .collect())
 }

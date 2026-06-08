@@ -57,9 +57,7 @@ fn main() {
         if use_icb {
             rlx_ir::env::set("RLX_USE_ICB", "1");
         } else {
-            unsafe {
-                rlx_ir::env::unset("RLX_USE_ICB");
-            }
+            rlx_ir::env::unset("RLX_USE_ICB");
         }
         let session = Session::new(dev);
         let mut compiled = session.compile(build());

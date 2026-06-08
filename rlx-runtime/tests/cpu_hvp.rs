@@ -57,7 +57,6 @@ fn hvp_sum_squares_gives_2v() {
     let v = vec![0.5, -0.25, 1.0, -1.5];
     let outs = c.run_typed(&[
         ("x", &f64s_to_bytes(&x_data), DType::F64),
-        ("d_output", &f64s_to_bytes(&[1.0]), DType::F64),
         ("tangent_x", &f64s_to_bytes(&v), DType::F64),
     ]);
     // Outputs: [primal_f, grad_x, tangent_f, H·v]
@@ -113,7 +112,6 @@ fn hvp_matches_finite_differences() {
     let v: Vec<f64> = vec![1.0, 0.25, -0.5];
     let outs = c.run_typed(&[
         ("x", &f64s_to_bytes(&x0), DType::F64),
-        ("d_output", &f64s_to_bytes(&[1.0]), DType::F64),
         ("tangent_x", &f64s_to_bytes(&v), DType::F64),
     ]);
     let hv = bytes_to_f64s(&outs[3].0);
@@ -132,4 +130,41 @@ fn hvp_matches_finite_differences() {
             want[i]
         );
     }
+}
+
+#[test]
+fn hvp_through_tanh_activation() {
+    use rlx_ir::op::Activation;
+
+    let mut g = Graph::new("tanh_hvp");
+    let x = g.input("x", Shape::scalar(DType::F64));
+    let tx = g.activation(Activation::Tanh, x, Shape::scalar(DType::F64));
+    g.set_outputs(vec![tx]);
+
+    let x_val: f64 = 0.5;
+    let v: f64 = 1.0;
+    let txv = x_val.tanh();
+    let want_hv = -2.0 * txv * (1.0 - txv * txv) * v;
+
+    let hg = hvp(&g, &[x]);
+    assert!(
+        hg.nodes()
+            .iter()
+            .all(|n| !matches!(&n.op, rlx_ir::Op::Input { name } if name == "d_output")),
+        "hvp must internalize d_output"
+    );
+
+    let mut c = Session::new(Device::Cpu).compile(hg);
+    let outs = c.run_typed(&[
+        ("x", &f64s_to_bytes(&[x_val]), DType::F64),
+        ("tangent_x", &f64s_to_bytes(&[v]), DType::F64),
+    ]);
+    let grad = bytes_to_f64s(&outs[1].0)[0];
+    let hv = bytes_to_f64s(&outs[3].0)[0];
+    let want_grad = 1.0 - txv * txv;
+    assert!(
+        (grad - want_grad).abs() < 1e-12,
+        "grad {grad} want {want_grad}"
+    );
+    assert!((hv - want_hv).abs() < 1e-10, "H·v {hv} want {want_hv}");
 }

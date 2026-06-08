@@ -17,7 +17,8 @@
 //! `cargo test -p rlx-cuda --features hip-cpu-validate`.
 //!
 //! These tests numerically validate that `.cu` kernels produce correct
-//! output when executed on CPU via HIP-CPU. They run anywhere C++17
+//! output when executed on CPU via HIP-CPU inside the linux-gnu Docker
+//! image (`just test-hip-cpu-validate`).
 //! compiles — Mac, Linux, Windows, Docker — without an NVIDIA driver.
 //!
 //! Same kernel sources as the GPU path; only the dispatch route changes.
@@ -627,4 +628,42 @@ fn elementwise_region_relu_add_mul_matches_reference() {
 
     let want: Vec<f32> = xs.iter().map(|x| (x + 0.5).max(0.0) * 2.0).collect();
     approx(&arena[18..24], &want, 1e-5);
+}
+
+#[test]
+fn batch_elementwise_region_relu_two_slices_matches_reference() {
+    let s0 = [-1.0f32, 0.0, 1.0, 2.0];
+    let s1 = [0.5f32, -0.5, 1.5, -1.0];
+    let mut arena: Vec<f32> = Vec::with_capacity(16);
+    arena.extend_from_slice(&s0);
+    arena.extend_from_slice(&s1);
+    arena.extend(std::iter::repeat(0.0f32).take(8));
+
+    let batch_input_offs = [0u32, 4];
+    let mut meta = [0u32; rlx_ir::REGION_META_WORDS];
+    let inp = |i: u32| i & 0x7FFF_FFFFu32;
+    let chain_base = rlx_ir::REGION_META_INPUT_WORDS;
+    meta[chain_base] = 0;
+    meta[chain_base + 1] = 3; // Relu
+    meta[chain_base + 2] = inp(0);
+    meta[chain_base + 3] = 0;
+
+    let input_modulus = [0u32; 16];
+    run_batch_elementwise_region(
+        &mut arena,
+        /*slice_len=*/ 4,
+        /*num_batch=*/ 2,
+        /*num_steps=*/ 1,
+        /*base_dst_off=*/ 8,
+        /*slice_elems=*/ 4,
+        &batch_input_offs,
+        &meta,
+        /*scalar_input_mask=*/ 0,
+        &input_modulus,
+    );
+
+    let want0: Vec<f32> = s0.iter().map(|x| x.max(0.0)).collect();
+    let want1: Vec<f32> = s1.iter().map(|x| x.max(0.0)).collect();
+    approx(&arena[8..12], &want0, 1e-5);
+    approx(&arena[12..16], &want1, 1e-5);
 }

@@ -32,18 +32,18 @@
 use cortex_m_rt::entry;
 use panic_halt as _;
 
-use nrf52840_hal as hal;
 use nrf_usbd::Usbd;
+use nrf52840_hal as hal;
 use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::device::{StringDescriptors, UsbDeviceBuilder, UsbVidPid};
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
-use rlx_cortexm::model::{infer, INPUT_LEN, SCRATCH_LEN};
+use rlx_cortexm::model::{INPUT_LEN, SCRATCH_LEN, infer};
 
 // Two scratch buffers + the input buffer in BSS.
 static mut BUF_A: [i8; SCRATCH_LEN] = [0; SCRATCH_LEN];
 static mut BUF_B: [i8; SCRATCH_LEN] = [0; SCRATCH_LEN];
-static mut INPUT: [i8; INPUT_LEN]   = [0; INPUT_LEN];
+static mut INPUT: [i8; INPUT_LEN] = [0; INPUT_LEN];
 
 #[entry]
 fn main() -> ! {
@@ -88,9 +88,7 @@ fn main() -> ! {
         // Read into the tail of INPUT.
         // SAFETY: we own INPUT for the program lifetime; the borrow
         // is local to this match arm.
-        let input_slice: &mut [i8] = unsafe {
-            &mut *core::ptr::addr_of_mut!(INPUT)
-        };
+        let input_slice: &mut [i8] = unsafe { &mut *core::ptr::addr_of_mut!(INPUT) };
         // serial.read takes &mut [u8]; cast our i8 buffer.
         let tail_u8: &mut [u8] = unsafe {
             core::slice::from_raw_parts_mut(

@@ -40,14 +40,18 @@
 
 pub mod arena;
 pub mod backend;
+pub mod calibrate;
 pub mod device;
 pub mod fft_dispatch;
 pub mod fft_host;
 pub mod gdn_host;
 pub mod gguf_gpu;
 pub mod gguf_host;
+pub mod host_staging;
+pub mod im2col_host;
 pub mod kernels;
 pub mod llada2_gate_host;
+pub mod log_mel_host;
 pub mod sam_ops_host;
 pub mod splat_host;
 #[cfg(feature = "native-splat")]

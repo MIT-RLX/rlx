@@ -14,6 +14,6 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Gaussian splat forward/backward for MLX lowering (CPU reference on host buffers).
 
-#![cfg(target_os = "macos")]
+#![cfg(rlx_mlx_host)]
 
 pub use rlx_cpu::splat::{backward_host_slices, render_host_slices};

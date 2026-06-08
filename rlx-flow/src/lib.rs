@@ -1,5 +1,17 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Block assembly-line API for RLX model builders.
 
@@ -15,6 +27,7 @@ mod layer;
 mod plugin;
 mod profile;
 mod recipe;
+pub mod rope;
 mod side;
 mod stage;
 mod stage_contract;
@@ -42,9 +55,14 @@ pub use plugin::{PluginStage, plugin, plugin_named};
 pub use profile::{
     BackendOverrides, CompileProfile, CpuBackendProfile, FusionPolicyKind, FusionProfile,
     FusionTargetKind, MetalBackendProfile, MixedPrecisionKind, PassProfile, PrecisionKind,
-    PrecisionProfile,
+    PrecisionProfile, ProfileMode,
 };
 pub use recipe::ModelRecipe;
+pub use rope::{
+    Llama3Scaling, YarnScaling, build_default_tables, build_mrope_text_tables, build_tables,
+    default_inv_freq, inv_freq_with_factors, llama3_scaled_inv_freq, mrope_row_for_sections,
+    mrope_section_for_pair, mrope_sections4, ntk_scaled_inv_freq, yarn_scaled_inv_freq,
+};
 pub use side::SideOutputs;
 pub use stage::FlowStage;
 pub use stage_contract::{BlockAsLayer, LayerStage, StageArtifacts};

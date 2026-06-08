@@ -403,10 +403,15 @@ kernel void sdpa_h(
     constant uint& head_dim   [[buffer(8)]],
     constant uint& seq_stride [[buffer(9)]],
     constant uint& mask_kind  [[buffer(10)]],
+    constant uint& seq_k      [[buffer(11)]],  // unused; mirrors sdpa signature
+    constant uint& k_stride   [[buffer(12)]],  // unused; mirrors sdpa signature
+    constant uint& bhsd       [[buffer(13)]],  // unused; mirrors sdpa signature
+    constant uint& window     [[buffer(14)]],
     uint tgid_x [[threadgroup_position_in_grid]],
     uint tid    [[thread_position_in_threadgroup]],
     uint tsize  [[threads_per_threadgroup]]
 ) {
+    (void)seq_k; (void)k_stride; (void)bhsd;  // accepted to share encode_sdpa layout
     threadgroup float scores[64 * 64];
     threadgroup float row_max;
     threadgroup float row_sum;
@@ -416,7 +421,7 @@ kernel void sdpa_h(
     if (bi >= batch) return;
 
     uint hs = heads * head_dim;
-    float scale = rsqrt(float(head_dim));
+    float scale = 1.0f / precise::sqrt(float(head_dim));
     uint per_batch_stride = seq_stride * hs;
 
     uint total = seq * seq;
@@ -434,6 +439,10 @@ kernel void sdpa_h(
             if (ki > qi) s = -1e9f;
         } else if (mask_kind == 2u) {
             if (float(M[bi * seq_stride + ki]) < 0.5f) s = -1e9f;
+        } else if (mask_kind == 4u) {
+            // Lq == Lk here (sdpa_h is prefill-only), so abs_q == qi.
+            uint lo = qi > window ? qi - window : 0u;
+            if (ki < lo || ki > qi) s = -1e9f;
         }
         scores[qi * seq + ki] = s;
     }
@@ -452,7 +461,7 @@ kernel void sdpa_h(
         if (tid == 0) {
             float sum = 0.0f;
             for (uint ki = 0; ki < seq; ++ki) {
-                float e = exp(scores[qi * seq + ki] - row_max);
+                float e = precise::exp(scores[qi * seq + ki] - row_max);
                 scores[qi * seq + ki] = e;
                 sum += e;
             }
@@ -556,6 +565,16 @@ kernel void copy_f32(
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= len) return;
+    dst[gid] = src[gid];
+}
+
+kernel void copy4(
+    device const packed_float4* src [[buffer(0)]],
+    device packed_float4* dst       [[buffer(1)]],
+    constant uint& len4             [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
     dst[gid] = src[gid];
 }
 
@@ -1011,6 +1030,389 @@ kernel void gelu_inplace(
     data[gid] = x * 0.5 * (1.0 + erf_val);
 }
 
+kernel void gelu_inplace4(
+    device packed_float4* data [[buffer(0)]],
+    constant uint& len4 [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    packed_float4 px = data[gid];
+    packed_float4 out;
+    for (uint c = 0; c < 4; ++c) {
+        float xv = px[c];
+        float arg = xv * 0.7071067811865475;
+        float sign = arg >= 0.0 ? 1.0 : -1.0;
+        float xa = abs(arg);
+        float t = 1.0 / (1.0 + 0.3275911 * xa);
+        float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
+                + t * (-1.453152027 + t * 1.061405429))));
+        float erf_val = sign * (1.0 - y * exp(-xa * xa));
+        out[c] = xv * 0.5 * (1.0 + erf_val);
+    }
+    data[gid] = out;
+}
+
+kernel void silu_inplace4(
+    device packed_float4* data [[buffer(0)]],
+    constant uint& len4 [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    packed_float4 px = data[gid];
+    packed_float4 out;
+    for (uint c = 0; c < 4; ++c) {
+        float xv = px[c];
+        out[c] = xv / (1.0 + exp(-xv));
+    }
+    data[gid] = out;
+}
+
+// rhs [cols] broadcast across rows: out[m, n] = lhs[m*cols+n] op rhs[n]
+kernel void binary_broadcast_rhs_col_f32(
+    device const float* lhs [[buffer(0)]],
+    device const float* rhs [[buffer(1)]],
+    device float* dst       [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols     [[buffer(4)]],
+    constant uint& op       [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint m = gid.y;
+    uint n = gid.x;
+    if (m >= rows || n >= cols) return;
+    float lv = lhs[m * cols + n];
+    float rv = rhs[n];
+    float out;
+    switch (op) {
+        case 0: out = lv + rv; break;
+        case 1: out = lv - rv; break;
+        case 2: out = lv * rv; break;
+        case 3: out = lv / rv; break;
+        case 4: out = max(lv, rv); break;
+        case 5: out = min(lv, rv); break;
+        default: out = pow(lv, rv); break;
+    }
+    dst[m * cols + n] = out;
+}
+
+kernel void binary_broadcast_rhs_col4(
+    device const float* lhs [[buffer(0)]],
+    device const float* rhs [[buffer(1)]],
+    device float* dst       [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols4    [[buffer(4)]],
+    constant uint& op       [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint m = gid.y;
+    uint n4 = gid.x;
+    uint cols = cols4 * 4u;
+    if (m >= rows || n4 >= cols4) return;
+    device const packed_float4* lhs4 =
+        (device const packed_float4*)(lhs + m * cols);
+    device const packed_float4* rhs4 = (device const packed_float4*)(rhs);
+    device packed_float4* dst4 = (device packed_float4*)(dst + m * cols);
+    packed_float4 lv = lhs4[n4];
+    packed_float4 rv = rhs4[n4];
+    packed_float4 out;
+    switch (op) {
+        case 0: out = lv + rv; break;
+        case 1: out = lv - rv; break;
+        case 2: out = lv * rv; break;
+        case 3: out = lv / rv; break;
+        case 4: out = max(lv, rv); break;
+        case 5: out = min(lv, rv); break;
+        default: out = pow(lv, rv); break;
+    }
+    dst4[n4] = out;
+}
+
+// Dense lhs + rhs row vector broadcast on the last axis (e.g. `[rows, cols] op [rows, 1]`).
+kernel void binary_broadcast_rhs_row_f32(
+    device const float* lhs [[buffer(0)]],
+    device const float* rhs [[buffer(1)]],
+    device float* dst       [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols     [[buffer(4)]],
+    constant uint& op       [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint m = gid.y;
+    uint n = gid.x;
+    if (m >= rows || n >= cols) return;
+    float lv = lhs[m * cols + n];
+    float rv = rhs[m];
+    float out;
+    switch (op) {
+        case 0: out = lv + rv; break;
+        case 1: out = lv - rv; break;
+        case 2: out = lv * rv; break;
+        case 3: out = lv / rv; break;
+        case 4: out = max(lv, rv); break;
+        case 5: out = min(lv, rv); break;
+        default: out = pow(lv, rv); break;
+    }
+    dst[m * cols + n] = out;
+}
+
+kernel void binary_broadcast_rhs_row4(
+    device const float* lhs [[buffer(0)]],
+    device const float* rhs [[buffer(1)]],
+    device float* dst       [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols4    [[buffer(4)]],
+    constant uint& op       [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint m = gid.y;
+    uint n4 = gid.x;
+    uint cols = cols4 * 4u;
+    if (m >= rows || n4 >= cols4) return;
+    device const packed_float4* lhs4 =
+        (device const packed_float4*)(lhs + m * cols);
+    float rv = rhs[m];
+    packed_float4 rv4 = packed_float4(rv);
+    device packed_float4* dst4 = (device packed_float4*)(dst + m * cols);
+    packed_float4 lv = lhs4[n4];
+    packed_float4 out;
+    switch (op) {
+        case 0: out = lv + rv4; break;
+        case 1: out = lv - rv4; break;
+        case 2: out = lv * rv4; break;
+        case 3: out = lv / rv4; break;
+        case 4: out = max(lv, rv4); break;
+        case 5: out = min(lv, rv4); break;
+        default: out = pow(lv, rv4); break;
+    }
+    dst4[n4] = out;
+}
+
+// Dense lhs + scalar rhs (all broadcast strides zero).
+kernel void binary_broadcast_rhs_scalar_f32(
+    device const float* lhs [[buffer(0)]],
+    device const float* rhs [[buffer(1)]],
+    device float* dst       [[buffer(2)]],
+    constant uint& len      [[buffer(3)]],
+    constant uint& op       [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    float lv = lhs[gid];
+    float rv = rhs[0];
+    float out;
+    switch (op) {
+        case 0: out = lv + rv; break;
+        case 1: out = lv - rv; break;
+        case 2: out = lv * rv; break;
+        case 3: out = lv / rv; break;
+        case 4: out = max(lv, rv); break;
+        case 5: out = min(lv, rv); break;
+        default: out = pow(lv, rv); break;
+    }
+    dst[gid] = out;
+}
+
+kernel void binary_broadcast_rhs_scalar4(
+    device const packed_float4* lhs [[buffer(0)]],
+    device const float* rhs         [[buffer(1)]],
+    device packed_float4* dst       [[buffer(2)]],
+    constant uint& len4             [[buffer(3)]],
+    constant uint& op               [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    float rv = rhs[0];
+    packed_float4 rv4 = packed_float4(rv);
+    packed_float4 lv = lhs[gid];
+    packed_float4 out;
+    switch (op) {
+        case 0: out = lv + rv4; break;
+        case 1: out = lv - rv4; break;
+        case 2: out = lv * rv4; break;
+        case 3: out = lv / rv4; break;
+        case 4: out = max(lv, rv4); break;
+        case 5: out = min(lv, rv4); break;
+        default: out = pow(lv, rv4); break;
+    }
+    dst[gid] = out;
+}
+
+// Dense lhs + rhs broadcast on exactly one axis (e.g. `[B, T, H] op [B, 1, H]`).
+kernel void binary_broadcast_1ax_f32(
+    device const float* lhs [[buffer(0)]],
+    device const float* rhs [[buffer(1)]],
+    device float* dst       [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols     [[buffer(4)]],
+    constant uint& mid      [[buffer(5)]],
+    constant uint& op       [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint row = gid.y;
+    if (col >= cols || row >= rows) return;
+    uint pre_i = row / mid;
+    uint li = row * cols + col;
+    uint ri = pre_i * cols + col;
+    float lv = lhs[li];
+    float rv = rhs[ri];
+    float out;
+    switch (op) {
+        case 0: out = lv + rv; break;
+        case 1: out = lv - rv; break;
+        case 2: out = lv * rv; break;
+        case 3: out = lv / rv; break;
+        case 4: out = max(lv, rv); break;
+        case 5: out = min(lv, rv); break;
+        default: out = pow(lv, rv); break;
+    }
+    dst[li] = out;
+}
+
+kernel void binary_broadcast_1ax4(
+    device const float* lhs [[buffer(0)]],
+    device const float* rhs [[buffer(1)]],
+    device float* dst       [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols4    [[buffer(4)]],
+    constant uint& mid      [[buffer(5)]],
+    constant uint& op       [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint col4 = gid.x;
+    uint row = gid.y;
+    uint cols = cols4 * 4u;
+    if (col4 >= cols4 || row >= rows) return;
+    uint pre_i = row / mid;
+    device const packed_float4* lhs4 =
+        (device const packed_float4*)(lhs + row * cols);
+    device const float* rhs_row = rhs + pre_i * cols;
+    device const packed_float4* rhs4 =
+        (device const packed_float4*)(rhs_row);
+    device packed_float4* dst4 =
+        (device packed_float4*)(dst + row * cols);
+    packed_float4 lv = lhs4[col4];
+    packed_float4 rv = rhs4[col4];
+    packed_float4 out;
+    switch (op) {
+        case 0: out = lv + rv; break;
+        case 1: out = lv - rv; break;
+        case 2: out = lv * rv; break;
+        case 3: out = lv / rv; break;
+        case 4: out = max(lv, rv); break;
+        case 5: out = min(lv, rv); break;
+        default: out = pow(lv, rv); break;
+    }
+    dst4[col4] = out;
+}
+
+inline float fused_bin(float lv, float rv, uint op) {
+    switch (op) {
+        case 0: return lv + rv;
+        case 1: return lv - rv;
+        case 2: return lv * rv;
+        case 3: return lv / rv;
+        case 4: return max(lv, rv);
+        case 5: return min(lv, rv);
+        default: return pow(lv, rv);
+    }
+}
+
+inline float fused_act(float x, uint act) {
+    switch (act) {
+        case 0: {
+            float arg = x * 0.7071067811865475;
+            float sign = arg >= 0.0 ? 1.0 : -1.0;
+            float xa = abs(arg);
+            float t = 1.0 / (1.0 + 0.3275911 * xa);
+            float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
+                    + t * (-1.453152027 + t * 1.061405429))));
+            float erf_val = sign * (1.0 - y * exp(-xa * xa));
+            return x * 0.5 * (1.0 + erf_val);
+        }
+        case 1: return x / (1.0 + exp(-x));
+        case 2: return max(x, 0.0);
+        case 3: return 1.0 / (1.0 + exp(-x));
+        case 4: return tanh(x);
+        default: return x;
+    }
+}
+
+kernel void fused_binary_activation_f32(
+    device const float* lhs [[buffer(0)]],
+    device const float* rhs [[buffer(1)]],
+    device float* dst       [[buffer(2)]],
+    constant uint& len      [[buffer(3)]],
+    constant uint& bin_op   [[buffer(4)]],
+    constant uint& act_op   [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    float v = fused_bin(lhs[gid], rhs[gid], bin_op);
+    dst[gid] = fused_act(v, act_op);
+}
+
+kernel void fused_binary_activation4(
+    device const packed_float4* lhs [[buffer(0)]],
+    device const packed_float4* rhs [[buffer(1)]],
+    device packed_float4* dst       [[buffer(2)]],
+    constant uint& len4             [[buffer(3)]],
+    constant uint& bin_op           [[buffer(4)]],
+    constant uint& act_op           [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    packed_float4 lv = lhs[gid];
+    packed_float4 rv = rhs[gid];
+    packed_float4 out;
+    for (uint c = 0; c < 4; ++c) {
+        float v = fused_bin(lv[c], rv[c], bin_op);
+        out[c] = fused_act(v, act_op);
+    }
+    dst[gid] = out;
+}
+
+kernel void fused_ternary_activation_f32(
+    device const float* lhs [[buffer(0)]],
+    device const float* rhs0 [[buffer(1)]],
+    device const float* rhs1 [[buffer(2)]],
+    device float* dst       [[buffer(3)]],
+    constant uint& len      [[buffer(4)]],
+    constant uint& bin_op0  [[buffer(5)]],
+    constant uint& bin_op1  [[buffer(6)]],
+    constant uint& act_op   [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    float v = fused_bin(lhs[gid], rhs0[gid], bin_op0);
+    v = fused_bin(v, rhs1[gid], bin_op1);
+    dst[gid] = fused_act(v, act_op);
+}
+
+kernel void fused_ternary_activation4(
+    device const packed_float4* lhs [[buffer(0)]],
+    device const packed_float4* rhs0 [[buffer(1)]],
+    device const packed_float4* rhs1 [[buffer(2)]],
+    device packed_float4* dst       [[buffer(3)]],
+    constant uint& len4             [[buffer(4)]],
+    constant uint& bin_op0          [[buffer(5)]],
+    constant uint& bin_op1          [[buffer(6)]],
+    constant uint& act_op           [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    packed_float4 lv = lhs[gid];
+    packed_float4 r0 = rhs0[gid];
+    packed_float4 r1 = rhs1[gid];
+    packed_float4 out;
+    for (uint c = 0; c < 4; ++c) {
+        float v = fused_bin(lv[c], r0[c], bin_op0);
+        v = fused_bin(v, r1[c], bin_op1);
+        out[c] = fused_act(v, act_op);
+    }
+    dst[gid] = out;
+}
+
 // Element-wise add: c = a + b (same length)
 kernel void elem_add(
     device const float* a [[buffer(0)]],
@@ -1021,6 +1423,102 @@ kernel void elem_add(
 ) {
     if (gid >= len) return;
     c[gid] = a[gid] + b[gid];
+}
+
+kernel void elem_add4(
+    device const packed_float4* a [[buffer(0)]],
+    device const packed_float4* b [[buffer(1)]],
+    device packed_float4* c       [[buffer(2)]],
+    constant uint& len4             [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    c[gid] = a[gid] + b[gid];
+}
+
+kernel void elem_sub4(
+    device const packed_float4* a [[buffer(0)]],
+    device const packed_float4* b [[buffer(1)]],
+    device packed_float4* c       [[buffer(2)]],
+    constant uint& len4             [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    c[gid] = a[gid] - b[gid];
+}
+
+// Rank-2 broadcast without a per-element rank loop (fallback after vec fast paths).
+kernel void binary_broadcast_rank2_f32(
+    device const float* lhs       [[buffer(0)]],
+    device const float* rhs       [[buffer(1)]],
+    device float* dst             [[buffer(2)]],
+    constant uint& len            [[buffer(3)]],
+    constant uint& dim0           [[buffer(4)]],
+    constant uint& dim1           [[buffer(5)]],
+    constant uint& lhs_stride0    [[buffer(6)]],
+    constant uint& lhs_stride1    [[buffer(7)]],
+    constant uint& rhs_stride0    [[buffer(8)]],
+    constant uint& rhs_stride1    [[buffer(9)]],
+    constant uint& op             [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    uint j = gid % dim1;
+    uint i = gid / dim1;
+    uint li = i * lhs_stride0 + j * lhs_stride1;
+    uint ri = i * rhs_stride0 + j * rhs_stride1;
+    float lv = lhs[li];
+    float rv = rhs[ri];
+    float out;
+    switch (op) {
+        case 0: out = lv + rv; break;
+        case 1: out = lv - rv; break;
+        case 2: out = lv * rv; break;
+        case 3: out = lv / rv; break;
+        case 4: out = max(lv, rv); break;
+        case 5: out = min(lv, rv); break;
+        default: out = pow(lv, rv); break;
+    }
+    dst[gid] = out;
+}
+
+kernel void binary_broadcast_rank24(
+    device const float* lhs       [[buffer(0)]],
+    device const float* rhs       [[buffer(1)]],
+    device float* dst             [[buffer(2)]],
+    constant uint& len4           [[buffer(3)]],
+    constant uint& dim0           [[buffer(4)]],
+    constant uint& dim1           [[buffer(5)]],
+    constant uint& lhs_stride0    [[buffer(6)]],
+    constant uint& lhs_stride1    [[buffer(7)]],
+    constant uint& rhs_stride0    [[buffer(8)]],
+    constant uint& rhs_stride1    [[buffer(9)]],
+    constant uint& op             [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    uint cols4 = dim1 / 4u;
+    uint j4 = gid % cols4;
+    uint i = gid / cols4;
+    uint j = j4 * 4u;
+    device const packed_float4* lhs4 =
+        (device const packed_float4*)(lhs + i * lhs_stride0 + j * lhs_stride1);
+    device const packed_float4* rhs4 =
+        (device const packed_float4*)(rhs + i * rhs_stride0 + j * rhs_stride1);
+    device packed_float4* dst4 = (device packed_float4*)(dst + i * dim1 + j);
+    packed_float4 lv = *lhs4;
+    packed_float4 rv = *rhs4;
+    packed_float4 out;
+    switch (op) {
+        case 0: out = lv + rv; break;
+        case 1: out = lv - rv; break;
+        case 2: out = lv * rv; break;
+        case 3: out = lv / rv; break;
+        case 4: out = max(lv, rv); break;
+        case 5: out = min(lv, rv); break;
+        default: out = pow(lv, rv); break;
+    }
+    *dst4 = out;
 }
 
 // Shape-aware broadcast binary op. Each thread computes one output
@@ -1078,6 +1576,28 @@ kernel void elem_mul(
 ) {
     if (gid >= len) return;
     c[gid] = a[gid] * b[gid];
+}
+
+kernel void elem_mul4(
+    device const packed_float4* a [[buffer(0)]],
+    device const packed_float4* b [[buffer(1)]],
+    device packed_float4* c       [[buffer(2)]],
+    constant uint& len4             [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    c[gid] = a[gid] * b[gid];
+}
+
+kernel void elem_div4(
+    device const packed_float4* a [[buffer(0)]],
+    device const packed_float4* b [[buffer(1)]],
+    device packed_float4* c       [[buffer(2)]],
+    constant uint& len4             [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    c[gid] = a[gid] / b[gid];
 }
 
 // Element-wise subtract: c = a - b
@@ -1204,6 +1724,57 @@ kernel void conv2d(
         }
     }
     dst[((n * c_out) + co) * h_out * w_out + ho * w_out + wo] = acc;
+}
+
+// 1-D conv (W_in = W_out = 1) — Voxtral codec layout `[N,C,T,1]`.
+kernel void conv2d_w1(
+    device const float* src [[buffer(0)]],
+    device const float* wt [[buffer(1)]],
+    device float* dst [[buffer(2)]],
+    constant uint4& nch [[buffer(3)]],       // [N, C_in, H, 1]
+    constant uint4& out_dims [[buffer(4)]],  // [C_out, H_out, 1, groups]
+    constant uint4& kshape [[buffer(5)]],
+    constant uint4& padd [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint nco = gid.z;
+    uint ho = gid.y;
+    uint h_out = out_dims.y;
+    uint c_out = out_dims.x;
+    uint groups = out_dims.w;
+    if (ho >= h_out || nco >= nch.x * c_out) return;
+    uint n = nco / c_out;
+    uint co = nco % c_out;
+    uint c_in = nch.y;
+    uint h = nch.z;
+    uint c_in_per_g = c_in / groups;
+    uint c_out_per_g = c_out / groups;
+    uint g = co / c_out_per_g;
+    uint ci_start = g * c_in_per_g;
+    uint kh = kshape.x;
+    uint kw = kshape.y;
+    uint sh = kshape.z;
+    uint sw = kshape.w;
+    uint ph = padd.x;
+    uint pw = padd.y;
+    uint dh = padd.z;
+    uint dw = padd.w;
+
+    float acc = 0.0f;
+    for (uint ci_off = 0; ci_off < c_in_per_g; ++ci_off) {
+        uint ci = ci_start + ci_off;
+        uint in_chan = ((n * c_in) + ci) * h;
+        uint wt_chan = ((co * c_in_per_g) + ci_off) * kh * kw;
+        for (uint ki = 0; ki < kh; ++ki) {
+            for (uint kj = 0; kj < kw; ++kj) {
+                int hi = (int)(ho * sh + ki * dh) - (int)ph;
+                int wi = (int)(kj * dw) - (int)pw;
+                if (hi < 0 || wi < 0 || hi >= (int)h || wi >= 1) continue;
+                acc += src[in_chan + (uint)hi] * wt[wt_chan + ki * kw + kj];
+            }
+        }
+    }
+    dst[((n * c_out) + co) * h_out + ho] = acc;
 }
 
 // LayerNorm2d (candle / SAM semantics): normalize across channels at each
@@ -1481,6 +2052,167 @@ kernel void transpose_nd(
         src_idx += coord * meta[rank + d];
     }
     dst[gid] = src[src_idx];
+}
+
+// Rank-2 swap (row-major [rows, cols] → [cols, rows]). Cheaper than transpose_nd
+// for attention/layout reshapes — 2D thread grid, coalesced reads.
+kernel void transpose_2d_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& rows     [[buffer(2)]],
+    constant uint& cols     [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint r = gid.x;
+    uint c = gid.y;
+    if (r >= rows || c >= cols) return;
+    dst[c * rows + r] = src[r * cols + c];
+}
+
+// Tiled transpose for large matrices (32x32 tile staged through threadgroup memory).
+// Threadgroup size: (32, 8, 1). Each thread loads 4 rows of the tile.
+kernel void transpose_2d_tiled_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& rows     [[buffer(2)]],
+    constant uint& cols     [[buffer(3)]],
+    ushort2 tid [[thread_position_in_threadgroup]],
+    ushort2 tgp [[threadgroup_position_in_grid]]
+) {
+    threadgroup float tile[32][33];
+    uint r0 = (uint)tgp.x * 32u + (uint)tid.x;
+    uint c0 = (uint)tgp.y * 32u + (uint)tid.y;
+    // Load 32x32 tile from src.
+    for (uint i = 0; i < 32; i += 8) {
+        uint c = c0 + i;
+        if (r0 < rows && c < cols) {
+            tile[tid.x][tid.y + i] = src[r0 * cols + c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Store transposed tile to dst.
+    uint rr0 = (uint)tgp.y * 32u + (uint)tid.x;
+    uint cc0 = (uint)tgp.x * 32u + (uint)tid.y;
+    for (uint i = 0; i < 32; i += 8) {
+        uint rr = rr0;
+        uint cc = cc0 + i;
+        if (rr < cols && cc < rows) {
+            dst[rr * rows + cc] = tile[tid.y + i][tid.x];
+        }
+    }
+}
+
+// Batched swap of the last two dims: src [batch, rows, cols] -> dst [batch, cols, rows]
+kernel void transpose_last2_batched_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& batch    [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols     [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.z;
+    uint r = gid.x;
+    uint c = gid.y;
+    if (b >= batch || r >= rows || c >= cols) return;
+    uint src_base = b * rows * cols;
+    uint dst_base = b * rows * cols;
+    dst[dst_base + c * rows + r] = src[src_base + r * cols + c];
+}
+
+// Tiled batched last2 transpose. Dispatch threadgroups over (rows, cols, batch).
+// Threadgroup size: (32, 8, 1).
+kernel void transpose_last2_batched_tiled_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& batch    [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols     [[buffer(4)]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 tgp [[threadgroup_position_in_grid]]
+) {
+    threadgroup float tile[32][33];
+    uint b = tgp.z;
+    if (b >= batch) return;
+    uint r0 = tgp.x * 32u + tid.x;
+    uint c0 = tgp.y * 32u + tid.y;
+    uint base = b * rows * cols;
+    for (uint i = 0; i < 32; i += 8) {
+        uint c = c0 + i;
+        if (r0 < rows && c < cols) {
+            tile[tid.x][tid.y + i] = src[base + r0 * cols + c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint rr0 = tgp.y * 32u + tid.x; // out row (col index)
+    uint cc0 = tgp.x * 32u + tid.y; // out col (row index)
+    for (uint i = 0; i < 32; i += 8) {
+        uint rr = rr0;
+        uint cc = cc0 + i;
+        if (rr < cols && cc < rows) {
+            dst[base + rr * rows + cc] = tile[tid.y + i][tid.x];
+        }
+    }
+}
+
+// `[B, A, C, D] → [B, C, A, D]` — swap axes 1 and 2 with trailing axis contiguous.
+kernel void transpose_swap12_batched_trail_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& batch    [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols     [[buffer(4)]],
+    constant uint& trail    [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint bd = gid.z;
+    uint b = bd / trail;
+    uint d = bd % trail;
+    uint r = gid.x;
+    uint c = gid.y;
+    if (b >= batch || r >= rows || c >= cols) return;
+    uint block = rows * cols * trail;
+    uint src_idx = b * block + c * rows * trail + r * trail + d;
+    uint dst_idx = b * block + r * cols * trail + c * trail + d;
+    dst[dst_idx] = src[src_idx];
+}
+
+kernel void transpose_swap12_batched_trail_tiled_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& batch    [[buffer(2)]],
+    constant uint& rows     [[buffer(3)]],
+    constant uint& cols     [[buffer(4)]],
+    constant uint& trail    [[buffer(5)]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 tgp [[threadgroup_position_in_grid]]
+) {
+    threadgroup float tile[32][33];
+    uint bd = tgp.z;
+    uint b = bd / trail;
+    uint d = bd % trail;
+    if (b >= batch) return;
+    uint block = rows * cols * trail;
+    uint plane = b * block + d;
+    uint r0 = tgp.x * 32u + tid.x;
+    uint c0 = tgp.y * 32u + tid.y;
+    for (uint i = 0; i < 32; i += 8) {
+        uint c = c0 + i;
+        if (r0 < rows && c < cols) {
+            tile[tid.x][tid.y + i] =
+                src[plane + c * rows * trail + r0 * trail];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint rr0 = tgp.y * 32u + tid.x;
+    uint cc0 = tgp.x * 32u + tid.y;
+    for (uint i = 0; i < 32; i += 8) {
+        uint rr = rr0;
+        uint cc = cc0 + i;
+        if (rr < cols && cc < rows) {
+            dst[plane + rr * cols * trail + cc * trail] = tile[tid.y + i][tid.x];
+        }
+    }
 }
 
 // Two-phase scatter-add: phase 0 zeros the output buffer, phase 1
@@ -1775,7 +2507,7 @@ kernel void softmax_lastax(
     for (uint i = tid; i < cols; i += tsize) {
         local_max = max(local_max, data[base + i]);
     }
-    partial[tid] = local_max;
+    partial[tid] = (float)local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = tsize / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
@@ -1792,7 +2524,7 @@ kernel void softmax_lastax(
         data[base + i] = e;
         local_sum += e;
     }
-    partial[tid] = local_sum;
+    partial[tid] = (float)local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = tsize / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
@@ -1842,6 +2574,70 @@ kernel void narrow_lastax(
     dst[i * len + j] = src[i * src_axis + start + j];
 }
 
+// Vectorized narrow for aligned shapes: src/dst treated as packed_float4.
+// Requirements (enforced in encoder): start, src_axis, len are divisible by 4.
+kernel void narrow_lastax4(
+    device const packed_float4* src [[buffer(0)]],
+    device packed_float4* dst       [[buffer(1)]],
+    constant uint& outer            [[buffer(2)]],
+    constant uint& src_axis4        [[buffer(3)]],
+    constant uint& start4           [[buffer(4)]],
+    constant uint& len4             [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint i = gid.y;
+    uint j4 = gid.x;
+    if (i >= outer || j4 >= len4) return;
+    dst[i * len4 + j4] = src[i * src_axis4 + start4 + j4];
+}
+
+struct NarrowSeg {
+    uint dst;
+    uint start;
+    uint len;
+};
+
+// Concat VJP: multiple last-axis slices from one source in one dispatch.
+kernel void split_lastax(
+    device const float* src [[buffer(0)]],
+    device char* arena    [[buffer(1)]],
+    constant uint& outer    [[buffer(2)]],
+    constant uint& src_axis [[buffer(3)]],
+    constant uint& num_seg  [[buffer(4)]],
+    constant NarrowSeg* segs [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint s = gid.z;
+    uint i = gid.y;
+    uint j = gid.x;
+    if (s >= num_seg) return;
+    NarrowSeg seg = segs[s];
+    if (i >= outer || j >= seg.len) return;
+    device float* dst = (device float*)(arena + seg.dst);
+    dst[i * seg.len + j] = src[i * src_axis + seg.start + j];
+}
+
+kernel void split_lastax4(
+    device const packed_float4* src [[buffer(0)]],
+    device char* arena            [[buffer(1)]],
+    constant uint& outer            [[buffer(2)]],
+    constant uint& src_axis4        [[buffer(3)]],
+    constant uint& num_seg          [[buffer(4)]],
+    constant NarrowSeg* segs        [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint s = gid.z;
+    uint i = gid.y;
+    uint j4 = gid.x;
+    if (s >= num_seg) return;
+    NarrowSeg seg = segs[s];
+    uint len4 = seg.len / 4u;
+    if (i >= outer || j4 >= len4) return;
+    device packed_float4* dst = (device packed_float4*)(arena + seg.dst);
+    uint start4 = seg.start / 4u;
+    dst[i * len4 + j4] = src[i * src_axis4 + start4 + j4];
+}
+
 // Concat segment: copy one [outer, src_axis] tensor into [outer, dst_axis]
 // at the column slice [dst_col .. dst_col + src_axis]. Multi-input concat
 // = N dispatches of this kernel, one per source. Mirror of narrow_lastax.
@@ -1858,6 +2654,71 @@ kernel void concat_segment_lastax(
     uint j = gid.x;
     if (i >= outer || j >= src_axis) return;
     dst[i * dst_axis + dst_col + j] = src[i * src_axis + j];
+}
+
+kernel void concat_segment_lastax4(
+    device const packed_float4* src [[buffer(0)]],
+    device packed_float4* dst       [[buffer(1)]],
+    constant uint& outer            [[buffer(2)]],
+    constant uint& src_axis4        [[buffer(3)]],
+    constant uint& dst_axis4        [[buffer(4)]],
+    constant uint& dst_col4         [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint i = gid.y;
+    uint j4 = gid.x;
+    if (i >= outer || j4 >= src_axis4) return;
+    dst[i * dst_axis4 + dst_col4 + j4] = src[i * src_axis4 + j4];
+}
+
+struct ConcatSeg {
+    uint src;
+    uint dst_col;
+    uint len;
+};
+
+kernel void concat_lastax_multi(
+    device char* arena      [[buffer(0)]],
+    constant uint& dst_byte [[buffer(1)]],
+    constant uint& outer    [[buffer(2)]],
+    constant uint& dst_axis [[buffer(3)]],
+    constant uint& num_seg  [[buffer(4)]],
+    constant ConcatSeg* segs [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint s = gid.z;
+    uint i = gid.y;
+    uint j = gid.x;
+    if (s >= num_seg) return;
+    ConcatSeg seg = segs[s];
+    if (i >= outer || j >= seg.len) return;
+    device const float* src = (device const float*)(arena + seg.src);
+    device float* dst = (device float*)(arena + dst_byte);
+    dst[i * dst_axis + seg.dst_col + j] = src[i * seg.len + j];
+}
+
+kernel void concat_lastax_multi4(
+    device char* arena       [[buffer(0)]],
+    constant uint& dst_byte  [[buffer(1)]],
+    constant uint& outer     [[buffer(2)]],
+    constant uint& dst_axis4 [[buffer(3)]],
+    constant uint& num_seg   [[buffer(4)]],
+    constant ConcatSeg* segs [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint s = gid.z;
+    uint i = gid.y;
+    uint j4 = gid.x;
+    if (s >= num_seg) return;
+    ConcatSeg seg = segs[s];
+    uint len4 = seg.len / 4u;
+    if (i >= outer || j4 >= len4) return;
+    device const packed_float4* src =
+        (device const packed_float4*)(arena + seg.src);
+    device packed_float4* dst =
+        (device packed_float4*)(arena + dst_byte);
+    uint dst_col4 = seg.dst_col / 4u;
+    dst[i * dst_axis4 + dst_col4 + j4] = src[i * len4 + j4];
 }
 
 kernel void concat_segment_lastax_h(
@@ -1957,6 +2818,28 @@ kernel void fused_residual_rms_norm(
     }
 }
 
+// Q/K/V offset helpers — BSNH [B, L, H*D] vs BHSD [B, H, L, D].
+static inline uint qkv_q_offset(
+    uint bi, uint hi, uint qi,
+    uint heads, uint seq_q, uint head_dim, uint q_stride, uint bhsd
+) {
+    if (bhsd != 0u) {
+        return bi * heads * seq_q * head_dim + hi * seq_q * head_dim + qi * head_dim;
+    }
+    uint hs = heads * head_dim;
+    return bi * q_stride * hs + qi * hs + hi * head_dim;
+}
+static inline uint qkv_kv_offset(
+    uint bi, uint hi, uint ki,
+    uint heads, uint seq_k, uint head_dim, uint k_stride, uint bhsd
+) {
+    if (bhsd != 0u) {
+        return bi * heads * seq_k * head_dim + hi * seq_k * head_dim + ki * head_dim;
+    }
+    uint hs = heads * head_dim;
+    return bi * k_stride * hs + ki * hs + hi * head_dim;
+}
+
 // Multi-head SDPA: attention(Q, K, V, mask) → out
 // Shapes: Q/out [batch, seq_q, heads*head_dim]; K/V [batch, seq_k, heads*head_dim]
 // One threadgroup per (batch, head). Each TG computes [seq_q, seq_k] scores
@@ -1976,14 +2859,18 @@ kernel void sdpa(
     constant uint& mask_kind  [[buffer(10)]],
     constant uint& seq_k      [[buffer(11)]],
     constant uint& k_stride   [[buffer(12)]],
+    constant uint& bhsd       [[buffer(13)]],
+    constant uint& window     [[buffer(14)]],
     uint tgid_x [[threadgroup_position_in_grid]],
     uint tid    [[thread_position_in_threadgroup]],
     uint tsize  [[threads_per_threadgroup]]
 ) {
     // mask_kind:
-    //   0 = None       (no masking)
-    //   1 = Causal     (mask ki > (seq_k - seq_q) + qi)
-    //   2 = Custom     (column-wise binary mask buffer M; 0 = padded)
+    //   0 = None           (no masking)
+    //   1 = Causal         (mask ki > (seq_k - seq_q) + qi)
+    //   2 = Custom         (column-wise binary mask buffer M; 0 = padded)
+    //   4 = SlidingWindow  (visible range [abs_q - window, abs_q],
+    //                       absolute positions so decode w/ cached K/V works)
     threadgroup float scores[64 * 64];   // up to seq_q * seq_k = 4096
     threadgroup float row_max;
     threadgroup float row_sum;
@@ -1993,10 +2880,11 @@ kernel void sdpa(
     uint hi = tgid_x % heads;
     if (bi >= batch) return;
 
-    uint hs = heads * head_dim;
-    float scale = rsqrt(float(head_dim));
-    uint q_per_batch = q_stride * hs;
-    uint k_per_batch = k_stride * hs;
+    // Precise scale: 1.0 / sqrt(...) — avoids the relaxed-precision
+    // `rsqrt` that the default `metal::` namespace resolves to, which
+    // contributes a few ULPs per element vs CPU.
+    float scale = 1.0f / precise::sqrt(float(head_dim));
+    uint q_offset = seq_k - seq_q;
 
     // 1. Compute scores[qi, ki] = scale * (Q[bi, qi, hi*dh:] · K[bi, ki, hi*dh:]) + mask.
     uint total = seq_q * seq_k;
@@ -2004,23 +2892,29 @@ kernel void sdpa(
         uint qi = idx / seq_k;
         uint ki = idx % seq_k;
         float dot = 0.0;
-        uint q_base = bi * q_per_batch + qi * hs + hi * head_dim;
-        uint k_base = bi * k_per_batch + ki * hs + hi * head_dim;
+        uint q_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
         for (uint d = 0; d < head_dim; ++d) {
             dot += Q[q_base + d] * K[k_base + d];
         }
         float s = dot * scale;
         if (mask_kind == 1u) {
-            uint q_offset = seq_k - seq_q;
             if (ki > q_offset + qi) s = -1e9;
         } else if (mask_kind == 2u) {
             if (M[bi * k_stride + ki] < 0.5) s = -1e9;
+        } else if (mask_kind == 4u) {
+            uint abs_q = q_offset + qi;
+            uint lo = abs_q > window ? abs_q - window : 0u;
+            if (ki < lo || ki > abs_q) s = -1e9;
         }
         scores[qi * seq_k + ki] = s;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // 2. Softmax row-by-row over scores[seq_q, seq_k]
+    // 2. Softmax row-by-row over scores[seq_q, seq_k]. `precise::exp`
+    // matches CPU `f32::exp` to within 1 ULP; the default fast-math
+    // `exp` accumulates several ULPs of error per token, which the
+    // softcap + LM head amplify into visible logit drift.
     for (uint qi = 0; qi < seq_q; ++qi) {
         if (tid == 0) {
             float mx = -1e30;
@@ -2034,7 +2928,7 @@ kernel void sdpa(
         if (tid == 0) {
             float sum = 0.0;
             for (uint ki = 0; ki < seq_k; ++ki) {
-                float e = exp(scores[qi * seq_k + ki] - row_max);
+                float e = precise::exp(scores[qi * seq_k + ki] - row_max);
                 scores[qi * seq_k + ki] = e;
                 sum += e;
             }
@@ -2055,10 +2949,10 @@ kernel void sdpa(
         uint d = idx % head_dim;
         float acc = 0.0;
         for (uint ki = 0; ki < seq_k; ++ki) {
-            uint v_base = bi * k_per_batch + ki * hs + hi * head_dim;
+            uint v_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
             acc += scores[qi * seq_k + ki] * V[v_base + d];
         }
-        uint o_base = bi * q_per_batch + qi * hs + hi * head_dim;
+        uint o_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
         OUT[o_base + d] = acc;
     }
 }
@@ -2091,6 +2985,8 @@ kernel void sdpa_long(
     constant uint& mask_kind   [[buffer(10)]],
     constant uint& seq_k       [[buffer(11)]],  // key/value length Lk
     constant uint& k_stride    [[buffer(12)]],  // per-batch K/V row stride (= Lk for dense)
+    constant uint& bhsd        [[buffer(13)]],  // 1 = [B,H,S,D]
+    constant uint& window      [[buffer(14)]],  // SlidingWindow lookback (0 otherwise)
     uint tid_x [[thread_position_in_grid]]
 ) {
     // mask_kind:
@@ -2098,6 +2994,7 @@ kernel void sdpa_long(
     //   1 = Causal           (prefill — Lq == Lk required)
     //   2 = Custom            (binary key-padding mask M[B, Lk])
     //   3 = Bias              (additive per-head bias M[B, H, Lq, Lk])
+    //   4 = SlidingWindow     (visible range [abs_q - window, abs_q])
     constexpr uint MAX_HEAD_DIM = 128u;
     uint total = batch * heads * seq_q;
     if (tid_x >= total) return;
@@ -2107,18 +3004,17 @@ kernel void sdpa_long(
     uint hi = bh % heads;
     uint bi = bh / heads;
 
-    uint hs = heads * head_dim;
-    float scale = rsqrt(float(head_dim));
-    uint q_per_batch = q_stride * hs;
-    uint k_per_batch = k_stride * hs;
+    // Precise scale: 1/sqrt over fast-math rsqrt — matches CPU.
+    float scale = 1.0f / precise::sqrt(float(head_dim));
 
     // Cache Q[qi, hi*dh : (hi+1)*dh] in registers — read seq_k times below.
     float q_reg[MAX_HEAD_DIM];
-    uint q_base = bi * q_per_batch + qi * hs + hi * head_dim;
+    uint q_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
     for (uint d = 0; d < head_dim; ++d) q_reg[d] = Q[q_base + d];
 
     // Bias base offset (only read when mask_kind == 3).
     uint bias_row_base = ((bi * heads + hi) * seq_q + qi) * seq_k;
+    uint q_offset = seq_k - seq_q;
 
     // Online softmax accumulators.
     float m_acc = -1e30;
@@ -2128,25 +3024,28 @@ kernel void sdpa_long(
 
     for (uint ki = 0; ki < seq_k; ++ki) {
         // Score: scale * (Q · K[ki]) + mask
-        uint k_base = bi * k_per_batch + ki * hs + hi * head_dim;
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
         float dot = 0.0;
         for (uint d = 0; d < head_dim; ++d) dot += q_reg[d] * K[k_base + d];
         float s = dot * scale;
         if (mask_kind == 1u) {
-            uint q_offset = seq_k - seq_q;
             if (ki > q_offset + qi) s = -1e9;
         } else if (mask_kind == 2u) {
             if (M[bi * k_stride + ki] < 0.5) s = -1e9;
         } else if (mask_kind == 3u) {
             s += M[bias_row_base + ki];
+        } else if (mask_kind == 4u) {
+            uint abs_q = q_offset + qi;
+            uint lo = abs_q > window ? abs_q - window : 0u;
+            if (ki < lo || ki > abs_q) s = -1e9;
         }
 
-        // Online softmax update.
+        // Online softmax update with precise exp.
         float m_new = max(m_acc, s);
-        float e_old = exp(m_acc - m_new);
-        float e_cur = exp(s - m_new);
+        float e_old = precise::exp(m_acc - m_new);
+        float e_cur = precise::exp(s - m_new);
         l_acc = e_old * l_acc + e_cur;
-        uint v_base = bi * k_per_batch + ki * hs + hi * head_dim;
+        uint v_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
         for (uint d = 0; d < head_dim; ++d) {
             o_acc[d] = e_old * o_acc[d] + e_cur * V[v_base + d];
         }
@@ -2155,7 +3054,7 @@ kernel void sdpa_long(
 
     // Normalize and emit.
     float inv_l = 1.0 / l_acc;
-    uint o_base = bi * q_per_batch + qi * hs + hi * head_dim;
+    uint o_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
     for (uint d = 0; d < head_dim; ++d) {
         OUT[o_base + d] = o_acc[d] * inv_l;
     }
@@ -2187,9 +3086,12 @@ kernel void sdpa_fa_f32(
     constant uint& mask_kind   [[buffer(10)]],
     constant uint& seq_k       [[buffer(11)]],
     constant uint& k_stride    [[buffer(12)]],
+    constant uint& bhsd        [[buffer(13)]],
+    constant uint& window      [[buffer(14)]],  // reserved; not yet wired in FA tile path
     uint3 tgid [[threadgroup_position_in_grid]],
     uint tid_in_tg [[thread_index_in_threadgroup]]
 ) {
+    (void)window;  // SlidingWindow falls through to sdpa_long today
     // Tile sizes — tuned for SAM3 image CA (dh=16) but kernel is
     // generic. With Br=8, Bc=64, the per-TG threadgroup memory is
     // 8*128 (Q) + 64*128 (K) + 64*128 (V) + 8*64 (S/M) ≈ 71KB at
@@ -2221,9 +3123,6 @@ kernel void sdpa_fa_f32(
     uint bi     = tgid.z;          // batch
     uint q_start = q_tile * Br;
 
-    uint hs = heads * head_dim;
-    uint q_per_batch = q_stride * hs;
-    uint k_per_batch = k_stride * hs;
     float scale = rsqrt(float(head_dim));
 
     // ── Load Q tile cooperatively ────────────────────────────────────
@@ -2232,7 +3131,7 @@ kernel void sdpa_fa_f32(
         uint di = i % head_dim;
         uint pos = q_start + qi;
         Q_tg[qi * MAX_DH + di] = (pos < seq_q)
-            ? Q[bi * q_per_batch + pos * hs + hi * head_dim + di]
+            ? Q[qkv_q_offset(bi, hi, pos, heads, seq_q, head_dim, q_stride, bhsd) + di]
             : 0.0f;
     }
 
@@ -2255,10 +3154,10 @@ kernel void sdpa_fa_f32(
             uint ki = i / head_dim;
             uint di = i % head_dim;
             uint pos = kt + ki;
-            uint kv_off = bi * k_per_batch + pos * hs + hi * head_dim + di;
+            uint kv_off = qkv_kv_offset(bi, hi, pos, heads, seq_k, head_dim, k_stride, bhsd);
             bool in_range = pos < seq_k;
-            K_tg[ki * MAX_DH + di] = in_range ? K[kv_off] : 0.0f;
-            V_tg[ki * MAX_DH + di] = in_range ? V[kv_off] : 0.0f;
+            K_tg[ki * MAX_DH + di] = in_range ? K[kv_off + di] : 0.0f;
+            V_tg[ki * MAX_DH + di] = in_range ? V[kv_off + di] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2325,7 +3224,7 @@ kernel void sdpa_fa_f32(
         uint pos = q_start + qi;
         if (pos < seq_q) {
             float o = o_row[qi * MAX_DH + di] / l_row[qi];
-            OUT[bi * q_per_batch + pos * hs + hi * head_dim + di] = o;
+            OUT[qkv_q_offset(bi, hi, pos, heads, seq_q, head_dim, q_stride, bhsd) + di] = o;
         }
     }
 }
@@ -2568,7 +3467,7 @@ kernel void rms_norm(
     uint tsize [[threads_per_threadgroup]]
 ) {
     threadgroup float partial_sumsq[256];
-    float local_sumsq = 0.0;
+    float local_sumsq = 0.0f;
     for (uint i = tid; i < h; i += tsize) {
         float v = input[row * h + i];
         local_sumsq += v * v;
@@ -2705,6 +3604,45 @@ kernel void reduce_axes_h(
 // per step: op_kind, op_sub, lhs_enc, rhs_enc) into a private
 // scratch register array. Operand encoding: bit 31 = src kind
 // (0=Input, 1=Step), bits 0..30 = index. Caps: 32 steps, 16 inputs.
+inline uint region_input_row_resize2x_nchw(
+    uint gid,
+    uint out_n,
+    uint out_c,
+    uint out_h,
+    uint out_w
+) {
+    uint plane = out_c * out_h * out_w;
+    uint local = gid % plane;
+    uint batch = gid / plane;
+    uint w_pos = local % out_w;
+    uint tmp = local / out_w;
+    uint h_pos = tmp % out_h;
+    uint c_pos = tmp / out_h;
+    uint in_w = out_w / 2u;
+    uint in_h = out_h / 2u;
+    uint in_plane = out_c * in_h * in_w;
+    return batch * in_plane + c_pos * in_h * in_w + (h_pos / 2u) * in_w + (w_pos / 2u);
+}
+
+inline uint region_resolve_row(
+    uint gid,
+    uint kind,
+    uint idx,
+    uint prologue_row0,
+    uint has_prologue_row0,
+    uint prologue_input,
+    uint scalar_input_mask,
+    device const uint* input_modulus
+) {
+    if (kind != 0u) { return 0u; }
+    if (has_prologue_row0 != 0u && idx == prologue_input) {
+        return prologue_row0;
+    }
+    if ((scalar_input_mask & (1u << idx)) != 0u) { return 0u; }
+    if (input_modulus[idx] != 0u) { return gid % input_modulus[idx]; }
+    return gid;
+}
+
 kernel void elementwise_region(
     device float* arena              [[buffer(0)]],
     constant uint& len               [[buffer(1)]],
@@ -2715,9 +3653,31 @@ kernel void elementwise_region(
     device const uint* chain         [[buffer(6)]],   // 128 entries (32 steps * 4)
     constant uint& scalar_input_mask [[buffer(7)]],
     device const uint* input_modulus [[buffer(8)]],   // 16 entries
-    uint gid [[thread_position_in_grid]]
+    constant uint& prologue          [[buffer(9)]],
+    constant uint& out_n             [[buffer(10)]],
+    constant uint& out_c             [[buffer(11)]],
+    constant uint& out_h             [[buffer(12)]],
+    constant uint& out_w             [[buffer(13)]],
+    constant uint& prologue_input    [[buffer(14)]],
+    uint3 gpos [[thread_position_in_grid]]
 ) {
-    if (gid >= len) return;
+    uint gid;
+    if (prologue == 1u) {
+        uint nc = gpos.z;
+        uint ho = gpos.y;
+        uint wo = gpos.x;
+        if (nc >= out_n * out_c || ho >= out_h || wo >= out_w) { return; }
+        gid = nc * out_h * out_w + ho * out_w + wo;
+    } else {
+        gid = gpos.x;
+        if (gid >= len) { return; }
+    }
+    uint prologue_row0 = 0u;
+    uint has_prologue_row0 = 0u;
+    if (prologue == 1u) {
+        prologue_row0 = region_input_row_resize2x_nchw(gid, out_n, out_c, out_h, out_w);
+        has_prologue_row0 = 1u;
+    }
     float scratch[32];
     uint last_idx = 0;
     for (uint k = 0; k < num_steps; ++k) {
@@ -2735,11 +3695,9 @@ kernel void elementwise_region(
         {
             uint kind = lhs_enc >> 31;
             uint idx  = lhs_enc & 0x7FFFFFFFu;
-            uint row;
-            if (kind != 0u) { row = 0u; /* unused; scratch path below */ }
-            else if ((scalar_input_mask & (1u << idx)) != 0u) { row = 0u; }
-            else if (input_modulus[idx] != 0u) { row = gid % input_modulus[idx]; }
-            else { row = gid; }
+            uint row = region_resolve_row(
+                gid, kind, idx, prologue_row0, has_prologue_row0, prologue_input,
+                scalar_input_mask, input_modulus);
             lhs = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
         }
         float result;
@@ -2752,22 +3710,18 @@ kernel void elementwise_region(
             {
                 uint kind = op_sub >> 31;
                 uint idx  = op_sub & 0x7FFFFFFFu;
-                uint row;
-                if (kind != 0u) { row = 0u; }
-                else if ((scalar_input_mask & (1u << idx)) != 0u) { row = 0u; }
-                else if (input_modulus[idx] != 0u) { row = gid % input_modulus[idx]; }
-                else { row = gid; }
+                uint row = region_resolve_row(
+                    gid, kind, idx, prologue_row0, has_prologue_row0, prologue_input,
+                    scalar_input_mask, input_modulus);
                 cond = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
             }
             float on_false;
             {
                 uint kind = rhs_enc >> 31;
                 uint idx  = rhs_enc & 0x7FFFFFFFu;
-                uint row;
-                if (kind != 0u) { row = 0u; }
-                else if ((scalar_input_mask & (1u << idx)) != 0u) { row = 0u; }
-                else if (input_modulus[idx] != 0u) { row = gid % input_modulus[idx]; }
-                else { row = gid; }
+                uint row = region_resolve_row(
+                    gid, kind, idx, prologue_row0, has_prologue_row0, prologue_input,
+                    scalar_input_mask, input_modulus);
                 on_false = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
             }
             result = (cond != 0.0f) ? lhs : on_false;
@@ -2802,11 +3756,9 @@ kernel void elementwise_region(
             {
                 uint kind = rhs_enc >> 31;
                 uint idx  = rhs_enc & 0x7FFFFFFFu;
-                uint row;
-                if (kind != 0u) { row = 0u; }
-                else if ((scalar_input_mask & (1u << idx)) != 0u) { row = 0u; }
-                else if (input_modulus[idx] != 0u) { row = gid % input_modulus[idx]; }
-                else { row = gid; }
+                uint row = region_resolve_row(
+                    gid, kind, idx, prologue_row0, has_prologue_row0, prologue_input,
+                    scalar_input_mask, input_modulus);
                 rhs = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
             }
             if (op_kind == 2u) {
@@ -2832,6 +3784,138 @@ kernel void elementwise_region(
         last_idx = k;
     }
     arena[dst_off + gid] = scratch[last_idx];
+}
+
+inline uint batch_region_resolve_row(
+    uint gid,
+    uint kind,
+    uint idx,
+    uint scalar_input_mask,
+    constant uint* input_modulus
+) {
+    if (kind != 0u) { return 0u; }
+    if ((scalar_input_mask & (1u << idx)) != 0u) { return 0u; }
+    if (input_modulus[idx] != 0u) { return gid % input_modulus[idx]; }
+    return gid;
+}
+
+// FKL batch horizontal fusion: one dispatch, thread_position_in_grid.z = slice index.
+// Requires prologue == 0 (no resize prologue on batch slices).
+kernel void batch_elementwise_region(
+    device float* arena              [[buffer(0)]],
+    constant uint& slice_len         [[buffer(1)]],
+    constant uint& num_batch         [[buffer(2)]],
+    constant uint& num_steps         [[buffer(3)]],
+    constant uint& base_dst_off      [[buffer(4)]],
+    constant uint& slice_elems       [[buffer(5)]],
+    constant uint* batch_input_offs  [[buffer(6)]],   // 64 entries
+    constant uint* chain             [[buffer(7)]],   // 128 entries
+    constant uint& scalar_input_mask [[buffer(8)]],
+    constant uint* input_modulus     [[buffer(9)]],   // 16 entries
+    uint3 gpos [[thread_position_in_grid]]
+) {
+    uint batch_idx = gpos.z;
+    if (batch_idx >= num_batch) { return; }
+    uint i = gpos.x;
+    if (i >= slice_len) { return; }
+
+    uint input_offs[16];
+    for (uint k = 0; k < 16u; ++k) { input_offs[k] = 0u; }
+    input_offs[0] = batch_input_offs[batch_idx];
+    uint dst_off = base_dst_off + batch_idx * slice_elems;
+
+    float scratch[32];
+    uint last_idx = 0;
+    for (uint k = 0; k < num_steps; ++k) {
+        uint base    = k * 4;
+        uint op_kind = chain[base + 0];
+        uint op_sub  = chain[base + 1];
+        uint lhs_enc = chain[base + 2];
+        uint rhs_enc = chain[base + 3];
+
+        float lhs;
+        {
+            uint kind = lhs_enc >> 31;
+            uint idx  = lhs_enc & 0x7FFFFFFFu;
+            uint row = batch_region_resolve_row(
+                i, kind, idx, scalar_input_mask, input_modulus);
+            lhs = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
+        }
+        float result;
+        if (op_kind == 4u) {
+            float cond;
+            {
+                uint kind = op_sub >> 31;
+                uint idx  = op_sub & 0x7FFFFFFFu;
+                uint row = batch_region_resolve_row(
+                    i, kind, idx, scalar_input_mask, input_modulus);
+                cond = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
+            }
+            float on_false;
+            {
+                uint kind = rhs_enc >> 31;
+                uint idx  = rhs_enc & 0x7FFFFFFFu;
+                uint row = batch_region_resolve_row(
+                    i, kind, idx, scalar_input_mask, input_modulus);
+                on_false = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
+            }
+            result = (cond != 0.0f) ? lhs : on_false;
+        } else if (op_kind == 0u) {
+            if      (op_sub == 3u) result = max(lhs, 0.0f);
+            else if (op_sub == 0u || op_sub == 1u) {
+                float c = 0.7978845608f;
+                float inner = c * (lhs + 0.044715f * lhs * lhs * lhs);
+                result = 0.5f * lhs * (1.0f + tanh(inner));
+            }
+            else if (op_sub == 2u) result = lhs / (1.0f + exp(-lhs));
+            else if (op_sub == 4u) result = 1.0f / (1.0f + exp(-lhs));
+            else if (op_sub == 5u) result = tanh(lhs);
+            else if (op_sub == 6u) result = exp(lhs);
+            else if (op_sub == 7u) result = log(lhs);
+            else if (op_sub == 8u) result = sqrt(lhs);
+            else if (op_sub == 9u) result = 1.0f / sqrt(lhs);
+            else if (op_sub == 10u) result = -lhs;
+            else if (op_sub == 11u) result = fabs(lhs);
+            else if (op_sub == 12u) result = round(lhs);
+            else if (op_sub == 13u) result = sin(lhs);
+            else if (op_sub == 14u) result = cos(lhs);
+            else if (op_sub == 15u) result = tan(lhs);
+            else if (op_sub == 16u) result = atan(lhs);
+            else                    result = lhs;
+        } else if (op_kind == 1u) {
+            result = lhs;
+        } else {
+            float rhs;
+            {
+                uint kind = rhs_enc >> 31;
+                uint idx  = rhs_enc & 0x7FFFFFFFu;
+                uint row = batch_region_resolve_row(
+                    i, kind, idx, scalar_input_mask, input_modulus);
+                rhs = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
+            }
+            if (op_kind == 2u) {
+                if      (op_sub == 0u) result = lhs + rhs;
+                else if (op_sub == 1u) result = lhs - rhs;
+                else if (op_sub == 2u) result = lhs * rhs;
+                else if (op_sub == 3u) result = lhs / rhs;
+                else if (op_sub == 4u) result = max(lhs, rhs);
+                else if (op_sub == 5u) result = min(lhs, rhs);
+                else                   result = pow(lhs, rhs);
+            } else {
+                bool b;
+                if      (op_sub == 0u) b = (lhs == rhs);
+                else if (op_sub == 1u) b = (lhs != rhs);
+                else if (op_sub == 2u) b = (lhs <  rhs);
+                else if (op_sub == 3u) b = (lhs <= rhs);
+                else if (op_sub == 4u) b = (lhs >  rhs);
+                else                   b = (lhs >= rhs);
+                result = b ? 1.0f : 0.0f;
+            }
+        }
+        scratch[k] = result;
+        last_idx = k;
+    }
+    arena[dst_off + i] = scratch[last_idx];
 }
 
 // ── Gated DeltaNet scan (f32) ───────────────────────────────────────
@@ -3002,6 +4086,45 @@ kernel void rms_norm_bwd_param(
     }
 }
 
+// Per-row RMS inverse scale — scratch for parallel dgamma/dbeta.
+kernel void rms_norm_bwd_inv_r_f32(
+    device const float* x [[buffer(0)]],
+    device float* inv_r [[buffer(1)]],
+    constant uint& inner [[buffer(2)]],
+    constant float& eps [[buffer(3)]],
+    uint row [[thread_position_in_grid]]
+) {
+    float sumsq = 0.0f;
+    for (uint i = 0; i < inner; ++i) {
+        float xv = x[row * inner + i];
+        sumsq += xv * xv;
+    }
+    inv_r[row] = rsqrt(sumsq / float(inner) + eps);
+}
+
+// Reduce dy·x·inv_r (gamma) or dy (beta) across rows — one thread per param.
+kernel void rms_norm_bwd_param_reduce_f32(
+    device const float* x [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device const float* inv_r [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& inner [[buffer(5)]],
+    constant uint& wrt [[buffer(6)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= inner) return;
+    float acc = 0.0f;
+    for (uint row = 0; row < rows; ++row) {
+        if (wrt == 1u) {
+            acc += dy[row * inner + i] * x[row * inner + i] * inv_r[row];
+        } else {
+            acc += dy[row * inner + i];
+        }
+    }
+    out[i] = acc;
+}
+
 kernel void rope_bwd(
     device const float* dy [[buffer(0)]],
     device const float* cos [[buffer(1)]],
@@ -3059,6 +4182,398 @@ kernel void cumsum_bwd(
             dx[row * inner + ui] = suffix;
         }
     }
+}
+
+// Single im2col element for conv weight backward GEMM (B[k_idx, n_col]).
+inline float conv_bwd_im2col_elem(
+    device const float* x,
+    uint k_idx,
+    uint n_col,
+    uint c_in,
+    uint h,
+    uint w_in,
+    uint h_out,
+    uint w_out,
+    uint kh,
+    uint kw,
+    uint sh,
+    uint sw,
+    uint ph,
+    uint pw,
+    uint dh,
+    uint dw_dil
+) {
+    uint ho = k_idx / w_out;
+    uint wo = k_idx % w_out;
+    uint rem = n_col;
+    uint ci = rem / (kh * kw);
+    rem = rem % (kh * kw);
+    uint ki = rem / kw;
+    uint kj = rem % kw;
+    int hi = (int)(ho * sh + ki * dh) - (int)ph;
+    int wi = (int)(wo * sw + kj * dw_dil) - (int)pw;
+    if (hi < 0 || wi < 0 || hi >= (int)h || wi >= (int)w_in) {
+        return 0.0f;
+    }
+    return x[(ci * h + (uint)hi) * w_in + (uint)wi];
+}
+
+// dw = dy @ im2col(x) — 8×8 simdgroup tiles, B generated on the fly (no scratch).
+kernel void conv2d_bwd_weight_gemm(
+    device const float* dy [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* dw [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    constant uint4& nchw [[buffer(6)]],
+    constant uint4& out_dims [[buffer(7)]],
+    constant uint4& kshape [[buffer(8)]],
+    constant uint4& padd [[buffer(9)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint slid [[thread_index_in_threadgroup]]
+) {
+    uint row_base = tgid.y * 8;
+    uint col_base = tgid.x * 8;
+    if (row_base >= M || col_base >= N) return;
+
+    uint c_in = nchw.x;
+    uint h = nchw.y;
+    uint w_in = nchw.z;
+    uint h_out = out_dims.y;
+    uint w_out = out_dims.z;
+    uint kh = kshape.x;
+    uint kw = kshape.y;
+    uint sh = kshape.z;
+    uint sw = kshape.w;
+    uint ph = padd.x;
+    uint pw = padd.y;
+    uint dh = padd.z;
+    uint dw_dil = padd.w;
+
+    threadgroup float B_tg[64];
+    simdgroup_float8x8 a, b, c;
+    c = simdgroup_float8x8(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += 8) {
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 32 + slid;
+            if (idx < 64) {
+                uint br = idx / 8;
+                uint bc = idx % 8;
+                uint k_idx = k0 + br;
+                uint n_col = col_base + bc;
+                B_tg[idx] = (k_idx < K && n_col < N)
+                    ? conv_bwd_im2col_elem(
+                          x, k_idx, n_col, c_in, h, w_in, h_out, w_out, kh, kw, sh, sw, ph, pw,
+                          dh, dw_dil)
+                    : 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(a, dy + row_base * K + k0, K);
+        simdgroup_load(b, B_tg, 8);
+        simdgroup_multiply_accumulate(c, a, b, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(c, dw + row_base * N + col_base, N);
+}
+
+// dw = dy @ im2col(x) — 32×32 threadgroup tiles (requires M,K,N % 32 == 0).
+kernel void conv2d_bwd_weight_gemm_4x4(
+    device const float* dy [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* dw [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    constant uint4& nchw [[buffer(6)]],
+    constant uint4& out_dims [[buffer(7)]],
+    constant uint4& kshape [[buffer(8)]],
+    constant uint4& padd [[buffer(9)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint slid [[thread_index_in_simdgroup]]
+) {
+    uint sg_row = sgid / 4;
+    uint sg_col = sgid % 4;
+    uint tg_row_base = tgid.y * 32;
+    uint tg_col_base = tgid.x * 32;
+
+    uint c_in = nchw.x;
+    uint h = nchw.y;
+    uint w_in = nchw.z;
+    uint h_out = out_dims.y;
+    uint w_out = out_dims.z;
+    uint kh = kshape.x;
+    uint kw = kshape.y;
+    uint sh = kshape.z;
+    uint sw = kshape.w;
+    uint ph = padd.x;
+    uint pw = padd.y;
+    uint dh = padd.z;
+    uint dw_dil = padd.w;
+
+    threadgroup float A_tg[32 * 32];
+    threadgroup float B_tg[32 * 32];
+    simdgroup_float8x8 a, b, c;
+    c = simdgroup_float8x8(0.0f);
+
+    for (uint kk = 0; kk < K; kk += 32) {
+        uint linear = sgid * 32 + slid;
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 512 + linear;
+            uint ar = idx / 32;
+            uint ac = idx % 32;
+            A_tg[idx] = dy[(tg_row_base + ar) * K + (kk + ac)];
+        }
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 512 + linear;
+            uint br = idx / 32;
+            uint bc = idx % 32;
+            uint k_idx = kk + br;
+            uint n_col = tg_col_base + bc;
+            B_tg[idx] = conv_bwd_im2col_elem(
+                x, k_idx, n_col, c_in, h, w_in, h_out, w_out, kh, kw, sh, sw, ph, pw, dh,
+                dw_dil);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k_inner = 0; k_inner < 32; k_inner += 8) {
+            simdgroup_load(a, &A_tg[sg_row * 8 * 32 + k_inner], 32);
+            simdgroup_load(b, &B_tg[k_inner * 32 + sg_col * 8], 32);
+            simdgroup_multiply_accumulate(c, a, b, c);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint out_row = tg_row_base + sg_row * 8;
+    uint out_col = tg_col_base + sg_col * 8;
+    simdgroup_store(c, &dw[out_row * N + out_col], N);
+}
+
+// Fast im2col when W_in = W_out = 1 (Voxtral codec `[1,C,T,1]` slices).
+kernel void im2col_group_w1(
+    device const float* x [[buffer(0)]],
+    device float* col [[buffer(1)]],
+    constant uint4& nchw [[buffer(2)]],     // [C_in/g, H, 1, unused]
+    constant uint4& out_dims [[buffer(3)]], // [unused, H_out, 1, unused]
+    constant uint4& kshape [[buffer(4)]],
+    constant uint4& padd [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint h_out = out_dims.y;
+    uint c_in = nchw.x;
+    uint h = nchw.y;
+    uint kh = kshape.x;
+    uint kw = kshape.y;
+    uint sh = kshape.z;
+    uint ph = padd.x;
+    uint dh = padd.z;
+    uint n_dim = c_in * kh * kw;
+    uint k_dim = h_out;
+    uint idx = gid;
+    if (idx >= n_dim * k_dim) return;
+    uint row = idx / k_dim;
+    uint ho = idx % k_dim;
+    uint rem = row;
+    uint ci = rem / (kh * kw);
+    rem = rem % (kh * kw);
+    uint ki = rem / kw;
+    uint kj = rem % kw;
+    int hi = (int)(ho * sh + ki * dh) - (int)ph;
+    col[ho * n_dim + row] = (hi < 0 || hi >= (int)h)
+        ? 0.0f
+        : x[ci * h + (uint)hi];
+}
+
+// im2col for one (batch, group) slice — layout matches `rlx_cpu::conv_bwd` /
+// `[n_dim, k_dim]` row-major with `n_dim = C_in/g · kH · kW`, `k_dim = H_out · W_out`.
+kernel void im2col_group(
+    device const float* x [[buffer(0)]],
+    device float* col [[buffer(1)]],
+    constant uint4& nchw [[buffer(2)]],     // [C_in/g, H, W, unused] (group slice)
+    constant uint4& out_dims [[buffer(3)]], // [unused, H_out, W_out, unused]
+    constant uint4& kshape [[buffer(4)]],
+    constant uint4& padd [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint h_out = out_dims.y;
+    uint w_out = out_dims.z;
+    uint c_in = nchw.x;
+    uint h = nchw.y;
+    uint w = nchw.z;
+    uint kh = kshape.x;
+    uint kw = kshape.y;
+    uint sh = kshape.z;
+    uint sw = kshape.w;
+    uint ph = padd.x;
+    uint pw = padd.y;
+    uint dh = padd.z;
+    uint dw_dil = padd.w;
+    uint n_dim = c_in * kh * kw;
+    uint k_dim = h_out * w_out;
+    uint idx = gid.x;
+    if (idx >= n_dim * k_dim) return;
+    uint row = idx / k_dim;
+    uint k_idx = idx % k_dim;
+    uint ho = k_idx / w_out;
+    uint wo = k_idx % w_out;
+    uint rem = row;
+    uint ci = rem / (kh * kw);
+    rem = rem % (kh * kw);
+    uint ki = rem / kw;
+    uint kj = rem % kw;
+    int hi = (int)(ho * sh + ki * dh) - (int)ph;
+    int wi = (int)(wo * sw + kj * dw_dil) - (int)pw;
+    col[k_idx * n_dim + row] = (hi < 0 || wi < 0 || hi >= (int)h || wi >= (int)w)
+        ? 0.0f
+        : x[(ci * h + (uint)hi) * w + (uint)wi];
+}
+
+// ── Attention backward (recompute scores + softmax) ─────────────────────
+
+kernel void attn_bwd_scores_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant uint& hs [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant float& scale [[buffer(7)]],
+    constant uint& mask_kind [[buffer(8)]],
+    constant uint& window [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint qi = gid.y;
+    uint ki = gid.x;
+    if (qi >= sq || ki >= sk) return;
+    float dot = 0.0f;
+    for (uint d = 0; d < head_dim; ++d) {
+        dot += q[qi * hs + d] * k[ki * hs + d];
+    }
+    float s = dot * scale;
+    if (mask_kind == 1u) {
+        if (ki > qi) s = -1e4f;
+    } else if (mask_kind == 3u) {
+        uint lo = qi > window ? qi - window : 0u;
+        if (ki < lo || ki > qi) s = -1e4f;
+    }
+    scores[qi * sk + ki] = s;
+}
+
+kernel void attn_bwd_dp_f32(
+    device const float* dy [[buffer(0)]],
+    device const float* v [[buffer(1)]],
+    device float* dp [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant uint& hs [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint qi = gid.y;
+    uint ki = gid.x;
+    if (qi >= sq || ki >= sk) return;
+    float acc = 0.0f;
+    for (uint d = 0; d < head_dim; ++d) {
+        acc += dy[qi * hs + d] * v[ki * hs + d];
+    }
+    dp[qi * sk + ki] = acc;
+}
+
+kernel void attn_bwd_ds_f32(
+    device const float* scores [[buffer(0)]],
+    device const float* dp [[buffer(1)]],
+    device float* ds [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant float& scale [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    if (row >= sq) return;
+    float row_sum = 0.0f;
+    for (uint ki = tid; ki < sk; ki += tsize) {
+        row_sum += scores[row * sk + ki] * dp[row * sk + ki];
+    }
+    threadgroup float partial[256];
+    partial[tid] = row_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum = partial[0];
+    for (uint ki = tid; ki < sk; ki += tsize) {
+        uint idx = row * sk + ki;
+        float p = scores[idx];
+        ds[idx] = p * (dp[idx] - sum) * scale;
+    }
+}
+
+kernel void attn_bwd_dv_f32(
+    device const float* scores [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant uint& hs [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint ki = gid.y;
+    uint d = gid.x;
+    if (ki >= sk || d >= head_dim) return;
+    float acc = 0.0f;
+    for (uint qi = 0; qi < sq; ++qi) {
+        acc += scores[qi * sk + ki] * dy[qi * hs + d];
+    }
+    out[ki * hs + d] = acc;
+}
+
+kernel void attn_bwd_dq_f32(
+    device const float* ds [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant uint& hs [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint qi = gid.y;
+    uint d = gid.x;
+    if (qi >= sq || d >= head_dim) return;
+    float acc = 0.0f;
+    for (uint ki = 0; ki < sk; ++ki) {
+        acc += ds[qi * sk + ki] * k[ki * hs + d];
+    }
+    out[qi * hs + d] = acc;
+}
+
+kernel void attn_bwd_dk_f32(
+    device const float* ds [[buffer(0)]],
+    device const float* q [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant uint& hs [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint ki = gid.y;
+    uint d = gid.x;
+    if (ki >= sk || d >= head_dim) return;
+    float acc = 0.0f;
+    for (uint qi = 0; qi < sq; ++qi) {
+        acc += ds[qi * sk + ki] * q[qi * hs + d];
+    }
+    out[ki * hs + d] = acc;
 }
 
 kernel void gather_bwd_zero(
@@ -3129,19 +4644,43 @@ pub struct Kernels {
     pub cast_f32_to_f16: ComputePipelineState,
     pub cast_f16_to_f32: ComputePipelineState,
     pub copy_f32: ComputePipelineState,
+    pub copy4: ComputePipelineState,
     pub sgemm_simd_padded: ComputePipelineState,
     pub sgemm_simd_padded_bias: ComputePipelineState,
     pub sgemm_tiled: ComputePipelineState,
     pub bias_add: ComputePipelineState,
     pub gelu_inplace: ComputePipelineState,
+    pub gelu_inplace4: ComputePipelineState,
     pub silu_inplace: ComputePipelineState,
+    pub silu_inplace4: ComputePipelineState,
+    pub binary_broadcast_rhs_col_f32: ComputePipelineState,
+    pub binary_broadcast_rhs_col4: ComputePipelineState,
+    pub binary_broadcast_rhs_row_f32: ComputePipelineState,
+    pub binary_broadcast_rhs_row4: ComputePipelineState,
+    pub binary_broadcast_rhs_scalar_f32: ComputePipelineState,
+    pub binary_broadcast_rhs_scalar4: ComputePipelineState,
+    pub binary_broadcast_1ax_f32: ComputePipelineState,
+    pub binary_broadcast_1ax4: ComputePipelineState,
+    pub fused_binary_activation_f32: ComputePipelineState,
+    pub fused_binary_activation4: ComputePipelineState,
+    pub fused_ternary_activation_f32: ComputePipelineState,
+    pub fused_ternary_activation4: ComputePipelineState,
     pub layer_norm: ComputePipelineState,
     pub rms_norm: ComputePipelineState,
     pub elem_add: ComputePipelineState,
+    pub elem_add4: ComputePipelineState,
+    pub elem_sub4: ComputePipelineState,
     pub binary_broadcast_f32: ComputePipelineState,
+    pub binary_broadcast_rank2_f32: ComputePipelineState,
+    pub binary_broadcast_rank24: ComputePipelineState,
     pub elem_mul: ComputePipelineState,
+    pub elem_mul4: ComputePipelineState,
+    pub elem_div4: ComputePipelineState,
     pub gather_axis0: ComputePipelineState,
     pub narrow_lastax: ComputePipelineState,
+    pub narrow_lastax4: ComputePipelineState,
+    pub split_lastax: ComputePipelineState,
+    pub split_lastax4: ComputePipelineState,
     pub fused_residual_ln: ComputePipelineState,
     pub fused_residual_rms_norm: ComputePipelineState,
     pub sdpa: ComputePipelineState,
@@ -3152,9 +4691,14 @@ pub struct Kernels {
     pub fused_swiglu_h: ComputePipelineState,
     /// PLAN L2 — interpreted N-ary element-wise region kernel.
     pub elementwise_region: ComputePipelineState,
+    /// FKL batch horizontal fusion (one launch; no prologue).
+    pub batch_elementwise_region: ComputePipelineState,
     pub fused_swiglu_cast_f32_to_f16: ComputePipelineState,
     pub fused_swiglu_cast_f16_to_f32: ComputePipelineState,
     pub concat_segment_lastax: ComputePipelineState,
+    pub concat_segment_lastax4: ComputePipelineState,
+    pub concat_lastax_multi: ComputePipelineState,
+    pub concat_lastax_multi4: ComputePipelineState,
     pub concat_segment_lastax_h: ComputePipelineState,
     pub elem_sub: ComputePipelineState,
     pub elem_div: ComputePipelineState,
@@ -3169,9 +4713,16 @@ pub struct Kernels {
     pub scatter_add_zero: ComputePipelineState,
     pub scatter_add_accumulate: ComputePipelineState,
     pub transpose_nd: ComputePipelineState,
+    pub transpose_2d_f32: ComputePipelineState,
+    pub transpose_2d_tiled_f32: ComputePipelineState,
+    pub transpose_last2_batched_f32: ComputePipelineState,
+    pub transpose_last2_batched_tiled_f32: ComputePipelineState,
+    pub transpose_swap12_batched_trail_f32: ComputePipelineState,
+    pub transpose_swap12_batched_trail_tiled_f32: ComputePipelineState,
     pub gather_axis: ComputePipelineState,
     pub pool2d: ComputePipelineState,
     pub conv2d: ComputePipelineState,
+    pub conv2d_w1: ComputePipelineState,
     pub layer_norm2d: ComputePipelineState,
     pub group_norm: ComputePipelineState,
     pub resize_nearest_2x: ComputePipelineState,
@@ -3199,8 +4750,20 @@ pub struct Kernels {
     pub dequant_gguf: ComputePipelineState,
     pub rms_norm_bwd: ComputePipelineState,
     pub rms_norm_bwd_param: ComputePipelineState,
+    pub rms_norm_bwd_inv_r_f32: ComputePipelineState,
+    pub rms_norm_bwd_param_reduce_f32: ComputePipelineState,
     pub rope_bwd: ComputePipelineState,
     pub cumsum_bwd: ComputePipelineState,
+    pub im2col_group: ComputePipelineState,
+    pub im2col_group_w1: ComputePipelineState,
+    pub conv2d_bwd_weight_gemm: ComputePipelineState,
+    pub conv2d_bwd_weight_gemm_4x4: ComputePipelineState,
+    pub attn_bwd_scores_f32: ComputePipelineState,
+    pub attn_bwd_dp_f32: ComputePipelineState,
+    pub attn_bwd_ds_f32: ComputePipelineState,
+    pub attn_bwd_dv_f32: ComputePipelineState,
+    pub attn_bwd_dq_f32: ComputePipelineState,
+    pub attn_bwd_dk_f32: ComputePipelineState,
     pub gather_bwd_zero: ComputePipelineState,
     pub gather_bwd_acc: ComputePipelineState,
     /// Native Gaussian splat tile raster (see `splat.msl`).
@@ -3271,19 +4834,43 @@ impl Kernels {
             cast_f32_to_f16: pipeline("cast_f32_to_f16"),
             cast_f16_to_f32: pipeline("cast_f16_to_f32"),
             copy_f32: pipeline("copy_f32"),
+            copy4: pipeline("copy4"),
             sgemm_simd_padded: pipeline("sgemm_simd_padded"),
             sgemm_simd_padded_bias: pipeline("sgemm_simd_padded_bias"),
             sgemm_tiled: pipeline("sgemm_tiled"),
             bias_add: pipeline("bias_add"),
             gelu_inplace: pipeline("gelu_inplace"),
+            gelu_inplace4: pipeline("gelu_inplace4"),
             silu_inplace: pipeline("silu_inplace"),
+            silu_inplace4: pipeline("silu_inplace4"),
+            binary_broadcast_rhs_col_f32: pipeline("binary_broadcast_rhs_col_f32"),
+            binary_broadcast_rhs_col4: pipeline("binary_broadcast_rhs_col4"),
+            binary_broadcast_rhs_row_f32: pipeline("binary_broadcast_rhs_row_f32"),
+            binary_broadcast_rhs_row4: pipeline("binary_broadcast_rhs_row4"),
+            binary_broadcast_rhs_scalar_f32: pipeline("binary_broadcast_rhs_scalar_f32"),
+            binary_broadcast_rhs_scalar4: pipeline("binary_broadcast_rhs_scalar4"),
+            binary_broadcast_1ax_f32: pipeline("binary_broadcast_1ax_f32"),
+            binary_broadcast_1ax4: pipeline("binary_broadcast_1ax4"),
+            fused_binary_activation_f32: pipeline("fused_binary_activation_f32"),
+            fused_binary_activation4: pipeline("fused_binary_activation4"),
+            fused_ternary_activation_f32: pipeline("fused_ternary_activation_f32"),
+            fused_ternary_activation4: pipeline("fused_ternary_activation4"),
             layer_norm: pipeline("layer_norm"),
             rms_norm: pipeline("rms_norm"),
             elem_add: pipeline("elem_add"),
+            elem_add4: pipeline("elem_add4"),
+            elem_sub4: pipeline("elem_sub4"),
             binary_broadcast_f32: pipeline("binary_broadcast_f32"),
+            binary_broadcast_rank2_f32: pipeline("binary_broadcast_rank2_f32"),
+            binary_broadcast_rank24: pipeline("binary_broadcast_rank24"),
             elem_mul: pipeline("elem_mul"),
+            elem_mul4: pipeline("elem_mul4"),
+            elem_div4: pipeline("elem_div4"),
             gather_axis0: pipeline("gather_axis0"),
             narrow_lastax: pipeline("narrow_lastax"),
+            narrow_lastax4: pipeline("narrow_lastax4"),
+            split_lastax: pipeline("split_lastax"),
+            split_lastax4: pipeline("split_lastax4"),
             fused_residual_ln: pipeline("fused_residual_ln"),
             fused_residual_rms_norm: pipeline("fused_residual_rms_norm"),
             sdpa: pipeline("sdpa"),
@@ -3293,9 +4880,13 @@ impl Kernels {
             fused_swiglu: pipeline("fused_swiglu"),
             fused_swiglu_h: pipeline("fused_swiglu_h"),
             elementwise_region: pipeline("elementwise_region"),
+            batch_elementwise_region: pipeline("batch_elementwise_region"),
             fused_swiglu_cast_f32_to_f16: pipeline("fused_swiglu_cast_f32_to_f16"),
             fused_swiglu_cast_f16_to_f32: pipeline("fused_swiglu_cast_f16_to_f32"),
             concat_segment_lastax: pipeline("concat_segment_lastax"),
+            concat_segment_lastax4: pipeline("concat_segment_lastax4"),
+            concat_lastax_multi: pipeline("concat_lastax_multi"),
+            concat_lastax_multi4: pipeline("concat_lastax_multi4"),
             concat_segment_lastax_h: pipeline("concat_segment_lastax_h"),
             elem_sub: pipeline("elem_sub"),
             elem_div: pipeline("elem_div"),
@@ -3310,9 +4901,18 @@ impl Kernels {
             scatter_add_zero: pipeline("scatter_add_zero"),
             scatter_add_accumulate: pipeline("scatter_add_accumulate"),
             transpose_nd: pipeline("transpose_nd"),
+            transpose_2d_f32: pipeline("transpose_2d_f32"),
+            transpose_2d_tiled_f32: pipeline("transpose_2d_tiled_f32"),
+            transpose_last2_batched_f32: pipeline("transpose_last2_batched_f32"),
+            transpose_last2_batched_tiled_f32: pipeline("transpose_last2_batched_tiled_f32"),
+            transpose_swap12_batched_trail_f32: pipeline("transpose_swap12_batched_trail_f32"),
+            transpose_swap12_batched_trail_tiled_f32: pipeline(
+                "transpose_swap12_batched_trail_tiled_f32",
+            ),
             gather_axis: pipeline("gather_axis"),
             pool2d: pipeline("pool2d"),
             conv2d: pipeline("conv2d"),
+            conv2d_w1: pipeline("conv2d_w1"),
             layer_norm2d: pipeline("layer_norm2d"),
             group_norm: pipeline("group_norm"),
             resize_nearest_2x: pipeline("resize_nearest_2x"),
@@ -3340,8 +4940,20 @@ impl Kernels {
             dequant_gguf: pipeline("dequant_gguf"),
             rms_norm_bwd: pipeline("rms_norm_bwd"),
             rms_norm_bwd_param: pipeline("rms_norm_bwd_param"),
+            rms_norm_bwd_inv_r_f32: pipeline("rms_norm_bwd_inv_r_f32"),
+            rms_norm_bwd_param_reduce_f32: pipeline("rms_norm_bwd_param_reduce_f32"),
             rope_bwd: pipeline("rope_bwd"),
             cumsum_bwd: pipeline("cumsum_bwd"),
+            im2col_group: pipeline("im2col_group"),
+            im2col_group_w1: pipeline("im2col_group_w1"),
+            conv2d_bwd_weight_gemm: pipeline("conv2d_bwd_weight_gemm"),
+            conv2d_bwd_weight_gemm_4x4: pipeline("conv2d_bwd_weight_gemm_4x4"),
+            attn_bwd_scores_f32: pipeline("attn_bwd_scores_f32"),
+            attn_bwd_dp_f32: pipeline("attn_bwd_dp_f32"),
+            attn_bwd_ds_f32: pipeline("attn_bwd_ds_f32"),
+            attn_bwd_dv_f32: pipeline("attn_bwd_dv_f32"),
+            attn_bwd_dq_f32: pipeline("attn_bwd_dq_f32"),
+            attn_bwd_dk_f32: pipeline("attn_bwd_dk_f32"),
             gather_bwd_zero: pipeline("gather_bwd_zero"),
             gather_bwd_acc: pipeline("gather_bwd_acc"),
             gaussian_splat_rasterize: pipeline("gaussian_splat_rasterize"),

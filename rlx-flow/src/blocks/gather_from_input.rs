@@ -1,5 +1,17 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use anyhow::Result;
 use rlx_ir::HirGraphExt;
@@ -39,7 +51,10 @@ impl BlockStage for GatherFromInputStage {
         let w_shape = ctx.hir().node(embed_w).shape.clone();
         let mut dims: Vec<rlx_ir::Dim> = indices_shape.dims().to_vec();
         dims.push(w_shape.dim(1));
-        let out_shape = rlx_ir::Shape::from_dims(&dims, indices_shape.dtype());
+        // Gather output carries the TABLE's dtype, not the index dtype —
+        // mixing these produced corrupt embeddings on backends that
+        // honor declared dtypes.
+        let out_shape = rlx_ir::Shape::from_dims(&dims, w_shape.dtype());
 
         let mut gb = HirMut::new(ctx.hir());
         let id = gb.gather_(embed_w, indices_id, self.axis);
@@ -77,7 +92,7 @@ impl BlockStage for GatherAddStage {
         let w_shape = ctx.hir().node(embed_w).shape.clone();
         let mut dims: Vec<rlx_ir::Dim> = indices_shape.dims().to_vec();
         dims.push(w_shape.dim(1));
-        let out_shape = rlx_ir::Shape::from_dims(&dims, indices_shape.dtype());
+        let out_shape = rlx_ir::Shape::from_dims(&dims, w_shape.dtype());
 
         let mut gb = HirMut::new(ctx.hir());
         let gathered = gb.gather_(embed_w, indices_id, self.axis);

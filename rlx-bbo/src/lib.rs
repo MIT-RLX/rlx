@@ -16,16 +16,32 @@
 //!
 //! For compiled flow-map **policies** and RLX-graph FMQ training, use [`rlx-rl`](../rlx-rl/).
 
+pub mod acquisition;
+pub mod bo;
 mod cmaes;
 mod flow_map;
+pub mod gp;
+mod gradcheck;
+mod gradient_descent;
+mod graph_opt;
 mod q_guidance;
+pub mod sampling;
 mod surrogate;
+pub mod tpe;
 mod trajectory;
 mod twin;
 
+pub use bo::{Acquisition, BoConfig, bo};
 pub use cmaes::{CmaesConfig, cmaes};
 pub use flow_map::{
     LinearFlowMap, fmq_surrogate_step, load_flow_map, save_flow_map, train_from_jsonl,
+};
+pub use gp::{GpPosterior, Kernel, cholesky};
+pub use gradcheck::gradcheck_graph;
+pub use gradient_descent::{AdamOptConfig, AdamOptResult, adam_opt_1d, adam_opt_nd};
+pub use graph_opt::{
+    GraphOptConfig, GraphOptError, GraphOptResult, GraphOptSpec, adam_opt_graph, find_param_node,
+    find_param_nodes,
 };
 pub use q_guidance::{
     DEFAULT_KAPPA, QSteerConfig, QgbsConfig, eta_eff_twin, finite_diff_grad, q_guided_beam_search,

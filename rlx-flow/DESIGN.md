@@ -109,3 +109,6 @@ Arch recipes (`Flux2Flow`, `Qwen35Flow`) compose these; fused composites stay in
 4. Document weight key conventions.
 
 Promote repeated hand-wired subgraphs from in-tree model builders into blocks — do not add new `HirGraphExt` wiring in model code.
+## License
+
+GPL-3.0-only.

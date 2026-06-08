@@ -229,6 +229,29 @@ pub fn sync_narrow_ops(graph: &mut Graph) {
     }
 }
 
+/// After [`bind_graph`], sync `Op::Expand { target_shape }` with bound output shapes.
+pub fn sync_expand_ops(graph: &mut Graph) {
+    use crate::Op;
+    let nodes = graph.nodes().to_vec();
+    for node in &nodes {
+        let Op::Expand { .. } = &node.op else {
+            continue;
+        };
+        if !node.shape.is_static() {
+            continue;
+        }
+        let target: Vec<i64> = node
+            .shape
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static() as i64)
+            .collect();
+        graph.node_mut(node.id).op = Op::Expand {
+            target_shape: target,
+        };
+    }
+}
+
 /// Infer symbol sizes from runtime input element counts.
 ///
 /// Each `Op::Input` may have at most one dynamic dimension; its size is
@@ -284,7 +307,51 @@ pub fn infer_bindings_from_inputs(
             binding.set(sym, size);
         }
     }
+    complete_im2col_row_bindings(graph, &mut binding);
     Ok(binding)
+}
+
+/// When `sym::BATCH` is bound on NCHW inputs feeding `Op::Im2Col`, derive
+/// `sym::ROWS = batch · H_out · W_out` for im2col/matmul reshape consumers.
+pub fn complete_im2col_row_bindings(graph: &Graph, binding: &mut DimBinding) {
+    let Some(batch) = binding.get(sym::BATCH) else {
+        return;
+    };
+    if binding.get(sym::ROWS).is_some() {
+        return;
+    }
+    for node in graph.nodes() {
+        let Op::Im2Col {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+        } = &node.op
+        else {
+            continue;
+        };
+        let x_shape = &graph.node(node.inputs[0]).shape;
+        if x_shape.rank() != 4 {
+            continue;
+        }
+        if !x_shape.dim(2).is_static() || !x_shape.dim(3).is_static() {
+            continue;
+        }
+        let h = x_shape.dim(2).unwrap_static();
+        let w = x_shape.dim(3).unwrap_static();
+        let kh = kernel_size.first().copied().unwrap_or(1);
+        let kw = kernel_size.get(1).copied().unwrap_or(1);
+        let sh = stride.first().copied().unwrap_or(1);
+        let sw = stride.get(1).copied().unwrap_or(1);
+        let ph = padding.first().copied().unwrap_or(0);
+        let pw = padding.get(1).copied().unwrap_or(0);
+        let dh = dilation.first().copied().unwrap_or(1);
+        let dw = dilation.get(1).copied().unwrap_or(1);
+        let h_out = crate::shape::conv2d_spatial_output(h, kh, sh, ph, dh);
+        let w_out = crate::shape::conv2d_spatial_output(w, kw, sw, pw, dw);
+        binding.set(sym::ROWS, batch * h_out * w_out);
+        return;
+    }
 }
 
 /// Infer bindings from f32 slice lengths (convenience for tests/runtime).
@@ -348,5 +415,27 @@ mod tests {
         let b = infer_bindings_from_f32_inputs(&g, &[("x", &vec![0.0f32; 3 * 128 * 64])])
             .expect("infer");
         assert_eq!(b.get(sym::SEQ), Some(128));
+    }
+
+    #[test]
+    fn infer_bindings_sets_im2col_rows_from_batch() {
+        let mut g = Graph::new("im2col_rows");
+        let x = g.input(
+            "x",
+            Shape::from_dims(
+                &[
+                    Dim::Dynamic(sym::BATCH),
+                    Dim::Static(1),
+                    Dim::Static(4),
+                    Dim::Static(4),
+                ],
+                DType::F32,
+            ),
+        );
+        let _col = g.im2col(x, [3, 3], [1, 1], [1, 1], [1, 1]);
+        g.set_outputs(vec![x]);
+        let b = infer_bindings_from_f32_inputs(&g, &[("x", &[0.0f32; 2 * 16])]).expect("infer");
+        assert_eq!(b.get(sym::BATCH), Some(2));
+        assert_eq!(b.get(sym::ROWS), Some(2 * 4 * 4));
     }
 }

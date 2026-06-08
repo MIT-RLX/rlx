@@ -29,6 +29,25 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
 
+// Abramowitz & Stegun 7.1.26 — matches rlx-cpu `scalar_gelu` / matmul gelu_erf.
+fn gelu_erf(x: f32) -> f32 {
+    let arg = x * 0.70710678118654752;
+    let s = select(-1.0, 1.0, arg >= 0.0);
+    let xa = abs(arg);
+    let t = 1.0 / (1.0 + 0.3275911 * xa);
+    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
+                + t * (-1.453152027 + t * 1.061405429))));
+    let e = s * (1.0 - poly * exp(-xa * xa));
+    return 0.5 * x * (1.0 + e);
+}
+
+fn gelu_approx(x: f32) -> f32 {
+    let c = 0.7978845608028654;
+    let x3 = x * x * x;
+    let inner = clamp(c * (x + 0.044715 * x3), -15.0, 15.0);
+    return 0.5 * x * (1.0 + tanh(inner));
+}
+
 @compute @workgroup_size(64)
 fn unary(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
     let i = gid.x + gid.y * ngs.x * 64u;
@@ -45,33 +64,13 @@ fn unary(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         case 6u:  { y = inverseSqrt(x); }
         case 7u:  { y = -x; }
         case 8u:  { y = abs(x); }
-        case 9u:  {
-            // gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
-            // WGSL has no erf; use the tanh approximation:
-            //   gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 x^3)))
-            //
-            // Clamp the inner argument to avoid NaN: f32 exp overflows past
-            // ~88, so naive tanh = (e^x - e^-x)/(e^x + e^-x) yields inf/inf
-            // for large inner. Tanh saturates near ±1 outside |x| ≳ 15
-            // anyway, so clamping doesn't change observable output.
-            let c = 0.7978845608028654;          // sqrt(2/π)
-            let x3 = x * x * x;
-            let inner = clamp(c * (x + 0.044715 * x3), -15.0, 15.0);
-            y = 0.5 * x * (1.0 + tanh(inner));
-        }
+        case 9u:  { y = gelu_erf(x); }
         case 10u: {
             // silu(x) = x * sigmoid(x); clamp -x to avoid exp overflow.
             let nx = clamp(-x, -88.0, 88.0);
             y = x / (1.0 + exp(nx));
         }
-        case 11u: {
-            // Same approximation as Gelu — rlx's "GeluApprox" maps to
-            // the same tanh-form here.
-            let c = 0.7978845608028654;
-            let x3 = x * x * x;
-            let inner = clamp(c * (x + 0.044715 * x3), -15.0, 15.0);
-            y = 0.5 * x * (1.0 + tanh(inner));
-        }
+        case 11u: { y = gelu_approx(x); }
         case 13u: { y = sin(x); }
         case 14u: { y = cos(x); }
         case 15u: { y = tan(x); }

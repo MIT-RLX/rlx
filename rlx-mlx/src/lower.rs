@@ -22,10 +22,12 @@
 //! switch to `mlx::compile`-style placeholder bindings if we need
 //! to drop the per-run construction overhead.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use rlx_ir::RegionPrologue;
 use rlx_ir::op::{
     Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp, ScaleMode, SteKind,
+    TransformStep,
 };
 use rlx_ir::shape::{Dim, DimBinding, Shape};
 use rlx_ir::{DType, Graph, NodeId, Op};
@@ -65,9 +67,7 @@ pub enum LeafKey {
 }
 
 /// Walk `graph` in topo order and return the (NodeId, LeafKey) pairs
-/// for every Input/Param/Constant node, in declaration order. Used by
-/// the runtime's compile path to know which f32 buffers to bind to
-/// which positional input of the compiled function.
+/// for every Input/Param/Constant node, in declaration order.
 pub fn leaf_order(graph: &Graph) -> Vec<(NodeId, LeafKey)> {
     let mut out = Vec::new();
     for node in graph.nodes() {
@@ -79,6 +79,111 @@ pub fn leaf_order(graph: &Graph) -> Vec<(NodeId, LeafKey)> {
         }
     }
     out
+}
+
+/// Positional compile/run inputs: one slot per unique Input/Param name,
+/// every Constant node. Graph builders often call `g.param("shared", …)`
+/// once per block, producing many `NodeId`s with the same name; feeding
+/// each as a separate mlx::compile leaf misbinds inputs on replay.
+pub fn compile_leaf_order(graph: &Graph) -> Vec<(NodeId, LeafKey)> {
+    let mut seen_input = HashSet::new();
+    let mut seen_param = HashSet::new();
+    let mut out = Vec::new();
+    for node in graph.nodes() {
+        match &node.op {
+            Op::Input { name } if seen_input.insert(name.clone()) => {
+                out.push((node.id, LeafKey::Input(name.clone())));
+            }
+            Op::Param { name } if seen_param.insert(name.clone()) => {
+                out.push((node.id, LeafKey::Param(name.clone())));
+            }
+            Op::Constant { .. } => out.push((node.id, LeafKey::Constant)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// If `graph` contains an op whose MLX lowering eagerly evaluates a
+/// tensor on the host (`to_f32` / `to_bytes`), return a short label
+/// for the first offender. MLX's `mlx::compile` callback forbids
+/// host eval; entering Compiled mode on such a graph triggers the
+/// `[eval] Attempting to eval an array during function
+/// transformations…` panic. Backends should check this up front and
+/// fall back to Lazy.
+pub fn first_host_eval_op(graph: &Graph) -> Option<&'static str> {
+    for node in graph.nodes() {
+        match &node.op {
+            Op::DequantMatMul { scheme }
+                if (scheme.is_gguf() || matches!(scheme, rlx_ir::QuantScheme::Nvfp4Block)) =>
+            {
+                return Some("DequantMatMul[GGUF|NVFP4] (host dequant)");
+            }
+            Op::DequantGroupedMatMul { scheme } if scheme.is_gguf() => {
+                return Some("DequantGroupedMatMul[GGUF] (host dequant)");
+            }
+            Op::GaussianSplatRender { .. } => return Some("GaussianSplatRender (host kernel)"),
+            Op::GaussianSplatRenderBackward { .. } => {
+                return Some("GaussianSplatRenderBackward (host kernel)");
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Fan canonical leaf arrays out to every duplicate Input/Param `NodeId`.
+pub fn expand_leaf_env(
+    graph: &Graph,
+    mut env: HashMap<NodeId, Array>,
+) -> Result<HashMap<NodeId, Array>, MlxError> {
+    let mut canon_input: HashMap<String, NodeId> = HashMap::new();
+    let mut canon_param: HashMap<String, NodeId> = HashMap::new();
+    for (id, key) in compile_leaf_order(graph) {
+        match key {
+            LeafKey::Input(name) => {
+                canon_input.insert(name, id);
+            }
+            LeafKey::Param(name) => {
+                canon_param.insert(name, id);
+            }
+            LeafKey::Constant => {}
+        }
+    }
+
+    for node in graph.nodes() {
+        if env.contains_key(&node.id) {
+            continue;
+        }
+        match &node.op {
+            Op::Input { name } => {
+                let canon = *canon_input.get(name).ok_or_else(|| {
+                    MlxError(format!("expand_leaf_env: missing canonical input '{name}'"))
+                })?;
+                let arr = env.get(&canon).ok_or_else(|| {
+                    MlxError(format!("expand_leaf_env: canonical input '{name}' unbound"))
+                })?;
+                env.insert(node.id, arr.clone_handle()?);
+            }
+            Op::Param { name } => {
+                let canon = *canon_param.get(name).ok_or_else(|| {
+                    MlxError(format!("expand_leaf_env: missing canonical param '{name}'"))
+                })?;
+                let arr = env.get(&canon).ok_or_else(|| {
+                    MlxError(format!("expand_leaf_env: canonical param '{name}' unbound"))
+                })?;
+                env.insert(node.id, arr.clone_handle()?);
+            }
+            Op::Constant { .. } => {
+                return Err(MlxError(format!(
+                    "expand_leaf_env: constant leaf {:?} not bound",
+                    node.id
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(env)
 }
 
 /// Expand scalar host buffers to match a batched graph leaf when vmap
@@ -155,6 +260,21 @@ pub fn build_leaf_for(
             let data = params
                 .get(name)
                 .ok_or_else(|| MlxError(format!("missing param '{name}'")))?;
+            // Fast path: f32 param whose host buffer already matches
+            // the graph-declared shape (no broadcast needed). Wrap as
+            // a zero-copy view over the caller-owned `Vec<f32>` — the
+            // MlxExecutable mutates the Vec in place on set_param
+            // calls, keeping the buffer address stable across runs.
+            //
+            // SAFETY: `data` lives in `MlxExecutable::params` (a
+            // HashMap of Vec<f32>) which outlives the Array. The
+            // executable syncs MLX evaluation in `run_internal`
+            // before returning, so the Array is no longer referenced
+            // by MLX by the time the next `set_param` mutates the
+            // buffer.
+            if dtype == DType::F32 && data.len() == shape.iter().product::<usize>() {
+                return unsafe { Array::from_f32_slice_view(data, &shape) };
+            }
             let data = broadcast_leaf_data(name, data, &shape)?;
             Array::from_f32_slice(&data, &shape, dtype)
         }
@@ -199,6 +319,7 @@ pub fn lower_subgraph(
     parent_params_typed: &HashMap<String, (Vec<u8>, DType)>,
 ) -> Result<Vec<Array>, MlxError> {
     let mut sub_env: HashMap<NodeId, Array> = HashMap::with_capacity(sub.nodes().len());
+    let mut canon_param: HashMap<String, NodeId> = HashMap::new();
 
     let mut input_idx = 0;
     for node in sub.nodes() {
@@ -214,14 +335,21 @@ pub fn lower_subgraph(
                 input_idx += 1;
             }
             Op::Param { name } => {
-                if let Some((bytes, dt)) = parent_params_typed.get(name) {
+                if let Some(&canon_id) = canon_param.get(name) {
+                    let arr = sub_env.get(&canon_id).ok_or_else(|| {
+                        MlxError(format!("sub-graph canonical param '{name}' missing"))
+                    })?;
+                    sub_env.insert(node.id, arr.clone_handle()?);
+                    continue;
+                }
+                let leaf = if let Some((bytes, dt)) = parent_params_typed.get(name) {
                     let shape: Vec<usize> = node
                         .shape
                         .dims()
                         .iter()
                         .map(|d| d.unwrap_static())
                         .collect();
-                    sub_env.insert(node.id, Array::from_bytes(bytes, &shape, *dt)?);
+                    Array::from_bytes(bytes, &shape, *dt)?
                 } else if let Some(data) = parent_params.get(name) {
                     let shape: Vec<usize> = node
                         .shape
@@ -230,12 +358,14 @@ pub fn lower_subgraph(
                         .map(|d| d.unwrap_static())
                         .collect();
                     let dtype = node.shape.dtype();
-                    sub_env.insert(node.id, Array::from_f32_slice(data, &shape, dtype)?);
+                    Array::from_f32_slice(data, &shape, dtype)?
                 } else {
                     return Err(MlxError(format!(
                         "sub-graph param '{name}' not found in parent's param maps"
                     )));
-                }
+                };
+                canon_param.insert(name.clone(), node.id);
+                sub_env.insert(node.id, leaf);
             }
             Op::Constant { data } => {
                 let shape: Vec<usize> = node
@@ -509,28 +639,54 @@ pub fn lower_with_env(
                 let y = lookup(&env, node.inputs[2])?;
                 ops::select(c, x, y)?
             }
+            Op::TransformRegion { steps, .. } => {
+                let mut cur = lookup(&env, node.inputs[0])?.clone_handle()?;
+                for step in steps {
+                    match step {
+                        TransformStep::ResizeNearest2x(_) => {
+                            cur = ops::resize_nearest_2x_nchw(&cur)?;
+                        }
+                    }
+                }
+                cur
+            }
+            Op::BatchElementwiseRegion {
+                chain,
+                num_batch_inputs,
+                scalar_input_mask: _,
+                input_modulus: _,
+                prologue,
+                prologue_input: _,
+            } => {
+                let n = *num_batch_inputs as usize;
+                if node.inputs.len() != n {
+                    return Err(MlxError(format!(
+                        "BatchElementwiseRegion: declared {n} batch inputs but node has {}",
+                        node.inputs.len()
+                    )));
+                }
+                let mut slices = Vec::with_capacity(n);
+                for &in_id in &node.inputs {
+                    slices.push(eval_elementwise_region_on_inputs(
+                        &env,
+                        std::slice::from_ref(&in_id),
+                        chain,
+                        *prologue,
+                    )?);
+                }
+                let refs: Vec<&Array> = slices.iter().collect();
+                ops::concat(&refs, 0)?
+            }
             Op::ElementwiseRegion {
                 chain,
                 num_inputs,
                 scalar_input_mask: _,
                 input_modulus: _,
+                prologue,
+                prologue_input: _,
             } => {
-                // PLAN L2: native MLX lowering. Compose `mlx::core::ops::*`
-                // per ChainStep in declaration order; the resulting array
-                // sub-graph stays inside MLX's lazy trace, so the optimizer
-                // and `mlx::compile` get to fuse the whole chain into one
-                // kernel — no decomposer round-trip, no extra Op nodes for
-                // the executor to walk. Acts as the kernel-of-record for
-                // L2 on MLX.
-                //
-                // `scalar_input_mask` is intentionally ignored here:
-                // MLX's lazy eval natively broadcasts `[1]`-shape arrays
-                // against larger ones in element-wise ops, so scalar-
-                // broadcast inputs flow through the chain without any
-                // explicit per-operand handling. The mask exists for the
-                // kernel-launch backends (CPU/Metal/wgpu/CUDA/ROCm)
-                // whose interpreted-chain kernels need the explicit hint
-                // to swap their per-output indexing for element-0 reads.
+                // PLAN L2: native MLX lowering — see `eval_elementwise_region_on_inputs`.
+                // `scalar_input_mask` / `input_modulus` are for interpreted GPU kernels.
                 let n_in = *num_inputs as usize;
                 if node.inputs.len() != n_in {
                     return Err(MlxError(format!(
@@ -538,104 +694,7 @@ pub fn lower_with_env(
                         node.inputs.len()
                     )));
                 }
-                let inputs: Vec<&Array> = node
-                    .inputs
-                    .iter()
-                    .map(|&id| lookup(&env, id))
-                    .collect::<Result<_, _>>()?;
-                let mut steps: Vec<Array> = Vec::with_capacity(chain.len());
-                fn resolve<'a>(
-                    op: ChainOperand,
-                    inputs: &'a [&Array],
-                    steps: &'a [Array],
-                ) -> Result<&'a Array, MlxError> {
-                    match op {
-                        ChainOperand::Input(i) => {
-                            let i = i as usize;
-                            inputs.get(i).copied().ok_or_else(|| {
-                                MlxError(format!(
-                                    "ElementwiseRegion: ChainOperand::Input({i}) \
-                                 out of range (have {} inputs)",
-                                    inputs.len()
-                                ))
-                            })
-                        }
-                        ChainOperand::Step(i) => {
-                            let i = i as usize;
-                            steps.get(i).ok_or_else(|| {
-                                MlxError(format!(
-                                    "ElementwiseRegion: ChainOperand::Step({i}) \
-                                 references step not yet produced (have {} steps)",
-                                    steps.len()
-                                ))
-                            })
-                        }
-                    }
-                }
-                for step in chain {
-                    let arr = match step {
-                        ChainStep::Activation(act, x_op) => {
-                            let x = resolve(*x_op, &inputs, &steps)?;
-                            match act {
-                                Activation::Gelu | Activation::GeluApprox => ops::gelu(x)?,
-                                Activation::Silu => ops::silu(x)?,
-                                Activation::Relu => ops::unary(x, MlxUnary::Relu)?,
-                                Activation::Sigmoid => ops::unary(x, MlxUnary::Sigmoid)?,
-                                Activation::Tanh => ops::unary(x, MlxUnary::Tanh)?,
-                                Activation::Exp => ops::unary(x, MlxUnary::Exp)?,
-                                Activation::Log => ops::unary(x, MlxUnary::Log)?,
-                                Activation::Sqrt => ops::unary(x, MlxUnary::Sqrt)?,
-                                Activation::Rsqrt => ops::unary(x, MlxUnary::Rsqrt)?,
-                                Activation::Neg => ops::unary(x, MlxUnary::Neg)?,
-                                Activation::Abs => ops::unary(x, MlxUnary::Abs)?,
-                                Activation::Round => ops::unary(x, MlxUnary::Round)?,
-                                Activation::Sin => ops::unary(x, MlxUnary::Sin)?,
-                                Activation::Cos => ops::unary(x, MlxUnary::Cos)?,
-                                Activation::Tan => ops::unary(x, MlxUnary::Tan)?,
-                                Activation::Atan => ops::unary(x, MlxUnary::Atan)?,
-                            }
-                        }
-                        ChainStep::Cast(to, x_op) => {
-                            let x = resolve(*x_op, &inputs, &steps)?;
-                            ops::cast(x, *to)?
-                        }
-                        ChainStep::Binary(bop, l_op, r_op) => {
-                            let a = resolve(*l_op, &inputs, &steps)?;
-                            let b = resolve(*r_op, &inputs, &steps)?;
-                            match bop {
-                                BinaryOp::Add => ops::add(a, b)?,
-                                BinaryOp::Mul => ops::mul(a, b)?,
-                                BinaryOp::Sub => ops::sub(a, b)?,
-                                BinaryOp::Div => ops::div(a, b)?,
-                                BinaryOp::Max => ops::max(a, b)?,
-                                BinaryOp::Min => ops::min(a, b)?,
-                                BinaryOp::Pow => ops::pow(a, b)?,
-                            }
-                        }
-                        ChainStep::Compare(cop, l_op, r_op) => {
-                            let a = resolve(*l_op, &inputs, &steps)?;
-                            let b = resolve(*r_op, &inputs, &steps)?;
-                            match cop {
-                                CmpOp::Eq => ops::eq(a, b)?,
-                                CmpOp::Ne => ops::ne(a, b)?,
-                                CmpOp::Lt => ops::lt(a, b)?,
-                                CmpOp::Le => ops::le(a, b)?,
-                                CmpOp::Gt => ops::gt(a, b)?,
-                                CmpOp::Ge => ops::ge(a, b)?,
-                            }
-                        }
-                        ChainStep::Where(c_op, t_op, f_op) => {
-                            let c = resolve(*c_op, &inputs, &steps)?;
-                            let t = resolve(*t_op, &inputs, &steps)?;
-                            let f = resolve(*f_op, &inputs, &steps)?;
-                            ops::select(c, t, f)?
-                        }
-                    };
-                    steps.push(arr);
-                }
-                steps.pop().ok_or_else(|| {
-                    MlxError("ElementwiseRegion: empty chain has no output".into())
-                })?
+                eval_elementwise_region_on_inputs(&env, &node.inputs, chain, *prologue)?
             }
             Op::Activation(act) => {
                 let x = lookup(&env, node.inputs[0])?;
@@ -685,6 +744,10 @@ pub fn lower_with_env(
                 let x = lookup(&env, node.inputs[0])?;
                 let p: Vec<i32> = perm.iter().map(|&d| d as i32).collect();
                 ops::transpose(x, &p)?
+            }
+            Op::ResizeNearest2x => {
+                let x = lookup(&env, node.inputs[0])?;
+                ops::resize_nearest_2x_nchw(x)?
             }
             Op::Narrow { axis, start, len } => {
                 let x = lookup(&env, node.inputs[0])?;
@@ -767,17 +830,28 @@ pub fn lower_with_env(
                 let hd = *head_dim as i32;
                 let scale = 1.0 / (hd as f32).sqrt();
 
-                // Detect layout from rank.
-                let need_split = q_shape.len() == 3;
+                let q_ir = graph.node(node.inputs[0]).shape.clone();
+                let k_ir = graph.node(node.inputs[1]).shape.clone();
+                let geom = rlx_ir::attention_geom(&q_ir, &k_ir, *num_heads, *head_dim);
+                let bshd_rank4 = q_shape.len() == 4 && !geom.bhsd;
+
                 let to_bhsd = |t: &Array, sh: &[i32]| -> Result<Array, MlxError> {
                     if sh.len() == 4 {
-                        return t.clone_handle();
+                        if sh[1] == nh {
+                            return t.clone_handle();
+                        }
+                        // [B, S, H, D] → [B, H, S, D]
+                        let t = ops::transpose(t, &[0, 2, 1, 3])?;
+                        // Materialize: mlx::compile elides transpose views otherwise
+                        // (same issue as conv NHWC→NCHW in conv_compile_mode_repro).
+                        return ops::contiguous(&t);
                     }
                     // [B, S, H*D] → [B, S, H, D] → [B, H, S, D]
                     let b = sh[0];
                     let s = sh[1];
                     let r = ops::reshape(t, &[b, s, nh, hd])?;
-                    ops::transpose(&r, &[0, 2, 1, 3])
+                    let t = ops::transpose(&r, &[0, 2, 1, 3])?;
+                    ops::contiguous(&t)
                 };
                 let q = to_bhsd(q_in, &q_shape)?;
                 let k = to_bhsd(k_in, &k_shape)?;
@@ -863,12 +937,15 @@ pub fn lower_with_env(
                 let m_ref: Option<&Array> = mask.as_ref().or(mask_owned.as_ref());
                 let attn_out = ops::attention(&q, &k, &v, scale, mask_kind_ffi, m_ref)?;
 
-                if need_split {
+                if q_shape.len() == 3 {
                     // [B, H, S, D] → [B, S, H, D] → [B, S, H*D]
                     let b = q_shape[0];
                     let s = q_shape[1];
                     let bsd = ops::transpose(&attn_out, &[0, 2, 1, 3])?;
                     ops::reshape(&bsd, &[b, s, nh * hd])?
+                } else if bshd_rank4 {
+                    let t = ops::transpose(&attn_out, &[0, 2, 1, 3])?;
+                    ops::contiguous(&t)?
                 } else {
                     attn_out
                 }
@@ -1019,7 +1096,14 @@ pub fn lower_with_env(
                     let mut split_shape = x_shape.clone();
                     split_shape[n - 1] = heads_in_last;
                     split_shape.push(hd);
+                    // `Op::Rope`'s seq axis is `n-2` (original rank). For packed rank-3 callers
+                    // (`[B, S, H*D]`), reshape gives `[B, S, H, D]` but we need `[B, H, S, D]`
+                    // so that `seq_axis = n-1` (after adding the hd axis) points at `S`.
                     let x_split = ops::reshape(x, &split_shape)?;
+                    let mut perm: Vec<i32> = (0..(n as i32 + 1)).collect();
+                    perm.swap(n - 1, n - 2);
+                    let x_split = ops::transpose(&x_split, &perm)?;
+                    split_shape.swap(n - 1, n - 2);
                     if nr < hd {
                         let mut rot_stop = split_shape.clone();
                         rot_stop[n] = nr;
@@ -1031,10 +1115,17 @@ pub fn lower_with_env(
                         rot_shape[n] = nr;
                         let y_rot = rotate(&rot, &rot_shape, n - 1, rot_half)?;
                         let y_head = ops::concat(&[&y_rot, &pass], n as i32)?;
-                        ops::reshape(&y_head, &x_shape)?
+                        // Transpose back to `[... , S, H, D]` then reshape to original packed rank-3.
+                        let mut perm_back: Vec<i32> = (0..(n as i32 + 1)).collect();
+                        perm_back.swap(n - 1, n - 2);
+                        let y_bshd = ops::transpose(&y_head, &perm_back)?;
+                        ops::reshape(&y_bshd, &x_shape)?
                     } else {
                         let y_split = rotate(&x_split, &split_shape, n - 1, rot_half)?;
-                        ops::reshape(&y_split, &x_shape)?
+                        let mut perm_back: Vec<i32> = (0..(n as i32 + 1)).collect();
+                        perm_back.swap(n - 1, n - 2);
+                        let y_bshd = ops::transpose(&y_split, &perm_back)?;
+                        ops::reshape(&y_bshd, &x_shape)?
                     }
                 } else if nr < hd {
                     let mut rot_stop = x_shape.clone();
@@ -1528,23 +1619,41 @@ pub fn lower_with_env(
                 let q = ops::slice(&qkv, &[0, 0, 0], &[batch, seq, inner])?;
                 let k = ops::slice(&qkv, &[0, 0, inner], &[batch, seq, 2 * inner])?;
                 let v = ops::slice(&qkv, &[0, 0, 2 * inner], &[batch, seq, 3 * inner])?;
+                // Materialize the transpose with `ops::contiguous` (MLX's
+                // `compile` elides transpose views — same fix as Op::Attention
+                // at lower.rs:851/858 and Op::FusedAttentionBlock above).
                 let to_h = |t: Array| -> Result<Array, MlxError> {
                     let r = ops::reshape(&t, &[batch, seq, nh, hd])?;
-                    ops::transpose(&r, &[0, 2, 1, 3])
+                    let t = ops::transpose(&r, &[0, 2, 1, 3])?;
+                    ops::contiguous(&t)
                 };
                 let q = to_h(q)?;
                 let k = to_h(k)?;
                 let v = to_h(v)?;
                 let scale = 1.0 / (hd as f32).sqrt();
-                // Promote mask to Q's dtype (AutoMixed casts Q/K/V
-                // but not mask leaves — see Op::Attention site above).
+
+                // Convert the BERT-style binary mask `[B, S]` (1.0 valid,
+                // 0.0 padding) → additive (`(mask - 1) * 1e9`) and reshape
+                // to `[B, 1, 1, S]` so it broadcasts over heads + query
+                // positions in SDPA. Same handling as the unfused
+                // `Op::Attention` path and the standalone
+                // `Op::FusedAttentionBlock` above.
                 let h_dtype = graph.node(node.inputs[0]).shape.dtype();
-                let mask_owned;
-                let mask_ref: &Array = if h_dtype != DType::F32 {
-                    mask_owned = ops::cast(mask, h_dtype)?;
-                    &mask_owned
+                let mask_idx = if *has_bias { 13 } else { 7 };
+                let m_shape = node_input_shape(graph, node.inputs[mask_idx]);
+                let mask_cast = if h_dtype != DType::F32 {
+                    ops::cast(mask, h_dtype)?
                 } else {
-                    mask
+                    mask.clone_handle()?
+                };
+                let one = Array::from_f32_slice(&[1.0], &[1], h_dtype)?;
+                let scl = Array::from_f32_slice(&[1.0e9], &[1], h_dtype)?;
+                let shifted = ops::sub(&mask_cast, &one)?;
+                let additive = ops::mul(&shifted, &scl)?;
+                let additive_4d = match m_shape.len() {
+                    2 => ops::reshape(&additive, &[m_shape[0], 1, 1, m_shape[1]])?,
+                    3 => ops::reshape(&additive, &[m_shape[0], 1, m_shape[1], m_shape[2]])?,
+                    _ => additive,
                 };
                 let attn = ops::attention(
                     &q,
@@ -1552,7 +1661,7 @@ pub fn lower_with_env(
                     &v,
                     scale,
                     crate::ffi::MlxMask::Custom,
-                    Some(mask_ref),
+                    Some(&additive_4d),
                 )?;
                 let attn = ops::transpose(&attn, &[0, 2, 1, 3])?;
                 let attn = ops::reshape(&attn, &[batch, seq, inner])?;
@@ -1656,10 +1765,15 @@ pub fn lower_with_env(
                 let k = ops::slice(&qkv, &[0, 0, inner], &[batch, seq, 2 * inner])?;
                 let v = ops::slice(&qkv, &[0, 0, 2 * inner], &[batch, seq, 3 * inner])?;
 
-                // 3. reshape to [B, S, H, D] then transpose to [B, H, S, D]
+                // 3. reshape to [B, S, H, D] then transpose to [B, H, S, D].
+                // Materialize the transposed view with `ops::contiguous`: MLX's
+                // `compile` elides bare transpose views, and SDPA needs a real
+                // contiguous buffer (same materialization required by the
+                // unfused `Op::Attention` lowering at lower.rs:851 and 858).
                 let to_h = |t: Array| -> Result<Array, MlxError> {
                     let r = ops::reshape(&t, &[batch, seq, nh, hd])?;
-                    ops::transpose(&r, &[0, 2, 1, 3])
+                    let t = ops::transpose(&r, &[0, 2, 1, 3])?;
+                    ops::contiguous(&t)
                 };
                 let mut q = to_h(q)?;
                 let mut k = to_h(k)?;
@@ -1698,17 +1812,36 @@ pub fn lower_with_env(
                     k = do_rope(&k)?;
                 }
 
-                // 5. SDPA with custom mask
+                // 5. SDPA with custom mask.
+                //
+                // The mask on input #3 is the BERT-style binary mask
+                // `[B, S]` (1.0 = valid, 0.0 = padding). MLX's SDPA adds the
+                // mask *additively* to scores, so we must convert
+                // binary → additive (matching the unfused `Op::Attention`
+                // lowering at lower.rs:893-907):
+                //     additive = (mask - 1) * 1e9
+                //   → 0 for valid positions, -1e9 for padding.
+                //
+                // We also reshape the [B, S] mask to [B, 1, 1, S] so it
+                // broadcasts across the head and query axes against the
+                // [B, H, S_q, S_k] score tensor — same normalization the
+                // unfused path applies at lower.rs:875-881.
                 let scale = 1.0 / (hd as f32).sqrt();
-                // Mask must promote to Q dtype (AutoMixed promotes
-                // Q/K/V but not mask leaves).
                 let q_dtype = graph.node(node.inputs[h_idx]).shape.dtype();
-                let mask_owned;
-                let mask_ref: &Array = if q_dtype != DType::F32 {
-                    mask_owned = ops::cast(mask, q_dtype)?;
-                    &mask_owned
+                let m_shape = node_input_shape(graph, node.inputs[mask_idx]);
+                let mask_cast = if q_dtype != DType::F32 {
+                    ops::cast(mask, q_dtype)?
                 } else {
-                    mask
+                    mask.clone_handle()?
+                };
+                let one = Array::from_f32_slice(&[1.0], &[1], q_dtype)?;
+                let scl = Array::from_f32_slice(&[1.0e9], &[1], q_dtype)?;
+                let shifted = ops::sub(&mask_cast, &one)?;
+                let additive = ops::mul(&shifted, &scl)?;
+                let additive_4d = match m_shape.len() {
+                    2 => ops::reshape(&additive, &[m_shape[0], 1, 1, m_shape[1]])?,
+                    3 => ops::reshape(&additive, &[m_shape[0], 1, m_shape[1], m_shape[2]])?,
+                    _ => additive,
                 };
                 let attn_out = ops::attention(
                     &q,
@@ -1716,7 +1849,7 @@ pub fn lower_with_env(
                     &v_h,
                     scale,
                     crate::ffi::MlxMask::Custom,
-                    Some(mask_ref),
+                    Some(&additive_4d),
                 )?;
 
                 // 6. transpose back [B, H, S, D] → [B, S, H, D] → reshape [B, S, H*D]
@@ -3250,6 +3383,15 @@ pub fn lower_with_env(
                 kernel.execute(&in_refs, &node.shape, attrs)?
             }
 
+            // Identity-forward op used by the GRL (Gradient Reverse Layer)
+            // in adversarial training. Forward value matches the input; the
+            // gradient pass treats it as a stop. MLX's compiled trace only
+            // sees the forward, so we lower it to a no-op clone.
+            Op::StopGradient => {
+                let x = lookup(&env, node.inputs[0])?;
+                x.clone_handle()?
+            }
+
             other => {
                 return unsupported(format!("{other:?}"));
             }
@@ -3363,7 +3505,7 @@ pub fn lower_and_run_typed_with_extent(
         graph
     };
 
-    let order = leaf_order(graph);
+    let order = compile_leaf_order(graph);
     let mut env: HashMap<NodeId, Array> = HashMap::with_capacity(graph.nodes().len());
     for (id, _key) in &order {
         env.insert(
@@ -3379,6 +3521,7 @@ pub fn lower_and_run_typed_with_extent(
             )?,
         );
     }
+    env = expand_leaf_env(graph, env)?;
 
     // PLAN L1 active-extent: when hinted + safe, slice each Input leaf
     // along axis 0 from `upper` to `actual`. Only Input leaves get
@@ -3475,7 +3618,9 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::Binary(_)
             | Op::Compare(_)
             | Op::Where
-            | Op::ElementwiseRegion { .. } => {}
+            | Op::ElementwiseRegion { .. }
+            | Op::BatchElementwiseRegion { .. }
+            | Op::TransformRegion { .. } => {}
             // Per-row normalizations: operate on inner axes, batch is
             // pass-through. Safe.
             Op::Softmax { axis: _ }
@@ -3941,6 +4086,133 @@ fn map_graph_axis_to_runtime(axis: usize, graph_rank: usize, runtime_rank: usize
         axis
     } else {
         axis + (runtime_rank - graph_rank)
+    }
+}
+
+/// Evaluate an [`Op::ElementwiseRegion`] (or one batch slice) on MLX arrays.
+fn eval_elementwise_region_on_inputs(
+    env: &HashMap<NodeId, Array>,
+    node_inputs: &[NodeId],
+    chain: &[ChainStep],
+    prologue: RegionPrologue,
+) -> Result<Array, MlxError> {
+    let mut input0_up: Option<Array> = None;
+    if prologue == RegionPrologue::ResizeNearest2x {
+        let x = lookup(env, node_inputs[0])?;
+        input0_up = Some(ops::resize_nearest_2x_nchw(x)?);
+    }
+    let mut steps: Vec<Array> = Vec::with_capacity(chain.len());
+    for step in chain {
+        let arr = match step {
+            ChainStep::Activation(act, x_op) => {
+                let x =
+                    resolve_region_operand(*x_op, node_inputs, input0_up.as_ref(), env, &steps)?;
+                match act {
+                    Activation::Gelu | Activation::GeluApprox => ops::gelu(x)?,
+                    Activation::Silu => ops::silu(x)?,
+                    Activation::Relu => ops::unary(x, MlxUnary::Relu)?,
+                    Activation::Sigmoid => ops::unary(x, MlxUnary::Sigmoid)?,
+                    Activation::Tanh => ops::unary(x, MlxUnary::Tanh)?,
+                    Activation::Exp => ops::unary(x, MlxUnary::Exp)?,
+                    Activation::Log => ops::unary(x, MlxUnary::Log)?,
+                    Activation::Sqrt => ops::unary(x, MlxUnary::Sqrt)?,
+                    Activation::Rsqrt => ops::unary(x, MlxUnary::Rsqrt)?,
+                    Activation::Neg => ops::unary(x, MlxUnary::Neg)?,
+                    Activation::Abs => ops::unary(x, MlxUnary::Abs)?,
+                    Activation::Round => ops::unary(x, MlxUnary::Round)?,
+                    Activation::Sin => ops::unary(x, MlxUnary::Sin)?,
+                    Activation::Cos => ops::unary(x, MlxUnary::Cos)?,
+                    Activation::Tan => ops::unary(x, MlxUnary::Tan)?,
+                    Activation::Atan => ops::unary(x, MlxUnary::Atan)?,
+                }
+            }
+            ChainStep::Cast(to, x_op) => {
+                let x =
+                    resolve_region_operand(*x_op, node_inputs, input0_up.as_ref(), env, &steps)?;
+                ops::cast(x, *to)?
+            }
+            ChainStep::Binary(bop, l_op, r_op) => {
+                let a =
+                    resolve_region_operand(*l_op, node_inputs, input0_up.as_ref(), env, &steps)?;
+                let b =
+                    resolve_region_operand(*r_op, node_inputs, input0_up.as_ref(), env, &steps)?;
+                match bop {
+                    BinaryOp::Add => ops::add(a, b)?,
+                    BinaryOp::Mul => ops::mul(a, b)?,
+                    BinaryOp::Sub => ops::sub(a, b)?,
+                    BinaryOp::Div => ops::div(a, b)?,
+                    BinaryOp::Max => ops::max(a, b)?,
+                    BinaryOp::Min => ops::min(a, b)?,
+                    BinaryOp::Pow => ops::pow(a, b)?,
+                }
+            }
+            ChainStep::Compare(cop, l_op, r_op) => {
+                let a =
+                    resolve_region_operand(*l_op, node_inputs, input0_up.as_ref(), env, &steps)?;
+                let b =
+                    resolve_region_operand(*r_op, node_inputs, input0_up.as_ref(), env, &steps)?;
+                match cop {
+                    CmpOp::Eq => ops::eq(a, b)?,
+                    CmpOp::Ne => ops::ne(a, b)?,
+                    CmpOp::Lt => ops::lt(a, b)?,
+                    CmpOp::Le => ops::le(a, b)?,
+                    CmpOp::Gt => ops::gt(a, b)?,
+                    CmpOp::Ge => ops::ge(a, b)?,
+                }
+            }
+            ChainStep::Where(c_op, t_op, f_op) => {
+                let c =
+                    resolve_region_operand(*c_op, node_inputs, input0_up.as_ref(), env, &steps)?;
+                let t =
+                    resolve_region_operand(*t_op, node_inputs, input0_up.as_ref(), env, &steps)?;
+                let f =
+                    resolve_region_operand(*f_op, node_inputs, input0_up.as_ref(), env, &steps)?;
+                ops::select(c, t, f)?
+            }
+        };
+        steps.push(arr);
+    }
+    steps
+        .pop()
+        .ok_or_else(|| MlxError("ElementwiseRegion: empty chain has no output".into()))
+}
+
+fn resolve_region_operand<'a>(
+    op: ChainOperand,
+    node_inputs: &[NodeId],
+    input0_up: Option<&'a Array>,
+    env: &'a HashMap<NodeId, Array>,
+    steps: &'a [Array],
+) -> Result<&'a Array, MlxError> {
+    match op {
+        ChainOperand::Input(i) => {
+            let i = i as usize;
+            if i == 0 {
+                if let Some(up) = input0_up {
+                    return Ok(up);
+                }
+            }
+            let id = *node_inputs.get(i).ok_or_else(|| {
+                MlxError(format!(
+                    "ElementwiseRegion: ChainOperand::Input({i}) out of range"
+                ))
+            })?;
+            env.get(&id).ok_or_else(|| {
+                MlxError(format!(
+                    "ElementwiseRegion: missing input node for Input({i})"
+                ))
+            })
+        }
+        ChainOperand::Step(i) => {
+            let i = i as usize;
+            steps.get(i).ok_or_else(|| {
+                MlxError(format!(
+                    "ElementwiseRegion: ChainOperand::Step({i}) \
+                     references step not yet produced (have {} steps)",
+                    steps.len()
+                ))
+            })
+        }
     }
 }
 

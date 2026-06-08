@@ -117,7 +117,7 @@ kernel_cache!(BINARY, binary_kernel, BINARY_CU, "binary");
 kernel_cache!(
     FUSED_BINARY_UNARY,
     fused_binary_unary_kernel,
-    FUSED_BINARY_UNARY_CU,
+    rlx_gpu_kernels::fused_binary_unary_cuda_src(),
     "fused_binary_unary"
 );
 kernel_cache!(
@@ -126,13 +126,23 @@ kernel_cache!(
     CAST_F32_TO_HALF_CU,
     "cast_f32_to_half"
 );
-kernel_cache!(UNARY, unary_kernel, UNARY_CU, "unary");
+kernel_cache!(
+    UNARY,
+    unary_kernel,
+    rlx_gpu_kernels::unary_cuda_src(),
+    "unary"
+);
 kernel_cache!(COPY, copy_kernel, COPY_CU, "copy");
-kernel_cache!(MATMUL, matmul_kernel, MATMUL_CU, "matmul");
+kernel_cache!(
+    MATMUL,
+    matmul_kernel,
+    rlx_gpu_kernels::matmul_cuda_src(),
+    "matmul"
+);
 kernel_cache!(
     MATMUL_EPILOGUE,
     matmul_epilogue_kernel,
-    MATMUL_EPILOGUE_CU,
+    rlx_gpu_kernels::matmul_epilogue_cuda_src(),
     "matmul_epilogue"
 );
 kernel_cache!(
@@ -190,6 +200,12 @@ kernel_cache!(TRANSPOSE, transpose_kernel, TRANSPOSE_CU, "transpose");
 kernel_cache!(EXPAND, expand_kernel, EXPAND_CU, "expand");
 kernel_cache!(ATTENTION, attention_kernel, ATTENTION_CU, "attention");
 kernel_cache!(
+    ATTENTION_ROW,
+    attention_row_kernel,
+    ATTENTION_ROW_CU,
+    "attention_row"
+);
+kernel_cache!(
     ATTENTION_BWD,
     attention_bwd_kernel,
     ATTENTION_BWD_CU,
@@ -241,6 +257,7 @@ kernel_cache!(POOL2D, pool2d_kernel, POOL2D_CU, "pool2d");
 kernel_cache!(POOL3D, pool3d_kernel, POOL3D_CU, "pool3d");
 kernel_cache!(CONV1D, conv1d_kernel, CONV1D_CU, "conv1d");
 kernel_cache!(CONV2D, conv2d_kernel, CONV2D_CU, "conv2d");
+kernel_cache!(IM2COL, im2col_kernel, IM2COL_CU, "im2col");
 kernel_cache!(CONV3D, conv3d_kernel, CONV3D_CU, "conv3d");
 kernel_cache!(
     LAYER_NORM2D,
@@ -264,8 +281,14 @@ kernel_cache!(
 kernel_cache!(
     ELEMENTWISE_REGION,
     elementwise_region_kernel,
-    ELEMENTWISE_REGION_CU,
+    rlx_gpu_kernels::elementwise_region_cuda_src(),
     "elementwise_region"
+);
+kernel_cache!(
+    BATCH_ELEMENTWISE_REGION,
+    batch_elementwise_region_kernel,
+    rlx_gpu_kernels::batch_elementwise_region_cuda_src(),
+    "batch_elementwise_region"
 );
 kernel_cache!(
     GAUSSIAN_SPLAT_RASTERIZE,
@@ -306,5 +329,15 @@ pub fn dispatch_grid_2d(
     (
         (width.div_ceil(block_x), height.div_ceil(block_y), 1),
         (block_x, block_y, 1),
+    )
+}
+
+/// 3-D grid for NCHW resize-prologue region kernels (W × H × N·C).
+pub fn dispatch_grid_prologue_nchw(w: u32, h: u32, nc: u32) -> ((u32, u32, u32), (u32, u32, u32)) {
+    const BX: u32 = 16;
+    const BY: u32 = 16;
+    (
+        (w.div_ceil(BX), h.div_ceil(BY), nc),
+        (BX.min(w.max(1)), BY.min(h.max(1)), 1),
     )
 }

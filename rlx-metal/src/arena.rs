@@ -138,10 +138,93 @@ impl Arena {
                         dst[i] = half::f16::from_f32(v);
                     }
                 }
+                DType::BF16 => {
+                    let dst = std::slice::from_raw_parts_mut(base as *mut half::bf16, len);
+                    for (i, &v) in data.iter().take(len).enumerate() {
+                        dst[i] = half::bf16::from_f32(v);
+                    }
+                }
+                // Integer-typed inputs (token IDs, position indices) get
+                // cast from f32 → int. The previous fallthrough memcpy
+                // bit-pattern-reinterpreted the floats as ints, which
+                // produced stable garbled-token streams from gather/take.
+                DType::I32 => {
+                    let dst = std::slice::from_raw_parts_mut(base as *mut i32, len);
+                    for (i, &v) in data.iter().take(len).enumerate() {
+                        dst[i] = v as i32;
+                    }
+                }
+                DType::I64 => {
+                    let dst = std::slice::from_raw_parts_mut(base as *mut i64, len);
+                    for (i, &v) in data.iter().take(len).enumerate() {
+                        dst[i] = v as i64;
+                    }
+                }
+                DType::U32 => {
+                    let dst = std::slice::from_raw_parts_mut(base as *mut u32, len);
+                    for (i, &v) in data.iter().take(len).enumerate() {
+                        dst[i] = v as u32;
+                    }
+                }
+                DType::I16 => {
+                    let dst = std::slice::from_raw_parts_mut(base as *mut i16, len);
+                    for (i, &v) in data.iter().take(len).enumerate() {
+                        dst[i] = v as i16;
+                    }
+                }
+                DType::I8 => {
+                    let dst = std::slice::from_raw_parts_mut(base as *mut i8, len);
+                    for (i, &v) in data.iter().take(len).enumerate() {
+                        dst[i] = v as i8;
+                    }
+                }
+                DType::U8 => {
+                    let dst = std::slice::from_raw_parts_mut(base, len);
+                    for (i, &v) in data.iter().take(len).enumerate() {
+                        dst[i] = v as u8;
+                    }
+                }
+                DType::Bool => {
+                    let dst = std::slice::from_raw_parts_mut(base, len);
+                    for (i, &v) in data.iter().take(len).enumerate() {
+                        dst[i] = if v != 0.0 { 1 } else { 0 };
+                    }
+                }
+                // F64 / Complex64 don't appear in user input feeds today.
                 _ => {
                     std::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut f32, len);
                 }
             }
+        }
+    }
+
+    /// Copy one arena node's f32 payload into another (unified-memory memcpy).
+    pub fn copy_node_f32(&self, dst: NodeId, src: NodeId) {
+        let dst_len = *self.element_counts.get(&dst).unwrap_or(&0);
+        let src_len = *self.element_counts.get(&src).unwrap_or(&0);
+        self.copy_node_f32_prefix(dst, src, dst_len.min(src_len));
+    }
+
+    /// Copy the first `elems` floats from `src` into `dst` (KV prefix after active-extent).
+    pub fn copy_node_f32_prefix(&self, dst: NodeId, src: NodeId, elems: usize) {
+        if elems == 0 {
+            return;
+        }
+        let dst_off = self.byte_offset(dst);
+        let src_off = self.byte_offset(src);
+        let dst_cap = *self.element_counts.get(&dst).unwrap_or(&0);
+        let src_cap = *self.element_counts.get(&src).unwrap_or(&0);
+        let len = elems.min(dst_cap).min(src_cap);
+        if len == 0 {
+            return;
+        }
+        unsafe {
+            let base = self.buffer.contents() as *mut u8;
+            std::ptr::copy(
+                base.add(src_off) as *const f32,
+                base.add(dst_off) as *mut f32,
+                len,
+            );
         }
     }
 

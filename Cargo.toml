@@ -8,6 +8,7 @@ members = [
     "rlx-autodiff",    # Reverse/forward-mode AD on MIR
     "rlx-compile",     # HIR → MIR → LIR pipeline
     "rlx-opt",         # Facade: re-exports fusion + autodiff + compile
+    "rlx-optim",       # Training-step optimizers (Adam, AdamW, Lion, SOAP, Muon, …)
 
     # Driver layer (devices, arenas, buffers, streams)
     "rlx-driver",
@@ -36,7 +37,8 @@ members = [
     # "rlx-directx",   # DirectX 12 compute
     # "rlx-webgpu",    # WebGPU/WASM
 
-    "rlx-gguf",        # GGUF parser + dequant (standalone, format-only)
+    "rlx-gguf",        # GGUF parser + dequant + quant encoders + writer
+    "rlx-gguf-convert", # safetensors / ONNX → GGUF conversion with per-tensor quant
     "rlx-gpu-kernels", # Shared CUDA/HIP .cu sources for rlx-cuda + rlx-rocm
     "rlx-mlx-sys",     # Vendored MLX C++ + rlx_mlx_shim C ABI
 
@@ -61,6 +63,12 @@ members = [
 
     # Benchmark framework (PLAN L5)
     "rlx-bench",       # BenchmarkPattern + per-backend timing harness
+    "rlx-onnx",        # ONNX Runtime inference for .onnx files (PLAN B7)
+    "rlx-onnx-import", # ONNX → RLX HIR import + op lowering
+    "rlx-onnx-conformance", # ONNX op-level ORT parity harness
+
+    # Text: tokenizer + chat template + sampling (public surface for downstream LM apps)
+    "rlx-text",
 
     # Python bindings
     "pyrlx",           # PyO3 + maturin: run any RLX backend from Python
@@ -100,7 +108,7 @@ incremental = false
 # Add them as crates reach individual readiness.
 
 [workspace.package]
-version       = "0.2.1"
+version       = "0.2.4"
 edition       = "2024"
 rust-version  = "1.87"  # edition=2024 needs ≥1.85; we use `is_multiple_of` (stable in 1.87)
 license       = "GPL-3.0-only"

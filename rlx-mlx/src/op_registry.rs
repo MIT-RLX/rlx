@@ -57,7 +57,7 @@
 //! `mlx::fast::metal_kernel` (raw MSL, dispatched by MLX). Wrapping
 //! that is a future trait extension.
 
-#![cfg(target_os = "macos")]
+#![cfg(rlx_mlx_host)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};

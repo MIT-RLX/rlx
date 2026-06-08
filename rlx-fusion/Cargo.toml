@@ -1,6 +1,6 @@
 [package]
 name = "rlx-fusion"
-version                = "0.2.2"
+version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 description = "Fusion passes and fused-op decomposition for RLX MIR"
@@ -14,7 +14,11 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
+
+[dev-dependencies]
+rlx-cpu = { path = "../rlx-cpu" }
+rlx-opt = { path = "../rlx-opt", features = ["compile"] }
 
 [lints]
 workspace = true

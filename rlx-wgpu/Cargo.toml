@@ -1,6 +1,6 @@
 [package]
 name = "rlx-wgpu"
-version                = "0.2.3"
+version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 description = "Cross-platform GPU backend for RLX via wgpu (Metal/Vulkan/DX12/WebGPU)"
@@ -19,22 +19,20 @@ native-splat = []
 splat = ["rlx-cpu/splat"]
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.2", default-features = false, features = ["compile"] }
-rlx-compile = { path = "../rlx-compile", version = "0.2.2" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.3", features = ["splat"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.4", default-features = false, features = ["compile"] }
+rlx-compile = { path = "../rlx-compile", version = "0.2.4" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.4", features = ["splat"] }
 
 # wgpu 29: brings naga WGSL parser support for `enable f16;` and the
 # `f16` type, which unlocks the half-precision storage matmul path.
-# We disable defaults and pick backends explicitly: dx12 + gles are
-# excluded because wgpu-hal 29.0.3's dx12 path has a type mismatch
-# against gpu-allocator 0.28 + windows-rs 0.62.2 (upstream regression
-# observed 2026-05). Vulkan covers Windows (RTX/RDNA) and Linux;
-# Metal covers macOS.
+# Backends picked explicitly. DX12 is enabled for native Windows tensor-core
+# paths (preferred over Vulkan when the adapter supports it). GLES excluded.
 wgpu = { version = "29", default-features = false, features = [
     "std",
     "parking_lot",
     "vulkan",
+    "dx12",
     "metal",
     "wgsl",
     "webgpu",
@@ -44,6 +42,9 @@ bytemuck = { version = "1", features = ["derive"] }
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+rlx = { path = "../rlx", default-features = false, features = ["cpu", "gpu"] }
 
 [lints]
 workspace = true

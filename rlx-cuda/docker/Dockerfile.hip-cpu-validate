@@ -1,0 +1,26 @@
+# HIP-CPU kernel validation image for rlx-cuda / rlx-rocm.
+#
+# HIP-CPU requires linux-gnu libstdc++ (C++17 parallel algorithms). Do not
+# enable `hip-cpu-validate` on the macOS host — run via `just test-hip-cpu-validate`.
+#
+# HIP-CPU is cloned at test time into rlx-cuda/docker/vendor/HIP-CPU (gitignored).
+#
+# Build image:
+#   docker build -f rlx-cuda/docker/Dockerfile.hip-cpu-validate -t rlx-hip-cpu-validate .
+#
+# Run tests (repo mounted at /work):
+#   just test-hip-cpu-validate
+
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git build-essential g++ libtbb-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
+
+WORKDIR /work
+
+CMD ["bash"]

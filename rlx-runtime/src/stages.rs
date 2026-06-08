@@ -49,19 +49,26 @@ pub fn pipeline_for(device: Device, options: &CompileOptions) -> CompilePipeline
     let target = options
         .fusion_target
         .unwrap_or_else(|| fusion_target_for(device));
-    let mut opts = options.fusion_opts;
-    if matches!(target, FusionTarget::Cpu) && !opts.unfuse_elementwise_regions {
-        opts.unfuse_elementwise_regions = true;
-    }
-    if matches!(target, FusionTarget::Metal) {
-        let metal_env = FusionOptions::from_metal_env();
-        if !rlx_ir::env::flag("RLX_METAL_NO_FUSION") {
-            // Preserve caller overrides; only merge env flags the caller left default.
+    let mut opts = options.fusion_opts.merge_env();
+    if !opts.keep_elementwise_regions {
+        if matches!(target, FusionTarget::Cpu) && !opts.unfuse_elementwise_regions {
+            opts.unfuse_elementwise_regions = true;
         }
-        if metal_env.skip_fusion {
-            opts.skip_fusion = true;
+        if matches!(target, FusionTarget::Metal) {
+            let metal_env = FusionOptions::from_metal_env();
+            if metal_env.skip_fusion {
+                opts.skip_fusion = true;
+            }
+            if !opts.unfuse_elementwise_regions {
+                opts.unfuse_elementwise_regions = true;
+            }
         }
-        if metal_env.unfuse_elementwise_regions {
+        if matches!(target, FusionTarget::Wgpu) && !opts.unfuse_elementwise_regions {
+            opts.unfuse_elementwise_regions = true;
+        }
+        if matches!(target, FusionTarget::Cuda | FusionTarget::Rocm)
+            && !opts.unfuse_elementwise_regions
+        {
             opts.unfuse_elementwise_regions = true;
         }
     }
@@ -70,6 +77,7 @@ pub fn pipeline_for(device: Device, options: &CompileOptions) -> CompilePipeline
     if pipe.opts.fusion_limits == FusionLimits::default() {
         pipe.opts.fusion_limits = fusion_limits_for_target(target);
     }
+    pipe.opts = pipe.opts.apply_native_fk_defaults(target);
     pipe.arena_alignment = options.arena_alignment;
     pipe.assert_fusion_clean = options.assert_fusion_clean;
     if let Some(ops) = options.supported_ops {

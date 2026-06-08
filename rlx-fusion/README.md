@@ -12,6 +12,9 @@ MIR fusion passes and [`unfuse_fused_for_autodiff`] for RLX. Depends on
 - **`unfuse`** — split fused ops for backends or AD (`unfuse_fused_for_autodiff`).
 - **`lower_dot_general`** — XLA-style `DotGeneral` → `MatMul` + reshapes.
 - **`control_flow`** — `LowerControlFlow`, while unrolling helpers.
+- **`fk_fusion`** — FKL-style passes (`FuseRegionPrologue`, `FuseBatchPreprocess`,
+  `MarkBatchSliceRegions`, `DecomposeFusionRegions`). See [`docs/fk-fusion.md`](../docs/fk-fusion.md).
+- **`fk_graphs`** — shared test/builder graphs (`batch_narrow_relu_primitive_graph`, …).
 
 ## Consumers
 

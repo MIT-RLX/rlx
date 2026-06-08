@@ -550,6 +550,13 @@ int rlx_mlx_compiled_call(
 
 void rlx_mlx_compiled_free(rlx_mlx_compiled_t* compiled);
 
+// `mlx::compile` multi-output slot limit (training backward graphs).
+// Override with env `RLX_COMPILE_OUTPUT_CAP` (or legacy `RLX_MLX_COMPILE_OUTPUT_CAP`)
+// or `rlx_mlx_set_compile_output_cap`.
+size_t rlx_mlx_compile_output_cap(void);
+void rlx_mlx_set_compile_output_cap(size_t cap);
+void rlx_mlx_reset_compile_output_cap(void);
+
 // MLX runtime version (string is statically allocated, do not free).
 const char* rlx_mlx_version(void);
 

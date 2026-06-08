@@ -78,6 +78,64 @@ pub(crate) fn jvp(graph: &Bound<'_, PyGraph>, tangent_for: Vec<u32>) -> PyResult
     })
 }
 
+/// `hvp(graph, wrt)` — Hessian-vector product via forward-over-reverse AD.
+///
+/// Returns a graph whose outputs are `[primals..., grads..., tangent_primals...,
+/// tangent_grads...]`. Tangent inputs are named `tangent_<original>`.
+#[pyfunction]
+pub(crate) fn hvp(graph: &Bound<'_, PyGraph>, wrt: Vec<u32>) -> PyResult<PyGraph> {
+    let borrowed = graph.borrow();
+    let inner = borrowed
+        .inner
+        .as_ref()
+        .ok_or_else(|| PyRuntimeError::new_err("hvp: input Graph has already been consumed"))?;
+    let wrt: Vec<NodeId> = wrt.into_iter().map(NodeId).collect();
+    let hg = rlx_opt::autodiff_fwd::hvp(inner, &wrt);
+    Ok(PyGraph { inner: Some(hg) })
+}
+
+/// `nth_order_grad(graph, wrt_name, order)` — stack reverse-mode AD `order` times.
+///
+/// The forward graph must have a single scalar output. Returns a graph whose
+/// sole output is `d^order f / d(wrt)^order`.
+#[pyfunction]
+pub(crate) fn nth_order_grad(
+    graph: &Bound<'_, PyGraph>,
+    wrt_name: &str,
+    order: usize,
+) -> PyResult<PyGraph> {
+    let borrowed = graph.borrow();
+    let inner = borrowed.inner.as_ref().ok_or_else(|| {
+        PyRuntimeError::new_err("nth_order_grad: input Graph has already been consumed")
+    })?;
+    let hg = rlx_opt::nth_order_grad(inner, wrt_name, order);
+    Ok(PyGraph { inner: Some(hg) })
+}
+
+/// `directional_nth_grad(graph, wrt_name, order)` — directional higher-order grad.
+///
+/// Creates `dir_0` … `dir_{order-1}` inputs for per-level contraction.
+#[pyfunction]
+pub(crate) fn directional_nth_grad(
+    graph: &Bound<'_, PyGraph>,
+    wrt_name: &str,
+    order: usize,
+) -> PyResult<PyGraph> {
+    let borrowed = graph.borrow();
+    let inner = borrowed.inner.as_ref().ok_or_else(|| {
+        PyRuntimeError::new_err("directional_nth_grad: input Graph has already been consumed")
+    })?;
+    let dirs: Vec<&str> = (0..order)
+        .map(|i| {
+            // Names are ignored by the Rust API — inputs are always dir_<level>.
+            let _ = i;
+            "v"
+        })
+        .collect();
+    let hg = rlx_opt::directional_nth_grad(inner, wrt_name, &dirs);
+    Ok(PyGraph { inner: Some(hg) })
+}
+
 /// `vmap(graph, batched_input_names, batch_size)` — vectorise a
 /// graph over a leading batch axis.
 ///

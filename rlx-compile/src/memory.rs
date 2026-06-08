@@ -22,9 +22,25 @@
 //! The output is a [`MemoryPlan`] that tells the runtime exactly how
 //! large the arena should be and where each tensor lives within it.
 
+use rlx_ir::op::BinaryOp;
 use rlx_ir::{Graph, NodeId, Op};
 use std::collections::HashMap;
 
+/// Extra bytes reserved after Input/Param/Constant slots so a kernel
+/// that writes slightly past its logical tensor size cannot stomp the
+/// next arena slot (e.g. small bias tensor adjacent to input_ids).
+const BOUNDARY_TAIL_GUARD_BYTES: usize = 128;
+
+fn boundary_tail_guard(op: &rlx_ir::Op, alignment: usize) -> usize {
+    if matches!(
+        op,
+        rlx_ir::Op::Input { .. } | rlx_ir::Op::Param { .. } | rlx_ir::Op::Constant { .. }
+    ) {
+        alignment.max(BOUNDARY_TAIL_GUARD_BYTES)
+    } else {
+        0
+    }
+}
 /// Identify ops whose output is a *view* of an existing buffer — no
 /// copy needed, no separate arena slot. Returns the parent input index
 /// and the byte offset of the view within the parent.
@@ -200,6 +216,28 @@ fn compute_live_ranges(graph: &Graph) -> HashMap<NodeId, (usize, usize)> {
         }
     }
 
+    // All producers feeding graph outputs must stay live through the final
+    // read-back (e.g. Cast f32→i64 feeding a boundary output). Without
+    // this, a later epilogue tensor can reuse an ancestor slot while thunks
+    // still run out of schedule order on overlapping paths.
+    {
+        let mut stack: Vec<NodeId> = graph.outputs.clone();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let (root, _) = resolve_view_root(graph, id);
+            ranges.entry(root).and_modify(|r| r.1 = last_step);
+            if root != id {
+                ranges.entry(id).and_modify(|r| r.1 = last_step);
+            }
+            for &input in &graph.node(id).inputs {
+                stack.push(input);
+            }
+        }
+    }
+
     // Params, Inputs, and Constants live for the ENTIRE execution.
     // Params/Inputs are pre-loaded externally; Constants are pre-loaded
     // by the runtime's compile step (see backend.rs::compile_inner). In
@@ -221,6 +259,111 @@ fn compute_live_ranges(graph: &Graph) -> HashMap<NodeId, (usize, usize)> {
     ranges
 }
 
+/// Keep packed `[B,S,3,H,D]` QKV parents alive through Attention. Without
+/// this, liveness ends after the Narrow ops and the planner may reuse the
+/// parent slot for the attention output while the CPU fused path (and
+/// wgpu packed stride path) still read Q/K/V from that buffer.
+fn extend_node_chain_liveness_to_end(
+    graph: &Graph,
+    ranges: &mut HashMap<NodeId, (usize, usize)>,
+    start: NodeId,
+    last_step: usize,
+) {
+    let mut stack = vec![start];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let (root, _) = resolve_view_root(graph, id);
+        ranges.entry(root).and_modify(|r| r.1 = last_step);
+        if root != id {
+            ranges.entry(id).and_modify(|r| r.1 = last_step);
+        }
+        for &input in &graph.node(id).inputs {
+            stack.push(input);
+        }
+    }
+}
+
+/// Keep primary data inputs alive through graph end for `Op::Custom("onnx.*")`
+/// thunks that read activations after parallel branches would otherwise reuse slots.
+fn extend_custom_op_input_liveness(graph: &Graph, ranges: &mut HashMap<NodeId, (usize, usize)>) {
+    let last_step = graph.len();
+    for node in graph.nodes() {
+        let Op::Custom {
+            name, num_inputs, ..
+        } = &node.op
+        else {
+            continue;
+        };
+        if !name.starts_with("onnx.") {
+            continue;
+        }
+        let n = (*num_inputs as usize).min(node.inputs.len());
+        for &input in &node.inputs[..n] {
+            extend_node_chain_liveness_to_end(graph, ranges, input, last_step);
+        }
+    }
+}
+
+/// Albert-style blocks reuse hidden buffers across many sequential Add/LN
+/// stages; keep residual inputs alive through graph end when this graph uses
+/// ONNX `QMatMul` thunks (marker for the bundled ONNX import path).
+fn extend_bert_hidden_liveness(graph: &Graph, ranges: &mut HashMap<NodeId, (usize, usize)>) {
+    let uses_onnx_qmatmul = graph.nodes().iter().any(|node| {
+        matches!(
+            &node.op,
+            Op::Custom { name, .. } if name == "onnx.QMatMul" || name == "onnx.ActCopy"
+        )
+    });
+    if !uses_onnx_qmatmul {
+        return;
+    }
+    let last_step = graph.len();
+    for node in graph.nodes() {
+        match &node.op {
+            Op::LayerNorm { .. } | Op::LayerNorm2d { .. } => {
+                if let Some(&input) = node.inputs.first() {
+                    extend_node_chain_liveness_to_end(graph, ranges, input, last_step);
+                }
+                ranges.entry(node.id).and_modify(|r| r.1 = last_step);
+            }
+            Op::Binary(BinaryOp::Add) => {
+                for &input in &node.inputs {
+                    extend_node_chain_liveness_to_end(graph, ranges, input, last_step);
+                }
+                ranges.entry(node.id).and_modify(|r| r.1 = last_step);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extend_packed_qkv_parent_liveness(graph: &Graph, ranges: &mut HashMap<NodeId, (usize, usize)>) {
+    for (step, node) in graph.nodes().iter().enumerate() {
+        let rlx_ir::Op::Attention { .. } = &node.op else {
+            continue;
+        };
+        if node.inputs.len() < 3 {
+            continue;
+        }
+        let Some((parent, _, _)) = rlx_ir::detect_packed_bshd_qkv_attention(
+            graph,
+            node.inputs[0],
+            node.inputs[1],
+            node.inputs[2],
+        ) else {
+            continue;
+        };
+        let (root, _) = resolve_view_root(graph, parent);
+        ranges.entry(root).and_modify(|r| r.1 = r.1.max(step));
+        if root != parent {
+            ranges.entry(parent).and_modify(|r| r.1 = r.1.max(step));
+        }
+    }
+}
+
 /// Assign buffers using a greedy best-fit algorithm.
 ///
 /// Sorts buffers by size (largest first), then for each buffer finds
@@ -237,6 +380,8 @@ pub struct MemoryPlanOptions {
     pub allocate_params: bool,
     pub allocate_inputs: bool,
     pub allocate_constants: bool,
+    /// When true (or env `RLX_ARENA_NO_REUSE=1`), every tensor gets a unique arena slot.
+    pub arena_no_reuse: bool,
 }
 
 impl MemoryPlanOptions {
@@ -245,6 +390,9 @@ impl MemoryPlanOptions {
             allocate_params: true,
             allocate_inputs: true,
             allocate_constants: true,
+            arena_no_reuse: std::env::var("RLX_ARENA_NO_REUSE")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         }
     }
 
@@ -254,6 +402,9 @@ impl MemoryPlanOptions {
             allocate_params: false,
             allocate_inputs: true,
             allocate_constants: true,
+            arena_no_reuse: std::env::var("RLX_ARENA_NO_REUSE")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         }
     }
 }
@@ -390,8 +541,10 @@ fn plan_memory_aligned_inner(
     weights: Option<&SharedWeightLayout>,
     f32_uniform: bool,
 ) -> MemoryPlan {
-    let ranges = compute_live_ranges(graph);
-
+    let mut ranges = compute_live_ranges(graph);
+    extend_packed_qkv_parent_liveness(graph, &mut ranges);
+    extend_custom_op_input_liveness(graph, &mut ranges);
+    extend_bert_hidden_liveness(graph, &mut ranges);
     // Collect buffers that need allocation (skip inputs/params — external)
     struct BufInfo {
         id: NodeId,
@@ -433,6 +586,9 @@ fn plan_memory_aligned_inner(
 
     for buf in &buffers {
         let align = alignment;
+        let node = graph.node(buf.id);
+        let tail_guard = boundary_tail_guard(&node.op, align);
+        let placement_size = buf.size + tail_guard;
         let mut best_offset: Option<usize> = None;
 
         // Collect candidate start offsets: 0 plus the end of every placed
@@ -446,7 +602,7 @@ fn plan_memory_aligned_inner(
 
         for &candidate_offset in &candidates {
             let aligned = (candidate_offset + align - 1) & !(align - 1);
-            let end = aligned + buf.size;
+            let end = aligned + placement_size;
 
             let conflict = placed.iter().any(|&(p_off, p_size, p_birth, p_death)| {
                 let p_end = p_off + p_size;
@@ -464,10 +620,14 @@ fn plan_memory_aligned_inner(
             }
         }
 
-        let aligned = best_offset.unwrap_or_else(|| {
-            // No gap fit — append at arena tail.
+        let aligned = if opts.arena_no_reuse {
             (arena_size + align - 1) & !(align - 1)
-        });
+        } else {
+            best_offset.unwrap_or_else(|| {
+                // No gap fit — append at arena tail.
+                (arena_size + align - 1) & !(align - 1)
+            })
+        };
         assignments.insert(
             buf.id,
             BufferSlot {
@@ -475,8 +635,8 @@ fn plan_memory_aligned_inner(
                 size: buf.size,
             },
         );
-        placed.push((aligned, buf.size, buf.birth, buf.death));
-        arena_size = arena_size.max(aligned + buf.size);
+        placed.push((aligned, placement_size, buf.birth, buf.death));
+        arena_size = arena_size.max(aligned + placement_size);
     }
 
     // ── View aliasing pass (plan #46) ────────────────────────
@@ -516,7 +676,6 @@ fn plan_memory_aligned_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rlx_ir::op::*;
     use rlx_ir::*;
 
     #[test]
@@ -544,13 +703,17 @@ mod tests {
             }
         }
 
-        // mm1 and mm2 have non-overlapping lifetimes, so they CAN share memory.
-        // The arena should be smaller than the sum of all buffers.
-        let total_if_no_sharing: usize = plan.assignments.values().map(|s| s.size).sum();
+        // Logical slot sizes omit 64-byte alignment gaps and param tail guards
+        // (see `boundary_tail_guard`). Arena may be slightly larger than that sum
+        // even when temporaries reuse gaps; cap slack at one guard per slot.
+        let total_logical: usize = plan.assignments.values().map(|s| s.size).sum();
+        let align_slack = plan.assignments.len() * BOUNDARY_TAIL_GUARD_BYTES;
         assert!(
-            plan.arena_size <= total_if_no_sharing,
-            "arena {0} should be <= sum {total_if_no_sharing}",
-            plan.arena_size
+            plan.arena_size <= total_logical + align_slack,
+            "arena {} should be <= logical sum {} + slack {}",
+            plan.arena_size,
+            total_logical,
+            align_slack
         );
     }
 

@@ -19,7 +19,7 @@
 // QK and PV passes. Online softmax across KV tiles maintains
 // row_max/row_sum and rescales the running V accumulator on each tile.
 //
-// Q/K/V layout: [B, H, S, D] f32 in arena.
+// Q/K/V layout: [B, H, S, D] or [B, S, H, D] via per-axis strides.
 // Mask kinds: 0=None 1=Causal 2=Custom (binary) 3=SlidingWindow
 //
 // Block geometry:
@@ -58,7 +58,23 @@ extern "C" __global__ void attention(
     unsigned int mask_off,
     unsigned int mask_kind,
     unsigned int scale_bits,
-    unsigned int window
+    unsigned int window,
+    unsigned int seq_q_stride,
+    unsigned int seq_k_stride,
+    unsigned int mask_batch_stride,
+    unsigned int mask_head_stride,
+    unsigned int q_batch_stride,
+    unsigned int q_head_stride,
+    unsigned int q_seq_stride,
+    unsigned int k_batch_stride,
+    unsigned int k_head_stride,
+    unsigned int k_seq_stride,
+    unsigned int v_batch_stride,
+    unsigned int v_head_stride,
+    unsigned int v_seq_stride,
+    unsigned int o_batch_stride,
+    unsigned int o_head_stride,
+    unsigned int o_seq_stride
 ) {
     if (head_dim > MAX_HEAD_DIM) return;
     float scale = __int_as_float((int)scale_bits);
@@ -88,10 +104,22 @@ extern "C" __global__ void attention(
     unsigned int qi = qi0 + q_lane;
     bool q_valid = qi < seq_q;
 
-    unsigned int q_base = q_off + (bh * seq_q + qi) * head_dim;
-    unsigned int k_base_g = k_off + bh * seq_k * head_dim;
-    unsigned int v_base_g = v_off + bh * seq_k * head_dim;
-    unsigned int o_base = out_off + (bh * seq_q + qi) * head_dim;
+    unsigned int h_idx = bh % heads;
+    unsigned int b_idx = bh / heads;
+    unsigned int q_base = q_off
+        + b_idx * q_batch_stride
+        + h_idx * q_head_stride
+        + qi * q_seq_stride;
+    unsigned int k_bh = k_off + b_idx * k_batch_stride + h_idx * k_head_stride;
+    unsigned int v_bh = v_off + b_idx * v_batch_stride + h_idx * v_head_stride;
+    unsigned int o_base = out_off
+        + b_idx * o_batch_stride
+        + h_idx * o_head_stride
+        + qi * o_seq_stride;
+    unsigned int mask_partial = mask_off
+        + b_idx * mask_batch_stride
+        + h_idx * mask_head_stride
+        + qi * seq_q_stride;
 
     __shared__ float q_shared[BR][D_PAD];
     __shared__ float k_tile[BC][D_PAD];
@@ -128,8 +156,8 @@ extern "C" __global__ void attention(
             unsigned int s = kc0 + r;
             for (unsigned int d = d_lane; d < head_dim; d += WARPS_PER_Q) {
                 if (s < seq_k) {
-                    k_tile[r][d] = arena[k_base_g + s * head_dim + d];
-                    v_tile[r][d] = arena[v_base_g + s * head_dim + d];
+                    k_tile[r][d] = arena[k_bh + s * k_seq_stride + d];
+                    v_tile[r][d] = arena[v_bh + s * v_seq_stride + d];
                 } else {
                     k_tile[r][d] = 0.0f;
                     v_tile[r][d] = 0.0f;
@@ -152,8 +180,7 @@ extern "C" __global__ void attention(
                 if (mask_kind == 1) {
                     if (s > qi) dot = -3.4e38f;
                 } else if (mask_kind == 2) {
-                    unsigned int m_idx = (bh * seq_q + qi) * seq_k + s;
-                    if (arena[mask_off + m_idx] < 0.5f) dot = -1e9f;
+                    if (arena[mask_partial + s * seq_k_stride] < 0.5f) dot = -1e9f;
                 } else if (mask_kind == 3) {
                     if (s > qi) dot = -3.4e38f;
                     else if (qi - s > window) dot = -3.4e38f;

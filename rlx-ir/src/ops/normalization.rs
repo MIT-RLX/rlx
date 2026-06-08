@@ -47,6 +47,25 @@ impl Graph {
         )
     }
 
+    /// BatchNorm inference (frozen running mean/variance).
+    pub fn batch_norm_inference(
+        &mut self,
+        input: NodeId,
+        gamma: NodeId,
+        beta: NodeId,
+        running_mean: NodeId,
+        running_var: NodeId,
+        eps: f32,
+    ) -> NodeId {
+        let shape = self.node(input).shape.clone();
+        self.push(
+            Op::BatchNormInference { eps },
+            vec![input, gamma, beta, running_mean, running_var],
+            shape,
+            None,
+        )
+    }
+
     /// Layer normalization.
     pub fn layer_norm(
         &mut self,

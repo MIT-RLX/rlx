@@ -25,6 +25,25 @@ use rlx_ir::{Graph, Op};
 
 use crate::CompileOptions;
 
+/// Preferred probe order for ML workloads (highest throughput first).
+///
+/// Used by [`fastest_device`] and by [`crate::cost::fastest_device_for`] when
+/// calibrated cost models are unavailable for every candidate backend.
+pub(crate) const DEVICE_PRIORITY: &[Device] = &[
+    Device::Tpu,
+    Device::Cuda,
+    Device::Rocm,
+    Device::Mlx,
+    Device::Metal,
+    Device::Ane,
+    Device::Gpu,
+    Device::Vulkan,
+    Device::DirectX,
+    Device::OpenGl,
+    Device::WebGpu,
+    Device::Cpu,
+];
+
 /// Check whether `device` has a compiled-in backend or has been
 /// registered by an external crate.
 ///
@@ -33,6 +52,15 @@ use crate::CompileOptions;
 /// with `--features cuda` but have no NVIDIA stack don't report
 /// false positives. Other devices are Cargo-feature-gated; externally
 /// registered backends are discovered via the registry.
+/// Whether [`crate::CompiledGraph::run_slots`] + [`crate::CompiledGraph::arena_ptr`]
+/// are implemented (host readback layout; not a GPU-mapped arena on CUDA).
+pub fn supports_run_slots(device: Device) -> bool {
+    matches!(
+        device,
+        Device::Cpu | Device::Metal | Device::Mlx | Device::Cuda | Device::Rocm
+    )
+}
+
 pub fn is_available(device: Device) -> bool {
     #[cfg(feature = "cuda")]
     if device == Device::Cuda {
@@ -92,6 +120,32 @@ pub fn available_devices() -> Vec<Device> {
         .copied()
         .filter(|d| is_available(*d))
         .collect()
+}
+
+/// Intersection of [`available_devices`] and [`supports_graph`]. Use with
+/// [`crate::GraphDevices`] or [`crate::DevicePolicy`] to restrict the set.
+pub fn devices_for(graph: &Graph) -> Vec<Device> {
+    crate::device_policy::devices_for_with_policy(graph, &crate::DevicePolicy::default())
+}
+
+/// Highest-priority backend that is compiled in and live on this host.
+///
+/// Probes [`DEVICE_PRIORITY`] in order (TPU → CUDA → ROCm → MLX → Metal → …
+/// → CPU). Use this when you want a sensible default `Session` target without
+/// building a graph first. For workload-specific selection, prefer
+/// [`crate::cost::fastest_device_for`].
+pub fn fastest_device() -> Device {
+    fastest_among(&available_devices())
+}
+
+/// Pick the highest-priority entry from `candidates` (see [`DEVICE_PRIORITY`]).
+pub fn fastest_among(candidates: &[Device]) -> Device {
+    for &d in DEVICE_PRIORITY {
+        if candidates.contains(&d) {
+            return d;
+        }
+    }
+    candidates.first().copied().unwrap_or(Device::Cpu)
 }
 
 /// Pretty name with engine-known BLAS variant for the CPU device.
@@ -329,6 +383,19 @@ fn gpu_family_supports(op: &Op) -> bool {
     true
 }
 
+/// Block until `device`'s queue is idle. Metal drains the global queue;
+/// other backends are no-ops.
+pub fn drain_device(device: Device) {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        if device == Device::Metal {
+            rlx_metal::device::drain_command_queue();
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let _ = device;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +450,29 @@ mod tests {
         // CPU always supports.
         assert!(supports_graph(Device::Cpu, &g));
         assert!(first_unsupported_op(Device::Cpu, &g).is_none());
+    }
+
+    #[test]
+    fn fastest_device_returns_cpu_when_only_cpu_is_available() {
+        let pick = fastest_device();
+        assert!(is_available(pick));
+        assert_eq!(pick, fastest_among(&available_devices()));
+    }
+
+    #[test]
+    fn fastest_among_respects_priority_order() {
+        let pick = fastest_among(&[Device::Cpu, Device::Metal, Device::Mlx]);
+        assert_eq!(pick, Device::Mlx);
+    }
+
+    #[test]
+    fn devices_for_is_subset_of_available() {
+        let mut g = Graph::new("id");
+        let x = g.input("x", scalar_shape());
+        g.set_outputs(vec![x]);
+        for d in devices_for(&g) {
+            assert!(is_available(d));
+            assert!(supports_graph(d, &g));
+        }
     }
 }

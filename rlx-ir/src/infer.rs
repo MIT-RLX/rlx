@@ -27,8 +27,13 @@
 //! let mm = g.mm(x, w);
 //! let add = g.add(mm, b);
 //! let out = g.gelu(add);
+//! let two = g.constant(2.0, DType::F32);
+//! let scaled = g.mul(x, two);
+//! let c = g.try_constant(2.0, DType::F32).unwrap(); // fallible variant
+//! g.set_outputs(vec![out, scaled, c]);
 //! ```
 
+use crate::dtype::scalar_constant_bytes;
 use crate::op::*;
 use crate::shape;
 use crate::{DType, Graph, NodeId, Op, Shape};
@@ -135,6 +140,24 @@ pub trait GraphExt {
 
     // ── Cast ────────────────────────────────────────────────
     fn cast(&mut self, x: NodeId, to: DType) -> NodeId;
+
+    // ── Literals ────────────────────────────────────────────
+    /// Rank-0 broadcastable scalar (`Op::Constant`). `f16` / `bf16`
+    /// are lowered as `f32` constant + `cast`.
+    fn constant(&mut self, value: f64, dtype: DType) -> NodeId;
+
+    /// Fallible variant of [`GraphExt::constant`]. Returns an error when
+    /// `value` is out of range for `dtype` or when `dtype` cannot be encoded
+    /// directly (callers may lower `f16` / `bf16` via `try_constant` on
+    /// `F32` plus `cast`).
+    fn try_constant(&mut self, value: f64, dtype: DType) -> Result<NodeId, String>;
+
+    // ── Stop gradient ───────────────────────────────────────
+    /// Identity forward, zero backward. The reverse-mode autodiff rule
+    /// for `Op::StopGradient` returns no gradient contribution to the
+    /// input. Equivalent to PyTorch's `tensor.detach()` /
+    /// `jax.lax.stop_gradient` / TF's `tf.stop_gradient`.
+    fn stop_gradient(&mut self, x: NodeId) -> NodeId;
 }
 
 impl GraphExt for Graph {
@@ -368,6 +391,25 @@ impl GraphExt for Graph {
         let s = shape::cast_shape(self.shape(x), to);
         self.add_node(Op::Cast { to }, vec![x], s)
     }
+
+    fn try_constant(&mut self, value: f64, dtype: DType) -> Result<NodeId, String> {
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            let f32_id = self.try_constant(value, DType::F32)?;
+            return Ok(self.cast(f32_id, dtype));
+        }
+        let data = scalar_constant_bytes(value, dtype)?;
+        Ok(self.add_node(Op::Constant { data }, vec![], Shape::scalar(dtype)))
+    }
+
+    fn constant(&mut self, value: f64, dtype: DType) -> NodeId {
+        self.try_constant(value, dtype)
+            .expect("scalar constant encoding")
+    }
+
+    fn stop_gradient(&mut self, x: NodeId) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.add_node(Op::StopGradient, vec![x], s)
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +502,52 @@ mod tests {
 
         let transposed = g.transpose_(reshaped, vec![1, 0]);
         assert_eq!(g.shape(transposed), &Shape::new(&[384, 60], DType::F32));
+    }
+
+    #[test]
+    fn inferred_constant_broadcasts() {
+        let mut g = Graph::new("const");
+        let x = g.input("x", Shape::new(&[2, 3], DType::F32));
+        let c = g.constant(2.0, DType::F32);
+        assert_eq!(g.shape(c), &Shape::scalar(DType::F32));
+        let y = g.mul(x, c);
+        assert_eq!(g.shape(y), &Shape::new(&[2, 3], DType::F32));
+    }
+
+    #[test]
+    fn inferred_constant_f16_via_cast() {
+        let mut g = Graph::new("const_f16");
+        let c = g.constant(1.5, DType::F16);
+        assert_eq!(g.shape(c), &Shape::scalar(DType::F16));
+        let x = g.input("x", Shape::new(&[2], DType::F16));
+        let y = g.add(x, c);
+        assert_eq!(g.shape(y), &Shape::new(&[2], DType::F16));
+    }
+
+    #[test]
+    fn inferred_constant_arithmetic_chain() {
+        let mut g = Graph::new("const_chain");
+        let x = g.input("x", Shape::new(&[4], DType::F32));
+        let one = g.constant(1.0, DType::F32);
+        let two = g.constant(2.0, DType::F32);
+        let sum = g.add(x, one);
+        let y = g.div(sum, two);
+        assert_eq!(g.shape(y), &Shape::new(&[4], DType::F32));
+        g.set_outputs(vec![y]);
+    }
+
+    #[test]
+    fn try_constant_rejects_out_of_range() {
+        let mut g = Graph::new("try_const");
+        let err = g.try_constant(128.0, DType::I8).unwrap_err();
+        assert!(err.contains("out of range"));
+    }
+
+    #[test]
+    fn try_constant_f16_via_cast() {
+        let mut g = Graph::new("try_const_f16");
+        let c = g.try_constant(1.5, DType::F16).unwrap();
+        assert_eq!(g.shape(c), &Shape::scalar(DType::F16));
     }
 
     #[test]

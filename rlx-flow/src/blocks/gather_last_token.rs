@@ -1,5 +1,17 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use anyhow::Result;
 use rlx_ir::HirGraphExt;
@@ -42,7 +54,11 @@ impl BlockStage for GatherLastTokenStage {
             let mut gb = HirMut::new(ctx.hir());
             gb.narrow_(input.id, 1, seq - 1, 1)
         } else {
-            let idx = ctx.input(&self.input_name, Shape::new(&[self.batch], DType::F32));
+            // Token-position indices — must be integer; MLX `take` and
+            // the Metal gather kernel both treat the index tensor as I32.
+            // Declaring this F32 produced garbage logits (stable wrong
+            // token streams like "< as as as…").
+            let idx = ctx.input(&self.input_name, Shape::new(&[self.batch], DType::I32));
             let mut gb = HirMut::new(ctx.hir());
             let idx_2d = gb.reshape_(idx, vec![self.batch as i64, 1]);
             gb.gather_(input.id, idx_2d, 1)

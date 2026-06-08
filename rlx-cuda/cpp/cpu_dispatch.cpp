@@ -61,6 +61,7 @@
 #include "conv2d.cu"
 #include "conv3d.cu"
 #include "elementwise_region.cu"
+#include "batch_elementwise_region.cu"
 
 #define LAUNCH(kfunc, gx, gy, gz, bx, by, bz, ...)                          \
     do {                                                                    \
@@ -236,10 +237,25 @@ void launch_attention(float* a,
                       unsigned int vo, unsigned int oo,
                       unsigned int mask_o, unsigned int mask_kind,
                       unsigned int scale_bits, unsigned int window,
+                      unsigned int seq_q_stride, unsigned int seq_k_stride,
+                      unsigned int mask_batch_stride, unsigned int mask_head_stride,
+                      unsigned int q_batch_stride, unsigned int q_head_stride,
+                      unsigned int q_seq_stride,
+                      unsigned int k_batch_stride, unsigned int k_head_stride,
+                      unsigned int k_seq_stride,
+                      unsigned int v_batch_stride, unsigned int v_head_stride,
+                      unsigned int v_seq_stride,
+                      unsigned int o_batch_stride, unsigned int o_head_stride,
+                      unsigned int o_seq_stride,
                       unsigned int gx, unsigned int bx) {
     LAUNCH(attention, gx,1,1, bx,1,1,
         a, batch,heads,seq_q,seq_k,head_dim,
-        qo,ko,vo,oo, mask_o,mask_kind,scale_bits,window);
+        qo,ko,vo,oo, mask_o,mask_kind,scale_bits,window,
+        seq_q_stride,seq_k_stride,mask_batch_stride,mask_head_stride,
+        q_batch_stride,q_head_stride,q_seq_stride,
+        k_batch_stride,k_head_stride,k_seq_stride,
+        v_batch_stride,v_head_stride,v_seq_stride,
+        o_batch_stride,o_head_stride,o_seq_stride);
 }
 
 void launch_rope(float* a, unsigned int n_total, unsigned int seq,
@@ -383,6 +399,23 @@ void launch_elementwise_region(float* a, unsigned int len,
     LAUNCH(elementwise_region, gx,1,1, bx,1,1,
         a, len, num_inputs, num_steps, dst_off, meta,
         scalar_input_mask, mod_struct);
+}
+
+void launch_batch_elementwise_region(float* a, unsigned int slice_len,
+                                     unsigned int num_batch,
+                                     unsigned int num_steps,
+                                     unsigned int base_dst_off,
+                                     unsigned int slice_elems,
+                                     const unsigned int* batch_input_offs,
+                                     const unsigned int* meta,
+                                     unsigned int scalar_input_mask,
+                                     const unsigned int* input_modulus,
+                                     unsigned int gx, unsigned int bx) {
+    InputModulus mod_struct;
+    for (int i = 0; i < 16; ++i) mod_struct.v[i] = input_modulus[i];
+    LAUNCH(batch_elementwise_region, gx, 1, num_batch, bx, 1, 1,
+           a, slice_len, num_batch, num_steps, base_dst_off, slice_elems,
+           batch_input_offs, meta, scalar_input_mask, mod_struct);
 }
 
 }  // extern "C"

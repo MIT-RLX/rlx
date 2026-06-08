@@ -121,6 +121,7 @@ impl CompileCache {
         if self.entries.len() >= self.capacity
             && let Some(evict_key) = self.order.pop_front()
         {
+            sync_evicted_entry(&mut self.entries, evict_key);
             self.entries.retain(|(k, _)| *k != evict_key);
         }
         self.entries.push((key, compiled));
@@ -138,6 +139,19 @@ impl CompileCache {
     /// Was this key already compiled? Doesn't change recency.
     pub fn contains(&self, key: u64) -> bool {
         self.entries.iter().any(|(k, _)| *k == key)
+    }
+
+    /// Drain in-flight GPU work on every cached entry (Metal `commit_no_wait` paths).
+    pub fn sync_all(&mut self) {
+        for (_, compiled) in &mut self.entries {
+            compiled.sync_pending();
+        }
+    }
+}
+
+fn sync_evicted_entry(entries: &mut [(u64, CompiledGraph)], evict_key: u64) {
+    if let Some((_, compiled)) = entries.iter_mut().find(|(k, _)| *k == evict_key) {
+        compiled.sync_pending();
     }
 }
 
@@ -353,6 +367,12 @@ impl BucketedCompileCache {
         self.buckets.iter().position(|b| b.range.contains(&key))
     }
 
+    /// Upper compile extent for `key`'s bucket (`range.end - 1`), without compiling.
+    pub fn bucket_upper_for_key(&self, key: u64) -> Option<u64> {
+        let idx = self.bucket_for(key)?;
+        Some(self.buckets[idx].range.end - 1)
+    }
+
     pub fn buckets(&self) -> impl Iterator<Item = &Range<u64>> {
         self.buckets.iter().map(|b| &b.range)
     }
@@ -360,6 +380,12 @@ impl BucketedCompileCache {
     /// Number of buckets that have been compiled so far (≤ total buckets).
     pub fn compiled_count(&self) -> usize {
         self.buckets.iter().filter(|b| b.compiled.is_some()).count()
+    }
+
+    /// Mutable compiled graph for `key`'s bucket, if already compiled.
+    pub fn compiled_for_key_mut(&mut self, key: u64) -> Option<&mut CompiledGraph> {
+        let idx = self.bucket_for(key)?;
+        self.buckets[idx].compiled.as_mut()
     }
 
     pub fn total_buckets(&self) -> usize {
@@ -523,6 +549,15 @@ impl BucketedCompileCache {
 
         Some((upper, outs))
     }
+
+    /// Drain in-flight GPU work on every compiled bucket.
+    pub fn sync_all(&mut self) {
+        for bucket in &mut self.buckets {
+            if let Some(compiled) = &mut bucket.compiled {
+                compiled.sync_pending();
+            }
+        }
+    }
 }
 
 // ── Dynamic-dim cache (plan #54) ──────────────────────────────────────
@@ -603,6 +638,7 @@ impl DynamicDimCompileCache {
         if self.entries.len() >= self.capacity
             && let Some(evict_key) = self.order.pop_front()
         {
+            sync_evicted_entry(&mut self.entries, evict_key);
             self.entries.retain(|(k, _)| *k != evict_key);
         }
         self.entries.push((key, compiled));
@@ -624,6 +660,13 @@ impl DynamicDimCompileCache {
 
     pub fn has_template(&self) -> bool {
         self.template.is_some()
+    }
+
+    /// Drain in-flight GPU work on every specialized entry.
+    pub fn sync_all(&mut self) {
+        for (_, compiled) in &mut self.entries {
+            compiled.sync_pending();
+        }
     }
 
     /// Build the symbolic template once (no specialization).
@@ -665,6 +708,7 @@ impl DynamicDimCompileCache {
         if self.entries.len() >= self.capacity
             && let Some(evict_key) = self.order.pop_front()
         {
+            sync_evicted_entry(&mut self.entries, evict_key);
             self.entries.retain(|(k, _)| *k != evict_key);
         }
         self.entries.push((key, compiled));
@@ -697,6 +741,31 @@ pub fn pad_rows(data: &[f32], inner: usize, upper: u64) -> Vec<f32> {
     let mut out = vec![0.0_f32; upper * inner];
     out[..actual * inner].copy_from_slice(data);
     out
+}
+
+/// Pad `data` (`[actual, inner]` row-major) into preallocated `out` (`[upper, inner]`).
+pub fn pad_rows_into(out: &mut [f32], data: &[f32], inner: usize) {
+    assert!(inner > 0, "pad_rows_into: inner stride must be ≥ 1");
+    assert_eq!(
+        data.len() % inner,
+        0,
+        "pad_rows_into: data len {} not a multiple of inner {inner}",
+        data.len(),
+    );
+    assert_eq!(
+        out.len() % inner,
+        0,
+        "pad_rows_into: out len {} not a multiple of inner {inner}",
+        out.len(),
+    );
+    let upper = out.len() / inner;
+    let actual = data.len() / inner;
+    assert!(
+        actual <= upper,
+        "pad_rows_into: actual rows {actual} exceed upper bound {upper}",
+    );
+    out.fill(0.0);
+    out[..data.len()].copy_from_slice(data);
 }
 
 /// Slice `data` (interpreted as `[upper, inner]` row-major) down to
@@ -832,6 +901,9 @@ mod tests {
         assert!(cache.bucket_for(100).is_none());
         assert_eq!(cache.bucket_for(3), Some(0));
         assert_eq!(cache.bucket_for(4), Some(1));
+        assert_eq!(cache.bucket_upper_for_key(3), Some(3));
+        assert_eq!(cache.bucket_upper_for_key(4), Some(15));
+        assert!(cache.bucket_upper_for_key(0).is_none());
 
         let calls = Cell::new(0);
         let result = cache.get_or_compile(100, |u| {

@@ -66,6 +66,10 @@ pub fn registered_logical_kernels() -> &'static [LogicalKernelEntry] {
             name: "group_norm",
         },
         LogicalKernelEntry {
+            kind: OpKind::BatchNormInference,
+            name: "batch_norm_inference",
+        },
+        LogicalKernelEntry {
             kind: OpKind::ResizeNearest2x,
             name: "resize_nearest_2x",
         },

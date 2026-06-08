@@ -1,0 +1,68 @@
+[package]
+name = "rlx-onnx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ONNX inference for RLX — native compile by default, optional ORT fallback"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+bytemuck = "1"
+serde_json = "1"
+rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.4", default-features = false, features = ["cpu"] }
+rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.4" }
+
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+ort = { version = "=2.0.0-rc.11", optional = true, default-features = false, features = [
+    "std",
+    "pkg-config",
+    "download-binaries",
+    "tls-rustls",
+] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+ort = { version = "=2.0.0-rc.11", optional = true, default-features = false, features = [
+    "std",
+    "download-binaries",
+    "tls-rustls",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ort = { version = "=2.0.0-rc.11", optional = true, default-features = false, features = [
+    "std",
+    "download-binaries",
+    "tls-rustls",
+    "copy-dylibs",
+] }
+
+[features]
+default = ["native"]
+native = []
+ort = ["dep:ort"]
+ort-fallback = ["ort"]
+cpu = []
+cuda = ["rlx-runtime/cuda"]
+metal = ["rlx-runtime/metal"]
+mlx = ["rlx-runtime/mlx"]
+rocm = ["rlx-runtime/rocm"]
+gpu = ["rlx-runtime/gpu"]
+ort-coreml = ["ort", "ort/coreml"]
+ort-cuda = ["ort", "ort/cuda"]
+ort-rocm = ["ort", "ort/rocm"]
+ort-directml = ["ort", "ort/directml"]
+all-ep = ["metal", "mlx", "cuda", "rocm", "gpu", "ort-fallback", "ort-coreml", "ort-cuda", "ort-rocm", "ort-directml"]
+
+[[bin]]
+name = "rlx-onnx-run"
+path = "src/bin/run.rs"
+required-features = ["native"]
+
+[lints]
+workspace = true

@@ -100,7 +100,10 @@ impl MpsGraph {
                 name: nsname];
             // placeholder returns an autoreleased reference owned by the graph.
             // The graph holds it strongly; we just hand the pointer back.
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: Some(shape.to_vec()),
+            }
         }
     }
 
@@ -112,7 +115,10 @@ impl MpsGraph {
                 matrixMultiplicationWithPrimaryTensor: a.obj
                 secondaryTensor: b.obj
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -124,17 +130,18 @@ impl MpsGraph {
                 additionWithPrimaryTensor: a.obj
                 secondaryTensor: b.obj
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
-    /// GELU activation via the analytic approximation:
-    ///   `gelu(x) = 0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715 · x³)))`
+    /// Tanh-approximation GELU — matches PyTorch / `rlx_cpu::scalar_gelu_approx`:
+    ///   `y = 0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715 · x³)))`
     ///
-    /// MPSGraph added a native `geluWithTensor:name:` only in macOS 14;
-    /// the analytic form runs everywhere we ship and matches PyTorch's
-    /// approximate path used in Hugging Face BERT/Nomic.
-    pub fn gelu(&self, x: &MpsTensor) -> MpsTensor {
+    /// Use for `Activation::GeluApprox` (ViT / Brain-JEPA MLP blocks).
+    pub fn gelu_approx(&self, x: &MpsTensor) -> MpsTensor {
         let half = self.constant_scalar(0.5);
         let one = self.constant_scalar(1.0);
         let three = self.constant_scalar(3.0);
@@ -151,6 +158,12 @@ impl MpsGraph {
         self.mul(&half, &xt)
     }
 
+    /// `Activation::Gelu` on CPU uses an erf-based kernel; MPSGraph lowering uses the
+    /// tanh approximation until a native `geluWithTensor` / erf subgraph is wired.
+    pub fn gelu(&self, x: &MpsTensor) -> MpsTensor {
+        self.gelu_approx(x)
+    }
+
     /// `out = x * y` element-wise.
     pub fn mul(&self, a: &MpsTensor, b: &MpsTensor) -> MpsTensor {
         unsafe {
@@ -159,7 +172,10 @@ impl MpsGraph {
                 multiplicationWithPrimaryTensor: a.obj
                 secondaryTensor: b.obj
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -171,7 +187,10 @@ impl MpsGraph {
                 powerWithPrimaryTensor: a.obj
                 secondaryTensor: b.obj
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -182,7 +201,10 @@ impl MpsGraph {
             let t: *mut Object = msg_send![self.obj,
                 tanhWithTensor: x.obj
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -193,12 +215,291 @@ impl MpsGraph {
             let t: *mut Object = msg_send![self.obj,
                 sigmoidWithTensor: x.obj
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
     /// SiLU / Swish activation: `silu(x) = x * sigmoid(x)`.
     /// Used in SwiGLU FFN blocks (Nomic-Vision, LLaMA-style models).
+    /// Element-wise `exp(x)`.
+    pub fn exp(&self, x: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                exponentWithTensor: x.obj
+                name: ns_string("exp")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Element-wise natural log `log(x)`.
+    pub fn log(&self, x: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                logarithmWithTensor: x.obj
+                name: ns_string("log")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Element-wise `sqrt(x)`.
+    pub fn sqrt(&self, x: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                squareRootWithTensor: x.obj
+                name: ns_string("sqrt")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Element-wise `1 / sqrt(x)`.
+    pub fn rsqrt(&self, x: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                reverseSquareRootWithTensor: x.obj
+                name: ns_string("rsqrt")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Element-wise `-x`.
+    pub fn neg(&self, x: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                negativeWithTensor: x.obj
+                name: ns_string("neg")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Element-wise `|x|`.
+    pub fn abs(&self, x: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                absoluteWithTensor: x.obj
+                name: ns_string("abs")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Element-wise ReLU.
+    pub fn relu(&self, x: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                reLUWithTensor: x.obj
+                name: ns_string("relu")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Reduce-sum over the given axes (always keep dims; caller can reshape).
+    pub fn reduce_sum(&self, x: &MpsTensor, axes: &[i32]) -> MpsTensor {
+        unsafe {
+            let nsaxes = ns_array_of_i32(axes);
+            let t: *mut Object = msg_send![self.obj,
+                reductionSumWithTensor: x.obj
+                axes: nsaxes
+                name: ns_string("redsum")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Reduce-mean over the given axes (always keep dims; caller can reshape).
+    pub fn reduce_mean(&self, x: &MpsTensor, axes: &[i32]) -> MpsTensor {
+        unsafe {
+            let nsaxes = ns_array_of_i32(axes);
+            let t: *mut Object = msg_send![self.obj,
+                meanOfTensor: x.obj
+                axes: nsaxes
+                name: ns_string("redmean")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Reduce-max over the given axes (always keep dims; caller can reshape).
+    pub fn reduce_max(&self, x: &MpsTensor, axes: &[i32]) -> MpsTensor {
+        unsafe {
+            let nsaxes = ns_array_of_i32(axes);
+            let t: *mut Object = msg_send![self.obj,
+                reductionMaximumWithTensor: x.obj
+                axes: nsaxes
+                name: ns_string("redmax")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Reduce-min over the given axes (always keep dims).
+    pub fn reduce_min(&self, x: &MpsTensor, axes: &[i32]) -> MpsTensor {
+        unsafe {
+            let nsaxes = ns_array_of_i32(axes);
+            let t: *mut Object = msg_send![self.obj,
+                reductionMinimumWithTensor: x.obj
+                axes: nsaxes
+                name: ns_string("redmin")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Nearest-neighbor resize on NCHW spatial dims to `[out_h, out_w]`.
+    pub fn resize_nearest_nchw(&self, x: &MpsTensor, out_h: usize, out_w: usize) -> MpsTensor {
+        unsafe {
+            let size = [out_h, out_w];
+            let nssize = ns_array_of_numbers(&size);
+            let mode: u64 = 0; // MPSGraphResizeNearest
+            let layout: u64 = 0; // MPSGraphTensorNamedDataLayoutNCHW
+            let t: *mut Object = msg_send![self.obj,
+                resizeTensor: x.obj
+                size: nssize
+                mode: mode
+                centerResult: NO
+                alignCorners: NO
+                layout: layout
+                name: ns_string("resize_nn")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Arbitrary permutation transpose.
+    pub fn permute(&self, x: &MpsTensor, perm: &[i32]) -> MpsTensor {
+        unsafe {
+            let nsperm = ns_array_of_i32(perm);
+            let t: *mut Object = msg_send![self.obj,
+                transposeTensor: x.obj
+                permutation: nsperm
+                name: ns_string("permute")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Element-wise subtract `a - b`.
+    pub fn sub(&self, a: &MpsTensor, b: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                subtractionWithPrimaryTensor: a.obj
+                secondaryTensor: b.obj
+                name: ns_string("sub")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Element-wise equality `a == b` (result has F32 dtype, 0.0/1.0).
+    pub fn cmp_eq(&self, a: &MpsTensor, b: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                equalWithPrimaryTensor: a.obj
+                secondaryTensor: b.obj
+                name: ns_string("eq")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    pub fn cmp_ne(&self, a: &MpsTensor, b: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                notEqualWithPrimaryTensor: a.obj
+                secondaryTensor: b.obj
+                name: ns_string("ne")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    pub fn cmp_lt(&self, a: &MpsTensor, b: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                lessThanWithPrimaryTensor: a.obj
+                secondaryTensor: b.obj
+                name: ns_string("lt")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    pub fn cmp_le(&self, a: &MpsTensor, b: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                lessThanOrEqualToWithPrimaryTensor: a.obj
+                secondaryTensor: b.obj
+                name: ns_string("le")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    pub fn cmp_gt(&self, a: &MpsTensor, b: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                greaterThanWithPrimaryTensor: a.obj
+                secondaryTensor: b.obj
+                name: ns_string("gt")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    pub fn cmp_ge(&self, a: &MpsTensor, b: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                greaterThanOrEqualToWithPrimaryTensor: a.obj
+                secondaryTensor: b.obj
+                name: ns_string("ge")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
+    /// Element-wise divide `a / b`.
+    pub fn div(&self, a: &MpsTensor, b: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                divisionWithPrimaryTensor: a.obj
+                secondaryTensor: b.obj
+                name: ns_string("div")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
     pub fn silu(&self, x: &MpsTensor) -> MpsTensor {
         let s = self.sigmoid(x);
         self.mul(x, &s)
@@ -210,11 +511,23 @@ impl MpsGraph {
             let t: *mut Object = msg_send![self.obj,
                 constantWithScalar: v as f64
                 dataType: mps_dtype::Float32];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
     /// Layer normalization across `axes` with learnable `gamma`, `beta`.
+    ///
+    /// Built from primitive ops:
+    ///   `out = (x - mean) / sqrt(var + eps) * gamma + beta`
+    /// We avoid `normalizationWithTensor:meanTensor:varianceTensor:gammaTensor:betaTensor:epsilon:`
+    /// because (post-macOS-14) MPSGraph's optimizer can fold our
+    /// hand-rolled mean/var feeds into a reduction kernel that fails
+    /// at runtime with "epsilon must be a scalar" when the optimizer
+    /// pattern-matches our subgraph. The primitive form has a slightly
+    /// larger node count but executes correctly.
     pub fn layer_norm(
         &self,
         x: &MpsTensor,
@@ -223,39 +536,65 @@ impl MpsGraph {
         axes: &[i32],
         eps: f32,
     ) -> MpsTensor {
+        // Built from primitive ops:
+        //   out = (x − mean) / √(var + eps) · γ + β
+        // We avoid `normalizationWithTensor:meanTensor:variance...:epsilon:`
+        // and `meanOfTensor:axes:` chained patterns because MPSGraph's
+        // optimizer can fold them into a reduction kernel that fails at
+        // runtime with "epsilon must be a scalar" on rank≥3 axes that
+        // pattern-match its internal normalize layout. The primitive
+        // form has a slightly larger node count but executes correctly.
         unsafe {
-            let nsname = ns_string("ln");
             let nsaxes = ns_array_of_i32(axes);
-            // -[MPSGraph normalizationWithTensor:meanTensor:varianceTensor:gammaTensor:betaTensor:epsilon:name:]
-            // Compute mean / variance over `axes` ourselves.
             let mean: *mut Object = msg_send![self.obj,
                 meanOfTensor: x.obj
                 axes: nsaxes
-                name: ns_string("mean")];
+                name: ns_string("ln_mean")];
+            let diff: *mut Object = msg_send![self.obj,
+                subtractionWithPrimaryTensor: x.obj
+                secondaryTensor: mean
+                name: ns_string("ln_diff")];
+            let sq: *mut Object = msg_send![self.obj,
+                multiplicationWithPrimaryTensor: diff
+                secondaryTensor: diff
+                name: ns_string("ln_sq")];
             let var: *mut Object = msg_send![self.obj,
-                varianceOfTensor: x.obj
+                meanOfTensor: sq
                 axes: nsaxes
-                name: ns_string("var")];
-            let t: *mut Object = msg_send![self.obj,
-                normalizationWithTensor: x.obj
-                meanTensor: mean
-                varianceTensor: var
-                gammaTensor: gamma.obj
-                betaTensor: beta.obj
-                epsilon: eps
-                name: nsname];
-            MpsTensor { obj: t }
+                name: ns_string("ln_var")];
+            let eps_t: *mut Object = msg_send![self.obj,
+                constantWithScalar: eps as f64
+                dataType: mps_dtype::Float32];
+            let var_eps: *mut Object = msg_send![self.obj,
+                additionWithPrimaryTensor: var
+                secondaryTensor: eps_t
+                name: ns_string("ln_var_eps")];
+            let inv_std: *mut Object = msg_send![self.obj,
+                reverseSquareRootWithTensor: var_eps
+                name: ns_string("ln_inv_std")];
+            let x_hat: *mut Object = msg_send![self.obj,
+                multiplicationWithPrimaryTensor: diff
+                secondaryTensor: inv_std
+                name: ns_string("ln_xhat")];
+            let scaled: *mut Object = msg_send![self.obj,
+                multiplicationWithPrimaryTensor: x_hat
+                secondaryTensor: gamma.obj
+                name: ns_string("ln_scale")];
+            let out: *mut Object = msg_send![self.obj,
+                additionWithPrimaryTensor: scaled
+                secondaryTensor: beta.obj
+                name: ns_string("ln_out")];
+            MpsTensor {
+                obj: out,
+                shape: None,
+            }
         }
     }
 
     /// RMS normalization: `out = (x / sqrt(mean(x², axes) + eps)) · γ + β`.
-    ///
-    /// Implemented via MPSGraph's optimized
-    /// `normalizationWithTensor:mean:variance:gamma:beta:epsilon:` by
-    /// feeding `mean = 0` and `variance = mean(x · x, axes)` — the
-    /// builtin formula `(x − mean) / √(var + eps) · γ + β` then
-    /// collapses exactly to RMSNorm. Reuses Apple's fused norm kernel
-    /// instead of building rsqrt by hand.
+    /// Built from primitives to avoid the `normalizationWithTensor`
+    /// optimizer path (see `layer_norm` for context on the runtime
+    /// failure mode that motivated this).
     pub fn rms_norm(
         &self,
         x: &MpsTensor,
@@ -271,24 +610,37 @@ impl MpsGraph {
                 multiplicationWithPrimaryTensor: x.obj
                 secondaryTensor: x.obj
                 name: ns_string("rms_sq")];
-            // var = mean(x²) over the reduction axes (keepDims default).
+            // mean_sq = mean(x², axes)
             let mean_sq: *mut Object = msg_send![self.obj,
                 meanOfTensor: x_sq
                 axes: nsaxes
                 name: ns_string("rms_mean")];
-            // mean = 0 (scalar broadcasts across all dims).
-            let zero: *mut Object = msg_send![self.obj,
-                constantWithScalar: 0.0_f64
+            let eps_t: *mut Object = msg_send![self.obj,
+                constantWithScalar: eps as f64
                 dataType: mps_dtype::Float32];
-            let t: *mut Object = msg_send![self.obj,
-                normalizationWithTensor: x.obj
-                meanTensor: zero
-                varianceTensor: mean_sq
-                gammaTensor: gamma.obj
-                betaTensor: beta.obj
-                epsilon: eps
-                name: ns_string("rmsnorm")];
-            MpsTensor { obj: t }
+            let denom2: *mut Object = msg_send![self.obj,
+                additionWithPrimaryTensor: mean_sq
+                secondaryTensor: eps_t
+                name: ns_string("rms_dn2")];
+            let inv: *mut Object = msg_send![self.obj,
+                reverseSquareRootWithTensor: denom2
+                name: ns_string("rms_inv")];
+            let normed: *mut Object = msg_send![self.obj,
+                multiplicationWithPrimaryTensor: x.obj
+                secondaryTensor: inv
+                name: ns_string("rms_norm")];
+            let scaled: *mut Object = msg_send![self.obj,
+                multiplicationWithPrimaryTensor: normed
+                secondaryTensor: gamma.obj
+                name: ns_string("rms_scale")];
+            let out: *mut Object = msg_send![self.obj,
+                additionWithPrimaryTensor: scaled
+                secondaryTensor: beta.obj
+                name: ns_string("rms_out")];
+            MpsTensor {
+                obj: out,
+                shape: None,
+            }
         }
     }
 
@@ -300,7 +652,10 @@ impl MpsGraph {
                 softMaxWithTensor: x.obj
                 axis: axis as i64
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -313,7 +668,25 @@ impl MpsGraph {
                 dimension: dim_a as u64
                 withDimension: dim_b as u64
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
+    /// Broadcast `x` to `shape` via tile expansion.
+    pub fn broadcast_to(&self, x: &MpsTensor, shape: &[usize]) -> MpsTensor {
+        unsafe {
+            let nsshape = ns_array_of_numbers(shape);
+            let t: *mut Object = msg_send![self.obj,
+                broadcastTensor: x.obj
+                toShape: nsshape
+                name: ns_string("broadcast")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -326,7 +699,10 @@ impl MpsGraph {
                 reshapeTensor: x.obj
                 withShape: nsshape
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -341,7 +717,10 @@ impl MpsGraph {
                 axis: axis
                 batchDimensions: 0u64
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -353,7 +732,10 @@ impl MpsGraph {
                 castTensor: x.obj
                 toType: to_dtype
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -367,7 +749,10 @@ impl MpsGraph {
                 start: start
                 length: len
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -386,7 +771,10 @@ impl MpsGraph {
                 constantWithData: nsdata
                 shape: nsshape
                 dataType: dtype];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -466,6 +854,7 @@ impl MpsGraph {
         // placeholders. Bypasses the slice-of-computed pattern
         // entirely. Multi-day refactor — deferred.
         let r4 = |t: &MpsTensor, seq: usize| {
+            let seq = t.infer_attn_seq(batch, num_heads, head_dim, seq);
             let r = self.reshape(t, &[batch, seq, num_heads, head_dim]);
             self.transpose(&r, 1, 2) // (0,1,2,3) → (0,2,1,3)
         };
@@ -484,7 +873,13 @@ impl MpsGraph {
         let scores = self.mul(&scores, &scale);
 
         // Additive mask: (mask - 1) * 1e9 → 0 for valid, -1e9 for pad.
-        let mask_bc = self.reshape(mask, &[batch, 1, seq_q, seq_kv]);
+        // The input mask is `[B, seq_kv]` (one value per key position). Reshape
+        // it to `[B, 1, 1, seq_kv]` so MPSGraph's element-wise `add` broadcasts
+        // it across the head and query axes of `scores [B, NH, seq_q, seq_kv]`.
+        // (The previous code reshaped to `[B, 1, seq_q, seq_kv]` directly,
+        // which is invalid: reshape requires the element count to match.)
+        let mask_kv = mask.seq_axis(1, seq_kv);
+        let mask_bc = self.reshape(mask, &[batch, 1, 1, mask_kv]);
         let neg_one = self.constant_scalar(-1.0);
         let large_pos = self.constant_scalar(1.0e9);
         let mask_minus = self.add(&mask_bc, &neg_one);
@@ -498,7 +893,8 @@ impl MpsGraph {
         let out4 = self.matmul(&weights, &v4);
         // Transpose back to [B, seq_q, NH, DH] then reshape to [B, seq_q, NH*DH].
         let out_perm = self.transpose(&out4, 1, 2);
-        self.reshape(&out_perm, &[batch, seq_q, num_heads * head_dim])
+        let out_seq = q.infer_attn_seq(batch, num_heads, head_dim, seq_q);
+        self.reshape(&out_perm, &[batch, out_seq, num_heads * head_dim])
     }
 
     /// Unmasked multi-head SDPA. Supports cross-attention when `seq_kv != seq_q`.
@@ -517,6 +913,7 @@ impl MpsGraph {
         head_dim: usize,
     ) -> MpsTensor {
         let r4 = |t: &MpsTensor, seq: usize| {
+            let seq = t.infer_attn_seq(batch, num_heads, head_dim, seq);
             let r = self.reshape(t, &[batch, seq, num_heads, head_dim]);
             self.transpose(&r, 1, 2) // [B, S, NH, DH] → [B, NH, S, DH]
         };
@@ -531,7 +928,8 @@ impl MpsGraph {
         let weights = self.softmax(&scores, 3);
         let out4 = self.matmul(&weights, &v4);
         let out_perm = self.transpose(&out4, 1, 2);
-        self.reshape(&out_perm, &[batch, seq_q, num_heads * head_dim])
+        let out_seq = q.infer_attn_seq(batch, num_heads, head_dim, seq_q);
+        self.reshape(&out_perm, &[batch, out_seq, num_heads * head_dim])
     }
 
     /// Multi-head SDPA with a causal mask baked in as a graph constant.
@@ -558,7 +956,9 @@ impl MpsGraph {
         num_heads: usize,
         head_dim: usize,
     ) -> MpsTensor {
+        let seq_eff = q.infer_attn_seq(batch, num_heads, head_dim, seq);
         let r4 = |t: &MpsTensor| {
+            let seq = t.infer_attn_seq(batch, num_heads, head_dim, seq_eff);
             let r = self.reshape(t, &[batch, seq, num_heads, head_dim]);
             self.transpose(&r, 1, 2) // [B, S, NH, DH] → [B, NH, S, DH]
         };
@@ -569,14 +969,15 @@ impl MpsGraph {
         // Causal mask: additive bias of shape [1, 1, S, S] — `−∞` on
         // entries (i, j) where j > i so future positions get zeroed by
         // softmax. Built as a graph constant; broadcast over batch/head.
-        let mut mask_bytes = Vec::<u8>::with_capacity(seq * seq * 4);
-        for i in 0..seq {
-            for j in 0..seq {
+        let mut mask_bytes = Vec::<u8>::with_capacity(seq_eff * seq_eff * 4);
+        for i in 0..seq_eff {
+            for j in 0..seq_eff {
                 let v: f32 = if j > i { -1.0e9 } else { 0.0 };
                 mask_bytes.extend_from_slice(&v.to_le_bytes());
             }
         }
-        let mask = self.constant_from_bytes(&mask_bytes, &[1, 1, seq, seq], mps_dtype::Float32);
+        let mask =
+            self.constant_from_bytes(&mask_bytes, &[1, 1, seq_eff, seq_eff], mps_dtype::Float32);
         let scale = (head_dim as f32).sqrt().recip();
 
         // Prefer Apple's fused SDPA when available (macOS 14.4+) —
@@ -596,7 +997,7 @@ impl MpsGraph {
         };
 
         let out_perm = self.transpose(&out4, 1, 2);
-        self.reshape(&out_perm, &[batch, seq, num_heads * head_dim])
+        self.reshape(&out_perm, &[batch, seq_eff, num_heads * head_dim])
     }
 
     /// Apply rotary position embedding.
@@ -616,14 +1017,15 @@ impl MpsGraph {
         n_rot: usize,
     ) -> MpsTensor {
         let rot_half = n_rot / 2;
-        let r = self.reshape(x, &[batch, seq, num_heads, head_dim]);
+        let seq_eff = x.infer_attn_seq(batch, num_heads, head_dim, seq);
+        let r = self.reshape(x, &[batch, seq_eff, num_heads, head_dim]);
 
-        let cos_sliced = self.slice(cos_t, 0, 0, seq as i64);
-        let sin_sliced = self.slice(sin_t, 0, 0, seq as i64);
+        let cos_sliced = self.slice(cos_t, 0, 0, seq_eff as i64);
+        let sin_sliced = self.slice(sin_t, 0, 0, seq_eff as i64);
         let cos_rot = self.slice(&cos_sliced, 1, 0, rot_half as i64);
         let sin_rot = self.slice(&sin_sliced, 1, 0, rot_half as i64);
-        let cos_bc = self.reshape(&cos_rot, &[1, seq, 1, rot_half]);
-        let sin_bc = self.reshape(&sin_rot, &[1, seq, 1, rot_half]);
+        let cos_bc = self.reshape(&cos_rot, &[1, seq_eff, 1, rot_half]);
+        let sin_bc = self.reshape(&sin_rot, &[1, seq_eff, 1, rot_half]);
 
         let (rot_block, tail) = if n_rot < head_dim {
             let rot = self.slice(&r, 3, 0, n_rot as i64);
@@ -652,7 +1054,7 @@ impl MpsGraph {
         } else {
             rotated
         };
-        self.reshape(&cat, &[batch, seq, num_heads * head_dim])
+        self.reshape(&cat, &[batch, seq_eff, num_heads * head_dim])
     }
 
     /// Concatenate tensors along `axis`.
@@ -688,7 +1090,10 @@ impl MpsGraph {
             let mut out = Vec::with_capacity(count as usize);
             for i in 0..count {
                 let t: *mut Object = msg_send![arr, objectAtIndex: i];
-                out.push(MpsTensor { obj: t });
+                out.push(MpsTensor {
+                    obj: t,
+                    shape: None,
+                });
             }
             Some(out)
         }
@@ -730,7 +1135,10 @@ impl MpsGraph {
             if t.is_null() {
                 return None;
             }
-            Some(MpsTensor { obj: t })
+            Some(MpsTensor {
+                obj: t,
+                shape: None,
+            })
         }
     }
 
@@ -746,7 +1154,10 @@ impl MpsGraph {
                 concatTensors: arr
                 dimension: axis as i64
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -787,7 +1198,10 @@ impl MpsGraph {
                 weightsTensor: weights.obj
                 descriptor: desc
                 name: nsname];
-            MpsTensor { obj: t }
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
         }
     }
 
@@ -1163,7 +1577,56 @@ impl MpsGraphExecutable {
 
 /// Symbolic tensor reference owned by an MPSGraph (no Drop — graph owns it).
 pub struct MpsTensor {
-    obj: *mut Object,
+    pub(crate) obj: *mut Object,
+    /// IR/static shape when known (bucket-padded seq may exceed logical `seq_*` args).
+    pub(crate) shape: Option<Vec<usize>>,
+}
+
+impl MpsTensor {
+    pub fn with_shape(mut self, shape: Vec<usize>) -> Self {
+        self.shape = Some(shape);
+        self
+    }
+
+    /// Sequence length for `[B, S, NH·DH]` attention inputs. Prefer `fallback`
+    /// when element count matches logical seq; otherwise use padded axis (KV cache).
+    fn infer_attn_seq(
+        &self,
+        batch: usize,
+        num_heads: usize,
+        head_dim: usize,
+        fallback: usize,
+    ) -> usize {
+        let Some(s) = self.shape.as_ref() else {
+            return fallback;
+        };
+        if s.len() != 3 {
+            return fallback;
+        }
+        let hidden = num_heads * head_dim;
+        if s[2] != hidden {
+            return fallback;
+        }
+        let unit = batch.saturating_mul(hidden);
+        if unit == 0 {
+            return fallback;
+        }
+        let numel: usize = s.iter().product();
+        if numel == unit.saturating_mul(fallback) {
+            return fallback;
+        }
+        numel
+            .checked_div(unit)
+            .filter(|&q| q > 0)
+            .unwrap_or(fallback)
+    }
+
+    fn seq_axis(&self, axis: usize, fallback: usize) -> usize {
+        self.shape
+            .as_ref()
+            .and_then(|s| s.get(axis).copied())
+            .unwrap_or(fallback)
+    }
 }
 
 // ── Helper objc constructors ───────────────────────────────────────────

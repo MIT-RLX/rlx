@@ -250,6 +250,8 @@ fn main() {
             Activation::Sin => x.sin(),
             Activation::Cos => x.cos(),
             Activation::Round => x.round(),
+            Activation::Tan => x.tan(),
+            Activation::Atan => x.atan(),
         }
     }
     let act_variants = [
@@ -268,6 +270,8 @@ fn main() {
         ("sin", Activation::Sin),
         ("cos", Activation::Cos),
         ("round", Activation::Round),
+        ("tan", Activation::Tan),
+        ("atan", Activation::Atan),
     ];
     for (name, act) in &act_variants {
         let act = *act;

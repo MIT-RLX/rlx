@@ -106,6 +106,69 @@ pub fn pick_best_device(graph: &Graph, models: &[&dyn BackendCostModel]) -> Devi
     best.0
 }
 
+/// Pick the fastest backend for `graph` on this host.
+pub fn fastest_device_for(graph: &Graph) -> Device {
+    fastest_device_for_with_policy(graph, &crate::device_policy::DevicePolicy::default())
+}
+
+/// Like [`fastest_device_for`] but respects a [`crate::DevicePolicy`] allow-list.
+pub fn fastest_device_for_with_policy(
+    graph: &Graph,
+    policy: &crate::device_policy::DevicePolicy,
+) -> Device {
+    let candidates = crate::device_policy::devices_for_with_policy(graph, policy);
+    if candidates.is_empty() {
+        return crate::device_ext::fastest_among(&policy.apply(crate::available_devices()));
+    }
+
+    #[cfg(feature = "cpu")]
+    let cpu = CpuCostModel::new();
+    #[cfg(feature = "metal")]
+    let metal = MetalCostModel::new();
+    #[cfg(all(feature = "mlx", rlx_mlx_host))]
+    let mlx = MlxCostModel::new();
+    #[cfg(feature = "cuda")]
+    let cuda = CudaCostModel::new();
+    #[cfg(feature = "rocm")]
+    let rocm = RocmCostModel::new();
+    #[cfg(feature = "gpu")]
+    let wgpu = WgpuCostModel::new();
+
+    let mut models: Vec<&dyn BackendCostModel> = Vec::new();
+    #[cfg(feature = "cpu")]
+    if candidates.contains(&Device::Cpu) {
+        models.push(&cpu);
+    }
+    #[cfg(feature = "metal")]
+    if candidates.contains(&Device::Metal) {
+        models.push(&metal);
+    }
+    #[cfg(all(feature = "mlx", rlx_mlx_host))]
+    if candidates.contains(&Device::Mlx) {
+        models.push(&mlx);
+    }
+    #[cfg(feature = "cuda")]
+    if candidates.contains(&Device::Cuda) {
+        models.push(&cuda);
+    }
+    #[cfg(feature = "rocm")]
+    if candidates.contains(&Device::Rocm) {
+        models.push(&rocm);
+    }
+    #[cfg(feature = "gpu")]
+    if candidates.contains(&Device::Gpu) {
+        models.push(&wgpu);
+    }
+
+    if models.len() >= 2 {
+        pick_best_device(graph, &models)
+    } else if let Some(m) = models.first() {
+        m.device()
+    } else {
+        crate::device_ext::fastest_among(&candidates)
+    }
+}
+
 // ── Backend adapters (plan #29) ─────────────────────────────────
 //
 // The CPU and Metal crates own their own internal cost models for
@@ -228,7 +291,7 @@ impl BackendCostModel for MetalCostModel {
 /// the on-disk MLX calibration cache. The first construction on a
 /// fresh machine pays a one-time measurement cost (tens of ms);
 /// subsequent constructions read the cache.
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(all(feature = "mlx", rlx_mlx_host))]
 pub struct MlxCostModel {
     sgemm_large_flops: f64,
     sgemm_small_flops: f64,
@@ -236,7 +299,7 @@ pub struct MlxCostModel {
     memory_bw: f64,
 }
 
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(all(feature = "mlx", rlx_mlx_host))]
 impl MlxCostModel {
     pub fn new() -> Self {
         let cal = rlx_mlx::calibrate::Calibration::load_or_measure();
@@ -258,14 +321,14 @@ impl MlxCostModel {
     }
 }
 
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(all(feature = "mlx", rlx_mlx_host))]
 impl Default for MlxCostModel {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(all(feature = "mlx", rlx_mlx_host))]
 impl BackendCostModel for MlxCostModel {
     fn device(&self) -> Device {
         Device::Mlx
@@ -294,5 +357,191 @@ impl BackendCostModel for MlxCostModel {
     }
     fn num_threads(&self) -> usize {
         1
+    }
+}
+
+/// Heuristic CUDA cost model until a dedicated calibrator lands.
+#[cfg(feature = "cuda")]
+pub struct CudaCostModel {
+    sgemm_gflops: f64,
+    roundtrip_ns: f64,
+    memory_bw: f64,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaCostModel {
+    pub fn new() -> Self {
+        if crate::is_available(crate::Device::Cuda) {
+            let cal = rlx_cuda::calibrate::Calibration::load_or_measure();
+            return Self {
+                sgemm_gflops: cal.sgemm_gflops,
+                roundtrip_ns: cal.roundtrip_overhead_ns,
+                memory_bw: cal.memory_bw_gbps,
+            };
+        }
+        Self {
+            sgemm_gflops: 12_000.0,
+            roundtrip_ns: 35_000.0,
+            memory_bw: 900.0,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Default for CudaCostModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl BackendCostModel for CudaCostModel {
+    fn device(&self) -> Device {
+        Device::Cuda
+    }
+    fn sgemm_gflops(&self, _m: usize, _k: usize, _n: usize) -> f64 {
+        self.sgemm_gflops
+    }
+    fn dispatch_overhead_ns(&self) -> f64 {
+        3_000.0
+    }
+    fn roundtrip_overhead_ns(&self) -> f64 {
+        self.roundtrip_ns
+    }
+    fn memory_bw(&self) -> f64 {
+        self.memory_bw
+    }
+    fn num_threads(&self) -> usize {
+        1
+    }
+}
+
+/// Heuristic ROCm cost model (same class as CUDA until calibrated).
+#[cfg(feature = "rocm")]
+pub struct RocmCostModel {
+    sgemm_gflops: f64,
+    roundtrip_ns: f64,
+    memory_bw: f64,
+}
+
+#[cfg(feature = "rocm")]
+impl RocmCostModel {
+    pub fn new() -> Self {
+        if crate::is_available(crate::Device::Rocm) {
+            let cal = rlx_rocm::calibrate::Calibration::load_or_measure();
+            return Self {
+                sgemm_gflops: cal.sgemm_gflops,
+                roundtrip_ns: cal.roundtrip_overhead_ns,
+                memory_bw: cal.memory_bw_gbps,
+            };
+        }
+        Self {
+            sgemm_gflops: 10_000.0,
+            roundtrip_ns: 40_000.0,
+            memory_bw: 800.0,
+        }
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl Default for RocmCostModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl BackendCostModel for RocmCostModel {
+    fn device(&self) -> Device {
+        Device::Rocm
+    }
+    fn sgemm_gflops(&self, _m: usize, _k: usize, _n: usize) -> f64 {
+        self.sgemm_gflops
+    }
+    fn dispatch_overhead_ns(&self) -> f64 {
+        3_000.0
+    }
+    fn roundtrip_overhead_ns(&self) -> f64 {
+        self.roundtrip_ns
+    }
+    fn memory_bw(&self) -> f64 {
+        self.memory_bw
+    }
+    fn num_threads(&self) -> usize {
+        1
+    }
+}
+
+/// Heuristic wgpu (`Device::Gpu`) cost model.
+#[cfg(feature = "gpu")]
+pub struct WgpuCostModel {
+    sgemm_gflops: f64,
+    roundtrip_ns: f64,
+    memory_bw: f64,
+}
+
+#[cfg(feature = "gpu")]
+impl WgpuCostModel {
+    pub fn new() -> Self {
+        if rlx_wgpu::is_available() {
+            let cal = rlx_wgpu::calibrate::Calibration::load_or_measure();
+            return Self {
+                sgemm_gflops: cal.sgemm_gflops,
+                roundtrip_ns: cal.roundtrip_overhead_ns,
+                memory_bw: cal.memory_bw_gbps,
+            };
+        }
+        Self {
+            sgemm_gflops: 2_500.0,
+            roundtrip_ns: 80_000.0,
+            memory_bw: 120.0,
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Default for WgpuCostModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl BackendCostModel for WgpuCostModel {
+    fn device(&self) -> Device {
+        Device::Gpu
+    }
+    fn sgemm_gflops(&self, _m: usize, _k: usize, _n: usize) -> f64 {
+        self.sgemm_gflops
+    }
+    fn dispatch_overhead_ns(&self) -> f64 {
+        5_000.0
+    }
+    fn roundtrip_overhead_ns(&self) -> f64 {
+        self.roundtrip_ns
+    }
+    fn memory_bw(&self) -> f64 {
+        self.memory_bw
+    }
+    fn num_threads(&self) -> usize {
+        1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlx_ir::{DType, Graph, Shape};
+
+    #[test]
+    fn fastest_device_for_falls_back_to_cpu_for_simple_graph() {
+        let mut g = Graph::new("mm");
+        let x = g.input("x", Shape::new(&[4, 4], DType::F32));
+        let w = g.param("w", Shape::new(&[4, 4], DType::F32));
+        let y = g.matmul(x, w, Shape::new(&[4, 4], DType::F32));
+        g.set_outputs(vec![y]);
+        let pick = fastest_device_for(&g);
+        assert!(crate::is_available(pick));
+        assert!(crate::devices_for(&g).contains(&pick));
     }
 }

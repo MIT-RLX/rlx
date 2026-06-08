@@ -22,6 +22,9 @@ through every backend. `rlx-ir` owns:
   `fft_conv1d` from primitive ops.
 - **`MaskKind`** — attention mask kind (None / Causal / SlidingWindow /
   Custom). Added Apr 2026 per plan #20.
+- **`attention_layout`** — BHSD `[B,H,S,D]` vs BSHD `[B,S,H,D]` (EEG-DINO),
+  launch strides, packed `[B,S,3,H,D]` QKV detection, and shared flash-vs-row
+  dispatch (`attention_dispatch_use_row`, `ATTENTION_FLASH_MAX_HEAD_DIM`).
 - **`Graph`** — DAG builder + topo iterator.
 - **`infer.rs`** — shape inference per op. Drives fusion and arena
   planning.

@@ -1,6 +1,19 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+//
 // GPU parity: Op::AttentionBackward (3 kernels) vs CPU thunk ([B,H,S,D], causal).
 
 use rlx_compile::legalize_broadcast::run_with_remap;
@@ -97,6 +110,7 @@ fn cpu_bwd_grads(
 #[cfg(any(
     feature = "gpu",
     feature = "cuda",
+    feature = "rocm",
     all(target_os = "macos", feature = "metal")
 ))]
 fn assert_grads_close(name: &str, cpu: &[f32], gpu: &[f32], rtol: f32) {
@@ -169,6 +183,27 @@ fn cuda_attention_backward_matches_cpu() {
     let (dq_cpu, dk_cpu, dv_cpu) = cpu_bwd_grads(bwd.clone(), &q, &k, &v, &dy);
 
     let session = Session::new(Device::Cuda);
+    let mut compiled = session.compile_with(bwd, &CompileOptions::default());
+    let outs = compiled.run(&[("q", &q), ("k", &k), ("v", &v), ("dy", &dy)]);
+    assert_eq!(outs.len(), 3);
+    assert_grads_close("dq", &dq_cpu, &outs[0], 1e-3);
+    assert_grads_close("dk", &dk_cpu, &outs[1], 1e-3);
+    assert_grads_close("dv", &dv_cpu, &outs[2], 1e-3);
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_attention_backward_matches_cpu() {
+    use rlx_runtime::{CompileOptions, Device, Session, is_available};
+    if !is_available(Device::Rocm) {
+        eprintln!("skip rocm_attention_backward_matches_cpu (unavailable)");
+        return;
+    }
+    let (q, k, v, dy) = synthetic_inputs();
+    let bwd = build_bwd_kernel_graph();
+    let (dq_cpu, dk_cpu, dv_cpu) = cpu_bwd_grads(bwd.clone(), &q, &k, &v, &dy);
+
+    let session = Session::new(Device::Rocm);
     let mut compiled = session.compile_with(bwd, &CompileOptions::default());
     let outs = compiled.run(&[("q", &q), ("k", &k), ("v", &v), ("dy", &dy)]);
     assert_eq!(outs.len(), 3);

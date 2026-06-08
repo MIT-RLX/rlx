@@ -1,5 +1,17 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! wgpu device discovery + capabilities.
 //!
@@ -83,7 +95,31 @@ impl WgpuDevice {
     }
 
     fn new_default() -> Option<Self> {
-        Self::new_with_backends(wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all()))
+        Self::new_with_backends(default_backends())
+    }
+}
+
+fn default_backends() -> wgpu::Backends {
+    if let Some(b) = wgpu::Backends::from_env() {
+        return b;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Native DX12 first on Windows MSVC; Vulkan remains as fallback.
+        wgpu::Backends::DX12 | wgpu::Backends::VULKAN
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // WSL Ubuntu + native Linux: prefer Vulkan (NVIDIA passthrough).
+        wgpu::Backends::VULKAN
+    }
+    #[cfg(target_os = "macos")]
+    {
+        wgpu::Backends::METAL | wgpu::Backends::VULKAN
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        wgpu::Backends::all()
     }
 }
 
@@ -123,4 +159,64 @@ pub fn wgpu_device() -> Option<&'static WgpuDevice> {
     } else {
         default_device()
     }
+}
+
+/// Adapter name for calibration cache keys.
+pub fn adapter_name() -> Option<String> {
+    wgpu_device().map(|d| d.name.clone())
+}
+
+/// True on Vulkan or DX12 — discrete GPU cooperative-matrix backends.
+pub fn coop_discrete_backend() -> bool {
+    wgpu_device()
+        .map(|d| matches!(d.backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12))
+        .unwrap_or(false)
+}
+
+/// True when the adapter reports 8×8×8 f32 cooperative-matrix support
+/// (required for `matmul_coop_f32_portable` on Vulkan/DX12).
+pub fn coop_f32_8x8_supported() -> bool {
+    let dev = match wgpu_device() {
+        Some(d) => d,
+        None => return false,
+    };
+    dev.adapter.cooperative_matrix_properties().iter().any(|p| {
+        p.m_size == 8
+            && p.n_size == 8
+            && p.k_size == 8
+            && p.ab_type == wgpu::CooperativeScalarType::F32
+            && p.cr_type == wgpu::CooperativeScalarType::F32
+    })
+}
+
+/// True when the adapter reports 16×16×16 f16 cooperative-matrix support
+/// (NVIDIA / AMD tensor-core path on Vulkan/DX12).
+pub fn coop_f16_16x16_supported() -> bool {
+    let dev = match wgpu_device() {
+        Some(d) => d,
+        None => return false,
+    };
+    dev.adapter.cooperative_matrix_properties().iter().any(|p| {
+        p.m_size == 16
+            && p.n_size == 16
+            && p.k_size == 16
+            && p.ab_type == wgpu::CooperativeScalarType::F16
+            && (p.cr_type == wgpu::CooperativeScalarType::F16
+                || p.cr_type == wgpu::CooperativeScalarType::F32)
+    })
+}
+
+/// True when f16 operands with f32 accumulator are available (preferred on RTX).
+pub fn coop_f16_16x16_f32_acc_supported() -> bool {
+    let dev = match wgpu_device() {
+        Some(d) => d,
+        None => return false,
+    };
+    dev.adapter.cooperative_matrix_properties().iter().any(|p| {
+        p.m_size == 16
+            && p.n_size == 16
+            && p.k_size == 16
+            && p.ab_type == wgpu::CooperativeScalarType::F16
+            && p.cr_type == wgpu::CooperativeScalarType::F32
+    })
 }

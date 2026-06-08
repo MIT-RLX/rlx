@@ -1,6 +1,19 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+//
 // Closed-form training backward kernels (RMSNorm, RoPE, GroupNorm, Cumsum, Gather).
 
 /// RMSNorm backward for one row: `y = x * inv_rms * gamma + beta`.
@@ -253,5 +266,80 @@ pub fn gather_axis_backward(
                 d_table[tab_row + j] += dy[dy_row + j];
             }
         }
+    }
+}
+
+/// MaxPool2d backward on NCHW tensors (argmax scatter, first-hit tiebreak).
+pub fn maxpool2d_backward_nchw(
+    x: &[f32],
+    dy: &[f32],
+    dx: &mut [f32],
+    n: usize,
+    c: usize,
+    h: usize,
+    w: usize,
+    h_out: usize,
+    w_out: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+) {
+    let x_len = n * c * h * w;
+    let dy_len = n * c * h_out * w_out;
+    debug_assert_eq!(x.len(), x_len);
+    debug_assert_eq!(dy.len(), dy_len);
+    debug_assert_eq!(dx.len(), x_len);
+    dx.fill(0.0);
+    for ni in 0..n {
+        for ci in 0..c {
+            let in_chan = (ni * c + ci) * h * w;
+            let out_chan = (ni * c + ci) * h_out * w_out;
+            for ho in 0..h_out {
+                for wo in 0..w_out {
+                    let mut best_v = f32::NEG_INFINITY;
+                    let mut best_idx: Option<usize> = None;
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            let hi = ho * sh + ki;
+                            let wi = wo * sw + kj;
+                            if hi < ph || wi < pw {
+                                continue;
+                            }
+                            let hi = hi - ph;
+                            let wi = wi - pw;
+                            if hi >= h || wi >= w {
+                                continue;
+                            }
+                            let idx = in_chan + hi * w + wi;
+                            let v = x[idx];
+                            if v > best_v {
+                                best_v = v;
+                                best_idx = Some(idx);
+                            }
+                        }
+                    }
+                    if let Some(idx) = best_idx {
+                        dx[idx] += dy[out_chan + ho * w_out + wo];
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod maxpool_tests {
+    use super::*;
+
+    #[test]
+    fn maxpool2d_backward_scatters_to_argmax() {
+        let x = [1.0, 3.0, 2.0, 0.0];
+        let dy = [2.0];
+        let mut dx = [0.0; 4];
+        maxpool2d_backward_nchw(&x, &dy, &mut dx, 1, 1, 2, 2, 1, 1, 2, 2, 2, 2, 0, 0);
+        assert_eq!(dx, [0.0, 2.0, 0.0, 0.0]);
     }
 }

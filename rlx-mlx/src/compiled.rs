@@ -63,7 +63,14 @@ impl CompiledFn {
     /// Compile `graph` once and return a handle that replays the
     /// optimized trace on subsequent calls.
     pub fn compile(graph: Graph) -> Result<Self, MlxError> {
-        let leaf_order = lower::leaf_order(&graph);
+        if let Some(op) = lower::first_host_eval_op(&graph) {
+            return Err(MlxError(format!(
+                "rlx-mlx: graph contains `{op}` whose lowering evaluates a tensor on the host; \
+                 mlx::compile forbids eval inside its trace. Use MlxMode::Lazy for this graph, \
+                 or pre-dequantize the affected weights at load time."
+            )));
+        }
+        let leaf_order = lower::compile_leaf_order(&graph);
         let state = Box::new(CompiledState {
             graph,
             leaf_order: leaf_order.clone(),
@@ -102,8 +109,8 @@ impl CompiledFn {
             )));
         }
         let in_handles: Vec<*mut mlx_array_t> = inputs.iter().map(|a| a.ptr).collect();
-        const CAP: usize = 64;
-        let mut out_handles: Vec<*mut mlx_array_t> = vec![ptr::null_mut(); CAP];
+        let cap = crate::config::compile_output_cap();
+        let mut out_handles: Vec<*mut mlx_array_t> = vec![ptr::null_mut(); cap];
         let mut n_out: usize = 0;
         let rc = unsafe {
             ffi::rlx_mlx_compiled_call(
@@ -111,7 +118,7 @@ impl CompiledFn {
                 in_handles.as_ptr(),
                 in_handles.len(),
                 out_handles.as_mut_ptr(),
-                CAP,
+                cap,
                 &mut n_out,
             )
         };
@@ -201,6 +208,7 @@ fn run_callback(
     for ((id, _key), &ptr) in state.leaf_order.iter().zip(in_slice) {
         env.insert(*id, Array::from_raw(ptr));
     }
+    env = lower::expand_leaf_env(&state.graph, env)?;
     // Compile mode passes empty param maps — sub-graphs that
     // reference parent params won't work in this trace context.
     // Op::If / Op::While inside a compiled trace will fail to find
@@ -218,6 +226,17 @@ fn run_callback(
             cap
         )));
     }
+
+    // Materialize each output via `contiguous`: mlx::compile elides
+    // pure-view ops (transpose, slice, reshape) when they sit at the
+    // graph boundary, which causes downstream `to_f32` to read the
+    // pre-view buffer (reshape_transpose_match_reference repro).
+    // `contiguous` forces a real memory rewrite so the cached trace
+    // produces the same bytes Lazy mode does.
+    let outs: Vec<Array> = outs
+        .into_iter()
+        .map(|a| crate::ops::contiguous(&a))
+        .collect::<Result<_, _>>()?;
 
     // Hand handles back to C++; forget wrappers so Drop doesn't run.
     let count = outs.len();

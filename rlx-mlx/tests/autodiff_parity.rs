@@ -17,7 +17,7 @@
 //! its output matches a hand-computed reference. Mirrors the formulas
 //! in `rlx-cpu/src/thunk.rs` so a regression in either side surfaces.
 
-#![cfg(target_os = "macos")]
+#![cfg(rlx_mlx_host)]
 
 use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Op, Shape};

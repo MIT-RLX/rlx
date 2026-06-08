@@ -97,3 +97,6 @@ This is a **forward-pass latency** harness. It does not measure:
 - peak memory
 
 For those, build a separate harness — this one is small on purpose.
+## License
+
+GPL-3.0-only.

@@ -26,6 +26,8 @@ use rlx_ir::lir::LirModule;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cpu_low_precision;
+
 // ── Typed I/O helpers (shared across f32-arena backends) ────────────────
 
 /// Widen a typed byte buffer to `Vec<f32>`. Used by `set_param_typed` /
@@ -160,6 +162,24 @@ pub trait ExecutableGraph: Send {
     /// Execute the graph with named inputs. Returns output data (copies from arena).
     fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>>;
 
+    /// Like [`Self::run`] but only read back outputs at `read_indices`.
+    /// GPU handle feeds still update for every output. Default: all outputs.
+    fn run_read_outputs(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        read_indices: Option<&[usize]>,
+    ) -> Vec<Vec<f32>> {
+        match read_indices {
+            None => self.run(inputs),
+            Some(ix) => {
+                // Backends without a native partial-read path still run the full
+                // graph; only clone the requested outputs on the host.
+                let all = self.run(inputs);
+                ix.iter().filter_map(|&i| all.get(i).cloned()).collect()
+            }
+        }
+    }
+
     /// Execute and return raw pointers to output data in arena (zero-copy).
     fn run_raw(&mut self, inputs: &[(&str, &[f32])]) -> Vec<(*const f32, usize)> {
         let vecs = self.run(inputs);
@@ -244,6 +264,12 @@ pub trait ExecutableGraph: Send {
     }
 
     fn read_gpu_handle(&self, _name: &str) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Read one row from a row-major graph output after `run` / `run_read_outputs`.
+    /// Metal reads a single row from the arena; default returns `None` (caller falls back).
+    fn read_output_row(&self, _out_idx: usize, _row: usize, _row_inner: usize) -> Option<Vec<f32>> {
         None
     }
 
@@ -448,17 +474,24 @@ fn prepare_fused_graph(
             rlx_opt::format_dispatch_report(&report)
         );
     }
-    use rlx_opt::pass::Pass as _;
-    if options.dce {
-        graph = rlx_opt::DeadCodeElimination.run(graph);
-    }
-    if options.constant_folding {
-        graph = rlx_opt::ConstantFolding.run(graph);
-    }
+    graph = crate::precompile::post_fusion_cleanup(graph, options);
     if let Some(p) = options.policy.clone() {
+        use rlx_opt::pass::Pass as _;
         graph = rlx_opt::AutoMixedPrecision::new(p).run(graph);
     }
     graph
+}
+
+#[allow(dead_code)]
+fn declared_output_dtypes(
+    manifest: &cpu_low_precision::IoDtypeManifest,
+    exec_dtypes: Vec<rlx_ir::DType>,
+) -> Vec<rlx_ir::DType> {
+    exec_dtypes
+        .into_iter()
+        .enumerate()
+        .map(|(i, exec)| manifest.output_dtype(i, exec))
+        .collect()
 }
 
 // ── Convenience helpers preserved from older API ──────────────────────
@@ -541,6 +574,7 @@ pub mod cpu_backend {
             Constant,
             Activation,
             Cast,
+            StopGradient,
             Binary,
             Compare,
             Where,
@@ -555,6 +589,7 @@ pub mod cpu_backend {
             LayerNorm,
             LayerNorm2d,
             GroupNorm,
+            BatchNormInference,
             RmsNorm,
             ResizeNearest2x,
             AxialRope2d,
@@ -572,6 +607,7 @@ pub mod cpu_backend {
             TopK,
             Sample,
             Conv,
+            Im2Col,
             ConvTranspose2d,
             Pool,
             GroupedMatMul,
@@ -603,6 +639,9 @@ pub mod cpu_backend {
             AttentionBackward,
             LayerNormBackwardInput,
             LayerNormBackwardGamma,
+            BatchNormInferenceBackwardInput,
+            BatchNormInferenceBackwardGamma,
+            BatchNormInferenceBackwardBeta,
             RmsNormBackwardInput,
             RmsNormBackwardGamma,
             RmsNormBackwardBeta,
@@ -626,6 +665,9 @@ pub mod cpu_backend {
             // power-of-2 sizes). Other backends panic at lowering;
             // pin FFT-containing graphs to Device::Cpu for now.
             Fft,
+            FftButterflyStage,
+            LogMel,
+            LogMelBackward,
             // C64 Wirtinger AD surface. ComplexNormSq is the canonical
             // real-valued loss for complex inputs; Conjugate is emitted
             // by the new Wirtinger VJP rules for BinaryOp::Mul/Div on
@@ -659,17 +701,7 @@ pub mod cpu_backend {
             let _precision = options.precision;
             let cfg = rlx_cpu::config::RuntimeConfig::global();
 
-            // Optional preliminary cleanup passes
-            let graph = if options.dce {
-                rlx_opt::DeadCodeElimination.run(graph)
-            } else {
-                graph
-            };
-            let graph = if options.constant_folding {
-                rlx_opt::ConstantFolding.run(graph)
-            } else {
-                graph
-            };
+            let graph = crate::precompile::precompile_cleanup(graph, options);
 
             // Run fusion pipeline (HIR/MIR/LIR ideology — fusion is first-class).
             let mut compile_opts = options.clone();
@@ -690,8 +722,15 @@ pub mod cpu_backend {
                 None => fused,
             };
 
+            let io_manifest = cpu_low_precision::IoDtypeManifest::from_graph(&fused);
+            let exec_graph = if cpu_low_precision::needs_f32_exec(&fused) {
+                cpu_low_precision::promote_to_f32(fused)
+            } else {
+                fused
+            };
+
             // Re-plan after precision rewrites (may change dtypes / sizes).
-            let plan = memory::plan_memory_aligned(&fused, cfg.arena_alignment);
+            let plan = memory::plan_memory_aligned(&exec_graph, cfg.arena_alignment);
             if cfg.verbose >= 1 {
                 eprintln!(
                     "[rlx] arena: {} bytes, {} buffers, alignment: {}",
@@ -700,7 +739,7 @@ pub mod cpu_backend {
                     cfg.arena_alignment
                 );
             }
-            Box::new(build_cpu_executable(fused, plan))
+            Box::new(build_cpu_executable(exec_graph, plan, io_manifest))
         }
 
         fn compile_lir(
@@ -709,17 +748,25 @@ pub mod cpu_backend {
             options: &CompileOptions,
         ) -> Box<dyn ExecutableGraph> {
             let alignment = lir.buffers.alignment.max(options.arena_alignment);
-            let embedded: MemoryPlan = (&lir.buffers).into();
             let mut graph = lir.into_graph();
+            {
+                use rlx_opt::pass::Pass as _;
+                graph = rlx_opt::LegalizeBroadcast.run(graph);
+            }
             if let Some(p) = options.policy.clone() {
                 use rlx_opt::pass::Pass;
                 graph = rlx_opt::AutoMixedPrecision::new(p).run(graph);
             }
-            let plan = if options.policy.is_some() {
-                memory::plan_memory_aligned(&graph, alignment)
+            let io_manifest = cpu_low_precision::IoDtypeManifest::from_graph(&graph);
+            let promote = cpu_low_precision::needs_f32_exec(&graph);
+            let exec_graph = if promote {
+                cpu_low_precision::promote_to_f32(graph)
             } else {
-                embedded
+                graph
             };
+            // LegalizeBroadcast may insert Expand nodes — must replan; the
+            // embedded LIR buffer map is from before legalization.
+            let plan = memory::plan_memory_aligned(&exec_graph, alignment);
             let cfg = rlx_cpu::config::RuntimeConfig::global();
             if cfg.verbose >= 1 {
                 eprintln!(
@@ -729,11 +776,15 @@ pub mod cpu_backend {
                     alignment,
                 );
             }
-            Box::new(build_cpu_executable(graph, plan))
+            Box::new(build_cpu_executable(exec_graph, plan, io_manifest))
         }
     }
 
-    fn build_cpu_executable(graph: Graph, plan: MemoryPlan) -> CpuExecutable {
+    fn build_cpu_executable(
+        graph: Graph,
+        plan: MemoryPlan,
+        io_manifest: cpu_low_precision::IoDtypeManifest,
+    ) -> CpuExecutable {
         let mut arena = Arena::from_plan(plan);
         let mut input_ids = HashMap::new();
         let mut param_ids = HashMap::new();
@@ -778,7 +829,7 @@ pub mod cpu_backend {
                 && !data.is_empty()
             {
                 match node.shape.dtype() {
-                    DType::F64 => {
+                    DType::F64 | DType::F16 | DType::BF16 => {
                         let off = arena.byte_offset(node.id);
                         let buf = arena.raw_buf_mut();
                         let n = buf.len().saturating_sub(off).min(data.len());
@@ -806,9 +857,11 @@ pub mod cpu_backend {
             graph,
             arena,
             params: HashMap::new(),
+            typed_params: HashMap::new(),
             input_ids,
             param_ids,
             node_dtypes,
+            io_manifest,
             schedule,
             input_slots,
             output_slots,
@@ -825,11 +878,15 @@ pub mod cpu_backend {
         graph: Graph,
         arena: Arena,
         params: HashMap<String, Vec<f32>>,
+        /// Byte-backed params (`set_param_typed` / `set_param_bytes`).
+        typed_params: HashMap<String, (Vec<u8>, DType)>,
         input_ids: HashMap<String, NodeId>,
         param_ids: HashMap<String, NodeId>,
         /// Per-node arena dtype. Lets set_param/run cast f32 ↔ F16/BF16
         /// when AutoMixedPrecision has rewritten the graph.
         node_dtypes: HashMap<NodeId, DType>,
+        /// User-facing boundary dtypes (before f32 promotion for CPU exec).
+        io_manifest: cpu_low_precision::IoDtypeManifest,
         schedule: thunk::ThunkSchedule,
         // Pre-resolved: ordered list of (input_name, arena_byte_offset, max_elems, dtype)
         input_slots: Vec<(String, usize, usize, DType)>,
@@ -881,6 +938,8 @@ pub mod cpu_backend {
             Box::new(self.clone())
         }
         fn set_param(&mut self, name: &str, data: &[f32]) {
+            self.params.insert(name.to_string(), data.to_vec());
+            self.typed_params.remove(name);
             // Write directly into the arena — zero per-call lookup for params.
             // Cast f32 → arena dtype when the param has been rewritten to F16/BF16.
             if let Some(&id) = self.param_ids.get(name)
@@ -894,13 +953,11 @@ pub mod cpu_backend {
                 unsafe {
                     write_typed_from_f32(buf.as_mut_ptr().add(off), dtype, data, max_elems);
                 }
-                return;
             }
-            // Fallback: store in HashMap if no arena slot
-            self.params.insert(name.to_string(), data.to_vec());
         }
 
         fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+            self.restore_arena_baseline();
             // 1. Apply persistent handles first — they act like default inputs.
             //    Explicit `inputs` passed to run() override matching handle names.
             let handle_names: Vec<String> = self.handles.keys().cloned().collect();
@@ -959,6 +1016,7 @@ pub mod cpu_backend {
         }
 
         fn run_raw(&mut self, inputs: &[(&str, &[f32])]) -> Vec<(*const f32, usize)> {
+            self.restore_arena_baseline();
             // Copy inputs by name (HashMap lookup), casting to arena dtype.
             for &(name, data) in inputs {
                 if let Some(&id) = self.input_ids.get(name)
@@ -985,6 +1043,7 @@ pub mod cpu_backend {
         /// No HashMap, no name matching, no Vec allocation. Casts f32 input
         /// to F16/BF16 if the input slot's dtype was rewritten.
         fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
+            self.restore_arena_baseline();
             let buf = self.arena.raw_buf_mut();
             for (i, &data) in inputs.iter().enumerate() {
                 if i < self.input_slots.len() {
@@ -1062,7 +1121,7 @@ pub mod cpu_backend {
         /// non-widenable dtype) lands directly in the arena as bytes —
         /// the f32 path would lose precision.
         fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
-            if dtype == DType::F64 {
+            if matches!(dtype, DType::F64 | DType::I64 | DType::I32 | DType::U32) {
                 self.set_param_bytes(name, data, dtype);
                 return;
             }
@@ -1128,7 +1187,10 @@ pub mod cpu_backend {
                 // route through widen-to-f32 + run.
                 let mut f32_owned: Vec<(String, Vec<f32>)> = Vec::new();
                 for (name, data, dt) in inputs {
-                    let direct = matches!(*dt, DType::F64 | DType::I32 | DType::I64 | DType::U32,);
+                    let direct = matches!(
+                        *dt,
+                        DType::F64 | DType::I32 | DType::I64 | DType::U32 | DType::C64
+                    );
                     if direct {
                         if let Some(&id) = self.input_ids.get(*name) {
                             if !self.arena.has_buffer(id) {
@@ -1143,36 +1205,148 @@ pub mod cpu_backend {
                         f32_owned.push((name.to_string(), v));
                     }
                 }
-                let refs: Vec<(&str, &[f32])> = f32_owned
-                    .iter()
-                    .map(|(n, d)| (n.as_str(), d.as_slice()))
-                    .collect();
-                let _ = self.run(&refs);
+                for (name, data) in &f32_owned {
+                    if let Some(&id) = self.input_ids.get(name.as_str()) {
+                        if self.arena.has_buffer(id) {
+                            self.write_input(id, data);
+                        }
+                    }
+                }
+                let active_used = if let Some((actual, upper)) = self.active_extent {
+                    thunk::execute_thunks_active(
+                        &self.schedule,
+                        self.arena.raw_buf_mut(),
+                        actual,
+                        upper,
+                    )
+                } else {
+                    false
+                };
+                if !active_used {
+                    thunk::execute_thunks(&self.schedule, self.arena.raw_buf_mut());
+                }
             }
 
-            // Read each output's bytes from the arena in its declared dtype.
+            // Read outputs in declared boundary dtypes.
             self.graph
                 .outputs
                 .iter()
-                .map(|&id| {
-                    let dtype = self.graph.node(id).shape.dtype();
-                    let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
-                    let n_bytes = n_elems * dtype.size_bytes();
-                    let off = self.arena.byte_offset(id);
-                    let bytes = self.arena.raw_buf()[off..off + n_bytes].to_vec();
-                    (bytes, dtype)
+                .enumerate()
+                .map(|(idx, &id)| {
+                    let exec_dtype = self.graph.node(id).shape.dtype();
+                    let declared = self.io_manifest.output_dtype(idx, exec_dtype);
+                    if matches!(
+                        exec_dtype,
+                        DType::F64
+                            | DType::F16
+                            | DType::BF16
+                            | DType::I32
+                            | DType::I64
+                            | DType::U32
+                            | DType::C64
+                    ) {
+                        let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+                        let n_bytes = n_elems * exec_dtype.size_bytes();
+                        let off = self.arena.byte_offset(id);
+                        let bytes = self.arena.raw_buf()[off..off + n_bytes].to_vec();
+                        return (bytes, declared);
+                    }
+                    let f32_vals = self.read_output(id);
+                    if declared != exec_dtype {
+                        return (super::narrow_f32_to_bytes(&f32_vals, declared), declared);
+                    }
+                    let bytes = f32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    (bytes, declared)
                 })
                 .collect()
         }
     }
 
     impl CpuExecutable {
+        /// Clear ephemeral arena slots, then restore compile-time constants
+        /// and cached params. Intermediate buffers are reused across `run()`
+        /// calls; without this reset, a second execution can read stale data
+        /// from the previous pass.
+        fn restore_arena_baseline(&mut self) {
+            self.arena.raw_buf_mut().fill(0);
+            let constants: Vec<(NodeId, DType, Vec<u8>)> = self
+                .graph
+                .nodes()
+                .iter()
+                .filter_map(|node| {
+                    if let Op::Constant { data } = &node.op
+                        && self.arena.has_buffer(node.id)
+                        && !data.is_empty()
+                    {
+                        Some((node.id, node.shape.dtype(), data.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (id, dtype, data) in constants {
+                self.write_constant_to_arena(id, dtype, &data);
+            }
+            let params = self.params.clone();
+            for (name, data) in params {
+                if let Some(&id) = self.param_ids.get(&name)
+                    && self.arena.has_buffer(id)
+                {
+                    let dtype = self.node_dtypes.get(&id).copied().unwrap_or(DType::F32);
+                    let off = self.arena.byte_offset(id);
+                    let buf = self.arena.raw_buf_mut();
+                    let elem_size = dtype.size_bytes();
+                    let max_elems = (buf.len() - off) / elem_size;
+                    unsafe {
+                        write_typed_from_f32(buf.as_mut_ptr().add(off), dtype, &data, max_elems);
+                    }
+                }
+            }
+            let typed = self.typed_params.clone();
+            for (name, (data, dtype)) in typed {
+                self.write_param_bytes_to_arena(&name, &data);
+                let _ = dtype;
+            }
+        }
+
+        fn write_constant_to_arena(&mut self, id: NodeId, dtype: DType, data: &[u8]) {
+            match dtype {
+                DType::F64 | DType::F16 | DType::BF16 | DType::U8 | DType::I8 => {
+                    let off = self.arena.byte_offset(id);
+                    let buf = self.arena.raw_buf_mut();
+                    let n = buf.len().saturating_sub(off).min(data.len());
+                    buf[off..off + n].copy_from_slice(&data[..n]);
+                }
+                _ => {
+                    let buf = self.arena.slice_mut(id);
+                    let n_floats = data.len() / 4;
+                    let n = buf.len().min(n_floats);
+                    for i in 0..n {
+                        let bytes = [
+                            data[i * 4],
+                            data[i * 4 + 1],
+                            data[i * 4 + 2],
+                            data[i * 4 + 3],
+                        ];
+                        buf[i] = f32::from_le_bytes(bytes);
+                    }
+                }
+            }
+        }
+
         /// Direct-byte param upload — copies caller's bytes into the
         /// arena slot for the named param without any dtype conversion.
         /// Used by `set_param_typed` for dtypes that f32-widening would
         /// corrupt (F64). Caller is responsible for matching the param's
         /// declared graph dtype.
-        fn set_param_bytes(&mut self, name: &str, data: &[u8], _dtype: rlx_ir::DType) {
+        fn set_param_bytes(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+            self.typed_params
+                .insert(name.to_string(), (data.to_vec(), dtype));
+            self.params.remove(name);
+            self.write_param_bytes_to_arena(name, data);
+        }
+
+        fn write_param_bytes_to_arena(&mut self, name: &str, data: &[u8]) {
             if let Some(&id) = self.param_ids.get(name)
                 && self.arena.has_buffer(id)
             {
@@ -1211,10 +1385,13 @@ pub mod wgpu_backend {
         OpKind::Constant,
         OpKind::Activation,
         OpKind::Cast,
+        OpKind::StopGradient,
         OpKind::Binary,
         OpKind::Compare,
         OpKind::Where,
         OpKind::ElementwiseRegion,
+        OpKind::TransformRegion,
+        OpKind::BatchElementwiseRegion,
         OpKind::MatMul,
         OpKind::DotGeneral,
         OpKind::LayerNorm,
@@ -1224,6 +1401,14 @@ pub mod wgpu_backend {
         OpKind::RmsNormBackwardInput,
         OpKind::RmsNormBackwardGamma,
         OpKind::RmsNormBackwardBeta,
+        // LayerNorm backward family:
+        //   * Input  — single workgroup-per-row fused kernel.
+        //   * Gamma  — two-dispatch (partial + reduce) that uses a tail
+        //              scratch zone in the arena to hold per-chunk
+        //              partial sums; the reduce kernel sums them.
+        // Both beat the autodiff-decomposed primitive chain.
+        OpKind::LayerNormBackwardInput,
+        OpKind::LayerNormBackwardGamma,
         OpKind::RopeBackward,
         OpKind::CumsumBackward,
         OpKind::GatherBackward,
@@ -1240,6 +1425,7 @@ pub mod wgpu_backend {
         OpKind::TopK,
         OpKind::Sample,
         OpKind::Conv,
+        OpKind::Im2Col,
         OpKind::Pool,
         OpKind::GroupedMatMul,
         OpKind::DequantGroupedMatMul,
@@ -1259,6 +1445,8 @@ pub mod wgpu_backend {
         // unified memory, so silent CPU round-trip would be a hidden
         // performance cliff.
         OpKind::Fft,
+        OpKind::LogMel,
+        OpKind::LogMelBackward,
         // 3D Gaussian splat: native Metal / CPU reference per backend.
         OpKind::GaussianSplatRender,
         OpKind::GaussianSplatRenderBackward,
@@ -1280,17 +1468,11 @@ pub mod wgpu_backend {
                 .unwrap_or_else(|errors| {
                     panic!("{}", rlx_opt::format_legalize_error("wgpu", &errors));
                 });
-            // Cleanup passes upstream of wgpu's pipeline.
-            let graph = if options.dce {
-                rlx_opt::DeadCodeElimination.run(graph)
-            } else {
-                graph
-            };
-            let graph = if options.constant_folding {
-                rlx_opt::ConstantFolding.run(graph)
-            } else {
-                graph
-            };
+            let graph = crate::precompile::precompile_cleanup(graph, options);
+            // Materialize mid-axis broadcasts before MarkElementwiseRegions:
+            // wgpu Binary/region kernels only handle trailing/scalar broadcast
+            // via modulus; EEG patch embed uses [1,C,1,D] + [1,C,P,D].
+            let graph = rlx_opt::LegalizeBroadcast.run(graph);
             // ORDER MATTERS: targeted-pattern fusions run BEFORE the
             // catch-all `MarkElementwiseRegions`. Otherwise the region
             // pass swallows the Add / Activation nodes into chains and
@@ -1311,8 +1493,10 @@ pub mod wgpu_backend {
                 Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
                 None => graph,
             };
+            let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
             Box::new(WgpuExecutableWrapper {
                 inner: WgpuExecutable::compile(graph),
+                io_manifest,
             })
         }
 
@@ -1321,15 +1505,22 @@ pub mod wgpu_backend {
             lir: LirModule,
             options: &CompileOptions,
         ) -> Box<dyn ExecutableGraph> {
-            let graph = prepare_fused_graph(lir.into_graph(), options, WGPU_SUPPORTED_OPS, "wgpu");
+            use rlx_opt::pass::Pass as _;
+            // LIR may already contain fused ElementwiseRegions; legalize
+            // broadcasts on the unfused graph shape before backend prep.
+            let graph = rlx_opt::LegalizeBroadcast.run(lir.into_graph());
+            let graph = prepare_fused_graph(graph, options, WGPU_SUPPORTED_OPS, "wgpu");
+            let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
             Box::new(WgpuExecutableWrapper {
                 inner: WgpuExecutable::compile(graph),
+                io_manifest,
             })
         }
     }
 
     struct WgpuExecutableWrapper {
         inner: WgpuExecutable,
+        io_manifest: cpu_low_precision::IoDtypeManifest,
     }
 
     unsafe impl Send for WgpuExecutableWrapper {}
@@ -1340,6 +1531,26 @@ pub mod wgpu_backend {
         }
         fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
             self.inner.run(inputs)
+        }
+        fn run_read_outputs(
+            &mut self,
+            inputs: &[(&str, &[f32])],
+            read_indices: Option<&[usize]>,
+        ) -> Vec<Vec<f32>> {
+            self.inner.run_read_outputs(inputs, read_indices)
+        }
+        fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
+            self.inner.bind_gpu_handle(name, data)
+        }
+        fn has_gpu_handle(&self, name: &str) -> bool {
+            self.inner.has_gpu_handle(name)
+        }
+        fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+            self.inner.set_gpu_handle_feed(handle_name, output_index);
+            true
+        }
+        fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
+            self.inner.read_gpu_handle(name)
         }
         fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
             self.inner.set_active_extent(extent);
@@ -1418,7 +1629,8 @@ pub mod wgpu_backend {
                 .iter()
                 .map(|(n, d)| (n.as_str(), d.as_slice()))
                 .collect();
-            let dtypes = self.inner.output_dtypes();
+            let dtypes =
+                super::declared_output_dtypes(&self.io_manifest, self.inner.output_dtypes());
             let outs = self.inner.run(&refs);
             outs.into_iter()
                 .zip(
@@ -1520,7 +1732,7 @@ pub mod wgpu_backend {
 
 // ── MLX Backend ─────────────────────────────────────────────────────────
 
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(all(feature = "mlx", rlx_mlx_host))]
 pub mod mlx_backend {
     use super::*;
     use rlx_mlx::MlxExecutable;
@@ -1532,6 +1744,10 @@ pub mod mlx_backend {
     /// including If/While via topo unrolling, and lowers
     /// ElementwiseRegion natively via the per-step composition in
     /// rlx-mlx/src/lower.rs (PLAN L2).
+    ///
+    /// `GroupNorm` / `BatchNormInference` are intentionally omitted — lowered
+    /// to primitives via [`LowerGroupNorm`] / [`LowerBatchNormInference`]
+    /// before MLX lowering (no native MLX kernel).
     const MLX_SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         use rlx_ir::OpKind::*;
         &[
@@ -1540,16 +1756,20 @@ pub mod mlx_backend {
             Constant,
             Activation,
             Cast,
+            StopGradient,
             Binary,
             Compare,
             Where,
             ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
             MatMul,
             DotGeneral,
             DenseSolve,
             BatchedDenseSolve,
             LayerNorm,
             LayerNorm2d,
+            ResizeNearest2x,
             RmsNorm,
             Attention,
             Rope,
@@ -1621,6 +1841,8 @@ pub mod mlx_backend {
             // to produce the lazy MLX `Array` for this node.
             Custom,
             Fft,
+            LogMel,
+            LogMelBackward,
             GaussianSplatRender,
             GaussianSplatRenderBackward,
             // Op::Fft on MLX: native `mlx::fft::fft` via rlx_mlx_op_fft shim.
@@ -1658,6 +1880,7 @@ pub mod mlx_backend {
     }
 
     fn build_mlx_executable(graph: Graph) -> MlxExecutableWrapper {
+        let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
         let mode = mlx_mode_from_env();
         let mut exe = MlxExecutable::compile_from_fused(graph, mode);
         if mode == rlx_mlx::lower::MlxMode::Compiled {
@@ -1667,7 +1890,10 @@ pub mod mlx_backend {
                 );
             }
         }
-        MlxExecutableWrapper { inner: exe }
+        MlxExecutableWrapper {
+            inner: exe,
+            io_manifest,
+        }
     }
 
     fn mlx_mode_from_env() -> rlx_mlx::lower::MlxMode {
@@ -1681,6 +1907,7 @@ pub mod mlx_backend {
 
     struct MlxExecutableWrapper {
         inner: MlxExecutable,
+        io_manifest: cpu_low_precision::IoDtypeManifest,
     }
 
     unsafe impl Send for MlxExecutableWrapper {}
@@ -1691,6 +1918,15 @@ pub mod mlx_backend {
         }
         fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
             self.inner.run(inputs)
+        }
+        fn run_read_outputs(
+            &mut self,
+            inputs: &[(&str, &[f32])],
+            read_indices: Option<&[usize]>,
+        ) -> Vec<Vec<f32>> {
+            self.inner
+                .run_read_outputs(inputs, read_indices)
+                .unwrap_or_else(|e| panic!("MLX run_read_outputs failed: {e}"))
         }
         fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
             self.inner.run_slots(inputs)
@@ -1743,7 +1979,29 @@ pub mod mlx_backend {
             &mut self,
             inputs: &[(&str, &[u8], rlx_ir::DType)],
         ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
-            self.inner.run_typed(inputs)
+            let mut owned: Vec<(String, Vec<f32>)> = Vec::with_capacity(inputs.len());
+            for (name, data, dt) in inputs {
+                let v = super::widen_bytes_to_f32(data, *dt);
+                owned.push((name.to_string(), v));
+            }
+            let refs: Vec<(&str, &[f32])> = owned
+                .iter()
+                .map(|(n, d)| (n.as_str(), d.as_slice()))
+                .collect();
+            let f32_outs = self.inner.run(&refs);
+            let declared = super::declared_output_dtypes(
+                &self.io_manifest,
+                (0..f32_outs.len()).map(|_| rlx_ir::DType::F32).collect(),
+            );
+            f32_outs
+                .into_iter()
+                .zip(
+                    declared
+                        .into_iter()
+                        .chain(std::iter::repeat(rlx_ir::DType::F32)),
+                )
+                .map(|(v, dt)| (super::narrow_f32_to_bytes(&v, dt), dt))
+                .collect()
         }
         fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
             self.inner.set_active_extent(extent);
@@ -1766,6 +2024,7 @@ pub mod metal_backend {
     /// not yet wired in `rlx-metal/src/thunk.rs`'s compile_thunks.
     /// DequantMatMul (GGUF K-quants) lowers to a GPU dequant kernel
     /// + MPS matmul; legacy Int8 schemes remain CPU-only.
+    ///
     const METAL_SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         use rlx_ir::OpKind::*;
         &[
@@ -1774,10 +2033,13 @@ pub mod metal_backend {
             Constant,
             Activation,
             Cast,
+            StopGradient,
             Binary,
             Compare,
             Where,
             ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
             MatMul,
             DotGeneral,
             LayerNorm,
@@ -1794,6 +2056,9 @@ pub mod metal_backend {
             RopeBackward,
             CumsumBackward,
             GatherBackward,
+            Conv2dBackwardInput,
+            Conv2dBackwardWeight,
+            MaxPool2dBackward,
             Rope,
             Reshape,
             Transpose,
@@ -1805,6 +2070,7 @@ pub mod metal_backend {
             Softmax,
             TopK,
             Conv,
+            Im2Col,
             ConvTranspose2d,
             Pool,
             GroupedMatMul,
@@ -1829,6 +2095,8 @@ pub mod metal_backend {
             // compute kernel will replace this when a workload makes
             // the sync the bottleneck.
             Fft,
+            LogMel,
+            LogMelBackward,
             // Host-fallback splat (unified-memory arena + rlx-cpu/splat).
             GaussianSplatRender,
             GaussianSplatRenderBackward,
@@ -1848,7 +2116,7 @@ pub mod metal_backend {
             // (Metal also has no native sub-graph executor wired
             // through its thunk schedule).
             let graph = rlx_opt::LowerControlFlow.run(graph);
-            let mut dispatch = options.kernel_dispatch;
+            let dispatch = options.kernel_dispatch;
             let graph = rlx_opt::legalize_or_rewrite_for_backend_with_config(
                 graph,
                 METAL_SUPPORTED_OPS,
@@ -1857,26 +2125,18 @@ pub mod metal_backend {
             .unwrap_or_else(|errors| {
                 panic!("{}", rlx_opt::format_legalize_error("metal", &errors));
             });
-            // Optional cleanup passes upstream of Metal's pipeline
-            let graph = if options.dce {
-                rlx_opt::DeadCodeElimination.run(graph)
-            } else {
-                graph
-            };
-            let graph = if options.constant_folding {
-                rlx_opt::ConstantFolding.run(graph)
-            } else {
-                graph
-            };
+            let graph = crate::precompile::precompile_cleanup(graph, options);
 
             // Hand the policy to MetalExecutable so the rewrite runs AFTER
             // its internal fusion passes (avoids breaking pattern matchers).
+            let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
             Box::new(MetalExecutableWrapper {
                 inner: MetalExecutable::compile_with_policy(
                     graph,
                     options.policy.clone(),
                     Some(METAL_SUPPORTED_OPS),
                 ),
+                io_manifest,
             })
         }
 
@@ -1888,7 +2148,7 @@ pub mod metal_backend {
             use rlx_opt::pass::Pass as _;
             let mut graph = lir.into_graph();
             graph = rlx_opt::LowerControlFlow.run(graph);
-            let mut dispatch = options.kernel_dispatch;
+            let dispatch = options.kernel_dispatch;
             let mut graph = rlx_opt::legalize_or_rewrite_for_backend_with_config(
                 graph,
                 METAL_SUPPORTED_OPS,
@@ -1897,24 +2157,22 @@ pub mod metal_backend {
             .unwrap_or_else(|errors| {
                 panic!("{}", rlx_opt::format_legalize_error("metal", &errors));
             });
-            if options.dce {
-                graph = rlx_opt::DeadCodeElimination.run(graph);
-            }
-            if options.constant_folding {
-                graph = rlx_opt::ConstantFolding.run(graph);
-            }
+            graph = crate::precompile::precompile_cleanup(graph, options);
+            let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
             Box::new(MetalExecutableWrapper {
                 inner: MetalExecutable::compile_from_fused(
                     graph,
                     options.policy.clone(),
                     Some(METAL_SUPPORTED_OPS),
                 ),
+                io_manifest,
             })
         }
     }
 
     struct MetalExecutableWrapper {
         inner: MetalExecutable,
+        io_manifest: cpu_low_precision::IoDtypeManifest,
     }
 
     unsafe impl Send for MetalExecutableWrapper {}
@@ -1925,6 +2183,34 @@ pub mod metal_backend {
         }
         fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
             self.inner.run(inputs)
+        }
+        fn run_read_outputs(
+            &mut self,
+            inputs: &[(&str, &[f32])],
+            read_indices: Option<&[usize]>,
+        ) -> Vec<Vec<f32>> {
+            self.inner.run_read_outputs(inputs, read_indices)
+        }
+        fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
+            self.inner.bind_gpu_handle(name, data)
+        }
+        fn has_gpu_handle(&self, name: &str) -> bool {
+            self.inner.has_gpu_handle(name)
+        }
+        fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+            self.inner.set_gpu_handle_feed(handle_name, output_index);
+            true
+        }
+        fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
+            self.inner.read_gpu_handle(name)
+        }
+        fn read_output_row(
+            &self,
+            out_idx: usize,
+            row: usize,
+            row_inner: usize,
+        ) -> Option<Vec<f32>> {
+            Some(self.inner.read_graph_output_row(out_idx, row, row_inner))
         }
         fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
             self.inner.run_slots(inputs)
@@ -1985,7 +2271,8 @@ pub mod metal_backend {
                 .iter()
                 .map(|(n, d)| (n.as_str(), d.as_slice()))
                 .collect();
-            let dtypes = self.inner.output_dtypes();
+            let dtypes =
+                super::declared_output_dtypes(&self.io_manifest, self.inner.output_dtypes());
             let f32_outs = self.inner.run(&refs);
             let byte_outs = self.inner.output_bytes_per_node();
             f32_outs
@@ -2031,10 +2318,249 @@ pub mod cuda_backend {
             Compare,
             Where,
             ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
             MatMul,
             DotGeneral,
             LayerNorm,
             LayerNorm2d,
+            GroupNorm,
+            ResizeNearest2x,
+            RmsNorm,
+            Attention,
+            AttentionBackward,
+            RmsNormBackwardInput,
+            RmsNormBackwardGamma,
+            RmsNormBackwardBeta,
+            RopeBackward,
+            CumsumBackward,
+            GatherBackward,
+            Conv2dBackwardInput,
+            Conv2dBackwardWeight,
+            MaxPool2dBackward,
+            Rope,
+            Reshape,
+            Transpose,
+            Narrow,
+            Concat,
+            Expand,
+            Gather,
+            Reduce,
+            Softmax,
+            Cumsum,
+            TopK,
+            Sample,
+            Conv,
+            ConvTranspose2d,
+            Pool,
+            GroupedMatMul,
+            DequantGroupedMatMul,
+            DequantMoEWeights,
+            ScatterAdd,
+            DequantMatMul,
+            SelectiveScan,
+            FusedMatMulBiasAct,
+            FusedResidualLN,
+            FusedResidualRmsNorm,
+            GaussianSplatRender,
+            GaussianSplatRenderBackward,
+            GaussianSplatPrepare,
+            GaussianSplatRasterize,
+            Custom,
+            Fft,
+            LogMel,
+            LogMelBackward,
+            Im2Col,
+        ]
+    };
+
+    impl Backend for CudaBackend {
+        fn supported_ops(&self) -> &'static [rlx_ir::OpKind] {
+            CUDA_SUPPORTED_OPS
+        }
+
+        fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+            // Decompose FusedSwiGLU / FAB / etc. before legalization (CudaExecutable
+            // unfuses again; this pass is idempotent).
+            let graph = rlx_cuda::unfuse::unfuse(graph);
+            let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, CUDA_SUPPORTED_OPS)
+                .unwrap_or_else(|errors| {
+                    panic!("{}", rlx_opt::format_legalize_error("cuda", &errors));
+                });
+            let graph = crate::precompile::precompile_cleanup(graph, options);
+            // Mid-axis broadcasts (EEG patch embed) before elementwise fusion.
+            let graph = rlx_opt::LegalizeBroadcast.run(graph);
+            // Backend-aware fusion via the shared compile pipeline.
+            let compile_result = crate::stages::compile_graph_stages_for_backend(
+                rlx_driver::Device::Cuda,
+                graph,
+                options,
+                CUDA_SUPPORTED_OPS,
+            );
+            crate::stages::maybe_log_fusion(&compile_result.fusion);
+            let graph = compile_result.lir.into_graph();
+            let graph = match options.policy.clone() {
+                Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
+                None => graph,
+            };
+            let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
+            Box::new(CudaExecutableWrapper {
+                inner: CudaExecutable::compile(graph),
+                io_manifest,
+            })
+        }
+
+        fn compile_lir(
+            &self,
+            lir: LirModule,
+            options: &CompileOptions,
+        ) -> Box<dyn ExecutableGraph> {
+            use rlx_opt::pass::Pass as _;
+            let graph = rlx_opt::LegalizeBroadcast.run(lir.into_graph());
+            let (graph, io_manifest) =
+                cpu_low_precision::prepare_f32_exec_graph(prepare_fused_graph(
+                    rlx_cuda::unfuse::unfuse(graph),
+                    options,
+                    CUDA_SUPPORTED_OPS,
+                    "cuda",
+                ));
+            Box::new(CudaExecutableWrapper {
+                inner: CudaExecutable::compile(graph),
+                io_manifest,
+            })
+        }
+    }
+
+    struct CudaExecutableWrapper {
+        inner: CudaExecutable,
+        io_manifest: cpu_low_precision::IoDtypeManifest,
+    }
+
+    // CudaExecutable owns CudaContext + CudaSlice handles; cudarc claims
+    // they're Send (CudaContext is Arc-wrapped, CudaSlice is logically
+    // a device pointer + length). The Backend trait requires Send for
+    // the executable; we honor that here.
+    unsafe impl Send for CudaExecutableWrapper {}
+
+    impl ExecutableGraph for CudaExecutableWrapper {
+        fn set_param(&mut self, name: &str, data: &[f32]) {
+            self.inner.set_param(name, data);
+        }
+        fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+            self.inner.run(inputs)
+        }
+        fn run_read_outputs(
+            &mut self,
+            inputs: &[(&str, &[f32])],
+            read_indices: Option<&[usize]>,
+        ) -> Vec<Vec<f32>> {
+            self.inner.run_read_outputs(inputs, read_indices)
+        }
+        fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
+            self.inner.bind_gpu_handle(name, data)
+        }
+        fn has_gpu_handle(&self, name: &str) -> bool {
+            self.inner.has_gpu_handle(name)
+        }
+        fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+            self.inner.set_gpu_handle_feed(handle_name, output_index);
+            true
+        }
+        fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
+            self.inner.read_gpu_handle(name)
+        }
+        fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
+            self.inner.set_active_extent(extent);
+        }
+
+        fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
+            self.inner.run_slots(inputs)
+        }
+
+        fn arena_ptr(&self) -> *const u8 {
+            self.inner.arena_ptr()
+        }
+
+        /// Typed param upload — widens F16/BF16 host bytes to f32
+        /// before routing through `set_param`. CUDA's arena is
+        /// f32-uniform; the half-precision matmul tier opts in via
+        /// the separate `set_param_half` API.
+        fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+            if matches!(dtype, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
+                self.inner.set_param_bytes(name, data);
+                return;
+            }
+            if dtype == rlx_ir::DType::F32 {
+                let n = data.len() / 4;
+                let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
+                self.inner.set_param(name, s);
+            } else {
+                let f32_buf = super::widen_bytes_to_f32(data, dtype);
+                self.inner.set_param(name, &f32_buf);
+            }
+        }
+
+        /// Typed run — widen each typed input to F32, run, then narrow
+        /// each output back to its declared graph dtype.
+        fn run_typed(
+            &mut self,
+            inputs: &[(&str, &[u8], rlx_ir::DType)],
+        ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
+            let mut owned: Vec<(String, Vec<f32>)> = Vec::with_capacity(inputs.len());
+            for (name, data, dt) in inputs {
+                let v = super::widen_bytes_to_f32(data, *dt);
+                owned.push((name.to_string(), v));
+            }
+            let refs: Vec<(&str, &[f32])> = owned
+                .iter()
+                .map(|(n, d)| (n.as_str(), d.as_slice()))
+                .collect();
+            let dtypes =
+                super::declared_output_dtypes(&self.io_manifest, self.inner.output_dtypes());
+            let outs = self.inner.run(&refs);
+            outs.into_iter()
+                .zip(
+                    dtypes
+                        .into_iter()
+                        .chain(std::iter::repeat(rlx_ir::DType::F32)),
+                )
+                .map(|(v, dt)| (super::narrow_f32_to_bytes(&v, dt), dt))
+                .collect()
+        }
+    }
+}
+
+// ── ROCm Backend ────────────────────────────────────────────────────────
+
+#[cfg(feature = "rocm")]
+pub mod rocm_backend {
+    use super::*;
+    use rlx_rocm::backend::RocmExecutable;
+
+    pub struct RocmBackend;
+
+    /// PLAN L4: ROCm is the sister crate of CUDA; identical Step
+    /// enum + dispatch shape → identical claimed op set.
+    const ROCM_SUPPORTED_OPS: &[rlx_ir::OpKind] = {
+        use rlx_ir::OpKind::*;
+        &[
+            Input,
+            Param,
+            Constant,
+            Activation,
+            Cast,
+            Binary,
+            Compare,
+            Where,
+            ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
+            MatMul,
+            DotGeneral,
+            LayerNorm,
+            LayerNorm2d,
+            GroupNorm,
+            ResizeNearest2x,
             RmsNorm,
             Attention,
             AttentionBackward,
@@ -2074,195 +2600,9 @@ pub mod cuda_backend {
             GaussianSplatRasterize,
             Custom,
             Fft,
-        ]
-    };
-
-    impl Backend for CudaBackend {
-        fn supported_ops(&self) -> &'static [rlx_ir::OpKind] {
-            CUDA_SUPPORTED_OPS
-        }
-
-        fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-            // Decompose FusedSwiGLU / FAB / etc. before legalization (CudaExecutable
-            // unfuses again; this pass is idempotent).
-            let graph = rlx_cuda::unfuse::unfuse(graph);
-            let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, CUDA_SUPPORTED_OPS)
-                .unwrap_or_else(|errors| {
-                    panic!("{}", rlx_opt::format_legalize_error("cuda", &errors));
-                });
-            use rlx_opt::pass::Pass as _;
-            let graph = if options.dce {
-                rlx_opt::DeadCodeElimination.run(graph)
-            } else {
-                graph
-            };
-            let graph = if options.constant_folding {
-                rlx_opt::ConstantFolding.run(graph)
-            } else {
-                graph
-            };
-            // Backend-aware fusion via the shared compile pipeline.
-            let compile_result = crate::stages::compile_graph_stages_for_backend(
-                rlx_driver::Device::Cuda,
-                graph,
-                options,
-                CUDA_SUPPORTED_OPS,
-            );
-            crate::stages::maybe_log_fusion(&compile_result.fusion);
-            let graph = compile_result.lir.into_graph();
-            let graph = match options.policy.clone() {
-                Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
-                None => graph,
-            };
-            Box::new(CudaExecutableWrapper {
-                inner: CudaExecutable::compile(graph),
-            })
-        }
-
-        fn compile_lir(
-            &self,
-            lir: LirModule,
-            options: &CompileOptions,
-        ) -> Box<dyn ExecutableGraph> {
-            let graph = prepare_fused_graph(
-                rlx_cuda::unfuse::unfuse(lir.into_graph()),
-                options,
-                CUDA_SUPPORTED_OPS,
-                "cuda",
-            );
-            Box::new(CudaExecutableWrapper {
-                inner: CudaExecutable::compile(graph),
-            })
-        }
-    }
-
-    struct CudaExecutableWrapper {
-        inner: CudaExecutable,
-    }
-
-    // CudaExecutable owns CudaContext + CudaSlice handles; cudarc claims
-    // they're Send (CudaContext is Arc-wrapped, CudaSlice is logically
-    // a device pointer + length). The Backend trait requires Send for
-    // the executable; we honor that here.
-    unsafe impl Send for CudaExecutableWrapper {}
-
-    impl ExecutableGraph for CudaExecutableWrapper {
-        fn set_param(&mut self, name: &str, data: &[f32]) {
-            self.inner.set_param(name, data);
-        }
-        fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
-            self.inner.run(inputs)
-        }
-        fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
-            self.inner.set_active_extent(extent);
-        }
-
-        /// Typed param upload — widens F16/BF16 host bytes to f32
-        /// before routing through `set_param`. CUDA's arena is
-        /// f32-uniform; the half-precision matmul tier opts in via
-        /// the separate `set_param_half` API.
-        fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
-            if matches!(dtype, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
-                self.inner.set_param_bytes(name, data);
-                return;
-            }
-            if dtype == rlx_ir::DType::F32 {
-                let n = data.len() / 4;
-                let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-                self.inner.set_param(name, s);
-            } else {
-                let f32_buf = super::widen_bytes_to_f32(data, dtype);
-                self.inner.set_param(name, &f32_buf);
-            }
-        }
-
-        /// Typed run — widen each typed input to F32, run, then narrow
-        /// each output back to its declared graph dtype.
-        fn run_typed(
-            &mut self,
-            inputs: &[(&str, &[u8], rlx_ir::DType)],
-        ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
-            let mut owned: Vec<(String, Vec<f32>)> = Vec::with_capacity(inputs.len());
-            for (name, data, dt) in inputs {
-                let v = super::widen_bytes_to_f32(data, *dt);
-                owned.push((name.to_string(), v));
-            }
-            let refs: Vec<(&str, &[f32])> = owned
-                .iter()
-                .map(|(n, d)| (n.as_str(), d.as_slice()))
-                .collect();
-            let dtypes = self.inner.output_dtypes();
-            let outs = self.inner.run(&refs);
-            outs.into_iter()
-                .zip(
-                    dtypes
-                        .into_iter()
-                        .chain(std::iter::repeat(rlx_ir::DType::F32)),
-                )
-                .map(|(v, dt)| (super::narrow_f32_to_bytes(&v, dt), dt))
-                .collect()
-        }
-    }
-}
-
-// ── ROCm Backend ────────────────────────────────────────────────────────
-
-#[cfg(feature = "rocm")]
-pub mod rocm_backend {
-    use super::*;
-    use rlx_rocm::backend::RocmExecutable;
-
-    pub struct RocmBackend;
-
-    /// PLAN L4: ROCm is the sister crate of CUDA; identical Step
-    /// enum + dispatch shape → identical claimed op set.
-    const ROCM_SUPPORTED_OPS: &[rlx_ir::OpKind] = {
-        use rlx_ir::OpKind::*;
-        &[
-            Input,
-            Param,
-            Constant,
-            Activation,
-            Cast,
-            Binary,
-            Compare,
-            Where,
-            ElementwiseRegion,
-            MatMul,
-            DotGeneral,
-            LayerNorm,
-            RmsNorm,
-            Attention,
-            AttentionBackward,
-            Rope,
-            Reshape,
-            Transpose,
-            Narrow,
-            Concat,
-            Expand,
-            Gather,
-            Reduce,
-            Softmax,
-            Cumsum,
-            TopK,
-            Sample,
-            Conv,
-            Pool,
-            GroupedMatMul,
-            DequantGroupedMatMul,
-            DequantMoEWeights,
-            ScatterAdd,
-            DequantMatMul,
-            SelectiveScan,
-            FusedMatMulBiasAct,
-            FusedResidualLN,
-            FusedResidualRmsNorm,
-            GaussianSplatRender,
-            GaussianSplatRenderBackward,
-            GaussianSplatPrepare,
-            GaussianSplatRasterize,
-            Custom,
-            Fft,
+            LogMel,
+            LogMelBackward,
+            Im2Col,
         ]
     };
 
@@ -2272,21 +2612,13 @@ pub mod rocm_backend {
         }
 
         fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-            let graph = rlx_opt::rewrite_for_backend(graph, ROCM_SUPPORTED_OPS);
-            if let Err(errors) = rlx_opt::legalize_for_backend(&graph, ROCM_SUPPORTED_OPS) {
-                panic!("{}", rlx_opt::format_legalize_error("rocm", &errors));
-            }
-            use rlx_opt::pass::Pass as _;
-            let graph = if options.dce {
-                rlx_opt::DeadCodeElimination.run(graph)
-            } else {
-                graph
-            };
-            let graph = if options.constant_folding {
-                rlx_opt::ConstantFolding.run(graph)
-            } else {
-                graph
-            };
+            let graph = rlx_rocm::unfuse::unfuse(graph);
+            let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, ROCM_SUPPORTED_OPS)
+                .unwrap_or_else(|errors| {
+                    panic!("{}", rlx_opt::format_legalize_error("rocm", &errors));
+                });
+            let graph = crate::precompile::precompile_cleanup(graph, options);
+            let graph = rlx_opt::LegalizeBroadcast.run(graph);
             let compile_result = crate::stages::compile_graph_stages_for_backend(
                 rlx_driver::Device::Rocm,
                 graph,
@@ -2299,8 +2631,10 @@ pub mod rocm_backend {
                 Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
                 None => graph,
             };
+            let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
             Box::new(RocmExecutableWrapper {
                 inner: RocmExecutable::compile(graph),
+                io_manifest,
             })
         }
 
@@ -2309,15 +2643,23 @@ pub mod rocm_backend {
             lir: LirModule,
             options: &CompileOptions,
         ) -> Box<dyn ExecutableGraph> {
-            let graph = prepare_fused_graph(lir.into_graph(), options, ROCM_SUPPORTED_OPS, "rocm");
+            let (graph, io_manifest) =
+                cpu_low_precision::prepare_f32_exec_graph(prepare_fused_graph(
+                    rlx_rocm::unfuse::unfuse(lir.into_graph()),
+                    options,
+                    ROCM_SUPPORTED_OPS,
+                    "rocm",
+                ));
             Box::new(RocmExecutableWrapper {
                 inner: RocmExecutable::compile(graph),
+                io_manifest,
             })
         }
     }
 
     struct RocmExecutableWrapper {
         inner: RocmExecutable,
+        io_manifest: cpu_low_precision::IoDtypeManifest,
     }
 
     // Same Send-claim shape as CudaExecutableWrapper. RocmExecutable
@@ -2331,6 +2673,32 @@ pub mod rocm_backend {
         }
         fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
             self.inner.run(inputs)
+        }
+        fn run_read_outputs(
+            &mut self,
+            inputs: &[(&str, &[f32])],
+            read_indices: Option<&[usize]>,
+        ) -> Vec<Vec<f32>> {
+            self.inner.run_read_outputs(inputs, read_indices)
+        }
+        fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
+            self.inner.bind_gpu_handle(name, data)
+        }
+        fn has_gpu_handle(&self, name: &str) -> bool {
+            self.inner.has_gpu_handle(name)
+        }
+        fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+            self.inner.set_gpu_handle_feed(handle_name, output_index);
+            true
+        }
+        fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
+            self.inner.read_gpu_handle(name)
+        }
+        fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
+            self.inner.run_slots(inputs)
+        }
+        fn arena_ptr(&self) -> *const u8 {
+            self.inner.arena_ptr()
         }
         fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
             self.inner.set_active_extent(extent);
@@ -2370,7 +2738,8 @@ pub mod rocm_backend {
                 .iter()
                 .map(|(n, d)| (n.as_str(), d.as_slice()))
                 .collect();
-            let dtypes = self.inner.output_dtypes();
+            let dtypes =
+                super::declared_output_dtypes(&self.io_manifest, self.inner.output_dtypes());
             let outs = self.inner.run(&refs);
             outs.into_iter()
                 .zip(
@@ -2410,6 +2779,8 @@ pub mod tpu_backend {
             Compare,
             Where,
             ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
             MatMul,
             DotGeneral,
             LayerNorm,
@@ -2444,6 +2815,8 @@ pub mod tpu_backend {
             FusedResidualLN,
             FusedResidualRmsNorm,
             Fft,
+            LogMel,
+            LogMelBackward,
             // Splat: no on-chip kernel — lowered to common primitive MIR via logical_kernel.
         ]
     };

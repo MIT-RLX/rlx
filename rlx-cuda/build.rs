@@ -20,11 +20,9 @@
 //!
 //! With `--features hip-cpu-validate`, we compile a single C++ TU
 //! (`cpp/cpu_dispatch.cpp`) against HIP-CPU's header-only runtime,
-//! producing a static lib that the Rust crate links against. The CPU
-//! path is *strictly* a development convenience — it lets us run the
-//! same kernel sources on CPU threads on Mac/Docker for parity-check
-//! purposes, without renting a CUDA box. Production paths still use
-//! cudarc + real NVIDIA hardware.
+//! producing a static lib that the Rust crate links against. Use only inside
+//! the linux-gnu Docker image (`just test-hip-cpu-validate`); do not enable on
+//! macOS hosts.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -36,16 +34,15 @@ fn main() {
 #[cfg(feature = "hip-cpu-validate")]
 fn build_hip_cpu() {
     use std::path::Path;
-    let hip_cpu_include = Path::new("vendor/HIP-CPU/include");
+    let hip_cpu_include = Path::new("docker/vendor/HIP-CPU/include");
     if !hip_cpu_include.exists() {
         panic!(
             "rlx-cuda hip-cpu-validate: missing HIP-CPU headers at {}\n\
-             Initialize the submodule with:\n\
+             HIP-CPU is fetched only inside Docker (linux-gnu libstdc++).\n\
              \n\
-             \tgit submodule add https://github.com/ROCm-Developer-Tools/HIP-CPU.git \\\n\
-             \t    rlx-cuda/vendor/HIP-CPU\n\
+             \tjust test-hip-cpu-validate\n\
              \n\
-             (or whatever upstream HIP-CPU mirror is current)",
+             (clones into rlx-cuda/docker/vendor/HIP-CPU via rlx-cuda/docker/fetch-hip-cpu.sh)",
             hip_cpu_include.display()
         );
     }

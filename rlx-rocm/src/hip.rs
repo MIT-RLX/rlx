@@ -106,6 +106,8 @@ type FnHipCtxCreate = unsafe extern "C" fn(*mut HipCtx, c_uint, HipDevice) -> Hi
 type FnHipCtxDestroy = unsafe extern "C" fn(HipCtx) -> HipError;
 type FnHipMemAlloc = unsafe extern "C" fn(*mut HipDeviceptr, c_size_t) -> HipError;
 type FnHipMemFree = unsafe extern "C" fn(HipDeviceptr) -> HipError;
+type FnHipHostMalloc = unsafe extern "C" fn(*mut *mut c_void, c_size_t, c_uint) -> HipError;
+type FnHipHostFree = unsafe extern "C" fn(*mut c_void) -> HipError;
 type FnHipMemcpyHtoD = unsafe extern "C" fn(HipDeviceptr, *const c_void, c_size_t) -> HipError;
 type FnHipMemcpyDtoH = unsafe extern "C" fn(*mut c_void, HipDeviceptr, c_size_t) -> HipError;
 type FnHipMemcpyDtoD = unsafe extern "C" fn(HipDeviceptr, HipDeviceptr, c_size_t) -> HipError;
@@ -181,6 +183,9 @@ pub struct HipRuntime {
     pub hip_ctx_destroy: FnHipCtxDestroy,
     pub hip_mem_alloc: FnHipMemAlloc,
     pub hip_mem_free: FnHipMemFree,
+    /// Optional — used for pinned host I/O when `RLX_ROCM_PINNED_IO=1`.
+    pub hip_host_malloc: Option<FnHipHostMalloc>,
+    pub hip_host_free: Option<FnHipHostFree>,
     pub hip_memcpy_htod: FnHipMemcpyHtoD,
     pub hip_memcpy_dtoh: FnHipMemcpyDtoH,
     pub hip_memcpy_dtod: FnHipMemcpyDtoD,
@@ -239,6 +244,13 @@ impl HipRuntime {
                     *s.into_raw()
                 }};
             }
+            macro_rules! sym_opt {
+                ($lib:expr, $name:literal, $ty:ty) => {
+                    $lib.get($name)
+                        .ok()
+                        .map(|s: libloading::Symbol<$ty>| *s.into_raw())
+                };
+            }
 
             let rt = HipRuntime {
                 hip_init: sym!(hip, b"hipInit", FnHipInit),
@@ -248,6 +260,8 @@ impl HipRuntime {
                 hip_ctx_destroy: sym!(hip, b"hipCtxDestroy", FnHipCtxDestroy),
                 hip_mem_alloc: sym!(hip, b"hipMalloc", FnHipMemAlloc),
                 hip_mem_free: sym!(hip, b"hipFree", FnHipMemFree),
+                hip_host_malloc: sym_opt!(hip, b"hipHostMalloc", FnHipHostMalloc),
+                hip_host_free: sym_opt!(hip, b"hipHostFree", FnHipHostFree),
                 hip_memcpy_htod: sym!(hip, b"hipMemcpyHtoD", FnHipMemcpyHtoD),
                 hip_memcpy_dtoh: sym!(hip, b"hipMemcpyDtoH", FnHipMemcpyDtoH),
                 hip_memcpy_dtod: sym!(hip, b"hipMemcpyDtoD", FnHipMemcpyDtoD),

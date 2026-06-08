@@ -42,6 +42,11 @@ pub(crate) fn parse_dtype(s: &str) -> PyResult<DType> {
 }
 
 #[allow(dead_code)]
+/// Encode a Python scalar as little-endian bytes for `Op::Constant`.
+pub(crate) fn scalar_constant_bytes(value: f64, dtype: DType) -> PyResult<Vec<u8>> {
+    rlx_ir::scalar_constant_bytes(value, dtype).map_err(PyValueError::new_err)
+}
+
 pub(crate) fn dtype_label(d: DType) -> &'static str {
     match d {
         DType::F32 => "f32",

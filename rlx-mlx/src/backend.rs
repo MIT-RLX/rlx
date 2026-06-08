@@ -83,6 +83,10 @@ pub struct MlxExecutable {
     /// `Reshape`/`Expand` with a hardcoded `upper` dim, axis-0
     /// `Reduce`/`Cumsum`/`Concat`/`Narrow`).
     active_extent: Option<(usize, usize)>,
+    /// Set once `CompiledFn::compile` refuses the graph (host-eval op
+    /// detected). Subsequent `run` calls take the Lazy path instead of
+    /// re-attempting compile every step.
+    compile_disabled: Option<String>,
 }
 
 impl MlxExecutable {
@@ -147,6 +151,7 @@ impl MlxExecutable {
             inputs_typed: HashMap::new(),
             output_dtypes,
             active_extent: None,
+            compile_disabled: None,
         }
     }
 
@@ -164,15 +169,64 @@ impl MlxExecutable {
     /// No-op for non-Compiled modes.
     pub fn warm_compile(&mut self) -> Result<(), MlxError> {
         let _guard = crate::sync::runtime_guard();
-        if self.mode != MlxMode::Compiled || self.compiled.is_some() {
+        if self.mode != MlxMode::Compiled
+            || self.compiled.is_some()
+            || self.compile_disabled.is_some()
+        {
             return Ok(());
         }
-        self.compiled = Some(CompiledFn::compile(self.graph.clone())?);
-        Ok(())
+        match CompiledFn::compile(self.graph.clone()) {
+            Ok(c) => {
+                self.compiled = Some(c);
+                Ok(())
+            }
+            Err(e) => {
+                self.note_compile_disabled(e.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// True if this executable has fallen back from Compiled → Lazy
+    /// because the graph contains a host-eval op.
+    pub fn compile_disabled_reason(&self) -> Option<&str> {
+        self.compile_disabled.as_deref()
+    }
+
+    fn note_compile_disabled(&mut self, reason: String) {
+        if self.compile_disabled.is_none() {
+            eprintln!(
+                "rlx-mlx: falling back to MlxMode::Lazy — compile mode unsupported for this \
+                 graph: {reason}"
+            );
+        }
+        self.compile_disabled = Some(reason);
+    }
+
+    fn use_compiled(&self) -> bool {
+        // `active_extent` is a per-call shape hint for Lazy lowering
+        // (PLAN L1 bucket trimming); the compiled trace is built once
+        // at a fixed shape, so honoring it requires Lazy.
+        self.mode == MlxMode::Compiled
+            && self.compile_disabled.is_none()
+            && self.active_extent.is_none()
     }
 
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
-        self.params.insert(name.to_string(), data.to_vec());
+        // Mutate the existing Vec in place when possible so the
+        // backing buffer's address stays stable across calls. This
+        // lets `build_leaf_for` construct a zero-copy MLX Array view
+        // over the persistent buffer instead of copying through MLX's
+        // float-iterator constructor on every step. Realloc only on
+        // first set (or if the caller hands us a different length).
+        match self.params.get_mut(name) {
+            Some(existing) if existing.len() == data.len() => {
+                existing.copy_from_slice(data);
+            }
+            _ => {
+                self.params.insert(name.to_string(), data.to_vec());
+            }
+        }
         // Drop any typed override so subsequent runs see the f32 data.
         self.params_typed.remove(name);
     }
@@ -188,8 +242,62 @@ impl MlxExecutable {
     }
 
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
-        self.run_internal(inputs, true)
+        self.run_read_outputs(inputs, None)
             .unwrap_or_else(|e| panic!("MLX backend run failed: {e}"))
+    }
+
+    /// Run the graph and read back only the listed output indices (e.g. `[0]` for logits-only).
+    /// GPU handle feeds still run for every output. Pass `None` to read all outputs.
+    pub fn run_read_outputs(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        read_indices: Option<&[usize]>,
+    ) -> Result<Vec<Vec<f32>>, MlxError> {
+        let outs = self.run_arrays(inputs)?;
+        let indices: Vec<usize> = match read_indices {
+            None => (0..outs.len()).collect(),
+            Some(ix) => ix.to_vec(),
+        };
+        indices
+            .iter()
+            .map(|&i| {
+                outs.get(i)
+                    .ok_or_else(|| MlxError(format!("output index {i} missing")))?
+                    .to_f32()
+            })
+            .collect()
+    }
+
+    /// Execute and return MLX output arrays (after GPU handle refresh).
+    fn run_arrays(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Array>, MlxError> {
+        let _guard = crate::sync::runtime_guard();
+        self.sync_pending_inner();
+        let mut input_map: HashMap<String, Vec<f32>> = self.handles.clone();
+        for &(name, data) in inputs {
+            input_map.insert(name.to_string(), data.to_vec());
+        }
+
+        let outs = if self.use_compiled() {
+            self.run_compiled(&input_map)?
+        } else {
+            lower::lower_and_run_typed_with_extent(
+                &self.graph,
+                &self.params,
+                &self.params_typed,
+                &input_map,
+                &self.inputs_typed,
+                if self.compile_disabled.is_some() {
+                    MlxMode::Lazy
+                } else {
+                    self.mode
+                },
+                self.active_extent,
+                Some(&self.gpu_handles),
+            )?
+        };
+
+        self.refresh_gpu_handles_from_outputs(&outs)?;
+        Ok(outs)
     }
 
     /// Run with typed inputs and read outputs back as raw bytes in
@@ -208,7 +316,7 @@ impl MlxExecutable {
                 .insert(name.to_string(), (data.to_vec(), *dt));
         }
 
-        let outs = if self.mode == MlxMode::Compiled {
+        let outs = if self.use_compiled() {
             // Compiled-mode picks up self.inputs_typed via run_compiled's
             // call to build_leaf_for, which already threads the typed maps.
             // input_map (f32) stays empty for typed-only runs.
@@ -217,13 +325,18 @@ impl MlxExecutable {
                 Err(e) => panic!("MLX compiled run_typed failed: {e}"),
             }
         } else {
+            let lower_mode = if self.compile_disabled.is_some() {
+                MlxMode::Lazy
+            } else {
+                self.mode
+            };
             match lower::lower_and_run_typed_with_extent(
                 &self.graph,
                 &self.params,
                 &self.params_typed,
                 &HashMap::new(),
                 &self.inputs_typed,
-                self.mode,
+                lower_mode,
                 self.active_extent,
                 Some(&self.gpu_handles),
             ) {
@@ -254,7 +367,22 @@ impl MlxExecutable {
         input_map: &HashMap<String, Vec<f32>>,
     ) -> Result<Vec<Array>, MlxError> {
         if self.compiled.is_none() {
-            self.compiled = Some(CompiledFn::compile(self.graph.clone())?);
+            match CompiledFn::compile(self.graph.clone()) {
+                Ok(c) => self.compiled = Some(c),
+                Err(e) => {
+                    self.note_compile_disabled(e.to_string());
+                    return lower::lower_and_run_typed_with_extent(
+                        &self.graph,
+                        &self.params,
+                        &self.params_typed,
+                        input_map,
+                        &self.inputs_typed,
+                        MlxMode::Lazy,
+                        self.active_extent,
+                        Some(&self.gpu_handles),
+                    );
+                }
+            }
         }
         let compiled = self.compiled.as_ref().unwrap();
         let order = compiled.leaf_order();
@@ -302,7 +430,7 @@ impl MlxExecutable {
             }
         }
 
-        let lowered = if self.mode == MlxMode::Compiled {
+        let lowered = if self.use_compiled() {
             self.run_compiled(&input_map)
         } else {
             lower::lower_and_run_typed(
@@ -311,7 +439,11 @@ impl MlxExecutable {
                 &self.params_typed,
                 &input_map,
                 &self.inputs_typed,
-                self.mode,
+                if self.compile_disabled.is_some() {
+                    MlxMode::Lazy
+                } else {
+                    self.mode
+                },
             )
         };
         match lowered {
@@ -355,7 +487,7 @@ impl MlxExecutable {
             input_map.insert(name.to_string(), data.to_vec());
         }
 
-        if self.mode == MlxMode::Compiled {
+        if self.use_compiled() {
             // Compiled-mode async: invoke the compiled fn (replays the
             // optimized trace), then async_eval its outputs without
             // waiting. sync_pending later drains.
@@ -493,49 +625,12 @@ impl MlxExecutable {
         inputs: &[(&str, &[f32])],
         readback_outputs: bool,
     ) -> Result<Vec<Vec<f32>>, MlxError> {
-        let _guard = crate::sync::runtime_guard();
-        self.sync_pending_inner();
-        let mut input_map: HashMap<String, Vec<f32>> = self.handles.clone();
-        for &(name, data) in inputs {
-            input_map.insert(name.to_string(), data.to_vec());
-        }
-
-        let outs = if self.mode == MlxMode::Compiled {
-            self.run_compiled(&input_map)?
+        let read = if readback_outputs {
+            None
         } else {
-            lower::lower_and_run_typed_with_extent(
-                &self.graph,
-                &self.params,
-                &self.params_typed,
-                &input_map,
-                &self.inputs_typed,
-                self.mode,
-                self.active_extent,
-                Some(&self.gpu_handles),
-            )?
+            Some(&[][..])
         };
-
-        self.refresh_gpu_handles_from_outputs(&outs)?;
-
-        if !readback_outputs {
-            return Ok(Vec::new());
-        }
-
-        let result: Vec<Vec<f32>> = outs
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                a.to_f32()
-                    .unwrap_or_else(|e| panic!("MLX backend output {i} readback failed: {e}"))
-            })
-            .collect();
-        for (i, vals) in result.iter().enumerate() {
-            let name = format!("out{i}");
-            if self.handles.contains_key(&name) {
-                self.handles.insert(name, vals.clone());
-            }
-        }
-        Ok(result)
+        self.run_read_outputs(inputs, read)
     }
 
     pub fn graph(&self) -> &Graph {
@@ -550,13 +645,17 @@ impl MlxExecutable {
 }
 
 /// Read `RLX_MLX_MODE=eager|lazy|compiled` (case-insensitive) and
-/// pick a default. `compiled` enables persistent `mlx::compile` trace
-/// caching; `eager` evals after every op (debug-friendly); `lazy`
-/// (default) evals once per run.
+/// pick a default. `compiled` (default) enables persistent
+/// `mlx::compile` trace caching; `eager` evals after every op
+/// (debug-friendly); `lazy` evals once per run without compile.
+/// Compiled-mode graphs that contain host-eval ops (e.g. GGUF
+/// DequantMatMul) auto-fall back to Lazy on first run with a
+/// warning — see `MlxExecutable::compile_disabled_reason`.
 fn mode_from_env() -> MlxMode {
     match rlx_ir::env::var("RLX_MLX_MODE").as_deref() {
         Some(s) if s.eq_ignore_ascii_case("eager") => MlxMode::Eager,
+        Some(s) if s.eq_ignore_ascii_case("lazy") => MlxMode::Lazy,
         Some(s) if s.eq_ignore_ascii_case("compiled") => MlxMode::Compiled,
-        _ => MlxMode::Lazy,
+        _ => MlxMode::Compiled,
     }
 }

@@ -35,4 +35,56 @@ fn probe_cooperative_matrix_support() {
         "EXPERIMENTAL_COOPERATIVE_MATRIX: {}",
         adapter_feats.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
     );
+    for (i, p) in dev
+        .adapter
+        .cooperative_matrix_properties()
+        .iter()
+        .enumerate()
+    {
+        eprintln!(
+            "  coop[{i}] {}x{}x{} AB={:?} CR={:?}{}",
+            p.m_size,
+            p.n_size,
+            p.k_size,
+            p.ab_type,
+            p.cr_type,
+            if p.saturating_accumulation {
+                " sat"
+            } else {
+                ""
+            }
+        );
+    }
+    eprintln!(
+        "coop_f32_8x8_supported: {}",
+        rlx_wgpu::device::coop_f32_8x8_supported()
+    );
+    eprintln!(
+        "coop_f16_16x16_supported: {}",
+        rlx_wgpu::device::coop_f16_16x16_supported()
+    );
+    eprintln!(
+        "coop_f16_16x16_f32_acc_supported: {}",
+        rlx_wgpu::device::coop_f16_16x16_f32_acc_supported()
+    );
+    eprintln!(
+        "coop_discrete_backend: {}",
+        rlx_wgpu::device::coop_discrete_backend()
+    );
+    if rlx_wgpu::device::coop_discrete_backend() {
+        let k = rlx_wgpu::kernels::matmul_coop_f16_vulkan_kernel(&dev.device);
+        eprintln!(
+            "matmul_coop_f16_vulkan: {}",
+            if k.is_some() { "compiled OK" } else { "None" }
+        );
+        eprintln!(
+            "coop_f16_vk_f32acc: {}",
+            rlx_wgpu::kernels::coop_f16_vk_f32acc_available(&dev.device)
+        );
+        let qkv = rlx_wgpu::kernels::matmul_qkv_coop_f16_vk_kernel(&dev.device);
+        eprintln!(
+            "matmul_qkv_coop_f16_vk: {}",
+            if qkv.is_some() { "compiled OK" } else { "None" }
+        );
+    }
 }

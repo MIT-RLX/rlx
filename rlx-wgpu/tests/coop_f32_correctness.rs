@@ -13,24 +13,41 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Direct correctness test for matmul_coop_f32. We feed a matmul whose
-//! intermediate values exceed f16 max (65504). If the kernel is honoring
-//! f32 the result is exact; if naga silently downcasts to half on Apple,
-//! the result will be wrong by orders of magnitude.
+//! Direct correctness test for matmul_coop_f32 (Metal simdgroup path).
+//! On Vulkan/DX12 the portable coop kernel auto-enables when 8×8 f32
+//! cooperative-matrix support is present.
 
 use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_wgpu::backend::WgpuExecutable;
 
-#[test]
-fn coop_f32_uses_real_f32() {
-    let _ = match rlx_wgpu::device::wgpu_device() {
+fn require_coop_f32_test() -> bool {
+    let dev = match rlx_wgpu::device::wgpu_device() {
         Some(d) => d,
         None => {
             eprintln!("no wgpu adapter, skipping");
-            return;
+            return false;
         }
     };
+    let forced = rlx_ir::env::flag("RLX_WGPU_FORCE_COOP_F32");
+    let discrete =
+        rlx_wgpu::device::coop_discrete_backend() && rlx_wgpu::device::coop_f32_8x8_supported();
+    if dev.backend != wgpu::Backend::Metal && !forced && !discrete {
+        eprintln!(
+            "CoopF32 auto path is Metal-only or discrete 8×8 f32 coop; skipping on {:?} \
+             (set RLX_WGPU_FORCE_COOP_F32=1 to probe)",
+            dev.backend
+        );
+        return false;
+    }
+    true
+}
+
+#[test]
+fn coop_f32_uses_real_f32() {
+    if !require_coop_f32_test() {
+        return;
+    }
 
     // M=32, K=8, N=32 — meets the coop alignment (m%32==0, k%8==0, n%32==0).
     // A: all 1.0
@@ -74,14 +91,9 @@ fn coop_f32_uses_real_f32() {
 
 #[test]
 fn coop_f32_correct_at_minilm_qkv() {
-    // EXACT failing shape: MiniLM6 QKV at b=32 s=3. M=96, K=384, N=1152.
-    let _ = match rlx_wgpu::device::wgpu_device() {
-        Some(d) => d,
-        None => {
-            eprintln!("no wgpu adapter, skipping");
-            return;
-        }
-    };
+    if !require_coop_f32_test() {
+        return;
+    }
     const M: usize = 96;
     const K: usize = 384;
     const N: usize = 1152;
@@ -131,16 +143,9 @@ fn coop_f32_correct_at_minilm_qkv() {
 
 #[test]
 fn coop_f32_correct_chained_matmuls() {
-    // Three matmuls in sequence — same shapes as BERT FFN: in→fc1→fc2.
-    // Tests whether output of one matmul, consumed as A by the next,
-    // is corrupted somehow.
-    let _ = match rlx_wgpu::device::wgpu_device() {
-        Some(d) => d,
-        None => {
-            eprintln!("no wgpu adapter, skipping");
-            return;
-        }
-    };
+    if !require_coop_f32_test() {
+        return;
+    }
     const M: usize = 96;
     const H: usize = 384;
     const I: usize = 1536;
@@ -203,14 +208,9 @@ fn coop_f32_correct_chained_matmuls() {
 
 #[test]
 fn coop_f32_correct_with_bias_via_fmb() {
-    // FusedMatMulBiasAct (matmul + bias + GELU). Mimics BERT fc1.
-    let _ = match rlx_wgpu::device::wgpu_device() {
-        Some(d) => d,
-        None => {
-            eprintln!("no wgpu adapter, skipping");
-            return;
-        }
-    };
+    if !require_coop_f32_test() {
+        return;
+    }
     const M: usize = 96;
     const K: usize = 384;
     const N: usize = 1536;

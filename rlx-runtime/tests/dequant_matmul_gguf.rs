@@ -173,6 +173,62 @@ fn dequant_matmul_q6k_runs_without_panicking() {
     );
 }
 
+#[test]
+fn dequant_matmul_q6k_signed_scale_matches_reference() {
+    // Regression: `dequant_q6_k_block` must cast scale bytes as i8 (same as
+    // `dequant_q6_k`). Using `as f32` on 0xFF turns −1 into 255 and skews matmul.
+    const BLK: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
+    let mut block = [0u8; BLK];
+    let sc_off = QK_K / 2 + QK_K / 4;
+    block[sc_off] = 0xFF;
+    block[0] = 0x21;
+    block[QK_K / 2] = 0x08;
+    block[BLK - 2..].copy_from_slice(&half::f16::ONE.to_le_bytes());
+    let packed = block.to_vec();
+
+    let k = 256;
+    let n = 1;
+    let m = 2;
+    let w_ref = rlx_gguf::dequant_q6_k(&packed, k * n).unwrap();
+    let x: Vec<f32> = (0..(m * k)).map(|i| 0.01 * (i as f32 + 1.0)).collect();
+    let mut expected = vec![0f32; m * n];
+    for r in 0..m {
+        for c in 0..n {
+            let mut acc = 0f32;
+            for i in 0..k {
+                acc += x[r * k + i] * w_ref[c * k + i];
+            }
+            expected[r * n + c] = acc;
+        }
+    }
+
+    let mut g = Graph::new("q6k_signed_matmul");
+    let x_in = g.input("x", Shape::new(&[m, k], DType::F32));
+    let w_packed = g.param("w_packed", Shape::new(&[packed.len()], DType::U8));
+    let y = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ6K,
+        },
+        vec![x_in, w_packed],
+        Shape::new(&[m, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+
+    let session = Session::new(Device::Cpu);
+    let mut compiled = session.compile(g);
+    compiled.set_param_typed("w_packed", &packed, DType::U8);
+    let actual = compiled.run(&[("x", x.as_slice())]).pop().unwrap();
+    for i in 0..actual.len() {
+        let rel = (actual[i] - expected[i]).abs() / expected[i].abs().max(1.0);
+        assert!(
+            rel < 1e-3,
+            "q6k signed-scale mismatch at {i}: {} vs {}",
+            actual[i],
+            expected[i]
+        );
+    }
+}
+
 fn run_q8k_layout_case(device: Device) {
     let k = 256;
     let n = 4;

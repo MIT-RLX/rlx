@@ -38,14 +38,8 @@ extern "C" __global__ void unary(
         case 6: y = rsqrtf(x); break;
         case 7: y = -x; break;
         case 8: y = fabsf(x); break;
-        case 9: case 11: {
-            // GELU (tanh approximation), clamped to keep tanh stable.
-            const float c = 0.7978845608028654f;
-            float x3 = x * x * x;
-            float inner = c * (x + 0.044715f * x3);
-            inner = fminf(fmaxf(inner, -15.0f), 15.0f);
-            y = 0.5f * x * (1.0f + tanhf(inner));
-        } break;
+        case 9:  { y = gelu_erf(x); } break;
+        case 11: { y = gelu_approx(x); } break;
         case 10: {
             // SiLU = x · sigmoid(x), with exp clamp.
             float nx = fminf(fmaxf(-x, -88.0f), 88.0f);

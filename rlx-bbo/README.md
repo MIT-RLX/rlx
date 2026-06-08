@@ -19,3 +19,7 @@ Reference JAX code: [`/Users/Shared/q-guided-flow-map-policies`](/Users/Shared/q
 ## rlx-eda
 
 Depend on `rlx-bbo` directly (workspace path `../rlx/rlx-bbo`). EDA-specific prescreen↔ngspice twins and harness JSON helpers stay in `eda-fmq`.
+
+## License
+
+GPL-3.0-only.

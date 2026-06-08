@@ -1,6 +1,6 @@
 [package]
 name = "rlx-mlx-sys"
-version                = "0.2.2"
+version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 description = "Low-level MLX C++ build + C ABI shim for RLX (vendored mlx, NVRTC-free)."
@@ -22,6 +22,11 @@ path = "src/lib.rs"
 [build-dependencies]
 cc = "1"
 cmake = "0.1"
+
+[features]
+default = []
+# Opt-in Linux CUDA backend (compiles hundreds of nvcc kernels; first build ~1h).
+cuda = []
 
 [package.metadata.docs.rs]
 default-target = "aarch64-apple-darwin"

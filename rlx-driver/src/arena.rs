@@ -81,6 +81,12 @@ pub unsafe fn write_typed_from_f32(dst_ptr: *mut u8, dtype: DType, src: &[f32], 
                 *dst.add(i) = half::bf16::from_f32(src[i]);
             }
         },
+        DType::C64 => unsafe {
+            // Interleaved [re, im, re, im, ...]; `max_elems` is complex count.
+            let dst = dst_ptr as *mut f32;
+            let n = src.len().min(max_elems.saturating_mul(2));
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
+        },
         _ => unsafe {
             let dst = dst_ptr as *mut f32;
             std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
@@ -111,6 +117,11 @@ pub unsafe fn read_typed_to_f32(src_ptr: *const u8, dtype: DType, n_elems: usize
             }
             out
         }
+        DType::C64 => unsafe {
+            // Interleaved [re, im, re, im, ...]; `n_elems` is complex count.
+            let src = src_ptr as *const f32;
+            std::slice::from_raw_parts(src, n_elems.saturating_mul(2)).to_vec()
+        },
         _ => unsafe {
             let src = src_ptr as *const f32;
             std::slice::from_raw_parts(src, n_elems).to_vec()

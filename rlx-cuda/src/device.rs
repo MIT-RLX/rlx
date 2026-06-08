@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 use cudarc::cublas::CudaBlas;
 use cudarc::cublaslt::sys as cublaslt_sys;
 use cudarc::cudnn::sys as cudnn_sys;
-use cudarc::driver::CudaContext;
+use cudarc::driver::{CudaContext, CudaSlice};
 
 static CTX: OnceLock<Option<Arc<CudaContext>>> = OnceLock::new();
 static BLAS: OnceLock<Option<Arc<Mutex<CudaBlas>>>> = OnceLock::new();
@@ -116,4 +116,43 @@ pub fn cuda_dnn_handle() -> Option<cudnn_sys::cudnnHandle_t> {
             result.ok().flatten()
         })
         .map(|h| h as cudnn_sys::cudnnHandle_t)
+}
+
+pub const CUBLASLT_WORKSPACE_BYTES: usize = 4 * 1024 * 1024;
+pub const CUDNN_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
+
+static BLAS_LT_WORKSPACE: OnceLock<Option<Arc<Mutex<CudaSlice<u8>>>>> = OnceLock::new();
+static DNN_WORKSPACE: OnceLock<Option<Arc<Mutex<CudaSlice<u8>>>>> = OnceLock::new();
+
+/// Shared cuBLASLt scratch (4 MiB). Allocated once per process on first conv/matmul use.
+pub fn cuda_blas_lt_workspace() -> Option<Arc<Mutex<CudaSlice<u8>>>> {
+    BLAS_LT_WORKSPACE
+        .get_or_init(|| {
+            cuda_blas_lt_handle()?;
+            let ctx = cuda_context()?;
+            ctx.default_stream()
+                .alloc_zeros::<u8>(CUBLASLT_WORKSPACE_BYTES)
+                .ok()
+                .map(|buf| Arc::new(Mutex::new(buf)))
+        })
+        .clone()
+}
+
+/// Shared cuDNN scratch (32 MiB). Allocated once per process on first conv use.
+pub fn cuda_dnn_workspace() -> Option<Arc<Mutex<CudaSlice<u8>>>> {
+    DNN_WORKSPACE
+        .get_or_init(|| {
+            cuda_dnn_handle()?;
+            let ctx = cuda_context()?;
+            ctx.default_stream()
+                .alloc_zeros::<u8>(CUDNN_WORKSPACE_BYTES)
+                .ok()
+                .map(|buf| Arc::new(Mutex::new(buf)))
+        })
+        .clone()
+}
+
+/// Stable label for calibration cache keys.
+pub fn device_name() -> Option<String> {
+    cuda_context().map(|_| "cuda-0".to_string())
 }

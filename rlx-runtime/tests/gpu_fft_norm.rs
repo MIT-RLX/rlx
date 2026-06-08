@@ -9,6 +9,7 @@
     feature = "cpu",
     any(
         feature = "cuda",
+        feature = "rocm",
         feature = "gpu",
         all(feature = "metal", target_os = "macos")
     )
@@ -146,6 +147,7 @@ fn assert_fft_real_and_psd(device: Device) {
 }
 
 gpu_fft_norm_tests!(cuda, Device::Cuda, all(feature = "cuda"));
+gpu_fft_norm_tests!(rocm, Device::Rocm, all(feature = "rocm"));
 gpu_fft_norm_tests!(wgpu, Device::Gpu, all(feature = "gpu"));
 gpu_fft_norm_tests!(
     metal,
@@ -157,6 +159,12 @@ gpu_fft_norm_tests!(
 #[test]
 fn cuda_fft_real_and_psd() {
     assert_fft_real_and_psd(Device::Cuda);
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_fft_real_and_psd() {
+    assert_fft_real_and_psd(Device::Rocm);
 }
 
 #[cfg(feature = "gpu")]

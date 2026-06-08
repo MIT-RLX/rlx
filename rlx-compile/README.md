@@ -15,6 +15,10 @@ Depends on [`rlx-ir`] and [`rlx-fusion`].
 - **`precision`** — auto-mixed precision policy (f32 ↔ f16/bf16 around matmul).
 - **`quant_insert`** / **`quant_propagate`** — PTQ Q/DQ insertion and propagation.
 - **`const_fold`**, **`dce`**, **`inline`**, **`promote_params`**, **`svg`**.
+- **`param_specialize`** — bake fixed `Op::Param` tensors into `Op::Constant`
+  before DCE / constant folding (`CompileOptions::param_bindings` in runtime).
+- **`algebraic_simplify`** — same-shape `x*0`, `x*1`, `x+0` rewrites (safe
+  only when constant rank matches output; no scalar-broadcast folding).
 
 ## Kernel dispatch transparency
 

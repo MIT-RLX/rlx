@@ -24,29 +24,36 @@
 //! `.cu` source + one Step variant + one match arm.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use cudarc::cublas::{CudaBlas, sys as cublas_sys};
 use cudarc::cublaslt::{result as cublaslt_result, sys as cublaslt_sys};
 use cudarc::cudnn::{result as cudnn_result, sys as cudnn_sys};
 use cudarc::driver::{CudaContext, DevicePtrMut, LaunchConfig, PushKernelArg};
-use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::{Graph, NodeId, Op};
+use rlx_opt::rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
+use rlx_opt::rlx_fusion::pass::Pass as _;
 
 use crate::arena::{Arena, plan_f32_uniform};
-use crate::device::{cuda_blas, cuda_blas_lt_handle, cuda_context, cuda_dnn_handle};
+use crate::device::{
+    CUBLASLT_WORKSPACE_BYTES, CUDNN_WORKSPACE_BYTES, cuda_blas, cuda_blas_lt_handle,
+    cuda_blas_lt_workspace, cuda_context, cuda_dnn_handle, cuda_dnn_workspace,
+};
+use crate::host_staging::F32HostSlot;
 use crate::kernels::{
-    argmax_kernel, attention_bwd_kernel, attention_kernel, binary_kernel, compare_kernel,
-    concat_kernel, conv_transpose2d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel,
-    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dispatch_grid_1d,
+    argmax_kernel, attention_bwd_kernel, attention_kernel, attention_row_kernel,
+    batch_elementwise_region_kernel, binary_kernel, compare_kernel, concat_kernel,
+    conv_transpose2d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, cumsum_backward_kernel,
+    cumsum_kernel, dequant_matmul_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw,
     elementwise_region_kernel, expand_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
     gather_axis_kernel, gather_backward_kernel, gather_kernel, group_norm_kernel,
-    grouped_matmul_kernel, layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel,
-    matmul_kernel, matmul_wmma_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
-    reduce_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel, rms_norm_bwd_zero_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_acc_kernel,
-    scatter_add_zero_kernel, selective_scan_kernel, softmax_kernel, topk_kernel, transpose_kernel,
-    unary_kernel, where_kernel,
+    grouped_matmul_kernel, im2col_kernel, layer_norm2d_kernel, layernorm_kernel,
+    matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel, narrow_kernel, pool1d_kernel,
+    pool2d_kernel, pool3d_kernel, reduce_kernel, resize_nearest_2x_kernel,
+    rms_norm_backward_kernel, rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel,
+    sample_kernel, scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel,
+    softmax_kernel, topk_kernel, transpose_kernel, unary_kernel, where_kernel,
 };
 
 /// Opt-in WMMA Tensor Core matmul. Reads `RLX_CUDA_WMMA=1` from env at
@@ -61,6 +68,18 @@ fn use_wmma() -> bool {
         rlx_ir::env::var("RLX_CUDA_WMMA")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    })
+}
+
+/// Strict f32 matmul for encoder parity: tiled `matmul.cu` kernel (same
+/// family as wgpu), not cuBLASLt / cuBLAS heuristics.
+fn matmul_parity_mode() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        rlx_ir::env::flag("RLX_CUDA_NO_TF32")
+            || rlx_ir::env::flag("RLX_CUDA_PARITY")
+            || rlx_ir::env::flag("RLX_CUDA_NO_CUBLASLT")
     })
 }
 
@@ -217,6 +236,22 @@ enum Step {
         mask_kind: u32,
         scale_bits: u32,
         window: u32,
+        seq_q_stride: u32,
+        seq_k_stride: u32,
+        mask_batch_stride: u32,
+        mask_head_stride: u32,
+        q_batch_stride: u32,
+        q_head_stride: u32,
+        q_seq_stride: u32,
+        k_batch_stride: u32,
+        k_head_stride: u32,
+        k_seq_stride: u32,
+        v_batch_stride: u32,
+        v_head_stride: u32,
+        v_seq_stride: u32,
+        o_batch_stride: u32,
+        o_head_stride: u32,
+        o_seq_stride: u32,
     },
     AttentionBackward {
         batch: u32,
@@ -347,6 +382,36 @@ enum Step {
         inverse: bool,
         norm_tag: u32,
         dtype_tag: u32,
+        use_gpu: bool,
+    },
+    /// Log-mel from block-layout FFT spectrum — host fallback.
+    LogMelHost {
+        spec_byte_off: u32,
+        filt_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        n_fft: u32,
+        n_bins: u32,
+        n_mels: u32,
+    },
+    /// NCHW im2col — GPU kernel or host fallback (dynamic batch / `RLX_CUDA_IM2COL_HOST=1`).
+    Im2ColHost {
+        x_byte_off: u32,
+        col_byte_off: u32,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw_dil: u32,
         use_gpu: bool,
     },
     /// Gated-DeltaNet — host scan between GPU segments (qwen35 linear layers).
@@ -533,6 +598,65 @@ enum Step {
         axis_dim: u32,
         num_idx: u32,
         trailing: u32,
+    },
+    MaxPool2dBackward {
+        x_byte_off: u32,
+        dy_byte_off: u32,
+        dx_byte_off: u32,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+    },
+    Conv2dBackwardInput {
+        dy_byte_off: u32,
+        w_byte_off: u32,
+        dx_byte_off: u32,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+    },
+    Conv2dBackwardWeight {
+        x_byte_off: u32,
+        dy_byte_off: u32,
+        dw_byte_off: u32,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w: u32,
+        c_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw_dil: u32,
+        groups: u32,
     },
     Pool1d {
         n: u32,
@@ -741,6 +865,25 @@ enum Step {
         /// `arena[input_offs[i] + (gid % input_modulus[i])]`.
         input_modulus: [u32; 16],
         meta_idx: usize,
+        /// When true, launch a W×H×(N·C) grid (resize prologue).
+        spatial_prologue: bool,
+        prologue_w: u32,
+        prologue_h: u32,
+        prologue_nc: u32,
+    },
+    /// FKL batch region: one launch over `num_batch` slices (`blockIdx.z`).
+    BatchElementwiseRegion {
+        slice_len: u32,
+        num_batch: u32,
+        num_steps: u32,
+        base_dst_off: u32,
+        slice_elems: u32,
+        /// Host copy for schedule dependency edges.
+        batch_input_offs: [u32; 64],
+        batch_offs_idx: usize,
+        meta_idx: usize,
+        scalar_input_mask: u32,
+        input_modulus: [u32; 16],
     },
 }
 
@@ -790,15 +933,15 @@ pub struct CudaExecutable {
     /// cuBLASLt handle for fused matmul + bias + activation. Falls back
     /// to plain cuBLAS sgemm + epilogue kernel when unavailable.
     blas_lt: Option<cublaslt_sys::cublasLtHandle_t>,
-    /// Scratch workspace for cuBLASLt heuristic-selected algorithms.
-    /// 4 MiB is the standard recommendation in cuBLAS docs.
-    blas_lt_workspace: Option<cudarc::driver::CudaSlice<u8>>,
+    /// Shared cuBLASLt scratch — process singleton, only referenced when
+    /// the schedule uses cublasLt-fusable matmul.
+    blas_lt_workspace: Option<Arc<Mutex<cudarc::driver::CudaSlice<u8>>>>,
     /// cuDNN handle for convolution dispatch (conv1d/2d/3d). Falls back
     /// to the custom direct-convolution kernels when unavailable.
     dnn: Option<cudnn_sys::cudnnHandle_t>,
-    /// Scratch workspace for cuDNN-selected conv algorithms. Sized at
-    /// 32 MiB which covers most modern conv shapes.
-    dnn_workspace: Option<cudarc::driver::CudaSlice<u8>>,
+    /// Shared cuDNN scratch — process singleton, only referenced when the
+    /// schedule contains conv steps.
+    dnn_workspace: Option<Arc<Mutex<cudarc::driver::CudaSlice<u8>>>>,
     /// Scratch f16 buffer for casting activations on-the-fly when the
     /// matching weight is half-stored. Sized to fit the largest
     /// per-call M·K product seen in matmul dispatch; grown lazily.
@@ -826,6 +969,30 @@ pub struct CudaExecutable {
     /// full extent) and dispatches per-step with scaled launch dims.
     /// Otherwise full-extent fallback. See PLAN L1.
     pub(crate) active_extent: Option<(usize, usize)>,
+    /// Reused host output buffers (stable addresses for CUDA Graph dtoh capture).
+    output_staging: Vec<F32HostSlot>,
+    /// Pinned/pageable host staging for fixed-size graph inputs.
+    input_staging: HashMap<String, F32HostSlot>,
+    /// Reused event for graph replay completion (avoids full stream sync when possible).
+    replay_event: Option<cudarc::driver::CudaEvent>,
+    /// Persistent KV inputs (host mirror + device upload each run).
+    gpu_handles: HashMap<String, Vec<f32>>,
+    gpu_handle_feeds: HashMap<String, usize>,
+    gpu_handle_resident: std::collections::HashSet<String>,
+    /// When set, only these output indices are read back from device (KV feeds stay on GPU).
+    pending_read_indices: Option<Vec<usize>>,
+    /// Reused sorted/deduped output indices for the current run (avoids alloc in `readback_plan`).
+    readback_plan_buf: Vec<usize>,
+    /// Output indices baked into the captured CUDA graph (must match on replay).
+    captured_readback_plan: Option<Vec<usize>>,
+    /// Graph input names in declaration order (parallel to `input_slots`).
+    input_slot_names: Vec<String>,
+    /// Graph inputs in declaration order: `(arena_byte_offset, max_f32_elems)`.
+    input_slots: Vec<(usize, usize)>,
+    /// Host readback layout: `(byte_offset_in_host_arena, f32_elems)` per graph output.
+    output_slots: Vec<(usize, usize)>,
+    /// Pinned/pageable host mirror for `run_slots` / `arena_ptr` (not GPU arena).
+    host_arena: Vec<f32>,
 }
 
 impl Step {
@@ -850,12 +1017,46 @@ impl Step {
                 | Step::Cumsum { .. }
                 | Step::FusedBinaryUnary { .. }
                 | Step::ElementwiseRegion { .. }
+                | Step::BatchElementwiseRegion { .. }
         )
+    }
+
+    /// False when the step performs host-side work or stream sync during dispatch.
+    pub fn graph_capture_safe(&self) -> bool {
+        match self {
+            Step::Im2ColHost { use_gpu, .. } | Step::Fft { use_gpu, .. } => *use_gpu,
+            Step::GatedDeltaNet { .. }
+            | Step::Llada2GroupLimitedGate { .. }
+            | Step::UmapKnn { .. }
+            | Step::GaussianSplatRender { .. }
+            | Step::GaussianSplatRenderBackward { .. }
+            | Step::GaussianSplatPrepare { .. } => false,
+            _ => true,
+        }
     }
 }
 
-const CUBLASLT_WORKSPACE_BYTES: usize = 4 * 1024 * 1024;
-const CUDNN_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
+fn schedule_graph_capture_safe(schedule: &[Step]) -> bool {
+    schedule.iter().all(Step::graph_capture_safe)
+}
+
+fn schedule_needs_blas_lt(schedule: &[Step]) -> bool {
+    schedule.iter().any(|s| {
+        matches!(
+            s,
+            Step::Matmul { act_id, .. } if cublaslt_act_supported(*act_id)
+        )
+    })
+}
+
+fn schedule_needs_dnn(schedule: &[Step]) -> bool {
+    schedule.iter().any(|s| {
+        matches!(
+            s,
+            Step::Conv1d { .. } | Step::Conv2d { .. } | Step::Conv3d { .. }
+        )
+    })
+}
 
 /// Map our internal activation id (matches the `unary` kernel table)
 /// to a cuBLASLt epilogue activation, if it's natively fusable.
@@ -954,14 +1155,16 @@ unsafe fn cublaslt_matmul_fused(
         }
     }
 
-    // CUBLAS_COMPUTE_32F_FAST_TF32 enables Tensor-Core paths for f32
-    // inputs on Ampere+ (10-bit mantissa intermediate vs 23-bit). ~2×
-    // speedup; precision delta is well within transformer-inference
-    // tolerance and matches what cublasSgemm already does by default.
-    let matmul_desc = cublaslt_result::create_matmul_desc(
-        cublaslt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
-        dt,
-    )?;
+    // CUBLAS_COMPUTE_32F_FAST_TF32 enables Tensor-Core paths on Ampere+.
+    // Set RLX_CUDA_NO_TF32=1 (or RLX_CUDA_PARITY=1) for strict f32 parity
+    // vs CPU / wgpu reference paths.
+    let compute_type =
+        if rlx_ir::env::flag("RLX_CUDA_NO_TF32") || rlx_ir::env::flag("RLX_CUDA_PARITY") {
+            cublaslt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+        } else {
+            cublaslt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
+        };
+    let matmul_desc = cublaslt_result::create_matmul_desc(compute_type, dt)?;
 
     // Pick the epilogue mode. cuBLASLt fuses bias broadcast over the
     // M dimension (in cuBLASLt's view). With our A↔B swap, cuBLASLt's
@@ -1563,7 +1766,7 @@ fn try_mixed_precision_gemm(
             shared_mem_bytes: 0,
         };
         let src_view = arena
-            .buffer
+            .f32_buf()
             .slice(a_off_f32 as usize..a_off_f32 as usize + n_total as usize);
         let scratch_mut = half_act_scratch.as_mut().unwrap();
         let mut launcher = stream.launch_builder(&kernel.function);
@@ -1579,7 +1782,10 @@ fn try_mixed_precision_gemm(
 
     // Phase 2: cublasGemmEx with both inputs half + f32 output.
     let blas = blas.lock().unwrap();
-    let (arena_ptr_u64, _ar) = arena.buffer.device_ptr_mut(stream);
+    let arena_ptr_u64 = {
+        let (p, _ar) = arena.buffer.device_ptr_mut(stream);
+        p
+    };
     let (half_buf_ptr, _hb) = arena.half_buffer.as_mut().unwrap().device_ptr_mut(stream);
     let scratch_ptr_u64 = {
         let s = half_act_scratch.as_mut().unwrap();
@@ -1702,6 +1908,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::Sample { .. } => "rlx::Sample",
         Step::SelectiveScan { .. } => "rlx::SelectiveScan",
         Step::Fft { .. } => "rlx::Fft",
+        Step::LogMelHost { .. } => "rlx::LogMelHost",
+        Step::Im2ColHost { .. } => "rlx::Im2ColHost",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Llada2GroupLimitedGate { .. } => "rlx::Llada2GroupLimitedGate",
         Step::UmapKnn { .. } => "rlx::UmapKnn",
@@ -1715,6 +1923,9 @@ fn step_name(step: &Step) -> &'static str {
         Step::RopeBackward { .. } => "rlx::RopeBackward",
         Step::CumsumBackward { .. } => "rlx::CumsumBackward",
         Step::GatherBackward { .. } => "rlx::GatherBackward",
+        Step::MaxPool2dBackward { .. } => "rlx::MaxPool2dBackward",
+        Step::Conv2dBackwardInput { .. } => "rlx::Conv2dBackwardInput",
+        Step::Conv2dBackwardWeight { .. } => "rlx::Conv2dBackwardWeight",
         Step::Pool1d { .. } => "rlx::Pool1d",
         Step::Pool2d { .. } => "rlx::Pool2d",
         Step::Pool3d { .. } => "rlx::Pool3d",
@@ -1727,6 +1938,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::ResizeNearest2x { .. } => "rlx::ResizeNearest2x",
         Step::FusedBinaryUnary { .. } => "rlx::FusedBinaryUnary",
         Step::ElementwiseRegion { .. } => "rlx::ElementwiseRegion",
+        Step::BatchElementwiseRegion { .. } => "rlx::BatchElementwiseRegion",
     }
 }
 
@@ -2005,6 +2217,20 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dst_byte_off,
             ..
         } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
+        Step::LogMelHost {
+            spec_byte_off,
+            filt_byte_off,
+            dst_byte_off,
+            ..
+        } => (
+            vec![*spec_byte_off / 4, *filt_byte_off / 4],
+            vec![*dst_byte_off / 4],
+        ),
+        Step::Im2ColHost {
+            x_byte_off,
+            col_byte_off,
+            ..
+        } => (vec![*x_byte_off / 4], vec![*col_byte_off / 4]),
         Step::GatedDeltaNet {
             q_byte_off,
             k_byte_off,
@@ -2176,6 +2402,33 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![dy_byte_off / 4, indices_byte_off / 4],
             vec![dst_byte_off / 4],
         ),
+        Step::MaxPool2dBackward {
+            x_byte_off,
+            dy_byte_off,
+            dx_byte_off,
+            ..
+        } => (
+            vec![*x_byte_off / 4, *dy_byte_off / 4],
+            vec![*dx_byte_off / 4],
+        ),
+        Step::Conv2dBackwardInput {
+            dy_byte_off,
+            w_byte_off,
+            dx_byte_off,
+            ..
+        } => (
+            vec![*dy_byte_off / 4, *w_byte_off / 4],
+            vec![*dx_byte_off / 4],
+        ),
+        Step::Conv2dBackwardWeight {
+            x_byte_off,
+            dy_byte_off,
+            dw_byte_off,
+            ..
+        } => (
+            vec![*x_byte_off / 4, *dy_byte_off / 4],
+            vec![*dw_byte_off / 4],
+        ),
         Step::Pool1d {
             in_off, out_off, ..
         }
@@ -2241,6 +2494,15 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             let n = (*num_inputs as usize).min(input_offs.len());
             (input_offs[..n].to_vec(), vec![*dst_off])
         }
+        Step::BatchElementwiseRegion {
+            base_dst_off,
+            batch_input_offs,
+            num_batch,
+            ..
+        } => {
+            let n = (*num_batch as usize).min(64);
+            (batch_input_offs[..n].to_vec(), vec![*base_dst_off])
+        }
         Step::GaussianSplatPrepare {
             positions_off,
             scales_off,
@@ -2273,8 +2535,15 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
 }
 
 /// Pre-compile every NVRTC kernel against `ctx`. Used by AOT mode to
-/// move JIT compile cost out of the first-run critical path.
+/// move JIT compile cost out of the first-run critical path. Runs at
+/// most once per process — later `CompileMode::Aot` compiles skip it.
+static AOT_PREWARM_ONCE: Once = Once::new();
+
 fn prewarm_all(ctx: &Arc<CudaContext>) {
+    AOT_PREWARM_ONCE.call_once(|| prewarm_all_kernels(ctx));
+}
+
+fn prewarm_all_kernels(ctx: &Arc<CudaContext>) {
     use crate::kernels::*;
     let _ = binary_kernel(ctx);
     let _ = fused_binary_unary_kernel(ctx);
@@ -2295,6 +2564,7 @@ fn prewarm_all(ctx: &Arc<CudaContext>) {
     let _ = transpose_kernel(ctx);
     let _ = expand_kernel(ctx);
     let _ = attention_kernel(ctx);
+    let _ = attention_row_kernel(ctx);
     let _ = attention_bwd_kernel(ctx);
     let _ = argmax_kernel(ctx);
     let _ = rope_kernel(ctx);
@@ -2312,20 +2582,82 @@ fn prewarm_all(ctx: &Arc<CudaContext>) {
     let _ = pool3d_kernel(ctx);
     let _ = conv1d_kernel(ctx);
     let _ = conv2d_kernel(ctx);
+    let _ = im2col_kernel(ctx);
     let _ = conv3d_kernel(ctx);
     let _ = layer_norm2d_kernel(ctx);
     let _ = conv_transpose2d_kernel(ctx);
     let _ = group_norm_kernel(ctx);
     let _ = resize_nearest_2x_kernel(ctx);
     let _ = elementwise_region_kernel(ctx);
+    let _ = batch_elementwise_region_kernel(ctx);
     // matmul_wmma deliberately excluded: requires SM 70+ and may fail
     // load_module on older GPUs. Compile lazily on first opt-in dispatch.
 }
 
+fn im2col_use_gpu(n: u32, exec_mode: ExecMode) -> bool {
+    if rlx_ir::env::var("RLX_CUDA_IM2COL_HOST").is_some() {
+        return false;
+    }
+    if matches!(exec_mode, ExecMode::Graph) {
+        return n > 0;
+    }
+    n > 0
+}
+
+fn pinned_host_io_disabled() -> bool {
+    rlx_ir::env::var("RLX_CUDA_PINNED_IO").is_some_and(|v| v.eq_ignore_ascii_case("0"))
+}
+
+/// Pinned host output staging (faster D2H). On by default; set `RLX_CUDA_PINNED_IO=0` to disable.
+fn pinned_output_staging_enabled() -> bool {
+    !pinned_host_io_disabled()
+}
+
+/// Pinned host input staging for H2D. Graph mode always; stream mode when `RLX_CUDA_PINNED_IO=1`.
+fn pinned_input_staging_enabled(exec_mode: ExecMode) -> bool {
+    if pinned_host_io_disabled() {
+        return false;
+    }
+    matches!(exec_mode, ExecMode::Graph)
+        || rlx_ir::env::var("RLX_CUDA_PINNED_IO").is_some_and(|v| !v.eq_ignore_ascii_case("0"))
+}
+
+fn normalize_read_indices(buf: &mut Vec<usize>) {
+    if buf.len() > 1 {
+        buf.sort_unstable();
+        buf.dedup();
+    }
+}
+
+fn compile_mode_from_env() -> CompileMode {
+    match rlx_ir::env::var("RLX_CUDA_COMPILE_MODE").as_deref() {
+        Some(mode) if mode.eq_ignore_ascii_case("aot") => CompileMode::Aot,
+        _ => CompileMode::Jit,
+    }
+}
+
+fn exec_mode_from_env() -> ExecMode {
+    match rlx_ir::env::var("RLX_CUDA_EXEC_MODE").as_deref() {
+        Some(mode) if mode.eq_ignore_ascii_case("graph") => ExecMode::Graph,
+        Some(mode) => {
+            let lower = mode.to_ascii_lowercase();
+            if let Some(rest) = lower.strip_prefix("multistream") {
+                let n = rest.trim_start_matches([':', '=']).parse().unwrap_or(2);
+                ExecMode::MultiStream(n.max(1))
+            } else {
+                ExecMode::Stream
+            }
+        }
+        _ => ExecMode::Stream,
+    }
+}
+
 impl CudaExecutable {
     /// JIT compile, stream-mode execution. Default entry point.
+    ///
+    /// Honors `RLX_CUDA_COMPILE_MODE=aot` and `RLX_CUDA_EXEC_MODE=graph|multistream:N`.
     pub fn compile(graph: Graph) -> Self {
-        Self::compile_with(graph, CompileMode::Jit, ExecMode::Stream)
+        Self::compile_with(graph, compile_mode_from_env(), exec_mode_from_env())
     }
 
     /// One-shot eager run. Compiles, executes once with the given
@@ -2345,8 +2677,9 @@ impl CudaExecutable {
 
         // Decompose composed ops we don't yet have native kernels for
         // (FusedMatMulBiasAct, canonical DotGeneral) into primitives
-        // before memory planning.
-        let graph = crate::unfuse::unfuse(graph);
+        // before memory planning. Fusion may reintroduce mid-axis Reduce
+        // (e.g. EEG temporal mean); CUDA only schedules last-axis Reduce.
+        let graph = LowerNonLastAxisReduce.run(crate::unfuse::unfuse(graph));
 
         let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
         let mut plan = plan_f32_uniform(&graph, 16);
@@ -2390,7 +2723,7 @@ impl CudaExecutable {
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_f32) };
                 let off_f32 = arena.offset(node.id) / 4;
                 let stream = ctx.default_stream();
-                let mut slot = arena.buffer.slice_mut(off_f32..off_f32 + n_f32);
+                let mut slot = arena.f32_buf_mut().slice_mut(off_f32..off_f32 + n_f32);
                 stream
                     .memcpy_htod(f32_view, &mut slot)
                     .expect("rlx-cuda: constant upload failed");
@@ -2399,6 +2732,25 @@ impl CudaExecutable {
 
         let mut schedule = Vec::new();
         let mut meta_buffers: Vec<cudarc::driver::CudaSlice<u32>> = Vec::new();
+        let mut packed_bshd_attn: HashMap<NodeId, (NodeId, u32)> = HashMap::new();
+        if !rlx_ir::env::flag("RLX_CUDA_NO_PACKED_BSHD_ATTN") {
+            for node in graph.nodes() {
+                let Op::Attention { .. } = &node.op else {
+                    continue;
+                };
+                if node.inputs.len() < 3 {
+                    continue;
+                }
+                if let Some((parent, head_width, _)) = rlx_ir::detect_packed_bshd_qkv_attention(
+                    &graph,
+                    node.inputs[0],
+                    node.inputs[1],
+                    node.inputs[2],
+                ) {
+                    packed_bshd_attn.insert(node.id, (parent, head_width as u32));
+                }
+            }
+        }
         for node in graph.nodes() {
             let elems = node.shape.num_elements().unwrap_or(0) as u32;
             match &node.op {
@@ -2486,11 +2838,112 @@ impl CudaExecutable {
                         out_off: (arena.offset(node.id) / 4) as u32,
                     });
                 }
+                Op::BatchElementwiseRegion {
+                    chain,
+                    num_batch_inputs,
+                    scalar_input_mask,
+                    input_modulus,
+                    prologue,
+                    prologue_input,
+                } => {
+                    let n = *num_batch_inputs as usize;
+                    if n == 0 || chain.len() > 32 {
+                        panic!(
+                            "rlx-cuda BatchElementwiseRegion: num_batch_inputs={n} steps={}",
+                            chain.len()
+                        );
+                    }
+                    let slice_shape = rlx_ir::batch_region_slice_shape(&node.shape);
+                    let slice_elems = rlx_ir::batch_region_slice_elems(&node.shape, n)
+                        .expect("batch region static shape");
+                    let base_dst_off = (arena.offset(node.id) / 4) as u32;
+                    let use_single = rlx_ir::fk_batch_use_single_launch(n, *prologue);
+                    if use_single {
+                        let mut batch_input_offs = [0u32; 64];
+                        for i in 0..n {
+                            batch_input_offs[i] = (arena.offset(node.inputs[i]) / 4) as u32;
+                        }
+                        let input_offs_meta = [0u32; 16];
+                        let meta_arr = rlx_ir::encode_elementwise_region_meta(
+                            &input_offs_meta,
+                            chain,
+                            *prologue,
+                            &slice_shape,
+                            *prologue_input,
+                        );
+                        let meta = ctx
+                            .default_stream()
+                            .clone_htod(&meta_arr.to_vec())
+                            .expect("rlx-cuda: batch elementwise_region meta upload failed");
+                        let meta_idx = meta_buffers.len();
+                        meta_buffers.push(meta);
+                        let batch_vec: Vec<u32> = batch_input_offs[..n].to_vec();
+                        let batch_dev = ctx
+                            .default_stream()
+                            .clone_htod(&batch_vec)
+                            .expect("rlx-cuda: batch input offs upload failed");
+                        let batch_offs_idx = meta_buffers.len();
+                        meta_buffers.push(batch_dev);
+                        schedule.push(Step::BatchElementwiseRegion {
+                            slice_len: slice_elems,
+                            num_batch: n as u32,
+                            num_steps: chain.len() as u32,
+                            base_dst_off,
+                            slice_elems,
+                            batch_input_offs,
+                            batch_offs_idx,
+                            meta_idx,
+                            scalar_input_mask: *scalar_input_mask,
+                            input_modulus: *input_modulus,
+                        });
+                    } else {
+                        for i in 0..n {
+                            let mut input_offs = [0u32; 16];
+                            input_offs[0] = (arena.offset(node.inputs[i]) / 4) as u32;
+                            let meta_arr = rlx_ir::encode_elementwise_region_meta(
+                                &input_offs,
+                                chain,
+                                *prologue,
+                                &slice_shape,
+                                *prologue_input,
+                            );
+                            let meta = ctx
+                                .default_stream()
+                                .clone_htod(&meta_arr.to_vec())
+                                .expect("rlx-cuda: batch elementwise_region meta upload failed");
+                            let meta_idx = meta_buffers.len();
+                            meta_buffers.push(meta);
+                            let spatial =
+                                matches!(*prologue, rlx_ir::RegionPrologue::ResizeNearest2x);
+                            let grid = rlx_ir::PrologueLaunchGrid::from_output_shape(&slice_shape);
+                            schedule.push(Step::ElementwiseRegion {
+                                len: slice_elems,
+                                num_inputs: 1,
+                                num_steps: chain.len() as u32,
+                                dst_off: rlx_ir::batch_region_slice_dst_off_f32(
+                                    base_dst_off,
+                                    slice_elems,
+                                    i,
+                                ),
+                                input_offs,
+                                scalar_input_mask: *scalar_input_mask,
+                                input_modulus: *input_modulus,
+                                meta_idx,
+                                spatial_prologue: spatial,
+                                prologue_w: grid.map(|g| g.width).unwrap_or(0),
+                                prologue_h: grid.map(|g| g.height).unwrap_or(0),
+                                prologue_nc: grid.map(|g| g.depth).unwrap_or(0),
+                            });
+                        }
+                    }
+                }
                 Op::ElementwiseRegion {
                     chain,
                     num_inputs,
                     scalar_input_mask,
                     input_modulus,
+                    prologue,
+                    prologue_input,
                 } => {
                     // PLAN L2 native lowering. Encode the chain into a
                     // 72-u32 metadata buffer (8 input offsets + 16 steps *
@@ -2512,93 +2965,22 @@ impl CudaExecutable {
                     for (i, &id) in node.inputs.iter().enumerate() {
                         input_offs[i] = (arena.offset(id) / 4) as u32;
                     }
-                    let encode_operand = |op: &ChainOperand| -> u32 {
-                        match *op {
-                            ChainOperand::Input(i) => i & 0x7FFF_FFFFu32,
-                            ChainOperand::Step(i) => 0x8000_0000u32 | (i & 0x7FFF_FFFFu32),
-                        }
-                    };
-                    // op_sub mappings shared with rlx-metal MSL +
-                    // rlx-wgpu WGSL chain kernels — the encoder
-                    // produces one byte stream that all three backends
-                    // interpret identically.
-                    let act_sub = |a: Activation| match a {
-                        Activation::Gelu => 0u32,
-                        Activation::GeluApprox => 1,
-                        Activation::Silu => 2,
-                        Activation::Relu => 3,
-                        Activation::Sigmoid => 4,
-                        Activation::Tanh => 5,
-                        Activation::Exp => 6,
-                        Activation::Log => 7,
-                        Activation::Sqrt => 8,
-                        Activation::Rsqrt => 9,
-                        Activation::Neg => 10,
-                        Activation::Abs => 11,
-                        Activation::Round => 12,
-                        Activation::Sin => 13,
-                        Activation::Cos => 14,
-                        Activation::Tan => 15,
-                        Activation::Atan => 16,
-                    };
-                    let bin_sub = |b: BinaryOp| match b {
-                        BinaryOp::Add => 0u32,
-                        BinaryOp::Sub => 1,
-                        BinaryOp::Mul => 2,
-                        BinaryOp::Div => 3,
-                        BinaryOp::Max => 4,
-                        BinaryOp::Min => 5,
-                        BinaryOp::Pow => 6,
-                    };
-                    let cmp_sub = |c: CmpOp| match c {
-                        CmpOp::Eq => 0u32,
-                        CmpOp::Ne => 1,
-                        CmpOp::Lt => 2,
-                        CmpOp::Le => 3,
-                        CmpOp::Gt => 4,
-                        CmpOp::Ge => 5,
-                    };
-                    // meta layout: 16 input offsets + 32 steps × 4 u32s = 144 words.
-                    let mut meta_data: Vec<u32> = Vec::with_capacity(144);
-                    meta_data.extend_from_slice(&input_offs);
-                    let mut chain_enc = [0u32; 128];
-                    for (k, step) in chain.iter().enumerate() {
-                        let base = k * 4;
-                        let (kind, sub, lhs, rhs) = match step {
-                            ChainStep::Activation(a, src) => {
-                                (0u32, act_sub(*a), encode_operand(src), 0u32)
-                            }
-                            ChainStep::Cast(_, src) => (1u32, 0, encode_operand(src), 0u32),
-                            ChainStep::Binary(op, l, r) => {
-                                (2u32, bin_sub(*op), encode_operand(l), encode_operand(r))
-                            }
-                            ChainStep::Compare(op, l, r) => {
-                                (3u32, cmp_sub(*op), encode_operand(l), encode_operand(r))
-                            }
-                            ChainStep::Where(c, t, f) =>
-                            // Pack 3 operands into the 4-u32 step:
-                            // op_sub=cond, lhs=on_true, rhs=on_false.
-                            {
-                                (
-                                    4u32,
-                                    encode_operand(c),
-                                    encode_operand(t),
-                                    encode_operand(f),
-                                )
-                            }
-                        };
-                        chain_enc[base] = kind;
-                        chain_enc[base + 1] = sub;
-                        chain_enc[base + 2] = lhs;
-                        chain_enc[base + 3] = rhs;
-                    }
-                    meta_data.extend_from_slice(&chain_enc);
+                    let meta_arr = rlx_ir::encode_elementwise_region_meta(
+                        &input_offs,
+                        chain,
+                        *prologue,
+                        &node.shape,
+                        *prologue_input,
+                    );
+                    let meta_data: Vec<u32> = meta_arr.to_vec();
                     let meta = ctx
                         .default_stream()
                         .clone_htod(&meta_data)
                         .expect("rlx-cuda: elementwise_region meta upload failed");
                     let meta_idx = meta_buffers.len();
                     meta_buffers.push(meta);
+                    let spatial = matches!(*prologue, rlx_ir::RegionPrologue::ResizeNearest2x);
+                    let grid = rlx_ir::PrologueLaunchGrid::from_output_shape(&node.shape);
                     schedule.push(Step::ElementwiseRegion {
                         len: elems,
                         num_inputs: *num_inputs,
@@ -2608,6 +2990,10 @@ impl CudaExecutable {
                         scalar_input_mask: *scalar_input_mask,
                         input_modulus: *input_modulus,
                         meta_idx,
+                        spatial_prologue: spatial,
+                        prologue_w: grid.map(|g| g.width).unwrap_or(0),
+                        prologue_h: grid.map(|g| g.height).unwrap_or(0),
+                        prologue_nc: grid.map(|g| g.depth).unwrap_or(0),
                     });
                 }
                 Op::Reduce {
@@ -2816,16 +3202,17 @@ impl CudaExecutable {
                     let in_id = node.inputs[0];
                     let in_shape = graph.node(in_id).shape.dims();
                     let rank = target_shape.len();
-                    if rank != in_shape.len() {
+                    if rank < in_shape.len() {
                         panic!(
-                            "rlx-cuda Expand: rank mismatch (in={}, target={})",
+                            "rlx-cuda Expand: cannot reduce rank (in={}, target={})",
                             in_shape.len(),
                             rank
                         );
                     }
                     let out_dims: Vec<u32> = target_shape.iter().map(|&d| d as u32).collect();
-                    let in_dims: Vec<u32> =
-                        in_shape.iter().map(|d| d.unwrap_static() as u32).collect();
+                    let pad = rank - in_shape.len();
+                    let mut in_dims: Vec<u32> = vec![1; pad];
+                    in_dims.extend(in_shape.iter().map(|d| d.unwrap_static() as u32));
                     let mut in_strides_row = vec![1u32; rank];
                     for i in (0..rank.saturating_sub(1)).rev() {
                         in_strides_row[i] = in_strides_row[i + 1] * in_dims[i + 1];
@@ -2896,8 +3283,6 @@ impl CudaExecutable {
                     score_scale: _,
                     attn_logit_softcap: _,
                 } => {
-                    // Rank-3 inputs already promoted by unfuse; here we only
-                    // see rank-4 [B, H, S, D].
                     let q_id = node.inputs[0];
                     let k_id = node.inputs[1];
                     let v_id = node.inputs[2];
@@ -2906,34 +3291,108 @@ impl CudaExecutable {
                     if q_shape.len() != 4 {
                         panic!("rlx-cuda Attention: unfuse should have promoted to rank-4");
                     }
-                    let batch = q_shape[0].unwrap_static() as u32;
-                    let heads = q_shape[1].unwrap_static() as u32;
-                    let seq_q = q_shape[2].unwrap_static() as u32;
-                    let seq_k = k_shape[2].unwrap_static() as u32;
+                    let q_ir = graph.node(q_id).shape.clone();
+                    let k_ir = graph.node(k_id).shape.clone();
+                    let geom = rlx_ir::attention_geom(&q_ir, &k_ir, *num_heads, *head_dim);
+                    let batch = geom.batch as u32;
+                    let heads = geom.heads as u32;
+                    let seq_q = geom.seq_q as u32;
+                    let seq_k = geom.seq_k as u32;
                     let hd = *head_dim as u32;
                     let scale = 1.0_f32 / (hd as f32).sqrt();
+                    let mask_shape = if matches!(mask_kind, MaskKind::Custom | MaskKind::Bias) {
+                        Some(graph.node(node.inputs[3]).shape.dims())
+                    } else {
+                        None
+                    };
+                    let packed_parent = packed_bshd_attn.get(&node.id).copied();
+                    let st = if let Some((_, head_width)) = packed_parent {
+                        let (qb, qh, qs) =
+                            rlx_ir::packed_bshd_qkv_strides(head_width as usize, hd, seq_q);
+                        let (ob, oh, os) =
+                            rlx_ir::strides_for_shape(node.shape.dims(), heads, hd, seq_q, false);
+                        let (mb, mh, mq, mk) = mask_shape
+                            .map(|m| rlx_ir::mask_strides_for_shape(m, heads, seq_q, seq_k))
+                            .unwrap_or_else(|| rlx_ir::mask_strides_bhsd(heads, seq_q, seq_k));
+                        rlx_ir::AttentionLaunchStrides {
+                            q_batch: qb,
+                            q_head: qh,
+                            q_seq: qs,
+                            k_batch: qb,
+                            k_head: qh,
+                            k_seq: qs,
+                            v_batch: qb,
+                            v_head: qh,
+                            v_seq: qs,
+                            o_batch: ob,
+                            o_head: oh,
+                            o_seq: os,
+                            mask_batch: mb,
+                            mask_head: mh,
+                            mask_q: mq,
+                            mask_k: mk,
+                        }
+                    } else {
+                        rlx_ir::attention_launch_strides(
+                            geom,
+                            q_shape,
+                            k_shape,
+                            graph.node(v_id).shape.dims(),
+                            node.shape.dims(),
+                            mask_shape,
+                        )
+                    };
+                    let (q_off, k_off, v_off) = if let Some((parent, head_width)) = packed_parent {
+                        let p = (arena.offset(parent) / 4) as u32;
+                        (
+                            p,
+                            p.saturating_add(head_width),
+                            p.saturating_add(head_width * 2),
+                        )
+                    } else {
+                        (
+                            (arena.offset(q_id) / 4) as u32,
+                            (arena.offset(k_id) / 4) as u32,
+                            (arena.offset(v_id) / 4) as u32,
+                        )
+                    };
                     let (mask_kind_id, mask_off, window) = match mask_kind {
                         MaskKind::None => (0u32, 0u32, 0u32),
                         MaskKind::Causal => (1u32, 0u32, 0u32),
                         MaskKind::Custom => (2u32, (arena.offset(node.inputs[3]) / 4) as u32, 0u32),
                         MaskKind::SlidingWindow(w) => (3u32, 0u32, *w as u32),
-                        MaskKind::Bias => (4u32, 0u32, 0u32),
+                        MaskKind::Bias => (4u32, (arena.offset(node.inputs[3]) / 4) as u32, 0u32),
                     };
-                    let _ = num_heads;
                     schedule.push(Step::Attention {
                         batch,
                         heads,
                         seq_q,
                         seq_k,
                         head_dim: hd,
-                        q_off: (arena.offset(q_id) / 4) as u32,
-                        k_off: (arena.offset(k_id) / 4) as u32,
-                        v_off: (arena.offset(v_id) / 4) as u32,
+                        q_off,
+                        k_off,
+                        v_off,
                         out_off: (arena.offset(node.id) / 4) as u32,
                         mask_off,
                         mask_kind: mask_kind_id,
                         scale_bits: scale.to_bits(),
                         window,
+                        seq_q_stride: st.mask_q,
+                        seq_k_stride: st.mask_k,
+                        mask_batch_stride: st.mask_batch,
+                        mask_head_stride: st.mask_head,
+                        q_batch_stride: st.q_batch,
+                        q_head_stride: st.q_head,
+                        q_seq_stride: st.q_seq,
+                        k_batch_stride: st.k_batch,
+                        k_head_stride: st.k_head,
+                        k_seq_stride: st.k_seq,
+                        v_batch_stride: st.v_batch,
+                        v_head_stride: st.v_head,
+                        v_seq_stride: st.v_seq,
+                        o_batch_stride: st.o_batch,
+                        o_head_stride: st.o_head,
+                        o_seq_stride: st.o_seq,
                     });
                 }
                 Op::AttentionBackward {
@@ -3208,6 +3667,80 @@ impl CudaExecutable {
                         norm_tag: norm.tag(),
                         dtype_tag: fft_dtype_tag(dtype),
                         use_gpu,
+                    });
+                }
+                Op::LogMel => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let filt_shape = graph.node(node.inputs[1]).shape.clone();
+                    let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
+                        .unwrap_or_else(|e| panic!("Op::LogMel: {e}"));
+                    schedule.push(Step::LogMelHost {
+                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                        filt_byte_off: arena.offset(node.inputs[1]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        outer: meta.outer as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_bins: meta.n_bins as u32,
+                        n_mels: meta.n_mels as u32,
+                    });
+                }
+                Op::Im2Col {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    if kernel_size.len() != 2 || x_shape.rank() != 4 {
+                        panic!("rlx-cuda Im2Col: 2D NCHW only");
+                    }
+                    let n = match x_shape.dim(0) {
+                        rlx_ir::shape::Dim::Static(v) => v as u32,
+                        _ => 0,
+                    };
+                    let c_in = x_shape.dim(1).unwrap_static() as u32;
+                    let h = x_shape.dim(2).unwrap_static() as u32;
+                    let w = x_shape.dim(3).unwrap_static() as u32;
+                    let kh = kernel_size[0] as u32;
+                    let kw = kernel_size[1] as u32;
+                    let sh = stride.first().copied().unwrap_or(1) as u32;
+                    let sw = stride.get(1).copied().unwrap_or(1) as u32;
+                    let ph = padding.first().copied().unwrap_or(0) as u32;
+                    let pw = padding.get(1).copied().unwrap_or(0) as u32;
+                    let dh = dilation.first().copied().unwrap_or(1) as u32;
+                    let dw_dil = dilation.get(1).copied().unwrap_or(1) as u32;
+                    let h_out = rlx_ir::shape::conv2d_spatial_output(
+                        h as usize,
+                        kh as usize,
+                        sh as usize,
+                        ph as usize,
+                        dh as usize,
+                    ) as u32;
+                    let w_out = rlx_ir::shape::conv2d_spatial_output(
+                        w as usize,
+                        kw as usize,
+                        sw as usize,
+                        pw as usize,
+                        dw_dil as usize,
+                    ) as u32;
+                    schedule.push(Step::Im2ColHost {
+                        x_byte_off: arena.offset(node.inputs[0]) as u32,
+                        col_byte_off: arena.offset(node.id) as u32,
+                        n,
+                        c_in,
+                        h,
+                        w,
+                        h_out,
+                        w_out,
+                        kh,
+                        kw,
+                        sh,
+                        sw,
+                        ph,
+                        pw,
+                        dh,
+                        dw_dil,
+                        use_gpu: im2col_use_gpu(n, exec_mode),
                     });
                 }
                 Op::GatedDeltaNet {
@@ -3833,6 +4366,105 @@ impl CudaExecutable {
                         trailing: trailing as u32,
                     });
                 }
+                Op::Conv2dBackwardInput {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    let dy_shape = &graph.node(node.inputs[0]).shape;
+                    let out_shape = &node.shape;
+                    if kernel_size.len() == 2 && dy_shape.rank() == 4 && out_shape.rank() == 4 {
+                        schedule.push(Step::Conv2dBackwardInput {
+                            dy_byte_off: arena.offset(node.inputs[0]) as u32,
+                            w_byte_off: arena.offset(node.inputs[1]) as u32,
+                            dx_byte_off: arena.offset(node.id) as u32,
+                            n: out_shape.dim(0).unwrap_static() as u32,
+                            c_in: out_shape.dim(1).unwrap_static() as u32,
+                            h: out_shape.dim(2).unwrap_static() as u32,
+                            w_in: out_shape.dim(3).unwrap_static() as u32,
+                            c_out: dy_shape.dim(1).unwrap_static() as u32,
+                            h_out: dy_shape.dim(2).unwrap_static() as u32,
+                            w_out: dy_shape.dim(3).unwrap_static() as u32,
+                            kh: kernel_size[0] as u32,
+                            kw: kernel_size[1] as u32,
+                            sh: stride.first().copied().unwrap_or(1) as u32,
+                            sw: stride.get(1).copied().unwrap_or(1) as u32,
+                            ph: padding.first().copied().unwrap_or(0) as u32,
+                            pw: padding.get(1).copied().unwrap_or(0) as u32,
+                            dh: dilation.first().copied().unwrap_or(1) as u32,
+                            dw: dilation.get(1).copied().unwrap_or(1) as u32,
+                            groups: *groups as u32,
+                        });
+                    } else {
+                        panic!("rlx-cuda: Conv2dBackwardInput expects 2-D conv on NCHW tensors");
+                    }
+                }
+                Op::Conv2dBackwardWeight {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let dy_shape = &graph.node(node.inputs[1]).shape;
+                    if kernel_size.len() == 2 && x_shape.rank() == 4 && dy_shape.rank() == 4 {
+                        schedule.push(Step::Conv2dBackwardWeight {
+                            x_byte_off: arena.offset(node.inputs[0]) as u32,
+                            dy_byte_off: arena.offset(node.inputs[1]) as u32,
+                            dw_byte_off: arena.offset(node.id) as u32,
+                            n: x_shape.dim(0).unwrap_static() as u32,
+                            c_in: x_shape.dim(1).unwrap_static() as u32,
+                            h: x_shape.dim(2).unwrap_static() as u32,
+                            w: x_shape.dim(3).unwrap_static() as u32,
+                            c_out: dy_shape.dim(1).unwrap_static() as u32,
+                            h_out: dy_shape.dim(2).unwrap_static() as u32,
+                            w_out: dy_shape.dim(3).unwrap_static() as u32,
+                            kh: kernel_size[0] as u32,
+                            kw: kernel_size[1] as u32,
+                            sh: stride.first().copied().unwrap_or(1) as u32,
+                            sw: stride.get(1).copied().unwrap_or(1) as u32,
+                            ph: padding.first().copied().unwrap_or(0) as u32,
+                            pw: padding.get(1).copied().unwrap_or(0) as u32,
+                            dh: dilation.first().copied().unwrap_or(1) as u32,
+                            dw_dil: dilation.get(1).copied().unwrap_or(1) as u32,
+                            groups: *groups as u32,
+                        });
+                    } else {
+                        panic!("rlx-cuda: Conv2dBackwardWeight expects 2-D conv on NCHW tensors");
+                    }
+                }
+                Op::MaxPool2dBackward {
+                    kernel_size,
+                    stride,
+                    padding,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let dy_shape = &graph.node(node.inputs[1]).shape;
+                    if kernel_size.len() == 2 && x_shape.rank() == 4 && dy_shape.rank() == 4 {
+                        schedule.push(Step::MaxPool2dBackward {
+                            x_byte_off: arena.offset(node.inputs[0]) as u32,
+                            dy_byte_off: arena.offset(node.inputs[1]) as u32,
+                            dx_byte_off: arena.offset(node.id) as u32,
+                            n: x_shape.dim(0).unwrap_static() as u32,
+                            c: x_shape.dim(1).unwrap_static() as u32,
+                            h: x_shape.dim(2).unwrap_static() as u32,
+                            w: x_shape.dim(3).unwrap_static() as u32,
+                            h_out: dy_shape.dim(2).unwrap_static() as u32,
+                            w_out: dy_shape.dim(3).unwrap_static() as u32,
+                            kh: kernel_size[0] as u32,
+                            kw: kernel_size[1] as u32,
+                            sh: stride.first().copied().unwrap_or(1) as u32,
+                            sw: stride.get(1).copied().unwrap_or(1) as u32,
+                            ph: padding.first().copied().unwrap_or(0) as u32,
+                            pw: padding.get(1).copied().unwrap_or(0) as u32,
+                        });
+                    } else {
+                        panic!("rlx-cuda: MaxPool2dBackward expects 2-D pool on NCHW tensors");
+                    }
+                }
                 other => panic!(
                     "rlx-cuda: op {other:?} not yet lowered. \
                      Open a follow-up PR if you hit this — every other op \
@@ -3844,19 +4476,21 @@ impl CudaExecutable {
         let schedule = fuse_elementwise_chains(schedule);
 
         let blas = cuda_blas();
-        let blas_lt = cuda_blas_lt_handle();
-        let blas_lt_workspace = if blas_lt.is_some() {
-            ctx.default_stream()
-                .alloc_zeros::<u8>(CUBLASLT_WORKSPACE_BYTES)
-                .ok()
+        let needs_blas_lt = schedule_needs_blas_lt(&schedule);
+        let needs_dnn = schedule_needs_dnn(&schedule);
+        let blas_lt = if needs_blas_lt {
+            cuda_blas_lt_handle()
         } else {
             None
         };
-        let dnn = cuda_dnn_handle();
-        let dnn_workspace = if dnn.is_some() {
-            ctx.default_stream()
-                .alloc_zeros::<u8>(CUDNN_WORKSPACE_BYTES)
-                .ok()
+        let blas_lt_workspace = if needs_blas_lt {
+            cuda_blas_lt_workspace()
+        } else {
+            None
+        };
+        let dnn = if needs_dnn { cuda_dnn_handle() } else { None };
+        let dnn_workspace = if needs_dnn {
+            cuda_dnn_workspace()
         } else {
             None
         };
@@ -3873,6 +4507,53 @@ impl CudaExecutable {
             }
             _ => Vec::new(),
         };
+
+        let output_staging: Vec<F32HostSlot> = graph
+            .outputs
+            .iter()
+            .map(|&id| {
+                let elems = graph.node(id).shape.num_elements().unwrap_or(0);
+                F32HostSlot::new(&ctx, elems, pinned_output_staging_enabled())
+            })
+            .collect();
+
+        let mut input_staging = HashMap::new();
+        if pinned_input_staging_enabled(exec_mode) {
+            for (name, &id) in &input_offsets {
+                let elems = graph.node(id).shape.num_elements().unwrap_or(0);
+                input_staging.insert(name.clone(), F32HostSlot::new(&ctx, elems, true));
+            }
+        }
+
+        let replay_event = if exec_mode == ExecMode::Graph {
+            ctx.new_event(None).ok()
+        } else {
+            None
+        };
+
+        let mut input_slot_names = Vec::new();
+        let mut input_slots = Vec::new();
+        for node in graph.nodes() {
+            if let Op::Input { name } = &node.op {
+                let off = if arena.has(node.id) {
+                    arena.offset(node.id)
+                } else {
+                    0
+                };
+                let len = node.shape.num_elements().unwrap_or(0);
+                input_slot_names.push(name.clone());
+                input_slots.push((off, len));
+            }
+        }
+
+        let mut host_total = 0usize;
+        let mut output_slots = Vec::new();
+        for &id in &graph.outputs {
+            let n = graph.node(id).shape.num_elements().unwrap_or(0);
+            output_slots.push((host_total * 4, n));
+            host_total += n;
+        }
+        let host_arena = vec![0.0f32; host_total];
 
         Self {
             ctx,
@@ -3893,7 +4574,79 @@ impl CudaExecutable {
             captured_graph: None,
             streams,
             active_extent: None,
+            output_staging,
+            input_staging,
+            replay_event,
+            gpu_handles: HashMap::new(),
+            gpu_handle_feeds: HashMap::new(),
+            gpu_handle_resident: std::collections::HashSet::new(),
+            pending_read_indices: None,
+            readback_plan_buf: Vec::new(),
+            captured_readback_plan: None,
+            input_slot_names,
+            input_slots,
+            output_slots,
+            host_arena,
         }
+    }
+
+    /// Host buffer base for reading outputs after [`Self::run_slots`].
+    /// Offsets in the returned slot pairs are **byte** offsets into this buffer.
+    pub fn arena_ptr(&self) -> *const u8 {
+        self.host_arena.as_ptr() as *const u8
+    }
+
+    pub fn output_slots(&self) -> &[(usize, usize)] {
+        &self.output_slots
+    }
+
+    fn upload_slot_inputs(&mut self, inputs: &[&[f32]]) {
+        let stream = self.ctx.default_stream();
+        for (i, data) in inputs.iter().enumerate() {
+            let Some(&(byte_off, max_elems)) = self.input_slots.get(i) else {
+                break;
+            };
+            let off_f32 = byte_off / 4;
+            let len = data.len().min(max_elems);
+            if len == 0 {
+                continue;
+            }
+            let mut slot = self.arena.f32_buf_mut().slice_mut(off_f32..off_f32 + len);
+            if let Some(name) = self.input_slot_names.get(i) {
+                if let Some(host) = self.input_staging.get_mut(name.as_str()) {
+                    host.copy_from_host(data);
+                    let _ = host.htod(&stream, &mut slot, len);
+                    continue;
+                }
+            }
+            let _ = stream.memcpy_htod(&data[..len], &mut slot);
+        }
+    }
+
+    fn pack_host_arena(&mut self) {
+        self.prepare_readback_plan();
+        for &i in &self.readback_plan_buf {
+            if i >= self.output_staging.len() || i >= self.output_slots.len() {
+                continue;
+            }
+            let (byte_off, n) = self.output_slots[i];
+            if n == 0 {
+                continue;
+            }
+            let start = byte_off / 4;
+            let end = start + n;
+            if end <= self.host_arena.len() {
+                self.output_staging[i].copy_into(&mut self.host_arena[start..end]);
+            }
+        }
+    }
+
+    /// Fast path: positional inputs, D2H into [`Self::host_arena`], no per-output `Vec`.
+    pub fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
+        self.upload_slot_inputs(inputs);
+        let _ = self.run_inner(&[]);
+        self.pack_host_arena();
+        &self.output_slots
     }
 
     /// Hint the next `run` to process only the first `actual` rows
@@ -3926,7 +4679,10 @@ impl CudaExecutable {
         {
             let off_f32 = self.arena.offset(id) / 4;
             let stream = self.ctx.default_stream();
-            let mut slot = self.arena.buffer.slice_mut(off_f32..off_f32 + data.len());
+            let mut slot = self
+                .arena
+                .f32_buf_mut()
+                .slice_mut(off_f32..off_f32 + data.len());
             stream
                 .memcpy_htod(data, &mut slot)
                 .expect("rlx-cuda: param upload failed");
@@ -3940,7 +4696,7 @@ impl CudaExecutable {
         {
             let byte_off = self.arena.offset(id);
             let stream = self.ctx.default_stream();
-            crate::gguf_host::upload_param_bytes(&stream, &mut self.arena.buffer, byte_off, data);
+            crate::gguf_host::upload_param_bytes(&stream, self.arena.f32_buf_mut(), byte_off, data);
         }
     }
 
@@ -3974,8 +4730,169 @@ impl CudaExecutable {
     }
 
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        self.run_read_outputs(inputs, None)
+    }
+
+    /// Run and read back only selected outputs (+ GPU handle feed outputs).
+    pub fn run_read_outputs(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        read_indices: Option<&[usize]>,
+    ) -> Vec<Vec<f32>> {
+        match read_indices {
+            None => self.pending_read_indices = None,
+            Some(ix) => {
+                let buf = self.pending_read_indices.get_or_insert_with(Vec::new);
+                buf.clear();
+                buf.extend_from_slice(ix);
+                normalize_read_indices(buf);
+            }
+        }
+        let outs = self.run_inner(inputs);
+        self.pending_read_indices = None;
+        outs
+    }
+
+    pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
+        if !self.input_offsets.contains_key(name) {
+            return false;
+        }
+        self.gpu_handle_resident.remove(name);
+        self.gpu_handles.insert(name.to_string(), data.to_vec());
+        true
+    }
+
+    pub fn has_gpu_handle(&self, name: &str) -> bool {
+        self.gpu_handles.contains_key(name)
+    }
+
+    pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
+        self.gpu_handle_feeds
+            .insert(handle_name.to_string(), output_index);
+    }
+
+    pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
+        if let Some(&out_idx) = self.gpu_handle_feeds.get(name) {
+            if out_idx < self.graph.outputs.len() {
+                let id = self.graph.outputs[out_idx];
+                let stream = self.ctx.default_stream();
+                let off_f32 = self.arena.offset(id) / 4;
+                let n_f32 = self.arena.len_of(id) / 4;
+                let mut host = vec![0f32; n_f32];
+                let src = self.arena.f32_buf().slice(off_f32..off_f32 + n_f32);
+                if stream.memcpy_dtoh(&src, host.as_mut_slice()).is_ok() {
+                    return Some(host);
+                }
+            }
+        }
+        if self.gpu_handle_resident.contains(name) {
+            if let Some(&id) = self.input_offsets.get(name) {
+                let stream = self.ctx.default_stream();
+                let off_f32 = self.arena.offset(id) / 4;
+                let n_f32 = self.arena.len_of(id) / 4;
+                let mut host = vec![0f32; n_f32];
+                let src = self.arena.f32_buf().slice(off_f32..off_f32 + n_f32);
+                if stream.memcpy_dtoh(&src, host.as_mut_slice()).is_ok() {
+                    return Some(host);
+                }
+            }
+        }
+        self.gpu_handles.get(name).cloned()
+    }
+
+    /// Build the sorted output readback plan into [`Self::readback_plan_buf`].
+    fn prepare_readback_plan(&mut self) {
+        self.readback_plan_buf.clear();
+        let n = self.graph.outputs.len();
+        if let Some(ref want) = self.pending_read_indices {
+            self.readback_plan_buf.extend_from_slice(want);
+            normalize_read_indices(&mut self.readback_plan_buf);
+            return;
+        }
+        self.readback_plan_buf.extend(0..n);
+    }
+
+    fn propagate_gpu_handle_feeds_d2d(&mut self, stream: &Arc<cudarc::driver::CudaStream>) {
+        let extent = self.active_extent;
+        for (name, &out_idx) in &self.gpu_handle_feeds {
+            if out_idx >= self.graph.outputs.len() {
+                continue;
+            }
+            let out_id = self.graph.outputs[out_idx];
+            let Some(&in_id) = self.input_offsets.get(name.as_str()) else {
+                continue;
+            };
+            if in_id != out_id {
+                let out_bytes = self.arena.len_of(out_id);
+                let copy_bytes = match extent {
+                    Some((actual, upper)) if upper > 0 => {
+                        let stride = (out_bytes / (upper + 1)).max(4);
+                        (actual * stride).min(out_bytes)
+                    }
+                    _ => out_bytes,
+                }
+                .min(self.arena.len_of(in_id));
+                let src_off = self.arena.offset(out_id) / 4;
+                let dst_off = self.arena.offset(in_id) / 4;
+                let n_f32 = copy_bytes / 4;
+                if n_f32 > 0 && src_off != dst_off {
+                    let mut tmp = vec![0.0f32; n_f32];
+                    let src = self.arena.f32_buf().slice(src_off..src_off + n_f32);
+                    if stream.memcpy_dtoh(&src, &mut tmp).is_ok() {
+                        let mut dst = self.arena.f32_buf_mut().slice_mut(dst_off..dst_off + n_f32);
+                        let _ = stream.memcpy_htod(&tmp, &mut dst);
+                    }
+                }
+            }
+            self.gpu_handle_resident.insert(name.clone());
+            self.gpu_handles.insert(name.clone(), Vec::new());
+        }
+    }
+
+    fn stage_gpu_handle_inputs(
+        &mut self,
+        stream: &Arc<cudarc::driver::CudaStream>,
+        inputs: &[(&str, &[f32])],
+    ) {
+        for (name, data) in &self.gpu_handles {
+            if self.gpu_handle_resident.contains(name) || inputs.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            if let Some(&id) = self.input_offsets.get(name.as_str())
+                && self.arena.has(id)
+            {
+                let off_f32 = self.arena.offset(id) / 4;
+                let mut slot = self
+                    .arena
+                    .f32_buf_mut()
+                    .slice_mut(off_f32..off_f32 + data.len());
+                if let Some(host) = self.input_staging.get_mut(name.as_str()) {
+                    host.copy_from_host(data);
+                    let _ = host.htod(stream, &mut slot, data.len());
+                } else {
+                    let _ = stream.memcpy_htod(data.as_slice(), &mut slot);
+                }
+            }
+        }
+    }
+
+    fn refresh_gpu_handles_from_staging(&mut self, plan: &[usize]) {
+        if self.pending_read_indices.is_some() {
+            return;
+        }
+        for (name, &out_idx) in &self.gpu_handle_feeds {
+            if plan.contains(&out_idx) && out_idx < self.output_staging.len() {
+                self.gpu_handles
+                    .insert(name.clone(), self.output_staging[out_idx].to_vec());
+            }
+        }
+    }
+
+    fn run_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         let default_stream = self.ctx.default_stream();
         let stream = default_stream.clone();
+
+        self.stage_gpu_handle_inputs(&stream, inputs);
 
         // Copy inputs to device. Always done outside any graph capture
         // — inputs change between runs and shouldn't be baked into the
@@ -3985,10 +4902,19 @@ impl CudaExecutable {
                 && self.arena.has(id)
             {
                 let off_f32 = self.arena.offset(id) / 4;
-                let mut slot = self.arena.buffer.slice_mut(off_f32..off_f32 + data.len());
-                stream
-                    .memcpy_htod(data, &mut slot)
-                    .expect("rlx-cuda: input upload failed");
+                let mut slot = self
+                    .arena
+                    .f32_buf_mut()
+                    .slice_mut(off_f32..off_f32 + data.len());
+                if let Some(host) = self.input_staging.get_mut(name) {
+                    host.copy_from_host(data);
+                    host.htod(&stream, &mut slot, data.len())
+                        .expect("rlx-cuda: pinned input upload failed");
+                } else {
+                    stream
+                        .memcpy_htod(data, &mut slot)
+                        .expect("rlx-cuda: input upload failed");
+                }
             }
         }
 
@@ -4012,28 +4938,59 @@ impl CudaExecutable {
         // normal dispatch loop with stream capture turned on; the
         // resulting graph is stashed in `self.captured_graph` and
         // replayed on every subsequent run.
-        let do_replay =
-            active.is_none() && self.exec_mode == ExecMode::Graph && self.captured_graph.is_some();
-        let do_capture =
-            active.is_none() && self.exec_mode == ExecMode::Graph && self.captured_graph.is_none();
+        let graph_eligible = active.is_none()
+            && self.exec_mode == ExecMode::Graph
+            && schedule_graph_capture_safe(&self.schedule);
+        let do_replay = graph_eligible && self.captured_graph.is_some();
+        let do_capture = graph_eligible && self.captured_graph.is_none();
 
         if do_replay {
-            self.captured_graph
+            self.prepare_readback_plan();
+            let plan_ok = self
+                .captured_readback_plan
                 .as_ref()
-                .unwrap()
-                .launch()
-                .expect("rlx-cuda: graph replay failed");
-            stream.synchronize().expect("rlx-cuda: stream sync failed");
-            return self.read_outputs(&stream);
+                .is_some_and(|p| p.as_slice() == self.readback_plan_buf.as_slice());
+            if plan_ok {
+                self.captured_graph
+                    .as_ref()
+                    .unwrap()
+                    .launch()
+                    .expect("rlx-cuda: graph replay failed");
+                if let Some(evt) = &self.replay_event {
+                    evt.record(&stream)
+                        .expect("rlx-cuda: replay event record failed");
+                    evt.synchronize()
+                        .expect("rlx-cuda: replay event sync failed");
+                } else {
+                    stream.synchronize().expect("rlx-cuda: stream sync failed");
+                }
+                let plan = self.readback_plan_buf.clone();
+                let read_all = plan.len() == self.graph.outputs.len();
+                // DtoH must run after every replay — inputs change each run and
+                // must not rely on dtoh baked into the captured graph.
+                if read_all {
+                    self.fill_output_staging(&stream)
+                        .expect("rlx-cuda: output dtoh failed after replay");
+                } else {
+                    self.fill_output_staging_indices(&stream, &plan)
+                        .expect("rlx-cuda: partial output dtoh failed after replay");
+                }
+                self.refresh_gpu_handles_from_staging(&plan);
+                return self.outputs_from_staging_plan(&plan);
+            }
+            // Readback plan changed (e.g. partial grads); drop stale capture and re-dispatch.
+            self.captured_graph = None;
+            self.captured_readback_plan = None;
         }
         let _ = do_replay;
 
+        let mut capturing = false;
         if do_capture {
-            stream
+            capturing = stream
                 .begin_capture(
                     cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
                 )
-                .expect("rlx-cuda: begin_capture failed");
+                .is_ok();
         }
 
         // Multi-stream scheduler state. When `exec_mode ==
@@ -4136,6 +5093,46 @@ impl CudaExecutable {
                     bias_off_f32,
                     act_id,
                 } => {
+                    if matmul_parity_mode() {
+                        let kernel = matmul_kernel(&self.ctx);
+                        let cfg = LaunchConfig {
+                            grid_dim: ((*n).div_ceil(64), (*m).div_ceil(64), *batch),
+                            block_dim: (16, 16, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(m)
+                            .arg(k)
+                            .arg(n)
+                            .arg(a_off_f32)
+                            .arg(b_off_f32)
+                            .arg(c_off_f32)
+                            .arg(batch)
+                            .arg(a_batch_stride)
+                            .arg(b_batch_stride)
+                            .arg(c_batch_stride)
+                            .arg(has_bias)
+                            .arg(bias_off_f32)
+                            .arg(act_id);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: matmul (parity) launch failed");
+                        }
+                        if let Some(idx) = assigned_idx {
+                            if let Ok(evt) = stream.record_event(None) {
+                                last_event.insert(idx, evt);
+                            }
+                            let (_, writes) = step_offsets(step);
+                            for w in &writes {
+                                producer_of.insert(*w, idx);
+                            }
+                        }
+                        continue;
+                    }
+
                     // Tier 0: mixed-precision GemmEx — when B (the weight)
                     // is stored in the half-arena, cast activations to
                     // f16/bf16 in a scratch buffer and call cublasGemmEx
@@ -4168,7 +5165,7 @@ impl CudaExecutable {
                             };
                             let mut launcher = stream.launch_builder(&kernel.function);
                             launcher
-                                .arg(&mut self.arena.buffer)
+                                .arg(self.arena.f32_buf_mut())
                                 .arg(&total)
                                 .arg(n)
                                 .arg(c_off_f32)
@@ -4204,9 +5201,10 @@ impl CudaExecutable {
                         && cublaslt_act_supported(*act_id);
                     let used_cublaslt = if try_cublaslt {
                         let lt_handle = self.blas_lt.unwrap();
-                        let workspace = self.blas_lt_workspace.as_mut().unwrap();
+                        let mut workspace =
+                            self.blas_lt_workspace.as_ref().unwrap().lock().unwrap();
                         let (workspace_ptr, _ws_record) = workspace.device_ptr_mut(&stream);
-                        let (arena_ptr, _record) = self.arena.buffer.device_ptr_mut(&stream);
+                        let (arena_ptr, _record) = self.arena.f32_buf_mut().device_ptr_mut(&stream);
                         let cu_stream = stream.cu_stream();
                         let act = cublaslt_act_for(*act_id);
                         let r = unsafe {
@@ -4246,7 +5244,8 @@ impl CudaExecutable {
                     // the borrow checker's same-buffer aliasing).
                     let used_cublas = if let Some(blas) = self.blas.as_ref() {
                         let blas = blas.lock().unwrap();
-                        let (arena_ptr_u64, _record) = self.arena.buffer.device_ptr_mut(&stream);
+                        let (arena_ptr_u64, _record) =
+                            self.arena.f32_buf_mut().device_ptr_mut(&stream);
                         let a_dev = arena_ptr_u64 + (*a_off_f32 as u64) * 4;
                         let b_dev = arena_ptr_u64 + (*b_off_f32 as u64) * 4;
                         let c_dev = arena_ptr_u64 + (*c_off_f32 as u64) * 4;
@@ -4320,7 +5319,7 @@ impl CudaExecutable {
                             };
                             let mut launcher = stream.launch_builder(&kernel.function);
                             launcher
-                                .arg(&mut self.arena.buffer)
+                                .arg(self.arena.f32_buf_mut())
                                 .arg(&total)
                                 .arg(n)
                                 .arg(c_off_f32)
@@ -4345,7 +5344,7 @@ impl CudaExecutable {
                         };
                         let mut launcher = stream.launch_builder(&kernel.function);
                         launcher
-                            .arg(&mut self.arena.buffer)
+                            .arg(self.arena.f32_buf_mut())
                             .arg(m)
                             .arg(k)
                             .arg(n)
@@ -4372,7 +5371,7 @@ impl CudaExecutable {
                             };
                             let mut launcher = stream.launch_builder(&kernel.function);
                             launcher
-                                .arg(&mut self.arena.buffer)
+                                .arg(self.arena.f32_buf_mut())
                                 .arg(&total)
                                 .arg(n)
                                 .arg(c_off_f32)
@@ -4395,7 +5394,7 @@ impl CudaExecutable {
                         };
                         let mut launcher = stream.launch_builder(&kernel.function);
                         launcher
-                            .arg(&mut self.arena.buffer)
+                            .arg(self.arena.f32_buf_mut())
                             .arg(m)
                             .arg(k)
                             .arg(n)
@@ -4436,7 +5435,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&n_s)
                         .arg(a_off)
                         .arg(b_off)
@@ -4457,16 +5456,25 @@ impl CudaExecutable {
                     scalar_input_mask,
                     input_modulus,
                     meta_idx,
+                    spatial_prologue,
+                    prologue_w,
+                    prologue_h,
+                    prologue_nc,
                 } => {
                     let len_s = scale(*len);
                     if len_s == 0 {
                         continue;
                     }
                     let kernel = elementwise_region_kernel(&self.ctx);
-                    let (grid, block) = dispatch_grid_1d(len_s, 256);
+                    let ((gx, gy, gz), (bx, by, bz)) = if *spatial_prologue {
+                        dispatch_grid_prologue_nchw(*prologue_w, *prologue_h, *prologue_nc)
+                    } else {
+                        let (grid, block) = dispatch_grid_1d(len_s, 256);
+                        ((grid, 1, 1), (block, 1, 1))
+                    };
                     let cfg = LaunchConfig {
-                        grid_dim: (grid, 1, 1),
-                        block_dim: (block, 1, 1),
+                        grid_dim: (gx, gy, gz),
+                        block_dim: (bx, by, bz),
                         shared_mem_bytes: 0,
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
@@ -4475,7 +5483,7 @@ impl CudaExecutable {
                     // but a constant param keeps the kernel signature
                     // self-describing.
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&len_s)
                         .arg(num_inputs)
                         .arg(num_steps)
@@ -4487,6 +5495,48 @@ impl CudaExecutable {
                         launcher
                             .launch(cfg)
                             .expect("rlx-cuda: elementwise_region launch failed");
+                    }
+                }
+                Step::BatchElementwiseRegion {
+                    slice_len,
+                    num_batch,
+                    num_steps,
+                    base_dst_off,
+                    slice_elems,
+                    batch_offs_idx,
+                    meta_idx,
+                    scalar_input_mask,
+                    input_modulus,
+                    ..
+                } => {
+                    let slice_len_s = scale(*slice_len);
+                    let num_batch_s = scale(*num_batch);
+                    if slice_len_s == 0 || num_batch_s == 0 {
+                        continue;
+                    }
+                    let kernel = batch_elementwise_region_kernel(&self.ctx);
+                    let (grid_x, block_x) = dispatch_grid_1d(slice_len_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid_x, 1, num_batch_s),
+                        block_dim: (block_x, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&slice_len_s)
+                        .arg(&num_batch_s)
+                        .arg(num_steps)
+                        .arg(base_dst_off)
+                        .arg(slice_elems)
+                        .arg(&self.meta_buffers[*batch_offs_idx])
+                        .arg(&self.meta_buffers[*meta_idx])
+                        .arg(scalar_input_mask)
+                        .arg(input_modulus);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: batch_elementwise_region launch failed");
                     }
                 }
                 Step::FusedBinaryUnary {
@@ -4510,7 +5560,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&n_s)
                         .arg(a_off)
                         .arg(b_off)
@@ -4542,7 +5592,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&n_s)
                         .arg(in_off)
                         .arg(out_off)
@@ -4571,7 +5621,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&n_s)
                         .arg(a_off)
                         .arg(b_off)
@@ -4603,7 +5653,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&n_s)
                         .arg(cond_off)
                         .arg(x_off)
@@ -4632,7 +5682,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&outer_s)
                         .arg(inner)
                         .arg(in_off)
@@ -4662,7 +5712,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&outer_s)
                         .arg(inner)
                         .arg(in_off)
@@ -4695,7 +5745,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&outer_s)
                         .arg(inner)
                         .arg(in_off)
@@ -4734,7 +5784,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&outer_s)
                         .arg(inner)
                         .arg(in_off)
@@ -4769,7 +5819,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(n_out)
                         .arg(n_idx)
                         .arg(dim)
@@ -4802,7 +5852,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(total)
                         .arg(outer)
                         .arg(axis_dim)
@@ -4836,7 +5886,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(total)
                         .arg(outer)
                         .arg(inner)
@@ -4866,7 +5916,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(outer)
                         .arg(inner)
                         .arg(in_off)
@@ -4893,7 +5943,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(rank)
                         .arg(out_total)
                         .arg(in_off)
@@ -4921,7 +5971,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(rank)
                         .arg(out_total)
                         .arg(in_off)
@@ -4952,7 +6002,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(total)
                         .arg(outer)
                         .arg(inner)
@@ -4981,19 +6031,36 @@ impl CudaExecutable {
                     mask_kind,
                     scale_bits,
                     window,
+                    seq_q_stride,
+                    seq_k_stride,
+                    mask_batch_stride,
+                    mask_head_stride,
+                    q_batch_stride,
+                    q_head_stride,
+                    q_seq_stride,
+                    k_batch_stride,
+                    k_head_stride,
+                    k_seq_stride,
+                    v_batch_stride,
+                    v_head_stride,
+                    v_seq_stride,
+                    o_batch_stride,
+                    o_head_stride,
+                    o_seq_stride,
                 } => {
-                    // FlashAttention-1: BR=16 q-rows per block, BC=32 KV-tile,
-                    // 128 threads/block. grid=(q_blocks, batch*heads, 1).
-                    let kernel = attention_kernel(&self.ctx);
-                    let q_blocks = (*seq_q).div_ceil(16);
-                    let cfg = LaunchConfig {
-                        grid_dim: (q_blocks, batch * heads, 1),
-                        block_dim: (128, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let mut launcher = stream.launch_builder(&kernel.function);
+                    // Tiled flash supports arbitrary Q/K/V strides (BSHD and BHSD).
+                    // Row kernel only when head_dim exceeds the flash tile cap or forced.
+                    let use_row = rlx_ir::attention_dispatch_use_row(
+                        *head_dim,
+                        "RLX_CUDA_FORCE_ATTENTION_ROW",
+                    );
+                    let mut launcher = stream.launch_builder(if use_row {
+                        &attention_row_kernel(&self.ctx).function
+                    } else {
+                        &attention_kernel(&self.ctx).function
+                    });
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(batch)
                         .arg(heads)
                         .arg(seq_q)
@@ -5006,7 +6073,39 @@ impl CudaExecutable {
                         .arg(mask_off)
                         .arg(mask_kind)
                         .arg(scale_bits)
-                        .arg(window);
+                        .arg(window)
+                        .arg(seq_q_stride)
+                        .arg(seq_k_stride)
+                        .arg(mask_batch_stride)
+                        .arg(mask_head_stride)
+                        .arg(q_batch_stride)
+                        .arg(q_head_stride)
+                        .arg(q_seq_stride)
+                        .arg(k_batch_stride)
+                        .arg(k_head_stride)
+                        .arg(k_seq_stride)
+                        .arg(v_batch_stride)
+                        .arg(v_head_stride)
+                        .arg(v_seq_stride)
+                        .arg(o_batch_stride)
+                        .arg(o_head_stride)
+                        .arg(o_seq_stride);
+                    let cfg = if use_row {
+                        let total = batch * heads * seq_q;
+                        let block = 256u32;
+                        LaunchConfig {
+                            grid_dim: (total.div_ceil(block), 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        }
+                    } else {
+                        let q_blocks = (*seq_q).div_ceil(16);
+                        LaunchConfig {
+                            grid_dim: (q_blocks, batch * heads, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        }
+                    };
                     unsafe {
                         launcher
                             .launch(cfg)
@@ -5040,7 +6139,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(batch)
                         .arg(heads)
                         .arg(seq_q)
@@ -5082,7 +6181,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(n_total)
                         .arg(seq)
                         .arg(head_dim)
@@ -5116,7 +6215,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(&outer_s)
                         .arg(inner)
                         .arg(in_off)
@@ -5144,7 +6243,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(outer)
                         .arg(inner)
                         .arg(k)
@@ -5180,7 +6279,7 @@ impl CudaExecutable {
                         let idx_host = {
                             let idx_slot = self
                                 .arena
-                                .buffer
+                                .f32_buf()
                                 .slice(*idx_off as usize..(idx_off + m) as usize);
                             stream.clone_dtoh(&idx_slot).ok()
                         };
@@ -5206,7 +6305,7 @@ impl CudaExecutable {
                                 if !runs.is_empty() && runs.len() <= threshold {
                                     let blas = blas.lock().unwrap();
                                     let (arena_ptr, _record) =
-                                        self.arena.buffer.device_ptr_mut(&stream);
+                                        self.arena.f32_buf_mut().device_ptr_mut(&stream);
                                     let alpha: f32 = 1.0;
                                     let beta: f32 = 0.0;
                                     let mut all_ok = true;
@@ -5261,7 +6360,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(m)
                         .arg(k)
                         .arg(n)
@@ -5286,7 +6385,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(out_off)
                         .arg(out_total);
                     unsafe {
@@ -5313,7 +6412,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(out_off)
                         .arg(upd_off)
                         .arg(idx_off)
@@ -5346,7 +6445,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(m)
                         .arg(k)
                         .arg(n)
@@ -5378,7 +6477,7 @@ impl CudaExecutable {
                         crate::gguf_gpu::run_dequant_matmul_gguf_gpu(
                             &self.ctx,
                             &stream,
-                            &mut self.arena.buffer,
+                            self.arena.f32_buf_mut(),
                             blas,
                             *m as usize,
                             *k as usize,
@@ -5392,7 +6491,7 @@ impl CudaExecutable {
                     } else {
                         crate::gguf_host::run_dequant_matmul_gguf(
                             &stream,
-                            &mut self.arena.buffer,
+                            self.arena.f32_buf_mut(),
                             *m as usize,
                             *k as usize,
                             *n as usize,
@@ -5420,7 +6519,7 @@ impl CudaExecutable {
                         crate::gguf_gpu::run_dequant_grouped_matmul_gguf_gpu(
                             &self.ctx,
                             &stream,
-                            &mut self.arena.buffer,
+                            self.arena.f32_buf_mut(),
                             blas,
                             *m as usize,
                             *k as usize,
@@ -5436,7 +6535,7 @@ impl CudaExecutable {
                     } else {
                         crate::gguf_host::run_dequant_grouped_matmul_gguf(
                             &stream,
-                            &mut self.arena.buffer,
+                            self.arena.f32_buf_mut(),
                             *m as usize,
                             *k as usize,
                             *n as usize,
@@ -5469,7 +6568,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(outer)
                         .arg(inner)
                         .arg(in_off)
@@ -5507,7 +6606,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(batch)
                         .arg(seq)
                         .arg(hidden)
@@ -5540,7 +6639,7 @@ impl CudaExecutable {
                         crate::fft_dispatch::run_fft_gpu(
                             &self.ctx,
                             &stream,
-                            &mut self.arena.buffer,
+                            self.arena.f32_buf_mut(),
                             *src_byte_off / 4,
                             *dst_byte_off / 4,
                             *outer,
@@ -5549,10 +6648,11 @@ impl CudaExecutable {
                             scale,
                         );
                     } else {
+                        let (buf, arena_size) = self.arena.f32_buf_and_size();
                         crate::fft_host::run_fft1d(
                             &stream,
-                            &mut self.arena.buffer,
-                            self.arena.size,
+                            buf,
+                            arena_size,
                             *src_byte_off as usize,
                             *dst_byte_off as usize,
                             *outer as usize,
@@ -5560,6 +6660,106 @@ impl CudaExecutable {
                             *inverse,
                             *norm_tag,
                             fft_dtype_from_tag(*dtype_tag),
+                        );
+                    }
+                }
+                Step::LogMelHost {
+                    spec_byte_off,
+                    filt_byte_off,
+                    dst_byte_off,
+                    outer,
+                    n_fft,
+                    n_bins,
+                    n_mels,
+                } => {
+                    crate::log_mel_host::run_log_mel(
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *spec_byte_off as usize,
+                        *filt_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *n_fft as usize,
+                        *n_bins as usize,
+                        *n_mels as usize,
+                    );
+                }
+                Step::Im2ColHost {
+                    x_byte_off,
+                    col_byte_off,
+                    n,
+                    c_in,
+                    h,
+                    w,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw_dil,
+                    use_gpu,
+                } => {
+                    if *use_gpu {
+                        let kernel = im2col_kernel(&self.ctx);
+                        let m = *n * *h_out * *w_out;
+                        let k = *c_in * *kh * *kw;
+                        let total = m * k;
+                        let (grid, block) = dispatch_grid_1d(total, 256);
+                        let cfg = LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let x_off = *x_byte_off / 4;
+                        let col_off = *col_byte_off / 4;
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(n)
+                            .arg(c_in)
+                            .arg(h)
+                            .arg(w)
+                            .arg(h_out)
+                            .arg(w_out)
+                            .arg(kh)
+                            .arg(kw)
+                            .arg(sh)
+                            .arg(sw)
+                            .arg(ph)
+                            .arg(pw)
+                            .arg(dh)
+                            .arg(dw_dil)
+                            .arg(&x_off)
+                            .arg(&col_off);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: im2col launch failed");
+                        }
+                    } else {
+                        crate::im2col_host::run_im2col(
+                            &stream,
+                            self.arena.f32_buf_mut(),
+                            *x_byte_off as usize,
+                            *col_byte_off as usize,
+                            *n,
+                            *c_in,
+                            *h,
+                            *w,
+                            *h_out,
+                            *w_out,
+                            *kh,
+                            *kw,
+                            *sh,
+                            *sw,
+                            *ph,
+                            *pw,
+                            *dh,
+                            *dw_dil,
                         );
                     }
                 }
@@ -5577,10 +6777,11 @@ impl CudaExecutable {
                     state_size,
                     use_carry,
                 } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
                     crate::gdn_host::run_gated_delta_net(
                         &stream,
-                        &mut self.arena.buffer,
-                        self.arena.size,
+                        buf,
+                        arena_size,
                         *q_byte_off as usize,
                         *k_byte_off as usize,
                         *v_byte_off as usize,
@@ -5602,10 +6803,11 @@ impl CudaExecutable {
                     n_elems,
                     attrs,
                 } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
                     crate::llada2_gate_host::run_llada2_group_limited_gate(
                         &stream,
-                        &mut self.arena.buffer,
-                        self.arena.size,
+                        buf,
+                        arena_size,
                         *sig_off as usize,
                         *route_off as usize,
                         *out_off as usize,
@@ -5619,10 +6821,11 @@ impl CudaExecutable {
                     n,
                     k,
                 } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
                     crate::umap_knn_host::run_umap_knn(
                         &stream,
-                        &mut self.arena.buffer,
-                        self.arena.size,
+                        buf,
+                        arena_size,
                         *pairwise_off as usize,
                         *out_off as usize,
                         *n as usize,
@@ -5650,7 +6853,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(src_off)
                         .arg(g_off)
                         .arg(b_off)
@@ -5697,7 +6900,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(src_off)
                         .arg(w_off)
                         .arg(dst_off)
@@ -5744,7 +6947,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(src_off)
                         .arg(g_off)
                         .arg(b_off)
@@ -5779,7 +6982,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(src_off)
                         .arg(dst_off)
                         .arg(n)
@@ -5817,11 +7020,12 @@ impl CudaExecutable {
                     transmittance_threshold,
                     max_list_entries,
                 } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
                     #[cfg(feature = "native-splat")]
                     crate::splat_native::run_gaussian_splat_render_native(
                         &stream,
-                        &mut self.arena.buffer,
-                        self.arena.size,
+                        buf,
+                        arena_size,
                         *positions_off as usize,
                         *positions_len as usize,
                         *scales_off as usize,
@@ -5848,8 +7052,8 @@ impl CudaExecutable {
                     #[cfg(not(feature = "native-splat"))]
                     crate::splat_host::run_gaussian_splat_render(
                         &stream,
-                        &mut self.arena.buffer,
-                        self.arena.size,
+                        buf,
+                        arena_size,
                         *positions_off as usize,
                         *positions_len as usize,
                         *scales_off as usize,
@@ -5901,10 +7105,11 @@ impl CudaExecutable {
                     transmittance_threshold,
                     max_list_entries,
                 } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
                     crate::splat_host::run_gaussian_splat_prepare(
                         &stream,
-                        &mut self.arena.buffer,
-                        self.arena.size,
+                        buf,
+                        arena_size,
                         *positions_off as usize,
                         *positions_len as usize,
                         *scales_off as usize,
@@ -5947,10 +7152,11 @@ impl CudaExecutable {
                     transmittance_threshold,
                     max_list_entries,
                 } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
                     crate::splat_host::run_gaussian_splat_rasterize(
                         &stream,
-                        &mut self.arena.buffer,
-                        self.arena.size,
+                        buf,
+                        arena_size,
                         *prep_off as usize,
                         *prep_len as usize,
                         *meta_off as usize,
@@ -5997,10 +7203,11 @@ impl CudaExecutable {
                     sh_band,
                     max_anisotropy,
                 } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
                     crate::splat_host::run_gaussian_splat_render_backward(
                         &stream,
-                        &mut self.arena.buffer,
-                        self.arena.size,
+                        buf,
+                        arena_size,
                         *positions_off as usize,
                         *positions_len as usize,
                         *scales_off as usize,
@@ -6044,7 +7251,7 @@ impl CudaExecutable {
                     launch_rms_norm_bwd(
                         &self.ctx,
                         &stream,
-                        &mut self.arena.buffer,
+                        self.arena.f32_buf_mut(),
                         *rows,
                         *h,
                         *x_byte_off / 4,
@@ -6069,7 +7276,7 @@ impl CudaExecutable {
                     launch_rms_norm_bwd(
                         &self.ctx,
                         &stream,
-                        &mut self.arena.buffer,
+                        self.arena.f32_buf_mut(),
                         *rows,
                         *h,
                         *x_byte_off / 4,
@@ -6094,7 +7301,7 @@ impl CudaExecutable {
                     launch_rms_norm_bwd(
                         &self.ctx,
                         &stream,
-                        &mut self.arena.buffer,
+                        self.arena.f32_buf_mut(),
                         *rows,
                         *h,
                         *x_byte_off / 4,
@@ -6121,7 +7328,7 @@ impl CudaExecutable {
                     launch_rope_bwd(
                         &self.ctx,
                         &stream,
-                        &mut self.arena.buffer,
+                        self.arena.f32_buf_mut(),
                         *batch,
                         *seq,
                         *hidden,
@@ -6144,7 +7351,7 @@ impl CudaExecutable {
                     launch_cumsum_bwd(
                         &self.ctx,
                         &stream,
-                        &mut self.arena.buffer,
+                        self.arena.f32_buf_mut(),
                         *rows,
                         *cols,
                         *dy_byte_off / 4,
@@ -6164,7 +7371,7 @@ impl CudaExecutable {
                     launch_gather_bwd(
                         &self.ctx,
                         &stream,
-                        &mut self.arena.buffer,
+                        self.arena.f32_buf_mut(),
                         *outer,
                         *axis_dim,
                         *num_idx,
@@ -6172,6 +7379,136 @@ impl CudaExecutable {
                         *dy_byte_off / 4,
                         *indices_byte_off / 4,
                         *dst_byte_off / 4,
+                    );
+                }
+                Step::MaxPool2dBackward {
+                    x_byte_off,
+                    dy_byte_off,
+                    dx_byte_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                } => {
+                    let buf = self.arena.f32_buf_mut();
+                    crate::training_bwd_host::run_maxpool2d_backward(
+                        &stream,
+                        buf,
+                        *x_byte_off as usize / 4,
+                        *dy_byte_off as usize / 4,
+                        *dx_byte_off as usize / 4,
+                        *n,
+                        *c,
+                        *h,
+                        *w,
+                        *h_out,
+                        *w_out,
+                        *kh,
+                        *kw,
+                        *sh,
+                        *sw,
+                        *ph,
+                        *pw,
+                    );
+                }
+                Step::Conv2dBackwardInput {
+                    dy_byte_off,
+                    w_byte_off,
+                    dx_byte_off,
+                    n,
+                    c_in,
+                    h,
+                    w_in,
+                    c_out,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw,
+                    groups,
+                } => {
+                    let buf = self.arena.f32_buf_mut();
+                    crate::training_bwd_host::run_conv2d_backward_input(
+                        &stream,
+                        buf,
+                        *dy_byte_off as usize / 4,
+                        *w_byte_off as usize / 4,
+                        *dx_byte_off as usize / 4,
+                        *n,
+                        *c_in,
+                        *h,
+                        *w_in,
+                        *c_out,
+                        *h_out,
+                        *w_out,
+                        *kh,
+                        *kw,
+                        *sh,
+                        *sw,
+                        *ph,
+                        *pw,
+                        *dh,
+                        *dw,
+                        *groups,
+                    );
+                }
+                Step::Conv2dBackwardWeight {
+                    x_byte_off,
+                    dy_byte_off,
+                    dw_byte_off,
+                    n,
+                    c_in,
+                    h,
+                    w,
+                    c_out,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw_dil,
+                    groups,
+                } => {
+                    let buf = self.arena.f32_buf_mut();
+                    crate::training_bwd_host::run_conv2d_backward_weight(
+                        &stream,
+                        buf,
+                        *x_byte_off as usize / 4,
+                        *dy_byte_off as usize / 4,
+                        *dw_byte_off as usize / 4,
+                        *n,
+                        *c_in,
+                        *h,
+                        *w,
+                        *c_out,
+                        *h_out,
+                        *w_out,
+                        *kh,
+                        *kw,
+                        *sh,
+                        *sw,
+                        *ph,
+                        *pw,
+                        *dh,
+                        *dw_dil,
+                        *groups,
                     );
                 }
                 Step::Pool1d {
@@ -6196,7 +7533,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(n)
                         .arg(c)
                         .arg(l)
@@ -6240,7 +7577,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(n)
                         .arg(c)
                         .arg(h)
@@ -6294,7 +7631,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(n)
                         .arg(c)
                         .arg(d)
@@ -6340,10 +7677,12 @@ impl CudaExecutable {
                     // with H=1, kh=1, sh=1, ph=0, dh=1. Same descriptors
                     // as conv2d; the H axis just collapses to 1.
                     let used_cudnn = if let (Some(handle), Some(workspace)) =
-                        (self.dnn, self.dnn_workspace.as_mut())
+                        (self.dnn, self.dnn_workspace.as_ref())
                     {
+                        let mut workspace = workspace.lock().unwrap();
                         let (ws_ptr, _ws_record) = workspace.device_ptr_mut(&stream);
-                        let (arena_ptr, _arena_record) = self.arena.buffer.device_ptr_mut(&stream);
+                        let (arena_ptr, _arena_record) =
+                            self.arena.f32_buf_mut().device_ptr_mut(&stream);
                         let r = unsafe {
                             cudnn_conv2d_forward(
                                 handle,
@@ -6393,7 +7732,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(n)
                         .arg(c_in)
                         .arg(c_out)
@@ -6436,11 +7775,18 @@ impl CudaExecutable {
                 } => {
                     // Tier 1: cuDNN — picks the fastest algo via the v7
                     // heuristic for the supplied shape + workspace size.
-                    let used_cudnn = if let (Some(handle), Some(workspace)) =
-                        (self.dnn, self.dnn_workspace.as_mut())
-                    {
+                    // Matmul parity (RLX_CUDA_PARITY) must not disable cuDNN conv — the
+                    // custom conv2d.cu fallback drifts vs CPU on Deep4; cuDNN matches CPU.
+                    let try_cudnn = self.dnn.is_some()
+                        && self.dnn_workspace.is_some()
+                        && !rlx_ir::env::flag("RLX_CUDA_NO_CUDNN");
+                    let used_cudnn = if try_cudnn {
+                        let handle = self.dnn.expect("dnn handle");
+                        let workspace = self.dnn_workspace.as_ref().expect("dnn workspace");
+                        let mut workspace = workspace.lock().unwrap();
                         let (ws_ptr, _ws_record) = workspace.device_ptr_mut(&stream);
-                        let (arena_ptr, _arena_record) = self.arena.buffer.device_ptr_mut(&stream);
+                        let (arena_ptr, _arena_record) =
+                            self.arena.f32_buf_mut().device_ptr_mut(&stream);
                         let r = unsafe {
                             cudnn_conv2d_forward(
                                 handle,
@@ -6479,7 +7825,7 @@ impl CudaExecutable {
                         continue;
                     }
 
-                    // Fallback: custom direct-convolution kernel.
+                    // Fallback: custom direct-convolution kernel (cuDNN preferred via PATH).
                     let kernel = conv2d_kernel(&self.ctx);
                     let total = n * c_out * h_out * w_out;
                     let (grid, block) = dispatch_grid_1d(total, 256);
@@ -6490,7 +7836,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(n)
                         .arg(c_in)
                         .arg(c_out)
@@ -6545,10 +7891,12 @@ impl CudaExecutable {
                 } => {
                     // Tier 1: cuDNN nd-conv (NCDHW + 3-D pads/strides/dilations).
                     let used_cudnn = if let (Some(handle), Some(workspace)) =
-                        (self.dnn, self.dnn_workspace.as_mut())
+                        (self.dnn, self.dnn_workspace.as_ref())
                     {
+                        let mut workspace = workspace.lock().unwrap();
                         let (ws_ptr, _ws_record) = workspace.device_ptr_mut(&stream);
-                        let (arena_ptr, _arena_record) = self.arena.buffer.device_ptr_mut(&stream);
+                        let (arena_ptr, _arena_record) =
+                            self.arena.f32_buf_mut().device_ptr_mut(&stream);
                         let r = unsafe {
                             cudnn_conv3d_forward(
                                 handle,
@@ -6604,7 +7952,7 @@ impl CudaExecutable {
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
-                        .arg(&mut self.arena.buffer)
+                        .arg(self.arena.f32_buf_mut())
                         .arg(n)
                         .arg(c_in)
                         .arg(c_out)
@@ -6660,7 +8008,15 @@ impl CudaExecutable {
             }
         }
 
-        if do_capture {
+        self.prepare_readback_plan();
+        let plan = self.readback_plan_buf.clone();
+        if !self.gpu_handle_feeds.is_empty() {
+            self.propagate_gpu_handle_feeds_d2d(&stream);
+        }
+        let read_all = plan.len() == self.graph.outputs.len();
+
+        if capturing {
+            // End capture before dtoh — the graph records compute kernels only.
             let cu_graph = stream.end_capture(
                 cudarc::driver::sys::CUgraphInstantiate_flags
                     ::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
@@ -6669,26 +8025,65 @@ impl CudaExecutable {
                 g.upload().expect("rlx-cuda: graph upload failed");
                 g.launch().expect("rlx-cuda: graph first launch failed");
                 self.captured_graph = Some(g);
+                self.captured_readback_plan = Some(plan.clone());
             }
         }
 
+        if read_all {
+            self.fill_output_staging(&stream)
+                .expect("rlx-cuda: output dtoh failed");
+        } else {
+            self.fill_output_staging_indices(&stream, &plan)
+                .expect("rlx-cuda: partial output dtoh failed");
+        }
+        self.refresh_gpu_handles_from_staging(&plan);
         stream.synchronize().expect("rlx-cuda: stream sync failed");
-        self.read_outputs(&stream)
+        self.outputs_from_staging_plan(&plan)
     }
 
-    fn read_outputs(&self, stream: &Arc<cudarc::driver::CudaStream>) -> Vec<Vec<f32>> {
-        self.graph
-            .outputs
+    fn fill_output_staging_indices(
+        &mut self,
+        stream: &Arc<cudarc::driver::CudaStream>,
+        indices: &[usize],
+    ) -> Result<(), cudarc::driver::DriverError> {
+        for &i in indices {
+            let id = self.graph.outputs[i];
+            let off_f32 = self.arena.offset(id) / 4;
+            let elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+            debug_assert_eq!(self.output_staging[i].len(), elems);
+            let slot = self.arena.f32_buf().slice(off_f32..off_f32 + elems);
+            self.output_staging[i].dtoh(stream, &slot)?;
+        }
+        Ok(())
+    }
+
+    fn outputs_from_staging_plan(&self, plan: &[usize]) -> Vec<Vec<f32>> {
+        if plan.len() == self.graph.outputs.len() {
+            return self.outputs_from_staging();
+        }
+        plan.iter()
+            .map(|&i| self.output_staging[i].to_vec())
+            .collect()
+    }
+
+    fn fill_output_staging(
+        &mut self,
+        stream: &Arc<cudarc::driver::CudaStream>,
+    ) -> Result<(), cudarc::driver::DriverError> {
+        for (i, &id) in self.graph.outputs.iter().enumerate() {
+            let off_f32 = self.arena.offset(id) / 4;
+            let elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+            debug_assert_eq!(self.output_staging[i].len(), elems);
+            let slot = self.arena.f32_buf().slice(off_f32..off_f32 + elems);
+            self.output_staging[i].dtoh(stream, &slot)?;
+        }
+        Ok(())
+    }
+
+    fn outputs_from_staging(&self) -> Vec<Vec<f32>> {
+        self.output_staging
             .iter()
-            .map(|&id| {
-                let off_f32 = self.arena.offset(id) / 4;
-                let elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
-                let slot = self.arena.buffer.slice(off_f32..off_f32 + elems);
-                stream
-                    .clone_dtoh(&slot)
-                    .expect("rlx-cuda: output download failed")
-                    .to_vec()
-            })
+            .map(F32HostSlot::to_vec)
             .collect()
     }
 }
@@ -6882,6 +8277,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normalize_read_indices_dedupes() {
+        let mut v = vec![3, 1, 2, 1, 0];
+        normalize_read_indices(&mut v);
+        assert_eq!(v, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
     fn step_offsets_binary() {
         let s = Step::Binary {
             n: 8,
@@ -6941,6 +8343,8 @@ mod tests {
 
     #[test]
     fn step_offsets_attention_causal_no_mask_arg() {
+        let (mb, mh, mq, mk) = rlx_ir::mask_strides_bhsd(1, 8, 8);
+        let (qb, qh, qs) = rlx_ir::strides_bhsd(1, 64, 8);
         let s = Step::Attention {
             batch: 1,
             heads: 1,
@@ -6955,6 +8359,22 @@ mod tests {
             mask_kind: 1, // causal — mask_off ignored
             scale_bits: 0,
             window: 0,
+            seq_q_stride: mq,
+            seq_k_stride: mk,
+            mask_batch_stride: mb,
+            mask_head_stride: mh,
+            q_batch_stride: qb,
+            q_head_stride: qh,
+            q_seq_stride: qs,
+            k_batch_stride: qb,
+            k_head_stride: qh,
+            k_seq_stride: qs,
+            v_batch_stride: qb,
+            v_head_stride: qh,
+            v_seq_stride: qs,
+            o_batch_stride: qb,
+            o_head_stride: qh,
+            o_seq_stride: qs,
         };
         let (r, _) = step_offsets(&s);
         assert!(!r.contains(&9999), "causal mask must not consume mask_off");
@@ -6963,6 +8383,8 @@ mod tests {
 
     #[test]
     fn step_offsets_attention_custom_mask_pulls_mask() {
+        let (mb, mh, mq, mk) = rlx_ir::mask_strides_bhsd(1, 8, 8);
+        let (qb, qh, qs) = rlx_ir::strides_bhsd(1, 64, 8);
         let s = Step::Attention {
             batch: 1,
             heads: 1,
@@ -6977,6 +8399,22 @@ mod tests {
             mask_kind: 2, // custom mask
             scale_bits: 0,
             window: 0,
+            seq_q_stride: mq,
+            seq_k_stride: mk,
+            mask_batch_stride: mb,
+            mask_head_stride: mh,
+            q_batch_stride: qb,
+            q_head_stride: qh,
+            q_seq_stride: qs,
+            k_batch_stride: qb,
+            k_head_stride: qh,
+            k_seq_stride: qs,
+            v_batch_stride: qb,
+            v_head_stride: qh,
+            v_seq_stride: qs,
+            o_batch_stride: qb,
+            o_head_stride: qh,
+            o_seq_stride: qs,
         };
         let (r, _) = step_offsets(&s);
         assert!(r.contains(&9999));

@@ -47,3 +47,6 @@ annotation case.
   `graph.rs` (builder), `verify.rs` (input count rule), both
   backends' `compile_thunks`, fusion patterns, cost model. ~6 files.
   No way around this without runtime dispatch.
+## License
+
+GPL-3.0-only.

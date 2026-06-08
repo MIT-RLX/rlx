@@ -27,9 +27,9 @@
 //! on CPU threads on Mac/Docker for parity-check purposes, without
 //! renting an AMD GPU.
 //!
-//! The HIP-CPU submodule lives in `rlx-cuda/vendor/HIP-CPU` (shared
-//! with rlx-cuda's harness — same upstream, same kernel sources, no
-//! point in two copies of the headers).
+//! HIP-CPU headers are cloned to `rlx-cuda/docker/vendor/HIP-CPU` inside Docker
+//! (`rlx-cuda/docker/fetch-hip-cpu.sh`; not a git submodule). Same path as
+//! rlx-cuda's harness — one upstream checkout, shared kernel sources.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -41,17 +41,13 @@ fn main() {
 #[cfg(feature = "hip-cpu-validate")]
 fn build_hip_cpu() {
     use std::path::Path;
-    let hip_cpu_include = Path::new("../rlx-cuda/vendor/HIP-CPU/include");
+    let hip_cpu_include = Path::new("../rlx-cuda/docker/vendor/HIP-CPU/include");
     if !hip_cpu_include.exists() {
         panic!(
             "rlx-rocm hip-cpu-validate: missing HIP-CPU headers at {}\n\
-             Initialize the submodule (shared with rlx-cuda) with:\n\
+             HIP-CPU is fetched only inside Docker (shared path with rlx-cuda):\n\
              \n\
-             \tgit submodule add https://github.com/ROCm-Developer-Tools/HIP-CPU.git \\\n\
-             \t    rlx-cuda/vendor/HIP-CPU\n\
-             \tgit submodule update --init\n\
-             \n\
-             (or whatever upstream HIP-CPU mirror is current)",
+             \tjust test-hip-cpu-validate",
             hip_cpu_include.display()
         );
     }

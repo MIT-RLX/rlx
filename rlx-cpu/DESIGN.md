@@ -65,3 +65,6 @@ on Apple Silicon's P/E asymmetric cores.
   arms in BOTH execution paths and the `thunk_read_offsets` helper
   if they read any arena buffer (used by view / fusion safety
   checks).
+## License
+
+GPL-3.0-only.

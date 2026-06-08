@@ -19,9 +19,12 @@
 // encoding (length `num_steps`, packed inside `meta`) into a private
 // scratch register array; the final step's result is written to dst.
 //
-// `meta` layout (144 u32 words, packed by the caller):
+// `meta` layout (150 u32 words, packed by the caller):
 //   meta[0..16]   = input_offs[0..16]  (only first num_inputs used)
 //   meta[16..144] = chain[0..128]      (32 steps * 4 u32s)
+//   meta[144]     = prologue (0=none, 1=resize_nearest_2x NCHW)
+//   meta[145..148]= out_n, out_c, out_h, out_w (for prologue)
+//   meta[149]     = prologue_input (external input index for prologue)
 //
 // Chain encoding (4 u32s per step, indices into chain[]):
 //   chain[k*4 + 0] = op_kind   (0=Activation, 1=Cast, 2=Binary,
@@ -42,6 +45,46 @@
 
 struct InputModulus { unsigned int v[16]; };
 
+// FKL-style closed region: map output gid to input row for resize-nearest 2x on NCHW.
+__device__ unsigned int region_input_row_resize2x_nchw(
+    unsigned int gid,
+    unsigned int out_n,
+    unsigned int out_c,
+    unsigned int out_h,
+    unsigned int out_w
+) {
+    unsigned int plane = out_c * out_h * out_w;
+    unsigned int local = gid % plane;
+    unsigned int batch = gid / plane;
+    unsigned int w_pos = local % out_w;
+    unsigned int tmp = local / out_w;
+    unsigned int h_pos = tmp % out_h;
+    unsigned int c_pos = tmp / out_h;
+    unsigned int in_w = out_w / 2u;
+    unsigned int in_h = out_h / 2u;
+    unsigned int in_plane = out_c * in_h * in_w;
+    return batch * in_plane + c_pos * in_h * in_w + (h_pos / 2u) * in_w + (w_pos / 2u);
+}
+
+__device__ unsigned int region_resolve_row(
+    unsigned int gid,
+    unsigned int kind,
+    unsigned int idx,
+    unsigned int prologue_row0,
+    unsigned int has_prologue_row0,
+    unsigned int prologue_input,
+    unsigned int scalar_input_mask,
+    InputModulus input_modulus
+) {
+    if (kind != 0u) { return 0u; }
+    if (has_prologue_row0 != 0u && idx == prologue_input) {
+        return prologue_row0;
+    }
+    if ((scalar_input_mask & (1u << idx)) != 0u) { return 0u; }
+    if (input_modulus.v[idx] != 0u) { return gid % input_modulus.v[idx]; }
+    return gid;
+}
+
 extern "C" __global__ void elementwise_region(
     float* arena,
     unsigned int len,
@@ -52,11 +95,37 @@ extern "C" __global__ void elementwise_region(
     unsigned int scalar_input_mask,
     InputModulus input_modulus
 ) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= len) return;
-
     const unsigned int* input_offs = meta;
     const unsigned int* chain      = meta + 16;
+    const unsigned int prologue    = meta[144];
+    const unsigned int out_n       = meta[145];
+    const unsigned int out_c       = meta[146];
+    const unsigned int out_h       = meta[147];
+    const unsigned int out_w       = meta[148];
+    const unsigned int prologue_input = meta[149];
+
+    unsigned int i;
+    if (prologue == 1u) {
+        unsigned int wo = blockIdx.x * blockDim.x + threadIdx.x;
+        unsigned int ho = blockIdx.y * blockDim.y + threadIdx.y;
+        unsigned int nc = blockIdx.z * blockDim.z + threadIdx.z;
+        if (nc >= out_n * out_c || ho >= out_h || wo >= out_w) {
+            return;
+        }
+        i = nc * out_h * out_w + ho * out_w + wo;
+    } else {
+        i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= len) {
+            return;
+        }
+    }
+
+    unsigned int prologue_row0 = 0u;
+    unsigned int has_prologue_row0 = 0u;
+    if (prologue == 1u) {
+        prologue_row0 = region_input_row_resize2x_nchw(i, out_n, out_c, out_h, out_w);
+        has_prologue_row0 = 1u;
+    }
 
     float scratch[32];
     unsigned int last_idx = 0;
@@ -75,11 +144,9 @@ extern "C" __global__ void elementwise_region(
         {
             unsigned int kind = lhs_enc >> 31;
             unsigned int idx  = lhs_enc & 0x7FFFFFFFu;
-            unsigned int row;
-            if (kind != 0u) { row = 0u; }
-            else if ((scalar_input_mask & (1u << idx)) != 0u) { row = 0u; }
-            else if (input_modulus.v[idx] != 0u) { row = i % input_modulus.v[idx]; }
-            else { row = i; }
+            unsigned int row = region_resolve_row(
+                i, kind, idx, prologue_row0, has_prologue_row0, prologue_input,
+                scalar_input_mask, input_modulus);
             lhs = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
         }
 
@@ -91,22 +158,18 @@ extern "C" __global__ void elementwise_region(
             {
                 unsigned int kind = op_sub >> 31;
                 unsigned int idx  = op_sub & 0x7FFFFFFFu;
-                unsigned int row;
-                if (kind != 0u) { row = 0u; }
-                else if ((scalar_input_mask & (1u << idx)) != 0u) { row = 0u; }
-                else if (input_modulus.v[idx] != 0u) { row = i % input_modulus.v[idx]; }
-                else { row = i; }
+                unsigned int row = region_resolve_row(
+                    i, kind, idx, prologue_row0, has_prologue_row0, prologue_input,
+                    scalar_input_mask, input_modulus);
                 cond = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
             }
             float on_false;
             {
                 unsigned int kind = rhs_enc >> 31;
                 unsigned int idx  = rhs_enc & 0x7FFFFFFFu;
-                unsigned int row;
-                if (kind != 0u) { row = 0u; }
-                else if ((scalar_input_mask & (1u << idx)) != 0u) { row = 0u; }
-                else if (input_modulus.v[idx] != 0u) { row = i % input_modulus.v[idx]; }
-                else { row = i; }
+                unsigned int row = region_resolve_row(
+                    i, kind, idx, prologue_row0, has_prologue_row0, prologue_input,
+                    scalar_input_mask, input_modulus);
                 on_false = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
             }
             result = (cond != 0.0f) ? lhs : on_false;
@@ -115,11 +178,8 @@ extern "C" __global__ void elementwise_region(
             // 4=Sigmoid, 5=Tanh, 6=Exp, 7=Log, 8=Sqrt, 9=Rsqrt,
             // 10=Neg, 11=Abs.
             if      (op_sub == 3u) result = fmaxf(lhs, 0.0f);
-            else if (op_sub == 0u || op_sub == 1u) {
-                float c = 0.7978845608f;
-                float inner = c * (lhs + 0.044715f * lhs * lhs * lhs);
-                result = 0.5f * lhs * (1.0f + tanhf(inner));
-            }
+            else if (op_sub == 0u) { result = gelu_erf(lhs); }
+            else if (op_sub == 1u) { result = gelu_approx(lhs); }
             else if (op_sub == 2u) result = lhs / (1.0f + expf(-lhs));
             else if (op_sub == 4u) result = 1.0f / (1.0f + expf(-lhs));
             else if (op_sub == 5u) result = tanhf(lhs);
@@ -140,11 +200,9 @@ extern "C" __global__ void elementwise_region(
             {
                 unsigned int kind = rhs_enc >> 31;
                 unsigned int idx  = rhs_enc & 0x7FFFFFFFu;
-                unsigned int row;
-                if (kind != 0u) { row = 0u; }
-                else if ((scalar_input_mask & (1u << idx)) != 0u) { row = 0u; }
-                else if (input_modulus.v[idx] != 0u) { row = i % input_modulus.v[idx]; }
-                else { row = i; }
+                unsigned int row = region_resolve_row(
+                    i, kind, idx, prologue_row0, has_prologue_row0, prologue_input,
+                    scalar_input_mask, input_modulus);
                 rhs = (kind == 0u) ? arena[input_offs[idx] + row] : scratch[idx];
             }
             if (op_kind == 2u) {

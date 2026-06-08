@@ -149,6 +149,26 @@ impl Graph {
         self.push(Op::Fft { inverse, norm }, vec![x], s, None)
     }
 
+    /// Ternary pruned radix-2 butterfly stage — see [`Op::FftButterflyStage`].
+    pub fn fft_butterfly_stage(
+        &mut self,
+        state: NodeId,
+        gate: NodeId,
+        rev: NodeId,
+        tw_re: NodeId,
+        tw_im: NodeId,
+        stage: u32,
+        n_fft: u32,
+    ) -> NodeId {
+        let s = self.shape(state).clone();
+        self.push(
+            Op::FftButterflyStage { stage, n_fft },
+            vec![state, gate, rev, tw_re, tw_im],
+            s,
+            None,
+        )
+    }
+
     /// 1D FFT along an arbitrary axis. Lowers to
     /// `Transpose(axis ↔ last) → Fft(last) → Transpose(last ↔ axis)`.
     ///

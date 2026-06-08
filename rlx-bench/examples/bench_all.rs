@@ -38,23 +38,38 @@ use rlx_driver::Device;
 fn devices() -> Vec<(&'static str, Device)> {
     let out = vec![("cpu", Device::Cpu)];
     #[cfg(feature = "metal")]
-    out.push(("metal", Device::Metal));
+    if is_available(Device::Metal) {
+        out.push(("metal", Device::Metal));
+    }
     #[cfg(feature = "mlx")]
-    out.push(("mlx", Device::Mlx));
+    if is_available(Device::Mlx) {
+        out.push(("mlx", Device::Mlx));
+    }
     #[cfg(feature = "gpu")]
-    out.push(("wgpu", Device::Gpu));
+    if is_available(Device::Gpu) {
+        out.push(("wgpu", Device::Gpu));
+    }
     #[cfg(feature = "cuda")]
-    out.push(("cuda", Device::Cuda));
+    if is_available(Device::Cuda) {
+        out.push(("cuda", Device::Cuda));
+    }
     #[cfg(feature = "rocm")]
-    out.push(("rocm", Device::Rocm));
+    if is_available(Device::Rocm) {
+        out.push(("rocm", Device::Rocm));
+    }
     out
 }
 
 fn run_pattern<P: BenchmarkPattern>(pattern: &P, devs: &[(&str, Device)]) {
     println!("\n# {}", pattern.name());
     for &(label, dev) in devs {
-        let r = run_benchmark(pattern, dev, /*warmup*/ 3, /*runs*/ 20);
-        println!("  {label:5} {r}");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_benchmark(pattern, dev, /*warmup*/ 3, /*runs*/ 20)
+        }));
+        match result {
+            Ok(r) => println!("  {label:5} {r}"),
+            Err(_) => eprintln!("  {label:5} FAILED (backend panic — see stderr)"),
+        }
     }
 }
 
@@ -66,6 +81,14 @@ fn main() {
     );
 
     run_pattern(&MatmulPattern { m: 8, k: 64, n: 64 }, &devs);
+    run_pattern(
+        &MatmulPattern {
+            m: 512,
+            k: 512,
+            n: 512,
+        },
+        &devs,
+    );
     run_pattern(
         &LayerNormPattern {
             rows: 32,

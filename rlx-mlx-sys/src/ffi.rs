@@ -104,6 +104,15 @@ unsafe extern "C" {
         out: *mut *mut mlx_array_t,
     ) -> c_int;
 
+    pub fn rlx_mlx_array_from_data_view(
+        shape: *const c_int,
+        ndim: usize,
+        data: *mut c_void,
+        nbytes: usize,
+        dtype: MlxDtype,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+
     pub fn rlx_mlx_array_from_bytes(
         shape: *const c_int,
         ndim: usize,
@@ -537,6 +546,10 @@ unsafe extern "C" {
     ) -> c_int;
 
     pub fn rlx_mlx_compiled_free(compiled: *mut mlx_compiled_t);
+
+    pub fn rlx_mlx_compile_output_cap() -> usize;
+    pub fn rlx_mlx_set_compile_output_cap(cap: usize);
+    pub fn rlx_mlx_reset_compile_output_cap();
 }
 
 #[repr(C)]

@@ -26,8 +26,8 @@ use rlx_ir::infer::GraphExt;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
 /// **L1 — single matmul.** `out = x @ w` with x: `[m, k]`, w: `[k, n]`.
-/// Plain BLAS / kernel dispatch — no fusion. Use to measure raw
-/// matmul throughput per device.
+/// Weights are `Op::Param` so GPU backends can select cooperative-matrix
+/// paths (CoopF32) where supported; activations stay as inputs.
 pub struct MatmulPattern {
     pub m: usize,
     pub k: usize,
@@ -46,17 +46,18 @@ impl BenchmarkPattern for MatmulPattern {
         let f = DType::F32;
         let mut g = Graph::new("matmul_bench");
         let x = g.input("x", Shape::new(&[self.m, self.k], f));
-        let w = g.input("w", Shape::new(&[self.k, self.n], f));
+        let w = g.param("w", Shape::new(&[self.k, self.n], f));
         let out = g.mm(x, w);
         g.set_outputs(vec![out]);
         g
     }
 
     fn input_data(&self) -> Vec<(String, Vec<f32>)> {
-        vec![
-            ("x".to_string(), vec![1.0; self.m * self.k]),
-            ("w".to_string(), vec![1.0; self.k * self.n]),
-        ]
+        vec![("x".to_string(), vec![1.0; self.m * self.k])]
+    }
+
+    fn param_data(&self) -> Vec<(String, Vec<f32>)> {
+        vec![("w".to_string(), vec![1.0; self.k * self.n])]
     }
 }
 

@@ -16,7 +16,7 @@
 //! Tier 2 autodiff lowering parity: Conv2dBackwardInput / Conv2dBackwardWeight
 //! on MLX vs a hand-written NCHW reference (mirrors `rlx-cpu`'s thunk).
 
-#![cfg(target_os = "macos")]
+#![cfg(rlx_mlx_host)]
 
 use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Op, Shape};

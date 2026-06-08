@@ -73,6 +73,22 @@ pub fn metal_device() -> Option<&'static MetalDevice> {
     DEVICE.get_or_init(MetalDevice::new).as_ref()
 }
 
+/// Block until the process-global command queue is idle.
+///
+/// Call after dropping compiled graphs or on GPU fault recovery so later
+/// submissions are not rejected with `SubmissionsIgnored`.
+#[cfg(target_os = "macos")]
+pub fn drain_command_queue() {
+    if let Some(dev) = metal_device() {
+        let cb = dev.queue.new_command_buffer();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn drain_command_queue() {}
+
 /// True if a Metal device is available on this system.
 pub fn has_metal_device() -> bool {
     metal_device().is_some()

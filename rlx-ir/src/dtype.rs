@@ -142,6 +142,86 @@ impl DType {
     }
 }
 
+fn integral_scalar(value: f64, name: &str) -> Result<i64, String> {
+    if !value.is_finite() {
+        return Err(format!(
+            "constant value {value} is not finite for dtype {name}"
+        ));
+    }
+    if value.fract() != 0.0 {
+        return Err(format!(
+            "constant value {value} must be integral for dtype {name}"
+        ));
+    }
+    Ok(value as i64)
+}
+
+/// Encode a scalar as little-endian bytes for [`crate::op::Op::Constant`].
+pub fn scalar_constant_bytes(value: f64, dtype: DType) -> Result<Vec<u8>, String> {
+    let out_of_range =
+        |name: &str| format!("constant value {value} is out of range for dtype {name}");
+    match dtype {
+        DType::F32 => Ok((value as f32).to_le_bytes().to_vec()),
+        DType::F64 => Ok(value.to_le_bytes().to_vec()),
+        DType::I8 => {
+            let v = integral_scalar(value, "i8")?;
+            if !(i8::MIN as i64..=i8::MAX as i64).contains(&v) {
+                return Err(out_of_range("i8"));
+            }
+            Ok((v as i8).to_le_bytes().to_vec())
+        }
+        DType::I16 => {
+            let v = integral_scalar(value, "i16")?;
+            if !(i16::MIN as i64..=i16::MAX as i64).contains(&v) {
+                return Err(out_of_range("i16"));
+            }
+            Ok((v as i16).to_le_bytes().to_vec())
+        }
+        DType::I32 => {
+            let v = integral_scalar(value, "i32")?;
+            if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+                return Err(out_of_range("i32"));
+            }
+            Ok((v as i32).to_le_bytes().to_vec())
+        }
+        DType::I64 => {
+            if !value.is_finite() {
+                return Err(format!(
+                    "constant value {value} is not finite for dtype i64"
+                ));
+            }
+            if value.fract() != 0.0 {
+                return Err(format!(
+                    "constant value {value} must be integral for dtype i64"
+                ));
+            }
+            // `i64::MAX as f64` rounds up to 2^63; use open bounds at ±2^63.
+            if value >= 9.223372036854776e18 || value < -9.223372036854776e18 {
+                return Err(out_of_range("i64"));
+            }
+            Ok((value as i64).to_le_bytes().to_vec())
+        }
+        DType::U8 => {
+            let v = integral_scalar(value, "u8")?;
+            if !(0..=u8::MAX as i64).contains(&v) {
+                return Err(out_of_range("u8"));
+            }
+            Ok((v as u8).to_le_bytes().to_vec())
+        }
+        DType::U32 => {
+            let v = integral_scalar(value, "u32")?;
+            if v < 0 || v > u32::MAX as i64 {
+                return Err(out_of_range("u32"));
+            }
+            Ok((v as u32).to_le_bytes().to_vec())
+        }
+        DType::Bool => Ok(vec![u8::from(value != 0.0)]),
+        DType::F16 | DType::BF16 | DType::C64 => Err(format!(
+            "scalar literal dtype '{dtype:?}' is built via f32 constant + cast"
+        )),
+    }
+}
+
 /// Per-element semantics that don't fit into a flat `DType` enum
 /// (plan #40). Mirrors MAX's `layout/element.mojo` `Element` type:
 /// `DType` says "f8", but two FP8 variants exist (e4m3 and e5m2)
@@ -283,5 +363,38 @@ mod tests {
                 "promote({a},{b}) should equal promote({b},{a})"
             );
         }
+    }
+
+    #[test]
+    fn scalar_constant_bytes_round_trips() {
+        assert_eq!(
+            scalar_constant_bytes(2.5, DType::F32).unwrap(),
+            2.5f32.to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            scalar_constant_bytes(-1.0, DType::F64).unwrap(),
+            (-1.0f64).to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            scalar_constant_bytes(7.0, DType::I32).unwrap(),
+            7i32.to_le_bytes()
+        );
+        assert_eq!(scalar_constant_bytes(0.0, DType::Bool).unwrap(), vec![0]);
+        assert_eq!(scalar_constant_bytes(1.0, DType::Bool).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn scalar_constant_bytes_rejects_out_of_range() {
+        assert!(scalar_constant_bytes(128.0, DType::I8).is_err());
+        assert!(scalar_constant_bytes(-1.0, DType::U32).is_err());
+        assert!(scalar_constant_bytes(9.223372036854776e18, DType::I64).is_err());
+        assert!(scalar_constant_bytes(2.5, DType::I32).is_err());
+    }
+
+    #[test]
+    fn scalar_constant_bytes_rejects_low_precision_direct() {
+        assert!(scalar_constant_bytes(1.0, DType::F16).is_err());
+        assert!(scalar_constant_bytes(1.0, DType::BF16).is_err());
+        assert!(scalar_constant_bytes(1.0, DType::C64).is_err());
     }
 }

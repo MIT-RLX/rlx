@@ -140,6 +140,28 @@ pub enum Thunk {
         act: Activation,
         dt: HalfFlag,
     },
+    /// Fused `act(lhs op rhs)` in one dispatch (region lowering).
+    FusedBinaryActivation {
+        lhs: usize,
+        rhs: usize,
+        dst: usize,
+        len: u32,
+        op: BinaryOp,
+        act: Activation,
+        dt: HalfFlag,
+    },
+    /// Fused `act((lhs op0 rhs0) op1 rhs1)` in one dispatch (region lowering).
+    FusedTernaryActivation {
+        lhs: usize,
+        rhs0: usize,
+        rhs1: usize,
+        dst: usize,
+        len: u32,
+        op0: BinaryOp,
+        op1: BinaryOp,
+        act: Activation,
+        dt: HalfFlag,
+    },
     LayerNorm {
         src: usize,
         g: usize,
@@ -304,6 +326,15 @@ pub enum Thunk {
         len: u32,
         dt: HalfFlag,
     },
+    /// Fused concat-VJP / multi-slice: one dispatch for many last-axis narrows
+    /// from the same source buffer (see `fuse_narrow_clusters` in `compile_thunks`).
+    SplitLastAxis {
+        src: usize,
+        outer: u32,
+        src_axis: u32,
+        dt: HalfFlag,
+        segments: Vec<(usize, u32, u32)>,
+    },
     /// Reshape / Cast / Expand: copy len elements
     Copy {
         src: usize,
@@ -313,11 +344,13 @@ pub enum Thunk {
     },
     /// SDPA. `mask_kind` encodes how to apply masking inside the
     /// kernel:
-    ///   0 = None         (no masking)
-    ///   1 = Causal       (prefill: upper-triangular fill in-kernel)
-    ///   2 = Custom       (read binary mask buffer `mask`)
-    /// SlidingWindow lowering is not yet wired — it would map to a
-    /// new `mask_kind == 3` plus a `window` parameter.
+    ///   0 = None           (no masking)
+    ///   1 = Causal         (prefill: upper-triangular fill in-kernel)
+    ///   2 = Custom         (read binary mask buffer `mask`)
+    ///   3 = Bias           (additive per-head bias; `sdpa_long`-only)
+    ///   4 = SlidingWindow  (causal + lookback `window`; lookback uses
+    ///                       absolute positions so decode mode with
+    ///                       cached K/V works correctly)
     Attention {
         q: usize,
         k: usize,
@@ -330,9 +363,15 @@ pub enum Thunk {
         heads: u32,
         head_dim: u32,
         mask_kind: u32,
+        /// Lookback distance for `mask_kind == 4` (SlidingWindow); 0
+        /// for every other mask kind. Visible range per query at
+        /// absolute position `abs_q` is `[abs_q - window, abs_q]`.
+        window: u32,
         dt: HalfFlag,
+        /// 1 iff Q/K/V are `[B, H, S, D]` (dim1 == num_heads).
+        bhsd: u32,
     },
-    /// [`Op::AttentionBackward`] — host fallback via `rlx_cpu::attention_bwd`
+    /// [`Op::AttentionBackward`] — GPU MSL when scratch fits; CPU fallback otherwise.
     /// on unified-memory arena (F32 only).
     AttentionBackward {
         q: usize,
@@ -544,6 +583,26 @@ pub enum Thunk {
         /// broadcast. `0` ⇒ no broadcast; `>0` ⇒ kernel reads
         /// `arena[input_offs[i] + (gid % input_modulus[i])]`.
         input_modulus: [u32; 16],
+        /// FKL closed region prologue (0=none, 1=resize nearest 2x NCHW).
+        prologue: u32,
+        out_n: u32,
+        out_c: u32,
+        out_h: u32,
+        out_w: u32,
+        /// External input index for prologue transform source (default 0).
+        prologue_input: u32,
+    },
+    /// FKL batch horizontal fusion: one launch over N slice chains (no prologue).
+    BatchElementwiseRegion {
+        slice_len: u32,
+        num_batch: u32,
+        num_steps: u32,
+        base_dst: usize,
+        slice_elems: u32,
+        batch_input_offs: [u32; 64],
+        chain: [u32; 128],
+        scalar_input_mask: u32,
+        input_modulus: [u32; 16],
     },
     /// Stateful gated-DeltaNet scan. Native MSL kernel (`gated_delta_net`);
     /// host fallback when `RLX_METAL_GDN_HOST_FALLBACK=1`, f16 tensors,
@@ -665,6 +724,68 @@ pub enum Thunk {
         axis_dim: u32,
         num_idx: u32,
         trailing: u32,
+    },
+    /// [`Op::MaxPool2dBackward`] — host CPU on unified-memory arena (F32).
+    MaxPool2dBackward {
+        x: usize,
+        dy: usize,
+        dx: usize,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+    },
+    /// [`Op::Conv2dBackwardInput`] — native MSL `conv2d` (same as decomposed `Op::Conv`).
+    Conv2dBackwardInput {
+        dy: usize,
+        w: usize,
+        dx: usize,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+    },
+    /// [`Op::Conv2dBackwardWeight`] — GPU implicit im2col+GEMM (N=1); im2col+sgemm or CPU fallback.
+    Conv2dBackwardWeight {
+        x: usize,
+        dy: usize,
+        dw: usize,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w: u32,
+        c_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw_dil: u32,
+        groups: u32,
     },
 
     /// User-registered custom op. Lowered from `Op::Custom`.
@@ -793,6 +914,25 @@ pub enum Thunk {
         theta: f32,
         repeat_factor: u32,
     },
+    /// NCHW im2col — host fallback on unified memory (F32).
+    Im2Col {
+        x: usize,
+        col: usize,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw_dil: u32,
+    },
     /// 1D FFT on the 2N-real-block layout, lowered from `Op::Fft`.
     /// f32 pow-2 uses native multi-kernel MSL (`fft_dispatch`); f64/C64
     /// and non-pow2 use a host fallback against the unified-memory arena.
@@ -804,6 +944,26 @@ pub enum Thunk {
         inverse: bool,
         norm_tag: u32,
         dtype: rlx_ir::DType,
+    },
+    /// Log-mel from block-layout FFT spectrum (host fallback on Metal).
+    LogMel {
+        spec: usize,
+        filters: usize,
+        dst: usize,
+        outer: u32,
+        n_fft: u32,
+        n_bins: u32,
+        n_mels: u32,
+    },
+    LogMelBackward {
+        spec: usize,
+        filters: usize,
+        dy: usize,
+        dst: usize,
+        outer: u32,
+        n_fft: u32,
+        n_bins: u32,
+        n_mels: u32,
     },
 }
 
@@ -820,6 +980,8 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Sgemm { .. } => "sgemm",
         Thunk::BatchedSgemm { .. } => "batched_sgemm",
         Thunk::FusedMmBiasAct { .. } => "fused_mm_bias_act",
+        Thunk::FusedBinaryActivation { .. } => "fused_binary_activation",
+        Thunk::FusedTernaryActivation { .. } => "fused_ternary_activation",
         Thunk::ActivationInPlace { .. } => "activation",
         Thunk::LayerNorm { .. } => "layer_norm",
         Thunk::GroupNorm { .. } => "group_norm",
@@ -834,6 +996,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::FusedResidualRmsNorm { .. } => "fused_residual_rms_norm",
         Thunk::Gather { .. } => "gather",
         Thunk::Narrow { .. } => "narrow",
+        Thunk::SplitLastAxis { .. } => "split_lastax",
         Thunk::Copy { .. } => "copy",
         Thunk::Attention { .. } => "attention",
         Thunk::AttentionBackward { .. } => "attention_bwd",
@@ -843,6 +1006,9 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::RopeBackward { .. } => "rope_backward",
         Thunk::CumsumBackward { .. } => "cumsum_backward",
         Thunk::GatherBackward { .. } => "gather_backward",
+        Thunk::MaxPool2dBackward { .. } => "maxpool2d_backward",
+        Thunk::Conv2dBackwardInput { .. } => "conv2d_backward_input",
+        Thunk::Conv2dBackwardWeight { .. } => "conv2d_backward_weight",
         Thunk::Rope { .. } => "rope",
         Thunk::Softmax { .. } => "softmax",
         Thunk::FusedSwiGLU { .. } => "fused_swiglu",
@@ -858,13 +1024,17 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Conv2D { .. } => "conv2d",
         Thunk::Where { .. } => "where",
         Thunk::ElementwiseRegion { .. } => "elementwise_region",
+        Thunk::BatchElementwiseRegion { .. } => "batch_elementwise_region",
         Thunk::CustomOp { .. } => "custom_op",
         Thunk::GaussianSplatRender { .. } => "gaussian_splat_render",
         Thunk::GaussianSplatRenderBackward { .. } => "gaussian_splat_render_backward",
         Thunk::GaussianSplatPrepare { .. } => "gaussian_splat_prepare",
         Thunk::GaussianSplatRasterize { .. } => "gaussian_splat_rasterize",
         Thunk::AxialRope2dHost { .. } => "axial_rope2d_host",
+        Thunk::Im2Col { .. } => "im2col",
         Thunk::Fft1d { .. } => "fft1d",
+        Thunk::LogMel { .. } => "log_mel",
+        Thunk::LogMelBackward { .. } => "log_mel_backward",
         Thunk::GatedDeltaNet { .. } => "gated_delta_net",
         Thunk::DequantMatMulGguf { .. } => "dequant_matmul_gguf",
         Thunk::DequantGroupedMatMulGguf { .. } => "dequant_grouped_matmul_gguf",
@@ -888,6 +1058,8 @@ impl Thunk {
             | Thunk::Cast { .. }
             | Thunk::Copy { .. }
             | Thunk::ActivationInPlace { .. }
+            | Thunk::FusedBinaryActivation { .. }
+            | Thunk::FusedTernaryActivation { .. }
             | Thunk::Sgemm { .. }
             | Thunk::BatchedSgemm { .. }
             | Thunk::FusedMmBiasAct { .. }
@@ -902,7 +1074,9 @@ impl Thunk {
             | Thunk::Where { .. }
             | Thunk::FusedSwiGLU { .. }
             | Thunk::ElementwiseRegion { .. }
+            | Thunk::BatchElementwiseRegion { .. }
             | Thunk::Narrow { .. }
+            | Thunk::SplitLastAxis { .. }
             | Thunk::Reduce { .. }
             | Thunk::TopK { .. }
             | Thunk::GroupedMatMul { .. }
@@ -922,7 +1096,10 @@ impl Thunk {
             | Thunk::RmsNormBackwardBeta { .. }
             | Thunk::RopeBackward { .. }
             | Thunk::CumsumBackward { .. }
-            | Thunk::GatherBackward { .. } => true,
+            | Thunk::GatherBackward { .. }
+            | Thunk::MaxPool2dBackward { .. }
+            | Thunk::Conv2dBackwardInput { .. }
+            | Thunk::Conv2dBackwardWeight { .. } => true,
             Thunk::Rope { .. } => true,
             // Decode seq=1 GDN / fused GGUF matmul: host paths use full
             // `batch`/`m` from the thunk (not seq-axis scale); marking
@@ -975,6 +1152,71 @@ impl ThunkSchedule {
             // GPU thunk path also emits Nop. Plan #46.
             if rlx_opt::is_pure_view(graph, node) {
                 thunks.push(Thunk::Nop);
+                continue;
+            }
+            if let Op::BatchElementwiseRegion {
+                chain,
+                num_batch_inputs,
+                scalar_input_mask,
+                input_modulus,
+                prologue,
+                prologue_input,
+            } = &node.op
+            {
+                let n = *num_batch_inputs as usize;
+                if n == 0 || chain.len() > 32 {
+                    panic!(
+                        "rlx-metal BatchElementwiseRegion: num_batch_inputs={n} steps={}",
+                        chain.len()
+                    );
+                }
+                let slice_shape = rlx_ir::batch_region_slice_shape(&node.shape);
+                let slice_elems = rlx_ir::batch_region_slice_elems(&node.shape, n)
+                    .expect("batch region static shape") as u32;
+                let elem_bytes = node.shape.dtype().size_bytes();
+                let slice_bytes = slice_elems as usize * elem_bytes;
+                let base_dst = off(node.id);
+                let chain_enc = rlx_ir::encode_chain_steps(chain);
+                let tail = rlx_ir::encode_prologue_tail(*prologue, &slice_shape, *prologue_input);
+                let use_single = rlx_ir::fk_batch_use_single_launch(n, *prologue);
+                if use_single {
+                    let mut batch_input_offs = [0u32; 64];
+                    for i in 0..n {
+                        batch_input_offs[i] = off(node.inputs[i]) as u32 / 4;
+                    }
+                    thunks.push(Thunk::BatchElementwiseRegion {
+                        slice_len: slice_elems,
+                        num_batch: n as u32,
+                        num_steps: chain.len() as u32,
+                        base_dst,
+                        slice_elems,
+                        batch_input_offs,
+                        chain: chain_enc,
+                        scalar_input_mask: *scalar_input_mask,
+                        input_modulus: *input_modulus,
+                    });
+                } else {
+                    for i in 0..n {
+                        let mut input_offs = [0u32; 16];
+                        input_offs[0] = off(node.inputs[i]) as u32 / 4;
+                        thunks.push(Thunk::ElementwiseRegion {
+                            len: slice_elems,
+                            num_inputs: 1,
+                            num_steps: chain.len() as u32,
+                            dst: base_dst + i * slice_bytes,
+                            input_offs,
+                            chain: chain_enc,
+                            scalar_input_mask: *scalar_input_mask,
+                            input_modulus: *input_modulus,
+                            prologue: tail[0],
+                            out_n: tail[1],
+                            out_c: tail[2],
+                            out_h: tail[3],
+                            out_w: tail[4],
+                            prologue_input: tail[5],
+                        });
+                    }
+                }
                 continue;
             }
             let t = match &node.op {
@@ -1371,6 +1613,19 @@ impl ThunkSchedule {
                     }
                 }
 
+                // Identity forward; gradient-stop on the backward (the AD
+                // pass treats `StopGradient` specially upstream so by the
+                // time we land here it's a pure copy).
+                Op::StopGradient => {
+                    let len = node.shape.num_elements().unwrap();
+                    Thunk::Copy {
+                        src: off(node.inputs[0]),
+                        dst: off(node.id),
+                        len: len as u32,
+                        dt: node.shape.dtype().into(),
+                    }
+                }
+
                 Op::Expand { .. } => {
                     // Broadcast via Transpose-with-stride-0: build per-dim
                     // strides where input dims of size 1 broadcast.
@@ -1421,16 +1676,12 @@ impl ThunkSchedule {
                     score_scale: _,
                     attn_logit_softcap: _,
                 } => {
-                    let mask_kind_u32: u32 = match mask_kind {
-                        rlx_ir::op::MaskKind::None => 0,
-                        rlx_ir::op::MaskKind::Causal => 1,
-                        rlx_ir::op::MaskKind::Custom => 2,
-                        rlx_ir::op::MaskKind::Bias => 3,
-                        rlx_ir::op::MaskKind::SlidingWindow(_) => {
-                            panic!(
-                                "Metal SDPA: MaskKind::SlidingWindow not yet supported (use Causal or Custom)"
-                            );
-                        }
+                    let (mask_kind_u32, window): (u32, u32) = match mask_kind {
+                        rlx_ir::op::MaskKind::None => (0, 0),
+                        rlx_ir::op::MaskKind::Causal => (1, 0),
+                        rlx_ir::op::MaskKind::Custom => (2, 0),
+                        rlx_ir::op::MaskKind::Bias => (3, 0),
+                        rlx_ir::op::MaskKind::SlidingWindow(w) => (4, *w as u32),
                     };
                     let mask_off = if matches!(
                         mask_kind,
@@ -1442,18 +1693,39 @@ impl ThunkSchedule {
                     };
                     let q_shape = &graph.node(node.inputs[0]).shape;
                     let k_shape = &graph.node(node.inputs[1]).shape;
-                    let (batch, seq) = if q_shape.rank() >= 3 {
+                    let rank = q_shape.rank();
+                    let (batch, seq, kv_seq, bhsd) = if rank == 4 {
+                        let d1 = q_shape.dim(1).unwrap_static();
+                        let d2 = q_shape.dim(2).unwrap_static();
+                        if d1 == *num_heads {
+                            (
+                                q_shape.dim(0).unwrap_static(),
+                                d2,
+                                k_shape.dim(2).unwrap_static(),
+                                1u32,
+                            )
+                        } else {
+                            (
+                                q_shape.dim(0).unwrap_static(),
+                                d1,
+                                k_shape.dim(1).unwrap_static(),
+                                0u32,
+                            )
+                        }
+                    } else if q_shape.rank() >= 3 {
                         (
                             q_shape.dim(0).unwrap_static(),
                             q_shape.dim(1).unwrap_static(),
+                            k_shape.dim(1).unwrap_static(),
+                            0u32,
                         )
                     } else {
-                        (1, q_shape.dim(0).unwrap_static())
-                    };
-                    let kv_seq = if k_shape.rank() >= 3 {
-                        k_shape.dim(1).unwrap_static()
-                    } else {
-                        k_shape.dim(0).unwrap_static()
+                        (
+                            1,
+                            q_shape.dim(0).unwrap_static(),
+                            k_shape.dim(0).unwrap_static(),
+                            0u32,
+                        )
                     };
                     Thunk::Attention {
                         q: off(node.inputs[0]),
@@ -1467,7 +1739,9 @@ impl ThunkSchedule {
                         heads: *num_heads as u32,
                         head_dim: *head_dim as u32,
                         mask_kind: mask_kind_u32,
+                        window,
                         dt: node.shape.dtype().into(),
+                        bhsd,
                     }
                 }
 
@@ -1911,8 +2185,9 @@ impl ThunkSchedule {
                     num_inputs,
                     scalar_input_mask,
                     input_modulus,
+                    prologue,
+                    prologue_input,
                 } => {
-                    use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, CmpOp};
                     let n = *num_inputs as usize;
                     if n > 16 || chain.len() > 32 {
                         panic!(
@@ -1926,81 +2201,9 @@ impl ThunkSchedule {
                     for (i, &id) in node.inputs.iter().enumerate() {
                         input_offs[i] = off(id) as u32 / 4;
                     }
-                    let encode_operand = |op: &ChainOperand| -> u32 {
-                        match *op {
-                            ChainOperand::Input(i) => i & 0x7FFF_FFFFu32,
-                            ChainOperand::Step(i) => 0x8000_0000u32 | (i & 0x7FFF_FFFFu32),
-                        }
-                    };
-                    let act_sub = |a: Activation| match a {
-                        Activation::Gelu => 0u32,
-                        Activation::GeluApprox => 1,
-                        Activation::Silu => 2,
-                        Activation::Relu => 3,
-                        Activation::Sigmoid => 4,
-                        Activation::Tanh => 5,
-                        Activation::Exp => 6,
-                        Activation::Log => 7,
-                        Activation::Sqrt => 8,
-                        Activation::Rsqrt => 9,
-                        Activation::Neg => 10,
-                        Activation::Abs => 11,
-                        Activation::Round => 12,
-                        Activation::Sin => 13,
-                        Activation::Cos => 14,
-                        Activation::Tan => 15,
-                        Activation::Atan => 16,
-                    };
-                    let bin_sub = |b: BinaryOp| match b {
-                        BinaryOp::Add => 0u32,
-                        BinaryOp::Sub => 1,
-                        BinaryOp::Mul => 2,
-                        BinaryOp::Div => 3,
-                        BinaryOp::Max => 4,
-                        BinaryOp::Min => 5,
-                        BinaryOp::Pow => 6,
-                    };
-                    let cmp_sub = |c: CmpOp| match c {
-                        CmpOp::Eq => 0u32,
-                        CmpOp::Ne => 1,
-                        CmpOp::Lt => 2,
-                        CmpOp::Le => 3,
-                        CmpOp::Gt => 4,
-                        CmpOp::Ge => 5,
-                    };
-                    let mut chain_enc = [0u32; 128];
-                    for (k, step) in chain.iter().enumerate() {
-                        let base = k * 4;
-                        let (kind, sub, lhs, rhs) = match step {
-                            ChainStep::Activation(a, src) => {
-                                (0u32, act_sub(*a), encode_operand(src), 0u32)
-                            }
-                            ChainStep::Cast(_, src) => (1u32, 0, encode_operand(src), 0u32),
-                            ChainStep::Binary(op, l, r) => {
-                                (2u32, bin_sub(*op), encode_operand(l), encode_operand(r))
-                            }
-                            ChainStep::Compare(op, l, r) => {
-                                (3u32, cmp_sub(*op), encode_operand(l), encode_operand(r))
-                            }
-                            ChainStep::Where(c, t, f) =>
-                            // Pack the 3-operand select into the 4-u32 step: the
-                            // op_sub slot carries the condition operand, lhs is
-                            // on_true, rhs is on_false. Kernel switches on
-                            // op_kind == 4 to read all three back.
-                            {
-                                (
-                                    4u32,
-                                    encode_operand(c),
-                                    encode_operand(t),
-                                    encode_operand(f),
-                                )
-                            }
-                        };
-                        chain_enc[base] = kind;
-                        chain_enc[base + 1] = sub;
-                        chain_enc[base + 2] = lhs;
-                        chain_enc[base + 3] = rhs;
-                    }
+                    let chain_enc = rlx_ir::encode_chain_steps(chain);
+                    let tail =
+                        rlx_ir::encode_prologue_tail(*prologue, &node.shape, *prologue_input);
                     Thunk::ElementwiseRegion {
                         len: node.shape.num_elements().unwrap() as u32,
                         num_inputs: *num_inputs,
@@ -2010,6 +2213,12 @@ impl ThunkSchedule {
                         chain: chain_enc,
                         scalar_input_mask: *scalar_input_mask,
                         input_modulus: *input_modulus,
+                        prologue: tail[0],
+                        out_n: tail[1],
+                        out_c: tail[2],
+                        out_h: tail[3],
+                        out_w: tail[4],
+                        prologue_input: tail[5],
                     }
                 }
 
@@ -2229,6 +2438,65 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::Im2Col {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    if kernel_size.len() != 2 || x_shape.rank() != 4 {
+                        panic!("rlx-metal Im2Col: 2D NCHW only");
+                    }
+                    let n = match x_shape.dim(0) {
+                        rlx_ir::shape::Dim::Static(v) => v as u32,
+                        _ => 0,
+                    };
+                    let c_in = x_shape.dim(1).unwrap_static() as u32;
+                    let h = x_shape.dim(2).unwrap_static() as u32;
+                    let w = x_shape.dim(3).unwrap_static() as u32;
+                    let kh = kernel_size[0] as u32;
+                    let kw = kernel_size[1] as u32;
+                    let sh = stride.first().copied().unwrap_or(1) as u32;
+                    let sw = stride.get(1).copied().unwrap_or(1) as u32;
+                    let ph = padding.first().copied().unwrap_or(0) as u32;
+                    let pw = padding.get(1).copied().unwrap_or(0) as u32;
+                    let dh = dilation.first().copied().unwrap_or(1) as u32;
+                    let dw_dil = dilation.get(1).copied().unwrap_or(1) as u32;
+                    let h_out = rlx_ir::shape::conv2d_spatial_output(
+                        h as usize,
+                        kh as usize,
+                        sh as usize,
+                        ph as usize,
+                        dh as usize,
+                    ) as u32;
+                    let w_out = rlx_ir::shape::conv2d_spatial_output(
+                        w as usize,
+                        kw as usize,
+                        sw as usize,
+                        pw as usize,
+                        dw_dil as usize,
+                    ) as u32;
+                    Thunk::Im2Col {
+                        x: off(node.inputs[0]),
+                        col: off(node.id),
+                        n,
+                        c_in,
+                        h,
+                        w,
+                        h_out,
+                        w_out,
+                        kh,
+                        kw,
+                        sh,
+                        sw,
+                        ph,
+                        pw,
+                        dh,
+                        dw_dil,
+                    }
+                }
+
                 Op::Fft { inverse, norm } => {
                     let shape = &node.shape;
                     let meta = rlx_ir::fft::fft_meta(shape);
@@ -2248,6 +2516,39 @@ impl ThunkSchedule {
                         inverse: *inverse,
                         norm_tag: norm.tag(),
                         dtype,
+                    }
+                }
+
+                Op::LogMel => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let filt_shape = graph.node(node.inputs[1]).shape.clone();
+                    let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
+                        .unwrap_or_else(|e| panic!("Op::LogMel: {e}"));
+                    Thunk::LogMel {
+                        spec: off(node.inputs[0]),
+                        filters: off(node.inputs[1]),
+                        dst: off(node.id),
+                        outer: meta.outer as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_bins: meta.n_bins as u32,
+                        n_mels: meta.n_mels as u32,
+                    }
+                }
+
+                Op::LogMelBackward => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let filt_shape = graph.node(node.inputs[1]).shape.clone();
+                    let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
+                        .unwrap_or_else(|e| panic!("Op::LogMelBackward: {e}"));
+                    Thunk::LogMelBackward {
+                        spec: off(node.inputs[0]),
+                        filters: off(node.inputs[1]),
+                        dy: off(node.inputs[2]),
+                        dst: off(node.id),
+                        outer: meta.outer as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_bins: meta.n_bins as u32,
+                        n_mels: meta.n_mels as u32,
                     }
                 }
 
@@ -2483,6 +2784,107 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::MaxPool2dBackward {
+                    kernel_size,
+                    stride,
+                    padding,
+                } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal MaxPool2dBackward: F32 only");
+                    }
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let dy_shape = &graph.node(node.inputs[1]).shape;
+                    Thunk::MaxPool2dBackward {
+                        x: off(node.inputs[0]),
+                        dy: off(node.inputs[1]),
+                        dx: off(node.id),
+                        n: x_shape.dim(0).unwrap_static() as u32,
+                        c: x_shape.dim(1).unwrap_static() as u32,
+                        h: x_shape.dim(2).unwrap_static() as u32,
+                        w: x_shape.dim(3).unwrap_static() as u32,
+                        h_out: dy_shape.dim(2).unwrap_static() as u32,
+                        w_out: dy_shape.dim(3).unwrap_static() as u32,
+                        kh: kernel_size[0] as u32,
+                        kw: kernel_size[1] as u32,
+                        sh: stride.first().copied().unwrap_or(1) as u32,
+                        sw: stride.get(1).copied().unwrap_or(1) as u32,
+                        ph: padding.first().copied().unwrap_or(0) as u32,
+                        pw: padding.get(1).copied().unwrap_or(0) as u32,
+                    }
+                }
+
+                Op::Conv2dBackwardInput {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal Conv2dBackwardInput: F32 only");
+                    }
+                    let dy_shape = &graph.node(node.inputs[0]).shape;
+                    let _w_shape = &graph.node(node.inputs[1]).shape;
+                    let out_shape = &node.shape;
+                    Thunk::Conv2dBackwardInput {
+                        dy: off(node.inputs[0]),
+                        w: off(node.inputs[1]),
+                        dx: off(node.id),
+                        n: out_shape.dim(0).unwrap_static() as u32,
+                        c_in: out_shape.dim(1).unwrap_static() as u32,
+                        h: out_shape.dim(2).unwrap_static() as u32,
+                        w_in: out_shape.dim(3).unwrap_static() as u32,
+                        c_out: dy_shape.dim(1).unwrap_static() as u32,
+                        h_out: dy_shape.dim(2).unwrap_static() as u32,
+                        w_out: dy_shape.dim(3).unwrap_static() as u32,
+                        kh: kernel_size[0] as u32,
+                        kw: kernel_size[1] as u32,
+                        sh: stride.first().copied().unwrap_or(1) as u32,
+                        sw: stride.get(1).copied().unwrap_or(1) as u32,
+                        ph: padding.first().copied().unwrap_or(0) as u32,
+                        pw: padding.get(1).copied().unwrap_or(0) as u32,
+                        dh: dilation.first().copied().unwrap_or(1) as u32,
+                        dw: dilation.get(1).copied().unwrap_or(1) as u32,
+                        groups: *groups as u32,
+                    }
+                }
+
+                Op::Conv2dBackwardWeight {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal Conv2dBackwardWeight: F32 only");
+                    }
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let dy_shape = &graph.node(node.inputs[1]).shape;
+                    let _dw_shape = &node.shape;
+                    Thunk::Conv2dBackwardWeight {
+                        x: off(node.inputs[0]),
+                        dy: off(node.inputs[1]),
+                        dw: off(node.id),
+                        n: x_shape.dim(0).unwrap_static() as u32,
+                        c_in: x_shape.dim(1).unwrap_static() as u32,
+                        h: x_shape.dim(2).unwrap_static() as u32,
+                        w: x_shape.dim(3).unwrap_static() as u32,
+                        c_out: dy_shape.dim(1).unwrap_static() as u32,
+                        h_out: dy_shape.dim(2).unwrap_static() as u32,
+                        w_out: dy_shape.dim(3).unwrap_static() as u32,
+                        kh: kernel_size[0] as u32,
+                        kw: kernel_size[1] as u32,
+                        sh: stride.first().copied().unwrap_or(1) as u32,
+                        sw: stride.get(1).copied().unwrap_or(1) as u32,
+                        ph: padding.first().copied().unwrap_or(0) as u32,
+                        pw: padding.get(1).copied().unwrap_or(0) as u32,
+                        dh: dilation.first().copied().unwrap_or(1) as u32,
+                        dw_dil: dilation.get(1).copied().unwrap_or(1) as u32,
+                        groups: *groups as u32,
+                    }
+                }
+
                 Op::Custom { name, attrs, .. } => {
                     let kernel =
                         crate::op_registry::lookup_metal_kernel(name).unwrap_or_else(|| {
@@ -2595,7 +2997,513 @@ impl ThunkSchedule {
             }
         }
 
+        rewrite_simple_elementwise_regions(&mut thunks);
+        rewrite_dense_binary_broadcast(&mut thunks);
+        fuse_narrow_clusters(&mut thunks);
+
         Self { thunks }
+    }
+}
+
+fn strides_dense_contiguous(rank: usize, dims: &[u32], strides: &[u32]) -> bool {
+    if rank == 0 || dims.len() < rank || strides.len() < rank {
+        return rank == 0;
+    }
+    let mut expected = 1u32;
+    for ax in (0..rank).rev() {
+        if strides[ax] != expected {
+            return false;
+        }
+        expected = expected.saturating_mul(dims[ax].max(1));
+    }
+    true
+}
+
+/// Drop trivial `ElementwiseRegion` chains to direct thunks (vec4 elem / in-place act).
+fn rewrite_simple_elementwise_regions(thunks: &mut Vec<Thunk>) {
+    let mut i = 0;
+    while i < thunks.len() {
+        match try_rewrite_elementwise_region(&thunks[i]) {
+            RegionRewrite::Keep => {
+                i += 1;
+            }
+            RegionRewrite::One(t) => {
+                thunks[i] = t;
+                i += 1;
+            }
+            RegionRewrite::Many(ts) => {
+                if ts.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let n = ts.len();
+                thunks.splice(i..=i, ts);
+                i += n;
+            }
+        }
+    }
+}
+
+enum RegionRewrite {
+    Keep,
+    One(Thunk),
+    Many(Vec<Thunk>),
+}
+
+fn region_is_dense(n_in: usize, scalar_input_mask: u32, input_modulus: &[u32; 16]) -> bool {
+    scalar_input_mask == 0 && !input_modulus.iter().take(n_in).any(|&m| m != 0)
+}
+
+fn decode_input_operand(enc: u32) -> Option<usize> {
+    if enc & 0x8000_0000 != 0 {
+        None
+    } else {
+        Some(enc as usize)
+    }
+}
+
+fn decode_step_operand(enc: u32) -> Option<usize> {
+    if enc & 0x8000_0000 == 0 {
+        None
+    } else {
+        Some((enc & 0x7FFF_FFFF) as usize)
+    }
+}
+
+fn map_chain_binary_op(sub: u32) -> Option<rlx_ir::op::BinaryOp> {
+    use rlx_ir::op::BinaryOp;
+    Some(match sub {
+        0 => BinaryOp::Add,
+        1 => BinaryOp::Sub,
+        2 => BinaryOp::Mul,
+        3 => BinaryOp::Div,
+        4 => BinaryOp::Max,
+        5 => BinaryOp::Min,
+        6 => BinaryOp::Pow,
+        _ => return None,
+    })
+}
+
+fn map_chain_activation(sub: u32) -> Option<rlx_ir::op::Activation> {
+    use rlx_ir::op::Activation;
+    Some(match sub {
+        0 | 1 => Activation::Gelu,
+        2 => Activation::Silu,
+        3 => Activation::Relu,
+        4 => Activation::Sigmoid,
+        5 => Activation::Tanh,
+        6 => Activation::Exp,
+        7 => Activation::Log,
+        8 => Activation::Sqrt,
+        9 => Activation::Rsqrt,
+        10 => Activation::Neg,
+        11 => Activation::Abs,
+        _ => return None,
+    })
+}
+
+fn try_rewrite_elementwise_region(t: &Thunk) -> RegionRewrite {
+    let Thunk::ElementwiseRegion {
+        len,
+        num_inputs,
+        num_steps,
+        dst,
+        input_offs,
+        chain,
+        scalar_input_mask,
+        input_modulus,
+        prologue,
+        out_n: _,
+        out_c: _,
+        out_h: _,
+        out_w: _,
+        prologue_input: _,
+    } = t
+    else {
+        return RegionRewrite::Keep;
+    };
+
+    if *prologue != 0 {
+        return RegionRewrite::Keep;
+    }
+
+    let n_in = *num_inputs as usize;
+    if !region_is_dense(n_in, *scalar_input_mask, input_modulus) {
+        return RegionRewrite::Keep;
+    }
+
+    let input_byte = |idx: usize| input_offs[idx] as usize * 4;
+
+    if *num_steps == 1 && chain[0] == 2 && n_in == 2 {
+        let Some(lhs_idx) = decode_input_operand(chain[2]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(rhs_idx) = decode_input_operand(chain[3]) else {
+            return RegionRewrite::Keep;
+        };
+        if lhs_idx >= n_in || rhs_idx >= n_in {
+            return RegionRewrite::Keep;
+        }
+        let Some(op) = map_chain_binary_op(chain[1]) else {
+            return RegionRewrite::Keep;
+        };
+        return RegionRewrite::One(Thunk::BinaryFull {
+            lhs: input_byte(lhs_idx),
+            rhs: input_byte(rhs_idx),
+            dst: *dst,
+            len: *len,
+            op,
+            dt: HalfFlag::F32,
+        });
+    }
+
+    if *num_steps == 2 && chain[0] == 2 && chain[4] == 0 {
+        let Some(lhs_idx) = decode_input_operand(chain[2]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(rhs_idx) = decode_input_operand(chain[3]) else {
+            return RegionRewrite::Keep;
+        };
+        if decode_step_operand(chain[6]) != Some(0) {
+            return RegionRewrite::Keep;
+        }
+        let Some(op) = map_chain_binary_op(chain[1]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(act) = map_chain_activation(chain[5]) else {
+            return RegionRewrite::Keep;
+        };
+        if lhs_idx >= n_in || rhs_idx >= n_in {
+            return RegionRewrite::Keep;
+        }
+        return RegionRewrite::One(Thunk::FusedBinaryActivation {
+            lhs: input_byte(lhs_idx),
+            rhs: input_byte(rhs_idx),
+            dst: *dst,
+            len: *len,
+            op,
+            act,
+            dt: HalfFlag::F32,
+        });
+    }
+
+    if *num_steps == 2 && chain[0] == 2 && chain[4] == 2 {
+        let Some(lhs0) = decode_input_operand(chain[2]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(rhs0) = decode_input_operand(chain[3]) else {
+            return RegionRewrite::Keep;
+        };
+        if decode_step_operand(chain[6]) != Some(0) {
+            return RegionRewrite::Keep;
+        }
+        let Some(rhs1) = decode_input_operand(chain[7]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(op0) = map_chain_binary_op(chain[1]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(op1) = map_chain_binary_op(chain[5]) else {
+            return RegionRewrite::Keep;
+        };
+        if lhs0 >= n_in || rhs0 >= n_in || rhs1 >= n_in {
+            return RegionRewrite::Keep;
+        }
+        return RegionRewrite::Many(vec![
+            Thunk::BinaryFull {
+                lhs: input_byte(lhs0),
+                rhs: input_byte(rhs0),
+                dst: *dst,
+                len: *len,
+                op: op0,
+                dt: HalfFlag::F32,
+            },
+            Thunk::BinaryFull {
+                lhs: *dst,
+                rhs: input_byte(rhs1),
+                dst: *dst,
+                len: *len,
+                op: op1,
+                dt: HalfFlag::F32,
+            },
+        ]);
+    }
+
+    if *num_steps == 3 && chain[0] == 2 && chain[4] == 2 && chain[8] == 0 {
+        let Some(lhs0) = decode_input_operand(chain[2]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(rhs0) = decode_input_operand(chain[3]) else {
+            return RegionRewrite::Keep;
+        };
+        if decode_step_operand(chain[6]) != Some(0) {
+            return RegionRewrite::Keep;
+        }
+        let Some(rhs1) = decode_input_operand(chain[7]) else {
+            return RegionRewrite::Keep;
+        };
+        if decode_step_operand(chain[10]) != Some(1) {
+            return RegionRewrite::Keep;
+        }
+        let Some(op0) = map_chain_binary_op(chain[1]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(op1) = map_chain_binary_op(chain[5]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(act) = map_chain_activation(chain[9]) else {
+            return RegionRewrite::Keep;
+        };
+        if lhs0 >= n_in || rhs0 >= n_in || rhs1 >= n_in {
+            return RegionRewrite::Keep;
+        }
+        return RegionRewrite::One(Thunk::FusedTernaryActivation {
+            lhs: input_byte(lhs0),
+            rhs0: input_byte(rhs0),
+            rhs1: input_byte(rhs1),
+            dst: *dst,
+            len: *len,
+            op0,
+            op1,
+            act,
+            dt: HalfFlag::F32,
+        });
+    }
+
+    if *num_steps == 3 && chain[0] == 2 && chain[4] == 2 && chain[8] == 2 {
+        let Some(lhs0) = decode_input_operand(chain[2]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(rhs0) = decode_input_operand(chain[3]) else {
+            return RegionRewrite::Keep;
+        };
+        if decode_step_operand(chain[6]) != Some(0) {
+            return RegionRewrite::Keep;
+        }
+        let Some(rhs1) = decode_input_operand(chain[7]) else {
+            return RegionRewrite::Keep;
+        };
+        if decode_step_operand(chain[10]) != Some(1) {
+            return RegionRewrite::Keep;
+        };
+        let Some(rhs2) = decode_input_operand(chain[11]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(op0) = map_chain_binary_op(chain[1]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(op1) = map_chain_binary_op(chain[5]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(op2) = map_chain_binary_op(chain[9]) else {
+            return RegionRewrite::Keep;
+        };
+        if lhs0 >= n_in || rhs0 >= n_in || rhs1 >= n_in || rhs2 >= n_in {
+            return RegionRewrite::Keep;
+        }
+        return RegionRewrite::Many(vec![
+            Thunk::BinaryFull {
+                lhs: input_byte(lhs0),
+                rhs: input_byte(rhs0),
+                dst: *dst,
+                len: *len,
+                op: op0,
+                dt: HalfFlag::F32,
+            },
+            Thunk::BinaryFull {
+                lhs: *dst,
+                rhs: input_byte(rhs1),
+                dst: *dst,
+                len: *len,
+                op: op1,
+                dt: HalfFlag::F32,
+            },
+            Thunk::BinaryFull {
+                lhs: *dst,
+                rhs: input_byte(rhs2),
+                dst: *dst,
+                len: *len,
+                op: op2,
+                dt: HalfFlag::F32,
+            },
+        ]);
+    }
+
+    if *num_steps == 2 && chain[0] == 1 && chain[4] == 2 {
+        let Some(cast_in) = decode_input_operand(chain[2]) else {
+            return RegionRewrite::Keep;
+        };
+        if decode_step_operand(chain[6]) != Some(0) {
+            return RegionRewrite::Keep;
+        }
+        let Some(rhs_idx) = decode_input_operand(chain[7]) else {
+            return RegionRewrite::Keep;
+        };
+        let Some(op) = map_chain_binary_op(chain[5]) else {
+            return RegionRewrite::Keep;
+        };
+        if cast_in >= n_in || rhs_idx >= n_in {
+            return RegionRewrite::Keep;
+        }
+        return RegionRewrite::One(Thunk::BinaryFull {
+            lhs: input_byte(cast_in),
+            rhs: input_byte(rhs_idx),
+            dst: *dst,
+            len: *len,
+            op,
+            dt: HalfFlag::F32,
+        });
+    }
+
+    if *num_steps == 1 && chain[0] == 0 && n_in > 0 {
+        let Some(src_idx) = decode_input_operand(chain[2]) else {
+            return RegionRewrite::Keep;
+        };
+        if src_idx >= n_in {
+            return RegionRewrite::Keep;
+        }
+        let data = input_byte(src_idx);
+        if data != *dst {
+            return RegionRewrite::Keep;
+        }
+        let Some(act) = map_chain_activation(chain[1]) else {
+            return RegionRewrite::Keep;
+        };
+        return RegionRewrite::One(Thunk::ActivationInPlace {
+            data,
+            len: *len,
+            act,
+            dt: HalfFlag::F32,
+        });
+    }
+
+    RegionRewrite::Keep
+}
+
+/// `BinaryBroadcast` with both operands row-major dense → `BinaryFull` (vec4 elem kernels).
+fn rewrite_dense_binary_broadcast(thunks: &mut [Thunk]) {
+    for t in thunks.iter_mut() {
+        let Thunk::BinaryBroadcast {
+            lhs,
+            rhs,
+            dst,
+            len,
+            op,
+            dt,
+            rank,
+            out_dims,
+            lhs_strides,
+            rhs_strides,
+        } = t
+        else {
+            continue;
+        };
+        let rank = *rank as usize;
+        if rank == 0
+            || !strides_dense_contiguous(rank, out_dims, lhs_strides)
+            || !strides_dense_contiguous(rank, out_dims, rhs_strides)
+        {
+            continue;
+        }
+        *t = Thunk::BinaryFull {
+            lhs: *lhs,
+            rhs: *rhs,
+            dst: *dst,
+            len: *len,
+            op: *op,
+            dt: *dt,
+        };
+    }
+}
+
+fn narrow_segments_partition(src_axis: u32, segments: &[(u32, u32)]) -> bool {
+    let mut sorted = segments.to_vec();
+    sorted.sort_by_key(|(s, _)| *s);
+    let mut end = 0u32;
+    for (start, len) in sorted {
+        if start != end {
+            return false;
+        }
+        end = end.saturating_add(len);
+    }
+    end == src_axis
+}
+
+/// Merge disjoint last-axis `Narrow` thunks that share a source into `SplitLastAxis`.
+fn fuse_narrow_clusters(thunks: &mut [Thunk]) {
+    use std::collections::HashMap;
+
+    #[derive(Hash, PartialEq, Eq, Clone, Copy)]
+    struct NarrowKey {
+        src: usize,
+        outer: u32,
+        src_axis: u32,
+        dt: u8,
+    }
+
+    let mut groups: HashMap<NarrowKey, Vec<(usize, usize, u32, u32)>> = HashMap::new();
+    for (i, t) in thunks.iter().enumerate() {
+        let Thunk::Narrow {
+            src,
+            dst,
+            outer,
+            src_axis,
+            start,
+            len,
+            dt,
+        } = t
+        else {
+            continue;
+        };
+        let key = NarrowKey {
+            src: *src,
+            outer: *outer,
+            src_axis: *src_axis,
+            dt: match dt {
+                HalfFlag::F32 => 0,
+                HalfFlag::F16 => 1,
+            },
+        };
+        groups.entry(key).or_default().push((i, *dst, *start, *len));
+    }
+
+    let mut groups_fused = 0usize;
+    let mut narrows_fused = 0usize;
+    for (key, mut items) in groups {
+        if items.len() < 2 || key.dt != 0 {
+            continue;
+        }
+        let meta: Vec<(u32, u32)> = items.iter().map(|(_, _, s, l)| (*s, *l)).collect();
+        if !narrow_segments_partition(key.src_axis, &meta) {
+            continue;
+        }
+        items.sort_by_key(|(i, _, _, _)| *i);
+        let dt = HalfFlag::F32;
+        let segments: Vec<(usize, u32, u32)> =
+            items.iter().map(|(_, d, s, l)| (*d, *s, *l)).collect();
+        let n = items.len();
+        let first = items[0].0;
+        thunks[first] = Thunk::SplitLastAxis {
+            src: key.src,
+            outer: key.outer,
+            src_axis: key.src_axis,
+            dt,
+            segments,
+        };
+        for (i, _, _, _) in items.into_iter().skip(1) {
+            thunks[i] = Thunk::Nop;
+        }
+        groups_fused += 1;
+        narrows_fused += n;
+    }
+    let verbose = rlx_ir::env::var("RLX_VERBOSE")
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(0)
+        >= 1;
+    if verbose && groups_fused > 0 {
+        eprintln!(
+            "[rlx-metal] fuse_narrow_clusters: {groups_fused} split groups ({narrows_fused} narrows merged)"
+        );
     }
 }
 
@@ -2608,6 +3516,10 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::BatchedSgemm { a, b, .. } => vec![*a, *b],
         Thunk::FusedMmBiasAct { a, w, bias, .. } => vec![*a, *w, *bias],
         Thunk::BinaryFull { lhs, rhs, .. } => vec![*lhs, *rhs],
+        Thunk::FusedBinaryActivation { lhs, rhs, .. } => vec![*lhs, *rhs],
+        Thunk::FusedTernaryActivation {
+            lhs, rhs0, rhs1, ..
+        } => vec![*lhs, *rhs0, *rhs1],
         Thunk::BinaryBroadcast { lhs, rhs, .. } => vec![*lhs, *rhs],
         Thunk::ActivationInPlace { data, .. } => vec![*data],
         Thunk::LayerNorm { src, g, b, .. } | Thunk::GroupNorm { src, g, b, .. } => {
@@ -2651,10 +3563,160 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::RopeBackward { dy, cos, sin, .. } => vec![*dy, *cos, *sin],
         Thunk::CumsumBackward { dy, .. } => vec![*dy],
         Thunk::GatherBackward { dy, indices, .. } => vec![*dy, *indices],
+        Thunk::MaxPool2dBackward { x, dy, .. } => vec![*x, *dy],
+        Thunk::Conv2dBackwardInput { dy, w, .. } => vec![*dy, *w],
+        Thunk::Conv2dBackwardWeight { x, dy, .. } => vec![*x, *dy],
         Thunk::FusedSwiGLU { src, .. } => vec![*src],
         Thunk::Concat { inputs, .. } => inputs.iter().map(|(o, _)| *o).collect(),
-        Thunk::Narrow { src, .. } => vec![*src],
+        Thunk::Narrow { src, .. } | Thunk::SplitLastAxis { src, .. } => vec![*src],
         Thunk::Copy { src, .. } => vec![*src],
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod region_rewrite_tests {
+    use super::*;
+    use rlx_ir::op::{Activation, BinaryOp};
+
+    fn empty_modulus() -> [u32; 16] {
+        [0; 16]
+    }
+
+    fn region(
+        len: u32,
+        n_in: u32,
+        num_steps: u32,
+        dst: usize,
+        input_offs: [u32; 16],
+        chain: [u32; 128],
+    ) -> Thunk {
+        Thunk::ElementwiseRegion {
+            len,
+            num_inputs: n_in,
+            num_steps,
+            dst,
+            input_offs,
+            chain,
+            scalar_input_mask: 0,
+            input_modulus: empty_modulus(),
+            prologue: 0,
+            out_n: 0,
+            out_c: 0,
+            out_h: 0,
+            out_w: 0,
+            prologue_input: 0,
+        }
+    }
+
+    #[test]
+    fn rewrite_single_binary_to_binary_full() {
+        let mut chain = [0u32; 128];
+        chain[0] = 2;
+        chain[1] = 0; // add
+        chain[2] = 0;
+        chain[3] = 1;
+        let t = region(
+            128,
+            2,
+            1,
+            4096,
+            [256, 512, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            chain,
+        );
+        match try_rewrite_elementwise_region(&t) {
+            RegionRewrite::One(Thunk::BinaryFull { op, len, .. }) => {
+                assert_eq!(op, BinaryOp::Add);
+                assert_eq!(len, 128);
+            }
+            _ => panic!("expected BinaryFull"),
+        }
+    }
+
+    #[test]
+    fn rewrite_binary_then_activation_to_fused() {
+        let mut chain = [0u32; 128];
+        chain[0] = 2;
+        chain[1] = 2; // mul
+        chain[2] = 0;
+        chain[3] = 1;
+        chain[4] = 0;
+        chain[5] = 2; // silu
+        chain[6] = 0x8000_0000;
+        let t = region(
+            64,
+            2,
+            2,
+            8192,
+            [128, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            chain,
+        );
+        match try_rewrite_elementwise_region(&t) {
+            RegionRewrite::One(Thunk::FusedBinaryActivation { op, act, .. }) => {
+                assert_eq!(op, BinaryOp::Mul);
+                assert_eq!(act, Activation::Silu);
+            }
+            _ => panic!("expected fused binary+activation"),
+        }
+    }
+
+    #[test]
+    fn rewrite_binary_then_binary_to_pair() {
+        let mut chain = [0u32; 128];
+        chain[0] = 2;
+        chain[1] = 0; // add
+        chain[2] = 0;
+        chain[3] = 1;
+        chain[4] = 2;
+        chain[5] = 2; // mul
+        chain[6] = 0x8000_0000;
+        chain[7] = 2;
+        let offs = [128, 256, 384, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let t = region(32, 3, 2, 4096, offs, chain);
+        match try_rewrite_elementwise_region(&t) {
+            RegionRewrite::Many(ts) if ts.len() == 2 => {
+                assert!(matches!(
+                    ts[0],
+                    Thunk::BinaryFull {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    ts[1],
+                    Thunk::BinaryFull {
+                        op: BinaryOp::Mul,
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("expected binary+binary pair"),
+        }
+    }
+
+    #[test]
+    fn rewrite_binary_binary_activation_to_fused_ternary() {
+        let mut chain = [0u32; 128];
+        chain[0] = 2;
+        chain[1] = 0; // add
+        chain[2] = 0;
+        chain[3] = 1;
+        chain[4] = 2;
+        chain[5] = 2; // mul
+        chain[6] = 0x8000_0000;
+        chain[7] = 2;
+        chain[8] = 0;
+        chain[9] = 2; // silu
+        chain[10] = 0x8000_0001;
+        let offs = [128, 256, 384, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let t = region(32, 3, 3, 4096, offs, chain);
+        match try_rewrite_elementwise_region(&t) {
+            RegionRewrite::One(Thunk::FusedTernaryActivation { op0, op1, act, .. }) => {
+                assert_eq!(op0, BinaryOp::Add);
+                assert_eq!(op1, BinaryOp::Mul);
+                assert_eq!(act, Activation::Silu);
+            }
+            _ => panic!("expected fused ternary+activation"),
+        }
     }
 }

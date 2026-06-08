@@ -30,9 +30,16 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => None,
 
         Op::MatMul => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
+        Op::LogMel => crate::audio::log_mel_output_shape(in_shape(0), in_shape(1)).ok(),
+        Op::LogMelBackward => Some(shape::unary_shape(in_shape(0))),
         Op::Binary(_) => shape::binary_shape(in_shape(0), in_shape(1)).ok(),
         Op::Compare(_) => shape::compare_shape(in_shape(0), in_shape(1)).ok(),
-        Op::Where => shape::binary_shape(in_shape(1), in_shape(2)).ok(),
+        Op::Where => {
+            let branches = shape::binary_shape(in_shape(1), in_shape(2)).ok()?;
+            shape::binary_shape(in_shape(0), &branches)
+                .ok()
+                .map(|s| s.with_dtype(branches.dtype()))
+        }
 
         Op::Activation(_) | Op::ReluBackward | Op::Conjugate => {
             Some(shape::unary_shape(in_shape(0)))
@@ -40,6 +47,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::ComplexNormSq => Some(Shape::from_dims(in_shape(0).dims(), DType::F32)),
         Op::ComplexNormSqBackward => Some(shape::unary_shape(in_shape(0))),
         Op::Cast { to } => Some(shape::cast_shape(in_shape(0), *to)),
+        Op::StopGradient => Some(shape::unary_shape(in_shape(0))),
 
         Op::Reduce { axes, keep_dim, .. } => shape::reduce_shape(in_shape(0), axes, *keep_dim).ok(),
         Op::Softmax { .. } => Some(shape::softmax_shape(in_shape(0))),
@@ -53,16 +61,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             shape::concat_shape(&inputs, *axis).ok()
         }
         Op::Gather { axis } => shape::gather_shape(in_shape(0), in_shape(1), *axis).ok(),
-        Op::Expand { target_shape } => {
-            if target_shape.iter().any(|&d| d < 0) {
-                return None;
-            }
-            let dtype = in_shape(0).dtype();
-            Some(Shape::new(
-                &target_shape.iter().map(|&d| d as usize).collect::<Vec<_>>(),
-                dtype,
-            ))
-        }
+        Op::Expand { target_shape } => shape::expand_shape(in_shape(0), target_shape).ok(),
 
         Op::LayerNorm { .. } | Op::LayerNorm2d { .. } | Op::GroupNorm { .. } => {
             Some(shape::unary_shape(in_shape(0)))
@@ -100,6 +99,19 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::Attention { .. } => Some(shape::attention_shape(in_shape(0))),
         Op::Rope { .. } => Some(shape::unary_shape(in_shape(0))),
         Op::AxialRope2d { .. } => Some(shape::unary_shape(in_shape(0))),
+
+        Op::Im2Col {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+        } => {
+            let ks = [kernel_size[0], kernel_size.get(1).copied().unwrap_or(1)];
+            let st = [stride[0], stride.get(1).copied().unwrap_or(1)];
+            let pad = [padding[0], padding.get(1).copied().unwrap_or(0)];
+            let dil = [dilation[0], dilation.get(1).copied().unwrap_or(1)];
+            shape::im2col_output_shape(in_shape(0), ks, st, pad, dil).ok()
+        }
 
         Op::FusedMatMulBiasAct { .. } => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
         Op::FusedSwiGLU { .. } => None,
@@ -158,14 +170,79 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         | Op::SelectiveScan { .. }
         | Op::GatedDeltaNet { .. }
         | Op::FusedAttentionBlock { .. }
-        | Op::FusedTransformerLayer { .. }
-        | Op::ElementwiseRegion { .. }
-        | Op::Custom { .. }
+        | Op::FusedTransformerLayer { .. } => Some(shape::unary_shape(in_shape(0))),
+        Op::ElementwiseRegion { prologue, .. } => {
+            let mut in_s = in_shape(0).clone();
+            if *prologue == RegionPrologue::ResizeNearest2x && in_s.rank() == 4 {
+                in_s = Shape::new(
+                    &[
+                        in_s.dim(0).unwrap_static(),
+                        in_s.dim(1).unwrap_static(),
+                        in_s.dim(2).unwrap_static() * 2,
+                        in_s.dim(3).unwrap_static() * 2,
+                    ],
+                    in_s.dtype(),
+                );
+            }
+            Some(in_s)
+        }
+        Op::BatchElementwiseRegion {
+            prologue,
+            num_batch_inputs,
+            ..
+        } => {
+            let n = *num_batch_inputs as usize;
+            let mut out_s = in_shape(0).clone();
+            if *prologue == RegionPrologue::ResizeNearest2x && out_s.rank() == 4 {
+                out_s = Shape::new(
+                    &[
+                        out_s.dim(0).unwrap_static(),
+                        out_s.dim(1).unwrap_static(),
+                        out_s.dim(2).unwrap_static() * 2,
+                        out_s.dim(3).unwrap_static() * 2,
+                    ],
+                    out_s.dtype(),
+                );
+            }
+            if out_s.rank() >= 1 && n > 1 {
+                let mut batch_dim = 0usize;
+                for i in 0..n.min(node.inputs.len()) {
+                    batch_dim += in_shape(i).dim(0).unwrap_static();
+                }
+                if batch_dim > 0 {
+                    out_s = out_s.with_dim(0, shape::Dim::Static(batch_dim));
+                }
+            }
+            Some(out_s)
+        }
+        Op::TransformRegion { steps, .. } => {
+            let mut in_s = in_shape(0).clone();
+            for step in steps {
+                if !matches!(step, TransformStep::ResizeNearest2x(_)) {
+                    return None;
+                }
+                if in_s.rank() != 4 {
+                    return None;
+                }
+                in_s = Shape::new(
+                    &[
+                        in_s.dim(0).unwrap_static(),
+                        in_s.dim(1).unwrap_static(),
+                        in_s.dim(2).unwrap_static() * 2,
+                        in_s.dim(3).unwrap_static() * 2,
+                    ],
+                    in_s.dtype(),
+                );
+            }
+            Some(in_s)
+        }
+        Op::Custom { .. }
         | Op::CustomFn { .. }
         | Op::Conv { .. }
         | Op::ConvTranspose2d { .. }
         | Op::Pool { .. }
-        | Op::Fft { .. } => None,
+        | Op::Fft { .. }
+        | Op::FftButterflyStage { .. } => None,
         _ => None,
     }
 }

@@ -41,6 +41,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{ItemFn, parse_macro_input};
 
+mod lm_runner;
 mod pipeline;
 
 /// Compile-time pipeline scheduler (plan #11). See `pipeline_schedule_impl`
@@ -122,4 +123,34 @@ pub fn rlx_model(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Register a per-family LM runner so [`rlx_runtime::auto_runner_name`]
+/// can route a weights file to it.
+///
+/// ```ignore
+/// rlx_macros::register_lm_runner! {
+///     family = "qwen3",
+///     description = "Qwen 3 LM",
+///     arches = ["qwen3", "qwen3moe"]
+/// }
+/// ```
+///
+/// Backed by `inventory` at startup; no per-bin `register_cli` call
+/// is needed once each family invokes this macro at the crate root.
+#[proc_macro]
+pub fn register_lm_runner(input: TokenStream) -> TokenStream {
+    lm_runner::register_lm_runner_impl(input)
+}
+
+/// `fn main()` for a per-family runner binary. Replaces the 8-line
+/// boilerplate at the top of every `rlx-<family>/src/bin/rlx_*.rs`.
+///
+/// ```ignore
+/// // src/bin/rlx_qwen3.rs
+/// rlx_macros::rlx_runner_main!(rlx_qwen3::cli::run, "rlx-qwen3");
+/// ```
+#[proc_macro]
+pub fn rlx_runner_main(input: TokenStream) -> TokenStream {
+    lm_runner::rlx_runner_main_impl(input)
 }

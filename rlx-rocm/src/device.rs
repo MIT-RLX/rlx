@@ -136,3 +136,8 @@ pub fn rocm_dnn() -> Option<Arc<MiopenContext>> {
     })
     .clone()
 }
+
+/// Stable label for calibration cache keys.
+pub fn device_name() -> Option<String> {
+    rocm_context().map(|_| "rocm-0".to_string())
+}

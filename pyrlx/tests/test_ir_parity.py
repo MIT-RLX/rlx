@@ -39,6 +39,59 @@ def _compile(g: rlx.Graph):
 
 # ── I/O + linear algebra ──────────────────────────────────────────
 
+def test_constant_scalar_shape_inference():
+    g = rlx.Graph("const")
+    c = g.constant(2.0)
+    assert g.shape_of(c) == ([], "f32")
+    c_i32 = g.constant(1.0, "i32")
+    assert g.shape_of(c_i32) == ([], "i32")
+
+
+def test_constant_broadcasts_in_binary():
+    g = rlx.Graph("const_bin")
+    x = g.input("x", [2, 3], "f32")
+    y = g.mul(x, g.constant(2.0))
+    assert g.shape_of(y) == ([2, 3], "f32")
+    g.set_outputs([y])
+    c = _compile(g)
+    [out] = c.run({"x": np.ones((2, 3), dtype=np.float32)})
+    np.testing.assert_array_equal(out, np.full((2, 3), 2.0, dtype=np.float32))
+
+
+@pytest.mark.parametrize("dtype,values", [
+    ("f32", [2.5]),
+    ("f64", [-1.0]),
+    ("i32", [7.0]),
+    ("bool", [1.0]),
+])
+def test_constant_scalar_dtypes(dtype, values):
+    g = rlx.Graph("const_dt")
+    c = g.constant(values[0], dtype)
+    assert g.shape_of(c) == ([], dtype)
+
+
+def test_constant_add_div_chain_runs():
+    g = rlx.Graph("const_chain")
+    x = g.input("x", [4], "f32")
+    y = g.div(g.add(x, g.constant(1.0)), g.constant(2.0))
+    g.set_outputs([y])
+    c = _compile(g)
+    [out] = c.run({"x": np.array([1.0, 3.0, 5.0, 7.0], dtype=np.float32)})
+    np.testing.assert_array_equal(out, np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
+
+
+def test_constant_out_of_range_raises():
+    g = rlx.Graph("range")
+    with pytest.raises(ValueError, match="out of range"):
+        g.constant(256.0, "i8")
+
+
+def test_constant_f16_shape_via_cast():
+    g = rlx.Graph("f16")
+    c = g.constant(1.5, "f16")
+    assert g.shape_of(c) == ([], "f16")
+
+
 def test_input_param_shape_inference():
     g = rlx.Graph("io")
     x = g.input("x", [4, 8], "f32")

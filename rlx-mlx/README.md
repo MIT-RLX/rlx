@@ -52,7 +52,31 @@ rlx-mlx = "0.2"
 rlx-mlx-sys = "0.2"
 ```
 
-The first build compiles MLX from source — minutes, not seconds.
+The first build compiles MLX from source — minutes on Linux CPU, **~1 hour** if you
+opt into the CUDA backend (`--features cuda` or `RLX_MLX_CUDA=1`). See
+[`rlx-mlx-sys`](../rlx-mlx-sys/README.md) for compile-time tips (ccache, `RLX_MLX_JOBS`).
+
+### Linux device selection
+
+Runtime backend inside MLX (CPU OpenBLAS vs CUDA GPU):
+
+```sh
+RLX_MLX_DEVICE=cpu  cargo test -p rlx-mlx --test basic   # default build
+RLX_MLX_DEVICE=gpu  cargo test -p rlx-mlx --features cuda --test basic
+```
+
+Via WSL rig:
+
+```sh
+./rig.sh --wsl build-mlx cpu          # fast (~5–10 min first time)
+./rig.sh --wsl build-mlx cuda         # slow (nvcc); once per target dir
+./rig.sh --wsl test-mlx cpu
+./rig.sh --wsl test-mlx cuda
+./rig.sh bench-mlx-devices wsl
+```
+
+Full Linux/WSL guide and **`rlx-mlx` CPU vs `rlx-cpu` matmul benchmarks**:
+[`docs/benchmarks/mlx-linux.md`](../docs/benchmarks/mlx-linux.md).
 
 ## Build / test
 
@@ -69,8 +93,11 @@ cargo build -p rlx-runtime --features mlx --release
 
 ## Status
 
-Mature on Apple Silicon (M1 / M2 / M3 / M4). On Intel Macs MLX falls
-back to its CPU path; supported but rarely the right choice.
+Mature on Apple Silicon (M1 / M2 / M3 / M4). **Linux/WSL:** CPU MLX
+compiles and passes parity tests; CUDA is opt-in. See
+[`docs/benchmarks/mlx-linux.md`](../docs/benchmarks/mlx-linux.md).
+On Intel Macs MLX falls back to its CPU path; supported but rarely the
+right choice.
 
 ## Gotchas
 

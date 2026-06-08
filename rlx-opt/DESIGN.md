@@ -51,3 +51,6 @@ compile the verify call out (zero overhead).
 - `is_pure_view(graph, node)` is the single predicate backends use
   to decide "emit Nop, the planner aliased this slot." Don't
   duplicate the view-detection logic in backends.
+## License
+
+GPL-3.0-only.
