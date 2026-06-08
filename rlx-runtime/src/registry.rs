@@ -75,7 +75,7 @@ fn register_builtin(r: &Registry) {
         Box::new(crate::backend::metal_backend::MetalBackend) as Box<dyn Backend>
     });
 
-    #[cfg(all(feature = "mlx", target_os = "macos"))]
+    #[cfg(all(feature = "mlx", rlx_mlx_host))]
     map.insert(Device::Mlx, || {
         Box::new(crate::backend::mlx_backend::MlxBackend) as Box<dyn Backend>
     });

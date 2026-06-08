@@ -61,13 +61,8 @@ extern "C" __global__ void fused_binary_unary(
             case 6: v = rsqrtf(v); break;
             case 7: v = -v; break;
             case 8: v = fabsf(v); break;
-            case 9: case 11: {
-                const float c = 0.7978845608028654f;
-                float x3 = v * v * v;
-                float inner = c * (v + 0.044715f * x3);
-                inner = fminf(fmaxf(inner, -15.0f), 15.0f);
-                v = 0.5f * v * (1.0f + tanhf(inner));
-            } break;
+            case 9:  { v = gelu_erf(v); } break;
+            case 11: { v = gelu_approx(v); } break;
             case 10: {
                 float nx = fminf(fmaxf(-v, -88.0f), 88.0f);
                 v = v / (1.0f + expf(nx));

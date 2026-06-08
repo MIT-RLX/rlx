@@ -51,11 +51,23 @@ compiled.set_param("w", &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
 let out = compiled.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
 ```
 
+### Multi-backend runtime
+
+```rust
+let mut runner = GraphDevices::with_policy(g, DevicePolicy::only([Device::Cpu, Device::Metal]));
+let out = runner.run_resolved_with_inputs(None, &inputs)?;
+
+let mut router = DeviceRouter::from_env(g)?;
+let (device, out) = router.run(&inputs, None)?;
+```
+
+See [`docs/backend-selection.md`](../docs/backend-selection.md).
+
 ## Prelude + namespaces
 
 | import                       | gives you                                                                |
 |------------------------------|--------------------------------------------------------------------------|
-| `use rlx::prelude::*;`       | `Graph`, `Session`, `DType`, `Device`, `Result`, `Activation`, `BinaryOp`, `jvp`, `vmap`, … |
+| `use rlx::prelude::*;`       | `Graph`, `Session`, `GraphDevices`, `DeviceRouter`, `DevicePolicy`, `FlexibleSession`, `DType`, `Device`, `Result`, `Activation`, `BinaryOp`, `jvp`, `vmap`, … |
 | `use rlx::ops::*;`           | IR helper enums: `Activation`, `BinaryOp`, `CmpOp`, `MaskKind`, `ChainStep`, `ChainOperand` |
 | `use rlx::quant::*;`         | `QuantScheme`, `QuantMap`                                                |
 | `use rlx::gguf::*;`          | GGUF parser + dequant (`gguf` feature)                                   |

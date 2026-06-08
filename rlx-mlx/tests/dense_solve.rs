@@ -14,7 +14,7 @@
 //! The batched variant is exercised separately so a regression in
 //! either path is bisectable.
 
-#![cfg(target_os = "macos")]
+#![cfg(rlx_mlx_host)]
 
 use rlx_ir::{DType, Graph, Shape};
 use rlx_mlx::{MlxExecutable, MlxMode};

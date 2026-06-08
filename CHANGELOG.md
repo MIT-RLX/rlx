@@ -5,13 +5,72 @@ All notable changes to RLX. Format loosely follows
 tracks SemVer with the understanding that any `0.x → 0.(x+1)`
 bump may carry breaking changes per `0.x`-semver convention.
 
-## [0.2.0] — 2026-05
+## [Unreleased]
 
-The first release with end-to-end **Qwen3 LM inference** on Apple
-Silicon (safetensors + GGUF, F32, parity-checked against the
-HuggingFace reference), a high-level **`rlx::run`** runner API, a
-**`rlx-run`** CLI, and **GGUF K-quant dequantization** baked into
-`Op::DequantMatMul`.
+## [0.2.3] — 2026-06
+
+### Added
+
+- **Multi-backend runtime** (`rlx-runtime` 0.2.3): `DevicePolicy`,
+  `GraphDevices`, `FlexibleSession`, `DeviceRouter`, env-driven resolve /
+  fallback (`RLX_DEVICE`, `RLX_DEVICE_CHAIN`, `RLX_BENCHMARK_PICK`),
+  `BackendsManifest`, `warm_all` / `benchmark_devices`, typed param sync
+  across cached backends.
+- **Prelude** (`rlx` 0.2.3): re-exports above + `register_backends!` macro.
+- **Python** (`pyrlx` 0.2.3): `GraphDevices`, `DeviceRouter`, `DevicePolicy`,
+  `FlexibleSession`, `parse_device`, `backends_manifest`, `fastest_device_for`,
+  `device_report`, `set_param_typed` on multi-backend runners.
+- **GPU calibrators**: on-disk matmul micro-bench caches for CUDA
+  (`rlx-cuda` 0.2.3), ROCm (`rlx-rocm` 0.2.3), wgpu (`rlx-wgpu` 0.2.3);
+  feed heterogeneous cost-model ranking.
+- **ROCm full CUDA parity** (`rlx-rocm` 0.2.3): all 48 hipRTC kernels, Session-path
+  `GroupNorm` / `ResizeNearest2x`, GPU backward ops, GGUF GPU dequant, splat prepare/rasterize,
+  im2col, pinned host I/O (`host_staging.rs`, `RLX_ROCM_PINNED_IO`).
+- **Runtime ROCm** (`rlx-runtime` 0.2.3): ROCm supported-op parity, `rocm_op_parity` tests,
+  ROCm arms in higher-order / autodiff GPU parity suites.
+- **FKL-style region fusion** ([`docs/fk-fusion.md`](docs/fk-fusion.md)): resize prologue
+  (`FuseRegionPrologue`), batch preprocess (`FuseBatchPreprocess` /
+  `BatchElementwiseRegion`), `MarkBatchSliceRegions`, `apply_native_fk_defaults` on
+  GPU-class targets and TPU. CUDA/ROCm/Metal/wgpu single-launch batch kernel via
+  `RLX_FK_BATCH_SINGLE_KERNEL=1`. TPU HLO lowering in `rlx-tpu` (`prepare_graph_for_hlo`,
+  `fk_pipeline`). Parity: `rlx-runtime/tests/fk_prologue_parity.rs`, `pyrlx` FK tests,
+  `rlx-bench` `bench_fk_fusion`.
+- **HIP-CPU**: Docker-only fetch into `rlx-cuda/docker/vendor/HIP-CPU` via
+  `just test-hip-cpu-validate` (linux-gnu; not a git submodule).
+- **Autodiff**: `prepare_graph_for_ad` runs `DecomposeFusionRegions` so FKL batch/transform
+  ops decompose before reverse-mode AD.
+- **Docs**: [`docs/backend-selection.md`](docs/backend-selection.md),
+  [`docs/development.md`](docs/development.md), [`docs/README.md`](docs/README.md).
+- **Examples**: `rlx-runtime/examples/graph_devices_demo.rs`.
+- **Tests**: full `hip_cpu_validate` suite (38 kernel families), `rlx-rocm/tests/basic.rs`
+  GatedDeltaNet, `rlx-runtime/tests/rocm_op_parity.rs`,
+  `rlx-runtime/tests/graph_devices_parity.rs`, `pyrlx/tests/test_graph_devices.py`,
+  ROCm suites in higher-order / autodiff GPU parity tests, `prologue_input` on region op
+  literals in Metal/MLX/wgpu parity tests.
+- **CI**: `just test-rocm`, `just test-hip-cpu-validate`, ROCm arm in `just ci` /
+  `test-third-order-gpu`.
+
+### Changed
+
+- Patch bumps for all crates in this release train (`rlx-ir`, `rlx-opt`,
+  `rlx-fusion`, `rlx-compile`, `rlx-autodiff`, `rlx-cpu`, `rlx-cuda`, `rlx-metal`,
+  `rlx-mlx`, `rlx-mlx-sys`, `rlx-gpu-kernels`, `rlx-bench`, `rlx-wgpu`); workspace
+  dependency pins leveled to 0.2.3.
+
+### Fixed
+
+- **`rlx-gguf`**: `dequant_q6_k_block` now casts per-sub-block scales as
+  `i8` (matching `dequant_q6_k`). The old `as f32` path misread bytes
+  ≥128 (e.g. `0xFF` → 255 instead of −1), breaking `Op::DequantMatMul`
+  on Q6_K tensors such as MiniCPM5 `v_proj` / `down_proj`.
+
+## [0.2.2] — 2026-05
+
+### Added
+
+- **`rlx-umap`** crate — UMAP / fast-umap custom ops (k-NN from pairwise distances).
+- **`rlx-gpu-kernels`** crate — shared CUDA/HIP `.cu` sources for `rlx-cuda` + `rlx-rocm`.
+- **`rlx-cpu`** kernel and executor improvements.
 
 ## [0.2.1] — 2026-05
 
@@ -290,6 +349,17 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 ---
 
+## [0.2.0] — 2026-05
+
+The first release with end-to-end **Qwen3 LM inference** on Apple
+Silicon (safetensors + GGUF, F32, parity-checked against the
+HuggingFace reference), a high-level **`rlx::run`** runner API, a
+**`rlx-run`** CLI, and **GGUF K-quant dequantization** baked into
+`Op::DequantMatMul`.
+
 ## [0.1.0] — 2026-04
 
 Initial release. Tracked at [git history root].
+## License
+
+GPL-3.0-only.

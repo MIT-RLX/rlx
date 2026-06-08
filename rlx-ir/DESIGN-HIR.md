@@ -120,3 +120,6 @@ offsets — weights are not stored twice. Inference uses `compile_module` /
   replacement enum.
 - LIR does not embed backend thunks — those stay in `rlx-cpu` /
   `rlx-metal` (device LIR).
+## License
+
+GPL-3.0-only.

@@ -33,6 +33,12 @@ on the loader path at runtime.
 A host-side HIP-CPU shim is bundled for off-GPU validation; see
 `rlx-rocm/tests/hip_cpu_validate.rs`.
 
+## Cost-model calibration
+
+When HIP is available, `rlx_rocm::calibrate::Calibration::load_or_measure()` runs a
+1024³ matmul micro-benchmark and writes `~/.cache/rlx/rocm-calib-<device>.json`.
+Feeds `RocmCostModel` in `rlx-runtime` for backend ranking.
+
 ## What's here
 
 * **Hand-rolled HIP runtime shim** (`src/hip.rs`) — libloading-based
@@ -50,19 +56,22 @@ A host-side HIP-CPU shim is bundled for off-GPU validation; see
 * **Arena** (`src/arena.rs`) — port of `rlx-cuda::arena`. f32 main
   buffer + optional u16 half-precision side-buffer. `set_param` /
   `set_param_half` upload paths fully wired against the HIP shim.
+* **`host_staging.rs`** — pageable or pinned host slots for input upload
+  and output download (`RLX_ROCM_PINNED_IO`, always on in graph exec mode).
+* **Attention** — BSHD `[B,S,H,D]` (EEG-DINO) and BHSD both use tiled flash
+  (`attention_kernel`) when `head_dim ≤ 128`; `RLX_ROCM_FORCE_ATTENTION_ROW=1`
+  forces `attention_row_kernel`. Packed QKV: `RLX_ROCM_NO_PACKED_BSHD_ATTN`.
+  `run_slots` + `arena_ptr` mirror `rlx-cuda`.
 * **Kernel cache** (`src/kernels/`) — hipRTC compile + per-kernel
   `OnceLock<HipKernel>` cache + persistent `.hsaco` disk cache at
   `$RLX_ROCM_HSACO_CACHE` / `$XDG_CACHE_HOME/rlx-rocm/hsaco-rocm`.
-  All 32 kernels registered (matmul_wmma intentionally excluded —
+  All 48 kernels registered (matmul_mfma intentionally excluded —
   needs MFMA/WMMA AMD intrinsics, not nvcuda::wmma).
 * **`unfuse.rs`** — copied verbatim from `rlx-cuda` (IR-level, no
   backend types).
-* **`Step` enum** — full 33-variant copy from `rlx-cuda`.
+* **`Step` enum** — full variant set copied from `rlx-cuda`.
 * **`CompileMode`** (Jit/Aot) + **`ExecMode`** (Stream/Eager/Graph/MultiStream).
-* **`compile_with()` body** — full IR walk from `rlx-cuda` ported with
-  `cudarc` → `HipBuffer` type swaps. All 33 Step variants emitted.
-* **`run()` body** — kernel-only dispatch loop using `launch_kernel!`
-  to hand-pack kernel params for `hipModuleLaunchKernel`.
+* **`compile_with()` / `run()`** — IR walk + kernel dispatch via `launch_kernel!`.
 
 ## Library tier ladder (parity with rlx-cuda)
 
@@ -107,19 +116,10 @@ What's **not** here yet:
 
 ## Status
 
-Sister-crate parity with `rlx-cuda`. Build-clean, clippy-clean, 8 unit +
-2 basic tests pass on Mac. Runtime correctness on real AMD hardware is
-**unverified** — first cloud-GPU run on MI300X / RX 7900 XTX is the
-validation gate. All library tiers fall through gracefully to the
-kernel-only path when their `.so` isn't loadable.
-
-## Why scaffold-first?
-
-Same reason `rlx-cuda` started out as a "minimum viable" crate without
-cuBLAS — gets the workspace integration, IR plumbing, test harness, and
-conventions in place so that real dispatch work lands as drop-in
-additions instead of a big ball of intermingled "new crate + new
-bindings + new dispatch" all at once.
+Sister-crate parity with `rlx-cuda` for the supported op set. Build-clean
+on Mac via libloading; runtime correctness on AMD hardware should be
+validated on MI300X / RX 7900 XTX class GPUs. Library tiers fall through
+to custom kernels when their `.so` isn't loadable.
 
 ## Dev: HIP-CPU validation path
 
@@ -141,7 +141,7 @@ bindings are **all shared with rlx-cuda** rather than duplicated:
 | `.cu` kernels | `rlx-gpu-kernels/kernels/*.cu` | `rlx-gpu-kernels` (`rocm` feature for MFMA) |
 | C++ wrapper layer (`launch_*` fns) | `rlx-cuda/cpp/cpu_dispatch.cpp` | `cpp/cpu_dispatch.cpp` (one-line `#include`) |
 | Rust FFI bindings (`run_*` fns) | `rlx-cuda/src/cpu_dispatch.rs` | `src/cpu_dispatch.rs` (one-line `#[path]`) |
-| HIP-CPU headers | `rlx-cuda/vendor/HIP-CPU` (submodule) | reused — single submodule, both crates |
+| HIP-CPU headers | `rlx-cuda/docker/vendor/HIP-CPU` (Docker clone) | reused — not in git |
 | Comprehensive kernel tests | `rlx-cuda/tests/hip_cpu_validate.rs` (38) | covered upstream |
 
 So any kernel improvement, FFI signature change, or wrapper fix in
@@ -150,25 +150,14 @@ rlx-cuda flows through to rlx-rocm automatically.
 ### Workflow
 
 ```sh
-# One-time: pull HIP-CPU as a submodule (shared with rlx-cuda).
-git submodule add https://github.com/ROCm-Developer-Tools/HIP-CPU.git \
-    rlx-cuda/vendor/HIP-CPU
-git submodule update --init
-
-# Compile + basic-test the CPU-execution path from rlx-rocm.
-cargo test -p rlx-rocm --features hip-cpu-validate
-
-# In Docker (any architecture, no GPU needed):
-docker run --rm -v $PWD:/work -w /work rust:1.76 \
-    bash -c "apt-get update && apt-get install -y g++ && \
-             cargo test -p rlx-rocm --features hip-cpu-validate"
+just test-hip-cpu-validate
 ```
 
 ## Build / test
 
 ```sh
 cargo build -p rlx-rocm --release          # compile-check on any host
-cargo test  -p rlx-rocm --release          # 2 basic tests
+cargo test  -p rlx-rocm --release          # basic + unit tests
 ```
 
 ## License

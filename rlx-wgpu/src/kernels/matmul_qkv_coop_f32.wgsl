@@ -154,7 +154,7 @@ fn matmul_qkv_coop_f32(
         let c = idx % 32u;
         let global_row = row_base + r;
         let global_col = col_base + c;
-        if (global_row >= params.m) { continue; }
+        if (global_row >= params.m || global_col >= params.n) { continue; }
         var v: f32 = acc_scratch[idx];
         if (params.has_bias != 0u) {
             v = v + arena[params.bias_off + global_col];

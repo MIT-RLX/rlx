@@ -28,7 +28,8 @@
 //! the bandwidth-sensitive softmax / norm / residual paths.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::mem::ManuallyDrop;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaSlice};
 use rlx_ir::{Graph, NodeId, Op};
@@ -48,7 +49,8 @@ pub enum HalfDtype {
 pub struct Arena {
     /// Underlying CUDA allocation for f32 activations + un-promoted
     /// params. Sized by the memory plan; lives as long as the executable.
-    pub buffer: CudaSlice<f32>,
+    /// Returned to a process-wide pool on drop.
+    pub buffer: ManuallyDrop<CudaSlice<f32>>,
     /// Per-node byte offset into `buffer`.
     pub offsets: HashMap<NodeId, usize>,
     /// Per-node byte length (data, not slot).
@@ -70,6 +72,41 @@ pub struct Arena {
     pub half_by_f32_off: HashMap<u32, (usize, HalfDtype)>,
     /// Total half-buffer size in u16 elements.
     pub half_size: usize,
+}
+
+const F32_ARENA_POOL_CAP: usize = 16;
+static F32_ARENA_POOL: OnceLock<Mutex<Vec<(usize, CudaSlice<f32>)>>> = OnceLock::new();
+
+fn f32_arena_pool() -> &'static Mutex<Vec<(usize, CudaSlice<f32>)>> {
+    F32_ARENA_POOL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn pool_acquire_f32(ctx: &Arc<CudaContext>, n_f32: usize) -> CudaSlice<f32> {
+    let need = n_f32.max(4);
+    let mut pool = f32_arena_pool()
+        .lock()
+        .expect("rlx-cuda: arena pool lock poisoned");
+    if let Some(idx) = pool.iter().position(|(cap, _)| *cap >= need) {
+        let (_, buf) = pool.swap_remove(idx);
+        return buf;
+    }
+    drop(pool);
+    unsafe {
+        ctx.default_stream()
+            .alloc(need)
+            .expect("rlx-cuda: device allocation failed")
+    }
+}
+
+fn pool_release_f32(cap_f32: usize, buffer: CudaSlice<f32>) {
+    let mut pool = f32_arena_pool()
+        .lock()
+        .expect("rlx-cuda: arena pool lock poisoned");
+    if pool.len() >= F32_ARENA_POOL_CAP {
+        pool.sort_by_key(|(cap, _)| *cap);
+        pool.remove(0);
+    }
+    pool.push((cap_f32.max(4), buffer));
 }
 
 /// Plan memory using f32-sized slots regardless of declared IR dtype.
@@ -113,13 +150,7 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
 impl Arena {
     pub fn from_plan(ctx: &Arc<CudaContext>, plan: &MemoryPlan) -> Self {
         let n_f32 = plan.arena_size.div_ceil(4);
-        let stream = ctx.default_stream();
-        // alloc_zeros gives a deterministic starting state — Constants
-        // get patched in afterward; everything else is overwritten by
-        // its kernel.
-        let buffer = stream
-            .alloc_zeros::<f32>(n_f32.max(4))
-            .expect("rlx-cuda: device allocation failed");
+        let buffer = ManuallyDrop::new(pool_acquire_f32(ctx, n_f32));
         let mut offsets = HashMap::new();
         let mut lens = HashMap::new();
         for (id, slot) in &plan.assignments {
@@ -141,6 +172,23 @@ impl Arena {
     pub fn has(&self, id: NodeId) -> bool {
         self.offsets.contains_key(&id)
     }
+
+    #[inline]
+    pub fn f32_buf(&self) -> &CudaSlice<f32> {
+        &self.buffer
+    }
+
+    #[inline]
+    pub fn f32_buf_mut(&mut self) -> &mut CudaSlice<f32> {
+        &mut self.buffer
+    }
+
+    #[inline]
+    pub fn f32_buf_and_size(&mut self) -> (&mut CudaSlice<f32>, usize) {
+        let size = self.size;
+        (self.f32_buf_mut(), size)
+    }
+
     pub fn offset(&self, id: NodeId) -> usize {
         self.offsets[&id]
     }
@@ -192,5 +240,13 @@ impl Arena {
     /// `(offset_in_u16_elements, dtype)` for a half-stored node.
     pub fn half_off(&self, id: NodeId) -> Option<(usize, HalfDtype)> {
         self.half_offsets.get(&id).copied()
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        let cap_f32 = self.size.div_ceil(4).max(4);
+        let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
+        pool_release_f32(cap_f32, buffer);
     }
 }

@@ -89,9 +89,31 @@ pub struct MetalExecutable {
     gdn_scratch_off: usize,
     /// Arena tail scratch for GPU GGUF dequant before matmul (reused per op).
     dequant_scratch_off: usize,
+    /// Arena tail scratch for GPU im2col before conv weight backward GEMM.
+    conv_bwd_scratch_off: usize,
+    /// Arena tail scratch for GPU attention backward (scores, dp, ds).
+    attn_bwd_scratch_off: usize,
+    /// Arena tail scratch for parallel RMSNorm param backward.
+    rms_norm_bwd_scratch_off: usize,
+    /// Persistent KV / state inputs (unified-memory `Vec`, fed into arena each run).
+    gpu_handles: HashMap<String, Vec<f32>>,
+    /// After each run, copy `graph.outputs[idx]` into the named handle.
+    gpu_handle_feeds: HashMap<String, usize>,
+    /// Handles whose arena input slots are authoritative (skip host mirror ping-pong).
+    gpu_handle_resident: std::collections::HashSet<String>,
 }
 
 unsafe impl Send for MetalExecutable {}
+
+impl Drop for MetalExecutable {
+    fn drop(&mut self) {
+        // Drain deferred commits before releasing MTL buffers / MPSGraph
+        // executables — otherwise Metal logs "operations may not have completed".
+        self.sync_pending();
+        crate::device::drain_command_queue();
+        crate::mps_blas::invalidate_caches();
+    }
+}
 
 impl MetalExecutable {
     /// Compile at the requested precision.
@@ -207,6 +229,9 @@ impl MetalExecutable {
         // Memory plan with GPU-aligned cache lines (128B on Apple Silicon)
         let gdn_scratch = gdn_ephemeral_state_bytes(&fused);
         let dequant_scratch = dequant_gguf_scratch_bytes(&fused);
+        let conv_bwd_scratch = conv_bwd_scratch_bytes(&fused);
+        let attn_bwd_scratch = crate::attention_bwd_gpu::scratch_bytes(&fused);
+        let rms_norm_bwd_scratch = rms_norm_bwd_scratch_bytes(&fused);
         let mut plan = memory::plan_memory_aligned(&fused, 128);
         let mut tail = plan.arena_size;
         let gdn_scratch_off = if gdn_scratch > 0 {
@@ -225,6 +250,30 @@ impl MetalExecutable {
         } else {
             0
         };
+        let conv_bwd_scratch_off = if conv_bwd_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + conv_bwd_scratch;
+            off
+        } else {
+            0
+        };
+        let attn_bwd_scratch_off = if attn_bwd_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + attn_bwd_scratch;
+            off
+        } else {
+            0
+        };
+        let rms_norm_bwd_scratch_off = if rms_norm_bwd_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + rms_norm_bwd_scratch;
+            off
+        } else {
+            0
+        };
         plan.arena_size = tail;
         if verbose && gdn_scratch > 0 {
             eprintln!(
@@ -236,6 +285,24 @@ impl MetalExecutable {
             eprintln!(
                 "[rlx-metal] DequantMatMul scratch: {} bytes @ offset {}",
                 dequant_scratch, dequant_scratch_off
+            );
+        }
+        if verbose && conv_bwd_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] Conv2dBackwardWeight scratch: {} bytes @ offset {}",
+                conv_bwd_scratch, conv_bwd_scratch_off
+            );
+        }
+        if verbose && attn_bwd_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] AttentionBackward scratch: {} bytes @ offset {}",
+                attn_bwd_scratch, attn_bwd_scratch_off
+            );
+        }
+        if verbose && rms_norm_bwd_scratch > 0 {
+            eprintln!(
+                "[rlx-metal] RmsNormBackward param scratch: {} bytes @ offset {}",
+                rms_norm_bwd_scratch, rms_norm_bwd_scratch_off
             );
         }
         if verbose {
@@ -308,8 +375,8 @@ impl MetalExecutable {
                 } else {
                     0
                 };
-                let len = fused.node(id).shape.num_elements().unwrap_or(0);
-                (off, len)
+                let logical = fused.node(id).shape.num_elements().unwrap_or(0);
+                (off, logical)
             })
             .collect();
 
@@ -401,6 +468,12 @@ impl MetalExecutable {
             mps_params_frozen: false,
             gdn_scratch_off,
             dequant_scratch_off,
+            conv_bwd_scratch_off,
+            attn_bwd_scratch_off,
+            rms_norm_bwd_scratch_off,
+            gpu_handles: HashMap::new(),
+            gpu_handle_feeds: HashMap::new(),
+            gpu_handle_resident: std::collections::HashSet::new(),
         };
         // Bind the MPSGraph executable's input/output arrays to the
         // arena once. After this, run_cached() avoids all per-call
@@ -558,6 +631,9 @@ impl MetalExecutable {
     /// Fastest path: inputs by slot index. Outputs are read directly from
     /// the shared arena buffer (zero-copy on Apple Silicon unified memory).
     pub fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
+        if crate::mps_profile::enabled() {
+            crate::mps_profile::reset();
+        }
         unsafe {
             let buf_ptr = self.arena.buffer.contents() as *mut u8;
             for (i, &data) in inputs.iter().enumerate() {
@@ -570,6 +646,9 @@ impl MetalExecutable {
             }
         }
         self.encode_and_run();
+        if crate::mps_profile::enabled() {
+            crate::mps_profile::print_summary();
+        }
         &self.output_slots
     }
 
@@ -759,6 +838,65 @@ impl MetalExecutable {
     }
 
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        self.run_read_outputs(inputs, None)
+    }
+
+    /// Read one graph output at IR logical length (matches CPU `read_output`).
+    ///
+    /// Bucket-padded arena slots may be larger than the declared output
+    /// shape; embeds decode graphs write the active row at index 0.
+    fn read_graph_output_f32(&self, out_idx: usize) -> Vec<f32> {
+        let id = self.graph.outputs[out_idx];
+        let logical_len = self.output_slots[out_idx].1;
+        let full = self.arena.read_as_f32(id);
+        if logical_len == 0 || full.len() <= logical_len {
+            return full;
+        }
+        full[..logical_len].to_vec()
+    }
+
+    /// Read one row from a row-major graph output (bucketed decode K/V).
+    pub fn read_graph_output_row(&self, out_idx: usize, row: usize, row_inner: usize) -> Vec<f32> {
+        let id = self.graph.outputs[out_idx];
+        let start = row * row_inner;
+        let end = start + row_inner;
+        if self.arena.dtype(id) == rlx_ir::DType::F32 {
+            let slice = self.arena.slice(id);
+            assert!(
+                end <= slice.len(),
+                "read_graph_output_row: out={out_idx} row={row} inner={row_inner} need {end} f32, have {}",
+                slice.len()
+            );
+            slice[start..end].to_vec()
+        } else {
+            let full = self.arena.read_as_f32(id);
+            assert!(
+                end <= full.len(),
+                "read_graph_output_row: out={out_idx} truncated"
+            );
+            full[start..end].to_vec()
+        }
+    }
+
+    /// Run and read back only selected graph outputs (e.g. logits-only decode).
+    pub fn run_read_outputs(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        read_indices: Option<&[usize]>,
+    ) -> Vec<Vec<f32>> {
+        if crate::mps_profile::enabled() {
+            crate::mps_profile::reset();
+        }
+        for (name, data) in &self.gpu_handles {
+            if self.gpu_handle_resident.contains(name) || inputs.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            if let Some(&id) = self.input_ids.get(name)
+                && self.arena.has_buffer(id)
+            {
+                self.arena.write_from_f32(id, data);
+            }
+        }
         for &(name, data) in inputs {
             if let Some(&id) = self.input_ids.get(name)
                 && self.arena.has_buffer(id)
@@ -767,15 +905,116 @@ impl MetalExecutable {
             }
         }
         self.encode_and_run();
-        // Read outputs as f32 regardless of native precision.
-        self.graph
-            .outputs
+        if !self.gpu_handle_feeds.is_empty() {
+            self.propagate_gpu_handle_feeds_in_arena();
+            if read_indices.is_none() || rlx_ir::env::flag("RLX_GPU_HANDLE_HOST_MIRROR") {
+                self.refresh_gpu_handles_from_outputs();
+            }
+        }
+        if crate::mps_profile::enabled() {
+            crate::mps_profile::print_summary();
+        }
+        let n_out = self.graph.outputs.len();
+        let indices: Vec<usize> = match read_indices {
+            None => (0..n_out).collect(),
+            Some(ix) => ix.to_vec(),
+        };
+        indices
             .iter()
-            .map(|&id| self.arena.read_as_f32(id))
+            .map(|&i| self.read_graph_output_f32(i))
             .collect()
     }
 
+    /// Persistent input buffer for KV-cache style graphs (unified memory).
+    pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
+        if !self.input_ids.contains_key(name) {
+            return false;
+        }
+        self.gpu_handle_resident.remove(name);
+        // Reuse arena slot when capacity matches (megakernel bucket reinstall).
+        if let Some(&id) = self.input_ids.get(name) {
+            let cap = *self.arena.element_counts.get(&id).unwrap_or(&0);
+            if self.arena.has_buffer(id) && cap == data.len() {
+                self.arena.write_from_f32(id, data);
+                self.gpu_handles.insert(name.to_string(), Vec::new());
+                return true;
+            }
+        }
+        self.gpu_handles.insert(name.to_string(), data.to_vec());
+        true
+    }
+
+    pub fn has_gpu_handle(&self, name: &str) -> bool {
+        self.gpu_handles.contains_key(name)
+    }
+
+    pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
+        self.gpu_handle_feeds
+            .insert(handle_name.to_string(), output_index);
+    }
+
+    pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
+        if let Some(&out_idx) = self.gpu_handle_feeds.get(name) {
+            if out_idx < self.graph.outputs.len() {
+                return Some(self.read_graph_output_f32(out_idx));
+            }
+        }
+        if self.gpu_handle_resident.contains(name) {
+            if let Some(&id) = self.input_ids.get(name) {
+                return Some(self.arena.read_as_f32(id));
+            }
+        }
+        self.gpu_handles.get(name).cloned()
+    }
+
+    fn propagate_gpu_handle_feeds_in_arena(&mut self) {
+        let extent = self.active_extent;
+        for (name, &out_idx) in &self.gpu_handle_feeds {
+            if out_idx >= self.graph.outputs.len() {
+                continue;
+            }
+            let out_id = self.graph.outputs[out_idx];
+            let Some(&in_id) = self.input_ids.get(name.as_str()) else {
+                continue;
+            };
+            if in_id != out_id {
+                let out_elems = *self.arena.element_counts.get(&out_id).unwrap_or(&0);
+                let copy_elems = match extent {
+                    Some((actual, upper)) if upper > 0 => actual * (out_elems / (upper + 1)).max(1),
+                    _ => out_elems,
+                };
+                self.arena
+                    .copy_node_f32_prefix(in_id, out_id, copy_elems.min(out_elems));
+            }
+            self.gpu_handle_resident.insert(name.clone());
+            self.gpu_handles.insert(name.clone(), Vec::new());
+        }
+    }
+
+    fn refresh_gpu_handles_from_outputs(&mut self) {
+        for (name, &out_idx) in &self.gpu_handle_feeds {
+            if out_idx >= self.graph.outputs.len() {
+                continue;
+            }
+            let id = self.graph.outputs[out_idx];
+            let src = self.arena.slice(id);
+            let entry = self
+                .gpu_handles
+                .entry(name.clone())
+                .or_insert_with(|| vec![0.0; src.len()]);
+            if entry.len() != src.len() {
+                entry.resize(src.len(), 0.0);
+            }
+            entry.copy_from_slice(src);
+        }
+    }
+
     fn encode_and_run(&mut self) {
+        if crate::thunk_profile::enabled() {
+            self.run_thunk_profile();
+            return;
+        }
+        use std::time::Instant;
         // First-run freeze: re-lower with params baked in as MPSGraph
         // constants so the optimizer can specialize matmul kernels
         // around the actual weight shapes / fold reshapes through
@@ -816,7 +1055,9 @@ impl MetalExecutable {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(1_000_000);
             if force || self.estimated_max_flops() >= threshold {
+                let t0 = Instant::now();
                 self.run_via_mps_graph();
+                crate::mps_profile::record("encode_path:mps_graph_full", t0.elapsed());
                 return;
             }
         }
@@ -832,13 +1073,34 @@ impl MetalExecutable {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(1_000_000);
             if force || self.estimated_max_flops() >= threshold {
+                let t0 = Instant::now();
                 self.run_via_mps_hybrid();
+                crate::mps_profile::record("encode_path:mps_hybrid", t0.elapsed());
                 return;
             }
         }
         // wait=true: synchronous, drop the buffer immediately after wait.
         // ICB segments (if any) are dispatched inline by encode_commit.
+        let t0 = Instant::now();
         let _ = self.encode_commit(true, None, None);
+        crate::mps_profile::record("encode_path:thunks_only", t0.elapsed());
+    }
+
+    /// Sequential per-thunk GPU timing (`RLX_METAL_THUNK_PROFILE=1`).
+    fn run_thunk_profile(&mut self) {
+        use std::time::Instant;
+        crate::thunk_profile::reset();
+        let n = self.schedule.thunks.len();
+        for i in 0..n {
+            let name = crate::thunk::thunk_name(&self.schedule.thunks[i]);
+            if name == "nop" {
+                continue;
+            }
+            let t0 = Instant::now();
+            let _ = self.encode_commit(true, None, Some(i..i + 1));
+            crate::thunk_profile::record(name, t0.elapsed());
+        }
+        crate::thunk_profile::print_summary();
     }
 
     /// Encode + commit. When `wait=true`, also waits for completion and
@@ -931,6 +1193,41 @@ impl MetalExecutable {
                 k: usize,
                 n: usize,
             },
+            /// Unified-memory memcpy — batched to avoid GPU dispatch on slices.
+            Memcpy {
+                src: usize,
+                dst: usize,
+                bytes: usize,
+            },
+            ConcatLastax {
+                dst: usize,
+                outer: u32,
+                dst_axis: u32,
+                segments: Vec<(usize, u32)>,
+            },
+            ConcatMidAxis {
+                dst: usize,
+                outer: u32,
+                dst_axis: u32,
+                inner: u32,
+                segments: Vec<(usize, u32)>,
+            },
+            /// Row-major [rows, cols] → [cols, rows] on unified memory.
+            Transpose2d {
+                src: usize,
+                dst: usize,
+                rows: u32,
+                cols: u32,
+            },
+            /// Narrow on the last axis (unified memory host copy).
+            NarrowLastAxis {
+                src: usize,
+                dst: usize,
+                outer: u32,
+                src_axis: u32,
+                start: u32,
+                len: u32,
+            },
         }
 
         let trace = rlx_ir::env::flag("RLX_METAL_TRACE");
@@ -959,6 +1256,7 @@ impl MetalExecutable {
         // reassignable.
         let mut enc: Option<metal::ComputeCommandEncoder> = None;
         let mut deferred_host: Vec<DeferredHostOp> = Vec::new();
+        let mut narrow_batch: Option<PendingNarrowBatch> = None;
 
         let flush_deferred_host =
             |cmd_buf: &mut metal::CommandBuffer,
@@ -1120,6 +1418,92 @@ impl MetalExecutable {
                                 arena_ptr,
                             );
                         },
+                        DeferredHostOp::Memcpy { src, dst, bytes } => unsafe {
+                            if bytes > 0 {
+                                std::ptr::copy_nonoverlapping(
+                                    arena_ptr.add(src),
+                                    arena_ptr.add(dst),
+                                    bytes,
+                                );
+                            }
+                        },
+                        DeferredHostOp::ConcatLastax {
+                            dst,
+                            outer,
+                            dst_axis,
+                            segments,
+                        } => unsafe {
+                            let dst_base = arena_ptr.add(dst);
+                            let dst_stride = dst_axis as usize * std::mem::size_of::<f32>();
+                            for o in 0..outer as usize {
+                                let mut col = 0usize;
+                                for &(src_off, src_axis) in &segments {
+                                    let src_axis = src_axis as usize;
+                                    let row_bytes = src_axis * std::mem::size_of::<f32>();
+                                    let src_row = arena_ptr.add(src_off).add(o * row_bytes);
+                                    let dst_row = dst_base
+                                        .add(o * dst_stride + col * std::mem::size_of::<f32>());
+                                    std::ptr::copy_nonoverlapping(src_row, dst_row, row_bytes);
+                                    col += src_axis;
+                                }
+                            }
+                        },
+                        DeferredHostOp::ConcatMidAxis {
+                            dst,
+                            outer,
+                            dst_axis,
+                            inner,
+                            segments,
+                        } => unsafe {
+                            let inner_b = inner as usize * std::mem::size_of::<f32>();
+                            let dst_base = arena_ptr.add(dst);
+                            let dst_stride = dst_axis as usize * inner_b;
+                            for o in 0..outer as usize {
+                                let mut axis_off = 0usize;
+                                for &(src_off, src_axis) in &segments {
+                                    let src_per_outer = src_axis as usize * inner_b;
+                                    let src_row = arena_ptr.add(src_off).add(o * src_per_outer);
+                                    let dst_row = dst_base.add(o * dst_stride + axis_off * inner_b);
+                                    std::ptr::copy_nonoverlapping(src_row, dst_row, src_per_outer);
+                                    axis_off += src_axis as usize;
+                                }
+                            }
+                        },
+                        DeferredHostOp::Transpose2d {
+                            src,
+                            dst,
+                            rows,
+                            cols,
+                        } => unsafe {
+                            let src_base = arena_ptr.add(src) as *const f32;
+                            let dst_base = arena_ptr.add(dst) as *mut f32;
+                            let rows = rows as usize;
+                            let cols = cols as usize;
+                            for r in 0..rows {
+                                for c in 0..cols {
+                                    *dst_base.add(c * rows + r) = *src_base.add(r * cols + c);
+                                }
+                            }
+                        },
+                        DeferredHostOp::NarrowLastAxis {
+                            src,
+                            dst,
+                            outer,
+                            src_axis,
+                            start,
+                            len,
+                        } => unsafe {
+                            let row_bytes = len as usize * std::mem::size_of::<f32>();
+                            let src_stride = src_axis as usize * std::mem::size_of::<f32>();
+                            let src_start = start as usize * std::mem::size_of::<f32>();
+                            for o in 0..outer as usize {
+                                std::ptr::copy_nonoverlapping(
+                                    arena_ptr.add(src + o * src_stride + src_start),
+                                    arena_ptr.add(dst + o * row_bytes),
+                                    row_bytes,
+                                );
+                            }
+                        },
                     }
                 }
                 *cmd_buf = dev.queue.new_command_buffer().to_owned();
@@ -1142,6 +1526,9 @@ impl MetalExecutable {
         }
         macro_rules! end_msl {
             () => {{
+                if narrow_batch.is_some() {
+                    flush_pending_narrow_batch(e!(), k, &self.arena.buffer, &mut narrow_batch);
+                }
                 flush_deferred_host(&mut cmd_buf, &mut enc, &mut deferred_host);
                 if let Some(active) = enc.take() {
                     active.end_encoding();
@@ -1173,7 +1560,8 @@ impl MetalExecutable {
         let loop_end = thunk_range.as_ref().map(|r| r.end).unwrap_or(thunks.len());
         let mut i = thunk_range.as_ref().map(|r| r.start).unwrap_or(0);
         while i < loop_end {
-            if active.is_none()
+            if thunk_range.is_none()
+                && active.is_none()
                 && let Some(range) = seg_iter.peek()
                 && range.start == i
             {
@@ -1184,6 +1572,11 @@ impl MetalExecutable {
             }
             let thunk = &thunks[i];
             i += 1;
+            if !matches!(thunk, Thunk::Narrow { .. } | Thunk::SplitLastAxis { .. })
+                && narrow_batch.is_some()
+            {
+                flush_pending_narrow_batch(e!(), k, &self.arena.buffer, &mut narrow_batch);
+            }
             // PLAN L3: per-thunk Perfetto span. No-op when env var
             // RLX_TRACE_PERFETTO unset.
             let _span = rlx_ir::perfetto::TraceSpan::new(crate::thunk::thunk_name(thunk), "metal");
@@ -1378,6 +1771,68 @@ impl MetalExecutable {
                         continue;
                     }
                     encode_activation(e!(), k, &self.arena.buffer, *data, len, *act, *dt);
+                }
+                Thunk::FusedBinaryActivation {
+                    lhs,
+                    rhs,
+                    dst,
+                    len,
+                    op,
+                    act,
+                    dt,
+                } => {
+                    use crate::thunk::HalfFlag;
+                    let len = scale(*len);
+                    if len == 0 {
+                        continue;
+                    }
+                    if !matches!(dt, HalfFlag::F32) {
+                        continue;
+                    }
+                    encode_fused_binary_activation(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *lhs,
+                        *rhs,
+                        *dst,
+                        len,
+                        *op,
+                        *act,
+                    );
+                }
+                Thunk::FusedTernaryActivation {
+                    lhs,
+                    rhs0,
+                    rhs1,
+                    dst,
+                    len,
+                    op0,
+                    op1,
+                    act,
+                    dt,
+                } => {
+                    use crate::thunk::HalfFlag;
+                    let len = scale(*len);
+                    if len == 0 {
+                        continue;
+                    }
+                    if !matches!(dt, HalfFlag::F32) {
+                        continue;
+                    }
+                    encode_fused_ternary_activation(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *lhs,
+                        *rhs0,
+                        *rhs1,
+                        *dst,
+                        len,
+                        *op0,
+                        *op1,
+                        *act,
+                    );
                 }
                 Thunk::LayerNorm {
                     src,
@@ -1692,6 +2147,103 @@ impl MetalExecutable {
                             rlx_ir::op::BinaryOp::Pow => 6,
                         };
                         let enc = e!();
+                        if let Some(rhs_scalar) =
+                            detect_scalar_broadcast(*rank, out_dims, lhs_strides, rhs_strides)
+                        {
+                            encode_binary_broadcast_rhs_scalar(
+                                enc,
+                                k,
+                                &self.arena.buffer,
+                                *lhs,
+                                *rhs,
+                                *dst,
+                                total_out as u32,
+                                op_id,
+                                rhs_scalar,
+                            );
+                            continue;
+                        }
+                        if let Some((rows, cols, rhs_col)) = detect_last_axis_col_broadcast(
+                            *rank,
+                            out_dims,
+                            lhs_strides,
+                            rhs_strides,
+                        ) {
+                            encode_binary_broadcast_rhs_col(
+                                enc,
+                                k,
+                                &self.arena.buffer,
+                                *lhs,
+                                *rhs,
+                                *dst,
+                                rows,
+                                cols,
+                                op_id,
+                                rhs_col,
+                            );
+                            continue;
+                        }
+                        if let Some((rows, cols, rhs_row)) = detect_last_axis_row_broadcast(
+                            *rank,
+                            out_dims,
+                            lhs_strides,
+                            rhs_strides,
+                        ) {
+                            encode_binary_broadcast_rhs_row(
+                                enc,
+                                k,
+                                &self.arena.buffer,
+                                *lhs,
+                                *rhs,
+                                *dst,
+                                rows,
+                                cols,
+                                op_id,
+                                rhs_row,
+                            );
+                            continue;
+                        }
+                        if let Some((rows, cols, mid, rhs_1ax)) =
+                            detect_single_axis_broadcast(*rank, out_dims, lhs_strides, rhs_strides)
+                        {
+                            encode_binary_broadcast_1ax(
+                                enc,
+                                k,
+                                &self.arena.buffer,
+                                *lhs,
+                                *rhs,
+                                *dst,
+                                rows,
+                                cols,
+                                mid,
+                                op_id,
+                                rhs_1ax,
+                            );
+                            continue;
+                        }
+                        if *rank == 2
+                            && out_dims.len() >= 2
+                            && lhs_strides.len() >= 2
+                            && rhs_strides.len() >= 2
+                        {
+                            encode_binary_broadcast_rank2(
+                                enc,
+                                k,
+                                &self.arena.buffer,
+                                *lhs,
+                                *rhs,
+                                *dst,
+                                total_out as u32,
+                                out_dims[0],
+                                out_dims[1],
+                                lhs_strides[0],
+                                lhs_strides[1],
+                                rhs_strides[0],
+                                rhs_strides[1],
+                                op_id,
+                            );
+                            continue;
+                        }
                         enc.set_compute_pipeline_state(&k.binary_broadcast_f32);
                         enc.set_buffer(0, Some(&self.arena.buffer), *lhs as u64);
                         enc.set_buffer(1, Some(&self.arena.buffer), *rhs as u64);
@@ -1718,8 +2270,12 @@ impl MetalExecutable {
                             height: 1,
                             depth: 1,
                         };
+                        let tg_w = k
+                            .binary_broadcast_f32
+                            .thread_execution_width()
+                            .min(total_out as u64);
                         let tg = metal::MTLSize {
-                            width: 64.min(total_out as u64),
+                            width: tg_w,
                             height: 1,
                             depth: 1,
                         };
@@ -1841,6 +2397,29 @@ impl MetalExecutable {
                         *dt,
                     );
                 }
+                Thunk::SplitLastAxis {
+                    src,
+                    outer,
+                    src_axis,
+                    dt,
+                    segments,
+                } => {
+                    let outer = scale(*outer);
+                    if outer == 0 || segments.is_empty() {
+                        continue;
+                    }
+                    if narrow_batch.is_some() {
+                        flush_pending_narrow_batch(e!(), k, &self.arena.buffer, &mut narrow_batch);
+                    }
+                    let batch = PendingNarrowBatch {
+                        src: *src,
+                        outer,
+                        src_axis: *src_axis,
+                        dt: *dt,
+                        segments: segments.clone(),
+                    };
+                    encode_split_lastax(e!(), k, &self.arena.buffer, &batch);
+                }
                 Thunk::Narrow {
                     src,
                     dst,
@@ -1854,10 +2433,54 @@ impl MetalExecutable {
                     if outer == 0 {
                         continue;
                     }
-                    encode_narrow(
-                        e!(),
-                        k,
-                        &self.arena.buffer,
+                    if metal_host_slices_enabled() && matches!(*dt, crate::thunk::HalfFlag::F32) {
+                        if narrow_batch.is_some() {
+                            flush_pending_narrow_batch(
+                                e!(),
+                                k,
+                                &self.arena.buffer,
+                                &mut narrow_batch,
+                            );
+                        }
+                        deferred_host.push(DeferredHostOp::NarrowLastAxis {
+                            src: *src,
+                            dst: *dst,
+                            outer,
+                            src_axis: *src_axis,
+                            start: *start,
+                            len: *len,
+                        });
+                    } else if outer == 1 {
+                        if narrow_batch.is_some() {
+                            flush_pending_narrow_batch(
+                                e!(),
+                                k,
+                                &self.arena.buffer,
+                                &mut narrow_batch,
+                            );
+                        }
+                        let src_off = *src + (*start as usize) * std::mem::size_of::<f32>();
+                        encode_copy(e!(), k, &self.arena.buffer, src_off, *dst, *len, *dt);
+                    } else if *start == 0 && *src_axis == *len {
+                        if narrow_batch.is_some() {
+                            flush_pending_narrow_batch(
+                                e!(),
+                                k,
+                                &self.arena.buffer,
+                                &mut narrow_batch,
+                            );
+                        }
+                        encode_copy(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *src,
+                            *dst,
+                            outer.saturating_mul(*len),
+                            *dt,
+                        );
+                    } else if !try_queue_narrow_batch(
+                        &mut narrow_batch,
                         *src,
                         *dst,
                         outer,
@@ -1865,14 +2488,47 @@ impl MetalExecutable {
                         *start,
                         *len,
                         *dt,
-                    );
+                    ) {
+                        flush_pending_narrow_batch(e!(), k, &self.arena.buffer, &mut narrow_batch);
+                        if !try_queue_narrow_batch(
+                            &mut narrow_batch,
+                            *src,
+                            *dst,
+                            outer,
+                            *src_axis,
+                            *start,
+                            *len,
+                            *dt,
+                        ) {
+                            encode_narrow(
+                                e!(),
+                                k,
+                                &self.arena.buffer,
+                                *src,
+                                *dst,
+                                outer,
+                                *src_axis,
+                                *start,
+                                *len,
+                                *dt,
+                            );
+                        }
+                    }
                 }
                 Thunk::Copy { src, dst, len, dt } => {
                     let len = scale(*len);
                     if len == 0 {
                         continue;
                     }
-                    encode_copy(e!(), k, &self.arena.buffer, *src, *dst, len, *dt);
+                    if metal_host_slices_enabled() && matches!(*dt, crate::thunk::HalfFlag::F32) {
+                        deferred_host.push(DeferredHostOp::Memcpy {
+                            src: *src,
+                            dst: *dst,
+                            bytes: len as usize * std::mem::size_of::<f32>(),
+                        });
+                    } else {
+                        encode_copy(e!(), k, &self.arena.buffer, *src, *dst, len, *dt);
+                    }
                 }
                 Thunk::AttentionBackward {
                     q,
@@ -1900,70 +2556,98 @@ impl MetalExecutable {
                     if sq == 0 || sk == 0 {
                         continue;
                     }
-                    let bhsd = *bhsd != 0;
-                    let q_len = if bhsd {
-                        b * nh * sq * dh
-                    } else {
-                        b * sq * nh * dh
-                    };
-                    let k_len = if bhsd {
-                        b * nh * sk * dh
-                    } else {
-                        b * sk * nh * dh
-                    };
-                    let mask_kind_ir = match *mask_kind {
-                        0 => MaskKind::None,
-                        1 => MaskKind::Causal,
-                        2 => MaskKind::Custom,
-                        3 => MaskKind::SlidingWindow(*window as usize),
-                        4 => MaskKind::Bias,
-                        _ => MaskKind::None,
-                    };
-                    let wrt_ir = match *wrt {
-                        0 => AttentionBwdWrt::Query,
-                        1 => AttentionBwdWrt::Key,
-                        _ => AttentionBwdWrt::Value,
-                    };
-                    unsafe {
-                        let base = self.arena.buffer.contents() as *mut u8;
-                        let f32_at = |byte_off: usize, len: usize| -> &[f32] {
-                            std::slice::from_raw_parts(base.add(byte_off) as *const f32, len)
-                        };
-                        let f32_at_mut = |byte_off: usize, len: usize| -> &mut [f32] {
-                            std::slice::from_raw_parts_mut(base.add(byte_off) as *mut f32, len)
-                        };
-                        let q_data = f32_at(*q, q_len);
-                        let k_data = f32_at(*kk, k_len);
-                        let v_data = f32_at(*v, k_len);
-                        let dy_data = f32_at(*dy, q_len);
-                        let out_len = if *wrt == 0 { q_len } else { k_len };
-                        let out_data = f32_at_mut(*out, out_len);
-                        let mask_data: &[f32] = if *mask_kind == 2 || *mask_kind == 4 {
-                            let ml = if *mask_kind == 2 {
-                                b * sk
-                            } else {
-                                b * nh * sq * sk
-                            };
-                            f32_at(*mask, ml)
-                        } else {
-                            &[]
-                        };
-                        rlx_cpu::attention_bwd::attention_backward(
-                            wrt_ir,
-                            q_data,
-                            k_data,
-                            v_data,
-                            dy_data,
-                            out_data,
-                            b,
-                            nh,
-                            sq,
-                            sk,
-                            dh,
-                            mask_kind_ir,
-                            mask_data,
-                            bhsd,
+                    if crate::attention_bwd_gpu::use_gpu(
+                        *mask_kind,
+                        *bhsd,
+                        sq,
+                        sk,
+                        self.attn_bwd_scratch_off,
+                    ) {
+                        crate::attention_bwd_gpu::encode_attention_bwd(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *q,
+                            *kk,
+                            *v,
+                            *dy,
+                            *out,
+                            self.attn_bwd_scratch_off,
+                            *batch,
+                            sq as u32,
+                            sk as u32,
+                            *heads,
+                            *head_dim,
+                            *mask_kind,
+                            *window,
+                            *wrt,
                         );
+                    } else {
+                        let bhsd = *bhsd != 0;
+                        let q_len = if bhsd {
+                            b * nh * sq * dh
+                        } else {
+                            b * sq * nh * dh
+                        };
+                        let k_len = if bhsd {
+                            b * nh * sk * dh
+                        } else {
+                            b * sk * nh * dh
+                        };
+                        let mask_kind_ir = match *mask_kind {
+                            0 => MaskKind::None,
+                            1 => MaskKind::Causal,
+                            2 => MaskKind::Custom,
+                            3 => MaskKind::SlidingWindow(*window as usize),
+                            4 => MaskKind::Bias,
+                            _ => MaskKind::None,
+                        };
+                        let wrt_ir = match *wrt {
+                            0 => AttentionBwdWrt::Query,
+                            1 => AttentionBwdWrt::Key,
+                            _ => AttentionBwdWrt::Value,
+                        };
+                        unsafe {
+                            let base = self.arena.buffer.contents() as *mut u8;
+                            let f32_at = |byte_off: usize, len: usize| -> &[f32] {
+                                std::slice::from_raw_parts(base.add(byte_off) as *const f32, len)
+                            };
+                            let f32_at_mut = |byte_off: usize, len: usize| -> &mut [f32] {
+                                std::slice::from_raw_parts_mut(base.add(byte_off) as *mut f32, len)
+                            };
+                            let q_data = f32_at(*q, q_len);
+                            let k_data = f32_at(*kk, k_len);
+                            let v_data = f32_at(*v, k_len);
+                            let dy_data = f32_at(*dy, q_len);
+                            let out_len = if *wrt == 0 { q_len } else { k_len };
+                            let out_data = f32_at_mut(*out, out_len);
+                            let mask_data: &[f32] = if *mask_kind == 2 || *mask_kind == 4 {
+                                let ml = if *mask_kind == 2 {
+                                    b * sk
+                                } else {
+                                    b * nh * sq * sk
+                                };
+                                f32_at(*mask, ml)
+                            } else {
+                                &[]
+                            };
+                            rlx_cpu::attention_bwd::attention_backward(
+                                wrt_ir,
+                                q_data,
+                                k_data,
+                                v_data,
+                                dy_data,
+                                out_data,
+                                b,
+                                nh,
+                                sq,
+                                sk,
+                                dh,
+                                mask_kind_ir,
+                                mask_data,
+                                bhsd,
+                            );
+                        }
                     }
                 }
                 Thunk::RmsNormBackwardInput {
@@ -2021,6 +2705,7 @@ impl MetalExecutable {
                         *h,
                         *eps,
                         1,
+                        self.rms_norm_bwd_scratch_off,
                     );
                 }
                 Thunk::RmsNormBackwardBeta {
@@ -2050,6 +2735,7 @@ impl MetalExecutable {
                         *h,
                         *eps,
                         2,
+                        self.rms_norm_bwd_scratch_off,
                     );
                 }
                 Thunk::RopeBackward {
@@ -2132,6 +2818,187 @@ impl MetalExecutable {
                         *trailing,
                     );
                 }
+                Thunk::MaxPool2dBackward {
+                    x,
+                    dy,
+                    dx,
+                    n,
+                    c,
+                    h,
+                    w,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                } => {
+                    let n_eff = scale(*n);
+                    if n_eff == 0 {
+                        continue;
+                    }
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    unsafe {
+                        rlx_cpu::thunk::execute_maxpool2d_backward_f32(
+                            *x, *dy, *dx, n_eff, *c, *h, *w, *h_out, *w_out, *kh, *kw, *sh, *sw,
+                            *ph, *pw, arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+                Thunk::Conv2dBackwardInput {
+                    dy,
+                    w,
+                    dx,
+                    n,
+                    c_in,
+                    h,
+                    w_in,
+                    c_out,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw,
+                    groups,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    // Same lowering as decomposed `Op::Conv(dy, w)` → `Conv2D`.
+                    encode_conv2d(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *dy,
+                        *w,
+                        *dx,
+                        n,
+                        *c_out,
+                        *h_out,
+                        *w_out,
+                        *c_in,
+                        *h,
+                        *w_in,
+                        *kh,
+                        *kw,
+                        *sh,
+                        *sw,
+                        *ph,
+                        *pw,
+                        *dh,
+                        *dw,
+                        *groups,
+                    );
+                }
+                Thunk::Conv2dBackwardWeight {
+                    x,
+                    dy,
+                    dw,
+                    n,
+                    c_in,
+                    h,
+                    w,
+                    c_out,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw_dil,
+                    groups,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    if n > 1 || self.conv_bwd_scratch_off == 0 {
+                        unsafe {
+                            let base = self.arena.buffer.contents() as *mut u8;
+                            rlx_cpu::conv_bwd::execute_conv2d_backward_weight_f32(
+                                base, *x, *dy, *dw, n, *c_in, *h, *w, *c_out, *h_out, *w_out, *kh,
+                                *kw, *sh, *sw, *ph, *pw, *dh, *dw_dil, *groups,
+                            );
+                        }
+                    } else {
+                        let c_in_per_g = *c_in / *groups;
+                        let c_out_per_g = *c_out / *groups;
+                        let n_dim = c_in_per_g * *kh * *kw;
+                        let k_dim = *h_out * *w_out;
+                        let x_stride_g = c_in_per_g * *h * *w;
+                        let dy_stride_g = c_out_per_g * *h_out * *w_out;
+                        let dw_stride_g = c_out_per_g * n_dim;
+                        let nchw_slice = [c_in_per_g, *h, *w, 0u32]; // MSL: .x=C, .y=H, .z=W
+                        let out_dims = [0u32, *h_out, *w_out, 0u32];
+                        let kshape = [*kh, *kw, *sh, *sw];
+                        let padd = [*ph, *pw, *dh, *dw_dil];
+                        let m = c_out_per_g as usize;
+                        let k_dim_usize = k_dim as usize;
+                        let n = n_dim as usize;
+                        let use_implicit = conv_bwd_weight_use_implicit_gemm(m, k_dim_usize, n);
+                        for g in 0..*groups {
+                            let x_g = *x + (g * x_stride_g * 4) as usize;
+                            let dy_g = *dy + (g * dy_stride_g * 4) as usize;
+                            let dw_g = *dw + (g * dw_stride_g * 4) as usize;
+                            if use_implicit {
+                                encode_conv2d_bwd_weight_gemm(
+                                    e!(),
+                                    k,
+                                    &self.arena.buffer,
+                                    dy_g,
+                                    x_g,
+                                    dw_g,
+                                    m,
+                                    k_dim_usize,
+                                    n,
+                                    &nchw_slice,
+                                    &out_dims,
+                                    &kshape,
+                                    &padd,
+                                );
+                            } else {
+                                let im2col_elems = (n_dim * k_dim) as u64;
+                                encode_im2col_group(
+                                    e!(),
+                                    k,
+                                    &self.arena.buffer,
+                                    x_g,
+                                    self.conv_bwd_scratch_off,
+                                    &nchw_slice,
+                                    &out_dims,
+                                    &kshape,
+                                    &padd,
+                                    im2col_elems,
+                                );
+                                crate::blas::metal_sgemm(
+                                    e!(),
+                                    &self.arena.buffer,
+                                    dy_g,
+                                    self.conv_bwd_scratch_off,
+                                    dw_g,
+                                    m,
+                                    k_dim_usize,
+                                    n,
+                                );
+                            }
+                        }
+                    }
+                }
                 Thunk::Attention {
                     q,
                     k: kk,
@@ -2144,14 +3011,25 @@ impl MetalExecutable {
                     heads,
                     head_dim,
                     mask_kind,
+                    window,
                     dt,
+                    bhsd,
                 } => {
                     // PLAN L1: split seq into runtime-scaled bound +
                     // compile-time full-extent stride; safe at any batch.
                     let seq_stride = *seq;
                     let kv_stride = *kv_seq;
-                    let seq = scale(*seq);
-                    let kv_seq_eff = scale(*kv_seq);
+                    let seq_full = *seq;
+                    let kv_seq_full = *kv_seq;
+                    let seq = scale(seq_full);
+                    // Bucketed decode (`mask_kind == 2`): new K lives at row `upper`
+                    // inside a padded `[0..upper]` past buffer. Scaling `kv_seq` down to
+                    // `past_seq+1` skips that row; the binary mask handles padding instead.
+                    let kv_seq_eff = if *mask_kind == 2 && kv_seq_full != seq_full {
+                        kv_seq_full
+                    } else {
+                        scale(kv_seq_full)
+                    };
                     if seq == 0 || kv_seq_eff == 0 {
                         continue;
                     }
@@ -2171,8 +3049,10 @@ impl MetalExecutable {
                         *dt,
                         seq_stride,
                         *mask_kind,
+                        *window,
                         kv_seq_eff,
                         kv_stride,
+                        *bhsd,
                     );
                 }
                 Thunk::Rope {
@@ -2264,7 +3144,24 @@ impl MetalExecutable {
                     if outer == 0 {
                         continue;
                     }
-                    if *inner == 1 {
+                    if metal_host_slices_enabled() && matches!(*dt, crate::thunk::HalfFlag::F32) {
+                        if *inner == 1 {
+                            deferred_host.push(DeferredHostOp::ConcatLastax {
+                                dst: *dst,
+                                outer,
+                                dst_axis: *dst_axis,
+                                segments: inputs.to_vec(),
+                            });
+                        } else {
+                            deferred_host.push(DeferredHostOp::ConcatMidAxis {
+                                dst: *dst,
+                                outer,
+                                dst_axis: *dst_axis,
+                                inner: *inner,
+                                segments: inputs.to_vec(),
+                            });
+                        }
+                    } else if *inner == 1 {
                         // Last-axis concat — use the existing kernel.
                         encode_concat_lastax(
                             e!(),
@@ -2277,12 +3174,7 @@ impl MetalExecutable {
                             inputs,
                         );
                     } else {
-                        // Mid-shape concat (e.g. SAM windowed-attention pad
-                        // along axis 1 or 2). The legacy kernel only does
-                        // last-axis concat and was silently wrong here.
-                        // Apple-Silicon unified memory makes the host
-                        // copy cheap; total bytes is ≤ a few MB even for
-                        // SAM's window-pad.
+                        // Mid-shape concat — sync + host copy fallback.
                         end_msl!();
                         cmd_buf.commit();
                         cmd_buf.wait_until_completed();
@@ -2293,8 +3185,6 @@ impl MetalExecutable {
                         };
                         let inner_b = *inner as usize * elem;
                         let dst_axis_total = *dst_axis as usize;
-                        // For each outer row, copy each input's
-                        // axis-slot contiguously.
                         unsafe {
                             let dst_base = arena_ptr.add(*dst);
                             for o in 0..outer as usize {
@@ -2434,6 +3324,12 @@ impl MetalExecutable {
                     chain,
                     scalar_input_mask,
                     input_modulus,
+                    prologue,
+                    out_n,
+                    out_c,
+                    out_h,
+                    out_w,
+                    prologue_input,
                 } => {
                     let len = scale(*len);
                     if len == 0 {
@@ -2448,6 +3344,43 @@ impl MetalExecutable {
                         *num_steps,
                         *dst,
                         input_offs,
+                        chain,
+                        *scalar_input_mask,
+                        input_modulus,
+                        *prologue,
+                        *out_n,
+                        *out_c,
+                        *out_h,
+                        *out_w,
+                        *prologue_input,
+                    );
+                }
+                Thunk::BatchElementwiseRegion {
+                    slice_len,
+                    num_batch,
+                    num_steps,
+                    base_dst,
+                    slice_elems,
+                    batch_input_offs,
+                    chain,
+                    scalar_input_mask,
+                    input_modulus,
+                } => {
+                    let slice_len = scale(*slice_len);
+                    let num_batch = scale(*num_batch);
+                    if slice_len == 0 || num_batch == 0 {
+                        continue;
+                    }
+                    encode_batch_elementwise_region(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        slice_len,
+                        num_batch,
+                        *num_steps,
+                        *base_dst,
+                        *slice_elems,
+                        batch_input_offs,
                         chain,
                         *scalar_input_mask,
                         input_modulus,
@@ -2499,16 +3432,69 @@ impl MetalExecutable {
                     if total_scaled == 0 {
                         continue;
                     }
-                    encode_transpose(
-                        e!(),
-                        k,
-                        &self.arena.buffer,
-                        *src,
-                        *dst,
-                        total_scaled,
-                        out_dims,
-                        in_strides,
-                    );
+                    let is_2d_swap = out_dims.len() == 2
+                        && in_strides.len() == 2
+                        && in_strides[0] == 1
+                        && in_strides[1] == out_dims[0];
+                    let last2_batched = detect_last2_batched_swap(out_dims, in_strides);
+                    if is_2d_swap {
+                        let rows = out_dims[1];
+                        let cols = out_dims[0];
+                        if metal_host_slices_enabled() {
+                            deferred_host.push(DeferredHostOp::Transpose2d {
+                                src: *src,
+                                dst: *dst,
+                                rows,
+                                cols,
+                            });
+                        } else {
+                            encode_transpose_2d(
+                                e!(),
+                                k,
+                                &self.arena.buffer,
+                                *src,
+                                *dst,
+                                rows,
+                                cols,
+                            );
+                        }
+                    } else if let Some((batch, rows, cols)) = last2_batched {
+                        encode_transpose_last2_batched(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *src,
+                            *dst,
+                            batch,
+                            rows,
+                            cols,
+                        );
+                    } else if let Some((batch, rows, cols, trail)) =
+                        detect_swap12_batched_trailing(out_dims, in_strides)
+                    {
+                        encode_transpose_swap12_batched_trailing(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *src,
+                            *dst,
+                            batch,
+                            rows,
+                            cols,
+                            trail,
+                        );
+                    } else {
+                        encode_transpose(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *src,
+                            *dst,
+                            total_scaled,
+                            out_dims,
+                            in_strides,
+                        );
+                    }
                 }
                 Thunk::GatherAxis {
                     table,
@@ -3081,6 +4067,95 @@ impl MetalExecutable {
                     }
                 }
 
+                Thunk::LogMel {
+                    spec,
+                    filters,
+                    dst,
+                    outer,
+                    n_fft,
+                    n_bins,
+                    n_mels,
+                } => {
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    unsafe {
+                        rlx_cpu::thunk::execute_log_mel_f32(
+                            *spec,
+                            *filters,
+                            *dst,
+                            *outer as usize,
+                            *n_fft as usize,
+                            *n_bins as usize,
+                            *n_mels as usize,
+                            arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+
+                Thunk::LogMelBackward {
+                    spec,
+                    filters,
+                    dy,
+                    dst,
+                    outer,
+                    n_fft,
+                    n_bins,
+                    n_mels,
+                } => {
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    unsafe {
+                        rlx_cpu::thunk::execute_log_mel_backward_f32(
+                            *spec,
+                            *filters,
+                            *dy,
+                            *dst,
+                            *outer as usize,
+                            *n_fft as usize,
+                            *n_bins as usize,
+                            *n_mels as usize,
+                            arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+
+                Thunk::Im2Col {
+                    x,
+                    col,
+                    n,
+                    c_in,
+                    h,
+                    w,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw_dil,
+                } => {
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    unsafe {
+                        rlx_cpu::im2col::execute_im2col_rows_layout(
+                            *x, *col, *n, *c_in, *h, *w, *h_out, *w_out, *kh, *kw, *sh, *sw, *ph,
+                            *pw, *dh, *dw_dil, arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+
                 Thunk::GatedDeltaNet {
                     q,
                     k: k_off,
@@ -3096,9 +4171,12 @@ impl MetalExecutable {
                     f16,
                 } => {
                     // Native MSL kernel supports f32 with n ≤ 128 (qwen35 uses 128).
-                    // f16 tensors and RLX_METAL_GDN_HOST_FALLBACK=1 use the CPU path.
-                    let force_host = rlx_ir::env::flag("RLX_METAL_GDN_HOST_FALLBACK");
-                    let prefer_cpu_blas = !rlx_ir::env::flag("RLX_METAL_GDN_GPU");
+                    // GPU path is the default; opt out with RLX_METAL_GDN_CPU=1 or
+                    // RLX_METAL_GDN_HOST_FALLBACK=1. f16 tensors and state_size > 128
+                    // still take the CPU thunk regardless of the flag.
+                    let force_host = rlx_ir::env::flag("RLX_METAL_GDN_HOST_FALLBACK")
+                        || rlx_ir::env::flag("RLX_METAL_GDN_CPU");
+                    let prefer_cpu_blas = false;
                     let use_carry = *state != 0;
                     let state_byte = if use_carry {
                         *state
@@ -3402,19 +4480,25 @@ impl MetalExecutable {
     /// are written into the arena slots so downstream consumers (run_slots
     /// callers) see them as if a thunk schedule had run.
     fn run_via_mps_graph(&mut self) {
+        use std::time::Instant;
         let plan = self.mps_plan.as_ref().expect("plan present");
+        let t0 = Instant::now();
         self.dispatch_mps_plan(plan, None, None);
+        crate::mps_profile::record("mps_graph:dispatch_full", t0.elapsed());
     }
 
     /// Interleaved MPS sub-graph + thunk dispatch for Qwen3.5 decode.
     fn run_via_mps_hybrid(&mut self) {
+        use std::time::Instant;
         let n = self.mps_hybrid.as_ref().expect("hybrid plan present").len();
         for i in 0..n {
             if let crate::mps_graph_hybrid::HybridStep::Thunks(range) =
                 &self.mps_hybrid.as_ref().unwrap()[i]
             {
                 let r = range.clone();
+                let t0 = Instant::now();
                 let _ = self.encode_commit(true, None, Some(r));
+                crate::mps_profile::record(format!("hybrid:thunks[{i}]"), t0.elapsed());
                 continue;
             }
             if let crate::mps_graph_hybrid::HybridStep::SubGraph {
@@ -3424,7 +4508,9 @@ impl MetalExecutable {
                 ..
             } = &self.mps_hybrid.as_ref().unwrap()[i]
             {
+                let t0 = Instant::now();
                 self.dispatch_mps_plan(plan, Some(boundary_parent_ids), Some(output_parent_ids));
+                crate::mps_profile::record(format!("hybrid:mps_subgraph[{i}]"), t0.elapsed());
             }
         }
     }
@@ -3793,6 +4879,180 @@ fn encode_bias_add(
     enc.dispatch_threads(grid, tg);
 }
 
+fn encode_fused_binary_activation(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    lhs: usize,
+    rhs: usize,
+    dst: usize,
+    len: u32,
+    op: rlx_ir::op::BinaryOp,
+    act: rlx_ir::op::Activation,
+) {
+    use rlx_ir::op::{Activation, BinaryOp};
+    let bin_op: u32 = match op {
+        BinaryOp::Add => 0,
+        BinaryOp::Sub => 1,
+        BinaryOp::Mul => 2,
+        BinaryOp::Div => 3,
+        BinaryOp::Max => 4,
+        BinaryOp::Min => 5,
+        BinaryOp::Pow => 6,
+    };
+    let act_op: u32 = match act {
+        Activation::Gelu | Activation::GeluApprox => 0,
+        Activation::Silu => 1,
+        Activation::Relu => 2,
+        Activation::Sigmoid => 3,
+        Activation::Tanh => 4,
+        _ => 255,
+    };
+    let use_vec4 = len.is_multiple_of(4) && len >= 4;
+    if use_vec4 {
+        let len4 = len / 4;
+        enc.set_compute_pipeline_state(&k.fused_binary_activation4);
+        enc.set_buffer(0, Some(buffer), lhs as u64);
+        enc.set_buffer(1, Some(buffer), rhs as u64);
+        enc.set_buffer(2, Some(buffer), dst as u64);
+        enc.set_bytes(3, 4, &len4 as *const u32 as *const _);
+        enc.set_bytes(4, 4, &bin_op as *const u32 as *const _);
+        enc.set_bytes(5, 4, &act_op as *const u32 as *const _);
+        let tg_w = k
+            .fused_binary_activation4
+            .thread_execution_width()
+            .min(len4 as u64);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: len4 as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
+    enc.set_compute_pipeline_state(&k.fused_binary_activation_f32);
+    enc.set_buffer(0, Some(buffer), lhs as u64);
+    enc.set_buffer(1, Some(buffer), rhs as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 4, &len as *const u32 as *const _);
+    enc.set_bytes(4, 4, &bin_op as *const u32 as *const _);
+    enc.set_bytes(5, 4, &act_op as *const u32 as *const _);
+    let tg_w = k
+        .fused_binary_activation_f32
+        .thread_execution_width()
+        .min(len as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn encode_fused_ternary_activation(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    lhs: usize,
+    rhs0: usize,
+    rhs1: usize,
+    dst: usize,
+    len: u32,
+    op0: rlx_ir::op::BinaryOp,
+    op1: rlx_ir::op::BinaryOp,
+    act: rlx_ir::op::Activation,
+) {
+    use rlx_ir::op::{Activation, BinaryOp};
+    let bin_op = |op: BinaryOp| -> u32 {
+        match op {
+            BinaryOp::Add => 0,
+            BinaryOp::Sub => 1,
+            BinaryOp::Mul => 2,
+            BinaryOp::Div => 3,
+            BinaryOp::Max => 4,
+            BinaryOp::Min => 5,
+            BinaryOp::Pow => 6,
+        }
+    };
+    let bin_op0 = bin_op(op0);
+    let bin_op1 = bin_op(op1);
+    let act_op: u32 = match act {
+        Activation::Gelu | Activation::GeluApprox => 0,
+        Activation::Silu => 1,
+        Activation::Relu => 2,
+        Activation::Sigmoid => 3,
+        Activation::Tanh => 4,
+        _ => 255,
+    };
+    let use_vec4 = len.is_multiple_of(4) && len >= 4;
+    if use_vec4 {
+        let len4 = len / 4;
+        enc.set_compute_pipeline_state(&k.fused_ternary_activation4);
+        enc.set_buffer(0, Some(buffer), lhs as u64);
+        enc.set_buffer(1, Some(buffer), rhs0 as u64);
+        enc.set_buffer(2, Some(buffer), rhs1 as u64);
+        enc.set_buffer(3, Some(buffer), dst as u64);
+        enc.set_bytes(4, 4, &len4 as *const u32 as *const _);
+        enc.set_bytes(5, 4, &bin_op0 as *const u32 as *const _);
+        enc.set_bytes(6, 4, &bin_op1 as *const u32 as *const _);
+        enc.set_bytes(7, 4, &act_op as *const u32 as *const _);
+        let tg_w = k
+            .fused_ternary_activation4
+            .thread_execution_width()
+            .min(len4 as u64);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: len4 as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
+    enc.set_compute_pipeline_state(&k.fused_ternary_activation_f32);
+    enc.set_buffer(0, Some(buffer), lhs as u64);
+    enc.set_buffer(1, Some(buffer), rhs0 as u64);
+    enc.set_buffer(2, Some(buffer), rhs1 as u64);
+    enc.set_buffer(3, Some(buffer), dst as u64);
+    enc.set_bytes(4, 4, &len as *const u32 as *const _);
+    enc.set_bytes(5, 4, &bin_op0 as *const u32 as *const _);
+    enc.set_bytes(6, 4, &bin_op1 as *const u32 as *const _);
+    enc.set_bytes(7, 4, &act_op as *const u32 as *const _);
+    let tg_w = k
+        .fused_ternary_activation_f32
+        .thread_execution_width()
+        .min(len as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 fn encode_activation(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -3804,6 +5064,54 @@ fn encode_activation(
 ) {
     use crate::thunk::HalfFlag;
     use rlx_ir::op::Activation;
+    if matches!(dt, HalfFlag::F32)
+        && len.is_multiple_of(4)
+        && len >= 4
+        && matches!(act, Activation::Gelu | Activation::GeluApprox)
+    {
+        let len4 = len / 4;
+        enc.set_compute_pipeline_state(&k.gelu_inplace4);
+        enc.set_buffer(0, Some(buffer), data_off as u64);
+        enc.set_bytes(1, 4, &len4 as *const u32 as *const _);
+        let tg_w = k.gelu_inplace4.thread_execution_width().min(len4 as u64);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: len4 as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
+    if matches!(dt, HalfFlag::F32)
+        && len.is_multiple_of(4)
+        && len >= 4
+        && matches!(act, Activation::Silu)
+    {
+        let len4 = len / 4;
+        enc.set_compute_pipeline_state(&k.silu_inplace4);
+        enc.set_buffer(0, Some(buffer), data_off as u64);
+        enc.set_bytes(1, 4, &len4 as *const u32 as *const _);
+        let tg_w = k.silu_inplace4.thread_execution_width().min(len4 as u64);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: len4 as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
     // f16 has h variants only for the activations Nomic actually uses
     // (Gelu, Silu). Other variants fall back to the f32 kernel — that's
     // a real correctness hole if a model uses them in mixed precision,
@@ -3884,12 +5192,13 @@ fn encode_layer_norm(
         std::mem::size_of::<f32>() as u64,
         &eps as *const f32 as *const _,
     );
-    // 1D grid: row index lives in threadgroup_position_in_grid.x. The kernel
-    // reads `row` as a uint scalar which binds to the .x component, so
-    // packing rows along width is what makes the multi-row dispatch work.
-    let tg_w = 256u64.min(h as u64);
+    // One threadgroup per row; reduction requires power-of-2 threadgroup size.
+    let mut tg_w: u64 = 1;
+    while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
+        tg_w *= 2;
+    }
     let grid = metal::MTLSize {
-        width: tg_w * rows as u64,
+        width: rows as u64,
         height: 1,
         depth: 1,
     };
@@ -3898,7 +5207,562 @@ fn encode_layer_norm(
         height: 1,
         depth: 1,
     };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
+/// Row-major dense strides for `out_dims`.
+fn dense_row_major_strides(out_dims: &[u32], rank: usize) -> Vec<u32> {
+    let mut dense = vec![1u32; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        dense[i] = dense[i + 1].saturating_mul(out_dims[i + 1].max(1));
+    }
+    dense
+}
+
+fn broadcast_strides_u32(in_dims: &[u32], out_dims: &[u32]) -> Vec<u32> {
+    let r_out = out_dims.len();
+    let r_in = in_dims.len();
+    let pad = r_out.saturating_sub(r_in);
+    let mut strides = vec![0u32; r_out];
+    let mut acc: u32 = 1;
+    for d in (0..r_out).rev() {
+        let in_size = if d < pad { 1 } else { in_dims[d - pad].max(1) };
+        if in_size == 1 {
+            strides[d] = 0;
+        } else {
+            strides[d] = acc;
+            acc = acc.saturating_mul(in_size);
+        }
+    }
+    strides
+}
+
+fn is_scalar_broadcast(strides: &[u32], rank: usize) -> bool {
+    rank == 0 || (strides.len() >= rank && strides[..rank].iter().all(|&s| s == 0))
+}
+
+fn is_row_vector_broadcast(strides: &[u32], rank: usize, out_dims: &[u32]) -> bool {
+    if rank < 2 || strides.len() < rank || strides[rank - 1] != 0 {
+        return false;
+    }
+    let mut in_dims = Vec::with_capacity(rank);
+    for i in 0..rank - 1 {
+        in_dims.push(out_dims[i]);
+    }
+    in_dims.push(1);
+    let expected = broadcast_strides_u32(&in_dims, out_dims);
+    strides[..rank] == expected[..rank]
+}
+
+/// `Some(rhs_is_scalar)` when one side is dense and the other is a scalar broadcast.
+fn detect_scalar_broadcast(
+    rank: u32,
+    out_dims: &[u32],
+    lhs_strides: &[u32],
+    rhs_strides: &[u32],
+) -> Option<bool> {
+    let rank = rank as usize;
+    if out_dims.len() < rank {
+        return None;
+    }
+    let dense = dense_row_major_strides(out_dims, rank);
+    if lhs_strides.len() >= rank
+        && rhs_strides.len() >= rank
+        && lhs_strides[..rank] == dense[..]
+        && is_scalar_broadcast(rhs_strides, rank)
+    {
+        return Some(true);
+    }
+    if rhs_strides.len() >= rank
+        && lhs_strides.len() >= rank
+        && rhs_strides[..rank] == dense[..]
+        && is_scalar_broadcast(lhs_strides, rank)
+    {
+        return Some(false);
+    }
+    None
+}
+
+/// `Some((rows, cols, rhs_is_broadcast))` when one operand is dense row-major and the other
+/// is a last-axis vector broadcast over all leading dimensions (`stride 0` on outer axes).
+fn detect_last_axis_col_broadcast(
+    rank: u32,
+    out_dims: &[u32],
+    lhs_strides: &[u32],
+    rhs_strides: &[u32],
+) -> Option<(u32, u32, bool)> {
+    let rank = rank as usize;
+    if rank < 2 || out_dims.len() < rank {
+        return None;
+    }
+    let cols = out_dims[rank - 1];
+    if cols == 0 {
+        return None;
+    }
+    let mut rows_u64 = 1u64;
+    for &d in &out_dims[..rank - 1] {
+        rows_u64 = rows_u64.saturating_mul(d.max(1) as u64);
+    }
+    if rows_u64 == 0 || rows_u64 > u32::MAX as u64 {
+        return None;
+    }
+    let rows = rows_u64 as u32;
+
+    let dense = dense_row_major_strides(out_dims, rank);
+
+    let rhs_is_vec = |strides: &[u32]| -> bool {
+        strides.len() >= rank
+            && strides[rank - 1] == 1
+            && strides[..rank - 1].iter().all(|&s| s == 0)
+    };
+
+    if lhs_strides.len() >= rank
+        && rhs_strides.len() >= rank
+        && lhs_strides[..rank] == dense[..]
+        && rhs_is_vec(rhs_strides)
+    {
+        return Some((rows, cols, true));
+    }
+    if rhs_strides.len() >= rank
+        && lhs_strides.len() >= rank
+        && rhs_strides[..rank] == dense[..]
+        && rhs_is_vec(lhs_strides)
+    {
+        return Some((rows, cols, false));
+    }
+    None
+}
+
+/// `Some((rows, cols, rhs_is_broadcast))` for `[…, cols] op […, 1]` row-vector broadcast.
+fn detect_last_axis_row_broadcast(
+    rank: u32,
+    out_dims: &[u32],
+    lhs_strides: &[u32],
+    rhs_strides: &[u32],
+) -> Option<(u32, u32, bool)> {
+    let rank = rank as usize;
+    if rank < 2 || out_dims.len() < rank {
+        return None;
+    }
+    let cols = out_dims[rank - 1];
+    if cols == 0 {
+        return None;
+    }
+    let mut rows_u64 = 1u64;
+    for &d in &out_dims[..rank - 1] {
+        rows_u64 = rows_u64.saturating_mul(d.max(1) as u64);
+    }
+    if rows_u64 == 0 || rows_u64 > u32::MAX as u64 {
+        return None;
+    }
+    let rows = rows_u64 as u32;
+    let dense = dense_row_major_strides(out_dims, rank);
+
+    if lhs_strides.len() >= rank
+        && rhs_strides.len() >= rank
+        && lhs_strides[..rank] == dense[..]
+        && is_row_vector_broadcast(rhs_strides, rank, out_dims)
+    {
+        return Some((rows, cols, true));
+    }
+    if rhs_strides.len() >= rank
+        && lhs_strides.len() >= rank
+        && rhs_strides[..rank] == dense[..]
+        && is_row_vector_broadcast(lhs_strides, rank, out_dims)
+    {
+        return Some((rows, cols, false));
+    }
+    None
+}
+
+/// Exactly one broadcast axis (e.g. `[B, T, H] op [B, 1, H]`).
+fn detect_single_axis_broadcast(
+    rank: u32,
+    out_dims: &[u32],
+    lhs_strides: &[u32],
+    rhs_strides: &[u32],
+) -> Option<(u32, u32, u32, bool)> {
+    let rank = rank as usize;
+    if rank < 2 || out_dims.len() < rank {
+        return None;
+    }
+    let dense = dense_row_major_strides(out_dims, rank);
+
+    let try_side = |strides: &[u32], other: &[u32]| -> Option<(u32, u32, u32)> {
+        if strides.len() < rank || other.len() < rank || other[..rank] != dense[..rank] {
+            return None;
+        }
+        let zero_axes: Vec<usize> = (0..rank).filter(|&i| strides[i] == 0).collect();
+        if zero_axes.len() != 1 {
+            return None;
+        }
+        let ba = zero_axes[0];
+        let mut in_dims = out_dims[..rank].to_vec();
+        in_dims[ba] = 1;
+        let expected = broadcast_strides_u32(&in_dims, out_dims);
+        if strides[..rank] != expected[..rank] {
+            return None;
+        }
+        let mut pre_u64 = 1u64;
+        for &d in &out_dims[..ba] {
+            pre_u64 = pre_u64.saturating_mul(d.max(1) as u64);
+        }
+        let mid = out_dims[ba];
+        let mut post_u64 = 1u64;
+        for &d in &out_dims[ba + 1..] {
+            post_u64 = post_u64.saturating_mul(d.max(1) as u64);
+        }
+        let rows_u64 = pre_u64.saturating_mul(mid.max(1) as u64);
+        if rows_u64 == 0
+            || post_u64 == 0
+            || rows_u64 > u32::MAX as u64
+            || post_u64 > u32::MAX as u64
+        {
+            return None;
+        }
+        Some((rows_u64 as u32, post_u64 as u32, mid))
+    };
+
+    if let Some((rows, cols, mid)) = try_side(rhs_strides, lhs_strides) {
+        return Some((rows, cols, mid, true));
+    }
+    if let Some((rows, cols, mid)) = try_side(lhs_strides, rhs_strides) {
+        return Some((rows, cols, mid, false));
+    }
+    None
+}
+
+fn encode_binary_broadcast_1ax(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    lhs: usize,
+    rhs: usize,
+    dst: usize,
+    rows: u32,
+    cols: u32,
+    mid: u32,
+    op: u32,
+    rhs_is_broadcast: bool,
+) {
+    let (a, b) = if rhs_is_broadcast {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
+    };
+    let use_vec4 = cols.is_multiple_of(4) && cols >= 4;
+    if use_vec4 {
+        let cols4 = cols / 4;
+        enc.set_compute_pipeline_state(&k.binary_broadcast_1ax4);
+        enc.set_buffer(0, Some(buffer), a as u64);
+        enc.set_buffer(1, Some(buffer), b as u64);
+        enc.set_buffer(2, Some(buffer), dst as u64);
+        enc.set_bytes(3, 4, &rows as *const u32 as *const _);
+        enc.set_bytes(4, 4, &cols4 as *const u32 as *const _);
+        enc.set_bytes(5, 4, &mid as *const u32 as *const _);
+        enc.set_bytes(6, 4, &op as *const u32 as *const _);
+        let grid = metal::MTLSize {
+            width: cols4 as u64,
+            height: rows as u64,
+            depth: 1,
+        };
+        let tg = metal::MTLSize {
+            width: 64.min(cols4 as u64),
+            height: 4.min(rows as u64),
+            depth: 1,
+        };
+        enc.dispatch_threads(grid, tg);
+        return;
+    }
+    enc.set_compute_pipeline_state(&k.binary_broadcast_1ax_f32);
+    enc.set_buffer(0, Some(buffer), a as u64);
+    enc.set_buffer(1, Some(buffer), b as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 4, &rows as *const u32 as *const _);
+    enc.set_bytes(4, 4, &cols as *const u32 as *const _);
+    enc.set_bytes(5, 4, &mid as *const u32 as *const _);
+    enc.set_bytes(6, 4, &op as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: cols as u64,
+        height: rows as u64,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 32.min(cols as u64),
+        height: 8.min(rows as u64),
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
+}
+
+fn encode_binary_broadcast_rhs_scalar(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    lhs: usize,
+    rhs: usize,
+    dst: usize,
+    len: u32,
+    op: u32,
+    rhs_is_scalar: bool,
+) {
+    let (a, b) = if rhs_is_scalar {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
+    };
+    let use_vec4 = len.is_multiple_of(4) && len >= 4;
+    if use_vec4 {
+        let len4 = len / 4;
+        enc.set_compute_pipeline_state(&k.binary_broadcast_rhs_scalar4);
+        enc.set_buffer(0, Some(buffer), a as u64);
+        enc.set_buffer(1, Some(buffer), b as u64);
+        enc.set_buffer(2, Some(buffer), dst as u64);
+        enc.set_bytes(3, 4, &len4 as *const u32 as *const _);
+        enc.set_bytes(4, 4, &op as *const u32 as *const _);
+        let tg_w = k
+            .binary_broadcast_rhs_scalar4
+            .thread_execution_width()
+            .min(len4 as u64);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: len4 as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
+    enc.set_compute_pipeline_state(&k.binary_broadcast_rhs_scalar_f32);
+    enc.set_buffer(0, Some(buffer), a as u64);
+    enc.set_buffer(1, Some(buffer), b as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 4, &len as *const u32 as *const _);
+    enc.set_bytes(4, 4, &op as *const u32 as *const _);
+    let tg_w = k
+        .binary_broadcast_rhs_scalar_f32
+        .thread_execution_width()
+        .min(len as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn encode_binary_broadcast_rhs_row(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    lhs: usize,
+    rhs: usize,
+    dst: usize,
+    rows: u32,
+    cols: u32,
+    op: u32,
+    rhs_is_broadcast: bool,
+) {
+    let (a, b) = if rhs_is_broadcast {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
+    };
+    let use_vec4 = cols.is_multiple_of(4) && cols >= 4;
+    if use_vec4 {
+        let cols4 = cols / 4;
+        enc.set_compute_pipeline_state(&k.binary_broadcast_rhs_row4);
+        enc.set_buffer(0, Some(buffer), a as u64);
+        enc.set_buffer(1, Some(buffer), b as u64);
+        enc.set_buffer(2, Some(buffer), dst as u64);
+        enc.set_bytes(3, 4, &rows as *const u32 as *const _);
+        enc.set_bytes(4, 4, &cols4 as *const u32 as *const _);
+        enc.set_bytes(5, 4, &op as *const u32 as *const _);
+        let grid = metal::MTLSize {
+            width: cols4 as u64,
+            height: rows as u64,
+            depth: 1,
+        };
+        let tg = metal::MTLSize {
+            width: 64.min(cols4 as u64),
+            height: 4.min(rows as u64),
+            depth: 1,
+        };
+        enc.dispatch_threads(grid, tg);
+        return;
+    }
+    enc.set_compute_pipeline_state(&k.binary_broadcast_rhs_row_f32);
+    enc.set_buffer(0, Some(buffer), a as u64);
+    enc.set_buffer(1, Some(buffer), b as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 4, &rows as *const u32 as *const _);
+    enc.set_bytes(4, 4, &cols as *const u32 as *const _);
+    enc.set_bytes(5, 4, &op as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: cols as u64,
+        height: rows as u64,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 32.min(cols as u64),
+        height: 8.min(rows as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+fn encode_binary_broadcast_rhs_col(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    lhs: usize,
+    rhs: usize,
+    dst: usize,
+    rows: u32,
+    cols: u32,
+    op: u32,
+    rhs_is_broadcast: bool,
+) {
+    let (a, b) = if rhs_is_broadcast {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
+    };
+    let use_vec4 = cols.is_multiple_of(4) && cols >= 4;
+    if use_vec4 {
+        let cols4 = cols / 4;
+        enc.set_compute_pipeline_state(&k.binary_broadcast_rhs_col4);
+        enc.set_buffer(0, Some(buffer), a as u64);
+        enc.set_buffer(1, Some(buffer), b as u64);
+        enc.set_buffer(2, Some(buffer), dst as u64);
+        enc.set_bytes(3, 4, &rows as *const u32 as *const _);
+        enc.set_bytes(4, 4, &cols4 as *const u32 as *const _);
+        enc.set_bytes(5, 4, &op as *const u32 as *const _);
+        let grid = metal::MTLSize {
+            width: cols4 as u64,
+            height: rows as u64,
+            depth: 1,
+        };
+        let tg = metal::MTLSize {
+            width: 64.min(cols4 as u64),
+            height: 4.min(rows as u64),
+            depth: 1,
+        };
+        enc.dispatch_threads(grid, tg);
+        return;
+    }
+    enc.set_compute_pipeline_state(&k.binary_broadcast_rhs_col_f32);
+    enc.set_buffer(0, Some(buffer), a as u64);
+    enc.set_buffer(1, Some(buffer), b as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 4, &rows as *const u32 as *const _);
+    enc.set_bytes(4, 4, &cols as *const u32 as *const _);
+    enc.set_bytes(5, 4, &op as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: cols as u64,
+        height: rows as u64,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 32.min(cols as u64),
+        height: 8.min(rows as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+fn encode_binary_broadcast_rank2(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    lhs: usize,
+    rhs: usize,
+    dst: usize,
+    len: u32,
+    dim0: u32,
+    dim1: u32,
+    lhs_stride0: u32,
+    lhs_stride1: u32,
+    rhs_stride0: u32,
+    rhs_stride1: u32,
+    op: u32,
+) {
+    let use_vec4 = len.is_multiple_of(4)
+        && dim1.is_multiple_of(4)
+        && len >= 4
+        && lhs_stride1 == 1
+        && rhs_stride1 == 1;
+    if use_vec4 {
+        let len4 = len / 4;
+        enc.set_compute_pipeline_state(&k.binary_broadcast_rank24);
+        enc.set_buffer(0, Some(buffer), lhs as u64);
+        enc.set_buffer(1, Some(buffer), rhs as u64);
+        enc.set_buffer(2, Some(buffer), dst as u64);
+        enc.set_bytes(3, 4, &len4 as *const u32 as *const _);
+        enc.set_bytes(4, 4, &dim0 as *const u32 as *const _);
+        enc.set_bytes(5, 4, &dim1 as *const u32 as *const _);
+        enc.set_bytes(6, 4, &lhs_stride0 as *const u32 as *const _);
+        enc.set_bytes(7, 4, &lhs_stride1 as *const u32 as *const _);
+        enc.set_bytes(8, 4, &rhs_stride0 as *const u32 as *const _);
+        enc.set_bytes(9, 4, &rhs_stride1 as *const u32 as *const _);
+        enc.set_bytes(10, 4, &op as *const u32 as *const _);
+        let tg_w = k
+            .binary_broadcast_rank24
+            .thread_execution_width()
+            .min(len4 as u64);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: len4 as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
+    enc.set_compute_pipeline_state(&k.binary_broadcast_rank2_f32);
+    enc.set_buffer(0, Some(buffer), lhs as u64);
+    enc.set_buffer(1, Some(buffer), rhs as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 4, &len as *const u32 as *const _);
+    enc.set_bytes(4, 4, &dim0 as *const u32 as *const _);
+    enc.set_bytes(5, 4, &dim1 as *const u32 as *const _);
+    enc.set_bytes(6, 4, &lhs_stride0 as *const u32 as *const _);
+    enc.set_bytes(7, 4, &lhs_stride1 as *const u32 as *const _);
+    enc.set_bytes(8, 4, &rhs_stride0 as *const u32 as *const _);
+    enc.set_bytes(9, 4, &rhs_stride1 as *const u32 as *const _);
+    enc.set_bytes(10, 4, &op as *const u32 as *const _);
+    let tg_w = k
+        .binary_broadcast_rank2_f32
+        .thread_execution_width()
+        .min(len as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 
 fn encode_binary(
@@ -3914,32 +5778,38 @@ fn encode_binary(
 ) {
     use crate::thunk::HalfFlag;
     use rlx_ir::op::BinaryOp;
+    let use_vec4 = matches!(dt, HalfFlag::F32) && len.is_multiple_of(4) && len >= 4;
     // f16 covers Add and Mul (the Nomic residual + SwiGLU patterns).
     // Other binaries silently fall back to f32 kernels in mixed
     // precision — same caveat as encode_activation.
-    let pipeline = match (dt, op) {
-        (HalfFlag::F16, BinaryOp::Add) => &k.elem_add_h,
-        (HalfFlag::F16, BinaryOp::Mul) => &k.elem_mul_h,
-        (_, BinaryOp::Add) => &k.elem_add,
-        (_, BinaryOp::Mul) => &k.elem_mul,
-        (_, BinaryOp::Sub) => &k.elem_sub,
-        (_, BinaryOp::Div) => &k.elem_div,
-        (_, BinaryOp::Max) => &k.elem_max,
-        (_, BinaryOp::Min) => &k.elem_min,
-        (_, BinaryOp::Pow) => &k.elem_pow,
+    let pipeline = match (dt, op, use_vec4) {
+        (HalfFlag::F16, BinaryOp::Add, _) => &k.elem_add_h,
+        (HalfFlag::F16, BinaryOp::Mul, _) => &k.elem_mul_h,
+        (_, BinaryOp::Add, true) => &k.elem_add4,
+        (_, BinaryOp::Mul, true) => &k.elem_mul4,
+        (_, BinaryOp::Sub, true) => &k.elem_sub4,
+        (_, BinaryOp::Div, true) => &k.elem_div4,
+        (_, BinaryOp::Add, false) => &k.elem_add,
+        (_, BinaryOp::Mul, false) => &k.elem_mul,
+        (_, BinaryOp::Sub, false) => &k.elem_sub,
+        (_, BinaryOp::Div, false) => &k.elem_div,
+        (_, BinaryOp::Max, _) => &k.elem_max,
+        (_, BinaryOp::Min, _) => &k.elem_min,
+        (_, BinaryOp::Pow, _) => &k.elem_pow,
     };
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(buffer), lhs as u64);
     enc.set_buffer(1, Some(buffer), rhs as u64);
     enc.set_buffer(2, Some(buffer), dst as u64);
+    let dispatch_len = if use_vec4 { len / 4 } else { len };
     enc.set_bytes(
         3,
         std::mem::size_of::<u32>() as u64,
-        &len as *const u32 as *const _,
+        &dispatch_len as *const u32 as *const _,
     );
-    let tg_w = pipeline.thread_execution_width().min(len as u64);
+    let tg_w = pipeline.thread_execution_width().min(dispatch_len as u64);
     let grid = metal::MTLSize {
-        width: len as u64,
+        width: dispatch_len as u64,
         height: 1,
         depth: 1,
     };
@@ -3961,6 +5831,27 @@ fn encode_copy(
     dt: crate::thunk::HalfFlag,
 ) {
     use crate::thunk::HalfFlag;
+    if matches!(dt, HalfFlag::F32) && len.is_multiple_of(4) && len >= 4 {
+        let len4 = len / 4;
+        enc.set_compute_pipeline_state(&k.copy4);
+        enc.set_buffer(0, Some(buffer), src as u64);
+        enc.set_buffer(1, Some(buffer), dst as u64);
+        enc.set_bytes(2, 4, &len4 as *const u32 as *const _);
+        let tg_w = k.copy4.thread_execution_width().min(len4 as u64);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: len4 as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
     // copy_f32 moves 4 bytes per dispatch slot. For f16, two f16 values
     // pack into one f32 slot, so we halve the dispatch count and reuse
     // the same kernel. Assumes even len (Nomic shapes always are).
@@ -4030,6 +5921,194 @@ fn encode_gather(
     enc.dispatch_threads(grid, tg);
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NarrowSegGpu {
+    dst: u32,
+    start: u32,
+    len: u32,
+}
+
+struct PendingNarrowBatch {
+    src: usize,
+    outer: u32,
+    src_axis: u32,
+    dt: crate::thunk::HalfFlag,
+    segments: Vec<(usize, u32, u32)>,
+}
+
+const NARROW_BATCH_MAX: usize = 64;
+
+fn metal_narrow_batch_enabled() -> bool {
+    !rlx_ir::env::flag("RLX_METAL_NARROW_BATCH")
+}
+
+fn narrow_segments_partition(src_axis: u32, segments: &[(u32, u32)]) -> bool {
+    let mut sorted = segments.to_vec();
+    sorted.sort_by_key(|(s, _)| *s);
+    let mut end = 0u32;
+    for (start, len) in sorted {
+        if start != end {
+            return false;
+        }
+        end = end.saturating_add(len);
+    }
+    end == src_axis
+}
+
+fn flush_pending_narrow_batch(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    batch: &mut Option<PendingNarrowBatch>,
+) {
+    let Some(b) = batch.take() else {
+        return;
+    };
+    if b.segments.is_empty() {
+        return;
+    }
+    if b.segments.len() == 1 {
+        let (dst, start, len) = b.segments[0];
+        encode_narrow(
+            enc, k, buffer, b.src, dst, b.outer, b.src_axis, start, len, b.dt,
+        );
+        return;
+    }
+    let meta: Vec<(u32, u32)> = b
+        .segments
+        .iter()
+        .map(|(_, start, len)| (*start, *len))
+        .collect();
+    if narrow_segments_partition(b.src_axis, &meta) {
+        encode_split_lastax(enc, k, buffer, &b);
+    } else {
+        for (dst, start, len) in b.segments {
+            encode_narrow(
+                enc, k, buffer, b.src, dst, b.outer, b.src_axis, start, len, b.dt,
+            );
+        }
+    }
+}
+
+fn try_queue_narrow_batch(
+    batch: &mut Option<PendingNarrowBatch>,
+    src: usize,
+    dst: usize,
+    outer: u32,
+    src_axis: u32,
+    start: u32,
+    len: u32,
+    dt: crate::thunk::HalfFlag,
+) -> bool {
+    if !metal_narrow_batch_enabled() || outer == 0 {
+        return false;
+    }
+    if !matches!(dt, crate::thunk::HalfFlag::F32) {
+        return false;
+    }
+    match batch {
+        None => {
+            *batch = Some(PendingNarrowBatch {
+                src,
+                outer,
+                src_axis,
+                dt,
+                segments: vec![(dst, start, len)],
+            });
+            true
+        }
+        Some(b) if b.src == src && b.outer == outer && b.src_axis == src_axis && b.dt == dt => {
+            if b.segments.len() >= NARROW_BATCH_MAX {
+                return false;
+            }
+            let mut meta: Vec<(u32, u32)> = b.segments.iter().map(|(_, s, l)| (*s, *l)).collect();
+            meta.push((start, len));
+            if !narrow_segments_partition(b.src_axis, &meta) {
+                return false;
+            }
+            b.segments.push((dst, start, len));
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+fn encode_split_lastax(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    batch: &PendingNarrowBatch,
+) {
+    use crate::thunk::HalfFlag;
+    debug_assert!(batch.segments.len() >= 2);
+    let segs: Vec<NarrowSegGpu> = batch
+        .segments
+        .iter()
+        .map(|(dst, start, len)| NarrowSegGpu {
+            dst: *dst as u32,
+            start: *start,
+            len: *len,
+        })
+        .collect();
+    let num_seg = segs.len() as u32;
+    let max_len = segs.iter().map(|s| s.len).max().unwrap_or(0);
+    let use_vec4 = batch.src_axis.is_multiple_of(4)
+        && segs
+            .iter()
+            .all(|s| (s.start % 4) == 0 && (s.len % 4) == 0 && s.len >= 4);
+    if use_vec4 {
+        let src_axis4 = batch.src_axis / 4;
+        let max_len4 = max_len / 4;
+        enc.set_compute_pipeline_state(&k.split_lastax4);
+        enc.set_buffer(0, Some(buffer), batch.src as u64);
+        enc.set_buffer(1, Some(buffer), 0);
+        enc.set_bytes(2, 4, &batch.outer as *const u32 as *const _);
+        enc.set_bytes(3, 4, &src_axis4 as *const u32 as *const _);
+        enc.set_bytes(4, 4, &num_seg as *const u32 as *const _);
+        enc.set_bytes(
+            5,
+            (segs.len() * std::mem::size_of::<NarrowSegGpu>()) as u64,
+            segs.as_ptr() as *const _,
+        );
+        let grid = metal::MTLSize {
+            width: max_len4 as u64,
+            height: batch.outer as u64,
+            depth: num_seg as u64,
+        };
+        let tg = metal::MTLSize {
+            width: 64.min(max_len4 as u64),
+            height: 4.min(batch.outer as u64),
+            depth: num_seg as u64,
+        };
+        enc.dispatch_threads(grid, tg);
+    } else {
+        enc.set_compute_pipeline_state(&k.split_lastax);
+        enc.set_buffer(0, Some(buffer), batch.src as u64);
+        enc.set_buffer(1, Some(buffer), 0);
+        enc.set_bytes(2, 4, &batch.outer as *const u32 as *const _);
+        enc.set_bytes(3, 4, &batch.src_axis as *const u32 as *const _);
+        enc.set_bytes(4, 4, &num_seg as *const u32 as *const _);
+        enc.set_bytes(
+            5,
+            (segs.len() * std::mem::size_of::<NarrowSegGpu>()) as u64,
+            segs.as_ptr() as *const _,
+        );
+        let grid = metal::MTLSize {
+            width: max_len as u64,
+            height: batch.outer as u64,
+            depth: num_seg as u64,
+        };
+        let tg = metal::MTLSize {
+            width: 32.min(max_len as u64),
+            height: 8.min(batch.outer as u64),
+            depth: num_seg as u64,
+        };
+        enc.dispatch_threads(grid, tg);
+    }
+    let _ = HalfFlag::F32;
+}
+
 fn encode_narrow(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -4043,44 +6122,76 @@ fn encode_narrow(
     dt: crate::thunk::HalfFlag,
 ) {
     use crate::thunk::HalfFlag;
-    let pipeline = match dt {
-        HalfFlag::F32 => &k.narrow_lastax,
-        HalfFlag::F16 => &k.narrow_lastax_h,
-    };
-    enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(buffer), src as u64);
-    enc.set_buffer(1, Some(buffer), dst as u64);
-    enc.set_bytes(
-        2,
-        std::mem::size_of::<u32>() as u64,
-        &outer as *const u32 as *const _,
-    );
-    enc.set_bytes(
-        3,
-        std::mem::size_of::<u32>() as u64,
-        &src_axis as *const u32 as *const _,
-    );
-    enc.set_bytes(
-        4,
-        std::mem::size_of::<u32>() as u64,
-        &start as *const u32 as *const _,
-    );
-    enc.set_bytes(
-        5,
-        std::mem::size_of::<u32>() as u64,
-        &len as *const u32 as *const _,
-    );
-    let grid = metal::MTLSize {
-        width: len as u64,
-        height: outer as u64,
-        depth: 1,
-    };
-    let tg = metal::MTLSize {
-        width: 16.min(len as u64),
-        height: 16.min(outer as u64),
-        depth: 1,
-    };
-    enc.dispatch_threads(grid, tg);
+    match dt {
+        HalfFlag::F32
+            if start.is_multiple_of(4)
+                && src_axis.is_multiple_of(4)
+                && len.is_multiple_of(4)
+                && len >= 4 =>
+        {
+            let src_axis4 = src_axis / 4;
+            let start4 = start / 4;
+            let len4 = len / 4;
+            enc.set_compute_pipeline_state(&k.narrow_lastax4);
+            enc.set_buffer(0, Some(buffer), src as u64);
+            enc.set_buffer(1, Some(buffer), dst as u64);
+            enc.set_bytes(2, 4, &outer as *const u32 as *const _);
+            enc.set_bytes(3, 4, &src_axis4 as *const u32 as *const _);
+            enc.set_bytes(4, 4, &start4 as *const u32 as *const _);
+            enc.set_bytes(5, 4, &len4 as *const u32 as *const _);
+            let grid = metal::MTLSize {
+                width: len4 as u64,
+                height: outer as u64,
+                depth: 1,
+            };
+            let tg = metal::MTLSize {
+                width: 64.min(len4 as u64),
+                height: 4.min(outer as u64),
+                depth: 1,
+            };
+            enc.dispatch_threads(grid, tg);
+        }
+        HalfFlag::F32 => {
+            enc.set_compute_pipeline_state(&k.narrow_lastax);
+            enc.set_buffer(0, Some(buffer), src as u64);
+            enc.set_buffer(1, Some(buffer), dst as u64);
+            enc.set_bytes(2, 4, &outer as *const u32 as *const _);
+            enc.set_bytes(3, 4, &src_axis as *const u32 as *const _);
+            enc.set_bytes(4, 4, &start as *const u32 as *const _);
+            enc.set_bytes(5, 4, &len as *const u32 as *const _);
+            let grid = metal::MTLSize {
+                width: len as u64,
+                height: outer as u64,
+                depth: 1,
+            };
+            let tg = metal::MTLSize {
+                width: 64.min(len as u64),
+                height: 8.min(outer as u64),
+                depth: 1,
+            };
+            enc.dispatch_threads(grid, tg);
+        }
+        HalfFlag::F16 => {
+            enc.set_compute_pipeline_state(&k.narrow_lastax_h);
+            enc.set_buffer(0, Some(buffer), src as u64);
+            enc.set_buffer(1, Some(buffer), dst as u64);
+            enc.set_bytes(2, 4, &outer as *const u32 as *const _);
+            enc.set_bytes(3, 4, &src_axis as *const u32 as *const _);
+            enc.set_bytes(4, 4, &start as *const u32 as *const _);
+            enc.set_bytes(5, 4, &len as *const u32 as *const _);
+            let grid = metal::MTLSize {
+                width: len as u64,
+                height: outer as u64,
+                depth: 1,
+            };
+            let tg = metal::MTLSize {
+                width: 32.min(len as u64),
+                height: 8.min(outer as u64),
+                depth: 1,
+            };
+            enc.dispatch_threads(grid, tg);
+        }
+    }
 }
 
 fn encode_fused_residual_ln(
@@ -4118,9 +6229,10 @@ fn encode_fused_residual_ln(
         std::mem::size_of::<f32>() as u64,
         &eps as *const f32 as *const _,
     );
-    // Same .x-binding gotcha as encode_layer_norm: row index must land in
-    // threadgroup_position_in_grid.x, so we put `rows` in tg_count.width.
-    let tg_w = 256u64.min(h as u64);
+    let mut tg_w: u64 = 1;
+    while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
+        tg_w *= 2;
+    }
     let tg = metal::MTLSize {
         width: tg_w,
         height: 1,
@@ -4169,7 +6281,10 @@ fn encode_fused_residual_rms_norm(
         std::mem::size_of::<f32>() as u64,
         &eps as *const f32 as *const _,
     );
-    let tg_w = 256u64.min(h as u64);
+    let mut tg_w: u64 = 1;
+    while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
+        tg_w *= 2;
+    }
     let tg = metal::MTLSize {
         width: tg_w,
         height: 1,
@@ -4183,6 +6298,7 @@ fn encode_fused_residual_rms_norm(
     enc.dispatch_thread_groups(tg_count, tg);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_sdpa(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -4199,8 +6315,10 @@ fn encode_sdpa(
     dt: crate::thunk::HalfFlag,
     seq_stride: u32,
     mask_kind: u32,
+    window: u32,
     kv_seq: u32,
     kv_stride: u32,
+    bhsd: u32,
 ) {
     use crate::thunk::HalfFlag;
     // The two-pass `sdpa` / `sdpa_h` kernels store an [seq, seq] scores
@@ -4210,11 +6328,12 @@ fn encode_sdpa(
     // = 256 patches + 1 CLS) we route to `sdpa_long`, an online-softmax
     // FA-v1 variant that's O(D) memory per query row and scales to any
     // seq length. Also route decode steps (Lq=1, Lk=past+1) through
-    // `sdpa_long` — the square kernel cannot index K/V past Lq.
+    // `sdpa_long` — the rectangular `sdpa` TG scores buffer is sized for
+    // self-attention prefill; bucketed decode must use the online kernel.
     // F16 input/output isn't supported by sdpa_long yet —
     // that path falls through and would hit the seq-64 ceiling; today
     // no f16-tagged graph hits seq>64 in production.
-    if matches!(dt, HalfFlag::F32) && (seq > 64 || kv_seq > 64) {
+    if matches!(dt, HalfFlag::F32) && (seq > 64 || kv_seq > 64 || kv_seq != seq) {
         // Pick between the scalar online-softmax (`sdpa_long`) and the
         // tile-based flash-attention (`sdpa_fa_f32`). FA amortizes K/V
         // reads across an 8-query tile via threadgroup memory, so it
@@ -4271,6 +6390,16 @@ fn encode_sdpa(
             12,
             std::mem::size_of::<u32>() as u64,
             &kv_stride as *const u32 as *const _,
+        );
+        enc.set_bytes(
+            13,
+            std::mem::size_of::<u32>() as u64,
+            &bhsd as *const u32 as *const _,
+        );
+        enc.set_bytes(
+            14,
+            std::mem::size_of::<u32>() as u64,
+            &window as *const u32 as *const _,
         );
         if use_fa {
             // FA kernel: 1 TG per (q_tile, head, batch), 64 threads, Br=8.
@@ -4352,6 +6481,16 @@ fn encode_sdpa(
         12,
         std::mem::size_of::<u32>() as u64,
         &kv_stride as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        13,
+        std::mem::size_of::<u32>() as u64,
+        &bhsd as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        14,
+        std::mem::size_of::<u32>() as u64,
+        &window as *const u32 as *const _,
     );
     let tg_count = metal::MTLSize {
         width: (batch * heads) as u64,
@@ -4475,10 +6614,13 @@ fn encode_rms_norm(
         std::mem::size_of::<f32>() as u64,
         &eps as *const f32 as *const _,
     );
-    // Rows packed in width — same .x scalar binding gotcha as encode_layer_norm.
-    let tg_w = 256u64.min(h as u64);
+    // One threadgroup per row; power-of-2 tg size for reduction (see encode_layer_norm).
+    let mut tg_w: u64 = 1;
+    while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
+        tg_w *= 2;
+    }
     let grid = metal::MTLSize {
-        width: tg_w * rows as u64,
+        width: rows as u64,
         height: 1,
         depth: 1,
     };
@@ -4487,7 +6629,7 @@ fn encode_rms_norm(
         height: 1,
         depth: 1,
     };
-    enc.dispatch_threads(grid, tg);
+    enc.dispatch_thread_groups(grid, tg);
 }
 
 fn encode_rms_norm_bwd_input(
@@ -4533,37 +6675,100 @@ fn encode_rms_norm_bwd_param(
     k: &crate::kernels::Kernels,
     buffer: &metal::Buffer,
     x: usize,
-    gamma: usize,
-    beta: usize,
+    _gamma: usize,
+    _beta: usize,
     dy: usize,
     out: usize,
     rows: u32,
     h: u32,
     eps: f32,
     wrt: u32,
+    inv_r_scratch: usize,
 ) {
-    enc.set_compute_pipeline_state(&k.rms_norm_bwd_param);
+    let use_parallel = inv_r_scratch != 0 && rows > 1;
+    if !use_parallel {
+        enc.set_compute_pipeline_state(&k.rms_norm_bwd_param);
+        enc.set_buffer(0, Some(buffer), x as u64);
+        enc.set_buffer(1, Some(buffer), _gamma as u64);
+        enc.set_buffer(2, Some(buffer), _beta as u64);
+        enc.set_buffer(3, Some(buffer), dy as u64);
+        enc.set_buffer(4, Some(buffer), out as u64);
+        enc.set_bytes(5, 4, &rows as *const u32 as *const _);
+        enc.set_bytes(6, 4, &h as *const u32 as *const _);
+        enc.set_bytes(7, 4, &eps as *const f32 as *const _);
+        enc.set_bytes(8, 4, &wrt as *const u32 as *const _);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
+
+    if wrt == 1 {
+        enc.set_compute_pipeline_state(&k.rms_norm_bwd_inv_r_f32);
+        enc.set_buffer(0, Some(buffer), x as u64);
+        enc.set_buffer(1, Some(buffer), inv_r_scratch as u64);
+        enc.set_bytes(2, 4, &h as *const u32 as *const _);
+        enc.set_bytes(3, 4, &eps as *const f32 as *const _);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: rows as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256.min(rows as u64).max(1),
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    enc.set_compute_pipeline_state(&k.rms_norm_bwd_param_reduce_f32);
     enc.set_buffer(0, Some(buffer), x as u64);
-    enc.set_buffer(1, Some(buffer), gamma as u64);
-    enc.set_buffer(2, Some(buffer), beta as u64);
-    enc.set_buffer(3, Some(buffer), dy as u64);
-    enc.set_buffer(4, Some(buffer), out as u64);
-    enc.set_bytes(5, 4, &rows as *const u32 as *const _);
-    enc.set_bytes(6, 4, &h as *const u32 as *const _);
-    enc.set_bytes(7, 4, &eps as *const f32 as *const _);
-    enc.set_bytes(8, 4, &wrt as *const u32 as *const _);
+    enc.set_buffer(1, Some(buffer), dy as u64);
+    enc.set_buffer(2, Some(buffer), inv_r_scratch as u64);
+    enc.set_buffer(3, Some(buffer), out as u64);
+    enc.set_bytes(4, 4, &rows as *const u32 as *const _);
+    enc.set_bytes(5, 4, &h as *const u32 as *const _);
+    enc.set_bytes(6, 4, &wrt as *const u32 as *const _);
+    let tg_w = 256u64.min(h as u64).max(1);
     enc.dispatch_threads(
         metal::MTLSize {
-            width: 1,
+            width: h as u64,
             height: 1,
             depth: 1,
         },
         metal::MTLSize {
-            width: 1,
+            width: tg_w,
             height: 1,
             depth: 1,
         },
     );
+}
+
+fn rms_norm_bwd_scratch_bytes(graph: &Graph) -> usize {
+    let mut max_rows = 0usize;
+    for node in graph.nodes() {
+        if matches!(
+            node.op,
+            Op::RmsNormBackwardGamma { .. } | Op::RmsNormBackwardBeta { .. }
+        ) {
+            let x_shape = &graph.node(node.inputs[0]).shape;
+            let h = x_shape.dim(x_shape.rank() - 1).unwrap_static();
+            let rows = x_shape.num_elements().unwrap() / h;
+            max_rows = max_rows.max(rows);
+        }
+    }
+    max_rows * std::mem::size_of::<f32>()
 }
 
 fn encode_rope_bwd(
@@ -4912,6 +7117,157 @@ fn encode_gated_delta_net(
     enc.dispatch_thread_groups(grid, tg);
 }
 
+fn conv_bwd_scratch_bytes(graph: &Graph) -> usize {
+    let mut max = 0usize;
+    for node in graph.nodes() {
+        if let Op::Conv2dBackwardWeight {
+            kernel_size,
+            groups,
+            ..
+        } = &node.op
+        {
+            let x_shape = &graph.node(node.inputs[0]).shape;
+            let dy_shape = &graph.node(node.inputs[1]).shape;
+            if x_shape.rank() != 4 || dy_shape.rank() != 4 {
+                continue;
+            }
+            let c_in = x_shape.dim(1).unwrap_static();
+            let h_out = dy_shape.dim(2).unwrap_static();
+            let w_out = dy_shape.dim(3).unwrap_static();
+            let kh = kernel_size.first().copied().unwrap_or(1);
+            let kw = kernel_size.get(1).copied().unwrap_or(1);
+            let groups = (*groups).max(1);
+            let c_in_per_g = c_in / groups;
+            let n_dim = c_in_per_g * kh * kw;
+            let k_dim = h_out * w_out;
+            max = max.max(n_dim * k_dim * std::mem::size_of::<f32>());
+        }
+    }
+    max
+}
+
+/// Implicit im2col+GEMM only when explicitly enabled — materialized im2col + MPS/simd
+/// sgemm wins on Voxtral-scale conv weight backward (see bench-encoder).
+fn conv_bwd_weight_use_implicit_gemm(m: usize, k: usize, n: usize) -> bool {
+    if !rlx_ir::env::var("RLX_METAL_CONV_BWD_IMPLICIT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if !k.is_multiple_of(8) || n < 8 || m < 1 {
+        return false;
+    }
+    !matches!(
+        crate::cost::hw_model().pick_sgemm(m, k, n),
+        crate::cost::SgemmVariant::Mps
+            | crate::cost::SgemmVariant::Tiled
+            | crate::cost::SgemmVariant::Naive
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_conv2d_bwd_weight_gemm(
+    enc: &metal::ComputeCommandEncoderRef,
+    kk: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    dy: usize,
+    x: usize,
+    dw: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    nchw: &[u32; 4],
+    out_dims: &[u32; 4],
+    kshape: &[u32; 4],
+    padd: &[u32; 4],
+) {
+    let m_u = m as u32;
+    let k_u = k as u32;
+    let n_u = n as u32;
+    enc.set_buffer(0, Some(buffer), dy as u64);
+    enc.set_buffer(1, Some(buffer), x as u64);
+    enc.set_buffer(2, Some(buffer), dw as u64);
+    enc.set_bytes(3, 4, &m_u as *const _ as *const _);
+    enc.set_bytes(4, 4, &k_u as *const _ as *const _);
+    enc.set_bytes(5, 4, &n_u as *const _ as *const _);
+    enc.set_bytes(6, 16, nchw.as_ptr() as *const _);
+    enc.set_bytes(7, 16, out_dims.as_ptr() as *const _);
+    enc.set_bytes(8, 16, kshape.as_ptr() as *const _);
+    enc.set_bytes(9, 16, padd.as_ptr() as *const _);
+
+    let aligned_32 = m.is_multiple_of(32) && k.is_multiple_of(32) && n.is_multiple_of(32);
+    if aligned_32 && m >= 32 && n >= 32 {
+        enc.set_compute_pipeline_state(&kk.conv2d_bwd_weight_gemm_4x4);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n.div_ceil(32) as u64,
+                height: m.div_ceil(32) as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 512,
+                height: 1,
+                depth: 1,
+            },
+        );
+    } else {
+        enc.set_compute_pipeline_state(&kk.conv2d_bwd_weight_gemm);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n.div_ceil(8) as u64,
+                height: m.div_ceil(8) as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_im2col_group(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    col: usize,
+    nchw: &[u32; 4],
+    out_dims: &[u32; 4],
+    kshape: &[u32; 4],
+    padd: &[u32; 4],
+    elems: u64,
+) {
+    let w1 = nchw[2] == 1 && out_dims[2] == 1;
+    if w1 {
+        enc.set_compute_pipeline_state(&k.im2col_group_w1);
+    } else {
+        enc.set_compute_pipeline_state(&k.im2col_group);
+    }
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), col as u64);
+    enc.set_bytes(2, 16, nchw.as_ptr() as *const _);
+    enc.set_bytes(3, 16, out_dims.as_ptr() as *const _);
+    enc.set_bytes(4, 16, kshape.as_ptr() as *const _);
+    enc.set_bytes(5, 16, padd.as_ptr() as *const _);
+    let tg_w = 512u64.min(elems).max(1);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: elems,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 fn encode_conv2d(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -4940,7 +7296,12 @@ fn encode_conv2d(
     let out_dims: [u32; 4] = [c_out, h_out, w_out, groups];
     let kshape: [u32; 4] = [kh, kw, sh, sw];
     let padd: [u32; 4] = [ph, pw, dh, dw];
-    enc.set_compute_pipeline_state(&k.conv2d);
+    let w1 = w == 1 && w_out == 1;
+    if w1 {
+        enc.set_compute_pipeline_state(&k.conv2d_w1);
+    } else {
+        enc.set_compute_pipeline_state(&k.conv2d);
+    }
     enc.set_buffer(0, Some(buffer), src as u64);
     enc.set_buffer(1, Some(buffer), weight as u64);
     enc.set_buffer(2, Some(buffer), dst as u64);
@@ -4948,15 +7309,31 @@ fn encode_conv2d(
     enc.set_bytes(4, 16, out_dims.as_ptr() as *const _);
     enc.set_bytes(5, 16, kshape.as_ptr() as *const _);
     enc.set_bytes(6, 16, padd.as_ptr() as *const _);
-    let grid = metal::MTLSize {
-        width: w_out as u64,
-        height: h_out as u64,
-        depth: (n * c_out) as u64,
+    let grid = if w1 {
+        metal::MTLSize {
+            width: 1,
+            height: h_out as u64,
+            depth: (n * c_out) as u64,
+        }
+    } else {
+        metal::MTLSize {
+            width: w_out as u64,
+            height: h_out as u64,
+            depth: (n * c_out) as u64,
+        }
     };
-    let tg = metal::MTLSize {
-        width: 8.min(w_out as u64),
-        height: 8.min(h_out as u64),
-        depth: 1,
+    let tg = if w1 {
+        metal::MTLSize {
+            width: 1,
+            height: 8.min(h_out as u64),
+            depth: 1,
+        }
+    } else {
+        metal::MTLSize {
+            width: 8.min(w_out as u64),
+            height: 8.min(h_out as u64),
+            depth: 1,
+        }
     };
     enc.dispatch_threads(grid, tg);
 }
@@ -4991,10 +7368,12 @@ fn encode_group_norm(
         height: 1,
         depth: 1,
     };
+    // Dispatch one threadgroup per (batch, group) along grid *width* so
+    // `threadgroup_position_in_grid` (scalar .x) indexes 0..batch*num_groups-1.
     let grid = metal::MTLSize {
-        width: 1,
+        width: groups.max(1),
         height: 1,
-        depth: groups.max(1),
+        depth: 1,
     };
     enc.dispatch_thread_groups(grid, tg);
 }
@@ -5200,6 +7579,228 @@ fn encode_gather_axis(
     enc.dispatch_threads(grid, tg);
 }
 
+/// Swap of the last two axes with dense leading batch dims → `(batch, rows, cols)`.
+fn detect_last2_batched_swap(out_dims: &[u32], in_strides: &[u32]) -> Option<(u32, u32, u32)> {
+    let rank = out_dims.len();
+    if rank < 3 || in_strides.len() < rank {
+        return None;
+    }
+    let rows = out_dims[rank - 1];
+    let cols = out_dims[rank - 2];
+    if in_strides[rank - 2] != 1 || in_strides[rank - 1] != cols {
+        return None;
+    }
+    let mut tail = cols.saturating_mul(rows);
+    if rank >= 3 && in_strides[rank - 3] != tail {
+        return None;
+    }
+    for i in (0..rank.saturating_sub(3)).rev() {
+        let expected = tail.saturating_mul(out_dims[i + 1].max(1));
+        if in_strides[i] != expected {
+            return None;
+        }
+        tail = expected;
+    }
+    let mut batch_u64 = 1u64;
+    for &d in &out_dims[..rank - 2] {
+        batch_u64 = batch_u64.saturating_mul(d.max(1) as u64);
+    }
+    if batch_u64 == 0 || batch_u64 > u32::MAX as u64 {
+        return None;
+    }
+    Some((batch_u64 as u32, rows, cols))
+}
+
+/// `[B, A, C, D] → [B, C, A, D]` (perm `[0, 2, 1, 3]`).
+fn detect_swap12_batched_trailing(
+    out_dims: &[u32],
+    in_strides: &[u32],
+) -> Option<(u32, u32, u32, u32)> {
+    if out_dims.len() != 4 || in_strides.len() != 4 {
+        return None;
+    }
+    let batch = out_dims[0];
+    let rows = out_dims[1];
+    let cols = out_dims[2];
+    let trail = out_dims[3];
+    if batch == 0 || rows == 0 || cols == 0 || trail == 0 {
+        return None;
+    }
+    if in_strides[3] != 1 {
+        return None;
+    }
+    if in_strides[1] != trail {
+        return None;
+    }
+    if in_strides[2] != rows.saturating_mul(trail) {
+        return None;
+    }
+    if in_strides[0] != cols.saturating_mul(rows).saturating_mul(trail) {
+        return None;
+    }
+    Some((batch, rows, cols, trail))
+}
+
+fn encode_transpose_swap12_batched_trailing(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    dst: usize,
+    batch: u32,
+    rows: u32,
+    cols: u32,
+    trail: u32,
+) {
+    let use_tiled = rows >= 32 && cols >= 32;
+    let depth = (batch as u64).saturating_mul(trail as u64);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), dst as u64);
+    enc.set_bytes(2, 4, &batch as *const u32 as *const _);
+    enc.set_bytes(3, 4, &rows as *const u32 as *const _);
+    enc.set_bytes(4, 4, &cols as *const u32 as *const _);
+    enc.set_bytes(5, 4, &trail as *const u32 as *const _);
+    if use_tiled {
+        enc.set_compute_pipeline_state(&k.transpose_swap12_batched_trail_tiled_f32);
+        let tg = metal::MTLSize {
+            width: 32,
+            height: 8,
+            depth: 1,
+        };
+        let groups = metal::MTLSize {
+            width: (rows as u64).div_ceil(32),
+            height: (cols as u64).div_ceil(32),
+            depth,
+        };
+        enc.dispatch_thread_groups(groups, tg);
+        return;
+    }
+    enc.set_compute_pipeline_state(&k.transpose_swap12_batched_trail_f32);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: rows as u64,
+            height: cols as u64,
+            depth,
+        },
+        metal::MTLSize {
+            width: 16.min(rows as u64),
+            height: 16.min(cols as u64),
+            depth: 1,
+        },
+    );
+}
+
+fn metal_host_slices_enabled() -> bool {
+    matches!(
+        std::env::var("RLX_METAL_HOST_SLICE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
+fn encode_transpose_2d(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    dst: usize,
+    rows: u32,
+    cols: u32,
+) {
+    let use_tiled = rows >= 32 && cols >= 32;
+    enc.set_compute_pipeline_state(if use_tiled {
+        &k.transpose_2d_tiled_f32
+    } else {
+        &k.transpose_2d_f32
+    });
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), dst as u64);
+    enc.set_bytes(2, 4, &rows as *const u32 as *const _);
+    enc.set_bytes(3, 4, &cols as *const u32 as *const _);
+    if use_tiled {
+        // 32x32 tile, threadgroup (32,8).
+        let tg = metal::MTLSize {
+            width: 32,
+            height: 8,
+            depth: 1,
+        };
+        let groups = metal::MTLSize {
+            width: (rows as u64).div_ceil(32),
+            height: (cols as u64).div_ceil(32),
+            depth: 1,
+        };
+        enc.dispatch_thread_groups(groups, tg);
+    } else {
+        let tg_w = k.transpose_2d_f32.thread_execution_width().min(cols as u64);
+        let tg_h = (256 / tg_w.max(1)).min(rows as u64);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: rows as u64,
+                height: cols as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: tg_h,
+                depth: 1,
+            },
+        );
+    }
+}
+
+fn encode_transpose_last2_batched(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    dst: usize,
+    batch: u32,
+    rows: u32,
+    cols: u32,
+) {
+    let use_tiled = rows >= 32 && cols >= 32;
+    enc.set_compute_pipeline_state(if use_tiled {
+        &k.transpose_last2_batched_tiled_f32
+    } else {
+        &k.transpose_last2_batched_f32
+    });
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), dst as u64);
+    enc.set_bytes(2, 4, &batch as *const u32 as *const _);
+    enc.set_bytes(3, 4, &rows as *const u32 as *const _);
+    enc.set_bytes(4, 4, &cols as *const u32 as *const _);
+    if use_tiled {
+        let tg = metal::MTLSize {
+            width: 32,
+            height: 8,
+            depth: 1,
+        };
+        let groups = metal::MTLSize {
+            width: (rows as u64).div_ceil(32),
+            height: (cols as u64).div_ceil(32),
+            depth: batch as u64,
+        };
+        enc.dispatch_thread_groups(groups, tg);
+    } else {
+        let tg_w = k
+            .transpose_last2_batched_f32
+            .thread_execution_width()
+            .min(rows as u64);
+        let tg_h = (256 / tg_w.max(1)).min(cols as u64);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: rows as u64,
+                height: cols as u64,
+                depth: batch as u64,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: tg_h,
+                depth: 1,
+            },
+        );
+    }
+}
+
 fn encode_transpose(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -5248,6 +7849,12 @@ fn encode_elementwise_region(
     chain: &[u32; 128],
     scalar_input_mask: u32,
     input_modulus: &[u32; 16],
+    prologue: u32,
+    out_n: u32,
+    out_c: u32,
+    out_h: u32,
+    out_w: u32,
+    prologue_input: u32,
 ) {
     enc.set_compute_pipeline_state(&k.elementwise_region);
     enc.set_buffer(0, Some(buffer), 0);
@@ -5288,15 +7895,135 @@ fn encode_elementwise_region(
         (input_modulus.len() * 4) as u64,
         input_modulus.as_ptr() as *const _,
     );
+    enc.set_bytes(
+        9,
+        std::mem::size_of::<u32>() as u64,
+        &prologue as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        10,
+        std::mem::size_of::<u32>() as u64,
+        &out_n as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        11,
+        std::mem::size_of::<u32>() as u64,
+        &out_c as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        12,
+        std::mem::size_of::<u32>() as u64,
+        &out_h as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        13,
+        std::mem::size_of::<u32>() as u64,
+        &out_w as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        14,
+        std::mem::size_of::<u32>() as u64,
+        &prologue_input as *const u32 as *const _,
+    );
+    if prologue != 0 && out_h > 0 && out_w > 0 {
+        let grid = metal::MTLSize {
+            width: out_w as u64,
+            height: out_h as u64,
+            depth: (out_n as u64) * (out_c as u64),
+        };
+        let tg = metal::MTLSize {
+            width: 8.min(out_w as u64),
+            height: 8.min(out_h as u64),
+            depth: 1,
+        };
+        enc.dispatch_threads(grid, tg);
+    } else {
+        let tg_w = k
+            .elementwise_region
+            .thread_execution_width()
+            .min(len as u64);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: len as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+}
+
+fn encode_batch_elementwise_region(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    slice_len: u32,
+    num_batch: u32,
+    num_steps: u32,
+    base_dst: usize,
+    slice_elems: u32,
+    batch_input_offs: &[u32; 64],
+    chain: &[u32; 128],
+    scalar_input_mask: u32,
+    input_modulus: &[u32; 16],
+) {
+    enc.set_compute_pipeline_state(&k.batch_elementwise_region);
+    enc.set_buffer(0, Some(buffer), 0);
+    enc.set_bytes(
+        1,
+        std::mem::size_of::<u32>() as u64,
+        &slice_len as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        2,
+        std::mem::size_of::<u32>() as u64,
+        &num_batch as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        3,
+        std::mem::size_of::<u32>() as u64,
+        &num_steps as *const u32 as *const _,
+    );
+    let base_dst_u32 = (base_dst / 4) as u32;
+    enc.set_bytes(
+        4,
+        std::mem::size_of::<u32>() as u64,
+        &base_dst_u32 as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        5,
+        std::mem::size_of::<u32>() as u64,
+        &slice_elems as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        6,
+        (batch_input_offs.len() * 4) as u64,
+        batch_input_offs.as_ptr() as *const _,
+    );
+    enc.set_bytes(7, (chain.len() * 4) as u64, chain.as_ptr() as *const _);
+    enc.set_bytes(
+        8,
+        std::mem::size_of::<u32>() as u64,
+        &scalar_input_mask as *const u32 as *const _,
+    );
+    enc.set_bytes(
+        9,
+        (input_modulus.len() * 4) as u64,
+        input_modulus.as_ptr() as *const _,
+    );
     let tg_w = k
-        .elementwise_region
+        .batch_elementwise_region
         .thread_execution_width()
-        .min(len as u64);
+        .min(slice_len as u64);
     enc.dispatch_threads(
         metal::MTLSize {
-            width: len as u64,
+            width: slice_len as u64,
             height: 1,
-            depth: 1,
+            depth: num_batch as u64,
         },
         metal::MTLSize {
             width: tg_w,
@@ -5584,9 +8311,19 @@ fn encode_softmax(
     enc.dispatch_threads(grid, tg);
 }
 
-/// Dispatch a concat-along-last-axis as N segment-kernel calls, one per
-/// input tensor. Each segment writes its source buffer into the
-/// corresponding slice of the destination's last dimension.
+fn metal_concat_multi_enabled() -> bool {
+    !rlx_ir::env::flag("RLX_METAL_CONCAT_MULTI")
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConcatSegGpu {
+    src: u32,
+    dst_col: u32,
+    len: u32,
+}
+
+/// Dispatch a concat-along-last-axis. Uses one multi-segment kernel when possible.
 fn encode_concat_lastax(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -5598,30 +8335,139 @@ fn encode_concat_lastax(
     inputs: &[(usize, u32)],
 ) {
     use crate::thunk::HalfFlag;
+    // GQA `repeat_kv` concats 16 head slices; `concat_lastax_multi{,4}` mis-copies
+    // beyond 8 segments on Apple GPUs — use per-segment kernels instead.
+    if inputs.len() >= 2
+        && inputs.len() <= 8
+        && matches!(dt, HalfFlag::F32)
+        && metal_concat_multi_enabled()
+        && inputs.len() <= NARROW_BATCH_MAX
+    {
+        let mut cum = 0u32;
+        let segs: Vec<ConcatSegGpu> = inputs
+            .iter()
+            .map(|&(src_off, src_axis)| {
+                let seg = ConcatSegGpu {
+                    src: src_off as u32,
+                    dst_col: cum,
+                    len: src_axis,
+                };
+                cum += src_axis;
+                seg
+            })
+            .collect();
+        let num_seg = segs.len() as u32;
+        let max_len = segs.iter().map(|s| s.len).max().unwrap_or(0);
+        let use_vec4 = dst_axis.is_multiple_of(4)
+            && cum == dst_axis
+            && segs
+                .iter()
+                .all(|s| (s.dst_col % 4) == 0 && (s.len % 4) == 0 && s.len >= 4);
+        if use_vec4 {
+            let dst_axis4 = dst_axis / 4;
+            let max_len4 = max_len / 4;
+            enc.set_compute_pipeline_state(&k.concat_lastax_multi4);
+            enc.set_buffer(0, Some(buffer), 0);
+            enc.set_bytes(1, 4, &(dst as u32) as *const u32 as *const _);
+            enc.set_bytes(2, 4, &outer as *const u32 as *const _);
+            enc.set_bytes(3, 4, &dst_axis4 as *const u32 as *const _);
+            enc.set_bytes(4, 4, &num_seg as *const u32 as *const _);
+            enc.set_bytes(
+                5,
+                (segs.len() * std::mem::size_of::<ConcatSegGpu>()) as u64,
+                segs.as_ptr() as *const _,
+            );
+            let grid = metal::MTLSize {
+                width: max_len4 as u64,
+                height: outer as u64,
+                depth: num_seg as u64,
+            };
+            let tg = metal::MTLSize {
+                width: 64.min(max_len4 as u64),
+                height: 4.min(outer as u64),
+                depth: num_seg as u64,
+            };
+            enc.dispatch_threads(grid, tg);
+            return;
+        }
+        enc.set_compute_pipeline_state(&k.concat_lastax_multi);
+        enc.set_buffer(0, Some(buffer), 0);
+        enc.set_bytes(1, 4, &(dst as u32) as *const u32 as *const _);
+        enc.set_bytes(2, 4, &outer as *const u32 as *const _);
+        enc.set_bytes(3, 4, &dst_axis as *const u32 as *const _);
+        enc.set_bytes(4, 4, &num_seg as *const u32 as *const _);
+        enc.set_bytes(
+            5,
+            (segs.len() * std::mem::size_of::<ConcatSegGpu>()) as u64,
+            segs.as_ptr() as *const _,
+        );
+        let grid = metal::MTLSize {
+            width: max_len as u64,
+            height: outer as u64,
+            depth: num_seg as u64,
+        };
+        let tg = metal::MTLSize {
+            width: 32.min(max_len as u64),
+            height: 8.min(outer as u64),
+            depth: num_seg as u64,
+        };
+        enc.dispatch_threads(grid, tg);
+        return;
+    }
+
     let pipeline = match dt {
         HalfFlag::F32 => &k.concat_segment_lastax,
         HalfFlag::F16 => &k.concat_segment_lastax_h,
     };
     let mut cum: u32 = 0;
     for &(src_off, src_axis) in inputs {
-        enc.set_compute_pipeline_state(pipeline);
-        enc.set_buffer(0, Some(buffer), src_off as u64);
-        enc.set_buffer(1, Some(buffer), dst as u64);
-        enc.set_bytes(2, 4, &outer as *const u32 as *const _);
-        enc.set_bytes(3, 4, &src_axis as *const u32 as *const _);
-        enc.set_bytes(4, 4, &dst_axis as *const u32 as *const _);
-        enc.set_bytes(5, 4, &cum as *const u32 as *const _);
-        let grid = metal::MTLSize {
-            width: src_axis as u64,
-            height: outer as u64,
-            depth: 1,
-        };
-        let tg = metal::MTLSize {
-            width: 16.min(src_axis as u64),
-            height: 16.min(outer as u64),
-            depth: 1,
-        };
-        enc.dispatch_threads(grid, tg);
+        let use_vec4 = matches!(dt, HalfFlag::F32)
+            && (src_axis % 4) == 0
+            && dst_axis.is_multiple_of(4)
+            && cum.is_multiple_of(4)
+            && src_axis >= 4;
+        if use_vec4 {
+            let src_axis4 = src_axis / 4;
+            let dst_axis4 = dst_axis / 4;
+            let dst_col4 = cum / 4;
+            enc.set_compute_pipeline_state(&k.concat_segment_lastax4);
+            enc.set_buffer(0, Some(buffer), src_off as u64);
+            enc.set_buffer(1, Some(buffer), dst as u64);
+            enc.set_bytes(2, 4, &outer as *const u32 as *const _);
+            enc.set_bytes(3, 4, &src_axis4 as *const u32 as *const _);
+            enc.set_bytes(4, 4, &dst_axis4 as *const u32 as *const _);
+            enc.set_bytes(5, 4, &dst_col4 as *const u32 as *const _);
+            let grid = metal::MTLSize {
+                width: src_axis4 as u64,
+                height: outer as u64,
+                depth: 1,
+            };
+            let tg = metal::MTLSize {
+                width: 64.min(src_axis4 as u64),
+                height: 4.min(outer as u64),
+                depth: 1,
+            };
+            enc.dispatch_threads(grid, tg);
+        } else {
+            enc.set_compute_pipeline_state(pipeline);
+            enc.set_buffer(0, Some(buffer), src_off as u64);
+            enc.set_buffer(1, Some(buffer), dst as u64);
+            enc.set_bytes(2, 4, &outer as *const u32 as *const _);
+            enc.set_bytes(3, 4, &src_axis as *const u32 as *const _);
+            enc.set_bytes(4, 4, &dst_axis as *const u32 as *const _);
+            enc.set_bytes(5, 4, &cum as *const u32 as *const _);
+            let grid = metal::MTLSize {
+                width: src_axis as u64,
+                height: outer as u64,
+                depth: 1,
+            };
+            let tg = metal::MTLSize {
+                width: 16.min(src_axis as u64),
+                height: 16.min(outer as u64),
+                depth: 1,
+            };
+            enc.dispatch_threads(grid, tg);
+        }
         cum += src_axis;
     }
 }

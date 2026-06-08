@@ -21,7 +21,8 @@
 //! time.
 //!
 //! Composite ops (LayerNorm, RmsNorm, Softmax, Attention, Rope, Pool,
-//! ElementwiseRegion, ...) are decomposed in HLO directly — no
+//! ElementwiseRegion, TransformRegion, and BatchElementwiseRegion are
+//! lowered inline as primitive HLO (chain walk / per-slice concat).
 //! custom_call. Keeps the emitted module portable across PJRT
 //! plugins (TPU, CPU, GPU). FusedSwiGLU / FusedAttentionBlock /
 //! FusedTransformerLayer / LoraMatMul / If / While are normalized
@@ -33,7 +34,10 @@
 
 use std::collections::HashMap;
 
-use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::op::{
+    Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp, RegionPrologue,
+    TransformStep,
+};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, NodeId, Op};
 
@@ -447,12 +451,39 @@ impl<'a> LowerCtx<'a> {
                 num_inputs,
                 scalar_input_mask,
                 input_modulus,
+                prologue,
+                prologue_input,
             } => self.lower_elementwise_region(
                 &n.inputs,
                 chain,
                 *num_inputs,
                 *scalar_input_mask,
                 input_modulus,
+                out_shape,
+                *prologue,
+                *prologue_input,
+            ),
+
+            Op::TransformRegion { steps, num_inputs } => {
+                self.lower_transform_region(&n.inputs, steps, *num_inputs, out_shape)
+            }
+
+            Op::BatchElementwiseRegion {
+                chain,
+                num_batch_inputs,
+                scalar_input_mask,
+                input_modulus,
+                prologue,
+                prologue_input,
+            } => self.lower_batch_elementwise_region(
+                &n.inputs,
+                chain,
+                *num_batch_inputs,
+                *scalar_input_mask,
+                input_modulus,
+                *prologue,
+                *prologue_input,
+                &n.shape,
                 out_shape,
             ),
 
@@ -1041,6 +1072,8 @@ impl<'a> LowerCtx<'a> {
         scalar_input_mask: u32,
         input_modulus: &[u32; 16],
         out_shape: Shape,
+        prologue: RegionPrologue,
+        prologue_input: u32,
     ) -> i64 {
         // Walk the chain, materializing each step as a regular HLO
         // op. ChainOperand::Input(i) refers to inputs[i] (broadcast
@@ -1061,6 +1094,16 @@ impl<'a> LowerCtx<'a> {
                 self.broadcast_to_target(id, &in_dims, target)
             };
             input_hlo.push(placed);
+        }
+        if prologue == RegionPrologue::ResizeNearest2x {
+            let pi = prologue_input as usize;
+            if pi >= n {
+                panic!(
+                    "rlx-tpu ElementwiseRegion: prologue_input={pi} out of range (num_inputs={n})"
+                );
+            }
+            let up_shape = self.resize_nearest_2x_shape(inputs[pi]);
+            input_hlo[pi] = self.lower_resize_nearest_2x_nchw(input_hlo[pi], inputs[pi], up_shape);
         }
         let mut step_results: Vec<i64> = Vec::with_capacity(chain.len());
 
@@ -1120,6 +1163,110 @@ impl<'a> LowerCtx<'a> {
         }
         // Output is the last step's result.
         *step_results.last().unwrap_or(&0)
+    }
+
+    fn resize_nearest_2x_shape(&self, input_id: NodeId) -> Shape {
+        let dims = self.ir_shape_dims(input_id);
+        assert_eq!(
+            dims.len(),
+            4,
+            "rlx-tpu resize_nearest_2x: expected NCHW rank 4, got rank {}",
+            dims.len()
+        );
+        Shape::array(
+            prim_of(self.dtype(input_id)),
+            &[dims[0], dims[1], dims[2] * 2, dims[3] * 2],
+        )
+    }
+
+    fn lower_resize_nearest_2x_nchw(&mut self, x: i64, input_id: NodeId, out: Shape) -> i64 {
+        let dims = self.ir_shape_dims(input_id);
+        assert_eq!(dims.len(), 4);
+        let dt = prim_of(self.dtype(input_id));
+        let rank6 = vec![dims[0], dims[1], dims[2], dims[3], 1, 1];
+        let r1 = self.entry.reshape(x, Shape::array(dt, &rank6));
+        let rank6_out = vec![dims[0], dims[1], dims[2], dims[3], 2, 2];
+        let bcast_dims: Vec<i64> = (0..4).collect();
+        let r2 = self
+            .entry
+            .broadcast(r1, &bcast_dims, Shape::array(dt, &rank6_out));
+        self.entry.reshape(r2, out)
+    }
+
+    fn lower_transform_region(
+        &mut self,
+        inputs: &[NodeId],
+        steps: &[TransformStep],
+        num_inputs: u32,
+        out_shape: Shape,
+    ) -> i64 {
+        let n = num_inputs as usize;
+        if n == 0 || inputs.is_empty() {
+            panic!("rlx-tpu TransformRegion: no inputs");
+        }
+        let mut cur = self.hlo(inputs[0]);
+        for step in steps {
+            match step {
+                TransformStep::ResizeNearest2x(src) => {
+                    let (x, id) = match src {
+                        ChainOperand::Input(i) => {
+                            let idx = *i as usize;
+                            if idx >= inputs.len() {
+                                panic!("rlx-tpu TransformRegion: input index {idx} out of range");
+                            }
+                            (self.hlo(inputs[idx]), inputs[idx])
+                        }
+                        ChainOperand::Step(_) => {
+                            panic!("rlx-tpu TransformRegion: step operands are not supported");
+                        }
+                    };
+                    let up = self.resize_nearest_2x_shape(id);
+                    cur = self.lower_resize_nearest_2x_nchw(x, id, up);
+                }
+            }
+        }
+        let _ = out_shape;
+        cur
+    }
+
+    fn lower_batch_elementwise_region(
+        &mut self,
+        inputs: &[NodeId],
+        chain: &[ChainStep],
+        num_batch: u32,
+        scalar_input_mask: u32,
+        input_modulus: &[u32; 16],
+        prologue: RegionPrologue,
+        prologue_input: u32,
+        batch_out: &rlx_ir::Shape,
+        out_shape: Shape,
+    ) -> i64 {
+        let n = num_batch as usize;
+        if inputs.len() != n {
+            panic!(
+                "rlx-tpu BatchElementwiseRegion: declared {n} batch inputs but node has {}",
+                inputs.len()
+            );
+        }
+        let slice_shape = rlx_ir::batch_region_slice_shape(batch_out);
+        let slice_dims: Vec<i64> = (0..slice_shape.rank())
+            .map(|d| slice_shape.dim(d).unwrap_static() as i64)
+            .collect();
+        let slice_out = Shape::array(prim_of(batch_out.dtype()), &slice_dims);
+        let mut slices = Vec::with_capacity(n);
+        for &in_id in inputs {
+            slices.push(self.lower_elementwise_region(
+                std::slice::from_ref(&in_id),
+                chain,
+                1,
+                scalar_input_mask,
+                input_modulus,
+                slice_out.clone(),
+                prologue,
+                prologue_input,
+            ));
+        }
+        self.entry.concat(&slices, 0, out_shape)
     }
 
     // ── MatMul ─────────────────────────────────────────────────

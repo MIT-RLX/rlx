@@ -38,9 +38,18 @@ fn probe_coop_f32_kernel_compiles() {
         return;
     }
 
-    let k = rlx_wgpu::kernels::matmul_coop_f32_kernel(&dev.device);
+    let k = rlx_wgpu::kernels::matmul_coop_f32_active_kernel(&dev.device);
     match k {
-        Some(_) => eprintln!("matmul_coop_f32 compiled OK"),
-        None => panic!("matmul_coop_f32 returned None despite coop matrix feature"),
+        Some(_) => eprintln!("matmul_coop_f32 active kernel compiled OK"),
+        None => eprintln!("no active coop f32 kernel for this backend"),
+    }
+    if f.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        && dev.backend == wgpu::Backend::Vulkan
+    {
+        let portable = rlx_wgpu::kernels::matmul_coop_f32_portable_kernel(&dev.device);
+        eprintln!(
+            "matmul_coop_f32_portable: {}",
+            if portable.is_some() { "OK" } else { "None" }
+        );
     }
 }

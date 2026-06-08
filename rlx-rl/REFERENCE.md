@@ -44,3 +44,6 @@ Maps to `configs/config.yaml`: `flow_map_warmup_steps`, `flow_map_anneal_end_ste
 - OGBench / RoboMimic loaders (`envs/`, `datasets/`)
 - WandB / HF checkpoint layout
 - `log_alpha` adaptive FMQ α
+## License
+
+GPL-3.0-only.

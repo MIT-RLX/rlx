@@ -30,11 +30,14 @@
 
 pub mod backend;
 pub mod buffer;
+pub mod calibrate;
+pub mod coop_f16_vk;
 pub mod device;
 pub mod fft_dispatch;
 pub mod fft_host;
 pub mod gdn_host;
 pub mod gguf_host;
+pub mod im2col_host;
 pub mod kernels;
 pub mod llada2_gate_host;
 #[cfg(feature = "splat")]

@@ -77,3 +77,7 @@ Llama32Flow::for_prefill(&cfg, 1, 128)
 ```
 
 See [`DESIGN.md`](DESIGN.md).
+
+## License
+
+GPL-3.0-only.

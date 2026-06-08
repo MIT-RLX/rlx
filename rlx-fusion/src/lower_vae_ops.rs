@@ -1,7 +1,19 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Lower VAE-specific ops (`GroupNorm`, `ResizeNearest2x`) to primitives.
+//! Lower VAE-specific ops (`GroupNorm`, `BatchNormInference`, `ResizeNearest2x`) to primitives.
 
 use crate::pass::Pass;
 use rlx_ir::infer::GraphExt;
@@ -40,6 +52,100 @@ fn broadcast_scalar_like(g: &mut Graph, scalar: NodeId, like: NodeId) -> NodeId 
         .map(|d| d.unwrap_static() as i64)
         .collect();
     expand_to(g, scalar, &target)
+}
+
+/// Broadcast a length-`C` vector (last axis) to match `like`'s shape.
+fn broadcast_channel_param(g: &mut Graph, param: NodeId, like: NodeId) -> NodeId {
+    let like_dims: Vec<usize> = g
+        .shape(like)
+        .dims()
+        .iter()
+        .map(|d| d.unwrap_static())
+        .collect();
+    let rank = like_dims.len();
+    let channels = like_dims[rank - 1];
+    let mut pad_dims = vec![1i64; rank.saturating_sub(1)];
+    pad_dims.push(channels as i64);
+    let padded = g.reshape_(param, pad_dims);
+    let target: Vec<i64> = like_dims.iter().map(|&d| d as i64).collect();
+    expand_to(g, padded, &target)
+}
+
+/// Inference BatchNorm with frozen running stats → elementwise ops.
+pub struct LowerBatchNormInference;
+
+impl Pass for LowerBatchNormInference {
+    fn name(&self) -> &str {
+        "lower_batch_norm_inference"
+    }
+
+    fn run(&self, graph: Graph) -> Graph {
+        if !graph
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::BatchNormInference { .. }))
+        {
+            return graph;
+        }
+
+        let mut new_graph = Graph::new(&graph.name);
+        let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+
+        for node in graph.nodes() {
+            let new_id = if let Op::BatchNormInference { eps } = &node.op {
+                let x = id_map[&node.inputs[0]];
+                let gamma = id_map[&node.inputs[1]];
+                let beta = id_map[&node.inputs[2]];
+                let mean = id_map[&node.inputs[3]];
+                let var = id_map[&node.inputs[4]];
+                lower_batch_norm_inference(
+                    &mut new_graph,
+                    x,
+                    gamma,
+                    beta,
+                    mean,
+                    var,
+                    node.shape.clone(),
+                    *eps,
+                )
+            } else {
+                let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+                new_graph.add_node(node.op.clone(), inputs, node.shape.clone())
+            };
+            id_map.insert(node.id, new_id);
+        }
+
+        let new_outputs: Vec<NodeId> = graph.outputs.iter().map(|i| id_map[i]).collect();
+        new_graph.set_outputs(new_outputs);
+        new_graph
+    }
+}
+
+fn lower_batch_norm_inference(
+    g: &mut Graph,
+    x: NodeId,
+    gamma: NodeId,
+    beta: NodeId,
+    mean: NodeId,
+    var: NodeId,
+    out_shape: Shape,
+    eps: f32,
+) -> NodeId {
+    let dtype = out_shape.dtype();
+    let mean_b = broadcast_channel_param(g, mean, x);
+    let var_b = broadcast_channel_param(g, var, x);
+    let x_centered = g.sub(x, mean_b);
+    let eps_c = scalar_const(g, eps, dtype);
+    let eps_b = broadcast_scalar_like(g, eps_c, var_b);
+    let var_eps = g.add(var_b, eps_b);
+    let one = scalar_const(g, 1.0, dtype);
+    let sqrt_var = g.sqrt(var_eps);
+    let inv_std = g.div(one, sqrt_var);
+    let xhat = g.mul(x_centered, inv_std);
+    let gamma_b = broadcast_channel_param(g, gamma, x);
+    let beta_b = broadcast_channel_param(g, beta, x);
+    let scaled = g.mul(xhat, gamma_b);
+    g.add(scaled, beta_b)
 }
 
 /// `GroupNorm` on NCHW → reshape / reduce / elementwise ops.
@@ -195,6 +301,33 @@ impl Pass for LowerResizeNearest2x {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn batch_norm_inference_lowers_to_primitives() {
+        let f = DType::F32;
+        let mut g = Graph::new("bn");
+        let x = g.input("x", Shape::new(&[2, 3, 4], f));
+        let gamma = g.param("g", Shape::new(&[4], f));
+        let beta = g.param("b", Shape::new(&[4], f));
+        let mean = g.param("m", Shape::new(&[4], f));
+        let var = g.param("v", Shape::new(&[4], f));
+        let out = g.batch_norm_inference(x, gamma, beta, mean, var, 1e-5);
+        g.set_outputs(vec![out]);
+
+        let lowered = LowerBatchNormInference.run(g);
+        assert!(
+            !lowered
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::BatchNormInference { .. }))
+        );
+        assert!(
+            lowered
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Binary { .. } | Op::Expand { .. }))
+        );
+    }
+
     #[test]
     fn group_norm_lowers_to_primitives() {
         let f = DType::F32;

@@ -116,3 +116,6 @@ assert!(report.compile_ready);
 rewrite + legalization probe when a backend is registered.
 
 See also the overview in the [workspace README](../README.md#kernel-dispatch-and-transparency).
+## License
+
+GPL-3.0-only.

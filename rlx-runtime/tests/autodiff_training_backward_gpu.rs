@@ -1,6 +1,19 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+//
 // GPU parity for fused training backward ops vs CPU thunks.
 
 use rlx_compile::legalize_broadcast::run_with_remap;
@@ -61,6 +74,7 @@ fn cpu_run(graph: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
 #[cfg(any(
     feature = "gpu",
     feature = "cuda",
+    feature = "rocm",
     all(target_os = "macos", feature = "metal")
 ))]
 fn assert_close(cpu: &[f32], gpu: &[f32], tol: f32) {
@@ -146,6 +160,28 @@ fn cuda_rms_norm_backward_input_matches_cpu() {
     assert_close(&want, &got, 1e-4);
 }
 
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_rms_norm_backward_input_matches_cpu() {
+    use rlx_runtime::{CompileOptions, Device, Session, is_available};
+    if !is_available(Device::Rocm) {
+        eprintln!("skip rocm_rms_norm_backward_input_matches_cpu (unavailable)");
+        return;
+    }
+    let (x, gamma, beta, dy) = rms_norm_inputs();
+    let bwd = build_rms_norm_bwd_input_graph();
+    let want = cpu_run(
+        bwd.clone(),
+        &[("x", &x), ("gamma", &gamma), ("beta", &beta), ("dy", &dy)],
+    );
+    let session = Session::new(Device::Rocm);
+    let mut compiled = session.compile_with(bwd, &CompileOptions::default());
+    let got = compiled
+        .run(&[("x", &x), ("gamma", &gamma), ("beta", &beta), ("dy", &dy)])
+        .remove(0);
+    assert_close(&want, &got, 1e-4);
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn metal_rms_norm_backward_input_matches_cpu() {
@@ -169,6 +205,7 @@ fn metal_rms_norm_backward_input_matches_cpu() {
 #[cfg(any(
     feature = "gpu",
     feature = "cuda",
+    feature = "rocm",
     all(target_os = "macos", feature = "metal")
 ))]
 fn build_rope_bwd_graph() -> Graph {
@@ -189,6 +226,7 @@ fn build_rope_bwd_graph() -> Graph {
 #[cfg(any(
     feature = "gpu",
     feature = "cuda",
+    feature = "rocm",
     all(target_os = "macos", feature = "metal")
 ))]
 fn rope_inputs() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -235,6 +273,25 @@ fn cuda_rope_backward_matches_cpu() {
     assert_close(&want, &got, 1e-4);
 }
 
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_rope_backward_matches_cpu() {
+    use rlx_runtime::{CompileOptions, Device, Session, is_available};
+    if !is_available(Device::Rocm) {
+        eprintln!("skip rocm_rope_backward_matches_cpu (unavailable)");
+        return;
+    }
+    let (dy, cos, sin) = rope_inputs();
+    let bwd = build_rope_bwd_graph();
+    let want = cpu_run(bwd.clone(), &[("dy", &dy), ("cos", &cos), ("sin", &sin)]);
+    let session = Session::new(Device::Rocm);
+    let mut compiled = session.compile_with(bwd, &CompileOptions::default());
+    let got = compiled
+        .run(&[("dy", &dy), ("cos", &cos), ("sin", &sin)])
+        .remove(0);
+    assert_close(&want, &got, 1e-4);
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn metal_rope_backward_matches_cpu() {
@@ -255,6 +312,7 @@ fn metal_rope_backward_matches_cpu() {
 #[cfg(any(
     feature = "gpu",
     feature = "cuda",
+    feature = "rocm",
     all(target_os = "macos", feature = "metal")
 ))]
 fn build_cumsum_bwd_graph() -> Graph {
@@ -271,6 +329,7 @@ fn build_cumsum_bwd_graph() -> Graph {
 #[cfg(any(
     feature = "gpu",
     feature = "cuda",
+    feature = "rocm",
     all(target_os = "macos", feature = "metal")
 ))]
 fn cumsum_inputs() -> Vec<f32> {
@@ -306,6 +365,23 @@ fn cuda_cumsum_backward_matches_cpu() {
     assert_close(&want, &got, 1e-4);
 }
 
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_cumsum_backward_matches_cpu() {
+    use rlx_runtime::{CompileOptions, Device, Session, is_available};
+    if !is_available(Device::Rocm) {
+        eprintln!("skip rocm_cumsum_backward_matches_cpu (unavailable)");
+        return;
+    }
+    let dy = cumsum_inputs();
+    let bwd = build_cumsum_bwd_graph();
+    let want = cpu_run(bwd.clone(), &[("dy", &dy)]);
+    let session = Session::new(Device::Rocm);
+    let mut compiled = session.compile_with(bwd, &CompileOptions::default());
+    let got = compiled.run(&[("dy", &dy)]).remove(0);
+    assert_close(&want, &got, 1e-4);
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn metal_cumsum_backward_matches_cpu() {
@@ -324,6 +400,7 @@ fn metal_cumsum_backward_matches_cpu() {
 #[cfg(any(
     feature = "gpu",
     feature = "cuda",
+    feature = "rocm",
     all(target_os = "macos", feature = "metal")
 ))]
 fn build_gather_bwd_graph() -> Graph {
@@ -339,6 +416,7 @@ fn build_gather_bwd_graph() -> Graph {
 #[cfg(any(
     feature = "gpu",
     feature = "cuda",
+    feature = "rocm",
     all(target_os = "macos", feature = "metal")
 ))]
 fn gather_inputs() -> (Vec<f32>, Vec<f32>) {
@@ -371,6 +449,25 @@ fn cuda_gather_backward_matches_cpu() {
     let bwd = build_gather_bwd_graph();
     let want = cpu_run(bwd.clone(), &[("dy", &dy), ("indices", &indices)]);
     let session = Session::new(Device::Cuda);
+    let mut compiled = session.compile_with(bwd, &CompileOptions::default());
+    let got = compiled
+        .run(&[("dy", &dy), ("indices", &indices)])
+        .remove(0);
+    assert_close(&want, &got, 1e-4);
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_gather_backward_matches_cpu() {
+    use rlx_runtime::{CompileOptions, Device, Session, is_available};
+    if !is_available(Device::Rocm) {
+        eprintln!("skip rocm_gather_backward_matches_cpu (unavailable)");
+        return;
+    }
+    let (dy, indices) = gather_inputs();
+    let bwd = build_gather_bwd_graph();
+    let want = cpu_run(bwd.clone(), &[("dy", &dy), ("indices", &indices)]);
+    let session = Session::new(Device::Rocm);
     let mut compiled = session.compile_with(bwd, &CompileOptions::default());
     let got = compiled
         .run(&[("dy", &dy), ("indices", &indices)])

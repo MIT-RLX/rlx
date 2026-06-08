@@ -1,6 +1,7 @@
 /target
 /models
 *.bak
+rlx-cuda/docker/vendor/
 
 # rig.sh — local remote CUDA rig (see rig.sh; config under scripts/rig/)
 rig.sh

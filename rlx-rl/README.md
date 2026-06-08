@@ -71,3 +71,7 @@ X_{r,t}(a_r \mid s) = a_r + (t-r)\, u_{r,t}(a_r \mid s), \quad a_1 = X_{0,1}(a_0
 \]
 
 Online FMQ: project \(a_1\) with \(\nabla_a Q\) inside a trust region, then regress \(u_{0,1}\) toward \(a_1^* - a_0\).
+
+## License
+
+GPL-3.0-only.

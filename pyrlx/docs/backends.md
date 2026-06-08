@@ -65,3 +65,29 @@ maturin develop --release \
 | `"vk"`             | `"vulkan"`         |
 | `"dx12"` / `"d3d12"` | `"directx"`      |
 | `"mtl"`            | `"metal"`          |
+
+## Multi-backend runtime (0.2.3+)
+
+After `maturin develop`, Python exposes the same multi-backend surface as Rust:
+
+| Class | Role |
+|-------|------|
+| `DevicePolicy` | Allow / deny / prefer backends; `from_env()` reads `RLX_*` |
+| `GraphDevices` | Lazy per-device compile cache; `run`, `run_chain`, `run_resolved` |
+| `FlexibleSession` | Defer backend until `compile_resolved` |
+| `DeviceRouter` | Warm-all on init; serving + fallback chain |
+
+```python
+import json, pyrlx as rlx
+
+print(json.loads(rlx.backends_manifest()))
+runner = rlx.GraphDevices(g, policy=rlx.DevicePolicy.only(["cpu", "metal"]))
+router = rlx.DeviceRouter(g, policy=rlx.DevicePolicy.from_env())
+```
+
+Full reference: [`docs/backend-selection.md`](../../docs/backend-selection.md).
+
+Tests: `pytest tests/test_graph_devices.py`.
+## License
+
+GPL-3.0-only.

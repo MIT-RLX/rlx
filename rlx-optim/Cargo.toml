@@ -1,0 +1,32 @@
+[package]
+name = "rlx-optim"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "RLX training-step optimizers — Adam, AdamW, NAdamW, RAdam, QHAdamW, LAMB, Adafactor, Lion, SOAP, Kron-PSGD, Muon, Sophia, MARS"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[features]
+default = []
+# Optional std::collections::HashMap-backed runner wrapper (matches the
+# pattern used by the rlx-umap host trainer). Off by default so the
+# crate stays minimal — pure step functions need no allocations of
+# their own.
+runner = []
+# Parallelize per-element inner loops via rayon when the tensor is
+# large enough to amortize the fork-join overhead (currently 64k
+# elements). Falls back to the sequential path when off.
+parallel = ["dep:rayon"]
+
+[dependencies]
+rayon = { version = "1.10", optional = true }
+
+[lints]
+workspace = true

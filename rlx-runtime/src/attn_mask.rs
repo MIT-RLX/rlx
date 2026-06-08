@@ -15,11 +15,33 @@
 
 //! Attention-mask helpers for bucketed decode (pad-to-upper, slice-back).
 
-/// Causal decode mask padded to bucket `upper`: `0` for positions `0..=past_seq`,
-/// large negative elsewhere (matches CPU `attn_mask_neg_inf` default).
+/// Causal decode mask padded to bucket `upper`.
+///
+/// **K layout** (after `concat(past_k, new_k_rope, dim=1)` in the decode graph):
+/// - `K[0..past_seq]`: real prompt K from the cache
+/// - `K[past_seq..upper]`: zero padding from `pad_layers_to_upper`
+/// - `K[upper]`: the newly rope-rotated K for the current token
+///
+/// So `mask[upper] = 1.0` (attend to self) and `mask[past_seq..upper] = 0.0`
+/// (mask the padding). An earlier off-by-one version attended padding at
+/// `past_seq` AND masked the new K at `upper`, which removed self-attention
+/// to the current token's own K and collapsed decode to degenerate tokens —
+/// `\n\n\n…` for short prompts, `attention attention attention…` for longer
+/// ones.
+///
+/// **Convention**: the IR's `MaskKind::Custom` is a **binary keep mask** —
+/// the CPU executor and Metal/MLX lowering all gate scores with a
+/// `m[ki] < 0.5` threshold.
 pub fn bucket_decode_mask(past_seq: usize, upper: usize) -> Vec<f32> {
-    const NEG: f32 = -1e9;
-    (0..upper)
-        .map(|i| if i <= past_seq { 0.0 } else { NEG })
+    // Graph mask shape is `[batch, upper + 1]` (past keys + new token).
+    (0..=upper)
+        .map(|i| {
+            if i < past_seq || i == upper {
+                // real past K, or newly-rope'd K for the current decode position
+                1.0
+            } else {
+                0.0 // padding
+            }
+        })
         .collect()
 }

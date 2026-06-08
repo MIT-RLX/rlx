@@ -24,6 +24,7 @@
 //!                Client_Create)
 //!   hlo.rs     — high-level builder API on top of prost types
 //!   lower.rs   — `rlx_ir::Graph` → HLO instruction emission
+//!   ir_passes.rs — shared pre-HLO pipeline (tier-2 fusion + FKL + unfuse)
 //!   unfuse.rs  — composite ops decomposed before lowering
 //!   backend.rs — `TpuExecutable`: compile, set_param, run
 
@@ -44,7 +45,9 @@ pub mod xla {
 
 pub mod backend;
 pub mod device;
+pub mod fk_pipeline;
 pub mod hlo;
+pub mod ir_passes;
 pub mod libtpu;
 pub mod lower;
 pub mod orchestrated;

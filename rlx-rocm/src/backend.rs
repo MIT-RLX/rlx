@@ -15,33 +15,15 @@
 
 //! `RocmExecutable` — sister to `rlx-cuda::CudaExecutable`.
 //!
-//! Currently lands the **structural foundation**: full `Step` enum,
-//! `CompileMode` / `ExecMode` (Stream + Eager — Graph + MultiStream
-//! deferred), `RocmExecutable` struct + lifecycle, `set_param` /
-//! `set_param_half` / output read, and the pure-Rust helpers
-//! (`step_offsets`, `fuse_elementwise_chains`, `step_name`,
-//! `prewarm_all`). The two remaining pieces are **mechanical ports**
-//! from `rlx-cuda` that need to be done with care since we can't
-//! validate on Mac:
-//!
-//!   1. `lower_graph()` — IR walk that builds `Vec<Step>` from a
-//!      `Graph`. Pure IR-level code; copy from `rlx-cuda::compile_with`
-//!      with `cudarc` type swaps where applicable. ~700 lines.
-//!
-//!   2. `dispatch_step()` — match-arm dispatch that maps each Step
-//!      to a kernel launch via the HIP shim. Custom kernels only —
-//!      no hipBLAS / hipBLASLt / MIOpen tiers (those land tier-by-
-//!      tier in subsequent commits). ~600 lines.
-//!
-//! Until those land, `compile_with` and `run` panic with a clear
-//! pointer to where the work picks up.
+//! Full IR walk, memory plan, Step emission, and HIP kernel dispatch
+//! mirroring `rlx-cuda` with `HipBuffer` / hipBLAS / MIOpen types.
 
 #![allow(clippy::too_many_arguments)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::{Graph, NodeId, Op};
 
 use std::sync::Mutex;
@@ -53,6 +35,7 @@ use crate::hipblas::{
     HipblasComputeType, HipblasContext, HipblasDatatype, HipblasOperation, hipblas_gemm_default,
 };
 use crate::hipblaslt::HipblasLtContext;
+use crate::host_staging::F32HostSlot;
 use crate::miopen::MiopenContext;
 
 const MIOPEN_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
@@ -214,6 +197,22 @@ pub(crate) enum Step {
         mask_kind: u32,
         scale_bits: u32,
         window: u32,
+        seq_q_stride: u32,
+        seq_k_stride: u32,
+        mask_batch_stride: u32,
+        mask_head_stride: u32,
+        q_batch_stride: u32,
+        q_head_stride: u32,
+        q_seq_stride: u32,
+        k_batch_stride: u32,
+        k_head_stride: u32,
+        k_seq_stride: u32,
+        v_batch_stride: u32,
+        v_head_stride: u32,
+        v_seq_stride: u32,
+        o_batch_stride: u32,
+        o_head_stride: u32,
+        o_seq_stride: u32,
     },
     AttentionBackward {
         batch: u32,
@@ -345,6 +344,25 @@ pub(crate) enum Step {
         dtype_tag: u32,
         use_gpu: bool,
     },
+    Im2ColHost {
+        x_byte_off: u32,
+        col_byte_off: u32,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw_dil: u32,
+        use_gpu: bool,
+    },
     GatedDeltaNet {
         q_byte_off: u32,
         k_byte_off: u32,
@@ -426,6 +444,48 @@ pub(crate) enum Step {
         loss_grad_clip: f32,
         sh_band: u32,
         max_anisotropy: f32,
+    },
+    GaussianSplatPrepare {
+        positions_off: u32,
+        positions_len: u32,
+        scales_off: u32,
+        scales_len: u32,
+        rotations_off: u32,
+        rotations_len: u32,
+        opacities_off: u32,
+        opacities_len: u32,
+        colors_off: u32,
+        colors_len: u32,
+        sh_coeffs_off: u32,
+        sh_coeffs_len: u32,
+        meta_off: u32,
+        meta_len: u32,
+        prep_off: u32,
+        prep_len: u32,
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        radius_scale: f32,
+        alpha_cutoff: f32,
+        max_splat_steps: u32,
+        transmittance_threshold: f32,
+        max_list_entries: u32,
+    },
+    GaussianSplatRasterize {
+        prep_off: u32,
+        prep_len: u32,
+        meta_off: u32,
+        meta_len: u32,
+        dst_off: u32,
+        dst_len: u32,
+        count: u32,
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        alpha_cutoff: f32,
+        max_splat_steps: u32,
+        transmittance_threshold: f32,
+        max_list_entries: u32,
     },
     RmsNormBackwardInput {
         x_byte_off: u32,
@@ -599,6 +659,58 @@ pub(crate) enum Step {
         w_off: u32,
         out_off: u32,
     },
+    LayerNorm2d {
+        src_off: u32,
+        g_off: u32,
+        b_off: u32,
+        dst_off: u32,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        eps_bits: u32,
+    },
+    ConvTranspose2d {
+        src_off: u32,
+        w_off: u32,
+        dst_off: u32,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+    },
+    GroupNorm {
+        src_off: u32,
+        g_off: u32,
+        b_off: u32,
+        dst_off: u32,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        num_groups: u32,
+        eps_bits: u32,
+    },
+    ResizeNearest2x {
+        src_off: u32,
+        dst_off: u32,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+    },
     FusedBinaryUnary {
         n: u32,
         a_off: u32,
@@ -629,6 +741,22 @@ pub(crate) enum Step {
         /// `arena[input_offs[i] + (gid % input_modulus[i])]`.
         input_modulus: [u32; 16],
         meta_idx: usize,
+        spatial_prologue: bool,
+        prologue_w: u32,
+        prologue_h: u32,
+        prologue_nc: u32,
+    },
+    BatchElementwiseRegion {
+        slice_len: u32,
+        num_batch: u32,
+        num_steps: u32,
+        base_dst_off: u32,
+        slice_elems: u32,
+        batch_input_offs: [u32; 64],
+        batch_offs_idx: usize,
+        meta_idx: usize,
+        scalar_input_mask: u32,
+        input_modulus: [u32; 16],
     },
 }
 
@@ -723,11 +851,14 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Sample { .. } => "rlx::Sample",
         Step::SelectiveScan { .. } => "rlx::SelectiveScan",
         Step::Fft { .. } => "rlx::Fft",
+        Step::Im2ColHost { .. } => "rlx::Im2ColHost",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Llada2GroupLimitedGate { .. } => "rlx::Llada2GroupLimitedGate",
         Step::UmapKnn { .. } => "rlx::UmapKnn",
         Step::GaussianSplatRender { .. } => "rlx::GaussianSplatRender",
         Step::GaussianSplatRenderBackward { .. } => "rlx::GaussianSplatRenderBackward",
+        Step::GaussianSplatPrepare { .. } => "rlx::GaussianSplatPrepare",
+        Step::GaussianSplatRasterize { .. } => "rlx::GaussianSplatRasterize",
         Step::RmsNormBackwardInput { .. } => "rlx::RmsNormBackwardInput",
         Step::RmsNormBackwardGamma { .. } => "rlx::RmsNormBackwardGamma",
         Step::RmsNormBackwardBeta { .. } => "rlx::RmsNormBackwardBeta",
@@ -740,8 +871,13 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Conv1d { .. } => "rlx::Conv1d",
         Step::Conv2d { .. } => "rlx::Conv2d",
         Step::Conv3d { .. } => "rlx::Conv3d",
+        Step::LayerNorm2d { .. } => "rlx::LayerNorm2d",
+        Step::ConvTranspose2d { .. } => "rlx::ConvTranspose2d",
+        Step::GroupNorm { .. } => "rlx::GroupNorm",
+        Step::ResizeNearest2x { .. } => "rlx::ResizeNearest2x",
         Step::FusedBinaryUnary { .. } => "rlx::FusedBinaryUnary",
         Step::ElementwiseRegion { .. } => "rlx::ElementwiseRegion",
+        Step::BatchElementwiseRegion { .. } => "rlx::BatchElementwiseRegion",
     }
 }
 
@@ -950,6 +1086,11 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dst_byte_off,
             ..
         } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
+        Step::Im2ColHost {
+            x_byte_off,
+            col_byte_off,
+            ..
+        } => (vec![*x_byte_off / 4], vec![*col_byte_off / 4]),
         Step::GatedDeltaNet {
             q_byte_off,
             k_byte_off,
@@ -1038,6 +1179,34 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ],
             vec![packed_off / 4],
         ),
+        Step::GaussianSplatPrepare {
+            positions_off,
+            scales_off,
+            rotations_off,
+            opacities_off,
+            colors_off,
+            sh_coeffs_off,
+            meta_off,
+            prep_off,
+            ..
+        } => (
+            vec![
+                positions_off / 4,
+                scales_off / 4,
+                rotations_off / 4,
+                opacities_off / 4,
+                colors_off / 4,
+                sh_coeffs_off / 4,
+                meta_off / 4,
+            ],
+            vec![prep_off / 4],
+        ),
+        Step::GaussianSplatRasterize {
+            prep_off,
+            meta_off,
+            dst_off,
+            ..
+        } => (vec![prep_off / 4, meta_off / 4], vec![dst_off / 4]),
         Step::RmsNormBackwardInput {
             x_byte_off,
             gamma_byte_off,
@@ -1137,6 +1306,29 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             out_off,
             ..
         } => (vec![*in_off, *w_off], vec![*out_off]),
+        Step::LayerNorm2d {
+            src_off,
+            g_off,
+            b_off,
+            dst_off,
+            ..
+        } => (vec![*src_off, *g_off, *b_off], vec![*dst_off]),
+        Step::ConvTranspose2d {
+            src_off,
+            w_off,
+            dst_off,
+            ..
+        } => (vec![*src_off, *w_off], vec![*dst_off]),
+        Step::GroupNorm {
+            src_off,
+            g_off,
+            b_off,
+            dst_off,
+            ..
+        } => (vec![*src_off, *g_off, *b_off], vec![*dst_off]),
+        Step::ResizeNearest2x {
+            src_off, dst_off, ..
+        } => (vec![*src_off], vec![*dst_off]),
         Step::FusedBinaryUnary {
             a_off,
             b_off,
@@ -1151,6 +1343,15 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         } => {
             let n = (*num_inputs as usize).min(input_offs.len());
             (input_offs[..n].to_vec(), vec![*dst_off])
+        }
+        Step::BatchElementwiseRegion {
+            base_dst_off,
+            batch_input_offs,
+            num_batch,
+            ..
+        } => {
+            let n = (*num_batch as usize).min(64);
+            (batch_input_offs[..n].to_vec(), vec![*base_dst_off])
         }
         Step::Llada2GroupLimitedGate {
             sig_off,
@@ -1515,6 +1716,8 @@ pub struct RocmExecutable {
     /// Scratch workspace for MIOpen-selected conv algorithms (32 MiB
     /// — same shape as rlx-cuda's cuDNN workspace).
     pub(crate) dnn_workspace: Option<HipBuffer<u8>>,
+    /// Byte offset in the f32 arena for GGUF dequant scratch (0 = none).
+    pub(crate) dequant_scratch_off: usize,
     pub(crate) graph: Graph,
     pub(crate) arena: Arena,
     pub(crate) schedule: Vec<Step>,
@@ -1534,6 +1737,23 @@ pub struct RocmExecutable {
     /// hipGraph capture (recorded at full extent) when set + every
     /// step in the safe set.
     pub(crate) active_extent: Option<(usize, usize)>,
+    /// Pinned or pageable host slots for output download.
+    pub(crate) output_staging: Vec<F32HostSlot>,
+    /// Pinned input staging when `RLX_ROCM_PINNED_IO=1` or graph mode.
+    pub(crate) input_staging: HashMap<String, F32HostSlot>,
+    /// Persistent KV inputs (host mirror + device upload each run).
+    gpu_handles: HashMap<String, Vec<f32>>,
+    gpu_handle_feeds: HashMap<String, usize>,
+    /// When set, only these output indices (+ feed outputs) are read back from device.
+    pending_read_indices: Option<Vec<usize>>,
+    /// Graph input names in declaration order (parallel to `input_slots`).
+    input_slot_names: Vec<String>,
+    /// Graph inputs in declaration order: `(arena_byte_offset, max_f32_elems)`.
+    input_slots: Vec<(usize, usize)>,
+    /// Host readback layout: `(byte_offset_in_host_arena, f32_elems)` per graph output.
+    output_slots: Vec<(usize, usize)>,
+    /// Pageable host mirror for `run_slots` / `arena_ptr` (not the GPU arena).
+    host_arena: Vec<f32>,
 }
 
 impl Step {
@@ -1555,8 +1775,45 @@ impl Step {
                 | Step::Cumsum { .. }
                 | Step::FusedBinaryUnary { .. }
                 | Step::ElementwiseRegion { .. }
+                | Step::BatchElementwiseRegion { .. }
         )
     }
+
+    /// False when the step performs host-side work or stream sync during dispatch.
+    pub fn graph_capture_safe(&self) -> bool {
+        match self {
+            Step::Im2ColHost { use_gpu, .. } | Step::Fft { use_gpu, .. } => *use_gpu,
+            Step::GatedDeltaNet { .. }
+            | Step::Llada2GroupLimitedGate { .. }
+            | Step::UmapKnn { .. }
+            | Step::GaussianSplatRender { .. }
+            | Step::GaussianSplatRenderBackward { .. }
+            | Step::GaussianSplatPrepare { .. }
+            | Step::GaussianSplatRasterize { .. } => false,
+            _ => true,
+        }
+    }
+}
+
+fn schedule_graph_capture_safe(schedule: &[Step]) -> bool {
+    schedule.iter().all(Step::graph_capture_safe)
+}
+
+fn im2col_use_gpu(n: u32, exec_mode: ExecMode) -> bool {
+    if rlx_ir::env::var("RLX_ROCM_IM2COL_HOST").is_some() {
+        return false;
+    }
+    if matches!(exec_mode, ExecMode::Graph) {
+        return n > 0;
+    }
+    n > 0
+}
+
+fn pinned_io_enabled(exec_mode: ExecMode) -> bool {
+    if matches!(exec_mode, ExecMode::Graph) {
+        return true;
+    }
+    rlx_ir::env::var("RLX_ROCM_PINNED_IO").is_some_and(|v| !v.eq_ignore_ascii_case("0"))
 }
 
 impl Drop for RocmExecutable {
@@ -1600,7 +1857,15 @@ impl RocmExecutable {
         // before memory planning.
         let graph = crate::unfuse::unfuse(graph);
 
-        let plan = plan_f32_uniform(&graph, 16);
+        let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
+        let mut plan = plan_f32_uniform(&graph, 16);
+        let dequant_scratch_off = if dequant_scratch > 0 {
+            let aligned = plan.arena_size.div_ceil(16) * 16;
+            plan.arena_size = aligned + dequant_scratch;
+            aligned
+        } else {
+            0
+        };
         let mut arena = Arena::from_plan(&ctx, &plan);
         for node in graph.nodes() {
             let elems = node.shape.num_elements().unwrap_or(0);
@@ -1639,6 +1904,25 @@ impl RocmExecutable {
 
         let mut schedule: Vec<Step> = Vec::new();
         let mut meta_buffers: Vec<HipBuffer<u32>> = Vec::new();
+        let mut packed_bshd_attn: HashMap<NodeId, (NodeId, u32)> = HashMap::new();
+        if !rlx_ir::env::flag("RLX_ROCM_NO_PACKED_BSHD_ATTN") {
+            for node in graph.nodes() {
+                let Op::Attention { .. } = &node.op else {
+                    continue;
+                };
+                if node.inputs.len() < 3 {
+                    continue;
+                }
+                if let Some((parent, head_width, _)) = rlx_ir::detect_packed_bshd_qkv_attention(
+                    &graph,
+                    node.inputs[0],
+                    node.inputs[1],
+                    node.inputs[2],
+                ) {
+                    packed_bshd_attn.insert(node.id, (parent, head_width as u32));
+                }
+            }
+        }
         for node in graph.nodes() {
             let elems = node.shape.num_elements().unwrap_or(0) as u32;
             match &node.op {
@@ -1724,20 +2008,108 @@ impl RocmExecutable {
                         out_off: (arena.offset(node.id) / 4) as u32,
                     });
                 }
+                Op::BatchElementwiseRegion {
+                    chain,
+                    num_batch_inputs,
+                    scalar_input_mask,
+                    input_modulus,
+                    prologue,
+                    prologue_input,
+                } => {
+                    let n = *num_batch_inputs as usize;
+                    if n == 0 || chain.len() > 32 {
+                        panic!(
+                            "rlx-rocm BatchElementwiseRegion: num_batch_inputs={n} steps={}",
+                            chain.len()
+                        );
+                    }
+                    let slice_shape = rlx_ir::batch_region_slice_shape(&node.shape);
+                    let slice_elems = rlx_ir::batch_region_slice_elems(&node.shape, n)
+                        .expect("batch region static shape");
+                    let base_dst_off = (arena.offset(node.id) / 4) as u32;
+                    let use_single = rlx_ir::fk_batch_use_single_launch(n, *prologue);
+                    if use_single {
+                        let mut batch_input_offs = [0u32; 64];
+                        for i in 0..n {
+                            batch_input_offs[i] = (arena.offset(node.inputs[i]) / 4) as u32;
+                        }
+                        let input_offs_meta = [0u32; 16];
+                        let meta_arr = rlx_ir::encode_elementwise_region_meta(
+                            &input_offs_meta,
+                            chain,
+                            *prologue,
+                            &slice_shape,
+                            *prologue_input,
+                        );
+                        let meta = upload_meta(&ctx, &meta_arr);
+                        let meta_idx = meta_buffers.len();
+                        meta_buffers.push(meta);
+                        let batch_vec: Vec<u32> = batch_input_offs[..n].to_vec();
+                        let batch_dev = upload_meta(&ctx, &batch_vec);
+                        let batch_offs_idx = meta_buffers.len();
+                        meta_buffers.push(batch_dev);
+                        schedule.push(Step::BatchElementwiseRegion {
+                            slice_len: slice_elems,
+                            num_batch: n as u32,
+                            num_steps: chain.len() as u32,
+                            base_dst_off,
+                            slice_elems,
+                            batch_input_offs,
+                            batch_offs_idx,
+                            meta_idx,
+                            scalar_input_mask: *scalar_input_mask,
+                            input_modulus: *input_modulus,
+                        });
+                    } else {
+                        for i in 0..n {
+                            let mut input_offs = [0u32; 16];
+                            input_offs[0] = (arena.offset(node.inputs[i]) / 4) as u32;
+                            let meta_arr = rlx_ir::encode_elementwise_region_meta(
+                                &input_offs,
+                                chain,
+                                *prologue,
+                                &slice_shape,
+                                *prologue_input,
+                            );
+                            let meta = upload_meta(&ctx, &meta_arr);
+                            let meta_idx = meta_buffers.len();
+                            meta_buffers.push(meta);
+                            let spatial =
+                                matches!(*prologue, rlx_ir::RegionPrologue::ResizeNearest2x);
+                            let grid = rlx_ir::PrologueLaunchGrid::from_output_shape(&slice_shape);
+                            schedule.push(Step::ElementwiseRegion {
+                                len: slice_elems,
+                                num_inputs: 1,
+                                num_steps: chain.len() as u32,
+                                dst_off: rlx_ir::batch_region_slice_dst_off_f32(
+                                    base_dst_off,
+                                    slice_elems,
+                                    i,
+                                ),
+                                input_offs,
+                                scalar_input_mask: *scalar_input_mask,
+                                input_modulus: *input_modulus,
+                                meta_idx,
+                                spatial_prologue: spatial,
+                                prologue_w: grid.map(|g| g.width).unwrap_or(0),
+                                prologue_h: grid.map(|g| g.height).unwrap_or(0),
+                                prologue_nc: grid.map(|g| g.depth).unwrap_or(0),
+                            });
+                        }
+                    }
+                }
                 Op::ElementwiseRegion {
                     chain,
                     num_inputs,
                     scalar_input_mask,
                     input_modulus,
+                    prologue,
+                    prologue_input,
                 } => {
                     // PLAN L2 native lowering. Encode the chain into a
-                    // 72-u32 metadata buffer (8 input offsets + 16 steps *
-                    // 4 u32s) uploaded once at compile time; the kernel
-                    // walks the chain interpretively in registers. Caps
-                    // and op_sub numbering match the cross-backend
-                    // Metal MSL / wgpu WGSL / rlx-cuda encoders so the
-                    // shared `elementwise_region.cu` kernel interprets
-                    // the byte stream identically.
+                    // 149-u32 metadata buffer (16 input offsets + 32 steps *
+                    // 4 u32s + prologue tail) uploaded once at compile time;
+                    // the kernel walks the chain interpretively in registers.
                     let n = *num_inputs as usize;
                     if n > 16 || chain.len() > 32 {
                         panic!(
@@ -1752,86 +2124,18 @@ impl RocmExecutable {
                     for (i, &id) in node.inputs.iter().enumerate() {
                         input_offs[i] = (arena.offset(id) / 4) as u32;
                     }
-                    let encode_operand = |op: &ChainOperand| -> u32 {
-                        match *op {
-                            ChainOperand::Input(i) => i & 0x7FFF_FFFFu32,
-                            ChainOperand::Step(i) => 0x8000_0000u32 | (i & 0x7FFF_FFFFu32),
-                        }
-                    };
-                    let act_sub = |a: Activation| match a {
-                        Activation::Gelu => 0u32,
-                        Activation::GeluApprox => 1,
-                        Activation::Silu => 2,
-                        Activation::Relu => 3,
-                        Activation::Sigmoid => 4,
-                        Activation::Tanh => 5,
-                        Activation::Exp => 6,
-                        Activation::Log => 7,
-                        Activation::Sqrt => 8,
-                        Activation::Rsqrt => 9,
-                        Activation::Neg => 10,
-                        Activation::Abs => 11,
-                        Activation::Round => 12,
-                        Activation::Sin => 13,
-                        Activation::Cos => 14,
-                        Activation::Tan => 15,
-                        Activation::Atan => 16,
-                    };
-                    let bin_sub = |b: BinaryOp| match b {
-                        BinaryOp::Add => 0u32,
-                        BinaryOp::Sub => 1,
-                        BinaryOp::Mul => 2,
-                        BinaryOp::Div => 3,
-                        BinaryOp::Max => 4,
-                        BinaryOp::Min => 5,
-                        BinaryOp::Pow => 6,
-                    };
-                    let cmp_sub = |c: CmpOp| match c {
-                        CmpOp::Eq => 0u32,
-                        CmpOp::Ne => 1,
-                        CmpOp::Lt => 2,
-                        CmpOp::Le => 3,
-                        CmpOp::Gt => 4,
-                        CmpOp::Ge => 5,
-                    };
-                    // meta layout: 16 input offsets + 32 steps × 4 u32s = 144 words.
-                    let mut meta_data: Vec<u32> = Vec::with_capacity(144);
-                    meta_data.extend_from_slice(&input_offs);
-                    let mut chain_enc = [0u32; 128];
-                    for (k, step) in chain.iter().enumerate() {
-                        let base = k * 4;
-                        let (kind, sub, lhs, rhs) = match step {
-                            ChainStep::Activation(a, src) => {
-                                (0u32, act_sub(*a), encode_operand(src), 0u32)
-                            }
-                            ChainStep::Cast(_, src) => (1u32, 0, encode_operand(src), 0u32),
-                            ChainStep::Binary(op, l, r) => {
-                                (2u32, bin_sub(*op), encode_operand(l), encode_operand(r))
-                            }
-                            ChainStep::Compare(op, l, r) => {
-                                (3u32, cmp_sub(*op), encode_operand(l), encode_operand(r))
-                            }
-                            ChainStep::Where(c, t, f) =>
-                            // Pack 3 operands into the 4-u32 step:
-                            // op_sub=cond, lhs=on_true, rhs=on_false.
-                            {
-                                (
-                                    4u32,
-                                    encode_operand(c),
-                                    encode_operand(t),
-                                    encode_operand(f),
-                                )
-                            }
-                        };
-                        chain_enc[base] = kind;
-                        chain_enc[base + 1] = sub;
-                        chain_enc[base + 2] = lhs;
-                        chain_enc[base + 3] = rhs;
-                    }
-                    meta_data.extend_from_slice(&chain_enc);
-                    let meta = upload_meta(&ctx, &meta_data);
+                    let meta_arr = rlx_ir::encode_elementwise_region_meta(
+                        &input_offs,
+                        chain,
+                        *prologue,
+                        &node.shape,
+                        *prologue_input,
+                    );
+                    let meta = upload_meta(&ctx, &meta_arr);
                     let meta_idx = meta_buffers.len();
                     meta_buffers.push(meta);
+                    let spatial = matches!(*prologue, rlx_ir::RegionPrologue::ResizeNearest2x);
+                    let grid = rlx_ir::PrologueLaunchGrid::from_output_shape(&node.shape);
                     schedule.push(Step::ElementwiseRegion {
                         len: elems,
                         num_inputs: *num_inputs,
@@ -1841,6 +2145,10 @@ impl RocmExecutable {
                         scalar_input_mask: *scalar_input_mask,
                         input_modulus: *input_modulus,
                         meta_idx,
+                        spatial_prologue: spatial,
+                        prologue_w: grid.map(|g| g.width).unwrap_or(0),
+                        prologue_h: grid.map(|g| g.height).unwrap_or(0),
+                        prologue_nc: grid.map(|g| g.depth).unwrap_or(0),
                     });
                 }
                 Op::Reduce {
@@ -2126,34 +2434,108 @@ impl RocmExecutable {
                     if q_shape.len() != 4 {
                         panic!("rlx-rocm Attention: unfuse should have promoted to rank-4");
                     }
-                    let batch = q_shape[0].unwrap_static() as u32;
-                    let heads = q_shape[1].unwrap_static() as u32;
-                    let seq_q = q_shape[2].unwrap_static() as u32;
-                    let seq_k = k_shape[2].unwrap_static() as u32;
+                    let q_ir = graph.node(q_id).shape.clone();
+                    let k_ir = graph.node(k_id).shape.clone();
+                    let geom = rlx_ir::attention_geom(&q_ir, &k_ir, *num_heads, *head_dim);
+                    let batch = geom.batch as u32;
+                    let heads = geom.heads as u32;
+                    let seq_q = geom.seq_q as u32;
+                    let seq_k = geom.seq_k as u32;
                     let hd = *head_dim as u32;
                     let scale = 1.0_f32 / (hd as f32).sqrt();
+                    let mask_shape = if matches!(mask_kind, MaskKind::Custom | MaskKind::Bias) {
+                        Some(graph.node(node.inputs[3]).shape.dims())
+                    } else {
+                        None
+                    };
+                    let packed_parent = packed_bshd_attn.get(&node.id).copied();
+                    let st = if let Some((_, head_width)) = packed_parent {
+                        let (qb, qh, qs) =
+                            rlx_ir::packed_bshd_qkv_strides(head_width as usize, hd, seq_q);
+                        let (ob, oh, os) =
+                            rlx_ir::strides_for_shape(node.shape.dims(), heads, hd, seq_q, false);
+                        let (mb, mh, mq, mk) = mask_shape
+                            .map(|m| rlx_ir::mask_strides_for_shape(m, heads, seq_q, seq_k))
+                            .unwrap_or_else(|| rlx_ir::mask_strides_bhsd(heads, seq_q, seq_k));
+                        rlx_ir::AttentionLaunchStrides {
+                            q_batch: qb,
+                            q_head: qh,
+                            q_seq: qs,
+                            k_batch: qb,
+                            k_head: qh,
+                            k_seq: qs,
+                            v_batch: qb,
+                            v_head: qh,
+                            v_seq: qs,
+                            o_batch: ob,
+                            o_head: oh,
+                            o_seq: os,
+                            mask_batch: mb,
+                            mask_head: mh,
+                            mask_q: mq,
+                            mask_k: mk,
+                        }
+                    } else {
+                        rlx_ir::attention_launch_strides(
+                            geom,
+                            q_shape,
+                            k_shape,
+                            graph.node(v_id).shape.dims(),
+                            node.shape.dims(),
+                            mask_shape,
+                        )
+                    };
+                    let (q_off, k_off, v_off) = if let Some((parent, head_width)) = packed_parent {
+                        let p = (arena.offset(parent) / 4) as u32;
+                        (
+                            p,
+                            p.saturating_add(head_width),
+                            p.saturating_add(head_width * 2),
+                        )
+                    } else {
+                        (
+                            (arena.offset(q_id) / 4) as u32,
+                            (arena.offset(k_id) / 4) as u32,
+                            (arena.offset(v_id) / 4) as u32,
+                        )
+                    };
                     let (mask_kind_id, mask_off, window) = match mask_kind {
                         MaskKind::None => (0u32, 0u32, 0u32),
                         MaskKind::Causal => (1u32, 0u32, 0u32),
                         MaskKind::Custom => (2u32, (arena.offset(node.inputs[3]) / 4) as u32, 0u32),
                         MaskKind::SlidingWindow(w) => (3u32, 0u32, *w as u32),
-                        MaskKind::Bias => (4u32, 0u32, 0u32),
+                        MaskKind::Bias => (4u32, (arena.offset(node.inputs[3]) / 4) as u32, 0u32),
                     };
-                    let _ = num_heads;
                     schedule.push(Step::Attention {
                         batch,
                         heads,
                         seq_q,
                         seq_k,
                         head_dim: hd,
-                        q_off: (arena.offset(q_id) / 4) as u32,
-                        k_off: (arena.offset(k_id) / 4) as u32,
-                        v_off: (arena.offset(v_id) / 4) as u32,
+                        q_off,
+                        k_off,
+                        v_off,
                         out_off: (arena.offset(node.id) / 4) as u32,
                         mask_off,
                         mask_kind: mask_kind_id,
                         scale_bits: scale.to_bits(),
                         window,
+                        seq_q_stride: st.mask_q,
+                        seq_k_stride: st.mask_k,
+                        mask_batch_stride: st.mask_batch,
+                        mask_head_stride: st.mask_head,
+                        q_batch_stride: st.q_batch,
+                        q_head_stride: st.q_head,
+                        q_seq_stride: st.q_seq,
+                        k_batch_stride: st.k_batch,
+                        k_head_stride: st.k_head,
+                        k_seq_stride: st.k_seq,
+                        v_batch_stride: st.v_batch,
+                        v_head_stride: st.v_head,
+                        v_seq_stride: st.v_seq,
+                        o_batch_stride: st.o_batch,
+                        o_head_stride: st.o_head,
+                        o_seq_stride: st.o_seq,
                     });
                 }
                 Op::AttentionBackward {
@@ -2430,6 +2812,65 @@ impl RocmExecutable {
                         use_gpu,
                     });
                 }
+                Op::Im2Col {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    if kernel_size.len() != 2 || x_shape.rank() != 4 {
+                        panic!("rlx-rocm Im2Col: 2D NCHW only");
+                    }
+                    let n = match x_shape.dim(0) {
+                        rlx_ir::shape::Dim::Static(v) => v as u32,
+                        _ => 0,
+                    };
+                    let c_in = x_shape.dim(1).unwrap_static() as u32;
+                    let h = x_shape.dim(2).unwrap_static() as u32;
+                    let w = x_shape.dim(3).unwrap_static() as u32;
+                    let kh = kernel_size[0] as u32;
+                    let kw = kernel_size[1] as u32;
+                    let sh = stride.first().copied().unwrap_or(1) as u32;
+                    let sw = stride.get(1).copied().unwrap_or(1) as u32;
+                    let ph = padding.first().copied().unwrap_or(0) as u32;
+                    let pw = padding.get(1).copied().unwrap_or(0) as u32;
+                    let dh = dilation.first().copied().unwrap_or(1) as u32;
+                    let dw_dil = dilation.get(1).copied().unwrap_or(1) as u32;
+                    let h_out = rlx_ir::shape::conv2d_spatial_output(
+                        h as usize,
+                        kh as usize,
+                        sh as usize,
+                        ph as usize,
+                        dh as usize,
+                    ) as u32;
+                    let w_out = rlx_ir::shape::conv2d_spatial_output(
+                        w as usize,
+                        kw as usize,
+                        sw as usize,
+                        pw as usize,
+                        dw_dil as usize,
+                    ) as u32;
+                    schedule.push(Step::Im2ColHost {
+                        x_byte_off: arena.offset(node.inputs[0]) as u32,
+                        col_byte_off: arena.offset(node.id) as u32,
+                        n,
+                        c_in,
+                        h,
+                        w,
+                        h_out,
+                        w_out,
+                        kh,
+                        kw,
+                        sh,
+                        sw,
+                        ph,
+                        pw,
+                        dh,
+                        dw_dil,
+                        use_gpu: im2col_use_gpu(n, exec_mode),
+                    });
+                }
                 Op::GatedDeltaNet {
                     state_size,
                     carry_state,
@@ -2577,6 +3018,157 @@ impl RocmExecutable {
                         loss_grad_clip: *loss_grad_clip,
                         sh_band: *sh_band,
                         max_anisotropy: *max_anisotropy,
+                    });
+                }
+
+                Op::GaussianSplatPrepare {
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    let elem_len = |id: NodeId| -> u32 {
+                        graph.node(id).shape.num_elements().unwrap_or(0) as u32
+                    };
+                    schedule.push(Step::GaussianSplatPrepare {
+                        positions_off: arena.offset(node.inputs[0]) as u32,
+                        positions_len: elem_len(node.inputs[0]),
+                        scales_off: arena.offset(node.inputs[1]) as u32,
+                        scales_len: elem_len(node.inputs[1]),
+                        rotations_off: arena.offset(node.inputs[2]) as u32,
+                        rotations_len: elem_len(node.inputs[2]),
+                        opacities_off: arena.offset(node.inputs[3]) as u32,
+                        opacities_len: elem_len(node.inputs[3]),
+                        colors_off: arena.offset(node.inputs[4]) as u32,
+                        colors_len: elem_len(node.inputs[4]),
+                        sh_coeffs_off: arena.offset(node.inputs[5]) as u32,
+                        sh_coeffs_len: elem_len(node.inputs[5]),
+                        meta_off: arena.offset(node.inputs[6]) as u32,
+                        meta_len: elem_len(node.inputs[6]),
+                        prep_off: arena.offset(node.id) as u32,
+                        prep_len: node.shape.num_elements().unwrap_or(0) as u32,
+                        width: *width,
+                        height: *height,
+                        tile_size: *tile_size,
+                        radius_scale: *radius_scale,
+                        alpha_cutoff: *alpha_cutoff,
+                        max_splat_steps: *max_splat_steps,
+                        transmittance_threshold: *transmittance_threshold,
+                        max_list_entries: *max_list_entries,
+                    });
+                }
+
+                Op::GaussianSplatRasterize {
+                    width,
+                    height,
+                    tile_size,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    let elem_len = |id: NodeId| -> u32 {
+                        graph.node(id).shape.num_elements().unwrap_or(0) as u32
+                    };
+                    let prep_id = node.inputs[0];
+                    let count = match &graph.node(prep_id).op {
+                        rlx_ir::Op::GaussianSplatPrepare { .. } => {
+                            elem_len(graph.node(prep_id).inputs[0]) / 3
+                        }
+                        _ => 1,
+                    };
+                    schedule.push(Step::GaussianSplatRasterize {
+                        prep_off: arena.offset(prep_id) as u32,
+                        prep_len: elem_len(prep_id),
+                        meta_off: arena.offset(node.inputs[1]) as u32,
+                        meta_len: elem_len(node.inputs[1]),
+                        dst_off: arena.offset(node.id) as u32,
+                        dst_len: node.shape.num_elements().unwrap_or(0) as u32,
+                        count,
+                        width: *width,
+                        height: *height,
+                        tile_size: *tile_size,
+                        alpha_cutoff: *alpha_cutoff,
+                        max_splat_steps: *max_splat_steps,
+                        transmittance_threshold: *transmittance_threshold,
+                        max_list_entries: *max_list_entries,
+                    });
+                }
+
+                Op::LayerNorm2d { eps } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::LayerNorm2d {
+                        src_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        g_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        b_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                        eps_bits: eps.to_bits(),
+                    });
+                }
+                Op::ConvTranspose2d {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    output_padding: _,
+                    groups,
+                } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let out_shape = &node.shape;
+                    schedule.push(Step::ConvTranspose2d {
+                        src_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        w_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c_in: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w_in: in_shape.dim(3).unwrap_static() as u32,
+                        c_out: out_shape.dim(1).unwrap_static() as u32,
+                        h_out: out_shape.dim(2).unwrap_static() as u32,
+                        w_out: out_shape.dim(3).unwrap_static() as u32,
+                        kh: kernel_size[0] as u32,
+                        kw: kernel_size[1] as u32,
+                        sh: stride.first().copied().unwrap_or(1) as u32,
+                        sw: stride.get(1).copied().unwrap_or(1) as u32,
+                        ph: padding.first().copied().unwrap_or(0) as u32,
+                        pw: padding.get(1).copied().unwrap_or(0) as u32,
+                        dh: dilation.first().copied().unwrap_or(1) as u32,
+                        dw: dilation.get(1).copied().unwrap_or(1) as u32,
+                        groups: *groups as u32,
+                    });
+                }
+                Op::GroupNorm { num_groups, eps } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::GroupNorm {
+                        src_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        g_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        b_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                        num_groups: *num_groups as u32,
+                        eps_bits: eps.to_bits(),
+                    });
+                }
+                Op::ResizeNearest2x => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::ResizeNearest2x {
+                        src_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
                     });
                 }
 
@@ -2930,6 +3522,47 @@ impl RocmExecutable {
             }
         }
 
+        let output_staging: Vec<F32HostSlot> = graph
+            .outputs
+            .iter()
+            .map(|&id| {
+                let elems = graph.node(id).shape.num_elements().unwrap_or(0);
+                F32HostSlot::new(&ctx.runtime, elems, pinned_io_enabled(exec_mode))
+            })
+            .collect();
+
+        let mut input_staging = HashMap::new();
+        if pinned_io_enabled(exec_mode) {
+            for (name, &id) in &input_offsets {
+                let elems = graph.node(id).shape.num_elements().unwrap_or(0);
+                input_staging.insert(name.clone(), F32HostSlot::new(&ctx.runtime, elems, true));
+            }
+        }
+
+        let mut input_slot_names = Vec::new();
+        let mut input_slots = Vec::new();
+        for node in graph.nodes() {
+            if let Op::Input { name } = &node.op {
+                let off = if arena.has(node.id) {
+                    arena.offset(node.id)
+                } else {
+                    0
+                };
+                let len = node.shape.num_elements().unwrap_or(0);
+                input_slot_names.push(name.clone());
+                input_slots.push((off, len));
+            }
+        }
+
+        let mut host_total = 0usize;
+        let mut output_slots = Vec::new();
+        for &id in &graph.outputs {
+            let n = graph.node(id).shape.num_elements().unwrap_or(0);
+            output_slots.push((host_total * 4, n));
+            host_total += n;
+        }
+        let host_arena = vec![0.0f32; host_total];
+
         Self {
             ctx,
             blas,
@@ -2937,6 +3570,7 @@ impl RocmExecutable {
             blas_lt_workspace,
             dnn,
             dnn_workspace,
+            dequant_scratch_off,
             graph,
             arena,
             schedule,
@@ -2948,7 +3582,83 @@ impl RocmExecutable {
             captured_graph: None,
             streams,
             active_extent: None,
+            output_staging,
+            input_staging,
+            gpu_handles: HashMap::new(),
+            gpu_handle_feeds: HashMap::new(),
+            pending_read_indices: None,
+            input_slot_names,
+            input_slots,
+            output_slots,
+            host_arena,
         }
+    }
+
+    /// Host buffer base for reading outputs after [`Self::run_slots`].
+    /// Offsets in the returned slot pairs are **byte** offsets into this buffer.
+    pub fn arena_ptr(&self) -> *const u8 {
+        self.host_arena.as_ptr() as *const u8
+    }
+
+    pub fn output_slots(&self) -> &[(usize, usize)] {
+        &self.output_slots
+    }
+
+    fn upload_slot_inputs(&mut self, inputs: &[&[f32]]) {
+        let rt = &self.ctx.runtime;
+        let arena_base = self.arena.buffer.ptr;
+        for (i, data) in inputs.iter().enumerate() {
+            let Some(&(byte_off, max_elems)) = self.input_slots.get(i) else {
+                break;
+            };
+            let off_f32 = byte_off / 4;
+            let len = data.len().min(max_elems);
+            if len == 0 {
+                continue;
+            }
+            let dst = arena_base + (off_f32 as u64) * 4;
+            if let Some(name) = self.input_slot_names.get(i) {
+                if let Some(host) = self.input_staging.get_mut(name.as_str()) {
+                    host.copy_from_host(&data[..len]);
+                    host.htod(rt, dst, len)
+                        .expect("rlx-rocm: pinned slot input upload failed");
+                    continue;
+                }
+            }
+            unsafe {
+                let _ = (rt.hip_memcpy_htod)(
+                    dst,
+                    data.as_ptr() as *const _,
+                    len * std::mem::size_of::<f32>(),
+                );
+            }
+        }
+    }
+
+    fn pack_host_arena(&mut self) {
+        let plan = self.readback_plan();
+        for &i in &plan {
+            if i >= self.output_staging.len() || i >= self.output_slots.len() {
+                continue;
+            }
+            let (byte_off, n) = self.output_slots[i];
+            if n == 0 {
+                continue;
+            }
+            let start = byte_off / 4;
+            let end = start + n;
+            if end <= self.host_arena.len() {
+                self.output_staging[i].copy_into(&mut self.host_arena[start..end]);
+            }
+        }
+    }
+
+    /// Fast path: positional inputs, D2H into [`Self::host_arena`], no per-output `Vec`.
+    pub fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
+        self.upload_slot_inputs(inputs);
+        let _ = self.run_inner(&[]);
+        self.pack_host_arena();
+        &self.output_slots
     }
 
     /// Hint the next `run` to process only the first `actual` rows
@@ -3015,10 +3725,49 @@ impl RocmExecutable {
     }
 
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        self.run_read_outputs(inputs, None)
+    }
+
+    /// Run and read back only selected outputs (+ GPU handle feed outputs).
+    pub fn run_read_outputs(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        read_indices: Option<&[usize]>,
+    ) -> Vec<Vec<f32>> {
+        self.pending_read_indices = read_indices.map(|s| s.to_vec());
+        let outs = self.run_inner(inputs);
+        self.pending_read_indices = None;
+        outs
+    }
+
+    pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
+        if !self.input_offsets.contains_key(name) {
+            return false;
+        }
+        self.gpu_handles.insert(name.to_string(), data.to_vec());
+        true
+    }
+
+    pub fn has_gpu_handle(&self, name: &str) -> bool {
+        self.gpu_handles.contains_key(name)
+    }
+
+    pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
+        self.gpu_handle_feeds
+            .insert(handle_name.to_string(), output_index);
+    }
+
+    pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
+        self.gpu_handles.get(name).cloned()
+    }
+
+    fn run_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         use crate::kernels::*;
 
         let stream = self.ctx.default_stream;
         let arena_base = self.arena.buffer.ptr;
+
+        self.stage_gpu_handle_inputs(inputs);
 
         // Copy inputs to device. Always done outside any graph capture
         // — inputs change between runs and shouldn't be baked into a
@@ -3029,12 +3778,18 @@ impl RocmExecutable {
             {
                 let off_f32 = self.arena.offset(id) / 4;
                 let dst = arena_base + (off_f32 as u64) * 4;
-                unsafe {
-                    let _ = (self.ctx.runtime.hip_memcpy_htod)(
-                        dst,
-                        data.as_ptr() as *const _,
-                        std::mem::size_of_val(data),
-                    );
+                if let Some(host) = self.input_staging.get_mut(name) {
+                    host.copy_from_host(data);
+                    host.htod(&self.ctx.runtime, dst, data.len())
+                        .expect("rlx-rocm: pinned input upload failed");
+                } else {
+                    unsafe {
+                        let _ = (self.ctx.runtime.hip_memcpy_htod)(
+                            dst,
+                            data.as_ptr() as *const _,
+                            std::mem::size_of_val(data),
+                        );
+                    }
                 }
             }
         }
@@ -3054,16 +3809,17 @@ impl RocmExecutable {
         };
 
         // hipGraph fast path: replay the previously-captured schedule.
-        let do_replay =
-            active.is_none() && self.exec_mode == ExecMode::Graph && self.captured_graph.is_some();
-        let do_capture =
-            active.is_none() && self.exec_mode == ExecMode::Graph && self.captured_graph.is_none();
+        let graph_eligible = active.is_none()
+            && self.exec_mode == ExecMode::Graph
+            && schedule_graph_capture_safe(&self.schedule);
+        let do_replay = graph_eligible && self.captured_graph.is_some();
+        let do_capture = graph_eligible && self.captured_graph.is_none();
         if do_replay {
             unsafe {
                 let _ = (self.ctx.runtime.hip_graph_launch)(self.captured_graph.unwrap(), stream);
                 let _ = (self.ctx.runtime.hip_stream_sync)(stream);
             }
-            return self.read_outputs();
+            return self.finalize_outputs();
         }
         if do_capture {
             // hipStreamCaptureMode_Relaxed = 2 (matches CUDA value).
@@ -3258,25 +4014,74 @@ impl RocmExecutable {
                     scalar_input_mask,
                     input_modulus,
                     meta_idx,
+                    spatial_prologue,
+                    prologue_w,
+                    prologue_h,
+                    prologue_nc,
                 } => {
                     let len_s = scale(*len);
                     if len_s == 0 {
                         continue;
                     }
                     let kernel = elementwise_region_kernel(&self.ctx);
-                    let (grid, block) = dispatch_grid_1d(len_s, 256);
+                    let ((gx, gy, gz), (bx, by, bz)) = if *spatial_prologue {
+                        dispatch_grid_prologue_nchw(*prologue_w, *prologue_h, *prologue_nc)
+                    } else {
+                        let (grid, block) = dispatch_grid_1d(len_s, 256);
+                        ((grid, 1, 1), (block, 1, 1))
+                    };
                     let mut meta_ptr = self.meta_buffers[*meta_idx].ptr;
                     crate::launch_kernel!(
                         kernel,
                         stream,
-                        (grid, 1, 1),
-                        (block, 1, 1),
+                        (gx, gy, gz),
+                        (bx, by, bz),
                         [
                             &mut arena_ptr,
                             &len_s,
                             num_inputs,
                             num_steps,
                             dst_off,
+                            &mut meta_ptr,
+                            scalar_input_mask,
+                            input_modulus
+                        ]
+                    );
+                }
+                Step::BatchElementwiseRegion {
+                    slice_len,
+                    num_batch,
+                    num_steps,
+                    base_dst_off,
+                    slice_elems,
+                    batch_offs_idx,
+                    meta_idx,
+                    scalar_input_mask,
+                    input_modulus,
+                    ..
+                } => {
+                    let slice_len_s = scale(*slice_len);
+                    let num_batch_s = scale(*num_batch);
+                    if slice_len_s == 0 || num_batch_s == 0 {
+                        continue;
+                    }
+                    let kernel = batch_elementwise_region_kernel(&self.ctx);
+                    let (grid_x, block_x) = dispatch_grid_1d(slice_len_s, 256);
+                    let mut batch_ptr = self.meta_buffers[*batch_offs_idx].ptr;
+                    let mut meta_ptr = self.meta_buffers[*meta_idx].ptr;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid_x, 1, num_batch_s),
+                        (block_x, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &slice_len_s,
+                            &num_batch_s,
+                            num_steps,
+                            base_dst_off,
+                            slice_elems,
+                            &mut batch_ptr,
                             &mut meta_ptr,
                             scalar_input_mask,
                             input_modulus
@@ -3692,32 +4497,109 @@ impl RocmExecutable {
                     mask_kind,
                     scale_bits,
                     window,
+                    seq_q_stride,
+                    seq_k_stride,
+                    mask_batch_stride,
+                    mask_head_stride,
+                    q_batch_stride,
+                    q_head_stride,
+                    q_seq_stride,
+                    k_batch_stride,
+                    k_head_stride,
+                    k_seq_stride,
+                    v_batch_stride,
+                    v_head_stride,
+                    v_seq_stride,
+                    o_batch_stride,
+                    o_head_stride,
+                    o_seq_stride,
                 } => {
-                    // FlashAttention-1: BR=16 q-rows per block, 128 threads/block.
-                    let kernel = attention_kernel(&self.ctx);
-                    let q_blocks = (*seq_q).div_ceil(16);
-                    crate::launch_kernel!(
-                        kernel,
-                        stream,
-                        (q_blocks, batch * heads, 1),
-                        (128, 1, 1),
-                        [
-                            &mut arena_ptr,
-                            batch,
-                            heads,
-                            seq_q,
-                            seq_k,
-                            head_dim,
-                            q_off,
-                            k_off,
-                            v_off,
-                            out_off,
-                            mask_off,
-                            mask_kind,
-                            scale_bits,
-                            window
-                        ]
+                    let use_row = rlx_ir::attention_dispatch_use_row(
+                        *head_dim,
+                        "RLX_ROCM_FORCE_ATTENTION_ROW",
                     );
+                    if use_row {
+                        let total = batch * heads * seq_q;
+                        let block = 256u32;
+                        crate::launch_kernel!(
+                            attention_row_kernel(&self.ctx),
+                            stream,
+                            (total.div_ceil(block), 1, 1),
+                            (block, 1, 1),
+                            [
+                                &mut arena_ptr,
+                                batch,
+                                heads,
+                                seq_q,
+                                seq_k,
+                                head_dim,
+                                q_off,
+                                k_off,
+                                v_off,
+                                out_off,
+                                mask_off,
+                                mask_kind,
+                                scale_bits,
+                                window,
+                                seq_q_stride,
+                                seq_k_stride,
+                                mask_batch_stride,
+                                mask_head_stride,
+                                q_batch_stride,
+                                q_head_stride,
+                                q_seq_stride,
+                                k_batch_stride,
+                                k_head_stride,
+                                k_seq_stride,
+                                v_batch_stride,
+                                v_head_stride,
+                                v_seq_stride,
+                                o_batch_stride,
+                                o_head_stride,
+                                o_seq_stride
+                            ]
+                        );
+                    } else {
+                        let q_blocks = (*seq_q).div_ceil(16);
+                        crate::launch_kernel!(
+                            attention_kernel(&self.ctx),
+                            stream,
+                            (q_blocks, batch * heads, 1),
+                            (128, 1, 1),
+                            [
+                                &mut arena_ptr,
+                                batch,
+                                heads,
+                                seq_q,
+                                seq_k,
+                                head_dim,
+                                q_off,
+                                k_off,
+                                v_off,
+                                out_off,
+                                mask_off,
+                                mask_kind,
+                                scale_bits,
+                                window,
+                                seq_q_stride,
+                                seq_k_stride,
+                                mask_batch_stride,
+                                mask_head_stride,
+                                q_batch_stride,
+                                q_head_stride,
+                                q_seq_stride,
+                                k_batch_stride,
+                                k_head_stride,
+                                k_seq_stride,
+                                v_batch_stride,
+                                v_head_stride,
+                                v_seq_stride,
+                                o_batch_stride,
+                                o_head_stride,
+                                o_seq_stride
+                            ]
+                        );
+                    }
                 }
                 Step::AttentionBackward {
                     batch,
@@ -4224,17 +5106,36 @@ impl RocmExecutable {
                     w_byte_off,
                     out_byte_off,
                 } => {
-                    crate::gguf_host::run_dequant_matmul_gguf(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        *m as usize,
-                        *k as usize,
-                        *n as usize,
-                        *scheme_id,
-                        *x_byte_off as usize,
-                        *w_byte_off as usize,
-                        *out_byte_off as usize,
-                    );
+                    let use_gpu = self.dequant_scratch_off > 0 && self.blas.is_some();
+                    if use_gpu {
+                        let blas = self.blas.as_ref().unwrap();
+                        crate::gguf_gpu::run_dequant_matmul_gguf_gpu(
+                            &self.ctx,
+                            stream,
+                            &self.arena.buffer,
+                            blas,
+                            *m as usize,
+                            *k as usize,
+                            *n as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            self.dequant_scratch_off,
+                            *out_byte_off as usize,
+                        );
+                    } else {
+                        crate::gguf_host::run_dequant_matmul_gguf(
+                            &self.ctx,
+                            &self.arena.buffer,
+                            *m as usize,
+                            *k as usize,
+                            *n as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
+                    }
                 }
                 Step::DequantGroupedMatmulGguf {
                     m,
@@ -4247,19 +5148,42 @@ impl RocmExecutable {
                     idx_byte_off,
                     out_byte_off,
                 } => {
-                    crate::gguf_host::run_dequant_grouped_matmul_gguf(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        *m as usize,
-                        *k as usize,
-                        *n as usize,
-                        *num_experts as usize,
-                        *scheme_id,
-                        *x_byte_off as usize,
-                        *w_byte_off as usize,
-                        *idx_byte_off as usize,
-                        *out_byte_off as usize,
-                    );
+                    let use_gpu = self.dequant_scratch_off > 0 && self.blas.is_some();
+                    if use_gpu {
+                        let blas = self.blas.as_ref().unwrap();
+                        unsafe {
+                            crate::gguf_gpu::run_dequant_grouped_matmul_gguf_gpu(
+                                &self.ctx,
+                                stream,
+                                &self.arena.buffer,
+                                blas,
+                                *m as usize,
+                                *k as usize,
+                                *n as usize,
+                                *num_experts as usize,
+                                *scheme_id,
+                                *x_byte_off as usize,
+                                *w_byte_off as usize,
+                                *idx_byte_off as usize,
+                                self.dequant_scratch_off,
+                                *out_byte_off as usize,
+                            );
+                        }
+                    } else {
+                        crate::gguf_host::run_dequant_grouped_matmul_gguf(
+                            &self.ctx,
+                            &self.arena.buffer,
+                            *m as usize,
+                            *k as usize,
+                            *n as usize,
+                            *num_experts as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *idx_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
+                    }
                 }
                 Step::SelectiveScan {
                     batch,
@@ -4332,6 +5256,81 @@ impl RocmExecutable {
                             *inverse,
                             *norm_tag,
                             rocm_fft_dtype_from_tag(*dtype_tag),
+                        );
+                    }
+                }
+                Step::Im2ColHost {
+                    x_byte_off,
+                    col_byte_off,
+                    n,
+                    c_in,
+                    h,
+                    w,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw_dil,
+                    use_gpu,
+                } => {
+                    if *use_gpu {
+                        let kernel = im2col_kernel(&self.ctx);
+                        let m_dim = *n * *h_out * *w_out;
+                        let k_dim = *c_in * *kh * *kw;
+                        let total = m_dim * k_dim;
+                        let (grid, block) = dispatch_grid_1d(total, 256);
+                        let x_off = *x_byte_off / 4;
+                        let col_off = *col_byte_off / 4;
+                        crate::launch_kernel!(
+                            kernel,
+                            stream,
+                            (grid, 1, 1),
+                            (block, 1, 1),
+                            [
+                                &mut arena_ptr,
+                                n,
+                                c_in,
+                                h,
+                                w,
+                                h_out,
+                                w_out,
+                                kh,
+                                kw,
+                                sh,
+                                sw,
+                                ph,
+                                pw,
+                                dh,
+                                dw_dil,
+                                &x_off,
+                                &col_off
+                            ]
+                        );
+                    } else {
+                        crate::im2col_host::run_im2col(
+                            &self.ctx,
+                            &self.arena.buffer,
+                            *x_byte_off as usize,
+                            *col_byte_off as usize,
+                            *n,
+                            *c_in,
+                            *h,
+                            *w,
+                            *h_out,
+                            *w_out,
+                            *kh,
+                            *kw,
+                            *sh,
+                            *sw,
+                            *ph,
+                            *pw,
+                            *dh,
+                            *dw_dil,
                         );
                     }
                 }
@@ -4548,6 +5547,98 @@ impl RocmExecutable {
                         *max_anisotropy,
                     );
                 }
+                Step::GaussianSplatPrepare {
+                    positions_off,
+                    positions_len,
+                    scales_off,
+                    scales_len,
+                    rotations_off,
+                    rotations_len,
+                    opacities_off,
+                    opacities_len,
+                    colors_off,
+                    colors_len,
+                    sh_coeffs_off,
+                    sh_coeffs_len,
+                    meta_off,
+                    meta_len,
+                    prep_off,
+                    prep_len,
+                    width,
+                    height,
+                    tile_size,
+                    radius_scale,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    crate::splat_host::run_gaussian_splat_prepare(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        *positions_off as usize,
+                        *positions_len as usize,
+                        *scales_off as usize,
+                        *scales_len as usize,
+                        *rotations_off as usize,
+                        *rotations_len as usize,
+                        *opacities_off as usize,
+                        *opacities_len as usize,
+                        *colors_off as usize,
+                        *colors_len as usize,
+                        *sh_coeffs_off as usize,
+                        *sh_coeffs_len as usize,
+                        *meta_off as usize,
+                        *meta_len as usize,
+                        *prep_off as usize,
+                        *prep_len as usize,
+                        *width,
+                        *height,
+                        *tile_size,
+                        *radius_scale,
+                        *alpha_cutoff,
+                        *max_splat_steps,
+                        *transmittance_threshold,
+                        *max_list_entries,
+                    );
+                }
+                Step::GaussianSplatRasterize {
+                    prep_off,
+                    prep_len,
+                    meta_off,
+                    meta_len,
+                    dst_off,
+                    dst_len,
+                    count,
+                    width,
+                    height,
+                    tile_size,
+                    alpha_cutoff,
+                    max_splat_steps,
+                    transmittance_threshold,
+                    max_list_entries,
+                } => {
+                    crate::splat_host::run_gaussian_splat_rasterize(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        *prep_off as usize,
+                        *prep_len as usize,
+                        *meta_off as usize,
+                        *meta_len as usize,
+                        *dst_off as usize,
+                        *dst_len as usize,
+                        *count as usize,
+                        *width,
+                        *height,
+                        *tile_size,
+                        *alpha_cutoff,
+                        *max_splat_steps,
+                        *transmittance_threshold,
+                        *max_list_entries,
+                    );
+                }
                 Step::RmsNormBackwardInput {
                     x_byte_off,
                     gamma_byte_off,
@@ -4558,18 +5649,30 @@ impl RocmExecutable {
                     h,
                     eps_bits,
                 } => {
-                    crate::training_bwd_host::run_rms_norm_backward_input(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        self.arena.size,
-                        *x_byte_off as usize,
-                        *gamma_byte_off as usize,
-                        *beta_byte_off as usize,
-                        *dy_byte_off as usize,
-                        *dx_byte_off as usize,
-                        *rows,
-                        *h,
-                        f32::from_bits(*eps_bits),
+                    let x_off = *x_byte_off / 4;
+                    let gamma_off = *gamma_byte_off / 4;
+                    let beta_off = *beta_byte_off / 4;
+                    let dy_off = *dy_byte_off / 4;
+                    let dx_off = *dx_byte_off / 4;
+                    let wrt = 0u32;
+                    let kernel = rms_norm_backward_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (*rows, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            rows,
+                            h,
+                            &x_off,
+                            &gamma_off,
+                            &beta_off,
+                            &dy_off,
+                            &dx_off,
+                            eps_bits,
+                            &wrt
+                        ]
                     );
                 }
                 Step::RmsNormBackwardGamma {
@@ -4582,18 +5685,39 @@ impl RocmExecutable {
                     h,
                     eps_bits,
                 } => {
-                    crate::training_bwd_host::run_rms_norm_backward_gamma(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        self.arena.size,
-                        *x_byte_off as usize,
-                        *gamma_byte_off as usize,
-                        *beta_byte_off as usize,
-                        *dy_byte_off as usize,
-                        *dgamma_byte_off as usize,
-                        *rows,
-                        *h,
-                        f32::from_bits(*eps_bits),
+                    let x_off = *x_byte_off / 4;
+                    let gamma_off = *gamma_byte_off / 4;
+                    let beta_off = *beta_byte_off / 4;
+                    let dy_off = *dy_byte_off / 4;
+                    let dgamma_off = *dgamma_byte_off / 4;
+                    let wrt = 1u32;
+                    let zk = rms_norm_bwd_zero_kernel(&self.ctx);
+                    let (zgrid, zblock) = dispatch_grid_1d(*h, 256);
+                    crate::launch_kernel!(
+                        zk,
+                        stream,
+                        (zgrid, 1, 1),
+                        (zblock, 1, 1),
+                        [&mut arena_ptr, &dgamma_off, h]
+                    );
+                    let kernel = rms_norm_backward_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (*rows, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            rows,
+                            h,
+                            &x_off,
+                            &gamma_off,
+                            &beta_off,
+                            &dy_off,
+                            &dgamma_off,
+                            eps_bits,
+                            &wrt
+                        ]
                     );
                 }
                 Step::RmsNormBackwardBeta {
@@ -4606,18 +5730,39 @@ impl RocmExecutable {
                     h,
                     eps_bits,
                 } => {
-                    crate::training_bwd_host::run_rms_norm_backward_beta(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        self.arena.size,
-                        *x_byte_off as usize,
-                        *gamma_byte_off as usize,
-                        *beta_byte_off as usize,
-                        *dy_byte_off as usize,
-                        *dbeta_byte_off as usize,
-                        *rows,
-                        *h,
-                        f32::from_bits(*eps_bits),
+                    let x_off = *x_byte_off / 4;
+                    let gamma_off = *gamma_byte_off / 4;
+                    let beta_off = *beta_byte_off / 4;
+                    let dy_off = *dy_byte_off / 4;
+                    let dbeta_off = *dbeta_byte_off / 4;
+                    let wrt = 2u32;
+                    let zk = rms_norm_bwd_zero_kernel(&self.ctx);
+                    let (zgrid, zblock) = dispatch_grid_1d(*h, 256);
+                    crate::launch_kernel!(
+                        zk,
+                        stream,
+                        (zgrid, 1, 1),
+                        (zblock, 1, 1),
+                        [&mut arena_ptr, &dbeta_off, h]
+                    );
+                    let kernel = rms_norm_backward_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (*rows, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            rows,
+                            h,
+                            &x_off,
+                            &gamma_off,
+                            &beta_off,
+                            &dy_off,
+                            &dbeta_off,
+                            eps_bits,
+                            &wrt
+                        ]
                     );
                 }
                 Step::RopeBackward {
@@ -4632,20 +5777,31 @@ impl RocmExecutable {
                     n_rot,
                     cos_len,
                 } => {
-                    crate::training_bwd_host::run_rope_backward(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        self.arena.size,
-                        *dy_byte_off as usize,
-                        *cos_byte_off as usize,
-                        *sin_byte_off as usize,
-                        *dx_byte_off as usize,
-                        *batch,
-                        *seq,
-                        *hidden,
-                        *head_dim,
-                        *n_rot,
-                        *cos_len,
+                    let dy_off = *dy_byte_off / 4;
+                    let cos_off = *cos_byte_off / 4;
+                    let sin_off = *sin_byte_off / 4;
+                    let dx_off = *dx_byte_off / 4;
+                    let kernel = rope_backward_kernel(&self.ctx);
+                    let total = batch * seq * hidden;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            batch,
+                            seq,
+                            hidden,
+                            head_dim,
+                            n_rot,
+                            &dy_off,
+                            &cos_off,
+                            &sin_off,
+                            &dx_off,
+                            cos_len
+                        ]
                     );
                 }
                 Step::CumsumBackward {
@@ -4655,15 +5811,17 @@ impl RocmExecutable {
                     cols,
                     exclusive,
                 } => {
-                    crate::training_bwd_host::run_cumsum_backward(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        self.arena.size,
-                        *dy_byte_off as usize,
-                        *dx_byte_off as usize,
-                        *rows,
-                        *cols,
-                        *exclusive,
+                    let dy_off = *dy_byte_off / 4;
+                    let dx_off = *dx_byte_off / 4;
+                    let excl = if *exclusive { 1u32 } else { 0u32 };
+                    let kernel = cumsum_backward_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*rows, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, rows, cols, &dy_off, &dx_off, &excl]
                     );
                 }
                 Step::GatherBackward {
@@ -4675,17 +5833,176 @@ impl RocmExecutable {
                     num_idx,
                     trailing,
                 } => {
-                    crate::training_bwd_host::run_gather_backward(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        self.arena.size,
-                        *dy_byte_off as usize,
-                        *indices_byte_off as usize,
-                        *dst_byte_off as usize,
-                        *outer,
-                        *axis_dim,
-                        *num_idx,
-                        *trailing,
+                    let dy_off = *dy_byte_off / 4;
+                    let idx_off = *indices_byte_off / 4;
+                    let dst_off = *dst_byte_off / 4;
+                    let total = *outer * *axis_dim * *trailing;
+                    if total > 0 {
+                        let zk = rms_norm_bwd_zero_kernel(&self.ctx);
+                        let (zgrid, zblock) = dispatch_grid_1d(total, 256);
+                        crate::launch_kernel!(
+                            zk,
+                            stream,
+                            (zgrid, 1, 1),
+                            (zblock, 1, 1),
+                            [&mut arena_ptr, &dst_off, &total]
+                        );
+                    }
+                    let kernel = gather_backward_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (*outer, (num_idx * trailing).div_ceil(256), 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            outer,
+                            axis_dim,
+                            num_idx,
+                            trailing,
+                            &dy_off,
+                            &idx_off,
+                            &dst_off
+                        ]
+                    );
+                }
+                Step::LayerNorm2d {
+                    src_off,
+                    g_off,
+                    b_off,
+                    dst_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                    eps_bits,
+                } => {
+                    let kernel = layer_norm2d_kernel(&self.ctx);
+                    let total = n * h * w;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            src_off,
+                            g_off,
+                            b_off,
+                            dst_off,
+                            n,
+                            c,
+                            h,
+                            w,
+                            eps_bits
+                        ]
+                    );
+                }
+                Step::ConvTranspose2d {
+                    src_off,
+                    w_off,
+                    dst_off,
+                    n,
+                    c_in,
+                    h,
+                    w_in,
+                    c_out,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw,
+                    groups,
+                } => {
+                    let kernel = conv_transpose2d_kernel(&self.ctx);
+                    let total = n * c_out * h_out * w_out;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            src_off,
+                            w_off,
+                            dst_off,
+                            n,
+                            c_in,
+                            h,
+                            w_in,
+                            c_out,
+                            h_out,
+                            w_out,
+                            kh,
+                            kw,
+                            sh,
+                            sw,
+                            ph,
+                            pw,
+                            dh,
+                            dw,
+                            groups
+                        ]
+                    );
+                }
+                Step::GroupNorm {
+                    src_off,
+                    g_off,
+                    b_off,
+                    dst_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                    num_groups,
+                    eps_bits,
+                } => {
+                    let kernel = group_norm_kernel(&self.ctx);
+                    let grid = n * num_groups;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            src_off,
+                            g_off,
+                            b_off,
+                            dst_off,
+                            n,
+                            c,
+                            h,
+                            w,
+                            num_groups,
+                            eps_bits
+                        ]
+                    );
+                }
+                Step::ResizeNearest2x {
+                    src_off,
+                    dst_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                } => {
+                    let kernel = resize_nearest_2x_kernel(&self.ctx);
+                    let total = n * c * h * 2 * w * 2;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, src_off, dst_off, n, c, h, w]
                     );
                 }
                 Step::Pool1d {
@@ -5188,27 +6505,118 @@ impl RocmExecutable {
         unsafe {
             let _ = (self.ctx.runtime.hip_stream_sync)(stream);
         }
-        self.read_outputs()
+        self.finalize_outputs()
     }
 
-    pub(crate) fn read_outputs(&self) -> Vec<Vec<f32>> {
-        self.graph
-            .outputs
-            .iter()
-            .map(|&id| {
+    fn readback_plan(&self) -> Vec<usize> {
+        let n = self.graph.outputs.len();
+        if self.pending_read_indices.is_none() && self.gpu_handle_feeds.is_empty() {
+            return (0..n).collect();
+        }
+        let mut set = std::collections::HashSet::new();
+        if let Some(ref want) = self.pending_read_indices {
+            set.extend(want.iter().copied());
+        } else {
+            return (0..n).collect();
+        }
+        for &idx in self.gpu_handle_feeds.values() {
+            set.insert(idx);
+        }
+        let mut v: Vec<_> = set.into_iter().collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn stage_gpu_handle_inputs(&mut self, inputs: &[(&str, &[f32])]) {
+        let arena_base = self.arena.buffer.ptr;
+        for (name, data) in &self.gpu_handles {
+            if inputs.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            if let Some(&id) = self.input_offsets.get(name.as_str())
+                && self.arena.has(id)
+            {
                 let off_f32 = self.arena.offset(id) / 4;
-                let elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
-                let mut host = vec![0.0_f32; elems];
-                let src = self.arena.buffer.ptr + (off_f32 as u64) * 4;
-                unsafe {
-                    let _ = (self.ctx.runtime.hip_memcpy_dtoh)(
-                        host.as_mut_ptr() as *mut _,
-                        src,
-                        elems * 4,
-                    );
+                let dst = arena_base + (off_f32 as u64) * 4;
+                if let Some(host) = self.input_staging.get_mut(name.as_str()) {
+                    host.copy_from_host(data);
+                    host.htod(&self.ctx.runtime, dst, data.len())
+                        .expect("rlx-rocm: gpu handle upload failed");
+                } else {
+                    unsafe {
+                        let _ = (self.ctx.runtime.hip_memcpy_htod)(
+                            dst,
+                            data.as_ptr() as *const _,
+                            std::mem::size_of_val(data.as_slice()),
+                        );
+                    }
                 }
-                host
-            })
+            }
+        }
+    }
+
+    fn refresh_gpu_handles_from_staging(&mut self, plan: &[usize]) {
+        for (name, &out_idx) in &self.gpu_handle_feeds {
+            if plan.contains(&out_idx) && out_idx < self.output_staging.len() {
+                self.gpu_handles
+                    .insert(name.clone(), self.output_staging[out_idx].to_vec());
+            }
+        }
+    }
+
+    fn finalize_outputs(&mut self) -> Vec<Vec<f32>> {
+        let plan = self.readback_plan();
+        if plan.len() == self.graph.outputs.len() {
+            self.fill_output_staging_all();
+        } else {
+            self.fill_output_staging_indices(&plan);
+        }
+        self.refresh_gpu_handles_from_staging(&plan);
+        self.outputs_from_staging_plan(&plan)
+    }
+
+    fn fill_output_staging_indices(&mut self, indices: &[usize]) {
+        unsafe {
+            let _ = (self.ctx.runtime.hip_stream_sync)(self.ctx.default_stream);
+        }
+        for &i in indices {
+            let id = self.graph.outputs[i];
+            let off_f32 = self.arena.offset(id) / 4;
+            let elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+            let src = self.arena.buffer.ptr + (off_f32 as u64) * 4;
+            debug_assert_eq!(self.output_staging[i].len(), elems);
+            self.output_staging[i]
+                .dtoh(&self.ctx.runtime, src, elems)
+                .expect("rlx-rocm: partial output download failed");
+        }
+    }
+
+    fn fill_output_staging_all(&mut self) {
+        unsafe {
+            let _ = (self.ctx.runtime.hip_stream_sync)(self.ctx.default_stream);
+        }
+        for (i, &id) in self.graph.outputs.iter().enumerate() {
+            let off_f32 = self.arena.offset(id) / 4;
+            let elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+            let src = self.arena.buffer.ptr + (off_f32 as u64) * 4;
+            debug_assert_eq!(self.output_staging[i].len(), elems);
+            self.output_staging[i]
+                .dtoh(&self.ctx.runtime, src, elems)
+                .expect("rlx-rocm: output download failed");
+        }
+    }
+
+    fn outputs_from_staging_plan(&self, plan: &[usize]) -> Vec<Vec<f32>> {
+        if self.pending_read_indices.is_none() && plan.len() == self.graph.outputs.len() {
+            return self
+                .output_staging
+                .iter()
+                .map(F32HostSlot::to_vec)
+                .collect();
+        }
+        let want = self.pending_read_indices.as_deref().unwrap_or(plan);
+        want.iter()
+            .map(|&i| self.output_staging[i].to_vec())
             .collect()
     }
 }
@@ -5277,6 +6685,8 @@ mod tests {
 
     #[test]
     fn step_offsets_attention_causal_no_mask_arg() {
+        let (mb, mh, mq, mk) = rlx_ir::mask_strides_bhsd(1, 8, 8);
+        let (qb, qh, qs) = rlx_ir::strides_bhsd(1, 64, 8);
         let s = Step::Attention {
             batch: 1,
             heads: 1,
@@ -5291,6 +6701,22 @@ mod tests {
             mask_kind: 1, // causal — mask_off ignored
             scale_bits: 0,
             window: 0,
+            seq_q_stride: mq,
+            seq_k_stride: mk,
+            mask_batch_stride: mb,
+            mask_head_stride: mh,
+            q_batch_stride: qb,
+            q_head_stride: qh,
+            q_seq_stride: qs,
+            k_batch_stride: qb,
+            k_head_stride: qh,
+            k_seq_stride: qs,
+            v_batch_stride: qb,
+            v_head_stride: qh,
+            v_seq_stride: qs,
+            o_batch_stride: qb,
+            o_head_stride: qh,
+            o_seq_stride: qs,
         };
         let (r, _) = step_offsets(&s);
         assert!(!r.contains(&9999), "causal mask must not consume mask_off");
@@ -5299,6 +6725,8 @@ mod tests {
 
     #[test]
     fn step_offsets_attention_custom_mask_pulls_mask() {
+        let (mb, mh, mq, mk) = rlx_ir::mask_strides_bhsd(1, 8, 8);
+        let (qb, qh, qs) = rlx_ir::strides_bhsd(1, 64, 8);
         let s = Step::Attention {
             batch: 1,
             heads: 1,
@@ -5313,6 +6741,22 @@ mod tests {
             mask_kind: 2, // custom mask
             scale_bits: 0,
             window: 0,
+            seq_q_stride: mq,
+            seq_k_stride: mk,
+            mask_batch_stride: mb,
+            mask_head_stride: mh,
+            q_batch_stride: qb,
+            q_head_stride: qh,
+            q_seq_stride: qs,
+            k_batch_stride: qb,
+            k_head_stride: qh,
+            k_seq_stride: qs,
+            v_batch_stride: qb,
+            v_head_stride: qh,
+            v_seq_stride: qs,
+            o_batch_stride: qb,
+            o_head_stride: qh,
+            o_seq_stride: qs,
         };
         let (r, _) = step_offsets(&s);
         assert!(r.contains(&9999));

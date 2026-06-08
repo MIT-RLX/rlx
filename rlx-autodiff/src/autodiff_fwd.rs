@@ -147,10 +147,14 @@ pub fn jvp(forward: &Graph, tangent_for: &[NodeId]) -> Graph {
 /// [`jvp`] (forward-mode): the JVP through the gradient function is
 /// `H·v` where H is the Hessian of the loss w.r.t. the seeded inputs.
 ///
+/// Before the inner `jvp`, the backward graph is prepared via
+/// [`crate::decompose_backward::prepare_grad_graph_for_jvp`]: `*Backward`
+/// ops are rewritten to primitives and `"d_output"` is baked in as
+/// `Constant(1.0)` so the forward-mode walk is well-defined.
+///
 /// The resulting graph has inputs:
 /// * Every `Op::Input` / `Op::Param` from the forward graph (unchanged
 ///   names + shapes).
-/// * `"d_output"` — upstream loss gradient (typically `[1.0]`).
 /// * `"tangent_<name>"` per entry in `wrt` — the v vector(s).
 ///
 /// And outputs (in this order):
@@ -159,8 +163,17 @@ pub fn jvp(forward: &Graph, tangent_for: &[NodeId]) -> Graph {
 /// * `[tangent_loss, H·v_0, …, H·v_{k-1}]` — JVP of each. The first
 ///   entry is `<grad, v>` (a scalar, sometimes useful for stoppage
 ///   tests); the rest are the Hessian-vector products.
+///
+/// ## Third order
+///
+/// `jvp(hvp(f))` does **not** yield the third derivative — the outer
+/// `jvp` graph is still not AD-ready for another pass. Use
+/// [`crate::higher_order::nth_order_grad`] or
+/// [`crate::higher_order::directional_nth_grad`] instead.
 pub fn hvp(forward: &Graph, wrt: &[NodeId]) -> Graph {
-    let bwd = crate::autodiff::grad_with_loss(forward, wrt);
+    let bwd = crate::decompose_backward::prepare_grad_graph_for_jvp(
+        crate::autodiff::grad_with_loss(forward, wrt),
+    );
     // Re-find each `wrt` input by name in the backward graph
     // (grad_with_loss preserves Input/Param names but reassigns NodeIds).
     let names: Vec<String> = wrt
@@ -598,6 +611,8 @@ fn jvp_rule(
                 Some(t_y)
             }
         }
+
+        Op::LogMel | Op::LogMelBackward => None,
 
         // Complex conjugate is R-linear (not C-linear), but under the
         // JAX-style cotangent convention the JVP and VJP rules coincide

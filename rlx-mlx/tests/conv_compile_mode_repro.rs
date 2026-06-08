@@ -18,7 +18,7 @@
 //! This isolates the issue from the bench harness so we can iterate on
 //! a fix.
 
-#![cfg(target_os = "macos")]
+#![cfg(rlx_mlx_host)]
 
 use rlx_ir::{DType, Graph, Shape};
 use rlx_mlx::{MlxExecutable, MlxMode};

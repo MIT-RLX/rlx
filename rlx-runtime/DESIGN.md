@@ -57,3 +57,6 @@ modules avoids the naming collision MAX hit by overloading "trace."
   3. Wrap in `CompiledGraph` with the arena.
 - Re-exported helpers (`Tick`, `CacheBuster`) come from `rlx_ir` so
   callers don't need a direct `rlx_ir` dep.
+## License
+
+GPL-3.0-only.

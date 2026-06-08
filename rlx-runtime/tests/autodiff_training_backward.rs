@@ -1,10 +1,26 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use rlx_autodiff::{grad_with_loss, prepare_graph_for_ad};
+use rlx_autodiff::{
+    decompose_backward::decompose_backward_for_ad, decompose_backward::decompose_backward_ops,
+    grad_with_loss, prepare_graph_for_ad,
+};
 use rlx_compile::legalize_broadcast::run_with_remap;
 use rlx_cpu::arena::Arena;
 use rlx_cpu::thunk::{compile_thunks, execute_thunks};
+use rlx_cpu::training_bwd;
 use rlx_ir::op::ReduceOp;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
@@ -168,6 +184,166 @@ fn group_norm_backward_kernel_smoke() {
     );
     assert_eq!(dx.len(), plane);
     assert!(dx.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn native_group_norm_backward_matches_training_bwd() {
+    let f = DType::F32;
+    let n = 1usize;
+    let c = 4usize;
+    let h = 2usize;
+    let w = 2usize;
+    let plane = c * h * w;
+    let mut g = Graph::new("gn_native");
+    let x = g.input("x", Shape::new(&[n, c, h, w], f));
+    let gamma = g.input("gamma", Shape::new(&[c], f));
+    let beta = g.input("beta", Shape::new(&[c], f));
+    let dy = g.input("dy", Shape::new(&[n, c, h, w], f));
+    let dx = g.group_norm_backward_input(x, gamma, beta, dy, 2, 1e-5);
+    g.set_outputs(vec![dx]);
+    let xv: Vec<f32> = (0..plane).map(|i| 0.1 * i as f32 - 0.3).collect();
+    let gv: Vec<f32> = vec![1.0, 1.1, 1.2, 1.3];
+    let dyv = vec![1.0f32; plane];
+    let bv = vec![0.01f32; c];
+    let slots = [
+        ("x", xv.as_slice()),
+        ("gamma", gv.as_slice()),
+        ("beta", bv.as_slice()),
+        ("dy", dyv.as_slice()),
+    ];
+    let native = run_bwd(g, &slots, 0);
+    let mut ref_dx = vec![0.0f32; plane];
+    training_bwd::group_norm_backward_input_nchw(&xv, &gv, &dyv, &mut ref_dx, n, c, h, w, 2, 1e-5);
+    let max = native
+        .iter()
+        .zip(ref_dx.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(max < 1e-6, "native thunk vs training_bwd: max={max}");
+}
+
+#[test]
+fn group_norm_decomposed_dx_matches_training_bwd() {
+    let f = DType::F32;
+    let n = 1usize;
+    let c = 4usize;
+    let h = 2usize;
+    let w = 2usize;
+    let plane = c * h * w;
+    let mut g = Graph::new("gn_bwd_only");
+    let x = g.input("x", Shape::new(&[n, c, h, w], f));
+    let gamma = g.input("gamma", Shape::new(&[c], f));
+    let beta = g.input("beta", Shape::new(&[c], f));
+    let dy = g.input("dy", Shape::new(&[n, c, h, w], f));
+    let dx = g.group_norm_backward_input(x, gamma, beta, dy, 2, 1e-5);
+    g.set_outputs(vec![dx]);
+    let decomposed = decompose_backward_ops(g);
+    let xv: Vec<f32> = (0..plane).map(|i| 0.1 * i as f32 - 0.3).collect();
+    let gv: Vec<f32> = vec![1.0, 1.1, 1.2, 1.3];
+    let dyv = vec![1.0f32; plane];
+    let bv = vec![0.01f32; c];
+    let slots = [
+        ("x", xv.as_slice()),
+        ("gamma", gv.as_slice()),
+        ("beta", bv.as_slice()),
+        ("dy", dyv.as_slice()),
+    ];
+    let dec = run_bwd(decomposed, &slots, 0);
+    let mut ref_dx = vec![0.0f32; plane];
+    training_bwd::group_norm_backward_input_nchw(&xv, &gv, &dyv, &mut ref_dx, n, c, h, w, 2, 1e-5);
+    let max = ref_dx
+        .iter()
+        .zip(dec.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(max < 1e-4, "isolated decompose vs training_bwd: max={max}");
+}
+
+#[test]
+fn group_norm_decomposed_first_grad_matches_native_cpu() {
+    let f = DType::F32;
+    let n = 1usize;
+    let c = 4usize;
+    let h = 2usize;
+    let w = 2usize;
+    let mut g = Graph::new("gn_decomp_parity");
+    let x = g.input("x", Shape::new(&[n, c, h, w], f));
+    let gamma = g.input("gamma", Shape::new(&[c], f));
+    let beta = g.input("beta", Shape::new(&[c], f));
+    let y = g.add_node(
+        Op::GroupNorm {
+            num_groups: 2,
+            eps: 1e-5,
+        },
+        vec![x, gamma, beta],
+        Shape::new(&[n, c, h, w], f),
+    );
+    let loss = g.add_node(
+        Op::Reduce {
+            op: ReduceOp::Sum,
+            axes: vec![0, 1, 2, 3],
+            keep_dim: false,
+        },
+        vec![y],
+        Shape::from_dims(&[], f),
+    );
+    g.set_outputs(vec![loss]);
+    let prep = prepare_graph_for_ad(g);
+    let bwd = grad_with_loss(&prep, &[x]);
+    let plane = c * h * w;
+    let xv: Vec<f32> = (0..plane).map(|i| 0.1 * i as f32 - 0.3).collect();
+    let gv: Vec<f32> = vec![1.0, 1.1, 1.2, 1.3];
+    let bv: Vec<f32> = vec![0.01; c];
+    let slots = [
+        ("x", xv.as_slice()),
+        ("gamma", gv.as_slice()),
+        ("beta", bv.as_slice()),
+        ("d_output", &[1.0]),
+    ];
+    let native = run_bwd(bwd.clone(), &slots, 1);
+    let decomposed = decompose_backward_for_ad(bwd, 0);
+    let dec_slots = [
+        ("x", xv.as_slice()),
+        ("gamma", gv.as_slice()),
+        ("beta", bv.as_slice()),
+    ];
+    let dec = run_bwd(decomposed, &dec_slots, 0);
+    let mut ref_dx = vec![0.0f32; plane];
+    let dy_up = vec![1.0f32; plane];
+    training_bwd::group_norm_backward_input_nchw(
+        &xv,
+        &gv,
+        &dy_up,
+        &mut ref_dx,
+        n,
+        c,
+        h,
+        w,
+        2,
+        1e-5,
+    );
+    let max_native = native
+        .iter()
+        .zip(ref_dx.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_native < 1e-4,
+        "native grad vs training_bwd: max={max_native}"
+    );
+    let max_ref = ref_dx
+        .iter()
+        .zip(dec.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(max_ref < 1e-4, "decompose vs training_bwd: max={max_ref}");
+    assert_eq!(native.len(), dec.len());
+    let max = native
+        .iter()
+        .zip(dec.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(max < 1e-4, "group norm decompose dx mismatch: max={max}");
 }
 
 #[test]

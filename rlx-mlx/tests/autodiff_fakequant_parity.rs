@@ -18,7 +18,7 @@
 //! `rlx-cpu/src/thunk.rs`. Closes the last published parity gap
 //! between `MLX_SUPPORTED_OPS` and `CPU_SUPPORTED_OPS`.
 
-#![cfg(target_os = "macos")]
+#![cfg(rlx_mlx_host)]
 
 use rlx_ir::op::{ScaleMode, SteKind};
 use rlx_ir::{DType, Graph, Op, Shape};

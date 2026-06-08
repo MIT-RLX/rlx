@@ -62,3 +62,6 @@ Hardware change → cache miss → re-measure automatically.
 - Calibration values feed `cost.rs`; `rlx_runtime::pick_best_device`
   consumes both backends' cost models to choose CPU vs Metal per
   graph.
+## License
+
+GPL-3.0-only.

@@ -123,26 +123,58 @@ pub use crate::prepare_ad::{
 /// Compute the reverse-mode gradient graph and the loss value.
 ///
 /// Returns a graph whose outputs are
-/// `[loss, grad_wrt[0], grad_wrt[1], ...]`. The loss is the original
-/// forward output; the gradients are w.r.t. each `wrt` node (typically
-/// `Op::Param` ids).
+/// `[loss, aux₁, aux₂, …, grad_wrt[0], grad_wrt[1], …]`.
+///
+/// The **first** forward output is treated as the scalar loss and is
+/// differentiated. Any **additional** forward outputs (`aux₁ …`) are
+/// mirrored from the forward graph and emitted unchanged — gradients are
+/// not propagated through them. This is the canonical hook for emitting
+/// training-side statistics (BatchNorm batch mean/variance, debug probes,
+/// …) alongside the loss in a single forward+backward pass.
 ///
 /// The returned graph contains a copy of the entire forward graph so
 /// activations needed by gradient kernels are recomputed from inputs;
 /// it also exposes a new `Op::Input` named `"d_output"` which the
 /// caller seeds with the upstream gradient of the loss (typically a
-/// scalar `1.0` for "differentiate the loss directly").
+/// scalar `1.0` for "differentiate the loss directly"). Auxiliary outputs
+/// have no `d_output`-equivalent — by construction they don't contribute
+/// to the gradient path.
 ///
 /// ## Limitations
-/// - Forward graph must have exactly one output (the loss / scalar
-///   you want to differentiate).
+/// - Forward graph must have **≥ 1** output. The first is the loss.
 /// - All ops in the forward graph must have an implemented VJP rule.
 ///   Hitting an op without one is a panic, not a silent miscompute.
+/// Options for [`grad_with_loss_opts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GradWithLossOptions {
+    /// When true, parameters in `wrt` with no gradient path receive an
+    /// explicit zero tensor instead of panicking (e.g. unused `logit_bias`).
+    pub zero_missing_wrt: bool,
+}
+
+impl GradWithLossOptions {
+    pub const STRICT: Self = Self {
+        zero_missing_wrt: false,
+    };
+    pub const TRAINING: Self = Self {
+        zero_missing_wrt: true,
+    };
+}
+
+/// Build a backward graph with scalar loss + gradients w.r.t. `wrt`.
+///
+/// Panics if any `wrt` parameter receives no gradient (use
+/// [`grad_with_loss_opts`] with [`GradWithLossOptions::TRAINING`] to
+/// zero-fill instead).
 pub fn grad_with_loss(forward: &Graph, wrt: &[NodeId]) -> Graph {
-    assert_eq!(
-        forward.outputs.len(),
-        1,
-        "grad_with_loss: forward must have exactly one output"
+    grad_with_loss_opts(forward, wrt, GradWithLossOptions::STRICT)
+}
+
+/// Like [`grad_with_loss`] with configurable unused-parameter handling.
+pub fn grad_with_loss_opts(forward: &Graph, wrt: &[NodeId], opts: GradWithLossOptions) -> Graph {
+    assert!(
+        !forward.outputs.is_empty(),
+        "grad_with_loss: forward must have at least one output (the loss)"
     );
 
     // Pre-autodiff unfuse: decompose fused ops back to primitives so
@@ -204,16 +236,31 @@ pub fn grad_with_loss(forward: &Graph, wrt: &[NodeId]) -> Graph {
         }
     }
 
-    let mut outputs = Vec::with_capacity(1 + wrt.len());
+    let n_aux = forward.outputs.len().saturating_sub(1);
+    let mut outputs = Vec::with_capacity(1 + n_aux + wrt.len());
     outputs.push(loss_bwd);
+    // Auxiliary forward outputs (everything past `outputs[0]`): mirrored
+    // from the forward graph, no gradient propagation.
+    for &aux in &forward.outputs[1..] {
+        outputs.push(fwd_to_bwd[&aux]);
+    }
     for &id in wrt {
-        let g = grads.get(&fwd_to_bwd[&id]).copied().unwrap_or_else(|| {
-            panic!(
-                "no gradient flowed to {id} — \
-                either the forward graph doesn't depend on it, or one \
-                of its consumer ops has no VJP rule"
-            )
-        });
+        let g = match grads.get(&fwd_to_bwd[&id]).copied() {
+            Some(g) => g,
+            None if opts.zero_missing_wrt => {
+                let shape = forward.node(id).shape.clone();
+                let n = shape.num_elements().unwrap_or(0);
+                let data: Vec<u8> = (0..n).flat_map(|_| 0.0f32.to_le_bytes()).collect();
+                bwd.add_node(Op::Constant { data }, vec![], shape)
+            }
+            None => {
+                panic!(
+                    "no gradient flowed to {id} — \
+                    either the forward graph doesn't depend on it, or one \
+                    of its consumer ops has no VJP rule"
+                )
+            }
+        };
         outputs.push(g);
     }
     bwd.set_outputs(outputs);
@@ -928,6 +975,12 @@ fn vjp(
             vec![(0, dx)]
         }
 
+        // Stop-gradient (a.k.a. `detach`): forward identity, **no**
+        // gradient contribution to the input. Returning an empty list
+        // here keeps the reverse-mode walker from accumulating any
+        // upstream into `node.inputs[0]`, which is the whole point.
+        Op::StopGradient => vec![],
+
         // Straight-through estimator: forward simulates the lossy
         // round-trip (x → q → x'), backward pretends it was an
         // identity. `dx = upstream` for both ops. The upstream is the
@@ -1002,6 +1055,29 @@ fn vjp(
             let x_shape = bwd.node(x_bwd).shape.clone();
             let dx = unbroadcast(upstream, &x_shape, bwd);
             vec![(0, dx)]
+        }
+
+        Op::BatchNormInference { eps } => {
+            let x_bwd = fwd_map[&node.inputs[0]];
+            let gamma_bwd = fwd_map[&node.inputs[1]];
+            let _beta_bwd = fwd_map[&node.inputs[2]];
+            let mean_bwd = fwd_map[&node.inputs[3]];
+            let var_bwd = fwd_map[&node.inputs[4]];
+            let gamma_shape = bwd.node(gamma_bwd).shape.clone();
+            let dx = bwd.batch_norm_inference_backward_input(
+                x_bwd, gamma_bwd, mean_bwd, var_bwd, upstream, *eps,
+            );
+            let dgamma = bwd.batch_norm_inference_backward_gamma(
+                x_bwd,
+                mean_bwd,
+                var_bwd,
+                upstream,
+                gamma_shape.clone(),
+                *eps,
+            );
+            let dbeta = bwd.batch_norm_inference_backward_beta(upstream, gamma_shape);
+            // mean/var are frozen — no gradients.
+            vec![(0, dx), (1, dgamma), (2, dbeta)]
         }
 
         Op::LayerNorm { axis, eps } => {
@@ -2201,6 +2277,66 @@ fn vjp(
             ext.vjp(node, &mut ctx)
         }
 
+        Op::Conv2dBackwardInput {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => {
+            let dy_bwd = fwd_map[&node.inputs[0]];
+            let w_bwd = fwd_map[&node.inputs[1]];
+            let dy_shape = bwd.node(dy_bwd).shape.clone();
+            let _x_shape = node.shape.clone();
+            let d_dy = bwd.add_node(
+                Op::Conv {
+                    kernel_size: kernel_size.clone(),
+                    stride: stride.clone(),
+                    padding: padding.clone(),
+                    dilation: dilation.clone(),
+                    groups: *groups,
+                },
+                vec![upstream, w_bwd],
+                dy_shape,
+            );
+            vec![(0, d_dy)]
+        }
+
+        Op::Conv2dBackwardWeight {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => {
+            let x_bwd = fwd_map[&node.inputs[0]];
+            let dy_bwd = fwd_map[&node.inputs[1]];
+            let x_shape = bwd.node(x_bwd).shape.clone();
+            let dy_shape = bwd.node(dy_bwd).shape.clone();
+            let d_x = bwd.conv2d_backward_input(
+                dy_bwd,
+                upstream,
+                x_shape,
+                kernel_size.clone(),
+                stride.clone(),
+                padding.clone(),
+                dilation.clone(),
+                *groups,
+            );
+            let d_dy = bwd.add_node(
+                Op::Conv {
+                    kernel_size: kernel_size.clone(),
+                    stride: stride.clone(),
+                    padding: padding.clone(),
+                    dilation: dilation.clone(),
+                    groups: *groups,
+                },
+                vec![x_bwd, upstream],
+                dy_shape,
+            );
+            vec![(0, d_x), (1, d_dy)]
+        }
+
         // 1D FFT: y = fft(x; inverse). Both forward and inverse are
         // unnormalized linear operators on the 2N real-block layout,
         // and the DFT matrix's transpose (over the real-block view)
@@ -2219,6 +2355,13 @@ fn vjp(
                 upstream
             };
             let dx = bwd.fft(z, !*inverse);
+            vec![(0, dx)]
+        }
+
+        Op::LogMel => {
+            let spec_bwd = fwd_map[&node.inputs[0]];
+            let filt_bwd = fwd_map[&node.inputs[1]];
+            let dx = bwd.log_mel_backward(spec_bwd, filt_bwd, upstream);
             vec![(0, dx)]
         }
 

@@ -148,3 +148,7 @@ let gq = goals_grad_wrt_q(&opt, &network, &goals, None)?;
 2. **Next:** IPOPT interface (external); tighter PCG-VJP vs host linear adjoint.
 
 **Anderson acceleration:** set [`IterativeConfig::anderson_depth`](src/iterative.rs) > 0 on nonlinear solves. Implicit adjoint unrolls a full `tmax` trajectory (`eta = 0`) so it matches central-difference `dL/dq`.
+
+## License
+
+GPL-3.0-only.

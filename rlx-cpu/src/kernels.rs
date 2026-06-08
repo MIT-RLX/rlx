@@ -327,7 +327,7 @@ pub fn layer_norm_row(
             sumsq += input[i] * input[i];
         }
         let mean = sum * inv_hf;
-        let var = sumsq * inv_hf - mean * mean;
+        let var = (sumsq * inv_hf - mean * mean).max(0.0);
         let inv = 1.0 / (var + eps).sqrt();
         let vmean = vdupq_n_f32(mean);
         let vinv = vdupq_n_f32(inv);
@@ -398,7 +398,7 @@ pub fn layer_norm_row(
             sumsq += input[i] * input[i];
         }
         let mean = sum * inv_hf;
-        let var = sumsq * inv_hf - mean * mean;
+        let var = (sumsq * inv_hf - mean * mean).max(0.0);
         let inv = 1.0 / (var + eps).sqrt();
         let vmean = _mm256_set1_ps(mean);
         let vinv = _mm256_set1_ps(inv);
@@ -440,10 +440,89 @@ pub fn layer_norm_row(
         sumsq += input[i] * input[i];
     }
     let mean = sum * inv_hf;
-    let var = sumsq * inv_hf - mean * mean;
+    let var = (sumsq * inv_hf - mean * mean).max(0.0);
     let inv = 1.0 / (var + eps).sqrt();
     for i in 0..h {
         output[i] = (input[i] - mean) * inv * gamma[i] + beta[i];
+    }
+}
+
+/// Inference BatchNorm with frozen running statistics (PyTorch `BatchNorm*d` eval).
+///
+/// `x` is row-major with feature dimension `channels` on the last axis
+/// (`[B, C]`, `[B, P, C]`, …). `gamma`, `beta`, `mean`, `var` are length `C`.
+pub fn batch_norm_inference(
+    x: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    mean: &[f32],
+    var: &[f32],
+    out: &mut [f32],
+    channels: usize,
+    eps: f32,
+) {
+    let n = x.len() / channels.max(1);
+    for i in 0..n {
+        for c in 0..channels {
+            let idx = i * channels + c;
+            let inv = 1.0 / (var[c] + eps).sqrt();
+            let xhat = (x[idx] - mean[c]) * inv;
+            out[idx] = gamma[c] * xhat + beta[c];
+        }
+    }
+}
+
+/// `d_x` for [`batch_norm_inference`] (mean/var treated as constants).
+pub fn batch_norm_inference_backward_input(
+    x: &[f32],
+    gamma: &[f32],
+    _mean: &[f32],
+    var: &[f32],
+    dy: &[f32],
+    dx: &mut [f32],
+    channels: usize,
+    eps: f32,
+) {
+    let n = x.len() / channels.max(1);
+    for i in 0..n {
+        for c in 0..channels {
+            let idx = i * channels + c;
+            let inv = 1.0 / (var[c] + eps).sqrt();
+            dx[idx] = dy[idx] * gamma[c] * inv;
+        }
+    }
+}
+
+/// `d_gamma` for [`batch_norm_inference`].
+pub fn batch_norm_inference_backward_gamma(
+    x: &[f32],
+    mean: &[f32],
+    var: &[f32],
+    dy: &[f32],
+    dgamma: &mut [f32],
+    channels: usize,
+    eps: f32,
+) {
+    dgamma.fill(0.0);
+    let n = x.len() / channels.max(1);
+    for i in 0..n {
+        for c in 0..channels {
+            let idx = i * channels + c;
+            let inv = 1.0 / (var[c] + eps).sqrt();
+            let xhat = (x[idx] - mean[c]) * inv;
+            dgamma[c] += dy[idx] * xhat;
+        }
+    }
+}
+
+/// `d_beta` for [`batch_norm_inference`].
+pub fn batch_norm_inference_backward_beta(dy: &[f32], dbeta: &mut [f32], channels: usize) {
+    dbeta.fill(0.0);
+    let n = dy.len() / channels.max(1);
+    for i in 0..n {
+        for c in 0..channels {
+            dbeta[c] += dy[i * channels + c];
+        }
     }
 }
 
@@ -1193,6 +1272,29 @@ mod tests {
         for &v in &data {
             assert!(v > 0.0, "bias_gelu produced {v}");
         }
+    }
+
+    #[test]
+    fn batch_norm_inference_roundtrip() {
+        let c = 4usize;
+        let x: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let gamma = vec![1.0; c];
+        let beta = vec![0.0; c];
+        let mean = vec![2.5, 2.5, 2.5, 2.5];
+        let var = vec![1.0; c];
+        let mut y = vec![0.0; 8];
+        batch_norm_inference(&x, &gamma, &beta, &mean, &var, &mut y, c, 1e-5);
+        let mut dx = vec![0.0; 8];
+        let dy = vec![1.0; 8];
+        let mut dgamma = vec![0.0; c];
+        let mut dbeta = vec![0.0; c];
+        batch_norm_inference_backward_input(&x, &gamma, &mean, &var, &dy, &mut dx, c, 1e-5);
+        batch_norm_inference_backward_gamma(&x, &mean, &var, &dy, &mut dgamma, c, 1e-5);
+        batch_norm_inference_backward_beta(&dy, &mut dbeta, c);
+        assert!(y.iter().all(|v| v.is_finite()));
+        assert!(dx.iter().all(|v| v.is_finite()));
+        assert!(dgamma.iter().any(|&v| v.abs() > 1e-6));
+        assert_eq!(dbeta, vec![2.0, 2.0, 2.0, 2.0]);
     }
 
     #[test]

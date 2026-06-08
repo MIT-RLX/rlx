@@ -64,23 +64,22 @@ extern "C" __global__ void rlx_norm(
     __shared__ float s[LN_BLOCK];
 
     if (op == 0) {
-        // Phase 1: mean.
+        // LayerNorm: var = max(E[x²] − E[x]², 0) — matches CPU / wgpu / PyTorch
+        // nn.LayerNorm (one read pass for moments, not two-pass (x−μ)²).
         float local_sum = 0.0f;
+        float local_sum_sq = 0.0f;
         for (unsigned int i = tid; i < inner; i += bsz) {
-            local_sum += arena[in_base + i];
+            float v = arena[in_base + i];
+            local_sum += v;
+            local_sum_sq += v * v;
         }
-        float mean = ln_block_sum(local_sum, s, tid, bsz) * n_inv;
+        float sum_x = ln_block_sum(local_sum, s, tid, bsz);
+        __syncthreads();
+        float sum_x2 = ln_block_sum(local_sum_sq, s, tid, bsz);
+        float mean = sum_x * n_inv;
+        float var = fmaxf(sum_x2 * n_inv - mean * mean, 0.0f);
+        float inv_std = rsqrtf(var + eps);
 
-        // Phase 2: variance.
-        float local_var = 0.0f;
-        for (unsigned int i = tid; i < inner; i += bsz) {
-            float d = arena[in_base + i] - mean;
-            local_var += d * d;
-        }
-        float var = ln_block_sum(local_var, s, tid, bsz);
-        float inv_std = rsqrtf(var * n_inv + eps);
-
-        // Phase 3: normalize.
         for (unsigned int i = tid; i < inner; i += bsz) {
             float g = arena[gamma_off + i];
             float b = arena[beta_off + i];

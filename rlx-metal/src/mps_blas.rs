@@ -152,18 +152,33 @@ unsafe fn get_or_build_matrix(
 
 /// Drop every cached MPSMatrix / MPSMatrixDescriptor / MPSMatrixMultiplication
 /// reference. Lets a caller (e.g. backend test harness, hot reload) reset
-/// MPS state explicitly. The default `Drop` for cached `*mut Object` would
-/// leak (no `release` call); but for correctness the leak is benign since
-/// Metal kernels and matrices are tiny.
+/// MPS state explicitly.
 pub fn invalidate_caches() {
     let cache = matrix_cache();
-    let mut mats = cache.matrices.lock().expect("matrix cache poisoned");
-    mats.clear();
-    let mut descs = cache.descriptors.lock().expect("descriptor cache poisoned");
-    descs.clear();
+    {
+        let mut mats = cache.matrices.lock().expect("matrix cache poisoned");
+        release_cached_ptrs(mats.drain().map(|(_, p)| p));
+    }
+    {
+        let mut descs = cache.descriptors.lock().expect("descriptor cache poisoned");
+        release_cached_ptrs(descs.drain().map(|(_, p)| p));
+    }
     let kcache = kernel_cache();
-    let mut km = kcache.map.lock().expect("kernel cache poisoned");
-    km.clear();
+    {
+        let mut km = kcache.map.lock().expect("kernel cache poisoned");
+        release_cached_ptrs(km.drain().map(|(_, p)| p));
+    }
+}
+
+fn release_cached_ptrs(ptrs: impl Iterator<Item = usize>) {
+    unsafe {
+        for p in ptrs {
+            if p != 0 {
+                let obj = p as *mut Object;
+                let _: () = msg_send![obj, release];
+            }
+        }
+    }
 }
 
 unsafe fn get_or_build_kernel(m: usize, k: usize, n: usize, transpose_b: bool) -> *mut Object {

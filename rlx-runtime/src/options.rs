@@ -34,6 +34,7 @@ use crate::Precision;
 use rlx_ir::OpKind;
 use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
 use rlx_opt::{FusionOptions, FusionTarget, PrecisionPolicy};
+use std::collections::HashMap;
 
 /// All knobs the compile pipeline understands.
 /// Add new fields here rather than introducing new compile entry points.
@@ -63,6 +64,8 @@ pub struct CompileOptions {
     pub supported_ops: Option<&'static [OpKind]>,
     /// When set, specialize symbolic dims before backend lowering.
     pub dim_binding: Option<rlx_ir::DimBinding>,
+    /// Bake fixed param tensors into constants before DCE / constant folding.
+    pub param_bindings: Option<HashMap<String, Vec<f32>>>,
     /// Native vs common IR lowering ([`KernelDispatchConfig`], `RLX_KERNEL_DISPATCH=common`).
     pub kernel_dispatch: KernelDispatchConfig,
 }
@@ -81,6 +84,7 @@ impl Default for CompileOptions {
             assert_fusion_clean: false,
             supported_ops: None,
             dim_binding: None,
+            param_bindings: None,
             kernel_dispatch: KernelDispatchConfig::from_env(),
         }
     }
@@ -137,6 +141,10 @@ impl CompileOptions {
     }
     pub fn dim_binding(mut self, binding: rlx_ir::DimBinding) -> Self {
         self.dim_binding = Some(binding);
+        self
+    }
+    pub fn param_bindings(mut self, bindings: HashMap<String, Vec<f32>>) -> Self {
+        self.param_bindings = Some(bindings);
         self
     }
     pub fn kernel_dispatch(mut self, policy: KernelDispatchPolicy) -> Self {

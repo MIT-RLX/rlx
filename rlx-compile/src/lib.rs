@@ -8,6 +8,7 @@
 //! HIR → MIR → LIR compile pipeline: fusion orchestration, legalization,
 //! memory planning, and diagnostics.
 
+pub mod algebraic_simplify;
 pub mod compiler;
 pub mod const_fold;
 pub mod dce;
@@ -19,6 +20,7 @@ pub mod inspect;
 pub mod legalize;
 pub mod legalize_broadcast;
 pub mod memory;
+pub mod param_specialize;
 pub mod precision;
 pub mod promote_params;
 pub mod quant_insert;
@@ -29,6 +31,7 @@ pub mod svg;
 #[cfg(feature = "training")]
 pub mod training_compile;
 
+pub use algebraic_simplify::{AlgebraicSimplify, algebraic_simplify};
 pub use compiler::{CompilePipeline, CompileResult};
 pub use const_fold::ConstantFolding;
 pub use dce::DeadCodeElimination;
@@ -37,8 +40,8 @@ pub use dispatch_report::{
     format_dispatch_report, maybe_log_dispatch_report, prepare_graph_for_backend_with_report,
 };
 pub use fusion_pipeline::{
-    FusionOptions, FusionTarget, fusion_limits_for_target, fusion_passes,
-    fusion_passes_for_supported, supported_for_target, supports_op,
+    FusionOptions, FusionTarget, fk_passes_after_elementwise_regions, fusion_limits_for_target,
+    fusion_passes, fusion_passes_for_supported, supported_for_target, supports_op,
 };
 pub use inline::inline_into;
 pub use inspect::{
@@ -50,6 +53,7 @@ pub use memory::{
     MemoryPlanOptions, SharedWeightLayout, WeightSlot, is_pure_view, plan_memory_backward,
     plan_memory_f32_uniform, plan_memory_with_options,
 };
+pub use param_specialize::{SpecializeParams, specialize_params};
 pub use precision::{AutoMixedPrecision, CastConfig, OpKind, Precision, PrecisionPolicy};
 pub use promote_params::promote_params_to_inputs;
 pub use quant_insert::{CalibrationEntry, CalibrationRecord, insert_q_dq};

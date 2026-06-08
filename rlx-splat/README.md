@@ -78,3 +78,7 @@ Avoid enabling `session` on `rlx-metal`’s dependency edge — use `reference` 
 cargo test -p rlx-splat --features test-support
 cargo test -p rlx-splat --features test-support session_decomposed
 ```
+
+## License
+
+GPL-3.0-only.

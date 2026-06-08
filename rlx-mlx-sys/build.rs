@@ -21,17 +21,24 @@
 //   2. Compile our C++ shim (cpp/rlx_mlx_shim.cpp) and link it against
 //      libmlx.a + the platform frameworks MLX itself depends on.
 //
-// On macOS, MLX builds its Metal kernels by default; that requires
-// `xcrun metal` / `xcrun metallib` on PATH. The `xcrun --find metal`
-// check below produces a clearer error than the deep-in-cmake one if
-// the toolchain is missing.
+// On Linux, upstream MLX expects system BLAS/LAPACK headers (`lapacke.h`).
+// When they are missing we bootstrap OpenBLAS into OUT_DIR (same spirit as
+// MLX's Windows FetchContent OpenBLAS zip).
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const OPENBLAS_VERSION: &str = "0.3.31";
+
+struct LapackPaths {
+    include_dir: PathBuf,
+    prefix_dir: PathBuf,
+}
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let mlx_src = manifest_dir.join("vendor").join("mlx");
 
     if !mlx_src.join("CMakeLists.txt").exists() {
@@ -58,7 +65,15 @@ fn main() {
     }
 
     // Stage 1: configure + build MLX into OUT_DIR.
-    let mlx_build = cmake::Config::new(&mlx_src)
+    let build_cuda = linux_build_cuda(&target_os);
+    let cmake_build_type = cmake_build_type_for_cargo_profile();
+    println!("cargo:rerun-if-env-changed=RLX_MLX_CUDA");
+    println!("cargo:rerun-if-env-changed=RLX_MLX_CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=RLX_MLX_JOBS");
+
+    let mut mlx_cfg = cmake::Config::new(&mlx_src);
+    mlx_cfg
+        .profile(cmake_build_type)
         .define("MLX_BUILD_TESTS", "OFF")
         .define("MLX_BUILD_EXAMPLES", "OFF")
         .define("MLX_BUILD_BENCHMARKS", "OFF")
@@ -69,8 +84,52 @@ fn main() {
         .define("MLX_BUILD_GGUF", "OFF")
         .define("MLX_BUILD_SAFETENSORS", "OFF")
         .define("BUILD_SHARED_LIBS", "OFF")
-        .define("CMAKE_BUILD_TYPE", "Release")
-        .build();
+        .define("CMAKE_BUILD_TYPE", cmake_build_type)
+        .define("MLX_USE_CCACHE", "ON");
+
+    apply_cmake_parallelism(&mut mlx_cfg);
+
+    if target_os == "linux" {
+        let lapack = linux_lapack_paths(&out_dir).unwrap_or_else(|| {
+            panic!(
+                "rlx-mlx-sys: failed to locate or bootstrap BLAS/LAPACK on Linux.\n\
+                 Install distro packages (fastest):\n\
+                 \n\
+                 \tsudo apt-get install libblas-dev liblapack-dev liblapacke-dev\n\
+                 \n\
+                 Or ensure `curl`, `tar`, and `cmake` are on PATH so build.rs can \
+                 compile OpenBLAS into OUT_DIR."
+            )
+        });
+        apply_lapack_hints(&mut mlx_cfg, &lapack);
+
+        if build_cuda {
+            eprintln!(
+                "cargo:warning=rlx-mlx-sys: building MLX CUDA backend ({cmake_build_type}); \
+                 first compile can take ~1h — use ccache + keep RLX_MLX_CUDA=1 stable"
+            );
+            mlx_cfg.define("MLX_BUILD_CUDA", "ON");
+            if let Some(arch) = env::var("RLX_MLX_CUDA_ARCH").ok().filter(|s| !s.is_empty()) {
+                mlx_cfg.define("MLX_CUDA_ARCHITECTURES", arch);
+            }
+            if let Some(cuda_root) = probe_linux_cuda_toolkit() {
+                let root = cuda_root.to_string_lossy();
+                mlx_cfg.define("CUDAToolkit_ROOT", root.as_ref());
+                let bin = cuda_root.join("bin");
+                if bin.is_dir() {
+                    let path = env::var("PATH").unwrap_or_default();
+                    mlx_cfg.env("PATH", format!("{}:{}", bin.display(), path));
+                }
+            }
+        } else if probe_linux_cuda_toolkit().is_some() && probe_linux_cudnn().is_some() {
+            eprintln!(
+                "cargo:warning=rlx-mlx-sys: CUDA+cuDNN found but MLX CUDA backend skipped \
+                 (CPU-only default). Set RLX_MLX_CUDA=1 or enable rlx-mlx-sys/cuda for GPU."
+            );
+        }
+    }
+
+    let mlx_build = mlx_cfg.build();
 
     let mlx_lib_dir = mlx_build.join("lib");
     let mlx_include_dir = mlx_build.join("include");
@@ -84,9 +143,16 @@ fn main() {
         .file("cpp/rlx_mlx_shim.cpp")
         .include(&mlx_include_dir)
         .include(&mlx_src)
+        .define("MLX_STATIC", None)
         .flag_if_supported("-fexceptions")
         .flag_if_supported("-fvisibility=hidden")
         .warnings(false);
+    if target_os == "windows" {
+        shim.define("NOMINMAX", None)
+            .define("WIN32_LEAN_AND_MEAN", None)
+            .define("NDEBUG", None)
+            .flag("/MD");
+    }
     shim.compile("rlx_mlx_shim");
 
     // Link mlx + platform frameworks. Order matters for static linking:
@@ -99,8 +165,17 @@ fn main() {
         }
         // C++ runtime
         println!("cargo:rustc-link-lib=c++");
-    } else {
+    } else if target_os == "linux" {
         println!("cargo:rustc-link-lib=stdc++");
+        println!("cargo:rustc-link-lib=dl");
+        println!("cargo:rustc-link-lib=pthread");
+        if build_cuda {
+            if let Some(cuda_root) = probe_linux_cuda_toolkit() {
+                link_linux_cuda_libs(&cuda_root);
+            }
+        }
+    } else if target_os == "windows" {
+        link_windows_mlx_deps(&out_dir);
     }
 
     // Re-run if the shim or vendored MLX commit changes.
@@ -108,4 +183,290 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/rlx_mlx_shim.h");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/mlx/mlx/version.h");
+}
+
+fn linux_build_cuda(target_os: &str) -> bool {
+    if target_os != "linux" {
+        return false;
+    }
+    match env_flag("RLX_MLX_CUDA") {
+        Some(false) => return false,
+        Some(true) => {}
+        None if env::var("CARGO_FEATURE_CUDA").is_ok() => {}
+        None => return false,
+    }
+    probe_linux_cuda_toolkit().is_some() && probe_linux_cudnn().is_some()
+}
+
+/// Match Cargo profile on Linux so `cargo build` (debug) skips `-O3` nvcc compiles.
+/// macOS/Windows stay on Release — Metal/MSVC paths are already cached and
+/// Debug MLX there buys little.
+fn cmake_build_type_for_cargo_profile() -> &'static str {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "linux" {
+        return "Release";
+    }
+    match env::var("PROFILE").as_deref() {
+        Ok("debug") => "Debug",
+        Ok("release") => "Release",
+        _ => "RelWithDebInfo",
+    }
+}
+
+fn apply_cmake_parallelism(cfg: &mut cmake::Config) {
+    if let Ok(jobs) = env::var("RLX_MLX_JOBS") {
+        if !jobs.is_empty() {
+            cfg.env("CMAKE_BUILD_PARALLEL_LEVEL", jobs);
+        }
+    }
+}
+
+fn env_flag(name: &str) -> Option<bool> {
+    let v = env::var(name).ok()?;
+    match v.trim().to_ascii_lowercase().as_str() {
+        "0" | "off" | "false" | "no" => Some(false),
+        "1" | "on" | "true" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
+fn probe_linux_cuda_toolkit() -> Option<PathBuf> {
+    for root in [
+        "/usr/local/cuda",
+        "/usr/local/cuda-12",
+        "/usr/local/cuda-12.6",
+    ] {
+        let path = PathBuf::from(root);
+        let lib64 = path.join("lib64");
+        if lib64.join("libcudart.so").exists() || lib64.join("libcudart.so.12").exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn probe_linux_cudnn() -> Option<PathBuf> {
+    for include in ["/usr/include/x86_64-linux-gnu", "/usr/include"] {
+        let path = PathBuf::from(include);
+        if path.join("cudnn.h").exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn link_linux_cuda_libs(cuda_root: &Path) {
+    let lib_dir = cuda_root.join("lib64");
+    let stubs = lib_dir.join("stubs");
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    if stubs.is_dir() {
+        println!("cargo:rustc-link-search=native={}", stubs.display());
+    }
+    println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
+    for lib in [
+        "cudart",
+        "cublas",
+        "cublasLt",
+        "cufft",
+        "nvrtc",
+        "cuda",
+        "cudnn",
+        "cudnn_graph",
+        "cudnn_engines_runtime_compiled",
+        "cudnn_ops",
+        "cudnn_cnn",
+        "cudnn_adv",
+        "cudnn_heuristic",
+        "cudnn_engines_precompiled",
+    ] {
+        println!("cargo:rustc-link-lib=dylib={lib}");
+    }
+}
+
+fn link_windows_mlx_deps(out_dir: &Path) {
+    println!("cargo:rustc-link-lib=advapi32");
+    link_lib_from_out_dir(out_dir, "dl.lib", "dl");
+    link_lib_from_out_dir(out_dir, "libopenblas.lib", "libopenblas");
+}
+
+fn link_lib_from_out_dir(out_dir: &Path, file_name: &str, link_name: &str) {
+    if let Some(path) = find_file_under(out_dir, file_name, 8) {
+        if let Some(dir) = path.parent() {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib={link_name}");
+            return;
+        }
+    }
+    eprintln!(
+        "cargo:warning=rlx-mlx-sys: {file_name} not found under OUT_DIR; \
+         MLX Windows link may fail"
+    );
+}
+
+fn find_file_under(root: &Path, file_name: &str, max_depth: usize) -> Option<PathBuf> {
+    fn walk(dir: &Path, file_name: &str, depth: usize, max_depth: usize) -> Option<PathBuf> {
+        if depth > max_depth {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.file_name().and_then(|n| n.to_str()) == Some(file_name) {
+                return Some(path);
+            }
+            if path.is_dir() {
+                if let Some(found) = walk(&path, file_name, depth + 1, max_depth) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    walk(root, file_name, 0, max_depth)
+}
+
+fn apply_lapack_hints(cfg: &mut cmake::Config, lapack: &LapackPaths) {
+    let include = lapack.include_dir.to_string_lossy();
+    cfg.define("LAPACK_INCLUDE_DIRS", include.as_ref());
+    cfg.define("BLAS_INCLUDE_DIRS", include.as_ref());
+    cfg.define("BLA_VENDOR", "OpenBLAS");
+    cfg.env("BLAS_HOME", &lapack.prefix_dir);
+    cfg.env("LAPACK_ROOT", &lapack.prefix_dir);
+    cfg.env(
+        "CMAKE_PREFIX_PATH",
+        lapack.prefix_dir.to_string_lossy().into_owned(),
+    );
+
+    let lib = lapack.prefix_dir.join("lib/libopenblas.a");
+    if lib.exists() {
+        let lib = lib.to_string_lossy();
+        cfg.define("LAPACK_LIBRARIES", lib.as_ref());
+        cfg.define("BLAS_LIBRARIES", lib.as_ref());
+    }
+}
+
+fn linux_lapack_paths(out_dir: &Path) -> Option<LapackPaths> {
+    if let Some(paths) = probe_system_lapack() {
+        return Some(paths);
+    }
+
+    eprintln!(
+        "cargo:warning=rlx-mlx-sys: lapacke.h not found; building OpenBLAS v{OPENBLAS_VERSION} into OUT_DIR (first build may take several minutes)"
+    );
+    bootstrap_openblas(out_dir)
+}
+
+fn probe_system_lapack() -> Option<LapackPaths> {
+    for include_dir in [
+        "/usr/include/x86_64-linux-gnu",
+        "/usr/include",
+        "/usr/local/include",
+        "/usr/include/openblas",
+        "/usr/local/include/openblas",
+    ] {
+        let include = PathBuf::from(include_dir);
+        if include.join("lapacke.h").exists() {
+            let prefix_dir = if include_dir.contains("/openblas") {
+                include.parent().unwrap_or(Path::new("/usr")).to_path_buf()
+            } else if Path::new("/usr/local").join("include/lapacke.h").exists()
+                && include_dir.starts_with("/usr/local")
+            {
+                PathBuf::from("/usr/local")
+            } else {
+                PathBuf::from("/usr")
+            };
+            return Some(LapackPaths {
+                include_dir: include,
+                prefix_dir,
+            });
+        }
+    }
+    None
+}
+
+fn bootstrap_openblas(out_dir: &Path) -> Option<LapackPaths> {
+    let tarball = out_dir.join(format!("OpenBLAS-{OPENBLAS_VERSION}.tar.gz"));
+    let src_dir = out_dir.join(format!("OpenBLAS-{OPENBLAS_VERSION}"));
+    let url = format!(
+        "https://github.com/OpenMathLib/OpenBLAS/releases/download/v{OPENBLAS_VERSION}/OpenBLAS-{OPENBLAS_VERSION}.tar.gz"
+    );
+
+    if !src_dir.join("CMakeLists.txt").exists() {
+        if !tarball.exists() {
+            download_file(&url, &tarball)?;
+        }
+        extract_tar_gz(&tarball, out_dir)?;
+    }
+
+    let install = cmake::Config::new(&src_dir)
+        .define("BUILD_SHARED_LIBS", "OFF")
+        .define("NOFORTRAN", "ON")
+        .define("C_LAPACK", "ON")
+        .define("DYNAMIC_ARCH", "OFF")
+        .build();
+
+    let include_dir = lapack_include_dir(&install)?;
+    Some(LapackPaths {
+        include_dir,
+        prefix_dir: install,
+    })
+}
+
+fn lapack_include_dir(prefix: &Path) -> Option<PathBuf> {
+    for include_dir in [prefix.join("include/openblas"), prefix.join("include")] {
+        if include_dir.join("lapacke.h").exists() {
+            return Some(include_dir);
+        }
+    }
+    eprintln!(
+        "cargo:warning=rlx-mlx-sys: OpenBLAS install missing lapacke.h under {}",
+        prefix.join("include").display()
+    );
+    None
+}
+
+fn download_file(url: &str, dest: &Path) -> Option<()> {
+    if dest.exists() {
+        return Some(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+
+    if Command::new("curl").arg("--version").output().is_ok() {
+        let status = Command::new("curl")
+            .args(["-fsSL", "-o"])
+            .arg(dest)
+            .arg(url)
+            .status()
+            .ok()?;
+        if status.success() {
+            return Some(());
+        }
+    }
+
+    if Command::new("wget").arg("--version").output().is_ok() {
+        let status = Command::new("wget")
+            .arg("-O")
+            .arg(dest)
+            .arg(url)
+            .status()
+            .ok()?;
+        if status.success() {
+            return Some(());
+        }
+    }
+
+    None
+}
+
+fn extract_tar_gz(archive: &Path, dest_dir: &Path) -> Option<()> {
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest_dir)
+        .status()
+        .ok()?;
+    if status.success() { Some(()) } else { None }
 }

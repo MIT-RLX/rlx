@@ -19,7 +19,7 @@
 //! Tiebreaking convention: first hit wins (strict `>`), matching both
 //! the CPU thunk and MLX's `argmax` first-index-on-ties.
 
-#![cfg(target_os = "macos")]
+#![cfg(rlx_mlx_host)]
 
 use rlx_ir::op::ReduceOp;
 use rlx_ir::{DType, Graph, Op, Shape};

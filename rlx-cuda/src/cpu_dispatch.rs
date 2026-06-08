@@ -298,6 +298,22 @@ unsafe extern "C" {
         mask_kind: c_uint,
         scale_bits: c_uint,
         window: c_uint,
+        seq_q_stride: c_uint,
+        seq_k_stride: c_uint,
+        mask_batch_stride: c_uint,
+        mask_head_stride: c_uint,
+        q_batch_stride: c_uint,
+        q_head_stride: c_uint,
+        q_seq_stride: c_uint,
+        k_batch_stride: c_uint,
+        k_head_stride: c_uint,
+        k_seq_stride: c_uint,
+        v_batch_stride: c_uint,
+        v_head_stride: c_uint,
+        v_seq_stride: c_uint,
+        o_batch_stride: c_uint,
+        o_head_stride: c_uint,
+        o_seq_stride: c_uint,
         gx: c_uint,
         bx: c_uint,
     );
@@ -498,6 +514,21 @@ unsafe extern "C" {
         num_inputs: c_uint,
         num_steps: c_uint,
         dst_off: c_uint,
+        meta: *const c_uint,
+        scalar_input_mask: c_uint,
+        input_modulus: *const c_uint,
+        gx: c_uint,
+        bx: c_uint,
+    );
+
+    pub fn launch_batch_elementwise_region(
+        a: *mut f32,
+        slice_len: c_uint,
+        num_batch: c_uint,
+        num_steps: c_uint,
+        base_dst_off: c_uint,
+        slice_elems: c_uint,
+        batch_input_offs: *const c_uint,
         meta: *const c_uint,
         scalar_input_mask: c_uint,
         input_modulus: *const c_uint,
@@ -906,6 +937,9 @@ pub fn run_attention(
     // kernel checks `gridDim.y == 1` and decodes (q_block, bh) from
     // blockIdx.x. Production CUDA uses the natural 2-D grid.
     let q_blocks = (seq_q + 15) / 16;
+    let (mb, mh, mq, mk) = rlx_ir::mask_strides_bhsd(heads, seq_q, seq_k);
+    let (qb, qh, qs) = rlx_ir::strides_bhsd(heads, head_dim, seq_q);
+    let (kb, kh, ks) = rlx_ir::strides_bhsd(heads, head_dim, seq_k);
     unsafe {
         launch_attention(
             a.as_mut_ptr(),
@@ -922,6 +956,22 @@ pub fn run_attention(
             mask_kind,
             scale.to_bits(),
             window,
+            mq,
+            mk,
+            mb,
+            mh,
+            qb,
+            qh,
+            qs,
+            kb,
+            kh,
+            ks,
+            kb,
+            kh,
+            ks,
+            qb,
+            qh,
+            qs,
             q_blocks * batch * heads,
             128,
         );
@@ -1323,7 +1373,7 @@ pub fn run_conv3d(
 }
 
 /// PLAN L2 — interpreted N-ary element-wise chain. `meta` must hold
-/// 144 u32 words: input_offs[0..16] then chain[0..128] (32 steps × 4).
+/// 149 u32 words: input_offs[0..16], chain[0..128], tail[0..5].
 /// `input_modulus` is 16 u32s (per-input element count for trailing-
 /// shape broadcast; 0 means no broadcast).
 pub fn run_elementwise_region(
@@ -1338,9 +1388,9 @@ pub fn run_elementwise_region(
 ) {
     assert_eq!(
         meta.len(),
-        144,
-        "run_elementwise_region: meta must be 144 u32 words \
-         (16 input_offs + 128 chain), got {}",
+        rlx_ir::REGION_META_WORDS,
+        "run_elementwise_region: meta must be {} u32 words, got {}",
+        rlx_ir::REGION_META_WORDS,
         meta.len()
     );
     unsafe {
@@ -1354,6 +1404,82 @@ pub fn run_elementwise_region(
             scalar_input_mask,
             input_modulus.as_ptr(),
             grid_1d(len),
+            BLOCK_X,
+        );
+    }
+}
+
+/// FKL batch horizontal fusion: one launch, `blockIdx.z` selects the slice.
+pub fn run_batch_elementwise_region(
+    a: &mut [f32],
+    slice_len: u32,
+    num_batch: u32,
+    num_steps: u32,
+    base_dst_off: u32,
+    slice_elems: u32,
+    batch_input_offs: &[u32],
+    meta: &[u32],
+    scalar_input_mask: u32,
+    input_modulus: &[u32; 16],
+) {
+    assert_eq!(
+        meta.len(),
+        rlx_ir::REGION_META_WORDS,
+        "run_batch_elementwise_region: meta must be {} u32 words, got {}",
+        rlx_ir::REGION_META_WORDS,
+        meta.len()
+    );
+    unsafe {
+        launch_batch_elementwise_region(
+            a.as_mut_ptr(),
+            slice_len,
+            num_batch,
+            num_steps,
+            base_dst_off,
+            slice_elems,
+            batch_input_offs.as_ptr(),
+            meta.as_ptr(),
+            scalar_input_mask,
+            input_modulus.as_ptr(),
+            grid_1d(slice_len),
+            BLOCK_X,
+        );
+    }
+}
+
+/// FKL batch horizontal fusion: one launch, `blockIdx.z` selects the slice.
+pub fn run_batch_elementwise_region(
+    a: &mut [f32],
+    slice_len: u32,
+    num_batch: u32,
+    num_steps: u32,
+    base_dst_off: u32,
+    slice_elems: u32,
+    batch_input_offs: &[u32],
+    meta: &[u32],
+    scalar_input_mask: u32,
+    input_modulus: &[u32; 16],
+) {
+    assert_eq!(
+        meta.len(),
+        rlx_ir::REGION_META_WORDS,
+        "run_batch_elementwise_region: meta must be {} u32 words, got {}",
+        rlx_ir::REGION_META_WORDS,
+        meta.len()
+    );
+    unsafe {
+        launch_batch_elementwise_region(
+            a.as_mut_ptr(),
+            slice_len,
+            num_batch,
+            num_steps,
+            base_dst_off,
+            slice_elems,
+            batch_input_offs.as_ptr(),
+            meta.as_ptr(),
+            scalar_input_mask,
+            input_modulus.as_ptr(),
+            grid_1d(slice_len),
             BLOCK_X,
         );
     }

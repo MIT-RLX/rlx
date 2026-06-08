@@ -725,12 +725,28 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
             }
 
             // ── Rotary position embedding ────────────────────────────
+            //
+            // Layout-aware position derivation:
+            //   - Packed rank-3 input `[B, S, H*D]` (heads in the last dim):
+            //     a head_dim-sized chunk index `c` maps to `(b, s, h)` with
+            //     `s = (c / H) % S`. We compute `s` explicitly and ignore
+            //     `cos.len()` for position derivation. Mirrors the MLX
+            //     `multi_head_packed` path in `rlx-mlx/src/lower.rs` so all
+            //     backends agree on per-chunk position.
+            //   - Rank-4 input `[B, H, S, D]` (heads as their own axis):
+            //     chunks per head are contiguous in `S`, so `s = c % S`.
+            //   - Single-head input `[B, S, D]`: same as rank-4 with H=1.
+            //   - Decode slice `cos.len() == half` (single position table):
+            //     `cos_len / tab_half = 1`, so `s = c % 1 = 0` is the right
+            //     value and matches the runtime-computed slice for absolute
+            //     position `past_seq`.
             Op::Rope { head_dim, n_rot } => {
                 let head_dim = *head_dim;
                 let n_rot = *n_rot;
                 let x = get_data(arena, external, node.inputs[0]);
                 let cos_cache = get_data(arena, external, node.inputs[1]);
                 let sin_cache = get_data(arena, external, node.inputs[2]);
+                let x_shape = &graph.node(node.inputs[0]).shape;
                 let output = get_output(arena, node_id);
                 output.copy_from_slice(x);
 
@@ -738,11 +754,79 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 let tab_half = head_dim / 2;
                 let total = output.len();
                 let num_chunks = total / head_dim;
+
+                // Derive (s_dim, heads_per_seq) from the input shape so we can
+                // map chunk index → seq position without assuming layout.
+                let cos_rows = cos_cache.len() / tab_half.max(1);
+                let (s_dim, heads_per_seq): (usize, usize) = {
+                    let rank = x_shape.rank();
+                    if rank == 0 {
+                        (1, 1)
+                    } else {
+                        let last = if x_shape.dim(rank - 1).is_static() {
+                            x_shape.dim(rank - 1).unwrap_static()
+                        } else {
+                            head_dim
+                        };
+                        if rank >= 3 && last > head_dim && last.is_multiple_of(head_dim) {
+                            // Packed multi-head [..., S, H*D].
+                            let s = if x_shape.dim(rank - 2).is_static() {
+                                x_shape.dim(rank - 2).unwrap_static()
+                            } else {
+                                1
+                            };
+                            (s, last / head_dim)
+                        } else if rank >= 4 && last == head_dim {
+                            // [B, H, S, D] — heads on outer axis.
+                            let s = if x_shape.dim(rank - 2).is_static() {
+                                x_shape.dim(rank - 2).unwrap_static()
+                            } else {
+                                1
+                            };
+                            (s, 1)
+                        } else if rank >= 3 && last == head_dim {
+                            // [..., S, D] single head.
+                            let s = if x_shape.dim(rank - 2).is_static() {
+                                x_shape.dim(rank - 2).unwrap_static()
+                            } else {
+                                1
+                            };
+                            (s, 1)
+                        } else {
+                            // Fallback: rely on the cos-table-length heuristic.
+                            (cos_rows.max(1), 1)
+                        }
+                    }
+                };
+
+                if std::env::var("RLX_ROPE_DEBUG").is_ok() {
+                    eprintln!(
+                        "[rope] shape={:?} num_chunks={num_chunks} cos_rows={cos_rows} s_dim={s_dim} heads_per_seq={heads_per_seq}",
+                        x_shape.dims()
+                    );
+                }
                 for chunk in 0..num_chunks {
                     let off = chunk * head_dim;
-                    let cos_len = cos_cache.len();
-                    let max_seq = cos_len / tab_half;
-                    let pos = chunk % max_seq;
+                    // Position derivation:
+                    //   - Packed [B, S, H*D]: chunk = ((b*S)+s)*H + h, so
+                    //     s = (chunk / heads_per_seq) % s_dim.
+                    //   - [B, H, S, D] / [B, S, D]: chunks per seq run contig,
+                    //     s = chunk % s_dim.
+                    let pos = if heads_per_seq > 1 {
+                        (chunk / heads_per_seq) % s_dim
+                    } else {
+                        chunk % s_dim
+                    };
+                    // For the decode-slice case (cos has a single row), force
+                    // pos = 0 so we always index the supplied past_seq slice.
+                    let pos = if cos_rows == 1 {
+                        0
+                    } else {
+                        pos.min(cos_rows.saturating_sub(1))
+                    };
+                    if std::env::var("RLX_ROPE_DEBUG").is_ok() && chunk < 4 {
+                        eprintln!("[rope]   chunk={chunk} pos={pos}");
+                    }
                     let cos_off = pos * tab_half;
 
                     for i in 0..rot_half {

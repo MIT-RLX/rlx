@@ -80,6 +80,15 @@ pub mod thunk;
 #[cfg(target_os = "macos")]
 pub mod backend;
 
+#[cfg(target_os = "macos")]
+pub mod attention_bwd_gpu;
+
+#[cfg(target_os = "macos")]
+pub mod thunk_profile;
+
+#[cfg(target_os = "macos")]
+pub mod mps_profile;
+
 #[cfg(all(feature = "native-splat", target_os = "macos"))]
 pub mod splat_adam;
 #[cfg(all(feature = "native-splat", target_os = "macos"))]

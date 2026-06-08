@@ -25,8 +25,9 @@ use rlx_fusion::fusion::UnfuseElementwiseRegions;
 use rlx_fusion::lower_backward_ops::LowerBackwardOps;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
 use rlx_fusion::lower_logical_kernels;
+use rlx_fusion::lower_loss_ops::LowerSoftmaxCrossEntropy;
 use rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
-use rlx_fusion::lower_vae_ops::{LowerGroupNorm, LowerResizeNearest2x};
+use rlx_fusion::lower_vae_ops::{LowerBatchNormInference, LowerGroupNorm, LowerResizeNearest2x};
 use rlx_fusion::pass::Pass;
 use rlx_fusion::unfuse::unfuse_fused_for_autodiff;
 use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
@@ -54,6 +55,28 @@ fn unsupported_kinds(graph: &Graph, supported: &[OpKind]) -> HashSet<OpKind> {
 
 fn needs_unfuse(kinds: &HashSet<OpKind>) -> bool {
     kinds.iter().any(|k| FUSED_KINDS.contains(k))
+}
+
+#[cfg(feature = "training")]
+fn needs_backward_decompose(bad: &HashSet<OpKind>) -> bool {
+    use OpKind::*;
+    bad.iter().any(|k| {
+        matches!(
+            k,
+            Conv2dBackwardInput
+                | Conv2dBackwardWeight
+                | MaxPool2dBackward
+                | LayerNormBackwardInput
+                | LayerNormBackwardGamma
+                | BatchNormInferenceBackwardInput
+                | BatchNormInferenceBackwardGamma
+                | BatchNormInferenceBackwardBeta
+                | FakeQuantizeBackward
+                | SoftmaxCrossEntropyBackward
+                | ReluBackward
+                | ActivationBackward
+        )
+    })
 }
 
 /// Rewrite `graph` toward `supported` op kinds. Idempotent when already legal.
@@ -97,6 +120,10 @@ pub fn rewrite_for_backend_with_config(
             graph = LowerGroupNorm.run(graph);
             changed = true;
         }
+        if bad.contains(&OpKind::BatchNormInference) {
+            graph = LowerBatchNormInference.run(graph);
+            changed = true;
+        }
         if bad.contains(&OpKind::ResizeNearest2x) {
             graph = LowerResizeNearest2x.run(graph);
             changed = true;
@@ -110,10 +137,26 @@ pub fn rewrite_for_backend_with_config(
             changed = true;
         }
         if bad.contains(&OpKind::ElementwiseRegion) {
-            graph = UnfuseElementwiseRegions.run(graph);
+            graph = UnfuseElementwiseRegions::FOR_CPU.run(graph);
             changed = true;
         }
-        if bad.contains(&OpKind::ReluBackward) || bad.contains(&OpKind::ActivationBackward) {
+        if bad.contains(&OpKind::SoftmaxCrossEntropyWithLogits)
+            || bad.contains(&OpKind::SoftmaxCrossEntropyBackward)
+        {
+            graph = LowerSoftmaxCrossEntropy.run(graph);
+            changed = true;
+        }
+        #[cfg(feature = "training")]
+        if needs_backward_decompose(&bad) {
+            graph = rlx_autodiff::decompose_backward_ops_except(graph, supported);
+            changed = true;
+        }
+        if bad.contains(&OpKind::ReluBackward)
+            || bad.contains(&OpKind::ActivationBackward)
+            || bad.contains(&OpKind::BatchNormInferenceBackwardInput)
+            || bad.contains(&OpKind::BatchNormInferenceBackwardGamma)
+            || bad.contains(&OpKind::BatchNormInferenceBackwardBeta)
+        {
             graph = LowerBackwardOps.run(graph);
             changed = true;
         }
@@ -179,6 +222,33 @@ mod tests {
     use super::*;
     use rlx_ir::infer::GraphExt;
     use rlx_ir::*;
+
+    #[test]
+    fn rewrite_lowers_sce_for_cuda_primitives() {
+        let f = DType::F32;
+        let mut g = Graph::new("sce");
+        let logits = g.input("logits", Shape::new(&[4, 4], f));
+        let labels = g.input("labels", Shape::new(&[4], f));
+        let loss = g.softmax_cross_entropy_with_logits(logits, labels);
+        g.set_outputs(vec![loss]);
+
+        let cuda_like = &[
+            OpKind::Input,
+            OpKind::Constant,
+            OpKind::Reduce,
+            OpKind::Binary,
+            OpKind::Expand,
+            OpKind::Activation,
+            OpKind::Reshape,
+            OpKind::Compare,
+            OpKind::Where,
+            OpKind::Concat,
+            OpKind::Softmax,
+        ];
+        assert!(legalize_for_backend(&g, cuda_like).is_err());
+        let lowered = rewrite_for_backend(g, cuda_like);
+        assert!(legalize_for_backend(&lowered, cuda_like).is_ok());
+    }
 
     #[test]
     fn unfuses_fused_matmul_for_minimal_cpu_set() {

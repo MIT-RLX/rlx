@@ -14,9 +14,22 @@ PrecisionPolicy Y?"
 - **Examples**:
   - `bench_all` — sweep every (pattern × device × policy) cell.
   - `bench_autodiff` — measure reverse-mode AD overhead per op.
+  - `bench_nth_order` — 3rd-order `sum(x³)` vs vector width N; all backends.
   - `bench_fft` — batch × N sweep across backends; set
     `RLX_BENCH_DISPATCH_ONLY=1` on wgpu to skip readback and isolate
     dispatch time.
+  - `bench_mlx_wgpu` — matmul: `Device::Cpu` vs `Device::Mlx` (set
+    `RLX_MLX_DEVICE=cpu` on Linux for MLX CPU path).
+  - `bench_mlx_devices` — MLX device legs (Metal / Linux CPU / Linux CUDA);
+    see [`docs/benchmarks/mlx-linux.md`](../docs/benchmarks/mlx-linux.md).
+  - `bench_fk_fusion` — FKL resize prologue + batch region vs primitives;
+    `FK_BENCH_OPS=1` prints fused op counts; `RLX_FK_BATCH_SINGLE_KERNEL=1`
+    (CUDA/ROCm/Metal/wgpu) uses one batch-region launch; TPU uses per-slice HLO.
+    See [`docs/fk-fusion.md`](../docs/fk-fusion.md).
+
+Cross-platform results: [`docs/benchmarks/higher-order-ad.md`](../docs/benchmarks/higher-order-ad.md).
+
+Linux MLX (compile, `RLX_MLX_DEVICE`, vs `rlx-cpu`): [`docs/benchmarks/mlx-linux.md`](../docs/benchmarks/mlx-linux.md).
 
 ## Install
 
@@ -38,6 +51,10 @@ RLX_BENCH_DISPATCH_ONLY=1 cargo run -p rlx-bench --release --example bench_fft -
 
 ```sh
 cargo run -p rlx-bench --release --example bench_all
+cargo run -p rlx-bench --release --example bench_nth_order --features metal,mlx,gpu,cuda
+RLX_MLX_DEVICE=cpu cargo run -p rlx-bench --release --example bench_mlx_wgpu --features mlx
+./rig.sh bench-nth-order both
+./rig.sh bench-mlx-devices wsl
 ```
 
 ## License

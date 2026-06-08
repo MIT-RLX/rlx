@@ -62,6 +62,25 @@ impl CompiledGraph {
         self.inner.run(inputs)
     }
 
+    /// Run and read back only selected outputs (logits-only decode on MLX).
+    pub fn run_read_outputs(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        read_indices: Option<&[usize]>,
+    ) -> Vec<Vec<f32>> {
+        self.inner.run_read_outputs(inputs, read_indices)
+    }
+
+    /// Read one row from a row-major output tensor after a forward pass.
+    pub fn read_output_row(
+        &self,
+        out_idx: usize,
+        row: usize,
+        row_inner: usize,
+    ) -> Option<Vec<f32>> {
+        self.inner.read_output_row(out_idx, row, row_inner)
+    }
+
     /// Execute and return raw pointers to output data (zero-copy).
     /// Data is valid until the next `run`/`run_raw` call.
     ///

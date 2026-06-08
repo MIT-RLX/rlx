@@ -57,6 +57,7 @@ impl OrchestratedExecutable {
                     graph: seg_graph,
                     output_orig,
                 } => {
+                    let seg_graph = crate::ir_passes::prepare_graph_for_hlo(seg_graph);
                     let module = lower_graph(&seg_graph);
                     let executable = compile_pjrt_executable(&module.bytes);
                     let n_params = module.param_names.len();

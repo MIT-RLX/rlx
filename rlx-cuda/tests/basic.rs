@@ -24,7 +24,7 @@
 use rlx_cuda::backend::CudaExecutable;
 use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::quant::QuantScheme;
-use rlx_ir::{DType, Graph, Shape};
+use rlx_ir::{DType, Graph, GraphExt, Shape};
 
 const QK_K: usize = 256;
 
@@ -416,5 +416,180 @@ fn resize_nearest_2x_matches_cpu_reference() {
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max)
+    );
+}
+
+#[test]
+fn attention_bshd_eeg_shape_matches_cpu() {
+    if !rlx_cuda::is_available() {
+        return;
+    }
+    use rlx_ir::op::MaskKind;
+
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let n = b * s * nh * dh;
+    let q: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin() * 0.5).collect();
+    let k: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).cos() * 0.3).collect();
+    let v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03) % 1.0 - 0.5).collect();
+
+    let want = rlx_ir::cpu_attention_bshd(&q, &k, &v, b, s, nh, dh);
+
+    let mut g = Graph::new("bshd_eeg");
+    let qi = g.input("q", Shape::new(&[b, s, nh, dh], DType::F32));
+    let ki = g.input("k", Shape::new(&[b, s, nh, dh], DType::F32));
+    let vi = g.input("v", Shape::new(&[b, s, nh, dh], DType::F32));
+    let o = g.add_node(
+        rlx_ir::Op::Attention {
+            num_heads: nh,
+            head_dim: dh,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![qi, ki, vi],
+        Shape::new(&[b, s, nh, dh], DType::F32),
+    );
+    g.set_outputs(vec![o]);
+    let mut exe = CudaExecutable::compile(g);
+    let got = exe
+        .run(&[("q", &q), ("k", &k), ("v", &v)])
+        .into_iter()
+        .next()
+        .unwrap();
+    let err = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err < 1e-3,
+        "BSHD flash attention [1,191,8,25] max_abs={err:.3e}",
+    );
+}
+
+#[test]
+fn packed_bshd_attn_matches_cpu_ref() {
+    if !rlx_cuda::is_available() {
+        return;
+    }
+    use rlx_ir::op::{MaskKind, Op};
+
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let hd = nh * dh;
+    let f = DType::F32;
+    let n = b * s * hd;
+    let x_v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w_v: Vec<f32> = (0..(hd * 3 * hd))
+        .map(|i| (i as f32 * 0.01).cos() * 0.1)
+        .collect();
+    let b_v: Vec<f32> = (0..(3 * hd)).map(|i| i as f32 * 0.001).collect();
+
+    let mut g_pack = Graph::new("pack");
+    let x = g_pack.input("x", Shape::new(&[b, s, hd], f));
+    let w = g_pack.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias = g_pack.param("b", Shape::new(&[3 * hd], f));
+    let qkv = g_pack.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv4 = g_pack.reshape_(qkv, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    g_pack.set_outputs(vec![qkv4]);
+
+    let mut pack_exe = CudaExecutable::compile(g_pack);
+    pack_exe.set_param("w", &w_v);
+    pack_exe.set_param("b", &b_v);
+    let packed = pack_exe.run(&[("x", &x_v)]).into_iter().next().unwrap();
+    let want = rlx_ir::cpu_attention_packed_bshd_qkv(&packed, b, s, nh, dh);
+
+    let mut g_attn = Graph::new("attn_pack");
+    let pin = g_attn.input("p", Shape::new(&[b, s, 3, nh, dh], f));
+    let q0 = g_attn.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: 1,
+        },
+        vec![pin],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let k0 = g_attn.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 1,
+            len: 1,
+        },
+        vec![pin],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let v0 = g_attn.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 2,
+            len: 1,
+        },
+        vec![pin],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let q = g_attn.reshape_(q0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let k = g_attn.reshape_(k0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let v = g_attn.reshape_(v0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let out = g_attn.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: dh,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v],
+        Shape::new(&[b, s, nh, dh], f),
+    );
+    g_attn.set_outputs(vec![out]);
+    let mut attn_exe = CudaExecutable::compile(g_attn);
+    let got = attn_exe.run(&[("p", &packed)]).into_iter().next().unwrap();
+    let err = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err < 1e-3,
+        "packed BSHD flash attn max_abs={err:.3e} idx26862 want={} got={}",
+        want[26862],
+        got[26862]
+    );
+}
+
+#[test]
+fn run_slots_matches_run_single_output() {
+    if !rlx_cuda::is_available() {
+        return;
+    }
+    let mut g = Graph::new("slots");
+    let x = g.input("x", Shape::new(&[1, 4], DType::F32));
+    let w = g.param("w", Shape::new(&[4, 4], DType::F32));
+    let y = g.matmul(x, w, Shape::new(&[1, 4], DType::F32));
+    g.set_outputs(vec![y]);
+    let mut exe = CudaExecutable::compile(g);
+    exe.set_param(
+        "w",
+        &[
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ],
+    );
+    let xv = [[1.0_f32, 2.0, 3.0, 4.0]];
+    let via_run = exe.run(&[("x", &xv[0])])[0].clone();
+    let slots = exe.run_slots(&[&xv[0]]).to_vec();
+    assert_eq!(slots.len(), 1);
+    let (byte_off, len) = slots[0];
+    assert!(!exe.arena_ptr().is_null());
+    let ptr = unsafe { exe.arena_ptr().add(byte_off) as *const f32 };
+    let got = unsafe { std::slice::from_raw_parts(ptr, len) };
+    assert!(
+        close(got, &via_run, 1e-5),
+        "run_slots readback mismatch: {:?} vs {:?}",
+        got,
+        via_run
     );
 }

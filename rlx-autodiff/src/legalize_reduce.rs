@@ -1,87 +1,104 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+//
 // Decompose multi-axis `Op::Reduce` into single-axis chains for backends
 // that only support one reduction axis at a time (e.g. WGPU).
 
-use rlx_ir::op::ReduceOp;
 use rlx_ir::shape::Dim;
 use rlx_ir::{Graph, NodeId, Op, Shape};
 
 /// Replace every `Reduce` with `axes.len() > 1` by a chain of single-axis
 /// reductions (`keep_dim=true` on each step; final reshape drops dims if needed).
-pub fn legalize_multi_axis_reduce(mut g: Graph) -> Graph {
-    let targets: Vec<(NodeId, ReduceOp, Vec<usize>, bool, Shape)> = g
+///
+/// Builds a fresh graph in topological order (multi-axis Reduce nodes are
+/// replaced **in-place** in the walk, not appended at the end). This is
+/// required so downstream passes like `unfuse_fused_for_autodiff` — which
+/// assume strict insertion=topological order — don't see consumer nodes
+/// whose inputs sit later in the node list.
+pub fn legalize_multi_axis_reduce(g: Graph) -> Graph {
+    use std::collections::HashMap;
+
+    // Cheap early-out: skip the rebuild if there's nothing to legalise.
+    let any_multi = g
         .nodes()
         .iter()
-        .filter_map(|n| {
-            if let Op::Reduce { op, axes, keep_dim } = &n.op {
-                (axes.len() > 1).then_some((n.id, *op, axes.clone(), *keep_dim, n.shape.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let mut remap: std::collections::HashMap<NodeId, NodeId> = std::collections::HashMap::new();
-
-    for (id, op, axes, keep_dim, final_shape) in targets {
-        let input = g.node(id).inputs[0];
-        let dtype = g.node(input).shape.dtype();
-        let mut cur = input;
-        let mut shape = g.node(cur).shape.clone();
-        let mut sorted = axes;
-        sorted.sort_unstable_by(|a, b| b.cmp(a));
-        for &ax in &sorted {
-            let mut dims: Vec<Dim> = shape.dims().to_vec();
-            dims[ax] = Dim::Static(1);
-            let step_shape = Shape::from_dims(&dims, dtype);
-            cur = g.add_node(
-                Op::Reduce {
-                    op,
-                    axes: vec![ax],
-                    keep_dim: true,
-                },
-                vec![cur],
-                step_shape,
-            );
-            shape = g.node(cur).shape.clone();
-        }
-        if !keep_dim {
-            let new_shape_dims: Vec<i64> = final_shape
-                .dims()
-                .iter()
-                .map(|d| match d {
-                    Dim::Static(n) => *n as i64,
-                    Dim::Dynamic(_) => -1,
-                })
-                .collect();
-            cur = g.add_node(
-                Op::Reshape {
-                    new_shape: new_shape_dims,
-                },
-                vec![cur],
-                final_shape,
-            );
-        }
-        remap.insert(id, cur);
-    }
-
-    if remap.is_empty() {
+        .any(|n| matches!(&n.op, Op::Reduce { axes, .. } if axes.len() > 1));
+    if !any_multi {
         return g;
     }
 
-    for node in g.nodes_mut() {
-        for inp in &mut node.inputs {
-            if let Some(&r) = remap.get(inp) {
-                *inp = r;
+    let mut out = Graph::new(g.name.clone());
+    let mut remap: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for node in g.nodes() {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| remap[i]).collect();
+
+        let final_new_id = match &node.op {
+            Op::Reduce { op, axes, keep_dim } if axes.len() > 1 => {
+                // Single-axis chain: reduce from the largest axis down so
+                // intermediate shapes stay well-defined under the original
+                // numbering. Each step uses `keep_dim=true`; a final
+                // `Reshape` (only when the original was `keep_dim=false`)
+                // collapses the size-1 dims back out.
+                let mut cur = new_inputs[0];
+                let mut shape = out.node(cur).shape.clone();
+                let dtype = shape.dtype();
+                let mut sorted = axes.clone();
+                sorted.sort_unstable_by(|a, b| b.cmp(a));
+                for &ax in &sorted {
+                    let mut dims: Vec<Dim> = shape.dims().to_vec();
+                    dims[ax] = Dim::Static(1);
+                    let step_shape = Shape::from_dims(&dims, dtype);
+                    cur = out.add_node(
+                        Op::Reduce {
+                            op: *op,
+                            axes: vec![ax],
+                            keep_dim: true,
+                        },
+                        vec![cur],
+                        step_shape,
+                    );
+                    shape = out.node(cur).shape.clone();
+                }
+                if !*keep_dim {
+                    let final_shape = node.shape.clone();
+                    let new_shape_dims: Vec<i64> = final_shape
+                        .dims()
+                        .iter()
+                        .map(|d| match d {
+                            Dim::Static(n) => *n as i64,
+                            Dim::Dynamic(_) => -1,
+                        })
+                        .collect();
+                    cur = out.add_node(
+                        Op::Reshape {
+                            new_shape: new_shape_dims,
+                        },
+                        vec![cur],
+                        final_shape,
+                    );
+                }
+                cur
             }
-        }
+            _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
+        };
+        remap.insert(node.id, final_new_id);
     }
-    for out in &mut g.outputs {
-        if let Some(&r) = remap.get(out) {
-            *out = r;
-        }
-    }
-    g
+
+    let new_outputs: Vec<NodeId> = g.outputs.iter().map(|id| remap[id]).collect();
+    out.set_outputs(new_outputs);
+    out
 }

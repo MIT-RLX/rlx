@@ -43,7 +43,7 @@
 //!    n=80) vs the MLX-CPU-stream baseline. Expected 20–80× win on
 //!    the middle two cases. ~1 day.
 
-#![cfg(target_os = "macos")]
+#![cfg(rlx_mlx_host)]
 
 use std::ffi::CString;
 use std::sync::Arc;

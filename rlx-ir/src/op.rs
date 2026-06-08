@@ -218,6 +218,7 @@ pub enum OpKind {
     Constant,
     Activation,
     Cast,
+    StopGradient,
     Quantize,
     Dequantize,
     FakeQuantize,
@@ -228,6 +229,10 @@ pub enum OpKind {
     Compare,
     Where,
     ElementwiseRegion,
+    /// Fused sampling / geometry chain (FKL-style transform region).
+    TransformRegion,
+    /// Same element-wise chain over multiple batch planes (horizontal fusion).
+    BatchElementwiseRegion,
     MatMul,
     DotGeneral,
     DenseSolve,
@@ -235,6 +240,7 @@ pub enum OpKind {
     LayerNorm,
     LayerNorm2d,
     GroupNorm,
+    BatchNormInference,
     RmsNorm,
     ResizeNearest2x,
     Attention,
@@ -252,6 +258,7 @@ pub enum OpKind {
     TopK,
     Sample,
     Conv,
+    Im2Col,
     ConvTranspose2d,
     Pool,
     ReluBackward,
@@ -275,6 +282,9 @@ pub enum OpKind {
     GroupNormBackwardInput,
     GroupNormBackwardGamma,
     GroupNormBackwardBeta,
+    BatchNormInferenceBackwardInput,
+    BatchNormInferenceBackwardGamma,
+    BatchNormInferenceBackwardBeta,
     CumsumBackward,
     GatherBackward,
     GroupedMatMul,
@@ -316,6 +326,12 @@ pub enum OpKind {
     CustomFn,
     /// 1D FFT primitive (forward or inverse) — see [`Op::Fft`].
     Fft,
+    /// Ternary pruned radix-2 butterfly stage — see [`Op::FftButterflyStage`].
+    FftButterflyStage,
+    /// Whisper-style log-mel from block-layout FFT spectrum — see [`Op::LogMel`].
+    LogMel,
+    /// Backward of [`Op::LogMel`] w.r.t. block-layout spectrum input 0.
+    LogMelBackward,
 }
 
 /// An operand inside a fused [`ChainStep`] — either a graph-level input
@@ -344,6 +360,23 @@ pub enum ChainStep {
     /// patterns into a single region kernel instead of breaking the
     /// chain at the first `Op::Where`.
     Where(ChainOperand, ChainOperand, ChainOperand),
+}
+
+/// Pre-region memory transform fused into [`Op::ElementwiseRegion`].
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RegionPrologue {
+    #[default]
+    None,
+    /// Input is half-resolution NCHW; output shape is 2× H×W (nearest 2×).
+    ResizeNearest2x,
+}
+
+/// One sampling step in [`Op::TransformRegion`].
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransformStep {
+    ResizeNearest2x(ChainOperand),
 }
 
 /// An operation in the RLX IR graph.
@@ -379,6 +412,13 @@ pub enum Op {
     Cast {
         to: DType,
     },
+
+    /// Stop-gradient (a.k.a. `detach` / `lax.stop_gradient`). Forward is
+    /// identity; the reverse-mode autodiff rule returns **no** gradient
+    /// contribution for the input. Single input, same shape & dtype
+    /// output. Used to build a Gradient-Reverse-Layer with identity
+    /// forward semantics in user code (see maet-rs `dat_loss`).
+    StopGradient,
 
     /// INT8 quantization. Input f32; output i8 same shape.
     ///   `q[i] = saturate_i8(round(x[i] / scale[c]) + zero_point[c])`
@@ -509,6 +549,28 @@ pub enum Op {
         num_inputs: u32,
         scalar_input_mask: u32,
         input_modulus: [u32; 16],
+        /// FKL-style closed fusion: apply before the element-wise chain.
+        prologue: RegionPrologue,
+        /// External input index that supplies the prologue transform source (default 0).
+        prologue_input: u32,
+    },
+
+    /// Fused transform chain (resize, future crop/color). Decompose via
+    /// [`rlx_fusion::DecomposeFusionRegions`] when no native kernel exists.
+    TransformRegion {
+        steps: Vec<TransformStep>,
+        num_inputs: u32,
+    },
+
+    /// Identical [`Op::ElementwiseRegion`] chain over `num_batch_inputs` tensors
+    /// (horizontal / z-plane fusion). Inputs are separate batch slices.
+    BatchElementwiseRegion {
+        chain: Vec<ChainStep>,
+        num_batch_inputs: u32,
+        scalar_input_mask: u32,
+        input_modulus: [u32; 16],
+        prologue: RegionPrologue,
+        prologue_input: u32,
     },
 
     // ── Linear algebra ──────────────────────────────────────────
@@ -574,6 +636,13 @@ pub enum Op {
     /// RMS normalization: input, gamma → normalized output.
     RmsNorm {
         axis: i32,
+        eps: f32,
+    },
+
+    /// BatchNorm inference with frozen running statistics.
+    /// Inputs: `x`, `gamma`, `beta`, `running_mean`, `running_var`.
+    /// Feature dimension is the last axis of `x`; stats are 1-D `[C]`.
+    BatchNormInference {
         eps: f32,
     },
 
@@ -899,6 +968,17 @@ pub enum Op {
         groups: usize,
     },
 
+    /// NCHW im2col for conv backward-weight style matmul.
+    /// Input `[N, C, H, W]`. Output `[M, C·kH·kW]` with
+    /// `M = N · H_out · W_out`. When batch is [`dynamic::sym::BATCH`],
+    /// output rows use [`dynamic::sym::ROWS`] (bind `N · H_out · W_out`).
+    Im2Col {
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+        dilation: Vec<usize>,
+    },
+
     /// 2D transposed convolution on NCHW. Weight layout (PyTorch):
     /// `[C_in, C_out / groups, kH, kW]`.
     ConvTranspose2d {
@@ -1012,6 +1092,19 @@ pub enum Op {
         num_groups: usize,
         eps: f32,
     },
+
+    /// BatchNorm inference backward w.r.t. `x`. Inputs `[x, gamma, mean, var, dy]`.
+    BatchNormInferenceBackwardInput {
+        eps: f32,
+    },
+
+    /// BatchNorm inference backward w.r.t. `gamma`. Inputs `[x, mean, var, dy]`.
+    BatchNormInferenceBackwardGamma {
+        eps: f32,
+    },
+
+    /// BatchNorm inference backward w.r.t. `beta`. Inputs `[dy]`; output = `beta.shape`.
+    BatchNormInferenceBackwardBeta,
 
     /// Cumsum backward along `axis`. Inputs `[dy]`; output matches forward input shape.
     CumsumBackward {
@@ -1485,6 +1578,38 @@ pub enum Op {
         norm: crate::fft::FftNorm,
     },
 
+    /// Ternary pruned radix-2 butterfly stage on interleaved complex state.
+    ///
+    /// Inputs:
+    ///   0 — state `[batch, n_fft, 2]` (re/im on axis 2)
+    ///   1 — gate `[half]` — 0 = identity, 1 = run butterfly (`half = n_fft/2`)
+    ///   2 — rev `[half]` — 0 = forward, 1 = swap outputs when gate=1
+    ///   3 — tw_re `[half]`
+    ///   4 — tw_im `[half]`
+    ///
+    /// Output: `[batch, n_fft, 2]` same layout. Slots with gate=0 copy inputs
+    /// without twiddle math.
+    FftButterflyStage {
+        stage: u32,
+        n_fft: u32,
+    },
+
+    /// Log-mel spectrogram from RLX FFT block-layout spectrum.
+    ///
+    /// Inputs:
+    ///   0 — spectrum `[..., 2*n_fft]` (re plane then im plane, same as `Op::Fft` output)
+    ///   1 — mel filterbank `[n_mels, n_bins]` with `n_bins = n_fft/2 + 1`
+    ///
+    /// Output: `[..., n_mels]` with Whisper dynamic-range compression
+    /// (`log10`, clamp to max−8 dB, `(x+4)/4`).
+    LogMel,
+
+    /// VJP of [`Op::LogMel`] w.r.t. spectrum (input 0).
+    ///
+    /// Inputs: spectrum block, mel filters, upstream `dy`.
+    /// Output: `d_spectrum` (same shape as input 0).
+    LogMelBackward,
+
     /// User-defined sub-graph with optional override AD rules.
     /// Mirrors JAX's `custom_vjp` / `custom_jvp` decorators: the
     /// caller wraps a forward computation and supplies its own
@@ -1540,6 +1665,7 @@ impl Op {
             Op::Constant { .. } => OpKind::Constant,
             Op::Activation(_) => OpKind::Activation,
             Op::Cast { .. } => OpKind::Cast,
+            Op::StopGradient => OpKind::StopGradient,
             Op::Quantize { .. } => OpKind::Quantize,
             Op::Dequantize { .. } => OpKind::Dequantize,
             Op::FakeQuantize { .. } => OpKind::FakeQuantize,
@@ -1550,6 +1676,8 @@ impl Op {
             Op::Compare(_) => OpKind::Compare,
             Op::Where => OpKind::Where,
             Op::ElementwiseRegion { .. } => OpKind::ElementwiseRegion,
+            Op::TransformRegion { .. } => OpKind::TransformRegion,
+            Op::BatchElementwiseRegion { .. } => OpKind::BatchElementwiseRegion,
             Op::MatMul => OpKind::MatMul,
             Op::DotGeneral { .. } => OpKind::DotGeneral,
             Op::DenseSolve => OpKind::DenseSolve,
@@ -1557,6 +1685,7 @@ impl Op {
             Op::LayerNorm { .. } => OpKind::LayerNorm,
             Op::LayerNorm2d { .. } => OpKind::LayerNorm2d,
             Op::GroupNorm { .. } => OpKind::GroupNorm,
+            Op::BatchNormInference { .. } => OpKind::BatchNormInference,
             Op::RmsNorm { .. } => OpKind::RmsNorm,
             Op::ResizeNearest2x => OpKind::ResizeNearest2x,
             Op::Attention { .. } => OpKind::Attention,
@@ -1574,6 +1703,7 @@ impl Op {
             Op::TopK { .. } => OpKind::TopK,
             Op::Sample { .. } => OpKind::Sample,
             Op::Conv { .. } => OpKind::Conv,
+            Op::Im2Col { .. } => OpKind::Im2Col,
             Op::ConvTranspose2d { .. } => OpKind::ConvTranspose2d,
             Op::Pool { .. } => OpKind::Pool,
             Op::ReluBackward => OpKind::ReluBackward,
@@ -1591,6 +1721,9 @@ impl Op {
             Op::GroupNormBackwardInput { .. } => OpKind::GroupNormBackwardInput,
             Op::GroupNormBackwardGamma { .. } => OpKind::GroupNormBackwardGamma,
             Op::GroupNormBackwardBeta { .. } => OpKind::GroupNormBackwardBeta,
+            Op::BatchNormInferenceBackwardInput { .. } => OpKind::BatchNormInferenceBackwardInput,
+            Op::BatchNormInferenceBackwardGamma { .. } => OpKind::BatchNormInferenceBackwardGamma,
+            Op::BatchNormInferenceBackwardBeta => OpKind::BatchNormInferenceBackwardBeta,
             Op::CumsumBackward { .. } => OpKind::CumsumBackward,
             Op::GatherBackward { .. } => OpKind::GatherBackward,
             Op::MaxPool2dBackward { .. } => OpKind::MaxPool2dBackward,
@@ -1627,6 +1760,9 @@ impl Op {
             Op::Custom { .. } => OpKind::Custom,
             Op::CustomFn { .. } => OpKind::CustomFn,
             Op::Fft { .. } => OpKind::Fft,
+            Op::FftButterflyStage { .. } => OpKind::FftButterflyStage,
+            Op::LogMel => OpKind::LogMel,
+            Op::LogMelBackward => OpKind::LogMelBackward,
         }
     }
 
@@ -1637,11 +1773,18 @@ impl Op {
             self,
             Op::Activation(_)
                 | Op::Cast { .. }
+                | Op::StopGradient
                 | Op::Binary(_)
                 | Op::Compare(_)
                 | Op::Where
                 | Op::ElementwiseRegion { .. }
+                | Op::BatchElementwiseRegion { .. }
         )
+    }
+
+    /// True if this op may appear in a [`Op::TransformRegion`] chain.
+    pub fn is_transform_eligible(&self) -> bool {
+        matches!(self, Op::ResizeNearest2x)
     }
 
     /// True if this op is a BLAS/compute-intensive op that forms a fusion boundary.
@@ -1653,6 +1796,7 @@ impl Op {
                 | Op::DenseSolve
                 | Op::BatchedDenseSolve
                 | Op::Conv { .. }
+                | Op::Im2Col { .. }
                 | Op::ConvTranspose2d { .. }
                 | Op::FusedMatMulBiasAct { .. }
                 | Op::GroupedMatMul
@@ -1691,6 +1835,7 @@ impl Op {
             Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => 0,
             Op::Activation(_)
             | Op::Cast { .. }
+            | Op::StopGradient
             | Op::Reshape { .. }
             | Op::Quantize { .. }
             | Op::Dequantize { .. }
@@ -1747,6 +1892,7 @@ impl Op {
             | Op::LayerNorm2d { .. }
             | Op::GroupNorm { .. }
             | Op::RmsNorm { .. } => 3, // input, gamma, beta
+            Op::BatchNormInference { .. } => 5, // x, gamma, beta, mean, var
             Op::FusedMatMulBiasAct { .. } => 3, // input, weight, bias
             Op::FusedResidualLN { has_bias: true, .. } => 5, // x, residual, bias, gamma, beta
             Op::FusedResidualLN {
@@ -1757,6 +1903,7 @@ impl Op {
                 has_bias: false, ..
             } => 4, // x, residual, gamma, beta
             Op::Conv { .. } | Op::ConvTranspose2d { .. } => 2, // input, weight (bias via Add)
+            Op::Im2Col { .. } => 1,
             Op::Pool { .. } => 1,
             Op::ReluBackward => 2,                  // x, dy
             Op::ActivationBackward { .. } => 2,     // x, dy
@@ -1773,14 +1920,17 @@ impl Op {
             Op::GroupNormBackwardInput { .. } => 4, // x, gamma, beta, dy
             Op::GroupNormBackwardGamma { .. } => 2, // x, dy
             Op::GroupNormBackwardBeta { .. } => 2,
-            Op::CumsumBackward { .. } => 1,         // dy
-            Op::GatherBackward { .. } => 2,         // dy, indices
-            Op::MaxPool2dBackward { .. } => 2,      // x, dy
-            Op::Conv2dBackwardInput { .. } => 2,    // dy, w
-            Op::Conv2dBackwardWeight { .. } => 2,   // x, dy
-            Op::SoftmaxCrossEntropyWithLogits => 2, // logits, labels
-            Op::SoftmaxCrossEntropyBackward => 3,   // logits, labels, d_loss
-            Op::Concat { .. } => 0,                 // variadic — checked at graph level
+            Op::BatchNormInferenceBackwardInput { .. } => 5, // x, gamma, mean, var, dy
+            Op::BatchNormInferenceBackwardGamma { .. } => 4, // x, mean, var, dy
+            Op::BatchNormInferenceBackwardBeta => 1,         // dy
+            Op::CumsumBackward { .. } => 1,                  // dy
+            Op::GatherBackward { .. } => 2,                  // dy, indices
+            Op::MaxPool2dBackward { .. } => 2,               // x, dy
+            Op::Conv2dBackwardInput { .. } => 2,             // dy, w
+            Op::Conv2dBackwardWeight { .. } => 2,            // x, dy
+            Op::SoftmaxCrossEntropyWithLogits => 2,          // logits, labels
+            Op::SoftmaxCrossEntropyBackward => 3,            // logits, labels, d_loss
+            Op::Concat { .. } => 0,                          // variadic — checked at graph level
             Op::DotGeneral { .. } => 2,
             Op::DenseSolve => 2,        // A, b
             Op::BatchedDenseSolve => 2, // A [B,N,N], b [B,N] or [B,N,K]
@@ -1804,9 +1954,16 @@ impl Op {
                 10 + if *has_bias { 4 } else { 0 }
             }
             Op::ElementwiseRegion { num_inputs, .. } => *num_inputs as usize,
+            Op::TransformRegion { num_inputs, .. } => *num_inputs as usize,
+            Op::BatchElementwiseRegion {
+                num_batch_inputs, ..
+            } => *num_batch_inputs as usize,
             Op::Custom { num_inputs, .. } => *num_inputs as usize,
             Op::CustomFn { num_inputs, .. } => *num_inputs as usize,
             Op::Fft { .. } => 1,
+            Op::FftButterflyStage { .. } => 5,
+            Op::LogMel => 2,
+            Op::LogMelBackward => 3,
         }
     }
 }
@@ -1852,6 +2009,7 @@ impl std::fmt::Display for Op {
                 write!(f, "fake_quant_lsq_bwd_s(bits={bits})")
             }
             Op::Cast { to } => write!(f, "cast({to})"),
+            Op::StopGradient => write!(f, "stop_gradient"),
             Op::Binary(op) => write!(f, "{op:?}"),
             Op::Compare(op) => write!(f, "{op:?}"),
             Op::Where => write!(f, "where"),
@@ -1863,6 +2021,7 @@ impl std::fmt::Display for Op {
             Op::GroupNorm { num_groups, eps } => {
                 write!(f, "group_norm(groups={num_groups},eps={eps})")
             }
+            Op::BatchNormInference { eps } => write!(f, "batch_norm_inference(eps={eps})"),
             Op::ResizeNearest2x => write!(f, "resize_nearest_2x"),
             Op::RmsNorm { eps, .. } => write!(f, "rms_norm(eps={eps})"),
             Op::Attention {
@@ -1962,6 +2121,7 @@ impl std::fmt::Display for Op {
             }
             Op::ScatterAdd => write!(f, "scatter_add"),
             Op::Conv { kernel_size, .. } => write!(f, "conv2d({kernel_size:?})"),
+            Op::Im2Col { kernel_size, .. } => write!(f, "im2col({kernel_size:?})"),
             Op::ConvTranspose2d { kernel_size, .. } => {
                 write!(f, "conv_transpose2d({kernel_size:?})")
             }
@@ -2123,18 +2283,39 @@ impl std::fmt::Display for Op {
                 num_inputs,
                 scalar_input_mask,
                 input_modulus: _,
+                prologue,
+                prologue_input: _,
             } => {
+                let pro = match prologue {
+                    RegionPrologue::None => "",
+                    RegionPrologue::ResizeNearest2x => ",prologue=resize2x",
+                };
                 if *scalar_input_mask != 0 {
                     write!(
                         f,
-                        "ew_region(in={num_inputs},steps={},scalar_mask=0x{:x})",
+                        "ew_region(in={num_inputs},steps={},scalar_mask=0x{:x}{pro})",
                         chain.len(),
                         scalar_input_mask
                     )
                 } else {
-                    write!(f, "ew_region(in={num_inputs},steps={})", chain.len())
+                    write!(f, "ew_region(in={num_inputs},steps={}{pro})", chain.len())
                 }
             }
+            Op::TransformRegion { steps, num_inputs } => {
+                write!(f, "transform_region(in={num_inputs},steps={})", steps.len())
+            }
+            Op::BatchElementwiseRegion {
+                chain,
+                num_batch_inputs,
+                scalar_input_mask,
+                prologue,
+                ..
+            } => write!(
+                f,
+                "batch_ew_region(batch={num_batch_inputs},steps={},mask=0x{:x},prologue={prologue:?})",
+                chain.len(),
+                scalar_input_mask
+            ),
             Op::LayerNormBackwardInput { eps, .. } => {
                 write!(f, "layer_norm_backward_input(eps={eps})")
             }
@@ -2155,6 +2336,15 @@ impl std::fmt::Display for Op {
             }
             Op::GroupNormBackwardBeta { num_groups, eps } => {
                 write!(f, "group_norm_backward_beta(g={num_groups},eps={eps})")
+            }
+            Op::BatchNormInferenceBackwardInput { eps } => {
+                write!(f, "batch_norm_inference_backward_input(eps={eps})")
+            }
+            Op::BatchNormInferenceBackwardGamma { eps } => {
+                write!(f, "batch_norm_inference_backward_gamma(eps={eps})")
+            }
+            Op::BatchNormInferenceBackwardBeta => {
+                write!(f, "batch_norm_inference_backward_beta")
             }
             Op::CumsumBackward { axis, exclusive } => {
                 write!(f, "cumsum_backward(axis={axis},exclusive={exclusive})")
@@ -2228,6 +2418,11 @@ impl std::fmt::Display for Op {
             Op::Fft { inverse, norm } => {
                 write!(f, "fft(inverse={inverse}, norm={norm:?})")
             }
+            Op::FftButterflyStage { stage, n_fft } => {
+                write!(f, "fft_butterfly_stage(stage={stage}, n_fft={n_fft})")
+            }
+            Op::LogMel => write!(f, "log_mel()"),
+            Op::LogMelBackward => write!(f, "log_mel_backward()"),
         }
     }
 }

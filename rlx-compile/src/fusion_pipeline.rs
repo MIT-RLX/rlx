@@ -24,10 +24,14 @@ use rlx_ir::OpKind;
 
 use crate::DeadCodeElimination;
 use rlx_fusion::control_flow::LowerControlFlow;
+use rlx_fusion::fk_fusion::{
+    DecomposeFusionRegions, FuseBatchPreprocess, FuseRegionPrologue, MarkBatchSliceRegions,
+    MarkTransformRegions,
+};
 use rlx_fusion::fusion::{
     FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
-    FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul, MarkElementwiseRegions,
-    UnfuseElementwiseRegions,
+    FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul, FuseTransformerLayer,
+    MarkElementwiseRegions, UnfuseElementwiseRegions,
 };
 use rlx_fusion::limits::FusionLimits;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
@@ -46,14 +50,42 @@ pub enum FusionTarget {
 }
 
 /// Per-target fusion toggles (env-driven on Metal today).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FusionOptions {
     /// Skip all pattern fusions (Metal: `RLX_METAL_NO_FUSION`).
     pub skip_fusion: bool,
     /// Break `ElementwiseRegion` back into primitives after marking.
     pub unfuse_elementwise_regions: bool,
+    /// Keep fused `ElementwiseRegion` through lowering (env: `RLX_KEEP_ELEMENTWISE_REGIONS`).
+    pub keep_elementwise_regions: bool,
+    /// Decompose FKL-style transform / batch regions before backend lowering.
+    pub decompose_fusion_regions: bool,
+    /// Run FKL passes (`MarkTransformRegions`, prologue, batch). Env: `RLX_NO_FK_FUSION=1` disables.
+    pub fk_fusion: bool,
+    /// Fold `ResizeNearest2x` into `ElementwiseRegion` prologue. Env: `RLX_FUSE_REGION_PROLOGUE=0` disables.
+    pub fuse_region_prologue: bool,
+    /// Merge parallel region slices into `BatchElementwiseRegion`. Env: `RLX_FUSE_BATCH_PREPROCESS=0` disables.
+    pub fuse_batch_preprocess: bool,
+    /// Keep `TransformRegion` / `BatchElementwiseRegion` in MIR for native lowering. Env: `RLX_NATIVE_FK_REGIONS=1`.
+    pub native_fk_regions: bool,
     /// Caps for fused elementwise chains (encoder / scratch limits).
     pub fusion_limits: FusionLimits,
+}
+
+impl Default for FusionOptions {
+    fn default() -> Self {
+        Self {
+            skip_fusion: false,
+            unfuse_elementwise_regions: false,
+            keep_elementwise_regions: false,
+            decompose_fusion_regions: false,
+            fk_fusion: true,
+            fuse_region_prologue: true,
+            fuse_batch_preprocess: true,
+            native_fk_regions: false,
+            fusion_limits: FusionLimits::default(),
+        }
+    }
 }
 
 impl FusionOptions {
@@ -62,8 +94,78 @@ impl FusionOptions {
         Self {
             skip_fusion: rlx_ir::env::flag("RLX_METAL_NO_FUSION"),
             unfuse_elementwise_regions: rlx_ir::env::flag("RLX_METAL_UNFUSE_REGIONS"),
+            keep_elementwise_regions: rlx_ir::env::flag("RLX_KEEP_ELEMENTWISE_REGIONS"),
+            decompose_fusion_regions: rlx_ir::env::flag("RLX_DECOMPOSE_FUSION_REGIONS"),
+            fk_fusion: !rlx_ir::env::flag("RLX_NO_FK_FUSION"),
+            fuse_region_prologue: if rlx_ir::env::is_unset("RLX_FUSE_REGION_PROLOGUE") {
+                true
+            } else {
+                rlx_ir::env::flag("RLX_FUSE_REGION_PROLOGUE")
+            },
+            fuse_batch_preprocess: if rlx_ir::env::is_unset("RLX_FUSE_BATCH_PREPROCESS") {
+                true
+            } else {
+                rlx_ir::env::flag("RLX_FUSE_BATCH_PREPROCESS")
+            },
+            native_fk_regions: rlx_ir::env::flag("RLX_NATIVE_FK_REGIONS"),
             ..Self::default()
         }
+    }
+
+    /// Merge session options with compile-time env overrides.
+    pub fn merge_env(mut self) -> Self {
+        if rlx_ir::env::flag("RLX_METAL_NO_FUSION") {
+            self.skip_fusion = true;
+        }
+        if rlx_ir::env::flag("RLX_METAL_UNFUSE_REGIONS") {
+            self.unfuse_elementwise_regions = true;
+        }
+        if rlx_ir::env::flag("RLX_KEEP_ELEMENTWISE_REGIONS") {
+            self.keep_elementwise_regions = true;
+        }
+        if rlx_ir::env::flag("RLX_DECOMPOSE_FUSION_REGIONS") {
+            self.decompose_fusion_regions = true;
+        }
+        if rlx_ir::env::flag("RLX_NO_FK_FUSION") {
+            self.fk_fusion = false;
+        }
+        if !rlx_ir::env::is_unset("RLX_FUSE_REGION_PROLOGUE") {
+            self.fuse_region_prologue = rlx_ir::env::flag("RLX_FUSE_REGION_PROLOGUE");
+        }
+        if !rlx_ir::env::is_unset("RLX_FUSE_BATCH_PREPROCESS") {
+            self.fuse_batch_preprocess = rlx_ir::env::flag("RLX_FUSE_BATCH_PREPROCESS");
+        }
+        if rlx_ir::env::flag("RLX_NATIVE_FK_REGIONS") {
+            self.native_fk_regions = true;
+        }
+        if rlx_ir::env::flag("RLX_NO_NATIVE_FK_REGIONS") {
+            self.native_fk_regions = false;
+        }
+        self
+    }
+
+    /// GPU-class targets keep native FKL regions unless opted out.
+    pub fn apply_native_fk_defaults(mut self, target: FusionTarget) -> Self {
+        if rlx_ir::env::flag("RLX_NO_NATIVE_FK_REGIONS") {
+            self.native_fk_regions = false;
+            return self;
+        }
+        if self.native_fk_regions || rlx_ir::env::flag("RLX_NATIVE_FK_REGIONS") {
+            self.native_fk_regions = true;
+            return self;
+        }
+        if matches!(
+            target,
+            FusionTarget::Metal
+                | FusionTarget::Cuda
+                | FusionTarget::Rocm
+                | FusionTarget::Wgpu
+                | FusionTarget::Mlx
+                | FusionTarget::Tpu
+        ) {
+            self.native_fk_regions = true;
+        }
+        self
     }
 
     /// CPU executes element-wise chains as per-op thunks — mark then unfuse.
@@ -71,6 +173,25 @@ impl FusionOptions {
         Self {
             unfuse_elementwise_regions: true,
             fusion_limits: FusionLimits::UNBOUNDED,
+            ..Self::default()
+        }
+    }
+
+    /// Metal keeps RMSNorm / matmul fusions but unfuses `ElementwiseRegion`
+    /// (fused MSL mis-lowers long chains on deep transformer graphs).
+    pub fn for_metal() -> Self {
+        let mut opts = Self::from_metal_env();
+        opts.unfuse_elementwise_regions = true;
+        opts
+    }
+
+    /// wgpu region kernel only supports trailing/scalar broadcast via
+    /// modulus — unfuse so LegalizeBroadcast Expand + Binary run separately.
+    pub fn for_wgpu() -> Self {
+        let keep = rlx_ir::env::flag("RLX_KEEP_ELEMENTWISE_REGIONS");
+        Self {
+            unfuse_elementwise_regions: !keep,
+            keep_elementwise_regions: keep,
             ..Self::default()
         }
     }
@@ -105,19 +226,36 @@ pub fn supports_op(supported: &[OpKind], kind: OpKind) -> bool {
 pub fn fusion_passes_for_supported(
     supported: &[OpKind],
     opts: FusionOptions,
+    target: FusionTarget,
 ) -> Vec<&'static dyn Pass> {
+    let opts = opts.apply_native_fk_defaults(target);
     if opts.skip_fusion {
         return vec![&LowerControlFlow, &LowerDotGeneral];
     }
 
     let mut passes: Vec<&'static dyn Pass> = vec![&LowerControlFlow, &LowerDotGeneral];
 
-    if supports_op(supported, OpKind::FusedAttentionBlock) {
-        passes.push(&FuseAttentionBlock);
-    }
+    // ORDER: FuseMatMulBiasAct first, then FuseAttentionBlock. The block-level
+    // pass matches the post-fusion shape
+    //   FusedMatMulBiasAct(qkv) → narrow×3 → Attention → FusedMatMulBiasAct(out)
+    // which is the pattern BERT-family encoders actually present after the
+    // per-layer matmul+bias fusion has collapsed Q, K, V, and out projections.
     if supports_op(supported, OpKind::FusedMatMulBiasAct) {
         passes.push(&FuseMatMulBiasAct);
     }
+    // Block-level fusion: `Op::FusedAttentionBlock`. All backends that claim
+    // this op now produce parity-correct output (the MLX
+    // `Op::FusedAttentionBlock` lowering at `rlx-mlx/src/lower.rs:1689`
+    // historically diverged on `MaskKind::Custom` BERT masks because it
+    // bypassed the binary→additive conversion and the contiguous
+    // materialization the unfused `Op::Attention` path applies — fixed
+    // alongside this pass landing).
+    if supports_op(supported, OpKind::FusedAttentionBlock) {
+        passes.push(&FuseAttentionBlock);
+    }
+    // FuseResidualLN must run BEFORE FuseTransformerLayer: the layer-level
+    // pass matches `FAB → FusedResidualLN → FMBA(GeLU) → FMBA → FusedResidualLN`
+    // and needs the residual+LN ops already collapsed.
     if supports_op(supported, OpKind::FusedResidualLN) {
         passes.push(&FuseResidualLN);
     }
@@ -125,6 +263,21 @@ pub fn fusion_passes_for_supported(
         passes.push(&FuseResidualRmsNorm);
     }
     passes.push(&FuseRmsNormReshape);
+
+    // Layer-level fusion runs AFTER FuseResidualLN so it can match the
+    // post-fusion shape `FAB → FusedResidualLN → FMBA(GeLU) → FMBA →
+    // FusedResidualLN`. Opt-in via `RLX_ENABLE_FUSE_TRANSFORMER_LAYER`
+    // because backend perf wins are uneven: WGPU un-fuses with no
+    // dispatch reduction; MLX's lowering is correct (per the FAB fix
+    // above) but the MLX `compile()` already collapses sub-ops, so the
+    // extra IR-level fusion doesn't beat the natural pipeline. The pass
+    // exists for backends planning a monolithic transformer-layer kernel.
+    if rlx_ir::env::flag("RLX_ENABLE_FUSE_TRANSFORMER_LAYER")
+        && supports_op(supported, OpKind::FusedTransformerLayer)
+        && supports_op(supported, OpKind::FusedAttentionBlock)
+    {
+        passes.push(&FuseTransformerLayer);
+    }
 
     if supports_op(supported, OpKind::FusedSwiGLU) {
         passes.push(&FuseSwiGLUDualMatmul);
@@ -139,25 +292,85 @@ pub fn fusion_passes_for_supported(
     // Mark eligible element-wise chains. Backends that don't lower
     // ElementwiseRegion natively unfuse immediately afterward.
     passes.push(&MarkElementwiseRegions);
+    if opts.fk_fusion {
+        passes.push(&MarkBatchSliceRegions);
+        passes.push(&MarkTransformRegions);
+        if opts.fuse_region_prologue {
+            passes.push(&FuseRegionPrologue);
+        }
+        if opts.fuse_batch_preprocess {
+            passes.push(&FuseBatchPreprocess);
+        }
+    }
+    let backend_native_fk = supports_op(supported, OpKind::TransformRegion)
+        && supports_op(supported, OpKind::BatchElementwiseRegion);
+    let keep_native_fk = opts.native_fk_regions && backend_native_fk;
+    if opts.decompose_fusion_regions || !keep_native_fk {
+        passes.push(&DecomposeFusionRegions);
+    }
     let keep_regions =
         supports_op(supported, OpKind::ElementwiseRegion) && !opts.unfuse_elementwise_regions;
     if !keep_regions {
-        passes.push(&UnfuseElementwiseRegions);
+        let unfuse = if matches!(target, FusionTarget::Cpu) {
+            &UnfuseElementwiseRegions::FOR_CPU
+        } else {
+            &UnfuseElementwiseRegions::FOR_GPU
+        };
+        passes.push(unfuse);
     }
 
+    finish_pipeline(passes)
+}
+
+/// FKL passes to run after [`MarkElementwiseRegions`] (e.g. `TpuExecutable::compile`).
+pub fn fk_passes_after_elementwise_regions(
+    supported: &[OpKind],
+    opts: FusionOptions,
+) -> Vec<&'static dyn Pass> {
+    let mut passes: Vec<&'static dyn Pass> = Vec::new();
+    if !opts.fk_fusion {
+        let backend_native_fk = supports_op(supported, OpKind::TransformRegion)
+            && supports_op(supported, OpKind::BatchElementwiseRegion);
+        let keep_native_fk = opts.native_fk_regions && backend_native_fk;
+        if opts.decompose_fusion_regions || !keep_native_fk {
+            passes.push(&DecomposeFusionRegions);
+        }
+        return finish_pipeline(passes);
+    }
+    passes.push(&MarkBatchSliceRegions);
+    passes.push(&MarkTransformRegions);
+    if opts.fuse_region_prologue {
+        passes.push(&FuseRegionPrologue);
+    }
+    if opts.fuse_batch_preprocess {
+        passes.push(&FuseBatchPreprocess);
+    }
+    let backend_native_fk = supports_op(supported, OpKind::TransformRegion)
+        && supports_op(supported, OpKind::BatchElementwiseRegion);
+    let keep_native_fk = opts.native_fk_regions && backend_native_fk;
+    if opts.decompose_fusion_regions || !keep_native_fk {
+        passes.push(&DecomposeFusionRegions);
+    }
     finish_pipeline(passes)
 }
 
 /// Return the ordered fusion passes for `target`.
 pub fn fusion_passes(target: FusionTarget, opts: FusionOptions) -> Vec<&'static dyn Pass> {
     let mut opts = opts;
-    if matches!(target, FusionTarget::Cpu) && !opts.unfuse_elementwise_regions {
+    // CPU thunks execute element-wise chains per-op. Metal's fused
+    // `ElementwiseRegion` MSL kernel mis-lowers long chains on deep
+    // transformer graphs (NaNs past ~14 blocks); keep FAB/RMSNorm fusions.
+    if !opts.keep_elementwise_regions
+        && matches!(target, FusionTarget::Cpu | FusionTarget::Metal)
+        && !opts.unfuse_elementwise_regions
+    {
         opts.unfuse_elementwise_regions = true;
     }
     if opts.fusion_limits == FusionLimits::default() {
         opts.fusion_limits = fusion_limits_for_target(target);
     }
-    fusion_passes_for_supported(supported_for_target(target), opts)
+    opts = opts.apply_native_fk_defaults(target);
+    fusion_passes_for_supported(supported_for_target(target), opts, target)
 }
 
 /// Per-target op claims used when a backend doesn't supply an explicit
@@ -180,6 +393,8 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
             MatMul,
             DotGeneral,
             ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
             FusedSwiGLU,
             FusedMatMulBiasAct,
             FusedResidualLN,
@@ -189,6 +404,8 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
             MatMul,
             DotGeneral,
             ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
             FusedSwiGLU,
             FusedMatMulBiasAct,
             FusedResidualLN,
@@ -197,6 +414,8 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
         FusionTarget::Wgpu => &[
             MatMul,
             ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
             FusedSwiGLU,
             FusedMatMulBiasAct,
             FusedResidualLN,
@@ -208,6 +427,8 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
             MatMul,
             DotGeneral,
             ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
             FusedMatMulBiasAct,
             FusedResidualLN,
             FusedResidualRmsNorm,
@@ -215,6 +436,8 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
         FusionTarget::Tpu => &[
             MatMul,
             ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
             FusedMatMulBiasAct,
             FusedResidualLN,
         ],
@@ -229,12 +452,20 @@ fn finish_pipeline(mut passes: Vec<&'static dyn Pass>) -> Vec<&'static dyn Pass>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_FK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cpu_pipeline_includes_attention_block() {
         let passes = fusion_passes(FusionTarget::Cpu, FusionOptions::default());
-        assert_eq!(passes.len(), 13);
-        assert_eq!(passes[2].name(), "fuse_attention_block");
+        assert_eq!(passes.len(), 18);
+        assert_eq!(passes[2].name(), "fuse_matmul_bias_act");
+        assert_eq!(passes[3].name(), "fuse_attention_block");
+        assert!(
+            passes.iter().any(|p| p.name() == "fuse_region_prologue"),
+            "default CPU pipeline should run FKL prologue fusion"
+        );
         assert_eq!(passes.last().unwrap().name(), "dead_code_elimination");
     }
 
@@ -257,6 +488,7 @@ mod tests {
         let passes = fusion_passes_for_supported(
             supported_for_target(FusionTarget::Metal),
             FusionOptions::default(),
+            FusionTarget::Metal,
         );
         assert!(
             !passes.iter().any(|p| p.name() == "fuse_attention_block"),
@@ -273,6 +505,7 @@ mod tests {
         let passes = fusion_passes_for_supported(
             supported_for_target(FusionTarget::Cuda),
             FusionOptions::default(),
+            FusionTarget::Cuda,
         );
         assert!(
             passes.iter().any(|p| p.name() == "fuse_matmul_bias_act"),
@@ -289,6 +522,7 @@ mod tests {
         let passes = fusion_passes_for_supported(
             supported_for_target(FusionTarget::Cpu),
             FusionOptions::for_cpu(),
+            FusionTarget::Cpu,
         );
         assert!(
             passes
@@ -298,15 +532,135 @@ mod tests {
     }
 
     #[test]
-    fn metal_keeps_elementwise_regions_by_default() {
-        let passes = fusion_passes_for_supported(
-            supported_for_target(FusionTarget::Metal),
-            FusionOptions::default(),
+    fn metal_unfuses_elementwise_regions_by_default() {
+        let passes = fusion_passes(FusionTarget::Metal, FusionOptions::default());
+        assert!(
+            passes
+                .iter()
+                .any(|p| p.name() == "unfuse_elementwise_regions")
+        );
+    }
+
+    #[test]
+    fn metal_default_unfuse_preserves_prologue_regions() {
+        let mut g = rlx_ir::Graph::new("t");
+        let shape_in = rlx_ir::Shape::new(&[1, 3, 8, 8], rlx_ir::DType::F32);
+        let shape_out = rlx_ir::Shape::new(&[1, 3, 16, 16], rlx_ir::DType::F32);
+        let x = g.input("x", shape_in);
+        let up = g.add_node(rlx_ir::Op::ResizeNearest2x, vec![x], shape_out.clone());
+        let r = g.add_node(
+            rlx_ir::Op::Activation(rlx_ir::op::Activation::Relu),
+            vec![up],
+            shape_out,
+        );
+        g.set_outputs(vec![r]);
+
+        let passes = fusion_passes(FusionTarget::Metal, FusionOptions::default());
+        let out = rlx_fusion::pass::run_passes(g, &passes, false);
+        assert!(out.nodes().iter().any(|n| {
+            matches!(
+                n.op,
+                rlx_ir::Op::ElementwiseRegion {
+                    prologue: rlx_ir::RegionPrologue::ResizeNearest2x,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn fk_passes_after_elementwise_includes_batch_fusion() {
+        let opts = FusionOptions::default().apply_native_fk_defaults(FusionTarget::Tpu);
+        let passes =
+            fk_passes_after_elementwise_regions(supported_for_target(FusionTarget::Tpu), opts);
+        let names: Vec<_> = passes.iter().map(|p| p.name()).collect();
+        assert!(names.contains(&"mark_batch_slice_regions"));
+        assert!(names.contains(&"fuse_batch_preprocess"));
+        assert!(
+            !names.contains(&"decompose_fusion_regions"),
+            "TPU native FK defaults should keep batch/transform regions"
+        );
+    }
+
+    #[test]
+    fn tpu_native_fk_region_pass_policy() {
+        let _lock = ENV_FK_TEST_LOCK.lock().unwrap();
+        let default_passes = fusion_passes(FusionTarget::Tpu, FusionOptions::default());
+        assert!(
+            !default_passes
+                .iter()
+                .any(|p| p.name() == "decompose_fusion_regions"),
+            "default TPU pipeline keeps batch/transform regions via native_fk_defaults"
+        );
+
+        rlx_ir::env::set("RLX_NO_NATIVE_FK_REGIONS", "1");
+        let opt_out = fusion_passes(FusionTarget::Tpu, FusionOptions::default());
+        rlx_ir::env::unset("RLX_NO_NATIVE_FK_REGIONS");
+        assert!(
+            opt_out
+                .iter()
+                .any(|p| p.name() == "decompose_fusion_regions"),
+            "RLX_NO_NATIVE_FK_REGIONS should force decompose on TPU"
+        );
+    }
+
+    #[test]
+    fn native_fk_regions_skips_decompose_on_tpu() {
+        let passes = fusion_passes(
+            FusionTarget::Tpu,
+            FusionOptions {
+                native_fk_regions: true,
+                decompose_fusion_regions: false,
+                unfuse_elementwise_regions: false,
+                ..FusionOptions::default()
+            },
         );
         assert!(
             !passes
                 .iter()
-                .any(|p| p.name() == "unfuse_elementwise_regions")
+                .any(|p| p.name() == "decompose_fusion_regions"),
+            "native_fk_regions should skip decompose on TPU when batch/transform are supported"
+        );
+    }
+
+    #[test]
+    fn native_fk_regions_skips_decompose_on_metal() {
+        let passes = fusion_passes(
+            FusionTarget::Metal,
+            FusionOptions {
+                native_fk_regions: true,
+                decompose_fusion_regions: false,
+                unfuse_elementwise_regions: false,
+                ..FusionOptions::default()
+            },
+        );
+        assert!(
+            !passes
+                .iter()
+                .any(|p| p.name() == "decompose_fusion_regions"),
+            "native_fk_regions should skip decompose when backend claims batch/transform ops"
+        );
+    }
+
+    #[test]
+    fn metal_keeps_elementwise_regions_when_requested() {
+        let passes = fusion_passes(
+            FusionTarget::Metal,
+            FusionOptions {
+                keep_elementwise_regions: true,
+                unfuse_elementwise_regions: false,
+                ..FusionOptions::default()
+            },
+        );
+        assert!(
+            !passes
+                .iter()
+                .any(|p| p.name() == "unfuse_elementwise_regions"),
+            "keep_elementwise_regions should skip unfuse pass"
+        );
+        assert!(
+            passes.iter().any(|p| p.name() == "fuse_region_prologue"),
+            "FKL prologue fusion should still run"
         );
     }
 }

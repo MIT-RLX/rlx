@@ -35,8 +35,12 @@
 #include "mlx/transforms.h"
 #include "mlx/version.h"
 
+#include <cctype>
+#include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -53,6 +57,27 @@ thread_local std::string g_last_error;
 void clear_error() { g_last_error.clear(); }
 void set_error(const char* what) {
     g_last_error.assign(what ? what : "(null)");
+}
+
+void init_default_device() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        const char* dev = std::getenv("RLX_MLX_DEVICE");
+        if (dev == nullptr || *dev == '\0') {
+            return;
+        }
+        std::string choice(dev);
+        for (char& c : choice) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (choice == "cpu") {
+            mc::set_default_device(mc::Device::cpu);
+        } else if (choice == "gpu" || choice == "cuda") {
+            if (mc::is_available(mc::Device::gpu)) {
+                mc::set_default_device(mc::Device::gpu);
+            }
+        }
+    });
 }
 
 mc::Dtype to_mlx_dtype(rlx_mlx_dtype_t d) {
@@ -86,6 +111,7 @@ inline rlx_mlx_array_t* wrap(mc::array a) {
 
 template <typename Fn>
 int guarded(Fn&& fn) {
+    init_default_device();
     clear_error();
     try {
         fn();
@@ -157,6 +183,43 @@ int rlx_mlx_array_from_data(
         mc::array result = (dtype == RLX_MLX_DTYPE_F32)
             ? std::move(f32)
             : mc::astype(f32, to_mlx_dtype(dtype));
+        *out = wrap(std::move(result));
+    });
+}
+
+/// Zero-copy view constructor: wraps `data` as an mc::array without
+/// copying. The caller MUST keep `data` alive until every dependent
+/// evaluation completes (typically: until the next `set_param` for
+/// the same name OR until the executable is dropped, whichever
+/// comes first). Uses MLX's `array(void*, Shape, Dtype, deleter)`
+/// constructor with a no-op deleter so MLX never frees the buffer.
+///
+/// Currently F32 only — the iterator path (which copies) handles the
+/// dtype conversion for half-precision params. Extend with explicit
+/// per-dtype branches when zero-copy becomes interesting for those.
+int rlx_mlx_array_from_data_view(
+    const int* shape, size_t ndim,
+    void* data, size_t nbytes,
+    rlx_mlx_dtype_t dtype,
+    rlx_mlx_array_t** out)
+{
+    return guarded([&] {
+        if (dtype != RLX_MLX_DTYPE_F32) {
+            throw std::runtime_error("from_data_view: only F32 dtype supported");
+        }
+        mc::Shape s;
+        s.reserve(ndim);
+        size_t expected_elems = 1;
+        for (size_t i = 0; i < ndim; ++i) {
+            s.push_back(shape[i]);
+            expected_elems *= static_cast<size_t>(shape[i]);
+        }
+        if (expected_elems * sizeof(float) != nbytes) {
+            throw std::runtime_error("from_data_view: nbytes mismatch with shape*4");
+        }
+        // No-op deleter: caller owns the buffer.
+        std::function<void(void*)> noop = [](void*) {};
+        mc::array result(data, std::move(s), mc::float32, noop);
         *out = wrap(std::move(result));
     });
 }
@@ -1317,6 +1380,46 @@ struct rlx_mlx_compiled_s {
     std::function<std::vector<mc::array>(const std::vector<mc::array>&)> fn;
 };
 
+namespace {
+
+std::atomic<size_t> g_explicit_compile_output_cap{0};
+
+size_t compile_output_cap_from_env() {
+    for (const char* key : {"RLX_COMPILE_OUTPUT_CAP", "RLX_MLX_COMPILE_OUTPUT_CAP"}) {
+        if (const char* v = std::getenv(key)) {
+            char* end = nullptr;
+            unsigned long n = std::strtoul(v, &end, 10);
+            if (end != v && n > 0) {
+                return static_cast<size_t>(n);
+            }
+        }
+    }
+    return 1024;
+}
+
+size_t current_compile_output_cap() {
+    const size_t explicit_cap =
+        g_explicit_compile_output_cap.load(std::memory_order_relaxed);
+    if (explicit_cap != 0) {
+        return explicit_cap;
+    }
+    return compile_output_cap_from_env();
+}
+
+} // namespace
+
+size_t rlx_mlx_compile_output_cap(void) {
+    return current_compile_output_cap();
+}
+
+void rlx_mlx_set_compile_output_cap(size_t cap) {
+    g_explicit_compile_output_cap.store(cap, std::memory_order_relaxed);
+}
+
+void rlx_mlx_reset_compile_output_cap(void) {
+    g_explicit_compile_output_cap.store(0, std::memory_order_relaxed);
+}
+
 int rlx_mlx_compile(
     rlx_mlx_lower_fn fn, void* ud,
     int shapeless,
@@ -1337,9 +1440,9 @@ int rlx_mlx_compile(
                 in_handles.push_back(wrap(a));
             }
 
-            // Reasonable upper bound — graph outputs typically ≤ a
-            // few; bump if a workload trips this.
-            constexpr size_t cap = 64;
+            // Training graphs that emit gradients for every parameter need
+            // a larger slot vector — see `RLX_MLX_COMPILE_OUTPUT_CAP`.
+            const size_t cap = current_compile_output_cap();
             std::vector<rlx_mlx_array_t*> out_handles(cap, nullptr);
             size_t n_out = 0;
             int rc = fn(ud, in_handles.data(), in_handles.size(),

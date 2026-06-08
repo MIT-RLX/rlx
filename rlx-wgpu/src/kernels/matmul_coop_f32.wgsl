@@ -209,7 +209,7 @@ fn matmul_coop_f32(
         // for the padded rows (it reads OOB in A and accumulates garbage
         // into acc). Skipping the write keeps the padded compute harmless
         // — the output rows past `params.m` are left untouched.
-        if (global_row >= params.m) { continue; }
+        if (global_row >= params.m || global_col >= params.n) { continue; }
         var v: f32 = acc_scratch[idx];
         if (params.has_bias != 0u) {
             v = v + arena[params.bias_off + global_col];

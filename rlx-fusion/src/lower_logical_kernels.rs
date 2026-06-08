@@ -17,7 +17,7 @@
 //! Runs before [`rlx_compile::rewrite_for_backend`] so native `supported_ops` still win under
 //! [`KernelDispatchPolicy::PreferNative`].
 
-use crate::lower_vae_ops::{LowerGroupNorm, LowerResizeNearest2x};
+use crate::lower_vae_ops::{LowerBatchNormInference, LowerGroupNorm, LowerResizeNearest2x};
 use crate::pass::Pass;
 use rlx_ir::logical_kernel::splat_common;
 use rlx_ir::logical_kernel::{self, KernelDispatchConfig};
@@ -46,6 +46,7 @@ pub fn lower_logical_kernels(
     for kind in to_lower {
         g = match kind {
             OpKind::GroupNorm => LowerGroupNorm.run(g),
+            OpKind::BatchNormInference => LowerBatchNormInference.run(g),
             OpKind::ResizeNearest2x => LowerResizeNearest2x.run(g),
             OpKind::GaussianSplatRender => lower_gaussian_splat_render_pass(g),
             OpKind::GaussianSplatRenderBackward => lower_gaussian_splat_backward_pass(g),

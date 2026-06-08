@@ -98,8 +98,8 @@
 #   metadata + packaging are still validated for them. The only
 #   pre-publish step that can fully dry-run is tier 0 (no RLX path
 #   deps). Run `scripts/publish.sh --list` to print the full tier
-#   order; `validate_publish_order` checks every `[dependencies]` and
-#   `[dev-dependencies]` path dep against that order before publishing.
+#   order; `validate_publish_order` checks every `[dependencies]` path
+#   dep against that order before publishing.
 #
 # Environment:
 #
@@ -140,7 +140,7 @@ SKIPPED=(
 # and `[dev-dependencies]` (including optional) against crates.io. Within
 # a tier, list deps before dependents (e.g. rlx-cpu before rlx-splat).
 TIERS=(
-    "rlx-ir rlx-gguf rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-bbo"
+    "rlx-ir rlx-gguf rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim"
     "rlx-flow rlx-fusion rlx-driver"
     "rlx-autodiff"
     "rlx-compile"
@@ -149,7 +149,9 @@ TIERS=(
     "rlx-splat"
     "rlx-metal"
     "rlx-runtime"
-    "rlx-sparse rlx-linalg rlx-umap"
+    "rlx-onnx-import rlx-bbo"
+    "rlx-sparse rlx-linalg rlx-umap rlx-text rlx-gguf-convert rlx-onnx-conformance"
+    "rlx-onnx"
     "rlx-fdm rlx-bench"
     "rlx-rl"
     "rlx"
@@ -259,15 +261,17 @@ validate_tier_coverage() {
 
 validate_tier_coverage
 
-# Every rlx-* path dep in [dependencies] / [dev-dependencies] must appear
-# in an earlier tier (or the same tier, listed before this crate).
+# Every rlx-* path dep in [dependencies] must appear in an earlier tier
+# (or the same tier, listed before this crate). Dev-dependencies are
+# ignored — they are not published and often create test-only cycles
+# (e.g. rlx-metal dev-dep on rlx-runtime while runtime optional-dep's metal).
 validate_publish_order() {
     if ! command -v python3 >/dev/null 2>&1; then
         yellow "python3 not found — skipping publish-order check (install python3 to enable)."
         return 0
     fi
     local err
-    err="$(python3 - "$PWD" <<'PY'
+    err="$(python3 - "$PWD" 2>&1 <<'PY'
 import re, sys
 from pathlib import Path
 
@@ -275,7 +279,7 @@ root = Path(sys.argv[1])
 script = (root / "scripts/publish.sh").read_text()
 m = re.search(r'TIERS=\(\n((?:\s+"[^"]+"\n)+)\)', script)
 if not m:
-    print("could not parse TIERS from publish.sh", file=sys.stderr)
+    print("could not parse TIERS from publish.sh")
     sys.exit(2)
 tier_lines = re.findall(r'"([^"]+)"', m.group(1))
 crate_tier = {}
@@ -286,14 +290,13 @@ for i, line in enumerate(tier_lines):
 def parse_rlx_deps(toml_path: Path) -> set[str]:
     text = toml_path.read_text()
     deps: set[str] = set()
-    for section in ("dependencies", "dev-dependencies"):
-        sm = re.search(rf"\[{section}\](.*?)(?=\n\[|\Z)", text, re.S)
-        if not sm:
-            continue
-        for line in sm.group(1).splitlines():
-            m2 = re.match(r"^(rlx-[a-z0-9-]+)\s*=", line.strip())
-            if m2:
-                deps.add(m2.group(1))
+    sm = re.search(r"\[dependencies\](.*?)(?=\n\[|\Z)", text, re.S)
+    if not sm:
+        return deps
+    for line in sm.group(1).splitlines():
+        m2 = re.match(r"^(rlx-[a-z0-9-]+)\s*=", line.strip())
+        if m2:
+            deps.add(m2.group(1))
     return deps
 
 violations: list[str] = []
@@ -320,7 +323,7 @@ for toml in sorted(root.glob("rlx-*/Cargo.toml")):
 
 if violations:
     for v in violations:
-        print(v, file=sys.stderr)
+        print(v)
     sys.exit(1)
 PY
 )" || true
@@ -329,7 +332,7 @@ PY
         while IFS= read -r line; do
             [[ -n "$line" ]] && red "  $line"
         done <<< "$err"
-        red "Fix scripts/publish.sh TIERS (or remove path deps from dev-dependencies)."
+        red "Fix scripts/publish.sh TIERS (or drop path deps from [dependencies])."
         exit 1
     fi
 }
@@ -931,7 +934,6 @@ for tier_idx in "${!TIERS[@]}"; do
 
     published_in_tier=0
     for crate in $tier; do
-        local version
         version="$(crate_version "$crate")"
 
         # Skip past --start-crate if specified.
@@ -957,8 +959,8 @@ for tier_idx in "${!TIERS[@]}"; do
             sleep_with_countdown "$MIN_INTERVAL" "rate-limit floor"
         fi
 
-        publish_one "$crate"
-        pub_rc=$?
+        pub_rc=0
+        publish_one "$crate" || pub_rc=$?
         if (( pub_rc == 2 )); then
             ALREADY_ON_CRATES_IO+=("$crate@$version")
             continue
@@ -988,7 +990,9 @@ if (( DRY_RUN )); then
     echo
     bold "Dry-run summary:"
     green "  passed (full dry-run incl. dep resolution): ${#DRY_RUN_PASS[@]}"
-    for c in "${DRY_RUN_PASS[@]}"; do echo "    ✓ $c"; done
+    if (( ${#DRY_RUN_PASS[@]} > 0 )); then
+        for c in "${DRY_RUN_PASS[@]}"; do echo "    ✓ $c"; done
+    fi
     if (( ${#DRY_RUN_FAIL[@]} > 0 )); then
         yellow "  metadata + packaging ok, dep resolution fails (expected pre-publish): ${#DRY_RUN_FAIL[@]}"
         for c in "${DRY_RUN_FAIL[@]}"; do echo "    ⚠ $c"; done

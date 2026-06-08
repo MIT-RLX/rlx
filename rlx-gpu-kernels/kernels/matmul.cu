@@ -45,14 +45,8 @@ __device__ __forceinline__ float apply_act(float v, unsigned int act_id) {
         case 5:  return sqrtf(v);
         case 7:  return -v;
         case 8:  return fabsf(v);
-        case 9:
-        case 11: {
-            const float c = 0.7978845608028654f;
-            float x3 = v * v * v;
-            float inner = c * (v + 0.044715f * x3);
-            inner = fminf(fmaxf(inner, -15.0f), 15.0f);
-            return 0.5f * v * (1.0f + tanhf(inner));
-        }
+        case 9:  return gelu_erf(v);
+        case 11: return gelu_approx(v);
         case 10: {
             float nx = fminf(fmaxf(-v, -88.0f), 88.0f);
             return v / (1.0f + expf(nx));

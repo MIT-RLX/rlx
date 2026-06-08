@@ -88,43 +88,8 @@ impl TpuExecutable {
 
         // ── IR-level optimization for HLO emission ────────────────
         //
-        // Run a minimal rlx-opt pipeline before lowering. XLA does
-        // its own aggressive fusion + layout selection downstream, so
-        // we keep this short — only passes that strictly reduce work
-        // for the lowering walker or shrink the emitted module:
-        //
-        //   * DCE + ConstantFolding — remove unused / fold compile-
-        //     time-known scalars; smaller graph → smaller HLO.
-        //   * FuseResidualLN / FuseMatMulBiasAct — collapse common
-        //     transformer building blocks into the tier-2 fused ops
-        //     that rlx-tpu lowers directly. One HLO subgraph instead
-        //     of three primitives, and we own the decomposition rather
-        //     than relying on XLA's pattern matcher to recognize it.
-        //   * LegalizeBroadcast — HLO requires explicit
-        //     `broadcast_in_dim` shapes (no implicit numpy-style
-        //     broadcasts), so canonicalize ahead of emission.
-        //   * MarkElementwiseRegions — fold maximal elementwise chains
-        //     into a single `Op::ElementwiseRegion`. Our lowering
-        //     walks the chain inline (one HLO subgraph), so this
-        //     trades many round-trip materializations for a single
-        //     primitive chain.
-        use rlx_opt::pass::Pass as _;
-        let graph = rlx_opt::DeadCodeElimination.run(graph);
-        let graph = rlx_opt::ConstantFolding.run(graph);
-        let graph = rlx_opt::FuseResidualLN.run(graph);
-        let graph = rlx_opt::FuseResidualRmsNorm.run(graph);
-        let graph = rlx_opt::FuseRmsNormReshape.run(graph);
-        let graph = rlx_opt::FuseMatMulBiasAct.run(graph);
-        let graph = rlx_opt::LegalizeBroadcast.run(graph);
-        let graph = rlx_opt::MarkElementwiseRegions.run(graph);
-
-        // Normalize composed ops via the local unfuse pass.
-        // FusedSwiGLU / FusedAttentionBlock / FusedTransformerLayer /
-        // LoraMatMul / If / While are decomposed back to primitives
-        // for HLO emission. FusedMatMulBiasAct and FusedResidualLN
-        // are NOT unfused — they're tier-2 fused ops that have their
-        // own dedicated lowering paths in lower.rs.
-        let graph = crate::unfuse::unfuse(graph);
+        // See [`crate::ir_passes::prepare_graph_for_hlo`].
+        let graph = crate::ir_passes::prepare_graph_for_hlo(graph);
 
         if segment::needs_orchestration(&graph) {
             return Self {

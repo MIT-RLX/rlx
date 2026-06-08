@@ -102,7 +102,7 @@ kernel_cache!(BINARY, binary_kernel, BINARY_CU, "binary");
 kernel_cache!(
     FUSED_BINARY_UNARY,
     fused_binary_unary_kernel,
-    FUSED_BINARY_UNARY_CU,
+    rlx_gpu_kernels::fused_binary_unary_cuda_src(),
     "fused_binary_unary"
 );
 kernel_cache!(
@@ -111,13 +111,23 @@ kernel_cache!(
     CAST_F32_TO_HALF_CU,
     "cast_f32_to_half"
 );
-kernel_cache!(UNARY, unary_kernel, UNARY_CU, "unary");
+kernel_cache!(
+    UNARY,
+    unary_kernel,
+    rlx_gpu_kernels::unary_cuda_src(),
+    "unary"
+);
 kernel_cache!(COPY, copy_kernel, COPY_CU, "copy");
-kernel_cache!(MATMUL, matmul_kernel, MATMUL_CU, "matmul");
+kernel_cache!(
+    MATMUL,
+    matmul_kernel,
+    rlx_gpu_kernels::matmul_cuda_src(),
+    "matmul"
+);
 kernel_cache!(
     MATMUL_EPILOGUE,
     matmul_epilogue_kernel,
-    MATMUL_EPILOGUE_CU,
+    rlx_gpu_kernels::matmul_epilogue_cuda_src(),
     "matmul_epilogue"
 );
 kernel_cache!(
@@ -131,6 +141,31 @@ kernel_cache!(WHEREK, where_kernel, WHERE_CU, "where_select");
 kernel_cache!(REDUCE, reduce_kernel, REDUCE_CU, "reduce");
 kernel_cache!(SOFTMAX, softmax_kernel, SOFTMAX_CU, "softmax");
 kernel_cache!(LAYERNORM, layernorm_kernel, LAYERNORM_CU, "norm");
+kernel_cache!(
+    RMS_NORM_BWD,
+    rms_norm_backward_kernel,
+    RMS_NORM_BWD_CU,
+    "rlx_rms_norm_bwd"
+);
+kernel_cache!(
+    RMS_NORM_BWD_ZERO,
+    rms_norm_bwd_zero_kernel,
+    RMS_NORM_BWD_CU,
+    "rlx_zero_f32"
+);
+kernel_cache!(
+    CUMSUM_BWD,
+    cumsum_backward_kernel,
+    CUMSUM_BWD_CU,
+    "rlx_cumsum_bwd"
+);
+kernel_cache!(ROPE_BWD, rope_backward_kernel, ROPE_BWD_CU, "rlx_rope_bwd");
+kernel_cache!(
+    GATHER_BWD,
+    gather_backward_kernel,
+    GATHER_BWD_CU,
+    "rlx_gather_axis_bwd"
+);
 kernel_cache!(
     FUSED_RESIDUAL_LN,
     fused_residual_ln_kernel,
@@ -149,6 +184,12 @@ kernel_cache!(CONCAT, concat_kernel, CONCAT_CU, "concat");
 kernel_cache!(TRANSPOSE, transpose_kernel, TRANSPOSE_CU, "transpose");
 kernel_cache!(EXPAND, expand_kernel, EXPAND_CU, "expand");
 kernel_cache!(ATTENTION, attention_kernel, ATTENTION_CU, "attention");
+kernel_cache!(
+    ATTENTION_ROW,
+    attention_row_kernel,
+    ATTENTION_ROW_CU,
+    "attention_row"
+);
 kernel_cache!(
     ATTENTION_BWD,
     attention_bwd_kernel,
@@ -183,6 +224,12 @@ kernel_cache!(
     DEQUANT_MATMUL_CU,
     "dequant_matmul"
 );
+kernel_cache!(
+    DEQUANT_GGUF,
+    dequant_gguf_kernel,
+    DEQUANT_GGUF_CU,
+    "dequant_gguf"
+);
 kernel_cache!(SAMPLE, sample_kernel, SAMPLE_CU, "sample");
 kernel_cache!(
     SELECTIVE_SCAN,
@@ -195,12 +242,38 @@ kernel_cache!(POOL2D, pool2d_kernel, POOL2D_CU, "pool2d");
 kernel_cache!(POOL3D, pool3d_kernel, POOL3D_CU, "pool3d");
 kernel_cache!(CONV1D, conv1d_kernel, CONV1D_CU, "conv1d");
 kernel_cache!(CONV2D, conv2d_kernel, CONV2D_CU, "conv2d");
+kernel_cache!(IM2COL, im2col_kernel, IM2COL_CU, "im2col");
 kernel_cache!(CONV3D, conv3d_kernel, CONV3D_CU, "conv3d");
+kernel_cache!(
+    LAYER_NORM2D,
+    layer_norm2d_kernel,
+    LAYER_NORM2D_CU,
+    "layer_norm2d"
+);
+kernel_cache!(
+    CONV_TRANSPOSE2D,
+    conv_transpose2d_kernel,
+    CONV_TRANSPOSE2D_CU,
+    "conv_transpose2d"
+);
+kernel_cache!(GROUP_NORM, group_norm_kernel, GROUP_NORM_CU, "group_norm");
+kernel_cache!(
+    RESIZE_NEAREST_2X,
+    resize_nearest_2x_kernel,
+    RESIZE_NEAREST_2X_CU,
+    "resize_nearest_2x"
+);
 kernel_cache!(
     ELEMENTWISE_REGION,
     elementwise_region_kernel,
-    ELEMENTWISE_REGION_CU,
+    rlx_gpu_kernels::elementwise_region_cuda_src(),
     "elementwise_region"
+);
+kernel_cache!(
+    BATCH_ELEMENTWISE_REGION,
+    batch_elementwise_region_kernel,
+    rlx_gpu_kernels::batch_elementwise_region_cuda_src(),
+    "batch_elementwise_region"
 );
 kernel_cache!(
     FFT_RADIX2_FULL,
@@ -240,6 +313,16 @@ pub fn dispatch_grid_2d(
     )
 }
 
+/// 3-D grid for NCHW resize-prologue region kernels (W × H × N·C).
+pub fn dispatch_grid_prologue_nchw(w: u32, h: u32, nc: u32) -> ((u32, u32, u32), (u32, u32, u32)) {
+    const BX: u32 = 16;
+    const BY: u32 = 16;
+    (
+        (w.div_ceil(BX), h.div_ceil(BY), nc),
+        (BX.min(w.max(1)), BY.min(h.max(1)), 1),
+    )
+}
+
 /// AOT pre-warm: force-compile every kernel up-front. Mirrors
 /// `rlx-cuda::backend::prewarm_all`.
 pub fn prewarm_all(ctx: &Arc<RocmContext>) {
@@ -254,6 +337,11 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = reduce_kernel(ctx);
     let _ = softmax_kernel(ctx);
     let _ = layernorm_kernel(ctx);
+    let _ = rms_norm_backward_kernel(ctx);
+    let _ = rms_norm_bwd_zero_kernel(ctx);
+    let _ = cumsum_backward_kernel(ctx);
+    let _ = rope_backward_kernel(ctx);
+    let _ = gather_backward_kernel(ctx);
     let _ = fused_residual_ln_kernel(ctx);
     let _ = gather_kernel(ctx);
     let _ = gather_axis_kernel(ctx);
@@ -262,6 +350,7 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = transpose_kernel(ctx);
     let _ = expand_kernel(ctx);
     let _ = attention_kernel(ctx);
+    let _ = attention_row_kernel(ctx);
     let _ = attention_bwd_kernel(ctx);
     let _ = argmax_kernel(ctx);
     let _ = rope_kernel(ctx);
@@ -271,6 +360,7 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = scatter_add_zero_kernel(ctx);
     let _ = scatter_add_acc_kernel(ctx);
     let _ = dequant_matmul_kernel(ctx);
+    let _ = dequant_gguf_kernel(ctx);
     let _ = sample_kernel(ctx);
     let _ = selective_scan_kernel(ctx);
     let _ = pool1d_kernel(ctx);
@@ -278,11 +368,18 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = pool3d_kernel(ctx);
     let _ = conv1d_kernel(ctx);
     let _ = conv2d_kernel(ctx);
+    let _ = im2col_kernel(ctx);
     let _ = conv3d_kernel(ctx);
+    let _ = layer_norm2d_kernel(ctx);
+    let _ = conv_transpose2d_kernel(ctx);
+    let _ = group_norm_kernel(ctx);
+    let _ = resize_nearest_2x_kernel(ctx);
     let _ = elementwise_region_kernel(ctx);
+    let _ = batch_elementwise_region_kernel(ctx);
     let _ = fft_radix2_full_kernel(ctx);
     let _ = fft_bit_reverse_kernel(ctx);
     let _ = fft_inner_kernel(ctx);
     let _ = fft_outer_r4_kernel(ctx);
     let _ = fft_outer_r2_kernel(ctx);
+    let _ = gaussian_splat_rasterize_kernel(ctx);
 }

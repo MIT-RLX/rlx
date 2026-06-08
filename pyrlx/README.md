@@ -3,12 +3,24 @@
 Python bindings for RLX via [PyO3](https://pyo3.rs/) +
 [maturin](https://maturin.rs/). Run any RLX backend from Python.
 
+## API overview
+
+| Style | Entry | When to use |
+|-------|-------|-------------|
+| Explicit | `rlx.Graph("name")` | Full IR, integer node ids, tests mirroring Rust |
+| DSL | `with rlx.graph("name") as g:` | Notebooks, `(x @ w + b).gelu()`, scalar literals |
+| Execute | `Session.compile(g)` or `compile(g.raw)` | Graph is consumed; cache `g.raw` first in DSL |
+| Typed I/O | `rlx.set_param` / `rlx.run` | f64 / integers without manual `tobytes` |
+
 ## Features
 
-- **Build graphs from Python** — `Graph` + `Tensor` mirrors of
-  `rlx_ir::Graph`.
+- **Build graphs from Python** — `Graph` (explicit ids) or the
+  `graph()` / `Node` DSL (`(x @ w + b).gelu()`, scalar literals).
 - **Compile + run on any backend** — `Session(device="cpu" | "metal" |
   "mlx" | …)`.
+- **Multi-backend runtime** — `GraphDevices`, `DeviceRouter`,
+  `DevicePolicy`, `FlexibleSession`, `backends_manifest()`,
+  `parse_device()`. See [`docs/backend-selection.md`](../docs/backend-selection.md).
 - **FFT helpers** — `fft`, `fft_norm`, `rfft`, `irfft`, `fftfreq`,
   `rfftfreq`, `psd_real` on `Graph` (see `pyrlx/tests/test_fft.py`).
 - **Autodiff** — `pyrlx.grad(graph, wrt=[…])` returns the backward
@@ -48,24 +60,57 @@ GitHub Releases page for the current wheel set:
 ## Quickstart
 
 ```python
+import numpy as np
 import pyrlx as rlx
+
+# Explicit builder
 g = rlx.Graph("hello")
-x = g.input("x", (1, 4), "f32")
-w = g.param("w", (4, 2), "f32")
+x = g.input("x", [1, 4], "f32")
+w = g.param("w", [4, 2], "f32")
 y = g.matmul(x, w)
 g.set_outputs([y])
 
-session = rlx.Session("cpu")
-compiled = session.compile(g)
-compiled.set_param("w", [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0])
-out = compiled.run({"x": [1.0, 2.0, 3.0, 4.0]})
+# Or the Pythonic DSL
+with rlx.graph("hello_dsl") as g:
+    x = g.input("x", [1, 4], "f32")
+    w = g.param("w", [4, 2], "f32")
+    g.outputs = [(x @ w * g.constant(2.0)).relu()]
+    graph = g.raw
+
+compiled = rlx.Session("cpu").compile(graph)
+rlx.set_param(compiled, "w", np.eye(4, 2, dtype=np.float32))
+out, = rlx.run(compiled, x=np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32))
 ```
+
+### Multi-backend
+
+```python
+policy = rlx.DevicePolicy.only(["cpu", "metal"])
+runner = rlx.GraphDevices(g, policy=policy)
+device, outs = runner.run_chain({"x": x})
+
+router = rlx.DeviceRouter(g, policy=policy)
+device, outs = router.run({"x": x})
+```
+
+See [`docs/backend-selection.md`](../docs/backend-selection.md),
+[`pyrlx/docs/dsl.md`](docs/dsl.md) (DSL reference), and
+[`pyrlx/docs/backends.md`](docs/backends.md).
+
+## Graph builder notes
+
+- **Shape inference** — prefer `matmul`, `add`, `conv2d`, `layer_norm`, etc.
+  over `*_with_shape` unless you need a fixed output layout.
+- **Literals** — `g.constant(2.0)` or `x * 2.0` in the DSL; rank-0, NumPy-broadcastable.
+- **Reserved names** — `where_`, `eq_`, `lt_`, `gt_`, `ge_`, `ne_` (trailing underscore).
+- **FFT / attention / conv** — on `Graph` and via DSL proxy forwarding; see
+  `tests/test_fft.py`, `tests/test_ir_parity.py`.
 
 ## Status
 
-Surface follows the Rust crates closely; ergonomics layer is minimal at
-0.2.2 — expect more `__repr__`, NumPy interop, and dunder support to
-land in subsequent minor versions.
+Surface follows the Rust crates closely. DSL + scalar literals + expanded
+`Graph` bindings (conv, norm, `stop_gradient`, …) ship alongside multi-backend
+helpers (`GraphDevices`, `DeviceRouter`).
 
 ## License
 

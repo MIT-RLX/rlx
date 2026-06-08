@@ -809,6 +809,8 @@ fn elementwise_region_decomposes_into_chain() {
             num_inputs: 3,
             scalar_input_mask: 0,
             input_modulus: [0; 16],
+            prologue: rlx_ir::RegionPrologue::None,
+            prologue_input: 0,
         },
         vec![x, y, z],
         s,
@@ -821,4 +823,58 @@ fn elementwise_region_decomposes_into_chain() {
             "ElementwiseRegion lowering missing `{op}` opcode"
         );
     }
+}
+
+#[test]
+fn batch_elementwise_region_lowers_to_concat_and_relu() {
+    use rlx_ir::op::{ChainOperand, ChainStep, RegionPrologue};
+    let mut g = Graph::new("batch_region");
+    let batch_shape = Shape::new(&[2, 3, 4, 4], DType::F32);
+    let slice_shape = Shape::new(&[1, 3, 4, 4], DType::F32);
+    let s0 = g.input("s0", slice_shape.clone());
+    let s1 = g.input("s1", slice_shape);
+    let chain = vec![ChainStep::Activation(
+        Activation::Relu,
+        ChainOperand::Input(0),
+    )];
+    let out = g.add_node(
+        rlx_ir::Op::BatchElementwiseRegion {
+            chain,
+            num_batch_inputs: 2,
+            scalar_input_mask: 0,
+            input_modulus: [0; 16],
+            prologue: RegionPrologue::None,
+            prologue_input: 0,
+        },
+        vec![s0, s1],
+        batch_shape,
+    );
+    g.set_outputs(vec![out]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "concatenate"),
+        "BatchElementwiseRegion should emit concatenate"
+    );
+    assert!(
+        contains_opcode(&b, "maximum"),
+        "batch relu chain should emit maximum (relu)"
+    );
+}
+
+#[test]
+fn elementwise_region_resize_prologue_lowers_via_broadcast() {
+    let g = rlx_fusion::fk_graphs::resize_relu_region_graph("resize_prologue", 1, 3, 4, 4);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "broadcast"),
+        "resize prologue should use broadcast_in_dim"
+    );
+    assert!(
+        contains_opcode(&b, "reshape"),
+        "resize prologue should reshape before/after broadcast"
+    );
+    assert!(
+        contains_opcode(&b, "maximum"),
+        "relu chain should lower to maximum"
+    );
 }

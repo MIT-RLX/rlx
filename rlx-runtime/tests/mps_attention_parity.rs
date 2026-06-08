@@ -121,10 +121,8 @@ fn cpu_vs_metal_attention_no_mask_unpadded() {
     rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
     rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
-    unsafe {
-        rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-        rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
-    }
+    rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+    rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
 
     assert_eq!(cpu_out.len(), mtl_out.len());
     let diff = max_abs_diff(&cpu_out, &mtl_out);
@@ -153,10 +151,8 @@ fn cpu_vs_metal_attention_multi_head_unpadded() {
     rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
     rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
-    unsafe {
-        rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-        rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
-    }
+    rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+    rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
     eprintln!("[attn-parity NH=2 DH=4 unpadded] max abs diff = {diff:e}");
@@ -263,10 +259,8 @@ fn cpu_vs_metal_full_block_unpadded() {
         .into_iter()
         .next()
         .unwrap();
-    unsafe {
-        rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-        rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
-    }
+    rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+    rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
     let cpu_max = cpu_out.iter().map(|v| v.abs()).fold(0f32, f32::max);
@@ -309,10 +303,8 @@ fn bisect(
         mtl.set_param(n, d);
     }
     let mtl_out = mtl.run(inputs).into_iter().next().unwrap();
-    unsafe {
-        rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-        rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
-    }
+    rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+    rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
     let cpu_max = cpu_out.iter().map(|v| v.abs()).fold(1e-9, f32::max);
@@ -825,10 +817,8 @@ fn cpu_vs_metal_attention_with_padding() {
     rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
     rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
     let mtl_out = run_on(Device::Metal, b, s, nh, dh, &qkv, &mask);
-    unsafe {
-        rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-        rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
-    }
+    rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+    rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
     eprintln!("[attn-parity NH=2 DH=4 padded] max abs diff = {diff:e}");

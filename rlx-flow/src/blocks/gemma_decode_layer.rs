@@ -1,5 +1,17 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use anyhow::Result;
 use rlx_ir::HirGraphExt;
@@ -21,6 +33,16 @@ pub struct GemmaDecodeLayerSpec {
     pub head_dim: usize,
     pub num_kv_heads: usize,
     pub kv_group_size: usize,
+    /// Number of leading per-head dims that get rotary-rotated. See
+    /// the equivalent field on [`crate::blocks::SelfAttnPrefillSpec`]
+    /// — used by Gemma 4 full-attention layers for partial RoPE.
+    pub n_rot: usize,
+    /// Optional named decode RoPE row (see
+    /// [`crate::blocks::NamedRopeTablesStage`]). `None` ⇒ uses the
+    /// default `decode.cos`/`decode.sin` bound by `BindDecodeInputs`.
+    pub rope_table: Option<String>,
+    /// Reuse the K projection as V (Gemma 4 `attention_k_eq_v`).
+    pub k_eq_v: bool,
     pub eps: f32,
     pub use_custom_mask: bool,
     pub hidden_shape: rlx_ir::Shape,
@@ -111,7 +133,11 @@ impl BlockStage for GemmaDecodeLayerStage {
 
         let q_w = ctx.load_param(&format!("{lp}.self_attn.q_proj.weight"), true)?;
         let k_w = ctx.load_param(&format!("{lp}.self_attn.k_proj.weight"), true)?;
-        let v_w = ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?;
+        let v_w = if spec.k_eq_v {
+            None
+        } else {
+            Some(ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?)
+        };
         let o_w = ctx.load_param(&format!("{lp}.self_attn.o_proj.weight"), true)?;
         let gate_w = ctx.load_param(&format!("{lp}.mlp.gate_proj.weight"), true)?;
         let up_w = ctx.load_param(&format!("{lp}.mlp.up_proj.weight"), true)?;
@@ -120,14 +146,37 @@ impl BlockStage for GemmaDecodeLayerStage {
         let past_k = decode.past_k[self.layer_idx];
         let past_v = decode.past_v[self.layer_idx];
 
+        // Pick the rope row for this layer — secondary tables for
+        // Gemma 4 full-attention layers live in `state.named`.
+        let (decode_cos, decode_sin) = if let Some(slot) = spec.rope_table.as_deref() {
+            let cos_key = format!("{slot}_cos");
+            let sin_key = format!("{slot}_sin");
+            let cos = ctx.state.named.get(&cos_key).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Gemma decode layer requested rope table `{slot}` but `{cos_key}` missing"
+                )
+            })?;
+            let sin = ctx.state.named.get(&sin_key).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Gemma decode layer requested rope table `{slot}` but `{sin_key}` missing"
+                )
+            })?;
+            (cos, sin)
+        } else {
+            (decode.cos, decode.sin)
+        };
+
         let mut gb = HirMut::new(ctx.hir());
         let in_gamma = gb.add(in_ln_ones, in_ln_w);
         let normed_in = gb.rms_norm(input.id, in_gamma, zero_beta, spec.eps);
         let q = gb.mm(normed_in, q_w);
         let k = gb.mm(normed_in, k_w);
-        let v = gb.mm(normed_in, v_w);
-        let q_rope = gb.rope(q, decode.cos, decode.sin, spec.head_dim);
-        let k_rope = gb.rope(k, decode.cos, decode.sin, spec.head_dim);
+        let v = match v_w {
+            Some(w) => gb.mm(normed_in, w),
+            None => k,
+        };
+        let q_rope = gb.rope_n(q, decode_cos, decode_sin, spec.head_dim, spec.n_rot);
+        let k_rope = gb.rope_n(k, decode_cos, decode_sin, spec.head_dim, spec.n_rot);
 
         let new_k = gb.concat_(vec![past_k, k_rope], 1);
         let new_v = gb.concat_(vec![past_v, v], 1);

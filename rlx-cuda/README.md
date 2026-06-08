@@ -28,6 +28,13 @@ the loader path. The crate is feature-gated in `rlx-runtime`:
 rlx = { version = "0.2", features = ["cuda"] }
 ```
 
+## Cost-model calibration
+
+On first use (when a CUDA driver is present), `rlx_cuda::calibrate::Calibration::load_or_measure()`
+runs a 1024³ matmul micro-benchmark and writes `~/.cache/rlx/cuda-calib-<device>.json`
+(`sgemm_gflops`, `roundtrip_overhead_ns`, `memory_bw_gbps`). The runtime's `CudaCostModel`
+reads this cache for `fastest_device_for` ranking. Delete the file to re-measure.
+
 ## Mac-side iteration
 
 `cudarc`'s `dynamic-loading` feature loads `libcuda` via `dlopen` at
@@ -61,6 +68,9 @@ self-hosted Linux box.
   missing libcuda returns `None` instead of crashing.
 - `arena.rs` — single device buffer + per-node offsets, mirroring the
   rlx-wgpu f32-uniform arena. Reshape and Cast alias the input slot.
+  Process-wide f32 buffer pool (cap 16) for reuse across executables.
+- `host_staging.rs` — pageable or pinned host slots for input upload
+  and output download on the run hot path.
 - `kernels/*.cu` — CUDA C++ sources (binary, unary, copy, matmul,
   attention, conv, etc.). Compiled via NVRTC at first dispatch and
   cached behind `OnceLock`s.
@@ -206,6 +216,51 @@ nd-descriptor APIs.
   in parallel; cross-stream sync is via CUDA events at fork/join
   points. Incompatible with `ExecMode::Graph`.
 
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `RLX_CUDA_COMPILE_MODE=aot` | NVRTC prewarm all kernels at compile (once per process). |
+| `RLX_CUDA_EXEC_MODE=graph` | Capture schedule into a CUDA Graph on first run; replay thereafter. D2H for outputs is captured inside the graph. |
+| `RLX_CUDA_PTX_CACHE` | Directory for persistent NVRTC PTX cache (default: `~/.cache/rlx-cuda`). |
+| `RLX_CUDA_PARITY=1` | Encoder/CPU parity: strict f32 cuBLASLt (`CUBLAS_COMPUTE_32F`), tiled `matmul.cu` instead of cuBLASLt/cuBLAS heuristics. Implies `RLX_CUDA_NO_TF32`. |
+| `RLX_CUDA_NO_TF32=1` | Strict f32 cuBLASLt only (no TF32 tensor cores). Matmul may still use cuBLASLt unless `RLX_CUDA_NO_CUBLASLT` or `RLX_CUDA_PARITY` is set. |
+| `RLX_CUDA_NO_CUBLASLT=1` | Skip cuBLASLt fused matmul; use tiled `matmul.cu` (or cuBLAS sgemm fallback). |
+| `RLX_CUDA_PINNED_IO=1` | Also pin **input** H2D staging in stream mode (outputs are pinned by default). |
+| `RLX_CUDA_PINNED_IO=0` | Disable pinned host staging (pageable buffers only). |
+| `RLX_CUDA_IM2COL_HOST=1` | Force host-side Im2Col for dynamic conv (default: GPU Im2Col in graph mode). |
+| `RLX_TRACE_PERFETTO=<path>` | Chrome trace per schedule step (cross-backend; load in Perfetto UI). |
+
+### EEG-CLIP batch encode note
+
+Fused graphs compiled with `batch > 1` on the EEG projection head (temporal mean over
+`n_preds` on `[B, P, C]`) can diverge from `B` sequential `batch=1` runs on CUDA when the
+full Deep4+projection graph is executed at once. **`eegclip-rs` avoids this** by running
+batched Deep4 only, then `project_eeg_features(..., batch=1)` per window inside
+`EegClipInference::encode_many_windows`. On CUDA, `EegEncoder::run_deep4` defaults to
+`B` sequential `batch=1` Deep4 calls unless `EEGCLIP_CUDA_DEEP4_BATCH=1` (batched conv
+parity still under investigation).
+
+### `run_slots` / embedder readback
+
+CUDA now implements the same [`run_slots` + `arena_ptr`] contract as Metal/MLX:
+positional inputs, one D2H into a stable **host** buffer (not a GPU-mapped arena).
+Use this for inference loops that want to reuse an output `Vec` without `run()` allocating
+each time (e.g. EEG-DINO `eegdino-rs` encoder).
+
+### EEG-DINO encoder notes
+
+- Attention uses **BSHD** `[B,S,H,D]`; CUDA uses tiled flash (`attention_kernel`) for `head_dim ≤ 128`
+  (same as wgpu). Set `RLX_CUDA_FORCE_ATTENTION_ROW=1` to fall back to `attention_row_kernel`.
+  Packed QKV (`RLX_CUDA_NO_PACKED_BSHD_ATTN` unset) avoids separate Q/K/V narrow matmuls.
+- Profile with `RLX_CUDA_EXEC_MODE=stream` and `RLX_TRACE_PERFETTO=trace.json` on one full
+  `run()` — prefix-subgraph profiling in embedders is approximate.
+
+Graph replay waits on a reused `CudaEvent` instead of synchronizing the
+whole stream. Input uploads use compile-time pinned staging when I/O
+pinning is on; output buffers are pinned and their addresses are stable
+across graph capture/replay.
+
 ## Build / test
 
 ```sh
@@ -232,18 +287,7 @@ host without an NVIDIA driver) before paying for cloud-GPU time.
 ### Workflow
 
 ```sh
-# One-time: pull HIP-CPU as a submodule.
-git submodule add https://github.com/ROCm-Developer-Tools/HIP-CPU.git \
-    rlx-cuda/vendor/HIP-CPU
-git submodule update --init
-
-# Compile + test the CPU-execution path.
-cargo test -p rlx-cuda --features hip-cpu-validate
-
-# In Docker (any architecture, no GPU needed):
-docker run --rm -v $PWD:/work -w /work rust:1.76 \
-    bash -c "apt-get update && apt-get install -y g++ && \
-             cargo test -p rlx-cuda --features hip-cpu-validate"
+just test-hip-cpu-validate
 ```
 
 ### Architecture

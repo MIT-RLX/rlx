@@ -1,6 +1,6 @@
 [package]
 name = "rlx-cuda"
-version                = "0.2.2"
+version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 description = "NVIDIA CUDA backend — cuBLAS for matmul + NVRTC-compiled kernels for everything else, via the pure-Rust `cudarc` crate."
@@ -13,10 +13,10 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.2" }
-rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.2" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.3", features = ["splat"] }
+rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.4" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.4" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.4", features = ["splat"] }
 
 # `dynamic-loading` lets the crate compile and link on hosts without a
 # CUDA SDK installed — libcuda is dlopen()'d at runtime. That's what
@@ -46,6 +46,8 @@ cudarc = { version = "0.19", default-features = false, features = [
     "dynamic-loading",
 ] }
 bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lib]
 path = "src/lib.rs"
@@ -55,12 +57,11 @@ path = "src/lib.rs"
 # Kernel sources live in `rlx-gpu-kernels`. `hip-cpu-validate` compiles them via HIP-CPU
 # headers and runs them on CPU threads instead of via cudarc + libcuda.
 # Off by default. Never enabled in workspace `cargo build` / production
-# builds. Only useful for `cargo test --features hip-cpu-validate` on
-# Mac (or any other host without a CUDA driver) to validate the kernel
-# logic without paying for cloud-GPU time.
+# builds. Validate in the linux-gnu Docker image only:
+#   `just test-hip-cpu-validate`
 #
-# Requires HIP-CPU headers at `vendor/HIP-CPU/include` (git submodule).
-# The build.rs compiles `cpu_dispatch.cpp` against those headers when
+# Requires HIP-CPU headers at `docker/vendor/HIP-CPU/include` (cloned by fetch-hip-cpu.sh in Docker).
+# build.rs compiles `cpp/cpu_dispatch.cpp` against those headers when
 # this feature is on; the resulting object file is linked into the
 # crate and called via Rust FFI.
 [features]

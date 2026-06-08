@@ -62,24 +62,22 @@ extern "C" __global__ void fused_residual_ln(
 
     __shared__ float s[FRL_BLOCK];
 
-    // Phase 1: fold residual + bias into out, accumulate row sum.
+    // Fold residual + bias into out; accumulate E[x] and E[x²] for LayerNorm.
     float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
     for (unsigned int i = tid; i < inner; i += bsz) {
         float v = arena[in_base + i] + arena[res_base + i];
         if (with_bias) v += arena[bias_off + i];
         arena[out_base + i] = v;
         local_sum += v;
+        local_sum_sq += v * v;
     }
-    float mean = frl_block_sum(local_sum, s, tid, bsz) * n_inv;
-
-    // Phase 2: variance.
-    float local_var = 0.0f;
-    for (unsigned int i = tid; i < inner; i += bsz) {
-        float d = arena[out_base + i] - mean;
-        local_var += d * d;
-    }
-    float var = frl_block_sum(local_var, s, tid, bsz);
-    float inv_std = rsqrtf(var * n_inv + eps);
+    float sum_x = frl_block_sum(local_sum, s, tid, bsz);
+    __syncthreads();
+    float sum_x2 = frl_block_sum(local_sum_sq, s, tid, bsz);
+    float mean = sum_x * n_inv;
+    float var = fmaxf(sum_x2 * n_inv - mean * mean, 0.0f);
+    float inv_std = rsqrtf(var + eps);
 
     // Phase 3: normalize, scale, shift.
     for (unsigned int i = tid; i < inner; i += bsz) {

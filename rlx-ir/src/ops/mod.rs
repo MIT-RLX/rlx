@@ -26,6 +26,7 @@
 //! `graph.rs`.
 
 pub mod attention;
+pub mod audio_ops;
 pub mod axial_rope2d;
 pub mod backward;
 pub mod blocks;

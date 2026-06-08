@@ -21,32 +21,25 @@
 // surface. Suppressing the lint at crate scope avoids drowning out
 // signal warnings.
 //!
-//! Sister crate to `rlx-cuda`. The CUDA C++ kernel sources in
-//! Kernel sources live in `rlx-gpu-kernels` (CUDA/HIP-compatible `.cu`
-//! files). The dispatch
-//! ladder mirrors `rlx-cuda`'s: hipBLASLt → hipBLAS → MIOpen-conv
-//! → custom kernels via hipRTC, falling through on any setup error.
-//!
-//! ## Status: Mac-iterable scaffold
-//!
-//! This crate currently compiles on any host but has no real HIP
-//! dispatch wired up — `is_available()` always returns `false`,
-//! `RocmExecutable::compile()` panics with a clear message. The
-//! intent is to ship the structural skeleton (workspace member,
-//! IR plumbing, kernel-source plumbing, basic-test harness) so we
-//! can iterate the real HIP runtime bindings + dispatch path as
-//! drop-in additions, the same way `rlx-cuda` started.
+//! Sister crate to `rlx-cuda`. Kernel sources live in `rlx-gpu-kernels`
+//! (CUDA/HIP-compatible `.cu` files). The dispatch ladder mirrors
+//! `rlx-cuda`'s: hipBLASLt → hipBLAS → MIOpen-conv → custom kernels
+//! via hipRTC, falling through on any setup error.
 
 pub mod arena;
 pub mod backend;
+pub mod calibrate;
 pub mod device;
 pub mod fft_dispatch;
 pub mod fft_host;
 pub mod gdn_host;
+pub mod gguf_gpu;
 pub mod gguf_host;
 pub mod hip;
 pub mod hipblas;
 pub mod hipblaslt;
+pub mod host_staging;
+pub mod im2col_host;
 pub mod kernels;
 pub mod launch;
 pub mod llada2_gate_host;
@@ -66,10 +59,7 @@ pub mod cpu_dispatch;
 
 pub use backend::{CompileMode, ExecMode, RocmExecutable};
 
-/// True if a HIP-capable AMD GPU is reachable. Returns false today
-/// because the HIP runtime bindings haven't landed yet — once they do,
-/// this will probe `libamdhip64` via the same panic-catching dlopen
-/// pattern `rlx-cuda` uses for `libcuda`.
+/// True when a HIP-capable AMD GPU is reachable via libamdhip64.
 pub fn is_available() -> bool {
     device::rocm_context().is_some()
 }

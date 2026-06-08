@@ -36,7 +36,8 @@
 //! let x = g.input("x", Shape::new(&[1, 4], DType::F32));
 //! let w = g.param("w", Shape::new(&[4, 2], DType::F32));
 //! let y = g.matmul(x, w, Shape::new(&[1, 2], DType::F32));
-//! g.set_outputs(vec![y]);
+//! let scaled = g.mul(x, g.constant(2.0, DType::F32)); // GraphExt literal
+//! g.set_outputs(vec![y, scaled]);
 //!
 //! let mut compiled = Session::new(Device::Cpu).compile(g);
 //! compiled.set_param("w", &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
@@ -55,6 +56,7 @@
 //! | `rlx::runtime`  | `rlx-runtime`   | `Session`, `CompiledGraph`                                                      |
 //! | `rlx::macros`   | `rlx-macros`    | `#[rlx_model]` proc macro                                                       |
 //! | `rlx::gguf`     | `rlx-gguf`      | GGUF parser + dequant *(feature `gguf`)*                                        |
+//! | `rlx::onnx`     | `rlx-onnx`      | ONNX Runtime `.onnx` inference *(feature `onnx`)*                               |
 //! | `rlx::bench`    | `rlx-bench`     | benchmark harness *(feature `bench`)*                                           |
 //! | `rlx::sparse`   | `rlx-sparse`    | downstream: sparse linalg *(feature `sparse`)*                                  |
 //! | `rlx::splat`    | `rlx-splat`     | 3D Gaussian splatting *(feature `splat`)* — `register()`, decomposed IR ops      |
@@ -138,9 +140,15 @@ pub use rlx_runtime as runtime;
 pub use rlx_macros as macros;
 
 #[cfg(feature = "gguf")]
-/// GGUF v1 / v2 / v3 parser + dequant.
+/// GGUF v1 / v2 / v3 parser + dequant + quant encoders + writer.
 /// See [`rlx-gguf`](https://crates.io/crates/rlx-gguf).
 pub use rlx_gguf as gguf;
+
+#[cfg(feature = "gguf-convert")]
+/// safetensors / ONNX → GGUF conversion with per-tensor quantization.
+/// Useful at first inference load to shrink memory + disk footprint.
+/// See [`rlx-gguf-convert`](https://crates.io/crates/rlx-gguf-convert).
+pub use rlx_gguf_convert as gguf_convert;
 
 #[cfg(feature = "bench")]
 /// Uniform benchmark harness.
@@ -166,6 +174,12 @@ pub use rlx_splat as splat;
 /// Downstream: UMAP / fast-umap custom ops (k-NN from pairwise distances).
 pub use rlx_umap as umap;
 
+#[cfg(feature = "optim")]
+/// Training-step optimizers (Adam, AdamW, NAdamW, RAdam, QHAdamW,
+/// LAMB, Adafactor, Lion, SOAP, Kron-PSGD, Muon, Sophia, MARS). See
+/// [`rlx-optim`](https://crates.io/crates/rlx-optim).
+pub use rlx_optim as optim;
+
 #[cfg(feature = "cortexm")]
 /// `no_std` ARMv7E-M INT8 kernels (Cortex-M4F / M7). Doesn't
 /// implement `Backend` — call the kernels (`dense`, `conv2d`,
@@ -179,6 +193,11 @@ pub use rlx_cortexm as cortexm;
 /// `rlx::fpga::codegen::emit_model`.
 /// See [`rlx-fpga`](https://crates.io/crates/rlx-fpga).
 pub use rlx_fpga as fpga;
+
+#[cfg(feature = "onnx")]
+/// ONNX Runtime inference for `.onnx` files on RLX [`Device`] backends.
+/// See [`rlx-onnx`](https://crates.io/crates/rlx-onnx).
+pub use rlx_onnx as onnx;
 
 // ── Error types ─────────────────────────────────────────────────
 //
@@ -202,8 +221,8 @@ pub type Error = anyhow::Error;
 pub use rlx_driver::Device;
 pub use rlx_ir::quant::QuantScheme;
 pub use rlx_ir::{
-    DType, Element, FusionPolicy, Graph, GraphModule, GraphStage, HirModule, HirOp, LirModule,
-    MirModule, Node, NodeId, Op, OpKind, Shape, Tick,
+    DType, Element, FusionPolicy, Graph, GraphExt, GraphModule, GraphStage, HirModule, HirOp,
+    LirModule, MirModule, Node, NodeId, Op, OpKind, Shape, Tick, scalar_constant_bytes,
 };
 pub use rlx_ir::{
     NodeOrigin, inspect_graph, inspect_graph_diff, inspect_hir, inspect_hir_stats, inspect_lir,
@@ -215,7 +234,14 @@ pub use rlx_opt::{
     fusion_passes_for_supported, hvp, inspect_pipeline, jvp, maybe_dump_pipeline,
     supported_for_target, supports_op, vmap,
 };
-pub use rlx_runtime::{CompiledGraph, Session};
+pub use rlx_runtime::{
+    BackendsManifest, CompiledGraph, DeviceBenchResult, DeviceCandidate, DeviceFallbackError,
+    DevicePickStrategy, DevicePolicy, DeviceRouter, FlexibleSession, GraphDevices,
+    ParseDeviceError, Session, available_devices, benchmark_devices, device_chain_from_env,
+    device_from_env, device_label, device_report, devices_for, devices_for_with_policy,
+    fastest_device, fastest_device_for, graph_param_names, is_available, parse_device,
+    parse_device_list, resolve_device, resolve_device_chain, run_with_fallback,
+};
 
 // ── Grouped namespaces ──────────────────────────────────────────
 
@@ -240,7 +266,7 @@ pub mod quant {
 /// used by `Op::ElementwiseRegion`.
 ///
 /// ```ignore
-/// use rlx::{Graph, Shape, DType};
+/// use rlx::{Graph, GraphExt, Shape, DType};
 /// use rlx::ops::{Activation, BinaryOp};
 ///
 /// let mut g = Graph::new("ex");
@@ -248,7 +274,8 @@ pub mod quant {
 /// let y = g.input("y", Shape::new(&[4], DType::F32));
 /// let s = g.binary(BinaryOp::Add, x, y, Shape::new(&[4], DType::F32));
 /// let r = g.activation(Activation::Silu, s, Shape::new(&[4], DType::F32));
-/// g.set_outputs(vec![r]);
+/// let scaled = g.mul(x, g.constant(2.0, DType::F32));
+/// g.set_outputs(vec![r, scaled]);
 /// ```
 pub mod ops {
     pub use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind};
@@ -279,17 +306,26 @@ pub mod autodiff {
 /// // graph building
 /// let mut g = Graph::new("ex");
 /// let x = g.input("x", Shape::new(&[1, 4], DType::F32));
+/// let y = g.mul(x, g.constant(2.0, DType::F32));
+/// g.set_outputs(vec![y]);
 ///
-/// // compile + run
-/// let mut compiled = Session::new(Device::Cpu).compile(g);
-/// let out = compiled.run(&[("x", &[1.0; 4])]);
+/// // compile + run (auto-pick fastest, or choose any compatible backend)
+/// let mut runner = GraphDevices::new(g);
+/// let device = runner.fastest(); // or pick from runner.devices()
+/// let out = runner.run(device, &[("x", &[1.0; 4])]).unwrap();
 ///
 /// ```
 pub mod prelude {
     // Core graph + runtime
     pub use crate::{
-        CompiledGraph, DType, Device, Element, Error, Graph, GraphModule, GraphStage, Node, NodeId,
-        Op, OpKind, Result, Session, Shape, Tick,
+        BackendsManifest, CompiledGraph, DType, Device, DeviceBenchResult, DeviceCandidate,
+        DeviceFallbackError, DevicePickStrategy, DevicePolicy, DeviceRouter, Element, Error,
+        FlexibleSession, Graph, GraphDevices, GraphExt, GraphModule, GraphStage, Node, NodeId, Op,
+        OpKind, ParseDeviceError, Result, Session, Shape, Tick, available_devices,
+        benchmark_devices, device_chain_from_env, device_from_env, device_label, device_report,
+        devices_for, devices_for_with_policy, fastest_device, fastest_device_for,
+        graph_param_names, is_available, parse_device, parse_device_list, resolve_device,
+        resolve_device_chain, run_with_fallback, scalar_constant_bytes,
     };
     // IR builder helpers
     pub use crate::ops::{Activation, BinaryOp, CmpOp, MaskKind};
@@ -314,4 +350,24 @@ pub mod prelude {
     };
     #[cfg(feature = "splat")]
     pub use rlx_splat::prep_layout::{prep_packed_len, tile_count};
+}
+
+/// Register optional custom backends and companion custom-op crates.
+///
+/// Builtins (CPU, Metal, CUDA, …) register automatically on first
+/// [`Session`] use. Call this at process startup when you ship extra
+/// backends or custom-op libraries:
+///
+/// ```ignore
+/// rlx::register_backends! {
+///     splat => rlx::splat::register,
+///     sparse => rlx::sparse::register,
+/// }
+/// ```
+#[macro_export]
+macro_rules! register_backends {
+    () => {};
+    ( $( $name:ident => $register:path ),* $(,)? ) => {
+        $( $register(); )*
+    };
 }

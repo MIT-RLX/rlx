@@ -21,7 +21,7 @@
 //! free of cross-backend deps — the expected values are computed in
 //! pure Rust.
 
-#![cfg(target_os = "macos")]
+#![cfg(rlx_mlx_host)]
 
 use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Shape};
@@ -994,8 +994,12 @@ fn calibration_records_memory_bw_and_attention() {
     // call measure() directly). Use measure() to avoid touching the
     // user's cache.
     let cal = Calibration::measure().expect("calibration measure failed");
+    // Apple Silicon unified memory: copy micro-bench is GB/s-class.
+    // Linux MLX CPU/CUDA reports much lower copy rates through the
+    // lazy allocator path — still require a positive measurement.
+    let min_bw = if cfg!(target_os = "macos") { 1.0 } else { 0.1 };
     assert!(
-        cal.memory_bw_gbps > 1.0,
+        cal.memory_bw_gbps > min_bw,
         "memory_bw_gbps too low: {:.1}",
         cal.memory_bw_gbps
     );
@@ -1006,13 +1010,18 @@ fn calibration_records_memory_bw_and_attention() {
         "memory_bw_gbps implausibly high: {:.0}",
         cal.memory_bw_gbps
     );
+    let min_attn = if cfg!(target_os = "macos") {
+        1.0e9
+    } else {
+        1.0e6
+    };
     assert!(
-        cal.attention_flops > 1.0e9,
+        cal.attention_flops > min_attn,
         "attention_flops too low: {:.0}",
         cal.attention_flops
     );
     assert!(
-        cal.reduce_gbps > 1.0,
+        cal.reduce_gbps > min_bw,
         "reduce_gbps too low: {:.1}",
         cal.reduce_gbps
     );
@@ -1022,10 +1031,10 @@ fn calibration_records_memory_bw_and_attention() {
 fn calibration_returns_plausible_numbers() {
     use rlx_mlx::calibrate::Calibration;
     let cal = Calibration::load_or_measure();
-    // Sanity bounds: large matmul should achieve at least 10 GF/s
-    // (any modern Apple Silicon GPU exceeds this comfortably).
+    // Sanity bounds: large matmul throughput (platform-dependent).
+    let min_large = if cfg!(target_os = "macos") { 10e9 } else { 1e8 };
     assert!(
-        cal.sgemm_large_flops > 10e9,
+        cal.sgemm_large_flops > min_large,
         "large sgemm too slow: {:.0} GF/s",
         cal.sgemm_large_flops / 1e9
     );
@@ -1819,6 +1828,8 @@ fn elementwise_region_scalar_broadcast_matches_atomic() {
             num_inputs: 3,
             scalar_input_mask,
             input_modulus,
+            prologue: rlx_ir::RegionPrologue::None,
+            prologue_input: 0,
         },
         vec![x2, b2, s2],
         shape.clone(),
@@ -1902,6 +1913,8 @@ fn elementwise_region_with_where_step_matches_atomic() {
             num_inputs: 2,
             scalar_input_mask: 0,
             input_modulus: [0u32; 16],
+            prologue: rlx_ir::RegionPrologue::None,
+            prologue_input: 0,
         },
         vec![a2, b2],
         shape.clone(),
@@ -1986,6 +1999,8 @@ fn elementwise_region_native_lowering_matches_atomic() {
             num_inputs: 3,
             scalar_input_mask: 0,
             input_modulus: [0u32; 16],
+            prologue: rlx_ir::RegionPrologue::None,
+            prologue_input: 0,
         },
         vec![x2, a2, b2],
         shape.clone(),
@@ -2018,5 +2033,250 @@ fn elementwise_region_native_lowering_matches_atomic() {
         close(&got_reg, &want, 1e-5),
         "ElementwiseRegion result vs hand-computed mismatch: \
          got={got_reg:?} want={want:?}"
+    );
+}
+
+#[test]
+fn transform_region_resize_matches_atomic() {
+    use rlx_ir::Op;
+    use rlx_ir::op::{ChainOperand, TransformStep};
+
+    let in_shape = Shape::new(&[1, 2, 2, 2], DType::F32);
+    let out_shape = Shape::new(&[1, 2, 4, 4], DType::F32);
+
+    let mut g_atom = Graph::new("transform_atom");
+    let x = g_atom.input("x", in_shape.clone());
+    let up = g_atom.add_node(Op::ResizeNearest2x, vec![x], out_shape.clone());
+    g_atom.set_outputs(vec![up]);
+
+    let mut g_tr = Graph::new("transform_reg");
+    let x2 = g_tr.input("x", in_shape);
+    let out = g_tr.add_node(
+        Op::TransformRegion {
+            steps: vec![TransformStep::ResizeNearest2x(ChainOperand::Input(0))],
+            num_inputs: 1,
+        },
+        vec![x2],
+        out_shape,
+    );
+    g_tr.set_outputs(vec![out]);
+
+    let xs: Vec<f32> = (0..8).map(|i| i as f32 * 0.1 - 0.5).collect();
+    let mut atom = MlxExecutable::compile(g_atom);
+    let mut tr = MlxExecutable::compile(g_tr);
+    let got_atom = atom.run(&[("x", &xs)]).into_iter().next().unwrap();
+    let got_tr = tr.run(&[("x", &xs)]).into_iter().next().unwrap();
+    assert!(
+        close(&got_atom, &got_tr, 1e-5),
+        "transform region vs atomic resize: atom={got_atom:?} tr={got_tr:?}"
+    );
+}
+
+#[test]
+fn batch_elementwise_region_matches_atomic() {
+    use rlx_ir::Op;
+    use rlx_ir::op::{Activation, ChainOperand, ChainStep};
+
+    let slice_shape = Shape::new(&[1, 2, 4, 4], DType::F32);
+    let out_shape = Shape::new(&[2, 2, 4, 4], DType::F32);
+
+    let mut g_atom = Graph::new("batch_atom");
+    let batch = g_atom.input("batch", out_shape.clone());
+    let n0 = g_atom.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: 0,
+            len: 1,
+        },
+        vec![batch],
+        slice_shape.clone(),
+    );
+    let n1 = g_atom.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: 1,
+            len: 1,
+        },
+        vec![batch],
+        slice_shape.clone(),
+    );
+    let chain = vec![ChainStep::Activation(
+        Activation::Relu,
+        ChainOperand::Input(0),
+    )];
+    let r0 = g_atom.add_node(
+        Op::ElementwiseRegion {
+            chain: chain.clone(),
+            num_inputs: 1,
+            scalar_input_mask: 0,
+            input_modulus: [0; 16],
+            prologue: rlx_ir::RegionPrologue::None,
+            prologue_input: 0,
+        },
+        vec![n0],
+        slice_shape.clone(),
+    );
+    let r1 = g_atom.add_node(
+        Op::ElementwiseRegion {
+            chain,
+            num_inputs: 1,
+            scalar_input_mask: 0,
+            input_modulus: [0; 16],
+            prologue: rlx_ir::RegionPrologue::None,
+            prologue_input: 0,
+        },
+        vec![n1],
+        slice_shape,
+    );
+    let cat = g_atom.add_node(Op::Concat { axis: 0 }, vec![r0, r1], out_shape.clone());
+    g_atom.set_outputs(vec![cat]);
+
+    let mut g_batch = Graph::new("batch_reg");
+    let batch2 = g_batch.input("batch", out_shape.clone());
+    let n0b = g_batch.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: 0,
+            len: 1,
+        },
+        vec![batch2],
+        Shape::new(&[1, 2, 4, 4], DType::F32),
+    );
+    let n1b = g_batch.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: 1,
+            len: 1,
+        },
+        vec![batch2],
+        Shape::new(&[1, 2, 4, 4], DType::F32),
+    );
+    let out = g_batch.add_node(
+        Op::BatchElementwiseRegion {
+            chain: vec![ChainStep::Activation(
+                Activation::Relu,
+                ChainOperand::Input(0),
+            )],
+            num_batch_inputs: 2,
+            scalar_input_mask: 0,
+            input_modulus: [0; 16],
+            prologue: rlx_ir::RegionPrologue::None,
+            prologue_input: 0,
+        },
+        vec![n0b, n1b],
+        out_shape,
+    );
+    g_batch.set_outputs(vec![out]);
+
+    let xs: Vec<f32> = (0..2 * 2 * 4 * 4)
+        .map(|i| (i as f32) * 0.01 - 0.5)
+        .collect();
+    let mut atom = MlxExecutable::compile(g_atom);
+    let mut batch_exe = MlxExecutable::compile(g_batch);
+    let got_atom = atom.run(&[("batch", &xs)]).into_iter().next().unwrap();
+    let got_batch = batch_exe.run(&[("batch", &xs)]).into_iter().next().unwrap();
+    assert!(
+        close(&got_atom, &got_batch, 1e-5),
+        "batch region vs atomic: atom={got_atom:?} batch={got_batch:?}"
+    );
+}
+
+#[test]
+fn elementwise_region_resize_prologue_matches_atomic() {
+    use rlx_ir::Op;
+    use rlx_ir::op::{Activation, ChainOperand, ChainStep};
+
+    let in_shape = Shape::new(&[1, 2, 2, 2], DType::F32);
+    let out_shape = Shape::new(&[1, 2, 4, 4], DType::F32);
+
+    let mut g_atom = Graph::new("prologue_atom");
+    let x = g_atom.input("x", in_shape.clone());
+    let up = g_atom.add_node(Op::ResizeNearest2x, vec![x], out_shape.clone());
+    let r = g_atom.activation(Activation::Relu, up, out_shape.clone());
+    g_atom.set_outputs(vec![r]);
+
+    let mut g_reg = Graph::new("prologue_reg");
+    let x2 = g_reg.input("x", in_shape);
+    let chain = vec![ChainStep::Activation(
+        Activation::Relu,
+        ChainOperand::Input(0),
+    )];
+    let region = g_reg.add_node(
+        Op::ElementwiseRegion {
+            chain,
+            num_inputs: 1,
+            scalar_input_mask: 0,
+            input_modulus: [0; 16],
+            prologue: rlx_ir::RegionPrologue::ResizeNearest2x,
+            prologue_input: 0,
+        },
+        vec![x2],
+        out_shape,
+    );
+    g_reg.set_outputs(vec![region]);
+
+    let xs: Vec<f32> = (0..8).map(|i| i as f32 * 0.1 - 0.5).collect();
+    let mut atom = MlxExecutable::compile(g_atom);
+    let mut reg = MlxExecutable::compile(g_reg);
+    let got_atom = atom.run(&[("x", &xs)]).into_iter().next().unwrap();
+    let got_reg = reg.run(&[("x", &xs)]).into_iter().next().unwrap();
+    assert!(
+        close(&got_atom, &got_reg, 1e-5),
+        "prologue region vs atomic: atom={got_atom:?} reg={got_reg:?}"
+    );
+}
+
+/// Regression: repeated `g.param("name", …)` across blocks must not
+/// break mlx::compile leaf binding (reve-rs hoists aux params per block).
+fn build_stacked_shared_param_graph(n_blocks: usize) -> Graph {
+    use rlx_ir::GraphExt;
+    let mut g = Graph::new("shared_param");
+    let x = g.input("x", Shape::new(&[4], DType::F32));
+    let mut h = x;
+    for _ in 0..n_blocks {
+        let scale = g.param("shared_scale", Shape::new(&[1], DType::F32));
+        let scaled = g.mul(h, scale);
+        h = g.add(h, scaled);
+    }
+    g.set_outputs(vec![h]);
+    g
+}
+
+fn expected_stacked_shared(x: &[f32], scale: f32, n_blocks: usize) -> Vec<f32> {
+    let factor = 1.0 + scale;
+    let mut acc = factor;
+    for _ in 1..n_blocks {
+        acc *= factor;
+    }
+    x.iter().map(|v| v * acc).collect()
+}
+
+#[test]
+fn duplicate_param_name_across_blocks_compiled() {
+    let g = build_stacked_shared_param_graph(4);
+    let mut exe = MlxExecutable::compile_with_mode(g, MlxMode::Compiled);
+    let x = vec![1.0, 2.0, 3.0, 4.0];
+    let scale = 0.5f32;
+    exe.set_param("shared_scale", &[scale]);
+    let got = exe.run(&[("x", &x)]).into_iter().next().unwrap();
+    let want = expected_stacked_shared(&x, scale, 4);
+    assert!(
+        close(&got, &want, 1e-5),
+        "duplicate param compiled: got {got:?} want {want:?}"
+    );
+}
+
+#[test]
+fn duplicate_param_name_across_blocks_lazy() {
+    let g = build_stacked_shared_param_graph(4);
+    let mut exe = MlxExecutable::compile_with_mode(g, MlxMode::Lazy);
+    let x = vec![1.0, 2.0, 3.0, 4.0];
+    let scale = 0.5f32;
+    exe.set_param("shared_scale", &[scale]);
+    let got = exe.run(&[("x", &x)]).into_iter().next().unwrap();
+    let want = expected_stacked_shared(&x, scale, 4);
+    assert!(
+        close(&got, &want, 1e-5),
+        "duplicate param lazy: got {got:?} want {want:?}"
     );
 }

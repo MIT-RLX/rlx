@@ -382,6 +382,983 @@ fn gather_embedding_matches_reference() {
     assert_eq!(r[0], vec![30.0, 31.0, 10.0, 11.0]);
 }
 
+/// SDPA reading Q/K/V from packed `[B, S, 3, H, D]` with CPU fused `row_stride = 3·H·D`.
+fn cpu_attention_packed_qkv(packed: &[f32], b: usize, s: usize, nh: usize, dh: usize) -> Vec<f32> {
+    let hs = nh * dh;
+    let qrs = hs * 3;
+    let scale = 1.0f32 / (dh as f32).sqrt();
+    let mut out = vec![0.0f32; b * s * hs];
+    for bi in 0..b {
+        for hi in 0..nh {
+            let mut qh = vec![0.0f32; s * dh];
+            let mut kh = vec![0.0f32; s * dh];
+            let mut vh = vec![0.0f32; s * dh];
+            for si in 0..s {
+                let q_off = bi * s * qrs + si * qrs + hi * dh;
+                let k_off = q_off + hs;
+                let v_off = q_off + 2 * hs;
+                qh[si * dh..(si + 1) * dh].copy_from_slice(&packed[q_off..q_off + dh]);
+                kh[si * dh..(si + 1) * dh].copy_from_slice(&packed[k_off..k_off + dh]);
+                vh[si * dh..(si + 1) * dh].copy_from_slice(&packed[v_off..v_off + dh]);
+            }
+            for qi in 0..s {
+                let o_off = bi * s * hs + qi * hs + hi * dh;
+                let mut m = f32::NEG_INFINITY;
+                let mut l = 0.0f32;
+                let mut acc = vec![0.0f32; dh];
+                for ki in 0..s {
+                    let mut score = 0.0f32;
+                    for d in 0..dh {
+                        score += qh[qi * dh + d] * kh[ki * dh + d];
+                    }
+                    score *= scale;
+                    let m_new = m.max(score);
+                    let e_old = (m - m_new).exp();
+                    let e_cur = (score - m_new).exp();
+                    l = e_old * l + e_cur;
+                    for d in 0..dh {
+                        acc[d] = e_old * acc[d] + e_cur * vh[ki * dh + d];
+                    }
+                    m = m_new;
+                }
+                let inv_l = 1.0 / l;
+                for d in 0..dh {
+                    out[o_off + d] = acc[d] * inv_l;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Reference SDPA for `[B, S, H, D]` (BSHD) layout — matches Metal `sdpa_long` / WGSL `attention`.
+fn cpu_attention_bshd(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    b: usize,
+    s: usize,
+    nh: usize,
+    dh: usize,
+) -> Vec<f32> {
+    let hs = nh * dh;
+    let scale = 1.0f32 / (dh as f32).sqrt();
+    let mut out = vec![0.0f32; b * s * hs];
+    for bi in 0..b {
+        for qi in 0..s {
+            for hi in 0..nh {
+                let q_base = bi * s * hs + qi * hs + hi * dh;
+                let mut m = f32::NEG_INFINITY;
+                let mut l = 0.0f32;
+                let mut acc = vec![0.0f32; dh];
+                for ki in 0..s {
+                    let k_base = bi * s * hs + ki * hs + hi * dh;
+                    let mut score = 0.0f32;
+                    for d in 0..dh {
+                        score += q[q_base + d] * k[k_base + d];
+                    }
+                    score *= scale;
+                    let m_new = m.max(score);
+                    let e_old = (m - m_new).exp();
+                    let e_cur = (score - m_new).exp();
+                    l = e_old * l + e_cur;
+                    let v_base = bi * s * hs + ki * hs + hi * dh;
+                    for d in 0..dh {
+                        acc[d] = e_old * acc[d] + e_cur * v[v_base + d];
+                    }
+                    m = m_new;
+                }
+                let inv_l = 1.0 / l;
+                for d in 0..dh {
+                    out[q_base + d] = acc[d] * inv_l;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// EEG-DINO QKV path: mm → reshape [B,S,3,H,D] → narrow×3 → reshape → attention.
+#[test]
+fn matmul_eeg_qkv_shape_matches_cpu() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let (m, k, n) = (191u32, 200u32, 600u32);
+    let mut g = Graph::new("mm");
+    let a = g.input("a", Shape::new(&[m as usize, k as usize], DType::F32));
+    let b = g.param("b", Shape::new(&[k as usize, n as usize], DType::F32));
+    let y = g.matmul(a, b, Shape::new(&[m as usize, n as usize], DType::F32));
+    g.set_outputs(vec![y]);
+    let a_v: Vec<f32> = (0..(m * k) as usize)
+        .map(|i| (i as f32 * 0.03).sin())
+        .collect();
+    let b_v: Vec<f32> = (0..(k * n) as usize)
+        .map(|i| (i as f32 * 0.02).cos() * 0.1)
+        .collect();
+    let cpu = Session::new(Device::Cpu);
+    let mut cc = cpu.compile(g.clone());
+    cc.set_param("b", &b_v);
+    let want = cc.run(&[("a", &a_v)]).into_iter().next().unwrap();
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("b", &b_v);
+    let got = exe.run(&[("a", &a_v)]).into_iter().next().unwrap();
+    let err = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(err < 1e-3, "QKV matmul max_abs={err:.3e}");
+}
+
+#[test]
+fn eeg_qkv_matmul_batched_matches_cpu() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let (b, s, k, n) = (1, 191, 200, 600);
+    let mut g = Graph::new("mm3");
+    let a = g.input("a", Shape::new(&[b, s, k], DType::F32));
+    let w = g.param("w", Shape::new(&[k, n], DType::F32));
+    let y = g.matmul(a, w, Shape::new(&[b, s, n], DType::F32));
+    g.set_outputs(vec![y]);
+    let a_v: Vec<f32> = (0..b * s * k).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w_v: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.01).cos() * 0.1).collect();
+    let cpu = Session::new(Device::Cpu);
+    let mut cc = cpu.compile(g.clone());
+    cc.set_param("w", &w_v);
+    let want = cc.run(&[("a", &a_v)]).into_iter().next().unwrap();
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("w", &w_v);
+    let got = exe.run(&[("a", &a_v)]).into_iter().next().unwrap();
+    let err = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err < 1e-3,
+        "batched QKV matmul max_abs={err:.3e} idx26862 cpu={} gpu={}",
+        want[26862],
+        got[26862]
+    );
+}
+
+#[test]
+fn eeg_qkv_fmb_and_narrows_match_cpu() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let hd = nh * dh;
+    let f = DType::F32;
+    let mut g = Graph::new("fmb_narrow");
+    let x = g.input("x", Shape::new(&[b, s, hd], f));
+    let w = g.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias = g.param("b", Shape::new(&[3 * hd], f));
+    let qkv = g.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv4 = g.reshape_(qkv, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    let q0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    g.set_outputs(vec![q0]);
+    let n = b * s * hd;
+    let x_v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w_v: Vec<f32> = (0..(hd * 3 * hd))
+        .map(|i| (i as f32 * 0.01).cos() * 0.1)
+        .collect();
+    let b_v: Vec<f32> = (0..(3 * hd)).map(|i| i as f32 * 0.001).collect();
+    let cpu = Session::new(Device::Cpu);
+    let mut cc = cpu.compile(g.clone());
+    cc.set_param("w", &w_v);
+    cc.set_param("b", &b_v);
+    let want = cc.run(&[("x", &x_v)]).into_iter().next().unwrap();
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("w", &w_v);
+    exe.set_param("b", &b_v);
+    let got = exe.run(&[("x", &x_v)]).into_iter().next().unwrap();
+    let err = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(err < 1e-3, "FMB+narrow Q max_abs={err:.3e}");
+}
+
+#[test]
+fn eeg_qkv_tensors_gpu_match_cpu() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let hd = nh * dh;
+    let f = DType::F32;
+    let n = b * s * hd;
+    let x_v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w_v: Vec<f32> = (0..(hd * 3 * hd))
+        .map(|i| (i as f32 * 0.01).cos() * 0.1)
+        .collect();
+    let b_v: Vec<f32> = (0..(3 * hd)).map(|i| i as f32 * 0.001).collect();
+
+    let mut g = Graph::new("qkv_tensors");
+    let x = g.input("x", Shape::new(&[b, s, hd], f));
+    let w = g.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias = g.param("b", Shape::new(&[3 * hd], f));
+    let qkv = g.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv4 = g.reshape_(qkv, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    let k0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 1,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let v0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 2,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let q0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let q = g.reshape_(q0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let k = g.reshape_(k0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let v = g.reshape_(v0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    g.set_outputs(vec![q, k, v]);
+    let cpu = Session::new(Device::Cpu);
+    let mut cc = cpu.compile(g.clone());
+    cc.set_param("w", &w_v);
+    cc.set_param("b", &b_v);
+    let want = cc.run(&[("x", &x_v)]);
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("w", &w_v);
+    exe.set_param("b", &b_v);
+    let got = exe.run(&[("x", &x_v)]);
+    for (name, w, g) in [
+        ("Q", &want[0], &got[0]),
+        ("K", &want[1], &got[1]),
+        ("V", &want[2], &got[2]),
+    ] {
+        let err = w
+            .iter()
+            .zip(g.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            err < 1e-3,
+            "GPU {name} tensor max_abs={err:.3e} idx26862 cpu={} gpu={}",
+            w[26862],
+            g[26862]
+        );
+    }
+}
+
+#[test]
+fn eeg_attention_with_cpu_qkv_matches_cpu() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let hd = nh * dh;
+    let f = DType::F32;
+    let n = b * s * hd;
+    let x_v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w_v: Vec<f32> = (0..(hd * 3 * hd))
+        .map(|i| (i as f32 * 0.01).cos() * 0.1)
+        .collect();
+    let b_v: Vec<f32> = (0..(3 * hd)).map(|i| i as f32 * 0.001).collect();
+
+    // CPU: full QKV path
+    let mut g_qkv = Graph::new("qkv");
+    let x = g_qkv.input("x", Shape::new(&[b, s, hd], f));
+    let w = g_qkv.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias = g_qkv.param("b", Shape::new(&[3 * hd], f));
+    let qkv = g_qkv.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv4 = g_qkv.reshape_(qkv, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    let q0 = g_qkv.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let k0 = g_qkv.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 1,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let v0 = g_qkv.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 2,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let q = g_qkv.reshape_(q0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let k = g_qkv.reshape_(k0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let v = g_qkv.reshape_(v0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    g_qkv.set_outputs(vec![q, k, v]);
+    let cpu = Session::new(Device::Cpu);
+    let mut cc = cpu.compile(g_qkv.clone());
+    cc.set_param("w", &w_v);
+    cc.set_param("b", &b_v);
+    let qkv_out = cc.run(&[("x", &x_v)]);
+    let (q_v, k_v, v_v) = (&qkv_out[0], &qkv_out[1], &qkv_out[2]);
+
+    let want = cpu_attention_bshd(q_v, k_v, v_v, b, s, nh, dh);
+
+    let mut g_attn = Graph::new("attn");
+    let qi = g_attn.input("q", Shape::new(&[b, s, nh, dh], f));
+    let ki = g_attn.input("k", Shape::new(&[b, s, nh, dh], f));
+    let vi = g_attn.input("v", Shape::new(&[b, s, nh, dh], f));
+    let out = g_attn.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: dh,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![qi, ki, vi],
+        Shape::new(&[b, s, nh, dh], f),
+    );
+    g_attn.set_outputs(vec![out]);
+    let mut exe = WgpuExecutable::compile(g_attn);
+    let got = exe
+        .run(&[("q", q_v), ("k", k_v), ("v", v_v)])
+        .into_iter()
+        .next()
+        .unwrap();
+    let err = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err < 1e-3,
+        "attention on CPU QKV max_abs={err:.3e} idx26862 cpu={} gpu={}",
+        want[26862],
+        got[26862]
+    );
+
+    let mut exe_qkv = WgpuExecutable::compile(g_qkv.clone());
+    exe_qkv.set_param("w", &w_v);
+    exe_qkv.set_param("b", &b_v);
+    let gpu_qkv = exe_qkv.run(&[("x", &x_v)]);
+    let ref_on_gpu_qkv = cpu_attention_bshd(&gpu_qkv[0], &gpu_qkv[1], &gpu_qkv[2], b, s, nh, dh);
+    let got2 = exe
+        .run(&[("q", &gpu_qkv[0]), ("k", &gpu_qkv[1]), ("v", &gpu_qkv[2])])
+        .into_iter()
+        .next()
+        .unwrap();
+    let err2 = ref_on_gpu_qkv
+        .iter()
+        .zip(got2.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err2 < 1e-3,
+        "wgpu attn on GPU QKV vs cpu ref max_abs={err2:.3e} idx26862 ref={} gpu={}",
+        ref_on_gpu_qkv[26862],
+        got2[26862]
+    );
+}
+
+#[test]
+fn attention_in_graph_does_not_change_qkv_activations() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let hd = nh * dh;
+    let f = DType::F32;
+    let n = b * s * hd;
+    let x_v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w_v: Vec<f32> = (0..(hd * 3 * hd))
+        .map(|i| (i as f32 * 0.01).cos() * 0.1)
+        .collect();
+    let b_v: Vec<f32> = (0..(3 * hd)).map(|i| i as f32 * 0.001).collect();
+
+    let mut g0 = Graph::new("qkv_only");
+    let x = g0.input("x", Shape::new(&[b, s, hd], f));
+    let w = g0.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias = g0.param("b", Shape::new(&[3 * hd], f));
+    let qkv = g0.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv4 = g0.reshape_(qkv, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    let q0 = g0.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let q_only = g0.reshape_(q0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    g0.set_outputs(vec![q_only]);
+
+    let mut g1 = Graph::new("qkv_plus_attn");
+    let x1 = g1.input("x", Shape::new(&[b, s, hd], f));
+    let w1 = g1.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias1 = g1.param("b", Shape::new(&[3 * hd], f));
+    let qkv1 = g1.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x1, w1, bias1],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv41 = g1.reshape_(qkv1, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    let q01 = g1.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: 1,
+        },
+        vec![qkv41],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let k01 = g1.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 1,
+            len: 1,
+        },
+        vec![qkv41],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let v01 = g1.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 2,
+            len: 1,
+        },
+        vec![qkv41],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let q1 = g1.reshape_(q01, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let k1 = g1.reshape_(k01, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let v1 = g1.reshape_(v01, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let _attn = g1.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: dh,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q1, k1, v1],
+        Shape::new(&[b, s, nh, dh], f),
+    );
+    g1.set_outputs(vec![q1]);
+
+    let mut exe0 = WgpuExecutable::compile(g0);
+    exe0.set_param("w", &w_v);
+    exe0.set_param("b", &b_v);
+    let q_a = exe0.run(&[("x", &x_v)]).into_iter().next().unwrap();
+
+    let mut exe1 = WgpuExecutable::compile(g1);
+    exe1.set_param("w", &w_v);
+    exe1.set_param("b", &b_v);
+    let q_b = exe1.run(&[("x", &x_v)]).into_iter().next().unwrap();
+
+    let err = q_a
+        .iter()
+        .zip(q_b.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err < 1e-6,
+        "Q differs when attention is in graph: max_abs={err:.3e} idx26862 a={} b={}",
+        q_a[26862],
+        q_b[26862]
+    );
+}
+
+#[test]
+fn eeg_qkv4_after_fmb_matches_cpu() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let hd = nh * dh;
+    let f = DType::F32;
+    let mut g = Graph::new("qkv4");
+    let x = g.input("x", Shape::new(&[b, s, hd], f));
+    let w = g.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias = g.param("b", Shape::new(&[3 * hd], f));
+    let qkv = g.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv4 = g.reshape_(qkv, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    g.set_outputs(vec![qkv4]);
+    let n = b * s * hd;
+    let x_v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w_v: Vec<f32> = (0..(hd * 3 * hd))
+        .map(|i| (i as f32 * 0.01).cos() * 0.1)
+        .collect();
+    let b_v: Vec<f32> = (0..(3 * hd)).map(|i| i as f32 * 0.001).collect();
+    let cpu = Session::new(Device::Cpu);
+    let mut cc = cpu.compile(g.clone());
+    cc.set_param("w", &w_v);
+    cc.set_param("b", &b_v);
+    let want = cc.run(&[("x", &x_v)]).into_iter().next().unwrap();
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("w", &w_v);
+    exe.set_param("b", &b_v);
+    let got = exe.run(&[("x", &x_v)]).into_iter().next().unwrap();
+    let err = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(err < 1e-3, "qkv4 after FMB max_abs={err:.3e}");
+}
+
+#[test]
+fn detect_packed_bshd_on_eeg_chain_graph() {
+    use rlx::prelude::*;
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let hd = nh * dh;
+    let f = DType::F32;
+    let mut g = Graph::new("qkv_chain");
+    let x = g.input("x", Shape::new(&[b, s, hd], f));
+    let w = g.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias = g.param("b", Shape::new(&[3 * hd], f));
+    let qkv = g.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv4 = g.reshape_(qkv, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    let q0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let k0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 1,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let v0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 2,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let q = g.reshape_(q0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let k = g.reshape_(k0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let v = g.reshape_(v0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let out = g.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: dh,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v],
+        Shape::new(&[b, s, nh, dh], f),
+    );
+    g.set_outputs(vec![out]);
+    let g = rlx_wgpu::unfuse::unfuse(g);
+    let attn = g
+        .nodes()
+        .iter()
+        .find(|n| matches!(n.op, Op::Attention { .. }))
+        .unwrap();
+    let got = rlx_ir::detect_packed_bshd_qkv_attention(
+        &g,
+        attn.inputs[0],
+        attn.inputs[1],
+        attn.inputs[2],
+    );
+    assert!(got.is_some(), "packed BSHD QKV pattern should be detected");
+    let (parent, hw, narrows) = got.unwrap();
+    assert_eq!(hw, nh * dh);
+    assert_eq!(g.node(parent).shape.dims().len(), 5);
+    assert!(
+        narrows
+            .iter()
+            .all(|&n| matches!(g.node(n).op, Op::Narrow { .. }))
+    );
+}
+
+#[test]
+fn wgpu_chain_attention_uses_packed_qkv_stride() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let hd = nh * dh;
+    let f = DType::F32;
+    let mut g = Graph::new("qkv_chain");
+    let x = g.input("x", Shape::new(&[b, s, hd], f));
+    let w = g.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias = g.param("b", Shape::new(&[3 * hd], f));
+    let qkv = g.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv4 = g.reshape_(qkv, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    let q0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let k0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 1,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let v0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 2,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let q = g.reshape_(q0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let k = g.reshape_(k0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let v = g.reshape_(v0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let out = g.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: dh,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v],
+        Shape::new(&[b, s, nh, dh], f),
+    );
+    g.set_outputs(vec![out]);
+    let exe = WgpuExecutable::compile(g);
+    let qs = exe.test_attn_q_seq_stride().expect("attention step");
+    assert_eq!(
+        qs,
+        (hd * 3) as u32,
+        "expected packed seq stride 3*H*D=600, got {qs}"
+    );
+    let (qo, ko, vo, _) = exe.test_attn_offsets_and_stride().unwrap();
+    let parent_g = exe.test_arena_offset_elems(qkv4);
+    let q_g = exe.test_arena_offset_elems(q);
+    assert_eq!(ko - qo, hd as u32);
+    assert_eq!(vo - ko, hd as u32);
+    // Packed path must use parent base, not reshape(q) slot.
+    assert_eq!(
+        qo, parent_g,
+        "q_off={qo} should equal parent qkv4 global off={parent_g}, q global={q_g}"
+    );
+}
+
+#[test]
+fn wgpu_packed_attn_matches_strided_cpu_ref() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let hd = nh * dh;
+    let f = DType::F32;
+    let n = b * s * hd;
+    let x_v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w_v: Vec<f32> = (0..(hd * 3 * hd))
+        .map(|i| (i as f32 * 0.01).cos() * 0.1)
+        .collect();
+    let b_v: Vec<f32> = (0..(3 * hd)).map(|i| i as f32 * 0.001).collect();
+
+    let mut g_pack = Graph::new("pack");
+    let x = g_pack.input("x", Shape::new(&[b, s, hd], f));
+    let w = g_pack.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias = g_pack.param("b", Shape::new(&[3 * hd], f));
+    let qkv = g_pack.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv4 = g_pack.reshape_(qkv, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    g_pack.set_outputs(vec![qkv4]);
+
+    let cpu = Session::new(Device::Cpu);
+    let mut cc = cpu.compile(g_pack.clone());
+    cc.set_param("w", &w_v);
+    cc.set_param("b", &b_v);
+    let packed = cc.run(&[("x", &x_v)]).into_iter().next().unwrap();
+    let want = cpu_attention_packed_qkv(&packed, b, s, nh, dh);
+
+    let mut g_attn = Graph::new("attn_pack");
+    let pin = g_attn.input("p", Shape::new(&[b, s, 3, nh, dh], f));
+    let q0 = g_attn.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: 1,
+        },
+        vec![pin],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let k0 = g_attn.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 1,
+            len: 1,
+        },
+        vec![pin],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let v0 = g_attn.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 2,
+            len: 1,
+        },
+        vec![pin],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let q = g_attn.reshape_(q0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let k = g_attn.reshape_(k0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let v = g_attn.reshape_(v0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let out = g_attn.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: dh,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v],
+        Shape::new(&[b, s, nh, dh], f),
+    );
+    g_attn.set_outputs(vec![out]);
+    let mut exe = WgpuExecutable::compile(g_attn);
+    let got = exe.run(&[("p", &packed)]).into_iter().next().unwrap();
+    let err = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err < 1e-3,
+        "packed strided attn max_abs={err:.3e} idx26862 want={} got={}",
+        want[26862],
+        got[26862]
+    );
+}
+
+#[test]
+fn encoder_qkv_attention_chain_matches_cpu() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let hd = nh * dh;
+    let f = DType::F32;
+    let mut g = Graph::new("qkv_chain");
+    let x = g.input("x", Shape::new(&[b, s, hd], f));
+    let w = g.param("w", Shape::new(&[hd, 3 * hd], f));
+    let bias = g.param("b", Shape::new(&[3 * hd], f));
+    let qkv = g.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[b, s, 3 * hd], f),
+    );
+    let qkv4 = g.reshape_(qkv, vec![b as i64, s as i64, 3, nh as i64, dh as i64]);
+    let q0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let k0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 1,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let v0 = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 2,
+            len: 1,
+        },
+        vec![qkv4],
+        Shape::new(&[b, s, 1, nh, dh], f),
+    );
+    let q = g.reshape_(q0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let k = g.reshape_(k0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let v = g.reshape_(v0, vec![b as i64, s as i64, nh as i64, dh as i64]);
+    let out = g.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: dh,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v],
+        Shape::new(&[b, s, nh, dh], f),
+    );
+    g.set_outputs(vec![out]);
+
+    let n = b * s * hd;
+    let x_v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w_v: Vec<f32> = (0..(hd * 3 * hd))
+        .map(|i| (i as f32 * 0.01).cos() * 0.1)
+        .collect();
+    let b_v: Vec<f32> = (0..(3 * hd)).map(|i| i as f32 * 0.001).collect();
+
+    let cpu_sess = Session::new(Device::Cpu);
+    let mut cpu_c = cpu_sess.compile(g.clone());
+    cpu_c.set_param("w", &w_v);
+    cpu_c.set_param("b", &b_v);
+    let cpu_out = cpu_c.run(&[("x", &x_v)]).into_iter().next().unwrap();
+
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("w", &w_v);
+    exe.set_param("b", &b_v);
+    let gpu_out = exe.run(&[("x", &x_v)]).into_iter().next().unwrap();
+
+    let err = cpu_out
+        .iter()
+        .zip(gpu_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err < 1e-3,
+        "QKV+attention chain max_abs={err:.3e} idx26862 cpu={} gpu={}",
+        cpu_out[26862],
+        gpu_out[26862]
+    );
+}
+
+#[test]
+fn attention_bshd_eeg_shape_matches_cpu() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    let (b, s, nh, dh) = (1, 191, 8, 25);
+    let n = b * s * nh * dh;
+    let q: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin() * 0.5).collect();
+    let k: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).cos() * 0.3).collect();
+    let v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03) % 1.0 - 0.5).collect();
+    let want = cpu_attention_bshd(&q, &k, &v, b, s, nh, dh);
+
+    let mut g = Graph::new("bshd_eeg");
+    let qi = g.input("q", Shape::new(&[b, s, nh, dh], DType::F32));
+    let ki = g.input("k", Shape::new(&[b, s, nh, dh], DType::F32));
+    let vi = g.input("v", Shape::new(&[b, s, nh, dh], DType::F32));
+    let o = g.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: dh,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![qi, ki, vi],
+        Shape::new(&[b, s, nh, dh], DType::F32),
+    );
+    g.set_outputs(vec![o]);
+    let mut exe = WgpuExecutable::compile(g);
+    let got = exe
+        .run(&[("q", &q), ("k", &k), ("v", &v)])
+        .into_iter()
+        .next()
+        .unwrap();
+    let err = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err < 1e-3,
+        "BSHD attention [1,191,8,25] max_abs={err:.3e} (idx 26862: cpu={} gpu={})",
+        want[26862],
+        got[26862]
+    );
+}
+
 #[test]
 fn attention_no_mask_matches_reference() {
     if !rlx_wgpu::is_available() {
@@ -894,6 +1871,44 @@ fn lora_matmul_matches_unfused_reference() {
         close(&r_out[0], &want, 1e-4),
         "LoRA mismatch: got {:?} want {want:?}",
         r_out[0]
+    );
+}
+
+#[test]
+fn gelu_eeg_tensor_matches_cpu() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+    let n = 25 * 190 * 8;
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017).sin() * 2.0).collect();
+    let mut g = Graph::new("gelu");
+    let xi = g.input("x", Shape::new(&[1, 25, 190, 8], DType::F32));
+    let y = g.activation(
+        Activation::Gelu,
+        xi,
+        Shape::new(&[1, 25, 190, 8], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let cpu = Session::new(Device::Cpu);
+    let want = cpu
+        .compile(g.clone())
+        .run(&[("x", &x)])
+        .into_iter()
+        .next()
+        .unwrap();
+    let gpu = Session::new(Device::Gpu);
+    let got = gpu.compile(g).run(&[("x", &x)]).into_iter().next().unwrap();
+    let err = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err < 1e-5,
+        "GELU [1,25,190,8] max_abs={err:.3e} (cpu[0]={} gpu[0]={})",
+        want[0],
+        got[0]
     );
 }
 
@@ -3146,6 +4161,8 @@ fn region_relu_matches_atomic() {
             num_inputs: 1,
             scalar_input_mask: 0,
             input_modulus: [0u32; 16],
+            prologue: rlx_ir::RegionPrologue::None,
+            prologue_input: 0,
         },
         vec![xr],
         Shape::new(&[8], DType::F32),

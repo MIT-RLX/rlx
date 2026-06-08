@@ -43,6 +43,7 @@ pub const CONCAT_CU: &str = include_str!("../kernels/concat.cu");
 pub const TRANSPOSE_CU: &str = include_str!("../kernels/transpose.cu");
 pub const EXPAND_CU: &str = include_str!("../kernels/expand.cu");
 pub const ATTENTION_CU: &str = include_str!("../kernels/attention.cu");
+pub const ATTENTION_ROW_CU: &str = include_str!("../kernels/attention_row.cu");
 pub const ATTENTION_BWD_CU: &str = include_str!("../kernels/attention_bwd.cu");
 pub const ARGMAX_CU: &str = include_str!("../kernels/argmax.cu");
 pub const ROPE_CU: &str = include_str!("../kernels/rope.cu");
@@ -59,15 +60,50 @@ pub const POOL2D_CU: &str = include_str!("../kernels/pool2d.cu");
 pub const POOL3D_CU: &str = include_str!("../kernels/pool3d.cu");
 pub const CONV1D_CU: &str = include_str!("../kernels/conv1d.cu");
 pub const CONV2D_CU: &str = include_str!("../kernels/conv2d.cu");
+pub const IM2COL_CU: &str = include_str!("../kernels/im2col.cu");
 pub const CONV3D_CU: &str = include_str!("../kernels/conv3d.cu");
 pub const LAYER_NORM2D_CU: &str = include_str!("../kernels/layer_norm2d.cu");
 pub const CONV_TRANSPOSE2D_CU: &str = include_str!("../kernels/conv_transpose2d.cu");
 pub const GROUP_NORM_CU: &str = include_str!("../kernels/group_norm.cu");
 pub const RESIZE_NEAREST_2X_CU: &str = include_str!("../kernels/resize_nearest_2x.cu");
 pub const ELEMENTWISE_REGION_CU: &str = include_str!("../kernels/elementwise_region.cu");
+pub const BATCH_ELEMENTWISE_REGION_CU: &str =
+    include_str!("../kernels/batch_elementwise_region.cu");
 pub const GAUSSIAN_SPLAT_RASTERIZE_CU: &str =
     include_str!("../kernels/gaussian_splat_rasterize.cu");
 pub const FFT_CU: &str = include_str!("../kernels/fft.cu");
+
+const GELU_CUH: &str = include_str!("../kernels/gelu.cuh");
+
+use std::sync::OnceLock;
+
+macro_rules! cuda_src_with_gelu {
+    ($name:ident, $body:expr) => {
+        pub fn $name() -> &'static str {
+            static S: OnceLock<String> = OnceLock::new();
+            S.get_or_init(|| format!("{GELU_CUH}\n{}", $body))
+        }
+    };
+}
+
+cuda_src_with_gelu!(unary_cuda_src, include_str!("../kernels/unary.cu"));
+cuda_src_with_gelu!(
+    fused_binary_unary_cuda_src,
+    include_str!("../kernels/fused_binary_unary.cu")
+);
+cuda_src_with_gelu!(matmul_cuda_src, include_str!("../kernels/matmul.cu"));
+cuda_src_with_gelu!(
+    matmul_epilogue_cuda_src,
+    include_str!("../kernels/matmul_epilogue.cu")
+);
+cuda_src_with_gelu!(
+    elementwise_region_cuda_src,
+    include_str!("../kernels/elementwise_region.cu")
+);
+cuda_src_with_gelu!(
+    batch_elementwise_region_cuda_src,
+    include_str!("../kernels/batch_elementwise_region.cu")
+);
 
 /// AMD rocWMMA / MFMA matmul (`RLX_ROCM_MFMA=1`). Not used on CUDA.
 #[cfg(feature = "rocm")]

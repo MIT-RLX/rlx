@@ -1,5 +1,17 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Gemma / Gemma 2 decoder blocks for tier-0 [`ModelFlow`] recipes.
 
@@ -22,12 +34,16 @@ pub enum GemmaLayerStyle {
     Gemma4,
 }
 
-/// Build prefill self-attention spec for one layer.
+/// Build prefill self-attention spec for one layer. `n_rot` controls
+/// the rotary slice — pass `head_dim` for plain RoPE, or
+/// `(head_dim * partial_rotary_factor)` for Gemma 4 full-attention
+/// p-RoPE.
 pub fn gemma_attn_spec(
     layer: usize,
     num_heads: usize,
     head_dim: usize,
     num_kv_heads: usize,
+    n_rot: usize,
     mask: MaskKind,
     score_scale: Option<f32>,
     attn_logit_softcap: Option<f32>,
@@ -40,6 +56,9 @@ pub fn gemma_attn_spec(
         num_heads,
         head_dim,
         num_kv_heads,
+        n_rot,
+        rope_table: None,
+        k_eq_v: false,
         mask,
         score_scale,
         attn_logit_softcap,
@@ -77,12 +96,23 @@ pub fn gemma_prefill_layer_composed(
         )));
 
     if let Some(sink) = kv_sink {
-        stack = stack.stage(FlowStage::GemmaKvTap(GemmaKvTapStage::layer(
-            layer_idx,
-            attn.head_dim,
-            eps,
-            sink,
-        )));
+        // Mirror the SelfAttn block's per-layer rope + k_eq_v
+        // configuration so the cached K/V match what the attention
+        // step will recompute. Gemma 4 full-attention layers use
+        // partial rotary (n_rot < head_dim) and a named "global"
+        // rope table; without honouring both here, the prefill K
+        // export drifts from the runtime attention K.
+        let mut tap = GemmaKvTapStage::layer(layer_idx, attn.head_dim, eps, sink);
+        if attn.n_rot != attn.head_dim {
+            tap = tap.with_n_rot(attn.n_rot);
+        }
+        if let Some(name) = attn.rope_table.as_deref() {
+            tap = tap.with_rope_table(name);
+        }
+        if attn.k_eq_v {
+            tap = tap.with_k_eq_v();
+        }
+        stack = stack.stage(FlowStage::GemmaKvTap(tap));
     }
 
     stack = stack

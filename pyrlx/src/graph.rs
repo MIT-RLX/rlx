@@ -15,15 +15,29 @@
 
 //! `pyrlx.Graph` — Python builder over `rlx_ir::Graph`.
 //!
-//! Surface parity: every public builder on `rlx_ir::Graph` and its
-//! `GraphExt` shape-inference companions is reachable from Python with
-//! the same name. Where `GraphExt` exists, the Python method is the
-//! shape-inferred variant (no explicit `out_shape` arg). Where the IR
-//! requires an explicit shape, the Python signature does too.
+//! # Surface parity
 //!
-//! Op names that aren't valid Python identifiers (`where`, `eq`, `lt`)
-//! get a trailing underscore (`where_`, `eq_`, `lt_`) — same Python
-//! convention torch / numpy use.
+//! Every public builder on `rlx_ir::Graph` and its [`GraphExt`] companions is
+//! reachable from Python with the same name. Where `GraphExt` infers output
+//! shape, the Python method omits `out_shape` (e.g. `matmul`, `add`, `conv2d`).
+//! Where the IR requires an explicit shape, the Python signature includes it
+//! (e.g. `matmul_with_shape`, `lora_matmul`, `sample`).
+//!
+//! # Naming
+//!
+//! Reserved Python keywords get a trailing underscore: `where_`, `eq_`, `lt_`,
+//! `gt_`, `ge_`, `ne_`.
+//!
+//! # Literals
+//!
+//! `constant(value, dtype="f32")` inserts a rank-0 [`Op::Constant`] node that
+//! broadcasts in binary ops. `f16` / `bf16` literals are lowered as f32 +
+//! `cast`.
+//!
+//! # Lifecycle
+//!
+//! `Session.compile` moves the inner `Graph` out of `PyGraph`; subsequent calls
+//! raise "graph already consumed".
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -37,6 +51,16 @@ use crate::dtype::parse_dtype;
 
 fn shape_from_py(dims: Vec<usize>, dtype: &str) -> PyResult<Shape> {
     Ok(Shape::new(&dims, parse_dtype(dtype)?))
+}
+
+fn parse_usize_pair(v: Vec<usize>, label: &str) -> PyResult<[usize; 2]> {
+    if v.len() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "{label} must have exactly 2 elements, got {}",
+            v.len()
+        )));
+    }
+    Ok([v[0], v[1]])
 }
 
 fn act_from_str(s: &str) -> PyResult<Activation> {
@@ -95,6 +119,12 @@ fn cmp_from_str(s: &str) -> PyResult<CmpOp> {
     })
 }
 
+fn compare_nodes(g: &mut Graph, op: CmpOp, a: u32, b: u32) -> PyResult<u32> {
+    let s = rlx_ir::shape::compare_shape(g.shape(NodeId(a)), g.shape(NodeId(b)))
+        .map_err(|e| PyValueError::new_err(format!("compare shape: {e}")))?;
+    Ok(g.add_node(Op::Compare(op), vec![NodeId(a), NodeId(b)], s).0)
+}
+
 fn reduce_from_str(s: &str) -> PyResult<ReduceOp> {
     Ok(match s.trim().to_ascii_lowercase().as_str() {
         "sum" => ReduceOp::Sum,
@@ -147,11 +177,22 @@ fn mask_kind_from_str(s: &str) -> PyResult<MaskKind> {
 
 // ── PyGraph ────────────────────────────────────────────────────
 
+/// Symbolic computation graph consumed by [`crate::session::PySession::compile`].
+///
+/// Builder methods return integer node ids. Prefer shape-inferred helpers
+/// (`matmul`, `gelu`, `conv2d`, …) over explicit-shape variants unless you
+/// need a non-default output layout.
 #[pyclass(name = "Graph", module = "pyrlx._pyrlx")]
 pub(crate) struct PyGraph {
     /// `Option` so we can move it out at compile time (rlx-runtime
     /// consumes the Graph by value). After compile, the graph is gone.
     pub(crate) inner: Option<Graph>,
+}
+
+pub(crate) fn graph_ref(g: &PyGraph) -> PyResult<&Graph> {
+    g.inner
+        .as_ref()
+        .ok_or_else(|| PyRuntimeError::new_err("graph already consumed"))
 }
 
 fn consumed() -> PyErr {
@@ -183,6 +224,21 @@ impl PyGraph {
     fn param(&mut self, name: &str, shape: Vec<usize>, dtype: &str) -> PyResult<u32> {
         let s = shape_from_py(shape, dtype)?;
         Ok(self.g()?.param(name.to_string(), s).0)
+    }
+
+    /// Broadcastable rank-0 literal.
+    ///
+    /// Inserts [`Op::Constant`] with [`Shape::scalar`]. Use in binary ops or
+    /// pass to the DSL via ``x * 2.0``. Out-of-range values raise
+    /// `ValueError`; `f16` / `bf16` are built as f32 constant + `cast`.
+    #[pyo3(signature = (value, dtype = "f32"))]
+    fn constant(&mut self, value: f64, dtype: &str) -> PyResult<u32> {
+        let dt = parse_dtype(dtype)?;
+        Ok(self
+            .g()?
+            .try_constant(value, dt)
+            .map_err(PyValueError::new_err)?
+            .0)
     }
 
     fn set_outputs(&mut self, outputs: Vec<u32>) -> PyResult<()> {
@@ -364,11 +420,34 @@ impl PyGraph {
     fn gelu(&mut self, x: u32) -> PyResult<u32> {
         Ok(self.g()?.gelu(NodeId(x)).0)
     }
+    /// Tanh-approximation GELU (PyTorch / many ViT checkpoints).
+    fn gelu_approx(&mut self, x: u32) -> PyResult<u32> {
+        Ok(self.g()?.gelu_approx(NodeId(x)).0)
+    }
     fn silu(&mut self, x: u32) -> PyResult<u32> {
         Ok(self.g()?.silu(NodeId(x)).0)
     }
     fn relu(&mut self, x: u32) -> PyResult<u32> {
         Ok(self.g()?.relu(NodeId(x)).0)
+    }
+
+    /// Nearest-neighbor 2x upsample (NCHW: H and W double).
+    fn resize_nearest_2x(&mut self, x: u32) -> PyResult<u32> {
+        let g = self.g()?;
+        let in_s = g.shape(NodeId(x));
+        if in_s.rank() != 4 {
+            return Err(PyValueError::new_err(
+                "resize_nearest_2x requires 4D NCHW input",
+            ));
+        }
+        let (n, c, h, w) = (
+            in_s.dim(0).unwrap_static(),
+            in_s.dim(1).unwrap_static(),
+            in_s.dim(2).unwrap_static(),
+            in_s.dim(3).unwrap_static(),
+        );
+        let out_s = Shape::new(&[n, c, h * 2, w * 2], in_s.dtype());
+        Ok(g.add_node(Op::ResizeNearest2x, vec![NodeId(x)], out_s).0)
     }
     fn exp(&mut self, x: u32) -> PyResult<u32> {
         Ok(self.g()?.exp(NodeId(x)).0)
@@ -383,27 +462,92 @@ impl PyGraph {
         Ok(self.g()?.tanh(NodeId(x)).0)
     }
 
+    /// Identity forward, zero backward (`jax.lax.stop_gradient` / `detach`).
+    fn stop_gradient(&mut self, x: u32) -> PyResult<u32> {
+        Ok(self.g()?.stop_gradient(NodeId(x)).0)
+    }
+
+    // ── Convolution (NCHW, shape-inferred) ────────────────
+
+    /// NCHW convolution; output shape inferred from padding / stride / dilation.
+    #[pyo3(signature = (input, weight, kernel_size, stride, padding, dilation, groups = 1))]
+    fn conv2d(
+        &mut self,
+        input: u32,
+        weight: u32,
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+        dilation: Vec<usize>,
+        groups: usize,
+    ) -> PyResult<u32> {
+        Ok(self
+            .g()?
+            .conv2d(
+                NodeId(input),
+                NodeId(weight),
+                parse_usize_pair(kernel_size, "kernel_size")?,
+                parse_usize_pair(stride, "stride")?,
+                parse_usize_pair(padding, "padding")?,
+                parse_usize_pair(dilation, "dilation")?,
+                groups,
+            )
+            .0)
+    }
+
+    /// Transposed NCHW convolution (upsampling decoder path).
+    #[pyo3(signature = (
+        input, weight, kernel_size, stride, padding, dilation,
+        output_padding, groups = 1
+    ))]
+    fn conv_transpose2d(
+        &mut self,
+        input: u32,
+        weight: u32,
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+        dilation: Vec<usize>,
+        output_padding: Vec<usize>,
+        groups: usize,
+    ) -> PyResult<u32> {
+        Ok(self
+            .g()?
+            .conv_transpose2d(
+                NodeId(input),
+                NodeId(weight),
+                parse_usize_pair(kernel_size, "kernel_size")?,
+                parse_usize_pair(stride, "stride")?,
+                parse_usize_pair(padding, "padding")?,
+                parse_usize_pair(dilation, "dilation")?,
+                parse_usize_pair(output_padding, "output_padding")?,
+                groups,
+            )
+            .0)
+    }
+
     // ── Comparison ──────────────────────────────────────────
     // Trailing underscore avoids shadowing Python's reserved keywords
     // and the `eq` / `lt` magic-method names users might rely on.
 
     fn compare(&mut self, op: &str, lhs: u32, rhs: u32) -> PyResult<u32> {
-        let g = self.g()?;
-        let s = rlx_ir::shape::compare_shape(g.shape(NodeId(lhs)), g.shape(NodeId(rhs)))
-            .map_err(|e| PyValueError::new_err(format!("compare shape: {e}")))?;
-        Ok(g.add_node(
-            Op::Compare(cmp_from_str(op)?),
-            vec![NodeId(lhs), NodeId(rhs)],
-            s,
-        )
-        .0)
+        compare_nodes(self.g()?, cmp_from_str(op)?, lhs, rhs)
     }
 
     fn eq_(&mut self, a: u32, b: u32) -> PyResult<u32> {
-        Ok(self.g()?.eq(NodeId(a), NodeId(b)).0)
+        compare_nodes(self.g()?, CmpOp::Eq, a, b)
     }
     fn lt_(&mut self, a: u32, b: u32) -> PyResult<u32> {
-        Ok(self.g()?.lt(NodeId(a), NodeId(b)).0)
+        compare_nodes(self.g()?, CmpOp::Lt, a, b)
+    }
+    fn gt_(&mut self, a: u32, b: u32) -> PyResult<u32> {
+        compare_nodes(self.g()?, CmpOp::Gt, a, b)
+    }
+    fn ge_(&mut self, a: u32, b: u32) -> PyResult<u32> {
+        compare_nodes(self.g()?, CmpOp::Ge, a, b)
+    }
+    fn ne_(&mut self, a: u32, b: u32) -> PyResult<u32> {
+        compare_nodes(self.g()?, CmpOp::Ne, a, b)
     }
 
     /// `where(cond, on_true, on_false)` — Python keyword clash fixed
@@ -568,6 +712,31 @@ impl PyGraph {
             .0)
     }
 
+    /// LayerNorm over channel dim for NCHW feature maps.
+    #[pyo3(signature = (input, gamma, beta, eps = 1e-5))]
+    fn layer_norm2d(&mut self, input: u32, gamma: u32, beta: u32, eps: f32) -> PyResult<u32> {
+        Ok(self
+            .g()?
+            .layer_norm2d(NodeId(input), NodeId(gamma), NodeId(beta), eps)
+            .0)
+    }
+
+    /// GroupNorm for NCHW tensors.
+    #[pyo3(signature = (input, gamma, beta, num_groups, eps = 1e-5))]
+    fn group_norm(
+        &mut self,
+        input: u32,
+        gamma: u32,
+        beta: u32,
+        num_groups: usize,
+        eps: f32,
+    ) -> PyResult<u32> {
+        Ok(self
+            .g()?
+            .group_norm(NodeId(input), NodeId(gamma), NodeId(beta), num_groups, eps)
+            .0)
+    }
+
     // ── Attention ───────────────────────────────────────────
 
     /// Attention with an explicit mask tensor (`MaskKind::Custom`).
@@ -626,6 +795,22 @@ impl PyGraph {
         Ok(self
             .g()?
             .rope(NodeId(x), NodeId(cos), NodeId(sin), head_dim)
+            .0)
+    }
+
+    /// Partial RoPE: rotate the first `n_rot` dims (must be even, ≤ `head_dim`).
+    #[pyo3(signature = (x, cos, sin, head_dim, n_rot))]
+    fn rope_n(
+        &mut self,
+        x: u32,
+        cos: u32,
+        sin: u32,
+        head_dim: usize,
+        n_rot: usize,
+    ) -> PyResult<u32> {
+        Ok(self
+            .g()?
+            .rope_n(NodeId(x), NodeId(cos), NodeId(sin), head_dim, n_rot)
             .0)
     }
 

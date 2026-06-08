@@ -32,7 +32,10 @@ and the device handle.
   always-f32 / always-bf16.
 - **`trace.rs`** — runtime tracing (verbose env-gated).
 - **`cost.rs`** — heterogeneous cost model that picks Cpu vs. Metal vs.
-  MLX per graph.
+  MLX per graph; CUDA / ROCm / wgpu use on-disk calibration caches.
+- **Multi-backend runtime** — `GraphDevices`, `DeviceRouter`,
+  `FlexibleSession`, `DevicePolicy`, `BackendsManifest`. See
+  [`docs/backend-selection.md`](../docs/backend-selection.md).
 - **FFT dispatch** — `Op::Fft` on CPU / Metal / MLX / CUDA / ROCm / wgpu /
   TPU. Pow-2 f32 uses native GPU kernels where available; other shapes and
   dtypes use partial host sync. Graph helpers (`rfft`, `irfft`, `stft`, …)
@@ -95,6 +98,21 @@ let mut compiled = Session::new(Device::Cpu).compile(g);
 compiled.set_param("w", &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
 let out = compiled.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
 ```
+
+### Multi-backend (optional)
+
+```rust
+use rlx_runtime::{DevicePolicy, GraphDevices, DeviceRouter};
+
+let mut runner = GraphDevices::with_policy(g, DevicePolicy::only([Device::Cpu, Device::Metal]));
+runner.set_param("w", &weights);
+let out = runner.run_resolved_with_inputs(None, &inputs)?;
+
+let mut router = DeviceRouter::from_env(g)?;
+let (device, out) = router.run(&inputs, None)?;
+```
+
+Full guide: [`docs/backend-selection.md`](../docs/backend-selection.md).
 
 ## Build / test
 

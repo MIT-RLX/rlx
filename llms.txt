@@ -15,7 +15,10 @@ layered crates.
   table), `MaskKind { None, Causal, SlidingWindow(w), Custom }`.
 - `rlx-flow` — block assembly-line API for model builders (tier 0/1/2).
 - `rlx-fusion` — MIR fusion passes, `Pass` trait, unfuse for AD/backends.
-- `rlx-autodiff` — `grad_with_loss`, `jvp`, `hvp`, `vmap`, prepare-for-AD.
+  FKL-style region fusion (resize prologue, batch regions): `docs/fk-fusion.md`.
+- `rlx-autodiff` — `grad_with_loss`, `jvp`, `hvp`, `nth_order_grad`,
+  `directional_nth_grad`, `prepare_grad_graph_for_jvp`, MLIP helpers, `vmap`.
+  Benchmarks: docs/benchmarks/higher-order-ad.md, docs/benchmarks/mlx-linux.md.
 - `rlx-compile` — `CompilePipeline`, legalization, memory plan, precision/PTQ.
 - `rlx-opt` — facade re-exporting fusion + autodiff + compile (`rlx::opt`).
 - `rlx-driver` — device handles, arenas, buffers, command streams.
@@ -31,15 +34,21 @@ layered crates.
   fusion via stride-aware MSL kernels.
 - `rlx-mlx` — Apple MLX. Hand-rolled C++ shim driving MLX's lazy
   graph + eager modes. Submodule at `rlx-mlx-sys/vendor/mlx` (`rlx-mlx-sys` crate).
+  Linux/WSL: CPU default compile; CUDA opt-in (`RLX_MLX_CUDA=1`). See
+  `docs/benchmarks/mlx-linux.md`.
 - `rlx-wgpu` — cross-platform GPU via wgpu (Metal/Vulkan/DX12/WebGPU).
   Single-pass online-softmax attention (FlashAttention-v1 style).
+  On-disk calibration: `~/.cache/rlx/wgpu-calib-*.json`.
 - `rlx-cuda` — NVIDIA via `cudarc`. cuBLAS + NVRTC kernels. 5-tier
   matmul dispatch (mixed-precision GemmEx → cublasLt fused → cuBLAS
   + epilogue → WMMA → scalar register-tile). cuDNN v7 conv1d/2d/3d.
-  `hip-cpu-validate` feature runs the kernels on host via HIP-CPU.
+  `hip-cpu-validate` runs kernels on CPU via HIP-CPU inside the linux-gnu
+  Docker image (`just test-hip-cpu-validate`); not on the macOS host.
+  On-disk calibration: `~/.cache/rlx/cuda-calib-*.json`.
 - `rlx-rocm` — AMD ROCm/HIP. Same `.cu` sources as rlx-cuda,
   dispatched via HIP. Library tiers: hipBLAS / hipBLASLt / MIOpen.
   Real-hardware validation gated on first MI300X / RX 7900 XTX run.
+  On-disk calibration: `~/.cache/rlx/rocm-calib-*.json`.
 - `rlx-tpu` — Google TPU via libtpu's PJRT plugin (no Python). HLO
   emission from the IR; XLA CPU plugin used for local bench.
 - `rlx-cortexm` — ARMv7E-M (Cortex-M4/M7) INT8 kernels (nRF52840
@@ -53,8 +62,9 @@ layered crates.
   deps.
 - `rlx-macros` — proc macros. `#[rlx_model]` AOT compilation.
 - `rlx-runtime` — user-facing API. `Session::new(Device).compile(graph)`
-  → `CompiledGraph`. Re-exports `Tick`, `CacheBuster`, `ktrace!`,
-  `nan_check::scan`. Backend selection is feature-gated (see below).
+  → `CompiledGraph`. Multi-backend helpers: `GraphDevices`, `DeviceRouter`,
+  `DevicePolicy`, `FlexibleSession`, env-driven pick/fallback (`RLX_DEVICE`,
+  `RLX_DEVICE_CHAIN`, `RLX_BENCHMARK_PICK`). See `docs/backend-selection.md`.
 
 ### Umbrella + downstream + tooling
 - `rlx` — prelude crate. Re-exports IR + optimizer + runtime + the
@@ -67,7 +77,17 @@ layered crates.
 - `rlx-bench` — uniform benchmark harness. `BenchmarkPattern` trait
   + per-backend timing; thermal-throttle gate; cycle-counter timing.
 - `pyrlx` — PyO3 + maturin Python bindings. Run any RLX backend
-  from Python.
+  from Python. Graph builders: explicit `Graph` (int node ids) or
+  DSL `with pyrlx.graph(...) as g:` + `Node` operators (`x @ w + b`,
+  scalar literals `x * 2.0`, `Graph.constant`) — see `pyrlx/docs/dsl.md`.
+  Multi-backend: `GraphDevices`, `DeviceRouter`, `DevicePolicy`,
+  `FlexibleSession`, `backends_manifest()`. FKL fusion: `FusionOptions`,
+  `Session.compile_with`, `Graph.resize_nearest_2x`,
+  `batch_narrow_relu_graph` — see `docs/fk-fusion.md`. Quick check:
+  `just test-fk`. Env: `RLX_NATIVE_FK_REGIONS`, `RLX_NO_NATIVE_FK_REGIONS`,
+  `RLX_FK_BATCH_SINGLE_KERNEL` (CUDA/ROCm/Metal/wgpu batch one-launch; TPU uses per-slice HLO),
+  `RLX_NO_FK_FUSION`,
+  `RLX_FUSE_BATCH_PREPROCESS`, `RLX_FUSE_REGION_PROLOGUE`.
 
 ## Where to read first
 
@@ -75,6 +95,9 @@ layered crates.
   (`/Users/Shared/modular`), ranked by leverage. The `## Landed`
   section at the bottom records what's already in tree, with bench
   deltas where measurable.
+- `docs/README.md` — doc index.
+- `docs/backend-selection.md` — `DevicePolicy`, `GraphDevices`,
+  `DeviceRouter`, `FlexibleSession`, env vars, Python API, calibration caches.
 - `Justfile` — dev recipes. `just --list` shows everything; key
   ones: `build`, `build-all`, `test`, `lint`, `fmt`, `bench MODEL`,
   `micro NAME`, `throttle`, `ci`.

@@ -236,6 +236,54 @@ impl Graph {
         )
     }
 
+    /// BatchNorm inference backward w.r.t. input.
+    pub fn batch_norm_inference_backward_input(
+        &mut self,
+        x: NodeId,
+        gamma: NodeId,
+        mean: NodeId,
+        var: NodeId,
+        dy: NodeId,
+        eps: f32,
+    ) -> NodeId {
+        let x_shape = self.shape(x).clone();
+        debug_assert_eq!(self.shape(x), self.shape(dy));
+        self.push(
+            Op::BatchNormInferenceBackwardInput { eps },
+            vec![x, gamma, mean, var, dy],
+            x_shape,
+            None,
+        )
+    }
+
+    /// BatchNorm inference backward w.r.t. gamma.
+    pub fn batch_norm_inference_backward_gamma(
+        &mut self,
+        x: NodeId,
+        mean: NodeId,
+        var: NodeId,
+        dy: NodeId,
+        gamma_shape: Shape,
+        eps: f32,
+    ) -> NodeId {
+        self.push(
+            Op::BatchNormInferenceBackwardGamma { eps },
+            vec![x, mean, var, dy],
+            gamma_shape,
+            None,
+        )
+    }
+
+    /// BatchNorm inference backward w.r.t. beta.
+    pub fn batch_norm_inference_backward_beta(&mut self, dy: NodeId, beta_shape: Shape) -> NodeId {
+        self.push(
+            Op::BatchNormInferenceBackwardBeta,
+            vec![dy],
+            beta_shape,
+            None,
+        )
+    }
+
     /// LayerNorm backward w.r.t. gamma. Inputs `[x, dy]`. Output shape
     /// is provided by the caller — typically the gamma's shape, e.g.
     /// `[D]` for a per-feature 1-D gamma.

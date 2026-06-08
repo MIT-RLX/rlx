@@ -20,19 +20,34 @@
 // times. Silence it crate-wide here.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-//! pyrlx — Python bindings for RLX.
+//! pyrlx — Python bindings for RLX (PyO3 extension `pyrlx._pyrlx`).
 //!
-//! Layered API:
-//! * `available_devices()` / `is_available(name)` — query the build's backends.
-//! * `Graph` — builder over `rlx_ir::Graph` for hand-rolled test graphs.
-//! * `Session(device, precision)` — backend selection at construction.
-//! * `CompiledGraph.set_param/run` — the hot-path execution surface.
+//! The user-facing package [`pyrlx`](../../python/pyrlx/__init__.py) re-exports
+//! this module and adds a pure-Python DSL (`graph`, `Node`, `set_param`, `run`).
+//!
+//! # Layers
+//!
+//! | Layer | Types / functions |
+//! |-------|-------------------|
+//! | Devices | `available_devices`, `is_available`, `parse_device`, `backends_manifest` |
+//! | Build | `Graph` — symbolic IR; shape-inferred where `GraphExt` allows |
+//! | Compile | `Session`, `FusionOptions`, `FlexibleSession` |
+//! | Execute | `CompiledGraph` — `set_param` / `run` (f32) and `_typed` variants |
+//! | Multi-backend | `GraphDevices`, `DeviceRouter`, `DevicePolicy` |
+//! | Transforms | `grad`, `jvp`, `hvp`, `vmap`, `nth_order_grad` |
+//!
+//! Graphs are consumed at compile time. Use `pyrlx.set_param` / `pyrlx.run` in
+//! Python for dtype-aware NumPy I/O without manual byte packing.
 use pyo3::prelude::*;
 
 mod autodiff;
 mod device;
+mod device_router;
 mod dtype;
+mod flexible_session;
+mod fusion_options;
 mod graph;
+mod graph_devices;
 mod session;
 
 /// Module init — `import pyrlx._pyrlx`.
@@ -40,13 +55,27 @@ mod session;
 fn _pyrlx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(device::available_devices, m)?)?;
     m.add_function(wrap_pyfunction!(device::is_available, m)?)?;
+    m.add_function(wrap_pyfunction!(device::parse_device_py, m)?)?;
+    m.add_function(wrap_pyfunction!(device::backends_manifest, m)?)?;
+    m.add_function(wrap_pyfunction!(device::fastest_device_for_py, m)?)?;
+    m.add_function(wrap_pyfunction!(device::device_report_py, m)?)?;
     m.add_function(wrap_pyfunction!(autodiff::grad, m)?)?;
     m.add_function(wrap_pyfunction!(autodiff::jvp, m)?)?;
+    m.add_function(wrap_pyfunction!(autodiff::hvp, m)?)?;
+    m.add_function(wrap_pyfunction!(autodiff::nth_order_grad, m)?)?;
+    m.add_function(wrap_pyfunction!(autodiff::directional_nth_grad, m)?)?;
     m.add_function(wrap_pyfunction!(autodiff::vmap_py, m)?)?;
 
     m.add_class::<graph::PyGraph>()?;
     m.add_class::<session::PySession>()?;
     m.add_class::<session::PyCompiled>()?;
+    m.add_class::<fusion_options::PyFusionOptions>()?;
+    m.add_class::<graph_devices::PyDevicePolicy>()?;
+    m.add_class::<graph_devices::PyGraphDevices>()?;
+    m.add_class::<graph_devices::PyDeviceCandidate>()?;
+    m.add_class::<graph_devices::PyDeviceBenchResult>()?;
+    m.add_class::<flexible_session::PyFlexibleSession>()?;
+    m.add_class::<device_router::PyDeviceRouter>()?;
 
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

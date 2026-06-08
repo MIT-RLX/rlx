@@ -122,6 +122,23 @@ pub fn broadcast_to(a: &Array, shape: &[i32]) -> Result<Array, MlxError> {
     Ok(Array::from_raw(out))
 }
 
+/// Nearest-neighbor 2× upsample on NCHW (FKL resize prologue).
+pub fn resize_nearest_2x_nchw(x: &Array) -> Result<Array, MlxError> {
+    let shape = x.shape().unwrap_or_default();
+    if shape.len() != 4 {
+        return Err(MlxError(format!(
+            "resize_nearest_2x_nchw: expected NCHW rank 4, got {shape:?}"
+        )));
+    }
+    let n = shape[0] as i32;
+    let c = shape[1] as i32;
+    let h = shape[2] as i32;
+    let w = shape[3] as i32;
+    let t = reshape(x, &[n, c, h, 1, w, 1])?;
+    let u = broadcast_to(&t, &[n, c, h, 2, w, 2])?;
+    reshape(&u, &[n, c, h * 2, w * 2])
+}
+
 pub fn take(a: &Array, indices: &Array, axis: i32) -> Result<Array, MlxError> {
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_take(a.ptr, indices.ptr, axis, &mut out) };

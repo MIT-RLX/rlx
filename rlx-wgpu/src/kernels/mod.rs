@@ -26,19 +26,37 @@ use bytemuck::{Pod, Zeroable};
 
 pub const MATMUL_WGSL: &str = include_str!("matmul.wgsl");
 pub const MATMUL_WIDE_WGSL: &str = include_str!("matmul_wide.wgsl");
+pub const MATMUL_WIDE_NV_WGSL: &str = include_str!("matmul_wide_nv.wgsl");
 pub const MATMUL_F16W_WGSL: &str = include_str!("matmul_f16w.wgsl");
 pub const MATMUL_F16_COMPUTE_WGSL: &str = include_str!("matmul_f16_compute.wgsl");
 pub const MATMUL_COOP16_WGSL: &str = include_str!("matmul_coop16.wgsl");
 pub const MATMUL_COOP_F32_WGSL: &str = include_str!("matmul_coop_f32.wgsl");
+pub const MATMUL_COOP_F32_PORTABLE_WGSL: &str = include_str!("matmul_coop_f32_portable.wgsl");
+pub const MATMUL_COOP_F16_VULKAN_WGSL: &str = include_str!("matmul_coop_f16_vulkan.wgsl");
+pub const MATMUL_COOP_F16_VULKAN_WIDEN_WGSL: &str =
+    include_str!("matmul_coop_f16_vulkan_widen.wgsl");
+pub const MATMUL_COOP_F16_VULKAN_F32ACC_WGSL: &str =
+    include_str!("matmul_coop_f16_vulkan_f32acc.wgsl");
+pub const MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC_WGSL: &str =
+    include_str!("matmul_coop_f16_vulkan_widen_f32acc.wgsl");
+pub const MATMUL_QKV_COOP_F16_VK_WGSL: &str = include_str!("matmul_qkv_coop_f16_vk.wgsl");
+pub const MATMUL_QKV_COOP_F16_VK_WIDEN_WGSL: &str =
+    include_str!("matmul_qkv_coop_f16_vk_widen.wgsl");
+pub const MATMUL_QKV_COOP_F16_VK_F32ACC_WGSL: &str =
+    include_str!("matmul_qkv_coop_f16_vk_f32acc.wgsl");
+pub const MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC_WGSL: &str =
+    include_str!("matmul_qkv_coop_f16_vk_widen_f32acc.wgsl");
 pub const CAST_F32_TO_F16_WGSL: &str = include_str!("cast_f32_to_f16.wgsl");
 pub const BINARY_WGSL: &str = include_str!("binary.wgsl");
 pub const UNARY_WGSL: &str = include_str!("unary.wgsl");
+pub const UNARY_F16_MIRROR_WGSL: &str = include_str!("unary_f16_mirror.wgsl");
 pub const COMPARE_WGSL: &str = include_str!("compare.wgsl");
 pub const WHERE_WGSL: &str = include_str!("where.wgsl");
 pub const REDUCE_WGSL: &str = include_str!("reduce.wgsl");
 pub const SOFTMAX_WGSL: &str = include_str!("softmax.wgsl");
 pub const LAYERNORM_WGSL: &str = include_str!("layernorm.wgsl");
 pub const RMS_NORM_BWD_WGSL: &str = include_str!("rms_norm_backward.wgsl");
+pub const LAYER_NORM_BWD_WGSL: &str = include_str!("layer_norm_backward.wgsl");
 pub const CUMSUM_BWD_WGSL: &str = include_str!("cumsum_backward.wgsl");
 pub const ROPE_BWD_WGSL: &str = include_str!("rope_backward.wgsl");
 pub const GATHER_BWD_WGSL: &str = include_str!("gather_backward.wgsl");
@@ -139,17 +157,45 @@ pub struct WhereParams {
 }
 
 /// Layout for reductions. 32 bytes.
+///
+/// Supports arbitrary-axis reductions. The reduce kernel walks the
+/// input as a 3D tensor `[outer, reduce_dim, inner]` where:
+///   * `outer` = product of dims BEFORE the reduce axis
+///   * `reduce_dim` = the reduce axis itself
+///   * `inner` = product of dims AFTER the reduce axis (=1 for the
+///     last-axis case, which is what the v3 dispatcher emitted).
+/// Output shape is `[outer, inner]` (or with the reduce axis kept as 1
+/// when `keep_dim`; the dispatcher handles the shape arithmetic).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct ReduceParams {
     pub outer: u32,
+    pub reduce_dim: u32,
     pub inner: u32,
     pub in_off: u32,
     pub out_off: u32,
     pub op: u32,
     pub _p0: u32,
     pub _p1: u32,
-    pub _p2: u32,
+}
+
+// Manual impls to avoid issues with structural derives if any field
+// arrangement subtly trips bytemuck.
+unsafe impl Pod for ReduceParams {}
+unsafe impl Zeroable for ReduceParams {}
+impl Copy for ReduceParams {}
+impl Clone for ReduceParams {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl std::fmt::Debug for ReduceParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ReduceParams {{ outer: {}, reduce_dim: {}, inner: {}, op: {} }}",
+            self.outer, self.reduce_dim, self.inner, self.op
+        )
+    }
 }
 
 /// Layout for softmax. 32 bytes.
@@ -178,6 +224,30 @@ pub struct LayerNormParams {
     pub beta_off: u32,
     pub eps_bits: u32, // bitcast::<u32>(eps)
     pub op: u32,       // 0=LayerNorm, 1=RmsNorm
+}
+
+/// LayerNorm backward kernel params (f32 element offsets). Shared by
+/// the three entry points; the dispatcher picks `layer_norm_bwd_input`,
+/// `layer_norm_bwd_gamma_partial`, or `layer_norm_bwd_gamma_reduce`
+/// based on which Step variant fired. dbeta isn't a dedicated op — it's
+/// a plain `Reduce::Sum` over the batch dim of `dy`, handled by the
+/// general reduce kernel.
+///
+/// `scratch_off` is the f32-element offset of the tail scratch zone
+/// (only used by the gamma partial/reduce kernels). For the reduce
+/// kernel `outer` carries the number of partial chunks emitted by the
+/// partial kernel.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct LayerNormBwdParams {
+    pub outer: u32,
+    pub inner: u32,
+    pub x_off: u32,
+    pub gamma_off: u32,
+    pub dy_off: u32,
+    pub out_off: u32,
+    pub eps_bits: u32,
+    pub scratch_off: u32,
 }
 
 /// RMSNorm backward kernel params (f32 element offsets). `wrt`: 0=dx, 1=dgamma, 2=dbeta.
@@ -300,9 +370,27 @@ pub struct ElementwiseRegionParams {
     pub input_offs: [u32; 16],
     pub chain: [u32; 128], // 32 steps * 4 u32s
     pub scalar_input_mask: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    pub prologue: u32,
+    pub out_n: u32,
+    pub out_c: u32,
+    pub out_h: u32,
+    pub out_w: u32,
+    pub prologue_input: u32,
+    pub input_modulus: [u32; 16],
+}
+
+/// FKL batch region: `batch_input_offs[slice]` + shared chain (no prologue).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BatchElementwiseRegionParams {
+    pub slice_len: u32,
+    pub num_batch: u32,
+    pub num_steps: u32,
+    pub base_dst_off: u32,
+    pub slice_elems: u32,
+    pub batch_input_offs: [u32; 64],
+    pub chain: [u32; 128],
+    pub scalar_input_mask: u32,
     pub input_modulus: [u32; 16],
 }
 
@@ -1053,6 +1141,206 @@ fn build_kernel_3(
     Kernel { pipeline, bgl }
 }
 
+/// f16 shadow (rw) + uniform + f32 arena (rw) — `cast_f32_to_f16` only.
+/// Separate from `build_kernel_3`: cast reads f32 written by a prior unary in
+/// the same arena; other 3-binding kernels keep binding 2 read-only.
+fn build_kernel_cast_f32_to_f16(
+    device: &wgpu::Device,
+    label: &'static str,
+    wgsl: &str,
+    entry_point: &'static str,
+) -> Kernel {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        module: &module,
+        entry_point: Some(entry_point),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    Kernel { pipeline, bgl }
+}
+
+/// f32 arena (rw) + uniform + f16 shadow (rw) — unary with CoopF16Vk mirror.
+fn build_kernel_f32_rw_uniform_f16_rw(
+    device: &wgpu::Device,
+    label: &'static str,
+    wgsl: &str,
+    entry_point: &'static str,
+) -> Kernel {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        module: &module,
+        entry_point: Some(entry_point),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    Kernel { pipeline, bgl }
+}
+
+/// f16 shadow (read) + f32 arena (rw) + uniform — Vulkan/DX12 coop f16 matmul.
+fn build_kernel_coop_f16_vk(
+    device: &wgpu::Device,
+    label: &'static str,
+    wgsl: &str,
+    entry_point: &'static str,
+) -> Kernel {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        module: &module,
+        entry_point: Some(entry_point),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    Kernel { pipeline, bgl }
+}
+
+fn try_build_kernel_coop_f16_vk(
+    device: &wgpu::Device,
+    label: &'static str,
+    wgsl: &str,
+    entry_point: &'static str,
+) -> Option<Kernel> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_kernel_coop_f16_vk(device, label, wgsl, entry_point)
+    }))
+    .ok()
+}
+
 fn build_kernel(
     device: &wgpu::Device,
     label: &'static str,
@@ -1106,13 +1394,20 @@ fn build_kernel(
 
 static MATMUL: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_WIDE: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_WIDE_NV: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_F16W: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_F16_COMPUTE: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP16: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F32: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F32_PORTABLE: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F16_VULKAN: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F16_VULKAN_WIDEN: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F16_VULKAN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 static CAST_F32_TO_F16: OnceLock<Kernel> = OnceLock::new();
 static BINARY: OnceLock<Kernel> = OnceLock::new();
 static UNARY: OnceLock<Kernel> = OnceLock::new();
+static UNARY_F16_MIRROR: OnceLock<Kernel> = OnceLock::new();
 static COMPARE: OnceLock<Kernel> = OnceLock::new();
 static WHEREK: OnceLock<Kernel> = OnceLock::new();
 static REDUCE: OnceLock<Kernel> = OnceLock::new();
@@ -1120,6 +1415,9 @@ static SOFTMAX: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD_PARAM: OnceLock<Kernel> = OnceLock::new();
+static LAYER_NORM_BWD_INPUT: OnceLock<Kernel> = OnceLock::new();
+static LAYER_NORM_BWD_GAMMA: OnceLock<Kernel> = OnceLock::new();
+static LAYER_NORM_BWD_GAMMA_REDUCE: OnceLock<Kernel> = OnceLock::new();
 static CUMSUM_BWD: OnceLock<Kernel> = OnceLock::new();
 static ROPE_BWD: OnceLock<Kernel> = OnceLock::new();
 static GATHER_BWD_ZERO: OnceLock<Kernel> = OnceLock::new();
@@ -1132,6 +1430,7 @@ static FFT_GPU_OUTER_R4: OnceLock<Kernel> = OnceLock::new();
 static FFT_GPU_OUTER_R2: OnceLock<Kernel> = OnceLock::new();
 static COPY: OnceLock<Kernel> = OnceLock::new();
 static ELEMENTWISE_REGION: OnceLock<Kernel> = OnceLock::new();
+static ELEMENTWISE_REGION_SPATIAL: OnceLock<Kernel> = OnceLock::new();
 static TRANSPOSE: OnceLock<Kernel> = OnceLock::new();
 static NARROW: OnceLock<Kernel> = OnceLock::new();
 static CONCAT: OnceLock<Kernel> = OnceLock::new();
@@ -1160,6 +1459,10 @@ static FUSED_RESIDUAL_LN_TEE: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_RMS_NORM: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_QKV: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_QKV_COOP_F32: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_QKV_COOP_F16_VK: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_QKV_COOP_F16_VK_WIDEN: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_QKV_COOP_F16_VK_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 
 pub fn matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
     MATMUL.get_or_init(|| build_kernel(device, "rlx-wgpu matmul", MATMUL_WGSL, "matmul"))
@@ -1171,6 +1474,17 @@ pub fn matmul_wide_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu matmul_wide",
             MATMUL_WIDE_WGSL,
             "matmul_wide",
+        )
+    })
+}
+/// 64×64 / 256-thread variant for discrete GPUs (Vulkan path).
+pub fn matmul_wide_nv_kernel(device: &wgpu::Device) -> &'static Kernel {
+    MATMUL_WIDE_NV.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_wide_nv",
+            MATMUL_WIDE_NV_WGSL,
+            "matmul_wide_nv",
         )
     })
 }
@@ -1247,6 +1561,174 @@ pub fn matmul_coop_f32_kernel(device: &wgpu::Device) -> Option<&'static Kernel> 
         )
     }))
 }
+/// Vulkan/DX12-oriented coop f32 matmul (`coopLoad`, 8×8 workgroups).
+pub fn matmul_coop_f32_portable_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    let feats = device.features();
+    if !feats.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        || !crate::device::coop_f32_8x8_supported()
+    {
+        return None;
+    }
+    Some(MATMUL_COOP_F32_PORTABLE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_coop_f32_portable",
+            MATMUL_COOP_F32_PORTABLE_WGSL,
+            "matmul_coop_f32_portable",
+        )
+    }))
+}
+fn coop_f16_vk_device_ready(device: &wgpu::Device) -> bool {
+    // Cooperative-matrix Vulkan/DX12 matmul is OFF by default — see
+    // `coop_f16_vk_eligible` in `backend.rs` for the rationale. Opt in
+    // with `RLX_WGPU_COOP_F16_VK_ENABLE=1`. Legacy
+    // `RLX_WGPU_COOP_F16_VK_DISABLE=1` also fully disables.
+    if rlx_ir::env::flag("RLX_WGPU_COOP_F16_VK_DISABLE")
+        || !rlx_ir::env::flag("RLX_WGPU_COOP_F16_VK_ENABLE")
+    {
+        return false;
+    }
+    device.features().contains(wgpu::Features::SHADER_F16)
+        && device
+            .features()
+            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        && crate::device::coop_f16_16x16_supported()
+        && crate::device::coop_discrete_backend()
+}
+
+fn coop_f16_vk_f32acc_device_ready(device: &wgpu::Device) -> bool {
+    coop_f16_vk_device_ready(device) && crate::device::coop_f16_16x16_f32_acc_supported()
+}
+
+pub fn matmul_coop_f16_vulkan_f32acc_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !coop_f16_vk_f32acc_device_ready(device) {
+        return None;
+    }
+    MATMUL_COOP_F16_VULKAN_F32ACC
+        .get_or_init(|| {
+            try_build_kernel_coop_f16_vk(
+                device,
+                "rlx-wgpu matmul_coop_f16_vulkan_f32acc",
+                MATMUL_COOP_F16_VULKAN_F32ACC_WGSL,
+                "matmul_coop_f16_vulkan_f32acc",
+            )
+        })
+        .as_ref()
+}
+
+pub fn matmul_coop_f16_vulkan_widen_f32acc_kernel(
+    device: &wgpu::Device,
+) -> Option<&'static Kernel> {
+    if !coop_f16_vk_f32acc_device_ready(device) {
+        return None;
+    }
+    MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC
+        .get_or_init(|| {
+            try_build_kernel_coop_f16_vk(
+                device,
+                "rlx-wgpu matmul_coop_f16_vulkan_widen_f32acc",
+                MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC_WGSL,
+                "matmul_coop_f16_vulkan_widen_f32acc",
+            )
+        })
+        .as_ref()
+}
+
+fn coop_f16_vk_use_f32acc(device: &wgpu::Device) -> bool {
+    !rlx_ir::env::flag("RLX_WGPU_COOP_F16_VK_NO_F32ACC")
+        && matmul_coop_f16_vulkan_f32acc_kernel(device).is_some()
+}
+
+fn pick_coop_f16_vk_matmul(
+    device: &wgpu::Device,
+    n: u32,
+    loadt: fn(&wgpu::Device) -> Option<&'static Kernel>,
+    loadt_f32acc: fn(&wgpu::Device) -> Option<&'static Kernel>,
+    widen: fn(&wgpu::Device) -> Option<&'static Kernel>,
+    widen_f32acc: fn(&wgpu::Device) -> Option<&'static Kernel>,
+) -> Option<&'static Kernel> {
+    if coop_f16_vk_use_f32acc(device) {
+        if coop_f16_vk_widen_b_load(n) {
+            return widen_f32acc(device).or_else(|| loadt_f32acc(device));
+        }
+        return loadt_f32acc(device);
+    }
+    if coop_f16_vk_widen_b_load(n) {
+        widen(device).or_else(|| loadt(device))
+    } else {
+        loadt(device)
+    }
+}
+
+/// Matmul CoopF16Vk kernel for column count `n`.
+pub fn matmul_coop_f16_vulkan_active_kernel(
+    device: &wgpu::Device,
+    n: u32,
+) -> Option<&'static Kernel> {
+    pick_coop_f16_vk_matmul(
+        device,
+        n,
+        matmul_coop_f16_vulkan_kernel,
+        matmul_coop_f16_vulkan_f32acc_kernel,
+        matmul_coop_f16_vulkan_widen_kernel,
+        matmul_coop_f16_vulkan_widen_f32acc_kernel,
+    )
+}
+
+pub fn matmul_coop_f16_vulkan_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !coop_f16_vk_device_ready(device) {
+        return None;
+    }
+    Some(MATMUL_COOP_F16_VULKAN.get_or_init(|| {
+        build_kernel_coop_f16_vk(
+            device,
+            "rlx-wgpu matmul_coop_f16_vulkan",
+            MATMUL_COOP_F16_VULKAN_WGSL,
+            "matmul_coop_f16_vulkan",
+        )
+    }))
+}
+/// N above which coop may use the row-major B-load variant (`RLX_WGPU_COOP_F16_VK_LARGE_N`).
+pub const COOP_F16_VK_WIDEN_N: u32 = 768;
+
+/// Use `coopLoad` on B instead of `coopLoadT` when N > 768 and `RLX_WGPU_COOP_F16_VK_LOAD_T` is unset.
+pub fn coop_f16_vk_widen_b_load(n: u32) -> bool {
+    n > COOP_F16_VK_WIDEN_N && !rlx_ir::env::flag("RLX_WGPU_COOP_F16_VK_LOAD_T")
+}
+
+pub fn matmul_coop_f16_vulkan_widen_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !coop_f16_vk_device_ready(device) {
+        return None;
+    }
+    Some(MATMUL_COOP_F16_VULKAN_WIDEN.get_or_init(|| {
+        build_kernel_coop_f16_vk(
+            device,
+            "rlx-wgpu matmul_coop_f16_vulkan_widen",
+            MATMUL_COOP_F16_VULKAN_WIDEN_WGSL,
+            "matmul_coop_f16_vulkan_widen",
+        )
+    }))
+}
+pub fn coop_f16_vk_f32acc_available(device: &wgpu::Device) -> bool {
+    matmul_coop_f16_vulkan_f32acc_kernel(device).is_some()
+}
+/// CoopF32 kernel for the active wgpu backend (Metal simdgroup vs Vulkan/DX12 portable).
+pub fn matmul_coop_f32_active_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    match crate::device::wgpu_device().map(|d| d.backend) {
+        Some(wgpu::Backend::Metal) => matmul_coop_f32_kernel(device),
+        Some(wgpu::Backend::Vulkan) | Some(wgpu::Backend::Dx12) => {
+            matmul_coop_f32_portable_kernel(device)
+        }
+        _ => None,
+    }
+}
+/// Wide f32 matmul kernel for the active backend.
+pub fn matmul_wide_active_kernel(device: &wgpu::Device) -> &'static Kernel {
+    match crate::device::wgpu_device().map(|d| d.backend) {
+        Some(wgpu::Backend::Vulkan) | Some(wgpu::Backend::Dx12) => matmul_wide_nv_kernel(device),
+        _ => matmul_wide_kernel(device),
+    }
+}
 /// Mirrors a region of the f32 arena into the f16 shadow buffer.
 /// Used before `matmul_coop16` for the matmul's activation operand
 /// (intermediate activations don't go through `set_param` /
@@ -1256,7 +1738,7 @@ pub fn cast_f32_to_f16_kernel(device: &wgpu::Device) -> Option<&'static Kernel> 
         return None;
     }
     Some(CAST_F32_TO_F16.get_or_init(|| {
-        build_kernel_3(
+        build_kernel_cast_f32_to_f16(
             device,
             "rlx-wgpu cast_f32_to_f16",
             CAST_F32_TO_F16_WGSL,
@@ -1269,6 +1751,19 @@ pub fn binary_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn unary_kernel(device: &wgpu::Device) -> &'static Kernel {
     UNARY.get_or_init(|| build_kernel(device, "rlx-wgpu unary", UNARY_WGSL, "unary"))
+}
+pub fn unary_f16_mirror_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !device.features().contains(wgpu::Features::SHADER_F16) {
+        return None;
+    }
+    Some(UNARY_F16_MIRROR.get_or_init(|| {
+        build_kernel_f32_rw_uniform_f16_rw(
+            device,
+            "rlx-wgpu unary_f16_mirror",
+            UNARY_F16_MIRROR_WGSL,
+            "unary_f16_mirror",
+        )
+    }))
 }
 pub fn compare_kernel(device: &wgpu::Device) -> &'static Kernel {
     COMPARE.get_or_init(|| build_kernel(device, "rlx-wgpu compare", COMPARE_WGSL, "compare"))
@@ -1302,6 +1797,37 @@ pub fn rms_norm_backward_param_kernel(device: &wgpu::Device) -> &'static Kernel 
             "rlx-wgpu rms_norm_bwd_param",
             RMS_NORM_BWD_WGSL,
             "rms_norm_bwd_param",
+        )
+    })
+}
+pub fn layer_norm_backward_input_kernel(device: &wgpu::Device) -> &'static Kernel {
+    LAYER_NORM_BWD_INPUT.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu layer_norm_bwd_input",
+            LAYER_NORM_BWD_WGSL,
+            "layer_norm_bwd_input",
+        )
+    })
+}
+pub fn layer_norm_backward_gamma_partial_kernel(device: &wgpu::Device) -> &'static Kernel {
+    LAYER_NORM_BWD_GAMMA.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu layer_norm_bwd_gamma_partial",
+            LAYER_NORM_BWD_WGSL,
+            "layer_norm_bwd_gamma_partial",
+        )
+    })
+}
+
+pub fn layer_norm_backward_gamma_reduce_kernel(device: &wgpu::Device) -> &'static Kernel {
+    LAYER_NORM_BWD_GAMMA_REDUCE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu layer_norm_bwd_gamma_reduce",
+            LAYER_NORM_BWD_WGSL,
+            "layer_norm_bwd_gamma_reduce",
         )
     })
 }
@@ -1393,6 +1919,30 @@ pub fn elementwise_region_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu elementwise_region",
             ELEMENTWISE_REGION_WGSL,
             "elementwise_region",
+        )
+    })
+}
+
+pub fn elementwise_region_spatial_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ELEMENTWISE_REGION_SPATIAL.get_or_init(|| {
+        build_kernel_region(
+            device,
+            "rlx-wgpu elementwise_region_spatial",
+            ELEMENTWISE_REGION_WGSL,
+            "elementwise_region_spatial",
+        )
+    })
+}
+
+static BATCH_ELEMENTWISE_REGION: std::sync::OnceLock<Kernel> = std::sync::OnceLock::new();
+
+pub fn batch_elementwise_region_kernel(device: &wgpu::Device) -> &'static Kernel {
+    BATCH_ELEMENTWISE_REGION.get_or_init(|| {
+        build_kernel_region(
+            device,
+            "rlx-wgpu batch_elementwise_region",
+            ELEMENTWISE_REGION_WGSL,
+            "batch_elementwise_region",
         )
     })
 }
@@ -1608,6 +2158,80 @@ pub fn matmul_qkv_coop_f32_kernel(device: &wgpu::Device) -> Option<&'static Kern
             "rlx-wgpu matmul_qkv_coop_f32",
             MATMUL_QKV_COOP_F32_WGSL,
             "matmul_qkv_coop_f32",
+        )
+    }))
+}
+pub fn matmul_qkv_coop_f16_vk_f32acc_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !coop_f16_vk_f32acc_device_ready(device) {
+        return None;
+    }
+    MATMUL_QKV_COOP_F16_VK_F32ACC
+        .get_or_init(|| {
+            try_build_kernel_coop_f16_vk(
+                device,
+                "rlx-wgpu matmul_qkv_coop_f16_vk_f32acc",
+                MATMUL_QKV_COOP_F16_VK_F32ACC_WGSL,
+                "matmul_qkv_coop_f16_vk_f32acc",
+            )
+        })
+        .as_ref()
+}
+
+pub fn matmul_qkv_coop_f16_vk_widen_f32acc_kernel(
+    device: &wgpu::Device,
+) -> Option<&'static Kernel> {
+    if !coop_f16_vk_f32acc_device_ready(device) {
+        return None;
+    }
+    MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC
+        .get_or_init(|| {
+            try_build_kernel_coop_f16_vk(
+                device,
+                "rlx-wgpu matmul_qkv_coop_f16_vk_widen_f32acc",
+                MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC_WGSL,
+                "matmul_qkv_coop_f16_vk_widen_f32acc",
+            )
+        })
+        .as_ref()
+}
+
+pub fn matmul_qkv_coop_f16_vk_active_kernel(
+    device: &wgpu::Device,
+    n: u32,
+) -> Option<&'static Kernel> {
+    pick_coop_f16_vk_matmul(
+        device,
+        n,
+        matmul_qkv_coop_f16_vk_kernel,
+        matmul_qkv_coop_f16_vk_f32acc_kernel,
+        matmul_qkv_coop_f16_vk_widen_kernel,
+        matmul_qkv_coop_f16_vk_widen_f32acc_kernel,
+    )
+}
+
+pub fn matmul_qkv_coop_f16_vk_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !coop_f16_vk_device_ready(device) {
+        return None;
+    }
+    Some(MATMUL_QKV_COOP_F16_VK.get_or_init(|| {
+        build_kernel_coop_f16_vk(
+            device,
+            "rlx-wgpu matmul_qkv_coop_f16_vk",
+            MATMUL_QKV_COOP_F16_VK_WGSL,
+            "matmul_qkv_coop_f16_vk",
+        )
+    }))
+}
+pub fn matmul_qkv_coop_f16_vk_widen_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !coop_f16_vk_device_ready(device) {
+        return None;
+    }
+    Some(MATMUL_QKV_COOP_F16_VK_WIDEN.get_or_init(|| {
+        build_kernel_coop_f16_vk(
+            device,
+            "rlx-wgpu matmul_qkv_coop_f16_vk_widen",
+            MATMUL_QKV_COOP_F16_VK_WIDEN_WGSL,
+            "matmul_qkv_coop_f16_vk_widen",
         )
     }))
 }

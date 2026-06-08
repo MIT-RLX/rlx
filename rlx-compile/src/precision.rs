@@ -106,6 +106,7 @@ fn op_kind(op: &Op) -> OpKind {
         Op::MatMul
         | Op::FusedMatMulBiasAct { .. }
         | Op::Conv { .. }
+        | Op::Im2Col { .. }
         | Op::DotGeneral { .. }
         | Op::DenseSolve
         | Op::BatchedDenseSolve
@@ -182,6 +183,9 @@ fn op_kind(op: &Op) -> OpKind {
         Op::ScanBackwardXs { .. } => OpKind::Compute,
         Op::CustomFn { .. } => OpKind::Compute,
         Op::Fft { .. } => OpKind::Compute,
+        Op::FftButterflyStage { .. } => OpKind::Compute,
+        Op::LogMel => OpKind::Compute,
+        Op::LogMelBackward => OpKind::Compute,
         _ => OpKind::Compute,
     }
 }

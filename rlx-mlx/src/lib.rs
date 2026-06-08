@@ -32,64 +32,72 @@
 //! - `lower`   — rlx-ir Graph → MLX op chain
 //! - `backend` — `MlxExecutable` (set_param / run / handles)
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub(crate) mod ffi {
     pub use rlx_mlx_sys::ffi::*;
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub mod array;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub mod ops;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub mod attention_bwd;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub mod lower;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub(crate) mod sync;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub mod backend;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
+pub mod config;
+
+#[cfg(rlx_mlx_host)]
 pub mod compiled;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub mod calibrate;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub mod op_registry;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub mod splat;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub mod batched_lu_kernel;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub mod llada2_gate;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub use array::{Array, MlxError, eval, version};
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub use backend::MlxExecutable;
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
 pub use compiled::CompiledFn;
-#[cfg(target_os = "macos")]
+#[cfg(rlx_mlx_host)]
+pub use config::{
+    COMPILE_OUTPUT_CAP_ENV, DEFAULT_COMPILE_OUTPUT_CAP, compile_output_cap,
+    reset_compile_output_cap, set_compile_output_cap,
+};
+#[cfg(rlx_mlx_host)]
 pub use lower::MlxMode;
 
-/// True if MLX is reachable on this build target. MLX requires Apple
-/// Silicon macOS; non-macOS builds compile out the entire backend.
-#[cfg(target_os = "macos")]
+/// True when this target links the native MLX stack (macOS Metal, CPU MLX on
+/// Linux / Windows).
+#[cfg(rlx_mlx_host)]
 pub fn is_available() -> bool {
     true
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(rlx_mlx_host))]
 pub fn is_available() -> bool {
     false
 }

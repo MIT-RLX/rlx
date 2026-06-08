@@ -249,6 +249,43 @@ mod algos {
     // Routed via `Op::Custom` — the IR-level VJP arm on each forward
     // op emits a call to the corresponding backward op.
 
+    /// General square solve `A · X = B` with row-major `A` (`n×n`) and
+    /// `B` (`n×nrhs`). Overwrites `out` with `X`.
+    pub fn gesv(
+        a: &[f64],
+        b: &[f64],
+        n: usize,
+        nrhs: usize,
+        out: &mut [f64],
+    ) -> Result<(), String> {
+        if a.len() != n * n || b.len() != n * nrhs || out.len() != n * nrhs {
+            return Err(format!("gesv: shape mismatch (n={n}, nrhs={nrhs})"));
+        }
+        let mut a_buf = a.to_vec();
+        out.copy_from_slice(b);
+        let info = rlx_cpu::blas::dgesv(&mut a_buf, out, n, nrhs);
+        if info != 0 {
+            return Err(format!("gesv: dgesv info={info}"));
+        }
+        Ok(())
+    }
+
+    /// Row-major `C = A·B` (`m×k` · `k×n` → `m×n`).
+    pub fn matmul(
+        a: &[f64],
+        b: &[f64],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f64],
+    ) -> Result<(), String> {
+        if a.len() != m * k || b.len() != k * n || out.len() != m * n {
+            return Err(format!("matmul: shape mismatch (m={m}, k={k}, n={n})"));
+        }
+        matmul_naive(a, b, m, k, n, out);
+        Ok(())
+    }
+
     /// Row-major C = A·B via Accelerate/MKL/OpenBLAS `dgemm`. Drop-in
     /// replacement for the previous hand-rolled triple-loop — the
     /// 10-50× win on n≥50 matters for every backward / JVP kernel
@@ -4036,6 +4073,14 @@ pub fn svd(g: &mut Graph, a: NodeId) -> (NodeId, NodeId, NodeId) {
         Shape::new(&[k, n], DType::F64),
     );
     (u, s, vt)
+}
+
+// ── Host LAPACK (non-graph callers) ──────────────────────────────
+
+/// Dense LAPACK wrappers for host-side crates (eda-doa, eda-fullwave, …).
+#[cfg(feature = "cpu")]
+pub mod host {
+    pub use super::algos::{cholesky, eigh, gesv, matmul, solve_triangular};
 }
 
 // ── Registration ─────────────────────────────────────────────────

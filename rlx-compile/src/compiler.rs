@@ -29,7 +29,7 @@ use rlx_ir::hir::HirModule;
 use rlx_ir::lir::{LirBufferPlan, LirBufferSlot, LirIoManifest, LirModule, LirViewAlias};
 use rlx_ir::mir::MirModule;
 use rlx_ir::phase::derive_phases;
-use rlx_ir::{Graph, GraphModule, GraphStage};
+use rlx_ir::{Graph, GraphModule, GraphStage, NodeId};
 
 use crate::DeadCodeElimination;
 use crate::debug_assert_graph;
@@ -101,11 +101,100 @@ impl Default for CompilePipeline {
     }
 }
 
+fn lstm_y_shape(x: &rlx_ir::Shape, hidden_size: usize, bidirectional: bool) -> rlx_ir::Shape {
+    let dirs = if bidirectional { 2 } else { 1 };
+    if x.rank() == 3 {
+        let seq = x.dim(0).unwrap_static();
+        let batch = x.dim(1).unwrap_static().max(1);
+        return rlx_ir::Shape::new(&[seq, dirs, batch, hidden_size], x.dtype());
+    }
+    rlx_ir::Shape::new(&[1, dirs, 1, hidden_size], x.dtype())
+}
+
+/// `sync_graph_shapes` can collapse `[seq,1,C]` LSTM inputs to `[1,1,C]`; restore seq.
+fn fix_import_lstm_x_shape(x: &rlx_ir::Shape) -> rlx_ir::Shape {
+    if x.rank() != 3 {
+        return x.clone();
+    }
+    let d0 = x.dim(0).unwrap_static();
+    let d1 = x.dim(1).unwrap_static();
+    let d2 = x.dim(2).unwrap_static();
+    if d0 == 1 && d1 <= 1 && (d2 == 640 || d2 == 512) {
+        let seq = std::env::var("RLX_ONNX_SEQUENCE_LENGTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128);
+        return rlx_ir::Shape::new(&[seq, d1.max(1), d2], x.dtype());
+    }
+    x.clone()
+}
+
+fn fix_lstm_output_shapes(graph: &mut Graph) {
+    use rlx_ir::Op;
+    let ids: Vec<NodeId> = graph.nodes().iter().map(|n| n.id).collect();
+    for id in ids {
+        let node = graph.node(id).clone();
+        let Op::Custom { name, attrs, .. } = &node.op else {
+            continue;
+        };
+        if !name.contains("LSTM") {
+            continue;
+        }
+        let hidden_size = if attrs.len() >= 4 {
+            u32::from_le_bytes(attrs[0..4].try_into().unwrap()) as usize
+        } else {
+            256
+        };
+        let bidirectional = attrs.len() > 4 && attrs[4] != 0;
+        let x_id = node.inputs[0];
+        let x = fix_import_lstm_x_shape(&graph.node(x_id).shape);
+        graph.node_mut(x_id).shape = x.clone();
+        graph.node_mut(id).shape = lstm_y_shape(&x, hidden_size, bidirectional);
+    }
+}
+
+/// `sync_graph_shapes` can collapse `[1, seq, C]` activations to `[1, 1, C]`
+/// when seq>1; restore from `RLX_ONNX_SEQUENCE_LENGTH` and propagate once.
+///
+/// Only runs when `RLX_ONNX_SEQUENCE_LENGTH` is set explicitly — decode graphs such as
+/// Qwen3 talker use legitimate `[1, 1, H]` hidden states and must not be expanded.
+fn fix_import_sequence_axis(graph: &mut Graph) {
+    let Ok(seq_str) = std::env::var("RLX_ONNX_SEQUENCE_LENGTH") else {
+        return;
+    };
+    let seq: usize = match seq_str.parse() {
+        Ok(s) if s > 1 => s,
+        _ => return,
+    };
+    for id in graph.nodes().iter().map(|n| n.id).collect::<Vec<_>>() {
+        let node = graph.node(id);
+        if node.shape.rank() != 3 {
+            continue;
+        }
+        let dims: Vec<_> = node
+            .shape
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .collect();
+        if dims[0] == 1 && dims[1] == 1 && dims[2] >= 64 {
+            graph.node_mut(id).shape = rlx_ir::Shape::new(&[1, seq, dims[2]], node.shape.dtype());
+        }
+    }
+    for id in graph.topo_order().collect::<Vec<_>>() {
+        let node = graph.node(id).clone();
+        if let Some(shape) = rlx_ir::infer_shape::infer_output_shape(graph, &node) {
+            graph.node_mut(id).shape = shape;
+        }
+    }
+}
+
 impl CompilePipeline {
     pub fn new(target: FusionTarget) -> Self {
         let mut opts = match target {
             FusionTarget::Cpu => FusionOptions::for_cpu(),
-            FusionTarget::Metal => FusionOptions::from_metal_env(),
+            FusionTarget::Metal => FusionOptions::for_metal(),
+            FusionTarget::Wgpu => FusionOptions::for_wgpu(),
             _ => FusionOptions::default(),
         };
         opts.fusion_limits = fusion_limits_for_target(target);
@@ -123,7 +212,8 @@ impl CompilePipeline {
 
     /// HIR → MIR (block lowering only).
     pub fn lower_hir(hir: HirModule) -> Result<MirModule, rlx_ir::hir::LowerError> {
-        let mir = hir.lower_to_mir()?;
+        let mut mir = hir.lower_to_mir()?;
+        rlx_ir::dynamic::sync_graph_shapes(mir.as_graph_mut());
         debug_assert_graph!(mir.as_graph(), "hir→mir");
         Ok(mir)
     }
@@ -174,12 +264,16 @@ impl CompilePipeline {
     /// Run fusion + cleanup passes on MIR, returning fusion diagnostics.
     pub fn optimize_with_report(&self, mir: MirModule) -> (MirModule, FusionReport) {
         let before = mir.as_graph().clone();
-        let passes = fusion_passes_for_supported(self.effective_supported(), self.opts);
+        let passes =
+            fusion_passes_for_supported(self.effective_supported(), self.opts, self.target);
         let limits = self.opts.fusion_limits;
         let graph = with_fusion_limits(limits, || run_passes(mir.into_graph(), &passes, false));
         let graph = clip_elementwise_regions(graph, limits);
         debug_assert_graph!(&graph, "fusion");
-        let graph = self.legalize_after_fusion(graph);
+        let mut graph = self.legalize_after_fusion(graph);
+        rlx_ir::dynamic::sync_graph_shapes(&mut graph);
+        fix_import_sequence_axis(&mut graph);
+        fix_lstm_output_shapes(&mut graph);
         debug_assert_graph!(&graph, "legalize");
         let mir = MirModule::from_graph(graph);
         let fusion = FusionReport::analyze(&before, mir.as_graph());
@@ -236,12 +330,14 @@ impl CompilePipeline {
     /// Bind symbolic dims and re-run buffer planning on specialized MIR.
     pub fn specialize_lir(&self, lir: &LirModule, binding: &rlx_ir::DimBinding) -> LirModule {
         use rlx_ir::dynamic::{
-            bind_graph, sync_concat_shapes, sync_graph_shapes, sync_narrow_ops, sync_reshape_ops,
+            bind_graph, sync_concat_shapes, sync_expand_ops, sync_graph_shapes, sync_narrow_ops,
+            sync_reshape_ops,
         };
         let mut bound = bind_graph(lir.as_graph(), binding);
         sync_reshape_ops(&mut bound);
         sync_concat_shapes(&mut bound);
         sync_narrow_ops(&mut bound);
+        sync_expand_ops(&mut bound);
         sync_graph_shapes(&mut bound);
         debug_assert_graph!(&bound, "specialize");
         self.plan_lir(MirModule::from_graph(bound))
@@ -495,6 +591,24 @@ mod tests {
         assert_eq!(result.lir.buffers.io.inputs.len(), 1);
         assert_eq!(result.lir.fingerprint(), result.lir.fingerprint());
         assert_eq!(result.lir.buffers.alignment, 64);
+    }
+
+    #[test]
+    fn decode_hidden_shape_not_expanded_without_env() {
+        // Qwen3 talker decode uses [1, 1, H] hidden states; must not be expanded to
+        // [1, RLX_ONNX_SEQUENCE_LENGTH, H] unless that env is set explicitly.
+        let mut g = Graph::new("decode_out");
+        let x = g.input("x", f32_shape(&[1, 1, 1024]));
+        g.set_outputs(vec![x]);
+        let pipe = CompilePipeline::new(FusionTarget::Cpu);
+        let result = pipe.compile_graph(g);
+        let out = result
+            .lir
+            .mir
+            .as_graph()
+            .node(result.lir.mir.as_graph().outputs[0]);
+        assert_eq!(out.shape.dims()[1].unwrap_static(), 1);
+        assert_eq!(out.shape.num_elements(), Some(1024));
     }
 
     #[test]

@@ -72,12 +72,8 @@ fn main() {
             rlx_ir::env::set("RLX_USE_MPSGRAPH", "1");
             rlx_ir::env::set("RLX_MPSGRAPH_ATTENTION", "1");
         } else {
-            unsafe {
-                rlx_ir::env::unset("RLX_USE_MPSGRAPH");
-            }
-            unsafe {
-                rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
-            }
+            rlx_ir::env::unset("RLX_USE_MPSGRAPH");
+            rlx_ir::env::unset("RLX_MPSGRAPH_ATTENTION");
         }
         let session = Session::new(dev);
         let mut compiled = session.compile(build());

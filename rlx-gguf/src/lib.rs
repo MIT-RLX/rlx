@@ -13,19 +13,58 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! GGUF (GGML Universal Format) parser + dequantization to f32.
+//! GGUF (GGML Universal Format) parser, dequantizer, **quantization
+//! encoder**, and **file writer**.
 //!
 //! Standalone: no `rlx-*` dependencies. Higher-level `WeightLoader` /
 //! HF name mapping lives in the separate model-builders repo (see root README).
 //!
 //! Supports GGUF v1, v2, v3 (the live formats). Tensor dtypes
-//! decoded today: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1.
-//! Other GGML quants parse but error on `dequant_f32` — file ships,
-//! callers know which key is unreadable. Extending = one match arm.
+//! decoded today: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1,
+//! and the full K-quant family Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K.
+//! The encoder side covers every dtype the decoder accepts — see
+//! [`quantize`] and [`writer::GgufWriter`]. Anything outside that set
+//! parses fine but errors on `dequant_f32` so callers know exactly
+//! which key is unreadable; extending is a one-arm match.
 //!
 //! Endianness: little-endian assumed (the only flavor that ships in
 //! practice). The GGUF spec reserves a flag for big-endian; we don't
 //! parse it.
+//!
+//! # Reading a GGUF file
+//!
+//! ```ignore
+//! use rlx_gguf::GgufFile;
+//!
+//! let f = GgufFile::from_path("model.gguf")?;
+//! let (data, shape) = f.dequant_f32("token_embd.weight")?;
+//! ```
+//!
+//! # Writing a GGUF file with mixed quant schemes
+//!
+//! ```ignore
+//! use rlx_gguf::{GgmlType, GgufWriter, MetaValue, quantize};
+//!
+//! let w_floats: Vec<f32> = /* … */;
+//! let bias_floats: Vec<f32> = /* … */;
+//!
+//! let mut w = GgufWriter::new();
+//! w.set_arch("llama");
+//! w.set_meta("general.name", MetaValue::String("my-model".into()));
+//!
+//! // Big projection → 4-bit K-quant. Tiny bias → float-16 (stays at
+//! // native precision so we don't pay 5% accuracy for 32 numbers).
+//! w.add_tensor_bytes("w", vec![4096, 4096], GgmlType::Q4K,
+//!     quantize(&w_floats, GgmlType::Q4K)?)?;
+//! w.add_tensor_bytes("b", vec![4096], GgmlType::F16,
+//!     quantize(&bias_floats, GgmlType::F16)?)?;
+//! w.write_to_path("out.gguf")?;
+//! ```
+//!
+//! For end-to-end safetensors / ONNX → GGUF conversion with per-tensor
+//! scheme rules see the companion [`rlx-gguf-convert`] crate.
+//!
+//! [`rlx-gguf-convert`]: https://docs.rs/rlx-gguf-convert
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -33,6 +72,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
+
+pub mod quantize;
+pub mod writer;
+pub use quantize::quantize;
+pub use writer::{GgufWriter, TensorPayload};
 
 pub const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian
 pub const DEFAULT_ALIGNMENT: u64 = 32;
@@ -388,7 +432,13 @@ pub const QK_K: usize = 256;
 /// Byte size of the packed scales+mins region in `block_q4_K` /
 /// `block_q5_K` — 8 sub-blocks × 12 bits (6 bits scale + 6 bits min)
 /// = 96 bits = 12 bytes. Same layout in both formats.
-const K_SCALE_SIZE: usize = 12;
+pub const K_SCALE_SIZE: usize = 12;
+
+/// Bytes a tensor of `n` elements occupies in storage for `dtype`.
+/// Returns `None` if `n` doesn't divide the scheme's block size.
+pub fn bytes_for_public(dtype: GgmlType, n: usize) -> Option<usize> {
+    bytes_for(dtype, n)
+}
 
 fn bytes_for(dtype: GgmlType, n: usize) -> Option<usize> {
     let blk = |qk: usize, blk_bytes: usize| -> Option<usize> {
@@ -836,10 +886,10 @@ pub fn dequant_q6_k_block(block: &[u8], out: &mut [f32; QK_K]) {
             let q2 = ((ql[ql_off + l + 32] & 0x0F) | (((qh_b >> 2) & 3) << 4)) as i32 - 32;
             let q3 = ((ql[ql_off + l] >> 4) | (((qh_b >> 4) & 3) << 4)) as i32 - 32;
             let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh_b >> 6) & 3) << 4)) as i32 - 32;
-            out[dst_base + l] = d * sc[sc_off + is] as f32 * q1 as f32;
-            out[dst_base + l + 32] = d * sc[sc_off + is + 2] as f32 * q2 as f32;
-            out[dst_base + l + 64] = d * sc[sc_off + is + 4] as f32 * q3 as f32;
-            out[dst_base + l + 96] = d * sc[sc_off + is + 6] as f32 * q4 as f32;
+            out[dst_base + l] = d * sc[sc_off + is] as i8 as f32 * q1 as f32;
+            out[dst_base + l + 32] = d * sc[sc_off + is + 2] as i8 as f32 * q2 as f32;
+            out[dst_base + l + 64] = d * sc[sc_off + is + 4] as i8 as f32 * q3 as f32;
+            out[dst_base + l + 96] = d * sc[sc_off + is + 6] as i8 as f32 * q4 as f32;
         }
     }
 }
@@ -1261,6 +1311,27 @@ mod tests {
         for v in &out[0..128] {
             assert!((v - 7.0).abs() < 1e-5, "Q4K decode mismatch: {v}");
         }
+    }
+
+    #[test]
+    fn dequant_q6_k_block_matches_full_with_signed_scale() {
+        const BLK: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
+        let mut block = [0u8; BLK];
+        let sc_off = QK_K / 2 + QK_K / 4;
+        block[sc_off] = 0xFF;
+        block[0] = 0x21;
+        block[QK_K / 2] = 0x08;
+        block[BLK - 2..].copy_from_slice(&half::f16::ONE.to_le_bytes());
+
+        let mut out_block = [0f32; QK_K];
+        dequant_q6_k_block(&block, &mut out_block);
+        let full = dequant_q6_k(&block, QK_K).unwrap();
+        assert!((out_block[0] - full[0]).abs() < 1e-4);
+        assert!(
+            (out_block[0] - 31.0).abs() < 1e-4,
+            "unexpected value {}",
+            out_block[0]
+        );
     }
 
     #[test]

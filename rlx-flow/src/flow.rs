@@ -1,5 +1,17 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! ModelFlow builder and built output.
 
@@ -219,9 +231,9 @@ impl BuiltModel {
         &self.output_names
     }
 
-    /// `(Graph, params)` for legacy compile paths.
-    pub fn into_graph_parts(self) -> Result<(Graph, HashMap<String, Vec<f32>>)> {
-        let params = self.params.clone();
+    /// `(Graph, params)` for legacy compile paths. Moves `params` (no clone).
+    pub fn into_graph_parts(mut self) -> Result<(Graph, HashMap<String, Vec<f32>>)> {
+        let params = std::mem::take(&mut self.params);
         let graph = self.into_graph()?;
         Ok((graph, params))
     }

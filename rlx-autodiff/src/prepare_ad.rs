@@ -77,23 +77,35 @@ impl std::error::Error for AutodiffError {
 /// Canonical MIR pre-passes before reverse- or forward-mode AD.
 ///
 /// Order:
+/// 0. [`DecomposeFusionRegions`](rlx_fusion::DecomposeFusionRegions) — FKL batch/transform → primitives
 /// 1. [`UnfuseElementwiseRegions`](rlx_fusion::UnfuseElementwiseRegions)
-/// 2. [`rlx_fusion::unfuse_fused_for_autodiff`] — tier-2 fused ops → primitives
-/// 3. [`LowerDotGeneral`](rlx_fusion::LowerDotGeneral)
-/// 4. [`control_flow::inline_if`]
-/// 5. [`control_flow::unroll_while`]
-/// 6. [`inline_custom_fn_for_autodiff`]
-/// 7. [`convert_scans_for_ad`]
+/// 2. [`legalize_multi_axis_reduce`](crate::legalize_reduce::legalize_multi_axis_reduce)
+/// 3. [`rlx_fusion::unfuse_fused_for_autodiff`] — tier-2 fused ops → primitives
+/// 4. [`LowerDotGeneral`](rlx_fusion::LowerDotGeneral)
+/// 5. [`control_flow::inline_if`]
+/// 6. [`control_flow::unroll_while`]
+/// 7. [`inline_custom_fn_for_autodiff`]
+/// 8. [`convert_scans_for_ad`]
+///
+/// **Why `legalize_multi_axis_reduce` runs early** (step 2, before
+/// `unfuse_fused_for_autodiff`). The unfuse walker assumes every input
+/// is already mapped by the time its consumer is visited; a user-built
+/// `Op::Reduce { axes: [0, 1], .. }` in a custom loss head can leave
+/// a dangling `id_map[i]` lookup inside the unfuser. Decomposing
+/// multi-axis Reduce into a single-axis chain first keeps the walk in
+/// strict topo order and is a no-op for graphs that never used
+/// multi-axis reduce.
 pub fn prepare_graph_for_ad(g: Graph) -> Graph {
     use rlx_fusion::pass::Pass as _;
-    let g = rlx_fusion::UnfuseElementwiseRegions.run(g);
+    let g = rlx_fusion::DecomposeFusionRegions.run(g);
+    let g = rlx_fusion::UnfuseElementwiseRegions::FOR_CPU.run(g);
+    let g = crate::legalize_reduce::legalize_multi_axis_reduce(g);
     let g = rlx_fusion::unfuse_fused_for_autodiff(g);
     let g = rlx_fusion::LowerDotGeneral.run(g);
     let g = rlx_fusion::control_flow::inline_if(g);
     let g = rlx_fusion::control_flow::unroll_while(g);
     let g = inline_custom_fn_for_autodiff(g);
     let g = convert_scans_for_ad(g);
-    let g = crate::legalize_reduce::legalize_multi_axis_reduce(g);
     crate::fuse_splat::fuse_decomposed_gaussian_splat(g)
 }
 
@@ -132,6 +144,26 @@ pub fn grad_with_loss_module(module: GraphModule, wrt: &[NodeId]) -> Result<Grap
 pub fn jvp_module(module: GraphModule, tangent_for: &[NodeId]) -> Result<Graph, AutodiffError> {
     let mir = module_into_mir(module)?;
     Ok(crate::autodiff_fwd::jvp(mir.as_graph(), tangent_for))
+}
+
+/// Hessian-vector product module wrapper (`wrt` params get tangent inputs).
+pub fn hvp_module(module: GraphModule, wrt: &[NodeId]) -> Result<Graph, AutodiffError> {
+    let mir = module_into_mir(module)?;
+    Ok(crate::autodiff_fwd::hvp(mir.as_graph(), wrt))
+}
+
+/// Higher-order reverse-mode AD on a [`GraphModule`].
+pub fn nth_order_grad_module(
+    module: GraphModule,
+    wrt_name: &str,
+    order: usize,
+) -> Result<Graph, AutodiffError> {
+    let mir = module_into_mir(module)?;
+    Ok(crate::higher_order::nth_order_grad(
+        mir.as_graph(),
+        wrt_name,
+        order,
+    ))
 }
 
 fn module_into_mir(module: GraphModule) -> Result<MirModule, AutodiffError> {
@@ -206,6 +238,28 @@ mod tests {
             "backward graph should not retain fused ops"
         );
         assert!(bwd.outputs.len() >= 2);
+    }
+
+    #[test]
+    fn prepare_for_autodiff_decomposes_batch_elementwise_region() {
+        use rlx_fusion::fk_fusion::{FuseBatchPreprocess, MarkBatchSliceRegions};
+        use rlx_fusion::fk_graphs::batch_narrow_relu_primitive_graph;
+        let g = batch_narrow_relu_primitive_graph("batch_ad", 2, 3, 8, 8);
+        let fused = FuseBatchPreprocess.run(MarkBatchSliceRegions.run(g));
+        assert!(
+            fused
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::BatchElementwiseRegion { .. }))
+        );
+        let prep = prepare_graph_for_ad(fused);
+        assert!(
+            !prep
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::BatchElementwiseRegion { .. })),
+            "AD prep should decompose BatchElementwiseRegion"
+        );
     }
 
     #[test]

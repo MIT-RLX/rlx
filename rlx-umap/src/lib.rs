@@ -85,6 +85,9 @@ pub mod utils;
 #[cfg(feature = "full")]
 pub mod weights;
 
+#[cfg(all(feature = "optim", feature = "full"))]
+pub mod optim_adapter;
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_kernels;
 

@@ -1,6 +1,6 @@
 [package]
 name = "rlx-mlx"
-version                = "0.2.2"
+version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 description = "MLX backend for RLX — Apple's array framework via hand-rolled C++ shim, eager + lazy execution"
@@ -15,24 +15,23 @@ documentation.workspace = true
 
 [features]
 default = []
+cuda = ["rlx-mlx-sys/cuda"]
 
 [dependencies]
-rlx-mlx-sys = { path = "../rlx-mlx-sys", version = "0.2.2" }
-rlx-ir = { path = "../rlx-ir", version = "0.2.2" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.2" }
-rlx-gguf = { path = "../rlx-gguf", version = "0.2.1" }
-
-[target.'cfg(target_os = "macos")'.dependencies]
+rlx-mlx-sys = { path = "../rlx-mlx-sys", version = "0.2.4" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.4" }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.4" }
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.3", default-features = false, features = ["blas", "splat"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.4", default-features = false, features = ["blas", "splat"] }
 
 [lints]
 workspace = true
 
 [package.metadata.docs.rs]
 default-target = "aarch64-apple-darwin"
-targets        = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
-rustdoc-args   = ["--cfg", "docsrs"]
+targets        = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+rustdoc-args   = ["--cfg", "docsrs", "--cfg", "rlx_mlx_host"]
 all-features  = false

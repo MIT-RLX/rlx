@@ -44,7 +44,7 @@
 //! to `captures[i]` when inlined into the parent.
 
 use crate::pass::Pass;
-use rlx_ir::op::{BinaryOp, CmpOp, ReduceOp};
+use rlx_ir::op::BinaryOp;
 use rlx_ir::shape::Dim;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use std::collections::HashMap;
@@ -137,8 +137,10 @@ pub fn unroll_while(g: Graph) -> Graph {
                 let mut carried = new_inputs;
                 for _ in 0..*n {
                     let cond_out = inline_subgraph_into(cond, &carried, &mut out);
-                    let cond_f = cond_to_scalar_f32(cond_out, &mut out, &scalar_f32);
-                    active = out.binary(BinaryOp::Mul, active, cond_f, scalar_f32.clone());
+                    let cond_f = cond_to_f32_mask(cond_out, &mut out);
+                    let cond_shape = out.node(cond_f).shape.clone();
+                    let active_lhs = expand_to_shape(active, &cond_shape, &mut out);
+                    active = out.binary(BinaryOp::Mul, active_lhs, cond_f, cond_shape);
 
                     let body_outs = inline_subgraph_into_outputs(body, &carried, &mut out);
                     assert_eq!(
@@ -178,52 +180,24 @@ pub fn unroll_while(g: Graph) -> Graph {
     out
 }
 
-/// Fold a cond-subgraph output into a scalar f32 loop flag for `active`.
-/// Vector conds are reduced with min(nonzero) so every element must be
-/// truthy for the loop to keep running (matches treating 0 as false).
-fn cond_to_scalar_f32(cond_out: NodeId, out: &mut Graph, scalar_f32: &Shape) -> NodeId {
+/// Cast a cond-subgraph output to an f32 loop mask. Bool uses the
+/// Bool→I32→F32 chain because CPU `Cast` Bool→F32 is a raw byte copy.
+fn cond_to_f32_mask(cond_out: NodeId, out: &mut Graph) -> NodeId {
     let cond_shape = out.node(cond_out).shape.clone();
-    let n = cond_shape
-        .dims()
-        .iter()
-        .filter_map(|d| match d {
-            Dim::Static(n) => Some(*n),
-            _ => None,
-        })
-        .product::<usize>();
-    let as_f32 = if cond_shape.dtype() == DType::F32 {
-        cond_out
-    } else {
-        out.add_node(
+    match cond_shape.dtype() {
+        DType::F32 => cond_out,
+        DType::Bool => {
+            let f32_shape = cond_shape.clone().with_dtype(DType::F32);
+            let i32_shape = cond_shape.with_dtype(DType::I32);
+            let as_i32 = out.add_node(Op::Cast { to: DType::I32 }, vec![cond_out], i32_shape);
+            out.add_node(Op::Cast { to: DType::F32 }, vec![as_i32], f32_shape)
+        }
+        _ => out.add_node(
             Op::Cast { to: DType::F32 },
             vec![cond_out],
             cond_shape.with_dtype(DType::F32),
-        )
-    };
-    if n <= 1 {
-        return as_f32;
+        ),
     }
-    let as_f32_shape = out.node(as_f32).shape.clone();
-    let rank = as_f32_shape.rank();
-    let zero = out.add_node(
-        Op::Constant {
-            data: 0.0_f32.to_le_bytes().to_vec(),
-        },
-        vec![],
-        scalar_f32.clone(),
-    );
-    let nonzero = out.add_node(
-        Op::Compare(CmpOp::Ne),
-        vec![as_f32, zero],
-        as_f32_shape.clone().with_dtype(DType::Bool),
-    );
-    let nonzero_f = out.add_node(
-        Op::Cast { to: DType::F32 },
-        vec![nonzero],
-        as_f32_shape.with_dtype(DType::F32),
-    );
-    let axes: Vec<usize> = (0..rank).collect();
-    out.reduce(nonzero_f, ReduceOp::Min, axes, true, scalar_f32.clone())
 }
 
 /// Expand a tensor up to `target` via `Op::Expand` if its shape
@@ -482,5 +456,88 @@ mod tests {
             .filter(|n| matches!(n.op, Op::Where))
             .count();
         assert_eq!(n_where, 6, "expected 3 iters × 2 carries Where masks");
+    }
+
+    #[test]
+    fn unroll_while_squares_on_cpu_thunks() {
+        let s = Shape::new(&[2], DType::F32);
+        let mut body_g = Graph::new("body");
+        let bi = body_g.input("c", s.clone());
+        let bo = body_g.binary(BinaryOp::Mul, bi, bi, s.clone());
+        body_g.set_outputs(vec![bo]);
+        let mut cond_g = Graph::new("cond");
+        let ci = cond_g.input("c", s.clone());
+        cond_g.set_outputs(vec![ci]);
+
+        let mut g = Graph::new("while_test");
+        let x = g.input("x", s.clone());
+        let y = g.add_node(
+            Op::While {
+                cond: Box::new(cond_g),
+                body: Box::new(body_g),
+                max_iterations: Some(3),
+            },
+            vec![x],
+            s.clone(),
+        );
+        g.set_outputs(vec![y]);
+
+        let lowered = unroll_while(g);
+        assert!(
+            !lowered
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::While { .. }))
+        );
+
+        let x_id = lowered
+            .nodes()
+            .iter()
+            .find(|n| matches!(&n.op, Op::Input { name, .. } if name == "x"))
+            .expect("lowered graph missing input x")
+            .id;
+        let plan = rlx_opt::memory::plan_memory(&lowered);
+        let mut arena = rlx_cpu::arena::Arena::from_plan(plan);
+        let sched = rlx_cpu::thunk::compile_thunks(&lowered, &arena);
+        for node in lowered.nodes() {
+            if let Op::Constant { data } = &node.op
+                && arena.has_buffer(node.id)
+                && !data.is_empty()
+            {
+                let buf = arena.slice_mut(node.id);
+                let n_floats = data.len() / 4;
+                let n = buf.len().min(n_floats);
+                for i in 0..n {
+                    let bytes = [
+                        data[i * 4],
+                        data[i * 4 + 1],
+                        data[i * 4 + 2],
+                        data[i * 4 + 3],
+                    ];
+                    buf[i] = f32::from_le_bytes(bytes);
+                }
+            }
+        }
+        let x_off = arena.byte_offset(x_id);
+        let out_id = lowered.outputs[0];
+        let out_off = arena.byte_offset(out_id);
+        let buf = arena.raw_buf_mut();
+        unsafe {
+            let px = buf.as_mut_ptr().add(x_off) as *mut f32;
+            *px.add(0) = 2.0;
+            *px.add(1) = 3.0;
+        }
+        rlx_cpu::thunk::execute_thunks(&sched, arena.raw_buf_mut());
+        let got: Vec<f32> = unsafe {
+            let p = arena.raw_buf().as_ptr().add(out_off) as *const f32;
+            vec![*p.add(0), *p.add(1)]
+        };
+        let want = [256.0_f32, 6561.0_f32];
+        for (i, (&a, &b)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "unrolled while[{i}]: got {a} want {b}"
+            );
+        }
     }
 }

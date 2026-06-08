@@ -75,6 +75,14 @@ own the lowering for:
    into one `Op::ElementwiseRegion`. The lowering walks the chain
    inline (one HLO primitive sequence per region) instead of
    emitting intermediate materializations between every primitive.
+6. **FKL passes** (`apply_fk_passes`) — `MarkBatchSliceRegions`,
+   `MarkTransformRegions`, `FuseRegionPrologue`, `FuseBatchPreprocess`;
+   native `BatchElementwiseRegion` / `TransformRegion` are kept when
+   the backend supports them (default on TPU; override with
+   `RLX_NO_NATIVE_FK_REGIONS=1` or `RLX_DECOMPOSE_FUSION_REGIONS=1`).
+
+Orchestrated (splat) HLO segments use the same [`ir_passes::prepare_graph_for_hlo`]
+pipeline before per-segment lowering.
 
 We deliberately do **not** run `UnfuseElementwiseRegions` (that
 would undo step 5) and we don't run `AutoMixedPrecision` by default
@@ -90,6 +98,8 @@ Lowered to HLO directly:
   Silu via logistic + multiply, etc.)
 - All 7 BinaryOp + 6 CmpOp + Where (HLO `select`)
 - ElementwiseRegion (chain inlined as primitive HLO ops)
+- TransformRegion (`ResizeNearest2x` via broadcast+reshape)
+- BatchElementwiseRegion (per-slice chain + `concatenate` on axis 0)
 - MatMul (HLO `dot` with batch + contracting dim numbers),
   DotGeneral
 - LayerNorm / RmsNorm / FusedResidualLN (decomposed via reduce +

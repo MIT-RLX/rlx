@@ -18,7 +18,7 @@
 //!
 //! Higher-level graph lowering lives in [`rlx-mlx`](../rlx-mlx).
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub mod ffi;
 
 /// Ensures this crate is linked so `build.rs` native artifacts propagate.

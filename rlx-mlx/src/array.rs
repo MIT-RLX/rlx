@@ -30,6 +30,46 @@ pub struct Array {
 }
 
 impl Array {
+    /// Zero-copy view over host f32 data. The caller MUST keep the
+    /// underlying buffer alive (and not move it) until every dependent
+    /// MLX evaluation completes. The MLX runtime calls a no-op deleter
+    /// on the buffer, so leaking responsibility stays with the caller.
+    ///
+    /// Use case: training-loop params that live in a stable host-side
+    /// buffer (e.g. `ParamState::data`). Pairs with [`MlxExecutable`]'s
+    /// `params_view` storage which holds a `Vec<f32>` per param —
+    /// `set_param` memcpys into the Vec without reallocating (the Vec
+    /// is sized once at first use), then `run_compiled` constructs
+    /// the Array via this view.
+    ///
+    /// Only F32 is supported by the underlying shim. For F16/BF16
+    /// params, fall back to [`Self::from_f32_slice`].
+    ///
+    /// # Safety
+    /// `data.as_ptr()` must remain valid (no realloc, no drop) until
+    /// every dependent MLX evaluation completes. The caller must also
+    /// avoid mutating the buffer while MLX may still read from it.
+    pub unsafe fn from_f32_slice_view(data: &[f32], shape: &[usize]) -> Result<Self, MlxError> {
+        let shape_i: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
+        let mut out: *mut mlx_array_t = ptr::null_mut();
+        let nbytes = std::mem::size_of_val(data);
+        // SAFETY: the underlying `void*` constructor on the MLX side
+        // doesn't mutate the buffer for Param inputs (read-only in
+        // the forward graph); cast away const to satisfy the C signature.
+        let rc = unsafe {
+            ffi::rlx_mlx_array_from_data_view(
+                shape_i.as_ptr(),
+                shape_i.len(),
+                data.as_ptr() as *mut std::ffi::c_void,
+                nbytes,
+                ffi::MlxDtype::F32,
+                &mut out,
+            )
+        };
+        check(rc)?;
+        Ok(Self { ptr: out })
+    }
+
     /// Construct an MLX leaf from host f32 data, casting to `dtype`.
     pub fn from_f32_slice(data: &[f32], shape: &[usize], dtype: DType) -> Result<Self, MlxError> {
         let shape_i: Vec<i32> = shape.iter().map(|&d| d as i32).collect();

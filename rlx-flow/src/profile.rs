@@ -1,5 +1,17 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Compile profile — tier-1 config for fusion, passes, precision, backends.
 
@@ -154,6 +166,52 @@ impl CompileProfile {
         let data = std::fs::read_to_string(path)?;
         Self::from_toml_str(&data)
     }
+
+    /// Load `<family>.rlx.toml` from the directory containing
+    /// `weights`. Falls back to the built-in preset for `(family, mode)`
+    /// when the sidecar is missing or unreadable.
+    ///
+    /// Replaces the per-crate `*_profile_near_weights` helpers (one per
+    /// family today: `llama32_profile_near_weights`, `qwen3_profile_*`,
+    /// `gemma_profile_*`). New families only need to register their
+    /// built-in presets via [`Self::default_for`].
+    pub fn near_weights(weights: &std::path::Path, family: &str, mode: ProfileMode) -> Self {
+        let default = Self::default_for(family, mode);
+        let dir = weights
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let sidecar = dir.join(format!("{family}.rlx.toml"));
+        Self::from_toml_path(&sidecar).unwrap_or(default)
+    }
+
+    /// Built-in preset for `(family, mode)`. Unknown families fall back
+    /// to the Llama 3.2 presets — same behavior the per-crate helpers
+    /// used before this method existed.
+    pub fn default_for(family: &str, mode: ProfileMode) -> Self {
+        match (family, mode) {
+            ("llama32", ProfileMode::Prefill) => Self::llama32_prefill(),
+            ("llama32", ProfileMode::Decode) => Self::llama32_decode(),
+            ("qwen3", ProfileMode::Prefill) => Self::qwen3_prefill(),
+            ("qwen3", ProfileMode::Decode) => Self::qwen3_decode(),
+            ("qwen35", ProfileMode::Prefill) => Self::qwen35_prefill(),
+            ("qwen35", ProfileMode::Decode) => Self::qwen35_decode(),
+            ("gemma", ProfileMode::Prefill) => Self::gemma_prefill(),
+            ("gemma", ProfileMode::Decode) => Self::gemma_decode(),
+            (_, ProfileMode::Prefill) => Self::llama32_prefill(),
+            (_, ProfileMode::Decode) => Self::llama32_decode(),
+            (_, ProfileMode::Encoder) => Self::encoder(),
+        }
+    }
+}
+
+/// Whether the graph being compiled is a prefill, decode, or
+/// encoder-style pass. Selects the right built-in preset in
+/// [`CompileProfile::near_weights`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileMode {
+    Prefill,
+    Decode,
+    Encoder,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

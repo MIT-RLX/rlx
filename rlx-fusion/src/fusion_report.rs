@@ -15,7 +15,7 @@
 
 //! Fusion diagnostics — what fused, what missed, and why.
 
-use rlx_ir::op::{Activation, BinaryOp};
+use rlx_ir::op::{Activation, BinaryOp, RegionPrologue};
 use rlx_ir::{Graph, NodeId, Op, node_label};
 use std::fmt;
 
@@ -63,6 +63,9 @@ pub struct FusionReport {
     pub fused_attention_block: usize,
     pub fused_transformer_layer: usize,
     pub elementwise_region: usize,
+    pub transform_region: usize,
+    pub batch_elementwise_region: usize,
+    pub fk_prologue_region: usize,
     pub missed: Vec<MissedFusion>,
 }
 
@@ -89,6 +92,9 @@ impl FusionReport {
             fused_attention_block: after_stats.fused_attention_block,
             fused_transformer_layer: after_stats.fused_transformer_layer,
             elementwise_region: after_stats.elementwise_region,
+            transform_region: after_stats.transform_region,
+            batch_elementwise_region: after_stats.batch_elementwise_region,
+            fk_prologue_region: after_stats.fk_prologue_region,
             missed,
         }
     }
@@ -115,6 +121,9 @@ impl FusionReport {
             fused_attention_block: stats.fused_attention_block,
             fused_transformer_layer: stats.fused_transformer_layer,
             elementwise_region: stats.elementwise_region,
+            transform_region: stats.transform_region,
+            batch_elementwise_region: stats.batch_elementwise_region,
+            fk_prologue_region: stats.fk_prologue_region,
             missed,
         }
     }
@@ -141,7 +150,8 @@ impl FusionReport {
     pub fn summary_line(&self) -> String {
         format!(
             "nodes={}→{} matmul={}→{} fused_mm_act={} fused_swiglu={} \
-             elementwise_region={} missed_mm_act={} missed_swiglu={} missed_shared_mm={}",
+             elementwise_region={} transform_region={} batch_region={} fk_prologue={} \
+             missed_mm_act={} missed_swiglu={} missed_shared_mm={}",
             self.nodes_before,
             self.nodes_after,
             self.matmul_before,
@@ -149,6 +159,9 @@ impl FusionReport {
             self.fused_matmul_bias_act,
             self.fused_swiglu,
             self.elementwise_region,
+            self.transform_region,
+            self.batch_elementwise_region,
+            self.fk_prologue_region,
             self.missed_matmul_bias_act(),
             self.missed_swiglu(),
             self.missed_shared_matmul(),
@@ -193,6 +206,9 @@ struct OpCounts {
     fused_attention_block: usize,
     fused_transformer_layer: usize,
     elementwise_region: usize,
+    transform_region: usize,
+    batch_elementwise_region: usize,
+    fk_prologue_region: usize,
 }
 
 fn count_ops(graph: &Graph) -> OpCounts {
@@ -211,7 +227,14 @@ fn count_ops(graph: &Graph) -> OpCounts {
             Op::FusedResidualRmsNorm { .. } => s.fused_residual_rms_norm += 1,
             Op::FusedAttentionBlock { .. } => s.fused_attention_block += 1,
             Op::FusedTransformerLayer { .. } => s.fused_transformer_layer += 1,
-            Op::ElementwiseRegion { .. } => s.elementwise_region += 1,
+            Op::ElementwiseRegion { prologue, .. } => {
+                s.elementwise_region += 1;
+                if *prologue != RegionPrologue::None {
+                    s.fk_prologue_region += 1;
+                }
+            }
+            Op::TransformRegion { .. } => s.transform_region += 1,
+            Op::BatchElementwiseRegion { .. } => s.batch_elementwise_region += 1,
             _ => {}
         }
     }

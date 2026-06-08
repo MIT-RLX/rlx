@@ -26,84 +26,7 @@ use std::collections::HashMap;
 
 // ── Helper: graph rewriter ──────────────────────────────────────────────
 
-/// Maps old NodeIds to new NodeIds during graph rewriting.
-struct Rewriter {
-    new_graph: Graph,
-    id_map: HashMap<NodeId, NodeId>,
-}
-
-impl Rewriter {
-    fn new(name: &str) -> Self {
-        Self {
-            new_graph: Graph::new(name),
-            id_map: HashMap::new(),
-        }
-    }
-
-    /// Map an old NodeId to its new equivalent.
-    fn map(&self, old: NodeId) -> NodeId {
-        self.id_map[&old]
-    }
-
-    /// Map a list of old NodeIds.
-    fn map_inputs(&self, old_inputs: &[NodeId]) -> Vec<NodeId> {
-        old_inputs.iter().map(|id| self.map(*id)).collect()
-    }
-
-    /// True iff every old NodeId in `ids` has already been mapped — used by fusion
-    /// patterns to gate a rewrite on its inputs being live in the new graph.
-    #[allow(dead_code)]
-    fn all_mapped(&self, ids: &[NodeId]) -> bool {
-        ids.iter().all(|id| self.id_map.contains_key(id))
-    }
-
-    /// Copy any not-yet-mapped nodes from `old` so fusion rewrites can
-    /// reference operands declared later in the source graph (e.g. a bias
-    /// param appended after its matmul consumer, or a reshape input that
-    /// has not been reached in the linear rewrite walk yet).
-    fn ensure_mapped(&mut self, old: &Graph, ids: &[NodeId]) {
-        for &id in ids {
-            if self.id_map.contains_key(&id) {
-                continue;
-            }
-            let node = old.node(id);
-            if !node.inputs.is_empty() {
-                self.ensure_mapped(old, &node.inputs);
-            }
-            self.copy_node(node);
-        }
-    }
-
-    /// Copy a node from the old graph, remapping inputs.
-    fn copy_node(&mut self, node: &Node) -> NodeId {
-        let new_inputs = self.map_inputs(&node.inputs);
-        let new_id = self
-            .new_graph
-            .add_node(node.op.clone(), new_inputs, node.shape.clone());
-        let new_node = self.new_graph.node_mut(new_id);
-        new_node.name = node.name.clone();
-        new_node.origin = node.origin.clone();
-        self.id_map.insert(node.id, new_id);
-        new_id
-    }
-
-    /// Add a new fused node (not from the old graph).
-    fn add_fused(&mut self, op: Op, old_inputs: &[NodeId], shape: Shape) -> NodeId {
-        let new_inputs: Vec<NodeId> = old_inputs.iter().map(|id| self.map(*id)).collect();
-        self.new_graph.add_node(op, new_inputs, shape)
-    }
-
-    /// Mark an old node as replaced by a new node.
-    fn replace(&mut self, old_id: NodeId, new_id: NodeId) {
-        self.id_map.insert(old_id, new_id);
-    }
-
-    fn finish(mut self, old_outputs: &[NodeId]) -> Graph {
-        let new_outputs = old_outputs.iter().map(|id| self.map(*id)).collect();
-        self.new_graph.set_outputs(new_outputs);
-        self.new_graph
-    }
-}
+use crate::graph_rewrite::Rewriter;
 
 // ── Pass 1: MatMul + Bias + Activation → FusedMatMulBiasAct ─────────────
 
@@ -891,10 +814,12 @@ pub struct FuseAttentionBlock;
 
 impl FuseAttentionBlock {
     /// Check if the graph has small enough inputs to benefit from fusion.
-    /// Currently unused — `Pass::run` is a no-op since attention fusion
-    /// happens at thunk-compile time, not graph-rewrite time. Kept here
-    /// for the planned graph-level rewrite path.
-    #[allow(dead_code)]
+    ///
+    /// Returns `true` when any 2-D+ input has `dim(0) * dim(1) ≤ threshold`,
+    /// where `threshold` defaults to 64 (overridable via
+    /// `RLX_FUSE_ATTN_THRESHOLD`). The cutoff matches the L1-cache budget for
+    /// keeping Q/K/V resident on CPU and reflects the dispatch-overhead
+    /// crossover for small-batch BERT-family encoders on GPU backends.
     fn should_fuse(graph: &Graph) -> bool {
         let threshold: usize = rlx_ir::env::var("RLX_FUSE_ATTN_THRESHOLD")
             .and_then(|v| v.parse().ok())
@@ -918,16 +843,545 @@ impl FuseAttentionBlock {
     }
 }
 
+/// Match a single producer node id that produces a tensor consumed by `narrow`.
+fn narrow_parent(node: &Node) -> Option<(NodeId, usize, usize, usize)> {
+    match &node.op {
+        Op::Narrow { axis, start, len } => Some((node.inputs[0], *axis, *start, *len)),
+        _ => None,
+    }
+}
+
+/// Match `FusedMatMulBiasAct{activation: None}` and return its (input, weight, bias) tuple.
+fn fused_mm_bias_none(node: &Node) -> Option<(NodeId, NodeId, NodeId)> {
+    if let Op::FusedMatMulBiasAct { activation: None } = &node.op
+        && node.inputs.len() == 3
+    {
+        return Some((node.inputs[0], node.inputs[1], node.inputs[2]));
+    }
+    None
+}
+
 impl Pass for FuseAttentionBlock {
     fn name(&self) -> &str {
         "fuse_attention_block"
     }
 
     fn run(&self, graph: Graph) -> Graph {
-        // Attention block fusion is done at the thunk level (compile_thunks)
-        // instead of the graph level, to avoid complex Rewriter issues.
-        // This pass is a no-op; the thunk compiler handles it directly.
-        graph
+        // Bail when graph input shape is too large to benefit (the L1-resident
+        // / single-dispatch win disappears once Q/K/V no longer fit on-chip).
+        if !Self::should_fuse(&graph) {
+            return graph;
+        }
+
+        // We rewrite the chain
+        //   hidden ─ FusedMatMulBiasAct(qkv_w, qkv_b) ─ narrow×3 ─ Attention(mask) ─ FusedMatMulBiasAct(out_w, out_b)
+        // into a single `Op::FusedAttentionBlock { has_bias: true, has_rope: false }`.
+        //
+        // Pattern preconditions:
+        //   * QKV producer's only consumers are the three narrows (and not a graph
+        //     output) — otherwise we'd duplicate compute on un-fuse.
+        //   * Each narrow has exactly one consumer (the attention).
+        //   * The attention has `MaskKind::Custom` (caller-supplied mask tensor).
+        //   * The attention's only consumer is the OutProj `FusedMatMulBiasAct`.
+        //   * The OutProj is not a graph output of an *intermediate* block (i.e.
+        //     fusing it is safe — its result is the layer's actual output).
+        //
+        // When any precondition fails we fall back to copying the chain through.
+
+        let mut is_output: HashMap<NodeId, ()> = HashMap::new();
+        for &oid in &graph.outputs {
+            is_output.insert(oid, ());
+        }
+
+        // Pre-scan: for each Attention with Custom mask, decide whether the
+        // surrounding chain matches. If yes, record the IDs that get folded away.
+        struct Match {
+            attn_id: NodeId,
+            qkv_mm_id: NodeId,
+            out_mm_id: NodeId,
+            narrows: [NodeId; 3],
+            hidden_id: NodeId,
+            qkv_w: NodeId,
+            qkv_b: NodeId,
+            out_w: NodeId,
+            out_b: NodeId,
+            mask: NodeId,
+            num_heads: usize,
+            head_dim: usize,
+            out_shape: Shape,
+        }
+        let mut matches: Vec<Match> = Vec::new();
+        let mut fused_away: HashMap<NodeId, ()> = HashMap::new();
+
+        for node in graph.nodes() {
+            let Op::Attention {
+                num_heads,
+                head_dim,
+                mask_kind,
+                score_scale,
+                attn_logit_softcap,
+            } = &node.op
+            else {
+                continue;
+            };
+            // Only the BERT-style mask form (caller-supplied [B, S] tensor),
+            // no score scale tweaks, no soft-cap.
+            if !matches!(mask_kind, MaskKind::Custom)
+                || score_scale.is_some()
+                || attn_logit_softcap.is_some()
+                || node.inputs.len() != 4
+            {
+                continue;
+            }
+            let (q, k, v, mask) = (
+                node.inputs[0],
+                node.inputs[1],
+                node.inputs[2],
+                node.inputs[3],
+            );
+
+            // All three of Q, K, V must be Narrows on the same parent at
+            // start=0,h,2h with len=h on the last (innermost) axis.
+            let qn = graph.node(q);
+            let kn = graph.node(k);
+            let vn = graph.node(v);
+            let (qp, q_axis, q_start, q_len) = match narrow_parent(qn) {
+                Some(p) => p,
+                None => continue,
+            };
+            let (kp, k_axis, k_start, k_len) = match narrow_parent(kn) {
+                Some(p) => p,
+                None => continue,
+            };
+            let (vp, v_axis, v_start, v_len) = match narrow_parent(vn) {
+                Some(p) => p,
+                None => continue,
+            };
+            if qp != kp || kp != vp {
+                continue;
+            }
+            let h = num_heads * head_dim;
+            let parent_rank = graph.node(qp).shape.rank();
+            let last_ax = parent_rank.saturating_sub(1);
+            if q_axis != last_ax || k_axis != last_ax || v_axis != last_ax {
+                continue;
+            }
+            if q_len != h || k_len != h || v_len != h {
+                continue;
+            }
+            if q_start != 0 || k_start != h || v_start != 2 * h {
+                continue;
+            }
+            // Narrows must be single-consumer to be safely consumed.
+            if graph.use_count(q) != 1
+                || graph.use_count(k) != 1
+                || graph.use_count(v) != 1
+                || is_output.contains_key(&q)
+                || is_output.contains_key(&k)
+                || is_output.contains_key(&v)
+            {
+                continue;
+            }
+
+            // Parent must be FusedMatMulBiasAct (post-FuseMatMulBiasAct shape).
+            let qkv_mm_node = graph.node(qp);
+            let (hidden_id, qkv_w, qkv_b) = match fused_mm_bias_none(qkv_mm_node) {
+                Some(t) => t,
+                None => continue,
+            };
+            // The QKV MM must have exactly the three narrows as consumers and
+            // must not be a graph output itself.
+            if graph.use_count(qp) != 3 || is_output.contains_key(&qp) {
+                continue;
+            }
+
+            // Find the OutProj consumer of the Attention.
+            if graph.use_count(node.id) != 1 || is_output.contains_key(&node.id) {
+                continue;
+            }
+            let out_consumer_id = match graph
+                .nodes()
+                .iter()
+                .find(|n| n.inputs.contains(&node.id))
+                .map(|n| n.id)
+            {
+                Some(id) => id,
+                None => continue,
+            };
+            let out_mm_node = graph.node(out_consumer_id);
+            let (out_in, out_w, out_b) = match fused_mm_bias_none(out_mm_node) {
+                Some(t) if t.0 == node.id => t,
+                _ => continue,
+            };
+            let _ = out_in;
+
+            // All checks passed — record the match.
+            matches.push(Match {
+                attn_id: node.id,
+                qkv_mm_id: qp,
+                out_mm_id: out_consumer_id,
+                narrows: [q, k, v],
+                hidden_id,
+                qkv_w,
+                qkv_b,
+                out_w,
+                out_b,
+                mask,
+                num_heads: *num_heads,
+                head_dim: *head_dim,
+                out_shape: out_mm_node.shape.clone(),
+            });
+            fused_away.insert(qp, ());
+            fused_away.insert(q, ());
+            fused_away.insert(k, ());
+            fused_away.insert(v, ());
+            fused_away.insert(node.id, ());
+            fused_away.insert(out_consumer_id, ());
+        }
+
+        if matches.is_empty() {
+            return graph;
+        }
+
+        // Index matches by the out-projection node id so we can swap it in-place.
+        let mut by_out: HashMap<NodeId, &Match> = HashMap::new();
+        for m in &matches {
+            by_out.insert(m.out_mm_id, m);
+        }
+
+        let mut rw = Rewriter::new(&graph.name);
+        for node in graph.nodes() {
+            if fused_away.contains_key(&node.id) {
+                if let Some(m) = by_out.get(&node.id) {
+                    // Make sure all referenced inputs are already in the new graph.
+                    rw.ensure_mapped(
+                        &graph,
+                        &[m.hidden_id, m.qkv_w, m.out_w, m.mask, m.qkv_b, m.out_b],
+                    );
+                    let fused_id = rw.add_fused(
+                        Op::FusedAttentionBlock {
+                            num_heads: m.num_heads,
+                            head_dim: m.head_dim,
+                            has_bias: true,
+                            has_rope: false,
+                        },
+                        &[m.hidden_id, m.qkv_w, m.out_w, m.mask, m.qkv_b, m.out_b],
+                        m.out_shape.clone(),
+                    );
+                    // Wire every old chain node to the new fused id so any
+                    // downstream consumer (residual add, LN, etc.) picks it up.
+                    rw.replace(m.qkv_mm_id, fused_id);
+                    rw.replace(m.narrows[0], fused_id);
+                    rw.replace(m.narrows[1], fused_id);
+                    rw.replace(m.narrows[2], fused_id);
+                    rw.replace(m.attn_id, fused_id);
+                    rw.replace(node.id, fused_id);
+                }
+                continue;
+            }
+            rw.copy_node(node);
+        }
+        rw.finish(&graph.outputs)
+    }
+}
+
+// ── Pass 5b: Full BERT layer → FusedTransformerLayer ────────────────────
+
+/// Fuses an entire BERT-style transformer layer (attention block + residual+LN +
+/// FFN + residual+LN) into one [`Op::FusedTransformerLayer`] node.
+///
+/// Pattern (after [`FuseMatMulBiasAct`], [`FuseResidualLN`], and
+/// [`FuseAttentionBlock`] have run — order matters):
+///
+/// ```text
+///   skip ──┬─→ FusedAttentionBlock(qkv_w, out_w, mask, qkv_b, out_b) ─→ attn_out
+///          └─→ FusedResidualLN(attn_out, skip, ln1_g, ln1_b) ─→ h1
+///                                                                ├─→ FusedMatMulBiasAct(fc1_w, fc1_b, GeLU) ─→ ffn_int
+///                                                                │                                              ↓
+///                                                                │           FusedMatMulBiasAct(fc2_w, fc2_b, None) ─→ ffn_out
+///                                                                └────────────────────→ FusedResidualLN(ffn_out, h1, ln2_g, ln2_b) ─→ out
+/// ```
+///
+/// All five nodes collapse into a single `FusedTransformerLayer { num_heads,
+/// head_dim, intermediate_size, eps1, eps2, activation, has_bias: true }`
+/// with the 14-input layout consumed by `rlx-mlx`'s lowering at
+/// `rlx-mlx/src/lower.rs:1528`:
+/// `[hidden, qkv_w, qkv_b, out_w, out_b, ln1_g, ln1_b, fc1_w, fc1_b, fc2_w, fc2_b, ln2_g, ln2_b, mask]`.
+///
+/// Threshold is the same as [`FuseAttentionBlock`] (`RLX_FUSE_ATTN_THRESHOLD`,
+/// default 64). Backends that don't natively support `FusedTransformerLayer`
+/// un-fuse it back to primitives at compile time; backends that do (MLX) can
+/// emit one monolithic kernel per layer.
+pub struct FuseTransformerLayer;
+
+impl FuseTransformerLayer {
+    fn should_fuse(graph: &Graph) -> bool {
+        // Same gate as FuseAttentionBlock — single-source of truth for
+        // "this graph is small enough for L1-resident block fusion".
+        FuseAttentionBlock::should_fuse(graph)
+    }
+}
+
+/// Match `FusedResidualLN { has_bias: false }` and return `(x, residual, gamma, beta, eps)`.
+fn fused_residual_ln_no_bias(node: &Node) -> Option<(NodeId, NodeId, NodeId, NodeId, f32)> {
+    if let Op::FusedResidualLN {
+        has_bias: false,
+        eps,
+    } = &node.op
+        && node.inputs.len() == 4
+    {
+        return Some((
+            node.inputs[0],
+            node.inputs[1],
+            node.inputs[2],
+            node.inputs[3],
+            *eps,
+        ));
+    }
+    None
+}
+
+/// Match `FusedMatMulBiasAct { activation: Some(a) }` and return `(input, weight, bias, activation)`.
+fn fused_mm_bias_act(node: &Node) -> Option<(NodeId, NodeId, NodeId, Activation)> {
+    if let Op::FusedMatMulBiasAct {
+        activation: Some(a),
+    } = &node.op
+        && node.inputs.len() == 3
+    {
+        return Some((node.inputs[0], node.inputs[1], node.inputs[2], *a));
+    }
+    None
+}
+
+/// Match `FusedAttentionBlock { has_bias: true, has_rope: false }` BERT shape.
+fn fused_attn_block_bert(
+    node: &Node,
+) -> Option<(usize, usize, NodeId, NodeId, NodeId, NodeId, NodeId, NodeId)> {
+    if let Op::FusedAttentionBlock {
+        num_heads,
+        head_dim,
+        has_bias: true,
+        has_rope: false,
+    } = &node.op
+        && node.inputs.len() == 6
+    {
+        // [hidden, qkv_w, out_w, mask, qkv_b, out_b]
+        return Some((
+            *num_heads,
+            *head_dim,
+            node.inputs[0],
+            node.inputs[1],
+            node.inputs[2],
+            node.inputs[3],
+            node.inputs[4],
+            node.inputs[5],
+        ));
+    }
+    None
+}
+
+impl Pass for FuseTransformerLayer {
+    fn name(&self) -> &str {
+        "fuse_transformer_layer"
+    }
+
+    fn run(&self, graph: Graph) -> Graph {
+        if !Self::should_fuse(&graph) {
+            return graph;
+        }
+
+        // Graph-output guard: any intermediate we'd absorb must not be an
+        // explicit output, otherwise a downstream caller would see the
+        // collapsed result instead of the per-stage tensor it expects.
+        let mut is_output: HashMap<NodeId, ()> = HashMap::new();
+        for &oid in &graph.outputs {
+            is_output.insert(oid, ());
+        }
+
+        struct LayerMatch {
+            attn_id: NodeId,
+            ln1_id: NodeId,
+            fc1_id: NodeId,
+            fc2_id: NodeId,
+            ln2_id: NodeId,
+            inputs: [NodeId; 14],
+            num_heads: usize,
+            head_dim: usize,
+            intermediate_size: usize,
+            eps1: f32,
+            eps2: f32,
+            activation: Activation,
+            out_shape: Shape,
+        }
+
+        let mut matches: Vec<LayerMatch> = Vec::new();
+        let mut fused_away: HashMap<NodeId, ()> = HashMap::new();
+
+        for node in graph.nodes() {
+            // Anchor on each FusedAttentionBlock — every BERT layer starts here.
+            let Some((num_heads, head_dim, hidden_id, qkv_w, out_w, mask, qkv_b, out_b)) =
+                fused_attn_block_bert(node)
+            else {
+                continue;
+            };
+            let attn_id = node.id;
+            // Attention's only consumer must be the post-attn FusedResidualLN.
+            if graph.use_count(attn_id) != 1 || is_output.contains_key(&attn_id) {
+                continue;
+            }
+            let ln1_id = match graph
+                .nodes()
+                .iter()
+                .find(|n| n.inputs.contains(&attn_id))
+                .map(|n| n.id)
+            {
+                Some(id) => id,
+                None => continue,
+            };
+            let ln1_node = graph.node(ln1_id);
+            let Some((ln1_x, ln1_res, ln1_g, ln1_b, eps1)) = fused_residual_ln_no_bias(ln1_node)
+            else {
+                continue;
+            };
+            // Order in the residual+LN: x = attn_out, residual = skip (= hidden).
+            if ln1_x != attn_id || ln1_res != hidden_id {
+                continue;
+            }
+            // h1 must have exactly 2 consumers (FFN.1 input AND ln2 residual).
+            if graph.use_count(ln1_id) != 2 || is_output.contains_key(&ln1_id) {
+                continue;
+            }
+
+            // Find FFN.1: FusedMatMulBiasAct(h1, fc1_w, fc1_b) with GeLU.
+            let mut fc1_candidate: Option<NodeId> = None;
+            let mut ln2_candidate: Option<NodeId> = None;
+            for cn in graph.nodes() {
+                if !cn.inputs.contains(&ln1_id) {
+                    continue;
+                }
+                if fused_mm_bias_act(cn).is_some() && cn.inputs[0] == ln1_id {
+                    fc1_candidate = Some(cn.id);
+                } else if fused_residual_ln_no_bias(cn).is_some() && cn.inputs[1] == ln1_id {
+                    ln2_candidate = Some(cn.id);
+                }
+            }
+            let (Some(fc1_id), Some(ln2_id)) = (fc1_candidate, ln2_candidate) else {
+                continue;
+            };
+            let fc1_node = graph.node(fc1_id);
+            let Some((_, fc1_w, fc1_b, activation)) = fused_mm_bias_act(fc1_node) else {
+                continue;
+            };
+            // FFN.1 output → FFN.2 (single consumer).
+            if graph.use_count(fc1_id) != 1 || is_output.contains_key(&fc1_id) {
+                continue;
+            }
+            let fc2_id = match graph
+                .nodes()
+                .iter()
+                .find(|n| n.inputs.contains(&fc1_id))
+                .map(|n| n.id)
+            {
+                Some(id) => id,
+                None => continue,
+            };
+            let fc2_node = graph.node(fc2_id);
+            // FFN.2 must be FusedMatMulBiasAct with activation=None.
+            let Some((fc2_in, fc2_w, fc2_b)) = fused_mm_bias_none(fc2_node) else {
+                continue;
+            };
+            if fc2_in != fc1_id {
+                continue;
+            }
+            if graph.use_count(fc2_id) != 1 || is_output.contains_key(&fc2_id) {
+                continue;
+            }
+            // Final residual+LN: x = ffn_out, residual = h1, gamma/beta + eps2.
+            let ln2_node = graph.node(ln2_id);
+            let Some((ln2_x, ln2_res, ln2_g, ln2_b, eps2)) = fused_residual_ln_no_bias(ln2_node)
+            else {
+                continue;
+            };
+            if ln2_x != fc2_id || ln2_res != ln1_id {
+                continue;
+            }
+            // intermediate_size from fc1_w (`[H, intermediate_size]`).
+            let intermediate_size = {
+                let s = &graph.node(fc1_w).shape;
+                if s.rank() != 2 {
+                    continue;
+                }
+                let d = s.dim(s.rank() - 1);
+                if !d.is_static() {
+                    continue;
+                }
+                d.unwrap_static()
+            };
+
+            matches.push(LayerMatch {
+                attn_id,
+                ln1_id,
+                fc1_id,
+                fc2_id,
+                ln2_id,
+                inputs: [
+                    hidden_id, qkv_w, qkv_b, out_w, out_b, ln1_g, ln1_b, fc1_w, fc1_b, fc2_w,
+                    fc2_b, ln2_g, ln2_b, mask,
+                ],
+                num_heads,
+                head_dim,
+                intermediate_size,
+                eps1,
+                eps2,
+                activation,
+                out_shape: ln2_node.shape.clone(),
+            });
+            fused_away.insert(attn_id, ());
+            fused_away.insert(ln1_id, ());
+            fused_away.insert(fc1_id, ());
+            fused_away.insert(fc2_id, ());
+            fused_away.insert(ln2_id, ());
+        }
+
+        if matches.is_empty() {
+            return graph;
+        }
+
+        // Index by ln2 (the layer's terminal node) so we know when to emit.
+        let mut by_terminal: HashMap<NodeId, &LayerMatch> = HashMap::new();
+        for m in &matches {
+            by_terminal.insert(m.ln2_id, m);
+        }
+
+        let mut rw = Rewriter::new(&graph.name);
+        for node in graph.nodes() {
+            if fused_away.contains_key(&node.id) {
+                if let Some(m) = by_terminal.get(&node.id) {
+                    rw.ensure_mapped(&graph, &m.inputs);
+                    let fused_id = rw.add_fused(
+                        Op::FusedTransformerLayer {
+                            num_heads: m.num_heads,
+                            head_dim: m.head_dim,
+                            intermediate_size: m.intermediate_size,
+                            eps1: m.eps1,
+                            eps2: m.eps2,
+                            activation: m.activation,
+                            has_bias: true,
+                        },
+                        &m.inputs,
+                        m.out_shape.clone(),
+                    );
+                    rw.replace(m.attn_id, fused_id);
+                    rw.replace(m.ln1_id, fused_id);
+                    rw.replace(m.fc1_id, fused_id);
+                    rw.replace(m.fc2_id, fused_id);
+                    rw.replace(node.id, fused_id);
+                }
+                continue;
+            }
+            rw.copy_node(node);
+        }
+        rw.finish(&graph.outputs)
     }
 }
 
@@ -1252,6 +1706,8 @@ impl Pass for MarkElementwiseRegions {
                             num_inputs: external_inputs.len() as u32,
                             scalar_input_mask,
                             input_modulus,
+                            prologue: RegionPrologue::None,
+                            prologue_input: 0,
                         },
                         &external_inputs,
                         graph.node(tail).shape.clone(),
@@ -1301,7 +1757,22 @@ impl Pass for MarkElementwiseRegions {
 // the backend's own lowering. No-op when the graph contains no
 // ElementwiseRegion nodes.
 
-pub struct UnfuseElementwiseRegions;
+pub struct UnfuseElementwiseRegions {
+    /// When false, `ElementwiseRegion` nodes with an FKL prologue are kept
+    /// for native GPU region kernels; when true (CPU), they decompose too.
+    pub unfuse_prologue: bool,
+}
+
+impl UnfuseElementwiseRegions {
+    /// GPU / Metal / CUDA / wgpu: unfuse plain regions, keep resize prologue.
+    pub const FOR_GPU: UnfuseElementwiseRegions = UnfuseElementwiseRegions {
+        unfuse_prologue: false,
+    };
+    /// CPU: decompose every region (no native region executor).
+    pub const FOR_CPU: UnfuseElementwiseRegions = UnfuseElementwiseRegions {
+        unfuse_prologue: true,
+    };
+}
 
 impl Pass for UnfuseElementwiseRegions {
     fn name(&self) -> &str {
@@ -1324,11 +1795,37 @@ impl Pass for UnfuseElementwiseRegions {
                 num_inputs: _,
                 scalar_input_mask: _,
                 input_modulus: _,
+                prologue,
+                prologue_input: _,
             } = &node.op
             {
-                // Region inputs (in the new graph) — the rewriter has
-                // already mapped each old input id.
-                let region_inputs: Vec<NodeId> = node.inputs.iter().map(|id| rw.map(*id)).collect();
+                if *prologue != RegionPrologue::None && !self.unfuse_prologue {
+                    rw.copy_node(node);
+                    continue;
+                }
+                let mut region_inputs: Vec<NodeId> =
+                    node.inputs.iter().map(|id| rw.map(*id)).collect();
+                if *prologue == RegionPrologue::ResizeNearest2x {
+                    let in_shape = rw.new_graph.node(region_inputs[0]).shape.clone();
+                    let out_shape = if in_shape.rank() == 4 {
+                        Shape::new(
+                            &[
+                                in_shape.dim(0).unwrap_static(),
+                                in_shape.dim(1).unwrap_static(),
+                                in_shape.dim(2).unwrap_static() * 2,
+                                in_shape.dim(3).unwrap_static() * 2,
+                            ],
+                            in_shape.dtype(),
+                        )
+                    } else {
+                        node.shape.clone()
+                    };
+                    region_inputs[0] = rw.new_graph.add_node(
+                        Op::ResizeNearest2x,
+                        vec![region_inputs[0]],
+                        out_shape,
+                    );
+                }
                 let mut step_ids: Vec<NodeId> = Vec::with_capacity(chain.len());
                 let region_shape = node.shape.clone();
                 let region_dims: Vec<_> = region_shape.dims().to_vec();
@@ -1523,6 +2020,8 @@ pub fn clip_elementwise_regions(graph: Graph, limits: crate::limits::FusionLimit
             num_inputs: _,
             scalar_input_mask: _,
             input_modulus: _,
+            prologue: _,
+            prologue_input: _,
         } = &node.op
         else {
             unreachable!();
@@ -2311,7 +2810,7 @@ mod tests {
                 .any(|n| matches!(n.op, Op::ElementwiseRegion { .. }))
         );
 
-        let unfused = UnfuseElementwiseRegions.run(fused);
+        let unfused = UnfuseElementwiseRegions::FOR_CPU.run(fused);
         // No region nodes left.
         assert!(
             !unfused
@@ -2352,6 +2851,8 @@ mod tests {
                 num_inputs: 1,
                 scalar_input_mask: 0,
                 input_modulus: [0; 16],
+                prologue: RegionPrologue::None,
+                prologue_input: 0,
             },
             vec![x],
             f32_shape(&[4]),
@@ -2377,7 +2878,7 @@ mod tests {
         let r = g.activation(Activation::Relu, a, Shape::new(&[4], f));
         g.set_outputs(vec![r]);
         let n_before = g.len();
-        let result = UnfuseElementwiseRegions.run(g);
+        let result = UnfuseElementwiseRegions::FOR_CPU.run(g);
         // Pass returns unchanged graph (early return on no-region check).
         assert_eq!(result.len(), n_before);
     }
@@ -2432,7 +2933,7 @@ mod tests {
         let add = g.binary(BinaryOp::Add, sel, a, s.clone());
         g.set_outputs(vec![add]);
         let fused = MarkElementwiseRegions.run(g);
-        let unfused = UnfuseElementwiseRegions.run(fused);
+        let unfused = UnfuseElementwiseRegions::FOR_CPU.run(fused);
         let where_count = unfused
             .nodes()
             .iter()
@@ -2442,5 +2943,328 @@ mod tests {
             where_count, 1,
             "decomposer should re-emit one Op::Where for the chain step"
         );
+    }
+
+    /// Synthetic BERT attention block: input [B,S,H] → QKV proj (matmul+bias) →
+    /// narrow×3 → Attention(mask) → OutProj (matmul+bias) → output [B,S,H].
+    /// Runs FuseMatMulBiasAct then FuseAttentionBlock and asserts collapse.
+    #[test]
+    fn fuse_attention_block_collapses_qkv_attn_outproj() {
+        let nh: usize = 4;
+        let dh: usize = 8;
+        let h: usize = nh * dh; // 32
+        let b: usize = 1;
+        let s: usize = 4; // tiny — keep b*s ≤ 64 so should_fuse fires
+
+        let mut g = Graph::new("attn-block");
+        let hidden = g.input("hidden", f32_shape(&[b, s, h]));
+        let mask = g.input("attention_mask", f32_shape(&[b, s]));
+
+        // QKV projection (matmul + bias).
+        let qkv_w = g.param("qkv_w", f32_shape(&[h, 3 * h]));
+        let qkv_b = g.param("qkv_b", f32_shape(&[3 * h]));
+        let qkv_mm = g.matmul(hidden, qkv_w, f32_shape(&[b, s, 3 * h]));
+        let qkv = g.binary(BinaryOp::Add, qkv_mm, qkv_b, f32_shape(&[b, s, 3 * h]));
+
+        // Three narrows on the innermost axis.
+        let q = g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start: 0,
+                len: h,
+            },
+            vec![qkv],
+            f32_shape(&[b, s, h]),
+        );
+        let k = g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start: h,
+                len: h,
+            },
+            vec![qkv],
+            f32_shape(&[b, s, h]),
+        );
+        let v = g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start: 2 * h,
+                len: h,
+            },
+            vec![qkv],
+            f32_shape(&[b, s, h]),
+        );
+
+        // Attention with custom (input) mask.
+        let attn = g.attention(q, k, v, mask, nh, dh, f32_shape(&[b, s, h]));
+
+        // OutProj (matmul + bias).
+        let out_w = g.param("out_w", f32_shape(&[h, h]));
+        let out_b = g.param("out_b", f32_shape(&[h]));
+        let out_mm = g.matmul(attn, out_w, f32_shape(&[b, s, h]));
+        let out = g.binary(BinaryOp::Add, out_mm, out_b, f32_shape(&[b, s, h]));
+        g.set_outputs(vec![out]);
+
+        // Step 1: FuseMatMulBiasAct collapses each matmul+bias into one node.
+        let fused1 = FuseMatMulBiasAct.run(g);
+        let mm_bias_count = fused1
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::FusedMatMulBiasAct { activation: None }))
+            .count();
+        assert_eq!(mm_bias_count, 2, "QKV + OutProj should each fuse");
+
+        // Step 2: FuseAttentionBlock collapses QKV-MM → narrow×3 → Attention → OutProj-MM
+        // into one FusedAttentionBlock node.
+        let fused2 = FuseAttentionBlock.run(fused1);
+        let fab_count = fused2
+            .nodes()
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.op,
+                    Op::FusedAttentionBlock {
+                        has_bias: true,
+                        has_rope: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            fab_count, 1,
+            "should produce exactly one FusedAttentionBlock"
+        );
+
+        // No stray Narrow / Attention / FusedMatMulBiasAct should remain from
+        // the collapsed chain.
+        let narrow_count = fused2
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Narrow { .. }))
+            .count();
+        let attention_count = fused2
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Attention { .. }))
+            .count();
+        let mm_bias_remaining = fused2
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::FusedMatMulBiasAct { .. }))
+            .count();
+        assert_eq!(narrow_count, 0, "QKV narrows absorbed");
+        assert_eq!(attention_count, 0, "Attention absorbed");
+        assert_eq!(mm_bias_remaining, 0, "both projections absorbed");
+
+        let out_node = fused2.node(fused2.outputs[0]);
+        assert!(matches!(out_node.op, Op::FusedAttentionBlock { .. }));
+    }
+
+    /// Synthetic full BERT layer (one block): hidden → FusedAttentionBlock →
+    /// FusedResidualLN → FusedMatMulBiasAct(GeLU) → FusedMatMulBiasAct →
+    /// FusedResidualLN. Confirm FuseTransformerLayer collapses to one node.
+    #[test]
+    fn fuse_transformer_layer_collapses_full_bert_block() {
+        let nh: usize = 4;
+        let dh: usize = 8;
+        let h: usize = nh * dh;
+        let inter = 4 * h;
+        let eps1: f32 = 1e-12;
+        let eps2: f32 = 1e-12;
+        let b: usize = 1;
+        let s: usize = 4;
+
+        let mut g = Graph::new("bert-layer");
+        let hidden = g.input("hidden", f32_shape(&[b, s, h]));
+        let mask = g.input("attention_mask", f32_shape(&[b, s]));
+
+        // === Attention block ===
+        let qkv_w = g.param("qkv_w", f32_shape(&[h, 3 * h]));
+        let qkv_b = g.param("qkv_b", f32_shape(&[3 * h]));
+        let qkv_mm = g.matmul(hidden, qkv_w, f32_shape(&[b, s, 3 * h]));
+        let qkv = g.binary(BinaryOp::Add, qkv_mm, qkv_b, f32_shape(&[b, s, 3 * h]));
+        let q = g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start: 0,
+                len: h,
+            },
+            vec![qkv],
+            f32_shape(&[b, s, h]),
+        );
+        let k = g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start: h,
+                len: h,
+            },
+            vec![qkv],
+            f32_shape(&[b, s, h]),
+        );
+        let v = g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start: 2 * h,
+                len: h,
+            },
+            vec![qkv],
+            f32_shape(&[b, s, h]),
+        );
+        let attn = g.attention(q, k, v, mask, nh, dh, f32_shape(&[b, s, h]));
+        let out_w = g.param("out_w", f32_shape(&[h, h]));
+        let out_b = g.param("out_b", f32_shape(&[h]));
+        let out_mm = g.matmul(attn, out_w, f32_shape(&[b, s, h]));
+        let attn_out = g.binary(BinaryOp::Add, out_mm, out_b, f32_shape(&[b, s, h]));
+
+        // === Post-attn residual + LN ===
+        let res1 = g.binary(BinaryOp::Add, attn_out, hidden, f32_shape(&[b, s, h]));
+        let ln1_g = g.param("ln1_g", f32_shape(&[h]));
+        let ln1_b = g.param("ln1_b", f32_shape(&[h]));
+        let h1 = g.add_node(
+            Op::LayerNorm {
+                axis: -1,
+                eps: eps1,
+            },
+            vec![res1, ln1_g, ln1_b],
+            f32_shape(&[b, s, h]),
+        );
+
+        // === FFN ===
+        let fc1_w = g.param("fc1_w", f32_shape(&[h, inter]));
+        let fc1_b = g.param("fc1_b", f32_shape(&[inter]));
+        let fc1_mm = g.matmul(h1, fc1_w, f32_shape(&[b, s, inter]));
+        let fc1_add = g.binary(BinaryOp::Add, fc1_mm, fc1_b, f32_shape(&[b, s, inter]));
+        let fc1_act = g.activation(Activation::Gelu, fc1_add, f32_shape(&[b, s, inter]));
+        let fc2_w = g.param("fc2_w", f32_shape(&[inter, h]));
+        let fc2_b = g.param("fc2_b", f32_shape(&[h]));
+        let fc2_mm = g.matmul(fc1_act, fc2_w, f32_shape(&[b, s, h]));
+        let ffn_out = g.binary(BinaryOp::Add, fc2_mm, fc2_b, f32_shape(&[b, s, h]));
+
+        // === Post-FFN residual + LN ===
+        let res2 = g.binary(BinaryOp::Add, ffn_out, h1, f32_shape(&[b, s, h]));
+        let ln2_g = g.param("ln2_g", f32_shape(&[h]));
+        let ln2_b = g.param("ln2_b", f32_shape(&[h]));
+        let out = g.add_node(
+            Op::LayerNorm {
+                axis: -1,
+                eps: eps2,
+            },
+            vec![res2, ln2_g, ln2_b],
+            f32_shape(&[b, s, h]),
+        );
+        g.set_outputs(vec![out]);
+
+        // Run the same pipeline order the production pipeline uses.
+        let g = FuseMatMulBiasAct.run(g);
+        let g = FuseResidualLN.run(g);
+        let g = FuseAttentionBlock.run(g);
+        let g = FuseTransformerLayer.run(g);
+
+        let ftl_count = g
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::FusedTransformerLayer { .. }))
+            .count();
+        assert_eq!(
+            ftl_count, 1,
+            "single layer should collapse to one FusedTransformerLayer"
+        );
+
+        // After the full pipeline, the layer's intermediate fused ops should
+        // be gone — only the parameter / input nodes and the single
+        // FusedTransformerLayer remain.
+        let leftover_fab = g
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::FusedAttentionBlock { .. }))
+            .count();
+        let leftover_frln = g
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::FusedResidualLN { .. }))
+            .count();
+        let leftover_fmba = g
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::FusedMatMulBiasAct { .. }))
+            .count();
+        assert_eq!(leftover_fab, 0, "attn block absorbed into layer");
+        assert_eq!(leftover_frln, 0, "both residual+LNs absorbed");
+        assert_eq!(leftover_fmba, 0, "FFN matmuls absorbed");
+
+        let out_node = g.node(g.outputs[0]);
+        assert!(matches!(
+            out_node.op,
+            Op::FusedTransformerLayer {
+                num_heads: 4,
+                head_dim: 8,
+                intermediate_size: 128,
+                has_bias: true,
+                ..
+            }
+        ));
+        assert_eq!(out_node.inputs.len(), 14);
+    }
+
+    /// `should_fuse` must reject the pass when batch·seq exceeds the threshold,
+    /// so attention block fusion stays opt-in for small inputs.
+    #[test]
+    fn fuse_attention_block_skips_large_inputs() {
+        let nh: usize = 4;
+        let dh: usize = 8;
+        let h: usize = nh * dh;
+        let b: usize = 16;
+        let s: usize = 128; // b*s = 2048 ≫ 64 default threshold
+
+        let mut g = Graph::new("attn-block-large");
+        let hidden = g.input("hidden", f32_shape(&[b, s, h]));
+        let mask = g.input("attention_mask", f32_shape(&[b, s]));
+        let qkv_w = g.param("qkv_w", f32_shape(&[h, 3 * h]));
+        let qkv_b = g.param("qkv_b", f32_shape(&[3 * h]));
+        let qkv_mm = g.matmul(hidden, qkv_w, f32_shape(&[b, s, 3 * h]));
+        let qkv = g.binary(BinaryOp::Add, qkv_mm, qkv_b, f32_shape(&[b, s, 3 * h]));
+        let q = g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start: 0,
+                len: h,
+            },
+            vec![qkv],
+            f32_shape(&[b, s, h]),
+        );
+        let k = g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start: h,
+                len: h,
+            },
+            vec![qkv],
+            f32_shape(&[b, s, h]),
+        );
+        let v = g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start: 2 * h,
+                len: h,
+            },
+            vec![qkv],
+            f32_shape(&[b, s, h]),
+        );
+        let attn = g.attention(q, k, v, mask, nh, dh, f32_shape(&[b, s, h]));
+        let out_w = g.param("out_w", f32_shape(&[h, h]));
+        let out_b = g.param("out_b", f32_shape(&[h]));
+        let out_mm = g.matmul(attn, out_w, f32_shape(&[b, s, h]));
+        let out = g.binary(BinaryOp::Add, out_mm, out_b, f32_shape(&[b, s, h]));
+        g.set_outputs(vec![out]);
+
+        let fused1 = FuseMatMulBiasAct.run(g);
+        let fused2 = FuseAttentionBlock.run(fused1);
+        let fab_count = fused2
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::FusedAttentionBlock { .. }))
+            .count();
+        assert_eq!(fab_count, 0, "block-fusion must skip large batches");
     }
 }

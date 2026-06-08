@@ -14,3 +14,7 @@ copy kernel for row-region staging).
 
 **Consumers:** depend on this crate and `use rlx_gpu_kernels::BINARY_CU` (or
 re-export). Do not `include_str!` across workspace crate boundaries.
+
+## License
+
+GPL-3.0-only.

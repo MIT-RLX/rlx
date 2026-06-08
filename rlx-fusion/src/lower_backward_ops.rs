@@ -1,5 +1,17 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Lower dedicated backward ops (`ReluBackward`, `ActivationBackward`) to
 //! primitives (`Compare`, `Where`, `Binary`, `Activation`) for backends
@@ -44,6 +56,91 @@ fn broadcast_scalar(g: &mut Graph, v: f32, like: NodeId) -> NodeId {
     let dtype = g.shape(like).dtype();
     let s = scalar_const(g, v, dtype);
     broadcast_like(g, s, like)
+}
+
+fn broadcast_channel_param(g: &mut Graph, param: NodeId, like: NodeId) -> NodeId {
+    let like_dims: Vec<usize> = g
+        .shape(like)
+        .dims()
+        .iter()
+        .map(|d| d.unwrap_static())
+        .collect();
+    let rank = like_dims.len();
+    let dtype = g.shape(like).dtype();
+    let channels = like_dims[rank - 1];
+    let mut pad_dims = vec![1i64; rank.saturating_sub(1)];
+    pad_dims.push(channels as i64);
+    let padded = g.reshape_(param, pad_dims);
+    let target: Vec<i64> = like_dims.iter().map(|&d| d as i64).collect();
+    let shape = Shape::new(
+        &target.iter().map(|&d| d as usize).collect::<Vec<_>>(),
+        dtype,
+    );
+    g.add_node(
+        Op::Expand {
+            target_shape: target,
+        },
+        vec![padded],
+        shape,
+    )
+}
+
+fn reduce_all_but_last(g: &mut Graph, x: NodeId) -> NodeId {
+    let rank = g.shape(x).rank();
+    if rank <= 1 {
+        return x;
+    }
+    g.sum(x, (0..rank - 1).collect(), false)
+}
+
+fn lower_batch_norm_inference_backward_input(
+    g: &mut Graph,
+    x: NodeId,
+    gamma: NodeId,
+    _mean: NodeId,
+    var: NodeId,
+    dy: NodeId,
+    out_shape: Shape,
+    eps: f32,
+) -> NodeId {
+    let _ = out_shape;
+    let var_b = broadcast_channel_param(g, var, x);
+    let eps_arr = broadcast_scalar(g, eps, var_b);
+    let var_eps = g.add(var_b, eps_arr);
+    let sqrt_var = g.sqrt(var_eps);
+    let one = broadcast_scalar(g, 1.0, var_b);
+    let inv_std = g.div(one, sqrt_var);
+    let gamma_b = broadcast_channel_param(g, gamma, x);
+    let scale = g.mul(gamma_b, inv_std);
+    g.mul(dy, scale)
+}
+
+fn lower_batch_norm_inference_backward_gamma(
+    g: &mut Graph,
+    x: NodeId,
+    mean: NodeId,
+    var: NodeId,
+    dy: NodeId,
+    out_shape: Shape,
+    eps: f32,
+) -> NodeId {
+    let _ = out_shape;
+    let mean_b = broadcast_channel_param(g, mean, x);
+    let var_b = broadcast_channel_param(g, var, x);
+    let x_centered = g.sub(x, mean_b);
+    let eps_arr = broadcast_scalar(g, eps, var_b);
+    let var_eps = g.add(var_b, eps_arr);
+    let sqrt_var = g.sqrt(var_eps);
+    let one = broadcast_scalar(g, 1.0, var_b);
+    let inv_std = g.div(one, sqrt_var);
+    let xhat = g.mul(x_centered, inv_std);
+    let prod = g.mul(dy, xhat);
+    reduce_all_but_last(g, prod)
+}
+
+fn lower_batch_norm_inference_backward_beta(g: &mut Graph, dy: NodeId, out_shape: Shape) -> NodeId {
+    let _ = out_shape;
+    reduce_all_but_last(g, dy)
 }
 
 fn compare_gt(g: &mut Graph, lhs: NodeId, rhs: NodeId) -> NodeId {
@@ -187,7 +284,7 @@ fn lower_gelu_approx_backward(g: &mut Graph, x: NodeId, dy: NodeId, _out_shape: 
     g.mul(dy, deriv)
 }
 
-/// Rewrite `ReluBackward` / `ActivationBackward` nodes to primitive ops.
+/// Rewrite `ReluBackward` / `ActivationBackward` / BatchNorm inference backward nodes to primitive ops.
 pub struct LowerBackwardOps;
 
 impl Pass for LowerBackwardOps {
@@ -196,10 +293,16 @@ impl Pass for LowerBackwardOps {
     }
 
     fn run(&self, graph: Graph) -> Graph {
-        let needs = graph
-            .nodes()
-            .iter()
-            .any(|n| matches!(n.op, Op::ReluBackward | Op::ActivationBackward { .. }));
+        let needs = graph.nodes().iter().any(|n| {
+            matches!(
+                n.op,
+                Op::ReluBackward
+                    | Op::ActivationBackward { .. }
+                    | Op::BatchNormInferenceBackwardInput { .. }
+                    | Op::BatchNormInferenceBackwardGamma { .. }
+                    | Op::BatchNormInferenceBackwardBeta
+            )
+        });
         if !needs {
             return graph;
         }
@@ -218,6 +321,42 @@ impl Pass for LowerBackwardOps {
                     let x = id_map[&node.inputs[0]];
                     let dy = id_map[&node.inputs[1]];
                     lower_activation_backward(&mut new_graph, *kind, x, dy, node.shape.clone())
+                }
+                Op::BatchNormInferenceBackwardInput { eps } => {
+                    let x = id_map[&node.inputs[0]];
+                    let gamma = id_map[&node.inputs[1]];
+                    let mean = id_map[&node.inputs[2]];
+                    let var = id_map[&node.inputs[3]];
+                    let dy = id_map[&node.inputs[4]];
+                    lower_batch_norm_inference_backward_input(
+                        &mut new_graph,
+                        x,
+                        gamma,
+                        mean,
+                        var,
+                        dy,
+                        node.shape.clone(),
+                        *eps,
+                    )
+                }
+                Op::BatchNormInferenceBackwardGamma { eps } => {
+                    let x = id_map[&node.inputs[0]];
+                    let mean = id_map[&node.inputs[1]];
+                    let var = id_map[&node.inputs[2]];
+                    let dy = id_map[&node.inputs[3]];
+                    lower_batch_norm_inference_backward_gamma(
+                        &mut new_graph,
+                        x,
+                        mean,
+                        var,
+                        dy,
+                        node.shape.clone(),
+                        *eps,
+                    )
+                }
+                Op::BatchNormInferenceBackwardBeta => {
+                    let dy = id_map[&node.inputs[0]];
+                    lower_batch_norm_inference_backward_beta(&mut new_graph, dy, node.shape.clone())
                 }
                 _ => {
                     let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();

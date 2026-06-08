@@ -25,7 +25,23 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
     let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
 
     for node in &nodes {
-        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_inputs: Vec<NodeId> = node
+            .inputs
+            .iter()
+            .map(|i| {
+                *id_map.get(i).unwrap_or_else(|| {
+                    panic!(
+                        "unfuse_fused_for_autodiff: node {:?} ({}) references input {i:?} \
+                 which has not been mapped — graph is not in strict topological \
+                 order at the start of this pass. Run \
+                 `legalize_multi_axis_reduce` before this pass if the input came \
+                 from a user-built multi-axis `Op::Reduce`, or check for an \
+                 upstream rewriter that left a dangling NodeId.",
+                        node.id, node.op,
+                    )
+                })
+            })
+            .collect();
         let new_id = match &node.op {
             Op::FusedMatMulBiasAct { activation } => {
                 // Inputs: [input, weight, bias]. Decomposes to:
