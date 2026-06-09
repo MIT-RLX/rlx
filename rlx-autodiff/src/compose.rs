@@ -365,6 +365,9 @@ pub fn merge_subgraph(
         }
         let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
         let new_id = base.add_node(node.op.clone(), inputs, node.shape.clone());
+        if let Some(inferred) = rlx_ir::infer_shape::infer_output_shape(base, base.node(new_id)) {
+            base.node_mut(new_id).shape = inferred;
+        }
         id_map.insert(node.id, new_id);
     }
     id_map

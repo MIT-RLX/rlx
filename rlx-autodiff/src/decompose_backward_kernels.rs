@@ -883,6 +883,7 @@ fn run_scan_backward_steps(
         if save_trajectory {
             let up_t = narrow_step(g, upstream, t, out_shape);
             d_out = g.add(d_out, up_t);
+            reconcile_node_shape(g, d_out);
         }
         let mut bind = std::collections::HashMap::from([
             (carry_name.clone(), carry_t),
@@ -894,8 +895,10 @@ fn run_scan_backward_steps(
         }
         let id_map = merge_subgraph(g, body_vjp, &bind);
         dcarry = id_map[&body_vjp.outputs[0]];
+        reconcile_node_shape(g, dcarry);
         if let (Some(idx), Some(steps)) = (xs_out_idx, dx_steps.as_mut()) {
             steps[t] = id_map[&body_vjp.outputs[idx]];
+            reconcile_node_shape(g, steps[t]);
         }
     };
 
@@ -935,6 +938,20 @@ fn run_scan_backward_steps(
     (dcarry, dx_steps)
 }
 
+fn finalize_scan_backward_carry(g: &mut Graph, dcarry: NodeId, out_shape: &Shape) -> NodeId {
+    reconcile_node_shape(g, dcarry);
+    if g.node(dcarry).shape.dims() != out_shape.dims() {
+        let dims: Vec<i64> = out_shape
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static() as i64)
+            .collect();
+        g.reshape_(dcarry, dims)
+    } else {
+        dcarry
+    }
+}
+
 fn narrow_step(g: &mut Graph, x: NodeId, t: usize, step_shape: &Shape) -> NodeId {
     let narrowed = g.narrow_(x, 0, t, 1);
     let narrowed_shape = g.node(narrowed).shape.clone();
@@ -947,6 +964,15 @@ fn narrow_step(g: &mut Graph, x: NodeId, t: usize, step_shape: &Shape) -> NodeId
             .map(|d| d.unwrap_static() as i64)
             .collect();
         g.reshape_(narrowed, dims)
+    }
+}
+
+fn reconcile_node_shape(g: &mut Graph, id: NodeId) {
+    let node = g.node(id).clone();
+    if let Some(inferred) = rlx_ir::infer_shape::infer_output_shape(g, &node) {
+        if inferred.dims() != node.shape.dims() {
+            g.node_mut(id).shape = inferred;
+        }
     }
 }
 
@@ -985,7 +1011,7 @@ pub fn compose_scan_backward(
         save_trajectory,
         "compose_scan_backward: save_trajectory=true only"
     );
-    run_scan_backward_steps(
+    let dcarry = run_scan_backward_steps(
         g,
         init,
         trajectory,
@@ -999,7 +1025,8 @@ pub fn compose_scan_backward(
         out_shape,
         None,
     )
-    .0
+    .0;
+    finalize_scan_backward_carry(g, dcarry, out_shape)
 }
 
 /// Unrolled `ScanBackwardXs` — stacks per-step `dxs` along axis 0.
@@ -1059,6 +1086,7 @@ pub fn compose_scan_backward_xs(
     let mut dx_steps = dx_steps.expect("dx steps");
     dx_steps.reverse();
     let stacked = g.concat_(dx_steps, 0);
+    reconcile_node_shape(g, stacked);
     let _ = (dcarry, out_shape);
     stacked
 }

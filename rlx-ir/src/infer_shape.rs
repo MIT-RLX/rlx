@@ -18,6 +18,7 @@
 
 use crate::op::*;
 use crate::shape;
+use crate::shape::Dim;
 use crate::{DType, Graph, Node, Shape};
 
 /// Infer the output shape of `node` from its op and input shapes.
@@ -166,11 +167,26 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::DotGeneral { .. }
         | Op::If { .. }
         | Op::While { .. }
-        | Op::Scan { .. }
         | Op::SelectiveScan { .. }
         | Op::GatedDeltaNet { .. }
         | Op::FusedAttentionBlock { .. }
         | Op::FusedTransformerLayer { .. } => Some(shape::unary_shape(in_shape(0))),
+        Op::Scan {
+            length,
+            save_trajectory,
+            ..
+        } => {
+            let carry = in_shape(0);
+            if *save_trajectory {
+                let mut dims = vec![Dim::Static(*length as usize)];
+                for i in 0..carry.rank() {
+                    dims.push(carry.dim(i));
+                }
+                Some(Shape::from_dims(&dims, carry.dtype()))
+            } else {
+                Some(shape::unary_shape(carry))
+            }
+        }
         Op::ElementwiseRegion { prologue, .. } => {
             let mut in_s = in_shape(0).clone();
             if *prologue == RegionPrologue::ResizeNearest2x && in_s.rank() == 4 {
@@ -244,5 +260,55 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         | Op::Fft { .. }
         | Op::FftButterflyStage { .. } => None,
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Graph, Op};
+
+    #[test]
+    fn scan_save_trajectory_infers_length_by_carry() {
+        let mut g = Graph::new("scan_traj");
+        let init = g.input("init", Shape::new(&[80], DType::F32));
+        let body = Graph::new("body");
+        let scan = g.add_node(
+            Op::Scan {
+                body: Box::new(body),
+                length: 70,
+                save_trajectory: true,
+                num_bcast: 0,
+                num_xs: 0,
+                num_checkpoints: 0,
+            },
+            vec![init],
+            Shape::new(&[70, 80], DType::F32),
+        );
+        let node = g.node(scan).clone();
+        let inferred = infer_output_shape(&g, &node).expect("scan infer");
+        assert_eq!(inferred.dims(), node.shape.dims());
+    }
+
+    #[test]
+    fn scan_without_trajectory_infers_carry_only() {
+        let mut g = Graph::new("scan_carry");
+        let init = g.input("init", Shape::new(&[80], DType::F32));
+        let body = Graph::new("body");
+        let scan = g.add_node(
+            Op::Scan {
+                body: Box::new(body),
+                length: 70,
+                save_trajectory: false,
+                num_bcast: 0,
+                num_xs: 0,
+                num_checkpoints: 0,
+            },
+            vec![init],
+            Shape::new(&[80], DType::F32),
+        );
+        let node = g.node(scan).clone();
+        let inferred = infer_output_shape(&g, &node).expect("scan infer");
+        assert_eq!(inferred.dims(), node.shape.dims());
     }
 }
