@@ -11,8 +11,8 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1"
-rlx-onnx-import = { path = "../rlx-onnx-import" }
-rlx-ir = { path = "../rlx-ir" }
+rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.4" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
 serde_json = "1"
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]

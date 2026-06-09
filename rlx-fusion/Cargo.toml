@@ -17,8 +17,8 @@ documentation.workspace = true
 rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
 
 [dev-dependencies]
-rlx-cpu = { path = "../rlx-cpu" }
-rlx-opt = { path = "../rlx-opt", features = ["compile"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.4" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.4", features = ["compile"] }
 
 [lints]
 workspace = true

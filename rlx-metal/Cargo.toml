@@ -40,7 +40,7 @@ half = "2"
 
 
 [dev-dependencies]
-rlx-runtime = { path = "../rlx-runtime", features = ["metal"] }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.4", features = ["metal"] }
 
 [lints]
 workspace = true

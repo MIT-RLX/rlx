@@ -12,10 +12,10 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir      = { path = "../rlx-ir" }
-rlx-opt     = { path = "../rlx-opt", features = ["training"] }
-rlx-optim   = { path = "../rlx-optim" }
-rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cpu"] }
+rlx-ir      = { path = "../rlx-ir", version = "0.2.4" }
+rlx-opt     = { path = "../rlx-opt", version = "0.2.4", features = ["training"] }
+rlx-optim   = { path = "../rlx-optim", version = "0.2.4" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.4", default-features = false, features = ["cpu"] }
 rand       = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 rand_distr = { version = "0.4", default-features = false, features = ["std_math"] }
 serde      = { version = "1", features = ["derive"] }
