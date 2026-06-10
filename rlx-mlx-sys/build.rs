@@ -86,12 +86,15 @@ fn main() {
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("CMAKE_BUILD_TYPE", cmake_build_type);
 
-    if is_macos {
+    let macos_deploy = if is_macos {
         let deploy = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "14.0".into());
         mlx_cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", deploy.as_str());
         mlx_cfg.env("CC", "/usr/bin/cc");
         mlx_cfg.env("CXX", "/usr/bin/c++");
-    }
+        Some(deploy)
+    } else {
+        None
+    };
 
     let use_ccache = is_macos
         && env_flag("RLX_MLX_NO_CCACHE") != Some(true)
@@ -162,6 +165,9 @@ fn main() {
         .flag_if_supported("-fexceptions")
         .flag_if_supported("-fvisibility=hidden")
         .warnings(false);
+    if let Some(ref deploy) = macos_deploy {
+        shim.flag(format!("-mmacosx-version-min={deploy}"));
+    }
     if target_os == "windows" {
         shim.define("NOMINMAX", None)
             .define("WIN32_LEAN_AND_MEAN", None)
@@ -175,11 +181,18 @@ fn main() {
     println!("cargo:rustc-link-lib=static=mlx");
 
     if is_macos {
+        if let Some(deploy) = macos_deploy {
+            // Match MLX CMake objects; avoid linking 14-built MLX at min 11.
+            println!("cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET={deploy}");
+            println!("cargo:rustc-link-arg=-mmacosx-version-min={deploy}");
+        }
         for fw in &["Metal", "Foundation", "QuartzCore", "Accelerate"] {
             println!("cargo:rustc-link-lib=framework={fw}");
         }
         // C++ runtime
         println!("cargo:rustc-link-lib=c++");
+        // MLX Metal uses __builtin_available → ___isPlatformVersionAtLeast (compiler-rt).
+        link_macos_clang_rt();
     } else if target_os == "linux" {
         println!("cargo:rustc-link-lib=stdc++");
         println!("cargo:rustc-link-lib=dl");
@@ -198,6 +211,40 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/rlx_mlx_shim.h");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/mlx/mlx/version.h");
+}
+
+/// `libclang_rt.osx` — required for `___isPlatformVersionAtLeast` from MLX
+/// `__builtin_available` checks. Rust's default link line omits it (`-nodefaultlibs`).
+fn link_macos_clang_rt() {
+    let output = match Command::new("clang")
+        .arg("--print-file-name=libclang_rt.osx.a")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => {
+            eprintln!(
+                "cargo:warning=rlx-mlx-sys: could not run `clang --print-file-name=libclang_rt.osx.a`"
+            );
+            return;
+        }
+    };
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() || path == "libclang_rt.osx.a" {
+        eprintln!("cargo:warning=rlx-mlx-sys: clang did not resolve libclang_rt.osx.a");
+        return;
+    }
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        eprintln!(
+            "cargo:warning=rlx-mlx-sys: libclang_rt.osx.a not found at {}",
+            path.display()
+        );
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        println!("cargo:rustc-link-search=native={}", parent.display());
+    }
+    println!("cargo:rustc-link-lib=static=clang_rt.osx");
 }
 
 fn linux_build_cuda(target_os: &str) -> bool {

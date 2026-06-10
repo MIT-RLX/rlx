@@ -90,19 +90,29 @@ pub struct IoFusionGate {
     pub memory_bw: f64,
     pub host_readback_bw: f64,
     pub unified_memory: bool,
+    /// Penalty per added host-sync thunk (`sync_points_saved < 0`), e.g. tail-host `WelchPeaks`.
+    pub host_thunk_penalty_ns: f64,
     pub min_gain_ns: f64,
 }
 
 impl IoFusionGate {
-    pub fn should_fuse(&self, before: &GraphIoProfile, after: &GraphIoProfile) -> bool {
-        fusion_benefit(before, after).should_fuse(
+    pub fn score_ns(&self, benefit: &FusionBenefit) -> f64 {
+        let mut score = benefit.score_ns(
             self.dispatch_ns,
             self.roundtrip_ns,
             self.memory_bw,
             self.host_readback_bw,
             self.unified_memory,
-            self.min_gain_ns,
-        )
+        );
+        if benefit.sync_points_saved < 0 {
+            score -= (-benefit.sync_points_saved as f64) * self.host_thunk_penalty_ns;
+        }
+        score
+    }
+
+    pub fn should_fuse(&self, before: &GraphIoProfile, after: &GraphIoProfile) -> bool {
+        let benefit = fusion_benefit(before, after);
+        self.score_ns(&benefit) >= self.min_gain_ns
     }
 }
 
@@ -149,8 +159,35 @@ mod tests {
             memory_bw: 200.0,
             host_readback_bw: 200.0,
             unified_memory: true,
+            host_thunk_penalty_ns: 2_000_000.0,
             min_gain_ns: 1_000.0,
         };
         assert!(gate.should_fuse(&dense, &fused));
+    }
+
+    #[test]
+    fn io_gate_rejects_welch_peaks_fusion_on_wgpu() {
+        let dense = GraphIoProfile {
+            kernel_launches: 3,
+            sync_points: 0,
+            host_output_bytes: 33_554_432,
+            device_traffic_bytes: 184_549_376,
+        };
+        let fused = GraphIoProfile {
+            kernel_launches: 4,
+            sync_points: 1,
+            host_output_bytes: 1_048_576,
+            device_traffic_bytes: 219_152_384,
+        };
+        let gate = IoFusionGate {
+            dispatch_ns: 3_000.0,
+            roundtrip_ns: 30_000.0,
+            memory_bw: 100.0,
+            host_readback_bw: 40.0,
+            unified_memory: false,
+            host_thunk_penalty_ns: 25_000_000.0,
+            min_gain_ns: 10_000.0,
+        };
+        assert!(!gate.should_fuse(&dense, &fused));
     }
 }

@@ -18,7 +18,7 @@ default = []
 cuda = ["rlx-mlx-sys/cuda"]
 
 [dependencies]
-rlx-mlx-sys = { path = "../rlx-mlx-sys", version = "0.2.5" }
+rlx-mlx-sys = { path = "../rlx-mlx-sys", version = "0.2.6" }
 rlx-ir = { path = "../rlx-ir", version = "0.2.5" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.4" }
 rlx-gguf = { path = "../rlx-gguf", version = "0.2.4" }
