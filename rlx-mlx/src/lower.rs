@@ -126,6 +126,8 @@ pub fn first_host_eval_op(graph: &Graph) -> Option<&'static str> {
             Op::GaussianSplatRenderBackward { .. } => {
                 return Some("GaussianSplatRenderBackward (host kernel)");
             }
+            Op::LogMel | Op::LogMelBackward => return Some("LogMel (host filterbank)"),
+            Op::WelchPeaks { .. } => return Some("WelchPeaks (host PSD top-K)"),
             _ => {}
         }
     }
@@ -802,6 +804,80 @@ pub fn lower_with_env(
             Op::Fft { inverse, norm } => {
                 let x = lookup(&env, node.inputs[0])?;
                 ops::fft(x, *inverse, norm.tag())?
+            }
+            Op::LogMel => {
+                let spec = lookup(&env, node.inputs[0])?.to_f32()?;
+                let filters = lookup(&env, node.inputs[1])?.to_f32()?;
+                let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                let filt_shape = graph.node(node.inputs[1]).shape.clone();
+                let meta =
+                    rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape).map_err(MlxError)?;
+                let mut out = vec![0f32; meta.outer * meta.n_mels];
+                rlx_ir::audio::log_mel_block_f32(
+                    &spec,
+                    &filters,
+                    meta.outer,
+                    meta.n_fft,
+                    meta.n_bins,
+                    meta.n_mels,
+                    &mut out,
+                );
+                let out_shape: Vec<usize> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect();
+                Array::from_f32_slice(&out, &out_shape, DType::F32)?
+            }
+            Op::LogMelBackward => {
+                let spec = lookup(&env, node.inputs[0])?.to_f32()?;
+                let filters = lookup(&env, node.inputs[1])?.to_f32()?;
+                let dy = lookup(&env, node.inputs[2])?.to_f32()?;
+                let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                let filt_shape = graph.node(node.inputs[1]).shape.clone();
+                let meta =
+                    rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape).map_err(MlxError)?;
+                let mut d_spec = vec![0f32; meta.outer * meta.n_fft * 2];
+                rlx_ir::audio::log_mel_block_vjp(
+                    &spec,
+                    &filters,
+                    &dy,
+                    meta.outer,
+                    meta.n_fft,
+                    meta.n_bins,
+                    meta.n_mels,
+                    &mut d_spec,
+                );
+                let out_shape: Vec<usize> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect();
+                Array::from_f32_slice(&d_spec, &out_shape, DType::F32)?
+            }
+            Op::WelchPeaks { k, n_segments } => {
+                let spec = lookup(&env, node.inputs[0])?.to_f32()?;
+                let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                let meta = rlx_ir::audio::welch_peaks_meta(&spec_shape, *k, *n_segments)
+                    .map_err(MlxError)?;
+                let mut out = vec![0f32; meta.welch_batch * meta.k * 2];
+                rlx_ir::audio::welch_peaks_block_f32(
+                    &spec,
+                    meta.welch_batch,
+                    meta.n_fft,
+                    meta.n_segments,
+                    meta.k,
+                    &mut out,
+                );
+                let out_shape: Vec<usize> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect();
+                Array::from_f32_slice(&out, &out_shape, DType::F32)?
             }
             Op::RmsNorm { eps, .. } => {
                 let x = lookup(&env, node.inputs[0])?;

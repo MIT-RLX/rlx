@@ -13,7 +13,7 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.5" }
 half = "2"
 
 [lints]

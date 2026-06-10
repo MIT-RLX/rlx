@@ -1739,6 +1739,14 @@ pub enum Thunk {
         n_bins: u32,
         n_mels: u32,
     },
+    WelchPeaks {
+        spec: usize,
+        dst: usize,
+        welch_batch: u32,
+        n_fft: u32,
+        n_segments: u32,
+        k: u32,
+    },
 }
 
 /// Compiled thunk schedule — the runtime hot path.
@@ -5529,6 +5537,20 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                 }
             }
 
+            Op::WelchPeaks { k, n_segments } => {
+                let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                let meta = rlx_ir::audio::welch_peaks_meta(&spec_shape, *k, *n_segments)
+                    .unwrap_or_else(|e| panic!("Op::WelchPeaks: {e}"));
+                Thunk::WelchPeaks {
+                    spec: node_offset(arena, node.inputs[0]),
+                    dst: node_offset(arena, node.id),
+                    welch_batch: meta.welch_batch as u32,
+                    n_fft: meta.n_fft as u32,
+                    n_segments: meta.n_segments as u32,
+                    k: meta.k as u32,
+                }
+            }
+
             Op::CustomFn {
                 fwd_body,
                 num_inputs,
@@ -6775,6 +6797,25 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     );
                 }),
 
+                Thunk::WelchPeaks {
+                    spec,
+                    dst,
+                    welch_batch,
+                    n_fft,
+                    n_segments,
+                    k,
+                } => Arc::new(move |base: *mut u8| unsafe {
+                    execute_welch_peaks_f32(
+                        spec,
+                        dst,
+                        welch_batch as usize,
+                        n_fft as usize,
+                        n_segments as usize,
+                        k as usize,
+                        base,
+                    );
+                }),
+
                 _ => Arc::new(|_: *mut u8| {}),
             }
         })
@@ -8008,6 +8049,25 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     *n_fft as usize,
                     *n_bins as usize,
                     *n_mels as usize,
+                    base,
+                );
+            },
+
+            Thunk::WelchPeaks {
+                spec,
+                dst,
+                welch_batch,
+                n_fft,
+                n_segments,
+                k,
+            } => unsafe {
+                execute_welch_peaks_f32(
+                    *spec,
+                    *dst,
+                    *welch_batch as usize,
+                    *n_fft as usize,
+                    *n_segments as usize,
+                    *k as usize,
                     base,
                 );
             },
@@ -14826,6 +14886,23 @@ pub unsafe fn execute_log_mel_f32(
     let filters = std::slice::from_raw_parts(filt_ptr, n_mels * n_bins);
     let out = std::slice::from_raw_parts_mut(dst_ptr, outer * n_mels);
     rlx_ir::audio::log_mel_block_f32(spec, filters, outer, n_fft, n_bins, n_mels, out);
+}
+
+pub unsafe fn execute_welch_peaks_f32(
+    spec: usize,
+    dst: usize,
+    welch_batch: usize,
+    n_fft: usize,
+    n_segments: usize,
+    k: usize,
+    base: *mut u8,
+) {
+    let spec_ptr = base.add(spec) as *const f32;
+    let dst_ptr = base.add(dst) as *mut f32;
+    let outer = welch_batch * n_segments;
+    let spec = std::slice::from_raw_parts(spec_ptr, outer * n_fft * 2);
+    let out = std::slice::from_raw_parts_mut(dst_ptr, welch_batch * k * 2);
+    rlx_ir::audio::welch_peaks_block_f32(spec, welch_batch, n_fft, n_segments, k, out);
 }
 
 pub unsafe fn execute_log_mel_backward_f32(

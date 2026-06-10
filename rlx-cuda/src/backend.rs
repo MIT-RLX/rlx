@@ -47,8 +47,8 @@ use crate::kernels::{
     conv_transpose2d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, cumsum_backward_kernel,
     cumsum_kernel, dequant_matmul_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw,
     elementwise_region_kernel, expand_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
-    gather_axis_kernel, gather_backward_kernel, gather_kernel, group_norm_kernel,
-    grouped_matmul_kernel, im2col_kernel, layer_norm2d_kernel, layernorm_kernel,
+    fused_residual_rms_norm_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
+    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, layer_norm2d_kernel, layernorm_kernel,
     matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel, narrow_kernel, pool1d_kernel,
     pool2d_kernel, pool3d_kernel, reduce_kernel, resize_nearest_2x_kernel,
     rms_norm_backward_kernel, rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel,
@@ -152,6 +152,18 @@ enum Step {
         op: u32,
     },
     FusedResidualLn {
+        outer: u32,
+        inner: u32,
+        in_off: u32,
+        residual_off: u32,
+        bias_off: u32,
+        gamma_off: u32,
+        beta_off: u32,
+        out_off: u32,
+        eps_bits: u32,
+        has_bias: u32,
+    },
+    FusedResidualRmsNorm {
         outer: u32,
         inner: u32,
         in_off: u32,
@@ -393,6 +405,25 @@ enum Step {
         n_fft: u32,
         n_bins: u32,
         n_mels: u32,
+    },
+    LogMelBackwardHost {
+        spec_byte_off: u32,
+        filt_byte_off: u32,
+        dy_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        n_fft: u32,
+        n_bins: u32,
+        n_mels: u32,
+    },
+    /// Welch PSD top-K from block-layout spectra — host fallback.
+    WelchPeaksHost {
+        spec_byte_off: u32,
+        dst_byte_off: u32,
+        welch_batch: u32,
+        n_fft: u32,
+        n_segments: u32,
+        k: u32,
     },
     /// NCHW im2col — GPU kernel or host fallback (dynamic batch / `RLX_CUDA_IM2COL_HOST=1`).
     Im2ColHost {
@@ -1014,6 +1045,7 @@ impl Step {
                 | Step::Softmax { .. }
                 | Step::LayerNorm { .. }
                 | Step::FusedResidualLn { .. }
+                | Step::FusedResidualRmsNorm { .. }
                 | Step::Cumsum { .. }
                 | Step::FusedBinaryUnary { .. }
                 | Step::ElementwiseRegion { .. }
@@ -1028,6 +1060,9 @@ impl Step {
             Step::GatedDeltaNet { .. }
             | Step::Llada2GroupLimitedGate { .. }
             | Step::UmapKnn { .. }
+            | Step::LogMelHost { .. }
+            | Step::LogMelBackwardHost { .. }
+            | Step::WelchPeaksHost { .. }
             | Step::GaussianSplatRender { .. }
             | Step::GaussianSplatRenderBackward { .. }
             | Step::GaussianSplatPrepare { .. } => false,
@@ -1038,6 +1073,100 @@ impl Step {
 
 fn schedule_graph_capture_safe(schedule: &[Step]) -> bool {
     schedule.iter().all(Step::graph_capture_safe)
+}
+
+fn step_is_tail_host(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::LogMelHost { .. } | Step::LogMelBackwardHost { .. } | Step::WelchPeaksHost { .. }
+    )
+}
+
+fn run_tail_host_audio_ops(
+    schedule: &[Step],
+    stream: &Arc<cudarc::driver::CudaStream>,
+    buffer: &mut cudarc::driver::CudaSlice<f32>,
+    pre_sync: bool,
+) {
+    if !schedule.iter().any(step_is_tail_host) {
+        return;
+    }
+    if pre_sync {
+        stream
+            .synchronize()
+            .expect("rlx-cuda: tail host pre-sync failed");
+    }
+    for step in schedule {
+        match step {
+            Step::LogMelHost {
+                spec_byte_off,
+                filt_byte_off,
+                dst_byte_off,
+                outer,
+                n_fft,
+                n_bins,
+                n_mels,
+            } => {
+                crate::log_mel_host::run_log_mel(
+                    stream,
+                    buffer,
+                    *spec_byte_off as usize,
+                    *filt_byte_off as usize,
+                    *dst_byte_off as usize,
+                    *outer as usize,
+                    *n_fft as usize,
+                    *n_bins as usize,
+                    *n_mels as usize,
+                    false,
+                );
+            }
+            Step::LogMelBackwardHost {
+                spec_byte_off,
+                filt_byte_off,
+                dy_byte_off,
+                dst_byte_off,
+                outer,
+                n_fft,
+                n_bins,
+                n_mels,
+            } => {
+                crate::log_mel_backward_host::run_log_mel_backward(
+                    stream,
+                    buffer,
+                    *spec_byte_off as usize,
+                    *filt_byte_off as usize,
+                    *dy_byte_off as usize,
+                    *dst_byte_off as usize,
+                    *outer as usize,
+                    *n_fft as usize,
+                    *n_bins as usize,
+                    *n_mels as usize,
+                    false,
+                );
+            }
+            Step::WelchPeaksHost {
+                spec_byte_off,
+                dst_byte_off,
+                welch_batch,
+                n_fft,
+                n_segments,
+                k,
+            } => {
+                crate::welch_peaks_host::run_welch_peaks(
+                    stream,
+                    buffer,
+                    *spec_byte_off as usize,
+                    *dst_byte_off as usize,
+                    *welch_batch as usize,
+                    *n_fft as usize,
+                    *n_segments as usize,
+                    *k as usize,
+                    false,
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 fn schedule_needs_blas_lt(schedule: &[Step]) -> bool {
@@ -1887,6 +2016,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::Softmax { .. } => "rlx::Softmax",
         Step::LayerNorm { .. } => "rlx::LayerNorm",
         Step::FusedResidualLn { .. } => "rlx::FusedResidualLN",
+        Step::FusedResidualRmsNorm { .. } => "rlx::FusedResidualRmsNorm",
         Step::Gather { .. } => "rlx::Gather",
         Step::GatherAxis { .. } => "rlx::GatherAxis",
         Step::Narrow { .. } => "rlx::Narrow",
@@ -1909,6 +2039,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::SelectiveScan { .. } => "rlx::SelectiveScan",
         Step::Fft { .. } => "rlx::Fft",
         Step::LogMelHost { .. } => "rlx::LogMelHost",
+        Step::LogMelBackwardHost { .. } => "rlx::LogMelBackwardHost",
+        Step::WelchPeaksHost { .. } => "rlx::WelchPeaksHost",
         Step::Im2ColHost { .. } => "rlx::Im2ColHost",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Llada2GroupLimitedGate { .. } => "rlx::Llada2GroupLimitedGate",
@@ -2088,6 +2220,22 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             }
             (r, vec![*out_off])
         }
+        Step::FusedResidualRmsNorm {
+            in_off,
+            residual_off,
+            bias_off,
+            gamma_off,
+            beta_off,
+            out_off,
+            has_bias,
+            ..
+        } => {
+            let mut r = vec![*in_off, *residual_off, *gamma_off, *beta_off];
+            if *has_bias != 0 {
+                r.push(*bias_off);
+            }
+            (r, vec![*out_off])
+        }
         Step::Gather {
             in_off,
             idx_off,
@@ -2226,6 +2374,21 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![*spec_byte_off / 4, *filt_byte_off / 4],
             vec![*dst_byte_off / 4],
         ),
+        Step::LogMelBackwardHost {
+            spec_byte_off,
+            filt_byte_off,
+            dy_byte_off,
+            dst_byte_off,
+            ..
+        } => (
+            vec![*spec_byte_off / 4, *filt_byte_off / 4, *dy_byte_off / 4],
+            vec![*dst_byte_off / 4],
+        ),
+        Step::WelchPeaksHost {
+            spec_byte_off,
+            dst_byte_off,
+            ..
+        } => (vec![*spec_byte_off / 4], vec![*dst_byte_off / 4]),
         Step::Im2ColHost {
             x_byte_off,
             col_byte_off,
@@ -2557,6 +2720,7 @@ fn prewarm_all_kernels(ctx: &Arc<CudaContext>) {
     let _ = softmax_kernel(ctx);
     let _ = layernorm_kernel(ctx);
     let _ = fused_residual_ln_kernel(ctx);
+    let _ = fused_residual_rms_norm_kernel(ctx);
     let _ = gather_kernel(ctx);
     let _ = gather_axis_kernel(ctx);
     let _ = narrow_kernel(ctx);
@@ -3079,6 +3243,31 @@ impl CudaExecutable {
                     let total: u32 = in_dims.iter().map(|d| d.unwrap_static() as u32).product();
                     let outer = total / inner.max(1);
                     schedule.push(Step::FusedResidualLn {
+                        outer,
+                        inner,
+                        in_off: (arena.offset(x_id) / 4) as u32,
+                        residual_off: (arena.offset(r_id) / 4) as u32,
+                        bias_off: (arena.offset(bias_id) / 4) as u32,
+                        gamma_off: (arena.offset(g_id) / 4) as u32,
+                        beta_off: (arena.offset(b_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        eps_bits: eps.to_bits(),
+                        has_bias: if *has_bias { 1 } else { 0 },
+                    });
+                }
+                Op::FusedResidualRmsNorm { has_bias, eps } => {
+                    let x_id = node.inputs[0];
+                    let r_id = node.inputs[1];
+                    let (bias_id, g_id, b_id) = if *has_bias {
+                        (node.inputs[2], node.inputs[3], node.inputs[4])
+                    } else {
+                        (x_id, node.inputs[2], node.inputs[3])
+                    };
+                    let in_dims = node.shape.dims();
+                    let inner = in_dims.last().unwrap().unwrap_static() as u32;
+                    let total: u32 = in_dims.iter().map(|d| d.unwrap_static() as u32).product();
+                    let outer = total / inner.max(1);
+                    schedule.push(Step::FusedResidualRmsNorm {
                         outer,
                         inner,
                         in_off: (arena.offset(x_id) / 4) as u32,
@@ -3682,6 +3871,35 @@ impl CudaExecutable {
                         n_fft: meta.n_fft as u32,
                         n_bins: meta.n_bins as u32,
                         n_mels: meta.n_mels as u32,
+                    });
+                }
+                Op::LogMelBackward => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let filt_shape = graph.node(node.inputs[1]).shape.clone();
+                    let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
+                        .unwrap_or_else(|e| panic!("Op::LogMelBackward: {e}"));
+                    schedule.push(Step::LogMelBackwardHost {
+                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                        filt_byte_off: arena.offset(node.inputs[1]) as u32,
+                        dy_byte_off: arena.offset(node.inputs[2]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        outer: meta.outer as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_bins: meta.n_bins as u32,
+                        n_mels: meta.n_mels as u32,
+                    });
+                }
+                Op::WelchPeaks { k, n_segments } => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let meta = rlx_ir::audio::welch_peaks_meta(&spec_shape, *k, *n_segments)
+                        .unwrap_or_else(|e| panic!("Op::WelchPeaks: {e}"));
+                    schedule.push(Step::WelchPeaksHost {
+                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        welch_batch: meta.welch_batch as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_segments: meta.n_segments as u32,
+                        k: meta.k as u32,
                     });
                 }
                 Op::Im2Col {
@@ -4964,6 +5182,7 @@ impl CudaExecutable {
                 } else {
                     stream.synchronize().expect("rlx-cuda: stream sync failed");
                 }
+                run_tail_host_audio_ops(&self.schedule, &stream, self.arena.f32_buf_mut(), false);
                 let plan = self.readback_plan_buf.clone();
                 let read_all = plan.len() == self.graph.outputs.len();
                 // DtoH must run after every replay — inputs change each run and
@@ -5799,6 +6018,47 @@ impl CudaExecutable {
                         launcher
                             .launch(cfg)
                             .expect("rlx-cuda: fused_residual_ln launch failed");
+                    }
+                }
+                Step::FusedResidualRmsNorm {
+                    outer,
+                    inner,
+                    in_off,
+                    residual_off,
+                    bias_off,
+                    gamma_off,
+                    beta_off,
+                    out_off,
+                    eps_bits,
+                    has_bias,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = fused_residual_rms_norm_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: (outer_s, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&outer_s)
+                        .arg(inner)
+                        .arg(in_off)
+                        .arg(residual_off)
+                        .arg(bias_off)
+                        .arg(gamma_off)
+                        .arg(beta_off)
+                        .arg(out_off)
+                        .arg(eps_bits)
+                        .arg(has_bias);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: fused_residual_rms_norm launch failed");
                     }
                 }
                 Step::Gather {
@@ -6663,27 +6923,9 @@ impl CudaExecutable {
                         );
                     }
                 }
-                Step::LogMelHost {
-                    spec_byte_off,
-                    filt_byte_off,
-                    dst_byte_off,
-                    outer,
-                    n_fft,
-                    n_bins,
-                    n_mels,
-                } => {
-                    crate::log_mel_host::run_log_mel(
-                        &stream,
-                        self.arena.f32_buf_mut(),
-                        *spec_byte_off as usize,
-                        *filt_byte_off as usize,
-                        *dst_byte_off as usize,
-                        *outer as usize,
-                        *n_fft as usize,
-                        *n_bins as usize,
-                        *n_mels as usize,
-                    );
-                }
+                Step::LogMelHost { .. }
+                | Step::LogMelBackwardHost { .. }
+                | Step::WelchPeaksHost { .. } => {}
                 Step::Im2ColHost {
                     x_byte_off,
                     col_byte_off,
@@ -8010,6 +8252,7 @@ impl CudaExecutable {
 
         self.prepare_readback_plan();
         let plan = self.readback_plan_buf.clone();
+        run_tail_host_audio_ops(&self.schedule, &stream, self.arena.f32_buf_mut(), true);
         if !self.gpu_handle_feeds.is_empty() {
             self.propagate_gpu_handle_feeds_d2d(&stream);
         }

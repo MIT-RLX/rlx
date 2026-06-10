@@ -47,6 +47,16 @@ pub trait BackendCostModel: Send + Sync {
     /// Memory bandwidth in bytes/ns (== GB/s).
     fn memory_bw(&self) -> f64;
 
+    /// Effective host readback bandwidth (bytes/ns). Defaults to [`Self::memory_bw`].
+    fn host_readback_bw(&self) -> f64 {
+        self.memory_bw()
+    }
+
+    /// True when device and host share the same physical memory (Apple Silicon Metal).
+    fn unified_memory(&self) -> bool {
+        false
+    }
+
     /// Number of compute threads available.
     fn num_threads(&self) -> usize;
 }
@@ -55,10 +65,23 @@ pub trait BackendCostModel: Send + Sync {
 /// Uses node-level cost contributions; conservative — actual time may
 /// be lower due to hardware parallelism we don't model.
 pub fn estimate_graph_cost(graph: &Graph, model: &dyn BackendCostModel) -> f64 {
+    estimate_graph_cost_with_io(graph, model, &crate::graph_io::profile_graph_io(graph))
+}
+
+/// IO-aware cost: compute + device traffic + host readback + sync points.
+pub fn estimate_graph_cost_with_io(
+    graph: &Graph,
+    model: &dyn BackendCostModel,
+    io: &crate::graph_io::GraphIoProfile,
+) -> f64 {
     let mut total = model.roundtrip_overhead_ns();
     for node in graph.nodes() {
         total += node_cost(node, graph, model);
     }
+    total += io.device_traffic_bytes as f64 / model.memory_bw().max(1.0);
+    total +=
+        io.host_readback_bytes(model.unified_memory()) as f64 / model.host_readback_bw().max(1.0);
+    total += io.sync_points as f64 * model.roundtrip_overhead_ns();
     total
 }
 
@@ -281,6 +304,9 @@ impl BackendCostModel for MetalCostModel {
     }
     fn memory_bw(&self) -> f64 {
         self.memory_bw
+    }
+    fn unified_memory(&self) -> bool {
+        true
     }
     fn num_threads(&self) -> usize {
         1

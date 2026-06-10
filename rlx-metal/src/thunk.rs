@@ -965,6 +965,14 @@ pub enum Thunk {
         n_bins: u32,
         n_mels: u32,
     },
+    WelchPeaks {
+        spec: usize,
+        dst: usize,
+        welch_batch: u32,
+        n_fft: u32,
+        n_segments: u32,
+        k: u32,
+    },
 }
 
 pub struct ThunkSchedule {
@@ -1035,6 +1043,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Fft1d { .. } => "fft1d",
         Thunk::LogMel { .. } => "log_mel",
         Thunk::LogMelBackward { .. } => "log_mel_backward",
+        Thunk::WelchPeaks { .. } => "welch_peaks",
         Thunk::GatedDeltaNet { .. } => "gated_delta_net",
         Thunk::DequantMatMulGguf { .. } => "dequant_matmul_gguf",
         Thunk::DequantGroupedMatMulGguf { .. } => "dequant_grouped_matmul_gguf",
@@ -2549,6 +2558,20 @@ impl ThunkSchedule {
                         n_fft: meta.n_fft as u32,
                         n_bins: meta.n_bins as u32,
                         n_mels: meta.n_mels as u32,
+                    }
+                }
+
+                Op::WelchPeaks { k, n_segments } => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let meta = rlx_ir::audio::welch_peaks_meta(&spec_shape, *k, *n_segments)
+                        .unwrap_or_else(|e| panic!("Op::WelchPeaks: {e}"));
+                    Thunk::WelchPeaks {
+                        spec: off(node.inputs[0]),
+                        dst: off(node.id),
+                        welch_batch: meta.welch_batch as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_segments: meta.n_segments as u32,
+                        k: meta.k as u32,
                     }
                 }
 

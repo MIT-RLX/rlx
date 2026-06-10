@@ -13,43 +13,43 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// RLX — versatile ML compiler + runtime.
-
 use cudarc::driver::{CudaSlice, CudaStream};
-use rlx_ir::DType;
 use std::sync::Arc;
 
-pub fn run_fft1d(
+pub fn run_welch_peaks(
     stream: &Arc<CudaStream>,
     buffer: &mut CudaSlice<f32>,
-    arena_size_bytes: usize,
-    src_byte_off: usize,
+    spec_byte_off: usize,
     dst_byte_off: usize,
-    outer: usize,
-    n_complex: usize,
-    inverse: bool,
-    norm_tag: u32,
-    dtype: DType,
+    welch_batch: usize,
+    n_fft: usize,
+    n_segments: usize,
+    k: usize,
+    pre_sync: bool,
 ) {
-    let meta = rlx_ir::fft::FftMeta {
-        outer,
-        n_complex,
-        axis_extent: match dtype {
-            DType::C64 => n_complex,
-            DType::F32 | DType::F64 => n_complex * 2,
-            other => panic!("fft_host: unsupported dtype {other:?}"),
-        },
-    };
-    let row_bytes = meta.row_bytes(dtype);
-    let (span_off, span_len) =
-        rlx_ir::fft::fft_arena_byte_span(src_byte_off, dst_byte_off, row_bytes, outer);
-    let _ = arena_size_bytes;
-    assert_eq!(span_off % 4, 0, "fft_host: span_off must be f32-aligned");
-    assert_eq!(span_len % 4, 0, "fft_host: span_len must be f32-aligned");
+    let spec_len = welch_batch * n_segments * n_fft * 2;
+    let dst_len = welch_batch * k * 2;
+    let span_off = spec_byte_off.min(dst_byte_off);
+    let span_end = (spec_byte_off + spec_len * 4).max(dst_byte_off + dst_len * 4);
+    let span_len = span_end - span_off;
+    assert_eq!(
+        span_off % 4,
+        0,
+        "welch_peaks_host: span_off must be f32-aligned"
+    );
+    assert_eq!(
+        span_len % 4,
+        0,
+        "welch_peaks_host: span_len must be f32-aligned"
+    );
     let span_f32 = span_off / 4;
     let span_n_f32 = span_len / 4;
 
-    stream.synchronize().expect("rlx-cuda: fft pre-sync failed");
+    if pre_sync {
+        stream
+            .synchronize()
+            .expect("rlx-cuda: welch_peaks pre-sync failed");
+    }
 
     let mut host = vec![0u8; span_len];
     stream
@@ -57,17 +57,16 @@ pub fn run_fft1d(
             &buffer.slice(span_f32..span_f32 + span_n_f32),
             bytemuck::cast_slice_mut(&mut host),
         )
-        .expect("rlx-cuda: fft partial dtoh failed");
+        .expect("rlx-cuda: welch_peaks partial dtoh failed");
 
     unsafe {
-        rlx_cpu::thunk::execute_fft1d(
-            src_byte_off - span_off,
+        rlx_cpu::thunk::execute_welch_peaks_f32(
+            spec_byte_off - span_off,
             dst_byte_off - span_off,
-            outer,
-            n_complex,
-            inverse,
-            norm_tag,
-            dtype,
+            welch_batch,
+            n_fft,
+            n_segments,
+            k,
             host.as_mut_ptr(),
         );
     }
@@ -77,5 +76,5 @@ pub fn run_fft1d(
             bytemuck::cast_slice(&host),
             &mut buffer.slice_mut(span_f32..span_f32 + span_n_f32),
         )
-        .expect("rlx-cuda: fft partial htod failed");
+        .expect("rlx-cuda: welch_peaks partial htod failed");
 }

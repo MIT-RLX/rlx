@@ -36,6 +36,7 @@ pub const CUMSUM_BWD_CU: &str = include_str!("../kernels/cumsum_backward.cu");
 pub const ROPE_BWD_CU: &str = include_str!("../kernels/rope_backward.cu");
 pub const GATHER_BWD_CU: &str = include_str!("../kernels/gather_backward.cu");
 pub const FUSED_RESIDUAL_LN_CU: &str = include_str!("../kernels/fused_residual_ln.cu");
+pub const FUSED_RESIDUAL_RMS_NORM_CU: &str = include_str!("../kernels/fused_residual_rms_norm.cu");
 pub const GATHER_CU: &str = include_str!("../kernels/gather.cu");
 pub const GATHER_AXIS_CU: &str = include_str!("../kernels/gather_axis.cu");
 pub const NARROW_CU: &str = include_str!("../kernels/narrow.cu");

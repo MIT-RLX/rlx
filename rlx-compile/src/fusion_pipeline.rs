@@ -354,6 +354,45 @@ pub fn fk_passes_after_elementwise_regions(
     finish_pipeline(passes)
 }
 
+/// Phase 3 — IO-aware gate defaults for fusion rewrites on `target`.
+pub fn io_fusion_gate_for_target(target: FusionTarget) -> crate::fusion_benefit::IoFusionGate {
+    use crate::fusion_benefit::IoFusionGate;
+    match target {
+        FusionTarget::Metal | FusionTarget::Mlx => IoFusionGate {
+            dispatch_ns: 500.0,
+            roundtrip_ns: 5_000.0,
+            memory_bw: 200.0,
+            host_readback_bw: 200.0,
+            unified_memory: true,
+            min_gain_ns: 1_000.0,
+        },
+        FusionTarget::Cuda | FusionTarget::Rocm => IoFusionGate {
+            dispatch_ns: 2_000.0,
+            roundtrip_ns: 20_000.0,
+            memory_bw: 800.0,
+            host_readback_bw: 50.0,
+            unified_memory: false,
+            min_gain_ns: 5_000.0,
+        },
+        FusionTarget::Wgpu | FusionTarget::Tpu => IoFusionGate {
+            dispatch_ns: 3_000.0,
+            roundtrip_ns: 30_000.0,
+            memory_bw: 100.0,
+            host_readback_bw: 40.0,
+            unified_memory: false,
+            min_gain_ns: 10_000.0,
+        },
+        FusionTarget::Cpu => IoFusionGate {
+            dispatch_ns: 50.0,
+            roundtrip_ns: 0.0,
+            memory_bw: 50.0,
+            host_readback_bw: 50.0,
+            unified_memory: true,
+            min_gain_ns: 0.0,
+        },
+    }
+}
+
 /// Return the ordered fusion passes for `target`.
 pub fn fusion_passes(target: FusionTarget, opts: FusionOptions) -> Vec<&'static dyn Pass> {
     let mut opts = opts;

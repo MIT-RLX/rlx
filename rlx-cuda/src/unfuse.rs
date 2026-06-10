@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 
 use rlx_ir::op::{Activation, BinaryOp, MaskKind};
-use rlx_ir::{DType, Graph, NodeId, Op, Shape};
+use rlx_ir::{DType, Graph, GraphExt, NodeId, Op, Shape};
 
 pub fn unfuse(graph: Graph) -> Graph {
     // Skip rebuild only if no fused/composed ops AND every Binary /
@@ -190,10 +190,9 @@ fn needs_broadcast_prologue(graph: &Graph, node: &rlx_ir::Node) -> bool {
 }
 
 fn should_unfuse(op: &Op) -> bool {
-    // FusedMatMulBiasAct and FusedResidualLN are now lowered natively
-    // — the matmul kernel folds bias + activation into its epilogue,
-    // and `fused_residual_ln.wgsl` does (Add[+bias] + LayerNorm) in
-    // one pass.
+    // FusedMatMulBiasAct, FusedResidualLN, and FusedResidualRmsNorm are
+    // lowered natively — matmul folds bias + activation into its epilogue,
+    // and `fused_residual_{ln,rms_norm}.cu` fuse Add[+bias] + norm in one pass.
     matches!(
         op,
         Op::FusedSwiGLU { .. }
@@ -249,6 +248,26 @@ fn expand_residual_ln(
     };
     let (gi, bi) = if has_bias { (3, 4) } else { (2, 3) };
     out.layer_norm(summed, inputs[gi], inputs[bi], -1, eps, shape.clone())
+}
+
+#[allow(dead_code)] // FusedResidualRmsNorm is lowered natively in CUDA.
+fn expand_residual_rms_norm(
+    out: &mut Graph,
+    inputs: &[NodeId],
+    shape: &Shape,
+    has_bias: bool,
+    eps: f32,
+) -> NodeId {
+    // inputs: [x, residual, [bias], gamma, beta]
+    let summed = out.binary(BinaryOp::Add, inputs[0], inputs[1], shape.clone());
+    let summed = if has_bias {
+        let bias_b = broadcast_to(out, inputs[2], shape);
+        out.binary(BinaryOp::Add, summed, bias_b, shape.clone())
+    } else {
+        summed
+    };
+    let (gi, bi) = if has_bias { (3, 4) } else { (2, 3) };
+    out.rms_norm(summed, inputs[gi], inputs[bi], eps)
 }
 
 fn expand_swiglu(

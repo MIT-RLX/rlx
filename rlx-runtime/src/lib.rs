@@ -66,6 +66,7 @@ pub mod device_ext;
 pub mod device_parse;
 pub mod device_policy;
 pub mod expert_pool;
+pub mod graph_io;
 pub mod jacfwd;
 pub mod kernel_trace;
 pub mod kv_cache;

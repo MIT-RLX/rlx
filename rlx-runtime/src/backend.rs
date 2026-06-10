@@ -668,6 +668,7 @@ pub mod cpu_backend {
             FftButterflyStage,
             LogMel,
             LogMelBackward,
+            WelchPeaks,
             // C64 Wirtinger AD surface. ComplexNormSq is the canonical
             // real-valued loss for complex inputs; Conjugate is emitted
             // by the new Wirtinger VJP rules for BinaryOp::Mul/Div on
@@ -1447,6 +1448,7 @@ pub mod wgpu_backend {
         OpKind::Fft,
         OpKind::LogMel,
         OpKind::LogMelBackward,
+        OpKind::WelchPeaks,
         // 3D Gaussian splat: native Metal / CPU reference per backend.
         OpKind::GaussianSplatRender,
         OpKind::GaussianSplatRenderBackward,
@@ -1843,6 +1845,7 @@ pub mod mlx_backend {
             Fft,
             LogMel,
             LogMelBackward,
+            WelchPeaks,
             GaussianSplatRender,
             GaussianSplatRenderBackward,
             // Op::Fft on MLX: native `mlx::fft::fft` via rlx_mlx_op_fft shim.
@@ -2097,6 +2100,7 @@ pub mod metal_backend {
             Fft,
             LogMel,
             LogMelBackward,
+            WelchPeaks,
             // Host-fallback splat (unified-memory arena + rlx-cpu/splat).
             GaussianSplatRender,
             GaussianSplatRenderBackward,
@@ -2370,6 +2374,7 @@ pub mod cuda_backend {
             Fft,
             LogMel,
             LogMelBackward,
+            WelchPeaks,
             Im2Col,
         ]
     };
@@ -2380,6 +2385,7 @@ pub mod cuda_backend {
         }
 
         fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+            use rlx_opt::pass::Pass as _;
             // Decompose FusedSwiGLU / FAB / etc. before legalization (CudaExecutable
             // unfuses again; this pass is idempotent).
             let graph = rlx_cuda::unfuse::unfuse(graph);
@@ -2602,6 +2608,7 @@ pub mod rocm_backend {
             Fft,
             LogMel,
             LogMelBackward,
+            WelchPeaks,
             Im2Col,
         ]
     };
@@ -2612,6 +2619,7 @@ pub mod rocm_backend {
         }
 
         fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+            use rlx_opt::pass::Pass as _;
             let graph = rlx_rocm::unfuse::unfuse(graph);
             let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, ROCM_SUPPORTED_OPS)
                 .unwrap_or_else(|errors| {
@@ -2817,6 +2825,7 @@ pub mod tpu_backend {
             Fft,
             LogMel,
             LogMelBackward,
+            WelchPeaks,
             // Splat: no on-chip kernel — lowered to common primitive MIR via logical_kernel.
         ]
     };

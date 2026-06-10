@@ -84,8 +84,23 @@ fn main() {
         .define("MLX_BUILD_GGUF", "OFF")
         .define("MLX_BUILD_SAFETENSORS", "OFF")
         .define("BUILD_SHARED_LIBS", "OFF")
-        .define("CMAKE_BUILD_TYPE", cmake_build_type)
-        .define("MLX_USE_CCACHE", "ON");
+        .define("CMAKE_BUILD_TYPE", cmake_build_type);
+
+    if is_macos {
+        let deploy = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "14.0".into());
+        mlx_cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", deploy.as_str());
+        mlx_cfg.env("CC", "/usr/bin/cc");
+        mlx_cfg.env("CXX", "/usr/bin/c++");
+    }
+
+    let use_ccache = is_macos
+        && env_flag("RLX_MLX_NO_CCACHE") != Some(true)
+        && Command::new("ccache")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    mlx_cfg.define("MLX_USE_CCACHE", if use_ccache { "ON" } else { "OFF" });
 
     apply_cmake_parallelism(&mut mlx_cfg);
 

@@ -52,6 +52,7 @@ pub mod mps_blas;
 #[cfg(target_os = "macos")]
 pub mod mps_graph;
 
+#[cfg(target_os = "macos")]
 pub mod mps_graph_hybrid;
 #[cfg(target_os = "macos")]
 pub mod mps_graph_lower;

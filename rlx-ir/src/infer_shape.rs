@@ -33,6 +33,9 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::MatMul => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
         Op::LogMel => crate::audio::log_mel_output_shape(in_shape(0), in_shape(1)).ok(),
         Op::LogMelBackward => Some(shape::unary_shape(in_shape(0))),
+        Op::WelchPeaks { k, n_segments } => {
+            crate::audio::welch_peaks_output_shape(in_shape(0), *k, *n_segments).ok()
+        }
         Op::Binary(_) => shape::binary_shape(in_shape(0), in_shape(1)).ok(),
         Op::Compare(_) => shape::compare_shape(in_shape(0), in_shape(1)).ok(),
         Op::Where => {
