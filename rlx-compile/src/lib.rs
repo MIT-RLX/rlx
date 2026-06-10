@@ -45,8 +45,8 @@ pub use fusion_benefit::{
 };
 pub use fusion_pipeline::{
     FusionOptions, FusionTarget, fk_passes_after_elementwise_regions, fusion_limits_for_target,
-    fusion_passes, fusion_passes_for_supported, io_fusion_gate_for_target, supported_for_target,
-    supports_op,
+    fusion_passes, fusion_passes_for_supported, io_fusion_gate_for_target, should_fuse_with_target,
+    supported_for_target, supports_op,
 };
 pub use inline::inline_into;
 pub use inspect::{

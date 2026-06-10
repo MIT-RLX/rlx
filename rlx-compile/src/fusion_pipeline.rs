@@ -354,6 +354,15 @@ pub fn fk_passes_after_elementwise_regions(
     finish_pipeline(passes)
 }
 
+/// IO gate decision for a rewrite on `target` (convenience for compile passes / model crates).
+pub fn should_fuse_with_target(
+    target: FusionTarget,
+    before: &crate::fusion_benefit::GraphIoProfile,
+    after: &crate::fusion_benefit::GraphIoProfile,
+) -> bool {
+    io_fusion_gate_for_target(target).should_fuse(before, after)
+}
+
 /// Phase 3 — IO-aware gate defaults for fusion rewrites on `target`.
 pub fn io_fusion_gate_for_target(target: FusionTarget) -> crate::fusion_benefit::IoFusionGate {
     use crate::fusion_benefit::IoFusionGate;
@@ -364,6 +373,7 @@ pub fn io_fusion_gate_for_target(target: FusionTarget) -> crate::fusion_benefit:
             memory_bw: 200.0,
             host_readback_bw: 200.0,
             unified_memory: true,
+            host_thunk_penalty_ns: 2_000_000.0,
             min_gain_ns: 1_000.0,
         },
         FusionTarget::Cuda | FusionTarget::Rocm => IoFusionGate {
@@ -372,6 +382,7 @@ pub fn io_fusion_gate_for_target(target: FusionTarget) -> crate::fusion_benefit:
             memory_bw: 800.0,
             host_readback_bw: 50.0,
             unified_memory: false,
+            host_thunk_penalty_ns: 15_000_000.0,
             min_gain_ns: 5_000.0,
         },
         FusionTarget::Wgpu | FusionTarget::Tpu => IoFusionGate {
@@ -380,6 +391,7 @@ pub fn io_fusion_gate_for_target(target: FusionTarget) -> crate::fusion_benefit:
             memory_bw: 100.0,
             host_readback_bw: 40.0,
             unified_memory: false,
+            host_thunk_penalty_ns: 25_000_000.0,
             min_gain_ns: 10_000.0,
         },
         FusionTarget::Cpu => IoFusionGate {
@@ -388,6 +400,7 @@ pub fn io_fusion_gate_for_target(target: FusionTarget) -> crate::fusion_benefit:
             memory_bw: 50.0,
             host_readback_bw: 50.0,
             unified_memory: true,
+            host_thunk_penalty_ns: 0.0,
             min_gain_ns: 0.0,
         },
     }
@@ -701,5 +714,24 @@ mod tests {
             passes.iter().any(|p| p.name() == "fuse_region_prologue"),
             "FKL prologue fusion should still run"
         );
+    }
+
+    #[test]
+    fn should_fuse_with_target_matches_gate() {
+        use crate::fusion_benefit::GraphIoProfile;
+        let dense = GraphIoProfile {
+            kernel_launches: 3,
+            sync_points: 0,
+            host_output_bytes: 33_554_432,
+            device_traffic_bytes: 184_549_376,
+        };
+        let fused = GraphIoProfile {
+            kernel_launches: 4,
+            sync_points: 1,
+            host_output_bytes: 1_048_576,
+            device_traffic_bytes: 219_152_384,
+        };
+        assert!(should_fuse_with_target(FusionTarget::Metal, &dense, &fused));
+        assert!(!should_fuse_with_target(FusionTarget::Wgpu, &dense, &fused));
     }
 }
