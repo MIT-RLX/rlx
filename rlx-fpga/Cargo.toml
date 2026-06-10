@@ -25,7 +25,7 @@ std = []
 # uses an f32 requantize; FPGA fabric needs integer-only Q0.31).
 [dependencies]
 rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.4", default-features = false, features = ["std"] }
-rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.5" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.4" }
 
 [dev-dependencies]

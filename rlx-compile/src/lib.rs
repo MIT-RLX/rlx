@@ -13,6 +13,7 @@ pub mod compiler;
 pub mod const_fold;
 pub mod dce;
 pub mod dispatch_report;
+pub mod fusion_benefit;
 pub mod fusion_pipeline;
 pub mod hardening;
 pub mod inline;
@@ -39,9 +40,13 @@ pub use dispatch_report::{
     DispatchPath, KernelDispatchReport, KindDispatchSummary, analyze_dispatch,
     format_dispatch_report, maybe_log_dispatch_report, prepare_graph_for_backend_with_report,
 };
+pub use fusion_benefit::{
+    FusionBenefit, GraphIoProfile as FusionIoProfile, IoFusionGate, fusion_benefit,
+};
 pub use fusion_pipeline::{
     FusionOptions, FusionTarget, fk_passes_after_elementwise_regions, fusion_limits_for_target,
-    fusion_passes, fusion_passes_for_supported, supported_for_target, supports_op,
+    fusion_passes, fusion_passes_for_supported, io_fusion_gate_for_target, supported_for_target,
+    supports_op,
 };
 pub use inline::inline_into;
 pub use inspect::{

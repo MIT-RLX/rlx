@@ -13,10 +13,10 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.4", features = ["rocm"] }
-rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
+rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.5", features = ["rocm"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.5" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.4" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.4", features = ["splat"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.5", features = ["splat"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libloading = "0.8"

@@ -245,6 +245,134 @@ pub fn log_mel_block_vjp(
     }
 }
 
+/// Geometry for `Op::WelchPeaks` from block-layout segment spectra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WelchPeaksMeta {
+    pub welch_batch: usize,
+    pub n_fft: usize,
+    pub n_bins: usize,
+    pub n_segments: usize,
+    pub k: usize,
+}
+
+pub fn welch_peaks_meta(
+    spectrum: &Shape,
+    k: usize,
+    n_segments: usize,
+) -> Result<WelchPeaksMeta, String> {
+    if spectrum.dtype() != DType::F32 {
+        return Err(format!(
+            "Op::WelchPeaks spectrum must be F32, got {:?}",
+            spectrum.dtype()
+        ));
+    }
+    if spectrum.rank() != 2 {
+        return Err("Op::WelchPeaks spectrum must be [outer, 2*n_fft]".into());
+    }
+    if n_segments == 0 || k == 0 {
+        return Err("Op::WelchPeaks requires k >= 1 and n_segments >= 1".into());
+    }
+    let n_fft2 = spectrum.dim(1).unwrap_static();
+    if !n_fft2.is_multiple_of(2) {
+        return Err(format!(
+            "Op::WelchPeaks spectrum last dim must be 2*n_fft, got {n_fft2}"
+        ));
+    }
+    let n_fft = n_fft2 / 2;
+    let outer = spectrum.dim(0).unwrap_static();
+    if !outer.is_multiple_of(n_segments) {
+        return Err(format!(
+            "Op::WelchPeaks outer {outer} not divisible by n_segments {n_segments}"
+        ));
+    }
+    Ok(WelchPeaksMeta {
+        welch_batch: outer / n_segments,
+        n_fft,
+        n_bins: n_fft / 2 + 1,
+        n_segments,
+        k,
+    })
+}
+
+pub fn welch_peaks_output_shape(
+    spectrum: &Shape,
+    k: usize,
+    n_segments: usize,
+) -> Result<Shape, String> {
+    let meta = welch_peaks_meta(spectrum, k, n_segments)?;
+    Ok(Shape::new(&[meta.welch_batch, meta.k * 2], DType::F32))
+}
+
+fn accumulate_block_power_row(row: &mut [f32], block: &[f32], n_fft: usize, scale: f32) {
+    let n_bins = n_fft / 2 + 1;
+    debug_assert!(block.len() >= n_fft * 2);
+    row[0] += scale * (block[0] * block[0] + block[n_fft] * block[n_fft]);
+    for bin in 1..n_bins.saturating_sub(1) {
+        let re = block[bin];
+        let im = block[n_fft + bin];
+        row[bin] += scale * 2.0 * (re * re + im * im);
+    }
+    if n_bins > 1 {
+        let bin = n_bins - 1;
+        row[bin] += scale * (block[bin] * block[bin] + block[n_fft + bin] * block[n_fft + bin]);
+    }
+}
+
+fn topk_peaks_one(psd: &[f32], k: usize) -> Vec<(usize, f32)> {
+    use std::cmp::Ordering;
+    let n_bins = psd.len();
+    let k = k.min(n_bins).max(1);
+    let mut top: Vec<(usize, f32)> = Vec::with_capacity(k);
+    for (bin, &power) in psd.iter().enumerate() {
+        if top.len() < k {
+            top.push((bin, power));
+            if top.len() == k {
+                top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            }
+            continue;
+        }
+        if power <= top[k - 1].1 {
+            continue;
+        }
+        top[k - 1] = (bin, power);
+        let mut i = k - 1;
+        while i > 0 && top[i].1 > top[i - 1].1 {
+            top.swap(i, i - 1);
+            i -= 1;
+        }
+    }
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    top
+}
+
+/// Block-layout segment spectra `[outer, 2*n_fft]` → packed peaks `[batch, k*2]`.
+pub fn welch_peaks_block_f32(
+    spectrum: &[f32],
+    welch_batch: usize,
+    n_fft: usize,
+    n_segments: usize,
+    k: usize,
+    out: &mut [f32],
+) {
+    let n_bins = n_fft / 2 + 1;
+    let row_len = n_fft * 2;
+    let inv = 1.0 / n_segments as f32;
+    let mut psd = vec![0f32; n_bins];
+    for b in 0..welch_batch {
+        psd.fill(0.0);
+        for s in 0..n_segments {
+            let base = (b * n_segments + s) * row_len;
+            accumulate_block_power_row(&mut psd, &spectrum[base..base + row_len], n_fft, inv);
+        }
+        let peaks = topk_peaks_one(&psd, k);
+        for (i, &(bin, power)) in peaks.iter().enumerate().take(k) {
+            let dst = (b * k + i) * 2;
+            out[dst] = bin as f32;
+            out[dst + 1] = power;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +441,36 @@ mod tests {
         for (a, b) in out_block.iter().zip(out_int.iter()) {
             assert!((a - b).abs() < 1e-6, "block={a} interleaved={b}");
         }
+    }
+
+    #[test]
+    fn welch_peaks_meta_and_topk() {
+        let spec = Shape::new(&[8, 256], DType::F32);
+        let meta = welch_peaks_meta(&spec, 4, 2).unwrap();
+        assert_eq!(meta.welch_batch, 4);
+        assert_eq!(meta.n_fft, 128);
+        assert_eq!(meta.k, 4);
+        let out_shape = welch_peaks_output_shape(&spec, 4, 2).unwrap();
+        assert_eq!(out_shape.dims()[0], crate::shape::Dim::Static(4));
+        assert_eq!(out_shape.dims()[1], crate::shape::Dim::Static(8));
+
+        let n_fft = 32;
+        let n_bins = n_fft / 2 + 1;
+        let row_len = n_fft * 2;
+        let n_segments = 2;
+        let welch_batch = 2;
+        let mut spectrum = vec![0f32; welch_batch * n_segments * row_len];
+        for s in 0..welch_batch * n_segments {
+            let base = s * row_len;
+            for k in 0..n_bins {
+                let amp = if k == 7 { 3.0 } else { 0.01 * k as f32 };
+                spectrum[base + k] = amp;
+                spectrum[base + n_fft + k] = 0.0;
+            }
+        }
+        let mut out = vec![0f32; welch_batch * 2 * 2];
+        welch_peaks_block_f32(&spectrum, welch_batch, n_fft, n_segments, 2, &mut out);
+        assert!((out[0] - 7.0).abs() < 1e-5);
+        assert!(out[1] > 1.0);
     }
 }

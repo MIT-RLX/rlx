@@ -7,6 +7,23 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-06
+
+### Fixed
+
+- **`rlx-runtime`**: import `rlx_opt::pass::Pass` in CUDA and ROCm `Backend::compile`
+  so `LegalizeBroadcast` / `AutoMixedPrecision` compile on Rust ≥1.87 (crates.io
+  0.2.4 tarball missed this in `compile()` while `compile_lir()` had it).
+
+### Added
+
+- **`Op::WelchPeaks`**: Welch PSD top-K spikes from block-layout FFT segment spectra
+  (`rlx-ir`, CPU + Metal + MLX lowering, CUDA/wgpu host sidecars, runtime supported-op lists).
+- **`rlx-runtime::graph_io`**: static IO / sync profiling for compile-time fusion
+  planning (`GraphIoProfile`, `profile_graph_io`, peaks-only output sizing).
+- **`rlx-compile::fusion_benefit`**: IO-aware fusion benefit scoring and per-target
+  gates (`io_fusion_gate_for_target`).
+
 ## [0.2.3] — 2026-06
 
 ### Added

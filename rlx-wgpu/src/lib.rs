@@ -40,6 +40,7 @@ pub mod gguf_host;
 pub mod im2col_host;
 pub mod kernels;
 pub mod llada2_gate_host;
+pub mod log_mel_host;
 #[cfg(feature = "splat")]
 pub mod splat;
 #[cfg(feature = "native-splat")]
@@ -47,6 +48,7 @@ pub mod splat_native;
 pub mod training_bwd_host;
 pub mod umap_knn_host;
 pub mod unfuse;
+pub mod welch_peaks_host;
 
 /// True if a wgpu adapter is reachable on this system. Always
 /// available at the crate level; the runtime registry only registers

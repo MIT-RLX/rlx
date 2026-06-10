@@ -42,4 +42,18 @@ impl Graph {
             None,
         )
     }
+
+    /// Top-K Welch peaks from RLX FFT block-layout segment spectra.
+    ///
+    /// * **spectrum** — `[batch * n_segments, 2*n_fft]`
+    /// * **k** — spikes per batch row
+    /// * **n_segments** — Welch segments averaged per row
+    ///
+    /// Output: `[batch, k*2]` interleaved `(bin, power)`.
+    pub fn welch_peaks(&mut self, spectrum: NodeId, k: usize, n_segments: usize) -> NodeId {
+        let spec_shape = self.shape(spectrum).clone();
+        let out = crate::audio::welch_peaks_output_shape(&spec_shape, k, n_segments)
+            .unwrap_or_else(|e| panic!("welch_peaks shape error: {e}"));
+        self.push(Op::WelchPeaks { k, n_segments }, vec![spectrum], out, None)
+    }
 }

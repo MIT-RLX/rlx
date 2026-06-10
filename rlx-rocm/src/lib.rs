@@ -43,6 +43,8 @@ pub mod im2col_host;
 pub mod kernels;
 pub mod launch;
 pub mod llada2_gate_host;
+pub mod log_mel_backward_host;
+pub mod log_mel_host;
 pub mod miopen;
 pub mod roctx;
 pub mod splat_host;
@@ -51,6 +53,7 @@ pub mod splat_native;
 pub mod training_bwd_host;
 pub mod umap_knn_host;
 pub mod unfuse;
+pub mod welch_peaks_host;
 
 // Dev-only HIP-CPU validation FFI. Bindings are reused verbatim from
 // rlx-cuda via `#[path]`; only compiled under `--features hip-cpu-validate`.

@@ -268,6 +268,34 @@ enum Step {
         norm_tag: u32,
         dtype_tag: u32,
     },
+    /// Welch PSD top-K — D2H → rlx-cpu → H2D.
+    WelchPeaksHost {
+        spec_byte_off: u32,
+        dst_byte_off: u32,
+        welch_batch: u32,
+        n_fft: u32,
+        n_segments: u32,
+        k: u32,
+    },
+    LogMelHost {
+        spec_byte_off: u32,
+        filt_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        n_fft: u32,
+        n_bins: u32,
+        n_mels: u32,
+    },
+    LogMelBackwardHost {
+        spec_byte_off: u32,
+        filt_byte_off: u32,
+        dy_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        n_fft: u32,
+        n_bins: u32,
+        n_mels: u32,
+    },
     /// NCHW im2col host path (D2H → rlx-cpu → H2D).
     Im2ColHost {
         x_byte_off: u32,
@@ -704,7 +732,10 @@ impl Step {
             // active-extent-safe ops still gets the optimization for
             // the rest of the schedule.
             Step::FftGpu { .. } | Step::FftHost { .. } => true,
-            Step::Im2ColHost { .. } => true,
+            Step::Im2ColHost { .. }
+            | Step::WelchPeaksHost { .. }
+            | Step::LogMelHost { .. }
+            | Step::LogMelBackwardHost { .. } => true,
             // Matmul: c_batch_stride is set at compile time at full m,
             // independent of params.m. With scaled m, threads with
             // global_row >= m early-return; per-batch output offsets
@@ -807,6 +838,9 @@ fn step_name(step: &Step) -> &'static str {
         Step::Cumsum { .. } => "cumsum",
         Step::FftGpu { .. } => "fft_gpu",
         Step::FftHost { .. } => "fft_host",
+        Step::WelchPeaksHost { .. } => "welch_peaks_host",
+        Step::LogMelHost { .. } => "log_mel_host",
+        Step::LogMelBackwardHost { .. } => "log_mel_backward_host",
         Step::Im2ColHost { .. } => "im2col_host",
         Step::BufferCopy { .. } => "buffer_copy",
         Step::Copy { .. } => "copy",
@@ -862,6 +896,13 @@ fn step_name(step: &Step) -> &'static str {
         Step::ElementwiseRegion { .. } => "elementwise_region",
         Step::BatchElementwiseRegion { .. } => "batch_elementwise_region",
     }
+}
+
+fn step_is_tail_host(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::WelchPeaksHost { .. } | Step::LogMelHost { .. } | Step::LogMelBackwardHost { .. }
+    )
 }
 
 fn step_runs_on_host(step: &Step) -> bool {
@@ -4511,6 +4552,50 @@ impl WgpuExecutable {
                         });
                     }
                 }
+                Op::WelchPeaks { k, n_segments } => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let meta = rlx_ir::audio::welch_peaks_meta(&spec_shape, *k, *n_segments)
+                        .unwrap_or_else(|e| panic!("Op::WelchPeaks: {e}"));
+                    schedule.push(Step::WelchPeaksHost {
+                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        welch_batch: meta.welch_batch as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_segments: meta.n_segments as u32,
+                        k: meta.k as u32,
+                    });
+                }
+                Op::LogMel => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let filt_shape = graph.node(node.inputs[1]).shape.clone();
+                    let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
+                        .unwrap_or_else(|e| panic!("Op::LogMel: {e}"));
+                    schedule.push(Step::LogMelHost {
+                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                        filt_byte_off: arena.offset(node.inputs[1]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        outer: meta.outer as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_bins: meta.n_bins as u32,
+                        n_mels: meta.n_mels as u32,
+                    });
+                }
+                Op::LogMelBackward => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let filt_shape = graph.node(node.inputs[1]).shape.clone();
+                    let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
+                        .unwrap_or_else(|e| panic!("Op::LogMelBackward: {e}"));
+                    schedule.push(Step::LogMelBackwardHost {
+                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                        filt_byte_off: arena.offset(node.inputs[1]) as u32,
+                        dy_byte_off: arena.offset(node.inputs[2]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        outer: meta.outer as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_bins: meta.n_bins as u32,
+                        n_mels: meta.n_mels as u32,
+                    });
+                }
                 Op::SelectiveScan { state_size } => {
                     if *state_size > 256 {
                         panic!(
@@ -5740,6 +5825,86 @@ impl WgpuExecutable {
             .collect()
     }
 
+    fn run_tail_host_audio_ops(&self, dev: &crate::device::WgpuDevice) {
+        if !self.schedule.iter().any(step_is_tail_host) {
+            return;
+        }
+        for step in &self.schedule {
+            if !step_is_tail_host(step) {
+                continue;
+            }
+            match step {
+                Step::WelchPeaksHost {
+                    spec_byte_off,
+                    dst_byte_off,
+                    welch_batch,
+                    n_fft,
+                    n_segments,
+                    k,
+                } => {
+                    crate::welch_peaks_host::run_welch_peaks(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *spec_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *welch_batch as usize,
+                        *n_fft as usize,
+                        *n_segments as usize,
+                        *k as usize,
+                    );
+                }
+                Step::LogMelHost {
+                    spec_byte_off,
+                    filt_byte_off,
+                    dst_byte_off,
+                    outer,
+                    n_fft,
+                    n_bins,
+                    n_mels,
+                } => {
+                    crate::log_mel_host::run_log_mel(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *spec_byte_off as usize,
+                        *filt_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *n_fft as usize,
+                        *n_bins as usize,
+                        *n_mels as usize,
+                    );
+                }
+                Step::LogMelBackwardHost {
+                    spec_byte_off,
+                    filt_byte_off,
+                    dy_byte_off,
+                    dst_byte_off,
+                    outer,
+                    n_fft,
+                    n_bins,
+                    n_mels,
+                } => {
+                    crate::log_mel_host::run_log_mel_backward(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *spec_byte_off as usize,
+                        *filt_byte_off as usize,
+                        *dy_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *n_fft as usize,
+                        *n_bins as usize,
+                        *n_mels as usize,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn run_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         // Lazy compile path: if we deferred compile waiting for shapes,
         // infer the binding from input data lengths now and compile.
@@ -6153,7 +6318,10 @@ impl WgpuExecutable {
                     | Step::Llada2GroupLimitedGate { .. }
                     | Step::UmapKnnHost { .. }
                     | Step::FftHost { .. }
-                    | Step::Im2ColHost { .. } => {}
+                    | Step::Im2ColHost { .. }
+                    | Step::WelchPeaksHost { .. }
+                    | Step::LogMelHost { .. }
+                    | Step::LogMelBackwardHost { .. } => {}
                     Step::FusedResidualLn { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
@@ -6220,6 +6388,10 @@ impl WgpuExecutable {
                 });
                 let mut pass_dispatched = false;
                 while step_i < self.schedule.len() {
+                    if step_is_tail_host(&self.schedule[step_i]) {
+                        step_i += 1;
+                        continue;
+                    }
                     if step_runs_on_host(&self.schedule[step_i]) {
                         break;
                     }
@@ -7038,7 +7210,10 @@ impl WgpuExecutable {
                         | Step::Llada2GroupLimitedGate { .. }
                         | Step::UmapKnnHost { .. }
                         | Step::FftHost { .. }
-                        | Step::Im2ColHost { .. } => {}
+                        | Step::Im2ColHost { .. }
+                        | Step::WelchPeaksHost { .. }
+                        | Step::LogMelHost { .. }
+                        | Step::LogMelBackwardHost { .. } => {}
                         #[cfg(feature = "splat")]
                         Step::GaussianSplatRender { .. }
                         | Step::GaussianSplatRenderBackward { .. }
@@ -7058,12 +7233,13 @@ impl WgpuExecutable {
                 && step_needs_pass_flush(&self.schedule[step_i], &self.schedule[step_i - 1]);
             let gpu_schedule_done = step_i >= self.schedule.len();
             let skip_readback = rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY");
+            let defer_tail = gpu_schedule_done && self.schedule.iter().any(step_is_tail_host);
             let mut fused_readback: Option<(
                 ReadbackLayout,
                 std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
                 Vec<usize>,
             )> = None;
-            if gpu_schedule_done && !skip_readback {
+            if gpu_schedule_done && !skip_readback && !defer_tail {
                 if !self.gpu_handle_feeds.is_empty() {
                     self.propagate_gpu_handle_feeds_on_gpu(dev, &mut enc);
                 }
@@ -7079,6 +7255,7 @@ impl WgpuExecutable {
                     encode_readback_copies(&mut enc, &self.arena, tiny.buffer(), &out_ids, &layout);
                     let map_rx = schedule_readback_map(&mut enc, tiny.buffer(), &layout);
                     dev.queue.submit(std::iter::once(enc.finish()));
+                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     wait_readback_map(&dev.device, &map_rx, layout.total_bytes);
                     map_rx.recv().unwrap().unwrap();
                     return self.pack_readback_outputs(
@@ -7104,6 +7281,66 @@ impl WgpuExecutable {
                 }
             }
             dev.queue.submit(std::iter::once(enc.finish()));
+            if defer_tail {
+                let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                self.run_tail_host_audio_ops(dev);
+                if !skip_readback {
+                    let mut rb_enc =
+                        dev.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("rlx-wgpu readback after tail-host"),
+                            });
+                    if !self.gpu_handle_feeds.is_empty() {
+                        self.propagate_gpu_handle_feeds_on_gpu(dev, &mut rb_enc);
+                    }
+                    let plan = self.readback_plan();
+                    let out_ids_all: Vec<_> = self.graph.outputs.clone();
+                    let out_ids: Vec<_> = plan.iter().map(|&i| out_ids_all[i]).collect();
+                    let layout = ReadbackLayout::for_nodes(&self.arena, &out_ids);
+                    if use_tiny_readback(&layout, out_ids.len()) && plan == vec![0] {
+                        if self.tiny_readback.is_none() {
+                            self.tiny_readback = Some(TinyReadbackStaging::new(&dev.device));
+                        }
+                        let tiny = self.tiny_readback.as_ref().expect("tiny readback");
+                        encode_readback_copies(
+                            &mut rb_enc,
+                            &self.arena,
+                            tiny.buffer(),
+                            &out_ids,
+                            &layout,
+                        );
+                        let map_rx = schedule_readback_map(&mut rb_enc, tiny.buffer(), &layout);
+                        dev.queue.submit(std::iter::once(rb_enc.finish()));
+                        wait_readback_map(&dev.device, &map_rx, layout.total_bytes);
+                        map_rx.recv().unwrap().unwrap();
+                        return self.pack_readback_outputs(
+                            &plan,
+                            vec![decode_tiny_mapped_f32(tiny.buffer(), layout.total_bytes)],
+                        );
+                    }
+                    ReadbackStaging::prepare(
+                        &dev.device,
+                        &mut self.readback_staging,
+                        layout.total_bytes,
+                    );
+                    if let Some(staging) = self.readback_staging.as_ref() {
+                        encode_readback_copies(
+                            &mut rb_enc,
+                            &self.arena,
+                            staging.buffer(),
+                            &out_ids,
+                            &layout,
+                        );
+                        let map_rx = schedule_readback_map(&mut rb_enc, staging.buffer(), &layout);
+                        dev.queue.submit(std::iter::once(rb_enc.finish()));
+                        wait_readback_map(&dev.device, &map_rx, layout.total_bytes);
+                        map_rx.recv().unwrap().unwrap();
+                        self.dump_node_stats_if_requested(dev);
+                        let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
+                        return self.pack_readback_outputs(&plan, partial);
+                    }
+                }
+            }
             if needs_f16_drain {
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
             }
@@ -7113,7 +7350,7 @@ impl WgpuExecutable {
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
             }
             if gpu_schedule_done {
-                if skip_readback {
+                if skip_readback || defer_tail {
                     return self
                         .graph
                         .outputs
@@ -7331,6 +7568,11 @@ impl WgpuExecutable {
                         *norm_tag,
                         fft_dtype_from_tag(*dtype_tag),
                     );
+                }
+                Step::WelchPeaksHost { .. }
+                | Step::LogMelHost { .. }
+                | Step::LogMelBackwardHost { .. } => {
+                    unreachable!("tail-host audio ops run after GPU wait")
                 }
                 Step::Im2ColHost {
                     x_byte_off,

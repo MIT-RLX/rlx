@@ -187,6 +187,12 @@ kernel_cache!(
     FUSED_RESIDUAL_LN_CU,
     "fused_residual_ln"
 );
+kernel_cache!(
+    FUSED_RESIDUAL_RMS_NORM,
+    fused_residual_rms_norm_kernel,
+    FUSED_RESIDUAL_RMS_NORM_CU,
+    "fused_residual_rms_norm"
+);
 kernel_cache!(GATHER, gather_kernel, GATHER_CU, "gather");
 kernel_cache!(
     GATHER_AXIS,

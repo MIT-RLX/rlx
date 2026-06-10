@@ -344,6 +344,33 @@ pub(crate) enum Step {
         dtype_tag: u32,
         use_gpu: bool,
     },
+    LogMelHost {
+        spec_byte_off: u32,
+        filt_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        n_fft: u32,
+        n_bins: u32,
+        n_mels: u32,
+    },
+    LogMelBackwardHost {
+        spec_byte_off: u32,
+        filt_byte_off: u32,
+        dy_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        n_fft: u32,
+        n_bins: u32,
+        n_mels: u32,
+    },
+    WelchPeaksHost {
+        spec_byte_off: u32,
+        dst_byte_off: u32,
+        welch_batch: u32,
+        n_fft: u32,
+        n_segments: u32,
+        k: u32,
+    },
     Im2ColHost {
         x_byte_off: u32,
         col_byte_off: u32,
@@ -851,6 +878,9 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Sample { .. } => "rlx::Sample",
         Step::SelectiveScan { .. } => "rlx::SelectiveScan",
         Step::Fft { .. } => "rlx::Fft",
+        Step::LogMelHost { .. } => "rlx::LogMelHost",
+        Step::LogMelBackwardHost { .. } => "rlx::LogMelBackwardHost",
+        Step::WelchPeaksHost { .. } => "rlx::WelchPeaksHost",
         Step::Im2ColHost { .. } => "rlx::Im2ColHost",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Llada2GroupLimitedGate { .. } => "rlx::Llada2GroupLimitedGate",
@@ -1086,6 +1116,30 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dst_byte_off,
             ..
         } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
+        Step::LogMelHost {
+            spec_byte_off,
+            filt_byte_off,
+            dst_byte_off,
+            ..
+        } => (
+            vec![*spec_byte_off / 4, *filt_byte_off / 4],
+            vec![*dst_byte_off / 4],
+        ),
+        Step::LogMelBackwardHost {
+            spec_byte_off,
+            filt_byte_off,
+            dy_byte_off,
+            dst_byte_off,
+            ..
+        } => (
+            vec![*spec_byte_off / 4, *filt_byte_off / 4, *dy_byte_off / 4],
+            vec![*dst_byte_off / 4],
+        ),
+        Step::WelchPeaksHost {
+            spec_byte_off,
+            dst_byte_off,
+            ..
+        } => (vec![*spec_byte_off / 4], vec![*dst_byte_off / 4]),
         Step::Im2ColHost {
             x_byte_off,
             col_byte_off,
@@ -1786,6 +1840,9 @@ impl Step {
             Step::GatedDeltaNet { .. }
             | Step::Llada2GroupLimitedGate { .. }
             | Step::UmapKnn { .. }
+            | Step::LogMelHost { .. }
+            | Step::LogMelBackwardHost { .. }
+            | Step::WelchPeaksHost { .. }
             | Step::GaussianSplatRender { .. }
             | Step::GaussianSplatRenderBackward { .. }
             | Step::GaussianSplatPrepare { .. }
@@ -1797,6 +1854,13 @@ impl Step {
 
 fn schedule_graph_capture_safe(schedule: &[Step]) -> bool {
     schedule.iter().all(Step::graph_capture_safe)
+}
+
+fn step_is_tail_host(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::LogMelHost { .. } | Step::LogMelBackwardHost { .. } | Step::WelchPeaksHost { .. }
+    )
 }
 
 fn im2col_use_gpu(n: u32, exec_mode: ExecMode) -> bool {
@@ -2812,6 +2876,50 @@ impl RocmExecutable {
                         use_gpu,
                     });
                 }
+                Op::LogMel => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let filt_shape = graph.node(node.inputs[1]).shape.clone();
+                    let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
+                        .unwrap_or_else(|e| panic!("Op::LogMel: {e}"));
+                    schedule.push(Step::LogMelHost {
+                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                        filt_byte_off: arena.offset(node.inputs[1]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        outer: meta.outer as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_bins: meta.n_bins as u32,
+                        n_mels: meta.n_mels as u32,
+                    });
+                }
+                Op::LogMelBackward => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let filt_shape = graph.node(node.inputs[1]).shape.clone();
+                    let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
+                        .unwrap_or_else(|e| panic!("Op::LogMelBackward: {e}"));
+                    schedule.push(Step::LogMelBackwardHost {
+                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                        filt_byte_off: arena.offset(node.inputs[1]) as u32,
+                        dy_byte_off: arena.offset(node.inputs[2]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        outer: meta.outer as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_bins: meta.n_bins as u32,
+                        n_mels: meta.n_mels as u32,
+                    });
+                }
+                Op::WelchPeaks { k, n_segments } => {
+                    let spec_shape = graph.node(node.inputs[0]).shape.clone();
+                    let meta = rlx_ir::audio::welch_peaks_meta(&spec_shape, *k, *n_segments)
+                        .unwrap_or_else(|e| panic!("Op::WelchPeaks: {e}"));
+                    schedule.push(Step::WelchPeaksHost {
+                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        welch_batch: meta.welch_batch as u32,
+                        n_fft: meta.n_fft as u32,
+                        n_segments: meta.n_segments as u32,
+                        k: meta.k as u32,
+                    });
+                }
                 Op::Im2Col {
                     kernel_size,
                     stride,
@@ -3819,6 +3927,7 @@ impl RocmExecutable {
                 let _ = (self.ctx.runtime.hip_graph_launch)(self.captured_graph.unwrap(), stream);
                 let _ = (self.ctx.runtime.hip_stream_sync)(stream);
             }
+            self.run_tail_host_audio_ops(false);
             return self.finalize_outputs();
         }
         if do_capture {
@@ -5259,6 +5368,9 @@ impl RocmExecutable {
                         );
                     }
                 }
+                Step::LogMelHost { .. }
+                | Step::LogMelBackwardHost { .. }
+                | Step::WelchPeaksHost { .. } => {}
                 Step::Im2ColHost {
                     x_byte_off,
                     col_byte_off,
@@ -6505,7 +6617,90 @@ impl RocmExecutable {
         unsafe {
             let _ = (self.ctx.runtime.hip_stream_sync)(stream);
         }
+        self.run_tail_host_audio_ops(false);
         self.finalize_outputs()
+    }
+
+    fn run_tail_host_audio_ops(&self, pre_sync: bool) {
+        if !self.schedule.iter().any(step_is_tail_host) {
+            return;
+        }
+        if pre_sync {
+            unsafe {
+                let _ = (self.ctx.runtime.hip_stream_sync)(self.ctx.default_stream);
+            }
+        }
+        for step in &self.schedule {
+            match step {
+                Step::LogMelHost {
+                    spec_byte_off,
+                    filt_byte_off,
+                    dst_byte_off,
+                    outer,
+                    n_fft,
+                    n_bins,
+                    n_mels,
+                } => {
+                    crate::log_mel_host::run_log_mel(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        *spec_byte_off as usize,
+                        *filt_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *n_fft as usize,
+                        *n_bins as usize,
+                        *n_mels as usize,
+                        false,
+                    );
+                }
+                Step::LogMelBackwardHost {
+                    spec_byte_off,
+                    filt_byte_off,
+                    dy_byte_off,
+                    dst_byte_off,
+                    outer,
+                    n_fft,
+                    n_bins,
+                    n_mels,
+                } => {
+                    crate::log_mel_backward_host::run_log_mel_backward(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        *spec_byte_off as usize,
+                        *filt_byte_off as usize,
+                        *dy_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *n_fft as usize,
+                        *n_bins as usize,
+                        *n_mels as usize,
+                        false,
+                    );
+                }
+                Step::WelchPeaksHost {
+                    spec_byte_off,
+                    dst_byte_off,
+                    welch_batch,
+                    n_fft,
+                    n_segments,
+                    k,
+                } => {
+                    crate::welch_peaks_host::run_welch_peaks(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        *spec_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *welch_batch as usize,
+                        *n_fft as usize,
+                        *n_segments as usize,
+                        *k as usize,
+                        false,
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 
     fn readback_plan(&self) -> Vec<usize> {

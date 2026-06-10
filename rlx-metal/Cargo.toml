@@ -13,14 +13,14 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.5" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.4" }
 # rlx-cpu is pulled in solely for its FFT host-fallback kernels
 # (`execute_fft1d_f32` / `execute_fft1d_f64`) — Apple Silicon's
 # unified memory lets us run them against the Metal arena pointer
 # with no copies. A native Metal FFT kernel will replace this when a
 # real workload justifies the .metal kernel work.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.4", features = ["splat"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.5", features = ["splat"] }
 bytemuck = { version = "1", features = ["derive"] }
 rlx-splat = { path = "../rlx-splat", version = "0.2.4", optional = true, default-features = false, features = ["reference", "metal"] }
 
@@ -40,6 +40,9 @@ half = "2"
 
 
 [dev-dependencies]
+# crates.io pin stays 0.2.4 so `cargo publish -p rlx-metal` resolves before
+# rlx-runtime 0.2.5 is on the index (dev-deps are still checked at publish time).
+# The path dep wins for local/workspace tests.
 rlx-runtime = { path = "../rlx-runtime", version = "0.2.4", features = ["metal"] }
 
 [lints]

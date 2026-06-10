@@ -64,11 +64,11 @@ edge          = ["cpu", "cortexm"]
 all-cpu       = ["cpu", "gguf", "linalg"]
 
 [dependencies]
-rlx-ir      = { path = "../rlx-ir",      version = "0.2.4" }
+rlx-ir      = { path = "../rlx-ir",      version = "0.2.5" }
 rlx-opt     = { path = "../rlx-opt",     version = "0.2.4" }
 rlx-driver  = { path = "../rlx-driver",  version = "0.2.4" }
 rlx-macros  = { path = "../rlx-macros",  version = "0.2.4" }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.4", default-features = false }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.5", default-features = false }
 rlx-gguf     = { path = "../rlx-gguf",    version = "0.2.4", optional = true }
 rlx-gguf-convert = { path = "../rlx-gguf-convert", version = "0.2.4", optional = true }
 rlx-bench   = { path = "../rlx-bench",   version = "0.2.4", optional = true }

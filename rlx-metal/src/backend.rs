@@ -1229,6 +1229,17 @@ impl MetalExecutable {
                 len: u32,
             },
         }
+        /// Host ops deferred until after the final GPU wait (one sync, no extra cmd_buf).
+        enum TailHostOp {
+            WelchPeaks {
+                spec: usize,
+                dst: usize,
+                welch_batch: u32,
+                n_fft: u32,
+                n_segments: u32,
+                k: u32,
+            },
+        }
 
         let trace = rlx_ir::env::flag("RLX_METAL_TRACE");
         let t_run_start = if trace {
@@ -1256,6 +1267,7 @@ impl MetalExecutable {
         // reassignable.
         let mut enc: Option<metal::ComputeCommandEncoder> = None;
         let mut deferred_host: Vec<DeferredHostOp> = Vec::new();
+        let mut tail_host: Vec<TailHostOp> = Vec::new();
         let mut narrow_batch: Option<PendingNarrowBatch> = None;
 
         let flush_deferred_host =
@@ -4125,6 +4137,24 @@ impl MetalExecutable {
                     cmd_buf = dev.queue.new_command_buffer().to_owned();
                 }
 
+                Thunk::WelchPeaks {
+                    spec,
+                    dst,
+                    welch_batch,
+                    n_fft,
+                    n_segments,
+                    k,
+                } => {
+                    tail_host.push(TailHostOp::WelchPeaks {
+                        spec: *spec,
+                        dst: *dst,
+                        welch_batch: *welch_batch,
+                        n_fft: *n_fft,
+                        n_segments: *n_segments,
+                        k: *k,
+                    });
+                }
+
                 Thunk::Im2Col {
                     x,
                     col,
@@ -4433,6 +4463,31 @@ impl MetalExecutable {
         };
         if wait {
             cmd_buf.wait_until_completed();
+            if !tail_host.is_empty() {
+                let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                for op in tail_host.drain(..) {
+                    match op {
+                        TailHostOp::WelchPeaks {
+                            spec,
+                            dst,
+                            welch_batch,
+                            n_fft,
+                            n_segments,
+                            k,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_welch_peaks_f32(
+                                spec,
+                                dst,
+                                welch_batch as usize,
+                                n_fft as usize,
+                                n_segments as usize,
+                                k as usize,
+                                arena_ptr,
+                            );
+                        },
+                    }
+                }
+            }
             if trace {
                 let t_wait_done = std::time::Instant::now();
                 let t_start = t_run_start.unwrap();

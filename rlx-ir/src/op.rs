@@ -332,6 +332,8 @@ pub enum OpKind {
     LogMel,
     /// Backward of [`Op::LogMel`] w.r.t. block-layout spectrum input 0.
     LogMelBackward,
+    /// Welch PSD top-K spikes from block-layout FFT spectra — see [`Op::WelchPeaks`].
+    WelchPeaks,
 }
 
 /// An operand inside a fused [`ChainStep`] — either a graph-level input
@@ -1610,6 +1612,15 @@ pub enum Op {
     /// Output: `d_spectrum` (same shape as input 0).
     LogMelBackward,
 
+    /// Top-K Welch peaks from block-layout segment spectra.
+    ///
+    /// Input 0: spectrum `[batch * n_segments, 2*n_fft]` (re ∥ im planes).
+    /// Output: `[batch, k*2]` interleaved `(bin, power)` per spike.
+    WelchPeaks {
+        k: usize,
+        n_segments: usize,
+    },
+
     /// User-defined sub-graph with optional override AD rules.
     /// Mirrors JAX's `custom_vjp` / `custom_jvp` decorators: the
     /// caller wraps a forward computation and supplies its own
@@ -1763,6 +1774,7 @@ impl Op {
             Op::FftButterflyStage { .. } => OpKind::FftButterflyStage,
             Op::LogMel => OpKind::LogMel,
             Op::LogMelBackward => OpKind::LogMelBackward,
+            Op::WelchPeaks { .. } => OpKind::WelchPeaks,
         }
     }
 
@@ -1964,6 +1976,7 @@ impl Op {
             Op::FftButterflyStage { .. } => 5,
             Op::LogMel => 2,
             Op::LogMelBackward => 3,
+            Op::WelchPeaks { .. } => 1,
         }
     }
 }
@@ -2423,6 +2436,9 @@ impl std::fmt::Display for Op {
             }
             Op::LogMel => write!(f, "log_mel()"),
             Op::LogMelBackward => write!(f, "log_mel_backward()"),
+            Op::WelchPeaks { k, n_segments } => {
+                write!(f, "welch_peaks(k={k}, n_segments={n_segments})")
+            }
         }
     }
 }

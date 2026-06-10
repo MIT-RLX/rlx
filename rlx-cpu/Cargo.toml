@@ -36,7 +36,7 @@ parity-gemm = ["dep:gemm"]
 splat = []
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.4" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.5" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.4" }
 # GGUF K-quant block decoders — used by Op::DequantMatMul's GGUF
 # schemes so packed weight bytes can stay in the arena until matmul
