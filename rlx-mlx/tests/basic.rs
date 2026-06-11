@@ -1117,6 +1117,28 @@ fn relu_matches_reference() {
     assert!(close(&got, &want, 1e-6), "got {got:?} want {want:?}");
 }
 
+fn scalar_gelu_approx(x: f32) -> f32 {
+    const C: f32 = 0.797_884_6;
+    const A: f32 = 0.044_715;
+    0.5 * x * (1.0 + (C * (x + A * x * x * x)).tanh())
+}
+
+#[test]
+fn gelu_approx_matches_cpu_formula_not_exact_gelu() {
+    let xs = [-3.0f32, -1.0, 0.0, 0.5, 1.0, 2.5, 4.0];
+    let got = run_unary(Activation::GeluApprox, &xs);
+    let want: Vec<f32> = xs.iter().map(|&x| scalar_gelu_approx(x)).collect();
+    assert!(
+        close(&got, &want, 1e-5),
+        "GeluApprox must use tanh form (ViT parity), not erf gelu: got {got:?} want {want:?}"
+    );
+    let exact = run_unary(Activation::Gelu, &xs);
+    assert!(
+        !close(&got, &exact, 1e-4),
+        "GeluApprox should differ from exact Gelu on at least one sample"
+    );
+}
+
 #[test]
 fn tanh_exp_log_match_reference() {
     let xs = [0.5, 1.0, 1.5];

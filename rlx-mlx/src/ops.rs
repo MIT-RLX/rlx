@@ -500,6 +500,45 @@ pub fn gelu(a: &Array) -> Result<Array, MlxError> {
     Ok(Array::from_raw(out))
 }
 
+/// Tanh-approximation GELU (PyTorch / ViT default): matches `rlx-cpu` `GeluApprox`.
+pub fn gelu_approx(x: &Array) -> Result<Array, MlxError> {
+    const C: f32 = 0.797_884_6;
+    const A: f32 = 0.044_715;
+    let half = Array::from_f32_slice(&[0.5], &[1], DType::F32)?;
+    let one = Array::from_f32_slice(&[1.0], &[1], DType::F32)?;
+    let c = Array::from_f32_slice(&[C], &[1], DType::F32)?;
+    let a = Array::from_f32_slice(&[A], &[1], DType::F32)?;
+
+    let x_sq = mul(x, x)?;
+    let x_cu = mul(&x_sq, x)?;
+    let a_x_cu = mul(&a, &x_cu)?;
+    let inner_sum = add(x, &a_x_cu)?;
+    let inner = mul(&c, &inner_sum)?;
+    let t = unary(&inner, MlxUnary::Tanh)?;
+    let one_plus_t = add(&one, &t)?;
+    let half_x = mul(&half, x)?;
+    mul(&half_x, &one_plus_t)
+}
+
+/// Unfused SDPA on rank-4 `[B, H, S, D]` tensors — parity reference for `fast::sdpa`.
+pub fn attention_reference_bhsd(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+) -> Result<Array, MlxError> {
+    let k_t = transpose(k, &[0, 1, 3, 2])?;
+    let mut scores = matmul(q, &k_t)?;
+    let scale_arr = Array::from_f32_slice(&[scale], &[1], DType::F32)?;
+    scores = mul(&scores, &scale_arr)?;
+    if let Some(m) = mask {
+        scores = add(&scores, m)?;
+    }
+    let probs = softmax(&scores, -1)?;
+    matmul(&probs, v)
+}
+
 pub fn silu(a: &Array) -> Result<Array, MlxError> {
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_silu(a.ptr, &mut out) };

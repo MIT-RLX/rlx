@@ -317,6 +317,12 @@ kernel_cache!(
 kernel_cache!(FFT_INNER, fft_inner_kernel, FFT_CU, "fft_inner");
 kernel_cache!(FFT_OUTER_R4, fft_outer_r4_kernel, FFT_CU, "fft_outer_r4");
 kernel_cache!(FFT_OUTER_R2, fft_outer_r2_kernel, FFT_CU, "fft_outer_r2");
+kernel_cache!(
+    WELCH_PEAKS_GPU,
+    welch_peaks_gpu_kernel,
+    WELCH_PEAKS_CU,
+    "welch_peaks_gpu"
+);
 
 /// Dispatch grid for a 1-D workload of `n` threads with workgroup
 /// size `block_x`. CUDA's per-grid-dim limit is 2^31-1 on the X axis,

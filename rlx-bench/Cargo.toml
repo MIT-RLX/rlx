@@ -13,12 +13,12 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.5" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.6" }
 rlx-opt = { path = "../rlx-opt", version = "0.2.4" }
 rlx-fusion = { path = "../rlx-fusion", version = "0.2.4" }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.5", features = ["cpu"] }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.6", features = ["cpu"] }
 rlx-driver = { path = "../rlx-driver", version = "0.2.4" }
-rlx-mlx = { path = "../rlx-mlx", version = "0.2.5", optional = true }
+rlx-mlx = { path = "../rlx-mlx", version = "0.2.6", optional = true }
 
 [features]
 default = []

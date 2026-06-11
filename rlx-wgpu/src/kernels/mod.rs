@@ -82,6 +82,7 @@ pub const CONV1D_WGSL: &str = include_str!("conv1d.wgsl");
 pub const CONV3D_WGSL: &str = include_str!("conv3d.wgsl");
 pub const SCATTER_ADD_WGSL: &str = include_str!("scatter_add.wgsl");
 pub const TOPK_WGSL: &str = include_str!("topk.wgsl");
+pub const WELCH_PEAKS_GPU_WGSL: &str = include_str!("welch_peaks_gpu.wgsl");
 pub const UMAP_KNN_WGSL: &str = include_str!("umap_knn.wgsl");
 pub const GROUPED_MATMUL_WGSL: &str = include_str!("grouped_matmul.wgsl");
 pub const SAMPLE_WGSL: &str = include_str!("sample.wgsl");
@@ -912,6 +913,21 @@ pub struct TopKParams {
     pub _p2: u32,
 }
 
+/// Native GPU WelchPeaks dispatch parameters.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct WelchPeaksGpuParams {
+    pub spec_off: u32,
+    pub dst_off: u32,
+    pub welch_batch: u32,
+    pub n_fft: u32,
+    pub n_segments: u32,
+    pub k: u32,
+    pub n_bins: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+}
+
 /// Layout for UMAP k-NN on a pairwise `[n, n]` matrix. 32 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -1449,6 +1465,7 @@ static CONV1D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D: OnceLock<Kernel> = OnceLock::new();
 static SCATTER_ADD: OnceLock<Kernel> = OnceLock::new();
 static TOPK: OnceLock<Kernel> = OnceLock::new();
+static WELCH_PEAKS_GPU: OnceLock<Kernel> = OnceLock::new();
 static UMAP_KNN: OnceLock<Kernel> = OnceLock::new();
 static GROUPED_MATMUL: OnceLock<Kernel> = OnceLock::new();
 static SAMPLE: OnceLock<Kernel> = OnceLock::new();
@@ -2074,6 +2091,16 @@ pub fn scatter_add_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn topk_kernel(device: &wgpu::Device) -> &'static Kernel {
     TOPK.get_or_init(|| build_kernel(device, "rlx-wgpu topk", TOPK_WGSL, "topk"))
+}
+pub fn welch_peaks_gpu_kernel(device: &wgpu::Device) -> &'static Kernel {
+    WELCH_PEAKS_GPU.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu welch_peaks_gpu",
+            WELCH_PEAKS_GPU_WGSL,
+            "welch_peaks_gpu",
+        )
+    })
 }
 pub fn umap_knn_kernel(device: &wgpu::Device) -> &'static Kernel {
     UMAP_KNN.get_or_init(|| build_kernel(device, "rlx-wgpu umap_knn", UMAP_KNN_WGSL, "umap_knn"))

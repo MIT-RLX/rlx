@@ -158,10 +158,31 @@ impl MpsGraph {
         self.mul(&half, &xt)
     }
 
-    /// `Activation::Gelu` on CPU uses an erf-based kernel; MPSGraph lowering uses the
-    /// tanh approximation until a native `geluWithTensor` / erf subgraph is wired.
+    /// Error function — matches CPU `Activation::Gelu` (erf form).
+    pub fn erf(&self, x: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let nsname = ns_string("erf");
+            let t: *mut Object = msg_send![self.obj,
+                erfWithTensor: x.obj
+                name: nsname];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
+    /// Erf-based GELU — matches CPU `scalar_gelu` / `Activation::Gelu`:
+    ///   `y = 0.5 · x · (1 + erf(x / √2))`
     pub fn gelu(&self, x: &MpsTensor) -> MpsTensor {
-        self.gelu_approx(x)
+        let inv_sqrt2 = self.constant_scalar(std::f32::consts::FRAC_1_SQRT_2);
+        let scaled = self.mul(x, &inv_sqrt2);
+        let e = self.erf(&scaled);
+        let one = self.constant_scalar(1.0);
+        let one_p_erf = self.add(&one, &e);
+        let half = self.constant_scalar(0.5);
+        let cdf = self.mul(&one_p_erf, &half);
+        self.mul(x, &cdf)
     }
 
     /// `out = x * y` element-wise.

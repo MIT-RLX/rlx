@@ -73,6 +73,7 @@ pub const BATCH_ELEMENTWISE_REGION_CU: &str =
 pub const GAUSSIAN_SPLAT_RASTERIZE_CU: &str =
     include_str!("../kernels/gaussian_splat_rasterize.cu");
 pub const FFT_CU: &str = include_str!("../kernels/fft.cu");
+pub const WELCH_PEAKS_CU: &str = include_str!("../kernels/welch_peaks.cu");
 
 const GELU_CUH: &str = include_str!("../kernels/gelu.cuh");
 

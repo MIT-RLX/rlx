@@ -6,6 +6,13 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-06
+
+### Changed
+
+- Dependency pins aligned with RLX workspace **0.2.6** (MLX GELU-approx and Metal
+  MPSGraph GELU parity fixes from upstream `rlx-mlx` / `rlx-metal`).
+
 ## [0.2.4] — 2026-06-08
 
 ### Added
@@ -63,7 +70,8 @@ and the project follows [Semantic Versioning](https://semver.org/).
   `cpu`, `blas-accelerate`, `blas-mkl`, `blas-openblas`, `metal`,
   `mlx`, `gpu` (wgpu), `cuda`, `rocm`.
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/pyrlx-v0.2.4...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/pyrlx-v0.2.6...HEAD
+[0.2.6]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.6
 [0.2.4]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.4
 [0.2.3]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.3
 [0.1.0]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.1.0

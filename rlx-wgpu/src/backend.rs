@@ -42,7 +42,7 @@ use crate::kernels::{
     MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams,
     RmsNormBwdParams, RopeBwdParams, RopeParams, SampleParams, ScatterAddParams,
     SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
-    WhereParams, argmax_kernel, attention_bwd_kernel, attention_kernel,
+    WelchPeaksGpuParams, WhereParams, argmax_kernel, attention_bwd_kernel, attention_kernel,
     batch_elementwise_region_kernel, binary_kernel, cast_f32_to_f16_kernel, compare_kernel,
     concat_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
     cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel,
@@ -58,7 +58,8 @@ use crate::kernels::{
     narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
     rms_norm_backward_kernel, rms_norm_backward_param_kernel, rope_backward_kernel, rope_kernel,
     sample_kernel, scatter_add_kernel, selective_scan_kernel, softmax_kernel, topk_kernel,
-    transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, where_kernel,
+    transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
+    welch_peaks_gpu_kernel, where_kernel,
 };
 /// Compute the maximum tail-scratch bytes any single op needs across
 /// the graph. Currently only `Op::LayerNormBackwardGamma` uses scratch
@@ -395,6 +396,9 @@ enum Step {
     TopK {
         params: TopKParams,
     },
+    WelchPeaksGpu {
+        params: WelchPeaksGpuParams,
+    },
     GroupedMatmul {
         params: GroupedMatmulParams,
     },
@@ -708,6 +712,7 @@ impl Step {
             | Step::BatchElementwiseRegion { .. }
             | Step::Argmax { .. }
             | Step::TopK { .. }
+            | Step::WelchPeaksGpu { .. }
             | Step::Sample { .. }
             | Step::Gather { .. }
             | Step::GatherAxis { .. }
@@ -862,6 +867,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::Conv3d { .. } => "conv3d",
         Step::ScatterAdd { .. } => "scatter_add",
         Step::TopK { .. } => "topk",
+        Step::WelchPeaksGpu { .. } => "welch_peaks_gpu",
         Step::GroupedMatmul { .. } => "grouped_matmul",
         Step::Sample { .. } => "sample",
         Step::SelectiveScan { .. } => "selective_scan",
@@ -4556,14 +4562,40 @@ impl WgpuExecutable {
                     let spec_shape = graph.node(node.inputs[0]).shape.clone();
                     let meta = rlx_ir::audio::welch_peaks_meta(&spec_shape, *k, *n_segments)
                         .unwrap_or_else(|e| panic!("Op::WelchPeaks: {e}"));
-                    schedule.push(Step::WelchPeaksHost {
-                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
-                        welch_batch: meta.welch_batch as u32,
-                        n_fft: meta.n_fft as u32,
-                        n_segments: meta.n_segments as u32,
-                        k: meta.k as u32,
-                    });
+                    let use_gpu = rlx_ir::audio::welch_peaks_gpu_native_eligible(
+                        &spec_shape,
+                        *k,
+                        *n_segments,
+                    )
+                    .unwrap_or(false);
+                    if use_gpu {
+                        let p = WelchPeaksGpuParams {
+                            spec_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                            dst_off: (arena.offset(node.id) / 4) as u32,
+                            welch_batch: meta.welch_batch as u32,
+                            n_fft: meta.n_fft as u32,
+                            n_segments: meta.n_segments as u32,
+                            k: meta.k as u32,
+                            n_bins: meta.n_bins as u32,
+                            _p0: 0,
+                            _p1: 0,
+                        };
+                        schedule.push(Step::WelchPeaksGpu { params: p });
+                        let wk = welch_peaks_gpu_kernel(&dev.device);
+                        let u = emit_uniform(std::mem::size_of::<WelchPeaksGpuParams>());
+                        let bg = bind_op_output_window(&dev.device, wk, &arena, node.id, &u);
+                        uniforms.push(u);
+                        bind_groups.push(bg);
+                    } else {
+                        schedule.push(Step::WelchPeaksHost {
+                            spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                            dst_byte_off: arena.offset(node.id) as u32,
+                            welch_batch: meta.welch_batch as u32,
+                            n_fft: meta.n_fft as u32,
+                            n_segments: meta.n_segments as u32,
+                            k: meta.k as u32,
+                        });
+                    }
                 }
                 Op::LogMel => {
                     let spec_shape = graph.node(node.inputs[0]).shape.clone();
@@ -6281,6 +6313,12 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::WelchPeaksGpu { params } => {
+                        let mut p = *params;
+                        p.welch_batch = scale(p.welch_batch);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::UmapKnn { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
@@ -7052,6 +7090,17 @@ impl WgpuExecutable {
                             pass.set_pipeline(&tk.pipeline);
                             pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::WelchPeaksGpu { params } => {
+                            let batch_s = scale(params.welch_batch);
+                            if batch_s == 0 {
+                                continue;
+                            }
+                            let wk = welch_peaks_gpu_kernel(&dev.device);
+                            pass.set_pipeline(&wk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            let (gx, gy, gz) = dispatch_dims(batch_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
                         Step::UmapKnn { params } => {

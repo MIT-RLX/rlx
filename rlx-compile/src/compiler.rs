@@ -37,6 +37,7 @@ use crate::fusion_pipeline::{
     FusionOptions, FusionTarget, fusion_limits_for_target, fusion_passes_for_supported,
     supported_for_target,
 };
+use crate::fusion_target::with_fusion_target;
 use crate::legalize::{format_legalize_error, legalize_for_backend};
 use crate::memory::{self, MemoryPlan};
 use crate::rewrite::rewrite_for_backend_with_config;
@@ -267,7 +268,9 @@ impl CompilePipeline {
         let passes =
             fusion_passes_for_supported(self.effective_supported(), self.opts, self.target);
         let limits = self.opts.fusion_limits;
-        let graph = with_fusion_limits(limits, || run_passes(mir.into_graph(), &passes, false));
+        let graph = with_fusion_target(self.target, || {
+            with_fusion_limits(limits, || run_passes(mir.into_graph(), &passes, false))
+        });
         let graph = clip_elementwise_regions(graph, limits);
         debug_assert_graph!(&graph, "fusion");
         let mut graph = self.legalize_after_fusion(graph);

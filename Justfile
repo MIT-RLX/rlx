@@ -51,6 +51,7 @@ build-mlx:
 # Run rlx-mlx tests (matmul+add parity check, both eager and lazy modes).
 test-mlx:
     cargo test --release -p rlx-mlx
+    cargo test --release -p rlx-runtime --features cpu,mlx --test mlx_attention_parity
 
 # FKL region fusion parity (docs/fk-fusion.md). Metal MPS tests skip off macOS.
 test-fk:
