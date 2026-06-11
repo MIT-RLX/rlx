@@ -7,6 +7,36 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-06
+
+### Added
+
+- **Native GPU `Op::WelchPeaks`** (`rlx-cuda`, `rlx-wgpu`, `rlx-gpu-kernels`):
+  in-arena Welch PSD top-K when eligible (`rlx-ir::welch_peaks_gpu_native_eligible`,
+  f32 spectrum, ≤512 one-sided bins, K≤64); host CPU path unchanged for out-of-range
+  shapes.
+- **`rlx-compile` IO-gated fusion**: `SelectPeaksOnlyOutputs` drops FFT spectrum from
+  graph outputs when peaks-only readback wins the per-target IO gate; compile-time
+  `profile_graph_io` / `profile_graph_io_outputs`; thread-local `FusionTarget` for
+  gated passes. Opt out with `RLX_NO_IO_PEAKS_OUTPUT=1`.
+
+### Fixed
+
+- **`rlx-mlx` `Activation::GeluApprox`**: lower through `ops::gelu_approx` (tanh
+  form matching `rlx-cpu`) instead of exact `gelu`. Fixes ~3% Brain-JEPA predictor
+  drift vs CPU while SDPA stayed within tolerance. Optional `RLX_MLX_SDPA_REFERENCE=1`
+  composes unfused matmul+softmax for SDPA bisects.
+- **`rlx-metal` MPSGraph `Activation::Gelu`**: use `erfWithTensor` + the CPU
+  erf GELU formula (`0.5·x·(1+erf(x/√2))`) instead of the tanh approximation.
+  Fixes large CPU/Metal drift on REVE-style GEGLU blocks (~0.08 max abs → ~5e-3
+  on a single transformer layer; full-model parity restored with MPSGraph enabled).
+
+### Changed
+
+- Patch bumps for all workspace crates in this release train to **0.2.6**
+  (`rlx-ir`, `rlx-compile`, `rlx-gpu-kernels`, `rlx-cuda`, `rlx-wgpu`, `rlx-metal`,
+  `rlx-mlx`, `rlx-runtime`, `rlx`, …); `rlx-mlx-sys` remains **0.2.6**.
+
 ## [0.2.5] — 2026-06
 
 ### Fixed

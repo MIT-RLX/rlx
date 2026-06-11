@@ -303,6 +303,24 @@ pub fn welch_peaks_output_shape(
     Ok(Shape::new(&[meta.welch_batch, meta.k * 2], DType::F32))
 }
 
+/// Max one-sided bins for native GPU WelchPeaks kernels (WGSL/CUDA).
+pub const WELCH_PEAKS_GPU_MAX_BINS: usize = 512;
+
+/// Max top-K for native GPU WelchPeaks kernels.
+pub const WELCH_PEAKS_GPU_MAX_K: usize = 64;
+
+/// True when backends may use in-arena GPU WelchPeaks instead of tail-host CPU.
+pub fn welch_peaks_gpu_native_eligible(
+    spectrum: &Shape,
+    k: usize,
+    n_segments: usize,
+) -> Result<bool, String> {
+    let meta = welch_peaks_meta(spectrum, k, n_segments)?;
+    Ok(spectrum.dtype() == DType::F32
+        && meta.n_bins <= WELCH_PEAKS_GPU_MAX_BINS
+        && meta.k <= WELCH_PEAKS_GPU_MAX_K)
+}
+
 fn accumulate_block_power_row(row: &mut [f32], block: &[f32], n_fft: usize, scale: f32) {
     let n_bins = n_fft / 2 + 1;
     debug_assert!(block.len() >= n_fft * 2);

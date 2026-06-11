@@ -701,7 +701,8 @@ pub fn lower_with_env(
             Op::Activation(act) => {
                 let x = lookup(&env, node.inputs[0])?;
                 match act {
-                    Activation::Gelu | Activation::GeluApprox => ops::gelu(x)?,
+                    Activation::Gelu => ops::gelu(x)?,
+                    Activation::GeluApprox => ops::gelu_approx(x)?,
                     Activation::Silu => ops::silu(x)?,
                     Activation::Relu => ops::unary(x, MlxUnary::Relu)?,
                     Activation::Sigmoid => ops::unary(x, MlxUnary::Sigmoid)?,
@@ -1011,7 +1012,11 @@ pub fn lower_with_env(
                     }
                 };
                 let m_ref: Option<&Array> = mask.as_ref().or(mask_owned.as_ref());
-                let attn_out = ops::attention(&q, &k, &v, scale, mask_kind_ffi, m_ref)?;
+                let attn_out = if rlx_ir::env::flag("RLX_MLX_SDPA_REFERENCE") {
+                    ops::attention_reference_bhsd(&q, &k, &v, scale, m_ref)?
+                } else {
+                    ops::attention(&q, &k, &v, scale, mask_kind_ffi, m_ref)?
+                };
 
                 if q_shape.len() == 3 {
                     // [B, H, S, D] → [B, S, H, D] → [B, S, H*D]
@@ -1040,7 +1045,8 @@ pub fn lower_with_env(
                 let biased = ops::add(&mm, b)?;
                 match activation {
                     None => biased,
-                    Some(Activation::Gelu) | Some(Activation::GeluApprox) => ops::gelu(&biased)?,
+                    Some(Activation::Gelu) => ops::gelu(&biased)?,
+                    Some(Activation::GeluApprox) => ops::gelu_approx(&biased)?,
                     Some(Activation::Silu) => ops::silu(&biased)?,
                     Some(Activation::Relu) => ops::unary(&biased, MlxUnary::Relu)?,
                     Some(Activation::Sigmoid) => ops::unary(&biased, MlxUnary::Sigmoid)?,
@@ -1752,7 +1758,8 @@ pub fn lower_with_env(
                 let ffn1 = ops::matmul(&h1, fc1_w)?;
                 let ffn1 = maybe_add(ffn1, fc1_b)?;
                 let ffn1 = match activation {
-                    Activation::Gelu | Activation::GeluApprox => ops::gelu(&ffn1)?,
+                    Activation::Gelu => ops::gelu(&ffn1)?,
+                    Activation::GeluApprox => ops::gelu_approx(&ffn1)?,
                     Activation::Silu => ops::silu(&ffn1)?,
                     Activation::Relu => ops::unary(&ffn1, MlxUnary::Relu)?,
                     Activation::Sigmoid => ops::unary(&ffn1, MlxUnary::Sigmoid)?,
@@ -4184,7 +4191,8 @@ fn eval_elementwise_region_on_inputs(
                 let x =
                     resolve_region_operand(*x_op, node_inputs, input0_up.as_ref(), env, &steps)?;
                 match act {
-                    Activation::Gelu | Activation::GeluApprox => ops::gelu(x)?,
+                    Activation::Gelu => ops::gelu(x)?,
+                    Activation::GeluApprox => ops::gelu_approx(x)?,
                     Activation::Silu => ops::silu(x)?,
                     Activation::Relu => ops::unary(x, MlxUnary::Relu)?,
                     Activation::Sigmoid => ops::unary(x, MlxUnary::Sigmoid)?,

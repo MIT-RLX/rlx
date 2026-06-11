@@ -142,7 +142,7 @@ SKIPPED=(
 #
 # rlx-metal → rlx-runtime dev-dep is pinned to 0.2.4 on crates.io (path for
 # local tests) so metal can publish before runtime; rlx-runtime optional-dep's
-# rlx-metal at 0.2.5 — publish metal first, wait for index, then runtime.
+# rlx-metal at 0.2.6 — publish metal first, wait for index, then runtime.
 TIERS=(
     "rlx-ir rlx-gguf rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim"
     "rlx-flow rlx-fusion rlx-driver"
@@ -269,7 +269,7 @@ validate_tier_coverage
 # (or the same tier, listed before this crate). Dev-dependencies are
 # skipped here but cargo publish still resolves them against crates.io —
 # keep test-only cycles on an already-published version (metal dev-dep
-# rlx-runtime 0.2.4 while runtime optional-dep's metal 0.2.5).
+# rlx-runtime 0.2.4 while runtime optional-dep's metal 0.2.6).
 validate_publish_order() {
     if ! command -v python3 >/dev/null 2>&1; then
         yellow "python3 not found — skipping publish-order check (install python3 to enable)."

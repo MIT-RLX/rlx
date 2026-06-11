@@ -23,6 +23,7 @@
 use rlx_ir::OpKind;
 
 use crate::DeadCodeElimination;
+use crate::io_output_gate::SelectPeaksOnlyOutputs;
 use rlx_fusion::control_flow::LowerControlFlow;
 use rlx_fusion::fk_fusion::{
     DecomposeFusionRegions, FuseBatchPreprocess, FuseRegionPrologue, MarkBatchSliceRegions,
@@ -33,9 +34,12 @@ use rlx_fusion::fusion::{
     FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul, FuseTransformerLayer,
     MarkElementwiseRegions, UnfuseElementwiseRegions,
 };
-use rlx_fusion::limits::FusionLimits;
+use rlx_fusion::limits::{FusionLimits, with_fusion_limits};
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
-use rlx_fusion::pass::Pass;
+use rlx_fusion::pass::{Pass, run_passes};
+use rlx_ir::Graph;
+
+use crate::fusion_target::with_fusion_target;
 
 /// Compile target that selects a fusion pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +323,10 @@ pub fn fusion_passes_for_supported(
         passes.push(unfuse);
     }
 
+    if supports_op(supported, OpKind::Fft) && supports_op(supported, OpKind::WelchPeaks) {
+        passes.push(&SelectPeaksOnlyOutputs);
+    }
+
     finish_pipeline(passes)
 }
 
@@ -501,6 +509,24 @@ fn finish_pipeline(mut passes: Vec<&'static dyn Pass>) -> Vec<&'static dyn Pass>
     passes
 }
 
+/// Run the fusion pipeline for `target` on a MIR graph (IO-gated passes included).
+pub fn run_fusion_pipeline(
+    graph: Graph,
+    target: FusionTarget,
+    supported: &[OpKind],
+    opts: FusionOptions,
+) -> Graph {
+    let mut opts = opts.apply_native_fk_defaults(target);
+    if opts.fusion_limits == FusionLimits::default() {
+        opts.fusion_limits = fusion_limits_for_target(target);
+    }
+    let limits = opts.fusion_limits;
+    let passes = fusion_passes_for_supported(supported, opts, target);
+    with_fusion_target(target, || {
+        with_fusion_limits(limits, || run_passes(graph, &passes, false))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +537,11 @@ mod tests {
     #[test]
     fn cpu_pipeline_includes_attention_block() {
         let passes = fusion_passes(FusionTarget::Cpu, FusionOptions::default());
-        assert_eq!(passes.len(), 18);
+        assert_eq!(
+            passes.len(),
+            18,
+            "CPU default supported_ops omit Fft/WelchPeaks"
+        );
         assert_eq!(passes[2].name(), "fuse_matmul_bias_act");
         assert_eq!(passes[3].name(), "fuse_attention_block");
         assert!(
@@ -713,6 +743,21 @@ mod tests {
         assert!(
             passes.iter().any(|p| p.name() == "fuse_region_prologue"),
             "FKL prologue fusion should still run"
+        );
+    }
+
+    #[test]
+    fn metal_audio_ops_pipeline_includes_peaks_output_gate() {
+        let mut supported = supported_for_target(FusionTarget::Metal).to_vec();
+        supported.push(OpKind::Fft);
+        supported.push(OpKind::WelchPeaks);
+        let passes =
+            fusion_passes_for_supported(&supported, FusionOptions::default(), FusionTarget::Metal);
+        assert!(
+            passes
+                .iter()
+                .any(|p| p.name() == "select_peaks_only_outputs"),
+            "Metal + Fft/WelchPeaks should run IO peaks-only output gate"
         );
     }
 

@@ -48,6 +48,7 @@ pub mod splat_native;
 pub mod training_bwd_host;
 pub mod umap_knn_host;
 pub mod unfuse;
+pub mod welch_peaks_dispatch;
 pub mod welch_peaks_host;
 
 /// True if a wgpu adapter is reachable on this system. Always

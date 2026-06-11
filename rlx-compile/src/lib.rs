@@ -15,9 +15,11 @@ pub mod dce;
 pub mod dispatch_report;
 pub mod fusion_benefit;
 pub mod fusion_pipeline;
+pub mod fusion_target;
 pub mod hardening;
 pub mod inline;
 pub mod inspect;
+pub mod io_output_gate;
 pub mod legalize;
 pub mod legalize_broadcast;
 pub mod memory;
@@ -42,16 +44,19 @@ pub use dispatch_report::{
 };
 pub use fusion_benefit::{
     FusionBenefit, GraphIoProfile as FusionIoProfile, IoFusionGate, fusion_benefit,
+    profile_graph_io as profile_fusion_graph_io, profile_graph_io_outputs,
 };
 pub use fusion_pipeline::{
     FusionOptions, FusionTarget, fk_passes_after_elementwise_regions, fusion_limits_for_target,
-    fusion_passes, fusion_passes_for_supported, io_fusion_gate_for_target, should_fuse_with_target,
-    supported_for_target, supports_op,
+    fusion_passes, fusion_passes_for_supported, io_fusion_gate_for_target, run_fusion_pipeline,
+    should_fuse_with_target, supported_for_target, supports_op,
 };
+pub use fusion_target::{active_fusion_target, with_fusion_target};
 pub use inline::inline_into;
 pub use inspect::{
     PipelineInspect, inspect_compiled, inspect_fusion, inspect_pipeline, maybe_dump_pipeline,
 };
+pub use io_output_gate::SelectPeaksOnlyOutputs;
 pub use legalize::{LegalizeResult, format_legalize_error, legalize_for_backend};
 pub use legalize_broadcast::LegalizeBroadcast;
 pub use memory::{

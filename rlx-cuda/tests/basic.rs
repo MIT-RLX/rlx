@@ -593,3 +593,39 @@ fn run_slots_matches_run_single_output() {
         via_run
     );
 }
+
+#[test]
+fn welch_peaks_gpu_matches_cpu_reference() {
+    if !rlx_cuda::is_available() {
+        return;
+    }
+    let batch = 8usize;
+    let n_fft = 256usize;
+    let n_segments = 2usize;
+    let k = 16usize;
+    let seg_batch = batch * n_segments;
+    let row_len = n_fft * 2;
+    let mut spectrum = vec![0f32; seg_batch * row_len];
+    for i in 0..spectrum.len() {
+        spectrum[i] = ((i as f32) * 0.013).sin() * 0.5 + 0.01 * (i as f32).cos();
+    }
+
+    let mut g = Graph::new("welch_peaks");
+    let spec_in = g.input("spec", Shape::new(&[seg_batch, row_len], DType::F32));
+    let peaks = g.welch_peaks(spec_in, k, n_segments);
+    g.set_outputs(vec![peaks]);
+    let mut exe = CudaExecutable::compile(g);
+    let gpu_out = exe.run(&[("spec", &spectrum)]).remove(0);
+
+    let mut ref_out = vec![0f32; batch * k * 2];
+    rlx_ir::audio::welch_peaks_block_f32(&spectrum, batch, n_fft, n_segments, k, &mut ref_out);
+    assert!(
+        close(&gpu_out, &ref_out, 1e-4),
+        "welch_peaks_gpu mismatch max={:.3e}",
+        gpu_out
+            .iter()
+            .zip(ref_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    );
+}
