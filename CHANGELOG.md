@@ -11,7 +11,7 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ### Added
 
-- **Native GPU `Op::WelchPeaks`** (`rlx-cuda`, `rlx-wgpu`, `rlx-gpu-kernels`):
+- **Native GPU `Op::WelchPeaks`** (`rlx-cuda`, `rlx-wgpu`, `rlx-rocm`, `rlx-gpu-kernels`):
   in-arena Welch PSD top-K when eligible (`rlx-ir::welch_peaks_gpu_native_eligible`,
   f32 spectrum, ≤512 one-sided bins, K≤64); host CPU path unchanged for out-of-range
   shapes.

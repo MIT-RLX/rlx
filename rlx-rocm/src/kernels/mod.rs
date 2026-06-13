@@ -297,6 +297,13 @@ kernel_cache!(
     "gaussian_splat_rasterize"
 );
 
+kernel_cache!(
+    WELCH_PEAKS_GPU,
+    welch_peaks_gpu_kernel,
+    WELCH_PEAKS_CU,
+    "welch_peaks_gpu"
+);
+
 pub fn dispatch_grid_1d(n: u32, block_x: u32) -> (u32, u32) {
     (n.div_ceil(block_x), block_x)
 }
@@ -382,4 +389,5 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = fft_outer_r4_kernel(ctx);
     let _ = fft_outer_r2_kernel(ctx);
     let _ = gaussian_splat_rasterize_kernel(ctx);
+    let _ = welch_peaks_gpu_kernel(ctx);
 }
