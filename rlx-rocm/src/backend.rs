@@ -371,6 +371,16 @@ pub(crate) enum Step {
         n_segments: u32,
         k: u32,
     },
+    /// Native GPU WelchPeaks (in-arena, no D2H).
+    WelchPeaksGpu {
+        spec_off: u32,
+        dst_off: u32,
+        welch_batch: u32,
+        n_fft: u32,
+        n_segments: u32,
+        k: u32,
+        n_bins: u32,
+    },
     Im2ColHost {
         x_byte_off: u32,
         col_byte_off: u32,
@@ -881,6 +891,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::LogMelHost { .. } => "rlx::LogMelHost",
         Step::LogMelBackwardHost { .. } => "rlx::LogMelBackwardHost",
         Step::WelchPeaksHost { .. } => "rlx::WelchPeaksHost",
+        Step::WelchPeaksGpu { .. } => "rlx::WelchPeaksGpu",
         Step::Im2ColHost { .. } => "rlx::Im2ColHost",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Llada2GroupLimitedGate { .. } => "rlx::Llada2GroupLimitedGate",
@@ -1140,6 +1151,9 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dst_byte_off,
             ..
         } => (vec![*spec_byte_off / 4], vec![*dst_byte_off / 4]),
+        Step::WelchPeaksGpu {
+            spec_off, dst_off, ..
+        } => (vec![*spec_off], vec![*dst_off]),
         Step::Im2ColHost {
             x_byte_off,
             col_byte_off,
@@ -2911,14 +2925,32 @@ impl RocmExecutable {
                     let spec_shape = graph.node(node.inputs[0]).shape.clone();
                     let meta = rlx_ir::audio::welch_peaks_meta(&spec_shape, *k, *n_segments)
                         .unwrap_or_else(|e| panic!("Op::WelchPeaks: {e}"));
-                    schedule.push(Step::WelchPeaksHost {
-                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
-                        welch_batch: meta.welch_batch as u32,
-                        n_fft: meta.n_fft as u32,
-                        n_segments: meta.n_segments as u32,
-                        k: meta.k as u32,
-                    });
+                    let use_gpu = rlx_ir::audio::welch_peaks_gpu_native_eligible(
+                        &spec_shape,
+                        *k,
+                        *n_segments,
+                    )
+                    .unwrap_or(false);
+                    if use_gpu {
+                        schedule.push(Step::WelchPeaksGpu {
+                            spec_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                            dst_off: (arena.offset(node.id) / 4) as u32,
+                            welch_batch: meta.welch_batch as u32,
+                            n_fft: meta.n_fft as u32,
+                            n_segments: meta.n_segments as u32,
+                            k: meta.k as u32,
+                            n_bins: meta.n_bins as u32,
+                        });
+                    } else {
+                        schedule.push(Step::WelchPeaksHost {
+                            spec_byte_off: arena.offset(node.inputs[0]) as u32,
+                            dst_byte_off: arena.offset(node.id) as u32,
+                            welch_batch: meta.welch_batch as u32,
+                            n_fft: meta.n_fft as u32,
+                            n_segments: meta.n_segments as u32,
+                            k: meta.k as u32,
+                        });
+                    }
                 }
                 Op::Im2Col {
                     kernel_size,
@@ -5367,6 +5399,28 @@ impl RocmExecutable {
                             rocm_fft_dtype_from_tag(*dtype_tag),
                         );
                     }
+                }
+                Step::WelchPeaksGpu {
+                    spec_off,
+                    dst_off,
+                    welch_batch,
+                    n_fft,
+                    n_segments,
+                    k,
+                    n_bins,
+                } => {
+                    crate::welch_peaks_dispatch::run_welch_peaks_gpu(
+                        &self.ctx,
+                        stream,
+                        arena_ptr,
+                        *spec_off,
+                        *dst_off,
+                        *welch_batch,
+                        *n_fft,
+                        *n_segments,
+                        *k,
+                        *n_bins,
+                    );
                 }
                 Step::LogMelHost { .. }
                 | Step::LogMelBackwardHost { .. }
