@@ -373,6 +373,23 @@ enum Step {
         seed_lo: u32,
         seed_hi: u32,
     },
+    /// Host fill for [`Op::RngNormal`].
+    RngNormal {
+        dst_byte_off: u32,
+        len: u32,
+        mean: f32,
+        scale: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
+    RngUniform {
+        dst_byte_off: u32,
+        len: u32,
+        low: f32,
+        high: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
     SelectiveScan {
         batch: u32,
         seq: u32,
@@ -1034,6 +1051,20 @@ pub struct CudaExecutable {
     output_slots: Vec<(usize, usize)>,
     /// Pinned/pageable host mirror for `run_slots` / `arena_ptr` (not GPU arena).
     host_arena: Vec<f32>,
+    /// Runtime-mutable RNG policy for in-graph random ops.
+    rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+}
+
+impl CudaExecutable {
+    /// Override RNG policy for in-graph random ops without recompiling.
+    pub fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+        *self.rng.write().expect("rng lock") = rng;
+    }
+
+    /// Current RNG compile/execute policy.
+    pub fn rng(&self) -> rlx_ir::RngOptions {
+        *self.rng.read().expect("rng lock")
+    }
 }
 
 impl Step {
@@ -1073,6 +1104,8 @@ impl Step {
             | Step::LogMelHost { .. }
             | Step::LogMelBackwardHost { .. }
             | Step::WelchPeaksHost { .. }
+            | Step::RngNormal { .. }
+            | Step::RngUniform { .. }
             | Step::GaussianSplatRender { .. }
             | Step::GaussianSplatRenderBackward { .. }
             | Step::GaussianSplatPrepare { .. } => false,
@@ -2046,6 +2079,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::DequantMatmulGguf { .. } => "rlx::DequantMatmulGguf",
         Step::DequantGroupedMatmulGguf { .. } => "rlx::DequantGroupedMatmulGguf",
         Step::Sample { .. } => "rlx::Sample",
+        Step::RngNormal { .. } => "rlx::RngNormal",
+        Step::RngUniform { .. } => "rlx::RngUniform",
         Step::SelectiveScan { .. } => "rlx::SelectiveScan",
         Step::Fft { .. } => "rlx::Fft",
         Step::LogMelHost { .. } => "rlx::LogMelHost",
@@ -2205,6 +2240,9 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         | Step::Sample {
             in_off, out_off, ..
         } => (vec![*in_off], vec![*out_off]),
+        Step::RngNormal { dst_byte_off, .. } | Step::RngUniform { dst_byte_off, .. } => {
+            (vec![], vec![*dst_byte_off / 4])
+        }
         Step::TopK {
             in_off, out_off, ..
         } => (vec![*in_off], vec![*out_off]),
@@ -2835,18 +2873,26 @@ impl CudaExecutable {
     ///
     /// Honors `RLX_CUDA_COMPILE_MODE=aot` and `RLX_CUDA_EXEC_MODE=graph|multistream:N`.
     pub fn compile(graph: Graph) -> Self {
-        Self::compile_with(graph, compile_mode_from_env(), exec_mode_from_env())
+        Self::compile_with_rng(
+            graph,
+            compile_mode_from_env(),
+            exec_mode_from_env(),
+            rlx_ir::RngOptions::default(),
+        )
     }
 
-    /// One-shot eager run. Compiles, executes once with the given
-    /// inputs, and drops the executable. No persistent state.
-    pub fn eager(graph: Graph, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
-        let mut exec = Self::compile_with(graph, CompileMode::Jit, ExecMode::Eager);
-        exec.run(inputs)
+    /// Compile with explicit RNG policy and env-selected compile/exec modes.
+    pub fn compile_rng(graph: Graph, rng: rlx_ir::RngOptions) -> Self {
+        Self::compile_with_rng(graph, compile_mode_from_env(), exec_mode_from_env(), rng)
     }
 
-    /// Full constructor with explicit compile + exec modes.
-    pub fn compile_with(graph: Graph, compile_mode: CompileMode, exec_mode: ExecMode) -> Self {
+    /// Compile with explicit RNG policy (used by [`rlx-runtime`]).
+    pub fn compile_with_rng(
+        graph: Graph,
+        compile_mode: CompileMode,
+        exec_mode: ExecMode,
+        rng: rlx_ir::RngOptions,
+    ) -> Self {
         let ctx = cuda_context().expect("rlx-cuda: no CUDA driver available");
 
         if compile_mode == CompileMode::Aot {
@@ -4492,6 +4538,38 @@ impl CudaExecutable {
                         });
                     }
                 }
+                Op::RngNormal {
+                    mean,
+                    scale,
+                    key,
+                    op_seed,
+                } => {
+                    let len = node.shape.num_elements().unwrap_or(0);
+                    schedule.push(Step::RngNormal {
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        len: len as u32,
+                        mean: *mean,
+                        scale: *scale,
+                        key: *key,
+                        op_seed: *op_seed,
+                    });
+                }
+                Op::RngUniform {
+                    low,
+                    high,
+                    key,
+                    op_seed,
+                } => {
+                    let len = node.shape.num_elements().unwrap_or(0);
+                    schedule.push(Step::RngUniform {
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        len: len as u32,
+                        low: *low,
+                        high: *high,
+                        key: *key,
+                        op_seed: *op_seed,
+                    });
+                }
                 Op::RmsNormBackwardInput { eps, .. }
                 | Op::RmsNormBackwardGamma { eps, .. }
                 | Op::RmsNormBackwardBeta { eps, .. } => {
@@ -4837,7 +4915,25 @@ impl CudaExecutable {
             input_slots,
             output_slots,
             host_arena,
+            rng: std::sync::Arc::new(std::sync::RwLock::new(rng)),
         }
+    }
+
+    /// Full constructor with explicit compile + exec modes (default RNG).
+    pub fn compile_with(graph: Graph, compile_mode: CompileMode, exec_mode: ExecMode) -> Self {
+        Self::compile_with_rng(
+            graph,
+            compile_mode,
+            exec_mode,
+            rlx_ir::RngOptions::default(),
+        )
+    }
+
+    /// One-shot eager run. Compiles, executes once with the given
+    /// inputs, and drops the executable. No persistent state.
+    pub fn eager(graph: Graph, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        let mut exec = Self::compile_with(graph, CompileMode::Jit, ExecMode::Eager);
+        exec.run(inputs)
     }
 
     /// Host buffer base for reading outputs after [`Self::run_slots`].
@@ -5048,6 +5144,24 @@ impl CudaExecutable {
             }
         }
         self.gpu_handles.get(name).cloned()
+    }
+
+    /// Clone into an independent executable (recompiles from the stored graph).
+    pub fn clone_for_cache(&self) -> Self {
+        let mut exe = Self::compile_with_rng(
+            self.graph.clone(),
+            compile_mode_from_env(),
+            exec_mode_from_env(),
+            self.rng(),
+        );
+        for (k, v) in &self.gpu_handles {
+            exe.bind_gpu_handle(k, v);
+        }
+        for (k, &idx) in &self.gpu_handle_feeds {
+            exe.set_gpu_handle_feed(k, idx);
+        }
+        exe.set_active_extent(self.active_extent);
+        exe
     }
 
     /// Build the sorted output readback plan into [`Self::readback_plan_buf`].
@@ -6875,6 +6989,48 @@ impl CudaExecutable {
                             .launch(cfg)
                             .expect("rlx-cuda: sample launch failed");
                     }
+                }
+                Step::RngNormal {
+                    dst_byte_off,
+                    len,
+                    mean,
+                    scale,
+                    key,
+                    op_seed,
+                } => {
+                    let opts = *self.rng.read().expect("rng lock");
+                    crate::rng_host::run_rng_normal(
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *dst_byte_off as usize,
+                        *len as usize,
+                        *mean,
+                        *scale,
+                        *key,
+                        *op_seed,
+                        opts,
+                    );
+                }
+                Step::RngUniform {
+                    dst_byte_off,
+                    len,
+                    low,
+                    high,
+                    key,
+                    op_seed,
+                } => {
+                    let opts = *self.rng.read().expect("rng lock");
+                    crate::rng_host::run_rng_uniform(
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *dst_byte_off as usize,
+                        *len as usize,
+                        *low,
+                        *high,
+                        *key,
+                        *op_seed,
+                        opts,
+                    );
                 }
                 Step::SelectiveScan {
                     batch,

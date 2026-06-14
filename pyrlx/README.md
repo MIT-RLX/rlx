@@ -21,6 +21,8 @@ Python bindings for RLX via [PyO3](https://pyo3.rs/) +
 - **Multi-backend runtime** — `GraphDevices`, `DeviceRouter`,
   `DevicePolicy`, `FlexibleSession`, `backends_manifest()`,
   `parse_device()`. See [`docs/backend-selection.md`](../docs/backend-selection.md).
+- **In-graph RNG (0.2.7+)** — ONNX `Random*` via upstream `rlx-runtime`
+  (`CompileOptions::rng`, `CompiledGraph::set_rng`). See [`CHANGELOG.md`](../CHANGELOG.md).
 - **FFT helpers** — `fft`, `fft_norm`, `rfft`, `irfft`, `fftfreq`,
   `rfftfreq`, `psd_real` on `Graph` (see `pyrlx/tests/test_fft.py`).
 - **Autodiff** — `pyrlx.grad(graph, wrt=[…])` returns the backward

@@ -53,6 +53,14 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::Cast { to } => Some(shape::cast_shape(in_shape(0), *to)),
         Op::StopGradient => Some(shape::unary_shape(in_shape(0))),
 
+        Op::RngNormal { .. } | Op::RngUniform { .. } => {
+            if node.inputs.is_empty() {
+                Some(node.shape.clone())
+            } else {
+                Some(shape::unary_shape(in_shape(0)))
+            }
+        }
+
         Op::Reduce { axes, keep_dim, .. } => shape::reduce_shape(in_shape(0), axes, *keep_dim).ok(),
         Op::Softmax { .. } => Some(shape::softmax_shape(in_shape(0))),
         Op::Cumsum { .. } => Some(shape::unary_shape(in_shape(0))),

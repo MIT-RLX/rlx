@@ -257,6 +257,10 @@ pub enum OpKind {
     Cumsum,
     TopK,
     Sample,
+    /// ONNX `RandomNormalLike` — shape from input 0, output filled at runtime.
+    RngNormal,
+    /// ONNX `RandomUniformLike`.
+    RngUniform,
     Conv,
     Im2Col,
     ConvTranspose2d,
@@ -895,6 +899,26 @@ pub enum Op {
         top_p: f32,       // 1.0 = disabled
         temperature: f32, // 1.0 = neutral
         seed: u64,        // 0 = use thread-local counter
+    },
+
+    /// ONNX `RandomNormalLike` / `RandomNormal`: zero or one shape-template
+    /// input (Like uses the template's shape; `RandomNormal` with a `shape`
+    /// attribute needs no input). Output shape is fixed on the node.
+    /// at compile/execute time. Optional ONNX `seed` attribute (f32) overrides
+    /// the mixed seed on the Ort backend.
+    RngNormal {
+        mean: f32,
+        scale: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
+
+    /// ONNX `RandomUniformLike`.
+    RngUniform {
+        low: f32,
+        high: f32,
+        key: u64,
+        op_seed: Option<f32>,
     },
 
     /// Inclusive cumulative sum along an axis. Same shape in/out.
@@ -1713,6 +1737,8 @@ impl Op {
             Op::Cumsum { .. } => OpKind::Cumsum,
             Op::TopK { .. } => OpKind::TopK,
             Op::Sample { .. } => OpKind::Sample,
+            Op::RngNormal { .. } => OpKind::RngNormal,
+            Op::RngUniform { .. } => OpKind::RngUniform,
             Op::Conv { .. } => OpKind::Conv,
             Op::Im2Col { .. } => OpKind::Im2Col,
             Op::ConvTranspose2d { .. } => OpKind::ConvTranspose2d,
@@ -1861,6 +1887,7 @@ impl Op {
             | Op::Cumsum { .. }
             | Op::Sample { .. }
             | Op::ResizeNearest2x => 1,
+            Op::RngNormal { .. } | Op::RngUniform { .. } => 0, // 0 or 1 — see verify
             // EMA / Fixed scale modes carry a state tensor as a 2nd input;
             // PerBatch (default) doesn't need one.
             Op::FakeQuantize { scale_mode, .. } => match scale_mode {
@@ -2100,6 +2127,30 @@ impl std::fmt::Display for Op {
                 }
                 if *top_p < 1.0 {
                     write!(f, ",p={top_p}")?;
+                }
+                write!(f, ")")
+            }
+            Op::RngNormal {
+                mean,
+                scale,
+                key,
+                op_seed,
+            } => {
+                write!(f, "rng_normal({mean},{scale},key={key}")?;
+                if let Some(s) = op_seed {
+                    write!(f, ",seed={s}")?;
+                }
+                write!(f, ")")
+            }
+            Op::RngUniform {
+                low,
+                high,
+                key,
+                op_seed,
+            } => {
+                write!(f, "rng_uniform({low},{high},key={key}")?;
+                if let Some(s) = op_seed {
+                    write!(f, ",seed={s}")?;
                 }
                 write!(f, ")")
             }

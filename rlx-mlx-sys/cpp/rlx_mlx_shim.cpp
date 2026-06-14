@@ -59,6 +59,13 @@ void set_error(const char* what) {
     g_last_error.assign(what ? what : "(null)");
 }
 
+mc::array indices_as_i64(const mc::array& idx) {
+    if (idx.dtype() == mc::int64) {
+        return idx;
+    }
+    return mc::astype(idx, mc::int64);
+}
+
 void init_default_device() {
     static std::once_flag once;
     std::call_once(once, []() {
@@ -802,13 +809,7 @@ int rlx_mlx_op_take(
     rlx_mlx_array_t** out)
 {
     return guarded([&] {
-        // Cast indices to int32 (rlx encodes them as f32 at the I/O
-        // boundary, but Op::Gather semantics treat them as integer
-        // positions; the lowering converts before calling us).
-        mc::array idx = unwrap(indices);
-        if (idx.dtype() != mc::int32 && idx.dtype() != mc::uint32) {
-            idx = mc::astype(idx, mc::int32);
-        }
+        mc::array idx = indices_as_i64(unwrap(indices));
         *out = wrap(mc::take(unwrap(a), idx, axis));
     });
 }
@@ -1079,10 +1080,7 @@ int rlx_mlx_op_scatter_add(
     rlx_mlx_array_t** out)
 {
     return guarded([&] {
-        mc::array idx = unwrap(indices);
-        if (idx.dtype() != mc::int32 && idx.dtype() != mc::uint32) {
-            idx = mc::astype(idx, mc::int32);
-        }
+        mc::array idx = indices_as_i64(unwrap(indices));
         *out = wrap(mc::scatter_add(unwrap(a), idx, unwrap(updates), axis));
     });
 }
@@ -1226,10 +1224,7 @@ int rlx_mlx_op_take_along_axis(
     rlx_mlx_array_t** out)
 {
     return guarded([&] {
-        mc::array idx = unwrap(indices);
-        if (idx.dtype() != mc::int32 && idx.dtype() != mc::uint32) {
-            idx = mc::astype(idx, mc::int32);
-        }
+        mc::array idx = indices_as_i64(unwrap(indices));
         *out = wrap(mc::take_along_axis(unwrap(a), idx, axis));
     });
 }
@@ -1242,10 +1237,7 @@ int rlx_mlx_op_scatter_add_axis(
     rlx_mlx_array_t** out)
 {
     return guarded([&] {
-        mc::array idx = unwrap(indices);
-        if (idx.dtype() != mc::int32 && idx.dtype() != mc::uint32) {
-            idx = mc::astype(idx, mc::int32);
-        }
+        mc::array idx = indices_as_i64(unwrap(indices));
         *out = wrap(mc::scatter_add_axis(unwrap(a), idx, unwrap(updates), axis));
     });
 }
@@ -1257,10 +1249,7 @@ int rlx_mlx_op_gather_mm(
     rlx_mlx_array_t** out)
 {
     return guarded([&] {
-        mc::array i = unwrap(idx);
-        if (i.dtype() != mc::int32 && i.dtype() != mc::uint32) {
-            i = mc::astype(i, mc::int32);
-        }
+        mc::array i = indices_as_i64(unwrap(idx));
         // gather_mm in MLX: gather_mm(a, b, lhs_indices, rhs_indices, sorted_indices)
         // For our use case (one expert per token), we want b indexed
         // by `i` along its leading dim — pass i as rhs_indices, no

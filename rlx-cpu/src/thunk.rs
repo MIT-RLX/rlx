@@ -794,6 +794,24 @@ pub enum Thunk {
         temperature: f32, // 1.0 = neutral
         seed: u64,
     },
+    /// ONNX `RandomNormalLike` fill.
+    RngNormal {
+        dst: usize,
+        len: u32,
+        mean: f32,
+        scale: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
+    /// ONNX `RandomUniformLike` fill.
+    RngUniform {
+        dst: usize,
+        len: u32,
+        low: f32,
+        high: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
     /// Attention SDPA. `mask` is the offset of the optional mask tensor
     /// (only meaningful when `mask_kind == MaskKind::Custom`); other
     /// kinds synthesize the mask in-kernel.
@@ -1770,6 +1788,8 @@ pub struct ThunkSchedule {
     /// `Fn(*mut u8)` so concurrent dispatch is safe; the arena pointer
     /// they receive is the only mutable state and is per-executor).
     pub compiled_fns: Vec<Arc<dyn Fn(*mut u8) + Send + Sync>>,
+    /// Runtime-mutable RNG policy for [`Thunk::RngNormal`] / [`Thunk::RngUniform`].
+    pub rng: Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
 }
 
 impl ThunkSchedule {
@@ -1875,6 +1895,7 @@ fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::Softmax { data, .. } => vec![*data],
         Thunk::Cumsum { src, .. } => vec![*src],
         Thunk::Sample { logits, .. } => vec![*logits],
+        Thunk::RngNormal { .. } | Thunk::RngUniform { .. } => vec![],
         Thunk::LoraMatMul { x, w, a, b, .. } => vec![*x, *w, *a, *b],
         Thunk::DequantMatMul {
             x, w_q, scale, zp, ..
@@ -1959,7 +1980,7 @@ fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
 /// working set. A NEON SIMD path that loads 16 i8 → splat-scale →
 /// fused-multiply-add is the natural follow-on.
 #[allow(clippy::too_many_arguments)]
-fn dequant_matmul_int8(
+pub fn dequant_matmul_int8(
     x: &[f32],       // [m, k]
     w_bytes: &[i8],  // [k, n]
     scales: &[f32],  // [k/block, n]
@@ -2276,6 +2297,16 @@ fn conv_nchw_dims(shape: &Shape) -> (u32, u32, u32, u32) {
 
 /// Compile graph into thunk schedule.
 pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
+    compile_thunks_with_rng(graph, arena, rlx_ir::RngOptions::default())
+}
+
+/// Compile graph into thunk schedule with explicit RNG policy.
+pub fn compile_thunks_with_rng(
+    graph: &Graph,
+    arena: &Arena,
+    rng: rlx_ir::RngOptions,
+) -> ThunkSchedule {
+    let rng_shared = Arc::new(std::sync::RwLock::new(rng));
     let mut thunks = Vec::with_capacity(graph.len());
 
     for node in graph.nodes() {
@@ -3454,6 +3485,34 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     seed: *seed,
                 }
             }
+
+            Op::RngNormal {
+                mean,
+                scale,
+                key,
+                op_seed,
+            } => Thunk::RngNormal {
+                dst: node_offset(arena, node.id),
+                len: node.shape.num_elements().unwrap_or(0) as u32,
+                mean: *mean,
+                scale: *scale,
+                key: *key,
+                op_seed: *op_seed,
+            },
+
+            Op::RngUniform {
+                low,
+                high,
+                key,
+                op_seed,
+            } => Thunk::RngUniform {
+                dst: node_offset(arena, node.id),
+                len: node.shape.num_elements().unwrap_or(0) as u32,
+                low: *low,
+                high: *high,
+                key: *key,
+                op_seed: *op_seed,
+            },
 
             Op::Cumsum { axis, exclusive } => {
                 // For now CPU only supports last-axis cumsum (the
@@ -4746,7 +4805,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     }
                 }
                 let body_init = body_arena.raw_buf().to_vec();
-                let body_schedule = compile_thunks(body, &body_arena);
+                let body_schedule = compile_thunks_with_rng(body, &body_arena, rng);
 
                 // Carry bytes — for trajectory mode, the outer node's
                 // shape is [length, *carry_shape], so dividing by length
@@ -4909,7 +4968,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     }
                 }
                 let body_init = body_arena.raw_buf().to_vec();
-                let body_schedule = compile_thunks(body_vjp, &body_arena);
+                let body_schedule = compile_thunks_with_rng(body_vjp, &body_arena, rng);
 
                 // Carry bytes from the dcarry output node (== carry shape).
                 let carry_bytes = body_vjp
@@ -4981,7 +5040,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                             }
                         }
                         let fb_init_bytes = fb_arena.raw_buf().to_vec();
-                        let fb_sched = compile_thunks(fb, &fb_arena);
+                        let fb_sched = compile_thunks_with_rng(fb, &fb_arena, rng);
                         (
                             Some(Arc::new(fb_sched)),
                             Some(Arc::new(fb_init_bytes)),
@@ -5118,7 +5177,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     }
                 }
                 let body_init = body_arena.raw_buf().to_vec();
-                let body_schedule = compile_thunks(body_vjp, &body_arena);
+                let body_schedule = compile_thunks_with_rng(body_vjp, &body_arena, rng);
 
                 let carry_bytes = body_vjp
                     .node(body_vjp.outputs[0])
@@ -5190,7 +5249,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                             }
                         }
                         let fb_init_bytes = fb_arena.raw_buf().to_vec();
-                        let fb_sched = compile_thunks(fb, &fb_arena);
+                        let fb_sched = compile_thunks_with_rng(fb, &fb_arena, rng);
                         (
                             Some(Arc::new(fb_sched)),
                             Some(Arc::new(fb_init_bytes)),
@@ -5614,7 +5673,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                     }
                 }
                 let body_init = body_arena.raw_buf().to_vec();
-                let body_schedule = compile_thunks(fwd_body, &body_arena);
+                let body_schedule = compile_thunks_with_rng(fwd_body, &body_arena, rng);
 
                 // Per primal input: (body_input_off, outer_input_off, bytes).
                 let inputs_v: Vec<(usize, usize, u32)> = (0..*num_inputs as usize)
@@ -5964,6 +6023,40 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
                             let row = &lg[bi * v..(bi + 1) * v];
                             out[bi] = sample_row(row, k, top_p, temperature, &mut rng) as f32;
                         }
+                    })
+                }
+
+                Thunk::RngNormal {
+                    dst,
+                    len,
+                    mean,
+                    scale,
+                    key,
+                    op_seed,
+                } => {
+                    let n = len as usize;
+                    let rng = rng_shared.clone();
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let out = sl_mut(dst, base, n);
+                        let opts = *rng.read().unwrap();
+                        rlx_ir::fill_normal_like(out, mean, scale, opts, key, op_seed);
+                    })
+                }
+
+                Thunk::RngUniform {
+                    dst,
+                    len,
+                    low,
+                    high,
+                    key,
+                    op_seed,
+                } => {
+                    let n = len as usize;
+                    let rng = rng_shared.clone();
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let out = sl_mut(dst, base, n);
+                        let opts = *rng.read().unwrap();
+                        rlx_ir::fill_uniform_like(out, low, high, opts, key, op_seed);
                     })
                 }
 
@@ -7455,6 +7548,7 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
         mask_neg_inf: cfg.attn_mask_neg_inf,
         score_skip: cfg.score_skip_threshold,
         compiled_fns,
+        rng: rng_shared,
     }
 }
 
@@ -9995,6 +10089,38 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         let row = &lg[bi * v..(bi + 1) * v];
                         out[bi] = sample_row(row, k, *top_p, *temperature, &mut rng) as f32;
                     }
+                }
+            }
+
+            Thunk::RngNormal {
+                dst,
+                len,
+                mean,
+                scale,
+                key,
+                op_seed,
+            } => {
+                let n = *len as usize;
+                unsafe {
+                    let out = sl_mut(*dst, base, n);
+                    let opts = *schedule.rng.read().unwrap();
+                    rlx_ir::fill_normal_like(out, *mean, *scale, opts, *key, *op_seed);
+                }
+            }
+
+            Thunk::RngUniform {
+                dst,
+                len,
+                low,
+                high,
+                key,
+                op_seed,
+            } => {
+                let n = *len as usize;
+                unsafe {
+                    let out = sl_mut(*dst, base, n);
+                    let opts = *schedule.rng.read().unwrap();
+                    rlx_ir::fill_uniform_like(out, *low, *high, opts, *key, *op_seed);
                 }
             }
 
@@ -14353,6 +14479,36 @@ pub unsafe fn execute_dequant_grouped_matmul_gguf_f32(
     }
 }
 
+/// Host-fallback entry for Int8 `Op::DequantMatMul` (Metal unified memory).
+pub unsafe fn execute_dequant_matmul_int8_f32(
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    zp: usize,
+    dst: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    block_size: u32,
+    is_asymmetric: bool,
+    base: *mut u8,
+) {
+    let bs = block_size as usize;
+    let n_blocks = k.div_ceil(bs);
+    unsafe {
+        let xs = sl(x, base, m * k);
+        let w_bytes = std::slice::from_raw_parts(base.add(w_q) as *const i8, k * n);
+        let scales = sl(scale, base, n_blocks * n);
+        let zps = if is_asymmetric {
+            sl(zp, base, n_blocks * n)
+        } else {
+            &[][..]
+        };
+        let out = sl_mut(dst, base, m * n);
+        dequant_matmul_int8(xs, w_bytes, scales, zps, out, m, k, n, bs, is_asymmetric);
+    }
+}
+
 /// Host-fallback entry for Int4 `Op::DequantMatMul` (Metal unified memory).
 pub unsafe fn execute_dequant_matmul_int4_f32(
     x: usize,
@@ -16236,6 +16392,49 @@ fn reduce_sum_f64(inp: &[f64], out: &mut [f64], outer: usize, reduced: usize, in
             }
             out[o * inner + n] = acc;
         }
+    }
+}
+
+/// Host-side RNG fill against a byte arena (Metal/CUDA unified-memory fallback).
+///
+/// # Safety
+///
+/// `arena` must point to a valid allocation with at least `dst_off + len * 4` bytes.
+pub unsafe fn fill_rng_normal_arena(
+    dst_off: usize,
+    len: usize,
+    mean: f32,
+    scale: f32,
+    key: u64,
+    op_seed: Option<f32>,
+    opts: rlx_ir::RngOptions,
+    arena: *mut u8,
+) {
+    if len == 0 {
+        return;
+    }
+    unsafe {
+        let out = std::slice::from_raw_parts_mut((arena.add(dst_off)) as *mut f32, len);
+        rlx_ir::fill_normal_like(out, mean, scale, opts, key, op_seed);
+    }
+}
+
+pub unsafe fn fill_rng_uniform_arena(
+    dst_off: usize,
+    len: usize,
+    low: f32,
+    high: f32,
+    key: u64,
+    op_seed: Option<f32>,
+    opts: rlx_ir::RngOptions,
+    arena: *mut u8,
+) {
+    if len == 0 {
+        return;
+    }
+    unsafe {
+        let out = std::slice::from_raw_parts_mut((arena.add(dst_off)) as *mut f32, len);
+        rlx_ir::fill_uniform_like(out, low, high, opts, key, op_seed);
     }
 }
 

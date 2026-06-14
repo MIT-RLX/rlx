@@ -217,6 +217,16 @@ pub trait ExecutableGraph: Send {
         let _ = extent;
     }
 
+    /// Override RNG policy for in-graph random ops without recompiling.
+    fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+        let _ = rng;
+    }
+
+    /// Current RNG policy (default when the backend does not override).
+    fn rng(&self) -> rlx_ir::RngOptions {
+        rlx_ir::RngOptions::default()
+    }
+
     /// TIDE merged placement mask (union across MoE layers). CPU: stats + host path.
     fn set_moe_resident_experts(&mut self, _mask: &[bool]) {}
 
@@ -606,6 +616,8 @@ pub mod cpu_backend {
             Cumsum,
             TopK,
             Sample,
+            RngNormal,
+            RngUniform,
             Conv,
             Im2Col,
             ConvTranspose2d,
@@ -740,7 +752,12 @@ pub mod cpu_backend {
                     cfg.arena_alignment
                 );
             }
-            Box::new(build_cpu_executable(exec_graph, plan, io_manifest))
+            Box::new(build_cpu_executable(
+                exec_graph,
+                plan,
+                io_manifest,
+                options.rng,
+            ))
         }
 
         fn compile_lir(
@@ -777,7 +794,12 @@ pub mod cpu_backend {
                     alignment,
                 );
             }
-            Box::new(build_cpu_executable(exec_graph, plan, io_manifest))
+            Box::new(build_cpu_executable(
+                exec_graph,
+                plan,
+                io_manifest,
+                options.rng,
+            ))
         }
     }
 
@@ -785,6 +807,7 @@ pub mod cpu_backend {
         graph: Graph,
         plan: MemoryPlan,
         io_manifest: cpu_low_precision::IoDtypeManifest,
+        rng: rlx_ir::RngOptions,
     ) -> CpuExecutable {
         let mut arena = Arena::from_plan(plan);
         let mut input_ids = HashMap::new();
@@ -803,7 +826,7 @@ pub mod cpu_backend {
             }
         }
 
-        let schedule = thunk::compile_thunks(&graph, &arena);
+        let schedule = thunk::compile_thunks_with_rng(&graph, &arena, rng);
 
         let mut input_slots = Vec::new();
         for node in graph.nodes() {
@@ -1077,6 +1100,14 @@ pub mod cpu_backend {
 
         fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
             self.active_extent = extent;
+        }
+
+        fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+            *self.schedule.rng.write().unwrap() = rng;
+        }
+
+        fn rng(&self) -> rlx_ir::RngOptions {
+            *self.schedule.rng.read().unwrap()
         }
 
         fn set_moe_resident_experts(&mut self, mask: &[bool]) {
@@ -1455,6 +1486,8 @@ pub mod wgpu_backend {
         OpKind::GaussianSplatPrepare,
         OpKind::GaussianSplatRasterize,
         OpKind::Custom,
+        OpKind::RngNormal,
+        OpKind::RngUniform,
         // LoRA, If, While: not yet wired in wgpu — fail loudly.
     ];
 
@@ -1497,7 +1530,7 @@ pub mod wgpu_backend {
             };
             let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
             Box::new(WgpuExecutableWrapper {
-                inner: WgpuExecutable::compile(graph),
+                inner: WgpuExecutable::compile_rng(graph, options.rng),
                 io_manifest,
             })
         }
@@ -1514,7 +1547,7 @@ pub mod wgpu_backend {
             let graph = prepare_fused_graph(graph, options, WGPU_SUPPORTED_OPS, "wgpu");
             let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
             Box::new(WgpuExecutableWrapper {
-                inner: WgpuExecutable::compile(graph),
+                inner: WgpuExecutable::compile_rng(graph, options.rng),
                 io_manifest,
             })
         }
@@ -1556,6 +1589,14 @@ pub mod wgpu_backend {
         }
         fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
             self.inner.set_active_extent(extent);
+        }
+
+        fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+            self.inner.set_rng(rng);
+        }
+
+        fn rng(&self) -> rlx_ir::RngOptions {
+            self.inner.rng()
         }
 
         /// Typed param upload: widens F16/BF16 to F32 at the host boundary,
@@ -1642,6 +1683,13 @@ pub mod wgpu_backend {
                 )
                 .map(|(v, dt)| (narrow_to_dtype(&v, dt), dt))
                 .collect()
+        }
+
+        fn clone_box(&self) -> Box<dyn ExecutableGraph> {
+            Box::new(WgpuExecutableWrapper {
+                inner: self.inner.clone_for_cache(),
+                io_manifest: self.io_manifest.clone(),
+            })
         }
     }
 
@@ -1785,6 +1833,8 @@ pub mod mlx_backend {
             Softmax,
             Cumsum,
             TopK,
+            RngNormal,
+            RngUniform,
             Sample,
             Conv,
             ConvTranspose2d,
@@ -1878,14 +1928,14 @@ pub mod mlx_backend {
             let mut graph = lir.into_graph();
             graph = rlx_opt::LowerControlFlow.run(graph);
             let graph = prepare_fused_graph(graph, options, MLX_SUPPORTED_OPS, "mlx");
-            Box::new(build_mlx_executable(graph))
+            Box::new(build_mlx_executable(graph, options.rng))
         }
     }
 
-    fn build_mlx_executable(graph: Graph) -> MlxExecutableWrapper {
+    fn build_mlx_executable(graph: Graph, rng: rlx_ir::RngOptions) -> MlxExecutableWrapper {
         let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
         let mode = mlx_mode_from_env();
-        let mut exe = MlxExecutable::compile_from_fused(graph, mode);
+        let mut exe = MlxExecutable::compile_from_fused_with_rng(graph, mode, rng);
         if mode == rlx_mlx::lower::MlxMode::Compiled {
             if let Err(e) = exe.warm_compile() {
                 eprintln!(
@@ -1982,32 +2032,25 @@ pub mod mlx_backend {
             &mut self,
             inputs: &[(&str, &[u8], rlx_ir::DType)],
         ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
-            let mut owned: Vec<(String, Vec<f32>)> = Vec::with_capacity(inputs.len());
-            for (name, data, dt) in inputs {
-                let v = super::widen_bytes_to_f32(data, *dt);
-                owned.push((name.to_string(), v));
-            }
-            let refs: Vec<(&str, &[f32])> = owned
-                .iter()
-                .map(|(n, d)| (n.as_str(), d.as_slice()))
-                .collect();
-            let f32_outs = self.inner.run(&refs);
-            let declared = super::declared_output_dtypes(
-                &self.io_manifest,
-                (0..f32_outs.len()).map(|_| rlx_ir::DType::F32).collect(),
-            );
-            f32_outs
-                .into_iter()
-                .zip(
-                    declared
-                        .into_iter()
-                        .chain(std::iter::repeat(rlx_ir::DType::F32)),
-                )
-                .map(|(v, dt)| (super::narrow_f32_to_bytes(&v, dt), dt))
-                .collect()
+            self.inner.run_typed(inputs)
         }
         fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
             self.inner.set_active_extent(extent);
+        }
+
+        fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+            self.inner.set_rng(rng);
+        }
+
+        fn rng(&self) -> rlx_ir::RngOptions {
+            self.inner.rng()
+        }
+
+        fn clone_box(&self) -> Box<dyn ExecutableGraph> {
+            Box::new(MlxExecutableWrapper {
+                inner: self.inner.clone_for_cache(),
+                io_manifest: self.io_manifest.clone(),
+            })
         }
     }
 }
@@ -2021,7 +2064,7 @@ pub mod metal_backend {
 
     /// PLAN L4: ops the Metal backend can lower today. Includes
     /// DotGeneral (LowerDotGeneral pass) and ElementwiseRegion
-    /// (decomposed by UnfuseElementwiseRegions). Excludes Cumsum,
+    /// (decomposed by UnfuseElementwiseRegions). Excludes
     /// SelectiveScan, LoraMatMul, Sample,
     /// FusedAttentionBlock, FusedTransformerLayer, If, While —
     /// not yet wired in `rlx-metal/src/thunk.rs`'s compile_thunks.
@@ -2057,6 +2100,7 @@ pub mod metal_backend {
             RmsNormBackwardGamma,
             RmsNormBackwardBeta,
             RopeBackward,
+            Cumsum,
             CumsumBackward,
             GatherBackward,
             Conv2dBackwardInput,
@@ -2072,6 +2116,8 @@ pub mod metal_backend {
             Reduce,
             Softmax,
             TopK,
+            RngNormal,
+            RngUniform,
             Conv,
             Im2Col,
             ConvTranspose2d,
@@ -2139,6 +2185,7 @@ pub mod metal_backend {
                     graph,
                     options.policy.clone(),
                     Some(METAL_SUPPORTED_OPS),
+                    options.rng,
                 ),
                 io_manifest,
             })
@@ -2168,6 +2215,7 @@ pub mod metal_backend {
                     graph,
                     options.policy.clone(),
                     Some(METAL_SUPPORTED_OPS),
+                    options.rng,
                 ),
                 io_manifest,
             })
@@ -2235,13 +2283,29 @@ pub mod metal_backend {
             self.inner.set_active_extent(extent);
         }
 
+        fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+            self.inner.set_rng(rng);
+        }
+
+        fn rng(&self) -> rlx_ir::RngOptions {
+            self.inner.rng()
+        }
+
         /// Typed param upload — accepts F16/BF16 host bytes by widening
         /// to F32 first, then routing through `set_param`. The Metal
         /// arena's `write_from_f32` honors per-node F16 storage when
         /// AutoMixedPrecision rewrote the param. U8/I8 packed weights
         /// copy directly into the arena for `Op::DequantMatMul`.
         fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
-            if matches!(dtype, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
+            if matches!(
+                dtype,
+                rlx_ir::DType::U8
+                    | rlx_ir::DType::I8
+                    | rlx_ir::DType::I32
+                    | rlx_ir::DType::I64
+                    | rlx_ir::DType::U32
+                    | rlx_ir::DType::F64
+            ) {
                 self.inner.set_param_bytes(name, data);
                 return;
             }
@@ -2255,43 +2319,21 @@ pub mod metal_backend {
             }
         }
 
-        /// Typed run. Inputs widen to F32 (existing path; F64 host
-        /// inputs through `run_typed` is a separate Metal extension).
-        /// Outputs: F64 outputs go through the byte-direct
-        /// `output_bytes_per_node` path (no precision loss in the
-        /// f32 round-trip); other dtypes keep the f32-narrow path
-        /// for backward compatibility with existing AutoMixedPrecision
-        /// rewrites.
+        /// Typed run. Integer inputs (I64 token ids, etc.) are copied
+        /// directly into the unified-memory arena; F32/F16/BF16 widen
+        /// through the existing host path. Outputs use native arena bytes.
         fn run_typed(
             &mut self,
             inputs: &[(&str, &[u8], rlx_ir::DType)],
         ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
-            let mut owned: Vec<(String, Vec<f32>)> = Vec::with_capacity(inputs.len());
-            for (name, data, dt) in inputs {
-                let v = super::widen_bytes_to_f32(data, *dt);
-                owned.push((name.to_string(), v));
-            }
-            let refs: Vec<(&str, &[f32])> = owned
-                .iter()
-                .map(|(n, d)| (n.as_str(), d.as_slice()))
-                .collect();
-            let dtypes =
-                super::declared_output_dtypes(&self.io_manifest, self.inner.output_dtypes());
-            let f32_outs = self.inner.run(&refs);
-            let byte_outs = self.inner.output_bytes_per_node();
-            f32_outs
-                .into_iter()
-                .zip(byte_outs.into_iter())
-                .zip(
-                    dtypes
-                        .into_iter()
-                        .chain(std::iter::repeat(rlx_ir::DType::F32)),
-                )
-                .map(|((f32_v, byte_v), dt)| match dt {
-                    rlx_ir::DType::F64 => (byte_v, dt),
-                    _ => (super::narrow_f32_to_bytes(&f32_v, dt), dt),
-                })
-                .collect()
+            self.inner.run_typed(inputs)
+        }
+
+        fn clone_box(&self) -> Box<dyn ExecutableGraph> {
+            Box::new(MetalExecutableWrapper {
+                inner: self.inner.clone_for_cache(),
+                io_manifest: self.io_manifest.clone(),
+            })
         }
     }
 }
@@ -2376,6 +2418,8 @@ pub mod cuda_backend {
             LogMelBackward,
             WelchPeaks,
             Im2Col,
+            RngNormal,
+            RngUniform,
         ]
     };
 
@@ -2411,7 +2455,7 @@ pub mod cuda_backend {
             };
             let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
             Box::new(CudaExecutableWrapper {
-                inner: CudaExecutable::compile(graph),
+                inner: CudaExecutable::compile_rng(graph, options.rng),
                 io_manifest,
             })
         }
@@ -2431,7 +2475,7 @@ pub mod cuda_backend {
                     "cuda",
                 ));
             Box::new(CudaExecutableWrapper {
-                inner: CudaExecutable::compile(graph),
+                inner: CudaExecutable::compile_rng(graph, options.rng),
                 io_manifest,
             })
         }
@@ -2477,6 +2521,14 @@ pub mod cuda_backend {
         }
         fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
             self.inner.set_active_extent(extent);
+        }
+
+        fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+            self.inner.set_rng(rng);
+        }
+
+        fn rng(&self) -> rlx_ir::RngOptions {
+            self.inner.rng()
         }
 
         fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
@@ -2532,6 +2584,13 @@ pub mod cuda_backend {
                 )
                 .map(|(v, dt)| (super::narrow_f32_to_bytes(&v, dt), dt))
                 .collect()
+        }
+
+        fn clone_box(&self) -> Box<dyn ExecutableGraph> {
+            Box::new(CudaExecutableWrapper {
+                inner: self.inner.clone_for_cache(),
+                io_manifest: self.io_manifest.clone(),
+            })
         }
     }
 }
@@ -2610,6 +2669,8 @@ pub mod rocm_backend {
             LogMelBackward,
             WelchPeaks,
             Im2Col,
+            RngNormal,
+            RngUniform,
         ]
     };
 
@@ -2641,7 +2702,7 @@ pub mod rocm_backend {
             };
             let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
             Box::new(RocmExecutableWrapper {
-                inner: RocmExecutable::compile(graph),
+                inner: RocmExecutable::compile_rng(graph, options.rng),
                 io_manifest,
             })
         }
@@ -2659,7 +2720,7 @@ pub mod rocm_backend {
                     "rocm",
                 ));
             Box::new(RocmExecutableWrapper {
-                inner: RocmExecutable::compile(graph),
+                inner: RocmExecutable::compile_rng(graph, options.rng),
                 io_manifest,
             })
         }
@@ -2712,6 +2773,14 @@ pub mod rocm_backend {
             self.inner.set_active_extent(extent);
         }
 
+        fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+            self.inner.set_rng(rng);
+        }
+
+        fn rng(&self) -> rlx_ir::RngOptions {
+            self.inner.rng()
+        }
+
         /// Typed param upload — widens F16/BF16 host bytes to f32
         /// before routing through `set_param`. ROCm's arena is
         /// f32-uniform; the half-precision matmul tier opts in via
@@ -2757,6 +2826,13 @@ pub mod rocm_backend {
                 )
                 .map(|(v, dt)| (super::narrow_f32_to_bytes(&v, dt), dt))
                 .collect()
+        }
+
+        fn clone_box(&self) -> Box<dyn ExecutableGraph> {
+            Box::new(RocmExecutableWrapper {
+                inner: self.inner.clone_for_cache(),
+                io_manifest: self.io_manifest.clone(),
+            })
         }
     }
 }
@@ -2826,6 +2902,8 @@ pub mod tpu_backend {
             LogMel,
             LogMelBackward,
             WelchPeaks,
+            RngNormal,
+            RngUniform,
             // Splat: no on-chip kernel — lowered to common primitive MIR via logical_kernel.
         ]
     };
@@ -2868,7 +2946,7 @@ pub mod tpu_backend {
             let _ = options.dce;
             let _ = options.constant_folding;
             Box::new(TpuExecutableWrapper {
-                inner: TpuExecutable::compile(graph),
+                inner: TpuExecutable::compile_rng(graph, options.rng),
             })
         }
     }
@@ -2928,6 +3006,12 @@ pub mod tpu_backend {
                 )
                 .map(|(v, dt)| (super::narrow_f32_to_bytes(&v, dt), dt))
                 .collect()
+        }
+
+        fn clone_box(&self) -> Box<dyn ExecutableGraph> {
+            Box::new(TpuExecutableWrapper {
+                inner: self.inner.clone_for_cache(),
+            })
         }
     }
 }

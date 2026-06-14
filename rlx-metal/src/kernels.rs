@@ -2489,6 +2489,12 @@ kernel void abs_inplace(
     uint gid [[thread_position_in_grid]]
 ) { if (gid >= len) return; data[gid] = abs(data[gid]); }
 
+kernel void round_inplace(
+    device float* data [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = round(data[gid]); }
+
 // Standalone softmax along the last axis. One threadgroup per row,
 // reduces max + exp-sum across the row, then normalizes. tg_size is
 // the actual number of threads per group (passed via threads_per_threadgroup).
@@ -4164,6 +4170,25 @@ kernel void rope_bwd(
     }
 }
 
+kernel void cumsum_fwd(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& inner [[buffer(2)]],
+    constant uint& exclusive [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    float acc = 0.0f;
+    for (uint i = 0; i < inner; ++i) {
+        if (exclusive != 0u) {
+            dst[row * inner + i] = acc;
+            acc += src[row * inner + i];
+        } else {
+            acc += src[row * inner + i];
+            dst[row * inner + i] = acc;
+        }
+    }
+}
+
 kernel void cumsum_bwd(
     device const float* dy [[buffer(0)]],
     device float* dx [[buffer(1)]],
@@ -4736,6 +4761,7 @@ pub struct Kernels {
     pub rsqrt_inplace: ComputePipelineState,
     pub neg_inplace: ComputePipelineState,
     pub abs_inplace: ComputePipelineState,
+    pub round_inplace: ComputePipelineState,
     pub sin_inplace: ComputePipelineState,
     pub cos_inplace: ComputePipelineState,
     pub tan_inplace: ComputePipelineState,
@@ -4753,6 +4779,7 @@ pub struct Kernels {
     pub rms_norm_bwd_inv_r_f32: ComputePipelineState,
     pub rms_norm_bwd_param_reduce_f32: ComputePipelineState,
     pub rope_bwd: ComputePipelineState,
+    pub cumsum_fwd: ComputePipelineState,
     pub cumsum_bwd: ComputePipelineState,
     pub im2col_group: ComputePipelineState,
     pub im2col_group_w1: ComputePipelineState,
@@ -4926,6 +4953,7 @@ impl Kernels {
             rsqrt_inplace: pipeline("rsqrt_inplace"),
             neg_inplace: pipeline("neg_inplace"),
             abs_inplace: pipeline("abs_inplace"),
+            round_inplace: pipeline("round_inplace"),
             sin_inplace: pipeline("sin_inplace"),
             cos_inplace: pipeline("cos_inplace"),
             tan_inplace: pipeline("tan_inplace"),
@@ -4943,6 +4971,7 @@ impl Kernels {
             rms_norm_bwd_inv_r_f32: pipeline("rms_norm_bwd_inv_r_f32"),
             rms_norm_bwd_param_reduce_f32: pipeline("rms_norm_bwd_param_reduce_f32"),
             rope_bwd: pipeline("rope_bwd"),
+            cumsum_fwd: pipeline("cumsum_fwd"),
             cumsum_bwd: pipeline("cumsum_bwd"),
             im2col_group: pipeline("im2col_group"),
             im2col_group_w1: pipeline("im2col_group_w1"),

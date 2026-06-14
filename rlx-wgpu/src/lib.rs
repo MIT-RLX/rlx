@@ -41,6 +41,7 @@ pub mod im2col_host;
 pub mod kernels;
 pub mod llada2_gate_host;
 pub mod log_mel_host;
+pub mod rng_host;
 #[cfg(feature = "splat")]
 pub mod splat;
 #[cfg(feature = "native-splat")]

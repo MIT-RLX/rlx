@@ -109,7 +109,7 @@ pub fn derive_phases(graph: &Graph) -> PhaseSchedule {
     let mut last_sample_step: Option<usize> = None;
     for (step, node) in graph.nodes().iter().enumerate() {
         match &node.op {
-            Op::Sample { .. } | Op::TopK { .. } => {
+            Op::Sample { .. } | Op::TopK { .. } | Op::RngNormal { .. } | Op::RngUniform { .. } => {
                 last_sample_step = Some(step);
             }
             Op::MatMul
@@ -133,7 +133,9 @@ pub fn derive_phases(graph: &Graph) -> PhaseSchedule {
     for (step, node) in graph.nodes().iter().enumerate() {
         let phase = match &node.op {
             Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => Phase::Prologue,
-            Op::Sample { .. } | Op::TopK { .. } => Phase::Epilogue,
+            Op::Sample { .. } | Op::TopK { .. } | Op::RngNormal { .. } | Op::RngUniform { .. } => {
+                Phase::Epilogue
+            }
             _ => {
                 if let Some(last) = last_sample_step {
                     if step > last

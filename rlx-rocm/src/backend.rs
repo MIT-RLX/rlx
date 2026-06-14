@@ -321,6 +321,22 @@ pub(crate) enum Step {
         seed_lo: u32,
         seed_hi: u32,
     },
+    RngNormal {
+        dst_byte_off: u32,
+        len: u32,
+        mean: f32,
+        scale: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
+    RngUniform {
+        dst_byte_off: u32,
+        len: u32,
+        low: f32,
+        high: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
     SelectiveScan {
         batch: u32,
         seq: u32,
@@ -886,6 +902,8 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::DequantMatmulGguf { .. } => "rlx::DequantMatmulGguf",
         Step::DequantGroupedMatmulGguf { .. } => "rlx::DequantGroupedMatmulGguf",
         Step::Sample { .. } => "rlx::Sample",
+        Step::RngNormal { .. } => "rlx::RngNormal",
+        Step::RngUniform { .. } => "rlx::RngUniform",
         Step::SelectiveScan { .. } => "rlx::SelectiveScan",
         Step::Fft { .. } => "rlx::Fft",
         Step::LogMelHost { .. } => "rlx::LogMelHost",
@@ -977,6 +995,9 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         | Step::Sample {
             in_off, out_off, ..
         } => (vec![*in_off], vec![*out_off]),
+        Step::RngNormal { dst_byte_off, .. } | Step::RngUniform { dst_byte_off, .. } => {
+            (vec![], vec![*dst_byte_off / 4])
+        }
         Step::TopK {
             in_off, out_off, ..
         } => (vec![*in_off], vec![*out_off]),
@@ -1822,6 +1843,18 @@ pub struct RocmExecutable {
     output_slots: Vec<(usize, usize)>,
     /// Pageable host mirror for `run_slots` / `arena_ptr` (not the GPU arena).
     host_arena: Vec<f32>,
+    /// Runtime-mutable RNG policy for in-graph random ops.
+    rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+}
+
+impl RocmExecutable {
+    pub fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+        *self.rng.write().expect("rng lock") = rng;
+    }
+
+    pub fn rng(&self) -> rlx_ir::RngOptions {
+        *self.rng.read().expect("rng lock")
+    }
 }
 
 impl Step {
@@ -1857,6 +1890,8 @@ impl Step {
             | Step::LogMelHost { .. }
             | Step::LogMelBackwardHost { .. }
             | Step::WelchPeaksHost { .. }
+            | Step::RngNormal { .. }
+            | Step::RngUniform { .. }
             | Step::GaussianSplatRender { .. }
             | Step::GaussianSplatRenderBackward { .. }
             | Step::GaussianSplatPrepare { .. }
@@ -1910,20 +1945,25 @@ impl Drop for RocmExecutable {
 impl RocmExecutable {
     /// JIT compile, stream-mode execution. Default entry point.
     pub fn compile(graph: Graph) -> Self {
-        Self::compile_with(graph, CompileMode::Jit, ExecMode::Stream)
+        Self::compile_with_rng(
+            graph,
+            CompileMode::Jit,
+            ExecMode::Stream,
+            rlx_ir::RngOptions::default(),
+        )
     }
 
-    /// One-shot eager run.
-    pub fn eager(graph: Graph, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
-        let mut exec = Self::compile_with(graph, CompileMode::Jit, ExecMode::Eager);
-        exec.run(inputs)
+    pub fn compile_rng(graph: Graph, rng: rlx_ir::RngOptions) -> Self {
+        Self::compile_with_rng(graph, CompileMode::Jit, ExecMode::Stream, rng)
     }
 
-    /// Full constructor with explicit compile + exec modes. Mirrors
-    /// `rlx-cuda::backend::CudaExecutable::compile_with` — the IR
-    /// walk + memory plan + Step emission is identical; only the
-    /// device-buffer types differ (`HipBuffer` vs `CudaSlice`).
-    pub fn compile_with(graph: Graph, compile_mode: CompileMode, exec_mode: ExecMode) -> Self {
+    /// Compile with explicit RNG policy (used by [`rlx-runtime`]).
+    pub fn compile_with_rng(
+        graph: Graph,
+        compile_mode: CompileMode,
+        exec_mode: ExecMode,
+        rng: rlx_ir::RngOptions,
+    ) -> Self {
         let ctx = rocm_context().expect("rlx-rocm: no HIP runtime available");
 
         if compile_mode == CompileMode::Aot {
@@ -3499,6 +3539,38 @@ impl RocmExecutable {
                         });
                     }
                 }
+                Op::RngNormal {
+                    mean,
+                    scale,
+                    key,
+                    op_seed,
+                } => {
+                    let len = node.shape.num_elements().unwrap_or(0);
+                    schedule.push(Step::RngNormal {
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        len: len as u32,
+                        mean: *mean,
+                        scale: *scale,
+                        key: *key,
+                        op_seed: *op_seed,
+                    });
+                }
+                Op::RngUniform {
+                    low,
+                    high,
+                    key,
+                    op_seed,
+                } => {
+                    let len = node.shape.num_elements().unwrap_or(0);
+                    schedule.push(Step::RngUniform {
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        len: len as u32,
+                        low: *low,
+                        high: *high,
+                        key: *key,
+                        op_seed: *op_seed,
+                    });
+                }
                 Op::RmsNormBackwardInput { eps, .. }
                 | Op::RmsNormBackwardGamma { eps, .. }
                 | Op::RmsNormBackwardBeta { eps, .. } => {
@@ -3731,7 +3803,23 @@ impl RocmExecutable {
             input_slots,
             output_slots,
             host_arena,
+            rng: std::sync::Arc::new(std::sync::RwLock::new(rng)),
         }
+    }
+
+    pub fn compile_with(graph: Graph, compile_mode: CompileMode, exec_mode: ExecMode) -> Self {
+        Self::compile_with_rng(
+            graph,
+            compile_mode,
+            exec_mode,
+            rlx_ir::RngOptions::default(),
+        )
+    }
+
+    /// One-shot eager run.
+    pub fn eager(graph: Graph, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        let mut exec = Self::compile_with(graph, CompileMode::Jit, ExecMode::Eager);
+        exec.run(inputs)
     }
 
     /// Host buffer base for reading outputs after [`Self::run_slots`].
@@ -3899,6 +3987,19 @@ impl RocmExecutable {
 
     pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         self.gpu_handles.get(name).cloned()
+    }
+
+    /// Clone into an independent executable (recompiles from the stored graph).
+    pub fn clone_for_cache(&self) -> Self {
+        let mut exe = Self::compile_rng(self.graph.clone(), self.rng());
+        for (k, v) in &self.gpu_handles {
+            exe.bind_gpu_handle(k, v);
+        }
+        for (k, &idx) in &self.gpu_handle_feeds {
+            exe.set_gpu_handle_feed(k, idx);
+        }
+        exe.set_active_extent(self.active_extent);
+        exe
     }
 
     fn run_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
@@ -4422,6 +4523,48 @@ impl RocmExecutable {
                             seed_lo,
                             seed_hi
                         ]
+                    );
+                }
+                Step::RngNormal {
+                    dst_byte_off,
+                    len,
+                    mean,
+                    scale,
+                    key,
+                    op_seed,
+                } => {
+                    let opts = *self.rng.read().expect("rng lock");
+                    crate::rng_host::run_rng_normal(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        *dst_byte_off as usize,
+                        *len as usize,
+                        *mean,
+                        *scale,
+                        *key,
+                        *op_seed,
+                        opts,
+                    );
+                }
+                Step::RngUniform {
+                    dst_byte_off,
+                    len,
+                    low,
+                    high,
+                    key,
+                    op_seed,
+                } => {
+                    let opts = *self.rng.read().expect("rng lock");
+                    crate::rng_host::run_rng_uniform(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        *dst_byte_off as usize,
+                        *len as usize,
+                        *low,
+                        *high,
+                        *key,
+                        *op_seed,
+                        opts,
                     );
                 }
                 Step::Gather {

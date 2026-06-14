@@ -62,6 +62,10 @@ pub struct HloModule {
 }
 
 pub fn lower_graph(graph: &Graph) -> HloModule {
+    lower_graph_with_rng(graph, rlx_ir::RngOptions::default())
+}
+
+pub fn lower_graph_with_rng(graph: &Graph, rng: rlx_ir::RngOptions) -> HloModule {
     let mut b = HloBuilder::new(&graph.name);
 
     // Reducer subcomputations cached by (opcode, prim_ty) so multiple
@@ -122,6 +126,7 @@ pub fn lower_graph(graph: &Graph) -> HloModule {
         id_map: &mut id_map,
         reducers: &mut reducers,
         builder: &mut b,
+        rng,
     };
     for &nid in &others {
         let id = ctx.lower_node(nid);
@@ -219,6 +224,7 @@ struct LowerCtx<'a> {
     id_map: &'a mut HashMap<NodeId, i64>,
     reducers: &'a mut HashMap<(String, i32), Computation>,
     builder: &'a mut HloBuilder,
+    rng: rlx_ir::RngOptions,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -685,6 +691,20 @@ impl<'a> LowerCtx<'a> {
                 *state_size,
                 out_shape,
             ),
+
+            Op::RngNormal {
+                mean,
+                scale,
+                key: _,
+                op_seed: _,
+            } => self.lower_rng_normal(*mean, *scale, out_shape),
+
+            Op::RngUniform {
+                low,
+                high,
+                key: _,
+                op_seed: _,
+            } => self.lower_rng_uniform(*low, *high, out_shape),
 
             // Backward / training ops — no rlx-tpu support yet.
             Op::ReluBackward
@@ -2601,9 +2621,33 @@ impl<'a> LowerCtx<'a> {
         self.entry.convert(cl, out)
     }
 
-    // ── Sample ────────────────────────────────────────────────────
+    // ── In-graph RNG (ONNX Random*) ───────────────────────────────
     //
-    // Logits [B, V] f32 → token_ids [B] f32.
+    // Lowers to XLA `rng` with UNIFORM (1) or NORMAL (2). Uses native
+    // PJRT/XLA semantics — not bit-identical to RLX Philox/Ort on CPU.
+    // `RngBackend::Zero` fills with a broadcast scalar zero instead.
+
+    fn lower_rng_uniform(&self, low: f32, high: f32, out: Shape) -> i64 {
+        if self.rng.backend == rlx_ir::RngBackend::Zero {
+            let zero = self.entry.constant_f32_scalar(0.0);
+            return self.entry.broadcast(zero, &[], out);
+        }
+        let a = self.entry.constant_f32_scalar(low);
+        let b = self.entry.constant_f32_scalar(high);
+        self.entry.rng(a, b, /*RNG_UNIFORM=*/ 1, out)
+    }
+
+    fn lower_rng_normal(&self, mean: f32, scale: f32, out: Shape) -> i64 {
+        if self.rng.backend == rlx_ir::RngBackend::Zero {
+            let zero = self.entry.constant_f32_scalar(0.0);
+            return self.entry.broadcast(zero, &[], out);
+        }
+        let a = self.entry.constant_f32_scalar(mean);
+        let b = self.entry.constant_f32_scalar(scale);
+        self.entry.rng(a, b, /*RNG_NORMAL=*/ 2, out)
+    }
+
+    // ── Sample ────────────────────────────────────────────────────
     //
     // Decomposition:
     //   * temperature == 0 → argmax via topk(k=1)

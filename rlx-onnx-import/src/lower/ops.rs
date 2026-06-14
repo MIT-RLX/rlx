@@ -1378,6 +1378,7 @@ fn lower_node(
         "ScatterElements" => lower_scatter_elements(m, ctx, node)?,
         "DynamicQuantizeLSTM" => lower_dynamic_quantize_lstm(m, ctx, node)?,
         "RandomNormalLike" | "RandomUniformLike" => lower_random_like(m, ctx, node)?,
+        "RandomNormal" | "RandomUniform" => lower_random(m, ctx, node)?,
         "If" | "Loop" | "Scan" | "SplitToSequence" | "ConcatFromSequence" | "SequenceEmpty" => {
             lower_control_flow(m, ctx, node)?
         }
@@ -3773,19 +3774,6 @@ fn lower_cumsum(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -
     Ok(true)
 }
 
-fn node_name_tag(name: &str) -> u64 {
-    name.bytes()
-        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
-}
-
-fn random_like_attrs(a: f32, b: f32, tag: u64) -> Vec<u8> {
-    let mut v = vec![0u8; 16];
-    v[0..4].copy_from_slice(&a.to_le_bytes());
-    v[4..8].copy_from_slice(&b.to_le_bytes());
-    v[8..16].copy_from_slice(&tag.to_le_bytes());
-    v
-}
-
 fn lower_random_like(
     m: &mut HirMut<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -3800,44 +3788,64 @@ fn lower_random_like(
     if out_s.rank() == 0 || out_s.num_elements().unwrap_or(0) == 0 {
         out_s = m.shape(shape_in).clone();
     }
-    let tag = node_name_tag(&node.name);
-    let (op_name, attrs) = match node.op.as_str() {
-        "RandomNormalLike" => {
-            let mean = node
-                .attrs
-                .get("mean")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as f32;
-            let scale = node
-                .attrs
-                .get("scale")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(1.0) as f32;
-            ("onnx.RandomNormalLike", random_like_attrs(mean, scale, tag))
-        }
-        _ => {
-            let low = node
-                .attrs
-                .get("low")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as f32;
-            let high = node
-                .attrs
-                .get("high")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(1.0) as f32;
-            ("onnx.RandomUniformLike", random_like_attrs(low, high, tag))
-        }
-    };
+    let tag = crate::random::node_name_tag(&node.name);
+    let op_seed = crate::random::op_seed(node);
+    let dist = crate::random::distribution(node);
+    if ctx.opts.lower_random_as_custom {
+        let id = m.add_node(
+            Op::Custom {
+                name: crate::random::custom_name(node).to_string(),
+                num_inputs: 1,
+                attrs: crate::random::custom_attrs(dist, tag),
+            },
+            vec![shape_in],
+            out_s,
+        );
+        ctx.env.insert(node.outputs[0].clone(), id);
+        return Ok(true);
+    }
     let id = m.add_node(
-        Op::Custom {
-            name: op_name.to_string(),
-            num_inputs: 1,
-            attrs,
-        },
+        crate::random::rng_op(dist, tag, op_seed),
         vec![shape_in],
         out_s,
     );
+    ctx.env.insert(node.outputs[0].clone(), id);
+    Ok(true)
+}
+
+fn lower_random(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+    let tag = crate::random::node_name_tag(&node.name);
+    let op_seed = crate::random::op_seed(node);
+    let dist = crate::random::distribution(node);
+    let placeholder = m.add_node(
+        Op::Constant { data: vec![0u8; 4] },
+        vec![],
+        Shape::new(&[1], DType::F32),
+    );
+    let mut inputs = Vec::new();
+    let mut out_s = output_shape(ctx, node, m, placeholder);
+    if let Some(shape_in) = node.inputs.first().filter(|n| !n.is_empty()) {
+        let id = ctx.tensor(shape_in)?;
+        inputs.push(id);
+        out_s = output_shape(ctx, node, m, id);
+    }
+    if out_s.rank() == 0 || out_s.num_elements().unwrap_or(0) == 0 {
+        anyhow::bail!("Random* at {} has no inferable output shape", node.name);
+    }
+    if ctx.opts.lower_random_as_custom {
+        let id = m.add_node(
+            Op::Custom {
+                name: crate::random::custom_name(node).to_string(),
+                num_inputs: inputs.len() as u32,
+                attrs: crate::random::custom_attrs(dist, tag),
+            },
+            inputs,
+            out_s,
+        );
+        ctx.env.insert(node.outputs[0].clone(), id);
+        return Ok(true);
+    }
+    let id = m.add_node(crate::random::rng_op(dist, tag, op_seed), inputs, out_s);
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }

@@ -877,6 +877,56 @@ fn vmap_op(
                 batched_shape(),
             )
         }
+        Op::RngNormal {
+            mean,
+            scale,
+            key,
+            op_seed,
+        } => {
+            let inputs: Vec<NodeId> = if new_inputs.is_empty() {
+                vec![]
+            } else {
+                vec![lift_to_batched(out, new_inputs[0], batched, batch_size)]
+            };
+            if let Some(&id) = inputs.first() {
+                batched.insert(id);
+            }
+            out.add_node(
+                Op::RngNormal {
+                    mean: *mean,
+                    scale: *scale,
+                    key: *key,
+                    op_seed: *op_seed,
+                },
+                inputs,
+                batched_shape(),
+            )
+        }
+        Op::RngUniform {
+            low,
+            high,
+            key,
+            op_seed,
+        } => {
+            let inputs: Vec<NodeId> = if new_inputs.is_empty() {
+                vec![]
+            } else {
+                vec![lift_to_batched(out, new_inputs[0], batched, batch_size)]
+            };
+            if let Some(&id) = inputs.first() {
+                batched.insert(id);
+            }
+            out.add_node(
+                Op::RngUniform {
+                    low: *low,
+                    high: *high,
+                    key: *key,
+                    op_seed: *op_seed,
+                },
+                inputs,
+                batched_shape(),
+            )
+        }
 
         // ── LoraMatMul: lift x/w/a/b, output [B, *] ──
         Op::LoraMatMul { scale } => {

@@ -131,7 +131,10 @@ pub use region_encode::{
     encode_elementwise_region_meta, encode_prologue_tail, fk_batch_single_kernel_enabled,
     fk_batch_use_single_launch,
 };
-pub use rng::Philox4x32;
+pub use rng::{
+    Philox4x32, RngBackend, RngOptions, combine_seed, fill_normal_like, fill_uniform_like,
+    ort_engine_seed,
+};
 #[cfg(feature = "serialize")]
 pub use serialize::{hir_from_json, hir_to_json, lir_from_json, lir_to_json};
 pub use verify::{VerifyError, verify, verify_all, verify_shapes};

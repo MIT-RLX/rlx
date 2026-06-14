@@ -27,6 +27,7 @@ pub mod layout;
 pub mod lower;
 pub mod onnx_file;
 pub mod ops;
+pub mod random;
 pub mod rewrite;
 pub mod shape_propagate;
 pub mod strict;

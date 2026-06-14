@@ -20,6 +20,12 @@ use rlx_ir::Shape;
 /// Optional per-node output shape correction during lowering (model bundles set this).
 pub type OutputShapeFix = fn(&str, &Shape) -> Option<Shape>;
 
+/// Hook after bundle `propagate_shapes` (model crates fix ORT trace dims before quant rewrites).
+pub type PostShapePropagate = fn(&mut [crate::bundle::BundleNode], &ImportOptions);
+
+/// Hook before bundle `propagate_shapes` (seed seq axes before sym env binds ORT trace dims).
+pub type PreShapePropagate = fn(&mut [crate::bundle::BundleNode], &ImportOptions);
+
 /// Per-node import statistics.
 #[derive(Debug, Default)]
 pub struct ImportReport {
@@ -46,8 +52,16 @@ pub struct ImportOptions {
     pub quantize_bundle_rewrites: bool,
     /// Upper bound multiplier for `Loop` / `ConcatFromSequence` static shapes (`seq * N`).
     pub max_frames_per_token: usize,
+    /// When true, lower ONNX `Random*` to `Op::Custom` instead of native
+    /// [`Op::RngNormal`] / [`Op::RngUniform`]. Kept for callers that still
+    /// route random ops through a backend custom-kernel registry.
+    pub lower_random_as_custom: bool,
     /// Correct inferred output shapes for known-bad ONNX metadata (set by downstream model crates).
     pub output_shape_fix: Option<OutputShapeFix>,
+    /// Model-specific bundle node patch after shape propagation (before quant rewrites).
+    pub post_shape_propagate: Option<PostShapePropagate>,
+    /// Model-specific bundle node patch before shape propagation.
+    pub pre_shape_propagate: Option<PreShapePropagate>,
 }
 
 impl Default for ImportOptions {
@@ -60,7 +74,10 @@ impl Default for ImportOptions {
             strict: true,
             quantize_bundle_rewrites: false,
             max_frames_per_token: 24,
+            lower_random_as_custom: false,
             output_shape_fix: None,
+            post_shape_propagate: None,
+            pre_shape_propagate: None,
         }
     }
 }

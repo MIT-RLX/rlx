@@ -415,6 +415,14 @@ pub enum Thunk {
         cols: u32,
         dt: HalfFlag,
     },
+    /// Inclusive (or exclusive) cumulative sum along the last axis.
+    Cumsum {
+        src: usize,
+        dst: usize,
+        rows: u32,
+        cols: u32,
+        exclusive: bool,
+    },
     /// Fused SwiGLU: `out[r,i] = x[r,i] * silu(x[r, n_half+i])`.
     /// Optional output cast: when `cast_to != src_dt` the kernel writes
     /// the result in `cast_to` precision; otherwise plain f32/f16 path.
@@ -630,6 +638,19 @@ pub enum Thunk {
         k: u32,
         n: u32,
         scheme: rlx_ir::quant::QuantScheme,
+    },
+    /// Legacy Int8 block matmul — CPU host fallback on unified memory.
+    DequantMatMulInt8 {
+        x: usize,
+        w_q: usize,
+        scale: usize,
+        zp: usize,
+        dst: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        block_size: u32,
+        is_asymmetric: bool,
     },
     /// Legacy Int4 block matmul — CPU host fallback on unified memory.
     DequantMatMulInt4 {
@@ -973,10 +994,28 @@ pub enum Thunk {
         n_segments: u32,
         k: u32,
     },
+    /// Host fill for [`Op::RngNormal`] (unified-memory arena).
+    RngNormal {
+        dst: usize,
+        len: u32,
+        mean: f32,
+        scale: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
+    RngUniform {
+        dst: usize,
+        len: u32,
+        low: f32,
+        high: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
 }
 
 pub struct ThunkSchedule {
     pub thunks: Vec<Thunk>,
+    pub rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
 }
 
 /// Static-string name for each Thunk variant — used by the Perfetto
@@ -1019,6 +1058,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Conv2dBackwardWeight { .. } => "conv2d_backward_weight",
         Thunk::Rope { .. } => "rope",
         Thunk::Softmax { .. } => "softmax",
+        Thunk::Cumsum { .. } => "cumsum",
         Thunk::FusedSwiGLU { .. } => "fused_swiglu",
         Thunk::Concat { .. } => "concat",
         Thunk::Compare { .. } => "compare",
@@ -1044,9 +1084,12 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::LogMel { .. } => "log_mel",
         Thunk::LogMelBackward { .. } => "log_mel_backward",
         Thunk::WelchPeaks { .. } => "welch_peaks",
+        Thunk::RngNormal { .. } => "rng_normal",
+        Thunk::RngUniform { .. } => "rng_uniform",
         Thunk::GatedDeltaNet { .. } => "gated_delta_net",
         Thunk::DequantMatMulGguf { .. } => "dequant_matmul_gguf",
         Thunk::DequantGroupedMatMulGguf { .. } => "dequant_grouped_matmul_gguf",
+        Thunk::DequantMatMulInt8 { .. } => "dequant_matmul_int8",
         Thunk::DequantMatMulInt4 { .. } => "dequant_matmul_int4",
         Thunk::DequantMatMulFp8 { .. } => "dequant_matmul_fp8",
         Thunk::DequantMatMulNvfp4 { .. } => "dequant_matmul_nvfp4",
@@ -1076,6 +1119,7 @@ impl Thunk {
             | Thunk::LayerNorm { .. }
             | Thunk::RmsNorm { .. }
             | Thunk::Softmax { .. }
+            | Thunk::Cumsum { .. }
             | Thunk::FusedResidualLN { .. }
             | Thunk::FusedResidualRmsNorm { .. }
             | Thunk::Gather { .. }
@@ -1116,6 +1160,7 @@ impl Thunk {
             Thunk::GatedDeltaNet { .. }
             | Thunk::DequantMatMulGguf { .. }
             | Thunk::DequantGroupedMatMulGguf { .. }
+            | Thunk::DequantMatMulInt8 { .. }
             | Thunk::DequantMatMulInt4 { .. }
             | Thunk::DequantMatMulFp8 { .. }
             | Thunk::DequantMatMulNvfp4 { .. } => true,
@@ -1146,6 +1191,11 @@ impl Thunk {
 
 impl ThunkSchedule {
     pub fn compile(graph: &Graph, arena: &Arena) -> Self {
+        Self::compile_with_rng(graph, arena, rlx_ir::RngOptions::default())
+    }
+
+    pub fn compile_with_rng(graph: &Graph, arena: &Arena, rng: rlx_ir::RngOptions) -> Self {
+        let rng_shared = std::sync::Arc::new(std::sync::RwLock::new(rng));
         let mut thunks = Vec::with_capacity(graph.len());
 
         let off = |id| -> usize {
@@ -2126,6 +2176,32 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::Cumsum { axis, exclusive } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal Cumsum: F32 only");
+                    }
+                    let rank = node.shape.rank();
+                    let ax = if *axis < 0 {
+                        (rank as i32 + *axis) as usize
+                    } else {
+                        *axis as usize
+                    };
+                    if ax != rank.saturating_sub(1) {
+                        panic!(
+                            "rlx-metal Cumsum: only last-axis wired (got axis={axis}, rank={rank})"
+                        );
+                    }
+                    let cols = node.shape.dim(ax).unwrap_static();
+                    let total = node.shape.num_elements().unwrap();
+                    Thunk::Cumsum {
+                        src: off(node.inputs[0]),
+                        dst: off(node.id),
+                        rows: (total / cols.max(1)) as u32,
+                        cols: cols as u32,
+                        exclusive: *exclusive,
+                    }
+                }
+
                 Op::Reduce {
                     op,
                     axes,
@@ -2575,6 +2651,34 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::RngNormal {
+                    mean,
+                    scale,
+                    key,
+                    op_seed,
+                } => Thunk::RngNormal {
+                    dst: off(node.id),
+                    len: node.shape.num_elements().unwrap_or(0) as u32,
+                    mean: *mean,
+                    scale: *scale,
+                    key: *key,
+                    op_seed: *op_seed,
+                },
+
+                Op::RngUniform {
+                    low,
+                    high,
+                    key,
+                    op_seed,
+                } => Thunk::RngUniform {
+                    dst: off(node.id),
+                    len: node.shape.num_elements().unwrap_or(0) as u32,
+                    low: *low,
+                    high: *high,
+                    key: *key,
+                    op_seed: *op_seed,
+                },
+
                 Op::GatedDeltaNet {
                     state_size,
                     carry_state,
@@ -2626,6 +2730,30 @@ impl ThunkSchedule {
                                 m: m as u32,
                                 k: k as u32,
                                 n: n as u32,
+                            },
+                            QuantScheme::Int8Block { block_size } => Thunk::DequantMatMulInt8 {
+                                x: off(node.inputs[0]),
+                                w_q: off(node.inputs[1]),
+                                scale: off(node.inputs[2]),
+                                zp: off(node.inputs[3]),
+                                dst: off(node.id),
+                                m: m as u32,
+                                k: k as u32,
+                                n: n as u32,
+                                block_size: *block_size,
+                                is_asymmetric: false,
+                            },
+                            QuantScheme::Int8BlockAsym { block_size } => Thunk::DequantMatMulInt8 {
+                                x: off(node.inputs[0]),
+                                w_q: off(node.inputs[1]),
+                                scale: off(node.inputs[2]),
+                                zp: off(node.inputs[3]),
+                                dst: off(node.id),
+                                m: m as u32,
+                                k: k as u32,
+                                n: n as u32,
+                                block_size: *block_size,
+                                is_asymmetric: true,
                             },
                             QuantScheme::Int4Block { block_size } => Thunk::DequantMatMulInt4 {
                                 x: off(node.inputs[0]),
@@ -3024,7 +3152,10 @@ impl ThunkSchedule {
         rewrite_dense_binary_broadcast(&mut thunks);
         fuse_narrow_clusters(&mut thunks);
 
-        Self { thunks }
+        Self {
+            thunks,
+            rng: rng_shared,
+        }
     }
 }
 
@@ -3557,6 +3688,7 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             x, res, bias, g, b, ..
         } => vec![*x, *res, *bias, *g, *b],
         Thunk::Softmax { data, .. } => vec![*data],
+        Thunk::Cumsum { src, .. } => vec![*src],
         Thunk::Attention { q, k, v, mask, .. } => vec![*q, *k, *v, *mask],
         Thunk::AttentionBackward {
             q, k, v, dy, mask, ..

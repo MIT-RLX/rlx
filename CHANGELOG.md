@@ -7,6 +7,27 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-06
+
+### Added
+
+- **In-graph RNG** (`rlx-ir`): `Op::RngNormal` / `Op::RngUniform` for ONNX
+  `Random*` / `Random*Like`; `RngOptions` / `RngBackend` (Philox default,
+  Ort CPU parity, Zero for deterministic tests). `CompileOptions::rng` and
+  `CompiledGraph::set_rng` override policy without recompiling.
+- **RNG backends**: CPU Philox + ORT reference (`rlx-cpu`); host-fill on Metal/MLX;
+  D2H→fill→H2D on CUDA/ROCm/wgpu; XLA `rng` lowering on TPU (`rlx-tpu`).
+- **ONNX `Random*` import** (`rlx-onnx-import`): native lowering to
+  `Op::RngNormal` / `Op::RngUniform` (direct import + codegen); shared
+  `random.rs` helpers; conformance harness coverage (`rlx-onnx-conformance`).
+- **Autodiff / vmap**: RNG ops treated as stateless w.r.t. gradients (`rlx-autodiff`).
+
+### Changed
+
+- Patch bumps for all workspace crates in this release train to **0.2.7**
+  (`rlx-ir`, `rlx-compile`, `rlx-gpu-kernels`, `rlx-cuda`, `rlx-wgpu`, `rlx-metal`,
+  `rlx-mlx`, `rlx-runtime`, `rlx`, …); `rlx-mlx-sys` and `pyrlx` at **0.2.7**.
+
 ## [0.2.6] — 2026-06
 
 ### Added
@@ -407,6 +428,13 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 ## [0.1.0] — 2026-04
 
 Initial release. Tracked at [git history root].
+
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.7
+[0.2.6]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.6
+[0.2.5]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.5
+[0.2.3]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.3
+
 ## License
 
 GPL-3.0-only.

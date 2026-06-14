@@ -53,6 +53,7 @@ pub mod kernels;
 pub mod llada2_gate_host;
 pub mod log_mel_backward_host;
 pub mod log_mel_host;
+pub mod rng_host;
 pub mod sam_ops_host;
 pub mod splat_host;
 #[cfg(feature = "native-splat")]

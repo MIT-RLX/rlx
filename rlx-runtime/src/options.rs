@@ -44,6 +44,8 @@ pub struct CompileOptions {
     pub precision: Precision,
     /// Optional per-op precision policy (mixed precision rewrite).
     pub policy: Option<PrecisionPolicy>,
+    /// RNG policy for in-graph [`Op::RngNormal`] / [`Op::RngUniform`] nodes.
+    pub rng: rlx_ir::RngOptions,
     /// Run dead-code elimination as part of compile. Default: true.
     pub dce: bool,
     /// Run constant folding. Default: true (cheap, only helps).
@@ -75,6 +77,7 @@ impl Default for CompileOptions {
         Self {
             precision: Precision::F32,
             policy: None,
+            rng: rlx_ir::RngOptions::default(),
             dce: true,
             constant_folding: true,
             verbose: false,
@@ -101,6 +104,18 @@ impl CompileOptions {
     }
     pub fn policy(mut self, p: PrecisionPolicy) -> Self {
         self.policy = Some(p);
+        self
+    }
+    pub fn rng(mut self, rng: rlx_ir::RngOptions) -> Self {
+        self.rng = rng;
+        self
+    }
+    pub fn rng_backend(mut self, backend: rlx_ir::RngBackend) -> Self {
+        self.rng.backend = backend;
+        self
+    }
+    pub fn rng_seed(mut self, seed: u64) -> Self {
+        self.rng.seed = seed;
         self
     }
     pub fn no_policy(mut self) -> Self {

@@ -15,10 +15,30 @@
 
 //! Minimal synthetic ONNX graphs for registry ops.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rlx_onnx_import::{ImportOptions, build_hir_from_onnx_file};
+
+/// Embedded ONNX `RandomNormalLike` (mean=0.1, scale=2, seed=7, template [2×3]).
+pub fn random_normal_like_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rng_normal_like.onnx")
+}
+
+/// Embedded ONNX `RandomNormal` (mean=0.1, scale=2, seed=7, shape=[4]).
+pub fn random_normal_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rng_normal.onnx")
+}
+
+/// Embedded ONNX `RandomUniformLike` (low=0, high=1, seed=7, template [2×3]).
+pub fn random_uniform_like_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rng_uniform_like.onnx")
+}
+
+/// Embedded ONNX `RandomUniform` (low=0, high=1, seed=7, shape=[4]).
+pub fn random_uniform_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rng_uniform.onnx")
+}
 
 /// Build HIR from an ONNX file using generic strict import (no quant-bundle rewrites).
 pub fn import_onnx_strict(path: &Path) -> Result<rlx_ir::hir::HirModule> {

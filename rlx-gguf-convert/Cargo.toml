@@ -21,12 +21,12 @@ safetensors = ["dep:safetensors"]
 onnx = ["dep:rlx-onnx-import"]
 
 [dependencies]
-rlx-gguf = { path = "../rlx-gguf", version = "0.2.4" }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.7" }
 anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 safetensors = { version = "0.7", optional = true }
-rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.4", optional = true, default-features = false }
+rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.7", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

@@ -222,6 +222,16 @@ impl CompiledGraph {
     ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
         self.inner.run_typed(inputs)
     }
+
+    /// Override RNG policy for in-graph random ops without recompiling.
+    pub fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+        self.inner.set_rng(rng);
+    }
+
+    /// Current RNG compile/execute policy.
+    pub fn rng(&self) -> rlx_ir::RngOptions {
+        self.inner.rng()
+    }
 }
 
 #[cfg(test)]

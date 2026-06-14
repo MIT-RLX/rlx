@@ -38,7 +38,7 @@ pub fn compare_tensors(a: &[f32], b: &[f32], atol: f32) -> (f32, bool) {
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub struct OrtSession {
-    _session: ort::session::Session,
+    session: ort::session::Session,
 }
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -48,7 +48,55 @@ impl OrtSession {
             .context("ort session builder")?
             .commit_from_memory(model)
             .context("load ort model")?;
-        Ok(Self { _session: session })
+        Ok(Self { session })
+    }
+
+    /// Run a single f32 input and return one f32 output tensor (flattened).
+    pub fn run_one_f32_input(
+        &mut self,
+        input_name: &str,
+        input: &[f32],
+        input_shape: &[i64],
+        output_index: usize,
+    ) -> Result<Vec<f32>> {
+        use ort::session::{SessionInputValue, SessionInputs};
+        use ort::value::Tensor;
+        let owned: Vec<f32> = input.to_vec();
+        let shape_usize: Vec<usize> = input_shape.iter().map(|&d| d as usize).collect();
+        let tensor = Tensor::from_array((shape_usize.as_slice(), owned))
+            .context("ort input tensor")?
+            .into_dyn();
+        let feeds = vec![(input_name.to_string(), SessionInputValue::Owned(tensor))];
+        let outputs = self
+            .session
+            .run(SessionInputs::from(feeds))
+            .context("ort run")?;
+        let (out_name, out_val) = outputs
+            .iter()
+            .nth(output_index)
+            .with_context(|| format!("ort output index {output_index}"))?;
+        let (_shape, data) = out_val
+            .try_extract_tensor::<f32>()
+            .with_context(|| format!("extract ort output {out_name}"))?;
+        Ok(data.to_vec())
+    }
+
+    /// Run a zero-input model and return one f32 output tensor (flattened).
+    pub fn run_no_inputs(&mut self, output_index: usize) -> Result<Vec<f32>> {
+        use ort::session::{SessionInputValue, SessionInputs};
+        let empty: Vec<(String, SessionInputValue)> = Vec::new();
+        let outputs = self
+            .session
+            .run(SessionInputs::from(empty))
+            .context("ort run")?;
+        let (out_name, out_val) = outputs
+            .iter()
+            .nth(output_index)
+            .with_context(|| format!("ort output index {output_index}"))?;
+        let (_shape, data) = out_val
+            .try_extract_tensor::<f32>()
+            .with_context(|| format!("extract ort output {out_name}"))?;
+        Ok(data.to_vec())
     }
 }
 

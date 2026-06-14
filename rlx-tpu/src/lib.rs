@@ -51,6 +51,7 @@ pub mod ir_passes;
 pub mod libtpu;
 pub mod lower;
 pub mod orchestrated;
+pub mod rng;
 pub mod segment;
 pub mod splat_host;
 pub mod unfuse;

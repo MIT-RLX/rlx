@@ -217,7 +217,13 @@ fn run_callback(
     // rebinding is wired through compile mode.
     let empty_params: HashMap<String, Vec<f32>> = HashMap::new();
     let empty_typed: HashMap<String, (Vec<u8>, rlx_ir::DType)> = HashMap::new();
-    let outs = lower_with_env(&state.graph, env, &empty_params, &empty_typed)?;
+    let outs = lower_with_env(
+        &state.graph,
+        env,
+        &empty_params,
+        &empty_typed,
+        rlx_ir::RngOptions::default(),
+    )?;
 
     if outs.len() > cap {
         return Err(MlxError(format!(

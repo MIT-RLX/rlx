@@ -13,20 +13,151 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Counter-based deterministic RNG (plan #43).
+//! Counter-based and ONNX Runtime–compatible RNG for in-graph random ops.
 //!
-//! Borrowed from MAX's `nn/randn.mojo` / `nn/rand_uniform.mojo`
-//! pattern. Counter-based RNGs (Philox) are stateless besides the
-//! seed and counter — given the same `(seed, counter)` you get the
-//! same output bit-for-bit, which makes:
+//! # Behavioral contract
 //!
-//!   - init values deterministic for reproducible benches,
-//!   - weight init reproducible across machines (CI vs laptop),
-//!   - tests that depend on random data trivial to debug — replay
-//!     with the same seed.
+//! [`Op::RngNormal`] / [`Op::RngUniform`] take an optional shape-template input
+//! (ONNX `Random*Like`) or no inputs when the output shape is fixed at import
+//! time (ONNX `Random*` with a `shape` attribute). The output tensor shape is
+//! always the node's assigned shape; the template input is not copied into the
+//! output.
 //!
-//! Implementation is Philox 4×32-10 (the same family numpy / JAX
-//! use). Pure Rust, no extern crate.
+//! | Backend | Semantics |
+//! |---------|-----------|
+//! | [`RngBackend::Philox`] | Deterministic Philox4×32-10 stream keyed by [`RngOptions::seed`] + per-node `key`. Default for RLX-native runs. |
+//! | [`RngBackend::Ort`] | Matches ONNX Runtime CPU `Random*` (`minstd_rand0` + polar normal / uniform). Use for import parity tests. Per-op ONNX `seed` (f32) overrides the mixed engine seed when set. |
+//! | [`RngBackend::Zero`] | Writes zeros — useful when comparing against a stochastic reference without re-seeding ORT. |
+//!
+//! Policy is set at compile time via [`CompileOptions::rng`] and can be overridden
+//! per session through [`rlx_runtime::CompiledGraph::set_rng`] without
+//! recompiling. Each execute re-seeds from the current policy (ORT session state
+//! is not advanced across runs today).
+
+/// Which RNG implementation to use for [`Op::RngNormal`] / [`Op::RngUniform`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+pub enum RngBackend {
+    /// Philox4×32-10 sequential stream (RLX native default).
+    #[default]
+    Philox,
+    /// ONNX Runtime CPU `Random*Like` (`minstd_rand0` + `std::normal_distribution`).
+    Ort,
+    /// Fill with zero (deterministic parity vs stochastic reference runs).
+    Zero,
+}
+
+/// Compile-time / execute-time RNG policy for graphs containing random ops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+pub struct RngOptions {
+    /// Global seed mixed into per-node keys (maps to ORT session seed).
+    pub seed: u64,
+    pub backend: RngBackend,
+}
+
+impl Default for RngOptions {
+    fn default() -> Self {
+        Self {
+            seed: 42,
+            backend: RngBackend::Philox,
+        }
+    }
+}
+
+impl RngOptions {
+    pub const fn new(seed: u64, backend: RngBackend) -> Self {
+        Self { seed, backend }
+    }
+
+    pub fn philox(seed: u64) -> Self {
+        Self {
+            seed,
+            backend: RngBackend::Philox,
+        }
+    }
+
+    pub fn ort(seed: u64) -> Self {
+        Self {
+            seed,
+            backend: RngBackend::Ort,
+        }
+    }
+
+    pub fn zero() -> Self {
+        Self {
+            seed: 0,
+            backend: RngBackend::Zero,
+        }
+    }
+}
+
+/// Mix a global compile seed with a per-node key (ONNX node name hash).
+pub fn combine_seed(global: u64, key: u64) -> u64 {
+    global.wrapping_add(key.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// ORT CPU engine seed: explicit ONNX `seed` attr cast to u32, else global+key.
+pub fn ort_engine_seed(global: u64, key: u64, op_seed: Option<f32>) -> u32 {
+    if let Some(s) = op_seed {
+        s as u32
+    } else {
+        global.wrapping_add(key) as u32
+    }
+}
+
+/// Fill `out` with `mean + scale * N(0,1)` samples.
+pub fn fill_normal_like(
+    out: &mut [f32],
+    mean: f32,
+    scale: f32,
+    opts: RngOptions,
+    key: u64,
+    op_seed: Option<f32>,
+) {
+    match opts.backend {
+        RngBackend::Zero => out.fill(0.0),
+        RngBackend::Philox => {
+            let mut rng = Philox4x32::new(combine_seed(opts.seed, key));
+            for v in out.iter_mut() {
+                *v = mean + scale * rng.normal();
+            }
+        }
+        RngBackend::Ort => {
+            let mut eng = MinstdRand0::new(ort_engine_seed(opts.seed, key, op_seed));
+            let mut dist = StdNormalDist::new(mean, scale);
+            for v in out.iter_mut() {
+                *v = dist.sample(&mut eng);
+            }
+        }
+    }
+}
+
+/// Fill `out` with uniform samples in `[low, high)`.
+pub fn fill_uniform_like(
+    out: &mut [f32],
+    low: f32,
+    high: f32,
+    opts: RngOptions,
+    key: u64,
+    op_seed: Option<f32>,
+) {
+    match opts.backend {
+        RngBackend::Zero => out.fill(0.0),
+        RngBackend::Philox => {
+            let mut rng = Philox4x32::new(combine_seed(opts.seed, key));
+            for v in out.iter_mut() {
+                *v = rng.uniform(low, high);
+            }
+        }
+        RngBackend::Ort => {
+            let mut eng = MinstdRand0::new(ort_engine_seed(opts.seed, key, op_seed));
+            for v in out.iter_mut() {
+                *v = low + (high - low) * eng.unit_f32();
+            }
+        }
+    }
+}
 
 /// Philox4×32 counter-based RNG. Produces 4 u32s per round of the
 /// core hash — we expose an iterator that yields one f32 per call.
@@ -142,6 +273,72 @@ impl Philox4x32 {
     }
 }
 
+/// C++11 `std::default_random_engine` on libstdc++/libc++ (`minstd_rand0`).
+#[derive(Debug, Clone, Copy)]
+struct MinstdRand0 {
+    state: u32,
+}
+
+impl MinstdRand0 {
+    const A: u32 = 48_271;
+    const M: u32 = 2_147_483_647;
+
+    fn new(seed: u32) -> Self {
+        Self {
+            state: seed % Self::M,
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state = ((self.state as u64 * Self::A as u64) % Self::M as u64) as u32;
+        self.state
+    }
+
+    /// Uniform in `[0, 1)` matching ORT's `RealType(g()) / (g.max() - g.min())`.
+    fn unit_f32(&mut self) -> f32 {
+        self.next_u32() as f32 / (Self::M - 1) as f32
+    }
+}
+
+/// C++ `std::normal_distribution<float>` (polar method, caches spare sample).
+#[derive(Debug, Clone, Copy)]
+struct StdNormalDist {
+    mean: f32,
+    scale: f32,
+    spare: f32,
+    has_spare: bool,
+}
+
+impl StdNormalDist {
+    fn new(mean: f32, scale: f32) -> Self {
+        Self {
+            mean,
+            scale,
+            spare: 0.0,
+            has_spare: false,
+        }
+    }
+
+    fn sample(&mut self, eng: &mut MinstdRand0) -> f32 {
+        if self.has_spare {
+            self.has_spare = false;
+            return self.spare;
+        }
+        loop {
+            let u1 = 2.0 * eng.unit_f32() - 1.0;
+            let u2 = 2.0 * eng.unit_f32() - 1.0;
+            let s = u1 * u1 + u2 * u2;
+            if s >= 1.0 || s == 0.0 {
+                continue;
+            }
+            let factor = (-2.0 * s.ln() / s).sqrt();
+            self.spare = u2 * factor * self.scale + self.mean;
+            self.has_spare = true;
+            return u1 * factor * self.scale + self.mean;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,7 +390,6 @@ mod tests {
 
     #[test]
     fn normal_mean_is_near_zero() {
-        // Sanity check: 10k samples of N(0,1) should average within 0.1 of 0.
         let mut r = Philox4x32::new(123);
         let n = 10_000;
         let mut sum = 0f32;
@@ -202,5 +398,41 @@ mod tests {
         }
         let mean = sum / n as f32;
         assert!(mean.abs() < 0.1, "mean {mean} too far from 0");
+    }
+
+    #[test]
+    fn zero_backend_fills_zeros() {
+        let mut out = vec![1.0; 8];
+        fill_normal_like(&mut out, 0.0, 1.0, RngOptions::zero(), 0xABC, None);
+        assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn philox_backend_is_deterministic() {
+        let opts = RngOptions::philox(99);
+        let mut a = vec![0f32; 32];
+        let mut b = vec![0f32; 32];
+        fill_normal_like(&mut a, 0.0, 0.5, opts, 123, None);
+        fill_normal_like(&mut b, 0.0, 0.5, opts, 123, None);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ort_backend_is_deterministic() {
+        let opts = RngOptions::ort(7);
+        let mut a = vec![0f32; 64];
+        let mut b = vec![0f32; 64];
+        fill_normal_like(&mut a, 0.1, 2.0, opts, 555, None);
+        fill_normal_like(&mut b, 0.1, 2.0, opts, 555, None);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn backends_disagree() {
+        let mut philox = vec![0f32; 16];
+        let mut ort = vec![0f32; 16];
+        fill_normal_like(&mut philox, 0.0, 1.0, RngOptions::philox(42), 1, None);
+        fill_normal_like(&mut ort, 0.0, 1.0, RngOptions::ort(42), 1, None);
+        assert_ne!(philox, ort);
     }
 }

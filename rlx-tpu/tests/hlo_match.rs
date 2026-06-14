@@ -782,6 +782,75 @@ fn selective_scan_emits_while_and_dynamic_slice() {
 }
 
 #[test]
+fn rng_normal_emits_hlo_rng() {
+    let mut g = Graph::new("rng_normal");
+    let f = DType::F32;
+    let template = g.input("template", Shape::new(&[2, 3], f));
+    let y = g.add_node(
+        rlx_ir::Op::RngNormal {
+            mean: 0.1,
+            scale: 2.0,
+            key: 1,
+            op_seed: Some(7.0),
+        },
+        vec![template],
+        Shape::new(&[2, 3], f),
+    );
+    g.set_outputs(vec![y]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "rng"),
+        "RngNormal should lower to HLO rng"
+    );
+}
+
+#[test]
+fn rng_uniform_emits_hlo_rng() {
+    let mut g = Graph::new("rng_uniform");
+    let f = DType::F32;
+    let y = g.add_node(
+        rlx_ir::Op::RngUniform {
+            low: 0.0,
+            high: 1.0,
+            key: 2,
+            op_seed: None,
+        },
+        vec![],
+        Shape::new(&[4], f),
+    );
+    g.set_outputs(vec![y]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "rng"),
+        "RngUniform should lower to HLO rng"
+    );
+}
+
+#[test]
+fn rng_zero_backend_skips_hlo_rng() {
+    use rlx_tpu::lower::lower_graph_with_rng;
+    let mut g = Graph::new("rng_zero");
+    let f = DType::F32;
+    let y = g.add_node(
+        rlx_ir::Op::RngNormal {
+            mean: 0.1,
+            scale: 2.0,
+            key: 3,
+            op_seed: None,
+        },
+        vec![],
+        Shape::new(&[4], f),
+    );
+    g.set_outputs(vec![y]);
+    let b = lower_graph_with_rng(&g, rlx_ir::RngOptions::zero()).bytes;
+    assert!(
+        !contains_opcode(&b, "rng"),
+        "Zero backend should broadcast constants, not call rng"
+    );
+    assert!(contains_opcode(&b, "broadcast"));
+}
+
+#[test]
 fn elementwise_region_decomposes_into_chain() {
     // ElementwiseRegion lowers by walking the chain inline, so the
     // emitted HLO has all the individual primitives — `add`, `multiply`,

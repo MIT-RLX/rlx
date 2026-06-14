@@ -194,6 +194,84 @@ pub fn emit_dynamic_quant_output(
     }
 }
 
+fn node_name_tag_lit(node: &BundleNode) -> String {
+    crate::random::node_name_tag(&node.name).to_string()
+}
+
+fn emit_random_like(node: &BundleNode, out_ident: &str, meta0: &str) -> Vec<String> {
+    let tag = node_name_tag_lit(node);
+    let seed = node
+        .attrs
+        .get("seed")
+        .and_then(|v| v.as_f64())
+        .map(|v| format!("Some({v}f32)"))
+        .unwrap_or_else(|| "None".to_string());
+    let shape = rust_str_lit(&node.inputs[0]);
+    match node.op.as_str() {
+        "RandomNormalLike" => {
+            let mean = attr_f64(node, "mean", 0.0);
+            let scale = attr_f64(node, "scale", 1.0);
+            vec![format!(
+                "let {out_ident} = {{ let shape_in = b.tensor({shape})?; let mut m = HirMut::new(&mut b.hir); \
+                m.add_node(rlx_ir::Op::RngNormal {{ mean: {mean}f32, scale: {scale}f32, key: {tag}, op_seed: {seed} }}, \
+                vec![shape_in], shape_from_meta({meta0}, opts)) }};",
+            )]
+        }
+        _ => {
+            let low = attr_f64(node, "low", 0.0);
+            let high = attr_f64(node, "high", 1.0);
+            vec![format!(
+                "let {out_ident} = {{ let shape_in = b.tensor({shape})?; let mut m = HirMut::new(&mut b.hir); \
+                m.add_node(rlx_ir::Op::RngUniform {{ low: {low}f32, high: {high}f32, key: {tag}, op_seed: {seed} }}, \
+                vec![shape_in], shape_from_meta({meta0}, opts)) }};",
+            )]
+        }
+    }
+}
+
+fn emit_random(node: &BundleNode, out_ident: &str, meta0: &str) -> Vec<String> {
+    let tag = node_name_tag_lit(node);
+    let seed = node
+        .attrs
+        .get("seed")
+        .and_then(|v| v.as_f64())
+        .map(|v| format!("Some({v}f32)"))
+        .unwrap_or_else(|| "None".to_string());
+    let shape_in = if node.inputs.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "let shape_in = b.tensor({})?;",
+            rust_str_lit(&node.inputs[0])
+        )
+    };
+    let in_list = if node.inputs.is_empty() {
+        "vec![]".to_string()
+    } else {
+        "vec![shape_in]".to_string()
+    };
+    match node.op.as_str() {
+        "RandomNormal" => {
+            let mean = attr_f64(node, "mean", 0.0);
+            let scale = attr_f64(node, "scale", 1.0);
+            vec![format!(
+                "let {out_ident} = {{ {shape_in} let mut m = HirMut::new(&mut b.hir); \
+                m.add_node(rlx_ir::Op::RngNormal {{ mean: {mean}f32, scale: {scale}f32, key: {tag}, op_seed: {seed} }}, \
+                {in_list}, shape_from_meta({meta0}, opts)) }};",
+            )]
+        }
+        _ => {
+            let low = attr_f64(node, "low", 0.0);
+            let high = attr_f64(node, "high", 1.0);
+            vec![format!(
+                "let {out_ident} = {{ {shape_in} let mut m = HirMut::new(&mut b.hir); \
+                m.add_node(rlx_ir::Op::RngUniform {{ low: {low}f32, high: {high}f32, key: {tag}, op_seed: {seed} }}, \
+                {in_list}, shape_from_meta({meta0}, opts)) }};",
+            )]
+        }
+    }
+}
+
 /// Emit TopK values + indices (`outputs[0]` = values, `outputs[1]` = indices).
 pub fn emit_topk(node: &BundleNode, val_ident: &str, idx_ident: &str) -> Vec<String> {
     let x_name = &node.inputs[0];
@@ -651,9 +729,11 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
             lines
         }
         "Resize" => emit_resize(node, out_ident, &meta0),
-        "ScatterND" | "ScatterElements" | "CumSum" | "RandomNormalLike" | "RandomUniformLike"
-        | "SplitToSequence" | "ConcatFromSequence" | "SequenceEmpty" | "Loop" | "If" | "Range"
-        | "ConstantOfShape" | "Shape" | "Slice" | "Pad" => {
+        "RandomNormalLike" | "RandomUniformLike" => emit_random_like(node, out_ident, &meta0),
+        "RandomNormal" | "RandomUniform" => emit_random(node, out_ident, &meta0),
+        "ScatterND" | "ScatterElements" | "CumSum" | "SplitToSequence" | "ConcatFromSequence"
+        | "SequenceEmpty" | "Loop" | "If" | "Range" | "ConstantOfShape" | "Shape" | "Slice"
+        | "Pad" => {
             let mut lines = vec![format!("// passthrough / delegated: {}", node.op)];
             lines.extend(stub_node(out_ident, &meta0, out_name));
             lines

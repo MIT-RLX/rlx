@@ -90,6 +90,16 @@ pub fn format_legalize_error(backend_name: &str, errors: &[(NodeId, OpKind)]) ->
              \x20For now, pin custom-op graphs to `Device::Cpu`.",
         );
     }
+    if errors
+        .iter()
+        .any(|(_, k)| matches!(k, OpKind::RngNormal | OpKind::RngUniform))
+    {
+        s.push_str(
+            "\n  `Op::RngNormal` / `Op::RngUniform` require host-side RNG fill. \
+             Pin random-op graphs to `Device::Cpu`, `Device::Metal`, `Device::Mlx`, \
+             `Device::Cuda`, `Device::Rocm`, `Device::Gpu`, or `Device::Tpu`.",
+        );
+    }
     s
 }
 
@@ -159,5 +169,13 @@ mod tests {
         assert!(msg.contains("2 op kind"));
         assert!(msg.contains("Binary"));
         assert!(msg.contains("Activation"));
+    }
+
+    #[test]
+    fn format_error_hints_rng_ops_for_wgpu() {
+        let errors = [(NodeId(0), OpKind::RngNormal)];
+        let msg = format_legalize_error("wgpu", &errors);
+        assert!(msg.contains("host-side RNG fill"));
+        assert!(msg.contains("Device::Gpu"));
     }
 }

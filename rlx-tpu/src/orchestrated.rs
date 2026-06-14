@@ -20,7 +20,7 @@ use rlx_ir::{DType, Graph, NodeId, Op};
 
 use crate::backend::{compile_pjrt_executable, destroy_buffer, download_buffer, upload_buffer};
 use crate::device::tpu_context;
-use crate::lower::{HloModule, lower_graph};
+use crate::lower::{HloModule, lower_graph_with_rng};
 use crate::segment::{Segment, plan};
 use crate::splat_host::{HostTensors, run_splat_backward, run_splat_render};
 
@@ -29,6 +29,8 @@ pub struct OrchestratedExecutable {
     segments: Vec<CompiledSegment>,
     params: HashMap<String, Vec<u8>>,
     param_dtypes: HashMap<String, DType>,
+    uses_xla_rng: bool,
+    rng_exec_warned: bool,
 }
 
 enum CompiledSegment {
@@ -49,6 +51,12 @@ enum CompiledSegment {
 
 impl OrchestratedExecutable {
     pub fn compile(graph: Graph) -> Self {
+        let rng = rlx_ir::RngOptions::default();
+        let uses_xla_rng = crate::rng::uses_xla_native_rng(&graph, rng);
+        Self::compile_rng(graph, rng, uses_xla_rng)
+    }
+
+    pub fn compile_rng(graph: Graph, rng: rlx_ir::RngOptions, uses_xla_rng: bool) -> Self {
         let segments = plan(&graph);
         let mut compiled = Vec::new();
         for seg in segments {
@@ -58,7 +66,7 @@ impl OrchestratedExecutable {
                     output_orig,
                 } => {
                     let seg_graph = crate::ir_passes::prepare_graph_for_hlo(seg_graph);
-                    let module = lower_graph(&seg_graph);
+                    let module = lower_graph_with_rng(&seg_graph, rng);
                     let executable = compile_pjrt_executable(&module.bytes);
                     let n_params = module.param_names.len();
                     compiled.push(CompiledSegment::Hlo {
@@ -82,6 +90,8 @@ impl OrchestratedExecutable {
             segments: compiled,
             params: HashMap::new(),
             param_dtypes: HashMap::new(),
+            uses_xla_rng,
+            rng_exec_warned: false,
         }
     }
 
@@ -99,6 +109,9 @@ impl OrchestratedExecutable {
     }
 
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        if self.uses_xla_rng {
+            crate::rng::warn_xla_rng_on_execute(&mut self.rng_exec_warned);
+        }
         let mut env: HostTensors = HashMap::new();
         for n in self.graph.nodes() {
             if let Op::Input { name } = &n.op {
@@ -156,6 +169,20 @@ impl OrchestratedExecutable {
             .iter()
             .map(|&id| self.graph.node(id).shape.dtype())
             .collect()
+    }
+
+    /// Clone into an independent executable (recompiles PJRT segments).
+    pub fn clone_for_cache(&self) -> Self {
+        let mut exe = Self::compile_rng(
+            self.graph.clone(),
+            rlx_ir::RngOptions::default(),
+            self.uses_xla_rng,
+        );
+        for (k, bytes) in &self.params {
+            let dtype = self.param_dtypes.get(k).copied().unwrap_or(DType::F32);
+            exe.set_param_typed(k, bytes, dtype);
+        }
+        exe
     }
 }
 
