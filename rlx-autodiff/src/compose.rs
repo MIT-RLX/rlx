@@ -111,7 +111,11 @@ pub fn output_depends_on_differentiable(g: &Graph, output: NodeId, wrt: NodeId) 
 /// Inputs that can carry gradients w.r.t. continuous variables.
 fn diff_inputs<'a>(op: &'a Op, inputs: &'a [NodeId]) -> &'a [NodeId] {
     match op {
-        Op::Compare(_) | Op::TopK { .. } | Op::Sample { .. } => &[],
+        Op::Compare(_)
+        | Op::TopK { .. }
+        | Op::Sample { .. }
+        | Op::RngNormal { .. }
+        | Op::RngUniform { .. } => &[],
         Op::Where => {
             if inputs.len() >= 3 {
                 &inputs[1..3]

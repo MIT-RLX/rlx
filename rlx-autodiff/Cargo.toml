@@ -14,15 +14,15 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.6" }
-rlx-fusion = { path = "../rlx-fusion", version = "0.2.4" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.7" }
+rlx-fusion = { path = "../rlx-fusion", version = "0.2.7" }
 half = "2"
 
 [features]
 default = []
 
 [dev-dependencies]
-rlx = { path = "../rlx", version = "0.2.4", default-features = false, features = ["cpu"] }
+rlx = { path = "../rlx", version = "0.2.7", default-features = false, features = ["cpu"] }
 
 [lints]
 workspace = true

@@ -45,13 +45,16 @@ use crate::libtpu::{
     PJRT_PROGRAM_FORMAT_HLO, PJRT_Program, PjrtBuffer, PjrtLoadedExecutable, error_to_string,
     event_await,
 };
-use crate::lower::{HloModule, lower_graph};
+use crate::lower::{HloModule, lower_graph_with_rng};
 use crate::orchestrated::OrchestratedExecutable;
 use crate::segment;
 
 /// Compiled-once, run-many TPU executable.
 pub struct TpuExecutable {
     inner: ExecInner,
+    /// Set at compile time when the graph lowers to native XLA `rng`.
+    uses_xla_rng: bool,
+    rng_exec_warned: bool,
 }
 
 enum ExecInner {
@@ -75,6 +78,10 @@ unsafe impl Send for TpuExecutable {}
 impl TpuExecutable {
     /// Compile `graph` for the active TPU device.
     pub fn compile(graph: Graph) -> Self {
+        Self::compile_rng(graph, rlx_ir::RngOptions::default())
+    }
+
+    pub fn compile_rng(graph: Graph, rng: rlx_ir::RngOptions) -> Self {
         let _ctx = tpu_context().unwrap_or_else(|| {
             panic!(
                 "rlx-tpu: no PJRT runtime available. \
@@ -90,14 +97,21 @@ impl TpuExecutable {
         //
         // See [`crate::ir_passes::prepare_graph_for_hlo`].
         let graph = crate::ir_passes::prepare_graph_for_hlo(graph);
+        let uses_xla_rng = crate::rng::uses_xla_native_rng(&graph, rng);
 
         if segment::needs_orchestration(&graph) {
             return Self {
-                inner: ExecInner::Orchestrated(OrchestratedExecutable::compile(graph)),
+                inner: ExecInner::Orchestrated(OrchestratedExecutable::compile_rng(
+                    graph,
+                    rng,
+                    uses_xla_rng,
+                )),
+                uses_xla_rng: false,
+                rng_exec_warned: false,
             };
         }
 
-        let module = lower_graph(&graph);
+        let module = lower_graph_with_rng(&graph, rng);
 
         // Optional HLO dump for inspection. RLX_TPU_HLO_DUMP can be:
         //   * a directory  → write `<dir>/<graph_name>.pb`
@@ -141,6 +155,8 @@ impl TpuExecutable {
                 param_buffers: vec![std::ptr::null_mut(); n_params],
                 params_uploaded: false,
             },
+            uses_xla_rng,
+            rng_exec_warned: false,
         }
     }
 
@@ -185,7 +201,11 @@ impl TpuExecutable {
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         match &mut self.inner {
             ExecInner::Orchestrated(o) => return o.run(inputs),
-            ExecInner::Single { .. } => {}
+            ExecInner::Single { .. } => {
+                if self.uses_xla_rng {
+                    crate::rng::warn_xla_rng_on_execute(&mut self.rng_exec_warned);
+                }
+            }
         }
         let ExecInner::Single {
             module,
@@ -316,6 +336,49 @@ impl TpuExecutable {
         match &self.inner {
             ExecInner::Single { module, .. } => module.output_dtypes.clone(),
             ExecInner::Orchestrated(o) => o.output_dtypes(),
+        }
+    }
+
+    /// Clone into an independent executable (recompiles PJRT handles).
+    pub fn clone_for_cache(&self) -> Self {
+        match &self.inner {
+            ExecInner::Orchestrated(o) => Self {
+                inner: ExecInner::Orchestrated(o.clone_for_cache()),
+                uses_xla_rng: false,
+                rng_exec_warned: false,
+            },
+            ExecInner::Single {
+                module,
+                params,
+                param_dtypes,
+                ..
+            } => {
+                let executable = compile_pjrt_executable(&module.bytes);
+                let n_params = module.param_names.len();
+                Self {
+                    inner: ExecInner::Single {
+                        module: HloModule {
+                            bytes: module.bytes.clone(),
+                            output_lens: module.output_lens.clone(),
+                            output_dtypes: module.output_dtypes.clone(),
+                            output_shapes: module.output_shapes.clone(),
+                            input_names: module.input_names.clone(),
+                            input_dtypes: module.input_dtypes.clone(),
+                            input_shapes: module.input_shapes.clone(),
+                            param_names: module.param_names.clone(),
+                            param_dtypes: module.param_dtypes.clone(),
+                            param_shapes: module.param_shapes.clone(),
+                        },
+                        params: params.clone(),
+                        param_dtypes: param_dtypes.clone(),
+                        executable,
+                        param_buffers: vec![std::ptr::null_mut(); n_params],
+                        params_uploaded: false,
+                    },
+                    uses_xla_rng: self.uses_xla_rng,
+                    rng_exec_warned: false,
+                }
+            }
         }
     }
 }

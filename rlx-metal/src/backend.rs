@@ -140,7 +140,7 @@ impl MetalExecutable {
     }
 
     pub fn compile(graph: Graph) -> Self {
-        Self::compile_inner(graph, None, None, false)
+        Self::compile_inner(graph, None, None, false, rlx_ir::RngOptions::default())
     }
 
     /// Compile with an optional `PrecisionPolicy`. The pass runs *after*
@@ -150,8 +150,9 @@ impl MetalExecutable {
         graph: Graph,
         policy: Option<rlx_opt::PrecisionPolicy>,
         supported_ops: Option<&'static [rlx_ir::OpKind]>,
+        rng: rlx_ir::RngOptions,
     ) -> Self {
-        Self::compile_inner(graph, policy, supported_ops, false)
+        Self::compile_inner(graph, policy, supported_ops, false, rng)
     }
 
     /// Compile a graph that already went through the fusion pipeline
@@ -161,8 +162,9 @@ impl MetalExecutable {
         graph: Graph,
         policy: Option<rlx_opt::PrecisionPolicy>,
         supported_ops: Option<&'static [rlx_ir::OpKind]>,
+        rng: rlx_ir::RngOptions,
     ) -> Self {
-        Self::compile_inner(graph, policy, supported_ops, true)
+        Self::compile_inner(graph, policy, supported_ops, true, rng)
     }
 
     fn compile_inner(
@@ -170,6 +172,7 @@ impl MetalExecutable {
         policy: Option<rlx_opt::PrecisionPolicy>,
         supported_ops: Option<&'static [rlx_ir::OpKind]>,
         skip_fusion: bool,
+        rng: rlx_ir::RngOptions,
     ) -> Self {
         let verbose = rlx_ir::env::var("RLX_VERBOSE")
             .and_then(|v| v.parse::<u8>().ok())
@@ -336,7 +339,7 @@ impl MetalExecutable {
             }
         }
 
-        let schedule = ThunkSchedule::compile(&fused, &arena);
+        let schedule = ThunkSchedule::compile_with_rng(&fused, &arena, rng);
 
         if verbose {
             let nop_count = schedule
@@ -816,6 +819,16 @@ impl MetalExecutable {
         self.active_extent = extent;
     }
 
+    /// Override RNG policy for in-graph random ops without recompiling.
+    pub fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+        *self.schedule.rng.write().expect("rng lock") = rng;
+    }
+
+    /// Current RNG compile/execute policy.
+    pub fn rng(&self) -> rlx_ir::RngOptions {
+        *self.schedule.rng.read().expect("rng lock")
+    }
+
     /// Declared graph-output dtypes, in `graph.outputs` order. Used by
     /// the runtime wrapper's `run_typed` to narrow the f32 outputs back
     /// to F16/BF16/etc. on the way out, mirroring what backends with
@@ -965,6 +978,74 @@ impl MetalExecutable {
             }
         }
         self.gpu_handles.get(name).cloned()
+    }
+
+    /// Run with typed host inputs (I64 token ids, F32 style/speed, etc.).
+    pub fn run_typed(
+        &mut self,
+        inputs: &[(&str, &[u8], rlx_ir::DType)],
+    ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
+        let mut f32_owned: Vec<(String, Vec<f32>)> = Vec::new();
+        for (name, data, dt) in inputs {
+            let direct = matches!(
+                *dt,
+                rlx_ir::DType::F64
+                    | rlx_ir::DType::I32
+                    | rlx_ir::DType::I64
+                    | rlx_ir::DType::U32
+                    | rlx_ir::DType::U8
+                    | rlx_ir::DType::I8
+            );
+            if direct {
+                if let Some(&id) = self.input_ids.get(*name)
+                    && self.arena.has_buffer(id)
+                {
+                    self.arena.write_bytes(id, data);
+                }
+            } else if *dt == rlx_ir::DType::F32 {
+                let n = data.len() / 4;
+                let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
+                if let Some(&id) = self.input_ids.get(*name)
+                    && self.arena.has_buffer(id)
+                {
+                    self.arena.write_from_f32(id, s);
+                }
+            } else {
+                f32_owned.push((name.to_string(), widen_input_bytes_to_f32(data, *dt)));
+            }
+        }
+        for (name, data) in &f32_owned {
+            if let Some(&id) = self.input_ids.get(name.as_str())
+                && self.arena.has_buffer(id)
+            {
+                self.arena.write_from_f32(id, data);
+            }
+        }
+        self.run_read_outputs(&[], None);
+        self.output_bytes_per_node()
+            .into_iter()
+            .zip(self.output_dtypes())
+            .collect()
+    }
+
+    /// Clone into an independent executable (recompiles from the stored graph).
+    pub fn clone_for_cache(&self) -> Self {
+        let mut exe = Self::compile_from_fused(
+            self.graph.clone(),
+            None,
+            None,
+            rlx_ir::RngOptions::default(),
+        );
+        for (name, data) in &self.gpu_handles {
+            if !data.is_empty() {
+                exe.bind_gpu_handle(name, data);
+            }
+        }
+        for (name, &idx) in &self.gpu_handle_feeds {
+            exe.set_gpu_handle_feed(name, idx);
+        }
+        exe.set_active_extent(self.active_extent);
+        exe
     }
 
     fn propagate_gpu_handle_feeds_in_arena(&mut self) {
@@ -1160,6 +1241,18 @@ impl MetalExecutable {
                 n: usize,
                 num_experts: usize,
                 scheme: rlx_ir::quant::QuantScheme,
+            },
+            DequantMatMulInt8 {
+                x: usize,
+                w_q: usize,
+                scale: usize,
+                zp: usize,
+                dst: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+                block_size: u32,
+                is_asymmetric: bool,
             },
             DequantMatMulInt4 {
                 x: usize,
@@ -1365,6 +1458,32 @@ impl MetalExecutable {
                                 n,
                                 num_experts,
                                 scheme,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::DequantMatMulInt8 {
+                            x,
+                            w_q,
+                            scale,
+                            zp,
+                            dst,
+                            m,
+                            k,
+                            n,
+                            block_size,
+                            is_asymmetric,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_dequant_matmul_int8_f32(
+                                x,
+                                w_q,
+                                scale,
+                                zp,
+                                dst,
+                                m,
+                                k,
+                                n,
+                                block_size,
+                                is_asymmetric,
                                 arena_ptr,
                             );
                         },
@@ -3118,6 +3237,28 @@ impl MetalExecutable {
                     }
                     encode_softmax(e!(), k, &self.arena.buffer, *data, rows, *cols, *dt);
                 }
+                Thunk::Cumsum {
+                    src,
+                    dst,
+                    rows,
+                    cols,
+                    exclusive,
+                } => {
+                    let rows = scale(*rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_cumsum(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *dst,
+                        rows,
+                        *cols,
+                        *exclusive,
+                    );
+                }
                 Thunk::FusedSwiGLU {
                     src,
                     dst,
@@ -4155,6 +4296,62 @@ impl MetalExecutable {
                     });
                 }
 
+                Thunk::RngNormal {
+                    dst,
+                    len,
+                    mean,
+                    scale,
+                    key,
+                    op_seed,
+                } => {
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    let opts = *self.schedule.rng.read().unwrap();
+                    unsafe {
+                        rlx_cpu::thunk::fill_rng_normal_arena(
+                            *dst,
+                            *len as usize,
+                            *mean,
+                            *scale,
+                            *key,
+                            *op_seed,
+                            opts,
+                            arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+
+                Thunk::RngUniform {
+                    dst,
+                    len,
+                    low,
+                    high,
+                    key,
+                    op_seed,
+                } => {
+                    end_msl!();
+                    cmd_buf.commit();
+                    cmd_buf.wait_until_completed();
+                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
+                    let opts = *self.schedule.rng.read().unwrap();
+                    unsafe {
+                        rlx_cpu::thunk::fill_rng_uniform_arena(
+                            *dst,
+                            *len as usize,
+                            *low,
+                            *high,
+                            *key,
+                            *op_seed,
+                            opts,
+                            arena_ptr,
+                        );
+                    }
+                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                }
+
                 Thunk::Im2Col {
                     x,
                     col,
@@ -4353,6 +4550,32 @@ impl MetalExecutable {
                         );
                         end_msl!();
                     }
+                }
+
+                Thunk::DequantMatMulInt8 {
+                    x,
+                    w_q,
+                    scale,
+                    zp,
+                    dst,
+                    m,
+                    k: kk,
+                    n,
+                    block_size,
+                    is_asymmetric,
+                } => {
+                    deferred_host.push(DeferredHostOp::DequantMatMulInt8 {
+                        x: *x,
+                        w_q: *w_q,
+                        scale: *scale,
+                        zp: *zp,
+                        dst: *dst,
+                        m: *m as usize,
+                        k: *kk as usize,
+                        n: *n as usize,
+                        block_size: *block_size,
+                        is_asymmetric: *is_asymmetric,
+                    });
                 }
 
                 Thunk::DequantMatMulInt4 {
@@ -4830,6 +5053,30 @@ unsafe fn binary_broadcast_host<T>(
     }
 }
 
+fn widen_input_bytes_to_f32(data: &[u8], dt: rlx_ir::DType) -> Vec<f32> {
+    use rlx_ir::DType;
+    match dt {
+        DType::F32 => {
+            let n = data.len() / 4;
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) }.to_vec()
+        }
+        DType::F16 => {
+            let n = data.len() / 2;
+            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, n) };
+            s.iter().map(|h| h.to_f32()).collect()
+        }
+        DType::BF16 => {
+            let n = data.len() / 2;
+            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, n) };
+            s.iter().map(|h| h.to_f32()).collect()
+        }
+        other => panic!(
+            "rlx-metal widen_input_bytes_to_f32: dtype {other:?} unsupported \
+             (use direct byte write for integer dtypes)"
+        ),
+    }
+}
+
 fn encode_cast(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -5191,7 +5438,7 @@ fn encode_activation(
         (_, Activation::Cos) => &k.cos_inplace,
         (_, Activation::Tan) => &k.tan_inplace,
         (_, Activation::Atan) => &k.atan_inplace,
-        (_, Activation::Round) => panic!("rlx-metal: Activation::Round is training-only (rlx-cpu)"),
+        (_, Activation::Round) => &k.round_inplace,
     };
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(buffer), data_off as u64);
@@ -6862,6 +7109,36 @@ fn encode_rope_bwd(
         metal::MTLSize {
             width: head_dim.min(16) as u64,
             height: nh.min(8) as u64,
+            depth: 1,
+        },
+    );
+}
+
+fn encode_cumsum(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    dst: usize,
+    rows: u32,
+    cols: u32,
+    exclusive: bool,
+) {
+    enc.set_compute_pipeline_state(&k.cumsum_fwd);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), dst as u64);
+    enc.set_bytes(2, 4, &cols as *const u32 as *const _);
+    let ex: u32 = if exclusive { 1 } else { 0 };
+    enc.set_bytes(3, 4, &ex as *const u32 as *const _);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 1,
+            height: 1,
             depth: 1,
         },
     );

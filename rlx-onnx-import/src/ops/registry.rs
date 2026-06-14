@@ -175,6 +175,8 @@ pub const OP_REGISTRY: &[OpEntry] = &[
     op!("CumSum", 11, Mir, Indexing),
     op!("RandomNormalLike", 1, Mir, Random),
     op!("RandomUniformLike", 1, Mir, Random),
+    op!("RandomNormal", 1, Mir, Random),
+    op!("RandomUniform", 1, Mir, Random),
     op!("If", 1, ControlFlow, ControlFlow),
     op!("Loop", 1, ControlFlow, ControlFlow),
     op!("Scan", 1, ControlFlow, ControlFlow),

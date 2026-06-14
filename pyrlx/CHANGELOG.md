@@ -6,6 +6,13 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-06
+
+### Changed
+
+- Dependency pins aligned with RLX workspace **0.2.7** (in-graph RNG via
+  upstream `rlx-runtime` / `rlx-ir`; ONNX `Random*` import in `rlx-onnx-import`).
+
 ## [0.2.6] — 2026-06
 
 ### Changed
@@ -70,7 +77,8 @@ and the project follows [Semantic Versioning](https://semver.org/).
   `cpu`, `blas-accelerate`, `blas-mkl`, `blas-openblas`, `metal`,
   `mlx`, `gpu` (wgpu), `cuda`, `rocm`.
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/pyrlx-v0.2.6...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/pyrlx-v0.2.7...HEAD
+[0.2.7]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.7
 [0.2.6]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.6
 [0.2.4]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.4
 [0.2.3]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.3

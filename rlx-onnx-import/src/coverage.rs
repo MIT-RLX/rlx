@@ -103,6 +103,8 @@ pub const LOWERED_OPS: &[&str] = &[
     "CumSum",
     "RandomNormalLike",
     "RandomUniformLike",
+    "RandomNormal",
+    "RandomUniform",
     "SplitToSequence",
     "ConcatFromSequence",
     "SequenceEmpty",

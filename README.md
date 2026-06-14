@@ -6,10 +6,12 @@ backend-specific kernels for CPU, Apple Silicon (Metal / MLX), NVIDIA
 (CUDA), AMD (ROCm), Google TPU, cross-platform GPU (wgpu), and
 microcontrollers (Cortex-M).
 
-> Status: **0.2.3**, Apple-Silicon-first. The CPU and Apple GPU paths
+> Status: **0.2.7**, Apple-Silicon-first. The CPU and Apple GPU paths
 > are mature; CUDA / ROCm / TPU / WGPU work but have seen less mileage;
 > Cortex-M is a separate INT8 product. Multi-backend runtime helpers
 > (`GraphDevices`, `DeviceRouter`) — see [`docs/backend-selection.md`](docs/backend-selection.md).
+> In-graph RNG (`Op::RngNormal` / `Op::RngUniform`) with ONNX `Random*` import —
+> see [`CHANGELOG.md`](CHANGELOG.md) and [`rlx-runtime/README.md`](rlx-runtime/README.md).
 
 ## Why another one
 

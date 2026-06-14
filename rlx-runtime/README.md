@@ -42,6 +42,12 @@ and the device handle.
   live in `rlx_ir::ops::fft_ops`.
 - **`stream.rs`** — async command stream (Metal-side; CPU is sync).
 - **`paged_kv`** — paged KV cache + continuous batching primitives.
+- **In-graph RNG** — [`Op::RngNormal`] / [`Op::RngUniform`] (ONNX
+  `Random*`) with [`CompileOptions::rng`] and runtime
+  [`CompiledGraph::set_rng`]. Backends: Philox (default), Ort (CPU parity),
+  Zero (deterministic tests). GPU backends host-fill unified memory (Metal/MLX)
+  or D2H→fill→H2D segments (CUDA/ROCm/wgpu). TPU lowers to XLA `rng`.
+  *(Added in 0.2.7 — see [`CHANGELOG.md`](../CHANGELOG.md).)*
 
 Re-exports: `Tick`, `time_ns` from `rlx_ir::measure`. Use these for any
 sub-ms timing in the user-facing layer.
@@ -65,14 +71,14 @@ sub-ms timing in the user-facing layer.
 
 ```toml
 [dependencies]
-rlx-runtime = { version = "0.2", features = ["cpu"] }
+rlx-runtime = { version = "0.2.7", features = ["cpu"] }
 ```
 
 > **Heads-up.** The `mlx` and `rocm` features pull in `rlx-mlx` and
-> `rlx-rocm`, which **aren't on crates.io for 0.1.0** (workspace-
-> relative submodule / kernel-source paths). Enabling those features
-> on a crates.io build of `rlx-runtime` will fail to resolve. Use a
-> git source on the whole workspace instead:
+> `rlx-rocm`, which **aren't on crates.io** (workspace-relative submodule /
+> kernel-source paths). Enabling those features on a crates.io build of
+> `rlx-runtime` may fail to resolve. Use a git source on the whole workspace
+> instead:
 >
 > ```toml
 > rlx-runtime = { git = "https://github.com/MIT-RLX/rlx", features = ["mlx"] }

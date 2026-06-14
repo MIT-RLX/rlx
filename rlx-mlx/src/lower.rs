@@ -128,6 +128,10 @@ pub fn first_host_eval_op(graph: &Graph) -> Option<&'static str> {
             }
             Op::LogMel | Op::LogMelBackward => return Some("LogMel (host filterbank)"),
             Op::WelchPeaks { .. } => return Some("WelchPeaks (host PSD top-K)"),
+            Op::Custom { .. } => return Some("Custom (host kernel)"),
+            Op::RngNormal { .. } | Op::RngUniform { .. } => {
+                return Some("RngNormal/RngUniform (host fill)");
+            }
             _ => {}
         }
     }
@@ -319,6 +323,7 @@ pub fn lower_subgraph(
     captures: &[&Array],
     parent_params: &HashMap<String, Vec<f32>>,
     parent_params_typed: &HashMap<String, (Vec<u8>, DType)>,
+    rng: rlx_ir::RngOptions,
 ) -> Result<Vec<Array>, MlxError> {
     let mut sub_env: HashMap<NodeId, Array> = HashMap::with_capacity(sub.nodes().len());
     let mut canon_param: HashMap<String, NodeId> = HashMap::new();
@@ -406,7 +411,7 @@ pub fn lower_subgraph(
         // but worth a debug-friendly note. For now silently allow.
     }
 
-    lower_with_env(sub, sub_env, parent_params, parent_params_typed)
+    lower_with_env(sub, sub_env, parent_params, parent_params_typed, rng)
 }
 
 /// Walk `graph` with `env` already populated for every leaf node
@@ -425,7 +430,12 @@ pub fn lower_with_env(
     mut env: HashMap<NodeId, Array>,
     params: &HashMap<String, Vec<f32>>,
     params_typed: &HashMap<String, (Vec<u8>, DType)>,
+    rng: rlx_ir::RngOptions,
 ) -> Result<Vec<Array>, MlxError> {
+    let debug_eval = std::env::var("RLX_MLX_DEBUG_EVAL").is_ok();
+    if debug_eval {
+        eprintln!("rlx-mlx: lower_with_env {} nodes", graph.nodes().len());
+    }
     for node in graph.nodes() {
         let id = node.id;
         if env.contains_key(&id) {
@@ -613,33 +623,36 @@ pub fn lower_with_env(
             Op::Binary(bop) => {
                 let a = lookup(&env, node.inputs[0])?;
                 let b = lookup(&env, node.inputs[1])?;
+                let (a, b) = mlx_align_rank3_seq_pair(a, b)?;
                 match bop {
-                    BinaryOp::Add => ops::add(a, b)?,
-                    BinaryOp::Mul => ops::mul(a, b)?,
-                    BinaryOp::Sub => ops::sub(a, b)?,
-                    BinaryOp::Div => ops::div(a, b)?,
-                    BinaryOp::Max => ops::max(a, b)?,
-                    BinaryOp::Min => ops::min(a, b)?,
-                    BinaryOp::Pow => ops::pow(a, b)?,
+                    BinaryOp::Add => ops::add(&a, &b)?,
+                    BinaryOp::Mul => ops::mul(&a, &b)?,
+                    BinaryOp::Sub => ops::sub(&a, &b)?,
+                    BinaryOp::Div => ops::div(&a, &b)?,
+                    BinaryOp::Max => ops::max(&a, &b)?,
+                    BinaryOp::Min => ops::min(&a, &b)?,
+                    BinaryOp::Pow => ops::pow(&a, &b)?,
                 }
             }
             Op::Compare(cop) => {
                 let a = lookup(&env, node.inputs[0])?;
                 let b = lookup(&env, node.inputs[1])?;
+                let (a, b) = mlx_align_rank3_seq_pair(a, b)?;
                 match cop {
-                    CmpOp::Eq => ops::eq(a, b)?,
-                    CmpOp::Ne => ops::ne(a, b)?,
-                    CmpOp::Lt => ops::lt(a, b)?,
-                    CmpOp::Le => ops::le(a, b)?,
-                    CmpOp::Gt => ops::gt(a, b)?,
-                    CmpOp::Ge => ops::ge(a, b)?,
+                    CmpOp::Eq => ops::eq(&a, &b)?,
+                    CmpOp::Ne => ops::ne(&a, &b)?,
+                    CmpOp::Lt => ops::lt(&a, &b)?,
+                    CmpOp::Le => ops::le(&a, &b)?,
+                    CmpOp::Gt => ops::gt(&a, &b)?,
+                    CmpOp::Ge => ops::ge(&a, &b)?,
                 }
             }
             Op::Where => {
                 let c = lookup(&env, node.inputs[0])?;
                 let x = lookup(&env, node.inputs[1])?;
                 let y = lookup(&env, node.inputs[2])?;
-                ops::select(c, x, y)?
+                let (x, y) = mlx_align_rank3_seq_pair(x, y)?;
+                ops::select(c, &x, &y)?
             }
             Op::TransformRegion { steps, .. } => {
                 let mut cur = lookup(&env, node.inputs[0])?.clone_handle()?;
@@ -730,13 +743,13 @@ pub fn lower_with_env(
             }
             Op::LayerNorm { eps, .. } => {
                 let x = lookup(&env, node.inputs[0])?;
-                let g = lookup(&env, node.inputs[1])?;
+                let g = mlx_norm_scale_1d(lookup(&env, node.inputs[1])?)?;
                 let b = if node.inputs.len() >= 3 {
-                    Some(lookup(&env, node.inputs[2])?)
+                    Some(mlx_norm_scale_1d(lookup(&env, node.inputs[2])?)?)
                 } else {
                     None
                 };
-                ops::layer_norm(x, g, b, *eps)?
+                ops::layer_norm(x, &g, b.as_ref(), *eps)?
             }
             Op::Reshape { new_shape } => {
                 let x = lookup(&env, node.inputs[0])?;
@@ -770,17 +783,17 @@ pub fn lower_with_env(
                     .iter()
                     .map(|&id| lookup(&env, id))
                     .collect::<Result<_, _>>()?;
-                ops::concat(&inputs, *axis as i32)?
+                let aligned = mlx_align_concat_inputs(&inputs)?;
+                let refs: Vec<&Array> = aligned.iter().collect();
+                ops::concat(&refs, *axis as i32)?
             }
-            Op::Expand { target_shape } => {
-                let x = lookup(&env, node.inputs[0])?;
-                let s: Vec<i32> = target_shape.iter().map(|&d| d as i32).collect();
-                ops::broadcast_to(x, &s)?
+            Op::Expand { .. } => {
+                mlx_expand(graph, node.inputs[0], node, lookup(&env, node.inputs[0])?)?
             }
             Op::Gather { axis } => {
                 let x = lookup(&env, node.inputs[0])?;
-                let idx = lookup(&env, node.inputs[1])?;
-                ops::take(x, idx, *axis as i32)?
+                let idx = mlx_indices_i64(lookup(&env, node.inputs[1])?)?;
+                ops::take(x, &idx, *axis as i32)?
             }
             Op::Reduce {
                 op: rop,
@@ -882,8 +895,8 @@ pub fn lower_with_env(
             }
             Op::RmsNorm { eps, .. } => {
                 let x = lookup(&env, node.inputs[0])?;
-                let g = lookup(&env, node.inputs[1])?;
-                ops::rms_norm(x, g, *eps)?
+                let g = mlx_norm_scale_1d(lookup(&env, node.inputs[1])?)?;
+                ops::rms_norm(x, &g, *eps)?
             }
             Op::Attention {
                 num_heads,
@@ -1075,9 +1088,9 @@ pub fn lower_with_env(
                     summed
                 };
                 let (g_idx, b_idx) = if *has_bias { (3, 4) } else { (2, 3) };
-                let g = lookup(&env, node.inputs[g_idx])?;
-                let b = lookup(&env, node.inputs[b_idx])?;
-                ops::layer_norm(&summed, g, Some(b), *eps)?
+                let g = mlx_norm_scale_1d(lookup(&env, node.inputs[g_idx])?)?;
+                let b = mlx_norm_scale_1d(lookup(&env, node.inputs[b_idx])?)?;
+                ops::layer_norm(&summed, &g, Some(&b), *eps)?
             }
             Op::FusedResidualRmsNorm { has_bias, eps } => {
                 let x = lookup(&env, node.inputs[0])?;
@@ -1090,8 +1103,8 @@ pub fn lower_with_env(
                     summed
                 };
                 let g_idx = if *has_bias { 3 } else { 2 };
-                let g = lookup(&env, node.inputs[g_idx])?;
-                ops::rms_norm(&summed, g, *eps)?
+                let g = mlx_norm_scale_1d(lookup(&env, node.inputs[g_idx])?)?;
+                ops::rms_norm(&summed, &g, *eps)?
             }
             Op::Rope { head_dim, n_rot } => {
                 let x = lookup(&env, node.inputs[0])?;
@@ -1291,8 +1304,8 @@ pub fn lower_with_env(
             }
             Op::LayerNorm2d { eps } => {
                 let x = lookup(&env, node.inputs[0])?;
-                let g = lookup(&env, node.inputs[1])?;
-                let b = lookup(&env, node.inputs[2])?;
+                let g = mlx_norm_scale_1d(lookup(&env, node.inputs[1])?)?;
+                let b = mlx_norm_scale_1d(lookup(&env, node.inputs[2])?)?;
                 let shape = x.shape()?;
                 if shape.len() != 4 {
                     return Err(MlxError(
@@ -1304,7 +1317,7 @@ pub fn lower_with_env(
                 let h = shape[2];
                 let w = shape[3];
                 let flat = ops::reshape(x, &[(n * h * w) as i32, c as i32])?;
-                let y = ops::layer_norm(&flat, g, Some(b), *eps)?;
+                let y = ops::layer_norm(&flat, &g, Some(&b), *eps)?;
                 ops::reshape(&y, &[n as i32, c as i32, h as i32, w as i32])?
             }
             Op::ConvTranspose2d {
@@ -1438,7 +1451,7 @@ pub fn lower_with_env(
                 // MLX's scatter_add takes a base array and writes onto
                 // it — we feed it a zero base of the right shape.
                 let updates = lookup(&env, node.inputs[0])?;
-                let indices_in = lookup(&env, node.inputs[1])?.clone_handle()?;
+                let indices_in = mlx_indices_i64(lookup(&env, node.inputs[1])?)?;
                 let out_shape: Vec<i32> = node
                     .shape
                     .dims()
@@ -1569,6 +1582,53 @@ pub fn lower_with_env(
                         m,
                         k,
                         n,
+                    );
+                    let out_shape: Vec<usize> = node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
+                    Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
+                } else if matches!(
+                    scheme,
+                    rlx_ir::QuantScheme::Int8Block { .. }
+                        | rlx_ir::QuantScheme::Int8BlockAsym { .. }
+                ) {
+                    let x = lookup(&env, node.inputs[0])?;
+                    let wq = lookup(&env, node.inputs[1])?;
+                    let sc = lookup(&env, node.inputs[2])?;
+                    let zp = lookup(&env, node.inputs[3])?;
+                    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                    let total = node.shape.num_elements().unwrap();
+                    let m = total / n.max(1);
+                    let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+                    let k = x_total / m.max(1);
+                    let block_size = match scheme {
+                        rlx_ir::QuantScheme::Int8Block { block_size }
+                        | rlx_ir::QuantScheme::Int8BlockAsym { block_size } => *block_size,
+                        _ => unreachable!(),
+                    };
+                    let asym = matches!(scheme, rlx_ir::QuantScheme::Int8BlockAsym { .. });
+                    let xs = x.to_f32()?;
+                    let w_raw = wq.to_bytes()?;
+                    let w_bytes = unsafe {
+                        std::slice::from_raw_parts(w_raw.as_ptr() as *const i8, w_raw.len())
+                    };
+                    let scales = sc.to_f32()?;
+                    let zps = if asym { zp.to_f32()? } else { Vec::new() };
+                    let mut out_host = vec![0f32; m * n];
+                    rlx_cpu::thunk::dequant_matmul_int8(
+                        &xs,
+                        w_bytes,
+                        &scales,
+                        &zps,
+                        &mut out_host,
+                        m,
+                        k,
+                        n,
+                        block_size as usize,
+                        asym,
                     );
                     let out_shape: Vec<usize> = node
                         .shape
@@ -1752,7 +1812,9 @@ pub fn lower_with_env(
 
                 // --- Residual + LayerNorm 1 ---
                 let pre1 = ops::add(hidden, &attn_out)?;
-                let h1 = ops::layer_norm(&pre1, ln1_g, ln1_b, *eps1)?;
+                let ln1_g_n = mlx_norm_scale_1d(ln1_g)?;
+                let ln1_b_n = ln1_b.map(mlx_norm_scale_1d).transpose()?;
+                let h1 = ops::layer_norm(&pre1, &ln1_g_n, ln1_b_n.as_ref(), *eps1)?;
 
                 // --- FFN: activation(h1 @ fc1_w [+ fc1_b]) @ fc2_w [+ fc2_b] ---
                 let ffn1 = ops::matmul(&h1, fc1_w)?;
@@ -1781,7 +1843,9 @@ pub fn lower_with_env(
 
                 // --- Residual + LayerNorm 2 ---
                 let pre2 = ops::add(&h1, &ffn_out)?;
-                ops::layer_norm(&pre2, ln2_g, ln2_b, *eps2)?
+                let ln2_g_n = mlx_norm_scale_1d(ln2_g)?;
+                let ln2_b_n = ln2_b.map(mlx_norm_scale_1d).transpose()?;
+                ops::layer_norm(&pre2, &ln2_g_n, ln2_b_n.as_ref(), *eps2)?
             }
             Op::FusedAttentionBlock {
                 num_heads,
@@ -1992,8 +2056,8 @@ pub fn lower_with_env(
                     .iter()
                     .map(|&id| lookup(&env, id))
                     .collect::<Result<_, _>>()?;
-                let then_outs = lower_subgraph(then_branch, &captures, params, params_typed)?;
-                let else_outs = lower_subgraph(else_branch, &captures, params, params_typed)?;
+                let then_outs = lower_subgraph(then_branch, &captures, params, params_typed, rng)?;
+                let else_outs = lower_subgraph(else_branch, &captures, params, params_typed, rng)?;
                 if then_outs.len() != 1 || else_outs.len() != 1 {
                     return Err(MlxError(format!(
                         "If: each branch must produce exactly 1 output \
@@ -2036,7 +2100,7 @@ pub fn lower_with_env(
 
                 for _ in 0..max_iter {
                     let captures: Vec<&Array> = carried.iter().collect();
-                    let cond_outs = lower_subgraph(cond, &captures, params, params_typed)?;
+                    let cond_outs = lower_subgraph(cond, &captures, params, params_typed, rng)?;
                     if cond_outs.len() != 1 {
                         return Err(MlxError(format!(
                             "While: cond sub-graph must produce 1 output \
@@ -2048,7 +2112,7 @@ pub fn lower_with_env(
                     let cond_f = ops::cast(&cond_outs[0], DType::F32)?;
                     active = ops::mul(&active, &cond_f)?;
 
-                    let body_outs = lower_subgraph(body, &captures, params, params_typed)?;
+                    let body_outs = lower_subgraph(body, &captures, params, params_typed, rng)?;
                     if body_outs.len() != carried.len() {
                         return Err(MlxError(format!(
                             "While: body produced {} outputs but {} loop-carried \
@@ -2160,6 +2224,41 @@ pub fn lower_with_env(
                 // ids as f32 at the I/O boundary.
                 let ids = ops::categorical(final_logits, last_axis, *seed)?;
                 ops::cast(&ids, DType::F32)?
+            }
+
+            Op::RngNormal {
+                mean,
+                scale,
+                key,
+                op_seed,
+            } => {
+                let n = node.shape.num_elements().unwrap_or(0);
+                let mut buf = vec![0f32; n];
+                rlx_ir::fill_normal_like(&mut buf, *mean, *scale, rng, *key, *op_seed);
+                let dims: Vec<usize> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect();
+                Array::from_f32_slice(&buf, &dims, node.shape.dtype())?
+            }
+            Op::RngUniform {
+                low,
+                high,
+                key,
+                op_seed,
+            } => {
+                let n = node.shape.num_elements().unwrap_or(0);
+                let mut buf = vec![0f32; n];
+                rlx_ir::fill_uniform_like(&mut buf, *low, *high, rng, *key, *op_seed);
+                let dims: Vec<usize> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect();
+                Array::from_f32_slice(&buf, &dims, node.shape.dtype())?
             }
 
             // ── Explicit "no MLX primitive" stops ────────────────
@@ -2342,7 +2441,7 @@ pub fn lower_with_env(
                         captures.push(row_squeezed);
                     }
                     let capture_refs: Vec<&Array> = captures.iter().collect();
-                    let body_outs = lower_subgraph(body, &capture_refs, params, params_typed)?;
+                    let body_outs = lower_subgraph(body, &capture_refs, params, params_typed, rng)?;
                     if body_outs.is_empty() {
                         return Err(MlxError("Op::Scan: body produced no outputs".into()));
                     }
@@ -3481,6 +3580,16 @@ pub fn lower_with_env(
         };
 
         env.insert(id, arr);
+        if debug_eval {
+            let label = node
+                .name
+                .as_deref()
+                .map(|n| format!("{n} ({id:?})"))
+                .unwrap_or_else(|| format!("{id:?}"));
+            if let Some(a) = env.get(&id) {
+                eval(&[a]).map_err(|e| MlxError(format!("eval at {label}: {e}")))?;
+            }
+        }
     }
 
     // Look outputs up by reference — `graph.outputs` may legitimately
@@ -3554,6 +3663,7 @@ pub fn lower_and_run_typed(
         mode,
         /*active_extent=*/ None,
         None,
+        rlx_ir::RngOptions::default(),
     )
 }
 
@@ -3574,6 +3684,7 @@ pub fn lower_and_run_typed_with_extent(
     mode: MlxMode,
     active_extent: Option<(usize, usize)>,
     gpu_inputs: Option<&HashMap<String, Array>>,
+    rng: rlx_ir::RngOptions,
 ) -> Result<Vec<Array>, MlxError> {
     // Resolve dynamic dims if any. The graph as-given may have
     // Dim::Dynamic entries in Input shapes (and propagated through
@@ -3647,7 +3758,7 @@ pub fn lower_and_run_typed_with_extent(
     // construction is pure (no eval), so we trigger it here against
     // outputs after lowering. For interleaved per-op eval we'd need
     // a separate walker variant — currently no caller asks for that.
-    let outs = lower_with_env(graph, env, params, params_typed)?;
+    let outs = lower_with_env(graph, env, params, params_typed, rng)?;
 
     let refs: Vec<&Array> = outs.iter().collect();
     match mode {
@@ -3660,7 +3771,13 @@ pub fn lower_and_run_typed_with_extent(
             }
         }
         MlxMode::Lazy => {
-            eval(&refs)?;
+            for (i, o) in refs.iter().enumerate() {
+                let oid = graph.outputs.get(i).copied();
+                let name = oid
+                    .and_then(|id| graph.node(id).name.clone())
+                    .unwrap_or_else(|| format!("{oid:?}"));
+                eval(&[*o]).map_err(|e| MlxError(format!("eval output[{i}] {name}: {e}")))?;
+            }
         }
         MlxMode::AsyncCommit => {
             async_eval(&refs)?;
@@ -3782,6 +3899,8 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             // doesn't handle.
             Op::ScatterAdd
             | Op::Sample { .. }
+            | Op::RngNormal { .. }
+            | Op::RngUniform { .. }
             | Op::TopK { .. }
             | Op::SelectiveScan { .. }
             | Op::GatedDeltaNet { .. }
@@ -4108,6 +4227,155 @@ fn node_input_shape(graph: &Graph, id: NodeId) -> Vec<i32> {
         .iter()
         .map(|d| d.unwrap_static() as i32)
         .collect()
+}
+
+/// ONNX `Expand`: broadcast input to the **output node's** shape (not the
+/// op's `target_shape` hint, which can be a lower-rank broadcast template).
+/// Mirrors CPU/Metal leading-1 padding + stride-0 broadcast semantics.
+fn mlx_expand(
+    graph: &Graph,
+    input_id: NodeId,
+    out_node: &rlx_ir::Node,
+    x: &Array,
+) -> Result<Array, MlxError> {
+    let in_graph = node_input_shape(graph, input_id);
+    let out_graph = node_input_shape(graph, out_node.id);
+    let pad = out_graph.len().saturating_sub(in_graph.len());
+    let mut padded: Vec<i32> = vec![1; pad];
+    padded.extend_from_slice(&in_graph);
+    for (i, (in_d, out_d)) in padded.iter().zip(out_graph.iter()).enumerate() {
+        if in_d != out_d && *in_d != 1 {
+            return Err(MlxError(format!(
+                "Expand: incompatible dim {i} (in={in_d}, out={out_d})"
+            )));
+        }
+    }
+    let x = if pad > 0 {
+        ops::reshape(x, &padded)?
+    } else {
+        x.clone_handle()?
+    };
+    ops::broadcast_to(&x, &out_graph)
+}
+
+/// Pick a common seq axis for broadcast: padded compile tables (e.g. 512)
+/// narrow to the active row; two compile-scale mismatches (12 vs 14) widen
+/// to the larger compile slot count.
+fn mlx_pick_seq_dim(a: usize, b: usize) -> usize {
+    if a.max(b) > 128 { a.min(b) } else { a.max(b) }
+}
+
+/// Narrow `[1,S,C]` (or transpose of `[S,1,C]`) to `len` on axis 1.
+fn mlx_narrow_axis1(arr: &Array, len: usize) -> Result<Array, MlxError> {
+    let rt = arr.shape()?;
+    if rt.len() != 3 || rt[1] <= len {
+        return arr.clone_handle();
+    }
+    let start = vec![0i32; 3];
+    let mut stop: Vec<i32> = rt.iter().map(|&d| d as i32).collect();
+    stop[1] = len as i32;
+    ops::slice(arr, &start, &stop)
+}
+
+/// Align seq-first `[S,1,C]` with batch-major `[1,S,C]`, and narrow padded
+/// compile-time seq (e.g. 512) to the active runtime seq before broadcast.
+fn mlx_align_rank3_seq_pair(a: &Array, b: &Array) -> Result<(Array, Array), MlxError> {
+    let as_ = a.shape()?;
+    let bs = b.shape()?;
+    if as_.len() != 3 || bs.len() != 3 || as_[2] != bs[2] {
+        return Ok((a.clone_handle()?, b.clone_handle()?));
+    }
+    let mut a = a.clone_handle()?;
+    let mut b = b.clone_handle()?;
+    if as_[0] == bs[1] && as_[1] == 1 && bs[0] == 1 {
+        a = ops::transpose(&a, &[1, 0, 2])?;
+    } else if bs[0] == as_[1] && bs[1] == 1 && as_[0] == 1 {
+        b = ops::transpose(&b, &[1, 0, 2])?;
+    }
+    let as_ = a.shape()?;
+    let bs = b.shape()?;
+    if as_[0] == 1 && bs[0] == 1 && as_[1] != bs[1] {
+        let seq = mlx_pick_seq_dim(as_[1], bs[1]);
+        a = mlx_narrow_axis1(&a, seq)?;
+        b = mlx_narrow_axis1(&b, seq)?;
+    }
+    Ok((a, b))
+}
+
+/// Align concat inputs that mix padded compile seq with active runtime seq.
+fn mlx_align_concat_inputs(inputs: &[&Array]) -> Result<Vec<Array>, MlxError> {
+    let mut out: Vec<Array> = inputs
+        .iter()
+        .map(|a| a.clone_handle())
+        .collect::<Result<_, _>>()?;
+    let mut min_seq: Option<usize> = None;
+    for a in &out {
+        let s = a.shape()?;
+        if s.len() == 3 {
+            let seq = if s[0] == 1 {
+                s[1]
+            } else if s[1] == 1 {
+                s[0]
+            } else {
+                continue;
+            };
+            min_seq = Some(min_seq.map_or(seq, |m| mlx_pick_seq_dim(m, seq)));
+        }
+    }
+    let Some(seq) = min_seq else {
+        return Ok(out);
+    };
+    for a in &mut out {
+        let s = a.shape()?;
+        if s.len() != 3 {
+            continue;
+        }
+        if s[0] == 1 && s[1] > seq {
+            *a = mlx_narrow_axis1(a, seq)?;
+        } else if s[1] == 1 && s[0] > seq {
+            let t = ops::transpose(a, &[1, 0, 2])?;
+            *a = mlx_narrow_axis1(&t, seq)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Materialize gather/scatter indices as I64 (bundle params and TopK
+/// outputs are often F32 at the MLX lazy boundary).
+fn mlx_indices_i64(idx: &Array) -> Result<Array, MlxError> {
+    let shape = idx.shape()?;
+    let bytes = idx.to_bytes()?;
+    let nelems = shape.iter().product::<usize>().max(1);
+    if nelems == 0 {
+        return Array::from_bytes(&[], &shape, DType::I64);
+    }
+    let es = bytes.len() / nelems;
+    let i64_bytes: Vec<u8> = match es {
+        8 => bytes,
+        4 => bytes
+            .chunks_exact(4)
+            .map(|c| {
+                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                v.round() as i64
+            })
+            .flat_map(i64::to_le_bytes)
+            .collect(),
+        _ => return ops::contiguous(&ops::cast(idx, DType::I64)?),
+    };
+    Array::from_bytes(&i64_bytes, &shape, DType::I64)
+}
+
+/// MLX `layer_norm` / `rms_norm` expect 1-D scale vectors; graph params may
+/// be broadcast-expanded to rank 3 (`[1,1,C]` or `[1,S,C]`).
+fn mlx_norm_scale_1d(w: &Array) -> Result<Array, MlxError> {
+    let s = w.shape()?;
+    if s.len() == 1 {
+        return w.clone_handle();
+    }
+    if let Some(&last) = s.last() {
+        return ops::reshape(w, &[last as i32]);
+    }
+    w.clone_handle()
 }
 
 /// Prefer runtime shape when rank matches the graph (dynamic seq

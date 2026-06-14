@@ -14,11 +14,11 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.6" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.7" }
 
 [dev-dependencies]
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.6" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.4", features = ["compile"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.7" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.7", features = ["compile"] }
 
 [lints]
 workspace = true

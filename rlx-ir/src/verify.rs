@@ -20,6 +20,7 @@
 
 use crate::graph::{Graph, NodeId};
 use crate::infer_shape;
+use crate::op::Op;
 
 /// Error found during graph verification.
 #[derive(Debug)]
@@ -64,17 +65,33 @@ pub fn verify(graph: &Graph) -> Vec<VerifyError> {
         }
 
         // Check input count matches op expectation (except variadic ops like Concat).
-        let expected = node.op.num_inputs();
-        if expected > 0 && node.inputs.len() != expected {
-            errors.push(VerifyError {
-                node: Some(node.id),
-                message: format!(
-                    "{} expects {} inputs, got {}",
-                    node.op,
-                    expected,
-                    node.inputs.len()
-                ),
-            });
+        match &node.op {
+            Op::RngNormal { .. } | Op::RngUniform { .. } => {
+                if node.inputs.len() > 1 {
+                    errors.push(VerifyError {
+                        node: Some(node.id),
+                        message: format!(
+                            "{} accepts 0 or 1 inputs, got {}",
+                            node.op,
+                            node.inputs.len()
+                        ),
+                    });
+                }
+            }
+            _ => {
+                let expected = node.op.num_inputs();
+                if expected > 0 && node.inputs.len() != expected {
+                    errors.push(VerifyError {
+                        node: Some(node.id),
+                        message: format!(
+                            "{} expects {} inputs, got {}",
+                            node.op,
+                            expected,
+                            node.inputs.len()
+                        ),
+                    });
+                }
+            }
         }
     }
 

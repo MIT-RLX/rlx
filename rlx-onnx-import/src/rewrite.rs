@@ -39,7 +39,13 @@ pub fn rewrite_graph(
     quant_weight_keys: &HashSet<String>,
 ) -> RewriteResult {
     let mut nodes = nodes;
+    if let Some(patch) = opts.pre_shape_propagate {
+        patch(&mut nodes, opts);
+    }
     propagate_shapes(&mut nodes, manifest, init_shapes, opts);
+    if let Some(patch) = opts.post_shape_propagate {
+        patch(&mut nodes, opts);
+    }
     let mut extra_params = HashMap::new();
     let mut extra_shapes = HashMap::new();
     // ONNX-standard integer dequant → f32 MatMul/Conv (both profiles).

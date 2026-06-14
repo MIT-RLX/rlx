@@ -362,6 +362,9 @@ pub fn concat_shape(inputs: &[&Shape], axis: usize) -> Result<Shape, String> {
     let mut static_sum = 0usize;
     let mut dyn_sym: Option<u32> = None;
     for s in inputs {
+        if s.rank() == 0 {
+            return Err("concat: input has rank 0".into());
+        }
         if s.rank() != base.rank() {
             return Err(format!(
                 "concat: rank mismatch {} vs {}",

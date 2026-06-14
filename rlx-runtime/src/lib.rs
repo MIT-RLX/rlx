@@ -228,8 +228,9 @@ pub use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
 pub use rlx_ir::op;
 pub use rlx_ir::{
     BindingManifest, CompilationMode, DType, Graph, HirExtensionFn, HirReflection, IoBindingEntry,
-    ManifestDiff, ModelComponent, ModelPhase, ModelVariant, Node, NodeId, Op, Shape, WeightBlock,
-    apply_hir_extensions, register_hir_extension, registered_hir_extensions,
+    ManifestDiff, ModelComponent, ModelPhase, ModelVariant, Node, NodeId, Op, RngBackend,
+    RngOptions, Shape, WeightBlock, apply_hir_extensions, register_hir_extension,
+    registered_hir_extensions,
 };
 
 // Re-export proc macro

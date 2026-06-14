@@ -2076,7 +2076,7 @@ fn vjp(
         }
 
         // ── Sampling-style ops: non-differentiable ──
-        Op::TopK { .. } | Op::Sample { .. } => {
+        Op::TopK { .. } | Op::Sample { .. } | Op::RngNormal { .. } | Op::RngUniform { .. } => {
             // TopK selects; Sample multinomial-draws. Gradient w.r.t.
             // the input distribution is undefined / zero in the
             // standard sense. Skip propagation.

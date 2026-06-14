@@ -87,6 +87,24 @@ pub struct MlxExecutable {
     /// detected). Subsequent `run` calls take the Lazy path instead of
     /// re-attempting compile every step.
     compile_disabled: Option<String>,
+    /// Runtime-mutable RNG policy for in-graph random ops.
+    rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+}
+
+impl MlxExecutable {
+    fn current_rng(&self) -> rlx_ir::RngOptions {
+        *self.rng.read().expect("rng lock")
+    }
+
+    /// Override RNG policy for in-graph random ops without recompiling.
+    pub fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+        *self.rng.write().expect("rng lock") = rng;
+    }
+
+    /// Current RNG compile/execute policy.
+    pub fn rng(&self) -> rlx_ir::RngOptions {
+        self.current_rng()
+    }
 }
 
 impl MlxExecutable {
@@ -101,6 +119,14 @@ impl MlxExecutable {
     /// Compile a graph that already went through the fusion pipeline
     /// (e.g. from [`rlx_ir::LirModule`]). Does not re-run fusion passes.
     pub fn compile_from_fused(graph: Graph, mode: MlxMode) -> Self {
+        Self::compile_from_fused_with_rng(graph, mode, rlx_ir::RngOptions::default())
+    }
+
+    pub fn compile_from_fused_with_rng(
+        graph: Graph,
+        mode: MlxMode,
+        rng: rlx_ir::RngOptions,
+    ) -> Self {
         let output_names = graph.outputs.clone();
 
         // Pre-resolve output slot layout. We pack outputs end-to-end
@@ -152,6 +178,7 @@ impl MlxExecutable {
             output_dtypes,
             active_extent: None,
             compile_disabled: None,
+            rng: std::sync::Arc::new(std::sync::RwLock::new(rng)),
         }
     }
 
@@ -293,6 +320,7 @@ impl MlxExecutable {
                 },
                 self.active_extent,
                 Some(&self.gpu_handles),
+                self.current_rng(),
             )?
         };
 
@@ -317,12 +345,24 @@ impl MlxExecutable {
         }
 
         let outs = if self.use_compiled() {
-            // Compiled-mode picks up self.inputs_typed via run_compiled's
-            // call to build_leaf_for, which already threads the typed maps.
-            // input_map (f32) stays empty for typed-only runs.
             match self.run_compiled(&HashMap::new()) {
                 Ok(o) => o,
-                Err(e) => panic!("MLX compiled run_typed failed: {e}"),
+                Err(e) => {
+                    self.note_compile_disabled(e.to_string());
+                    let lower_mode = MlxMode::Lazy;
+                    lower::lower_and_run_typed_with_extent(
+                        &self.graph,
+                        &self.params,
+                        &self.params_typed,
+                        &HashMap::new(),
+                        &self.inputs_typed,
+                        lower_mode,
+                        self.active_extent,
+                        Some(&self.gpu_handles),
+                        self.current_rng(),
+                    )
+                    .unwrap_or_else(|e2| panic!("MLX run_typed failed: {e2}"))
+                }
             }
         } else {
             let lower_mode = if self.compile_disabled.is_some() {
@@ -339,6 +379,7 @@ impl MlxExecutable {
                 lower_mode,
                 self.active_extent,
                 Some(&self.gpu_handles),
+                self.current_rng(),
             ) {
                 Ok(o) => o,
                 Err(e) => panic!("MLX run_typed failed: {e}"),
@@ -380,6 +421,7 @@ impl MlxExecutable {
                         MlxMode::Lazy,
                         self.active_extent,
                         Some(&self.gpu_handles),
+                        self.current_rng(),
                     );
                 }
             }
@@ -641,6 +683,34 @@ impl MlxExecutable {
     }
     pub fn output_ids(&self) -> &[NodeId] {
         &self.output_names
+    }
+
+    /// Clone into an independent executable (recompiles from the stored graph).
+    pub fn clone_for_cache(&self) -> Self {
+        let gpu_snap: Vec<(String, Vec<f32>)> = self
+            .gpu_handles
+            .keys()
+            .filter_map(|k| self.read_gpu_handle(k).ok().map(|v| (k.clone(), v)))
+            .collect();
+        let mut exe =
+            Self::compile_from_fused_with_rng(self.graph.clone(), self.mode, self.current_rng());
+        for (k, v) in &self.params {
+            exe.set_param(k, v);
+        }
+        for (k, v) in &self.handles {
+            let _ = exe.bind_handle(k, v);
+        }
+        for (k, (bytes, dtype)) in &self.params_typed {
+            exe.set_param_typed(k, bytes, *dtype);
+        }
+        for (k, &idx) in &self.gpu_handle_feeds {
+            exe.set_gpu_handle_feed(k, idx);
+        }
+        for (k, v) in gpu_snap {
+            let _ = exe.bind_gpu_handle(&k, &v);
+        }
+        exe.set_active_extent(self.active_extent);
+        exe
     }
 }
 

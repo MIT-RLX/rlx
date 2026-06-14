@@ -58,6 +58,8 @@ pub const BUNDLED_ONNX_OP_TYPES: &[&str] = &[
     "Pow",
     "RandomNormalLike",
     "RandomUniformLike",
+    "RandomNormal",
+    "RandomUniform",
     "Range",
     "ReduceMax",
     "ReduceMean",

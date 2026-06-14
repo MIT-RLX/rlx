@@ -316,6 +316,24 @@ enum Step {
         dh: u32,
         dw_dil: u32,
     },
+    /// Host fill for [`Op::RngNormal`] (fill → H2D).
+    RngNormalHost {
+        dst_byte_off: u32,
+        len: u32,
+        mean: f32,
+        scale: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
+    /// Host fill for [`Op::RngUniform`] (fill → H2D).
+    RngUniformHost {
+        dst_byte_off: u32,
+        len: u32,
+        low: f32,
+        high: f32,
+        key: u64,
+        op_seed: Option<f32>,
+    },
     /// Host-side buffer copy (recorded into a command encoder) used to
     /// stage small param tensors into the tail scratch region so kernels
     /// can bind a ≤4GiB window of the arena.
@@ -686,6 +704,8 @@ pub struct WgpuExecutable {
     /// Arena input slots authoritative — skip host KV mirror each decode step.
     gpu_handle_resident: HashSet<String>,
     pending_read_indices: Option<Vec<usize>>,
+    /// Runtime-mutable RNG policy for [`Step::RngNormalHost`] / [`Step::RngUniformHost`].
+    rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
 }
 
 impl Step {
@@ -738,6 +758,8 @@ impl Step {
             // the rest of the schedule.
             Step::FftGpu { .. } | Step::FftHost { .. } => true,
             Step::Im2ColHost { .. }
+            | Step::RngNormalHost { .. }
+            | Step::RngUniformHost { .. }
             | Step::WelchPeaksHost { .. }
             | Step::LogMelHost { .. }
             | Step::LogMelBackwardHost { .. } => true,
@@ -847,6 +869,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::LogMelHost { .. } => "log_mel_host",
         Step::LogMelBackwardHost { .. } => "log_mel_backward_host",
         Step::Im2ColHost { .. } => "im2col_host",
+        Step::RngNormalHost { .. } => "rng_normal_host",
+        Step::RngUniformHost { .. } => "rng_uniform_host",
         Step::BufferCopy { .. } => "buffer_copy",
         Step::Copy { .. } => "copy",
         Step::Transpose { .. } => "transpose",
@@ -920,6 +944,8 @@ fn step_runs_on_host(step: &Step) -> bool {
         | Step::UmapKnnHost { .. }
         | Step::FftHost { .. }
         | Step::Im2ColHost { .. }
+        | Step::RngNormalHost { .. }
+        | Step::RngUniformHost { .. }
         | Step::BufferCopy { .. } => true,
         #[cfg(feature = "splat")]
         Step::GaussianSplatRender { .. }
@@ -1010,7 +1036,7 @@ impl WgpuExecutable {
         let pending_params = std::mem::take(&mut self.pending_params);
         let pending_bytes = std::mem::take(&mut self.pending_param_bytes);
 
-        let fresh = Self::compile_static_inner(resolved);
+        let fresh = Self::compile_static_inner(resolved, self.rng.clone());
 
         // Move the freshly-compiled fields into self, preserve the
         // unresolved+binding state for the next round.
@@ -1062,10 +1088,25 @@ impl WgpuExecutable {
     }
 
     pub fn compile(graph: Graph) -> Self {
+        Self::compile_rng(graph, rlx_ir::RngOptions::default())
+    }
+
+    pub fn compile_rng(graph: Graph, rng: rlx_ir::RngOptions) -> Self {
+        let rng = std::sync::Arc::new(std::sync::RwLock::new(rng));
         if has_dynamic_dims(&graph) {
-            return Self::deferred(graph);
+            return Self::deferred(graph, rng);
         }
-        Self::compile_static_inner(graph)
+        Self::compile_static_inner(graph, rng)
+    }
+
+    /// Override RNG policy for in-graph random ops without recompiling.
+    pub fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+        *self.rng.write().expect("rng lock") = rng;
+    }
+
+    /// Current RNG compile/execute policy.
+    pub fn rng(&self) -> rlx_ir::RngOptions {
+        *self.rng.read().expect("rng lock")
     }
 
     /// Test hook: first `Step::Attention` Q sequence stride (600 = packed QKV).
@@ -1107,7 +1148,7 @@ impl WgpuExecutable {
     /// The real compile happens on the first `run()` once input data
     /// reveals the symbol → size bindings. Buffered params (set via
     /// `set_param` / `set_param_bytes` before run) are replayed.
-    fn deferred(graph: Graph) -> Self {
+    fn deferred(graph: Graph, rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>) -> Self {
         let dev = wgpu_device().expect("rlx-wgpu: no compatible adapter found");
         // Minimal valid arena buffer. Replaced on first run().
         let placeholder = dev.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1156,6 +1197,7 @@ impl WgpuExecutable {
             gpu_handle_feeds: HashMap::new(),
             gpu_handle_resident: HashSet::new(),
             pending_read_indices: None,
+            rng,
         }
     }
 
@@ -1170,7 +1212,10 @@ impl WgpuExecutable {
         self.schedule.iter().all(|s| s.safe_for_active_extent())
     }
 
-    fn compile_static_inner(graph: Graph) -> Self {
+    fn compile_static_inner(
+        graph: Graph,
+        rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    ) -> Self {
         let dev = wgpu_device().expect("rlx-wgpu: no compatible adapter found");
 
         // Decompose composed/fused ops (FusedMatMulBiasAct, LoraMatMul,
@@ -5432,6 +5477,38 @@ impl WgpuExecutable {
                             check unfuse.rs::expand_if / expand_while"
                     );
                 }
+                Op::RngNormal {
+                    mean,
+                    scale,
+                    key,
+                    op_seed,
+                } => {
+                    let len = node.shape.num_elements().unwrap_or(0) as u32;
+                    schedule.push(Step::RngNormalHost {
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        len,
+                        mean: *mean,
+                        scale: *scale,
+                        key: *key,
+                        op_seed: *op_seed,
+                    });
+                }
+                Op::RngUniform {
+                    low,
+                    high,
+                    key,
+                    op_seed,
+                } => {
+                    let len = node.shape.num_elements().unwrap_or(0) as u32;
+                    schedule.push(Step::RngUniformHost {
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        len,
+                        low: *low,
+                        high: *high,
+                        key: *key,
+                        op_seed: *op_seed,
+                    });
+                }
                 other => panic!(
                     "rlx-wgpu: op {other:?} not yet lowered (v2 covers Matmul, \
                      Binary, Compare, Activation, Where — fall back to CPU/Metal/MLX)"
@@ -5493,6 +5570,7 @@ impl WgpuExecutable {
             gpu_handle_feeds: HashMap::new(),
             gpu_handle_resident: HashSet::new(),
             pending_read_indices: None,
+            rng,
         }
     }
 
@@ -5689,6 +5767,33 @@ impl WgpuExecutable {
             }
         }
         self.gpu_handles.get(name).cloned()
+    }
+
+    /// Clone into an independent executable (recompiles from the stored graph).
+    pub fn clone_for_cache(&self) -> Self {
+        let graph = self
+            .unresolved
+            .clone()
+            .unwrap_or_else(|| self.graph.clone());
+        let mut exe = Self::compile_rng(graph, self.rng());
+        for (k, v) in &self.stashed_params {
+            exe.set_param(k, v);
+        }
+        for (k, v) in &self.pending_params {
+            exe.set_param(k, v);
+        }
+        for (k, v) in &self.pending_param_bytes {
+            exe.set_param_bytes(k, v);
+        }
+        for (k, v) in &self.gpu_handles {
+            exe.bind_gpu_handle(k, v);
+        }
+        for (k, &idx) in &self.gpu_handle_feeds {
+            exe.set_gpu_handle_feed(k, idx);
+        }
+        exe.set_active_extent(self.active_extent);
+        exe.set_rng(self.rng());
+        exe
     }
 
     fn readback_plan(&self) -> Vec<usize> {
@@ -6357,6 +6462,8 @@ impl WgpuExecutable {
                     | Step::UmapKnnHost { .. }
                     | Step::FftHost { .. }
                     | Step::Im2ColHost { .. }
+                    | Step::RngNormalHost { .. }
+                    | Step::RngUniformHost { .. }
                     | Step::WelchPeaksHost { .. }
                     | Step::LogMelHost { .. }
                     | Step::LogMelBackwardHost { .. } => {}
@@ -7260,6 +7367,8 @@ impl WgpuExecutable {
                         | Step::UmapKnnHost { .. }
                         | Step::FftHost { .. }
                         | Step::Im2ColHost { .. }
+                        | Step::RngNormalHost { .. }
+                        | Step::RngUniformHost { .. }
                         | Step::WelchPeaksHost { .. }
                         | Step::LogMelHost { .. }
                         | Step::LogMelBackwardHost { .. } => {}
@@ -7661,6 +7770,48 @@ impl WgpuExecutable {
                         *pw,
                         *dh,
                         *dw_dil,
+                    );
+                }
+                Step::RngNormalHost {
+                    dst_byte_off,
+                    len,
+                    mean,
+                    scale,
+                    key,
+                    op_seed,
+                } => {
+                    let opts = *self.rng.read().expect("rng lock");
+                    crate::rng_host::run_rng_normal(
+                        &self.arena,
+                        &dev.queue,
+                        *dst_byte_off as usize,
+                        *len as usize,
+                        *mean,
+                        *scale,
+                        *key,
+                        *op_seed,
+                        opts,
+                    );
+                }
+                Step::RngUniformHost {
+                    dst_byte_off,
+                    len,
+                    low,
+                    high,
+                    key,
+                    op_seed,
+                } => {
+                    let opts = *self.rng.read().expect("rng lock");
+                    crate::rng_host::run_rng_uniform(
+                        &self.arena,
+                        &dev.queue,
+                        *dst_byte_off as usize,
+                        *len as usize,
+                        *low,
+                        *high,
+                        *key,
+                        *op_seed,
+                        opts,
                     );
                 }
                 #[cfg(feature = "splat")]

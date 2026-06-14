@@ -20,10 +20,10 @@ training = ["dep:rlx-autodiff", "rlx-compile/training"]
 full = ["compile", "training"]
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.6" }
-rlx-fusion = { path = "../rlx-fusion", version = "0.2.4" }
-rlx-compile = { path = "../rlx-compile", version = "0.2.6", optional = true }
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.4", optional = true }
+rlx-ir = { path = "../rlx-ir", version = "0.2.7" }
+rlx-fusion = { path = "../rlx-fusion", version = "0.2.7" }
+rlx-compile = { path = "../rlx-compile", version = "0.2.7", optional = true }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.7", optional = true }
 
 [lints]
 workspace = true
