@@ -2,34 +2,37 @@
 resolver = "2"
 members = [
     # Core (no backend dependencies)
-    "rlx-ir",          # Tensor IR: types, shapes, ops, graph, verifier
-    "rlx-flow",        # Block assembly-line API for model builders
-    "rlx-fusion",      # MIR fusion passes + fused-op unfuse
-    "rlx-autodiff",    # Reverse/forward-mode AD on MIR
-    "rlx-compile",     # HIR → MIR → LIR pipeline
-    "rlx-opt",         # Facade: re-exports fusion + autodiff + compile
-    "rlx-optim",       # Training-step optimizers (Adam, AdamW, Lion, SOAP, Muon, …)
+    "crates/rlx-ir",          # Tensor IR: types, shapes, ops, graph, verifier
+    "crates/rlx-tensor",      # Symbolic tensor DSL (operator-overloaded graph building)
+    "crates/rlx-flow",        # Block assembly-line API for model builders
+    "crates/rlx-fusion",      # MIR fusion passes + fused-op unfuse
+    "crates/rlx-autodiff",    # Reverse/forward-mode AD on MIR
+    "crates/rlx-compile",     # HIR → MIR → LIR pipeline
+    "crates/rlx-opt",         # Facade: re-exports fusion + autodiff + compile
+    "crates/rlx-optim",       # Training-step optimizers (Adam, AdamW, Lion, SOAP, Muon, …)
 
     # Driver layer (devices, arenas, buffers, streams)
-    "rlx-driver",
+    "crates/rlx-driver",
 
     # CPU backend
-    "rlx-cpu",         # SIMD kernels, BLAS FFI, thread pool, arena executor
+    "crates/rlx-cpu",         # SIMD kernels, BLAS FFI, thread pool, arena executor
 
     # GPU backends
-    "rlx-metal",       # Apple Metal native (MPS + custom MSL kernels)
-    "rlx-mlx",         # Apple MLX (lazy graph + eager modes, hand-rolled C++ shim)
-    "rlx-wgpu",        # Cross-platform GPU via wgpu (Metal/Vulkan/DX12/WebGPU)
-    "rlx-cuda",        # NVIDIA CUDA (cuBLAS + NVRTC kernels via cudarc)
-    "rlx-rocm",        # AMD ROCm/HIP — same kernels as rlx-cuda
-    "rlx-tpu",         # Google TPU via libtpu's PJRT plugin (no Python)
+    "crates/rlx-metal",       # Apple Metal native (MPS + custom MSL kernels)
+    "crates/rlx-mlx",         # Apple MLX (lazy graph + eager modes, hand-rolled C++ shim)
+    "crates/rlx-coreml",      # Apple CoreML / Neural Engine (ANE) — IR → MIL ML Program
+
+    "crates/rlx-wgpu",        # Cross-platform GPU via wgpu (Metal/Vulkan/DX12/WebGPU)
+    "crates/rlx-cuda",        # NVIDIA CUDA (cuBLAS + NVRTC kernels via cudarc)
+    "crates/rlx-rocm",        # AMD ROCm/HIP — same kernels as rlx-cuda
+    "crates/rlx-tpu",         # Google TPU via libtpu's PJRT plugin (no Python)
 
     # Microcontroller backend
-    "rlx-cortexm",     # ARMv7E-M (Cortex-M4/M7) INT8 kernels — nRF52840 etc.
-    "rlx-cortexm/trainer",  # Native fp32 trainer that emits the INT8 model_weights.rs
+    "crates/rlx-cortexm",     # ARMv7E-M (Cortex-M4/M7) INT8 kernels — nRF52840 etc.
+    "crates/rlx-cortexm/trainer",  # Native fp32 trainer that emits the INT8 model_weights.rs
 
     # FPGA backend
-    "rlx-fpga",        # IR → Verilog → bitstream (per-graph datapath, integer-only Q0.31 requant)
+    "crates/rlx-fpga",        # IR → Verilog → bitstream (per-graph datapath, integer-only Q0.31 requant)
 
     # GPU backends (future)
     # "rlx-vulkan",    # Vulkan compute
@@ -37,41 +40,46 @@ members = [
     # "rlx-directx",   # DirectX 12 compute
     # "rlx-webgpu",    # WebGPU/WASM
 
-    "rlx-gguf",        # GGUF parser + dequant + quant encoders + writer
-    "rlx-gguf-convert", # safetensors / ONNX → GGUF conversion with per-tensor quant
-    "rlx-gpu-kernels", # Shared CUDA/HIP .cu sources for rlx-cuda + rlx-rocm
-    "rlx-mlx-sys",     # Vendored MLX C++ + rlx_mlx_shim C ABI
+    "crates/rlx-gguf",        # GGUF parser + dequant + quant encoders + writer
+    "crates/rlx-gguf-convert", # safetensors / ONNX → GGUF conversion with per-tensor quant
+    "crates/rlx-nemo",        # NVIDIA NeMo `.nemo` loader (tar + torch.save ckpt + YAML)
+    "crates/rlx-gpu-kernels", # Shared CUDA/HIP .cu sources for rlx-cuda + rlx-rocm
+    "crates/rlx-mlx-sys",     # Vendored MLX C++ + rlx_mlx_shim C ABI
 
     # Proc macros
-    "rlx-macros",      # #[rlx_model] AOT compilation macro
+    "crates/rlx-macros",      # #[rlx_model] AOT compilation macro
 
     # Runtime (user-facing, feature-gated)
-    "rlx-runtime",     # Session API, backend dispatch
+    "crates/rlx-runtime",     # Session API, backend dispatch
 
     # Prelude crate — re-exports IR + optimizer + runtime + companion
     # crates behind feature gates. The `cargo add rlx` entry point.
-    "rlx",
+    "crates/rlx",
 
     # Downstream packages (registered against the custom-op scaffold)
-    "rlx-sparse",      # Sparse linear algebra (CSR LU/MatVec/CG) — JAX-style downstream
-    "rlx-linalg",      # Dense linalg (eigh/svd/qr/cholesky/solve_triangular) via LAPACK
-    "rlx-splat",       # 3D Gaussian splatting (CPU reference render custom op)
-    "rlx-fdm",         # Force density method — pin-jointed form-finding (jax_fdm port)
-    "rlx-rl",          # Flow-map policies + FMQ / QGBS (offline-to-online RL)
-    "rlx-bbo",         # Black-box + trust-region Q-guidance / QGBS (domain-agnostic f64)
-    "rlx-umap",        # UMAP / fast-umap custom ops (k-NN from pairwise distances, …)
+    "crates/rlx-sparse",      # Sparse linear algebra (CSR LU/MatVec/CG) — JAX-style downstream
+    "crates/rlx-linalg",      # Dense linalg (eigh/svd/qr/cholesky/solve_triangular) via LAPACK
+    # rlx-splat* temporarily moved out of the tree; references commented out to
+    # keep the workspace resolvable. Restore these 3 lines when splat returns.
+    # "rlx-splat",       # 3D Gaussian splatting (CPU reference render custom op)
+    # "rlx-splat-web",   # wasm-bindgen wrapper for rlx-splat — browser-renderable PLY scenes
+    # "rlx-splat-anim",  # offline pipeline: multi-view render → SAM3 prompts → per-splat skin weights
+    "crates/rlx-fdm",         # Force density method — pin-jointed form-finding (jax_fdm port)
+    "crates/rlx-rl",          # Flow-map policies + FMQ / QGBS (offline-to-online RL)
+    "crates/rlx-bbo",         # Black-box + trust-region Q-guidance / QGBS (domain-agnostic f64)
+    "crates/rlx-umap",        # UMAP / fast-umap custom ops (k-NN from pairwise distances, …)
 
     # Benchmark framework (PLAN L5)
-    "rlx-bench",       # BenchmarkPattern + per-backend timing harness
-    "rlx-onnx",        # ONNX Runtime inference for .onnx files (PLAN B7)
-    "rlx-onnx-import", # ONNX → RLX HIR import + op lowering
-    "rlx-onnx-conformance", # ONNX op-level ORT parity harness
+    "crates/rlx-bench",       # BenchmarkPattern + per-backend timing harness
+    "crates/rlx-onnx",        # ONNX Runtime inference for .onnx files (PLAN B7)
+    "crates/rlx-onnx-import", # ONNX → RLX HIR import + op lowering
+    "crates/rlx-onnx-conformance", # ONNX op-level ORT parity harness
 
     # Text: tokenizer + chat template + sampling (public surface for downstream LM apps)
-    "rlx-text",
+    "crates/rlx-text",
 
     # Python bindings
-    "pyrlx",           # PyO3 + maturin: run any RLX backend from Python
+    "crates/pyrlx",           # PyO3 + maturin: run any RLX backend from Python
 ]
 
 # ── Sanitizer / debug profiles (plan #41) ────────────────────────
@@ -108,7 +116,7 @@ incremental = false
 # Add them as crates reach individual readiness.
 
 [workspace.package]
-version       = "0.2.7"
+version       = "0.2.8"
 edition       = "2024"
 rust-version  = "1.87"  # edition=2024 needs ≥1.85; we use `is_multiple_of` (stable in 1.87)
 license       = "GPL-3.0-only"

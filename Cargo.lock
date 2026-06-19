@@ -172,12 +172,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
-name = "byteorder-lite"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
-
-[[package]]
 name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -626,15 +620,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
-name = "fdeflate"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
-dependencies = [
- "simd-adler32",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -995,32 +980,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
-name = "image"
-version = "0.25.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
-dependencies = [
- "bytemuck",
- "byteorder-lite",
- "image-webp",
- "moxcms",
- "num-traits",
- "png",
- "zune-core",
- "zune-jpeg",
-]
-
-[[package]]
-name = "image-webp"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
-dependencies = [
- "byteorder-lite",
- "quick-error",
-]
-
-[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1214,6 +1173,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memmap2"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "memo-map"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1301,16 +1269,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "moxcms"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
-dependencies = [
- "num-traits",
- "pxfm",
 ]
 
 [[package]]
@@ -1677,19 +1635,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "png"
-version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
-dependencies = [
- "bitflags 2.11.1",
- "crc32fast",
- "fdeflate",
- "flate2",
- "miniz_oxide",
-]
-
-[[package]]
 name = "pollster"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1916,12 +1861,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40e24eee682d89fb193496edf918a7f407d30175b2e785fe057e4392dfd182e0"
 
 [[package]]
-name = "pxfm"
-version = "0.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
-
-[[package]]
 name = "pyo3"
 version = "0.22.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1986,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "pyrlx"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "numpy",
  "pyo3",
@@ -1994,12 +1933,6 @@ dependencies = [
  "rlx-opt",
  "rlx-runtime",
 ]
-
-[[package]]
-name = "quick-error"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quote"
@@ -2267,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "rlx"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "rlx-bench",
@@ -2284,13 +2217,13 @@ dependencies = [
  "rlx-optim",
  "rlx-runtime",
  "rlx-sparse",
- "rlx-splat",
+ "rlx-tensor",
  "rlx-umap",
 ]
 
 [[package]]
 name = "rlx-autodiff"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "half",
  "rlx",
@@ -2300,7 +2233,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bbo"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rand 0.8.6",
  "rand_distr",
@@ -2315,7 +2248,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bench"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rlx-driver",
  "rlx-fusion",
@@ -2327,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-compile"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rlx-autodiff",
  "rlx-fusion",
@@ -2335,12 +2268,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-coreml"
+version = "0.2.8"
+dependencies = [
+ "bytemuck",
+ "cc",
+ "half",
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+ "rlx-gguf",
+ "rlx-ir",
+ "rlx-opt",
+ "rlx-runtime",
+]
+
+[[package]]
 name = "rlx-cortexm"
-version = "0.2.7"
+version = "0.2.8"
 
 [[package]]
 name = "rlx-cortexm-trainer"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rlx-autodiff",
  "rlx-cpu",
@@ -2350,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cpu"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "criterion",
  "gemm",
@@ -2365,12 +2314,13 @@ dependencies = [
 
 [[package]]
 name = "rlx-cuda"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "bytemuck",
  "cc",
  "cudarc",
  "rlx-cpu",
+ "rlx-gguf",
  "rlx-gpu-kernels",
  "rlx-ir",
  "rlx-opt",
@@ -2380,7 +2330,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-driver"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "half",
  "rlx-ir",
@@ -2388,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fdm"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "bytemuck",
  "rlx-autodiff",
@@ -2402,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-flow"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -2412,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fpga"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rlx-cortexm",
  "rlx-ir",
@@ -2422,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fusion"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -2431,7 +2381,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2441,12 +2391,13 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf-convert"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "bytemuck",
  "half",
  "rlx-gguf",
+ "rlx-nemo",
  "rlx-onnx-import",
  "safetensors",
  "tempfile",
@@ -2454,11 +2405,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-kernels"
-version = "0.2.7"
+version = "0.2.8"
 
 [[package]]
 name = "rlx-ir"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -2467,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-linalg"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -2475,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-macros"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2484,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-metal"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "bytemuck",
  "core-graphics-types",
@@ -2493,17 +2444,17 @@ dependencies = [
  "metal",
  "objc",
  "rlx-cpu",
+ "rlx-gguf",
  "rlx-ir",
  "rlx-opt",
  "rlx-runtime",
- "rlx-splat",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "rlx-mlx"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "half",
  "rlx-cpu",
@@ -2517,15 +2468,26 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-sys"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "cc",
  "cmake",
 ]
 
 [[package]]
+name = "rlx-nemo"
+version = "0.2.8"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "half",
+ "serde_yaml",
+ "tempfile",
+]
+
+[[package]]
 name = "rlx-onnx"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2538,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-conformance"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "ort",
@@ -2551,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-import"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2569,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-opt"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -2579,14 +2541,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-optim"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "rlx-rl"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -2597,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-rocm"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "cc",
  "libloading 0.8.9",
@@ -2611,13 +2573,15 @@ dependencies = [
 
 [[package]]
 name = "rlx-runtime"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "half",
  "inventory",
+ "memmap2",
  "rlx-autodiff",
  "rlx-compile",
+ "rlx-coreml",
  "rlx-cpu",
  "rlx-cuda",
  "rlx-driver",
@@ -2631,16 +2595,16 @@ dependencies = [
  "rlx-opt",
  "rlx-rocm",
  "rlx-sparse",
- "rlx-splat",
  "rlx-tpu",
  "rlx-wgpu",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
 name = "rlx-sparse"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -2649,22 +2613,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlx-splat"
-version = "0.2.7"
+name = "rlx-tensor"
+version = "0.2.8"
 dependencies = [
- "anyhow",
- "bytemuck",
- "image",
- "metal",
- "rayon",
- "rlx-cpu",
+ "ndarray 0.16.1",
+ "rlx-autodiff",
  "rlx-ir",
- "tempfile",
+ "rlx-optim",
+ "rlx-runtime",
 ]
 
 [[package]]
 name = "rlx-text"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "minijinja",
@@ -2677,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tpu"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "libloading 0.8.9",
  "prost",
@@ -2693,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-umap"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "crossbeam-channel",
  "ctrlc",
@@ -2718,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wgpu"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "bytemuck",
  "half",
@@ -2890,6 +2851,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -3223,6 +3197,12 @@ name = "unindent"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7264e107f553ccae879d21fbea1d6724ac785e8c3bfc762137959b5802826ef3"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
@@ -3803,18 +3783,3 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[package]]
-name = "zune-core"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9"
-
-[[package]]
-name = "zune-jpeg"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
-dependencies = [
- "zune-core",
-]

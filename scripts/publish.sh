@@ -138,22 +138,32 @@ SKIPPED=(
 # depends on another in the same tier (e.g. rlx-ir before rlx-flow).
 # Publish order: `cargo publish` resolves every path dep in `[dependencies]`
 # and `[dev-dependencies]` (including optional) against crates.io. Within
-# a tier, list deps before dependents (e.g. rlx-cpu before rlx-splat).
+# a tier, list deps before dependents (e.g. rlx-cpu before rlx-metal).
 #
-# rlx-metal → rlx-runtime dev-dep is pinned to 0.2.7 on crates.io (path for
-# local tests) so metal can publish before runtime; rlx-runtime optional-dep's
-# rlx-metal at 0.2.7 — publish metal first, wait for index, then runtime.
+# Test-only cycles on later-tier crates (rlx-metal's dev-dep on rlx-runtime,
+# and rlx-autodiff/rlx-wgpu's dev-deps on the umbrella `rlx`) are declared
+# PATH-ONLY with no `version =` field. cargo strips path-only dev-deps from the
+# published manifest entirely, so `cargo publish` never resolves them against
+# crates.io and they need no per-release pin bump — the path still wins for
+# local `cargo test`. (Older releases pinned these to the previously-published
+# version, which lagged one release on every bump; path-only removes that
+# maintenance.) rlx-runtime's optional-dep on rlx-metal still tracks the
+# workspace version — publish metal first, wait for the index, then runtime.
+#
+# rlx-tensor sits just after rlx-runtime: its [dependencies] are rlx-ir,
+# rlx-optim, rlx-autodiff (all earlier tiers) and an optional rlx-runtime
+# (the `eval` backend), so it must follow runtime; the umbrella `rlx`
+# optional-dep's rlx-tensor (`tensor` feature), so it lands before `rlx`.
 TIERS=(
-    "rlx-ir rlx-gguf rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim"
+    "rlx-ir rlx-gguf rlx-nemo rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim"
     "rlx-flow rlx-fusion rlx-driver"
     "rlx-autodiff"
     "rlx-compile"
     "rlx-opt"
-    "rlx-cpu rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-tpu rlx-fpga"
-    "rlx-splat"
+    "rlx-cpu rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga"
     "rlx-metal"
     "rlx-runtime"
-    "rlx-onnx-import rlx-bbo"
+    "rlx-tensor rlx-onnx-import rlx-bbo"
     "rlx-sparse rlx-linalg rlx-umap rlx-text rlx-gguf-convert rlx-onnx-conformance"
     "rlx-onnx"
     "rlx-fdm rlx-bench"
@@ -269,7 +279,8 @@ validate_tier_coverage
 # (or the same tier, listed before this crate). Dev-dependencies are
 # skipped here but cargo publish still resolves them against crates.io —
 # keep test-only cycles on an already-published version (metal dev-dep
-# rlx-runtime 0.2.7 while runtime optional-dep's metal 0.2.7).
+# rlx-runtime stays at the prior release 0.2.7 while runtime optional-dep's
+# metal tracks the workspace version 0.2.8).
 validate_publish_order() {
     if ! command -v python3 >/dev/null 2>&1; then
         yellow "python3 not found — skipping publish-order check (install python3 to enable)."
@@ -305,7 +316,7 @@ def parse_rlx_deps(toml_path: Path) -> set[str]:
     return deps
 
 violations: list[str] = []
-for toml in sorted(root.glob("rlx-*/Cargo.toml")):
+for toml in sorted(root.glob("crates/rlx-*/Cargo.toml")):
     name = toml.parent.name
     if name.endswith("-trainer"):
         continue
@@ -422,7 +433,7 @@ workspace_version = sys.argv[2]
 crates = sys.argv[3].split()
 
 def effective_version(crate: str) -> str:
-    toml = root / crate / "Cargo.toml"
+    toml = root / "crates" / crate / "Cargo.toml"
     if not toml.is_file():
         raise SystemExit(f"could not find Cargo.toml for {crate}")
     text = toml.read_text()
@@ -495,7 +506,7 @@ list_tiers() {
                 echo "  - pyrlx                    (PyPI via maturin)"
                 ;;
             rlx-cortexm-trainer)
-                echo "  - rlx-cortexm-trainer      (binary tool; nested under rlx-cortexm/trainer)"
+                echo "  - rlx-cortexm-trainer      (binary tool; nested under crates/rlx-cortexm/trainer)"
                 ;;
             *)
                 echo "  - $s"

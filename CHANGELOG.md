@@ -7,6 +7,124 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ## [Unreleased]
 
+## [0.2.8] — 2026-06
+
+### Added — PyTorch `.pt` weight loading
+
+- **`rlx_nemo::PtModel`** — standalone loader for plain PyTorch `.pt` /
+  `.pth` / `pytorch_model.bin` `torch.save` checkpoints, reusing the
+  non-executing pickle VM + STORED-zip reader that already backs the
+  `.nemo` loader. Tensors materialize on demand as contiguous f32
+  regardless of on-disk dtype (fp32 / fp16 / bf16 / int). Modern (≥ PyTorch
+  1.6) zip format only; legacy non-zip pickles are rejected with a clear
+  error.
+- **`rlx-gguf-convert` `pt` feature** — `Converter::from_pt(...)` + a
+  `PtReader` `TensorReader`, so `.pt` checkpoints convert/quantize to GGUF
+  like safetensors/ONNX. The `convert` example now dispatches by input
+  extension (`.safetensors` / `.pt` / `.pth` / `.bin` / `.onnx`).
+
+### Added — Recurrent / sequence ops & complex matmul
+
+- **`Op::Lstm`** — multi-layer, optionally bidirectional, optional decode
+  carry (`h0`/`c0` threaded in place). Packed weights; gate order i,f,g,o.
+  Real CPU kernel (`execute_lstm_f32`) shared by the CUDA / ROCm / wgpu /
+  Metal host fallbacks; **native Metal MSL kernel** for the single-layer
+  unidirectional path (`hidden ≤ 1024`, opt out via `RLX_METAL_LSTM_CPU=1`).
+  Decomposes via `unfuse` for MLX / CoreML / TPU and backprop-through-time
+  (verified against central finite differences).
+- **`Op::Gru`** (PyTorch r/z/n, separate `b_ih`/`b_hh`) and **`Op::Rnn`**
+  (Elman, tanh/ReLU) — multi-layer / bidirectional / carry, via the same
+  `unfuse`-for-autodiff decomposition.
+- **`Op::Mamba2`** — Mamba-2 / SSD scalar-decay structured state-space scan
+  (sibling of `SelectiveScan` / `GatedDeltaNet`); `unfuse` decomposition.
+- **Complex (C64) matmul** — `Thunk::CgemmC64` CPU kernel + a `MatMul`
+  lowering branch, completing the deferred piece of C64 support. `MatMul`
+  VJP now inserts Wirtinger conjugates for C64
+  (`dA = upstream·conj(B)ᵀ`, `dB = conj(A)ᵀ·upstream`).
+- **ONNX coverage ops** — GatherND, ScatterND, OneHot, NonZero, CumProd,
+  and Einsum (with a real equation parser) as `Op::Custom("onnx.*")` CPU
+  reference kernels wired through the ONNX import path.
+
+### Changed
+
+- **`rlx-mlx-sys`**: bumped the vendored MLX submodule to **0.32.0** (from
+  0.31.2). The C-ABI shim builds unchanged against the new upstream API;
+  all `rlx-mlx` (128) and runtime-MLX integration (455) tests pass.
+
+### Added — `rlx-tensor` symbolic Tensor DSL
+
+- **New crate `rlx-tensor`**: a native `ndarray` alternative — NumPy-style,
+  operator-overloaded `Tensor` handles that trace into `rlx-ir` instead of
+  executing eagerly. The graph stays lazy (so fusion + memory planning see
+  the whole expression) until forced. Re-exported through the prelude as
+  `rlx::tensor` / `rlx::prelude::{Tensor, graph, s, shape, ...}` behind the
+  umbrella `tensor` feature (**on by default**; `--no-default-features` drops
+  it). The umbrella backend flags (`cpu`/`metal`/`cuda`/…) now also enable the
+  matching `rlx-tensor` `eval` backend via weak features, so
+  `rlx::tensor::Tensor::to_vec` / `.on(Device::…)` materialize out of the box.
+- **Op surface**: arithmetic + scalar ops, activations (`relu`/`gelu`/`silu`/
+  …), reductions (`sum`/`mean`/`var`/`logsumexp`/`cumsum`/`argmax`/…), shape &
+  view ops (`reshape`/`narrow`/`slice` via `s![]`/`split`/`cat`/`stack`/…),
+  indexing (`gather`/`where_`/`masked_fill`/comparisons), and NN/linalg
+  (`matmul`/`softmax`/`layer_norm`/`rms_norm`/`conv2d`/`attention`/`rope`/
+  `fft`/`inv`/`solve`). First-class `Dim::Dynamic` for variable batch/seq.
+- **Opt-in features**: `eval` (materialize via `rlx_runtime::Session`, default
+  CPU; `eval-metal`/`eval-mlx`/`eval-cuda`/`eval-rocm`/`eval-gpu`/`eval-coreml`/
+  `eval-apple`/`eval-blas` for other backends), `grad`/`transforms` (reverse-mode
+  AD + composable `Func` transforms `vmap`/`jvp`/`hvp`), `optim`
+  (`Func::train_step` + `rlx_optim` optimizers), and `ndarray` interop
+  (`Tensor::from(array)` / `to_ndarray`). Base crate stays a pure `rlx-ir`
+  graph builder with no backend pulled in.
+
+### Added — IQ / TQ / MX dequant family
+
+- **`rlx-gguf`**: dequant kernels for every llama.cpp scheme — IQ4_NL,
+  IQ4_XS, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M, TQ1_0/TQ2_0, MXFP4, NVFP4.
+  Grid LUTs auto-extracted from `ggml-common.h` and shipped in
+  `src/iq_grids.rs`. Real-weight parity tests against `llama-quantize`
+  output on Qwen3-0.6B (`tests/iq_tq_real_weights.rs`).
+- **Q2_K / Q3_K layout fix** (`rlx-gguf`, `rlx-cpu/gguf_matmul`,
+  `rlx-metal/dequant_gguf.msl`, `rlx-cuda/dequant_gguf.cu`): pre-existing
+  encoder/decoder put f16 `d`/`dmin` at the front of the block, but
+  llama.cpp's actual layout is `scales | qs | d` (Q2_K) and
+  `hmask | qs | scales | d` (Q3_K). Constant-value round-trip tests
+  passed because the encoder used the same flipped layout; real GGUFs
+  produced NaN. Decoder and encoder now match `ggml-common.h` exactly.
+- **GPU dequant**: native MSL (rlx-metal) + CUDA (rlx-cuda) kernels for
+  all 19 schemes. IQ-family grids staged into a ~33 KB device buffer
+  per session/context via `Kernels::iq_grid_buffer` (Metal) /
+  `cuda_iq_grid_buffer` (CUDA), bound as the 6th kernel argument.
+  `has_metal_dequant_kernel(QuantScheme)` reports coverage.
+- **`rlx-ir`**: 13 new `QuantScheme` variants (`GgufIQ4NL`, `GgufIQ4XS`,
+  `GgufIQ2XXS`, `GgufIQ2XS`, `GgufIQ2S`, `GgufIQ3XXS`, `GgufIQ3S`,
+  `GgufIQ1S`, `GgufIQ1M`, `GgufTQ1_0`, `GgufTQ2_0`, `GgufMXFP4`,
+  `GgufNVFP4`) with byte-counts wired into `gguf_block_size` /
+  `gguf_block_bytes` / `is_gguf` / `bits_per_element_x10`.
+
+### Added — Samplers
+
+- **`rlx-runtime::samplers`** module: backend-agnostic `Sampler` trait +
+  `SamplerChain`. Implements Temperature, DynamicTemperature, TopK,
+  TopP, TopNSigma, TypicalP, Mirostat v1 / v2, XTC, DRY, RepetitionPenalty
+  in the canonical llama.cpp order.
+- **`SampleOpts` extended** (`rlx-runtime::lm`, `rlx_qwen3::sampling`):
+  fields for every advanced sampler default to off; `into_chain()`
+  builds the chain; `is_classic()` lets legacy callers stay on the
+  fast inline path. `MirostatMode` enum exposed at the runtime top
+  level. `sample_token_with_history()` and `sample_token_stateful()`
+  added to rlx-qwen3 for chain-aware decoders.
+
+### Added — Quantized KV cache
+
+- **`rlx-runtime::quantized_kv`**: per-layer K/V history stored as
+  `KvQuant::{F16, Q8_0, Q5_0, Q4_0}` GGUF blocks instead of f16/f32.
+  ~2–4× memory cut on long decodes. `QuantizedKvLayer::{append_rows,
+  read_all, read_window, drop_front}` + `QuantizedKvCache` aggregate.
+- **`mmap-kv` feature**: optional `MmapKvLayer` / `MmapKvCache` backed by
+  `memmap2` for anonymous or file-backed mappings. Pages cold history
+  in/out via the OS page cache; `prefetch_window` issues madvise
+  WILLNEED. Use case: 100k-token contexts that exceed RAM.
+
 ## [0.2.7] — 2026-06
 
 ### Added
@@ -429,7 +547,8 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 Initial release. Tracked at [git history root].
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.8
 [0.2.7]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.7
 [0.2.6]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.6
 [0.2.5]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.5

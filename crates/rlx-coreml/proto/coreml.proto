@@ -1,0 +1,218 @@
+// Focused subset of Apple's CoreML model specification, sufficient to
+// emit an ML Program (MIL) model and its I/O description. Field numbers
+// are taken verbatim from apple/coremltools `mlmodel/format/{Model,
+// FeatureTypes,MIL}.proto` (Apache-2.0) so the wire encoding produced by
+// prost is byte-compatible with what CoreML's loader expects. Only the
+// messages/fields RLX actually emits are reproduced here — a strict
+// subset of a protobuf schema is itself wire-compatible.
+syntax = "proto3";
+
+package coreml;
+
+// ---------------------------------------------------------------------------
+// Top-level model (Model.proto)
+// ---------------------------------------------------------------------------
+
+message Model {
+  int32 specificationVersion = 1;
+  ModelDescription description = 2;
+  bool isUpdatable = 10;
+
+  oneof Type {
+    Program mlProgram = 502;
+  }
+}
+
+message ModelDescription {
+  repeated FeatureDescription input = 1;
+  repeated FeatureDescription output = 10;
+  Metadata metadata = 100;
+}
+
+message FeatureDescription {
+  string name = 1;
+  string shortDescription = 2;
+  FeatureType type = 3;
+}
+
+message Metadata {
+  string shortDescription = 1;
+  string versionString = 2;
+  string author = 3;
+  string license = 4;
+  map<string, string> userDefined = 100;
+}
+
+// ---------------------------------------------------------------------------
+// Feature (I/O) types (FeatureTypes.proto)
+// ---------------------------------------------------------------------------
+
+message FeatureType {
+  oneof Type {
+    ArrayFeatureType multiArrayType = 5;
+  }
+  bool isOptional = 1000;
+}
+
+message ArrayFeatureType {
+  enum ArrayDataType {
+    INVALID_ARRAY_DATA_TYPE = 0;
+    FLOAT32 = 65568;
+    DOUBLE = 65600;
+    INT32 = 131104;
+    FLOAT16 = 65552;
+  }
+
+  repeated int64 shape = 1;
+  ArrayDataType dataType = 2;
+
+  oneof ShapeFlexibility {
+    ShapeRange shapeRange = 31;
+  }
+}
+
+message SizeRange {
+  uint64 lowerBound = 1;
+  int64 upperBound = 2;
+}
+
+message ShapeRange {
+  repeated SizeRange sizeRanges = 1;
+}
+
+// ---------------------------------------------------------------------------
+// ML Program / MIL (MIL.proto, package CoreML.Specification.MILSpec)
+// ---------------------------------------------------------------------------
+
+message Program {
+  int64 version = 1;
+  map<string, Function> functions = 2;
+  string docString = 3;
+  map<string, Value> attributes = 4;
+}
+
+message Function {
+  repeated NamedValueType inputs = 1;
+  string opset = 2;
+  map<string, Block> block_specializations = 3;
+  map<string, Value> attributes = 4;
+}
+
+message Block {
+  repeated NamedValueType inputs = 1;
+  repeated string outputs = 2;
+  repeated Operation operations = 3;
+  map<string, Value> attributes = 4;
+}
+
+message Operation {
+  string type = 1;
+  map<string, Argument> inputs = 2;
+  repeated NamedValueType outputs = 3;
+  repeated Block blocks = 4;
+  map<string, Value> attributes = 5;
+}
+
+message Argument {
+  message Binding {
+    oneof binding {
+      string name = 1;
+      Value value = 2;
+    }
+  }
+  repeated Binding arguments = 1;
+}
+
+message NamedValueType {
+  string name = 1;
+  ValueType type = 2;
+}
+
+message ValueType {
+  oneof type {
+    TensorType tensorType = 1;
+  }
+}
+
+message TensorType {
+  DataType dataType = 1;
+  int64 rank = 2;
+  repeated Dimension dimensions = 3;
+  map<string, Value> attributes = 4;
+}
+
+message Dimension {
+  message ConstantDimension {
+    uint64 size = 1;
+  }
+  message UnknownDimension {
+    bool variadic = 1;
+  }
+  oneof dimension {
+    ConstantDimension constant = 1;
+    UnknownDimension unknown = 2;
+  }
+}
+
+message Value {
+  message ImmediateValue {
+    oneof value {
+      TensorValue tensor = 1;
+    }
+  }
+  message BlobFileValue {
+    string fileName = 1;
+    uint64 offset = 2;
+  }
+
+  string docString = 1;
+  ValueType type = 2;
+  oneof value {
+    ImmediateValue immediateValue = 3;
+    BlobFileValue blobFileValue = 5;
+  }
+}
+
+message TensorValue {
+  message RepeatedFloats {
+    repeated float values = 1;
+  }
+  message RepeatedInts {
+    repeated int32 values = 1;
+  }
+  message RepeatedLongInts {
+    repeated int64 values = 1;
+  }
+  message RepeatedBools {
+    repeated bool values = 1;
+  }
+  message RepeatedStrings {
+    repeated string values = 1;
+  }
+  message RepeatedBytes {
+    bytes values = 1;
+  }
+
+  oneof value {
+    RepeatedFloats floats = 1;
+    RepeatedInts ints = 2;
+    RepeatedBools bools = 3;
+    RepeatedStrings strings = 4;
+    RepeatedLongInts longInts = 5;
+    RepeatedBytes bytes = 7;
+  }
+}
+
+enum DataType {
+  UNUSED_TYPE = 0;
+  BOOL = 1;
+  STRING = 2;
+  FLOAT16 = 10;
+  FLOAT32 = 11;
+  FLOAT64 = 12;
+  INT8 = 21;
+  INT16 = 22;
+  INT32 = 23;
+  INT64 = 24;
+  UINT8 = 31;
+}
