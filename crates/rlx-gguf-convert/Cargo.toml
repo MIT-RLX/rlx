@@ -1,0 +1,49 @@
+[package]
+name = "rlx-gguf-convert"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Convert safetensors / ONNX initializer tensors into GGUF with per-tensor quantization. Useful for shrinking a model's on-disk + in-memory footprint at first load and reusing the GGUF dump on subsequent runs."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[features]
+# Source readers are opt-in. Default to safetensors only — the
+# common case. `onnx` pulls in the heavier rlx-onnx-import crate.
+default = ["safetensors"]
+safetensors = ["dep:safetensors"]
+onnx = ["dep:rlx-onnx-import"]
+# `pt` reads PyTorch `.pt` / `.pth` / `pytorch_model.bin` torch.save
+# checkpoints via rlx-nemo's native pickle VM + zip reader.
+pt = ["dep:rlx-nemo"]
+
+[dependencies]
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.8" }
+anyhow = "1"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = "1"
+safetensors = { version = "0.7", optional = true }
+rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.8", optional = true, default-features = false }
+rlx-nemo = { path = "../rlx-nemo", version = "0.2.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+[[example]]
+name = "convert"
+path = "examples/convert.rs"
+required-features = ["safetensors"]
+
+[[example]]
+name = "fidelity_check"
+path = "examples/fidelity_check.rs"
+required-features = ["safetensors"]

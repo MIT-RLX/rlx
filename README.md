@@ -6,7 +6,7 @@ backend-specific kernels for CPU, Apple Silicon (Metal / MLX), NVIDIA
 (CUDA), AMD (ROCm), Google TPU, cross-platform GPU (wgpu), and
 microcontrollers (Cortex-M).
 
-> Status: **0.2.7**, Apple-Silicon-first. The CPU and Apple GPU paths
+> Status: **0.2.8**, Apple-Silicon-first. The CPU and Apple GPU paths
 > are mature; CUDA / ROCm / TPU / WGPU work but have seen less mileage;
 > Cortex-M is a separate INT8 product. Multi-backend runtime helpers
 > (`GraphDevices`, `DeviceRouter`) — see [`docs/backend-selection.md`](docs/backend-selection.md).
@@ -105,6 +105,19 @@ compiled.set_param("w", &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
 let out = compiled.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
 ```
 
+Prefer NumPy-style expressions? The `rlx::tensor` DSL ([`rlx-tensor`](rlx-tensor/README.md))
+builds the same IR with operator-overloaded, lazy `Tensor` handles —
+`(&a + &b).relu()` traces instead of executing, then fuses + memory-plans
+across any backend when you call `.to_vec()`:
+
+```rust
+use rlx_tensor::Tensor; // crate `rlx-tensor`, feature `eval`
+
+let a = Tensor::from_vec(vec![1.0, 2.0, 3.0], [3]);
+let c = (&a + &Tensor::ones([3])).relu();
+assert_eq!(c.to_vec(), vec![2.0, 3.0, 4.0]); // auto-picks the fastest backend
+```
+
 Domain-specific namespaces if you want narrower star-imports:
 `rlx::ops::*` (IR helper enums), `rlx::quant::*`, `rlx::autodiff::*`.
 Or the full per-crate surface
@@ -137,6 +150,7 @@ Or depend on each crate directly (`rlx-ir`, `rlx-opt`, `rlx-runtime`,
 ```
 rlx            prelude — re-exports framework crates + common types
 rlx-ir         leaf — types, shape, op enum, verifier, HIR hooks
+rlx-tensor     NumPy-style symbolic Tensor DSL (lazy, trace → fuse → any backend)
 rlx-flow       block assembly-line API for model builders
 rlx-fusion     MIR fusion passes + unfuse for AD
 rlx-autodiff   grad / jvp / hvp / vmap on MIR
@@ -153,7 +167,7 @@ rlx-wgpu       Cross-platform GPU via wgpu
 rlx-cortexm    ARMv7E-M INT8 kernels (no_std)
 rlx-fpga       IR → Verilog → bitstream
 rlx-runtime    user-facing Session / CompiledGraph
-rlx-gguf       standalone GGUF parser + dequant (incl. Q4_K / Q5_K / Q6_K / Q8_K)
+rlx-gguf       standalone GGUF parser + dequant (every llama.cpp scheme: Q4_0..Q8_0, Q2_K..Q8_K, IQ1..IQ4, TQ1/TQ2, MXFP4, NVFP4)
 rlx-macros     #[rlx_model] AOT macro
 rlx-bench      benchmark harness
 rlx-sparse     downstream: CSR LU / mat-vec / CG (custom-op scaffold)
@@ -292,7 +306,9 @@ new ops land. Pin exact versions in production until 1.0.
 | `vmap`                       | MVP — leading-axis batching                   |
 | QAT (PTQ + STE + LSQ)        | Complete: EMA, Fixed, PerBatch, propagation   |
 | Qwen3 LM (safetensors + GGUF)| End-to-end on Metal: 100% top-1 parity vs HF; matches/beats Python MPS on most prefill shapes. Q4_K_M GGUF loads + runs |
-| Op::DequantMatMul GGUF schemes | CPU: Q4_K / Q5_K / Q6_K / Q8_K supported (dequant scratch + sgemm — keeps arena packed). Metal: TBD; the per-op thunk path dequants to F32 once at load |
+| Op::DequantMatMul GGUF schemes | Every llama.cpp scheme covered: Q2..Q8 K-quants, Q4_0/Q8_0, IQ4_NL/XS, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M, TQ1_0/TQ2_0, MXFP4, NVFP4. CPU + Metal + CUDA have native fused kernels (per-block dequant + cuBLAS/MPS sgemm); MLX/ROCm/wgpu use host-side dequant via `rlx-cpu::gguf_matmul`. CoreML/ANE covers the K-quant subset via `constexpr_blockwise_shift_scale`. |
+| Sampler chain                  | `SamplerChain` in `rlx-runtime::samplers`: Temperature, DynamicTemperature, TopK, TopP, TopNSigma, TypicalP, Mirostat v1/v2, XTC, DRY, RepetitionPenalty. Wired into `SampleOpts::into_chain()`; classic top-k/top-p stay on the fast path via `is_classic()`. |
+| Quantized KV cache             | Per-layer K/V stored as q4_0 / q5_0 / q8_0 / f16 blocks via `rlx-runtime::quantized_kv`. Optional `mmap-kv` feature spills to a file-backed mapping for long contexts. |
 
 ## Authors
 

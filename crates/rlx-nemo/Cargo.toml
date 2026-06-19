@@ -1,0 +1,25 @@
+[package]
+name = "rlx-nemo"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "RLX — native loader for NVIDIA NeMo `.nemo` model files (tar + torch.save ckpt + YAML config)."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[dependencies]
+anyhow     = "1"
+flate2     = "1"
+half       = "2"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,897 @@
+// GGUF dequant — one thread per GGUF block. Block size varies per scheme:
+//
+//   scheme_id | scheme    | block elems | block bytes
+//   ----------|-----------|-------------|------------
+//      0      | Q4_K      | 256         | 144
+//      1      | Q5_K      | 256         | 176
+//      2      | Q6_K      | 256         | 210
+//      3      | Q8_K      | 256         | 292
+//      4      | Q2_K      | 256         | 84
+//      5      | Q3_K      | 256         | 110
+//      6      | IQ4_NL    | 32          | 18
+//      7      | IQ4_XS    | 256         | 136
+//      8      | TQ1_0     | 256         | 54
+//      9      | TQ2_0     | 256         | 66
+//     10      | MXFP4     | 32          | 17
+//     11      | NVFP4     | 16          | 9
+//     12      | IQ2_XXS   | 256         | 66    (uses grid LUT)
+//     13      | IQ2_XS    | 256         | 74    (uses grid LUT)
+//     14      | IQ2_S     | 256         | 82    (uses grid LUT)
+//     15      | IQ3_XXS   | 256         | 98    (uses grid LUT)
+//     16      | IQ3_S     | 256         | 110   (uses grid LUT)
+//     17      | IQ1_S     | 256         | 50    (uses grid LUT)
+//     18      | IQ1_M     | 256         | 56    (uses grid LUT)
+//
+// Caller passes `num_blocks = total_elements / scheme.block_elems`.
+//
+// IQ-family schemes (12..=18) consult grid lookup tables held in a
+// device buffer at `buffer(5)`. Tables are staged once at session init
+// from rlx_gguf::iq_grids by `iq_grid_buffer()`. Layout (concatenated):
+//
+//   offset    bytes    table
+//   0         8        KMASK_IQ2XS (u8 × 8)
+//   8         128      KSIGNS_IQ2XS (u8 × 128)
+//   136       2048     KGRID_IQ2XXS (u64 × 256)
+//   2184      4096     KGRID_IQ2XS (u64 × 512)
+//   6280      8192     KGRID_IQ2S (u64 × 1024)
+//   14472     1024     KGRID_IQ3XXS (u32 × 256)
+//   15496     2048     KGRID_IQ3S (u32 × 512)
+//   17544     16384    KGRID_IQ1S (u64 × 2048)
+
+constant uint DQ_QK_K = 256u;
+constant uint DQ_K_SCALE_SIZE = 12u;
+constant uint DQ_QK4_NL = 32u;
+constant uint DQ_QK_MXFP4 = 32u;
+constant uint DQ_QK_NVFP4 = 16u;
+
+constant uint IQ_GRID_OFF_KMASK     = 0u;
+constant uint IQ_GRID_OFF_KSIGNS    = 8u;
+constant uint IQ_GRID_OFF_IQ2XXS    = 136u;
+constant uint IQ_GRID_OFF_IQ2XS     = 2184u;
+constant uint IQ_GRID_OFF_IQ2S      = 6280u;
+constant uint IQ_GRID_OFF_IQ3XXS    = 14472u;
+constant uint IQ_GRID_OFF_IQ3S      = 15496u;
+constant uint IQ_GRID_OFF_IQ1S      = 17544u;
+
+// IQ4_NL / IQ4_XS non-linear LUT.
+constant int kvalues_iq4nl_lut[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+inline float dq_read_f16(device const uchar* b, uint off) {
+    ushort bits = ushort(b[off]) | (ushort(b[off + 1u]) << 8u);
+    uint sign = (uint(bits) >> 15u) & 1u;
+    uint exp  = (uint(bits) >> 10u) & 0x1Fu;
+    uint mant = uint(bits) & 0x3FFu;
+    float v;
+    if (exp == 0u) {
+        v = float(mant) / 1024.0f * exp2(-14.0f);
+    } else if (exp == 31u) {
+        v = (mant == 0u) ? INFINITY : 0.0f;
+    } else {
+        v = (1.0f + float(mant) / 1024.0f) * exp2(float(int(exp) - 15));
+    }
+    return (sign != 0u) ? -v : v;
+}
+
+inline void dq_get_scale_min_k4(device const uchar* q, uint j, thread uint& sc, thread uint& mn) {
+    if (j < 4u) {
+        sc = uint(q[j]) & 63u;
+        mn = uint(q[j + 4u]) & 63u;
+    } else {
+        sc = (uint(q[j + 4u]) & 0x0Fu) | (((uint(q[j - 4u]) >> 6u) & 3u) << 4u);
+        mn = (uint(q[j + 4u]) >> 4u) | (((uint(q[j]) >> 6u) & 3u) << 4u);
+    }
+}
+
+// Read one byte from the LUT buffer.
+inline uchar lut_u8(device const uchar* lut, uint off) {
+    return lut[off];
+}
+
+// Read one i8 grid byte at `entry_off + byte_idx`.
+inline int lut_i8(device const uchar* lut, uint off) {
+    return int((char)lut[off]);
+}
+
+inline uint lut_u16(device const uchar* lut, uint off) {
+    return uint(lut[off]) | (uint(lut[off + 1u]) << 8u);
+}
+
+inline uint lut_u32(device const uchar* lut, uint off) {
+    return uint(lut[off])
+         | (uint(lut[off + 1u]) << 8u)
+         | (uint(lut[off + 2u]) << 16u)
+         | (uint(lut[off + 3u]) << 24u);
+}
+
+kernel void dequant_gguf(
+    device float* arena        [[buffer(0)]],
+    constant ulong& w_byte_off   [[buffer(1)]],
+    constant ulong& dst_f32_off  [[buffer(2)]],
+    constant uint& scheme_id     [[buffer(3)]],
+    constant uint& num_blocks    [[buffer(4)]],
+    device const uchar* iq_lut   [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= num_blocks) return;
+
+    // w_byte_off / dst_f32_off are 64-bit because for ≥4 GB models the
+    // activation byte offsets exceed u32 (task #50: 12B Q4 GGUF arena ≈14 GB).
+    device uchar* w_base = (device uchar*)((device char*)arena + w_byte_off);
+
+    // ── 256-elem block schemes (K-quants, IQ4_XS, IQ2/3/1, TQ) ─────
+    if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u) {
+        device float* dst = arena + dst_f32_off + gid * DQ_QK_K;
+
+        if (scheme_id == 3u) {
+            uint off = gid * (4u + DQ_QK_K + (DQ_QK_K / 16u) * 2u);
+            float d = as_type<float>(*(device uint*)(w_base + off));
+            device const uchar* qs = w_base + off + 4u;
+            for (uint i = 0; i < DQ_QK_K; ++i) dst[i] = d * float(int8_t(qs[i]));
+            return;
+        }
+
+        if (scheme_id == 0u) {
+            uint blk = 2u + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 2u;
+            uint off = gid * blk;
+            float d = dq_read_f16(w_base, off);
+            float dmin = dq_read_f16(w_base, off + 2u);
+            device const uchar* scales = w_base + off + 4u;
+            device const uchar* qs = w_base + off + 4u + DQ_K_SCALE_SIZE;
+            uint is = 0u, out_i = 0u;
+            for (uint j = 0u; j < 8u; j += 2u) {
+                uint sc0, m0, sc1, m1;
+                dq_get_scale_min_k4(scales, j, sc0, m0);
+                dq_get_scale_min_k4(scales, j + 1u, sc1, m1);
+                float d0 = d * float(sc0), m0f = dmin * float(m0);
+                float d1 = d * float(sc1), m1f = dmin * float(m1);
+                for (uint l = 0u; l < 32u; ++l) dst[out_i++] = d0 * float(qs[is + l] & 0x0Fu) - m0f;
+                for (uint l = 0u; l < 32u; ++l) dst[out_i++] = d1 * float(qs[is + l] >> 4) - m1f;
+                is += 32u;
+            }
+            return;
+        }
+
+        if (scheme_id == 1u) {
+            uint blk = 2u + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 8u + DQ_QK_K / 2u;
+            uint off = gid * blk;
+            float d = dq_read_f16(w_base, off);
+            float dmin = dq_read_f16(w_base, off + 2u);
+            device const uchar* scales = w_base + off + 4u;
+            uint qh_off = off + 4u + DQ_K_SCALE_SIZE;
+            device const uchar* qh = w_base + qh_off;
+            device const uchar* qs = w_base + qh_off + DQ_QK_K / 8u;
+            uint is = 0u, out_i = 0u;
+            uchar u1 = 1u, u2 = 2u;
+            for (uint j = 0u; j < 8u; j += 2u) {
+                uint sc0, m0, sc1, m1;
+                dq_get_scale_min_k4(scales, j, sc0, m0);
+                dq_get_scale_min_k4(scales, j + 1u, sc1, m1);
+                float d0 = d * float(sc0), m0f = dmin * float(m0);
+                float d1 = d * float(sc1), m1f = dmin * float(m1);
+                for (uint l = 0u; l < 32u; ++l) {
+                    uint lo = uint(qs[is + l]) & 0x0Fu;
+                    uint hi = (qh[l] & u1) != 0u ? 16u : 0u;
+                    dst[out_i++] = d0 * float(lo + hi) - m0f;
+                }
+                for (uint l = 0u; l < 32u; ++l) {
+                    uint lo = uint(qs[is + l]) >> 4u;
+                    uint hi = (qh[l] & u2) != 0u ? 16u : 0u;
+                    dst[out_i++] = d1 * float(lo + hi) - m1f;
+                }
+                is += 32u;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+            return;
+        }
+
+        if (scheme_id == 2u) {
+            uint ql_len = DQ_QK_K / 2u, qh_len = DQ_QK_K / 4u, sc_len = DQ_QK_K / 16u;
+            uint blk = ql_len + qh_len + sc_len + 2u;
+            uint off = gid * blk;
+            device const uchar* ql = w_base + off;
+            device const uchar* qh = w_base + off + ql_len;
+            device const uchar* sc = w_base + off + ql_len + qh_len;
+            float d = dq_read_f16(w_base, off + ql_len + qh_len + sc_len);
+            for (uint h = 0u; h < 2u; ++h) {
+                uint dst_base = h * 128u, ql_off = h * 64u, qh_off_h = h * 32u, sc_off = h * 8u;
+                for (uint l = 0u; l < 32u; ++l) {
+                    uint is = l / 16u;
+                    uchar qh_b = qh[qh_off_h + l];
+                    float q1 = float(int(((ql[ql_off + l] & 0x0Fu) | (((qh_b >> 0) & 3u) << 4u)) - 32));
+                    float q2 = float(int(((ql[ql_off + l + 32u] & 0x0Fu) | (((qh_b >> 2) & 3u) << 4u)) - 32));
+                    float q3 = float(int(((ql[ql_off + l] >> 4) | (((qh_b >> 4) & 3u) << 4u)) - 32));
+                    float q4 = float(int(((ql[ql_off + l + 32u] >> 4) | (((qh_b >> 6) & 3u) << 4u)) - 32));
+                    dst[dst_base + l] = d * float(int8_t(sc[sc_off + is])) * q1;
+                    dst[dst_base + l + 32u] = d * float(int8_t(sc[sc_off + is + 2u])) * q2;
+                    dst[dst_base + l + 64u] = d * float(int8_t(sc[sc_off + is + 4u])) * q3;
+                    dst[dst_base + l + 96u] = d * float(int8_t(sc[sc_off + is + 6u])) * q4;
+                }
+            }
+            return;
+        }
+
+        if (scheme_id == 4u) {
+            // Q2_K: scales[16] | qs[64] | d (f16) | dmin (f16).
+            uint blk = 2u + 2u + DQ_QK_K / 16u + DQ_QK_K / 4u;
+            uint off = gid * blk;
+            uint scales_off = off;
+            uint qs_off = off + DQ_QK_K / 16u;
+            uint d_off = qs_off + DQ_QK_K / 4u;
+            float d = dq_read_f16(w_base, d_off);
+            float min_v = dq_read_f16(w_base, d_off + 2u);
+            device const uchar* q = w_base + qs_off;
+            uint is = 0u, out_i = 0u;
+            for (uint sb = 0u; sb < 2u; ++sb) {
+                uint shift = 0u;
+                for (uint t = 0u; t < 4u; ++t) {
+                    uchar sc = w_base[scales_off + is]; is += 1u;
+                    float dl = d * float(sc & 0xFu); float ml = min_v * float(sc >> 4);
+                    for (uint l = 0u; l < 16u; ++l) dst[out_i++] = dl * float((q[l] >> shift) & 3u) - ml;
+                    sc = w_base[scales_off + is]; is += 1u;
+                    dl = d * float(sc & 0xFu); ml = min_v * float(sc >> 4);
+                    for (uint l = 0u; l < 16u; ++l) dst[out_i++] = dl * float((q[l + 16u] >> shift) & 3u) - ml;
+                    shift += 2u;
+                }
+                q += 32u;
+            }
+            return;
+        }
+
+        if (scheme_id == 5u) {
+            // Q3_K: hmask[32] | qs[64] | scales[12] | d (f16).
+            const uint KMASK1 = 0x03030303u;
+            const uint KMASK2 = 0x0f0f0f0fu;
+            uint blk = 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 8u + DQ_QK_K / 4u;
+            uint off = gid * blk;
+            uint hm_off = off;
+            uint qs_off = off + DQ_QK_K / 8u;
+            uint scales_off = qs_off + DQ_QK_K / 4u;
+            uint d_off = scales_off + DQ_K_SCALE_SIZE;
+            float d_all = dq_read_f16(w_base, d_off);
+            device const uchar* hm = w_base + hm_off;
+            device const uchar* q = w_base + qs_off;
+            uint aux0 = uint(w_base[scales_off + 0u]) | (uint(w_base[scales_off + 1u]) << 8u)
+                      | (uint(w_base[scales_off + 2u]) << 16u) | (uint(w_base[scales_off + 3u]) << 24u);
+            uint aux1 = uint(w_base[scales_off + 4u]) | (uint(w_base[scales_off + 5u]) << 8u)
+                      | (uint(w_base[scales_off + 6u]) << 16u) | (uint(w_base[scales_off + 7u]) << 24u);
+            uint aux2 = uint(w_base[scales_off + 8u]) | (uint(w_base[scales_off + 9u]) << 8u)
+                      | (uint(w_base[scales_off + 10u]) << 16u) | (uint(w_base[scales_off + 11u]) << 24u);
+            uint tmp = aux2;
+            aux2 = ((aux0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+            // aux3 unused after KMASK split — sub-blocks 12-15 unused on QK_K=256.
+            aux0 = (aux0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+            aux1 = (aux1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+            thread char scales[8];
+            *((thread uint*)&scales[0]) = aux0;
+            *((thread uint*)&scales[4]) = aux1;
+            uint is = 0u; uchar m = 1u; uint out_i = 0u;
+            for (uint sb = 0u; sb < 2u; ++sb) {
+                uint shift = 0u;
+                for (uint t = 0u; t < 4u; ++t) {
+                    float dl = d_all * float(int(scales[is]) - 32); is += 1u;
+                    for (uint l = 0u; l < 16u; ++l) {
+                        int h = (hm[l] & m) != 0u ? 0 : 4;
+                        dst[out_i++] = dl * float(int(((q[l] >> shift) & 3u)) - h);
+                    }
+                    dl = d_all * float(int(scales[is]) - 32); is += 1u;
+                    for (uint l = 0u; l < 16u; ++l) {
+                        int h = (hm[l + 16u] & m) != 0u ? 0 : 4;
+                        dst[out_i++] = dl * float(int(((q[l + 16u] >> shift) & 3u)) - h);
+                    }
+                    shift += 2u; m <<= 1;
+                }
+                q += 32u;
+            }
+            return;
+        }
+
+        if (scheme_id == 7u) {
+            // IQ4_XS: 136 bytes / 256 elems.
+            uint blk = 2u + 2u + DQ_QK_K / 64u + DQ_QK_K / 2u;
+            uint off = gid * blk;
+            float d = dq_read_f16(w_base, off);
+            uint scales_h = uint(w_base[off + 2u]) | (uint(w_base[off + 3u]) << 8u);
+            device const uchar* scales_l = w_base + off + 4u;
+            device const uchar* qs = w_base + off + 4u + DQ_QK_K / 64u;
+            uint out_i = 0u, qs_idx = 0u;
+            for (uint ib = 0u; ib < DQ_QK_K / 32u; ++ib) {
+                uint lo = (uint(scales_l[ib / 2u]) >> (4u * (ib % 2u))) & 0xFu;
+                uint hi = (scales_h >> (2u * ib)) & 0x3u;
+                int ls = int(lo | (hi << 4u));
+                float dl = d * float(ls - 32);
+                for (uint j = 0u; j < 16u; ++j) {
+                    uchar bx = qs[qs_idx + j];
+                    dst[out_i + j] = dl * float(kvalues_iq4nl_lut[bx & 0x0Fu]);
+                    dst[out_i + j + 16u] = dl * float(kvalues_iq4nl_lut[bx >> 4]);
+                }
+                out_i += 32u;
+                qs_idx += 16u;
+            }
+            return;
+        }
+
+        if (scheme_id == 8u) {
+            // TQ1_0: qs[48] | qh[4] | d (f16). Trit unpacking via the
+            // (q * pow3[n] * 3) >> 8 trick — see rlx_gguf::tq_dequant.
+            const uchar POW3[5] = { 1, 3, 9, 27, 81 };
+            uint off = gid * 54u;
+            device const uchar* qs = w_base + off;
+            device const uchar* qh = w_base + off + 48u;
+            float d = dq_read_f16(w_base, off + 52u);
+            uint y = 0u;
+            // First chunk: 32 bytes packing 160 trits.
+            for (uint n = 0u; n < 5u; ++n) {
+                for (uint m = 0u; m < 32u; ++m) {
+                    uchar q = uchar(uint(qs[m]) * uint(POW3[n]));
+                    int xi = int((uint(q) * 3u) >> 8u);
+                    dst[y++] = float(xi - 1) * d;
+                }
+            }
+            // Second chunk: 16 bytes packing 80 trits.
+            for (uint n = 0u; n < 5u; ++n) {
+                for (uint m = 0u; m < 16u; ++m) {
+                    uchar q = uchar(uint(qs[32u + m]) * uint(POW3[n]));
+                    int xi = int((uint(q) * 3u) >> 8u);
+                    dst[y++] = float(xi - 1) * d;
+                }
+            }
+            // qh: 4 bytes packing 16 trits.
+            for (uint n = 0u; n < 4u; ++n) {
+                for (uint j = 0u; j < 4u; ++j) {
+                    uchar q = uchar(uint(qh[j]) * uint(POW3[n]));
+                    int xi = int((uint(q) * 3u) >> 8u);
+                    dst[y++] = float(xi - 1) * d;
+                }
+            }
+            return;
+        }
+
+        if (scheme_id == 9u) {
+            // TQ2_0: qs[64] | d (f16). 4 trits per byte (low→high) but
+            // emission order is (j+m, slot l) → element index out_y.
+            uint off = gid * 66u;
+            device const uchar* qs = w_base + off;
+            float d = dq_read_f16(w_base, off + 64u);
+            uint y = 0u;
+            for (uint j = 0u; j < 64u; j += 32u) {
+                for (uint l = 0u; l < 4u; ++l) {
+                    for (uint m = 0u; m < 32u; ++m) {
+                        int q = int((qs[j + m] >> (l * 2u)) & 3u);
+                        dst[y++] = float(q - 1) * d;
+                    }
+                }
+            }
+            return;
+        }
+
+        if (scheme_id == 12u) {
+            // IQ2_XXS: f16 d | u16 qs[32] (= 64 bytes). 4 u16 per
+            // 32-elem sub-block; aux32[0] = 4 grid indices (u8),
+            // aux32[1] = 4 × 7-bit sign masks + 4-bit scale.
+            uint off = gid * 66u;
+            float d = dq_read_f16(w_base, off);
+            device const uchar* qs = w_base + off + 2u;
+            uint y = 0u;
+            for (uint ib32 = 0u; ib32 < 8u; ++ib32) {
+                uint base = 8u * ib32;
+                uint aux32_0 = uint(qs[base + 0u]) | (uint(qs[base + 1u]) << 8u)
+                             | (uint(qs[base + 2u]) << 16u) | (uint(qs[base + 3u]) << 24u);
+                uint aux32_1 = uint(qs[base + 4u]) | (uint(qs[base + 5u]) << 8u)
+                             | (uint(qs[base + 6u]) << 16u) | (uint(qs[base + 7u]) << 24u);
+                uchar a0 = uchar(aux32_0 & 0xFFu);
+                uchar a1 = uchar((aux32_0 >> 8) & 0xFFu);
+                uchar a2 = uchar((aux32_0 >> 16) & 0xFFu);
+                uchar a3 = uchar((aux32_0 >> 24) & 0xFFu);
+                float db = d * (0.5f + float(aux32_1 >> 28)) * 0.25f;
+                uchar grid_bytes[4] = { a0, a1, a2, a3 };
+                for (uint l = 0u; l < 4u; ++l) {
+                    uint grid_off = IQ_GRID_OFF_IQ2XXS + uint(grid_bytes[l]) * 8u;
+                    uchar signs = lut_u8(iq_lut, IQ_GRID_OFF_KSIGNS + ((aux32_1 >> (7u * l)) & 127u));
+                    for (uint j = 0u; j < 8u; ++j) {
+                        int gv = lut_i8(iq_lut, grid_off + j);
+                        uchar mask = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j);
+                        float s = (signs & mask) != 0u ? -1.0f : 1.0f;
+                        dst[y + j] = db * float(gv) * s;
+                    }
+                    y += 8u;
+                }
+            }
+            return;
+        }
+
+        if (scheme_id == 13u) {
+            // IQ2_XS: f16 d | u16 qs[32] | u8 scales[8] = 74 bytes.
+            uint off = gid * 74u;
+            float d = dq_read_f16(w_base, off);
+            device const uchar* qs = w_base + off + 2u;
+            device const uchar* scales = w_base + off + 2u + 64u;
+            uint y = 0u;
+            for (uint ib32 = 0u; ib32 < 8u; ++ib32) {
+                float db0 = d * (0.5f + float(scales[ib32] & 0xFu)) * 0.25f;
+                float db1 = d * (0.5f + float(scales[ib32] >> 4u)) * 0.25f;
+                for (uint l = 0u; l < 4u; ++l) {
+                    uint pos = (4u * ib32 + l) * 2u;
+                    uint q = uint(qs[pos]) | (uint(qs[pos + 1u]) << 8u);
+                    uint grid_off = IQ_GRID_OFF_IQ2XS + (q & 511u) * 8u;
+                    uchar signs = lut_u8(iq_lut, IQ_GRID_OFF_KSIGNS + (q >> 9));
+                    float dl = (l / 2u == 0u) ? db0 : db1;
+                    for (uint j = 0u; j < 8u; ++j) {
+                        int gv = lut_i8(iq_lut, grid_off + j);
+                        uchar mask = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j);
+                        float s = (signs & mask) != 0u ? -1.0f : 1.0f;
+                        dst[y + j] = dl * float(gv) * s;
+                    }
+                    y += 8u;
+                }
+            }
+            return;
+        }
+
+        if (scheme_id == 14u) {
+            // IQ2_S: f16 d | qs[64] | qh[8] | scales[8] = 82 bytes.
+            uint off = gid * 82u;
+            float d = dq_read_f16(w_base, off);
+            device const uchar* qs = w_base + off + 2u;
+            device const uchar* qh = w_base + off + 2u + 64u;
+            device const uchar* scales = w_base + off + 2u + 64u + 8u;
+            uint y = 0u;
+            uint qs_idx = 0u, signs_idx = 32u;
+            for (uint ib32 = 0u; ib32 < 8u; ++ib32) {
+                float db0 = d * (0.5f + float(scales[ib32] & 0xFu)) * 0.25f;
+                float db1 = d * (0.5f + float(scales[ib32] >> 4u)) * 0.25f;
+                for (uint l = 0u; l < 4u; ++l) {
+                    float dl = (l / 2u == 0u) ? db0 : db1;
+                    uint q = uint(qs[qs_idx + l]);
+                    uint qh_b = uint(qh[ib32]);
+                    uint idx = q | ((qh_b << (8u - 2u * l)) & 0x300u);
+                    uint grid_off = IQ_GRID_OFF_IQ2S + idx * 8u;
+                    uchar sign = qs[signs_idx + l];
+                    for (uint j = 0u; j < 8u; ++j) {
+                        int gv = lut_i8(iq_lut, grid_off + j);
+                        uchar mask = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j);
+                        float s = (sign & mask) != 0u ? -1.0f : 1.0f;
+                        dst[y + j] = dl * float(gv) * s;
+                    }
+                    y += 8u;
+                }
+                qs_idx += 4u; signs_idx += 4u;
+            }
+            return;
+        }
+
+        if (scheme_id == 15u) {
+            // IQ3_XXS: f16 d | qs[64] | scales_and_signs[32] = 98 bytes.
+            uint off = gid * 98u;
+            float d = dq_read_f16(w_base, off);
+            device const uchar* qs = w_base + off + 2u;
+            device const uchar* sas = w_base + off + 2u + 64u;
+            uint y = 0u, qs_idx = 0u;
+            for (uint ib32 = 0u; ib32 < 8u; ++ib32) {
+                uint aux32 = uint(sas[4u*ib32]) | (uint(sas[4u*ib32+1u]) << 8u)
+                           | (uint(sas[4u*ib32+2u]) << 16u) | (uint(sas[4u*ib32+3u]) << 24u);
+                float db = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+                for (uint l = 0u; l < 4u; ++l) {
+                    uchar signs = lut_u8(iq_lut, IQ_GRID_OFF_KSIGNS + ((aux32 >> (7u * l)) & 127u));
+                    uint g1_off = IQ_GRID_OFF_IQ3XXS + uint(qs[qs_idx + 2u * l]) * 4u;
+                    uint g2_off = IQ_GRID_OFF_IQ3XXS + uint(qs[qs_idx + 2u * l + 1u]) * 4u;
+                    for (uint j = 0u; j < 4u; ++j) {
+                        int g1 = lut_i8(iq_lut, g1_off + j);
+                        int g2 = lut_i8(iq_lut, g2_off + j);
+                        uchar m0 = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j);
+                        uchar m1 = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j + 4u);
+                        float s0 = (signs & m0) != 0u ? -1.0f : 1.0f;
+                        float s1 = (signs & m1) != 0u ? -1.0f : 1.0f;
+                        dst[y + j] = db * float(g1) * s0;
+                        dst[y + j + 4u] = db * float(g2) * s1;
+                    }
+                    y += 8u;
+                }
+                qs_idx += 8u;
+            }
+            return;
+        }
+
+        if (scheme_id == 16u) {
+            // IQ3_S: f16 d | qs[64] | qh[8] | signs[32] | scales[4] = 110 bytes.
+            uint off = gid * 110u;
+            float d = dq_read_f16(w_base, off);
+            device const uchar* qs = w_base + off + 2u;
+            device const uchar* qh = w_base + off + 2u + 64u;
+            device const uchar* signs = w_base + off + 2u + 64u + 8u;
+            device const uchar* scales = w_base + off + 2u + 64u + 8u + 32u;
+            uint y = 0u, qs_walk = 0u, signs_walk = 0u, qh_walk = 0u;
+            for (uint ib32 = 0u; ib32 < 8u; ib32 += 2u) {
+                float db1 = d * (1.0f + 2.0f * float(scales[ib32 / 2u] & 0xFu));
+                float db2 = d * (1.0f + 2.0f * float(scales[ib32 / 2u] >> 4u));
+                for (uint half_iter = 0u; half_iter < 2u; ++half_iter) {
+                    float dl = (half_iter == 0u) ? db1 : db2;
+                    uint qh_byte = uint(qh[qh_walk + half_iter]);
+                    for (uint l = 0u; l < 4u; ++l) {
+                        uint idx1 = uint(qs[qs_walk + 2u * l]) | (((qh_byte << (8u - 2u * l)) & 256u));
+                        uint idx2 = uint(qs[qs_walk + 2u * l + 1u]) | (((qh_byte << (7u - 2u * l)) & 256u));
+                        uint g1_off = IQ_GRID_OFF_IQ3S + idx1 * 4u;
+                        uint g2_off = IQ_GRID_OFF_IQ3S + idx2 * 4u;
+                        uchar sign = signs[signs_walk + l];
+                        for (uint j = 0u; j < 4u; ++j) {
+                            int g1 = lut_i8(iq_lut, g1_off + j);
+                            int g2 = lut_i8(iq_lut, g2_off + j);
+                            uchar m0 = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j);
+                            uchar m1 = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j + 4u);
+                            float s0 = (sign & m0) != 0u ? -1.0f : 1.0f;
+                            float s1 = (sign & m1) != 0u ? -1.0f : 1.0f;
+                            dst[y + j] = dl * float(g1) * s0;
+                            dst[y + j + 4u] = dl * float(g2) * s1;
+                        }
+                        y += 8u;
+                    }
+                    qs_walk += 8u; signs_walk += 4u;
+                }
+                qh_walk += 2u;
+            }
+            return;
+        }
+
+        if (scheme_id == 17u) {
+            // IQ1_S: f16 d | qs[32] | qh[16] (u16 × 8) = 50 bytes.
+            uint off = gid * 50u;
+            float d = dq_read_f16(w_base, off);
+            device const uchar* qs = w_base + off + 2u;
+            device const uchar* qh_bytes = w_base + off + 2u + 32u;
+            uint y = 0u, qs_idx = 0u;
+            for (uint ib = 0u; ib < 8u; ++ib) {
+                uint qh = uint(qh_bytes[2u * ib]) | (uint(qh_bytes[2u * ib + 1u]) << 8u);
+                float dl = d * (2.0f * float((qh >> 12) & 7u) + 1.0f);
+                float delta = (qh & 0x8000u) != 0u ? -0.125f : 0.125f;
+                for (uint l = 0u; l < 4u; ++l) {
+                    uint idx = uint(qs[qs_idx + l]) | (((qh >> (3u * l)) & 7u) << 8u);
+                    uint grid_off = IQ_GRID_OFF_IQ1S + idx * 8u;
+                    for (uint j = 0u; j < 8u; ++j) {
+                        int gv = lut_i8(iq_lut, grid_off + j);
+                        dst[y + j] = dl * (float(gv) + delta);
+                    }
+                    y += 8u;
+                }
+                qs_idx += 4u;
+            }
+            return;
+        }
+
+        if (scheme_id == 18u) {
+            // IQ1_M: qs[32] | qh[16] | scales[8] = 56 bytes (no leading d!).
+            uint off = gid * 56u;
+            device const uchar* qs = w_base + off;
+            device const uchar* qh = w_base + off + 32u;
+            device const uchar* scales_b = w_base + off + 48u;
+            // Reconstruct f16 scale from 4 packed nibbles.
+            uint sc0 = lut_u16(scales_b, 0u);
+            uint sc1 = lut_u16(scales_b, 2u);
+            uint sc2 = lut_u16(scales_b, 4u);
+            uint sc3 = lut_u16(scales_b, 6u);
+            uint sc_u16 = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0u)
+                        | ((sc2 >> 4) & 0x0F00u) | (sc3 & 0xF000u);
+            // Inline f16 decode.
+            uint sign = (sc_u16 >> 15) & 1u;
+            uint exp_v = (sc_u16 >> 10) & 0x1Fu;
+            uint mant = sc_u16 & 0x3FFu;
+            float d;
+            if (exp_v == 0u) d = float(mant) / 1024.0f * exp2(-14.0f);
+            else if (exp_v == 31u) d = (mant == 0u) ? INFINITY : 0.0f;
+            else d = (1.0f + float(mant) / 1024.0f) * exp2(float(int(exp_v) - 15));
+            if (sign != 0u) d = -d;
+            uint sc_arr[4] = { sc0, sc1, sc2, sc3 };
+            uint y = 0u, qs_walk = 0u, qh_walk = 0u;
+            for (uint ib = 0u; ib < 8u; ++ib) {
+                float dl1 = d * (2.0f * float((sc_arr[ib / 2u] >> (6u * (ib % 2u))) & 0x7u) + 1.0f);
+                float dl2 = d * (2.0f * float((sc_arr[ib / 2u] >> (6u * (ib % 2u) + 3u)) & 0x7u) + 1.0f);
+                uint idx[4];
+                idx[0] = uint(qs[qs_walk]) | ((uint(qh[qh_walk]) << 8) & 0x700u);
+                idx[1] = uint(qs[qs_walk + 1u]) | ((uint(qh[qh_walk]) << 4) & 0x700u);
+                idx[2] = uint(qs[qs_walk + 2u]) | ((uint(qh[qh_walk + 1u]) << 8) & 0x700u);
+                idx[3] = uint(qs[qs_walk + 3u]) | ((uint(qh[qh_walk + 1u]) << 4) & 0x700u);
+                float delta[4];
+                delta[0] = (qh[qh_walk] & 0x08u) != 0u ? -0.125f : 0.125f;
+                delta[1] = (qh[qh_walk] & 0x80u) != 0u ? -0.125f : 0.125f;
+                delta[2] = (qh[qh_walk + 1u] & 0x08u) != 0u ? -0.125f : 0.125f;
+                delta[3] = (qh[qh_walk + 1u] & 0x80u) != 0u ? -0.125f : 0.125f;
+                float dls[4] = { dl1, dl1, dl2, dl2 };
+                for (uint l = 0u; l < 4u; ++l) {
+                    uint grid_off = IQ_GRID_OFF_IQ1S + idx[l] * 8u;
+                    for (uint j = 0u; j < 8u; ++j) {
+                        int gv = lut_i8(iq_lut, grid_off + j);
+                        dst[y + j] = dls[l] * (float(gv) + delta[l]);
+                    }
+                    y += 8u;
+                }
+                qs_walk += 4u; qh_walk += 2u;
+            }
+            return;
+        }
+        return;
+    }
+
+    // ── 32-elem block schemes: IQ4_NL, MXFP4 ──────────────────────
+    if (scheme_id == 6u) {
+        // IQ4_NL: 18 bytes / 32 elements.
+        uint off = gid * 18u;
+        float d = dq_read_f16(w_base, off);
+        device const uchar* qs = w_base + off + 2u;
+        device float* dst = arena + dst_f32_off + gid * DQ_QK4_NL;
+        for (uint j = 0u; j < DQ_QK4_NL / 2u; ++j) {
+            uchar bx = qs[j];
+            dst[j] = d * float(kvalues_iq4nl_lut[bx & 0x0Fu]);
+            dst[j + DQ_QK4_NL / 2u] = d * float(kvalues_iq4nl_lut[bx >> 4]);
+        }
+        return;
+    }
+
+    if (scheme_id == 10u) {
+        // MXFP4: E8M0 scale + 16 nibbles = 17 bytes / 32 elements.
+        // FP4 E2M1 LUT inline (saves a table lookup).
+        const float FP4[16] = {
+            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+            -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+        };
+        uint off = gid * 17u;
+        uchar e = w_base[off];
+        float s;
+        if (e == 0xFFu) s = 0.0f;
+        else s = exp2(float(int(uint(e)) - 127));
+        device const uchar* qs = w_base + off + 1u;
+        device float* dst = arena + dst_f32_off + gid * DQ_QK_MXFP4;
+        for (uint j = 0u; j < DQ_QK_MXFP4 / 2u; ++j) {
+            uchar bx = qs[j];
+            dst[2u * j] = s * FP4[bx & 0x0Fu];
+            dst[2u * j + 1u] = s * FP4[bx >> 4];
+        }
+        return;
+    }
+
+    // ── 16-elem block schemes: NVFP4 ──────────────────────────────
+    if (scheme_id == 11u) {
+        // NVFP4: E4M3 scale + 8 nibbles = 9 bytes / 16 elements.
+        const float FP4[16] = {
+            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+            -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+        };
+        uint off = gid * 9u;
+        uchar e = w_base[off];
+        // Inline E4M3 decode.
+        float s;
+        uint sign_b = (uint(e) >> 7) & 1u;
+        uint exp_v = (uint(e) >> 3) & 0x0Fu;
+        uint mant = uint(e) & 0x7u;
+        if (exp_v == 0u) {
+            s = (mant == 0u) ? 0.0f : (float(mant) / 8.0f) * exp2(-6.0f);
+        } else if (exp_v == 0x0Fu && mant == 0x7u) {
+            s = 0.0f;
+        } else {
+            s = (1.0f + float(mant) / 8.0f) * exp2(float(int(exp_v) - 7));
+        }
+        if (sign_b != 0u) s = -s;
+        device const uchar* qs = w_base + off + 1u;
+        device float* dst = arena + dst_f32_off + gid * DQ_QK_NVFP4;
+        for (uint j = 0u; j < DQ_QK_NVFP4 / 2u; ++j) {
+            uchar bx = qs[j];
+            dst[2u * j] = s * FP4[bx & 0x0Fu];
+            dst[2u * j + 1u] = s * FP4[bx >> 4];
+        }
+        return;
+    }
+}
+
+// ── Fused Q4_K_M GEMV: dst[n] = sum_k x[k] * dequant(w[n,k]) ─────────────
+//
+// Skips the f32 dequant scratch entirely — each thread streams one
+// output column's worth of Q4K blocks through registers, multiplies by
+// the corresponding slice of x, and accumulates to a single float.
+//
+// Weight layout: row-major `[n_dim, k_dim]` Q4K, i.e. row `n` starts at
+// byte `w_off + n * (k_dim/256) * 144`. Activations `x[k_dim]` are f32
+// at `x_off`. Output `dst[n_dim]` is f32 at `dst_off`.
+//
+// Grid: one thread per output column (`n_dim` threads total). `k_dim`
+// must be a multiple of 256 — caller guarantees this for Q4K tensors.
+kernel void q4k_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+
+    const uint nblocks   = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 2u + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 2u; // 144
+
+    // u64 offsets — task #50: ≥4 GB models have activation/scratch byte
+    // offsets that exceed u32.
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+
+    float4 acc4 = float4(0.0f);
+    uint  x_idx = 0u;
+
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d    = dq_read_f16(w0, off);
+        float dmin = dq_read_f16(w0, off + 2u);
+        device const uchar* scales = w0 + off + 4u;
+        device const uchar* qs     = w0 + off + 4u + DQ_K_SCALE_SIZE;
+        uint is = 0u;
+        for (uint j = 0u; j < 8u; j += 2u) {
+            uint sc0, m0, sc1, m1;
+            dq_get_scale_min_k4(scales, j,      sc0, m0);
+            dq_get_scale_min_k4(scales, j + 1u, sc1, m1);
+            float d0  = d * float(sc0);
+            float m0f = dmin * float(m0);
+            float d1  = d * float(sc1);
+            float m1f = dmin * float(m1);
+            // Low nibble half: 32 elements (8 float4 chunks of 4 consecutive
+            // bytes; each byte's low nibble contributes one element). `qs`
+            // starts 16 bytes into the 144-byte block so is u32-aligned, and
+            // `is` increments in 32s — all `qs+is+l` are u32-aligned for
+            // l%4==0. x is dispatched from a 64-byte-aligned arena offset
+            // and x_idx steps by 4 → float4 reads are aligned.
+            for (uint l = 0u; l < 32u; l += 4u) {
+                uint q4 = *(device const uint*)(qs + is + l);
+                float4 ww;
+                ww.x = d0 * float(q4         & 0x0Fu) - m0f;
+                ww.y = d0 * float((q4 >>  8) & 0x0Fu) - m0f;
+                ww.z = d0 * float((q4 >> 16) & 0x0Fu) - m0f;
+                ww.w = d0 * float((q4 >> 24) & 0x0Fu) - m0f;
+                float4 xv = *(device const float4*)(x + x_idx);
+                acc4 += xv * ww;
+                x_idx += 4;
+            }
+            // High nibble half: same 32 bytes of `qs`, upper 4 bits each.
+            for (uint l = 0u; l < 32u; l += 4u) {
+                uint q4 = *(device const uint*)(qs + is + l);
+                float4 ww;
+                ww.x = d1 * float((q4 >>  4) & 0x0Fu) - m1f;
+                ww.y = d1 * float((q4 >> 12) & 0x0Fu) - m1f;
+                ww.z = d1 * float((q4 >> 20) & 0x0Fu) - m1f;
+                ww.w = d1 * float((q4 >> 28) & 0x0Fu) - m1f;
+                float4 xv = *(device const float4*)(x + x_idx);
+                acc4 += xv * ww;
+                x_idx += 4;
+            }
+            is += 32u;
+        }
+    }
+
+    dst[gid] = acc4.x + acc4.y + acc4.z + acc4.w;
+}
+
+// ── Simdgroup-cooperative Q4_K_M GEMV (8 outputs per simdgroup) ─────────
+//
+// Same math as `q4k_mv_f32` but 32 threads cooperate on 8 output columns
+// with `simd_sum` at the end. Each thread does 1/4 of the k blocks for
+// all 8 outputs in parallel, sharing x reads through register/cluster
+// cache instead of every thread re-reading the same x slice. Adapted
+// from llama.cpp's `kernel_mul_mv_q4_K_f32_impl`.
+//
+// Constraint: `n_dim % 8 == 0` (else fall back to `q4k_mv_f32`).
+//
+// Grid: one threadgroup per group-of-8 outputs. Threadgroup size = 32
+// (one simdgroup). `tgpig.x` = output-group index.
+constant uint Q4K_NR0 = 8u;
+constant uint Q4K_BLK_BYTES = 144u;
+constant uint Q4K_KSCALE_OFF = 4u;
+constant uint Q4K_QS_OFF     = 4u + 12u;
+
+kernel void q4k_mv_f32_sg(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint3 tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiisg                 [[thread_index_in_simdgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]]
+) {
+    const ushort kmask1 = 0x3f3fu;
+    const ushort kmask2 = 0x0f0fu;
+    const ushort kmask3 = 0xc0c0u;
+
+    const short ix = (short)(tiisg / 8u);  // 0..3 — block-stride
+    const short it = (short)(tiisg % 8u);  // 0..7 — partition
+    const short iq = it / 4;               // 0 or 1 — low/high half
+    const short ir = it % 4;               // 0..3 — 8-elem chunk
+
+    const uint nb = k_dim / DQ_QK_K;       // blocks per row
+
+    // Each simdgroup within the threadgroup handles its own group of 8
+    // outputs. NSG simdgroups per threadgroup → NSG*8 outputs per tg.
+    const uint NSG = 4u;
+    const uint first_row = (tgpig.x * NSG + sgitg) * Q4K_NR0;
+    if (first_row >= n_dim) return;
+
+    device const float* x_base = (device const float*)((device char*)arena + x_off);
+    device float*       dst    = (device float*)((device char*)arena + dst_off);
+    device const uchar* w_base = (device const uchar*)arena + w_off;
+
+    float yl[16];
+    float yh[16];
+    float sumf[Q4K_NR0] = {0.f};
+
+    // x slice for this thread: 16 floats from yl + 16 from yh covers
+    // 32 of 256 elements per block, picked by (iq, ir).
+    device const float* y4 = x_base + ix * DQ_QK_K + 64u * iq + 8u * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+
+    for (uint ib = ix; ib < nb; ib += 4u) {
+        float4 sumy = float4(0.f);
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+
+        for (ushort row = 0; row < Q4K_NR0; ++row) {
+            const uint row_idx = first_row + row;
+            if (row_idx >= n_dim) break;
+
+            // Block ib of row row_idx
+            device const uchar* blk = w_base
+                + (row_idx * nb + ib) * Q4K_BLK_BYTES;
+            const float d    = dq_read_f16(blk, 0u);
+            const float dmin = dq_read_f16(blk, 2u);
+
+            device const uint16_t* sc = (device const uint16_t*)(blk + Q4K_KSCALE_OFF) + iq;
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t* q1 = (device const uint16_t*)(blk + Q4K_QS_OFF)
+                                       + 16u * iq + 4u * ir;
+            device const uint16_t* q2 = q1 + 32u;
+
+            float4 acc1 = float4(0.f);
+            float4 acc2 = float4(0.f);
+
+            // Unrolled 4-iteration inner sum (matches llama's
+            // `FOR_UNROLL` over `i=0..3`).
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000Fu);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00u);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0u);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000u);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000Fu);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00u);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0u);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000u);
+            }
+
+            sumf[row] += d * ((acc1[0] + acc1[1] * (1.f/256.f)) * sc8[0] +
+                              (acc1[2] + acc1[3] * (1.f/256.f)) * sc8[1] * (1.f/16.f) +
+                              (acc2[0] + acc2[1] * (1.f/256.f)) * sc8[4] +
+                              (acc2[2] + acc2[3] * (1.f/256.f)) * sc8[5] * (1.f/16.f))
+                       - dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3]
+                               + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+
+        y4 += 4u * DQ_QK_K;
+    }
+
+    for (ushort row = 0; row < Q4K_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0u) {
+            dst[row_idx] = total;
+        }
+    }
+}

@@ -8,7 +8,7 @@
 | [benchmarks/higher-order-ad.md](benchmarks/higher-order-ad.md) | Higher-order autodiff benchmarks |
 | [benchmarks/mlx-linux.md](benchmarks/mlx-linux.md) | MLX on Linux/WSL: compile, CPU vs CUDA, vs `rlx-cpu` matmul benches |
 
-Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.7**).
+Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.8**).
 
 Related repo docs:
 
