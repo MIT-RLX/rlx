@@ -16,6 +16,7 @@
 // RLX — versatile ML compiler + runtime.
 // Row-wise online-softmax SDPA (matches rlx-wgpu attention.wgsl).
 // One thread per (batch, head, q_row); supports arbitrary Q/K/V strides.
+// Mask kinds: 0=None 1=Causal 2=Custom (binary) 3=SlidingWindow 4=Bias (additive)
 
 #define MAX_HEAD_DIM 128
 
@@ -63,6 +64,12 @@ extern "C" __global__ void attention_row(
     unsigned int h = q1 % heads;
     unsigned int b = q1 / heads;
 
+    // Absolute query position for causal / sliding-window masking. During
+    // incremental decode seq_q < seq_k (the query sits after the cached KV),
+    // so causality must compare against qi + (seq_k - seq_q), not the local
+    // qi. Prefill (seq_q == seq_k) leaves this as qi.
+    unsigned int q_pos = (seq_k >= seq_q) ? (qi + (seq_k - seq_q)) : qi;
+
     unsigned int mask_partial = mask_off
         + b * mask_batch_stride
         + h * mask_head_stride
@@ -99,12 +106,17 @@ extern "C" __global__ void attention_row(
         }
         score *= scale;
         if (mask_kind == 1) {
-            if (s > qi) score = -3.4e38f;
+            if (s > q_pos) score = -3.4e38f;
         } else if (mask_kind == 2) {
             if (arena[mask_partial + s * seq_k_stride] < 0.5f) score = -1e9f;
         } else if (mask_kind == 3) {
-            if (s > qi) score = -3.4e38f;
-            else if (qi - s > window) score = -3.4e38f;
+            if (s > q_pos) score = -3.4e38f;
+            else if (q_pos - s > window) score = -3.4e38f;
+        } else if (mask_kind == 4) {
+            // Additive bias mask (e.g. ALiBi / block-diagonal window bias):
+            // the mask carries additive values added to the score
+            // pre-softmax — NOT a 0/1 indicator.
+            score += arena[mask_partial + s * seq_k_stride];
         }
 
         float m_new = fmaxf(m, score);

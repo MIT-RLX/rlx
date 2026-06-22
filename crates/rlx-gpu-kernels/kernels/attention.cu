@@ -20,7 +20,7 @@
 // row_max/row_sum and rescales the running V accumulator on each tile.
 //
 // Q/K/V layout: [B, H, S, D] or [B, S, H, D] via per-axis strides.
-// Mask kinds: 0=None 1=Causal 2=Custom (binary) 3=SlidingWindow
+// Mask kinds: 0=None 1=Causal 2=Custom (binary) 3=SlidingWindow 4=Bias (additive)
 //
 // Block geometry:
 //   BR  = 16 query rows / block
@@ -104,6 +104,13 @@ extern "C" __global__ void attention(
     unsigned int qi = qi0 + q_lane;
     bool q_valid = qi < seq_q;
 
+    // Absolute query position for causal / sliding-window masking. During
+    // incremental decode seq_q < seq_k (the query sits after the cached KV),
+    // so causality must compare against qi + (seq_k - seq_q), not the local
+    // qi. Prefill (seq_q == seq_k) leaves this as qi. Guard the unsigned
+    // subtraction in case a caller passes seq_q > seq_k.
+    unsigned int q_pos = (seq_k >= seq_q) ? (qi + (seq_k - seq_q)) : qi;
+
     unsigned int h_idx = bh % heads;
     unsigned int b_idx = bh / heads;
     unsigned int q_base = q_off
@@ -178,12 +185,17 @@ extern "C" __global__ void attention(
                 }
                 dot *= scale;
                 if (mask_kind == 1) {
-                    if (s > qi) dot = -3.4e38f;
+                    if (s > q_pos) dot = -3.4e38f;
                 } else if (mask_kind == 2) {
                     if (arena[mask_partial + s * seq_k_stride] < 0.5f) dot = -1e9f;
                 } else if (mask_kind == 3) {
-                    if (s > qi) dot = -3.4e38f;
-                    else if (qi - s > window) dot = -3.4e38f;
+                    if (s > q_pos) dot = -3.4e38f;
+                    else if (q_pos - s > window) dot = -3.4e38f;
+                } else if (mask_kind == 4) {
+                    // Additive bias mask (e.g. ALiBi / block-diagonal window
+                    // bias): the mask carries additive values added to the
+                    // score pre-softmax — NOT a 0/1 indicator.
+                    dot += arena[mask_partial + s * seq_k_stride];
                 }
             } else {
                 dot = -3.4e38f;

@@ -954,8 +954,15 @@ impl<'a> LowerCtx<'a> {
         n_rot: usize,
         out_name: &str,
     ) -> Result<()> {
-        let node = self.graph.node(id);
-        let shape = node.shape.clone();
+        let (shape, in0, in1, in2) = {
+            let node = self.graph.node(id);
+            (
+                node.shape.clone(),
+                node.inputs[0],
+                node.inputs[1],
+                node.inputs[2],
+            )
+        };
         let rank = shape.rank();
         let last = match shape.dim(rank - 1) {
             Dim::Static(n) => n,
@@ -963,24 +970,64 @@ impl<'a> LowerCtx<'a> {
                 return Err(CoremlError::DynamicShape(format!("rope last dim ?{s}")));
             }
         };
-        if last != head_dim {
-            return Err(CoremlError::Unsupported(
-                "rope: only last-dim == head_dim layout (BHSD / [B,S,D])".into(),
-            ));
-        }
-        let rot_half = n_rot / 2;
-        let x = self.val(node.inputs[0]);
-        let cos = self.val(node.inputs[1]);
-        let sin = self.val(node.inputs[2]);
 
-        let half_shape = with_last(&shape, rot_half);
-        let rot_shape = with_last(&shape, n_rot);
+        let x = self.val(in0);
+        let cos = self.val(in1);
+        let sin = self.val(in2);
+
+        // Flexible layout: the rotation runs on a tensor whose LAST axis is
+        // exactly `head_dim`. When the last axis instead packs multiple heads
+        // (`[.., G*head_dim]`, the fused-QKV layout used by e.g. Qwen3-ASR),
+        // reshape to `[.., G, head_dim]`, rotate per head, then reshape back —
+        // cos/sin gain a singleton head axis so they broadcast over the heads.
+        // The `last == head_dim` path is byte-for-byte the original lowering.
+        let (eff_x, eff_shape, eff_cos, eff_sin, restore) = if last == head_dim {
+            (x, shape.clone(), cos, sin, None)
+        } else if head_dim != 0 && last % head_dim == 0 {
+            let groups = last / head_dim;
+            let mut gd = shape.dims().to_vec();
+            gd.pop();
+            gd.push(Dim::Static(groups));
+            gd.push(Dim::Static(head_dim));
+            let gshape = Shape::from_dims(&gd, DType::F32);
+            let xg = format!("{out_name}_xg");
+            self.emit(
+                "reshape",
+                &xg,
+                &gshape,
+                vec![
+                    ("x", bind_name(&x)),
+                    ("shape", bind_value(vec_i32(&dims_i32(&gd)))),
+                ],
+            )?;
+            let cos_g = self.rope_insert_head_axis(in1, &cos, &format!("{out_name}_cosg"))?;
+            let sin_g = self.rope_insert_head_axis(in2, &sin, &format!("{out_name}_sing"))?;
+            (xg, gshape, cos_g, sin_g, Some(shape.clone()))
+        } else {
+            return Err(CoremlError::Unsupported(format!(
+                "rope: last dim {last} is not a multiple of head_dim {head_dim} \
+                 (dims={:?}, n_rot={n_rot})",
+                shape.dims()
+            )));
+        };
+
+        let eff_rank = eff_shape.rank();
+        let rot_half = n_rot / 2;
+        let half_shape = with_last(&eff_shape, rot_half);
+        let rot_shape = with_last(&eff_shape, n_rot);
+
+        // Rotated result lands in `core` — the real output unless we worked on
+        // a per-head view, in which case it is reshaped back below.
+        let core = match restore {
+            Some(_) => format!("{out_name}_core"),
+            None => out_name.to_string(),
+        };
 
         // x1 = x[..0:rh], x2 = x[..rh:n_rot]
         let x1 = format!("{out_name}_x1");
         let x2 = format!("{out_name}_x2");
-        self.slice_last(&x, rank, 0, rot_half, &half_shape, &x1)?;
-        self.slice_last(&x, rank, rot_half, rot_half, &half_shape, &x2)?;
+        self.slice_last(&eff_x, eff_rank, 0, rot_half, &half_shape, &x1)?;
+        self.slice_last(&eff_x, eff_rank, rot_half, rot_half, &half_shape, &x2)?;
 
         // out1 = x1*cos - x2*sin ; out2 = x2*cos + x1*sin
         let (x1c, x2s, x2c, x1s) = (
@@ -993,25 +1040,25 @@ impl<'a> LowerCtx<'a> {
             "mul",
             &x1c,
             &half_shape,
-            vec![("x", bind_name(&x1)), ("y", bind_name(&cos))],
+            vec![("x", bind_name(&x1)), ("y", bind_name(&eff_cos))],
         )?;
         self.emit(
             "mul",
             &x2s,
             &half_shape,
-            vec![("x", bind_name(&x2)), ("y", bind_name(&sin))],
+            vec![("x", bind_name(&x2)), ("y", bind_name(&eff_sin))],
         )?;
         self.emit(
             "mul",
             &x2c,
             &half_shape,
-            vec![("x", bind_name(&x2)), ("y", bind_name(&cos))],
+            vec![("x", bind_name(&x2)), ("y", bind_name(&eff_cos))],
         )?;
         self.emit(
             "mul",
             &x1s,
             &half_shape,
-            vec![("x", bind_name(&x1)), ("y", bind_name(&sin))],
+            vec![("x", bind_name(&x1)), ("y", bind_name(&eff_sin))],
         )?;
         let out1 = format!("{out_name}_o1");
         let out2 = format!("{out_name}_o2");
@@ -1028,13 +1075,13 @@ impl<'a> LowerCtx<'a> {
             vec![("x", bind_name(&x2c)), ("y", bind_name(&x1s))],
         )?;
 
-        let axis = (rank - 1) as i32;
+        let axis = (eff_rank - 1) as i32;
         let pass_len = head_dim - n_rot;
         if pass_len == 0 {
             self.emit(
                 "concat",
-                out_name,
-                &shape,
+                &core,
+                &eff_shape,
                 vec![
                     ("values", bind_names(&[out1, out2])),
                     ("axis", bind_value(scalar_i32(axis))),
@@ -1054,12 +1101,12 @@ impl<'a> LowerCtx<'a> {
                 ],
             )?;
             let pass = format!("{out_name}_pass");
-            let pass_shape = with_last(&shape, pass_len);
-            self.slice_last(&x, rank, n_rot, pass_len, &pass_shape, &pass)?;
+            let pass_shape = with_last(&eff_shape, pass_len);
+            self.slice_last(&eff_x, eff_rank, n_rot, pass_len, &pass_shape, &pass)?;
             self.emit(
                 "concat",
-                out_name,
-                &shape,
+                &core,
+                &eff_shape,
                 vec![
                     ("values", bind_names(&[out_rot, pass])),
                     ("axis", bind_value(scalar_i32(axis))),
@@ -1067,42 +1114,242 @@ impl<'a> LowerCtx<'a> {
                 ],
             )?;
         }
+
+        // Per-head view → fold the head axis back into the last dim.
+        if let Some(orig) = restore {
+            self.emit(
+                "reshape",
+                out_name,
+                &orig,
+                vec![
+                    ("x", bind_name(&core)),
+                    ("shape", bind_value(vec_i32(&dims_i32(orig.dims())))),
+                ],
+            )?;
+        }
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
 
-    /// Scaled dot-product attention composed from MIL primitives.
-    /// Inputs `[q, k, v]` (+ `bias` for `MaskKind::Bias`), all `[B,H,S,D]`.
-    /// `scores = softmax((q·kᵀ)·scale [+ mask] [softcap]) · v`.
+    /// Reshape a rope cos/sin table to gain a singleton head axis just before
+    /// its last dim, so it broadcasts over the per-head groups when rope runs
+    /// on a fused `[.., G, head_dim]` view.
+    fn rope_insert_head_axis(&mut self, src: NodeId, val: &str, out: &str) -> Result<String> {
+        let mut d = self.graph.shape(src).dims().to_vec();
+        let pos = d.len().saturating_sub(1);
+        d.insert(pos, Dim::Static(1));
+        let ns = Shape::from_dims(&d, DType::F32);
+        self.emit(
+            "reshape",
+            out,
+            &ns,
+            vec![
+                ("x", bind_name(val)),
+                ("shape", bind_value(vec_i32(&dims_i32(&d)))),
+            ],
+        )?;
+        Ok(out.to_string())
+    }
+
+    /// Scaled dot-product attention. Inputs `[q,k,v]` (+ mask tensor for
+    /// `Bias`/`Custom`). The operand layout is **dispatched** on
+    /// `num_heads`/`head_dim` — different layouts need different kernels:
+    ///   * **split** — last axis == `head_dim` (`[..,S,D]`, any rank ≥ 2):
+    ///     the core runs directly (MIL `matmul` batches the leading B/H dims).
+    ///   * **fused** — last axis == `num_heads*head_dim` (`[B,S,H·D]`, the
+    ///     Qwen3 fused-QKV layout where heads are packed in the last axis):
+    ///     reshape+transpose q/k/v to canonical `[B,H,S,D]`, run the core,
+    ///     then transpose+reshape the result back to `[B,S,H·D]`.
     fn lower_attention(
         &mut self,
         id: NodeId,
-        _num_heads: usize,
+        num_heads: usize,
         head_dim: usize,
         mask_kind: MaskKind,
         score_scale: Option<f32>,
         softcap: Option<f32>,
         out_name: &str,
     ) -> Result<()> {
-        let node = self.graph.node(id);
-        let q_shape = node.shape.clone();
-        if q_shape.rank() != 4 {
+        let (out_shape, in0, in1, in2, mask_in) = {
+            let node = self.graph.node(id);
+            let mask_in = match mask_kind {
+                MaskKind::Bias | MaskKind::Custom => node.inputs.get(3).copied(),
+                _ => None,
+            };
+            (
+                node.shape.clone(),
+                node.inputs[0],
+                node.inputs[1],
+                node.inputs[2],
+                mask_in,
+            )
+        };
+        let rank = out_shape.rank();
+        if rank < 2 {
             return Err(CoremlError::Unsupported(
-                "attention: only rank-4 [B,H,S,D] layout".into(),
+                "attention: need rank >= 2 [..,S,D] layout".into(),
             ));
         }
-        let k_shape = self.graph.shape(node.inputs[1]).clone();
-        let s_q = dim_static(&q_shape, 2)?;
-        let s_k = dim_static(&k_shape, 2)?;
+        let last = dim_static(&out_shape, rank - 1)?;
+
+        // ── split layout: last axis is already `head_dim` ──
+        if last == head_dim {
+            let q = self.val(in0);
+            let k = self.val(in1);
+            let v = self.val(in2);
+            let k_shape = self.graph.shape(in1).clone();
+            self.attention_core(
+                &q,
+                &k,
+                &v,
+                &out_shape,
+                &k_shape,
+                head_dim,
+                mask_kind,
+                mask_in,
+                score_scale,
+                softcap,
+                out_name,
+            )?;
+            self.names.insert(id.0, out_name.to_string());
+            return Ok(());
+        }
+
+        // ── fused layout: [B,S,H·D] → canonical [B,H,S,D] → attend → fold ──
+        if num_heads > 0 && last == num_heads * head_dim && rank == 3 {
+            let b = dim_static(&out_shape, 0)?;
+            let s_q = dim_static(&out_shape, 1)?;
+            let qc =
+                self.fused_to_bhsd(in0, b, s_q, num_heads, head_dim, &format!("{out_name}_q"))?;
+            let (kc, s_k) = self.fused_to_bhsd_kv(in1, b, head_dim, &format!("{out_name}_k"))?;
+            let (vc, _) = self.fused_to_bhsd_kv(in2, b, head_dim, &format!("{out_name}_v"))?;
+            let kh = dim_static(&self.graph.shape(in1).clone(), 2)? / head_dim;
+            let q_canon = bhsd_shape(b, num_heads, s_q, head_dim);
+            let k_canon = bhsd_shape(b, kh, s_k, head_dim);
+            let core = format!("{out_name}_attn");
+            self.attention_core(
+                &qc,
+                &kc,
+                &vc,
+                &q_canon,
+                &k_canon,
+                head_dim,
+                mask_kind,
+                mask_in,
+                score_scale,
+                softcap,
+                &core,
+            )?;
+            // [B,H,Sq,D] → [B,Sq,H,D] → [B,Sq,H·D]
+            let t = format!("{out_name}_ot");
+            self.emit(
+                "transpose",
+                &t,
+                &bhsd_shape(b, s_q, num_heads, head_dim),
+                vec![
+                    ("x", bind_name(&core)),
+                    ("perm", bind_value(vec_i32(&[0, 2, 1, 3]))),
+                ],
+            )?;
+            self.emit(
+                "reshape",
+                out_name,
+                &out_shape,
+                vec![
+                    ("x", bind_name(&t)),
+                    ("shape", bind_value(vec_i32(&dims_i32(out_shape.dims())))),
+                ],
+            )?;
+            self.names.insert(id.0, out_name.to_string());
+            return Ok(());
+        }
+
+        Err(CoremlError::Unsupported(format!(
+            "attention: last dim {last} is neither head_dim {head_dim} nor \
+             num_heads*head_dim {} (rank {rank})",
+            num_heads * head_dim
+        )))
+    }
+
+    /// Reshape+transpose a fused `[B,S,H·D]` operand to canonical `[B,H,S,D]`.
+    fn fused_to_bhsd(
+        &mut self,
+        in_id: NodeId,
+        b: usize,
+        s: usize,
+        h: usize,
+        d: usize,
+        prefix: &str,
+    ) -> Result<String> {
+        let x = self.val(in_id);
+        let r = format!("{prefix}_r");
+        self.emit(
+            "reshape",
+            &r,
+            &bhsd_shape(b, s, h, d),
+            vec![
+                ("x", bind_name(&x)),
+                (
+                    "shape",
+                    bind_value(vec_i32(&[b as i32, s as i32, h as i32, d as i32])),
+                ),
+            ],
+        )?;
+        let t = format!("{prefix}_t");
+        self.emit(
+            "transpose",
+            &t,
+            &bhsd_shape(b, h, s, d),
+            vec![
+                ("x", bind_name(&r)),
+                ("perm", bind_value(vec_i32(&[0, 2, 1, 3]))),
+            ],
+        )?;
+        Ok(t)
+    }
+
+    /// [`Self::fused_to_bhsd`] deriving head count + seq from the operand shape
+    /// (key/value heads may be fewer than `num_heads` before `repeat_kv`).
+    fn fused_to_bhsd_kv(
+        &mut self,
+        in_id: NodeId,
+        b: usize,
+        d: usize,
+        prefix: &str,
+    ) -> Result<(String, usize)> {
+        let shape = self.graph.shape(in_id).clone();
+        let s = dim_static(&shape, 1)?;
+        let h = dim_static(&shape, 2)? / d;
+        Ok((self.fused_to_bhsd(in_id, b, s, h, d, prefix)?, s))
+    }
+
+    /// Canonical scaled-dot-product attention on `[..,Sq,D]` q/k/v. MIL
+    /// `matmul` batches leading dims and the masks broadcast, so one core
+    /// serves both the split and (pre-canonicalized) fused paths. Writes
+    /// `out_name` in `q_shape`; the caller registers the node name.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_core(
+        &mut self,
+        q: &str,
+        k: &str,
+        v: &str,
+        q_shape: &Shape,
+        k_shape: &Shape,
+        head_dim: usize,
+        mask_kind: MaskKind,
+        mask_in: Option<NodeId>,
+        score_scale: Option<f32>,
+        softcap: Option<f32>,
+        out_name: &str,
+    ) -> Result<()> {
+        let rank = q_shape.rank();
+        let s_q = dim_static(q_shape, rank - 2)?;
+        let s_k = dim_static(k_shape, k_shape.rank() - 2)?;
         let scores_shape = {
             let mut d = q_shape.dims().to_vec();
-            d[3] = Dim::Static(s_k); // [B,H,Sq,Sk]
+            d[rank - 1] = Dim::Static(s_k); // [..,Sq,Sk]
             Shape::from_dims(&d, DType::F32)
         };
-
-        let q = self.val(node.inputs[0]);
-        let k = self.val(node.inputs[1]);
-        let v = self.val(node.inputs[2]);
         let scale = score_scale.unwrap_or((head_dim as f32).powf(-0.5));
 
         // raw = q @ kᵀ  (transpose_y batches over [B,H])
@@ -1112,8 +1359,8 @@ impl<'a> LowerCtx<'a> {
             &raw,
             &scores_shape,
             vec![
-                ("x", bind_name(&q)),
-                ("y", bind_name(&k)),
+                ("x", bind_name(q)),
+                ("y", bind_name(k)),
                 ("transpose_x", bind_value(scalar_bool(false))),
                 ("transpose_y", bind_value(scalar_bool(true))),
             ],
@@ -1149,7 +1396,59 @@ impl<'a> LowerCtx<'a> {
                 cur = masked;
             }
             MaskKind::Bias => {
-                let bias = self.val(node.inputs[3]);
+                let bias = self.val(mask_in.ok_or_else(|| {
+                    CoremlError::Unsupported("attention Bias: missing mask input".into())
+                })?);
+                let masked = format!("{out_name}_msk");
+                self.emit(
+                    "add",
+                    &masked,
+                    &scores_shape,
+                    vec![("x", bind_name(&cur)), ("y", bind_name(&bias))],
+                )?;
+                cur = masked;
+            }
+            MaskKind::Custom => {
+                // Key-padding mask `[B, S_k]` (1.0 = keep, <0.5 = drop). Turn
+                // it into an additive bias (keep→0, drop→-1e9 via (m-1)*1e9)
+                // reshaped to `[B, 1, .., 1, S_k]` so it broadcasts over the
+                // score tensor's head/query axes. (Batch is carried at the
+                // front; per-utterance ASR uses B=1.)
+                let mid = mask_in.ok_or_else(|| {
+                    CoremlError::Unsupported("attention Custom: missing mask input".into())
+                })?;
+                let mask = self.val(mid);
+                let mask_shape = self.graph.shape(mid).clone();
+                let b = dim_static(&mask_shape, 0)?;
+                let sub1 = format!("{out_name}_mk_s");
+                self.emit(
+                    "sub",
+                    &sub1,
+                    &mask_shape,
+                    vec![("x", bind_name(&mask)), ("y", bind_value(scalar_f32(1.0)))],
+                )?;
+                let bias_flat = format!("{out_name}_mk_a");
+                self.emit(
+                    "mul",
+                    &bias_flat,
+                    &mask_shape,
+                    vec![("x", bind_name(&sub1)), ("y", bind_value(scalar_f32(1e9)))],
+                )?;
+                let mut bd = vec![Dim::Static(1); scores_shape.rank()];
+                bd[0] = Dim::Static(b);
+                let blast = scores_shape.rank() - 1;
+                bd[blast] = Dim::Static(s_k);
+                let bshape = Shape::from_dims(&bd, DType::F32);
+                let bias = format!("{out_name}_mk_b");
+                self.emit(
+                    "reshape",
+                    &bias,
+                    &bshape,
+                    vec![
+                        ("x", bind_name(&bias_flat)),
+                        ("shape", bind_value(vec_i32(&dims_i32(&bd)))),
+                    ],
+                )?;
                 let masked = format!("{out_name}_msk");
                 self.emit(
                     "add",
@@ -1201,19 +1500,18 @@ impl<'a> LowerCtx<'a> {
             vec![("x", bind_name(&cur)), ("axis", bind_value(scalar_i32(-1)))],
         )?;
 
-        // out = probs @ v  -> [B,H,Sq,D]
+        // out = probs @ v  -> [..,Sq,D]
         self.emit(
             "matmul",
             out_name,
-            &q_shape,
+            q_shape,
             vec![
                 ("x", bind_name(&probs)),
-                ("y", bind_name(&v)),
+                ("y", bind_name(v)),
                 ("transpose_x", bind_value(scalar_bool(false))),
                 ("transpose_y", bind_value(scalar_bool(false))),
             ],
         )?;
-        self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
 
@@ -1516,20 +1814,31 @@ impl<'a> LowerCtx<'a> {
         // (`[N,C,1,L]`, weight `[Co,Ci,k,1]`). CoreML's 2D conv would run the k-tap
         // kernel over the singleton H axis, so collapse to a real rank-3 1D conv over
         // the length (matching CPU/MLX/wgpu and onnxruntime).
+        // 1D conv packed as 2D NCHW with ONE singleton spatial axis and the
+        // length in the other — either `[N,C,1,L]` (length-in-W) or
+        // `[N,C,L,1]` (length-in-H, e.g. Whisper's conv frontend) — with
+        // weight `[Co,Ci,k,1]`. Collapse to a real rank-3 1D conv over the
+        // length (matches CPU/MLX/wgpu/onnxruntime); CoreML's 2D conv over a
+        // singleton/degenerate spatial axis is not reliable here.
+        let in_h = in_shape.dim(2).unwrap_static();
+        let in_w = in_shape.dim(3).unwrap_static();
         let one_d = !transpose
             && in_shape.rank() == 4
-            && in_shape.dim(2).unwrap_static() == 1
             && w_shape.rank() == 4
             && w_shape.dim(3).unwrap_static() == 1
-            && w_shape.dim(2).unwrap_static() > 1;
+            && w_shape.dim(2).unwrap_static() > 1
+            && (in_h == 1 || in_w == 1);
         if one_d {
             let n = in_shape.dim(0).unwrap_static() as i32;
             let c = in_shape.dim(1).unwrap_static() as i32;
-            let l = in_shape.dim(3).unwrap_static() as i32;
+            // length is the non-singleton input spatial axis
+            let l = if in_h == 1 { in_w } else { in_h } as i32;
             let co = w_shape.dim(0).unwrap_static() as i32;
             let ci = w_shape.dim(1).unwrap_static() as i32;
             let k = w_shape.dim(2).unwrap_static() as i32;
-            let lo = shape.dim(3).unwrap_static() as i32;
+            let out_h = shape.dim(2).unwrap_static();
+            let out_w = shape.dim(3).unwrap_static();
+            let lo = if out_h == 1 { out_w } else { out_h } as i32;
             let xr = format!("{out_name}_x1d");
             self.emit(
                 "reshape",

@@ -5,7 +5,79 @@ All notable changes to RLX. Format loosely follows
 tracks SemVer with the understanding that any `0.x → 0.(x+1)`
 bump may carry breaking changes per `0.x`-semver convention.
 
-## [Unreleased]
+## [0.2.9] — 2026-06-22
+
+### Performance
+
+- **`rlx_cpu::ms_deform_attn`** (the shared host-delegate behind the fused
+  `Op::Custom("gdino.ms_deform_attn")` on CPU/Metal/MLX/CUDA/WGPU) now routes its
+  value/offset/attention/output projections through `blas::sgemm_bt` instead of a
+  naive triple loop. The projections dominate at full token counts (~18k); the
+  GPU host-delegates were ~7× slower than the CPU backend (which already used
+  BLAS) purely from this. Grounding DINO MLX enhancer 8.8→1.0s, decoder 2.6→0.1s.
+- **`rlx_cpu::conv_fwd::conv2d_forward_nchw_f32`** rewritten as im2col +
+  `blas::sgemm` (groups/stride/pad/dilation preserved); replaces a naive 6-deep
+  loop. Benefits CNN-backbone models on CPU and the GPU conv host-delegates.
+  Validated by the existing conv fwd/bwd/1×1/q_conv2d tests.
+
+### Added
+
+- **`rlx-coreml` fused multi-head attention & RoPE layouts.** `lower_attention`
+  and the RoPE lowering now dispatch on operand layout: the original split
+  `[..,S,D]` / last-dim-==-`head_dim` path is byte-for-byte unchanged, and a new
+  fused `[B,S,H·D]` path (heads packed in the last axis, as in Qwen3 / Qwen3-ASR
+  fused-QKV) reshapes+transposes to canonical `[B,H,S,D]`, runs the shared
+  `attention_core`, and folds the result back. RoPE gains the same per-head view
+  (cos/sin broadcast over a singleton head axis). Expands the set of transformer
+  models lowerable to CoreML/ANE.
+
+### Fixed
+
+- **`rlx-wgpu` attention additive-bias mask.** `MaskKind::Bias` now lowers to its
+  own kernel path (mask kind `4`, `score += mask`) instead of being folded into
+  the binary key-padding path (kind `2`, `mask < 0.5 → -inf`). The two are not
+  interchangeable — an additive block-diagonal window bias (e.g. the encoder
+  winmask) was silently corrupted by the binary path.
+- **`rlx-wgpu` decode-step causal/sliding-window masking.** The attention kernel
+  now compares against the absolute query position `qi + (seq_k − seq_q)` rather
+  than the local `qi`, so causal and sliding-window masks are correct when
+  `seq_q == 1` during incremental decode (past KV precedes the query). Prefill
+  (`seq_q == seq_k`) is unaffected.
+- **`rlx-wgpu` matmul arena-window assertion** no longer spuriously panics for
+  models whose entire arena fits within `max_binding` (whole-arena bind reports
+  `param_anchor = false`, but the large param B is trivially in-window); the
+  assertion now keys on actual addressability.
+- **`rlx-cuda` / `rlx-rocm` attention kernels** (`attention.cu`,
+  `attention_row.cu` in `rlx-gpu-kernels`, shared by both backends) gained
+  parity with the Metal/WGPU fixes above: (1) an additive-bias path for
+  `MaskKind::Bias` (kernel mask kind `4`, `score += mask`) — the backends
+  already bound the bias tensor for kind `4` but the kernels had no branch for
+  it, so the bias was silently dropped (ALiBi / block-diagonal window bias);
+  (2) decode-step causal/sliding-window masking now compares against the
+  absolute query position `qi + (seq_k − seq_q)` instead of the local `qi`, so
+  causality is correct when `seq_q < seq_k` during incremental decode. Masking
+  logic validated by a host-C++ harness; **not yet verified on CUDA/ROCm
+  hardware** (no device available in this environment).
+- **`rlx-mlx` concurrent free/eval crash.** `Array::drop` freed its MLX handle
+  (`rlx_mlx_array_free`) without the runtime lock, so a result array freed on
+  one thread could race a guarded `eval()` on another and SIGSEGV (intermittent,
+  release + multi-threaded). The runtime lock is now reentrant (thread-local
+  depth over the existing mutex) and is held by `Array::drop`, `eval`,
+  `async_eval`, `synchronize`, and `clone_handle` — so cross-thread frees
+  serialize against in-flight eval, while intermediate drops inside a guarded
+  `run_*` on the same thread don't deadlock. Single-threaded inference (the hot
+  path) only pays a thread-id check.
+
+### Changed
+
+- **`rlx-metal` built-in custom-op kernels auto-register.** The bundled
+  host-delegate kernels (e.g. `ms_deform_attn`) register themselves on first
+  custom-op lookup — no explicit `register()` call or extra cargo feature
+  required. (`llada2_gate` stays consumer-registered to avoid double-registration.)
+- **`rlx-mlx` Lazy-fallback warning** now fires at most once per distinct reason
+  per process (was once per executable — models with many graphs sharing a
+  host-eval op flooded the log). `RLX_MLX_WARN_LAZY=all` restores per-executable
+  warnings. Logging-only; execution is unchanged.
 
 ## [0.2.8] — 2026-06
 
@@ -547,7 +619,8 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 Initial release. Tracked at [git history root].
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.8...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.9...HEAD
+[0.2.9]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.9
 [0.2.8]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.8
 [0.2.7]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.7
 [0.2.6]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.6

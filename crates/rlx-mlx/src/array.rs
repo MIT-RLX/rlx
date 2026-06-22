@@ -165,6 +165,7 @@ impl Array {
     /// owns its own wrapper so independent Drop is safe.
     pub fn clone_handle(&self) -> Result<Self, MlxError> {
         let mut out: *mut mlx_array_t = std::ptr::null_mut();
+        let _guard = crate::sync::runtime_guard();
         let rc = unsafe { ffi::rlx_mlx_array_clone(self.ptr, &mut out) };
         check(rc)?;
         Ok(Self { ptr: out })
@@ -174,6 +175,11 @@ impl Array {
 impl Drop for Array {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // Serialize against any in-flight eval on another thread —
+            // `rlx_mlx_array_free` mutates MLX's refcount/allocator state.
+            // Reentrant, so dropping intermediates inside a guarded `run_*`
+            // on this thread does not deadlock. See `crate::sync`.
+            let _guard = crate::sync::runtime_guard();
             unsafe { ffi::rlx_mlx_array_free(self.ptr) };
             self.ptr = ptr::null_mut();
         }
@@ -258,6 +264,7 @@ pub fn eval(arrays: &[&Array]) -> Result<(), MlxError> {
         return Ok(());
     }
     let handles: Vec<*mut mlx_array_t> = arrays.iter().map(|a| a.ptr).collect();
+    let _guard = crate::sync::runtime_guard();
     let rc = unsafe { ffi::rlx_mlx_eval(handles.as_ptr(), handles.len()) };
     check(rc)
 }
@@ -270,12 +277,14 @@ pub fn async_eval(arrays: &[&Array]) -> Result<(), MlxError> {
         return Ok(());
     }
     let handles: Vec<*mut mlx_array_t> = arrays.iter().map(|a| a.ptr).collect();
+    let _guard = crate::sync::runtime_guard();
     let rc = unsafe { ffi::rlx_mlx_async_eval(handles.as_ptr(), handles.len()) };
     check(rc)
 }
 
 /// Wait for every in-flight async eval on every MLX stream.
 pub fn synchronize() -> Result<(), MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let rc = unsafe { ffi::rlx_mlx_synchronize() };
     check(rc)
 }

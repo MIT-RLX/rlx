@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "pyrlx"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "numpy",
  "pyo3",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "rlx"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "rlx-bench",
@@ -2223,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-autodiff"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "half",
  "rlx",
@@ -2233,7 +2233,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bbo"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rand 0.8.6",
  "rand_distr",
@@ -2248,7 +2248,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bench"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rlx-driver",
  "rlx-fusion",
@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-compile"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rlx-autodiff",
  "rlx-fusion",
@@ -2269,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-coreml"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bytemuck",
  "cc",
@@ -2285,11 +2285,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-cortexm"
-version = "0.2.8"
+version = "0.2.9"
 
 [[package]]
 name = "rlx-cortexm-trainer"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rlx-autodiff",
  "rlx-cpu",
@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cpu"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "criterion",
  "gemm",
@@ -2314,7 +2314,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cuda"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bytemuck",
  "cc",
@@ -2330,7 +2330,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-driver"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "half",
  "rlx-ir",
@@ -2338,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fdm"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bytemuck",
  "rlx-autodiff",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-flow"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -2362,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fpga"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rlx-cortexm",
  "rlx-ir",
@@ -2372,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fusion"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -2381,7 +2381,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf-convert"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2405,11 +2405,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-kernels"
-version = "0.2.8"
+version = "0.2.9"
 
 [[package]]
 name = "rlx-ir"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -2418,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-linalg"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-macros"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-metal"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bytemuck",
  "core-graphics-types",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "half",
  "rlx-cpu",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-sys"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "cc",
  "cmake",
@@ -2476,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nemo"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "flate2",
@@ -2487,7 +2487,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-conformance"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "ort",
@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-import"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2531,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-opt"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -2541,14 +2541,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-optim"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "rlx-rl"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -2559,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-rocm"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "cc",
  "libloading 0.8.9",
@@ -2573,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-runtime"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "half",
@@ -2604,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-sparse"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tensor"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "ndarray 0.16.1",
  "rlx-autodiff",
@@ -2625,7 +2625,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-text"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "minijinja",
@@ -2638,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tpu"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "libloading 0.8.9",
  "prost",
@@ -2654,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-umap"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "crossbeam-channel",
  "ctrlc",
@@ -2679,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wgpu"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bytemuck",
  "half",

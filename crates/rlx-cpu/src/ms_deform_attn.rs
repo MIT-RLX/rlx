@@ -73,17 +73,21 @@ fn decode_attrs(bytes: &[u8]) -> Result<Attrs, String> {
 }
 
 /// `y[r,o] = sum_i x[r,i] * w[o,i] + b[o]` (PyTorch `[out, in]` weight).
+///
+/// The value/offset/attention/output projections dominate this kernel's cost
+/// (each is `rows·d·d`-ish, with `rows` = the full multi-scale token count, e.g.
+/// ~18k). A naive triple loop here made the GPU backends' host-delegate ~7×
+/// slower than the CPU backend (which uses BLAS), so route through the same
+/// `sgemm_bt` the rest of the codebase uses.
 fn linear(x: &[f32], rows: usize, in_dim: usize, w: &[f32], out_dim: usize, b: &[f32]) -> Vec<f32> {
     let mut out = vec![0f32; rows * out_dim];
-    for r in 0..rows {
-        for o in 0..out_dim {
-            let mut acc = if b.is_empty() { 0.0 } else { b[o] };
-            let xr = &x[r * in_dim..r * in_dim + in_dim];
-            let wo = &w[o * in_dim..o * in_dim + in_dim];
-            for i in 0..in_dim {
-                acc += xr[i] * wo[i];
+    crate::blas::sgemm_bt(x, w, &mut out, rows, in_dim, out_dim, 1.0);
+    if !b.is_empty() {
+        for r in 0..rows {
+            let row = &mut out[r * out_dim..(r + 1) * out_dim];
+            for (o, bv) in row.iter_mut().zip(b.iter()) {
+                *o += *bv;
             }
-            out[r * out_dim + o] = acc;
         }
     }
     out

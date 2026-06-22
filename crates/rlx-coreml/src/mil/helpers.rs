@@ -405,6 +405,29 @@ pub(super) fn scalar_bool(b: bool) -> proto::Value {
     immediate(t, value_type(&scalar_shape(DType::Bool)).unwrap())
 }
 
+/// Build a static rank-4 shape (used for canonical `[B,H,S,D]` attention).
+pub(super) fn bhsd_shape(a: usize, b: usize, c: usize, d: usize) -> Shape {
+    Shape::from_dims(
+        &[
+            Dim::Static(a),
+            Dim::Static(b),
+            Dim::Static(c),
+            Dim::Static(d),
+        ],
+        DType::F32,
+    )
+}
+
+/// Map shape dims to an i32 list for a MIL `reshape` target (`-1` for dynamic).
+pub(super) fn dims_i32(dims: &[Dim]) -> Vec<i32> {
+    dims.iter()
+        .map(|d| match d {
+            Dim::Static(n) => *n as i32,
+            Dim::Dynamic(_) => -1,
+        })
+        .collect()
+}
+
 pub(super) fn vec_i32(xs: &[i32]) -> proto::Value {
     let t = proto::TensorValue {
         value: Some(proto::tensor_value::Value::Ints(

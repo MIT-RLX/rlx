@@ -1606,8 +1606,16 @@ impl WgpuExecutable {
                         arena_ensure_scratch_in_window(&mut scratch, base, size);
                     }
                     if b_is_param && b_bytes > ARENA_STAGE_CAP {
+                        // The invariant we actually need is that the large param
+                        // B is addressable in the bound window. That holds either
+                        // via an explicit param anchor OR when the whole arena is
+                        // bound (`arena_whole_arena_bind`), in which case
+                        // `arena_matmul_bind_window` returns `param_anchor=false`
+                        // but B is trivially in `[0, arena.size)`. Keying the
+                        // assert on `param_anchor` alone spuriously panicked for
+                        // models whose entire arena fits `max_binding`.
                         assert!(
-                            param_anchor && arena_tensor_in_window(&arena, b_id, base, size),
+                            arena_tensor_in_window(&arena, b_id, base, size),
                             "rlx-wgpu matmul: large param B {:?} off={} not in window base={base} size={size}",
                             b_id,
                             arena.offset(b_id),
@@ -2955,7 +2963,13 @@ impl WgpuExecutable {
                     let (mask_kind_id, mask_buf, window) = match mask_kind {
                         MaskKind::None => (0u32, None, 0u32),
                         MaskKind::Causal => (1u32, None, 0u32),
-                        MaskKind::Custom | MaskKind::Bias => (2u32, None, 0u32),
+                        // 2 = binary key-padding mask (Custom: <0.5 → -inf);
+                        // 4 = additive bias mask (Bias: score += mask). These
+                        // are NOT interchangeable — the encoder's block-diagonal
+                        // winmask is additive, so folding it into the binary
+                        // path silently corrupts attention.
+                        MaskKind::Custom => (2u32, None, 0u32),
+                        MaskKind::Bias => (4u32, None, 0u32),
                         MaskKind::SlidingWindow(w) => (3u32, None, *w as u32),
                     };
 
@@ -2971,7 +2985,7 @@ impl WgpuExecutable {
                         q: u32,
                         k: u32,
                     }
-                    let mask_strides = if mask_kind_id == 2u32 {
+                    let mask_strides = if mask_kind_id == 2u32 || mask_kind_id == 4u32 {
                         let m_dims = graph.node(node.inputs[3]).shape.dims();
                         let dim = |i: usize| m_dims[i].unwrap_static() as u32;
                         match m_dims.len() {
