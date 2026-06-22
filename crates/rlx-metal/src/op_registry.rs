@@ -149,7 +149,21 @@ pub fn register_metal_kernel(k: Arc<dyn MetalKernel>) {
     global_metal_kernels().register(k);
 }
 
+/// Register rlx-metal's own built-in custom-op kernels exactly once. Run before
+/// every custom-op lookup so consumers get them on Metal automatically — no
+/// explicit `register()` call or extra cargo feature required (these kernels are
+/// host-delegates over unified memory, see each module).
+fn ensure_builtins_registered() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        crate::ms_deform_attn::register();
+        // NB: `llada2_gate` is registered by its consumer (rlx-llada2); do not
+        // auto-register it here or it double-registers.
+    });
+}
+
 pub fn lookup_metal_kernel(name: &str) -> Option<Arc<dyn MetalKernel>> {
+    ensure_builtins_registered();
     global_metal_kernels().lookup(name)
 }
 

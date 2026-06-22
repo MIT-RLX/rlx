@@ -29,9 +29,12 @@
 // numerically stable than the 3-pass "max then sum_exp then weighted sum".
 //
 // Inputs all live in the arena as [B, H, S, D] f32 tensors.
-// Mask layout (when mask_kind == 2):
-//   [B, H, S_q, S_k] additive — added to scores pre-softmax.
-// Caller is responsible for normalizing other shapes upstream.
+// Mask kinds:
+//   2 = binary key-padding mask (Custom): element < 0.5 → score = -1e9.
+//   4 = additive bias mask (Bias): score += mask element (e.g. a
+//       block-diagonal window bias carrying 0 / large-negative).
+// Both index the mask via the per-axis mask strides below. Caller is
+// responsible for normalizing other shapes upstream.
 //
 // `O` is held in a per-thread private array<f32, MAX_HEAD_DIM>. BERT-class
 // models all use head_dim ≤ 128, so this stays well within Apple-Metal's
@@ -51,7 +54,7 @@ struct Params {
 
     out_off: u32,
     mask_off: u32,
-    mask_kind: u32,    // 0=None, 1=Causal, 2=Array(custom), 3=SlidingWindow
+    mask_kind: u32,    // 0=None, 1=Causal, 2=Custom(binary), 3=SlidingWindow, 4=Bias(additive)
     scale_bits: u32,   // bitcast<f32>(1/sqrt(D))
     window: u32,       // SlidingWindow width (only used when mask_kind == 3)
     // MASK address strides. The kernel computes:
@@ -92,6 +95,11 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     let h  = q1 % params.heads;
     let b  = q1 / params.heads;
     let scale = bitcast<f32>(params.scale_bits);
+    // Absolute query position for causal/window masking. In a decode step
+    // seq_q=1 but the query sits at position seq_k-1 (past KV preceded it), so
+    // causality must compare against `qi + (seq_k - seq_q)`, not the local
+    // `qi`. Prefill (seq_q == seq_k) leaves this as `qi`.
+    let q_abs = qi + select(0u, params.seq_k - params.seq_q, params.seq_k >= params.seq_q);
 
     // Mask address uses generic per-axis strides. Each axis is folded
     // independently; setting head/q strides to 0 lets us read a
@@ -138,15 +146,20 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         }
         score = score * scale;
         if (params.mask_kind == 1u) {
-            if (s > qi) { score = -3.4e38; }
+            if (s > q_abs) { score = -3.4e38; }
         } else if (params.mask_kind == 2u) {
             // BERT-style binary multiplicative mask (1=valid, 0=padding).
             // Matches CPU/Metal: a position with mask < 0.5 → score driven
             // to -1e9. Hardcoded 0.5 keeps parity across backends.
             if (arena[mask_partial + s * params.seq_k_stride] < 0.5) { score = -1e9; }
         } else if (params.mask_kind == 3u) {
-            if (s > qi) { score = -3.4e38; }
-            else if (qi - s > params.window) { score = -3.4e38; }
+            if (s > q_abs) { score = -3.4e38; }
+            else if (q_abs - s > params.window) { score = -3.4e38; }
+        } else if (params.mask_kind == 4u) {
+            // Additive bias mask (e.g. block-diagonal window bias): the mask
+            // carries additive values (0 to attend, large-negative to drop)
+            // added to the score pre-softmax — NOT a 0/1 indicator.
+            score = score + arena[mask_partial + s * params.seq_k_stride];
         }
 
         // Online softmax update.

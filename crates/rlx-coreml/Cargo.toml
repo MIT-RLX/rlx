@@ -14,10 +14,10 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.8" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.8" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.9" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.9" }
 # Host-side GGUF dequant fallback for the off-path quant schemes.
-rlx-gguf = { path = "../rlx-gguf", version = "0.2.8" }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.9" }
 prost = "0.13"
 half = "2"
 bytemuck = { version = "1", features = ["derive"] }

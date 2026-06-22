@@ -221,11 +221,33 @@ impl MlxExecutable {
     }
 
     fn note_compile_disabled(&mut self, reason: String) {
+        // Warn at most once per distinct reason per process. Many models build
+        // several executables that share the same host-eval op (e.g. one deform
+        // module per encoder layer), so a per-executable warning floods the log
+        // with identical lines. The fallback itself is correctness-neutral —
+        // Lazy mode runs the host-eval op fine; it only forgoes compile-trace
+        // caching, which mainly benefits repeated-decode loops, not one-shot
+        // graphs. Set `RLX_MLX_WARN_LAZY=all` to restore per-executable warnings.
         if self.compile_disabled.is_none() {
-            eprintln!(
-                "rlx-mlx: falling back to MlxMode::Lazy — compile mode unsupported for this \
-                 graph: {reason}"
-            );
+            use std::collections::HashSet;
+            use std::sync::{Mutex, OnceLock};
+            static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+            let warn_all = std::env::var("RLX_MLX_WARN_LAZY")
+                .map(|v| v.eq_ignore_ascii_case("all"))
+                .unwrap_or(false);
+            let first = {
+                let mut seen = SEEN
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .unwrap();
+                seen.insert(reason.clone())
+            };
+            if warn_all || first {
+                eprintln!(
+                    "rlx-mlx: falling back to MlxMode::Lazy — compile mode unsupported for this \
+                     graph: {reason}"
+                );
+            }
         }
         self.compile_disabled = Some(reason);
     }
