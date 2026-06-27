@@ -25,7 +25,7 @@
 //! file keeps working — slow, but correct on hosts without OpenBLAS /
 //! Accelerate / MKL (e.g. CI containers, fresh Win dev boxes).
 
-#[cfg(feature = "blas")]
+#[cfg(all(feature = "blas", not(target_arch = "wasm32")))]
 unsafe extern "C" {
     fn cblas_sgemm(
         order: i32,
@@ -75,7 +75,7 @@ unsafe extern "C" {
     fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, incx: i32);
 }
 
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 #[inline]
 unsafe fn cblas_sgemm(
@@ -129,7 +129,7 @@ unsafe fn cblas_sgemm(
     }
 }
 
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 #[inline]
 unsafe fn cblas_sgemv(
@@ -167,7 +167,7 @@ unsafe fn cblas_sgemv(
     }
 }
 
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 #[inline]
 unsafe fn cblas_sger(
@@ -197,7 +197,7 @@ unsafe fn cblas_sger(
     }
 }
 
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[inline]
 unsafe fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, _incx: i32) {
     for i in 0..n as usize {
@@ -220,7 +220,7 @@ unsafe fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, _incx: i32) {
 // must transpose A in/out (or transpose b's leading-dim convention)
 // — see the `dgesv` wrapper below for the row-major adapter.
 
-#[cfg(feature = "blas")]
+#[cfg(all(feature = "blas", not(target_arch = "wasm32")))]
 unsafe extern "C" {
     fn cblas_dgemm(
         order: i32,
@@ -363,7 +363,7 @@ unsafe extern "C" {
     );
 }
 
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 #[inline]
 unsafe fn cblas_dgemm(
@@ -417,7 +417,7 @@ unsafe fn cblas_dgemm(
 /// Pure-Rust LU + solve fallback for builds without BLAS/LAPACK.
 /// Partial pivoting; column-major in/out to match LAPACK's ABI.
 /// Returns 0 on success, k+1 if U[k,k] is zero (singular).
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dgesv(
     n: *const i32,
@@ -512,7 +512,7 @@ unsafe fn lapack_dgesv(
 
 /// f32 twin of `lapack_dgesv` for no-blas builds. Same algorithm,
 /// f32 instead of f64.
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_sgesv(
     n: *const i32,
@@ -752,7 +752,7 @@ const CBLAS_UNIT: i32 = 132;
 // path; if someone explicitly invokes one of these wrappers without
 // the `blas` feature, the panic surfaces the missing dependency.
 
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dpotrf(_: *const i8, _: *const i32, _: *mut f64, _: *const i32, info: *mut i32) {
     unsafe {
@@ -760,7 +760,7 @@ unsafe fn lapack_dpotrf(_: *const i8, _: *const i32, _: *mut f64, _: *const i32,
     }
     panic!("rlx-cpu: dpotrf requires the `blas` feature (LAPACK)");
 }
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dsyevd(
     _: *const i8,
@@ -780,7 +780,7 @@ unsafe fn lapack_dsyevd(
     }
     panic!("rlx-cpu: dsyevd requires the `blas` feature (LAPACK)");
 }
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dgeqrf(
     _: *const i32,
@@ -797,7 +797,7 @@ unsafe fn lapack_dgeqrf(
     }
     panic!("rlx-cpu: dgeqrf requires the `blas` feature (LAPACK)");
 }
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dorgqr(
     _: *const i32,
@@ -815,7 +815,7 @@ unsafe fn lapack_dorgqr(
     }
     panic!("rlx-cpu: dorgqr requires the `blas` feature (LAPACK)");
 }
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dgesvd(
     _: *const i8,
@@ -838,7 +838,7 @@ unsafe fn lapack_dgesvd(
     }
     panic!("rlx-cpu: dgesvd requires the `blas` feature (LAPACK)");
 }
-#[cfg(not(feature = "blas"))]
+#[cfg(any(not(feature = "blas"), target_arch = "wasm32"))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn cblas_dtrsm(
     _: i32,

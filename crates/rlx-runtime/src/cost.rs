@@ -146,7 +146,7 @@ pub fn fastest_device_for_with_policy(
 
     #[cfg(feature = "cpu")]
     let cpu = CpuCostModel::new();
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
     let metal = MetalCostModel::new();
     #[cfg(all(feature = "mlx", rlx_mlx_host))]
     let mlx = MlxCostModel::new();
@@ -162,7 +162,7 @@ pub fn fastest_device_for_with_policy(
     if candidates.contains(&Device::Cpu) {
         models.push(&cpu);
     }
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
     if candidates.contains(&Device::Metal) {
         models.push(&metal);
     }
@@ -252,14 +252,14 @@ impl BackendCostModel for CpuCostModel {
 /// `BackendCostModel` impl backed by `rlx_metal::cost`. Reads from
 /// the on-disk calibration cache so the numbers reflect what this
 /// machine actually measured.
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
 pub struct MetalCostModel {
     sgemm_gflops_avg: f64,
     roundtrip_ns: f64,
     memory_bw: f64,
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
 impl MetalCostModel {
     pub fn new() -> Self {
         let cal = rlx_metal::calibrate::Calibration::load_or_measure();
@@ -280,14 +280,14 @@ impl MetalCostModel {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
 impl Default for MetalCostModel {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
 impl BackendCostModel for MetalCostModel {
     fn device(&self) -> Device {
         Device::Metal

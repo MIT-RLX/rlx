@@ -775,7 +775,11 @@ fn jvp_rule(
             ext.jvp(node, &mut ctx)
         }
 
-        Op::Rope { head_dim, n_rot } => {
+        Op::Rope {
+            head_dim,
+            n_rot,
+            style,
+        } => {
             let t_x = t_inputs[0]?;
             let cos = fwd_map[&node.inputs[1]];
             let sin = fwd_map[&node.inputs[2]];
@@ -785,6 +789,7 @@ fn jvp_rule(
                 Op::Rope {
                     head_dim: *head_dim,
                     n_rot: *n_rot,
+                    style: *style,
                 },
                 vec![t_x, cos, neg_sin],
                 node.shape.clone(),

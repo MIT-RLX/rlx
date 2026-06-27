@@ -26,17 +26,21 @@ Use `rlx_ir::Tick` for sub-ms timing in hot paths, not `Instant::now()`.
 ## pyrlx
 
 ```sh
-cd pyrlx
+cd crates/pyrlx
 python3 -m venv .venv && source .venv/bin/activate
-pip install maturin numpy pytest
-maturin develop --features cpu,metal   # add backends as needed
-pytest tests/test_graph_devices.py -q
+pip install maturin numpy pytest safetensors
+maturin develop --features cpu,gguf-convert,metal   # add backends as needed
+pytest tests/ -q
+# or: just test-pyrlx
 ```
 
-Backend feature matrix: [`pyrlx/docs/backends.md`](../pyrlx/docs/backends.md).
+Backend feature matrix: [`crates/pyrlx/docs/backends.md`](../crates/pyrlx/docs/backends.md).
 
-Python DSL (`graph` / `Node`, scalar literals): [`pyrlx/docs/dsl.md`](../pyrlx/docs/dsl.md).
-Runnable demo: `python pyrlx/examples/dsl_quickstart.py` (after `maturin develop` in `pyrlx/`).
+Python DSL (`graph` / `Node`, scalar literals): [`crates/pyrlx/docs/dsl.md`](../crates/pyrlx/docs/dsl.md).
+GGUF helpers: `quantize`, `load_gguf`, `convert_to_gguf` — see [`gguf-backend-paths.md`](gguf-backend-paths.md).
+Runnable demo: `python crates/pyrlx/examples/dsl_quickstart.py` (after `maturin develop`).
+
+Grouped MoE GGUF tests (multi-GPU backends): `just test-gguf-grouped`.
 
 ## Multi-backend runtime
 
@@ -81,7 +85,7 @@ cargo test -p rlx-fusion fk_
 cargo test -p rlx-compile --lib fusion_pipeline::tests
 cargo test -p rlx-tpu --test fk_pipeline --test hlo_match batch_elementwise
 cargo test -p rlx-metal --test mps_graph_batch_region_lower
-cd pyrlx && python3 -m pytest tests/test_fk_batch_native.py tests/test_fk_batch_primitive.py -q
+cd crates/pyrlx && python3 -m pytest tests/test_fk_batch_native.py tests/test_fk_batch_primitive.py -q
 ```
 
 Or `just test-fk` from the repo root.

@@ -52,8 +52,10 @@ pub const UNARY_WGSL: &str = include_str!("unary.wgsl");
 pub const UNARY_F16_MIRROR_WGSL: &str = include_str!("unary_f16_mirror.wgsl");
 pub const COMPARE_WGSL: &str = include_str!("compare.wgsl");
 pub const WHERE_WGSL: &str = include_str!("where.wgsl");
+pub const FMA_WGSL: &str = include_str!("fma.wgsl");
 pub const REDUCE_WGSL: &str = include_str!("reduce.wgsl");
 pub const SOFTMAX_WGSL: &str = include_str!("softmax.wgsl");
+pub const SOFTMAX_CROSS_ENTROPY_WGSL: &str = include_str!("softmax_cross_entropy.wgsl");
 pub const LAYERNORM_WGSL: &str = include_str!("layernorm.wgsl");
 pub const RMS_NORM_BWD_WGSL: &str = include_str!("rms_norm_backward.wgsl");
 pub const LAYER_NORM_BWD_WGSL: &str = include_str!("layer_norm_backward.wgsl");
@@ -68,6 +70,7 @@ pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
 pub const NARROW_WGSL: &str = include_str!("narrow.wgsl");
 pub const CONCAT_WGSL: &str = include_str!("concat.wgsl");
 pub const GATHER_WGSL: &str = include_str!("gather.wgsl");
+pub const GATHER_SPLIT_WGSL: &str = include_str!("gather_split.wgsl");
 pub const GATHER_AXIS_WGSL: &str = include_str!("gather_axis.wgsl");
 pub const ATTENTION_WGSL: &str = include_str!("attention.wgsl");
 pub const ATTENTION_BWD_WGSL: &str = include_str!("attention_bwd.wgsl");
@@ -87,7 +90,12 @@ pub const UMAP_KNN_WGSL: &str = include_str!("umap_knn.wgsl");
 pub const GROUPED_MATMUL_WGSL: &str = include_str!("grouped_matmul.wgsl");
 pub const SAMPLE_WGSL: &str = include_str!("sample.wgsl");
 pub const SELECTIVE_SCAN_WGSL: &str = include_str!("selective_scan.wgsl");
+pub const MAMBA2_WGSL: &str = include_str!("mamba2.wgsl");
+pub const GRU_WGSL: &str = include_str!("gru.wgsl");
+pub const RNN_WGSL: &str = include_str!("rnn.wgsl");
 pub const DEQUANT_MATMUL_WGSL: &str = include_str!("dequant_matmul.wgsl");
+pub const DEQUANT_GGUF_WGSL: &str = include_str!("dequant_gguf.wgsl");
+pub const DEQUANT_GEMV_GGUF_WGSL: &str = include_str!("dequant_gemv_gguf.wgsl");
 pub const FUSED_RESIDUAL_LN_WGSL: &str = include_str!("fused_residual_ln.wgsl");
 pub const FUSED_RESIDUAL_LN_TEE_WGSL: &str = include_str!("fused_residual_ln_tee.wgsl");
 pub const FUSED_RESIDUAL_RMS_NORM_WGSL: &str = include_str!("fused_residual_rms_norm.wgsl");
@@ -157,6 +165,20 @@ pub struct WhereParams {
     pub _p2: u32,
 }
 
+/// Layout for fma (3-input fused multiply-add). 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct FmaParams {
+    pub n: u32,
+    pub a_off: u32,
+    pub b_off: u32,
+    pub c_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+}
+
 /// Layout for reductions. 32 bytes.
 ///
 /// Supports arbitrary-axis reductions. The reduce kernel walks the
@@ -211,6 +233,20 @@ pub struct SoftmaxParams {
     pub _p1: u32,
     pub _p2: u32,
     pub _p3: u32,
+}
+
+/// Layout for the fused dense softmax cross-entropy. 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct SceParams {
+    pub outer: u32,
+    pub inner: u32,
+    pub logits_off: u32,
+    pub targets_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
 }
 
 /// Layout for LayerNorm / RmsNorm.
@@ -606,7 +642,10 @@ pub struct RopeParams {
     /// `seq_stride` is the compile-time-fixed full seq for stride.
     pub batch: u32,
     pub seq_stride: u32,
-    pub _p2: u32,
+    /// RoPE pairing flavor: `0` = NeoX rotate-half `(i, i+half)`, `1` = GPT-J /
+    /// llama.cpp-NORM interleaved adjacent pairs `(2i, 2i+1)`. GGUF Llama weights
+    /// are permuted for the GPT-J layout, so GGUF-backed decode needs `style=1`.
+    pub style: u32,
 }
 
 /// Layout for Expand. Mirrors TransposeParams (rank, total, offsets);
@@ -762,6 +801,31 @@ pub struct Conv1dParams {
     pub _p2: u32,
 }
 
+/// Layout for dequant_gguf. 16 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct DequantGgufParams {
+    pub w_byte_off: u32,
+    pub dst_f32_off: u32,
+    pub scheme_id: u32,
+    pub num_blocks: u32,
+}
+
+/// Layout for the fused GGUF K-quant GEMV (`dequant_gemv_gguf.wgsl`). 32 bytes.
+/// Offsets are relative to each kernel binding's windowed base.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct DequantGemvGgufParams {
+    pub k: u32,
+    pub n: u32,
+    pub scheme_id: u32,
+    pub x_f32_off: u32,
+    pub w_byte_off: u32,
+    pub out_f32_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+}
+
 /// Layout for DequantMatMul. 48 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -840,6 +904,72 @@ pub struct FusedResidualLnParams {
     pub has_bias: u32,
     pub _p0: u32,
     pub _p1: u32,
+}
+
+/// Layout for Mamba2 (SSD scan). 68→72 bytes padded to 16.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Mamba2Params {
+    pub batch: u32,
+    pub seq: u32,
+    pub heads: u32,
+    pub head_dim: u32,
+    pub state_size: u32,
+    pub x_off: u32,
+    pub dt_off: u32,
+    pub a_off: u32,
+    pub b_off: u32,
+    pub c_off: u32,
+    pub out_off: u32,
+    pub seq_stride: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+    pub _p3: u32,
+    pub _p4: u32,
+}
+
+/// Layout for GRU (native WGSL). 64 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GruParams {
+    pub batch: u32,
+    pub seq: u32,
+    pub input_size: u32,
+    pub hidden: u32,
+    pub x_off: u32,
+    pub wih_off: u32,
+    pub whh_off: u32,
+    pub bih_off: u32,
+    pub bhh_off: u32,
+    pub out_off: u32,
+    pub seq_stride: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+    pub _p3: u32,
+    pub _p4: u32,
+    pub _p5: u32,
+}
+
+/// Layout for Elman RNN (native WGSL). 68→padded. `relu` selects activation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct RnnParams {
+    pub batch: u32,
+    pub seq: u32,
+    pub input_size: u32,
+    pub hidden: u32,
+    pub x_off: u32,
+    pub wih_off: u32,
+    pub whh_off: u32,
+    pub bias_off: u32,
+    pub out_off: u32,
+    pub seq_stride: u32,
+    pub relu: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+    pub _p3: u32,
+    pub _p4: u32,
+    pub _p5: u32,
 }
 
 /// Layout for SelectiveScan. 64 bytes.
@@ -1157,6 +1287,75 @@ fn build_kernel_3(
     Kernel { pipeline, bgl }
 }
 
+/// 4-binding layout: storage(ro) + uniform + storage(ro) + storage(rw).
+/// For the GGUF GEMV: x (ro arena window) + params + weight (ro arena window) +
+/// out (rw separate buffer). The arena is bound read-only twice (allowed), and
+/// the single read-write binding is a distinct buffer — sidestepping wgpu's
+/// "STORAGE_READ_WRITE is exclusive" rule for same-buffer aliasing.
+fn build_kernel_ro_u_ro_rw(
+    device: &wgpu::Device,
+    label: &'static str,
+    wgsl: &str,
+    entry_point: &'static str,
+) -> Kernel {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let storage = |read_only: bool| wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: storage(true),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: storage(true),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: storage(false),
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        module: &module,
+        entry_point: Some(entry_point),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    Kernel { pipeline, bgl }
+}
+
 /// f16 shadow (rw) + uniform + f32 arena (rw) — `cast_f32_to_f16` only.
 /// Separate from `build_kernel_3`: cast reads f32 written by a prior unary in
 /// the same arena; other 3-binding kernels keep binding 2 read-only.
@@ -1426,8 +1625,10 @@ static UNARY: OnceLock<Kernel> = OnceLock::new();
 static UNARY_F16_MIRROR: OnceLock<Kernel> = OnceLock::new();
 static COMPARE: OnceLock<Kernel> = OnceLock::new();
 static WHEREK: OnceLock<Kernel> = OnceLock::new();
+static FMAK: OnceLock<Kernel> = OnceLock::new();
 static REDUCE: OnceLock<Kernel> = OnceLock::new();
 static SOFTMAX: OnceLock<Kernel> = OnceLock::new();
+static SOFTMAX_CROSS_ENTROPY: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD_PARAM: OnceLock<Kernel> = OnceLock::new();
@@ -1451,6 +1652,7 @@ static TRANSPOSE: OnceLock<Kernel> = OnceLock::new();
 static NARROW: OnceLock<Kernel> = OnceLock::new();
 static CONCAT: OnceLock<Kernel> = OnceLock::new();
 static GATHER: OnceLock<Kernel> = OnceLock::new();
+static GATHER_SPLIT: OnceLock<Kernel> = OnceLock::new();
 static GATHER_AXIS: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_BWD: OnceLock<Kernel> = OnceLock::new();
@@ -1470,7 +1672,13 @@ static UMAP_KNN: OnceLock<Kernel> = OnceLock::new();
 static GROUPED_MATMUL: OnceLock<Kernel> = OnceLock::new();
 static SAMPLE: OnceLock<Kernel> = OnceLock::new();
 static SELECTIVE_SCAN: OnceLock<Kernel> = OnceLock::new();
+static MAMBA2: OnceLock<Kernel> = OnceLock::new();
+static GRU: OnceLock<Kernel> = OnceLock::new();
+static RNN: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_MATMUL: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GGUF: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMV_GGUF: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_BT: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN_TEE: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_RMS_NORM: OnceLock<Kernel> = OnceLock::new();
@@ -1788,11 +1996,24 @@ pub fn compare_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn where_kernel(device: &wgpu::Device) -> &'static Kernel {
     WHEREK.get_or_init(|| build_kernel(device, "rlx-wgpu where", WHERE_WGSL, "where_select"))
 }
+pub fn fma_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FMAK.get_or_init(|| build_kernel(device, "rlx-wgpu fma", FMA_WGSL, "fma_main"))
+}
 pub fn reduce_kernel(device: &wgpu::Device) -> &'static Kernel {
     REDUCE.get_or_init(|| build_kernel(device, "rlx-wgpu reduce", REDUCE_WGSL, "reduce"))
 }
 pub fn softmax_kernel(device: &wgpu::Device) -> &'static Kernel {
     SOFTMAX.get_or_init(|| build_kernel(device, "rlx-wgpu softmax", SOFTMAX_WGSL, "softmax"))
+}
+pub fn softmax_cross_entropy_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SOFTMAX_CROSS_ENTROPY.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu softmax_cross_entropy",
+            SOFTMAX_CROSS_ENTROPY_WGSL,
+            "softmax_cross_entropy",
+        )
+    })
 }
 pub fn layernorm_kernel(device: &wgpu::Device) -> &'static Kernel {
     LAYERNORM.get_or_init(|| build_kernel(device, "rlx-wgpu layernorm", LAYERNORM_WGSL, "norm"))
@@ -2028,6 +2249,14 @@ pub fn concat_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn gather_kernel(device: &wgpu::Device) -> &'static Kernel {
     GATHER.get_or_init(|| build_kernel(device, "rlx-wgpu gather", GATHER_WGSL, "gather"))
 }
+/// Split-binding gather: table (ro) + uniform + idx (ro) + out (rw, separate
+/// buffer). For >4 GiB arenas where the embedding output lies outside the
+/// table's bind window. See [`build_kernel_ro_u_ro_rw`].
+pub fn gather_split_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GATHER_SPLIT.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(device, "rlx-wgpu gather_split", GATHER_SPLIT_WGSL, "gather")
+    })
+}
 pub fn gather_axis_kernel(device: &wgpu::Device) -> &'static Kernel {
     GATHER_AXIS.get_or_init(|| {
         build_kernel(
@@ -2128,6 +2357,15 @@ pub fn selective_scan_kernel(device: &wgpu::Device) -> &'static Kernel {
         )
     })
 }
+pub fn mamba2_kernel(device: &wgpu::Device) -> &'static Kernel {
+    MAMBA2.get_or_init(|| build_kernel(device, "rlx-wgpu mamba2", MAMBA2_WGSL, "mamba2"))
+}
+pub fn gru_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GRU.get_or_init(|| build_kernel(device, "rlx-wgpu gru", GRU_WGSL, "gru"))
+}
+pub fn rnn_kernel(device: &wgpu::Device) -> &'static Kernel {
+    RNN.get_or_init(|| build_kernel(device, "rlx-wgpu rnn", RNN_WGSL, "rnn"))
+}
 pub fn dequant_matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_MATMUL.get_or_init(|| {
         build_kernel(
@@ -2135,6 +2373,29 @@ pub fn dequant_matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu dequant_matmul",
             DEQUANT_MATMUL_WGSL,
             "dequant_matmul",
+        )
+    })
+}
+pub fn dequant_gguf_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GGUF.get_or_init(|| {
+        build_kernel_3(
+            device,
+            "rlx-wgpu dequant_gguf",
+            DEQUANT_GGUF_WGSL,
+            "dequant_gguf",
+        )
+    })
+}
+pub fn matmul_bt_kernel(device: &wgpu::Device) -> &'static Kernel {
+    MATMUL_BT.get_or_init(|| build_kernel(device, "rlx-wgpu matmul_bt", MATMUL_WGSL, "matmul_bt"))
+}
+pub fn dequant_gemv_gguf_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMV_GGUF.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemv_gguf",
+            DEQUANT_GEMV_GGUF_WGSL,
+            "dequant_gemv",
         )
     })
 }

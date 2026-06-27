@@ -117,6 +117,7 @@ fn op_kind(op: &Op) -> OpKind {
         | Op::DequantMoEWeights { .. }
         | Op::LoraMatMul { .. }
         | Op::DequantMatMul { .. }
+        | Op::ScaledMatMul { .. }
         | Op::QMatMul { .. }
         | Op::QConv2d { .. }
         | Op::Conv2dBackwardInput { .. }
@@ -136,6 +137,7 @@ fn op_kind(op: &Op) -> OpKind {
         | Op::Gru { .. }
         | Op::Rnn { .. }
         | Op::Mamba2 { .. }
+        | Op::SoftmaxCrossEntropy
         | Op::SoftmaxCrossEntropyWithLogits
         | Op::SoftmaxCrossEntropyBackward
         | Op::LayerNormBackwardInput { .. }
@@ -148,6 +150,9 @@ fn op_kind(op: &Op) -> OpKind {
         | Op::Where
         | Op::ElementwiseRegion { .. }
         | Op::Quantize { .. }
+        | Op::ScaledQuantize { .. }
+        | Op::ScaledQuantScale { .. }
+        | Op::ScaledDequantize { .. }
         | Op::Dequantize { .. }
         | Op::FakeQuantize { .. }
         | Op::FakeQuantizeBackward { .. }
@@ -316,6 +321,39 @@ impl Pass for AutoMixedPrecision {
         let mut cast_cache: HashMap<(NodeId, Precision), NodeId> = HashMap::new();
 
         for node in graph.nodes() {
+            // Native fp8 GEMM subgraph (from `scaled_quant_insert`): leave it
+            // intact. Its operands are U8 codes and its output is already f32 —
+            // relabeling the op's dtype or casting U8 inputs to f16 would
+            // corrupt it. Emit unchanged; if an f32 operand of a quantize op
+            // was lowered to f16 upstream, cast it back to f32 first.
+            if matches!(
+                node.op,
+                Op::ScaledMatMul { .. }
+                    | Op::ScaledQuantize { .. }
+                    | Op::ScaledQuantScale { .. }
+                    | Op::ScaledDequantize { .. }
+            ) {
+                let new_inputs: Vec<NodeId> = node
+                    .inputs
+                    .iter()
+                    .map(|&in_id| {
+                        let src = id_map[&in_id];
+                        let sd = new_graph.node(src).shape.dtype();
+                        if matches!(sd, DType::F16 | DType::BF16) {
+                            let shape = new_graph.node(src).shape.clone().with_dtype(DType::F32);
+                            new_graph.add_node(Op::Cast { to: DType::F32 }, vec![src], shape)
+                        } else {
+                            src
+                        }
+                    })
+                    .collect();
+                let new_id = new_graph.add_node(node.op.clone(), new_inputs, node.shape.clone());
+                id_map.insert(node.id, new_id);
+                // The matmul's output is f32; consumers cast it down as needed.
+                node_precision.insert(node.id, Precision::F32);
+                continue;
+            }
+
             let kind = op_kind(&node.op);
             let target = self.policy.precision_for(kind);
 

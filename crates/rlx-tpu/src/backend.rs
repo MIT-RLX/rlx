@@ -45,7 +45,7 @@ use crate::libtpu::{
     PJRT_PROGRAM_FORMAT_HLO, PJRT_Program, PjrtBuffer, PjrtLoadedExecutable, error_to_string,
     event_await,
 };
-use crate::lower::{HloModule, lower_graph_with_rng};
+use crate::lower::{HloModule, LowerParamBytes, lower_graph_with_rng_and_params};
 use crate::orchestrated::OrchestratedExecutable;
 use crate::segment;
 
@@ -75,6 +75,26 @@ enum ExecInner {
 // upstream C API.
 unsafe impl Send for TpuExecutable {}
 
+fn invalidate_param_upload(inner: &mut ExecInner) {
+    let ExecInner::Single {
+        param_buffers,
+        params_uploaded,
+        ..
+    } = inner
+    else {
+        return;
+    };
+    if let Some(ctx) = tpu_context() {
+        for buf in param_buffers.iter_mut() {
+            if !buf.is_null() {
+                destroy_buffer(ctx, *buf);
+                *buf = std::ptr::null_mut();
+            }
+        }
+    }
+    *params_uploaded = false;
+}
+
 impl TpuExecutable {
     /// Compile `graph` for the active TPU device.
     pub fn compile(graph: Graph) -> Self {
@@ -82,6 +102,18 @@ impl TpuExecutable {
     }
 
     pub fn compile_rng(graph: Graph, rng: rlx_ir::RngOptions) -> Self {
+        Self::compile_rng_with_param_bytes(graph, rng, None)
+    }
+
+    /// Compile with optional packed GGUF bytes for `Op::Param` weights used by `DequantMatMul`.
+    ///
+    /// When `param_bytes` is set, those weights are host-dequantized and baked into HLO
+    /// constants at compile time (same as `Op::Constant` weights).
+    pub fn compile_rng_with_param_bytes(
+        graph: Graph,
+        rng: rlx_ir::RngOptions,
+        param_bytes: Option<&LowerParamBytes>,
+    ) -> Self {
         let _ctx = tpu_context().unwrap_or_else(|| {
             panic!(
                 "rlx-tpu: no PJRT runtime available. \
@@ -101,17 +133,20 @@ impl TpuExecutable {
 
         if segment::needs_orchestration(&graph) {
             return Self {
-                inner: ExecInner::Orchestrated(OrchestratedExecutable::compile_rng(
-                    graph,
-                    rng,
-                    uses_xla_rng,
-                )),
+                inner: ExecInner::Orchestrated(
+                    OrchestratedExecutable::compile_rng_with_param_bytes(
+                        graph,
+                        rng,
+                        uses_xla_rng,
+                        param_bytes,
+                    ),
+                ),
                 uses_xla_rng: false,
                 rng_exec_warned: false,
             };
         }
 
-        let module = lower_graph_with_rng(&graph, rng);
+        let module = lower_graph_with_rng_and_params(&graph, rng, param_bytes);
 
         // Optional HLO dump for inspection. RLX_TPU_HLO_DUMP can be:
         //   * a directory  → write `<dir>/<graph_name>.pb`
@@ -176,6 +211,7 @@ impl TpuExecutable {
                 .to_vec();
                 params.insert(name.to_string(), bytes);
                 param_dtypes.insert(name.to_string(), DType::F32);
+                invalidate_param_upload(&mut self.inner);
             }
             ExecInner::Orchestrated(o) => o.set_param(name, data),
         }
@@ -185,12 +221,22 @@ impl TpuExecutable {
     pub fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: DType) {
         match &mut self.inner {
             ExecInner::Single {
+                module,
                 params,
                 param_dtypes,
                 ..
             } => {
+                if let Some((bytes, dt)) =
+                    crate::lower::gguf_param_bytes_from_u8(&module.gguf_deferred, name, data, dtype)
+                {
+                    params.insert(name.to_string(), bytes);
+                    param_dtypes.insert(name.to_string(), dt);
+                    invalidate_param_upload(&mut self.inner);
+                    return;
+                }
                 params.insert(name.to_string(), data.to_vec());
                 param_dtypes.insert(name.to_string(), dtype);
+                invalidate_param_upload(&mut self.inner);
             }
             ExecInner::Orchestrated(o) => o.set_param_typed(name, data, dtype),
         }
@@ -232,6 +278,9 @@ impl TpuExecutable {
                      set_param before run"
                     )
                 });
+                if !param_buffers[i].is_null() {
+                    destroy_buffer(ctx, param_buffers[i]);
+                }
                 param_buffers[i] = upload_buffer(ctx, bytes, dtype, &dims);
             }
             *params_uploaded = true;
@@ -368,6 +417,7 @@ impl TpuExecutable {
                             param_names: module.param_names.clone(),
                             param_dtypes: module.param_dtypes.clone(),
                             param_shapes: module.param_shapes.clone(),
+                            gguf_deferred: module.gguf_deferred.clone(),
                         },
                         params: params.clone(),
                         param_dtypes: param_dtypes.clone(),

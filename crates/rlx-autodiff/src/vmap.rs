@@ -1346,7 +1346,9 @@ fn vmap_op(
             )
         }
 
-        Op::SoftmaxCrossEntropyWithLogits | Op::SoftmaxCrossEntropyBackward => panic!(
+        Op::SoftmaxCrossEntropy
+        | Op::SoftmaxCrossEntropyWithLogits
+        | Op::SoftmaxCrossEntropyBackward => panic!(
             "vmap: SoftmaxCrossEntropy* expect 2-D logits; lifting to \
              3-D would need a kernel change. Workaround: reshape \
              logits to 2-D before the op and back after.",

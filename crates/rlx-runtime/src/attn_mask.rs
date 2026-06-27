@@ -45,3 +45,48 @@ pub fn bucket_decode_mask(past_seq: usize, upper: usize) -> Vec<f32> {
         })
         .collect()
 }
+
+/// Like [`bucket_decode_mask`] but for **sliding-window** attention: the
+/// current token (absolute position `past_seq`) attends only to cached keys in
+/// `[past_seq - window, past_seq]` — older real-past keys are masked out too,
+/// matching `MaskKind::SlidingWindow(window)` in prefill. `window == 0` or
+/// `window >= past_seq` reduces to the full causal [`bucket_decode_mask`].
+pub fn bucket_decode_mask_windowed(past_seq: usize, upper: usize, window: usize) -> Vec<f32> {
+    let lo = if window == 0 {
+        0
+    } else {
+        past_seq.saturating_sub(window)
+    };
+    (0..=upper)
+        .map(|i| {
+            let real_past_in_window = i >= lo && i < past_seq;
+            if real_past_in_window || i == upper {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windowed_mask_reduces_to_causal_when_wide() {
+        // window >= past_seq → identical to the full causal mask.
+        assert_eq!(
+            bucket_decode_mask_windowed(5, 8, 100),
+            bucket_decode_mask(5, 8)
+        );
+    }
+
+    #[test]
+    fn windowed_mask_drops_old_keys() {
+        // past_seq=5, window=2 → attend to keys [3,4] + the new token at upper.
+        let m = bucket_decode_mask_windowed(5, 6, 2);
+        assert_eq!(m, vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
+        //                  0    1    2    3    4   pad  new(=upper)
+    }
+}

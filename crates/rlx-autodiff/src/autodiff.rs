@@ -910,6 +910,25 @@ fn vjp(
             vec![(0, dlogits)]
         }
 
+        Op::SoftmaxCrossEntropy => {
+            // loss[n] = lse(logits[n]) - Σ_c targets[n,c]·logits[n,c].
+            // dlogits = (softmax(logits) - targets) * d_loss[n]
+            // dtargets = -logits * d_loss[n]
+            // Decomposed into primitives — `softmax` is a peak-perf kernel on
+            // every backend, so no dedicated dense-backward op is needed.
+            let logits_bwd = fwd_map[&node.inputs[0]];
+            let targets_bwd = fwd_map[&node.inputs[1]];
+            let logits_shape = bwd.node(logits_bwd).shape.clone();
+            // upstream is [N]; reshape to [N, 1] so it broadcasts over C.
+            let upstream_2d = bwd.reshape_(upstream, vec![-1, 1]);
+            let sm = bwd.softmax(logits_bwd, -1, logits_shape.clone());
+            let diff = bwd.sub(sm, targets_bwd);
+            let dlogits = bwd.mul(diff, upstream_2d);
+            let neg_logits = bwd.neg(logits_bwd);
+            let dtargets = bwd.mul(neg_logits, upstream_2d);
+            vec![(0, dlogits), (1, dtargets)]
+        }
+
         Op::Reduce {
             op: ReduceOp::Sum,
             axes,
@@ -1403,7 +1422,9 @@ fn vjp(
         //   forward:  out = x * cos + rotate(x) * sin
         //   reverse:  dx  = dy * cos + rotate(dy) * (-sin)
         //         =  rope(dy, cos, neg(sin))
-        Op::Rope { head_dim, n_rot } => {
+        Op::Rope {
+            head_dim, n_rot, ..
+        } => {
             let cos = fwd_map[&node.inputs[1]];
             let sin = fwd_map[&node.inputs[2]];
             let dx = bwd.rope_backward(upstream, cos, sin, *head_dim, *n_rot);
@@ -1630,6 +1651,78 @@ fn vjp(
         //
         // For full QAT with learnable scale/zp, replace the zero
         // gradients with the closed-form ∂y/∂scale / ∂y/∂zp.
+        // Native low-precision GEMM — straight-through QAT VJP. We rebuild the
+        // (quantized) f32 operands with `ScaledDequantize` and run the ordinary
+        // matmul backward; the gradient is routed to the U8 code inputs as if
+        // they were those f32 operands, and `ScaledQuantize`'s STE VJP forwards
+        // it to the original f32 source. TN forward: out[m,n] = lhs[m,k]·rhs[n,k]ᵀ
+        //   d_lhs = upstream @ rhs_recon          ([m,n]·[n,k] → [m,k])
+        //   d_rhs = upstreamᵀ @ lhs_recon         ([n,m]·[m,k] → [n,k])
+        Op::ScaledMatMul {
+            lhs_format,
+            rhs_format,
+            scale_layout,
+            has_bias,
+        } => {
+            let lhs_codes = fwd_map[&node.inputs[0]];
+            let rhs_codes = fwd_map[&node.inputs[1]];
+            let lhs_scale = fwd_map[&node.inputs[2]];
+            let rhs_scale = fwd_map[&node.inputs[3]];
+            let lhs_shape = bwd.node(lhs_codes).shape.clone();
+            let rhs_shape = bwd.node(rhs_codes).shape.clone();
+            let m = lhs_shape.dim(0);
+            let k = lhs_shape.dim(1);
+            let n = rhs_shape.dim(0);
+            let f32 = DType::F32;
+
+            let lhs_recon = bwd.add_node(
+                Op::ScaledDequantize {
+                    format: *lhs_format,
+                    scale_layout: *scale_layout,
+                },
+                vec![lhs_codes, lhs_scale],
+                Shape::from_dims(&[m, k], f32),
+            );
+            let rhs_recon = bwd.add_node(
+                Op::ScaledDequantize {
+                    format: *rhs_format,
+                    scale_layout: *scale_layout,
+                },
+                vec![rhs_codes, rhs_scale],
+                Shape::from_dims(&[n, k], f32),
+            );
+
+            let d_lhs = bwd.matmul(upstream, rhs_recon, Shape::from_dims(&[m, k], f32));
+            let up_t = bwd.add_node(
+                Op::Transpose { perm: vec![1, 0] },
+                vec![upstream],
+                Shape::from_dims(&[n, m], f32),
+            );
+            let d_rhs = bwd.matmul(up_t, lhs_recon, Shape::from_dims(&[n, k], f32));
+
+            let mut grads = vec![(0usize, d_lhs), (1usize, d_rhs)];
+            if *has_bias {
+                let d_bias = bwd.add_node(
+                    Op::Reduce {
+                        op: ReduceOp::Sum,
+                        axes: vec![0],
+                        keep_dim: false,
+                    },
+                    vec![upstream],
+                    Shape::from_dims(&[n], f32),
+                );
+                grads.push((4usize, d_bias));
+            }
+            grads
+        }
+
+        // Straight-through: quantize is identity for the gradient (the f32
+        // operand receives the cotangent of the codes); the scale is detached.
+        Op::ScaledQuantize { .. } => vec![(0, upstream)],
+
+        // The scale is a detached statistic (amax) — no gradient to its input.
+        Op::ScaledQuantScale { .. } => vec![],
+
         Op::DequantMatMul { scheme: _ } => {
             let x_bwd = fwd_map[&node.inputs[0]];
             let w_q_bwd = fwd_map[&node.inputs[1]];

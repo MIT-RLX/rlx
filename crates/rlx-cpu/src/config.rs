@@ -33,10 +33,12 @@ use std::sync::OnceLock;
 // ── Compile-time platform defaults ──────────────────────────────────────
 
 /// Cache line size — known at compile time per platform.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+/// Apple Silicon (Macs, iPhones/iPads, Apple TV/Watch, Vision Pro) uses
+/// 128-byte L1 lines.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 const PLATFORM_CACHE_LINE: usize = 128; // Apple Silicon: 128-byte L1 lines
 
-#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
 const PLATFORM_CACHE_LINE: usize = 64; // ARM servers (Graviton, Ampere): typically 64
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -45,10 +47,11 @@ const PLATFORM_CACHE_LINE: usize = 64; // x86_64: 64-byte cache lines
 /// Default parallel threshold — tuned per platform.
 /// Apple Silicon AMX handles BLAS internally; our par_for is for element-wise ops.
 /// Lower threshold = more parallelism for LayerNorm/GELU on small tensors.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+/// All Apple devices are Apple Silicon, so they share the macOS tuning.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 const PLATFORM_PAR_THRESHOLD: usize = 16_384; // Apple Silicon: AMX does BLAS, parallelize rest earlier
 
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
 const PLATFORM_PAR_THRESHOLD: usize = 30_000;
 
 // ── Runtime hardware detection ──────────────────────────────────────────
@@ -68,6 +71,9 @@ impl HwInfo {
             .map(|n| n.get())
             .unwrap_or(2);
 
+        // `info` is mutated only under per-OS cfg blocks below; on targets
+        // without one (e.g. wasm) it stays as-detected.
+        #[allow(unused_mut)]
         let mut info = HwInfo {
             total_cpus: total,
             perf_cores: 0,
@@ -76,7 +82,7 @@ impl HwInfo {
             cache_line: 0,
         };
 
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         {
             info.perf_cores = sysctl_usize("hw.perflevel0.physicalcpu").unwrap_or(0);
             info.l1d_cache = sysctl_usize("hw.l1dcachesize").unwrap_or(0);
@@ -142,7 +148,7 @@ impl HwInfo {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn sysctl_usize(name: &str) -> Option<usize> {
     use std::ffi::CString;
     let cname = CString::new(name).ok()?;
@@ -311,8 +317,8 @@ mod tests {
     fn hw_detection() {
         let hw = HwInfo::detect();
         assert!(hw.total_cpus >= 1);
-        // On macOS with sysctl, we should detect cache line
-        #[cfg(target_os = "macos")]
+        // On any Apple platform sysctl should report the cache line size
+        #[cfg(target_vendor = "apple")]
         assert!(
             hw.cache_line > 0,
             "expected sysctl to return cache line size"

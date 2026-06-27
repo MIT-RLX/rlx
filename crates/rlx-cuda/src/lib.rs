@@ -41,12 +41,15 @@
 pub mod arena;
 pub mod backend;
 pub mod calibrate;
+#[cfg(feature = "cufft")]
+pub mod cufft_dispatch;
 pub mod device;
 pub mod fft_dispatch;
 pub mod fft_host;
 pub mod gdn_host;
 pub mod gguf_gpu;
 pub mod gguf_host;
+pub mod host_misc;
 pub mod host_staging;
 pub mod im2col_host;
 pub mod iq_grid;
@@ -56,6 +59,8 @@ pub mod log_mel_backward_host;
 pub mod log_mel_host;
 pub mod lstm_host;
 pub mod ms_deform_attn_host;
+#[cfg(feature = "native-cuda-fft")]
+pub mod native_fft_dispatch;
 pub mod rng_host;
 pub mod sam_ops_host;
 pub mod splat_host;

@@ -24,7 +24,7 @@ use rlx_cortexm::model_weights as w;
 use rlx_cortexm::relu::relu_i8;
 
 #[test]
-#[ignore]
+#[ignore = "debug dump (prints logits), not an assertion; run with --ignored --nocapture"]
 fn dump_fc_logits() {
     let mut a = vec![0i8; SCRATCH_LEN];
     let mut b = vec![0i8; SCRATCH_LEN];

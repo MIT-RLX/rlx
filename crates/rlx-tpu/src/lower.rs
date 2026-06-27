@@ -29,8 +29,11 @@
 //! through `crate::unfuse` before lowering.
 //!
 //! Ops that have no clean HLO decomposition without large blowup
-//! (Sample, TopK, SelectiveScan, DequantMatMul, GroupedMatMul) panic
-//! with a clear message — they need follow-up tier work.
+//! (Sample, TopK, SelectiveScan) panic with a clear message.
+//!
+//! **GGUF `DequantMatMul`:** host-dequant at emit time → f32 constant →
+//! `dot_general` ([`lower_dequant_matmul_gguf`]). See
+//! [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md) (TPU section).
 
 use std::collections::HashMap;
 
@@ -59,13 +62,37 @@ pub struct HloModule {
     pub param_names: Vec<String>,
     pub param_dtypes: Vec<DType>,
     pub param_shapes: Vec<Vec<i64>>,
+    /// GGUF `DequantMatMul` weights supplied at runtime via `set_param_typed(U8)`.
+    pub gguf_deferred: HashMap<String, GgufDeferredParam>,
+}
+
+/// Runtime GGUF param: host-dequant to f32 before PJRT upload.
+#[derive(Clone, Debug)]
+pub struct GgufDeferredParam {
+    pub scheme: QuantScheme,
+    pub k: i64,
+    pub n: i64,
 }
 
 pub fn lower_graph(graph: &Graph) -> HloModule {
     lower_graph_with_rng(graph, rlx_ir::RngOptions::default())
 }
 
+/// Compile-time GGUF weight bytes keyed by `Op::Param` name.
+///
+/// When lowering `DequantMatMul` with a `Param` weight, TPU embeds host-dequantized
+/// f32 as HLO constants. Pass packed bytes here (mirrors CoreML `quant_bytes`).
+pub type LowerParamBytes = HashMap<String, Vec<u8>>;
+
 pub fn lower_graph_with_rng(graph: &Graph, rng: rlx_ir::RngOptions) -> HloModule {
+    lower_graph_with_rng_and_params(graph, rng, None)
+}
+
+pub fn lower_graph_with_rng_and_params(
+    graph: &Graph,
+    rng: rlx_ir::RngOptions,
+    param_bytes: Option<&LowerParamBytes>,
+) -> HloModule {
     let mut b = HloBuilder::new(&graph.name);
 
     // Reducer subcomputations cached by (opcode, prim_ty) so multiple
@@ -76,6 +103,7 @@ pub fn lower_graph_with_rng(graph: &Graph, rng: rlx_ir::RngOptions) -> HloModule
     let mut id_map: HashMap<NodeId, i64> = HashMap::new();
 
     let (inputs, params, others) = partition_nodes(graph);
+    let deferred = collect_gguf_deferred_params(graph, param_bytes);
 
     let mut input_names = Vec::new();
     let mut input_dtypes = Vec::new();
@@ -109,12 +137,16 @@ pub fn lower_graph_with_rng(graph: &Graph, rng: rlx_ir::RngOptions) -> HloModule
             Op::Param { name } => name.clone(),
             _ => unreachable!(),
         };
-        let dims = ir_dims(&n.shape);
-        let shape = Shape::array(prim_of(n.shape.dtype()), &dims);
+        let (dims, dtype) = if let Some(def) = deferred.get(&name) {
+            (vec![def.k, def.n], DType::F32)
+        } else {
+            (ir_dims(&n.shape), n.shape.dtype())
+        };
+        let shape = Shape::array(prim_of(dtype), &dims);
         let id = entry.parameter(next_param_base + i as i64, &name, shape.clone());
         id_map.insert(nid, id);
         param_names.push(name.clone());
-        param_dtypes.push(n.shape.dtype());
+        param_dtypes.push(dtype);
         param_shapes.push(dims);
         program_param_shapes.push(shape);
         program_param_names.push(name);
@@ -127,6 +159,7 @@ pub fn lower_graph_with_rng(graph: &Graph, rng: rlx_ir::RngOptions) -> HloModule
         reducers: &mut reducers,
         builder: &mut b,
         rng,
+        param_bytes,
     };
     for &nid in &others {
         let id = ctx.lower_node(nid);
@@ -188,7 +221,72 @@ pub fn lower_graph_with_rng(graph: &Graph, rng: rlx_ir::RngOptions) -> HloModule
         param_names,
         param_dtypes,
         param_shapes,
+        gguf_deferred: deferred,
     }
+}
+
+fn collect_gguf_deferred_params(
+    graph: &Graph,
+    param_bytes: Option<&LowerParamBytes>,
+) -> HashMap<String, GgufDeferredParam> {
+    use rlx_ir::Dim;
+    let mut out = HashMap::new();
+    for node in graph.nodes() {
+        let Op::DequantMatMul { scheme } = &node.op else {
+            continue;
+        };
+        if !scheme.is_gguf() {
+            continue;
+        }
+        let w_id = node.inputs[1];
+        let Op::Param { name } = &graph.node(w_id).op else {
+            continue;
+        };
+        if param_bytes.and_then(|m| m.get(name)).is_some() {
+            continue;
+        }
+        let x_dims = graph.node(node.inputs[0]).shape.dims();
+        let y_dims = node.shape.dims();
+        let k = match x_dims.last() {
+            Some(Dim::Static(k)) => *k as i64,
+            _ => panic!("rlx-tpu: GGUF deferred param requires static k on x input"),
+        };
+        let n = match y_dims.last() {
+            Some(Dim::Static(n)) => *n as i64,
+            _ => panic!("rlx-tpu: GGUF deferred param requires static n on output"),
+        };
+        out.insert(
+            name.clone(),
+            GgufDeferredParam {
+                scheme: *scheme,
+                k,
+                n,
+            },
+        );
+    }
+    out
+}
+
+/// Convert a runtime U8 GGUF upload into f32 bytes for PJRT when the HLO module
+/// was compiled with a deferred GGUF weight parameter.
+pub fn gguf_param_bytes_from_u8(
+    deferred: &HashMap<String, GgufDeferredParam>,
+    name: &str,
+    data: &[u8],
+    dtype: DType,
+) -> Option<(Vec<u8>, DType)> {
+    if dtype != DType::U8 {
+        return None;
+    }
+    let def = deferred.get(name)?;
+    let n_elems = (def.k * def.n) as usize;
+    let w_f32 = dequant_gguf_bytes(def.scheme, data, n_elems)
+        .unwrap_or_else(|e| panic!("rlx-tpu: GGUF runtime dequant for '{name}': {e}"));
+    let mut bytes = Vec::with_capacity(w_f32.len() * 4);
+    for v in &w_f32 {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    Some((bytes, DType::F32))
 }
 
 fn partition_nodes(graph: &Graph) -> (Vec<NodeId>, Vec<NodeId>, Vec<NodeId>) {
@@ -225,6 +323,7 @@ struct LowerCtx<'a> {
     reducers: &'a mut HashMap<(String, i32), Computation>,
     builder: &'a mut HloBuilder,
     rng: rlx_ir::RngOptions,
+    param_bytes: Option<&'a LowerParamBytes>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -247,6 +346,35 @@ impl<'a> LowerCtx<'a> {
 
     fn dtype(&self, nid: NodeId) -> DType {
         self.graph.node(nid).shape.dtype()
+    }
+
+    /// Packed GGUF bytes for a weight node used by `DequantMatMul` lowering.
+    /// Packed GGUF bytes for a weight node used by `DequantMatMul` lowering.
+    fn gguf_weight_is_deferred(&self, w_id: NodeId) -> bool {
+        match &self.graph.node(w_id).op {
+            Op::Param { name } => self.param_bytes.and_then(|m| m.get(name)).is_none(),
+            _ => false,
+        }
+    }
+
+    fn gguf_weight_bytes(&self, w_id: NodeId) -> Vec<u8> {
+        match &self.graph.node(w_id).op {
+            Op::Constant { data } => data.to_vec(),
+            Op::Param { name } => {
+                if let Some(map) = self.param_bytes {
+                    if let Some(bytes) = map.get(name) {
+                        return bytes.clone();
+                    }
+                }
+                panic!(
+                    "rlx-tpu: GGUF DequantMatMul weight '{name}' is a runtime Param without \
+                     compile-time bytes. Pass `LowerParamBytes` via \
+                     `lower_graph_with_rng_and_params` or \
+                     `TpuExecutable::compile_rng_with_param_bytes`."
+                );
+            }
+            other => panic!("rlx-tpu: GGUF weight node must be Constant/Param, got {other:?}"),
+        }
     }
 
     /// Get-or-create a binary-op reducer subcomputation.
@@ -546,13 +674,18 @@ impl<'a> LowerCtx<'a> {
                 attn_logit_softcap: _,
             } => self.lower_attention(&n.inputs, *num_heads, *head_dim, *mask_kind, out_shape),
 
-            Op::Rope { head_dim, n_rot: _ } => {
-                self.lower_rope(n.inputs[0], n.inputs[1], n.inputs[2], *head_dim, out_shape)
-            }
+            Op::Rope {
+                head_dim, n_rot: _, ..
+            } => self.lower_rope(n.inputs[0], n.inputs[1], n.inputs[2], *head_dim, out_shape),
 
             Op::Reshape { new_shape: _ } => {
                 let x = self.hlo(n.inputs[0]);
                 self.entry.reshape(x, out_shape)
+            }
+            Op::StopGradient => {
+                // Pure forward identity — XLA `stop_gradient` only affects AD,
+                // which has already run by lowering time. Alias the input HLO.
+                self.hlo(n.inputs[0])
             }
             Op::Transpose { perm } => {
                 let x = self.hlo(n.inputs[0]);
@@ -622,6 +755,10 @@ impl<'a> LowerCtx<'a> {
 
             Op::GroupedMatMul => {
                 self.lower_grouped_matmul(n.inputs[0], n.inputs[1], n.inputs[2], out_shape)
+            }
+
+            Op::DequantMatMul { scheme } if scheme.is_gguf() => {
+                self.lower_dequant_matmul_gguf(n.inputs[0], n.inputs[1], *scheme, out_shape)
             }
 
             Op::DequantMatMul { scheme } => self.lower_dequant_matmul(
@@ -712,6 +849,7 @@ impl<'a> LowerCtx<'a> {
             | Op::MaxPool2dBackward { .. }
             | Op::Conv2dBackwardInput { .. }
             | Op::Conv2dBackwardWeight { .. }
+            | Op::SoftmaxCrossEntropy
             | Op::SoftmaxCrossEntropyWithLogits
             | Op::SoftmaxCrossEntropyBackward
             | Op::LayerNormBackwardInput { .. }
@@ -2367,9 +2505,46 @@ impl<'a> LowerCtx<'a> {
 
     // ── DequantMatMul ────────────────────────────────────────────
     //
-    // Dequantize w_q on the fly, then dot. Per-block scale/zero-point
-    // broadcast from [K/block, N] to [K, N] via reshape→broadcast→
-    // reshape (the standard "tile rows" idiom in HLO).
+    // Non-GGUF: dequantize w_q in HLO (convert + per-block scale/zp tile) then dot.
+    //
+    // GGUF (`scheme.is_gguf()`): host-dequant at lowering time via
+    // `dequant_gguf_bytes`, embed as f32 Constant, `dot_general`. No on-device
+    // GGUF kernels on TPU — weights must be available when the HLO module is built
+    // (`Op::Constant`, or `Op::Param` with bytes in `LowerParamBytes`).
+
+    fn lower_dequant_matmul_gguf(
+        &mut self,
+        x_id: NodeId,
+        w_id: NodeId,
+        scheme: QuantScheme,
+        out: Shape,
+    ) -> i64 {
+        let x_dims = self.ir_shape_dims(x_id);
+        let k = *x_dims.last().expect("DequantMatMul x rank >= 1");
+        let n = *out.dimensions.last().expect("DequantMatMul out rank >= 1");
+        let w_hlo = if self.gguf_weight_is_deferred(w_id) {
+            self.hlo(w_id)
+        } else {
+            let n_elems = (k * n) as usize;
+            let bytes = self.gguf_weight_bytes(w_id);
+            let w_f32 = dequant_gguf_bytes(scheme, &bytes, n_elems)
+                .unwrap_or_else(|e| panic!("rlx-tpu: GGUF host dequant failed: {e}"));
+            let mut w_bytes = Vec::with_capacity(w_f32.len() * 4);
+            for v in &w_f32 {
+                w_bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            let kn_f32 = Shape::array(prim::F32, &[k, n]);
+            self.lower_constant(&w_bytes, kn_f32, DType::F32)
+        };
+        let x = self.hlo(x_id);
+        let dn = DotDimNumbers {
+            lhs_contracting: vec![1],
+            rhs_contracting: vec![0],
+            lhs_batch: vec![],
+            rhs_batch: vec![],
+        };
+        self.entry.dot_general(x, w_hlo, dn, out)
+    }
 
     fn lower_dequant_matmul(
         &mut self,
@@ -2393,7 +2568,11 @@ impl<'a> LowerCtx<'a> {
             | QuantScheme::Int4Block { block_size } => block_size as i64,
             // Fp8 schemes are per-tensor; treat as one-block-of-K.
             QuantScheme::Fp8E4m3 | QuantScheme::Fp8E5m2 => k,
-            QuantScheme::GgufQ4_0 | QuantScheme::GgufQ8_0 => panic!(
+            QuantScheme::GgufQ4_0
+            | QuantScheme::GgufQ8_0
+            | QuantScheme::GgufQ4_1
+            | QuantScheme::GgufQ5_0
+            | QuantScheme::GgufQ5_1 => panic!(
                 "rlx-tpu: GGUF / NVFP4 quant schemes have no HLO lowering — dequantize on CPU first."
             ),
             QuantScheme::GgufQ4K
@@ -3187,4 +3366,40 @@ impl<'a> LowerCtx<'a> {
             self.entry.convert(outs, out)
         }
     }
+}
+
+/// Host-side GGUF dequant dispatch for TPU lowering (all `Gguf*` schemes).
+///
+/// Used by [`LowerCtx::lower_dequant_matmul_gguf`] to bake f32 weights into HLO
+/// constants. Not invoked at PJRT runtime.
+fn dequant_gguf_bytes(scheme: QuantScheme, bytes: &[u8], n: usize) -> Result<Vec<f32>, String> {
+    use QuantScheme::*;
+    let r = match scheme {
+        GgufQ8_0 => rlx_gguf::dequant_q8_0(bytes, n),
+        GgufQ4_0 => rlx_gguf::dequant_q4_0(bytes, n),
+        GgufQ4_1 => rlx_gguf::dequant_q4_1(bytes, n),
+        GgufQ5_0 => rlx_gguf::dequant_q5_0(bytes, n),
+        GgufQ5_1 => rlx_gguf::dequant_q5_1(bytes, n),
+        GgufQ2K => rlx_gguf::dequant_q2_k(bytes, n),
+        GgufQ3K => rlx_gguf::dequant_q3_k(bytes, n),
+        GgufQ4K => rlx_gguf::dequant_q4_k(bytes, n),
+        GgufQ5K => rlx_gguf::dequant_q5_k(bytes, n),
+        GgufQ6K => rlx_gguf::dequant_q6_k(bytes, n),
+        GgufQ8K => rlx_gguf::dequant_q8_k(bytes, n),
+        GgufIQ4NL => rlx_gguf::iq_dequant::dequant_iq4_nl(bytes, n),
+        GgufIQ4XS => rlx_gguf::iq_dequant::dequant_iq4_xs(bytes, n),
+        GgufIQ2XXS => rlx_gguf::iq_dequant::dequant_iq2_xxs(bytes, n),
+        GgufIQ2XS => rlx_gguf::iq_dequant::dequant_iq2_xs(bytes, n),
+        GgufIQ2S => rlx_gguf::iq_dequant::dequant_iq2_s(bytes, n),
+        GgufIQ3XXS => rlx_gguf::iq_dequant::dequant_iq3_xxs(bytes, n),
+        GgufIQ3S => rlx_gguf::iq_dequant::dequant_iq3_s(bytes, n),
+        GgufIQ1S => rlx_gguf::iq_dequant::dequant_iq1_s(bytes, n),
+        GgufIQ1M => rlx_gguf::iq_dequant::dequant_iq1_m(bytes, n),
+        GgufTQ1_0 => rlx_gguf::tq_dequant::dequant_tq1_0(bytes, n),
+        GgufTQ2_0 => rlx_gguf::tq_dequant::dequant_tq2_0(bytes, n),
+        GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4(bytes, n),
+        GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(bytes, n),
+        other => return Err(format!("unsupported GGUF scheme {other:?}")),
+    };
+    r.map_err(|e| e.to_string())
 }

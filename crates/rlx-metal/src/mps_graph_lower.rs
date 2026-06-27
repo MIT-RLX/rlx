@@ -23,10 +23,15 @@
 //!   Input | Param | Constant | MatMul | FusedMatMulBiasAct |
 //!   Activation(Gelu/Silu/GeluApprox) | Binary(Add/Mul) | LayerNorm |
 //!   FusedResidualLN | Reshape | Transpose (2D swap + arbitrary perm) |
-//!   Cast | Gather | Narrow | Attention | Softmax | Reduce
+//!   Cast | Gather | Narrow | Attention | Softmax | SoftmaxCrossEntropy |
+//!   Reduce
+//!
+//! Conv2d (forward + data/weights gradients) and MaxPool2d (forward +
+//! gradient) lower to native MPSGraph primitives (NCHW/OIHW), so a full CNN
+//! training step — fwd, bwd, in-graph SGD — stays on one fused MPSGraph.
 //!
 //! Not yet supported (graph stays on thunks / hybrid):
-//!   Op::Rope, Op::FusedAttentionBlock, Conv2d, most higher-order ops
+//!   Op::Rope, Op::FusedAttentionBlock, avg-pool, most higher-order ops
 
 use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, TransformStep};
 use rlx_ir::{DType, Graph, Node, NodeId, Op, RegionPrologue};
@@ -68,6 +73,29 @@ fn dtype_to_mps(d: DType) -> Option<u32> {
         DType::F16 => Some(F16_DT),
         DType::I32 => Some(I32_DT),
         _ => None,
+    }
+}
+
+/// Mixed-precision wrapper for a 2-input compute op (`RLX_MPS_FP16`): cast both
+/// inputs to fp16, run `op` in half precision (Apple GPUs have ~2× fp16
+/// throughput), cast the result back to fp32. Leaves `node_to_tensor` in fp32 so
+/// everything downstream — bias add, loss, the in-graph SGD update — stays
+/// full-precision (compute-in-fp16, store-in-fp32; MPSGraph conv/matmul still
+/// accumulate in fp32 internally). When `fp16` is false this is the identity op.
+fn f16_compute2(
+    mg: &MpsGraph,
+    fp16: bool,
+    a: &MpsTensor,
+    b: &MpsTensor,
+    op: impl FnOnce(&MpsTensor, &MpsTensor) -> MpsTensor,
+) -> MpsTensor {
+    if fp16 {
+        let ah = mg.cast(a, F16_DT);
+        let bh = mg.cast(b, F16_DT);
+        let out = op(&ah, &bh);
+        mg.cast(&out, F32_DT)
+    } else {
+        op(a, b)
     }
 }
 
@@ -273,6 +301,9 @@ pub fn try_lower_with_constants(
     let mut params = Vec::new();
 
     let trace = rlx_ir::env::flag("RLX_MPSGRAPH_TRACE");
+    // Run conv/matmul (forward + gradients) in fp16, keeping storage/loss/SGD in
+    // fp32. Apple GPUs do fp16 conv ~2× faster; MNIST tolerates the precision.
+    let fp16 = rlx_ir::env::flag("RLX_MPS_FP16");
     for node in graph.nodes() {
         let dt = dtype_to_mps(node.shape.dtype())?;
         let dims = mps_shape_dims(graph, node.id)?;
@@ -315,7 +346,116 @@ pub fn try_lower_with_constants(
             Op::MatMul => {
                 let a = node_to_tensor.get(&node.inputs[0])?;
                 let b = node_to_tensor.get(&node.inputs[1])?;
-                mg.matmul(a, b)
+                f16_compute2(&mg, fp16, a, b, |a, b| mg.matmul(a, b))
+            }
+            // ── Conv / pool (NCHW) and their gradients ──
+            // MPSGraph has native primitives for all five; lowering them keeps
+            // the whole CNN training step on one fused graph instead of falling
+            // back to per-kernel thunks. `dims` is the node's output shape, which
+            // is exactly the `outputShape` the conv-gradient ops require.
+            Op::Conv {
+                kernel_size: _,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                if stride.len() != 2 || padding.len() != 2 || dilation.len() != 2 {
+                    return None;
+                }
+                let x = node_to_tensor.get(&node.inputs[0])?;
+                let w = node_to_tensor.get(&node.inputs[1])?;
+                let (s, p, d, g) = (
+                    (stride[0], stride[1]),
+                    (padding[0], padding[1]),
+                    (dilation[0], dilation[1]),
+                    *groups,
+                );
+                f16_compute2(&mg, fp16, x, w, |x, w| mg.conv2d_nchw(x, w, s, p, d, g))
+            }
+            Op::Pool {
+                kind,
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                if !matches!(kind, rlx_ir::op::ReduceOp::Max) {
+                    return None; // only max-pool has an MPSGraph gradient pairing here
+                }
+                if kernel_size.len() != 2 || stride.len() != 2 || padding.len() != 2 {
+                    return None;
+                }
+                let x = node_to_tensor.get(&node.inputs[0])?;
+                mg.maxpool2d(
+                    x,
+                    (kernel_size[0], kernel_size[1]),
+                    (stride[0], stride[1]),
+                    (padding[0], padding[1]),
+                )
+            }
+            Op::Conv2dBackwardInput {
+                kernel_size: _,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                if stride.len() != 2 || padding.len() != 2 || dilation.len() != 2 {
+                    return None;
+                }
+                let dy = node_to_tensor.get(&node.inputs[0])?;
+                let w = node_to_tensor.get(&node.inputs[1])?;
+                let (s, p, d, g) = (
+                    (stride[0], stride[1]),
+                    (padding[0], padding[1]),
+                    (dilation[0], dilation[1]),
+                    *groups,
+                );
+                f16_compute2(&mg, fp16, dy, w, |dy, w| {
+                    mg.conv2d_data_grad(dy, w, &dims, s, p, d, g)
+                })
+            }
+            Op::Conv2dBackwardWeight {
+                kernel_size: _,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                if stride.len() != 2 || padding.len() != 2 || dilation.len() != 2 {
+                    return None;
+                }
+                // RLX inputs are [x, dy]; MPSGraph wants (grad=dy, source=x).
+                let x = node_to_tensor.get(&node.inputs[0])?;
+                let dy = node_to_tensor.get(&node.inputs[1])?;
+                let (s, p, d, g) = (
+                    (stride[0], stride[1]),
+                    (padding[0], padding[1]),
+                    (dilation[0], dilation[1]),
+                    *groups,
+                );
+                f16_compute2(&mg, fp16, dy, x, |dy, x| {
+                    mg.conv2d_weights_grad(dy, x, &dims, s, p, d, g)
+                })
+            }
+            Op::MaxPool2dBackward {
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                if kernel_size.len() != 2 || stride.len() != 2 || padding.len() != 2 {
+                    return None;
+                }
+                // RLX inputs are [x, dy]; MPSGraph wants (grad=dy, source=x).
+                let x = node_to_tensor.get(&node.inputs[0])?;
+                let dy = node_to_tensor.get(&node.inputs[1])?;
+                mg.maxpool2d_grad(
+                    dy,
+                    x,
+                    (kernel_size[0], kernel_size[1]),
+                    (stride[0], stride[1]),
+                    (padding[0], padding[1]),
+                )
             }
             Op::FusedMatMulBiasAct { activation } => {
                 let a = node_to_tensor.get(&node.inputs[0])?;
@@ -432,6 +572,59 @@ pub fn try_lower_with_constants(
                 let rank = node.shape.rank() as i32;
                 let pos_axis = if *axis < 0 { rank + *axis } else { *axis };
                 mg.softmax(x, pos_axis)
+            }
+            Op::SoftmaxCrossEntropy => {
+                // Dense / soft-label cross-entropy: logits [N,C], targets
+                // [N,C] → loss [N].
+                //   loss = logsumexp(logits) - Σ_c targets[n,c]·logits[n,c]
+                // MPSGraph keeps dims after reduction, so the intermediates
+                // stay [N,1]; reshape the final [N,1] result to the IR's [N].
+                // Apple's graph optimizer fuses the max/exp/sum/log chain.
+                let logits = node_to_tensor.get(&node.inputs[0])?;
+                let targets = node_to_tensor.get(&node.inputs[1])?;
+                let m = mg.reduce_max(logits, &[1]);
+                let shifted = mg.sub(logits, &m);
+                let exp_d = mg.exp(&shifted);
+                let sum_exp = mg.reduce_sum(&exp_d, &[1]);
+                let log_sum = mg.log(&sum_exp);
+                let lse = mg.add(&m, &log_sum);
+                let prod = mg.mul(logits, targets);
+                let dot = mg.reduce_sum(&prod, &[1]);
+                let loss = mg.sub(&lse, &dot);
+                mg.reshape(&loss, &dims)
+            }
+            Op::SoftmaxCrossEntropyWithLogits => {
+                // Integer-label variant: logits [N,C], labels [N] → loss [N].
+                // Build a one-hot from the labels, then reuse the dense formula.
+                let logits = node_to_tensor.get(&node.inputs[0])?;
+                let labels = node_to_tensor.get(&node.inputs[1])?;
+                let c = mps_shape_dims(graph, node.inputs[0])?.get(1).copied()?;
+                let onehot = mg.one_hot(labels, c as u64, 1);
+                let m = mg.reduce_max(logits, &[1]);
+                let shifted = mg.sub(logits, &m);
+                let exp_d = mg.exp(&shifted);
+                let sum_exp = mg.reduce_sum(&exp_d, &[1]);
+                let log_sum = mg.log(&sum_exp);
+                let lse = mg.add(&m, &log_sum);
+                let prod = mg.mul(logits, &onehot);
+                let dot = mg.reduce_sum(&prod, &[1]);
+                let loss = mg.sub(&lse, &dot);
+                mg.reshape(&loss, &dims)
+            }
+            Op::SoftmaxCrossEntropyBackward => {
+                // dlogits[n,k] = (softmax(logits)[n,k] - onehot[n,k]) * d_loss[n].
+                // logits/dlogits [N,C], labels [N], d_loss [N].
+                let logits = node_to_tensor.get(&node.inputs[0])?;
+                let labels = node_to_tensor.get(&node.inputs[1])?;
+                let d_loss = node_to_tensor.get(&node.inputs[2])?;
+                let n = *dims.first()?;
+                let c = *dims.get(1)?;
+                let sm = mg.softmax(logits, 1);
+                let onehot = mg.one_hot(labels, c as u64, 1);
+                let diff = mg.sub(&sm, &onehot);
+                let dl = mg.reshape(d_loss, &[n, 1]); // broadcast over C
+                let out = mg.mul(&diff, &dl);
+                mg.reshape(&out, &dims)
             }
             Op::Transpose { perm } => {
                 let x = node_to_tensor.get(&node.inputs[0])?;
@@ -791,7 +984,9 @@ pub fn try_lower_with_constants(
                     }
                 }
             }
-            Op::Rope { head_dim, n_rot } => {
+            Op::Rope {
+                head_dim, n_rot, ..
+            } => {
                 let x = node_to_tensor.get(&node.inputs[0])?;
                 let cos_t = node_to_tensor.get(&node.inputs[1])?;
                 let sin_t = node_to_tensor.get(&node.inputs[2])?;

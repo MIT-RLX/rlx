@@ -137,6 +137,25 @@ pub trait GraphExt {
         head_dim: usize,
         n_rot: usize,
     ) -> NodeId;
+    /// RoPE with an explicit pairing flavor ([`crate::op::RopeStyle`]).
+    fn rope_styled(
+        &mut self,
+        x: NodeId,
+        cos: NodeId,
+        sin: NodeId,
+        head_dim: usize,
+        style: crate::op::RopeStyle,
+    ) -> NodeId;
+    /// Partial RoPE with an explicit pairing flavor.
+    fn rope_n_styled(
+        &mut self,
+        x: NodeId,
+        cos: NodeId,
+        sin: NodeId,
+        head_dim: usize,
+        n_rot: usize,
+        style: crate::op::RopeStyle,
+    ) -> NodeId;
 
     // ── Cast ────────────────────────────────────────────────
     fn cast(&mut self, x: NodeId, to: DType) -> NodeId;
@@ -379,12 +398,43 @@ impl GraphExt for Graph {
         head_dim: usize,
         n_rot: usize,
     ) -> NodeId {
+        self.rope_n_styled(x, cos, sin, head_dim, n_rot, crate::op::RopeStyle::NeoX)
+    }
+
+    fn rope_styled(
+        &mut self,
+        x: NodeId,
+        cos: NodeId,
+        sin: NodeId,
+        head_dim: usize,
+        style: crate::op::RopeStyle,
+    ) -> NodeId {
+        self.rope_n_styled(x, cos, sin, head_dim, head_dim, style)
+    }
+
+    fn rope_n_styled(
+        &mut self,
+        x: NodeId,
+        cos: NodeId,
+        sin: NodeId,
+        head_dim: usize,
+        n_rot: usize,
+        style: crate::op::RopeStyle,
+    ) -> NodeId {
         assert!(
             n_rot <= head_dim && n_rot.is_multiple_of(2),
             "rope_n: n_rot={n_rot} must be even and <= head_dim={head_dim}"
         );
         let s = shape::unary_shape(self.shape(x));
-        self.add_node(Op::Rope { head_dim, n_rot }, vec![x, cos, sin], s)
+        self.add_node(
+            Op::Rope {
+                head_dim,
+                n_rot,
+                style,
+            },
+            vec![x, cos, sin],
+            s,
+        )
     }
 
     fn cast(&mut self, x: NodeId, to: DType) -> NodeId {

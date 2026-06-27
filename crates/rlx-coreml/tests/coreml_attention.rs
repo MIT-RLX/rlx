@@ -76,6 +76,7 @@ fn rope_matches_reference() {
         Op::Rope {
             head_dim: D,
             n_rot: D,
+            style: rlx_ir::RopeStyle::NeoX,
         },
         vec![xi, ci, si],
         Shape::new(&[B, H, S, D], DType::F32),
@@ -286,6 +287,7 @@ fn attn_block() -> Graph {
             Op::Rope {
                 head_dim: D,
                 n_rot: D,
+                style: rlx_ir::RopeStyle::NeoX,
             },
             vec![t, cos, sin],
             Shape::new(&[B, H, S, D], DType::F32),

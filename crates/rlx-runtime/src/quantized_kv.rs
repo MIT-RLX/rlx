@@ -161,21 +161,32 @@ impl QuantizedKvLayer {
         Ok((k, v))
     }
 
+    /// Dequantize `count` rows starting at row `start` (K, V). Lets a caller
+    /// stream the cache a row (or small block) at a time — peak extra memory is
+    /// `count × kv_dim` floats, not the whole past.
+    pub fn read_rows(&self, start: usize, count: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        if start + count > self.past_len {
+            bail!(
+                "read_rows: [{start}, {}) out of range (past_len {})",
+                start + count,
+                self.past_len
+            );
+        }
+        let blk = self.scheme.block_elements();
+        let bytes_per_row = (self.kv_dim / blk) * self.scheme.block_bytes();
+        let start_byte = start * bytes_per_row;
+        let n = count * self.kv_dim;
+        let k = dequant_rows(&self.k[start_byte..], self.scheme, n)?;
+        let v = dequant_rows(&self.v[start_byte..], self.scheme, n)?;
+        Ok((k, v))
+    }
+
     /// Dequantize the last `window` rows (or all rows if past_len ≤ window).
     pub fn read_window(&self, window: usize) -> Result<(Vec<f32>, Vec<f32>)> {
         if window >= self.past_len {
             return self.read_all();
         }
-        // Window slicing needs byte-precise offsets because rows are quantized.
-        // Each block holds N elements; rows are aligned to (kv_dim / block).
-        let blk = self.scheme.block_elements();
-        let blocks_per_row = self.kv_dim / blk;
-        let bytes_per_row = blocks_per_row * self.scheme.block_bytes();
-        let start_byte = (self.past_len - window) * bytes_per_row;
-        let n = window * self.kv_dim;
-        let k = dequant_rows(&self.k[start_byte..], self.scheme, n)?;
-        let v = dequant_rows(&self.v[start_byte..], self.scheme, n)?;
-        Ok((k, v))
+        self.read_rows(self.past_len - window, window)
     }
 
     /// Drop the oldest `n_rows` from this layer (sliding window).
@@ -197,6 +208,90 @@ impl QuantizedKvLayer {
     pub fn bytes(&self) -> usize {
         self.k.len() + self.v.len()
     }
+}
+
+/// Single-query attention directly over a **quantized** K/V layer, dequantizing
+/// one row at a time so peak extra memory is `O(kv_dim)`, not `O(past_len ×
+/// kv_dim)` — the point of quantized-KV attention vs the dequantize-the-whole-
+/// cache path. GQA-aware: `n_heads` query heads share `kv_heads` K/V heads
+/// (`group = n_heads / kv_heads`).
+///
+/// - `q`: the new token's query, `[n_heads × head_dim]`.
+/// - returns the attention output `[n_heads × head_dim]`.
+///
+/// This is the host reference for a future first-class `QuantizedAttention` op;
+/// it lets long-context decode keep the cache small without ever materializing
+/// the full f32 history.
+pub fn attend_quantized(
+    q: &[f32],
+    layer: &QuantizedKvLayer,
+    n_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<Vec<f32>> {
+    let kv_dim = kv_heads * head_dim;
+    if layer.kv_dim != kv_dim {
+        bail!(
+            "attend_quantized: layer kv_dim {} != {kv_heads}×{head_dim}",
+            layer.kv_dim
+        );
+    }
+    if q.len() != n_heads * head_dim {
+        bail!(
+            "attend_quantized: q len {} != {n_heads}×{head_dim}",
+            q.len()
+        );
+    }
+    let mut out = vec![0f32; n_heads * head_dim];
+    let past = layer.past_len;
+    if past == 0 {
+        return Ok(out);
+    }
+    let group = (n_heads / kv_heads.max(1)).max(1);
+
+    // Pass 1: stream K row-by-row, accumulate per-head scores.
+    let mut scores = vec![0f32; n_heads * past];
+    for p in 0..past {
+        let (k_row, _) = layer.read_rows(p, 1)?;
+        for h in 0..n_heads {
+            let kvh = h / group;
+            let q_h = &q[h * head_dim..(h + 1) * head_dim];
+            let k_h = &k_row[kvh * head_dim..(kvh + 1) * head_dim];
+            let dot: f32 = q_h.iter().zip(k_h).map(|(a, b)| a * b).sum();
+            scores[h * past + p] = dot * scale;
+        }
+    }
+
+    // Softmax per head over the `past` keys (numerically stable).
+    for h in 0..n_heads {
+        let row = &mut scores[h * past..(h + 1) * past];
+        let max = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+        let mut sum = 0f32;
+        for v in row.iter_mut() {
+            *v = (*v - max).exp();
+            sum += *v;
+        }
+        let inv = 1.0 / sum.max(1e-20);
+        for v in row.iter_mut() {
+            *v *= inv;
+        }
+    }
+
+    // Pass 2: stream V row-by-row, accumulate weighted output.
+    for p in 0..past {
+        let (_, v_row) = layer.read_rows(p, 1)?;
+        for h in 0..n_heads {
+            let kvh = h / group;
+            let w = scores[h * past + p];
+            let v_h = &v_row[kvh * head_dim..(kvh + 1) * head_dim];
+            let o_h = &mut out[h * head_dim..(h + 1) * head_dim];
+            for (o, &vv) in o_h.iter_mut().zip(v_h) {
+                *o += w * vv;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// All layers of a quantized KV cache.
@@ -719,6 +814,65 @@ mod tests {
         assert!(QuantizedKvLayer::new(24, KvQuant::Q4_0).is_err());
         // f16 has block 1 so any dim works.
         assert!(QuantizedKvLayer::new(24, KvQuant::F16).is_ok());
+    }
+
+    #[test]
+    fn streaming_quantized_attention_matches_full_dequant() {
+        let (n_heads, kv_heads, head_dim) = (4usize, 2usize, 32usize);
+        let kv_dim = kv_heads * head_dim; // 64 — multiple of 32 for Q8_0
+        let past = 5usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mut layer = QuantizedKvLayer::new(kv_dim, KvQuant::Q8_0).unwrap();
+        for p in 0..past {
+            let k: Vec<f32> = (0..kv_dim)
+                .map(|i| ((i + p * 7) as f32 * 0.05).sin())
+                .collect();
+            let v: Vec<f32> = (0..kv_dim)
+                .map(|i| ((i + p * 3) as f32 * 0.04).cos())
+                .collect();
+            layer.append_rows(&k, &v).unwrap();
+        }
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| (i as f32 * 0.02).sin())
+            .collect();
+
+        let out = attend_quantized(&q, &layer, n_heads, kv_heads, head_dim, scale).unwrap();
+
+        // Reference: dequantize the whole cache, run standard attention.
+        let (k_all, v_all) = layer.read_all().unwrap();
+        let group = n_heads / kv_heads;
+        let mut reference = vec![0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let kvh = h / group;
+            let mut sc = vec![0f32; past];
+            for p in 0..past {
+                let qh = &q[h * head_dim..(h + 1) * head_dim];
+                let base = p * kv_dim + kvh * head_dim;
+                let kh = &k_all[base..base + head_dim];
+                let dot: f32 = qh.iter().zip(kh).map(|(a, b)| a * b).sum();
+                sc[p] = dot * scale;
+            }
+            let max = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0;
+            for x in sc.iter_mut() {
+                *x = (*x - max).exp();
+                sum += *x;
+            }
+            for x in sc.iter_mut() {
+                *x /= sum;
+            }
+            for p in 0..past {
+                let base = p * kv_dim + kvh * head_dim;
+                let vh = &v_all[base..base + head_dim];
+                for d in 0..head_dim {
+                    reference[h * head_dim + d] += sc[p] * vh[d];
+                }
+            }
+        }
+        for (a, b) in out.iter().zip(&reference) {
+            assert!((a - b).abs() < 1e-4, "streaming {a} vs full-dequant {b}");
+        }
     }
 
     #[test]

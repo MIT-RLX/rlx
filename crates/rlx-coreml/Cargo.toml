@@ -13,14 +13,25 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 
+[features]
+default = []
+# On-device training / backward. Compiles the native MIL backward kernels
+# (mil/mod.rs) and the MLUpdateTask training-session path. Off by default so
+# inference builds keep the lean lowering surface and pay zero cost. Enabled
+# transitively by `rlx-runtime`'s own `training` feature.
+training = []
+
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.9" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.9" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.10" }
 # Host-side GGUF dequant fallback for the off-path quant schemes.
-rlx-gguf = { path = "../rlx-gguf", version = "0.2.9" }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.10" }
 prost = "0.13"
 half = "2"
 bytemuck = { version = "1", features = ["derive"] }
+
+[target.'cfg(all(target_vendor = "apple", not(target_os = "watchos")))'.dependencies]
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", default-features = false }
 
 [build-dependencies]
 prost-build = "0.13"
@@ -35,7 +46,7 @@ cc = "1"
 # Back-edge: rlx-runtime (tier 7) publishes AFTER rlx-coreml (tier 5).
 # PATH-ONLY (no `version`) so cargo strips it from the published manifest
 # and `cargo publish -p rlx-coreml` doesn't resolve runtime against crates.io.
-rlx-runtime = { path = "../rlx-runtime", features = ["coreml"] }
+rlx-runtime = { path = "../rlx-runtime", features = ["coreml", "training"] }
 
 [lints]
 workspace = true

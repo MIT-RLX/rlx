@@ -127,29 +127,63 @@ macro_rules! __dim {
 
 /// Build a [`Shape`]. Default dtype is `F32`.
 ///
-/// Dynamic dimensions: `?` → symbol 0 (repeat `?` for the same unknown size),
-/// `?1` → symbol 1, etc.
+/// Each static dimension may be **any `usize` expression** — a literal, an
+/// identifier, or arithmetic like `w / 2`, `w + heads`, `cfg.width * 2` — so graph
+/// builders can size params/inputs from computed dimensions directly (no need to
+/// hoist every derived size into a `let`). Dynamic dimensions use `?` → symbol 0
+/// (repeat `?` for the same unknown size), `?1` → symbol 1, etc. A leading
+/// `Dtype;` sets the element type (default `F32`).
 ///
 /// ```rust
 /// use rlx_tensor::{shape, DType};
 ///
 /// let a = shape![2, 4];
 /// let b = shape![F32; ?, 128];
-/// assert_eq!(b.dtype(), DType::F32);
+/// let w = 64usize;
+/// let c = shape![w + 1, w / 2, 3 * w];   // computed dimensions
+/// assert_eq!(c.dtype(), DType::F32);
+/// assert!(c.is_static());
 /// assert!(!b.is_static());
 /// ```
 #[macro_export]
 macro_rules! shape {
-    ($dtype:ident; $($d:tt),+ $(,)?) => {
-        $crate::Shape::from_dims(
-            &[$( $crate::__dim!($d) ),+],
-            $crate::DType::$dtype,
-        )
+    ($dtype:ident; $($rest:tt)+) => {
+        $crate::Shape::from_dims(&$crate::__shape_dims!([] ; $($rest)+), $crate::DType::$dtype)
     };
-    ($($d:tt),+ $(,)?) => {
-        $crate::Shape::from_dims(
-            &[$( $crate::__dim!($d) ),+],
-            $crate::DType::F32,
-        )
+    ($($rest:tt)+) => {
+        $crate::Shape::from_dims(&$crate::__shape_dims!([] ; $($rest)+), $crate::DType::F32)
+    };
+}
+
+/// Token-tree muncher backing [`shape!`]: accumulates `Dim`s left to right,
+/// dispatching `?`/`?N` to dynamic dims and everything else to a `usize` expression.
+/// (A `tt`-list can't mix the `?` syntax with multi-token expressions, so we munch.)
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __shape_dims {
+    // done (with or without a trailing comma)
+    ([$($acc:tt)*] ; ) => { [ $($acc)* ] };
+    ([$($acc:tt)*] ; ,) => { [ $($acc)* ] };
+    // dynamic `?N`
+    ([$($acc:tt)*] ; ? $sym:literal , $($rest:tt)*) => {
+        $crate::__shape_dims!([$($acc)* $crate::Dim::Dynamic($sym),] ; $($rest)*)
+    };
+    ([$($acc:tt)*] ; ? $sym:literal) => {
+        [ $($acc)* $crate::Dim::Dynamic($sym) ]
+    };
+    // dynamic `?` (symbol 0)
+    ([$($acc:tt)*] ; ? , $($rest:tt)*) => {
+        $crate::__shape_dims!([$($acc)* $crate::Dim::Dynamic(0),] ; $($rest)*)
+    };
+    ([$($acc:tt)*] ; ?) => {
+        [ $($acc)* $crate::Dim::Dynamic(0) ]
+    };
+    // static dimension: any expression, more following
+    ([$($acc:tt)*] ; $e:expr, $($rest:tt)*) => {
+        $crate::__shape_dims!([$($acc)* $crate::Dim::Static($e),] ; $($rest)*)
+    };
+    // static dimension: any expression, last
+    ([$($acc:tt)*] ; $e:expr) => {
+        [ $($acc)* $crate::Dim::Static($e) ]
     };
 }

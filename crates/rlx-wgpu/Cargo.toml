@@ -19,10 +19,11 @@ native-splat = []
 splat = ["rlx-cpu/splat"]
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.9" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.9", default-features = false, features = ["compile"] }
-rlx-compile = { path = "../rlx-compile", version = "0.2.9" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.9", features = ["splat"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.10", default-features = false, features = ["compile"] }
+rlx-compile = { path = "../rlx-compile", version = "0.2.10" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", features = ["splat"] }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.10" }
 
 # wgpu 29: brings naga WGSL parser support for `enable f16;` and the
 # `f16` type, which unlocks the half-precision storage matmul path.
@@ -48,6 +49,9 @@ serde_json = "1"
 # published last. cargo strips path-only dev-deps from the published manifest,
 # so this never resolves against crates.io and needs no per-release pin bump.
 rlx = { path = "../rlx", default-features = false, features = ["cpu", "gpu"] }
+half = "2"
+pollster = "0.3"
+bytemuck = "1"
 
 [lints]
 workspace = true

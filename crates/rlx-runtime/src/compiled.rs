@@ -133,6 +133,20 @@ impl CompiledGraph {
         self.inner.read_gpu_handle(name)
     }
 
+    /// Register a targeted row feed for resident KV decode (graphs that emit the
+    /// new token at the last bucket-padded output row). No-op (false) on
+    /// backends without GPU-resident handle support. See [`Self::feed_kv_row`].
+    pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+        self.inner.register_kv_row_feed(handle_name, output_index)
+    }
+
+    /// Fold each registered row feed's new-token row (`src_row` of its output)
+    /// into the resident handle slot at `dst_row` (`row_elems` = kv_dim),
+    /// in-place on device. Returns false when unsupported.
+    pub fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
+        self.inner.feed_kv_row(src_row, dst_row, row_elems)
+    }
+
     /// Run, refresh GPU handle from output, return that output vector.
     pub fn run_feed_gpu_handle(
         &mut self,

@@ -175,3 +175,59 @@ fn iq4_xs_msl_matches_cpu_reference() {
     let block = make_iq4_xs_block(d, scales, qs);
     parity(7, &block, 256, 1e-3, "IQ4_XS");
 }
+
+/// Encode→dequant round-trip via `rlx_gguf::quantize` (covers encoder layout).
+fn parity_quantized(
+    scheme_id: u32,
+    ggml: rlx_gguf::GgmlType,
+    k: usize,
+    n: usize,
+    tol: f32,
+    scheme_name: &str,
+) {
+    let w_row: Vec<f32> = (0..k * n)
+        .map(|i| ((i as f32) * 0.017).sin() * 0.42)
+        .collect();
+    let packed = rlx_gguf::quantize(&w_row, ggml).expect("quantize");
+    parity(scheme_id, &packed, k * n, tol, scheme_name);
+}
+
+#[test]
+fn iq2_xxs_msl_matches_cpu_reference() {
+    parity_quantized(12, rlx_gguf::GgmlType::IQ2XXS, 256, 2, 1e-3, "IQ2_XXS");
+}
+
+#[test]
+fn iq2_xs_msl_matches_cpu_reference() {
+    parity_quantized(13, rlx_gguf::GgmlType::IQ2XS, 256, 2, 1e-3, "IQ2_XS");
+}
+
+#[test]
+fn iq2_s_msl_matches_cpu_reference() {
+    parity_quantized(14, rlx_gguf::GgmlType::IQ2S, 256, 2, 1e-3, "IQ2_S");
+}
+
+#[test]
+fn iq3_xxs_msl_matches_cpu_reference() {
+    parity_quantized(15, rlx_gguf::GgmlType::IQ3XXS, 256, 2, 5e-3, "IQ3_XXS");
+}
+
+#[test]
+fn iq3_s_msl_matches_cpu_reference() {
+    parity_quantized(16, rlx_gguf::GgmlType::IQ3S, 256, 2, 5e-3, "IQ3_S");
+}
+
+#[test]
+fn iq1_s_msl_matches_cpu_reference() {
+    parity_quantized(17, rlx_gguf::GgmlType::IQ1S, 256, 2, 5e-3, "IQ1_S");
+}
+
+#[test]
+fn iq1_m_msl_matches_cpu_reference() {
+    parity_quantized(18, rlx_gguf::GgmlType::IQ1M, 256, 2, 5e-3, "IQ1_M");
+}
+
+#[test]
+fn tq2_0_msl_matches_cpu_reference() {
+    parity_quantized(9, rlx_gguf::GgmlType::TQ2_0, 256, 2, 1e-3, "TQ2_0");
+}

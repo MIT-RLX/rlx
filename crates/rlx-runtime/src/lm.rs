@@ -36,6 +36,14 @@ use std::path::{Path, PathBuf};
 
 use crate::Device;
 
+/// A model-agnostic decode-session snapshot: the KV cache plus the token
+/// history that produced it. Used by the prompt cache to reuse a prefix.
+#[derive(Debug, Clone)]
+pub struct SessionSnapshot {
+    pub kv: crate::kv_cache::LayerKvCache,
+    pub tokens: Vec<u32>,
+}
+
 /// Minimal per-family runner interface used by `auto_dispatch` and
 /// the `rlx-text` / `skill` integration.
 ///
@@ -78,6 +86,52 @@ pub trait LmRunner: Send {
             }
         }
         Ok(produced)
+    }
+
+    /// Prefill `prompt_ids`, seed the decode KV cache, and return the
+    /// last-position logits `[vocab]`. Together with [`decode_logits`] this
+    /// gives a **host-driven** decode loop: the caller owns sampling, logit
+    /// bias, log-probs, and stop detection (used by the HTTP server). The
+    /// default reports unsupported so existing runners keep compiling.
+    fn prefill_logits(&mut self, _prompt_ids: &[u32]) -> anyhow::Result<Vec<f32>> {
+        Err(anyhow::anyhow!(
+            "{}: host-driven logits decode (prefill_logits) unsupported",
+            self.family()
+        ))
+    }
+
+    /// Feed one token, advance the KV cache, and return the next-position
+    /// logits `[vocab]`. See [`LmRunner::prefill_logits`]. Default: unsupported.
+    fn decode_logits(&mut self, _token: u32) -> anyhow::Result<Vec<f32>> {
+        Err(anyhow::anyhow!(
+            "{}: host-driven logits decode (decode_logits) unsupported",
+            self.family()
+        ))
+    }
+
+    /// Prefill `prompt` reusing a session snapshot that already covers its
+    /// first `reuse_len` tokens — only the suffix is processed. Returns the
+    /// last-position logits. The default ignores the snapshot and does a full
+    /// prefill, so callers always get correct logits even without reuse.
+    fn prefill_logits_reusing(
+        &mut self,
+        prompt: &[u32],
+        _snap: &SessionSnapshot,
+        _reuse_len: usize,
+    ) -> anyhow::Result<Vec<f32>> {
+        self.prefill_logits(prompt)
+    }
+
+    /// Snapshot this runner's decode session (KV cache + token history) for
+    /// prompt-cache reuse. `None` ⇒ the family doesn't support it.
+    fn export_session(&self) -> Option<SessionSnapshot> {
+        None
+    }
+
+    /// Restore a previously exported session so generation resumes from a
+    /// cached prefix. Returns `true` if applied.
+    fn restore_session(&mut self, _snap: &SessionSnapshot) -> bool {
+        false
     }
 
     /// Whether this runner supports multimodal (image+text) generation.
@@ -204,6 +258,9 @@ pub struct SampleOpts {
     pub typical_p: f32,
     /// Top-n-σ cutoff (Hewitt et al. 2024). 0 ⇒ off.
     pub top_n_sigma: f32,
+    /// Min-p cutoff (Nguyen et al. 2024): keep tokens with prob ≥ `min_p` ·
+    /// p_max. 0 ⇒ off.
+    pub min_p: f32,
     /// XTC: probability of dropping high-confidence top tokens.
     pub xtc_threshold: f32,
     pub xtc_prob: f32,
@@ -243,6 +300,7 @@ impl SampleOpts {
             dynamic_temp_exponent: 1.0,
             typical_p: 1.0,
             top_n_sigma: 0.0,
+            min_p: 0.0,
             xtc_threshold: 0.0,
             xtc_prob: 0.0,
             dry_multiplier: 0.0,
@@ -280,6 +338,7 @@ impl SampleOpts {
         self.dynamic_temp.is_none()
             && self.typical_p >= 1.0
             && self.top_n_sigma <= 0.0
+            && self.min_p <= 0.0
             && self.xtc_prob <= 0.0
             && self.dry_multiplier <= 0.0
             && self.mirostat == MirostatMode::Off
@@ -353,6 +412,12 @@ impl SampleOpts {
         if self.top_p < 1.0 && self.top_p > 0.0 {
             b = b.push(TopP {
                 p: self.top_p,
+                min_keep: self.min_keep,
+            });
+        }
+        if self.min_p > 0.0 {
+            b = b.push(MinP {
+                p: self.min_p,
                 min_keep: self.min_keep,
             });
         }

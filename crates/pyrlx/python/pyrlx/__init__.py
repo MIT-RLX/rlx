@@ -53,6 +53,12 @@ Transforms
 ``grad``, ``jvp``, ``hvp``, ``vmap``, ``nth_order_grad`` — build derivative /
 batched graphs from a forward graph before compile.
 
+GGUF
+----
+``quantize`` / ``dequant`` pack single tensors; ``load_gguf`` / ``write_gguf``
+read and write v3 files; ``convert_to_gguf`` runs safetensors → GGUF via
+``rlx-gguf-convert``. No backend required.
+
 Further reading: ``pyrlx/README.md``, ``pyrlx/docs/quickstart.md``,
 ``pyrlx/docs/dsl.md``, ``pyrlx/docs/backends.md``.
 """
@@ -72,6 +78,13 @@ from ._pyrlx import (        # type: ignore[attr-defined]
     nth_order_grad,
     directional_nth_grad,
     vmap,
+    quantize_gguf,
+    dequant_gguf,
+    GgufFile,
+    load_gguf,
+    write_gguf,
+    convert_to_gguf,
+    GgufConvertReport,
     Graph,
     Session,
     CompiledGraph,
@@ -108,6 +121,15 @@ __all__ = [
     "directional_nth_grad",
     "vmap",
     "jacfwd",
+    "quantize",
+    "dequant",
+    "quantize_gguf",
+    "dequant_gguf",
+    "GgufFile",
+    "load_gguf",
+    "write_gguf",
+    "convert_to_gguf",
+    "GgufConvertReport",
     "Graph",
     "Session",
     "CompiledGraph",
@@ -243,3 +265,8 @@ def jacfwd(
         stacked = np.stack(cols, axis=0).reshape(n_in, out_n).T
         result.append(stacked.reshape((out_n,) + tuple(wrt_shape)))
     return result
+
+
+# GGUF pack / unpack (rlx-gguf encoders; no backend required).
+quantize = quantize_gguf
+dequant = dequant_gguf

@@ -28,6 +28,7 @@ pub struct LlamaDecoderStage {
     pub eps: f32,
     pub mask: MaskKind,
     pub hidden_shape: rlx_ir::Shape,
+    pub rope_style: rlx_ir::RopeStyle,
 }
 
 impl LlamaDecoderStage {
@@ -40,6 +41,7 @@ impl LlamaDecoderStage {
             eps: spec.eps,
             mask: spec.mask,
             hidden_shape: spec.hidden_shape,
+            rope_style: spec.rope_style,
         }
     }
 }
@@ -52,6 +54,8 @@ pub struct LlamaDecoderSpec {
     pub eps: f32,
     pub mask: MaskKind,
     pub hidden_shape: rlx_ir::Shape,
+    /// RoPE pairing flavor (GGUF Llama → [`rlx_ir::RopeStyle::GptJ`]).
+    pub rope_style: rlx_ir::RopeStyle,
 }
 
 impl BlockStage for LlamaDecoderStage {
@@ -101,6 +105,7 @@ impl BlockStage for LlamaDecoderStage {
             self.num_kv_heads,
             self.eps,
             self.mask,
+            self.rope_style,
             self.hidden_shape.clone(),
         );
 

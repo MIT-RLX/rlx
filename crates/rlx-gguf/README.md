@@ -18,14 +18,14 @@ Rust ML project.
 | `Q5_K` | 256 | 5.5 | ✅ | ✅ | super-block + high-bit plane |
 | `Q6_K` | 256 | 6.5 | ✅ | ✅ | super-block + per-sub-block signed scale |
 | `Q8_K` | 256 | 8.6 | ✅ | ✅ | super-block + i16 partial sums (sums ignored on dequant) |
-| `IQ4_NL` | 32 | 4.5 | ✅ | — | 16-entry non-linear LUT |
-| `IQ4_XS` | 256 | 4.25 | ✅ | — | super-block IQ4 |
-| `IQ2_XXS` / `IQ2_XS` / `IQ2_S` | 256 | 2.06 / 2.31 / 2.5 | ✅ | — | grid-coded; needs imatrix to encode |
-| `IQ3_XXS` / `IQ3_S` | 256 | 3.06 / 3.44 | ✅ | — | 3-bit grid + signs |
-| `IQ1_S` / `IQ1_M` | 256 | 1.56 / 1.75 | ✅ | — | 1-bit grid + δ nudge |
-| `TQ1_0` / `TQ2_0` | 256 | 1.69 / 2.06 | ✅ | — | BitNet-style ternary {−1,0,+1} |
-| `MXFP4` | 32 | 4.25 | ✅ | — | E8M0 scale + E2M1 nibbles (OCP MX) |
-| `NVFP4` | 16 | 4.5 | ✅ | — | E4M3 scale + E2M1 nibbles |
+| `IQ4_NL` | 32 | 4.5 | ✅ | ✅ | 16-entry non-linear LUT |
+| `IQ4_XS` | 256 | 4.25 | ✅ | ✅ | super-block IQ4 |
+| `IQ2_XXS` / `IQ2_XS` / `IQ2_S` | 256 | 2.06 / 2.31 / 2.5 | ✅ | ✅ | kmap + sign extract (llama.cpp-style) |
+| `IQ3_XXS` / `IQ3_S` | 256 | 3.06 / 3.44 | ✅ | ✅ | 3-bit grid + signs |
+| `IQ1_S` / `IQ1_M` | 256 | 1.56 / 1.75 | ✅ | ✅ | 1-bit grid + δ nudge |
+| `TQ1_0` / `TQ2_0` | 256 | 1.69 / 2.06 | ✅ | ✅ | BitNet-style ternary {−1,0,+1} |
+| `MXFP4` | 32 | 4.25 | ✅ | ✅ | E8M0 scale + E2M1 nibbles (OCP MX) |
+| `NVFP4` | 16 | 4.5 | ✅ | ✅ | E4M3 scale + E2M1 nibbles |
 
 Not yet decoded: `Q1_0`. Files that contain it raise a clean
 `"dequant for {type} not implemented yet"` error instead of
@@ -38,11 +38,32 @@ implementation byte-for-byte. Verified element-wise against
 IQ-family grid LUTs are auto-extracted from `ggml-common.h` and
 checked into [`src/iq_grids.rs`](src/iq_grids.rs).
 
-The **encoder** path uses a per-sub-block min/max quantizer — simpler
-than upstream's iterative `make_qx_quants` search but byte-compatible
-with the decode side. Round-trip cosine ≥ 0.99 on transformer
-weights; for peak quality keep using `llama-quantize`, for
-shrink-on-first-load pipelines this avoids the C++ dependency.
+The **encoder** path covers legacy Q/K-quants plus IQ/TQ/MX (`iq_quantize.rs`,
+`tq_quantize.rs`, `mx_quantize.rs`, `iq2_encode.rs`, `iq3_encode.rs`,
+`iq1_encode.rs`). IQ2 uses llama.cpp kmap + sign-extraction (uniform
+weights); IQ3/IQ1 use precomputed grids with reduced search. Blocks quantize
+in parallel via `rayon`. For peak IQ quality with imatrix weighting, keep
+using `llama-quantize`.
+
+## Backend integration
+
+RLX backends consume packed bytes through `Op::DequantMatMul { scheme }`.
+GPU kernels (Metal/CUDA/ROCm/WGPU) share integer **scheme ids** 0–23;
+decode reference implementations live in this crate.
+
+| id | Scheme |
+|----|--------|
+| 19 | Q4_0 |
+| 20 | Q8_0 |
+| 21 | Q4_1 |
+| 22 | Q5_0 |
+| 23 | Q5_1 |
+
+Per-backend dispatch (GPU vs host, fused GEMV, ANE MIL constexpr, TPU
+compile-time bake): [docs/gguf-backend-paths.md](../docs/gguf-backend-paths.md).
+
+When adding a format: implement `dequant_*` here, assign the next scheme id,
+then update MSL/CUDA/WGSL kernels and each backend's `gguf_scheme_id`.
 
 ## Install
 
@@ -78,8 +99,9 @@ w.add_tensor_bytes("token_embd.weight", vec![4096, 32000], GgmlType::Q4K, q4k_by
 w.write_to_path("out.gguf")?;
 ```
 
-For end-to-end conversion from safetensors / ONNX, see the companion
-[`rlx-gguf-convert`](../rlx-gguf-convert/) crate.
+For end-to-end conversion from safetensors / ONNX / PyTorch, see the companion
+[`rlx-gguf-convert`](../rlx-gguf-convert/) crate or **pyrlx** (`convert_to_gguf`,
+`load_gguf`, `write_gguf` — no backend required).
 
 For HF-name lookup + MTP-head isolation, use the `GgufLoader` adapter
 in the separate model-builders repo (applies the safetensors

@@ -314,6 +314,7 @@ fn hir_op_kind(op: &HirOp) -> String {
         HirOp::DequantMatMul { .. } => "DequantMatMul".into(),
         HirOp::GatedDeltaNet { .. } => "GatedDeltaNet".into(),
         HirOp::Lstm { .. } => "Lstm".into(),
+        HirOp::Gru { .. } => "Gru".into(),
         HirOp::RoPE { .. } => "RoPE".into(),
         HirOp::RmsNorm { .. } => "RmsNorm".into(),
         HirOp::Mir(_) => "Mir".into(),
@@ -387,6 +388,15 @@ fn format_hir_op(op: &HirOp) -> String {
             let dir = if *bidirectional { "bi" } else { "uni" };
             format!("lstm(h={hidden_size},layers={num_layers},{dir})")
         }
+        HirOp::Gru {
+            hidden_size,
+            num_layers,
+            bidirectional,
+            ..
+        } => {
+            let dir = if *bidirectional { "bi" } else { "uni" };
+            format!("gru(h={hidden_size},layers={num_layers},{dir})")
+        }
         HirOp::RoPE { head_dim, n_rot } => format!("rope(d={head_dim}, n_rot={n_rot})"),
         HirOp::RmsNorm { eps } => format!("rms_norm(eps={eps})"),
         HirOp::LlamaDecoderBlock {
@@ -395,8 +405,9 @@ fn format_hir_op(op: &HirOp) -> String {
             num_kv_heads,
             eps,
             mask,
+            rope_style,
         } => format!(
-            "llama_decoder_block(heads={num_heads}, dim={head_dim}, kv={num_kv_heads}, eps={eps}, mask={mask:?})"
+            "llama_decoder_block(heads={num_heads}, dim={head_dim}, kv={num_kv_heads}, eps={eps}, mask={mask:?}, rope={rope_style:?})"
         ),
         HirOp::Qwen35MtpHead {
             num_heads,

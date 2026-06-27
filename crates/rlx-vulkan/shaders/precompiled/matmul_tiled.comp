@@ -1,0 +1,81 @@
+#version 450
+// Shared-memory tiled batched matmul C[b,m,n] = sum_k A[b,m,k] * B[b,k,n].
+// One 16x16 output tile per workgroup: the 256 threads cooperatively stage a
+// 16x16 block of A and of B into shared memory, then each thread accumulates
+// its output element in fp32 across the staged block. This cuts global-memory
+// traffic ~TS-fold versus the naive one-element-per-thread `matmul.comp`
+// (each A/B value is read from VRAM once per tile instead of once per output),
+// which is the win on a discrete GPU's memory hierarchy. fp32 throughout, so
+// numerics match the scalar kernel within tolerance.
+//
+// Shape: fully general — per-thread bounds guards zero-pad partial edge tiles
+// in M, N and K, so any M/N/K is correct (batch via the stride push-constants).
+//
+// `matmul.comp` is kept as the scalar fallback: on MoltenVK (Vulkan→Metal
+// translation) shared-memory tiling + barriers regress, and Apple's native
+// path is Metal anyway — the backend selects this kernel only off the
+// portability driver. Identical push-constant layout to `matmul.comp`.
+//
+// Precompiled with glslang, not naga: naga's GLSL frontend lacks
+// `memoryBarrierShared`, and its bare `barrier()` does not enforce the
+// cross-subgroup shared-memory visibility this kernel needs (K > 16 read
+// stale tiles → wrong results), so the committed `.spv` is the build input.
+// Regenerate (run from this directory):
+//   glslangValidator -V --target-env vulkan1.3 matmul_tiled.comp -o matmul_tiled.spv
+#define TS 16u
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) buffer Arena { float data[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint k;
+    uint n;
+    uint a_off;
+    uint b_off;
+    uint c_off;
+    uint batch;
+    uint a_bs;   // A batch stride (0 ⇒ broadcast)
+    uint b_bs;   // B batch stride (0 ⇒ broadcast)
+    uint c_bs;   // C batch stride
+} pc;
+
+shared float As[256]; // TS*TS
+shared float Bs[256];
+
+void main() {
+    uint lx = gl_LocalInvocationID.x; // column within the tile [0,TS)
+    uint ly = gl_LocalInvocationID.y; // row within the tile    [0,TS)
+    uint col = gl_GlobalInvocationID.x; // n
+    uint row = gl_GlobalInvocationID.y; // m
+    uint bz  = gl_GlobalInvocationID.z; // batch
+
+    uint a_base = pc.a_off + bz * pc.a_bs;
+    uint b_base = pc.b_off + bz * pc.b_bs;
+
+    float acc = 0.0;
+    uint tiles = (pc.k + TS - 1u) / TS;
+    for (uint t = 0u; t < tiles; t++) {
+        uint a_col = t * TS + lx; // k index staged for A
+        uint b_row = t * TS + ly; // k index staged for B
+        As[ly * TS + lx] = (row < pc.m && a_col < pc.k)
+            ? data[a_base + row * pc.k + a_col] : 0.0;
+        Bs[ly * TS + lx] = (b_row < pc.k && col < pc.n)
+            ? data[b_base + b_row * pc.n + col] : 0.0;
+        // Make the staged tile visible workgroup-wide before the inner loop
+        // reads it: the inner loop reads As/Bs entries written by threads in
+        // OTHER subgroups, so a control barrier alone (no shared-memory memory
+        // barrier) leaves cross-subgroup reads racy — wrong for K > 16.
+        memoryBarrierShared();
+        barrier();
+        for (uint kk = 0u; kk < TS; kk++) {
+            acc += As[ly * TS + kk] * Bs[kk * TS + lx];
+        }
+        barrier(); // all reads done before the next tile overwrites As/Bs
+    }
+
+    if (row < pc.m && col < pc.n && bz < pc.batch) {
+        data[pc.c_off + bz * pc.c_bs + row * pc.n + col] = acc;
+    }
+}

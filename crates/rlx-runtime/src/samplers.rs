@@ -316,6 +316,71 @@ impl Sampler for TopP {
     }
 }
 
+// ─── MinP ────────────────────────────────────────────────────────────
+//
+// Keep tokens whose probability ≥ p · p_max, where p_max is the top
+// token's probability (Nguyen et al. 2024, "min-p sampling"). The cutoff
+// scales with the model's confidence: permissive when the distribution is
+// flat, strict when one token dominates. A cheaper, often better-behaved
+// alternative to top-p.
+
+#[derive(Debug, Clone, Copy)]
+pub struct MinP {
+    pub p: f32,
+    /// Always keep at least this many tokens (avoids an empty nucleus when
+    /// one token dominates and `p` is large).
+    pub min_keep: usize,
+}
+
+impl Sampler for MinP {
+    fn apply(&self, logits: Logits<'_>, _h: &[u32], _s: &mut SamplerState, _r: &mut Philox4x32) {
+        // Reject p outside (0, 1]; the explicit is_nan keeps a NaN p from
+        // slipping past the bounds checks (NaN compares false to everything).
+        if self.p <= 0.0 || self.p > 1.0 || self.p.is_nan() {
+            return;
+        }
+        let v = logits.len();
+        if v == 0 {
+            return;
+        }
+        let mut probs: Vec<f32> = logits.to_vec();
+        softmax_inplace(&mut probs);
+        let p_max = probs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if p_max <= 0.0 || p_max.is_nan() {
+            return;
+        }
+        let threshold = self.p * p_max;
+        let mut keep: Vec<bool> = probs.iter().map(|&p| p >= threshold).collect();
+        // Guarantee at least `min_keep` survivors: re-admit the top probs.
+        let floor = self.min_keep.max(1);
+        if keep.iter().filter(|&&k| k).count() < floor {
+            for (idx, _) in sorted_desc(&probs).into_iter().take(floor) {
+                keep[idx] = true;
+            }
+        }
+        for (i, x) in logits.iter_mut().enumerate() {
+            if !keep[i] {
+                *x = f32::NEG_INFINITY;
+            }
+        }
+    }
+}
+
+/// Apply an additive per-token logit bias in place (OpenAI `logit_bias`
+/// semantics): `logits[id] += bias`. Out-of-range ids are ignored. This is
+/// a host-side logits processor — run it on the raw logits row *before*
+/// the sampler chain. Kept as a free function (not a `SampleOpts` field) so
+/// `SampleOpts` stays `Copy`.
+pub fn apply_logit_bias(logits: &mut [f32], bias: &[(u32, f32)]) {
+    let v = logits.len();
+    for &(id, b) in bias {
+        let i = id as usize;
+        if i < v {
+            logits[i] += b;
+        }
+    }
+}
+
 // ─── TopNSigma ───────────────────────────────────────────────────────
 //
 // Keep tokens whose logit ≥ max_logit − n × σ(logits). Works directly on
@@ -830,6 +895,45 @@ mod tests {
         // Lowest-probability tokens should be masked.
         assert!(logits[2].is_infinite() && logits[2] < 0.0);
         assert!(logits[3].is_infinite() && logits[3] < 0.0);
+    }
+
+    #[test]
+    fn min_p_scales_cutoff_by_top_prob() {
+        // Dominant token: prob ~ exp(10)/Z ≈ 1; a 0.1 cutoff keeps only it.
+        let mut logits = vec![0.0f32; 4];
+        logits[0] = 10.0;
+        logits[1] = 2.0;
+        let mut s = SamplerState::new();
+        let mut r = rng();
+        MinP {
+            p: 0.1,
+            min_keep: 1,
+        }
+        .apply(&mut logits, &[], &mut s, &mut r);
+        assert!(logits[0].is_finite());
+        assert!(logits[1].is_infinite() && logits[1] < 0.0);
+        assert!(logits[2].is_infinite() && logits[2] < 0.0);
+    }
+
+    #[test]
+    fn min_p_min_keep_admits_top_tokens() {
+        // Even with an aggressive cutoff, min_keep survivors are guaranteed.
+        let mut logits = vec![10.0, 9.0, 1.0, 0.0];
+        let mut s = SamplerState::new();
+        let mut r = rng();
+        MinP {
+            p: 0.99,
+            min_keep: 2,
+        }
+        .apply(&mut logits, &[], &mut s, &mut r);
+        assert!(logits[0].is_finite() && logits[1].is_finite());
+    }
+
+    #[test]
+    fn logit_bias_is_additive_and_bounds_checked() {
+        let mut logits = vec![0.0f32, 1.0, 2.0];
+        apply_logit_bias(&mut logits, &[(1, 5.0), (99, 1.0)]); // 99 ignored
+        assert_eq!(logits, vec![0.0, 6.0, 2.0]);
     }
 
     #[test]

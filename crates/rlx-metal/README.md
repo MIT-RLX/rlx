@@ -36,16 +36,25 @@ throughput unlock — Phase H made matmul-interleaved schedules use it.
   host fallback. MPSGraph skips graphs containing `Op::Fft`; `fft_real`
   subgraphs route through thunks automatically.
 - **GGUF dequant** (`dequant_gguf.msl` + `backend::encode_dequant_gguf`) —
-  on-device dequant for every GGUF scheme:
-  Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_K, IQ4_NL / IQ4_XS,
-  IQ2_XXS / IQ2_XS / IQ2_S, IQ3_XXS / IQ3_S, IQ1_S / IQ1_M, TQ1_0 / TQ2_0,
-  MXFP4, NVFP4. IQ-family schemes consult a 33 KB grid LUT staged into
-  one Metal buffer at session init (`Kernels::iq_grid_buffer`) from
-  `rlx_gguf::iq_grids::*`; the buffer is bound to `buffer(5)` on every
-  dispatch. Use [`backend::has_metal_dequant_kernel`] to query coverage
-  from the runtime side. Real-weight parity tested against the
-  `rlx_gguf` CPU reference on quantized Qwen3-0.6B GGUFs — see
-  [`tests/iq_full_real_weights.rs`](tests/iq_full_real_weights.rs).
+  on-device dequant for every GGUF scheme (ids 0–23), including **Q4_1**
+  (21) and **Q5_0 / Q5_1** (22 / 23).
+  (id 21). IQ-family schemes consult a 33 KB grid LUT staged at session
+  init (`Kernels::iq_grid_buffer`). Query runtime coverage with
+  [`backend::has_metal_dequant_kernel`].
+- **Fused decode GEMV** — single-pass matvec when `m == 1` (skips f32 scratch):
+  Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M (`dequant_gguf.msl`).
+  See [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md) for shape
+  constraints and disable env vars.
+- **FP8 / NVFP4 block matmul** — `dequant_matmul_fp8` / `dequant_matmul_nvfp4`
+  MSL for non-GGUF `QuantScheme::Fp8*` / `Nvfp4Block` (CPU fallback when
+  deferred host ops are pending).
+
+Full backend matrix: [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
+Parity vs `rlx_gguf` on real Qwen3-0.6B weights:
+[`tests/iq_full_real_weights.rs`](tests/iq_full_real_weights.rs),
+[`tests/iq_mv_parity.rs`](tests/iq_mv_parity.rs),
+[`tests/iq4_dequant_parity.rs`](tests/iq4_dequant_parity.rs),
+[`tests/q8_q4_dequant_parity.rs`](tests/q8_q4_dequant_parity.rs).
 
 ## Cargo features
 
@@ -82,6 +91,16 @@ Gating env vars worth knowing:
 - `RLX_MPSGRAPH_ATTENTION=1` — opt into MPSGraph attention lowering
   (otherwise thunks).
 - `RLX_VERBOSE=1` — calibration log.
+- `RLX_METAL_DEQUANT_GPU_DISABLE=1` — CPU GGUF dequant instead of MSL.
+- `RLX_METAL_Q4K_FUSED_DISABLE=1` / `RLX_METAL_Q4K_SG_DISABLE=1` —
+  disable fused Q4_K GEMV paths.
+- `RLX_METAL_Q40_FUSED_DISABLE=1` / `RLX_METAL_Q41_FUSED_DISABLE=1` /
+  `RLX_METAL_Q80_FUSED_DISABLE=1` — disable fused Q4_0 / Q4_1 / Q8_0 GEMV.
+- `RLX_METAL_IQ4NL_FUSED_DISABLE=1` and `RLX_METAL_IQ{2,3,1}*_FUSED_DISABLE=1` —
+  disable fused IQ-family GEMV paths.
+
+See [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md) for the
+full GGUF env table.
 
 ## Status
 

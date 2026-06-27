@@ -45,8 +45,18 @@ fn ane_op_support_introspection() {
             attn_logit_softcap: None,
         }
     ));
-    // A training/backward op is never lowerable on an inference backend.
-    assert!(!rlx_runtime::supports(Device::Ane, &Op::ReluBackward));
+    // With the `training` feature on, ANE participates in backward: the runtime
+    // reports `*Backward` ops as supported (they decompose to — or, for the hot
+    // ops, lower through native MIL kernels of — the supported primitive set), so
+    // device selection picks Ane for autodiff-produced backward graphs.
+    assert!(rlx_runtime::supports(Device::Ane, &Op::ReluBackward));
+    assert!(rlx_runtime::supports(
+        Device::Ane,
+        &Op::RmsNormBackwardInput {
+            axis: -1,
+            eps: 1e-6
+        }
+    ));
 
     // A graph of supported ops is dispatchable; first_unsupported_op finds
     // the gap when one isn't.

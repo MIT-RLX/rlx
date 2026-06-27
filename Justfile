@@ -53,6 +53,58 @@ test-mlx:
     cargo test --release -p rlx-mlx
     cargo test --release -p rlx-runtime --features cpu,mlx --test mlx_attention_parity
 
+# Run rlx-cerebras tests (CSL codegen + matmul oracle parity). Pure Rust, no SDK.
+test-cerebras:
+    cargo test -p rlx-cerebras
+
+# Emit CSL artifacts for an MxKxN matmul (default 32x64x32) into OUT.
+# Compile + run on a Linux host with the Cerebras SDK container:
+#   cd OUT && bash commands_wse2.sh
+cerebras-emit M="32" K="64" N="32" OUT="cerebras-out":
+    cargo run -q -p rlx-cerebras --bin rlx-cerebras-emit -- {{M}} {{K}} {{N}} {{OUT}}
+
+# Emit + (if cslc is on PATH, i.e. inside the SDK container) compile & simulate.
+cerebras-sim M="32" K="64" N="32" OUT="cerebras-out": (cerebras-emit M K N OUT)
+    #!/usr/bin/env bash
+    set -e
+    if command -v cslc >/dev/null 2>&1; then
+        cd {{OUT}} && bash commands_wse2.sh
+    else
+        echo "cslc not found — run inside the Cerebras SDK container (Linux host)."
+        echo "artifacts are in {{OUT}}/; then: cd {{OUT}} && bash commands_wse2.sh"
+    fi
+
+# Run rlx-qnn tests (QNN model-C++ codegen + matmul oracle parity). Pure Rust, no SDK.
+test-qnn:
+    cargo test -p rlx-qnn
+
+# Emit QNN model artifacts for an MxKxN matmul (default 32x64x32) into OUT.
+# Build + run on a Linux host with the QNN SDK (QNN_SDK_ROOT set):
+#   cd OUT && bash run_qnn.sh
+qnn-emit M="32" K="64" N="32" OUT="qnn-out":
+    cargo run -q -p rlx-qnn --bin rlx-qnn-emit -- {{M}} {{K}} {{N}} {{OUT}}
+
+# Emit + (if the QNN SDK tools are on PATH) build & run on the x86 reference backend.
+qnn-run M="32" K="64" N="32" OUT="qnn-out": (qnn-emit M K N OUT)
+    #!/usr/bin/env bash
+    set -e
+    if command -v qnn-net-run >/dev/null 2>&1; then
+        cd {{OUT}} && bash run_qnn.sh
+    else
+        echo "qnn-net-run not found — install the Qualcomm AI Engine Direct SDK (Linux host)."
+        echo "artifacts are in {{OUT}}/; then: cd {{OUT}} && bash run_qnn.sh"
+    fi
+
+# SDK-free Docker self-test of the QNN host harness (verify.py + plumbing).
+# Needs only Docker; uses a numpy stand-in for qnn-net-run.
+qnn-docker-test M="8" K="16" N="4":
+    python3 crates/rlx-qnn/docker/validate.py harness-test --dims {{M}} {{K}} {{N}}
+
+# Real Docker validation: build the model lib + run on libQnnCpu.so.
+# Needs Docker AND the proprietary QNN SDK (set QNN_SDK_ROOT).
+qnn-docker-run M="32" K="64" N="32":
+    python3 crates/rlx-qnn/docker/validate.py run --dims {{M}} {{K}} {{N}}
+
 # FKL region fusion parity (docs/fk-fusion.md). Metal MPS tests skip off macOS.
 test-fk:
     cargo test -p rlx-fusion fk_
@@ -66,15 +118,19 @@ test-fk:
 test:
     cargo test --release
 
-# pyrlx: build extension into pyrlx/.venv (first run) and run pytest.
+# GGUF grouped MoE integration — serial when multiple GPU backends link in.
+test-gguf-grouped:
+    cargo test -p rlx-runtime --test dequant_grouped_matmul_gguf -- --test-threads=1
+
+# pyrlx: build extension into crates/pyrlx/.venv (first run) and run pytest.
 test-pyrlx:
     #!/usr/bin/env bash
     set -euo pipefail
-    cd "{{justfile_directory()}}/pyrlx"
+    cd "{{justfile_directory()}}/crates/pyrlx"
     if [[ ! -d .venv ]]; then
         python3 -m venv .venv
-        .venv/bin/pip install -q maturin numpy pytest
-        .venv/bin/maturin develop --features cpu
+        .venv/bin/pip install -q maturin numpy pytest safetensors
+        .venv/bin/maturin develop --features cpu,gguf-convert
     fi
     .venv/bin/python -m pytest tests/ -q
 
@@ -93,6 +149,69 @@ fmt:
 # Clippy with warnings as errors.
 lint:
     cargo clippy --all-targets -- -D warnings
+
+# Cross-compile gate: the CPU + WebGPU stack must build for the browser
+# (wasm32-unknown-unknown). Compile-only — running models in a browser is
+# done via `just serve-web`.
+check-wasm:
+    rustup target add wasm32-unknown-unknown
+    cargo check -p rlx-cpu -p rlx-wgpu -p rlx-webgl --target wasm32-unknown-unknown
+    cargo check -p rlx-web --target wasm32-unknown-unknown
+    cargo check -p rlx-web --target wasm32-unknown-unknown --features webgpu,webgl
+    # rlx-webgl's planner + CPU executor are verified natively against autodiff.
+    cargo test -p rlx-webgl
+
+# Cross-compile gate: the Apple on-device stack must build for every Apple
+# platform. The native backends are rlx-cpu (Accelerate/AMX), rlx-metal
+# (Metal + MPS + MPSGraph) and rlx-coreml (ANE) — each compiles the *real*
+# backend, not the non-Apple stub. Platform support matrix:
+#   macOS / iOS / tvOS / visionOS → CPU + Metal + CoreML
+#   watchOS                        → CPU/Accelerate only (no Metal API; CoreML
+#                                    runtime model-compilation is unavailable)
+# Compile-only — shipping to a device needs Xcode packaging (XCFramework).
+# `check-ios` kept as an alias for the common iPhone/iPad case.
+check-ios: check-apple
+check-apple:
+    # iOS is Rust tier-2 (prebuilt std): plain stable cargo. Driving the full
+    # runtime pulls in the backend crates transitively. The `apple` umbrella
+    # also exercises wgpu (Metal-on-Apple) + the MLX stub.
+    rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+    cargo check -p rlx-runtime --features apple --target aarch64-apple-ios
+    cargo check -p rlx-runtime --no-default-features --features cpu,metal,coreml --target aarch64-apple-ios-sim
+    # tvOS / watchOS / visionOS are Rust tier-3 — build std from source (nightly).
+    rustup component add rust-src --toolchain nightly
+    # tvOS + visionOS ship Metal + CoreML, same surface as iOS.
+    cargo +nightly check -Zbuild-std -p rlx-runtime --no-default-features --features cpu,metal,coreml --target aarch64-apple-tvos
+    cargo +nightly check -Zbuild-std -p rlx-runtime --no-default-features --features cpu,metal,coreml --target aarch64-apple-visionos
+    # watchOS: CPU/Accelerate backend only (no Metal API; no CoreML runtime compile).
+    cargo +nightly check -Zbuild-std -p rlx-runtime --no-default-features --features cpu --target aarch64-apple-watchos
+
+# Run the Apple backend smoke + parity test ON an iOS simulator. Boots a sim
+# (override with RLX_SIM_DEVICE=<name|udid>) and runs the test binary inside it
+# via `simctl spawn` — real on-simulator execution, not just a cross-compile.
+# Needs Xcode + the iOS simulator runtime.
+#
+# Backends: cpu,metal,coreml. MLX is intentionally excluded from the *sim test*:
+# a headless `simctl spawn` exposes no Metal device (so MLX/Metal can't run
+# there anyway), and statically linking MLX pulls in newest-SDK Metal symbols
+# (MTLTensor) that need a high link deployment target. MLX-on-iOS compile is
+# covered by `just check-apple` (the `apple` umbrella includes mlx) + the host
+# parity test in this same file.
+test-apple-sim:
+    rustup target add aarch64-apple-ios-sim
+    CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUNNER={{justfile_directory()}}/scripts/apple-sim-runner.sh \
+        cargo test -p rlx-runtime --no-default-features --features cpu,metal,coreml \
+        --target aarch64-apple-ios-sim \
+        --test apple_backends_sim -- --nocapture --test-threads=1
+
+# Build the browser bundle (wasm + JS bindings) into crates/rlx-web/web/pkg.
+# Add `--webgpu` to also bring up a WebGPU device. One command, all platforms.
+build-web *ARGS:
+    python3 crates/rlx-web/build.py {{ARGS}}
+
+# Build + serve the demo at http://localhost:8000 (Ctrl-C to stop).
+serve-web *ARGS:
+    python3 crates/rlx-web/build.py --serve {{ARGS}}
 
 # Run burnembed bench for a single model. `just bench minilm6`.
 bench MODEL:
@@ -114,7 +233,7 @@ run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
 # Quick basic test of the workspace: build + test + lint + fast smokes.
-ci: build test lint test-pyrlx test-third-order-gpu test-rocm
+ci: build test lint check-wasm test-pyrlx test-third-order-gpu test-rocm
 
 # ROCm compile check + graph_devices parity (tests skip when HIP unavailable).
 test-rocm:

@@ -20,6 +20,8 @@ use crate::proto;
 use crate::{CoremlError, Result};
 
 mod helpers;
+pub(crate) use helpers::bytes_to_f32;
+use helpers::simple_op_flex;
 use helpers::*;
 
 /// MIL opset / spec version targeted. opset `CoreML6` ⇒
@@ -40,12 +42,40 @@ pub struct IoTensor {
     pub dims: Vec<i64>,
     /// Element type.
     pub dtype: DType,
+    /// Per-dimension flexibility for CoreML `ShapeRange` (model inputs).
+    pub flex_dims: Vec<bool>,
 }
 
 impl IoTensor {
-    /// Number of f32 elements (product of dims).
+    /// Number of elements (product of dims); use [`runtime_dims`] when flex.
     pub fn numel(&self) -> usize {
         self.dims.iter().product::<i64>().max(0) as usize
+    }
+
+    /// Resolve flexible dimensions from a concrete input buffer length.
+    pub fn runtime_dims(&self, data_len: usize) -> Vec<i64> {
+        if !self.flex_dims.iter().any(|&f| f) {
+            return self.dims.clone();
+        }
+        let static_product: i64 = self
+            .dims
+            .iter()
+            .zip(self.flex_dims.iter())
+            .filter(|(_, flex)| !**flex)
+            .map(|(d, _)| *d)
+            .product();
+        let mut dims = self.dims.clone();
+        let denom = static_product.max(1);
+        for (d, flex) in dims.iter_mut().zip(self.flex_dims.iter()) {
+            if *flex {
+                *d = data_len as i64 / denom;
+            }
+        }
+        dims
+    }
+
+    pub fn runtime_numel(dims: &[i64]) -> usize {
+        dims.iter().product::<i64>().max(0) as usize
     }
 }
 
@@ -58,6 +88,40 @@ pub struct LoweredProgram {
     pub blob: Vec<u8>,
 }
 
+/// Lowering knobs: numeric precision and optional flexible input shapes.
+#[derive(Debug, Clone, Copy)]
+pub struct LowerOptions {
+    /// Float storage for activations/weights in MIL (F32 or F16).
+    pub float_dtype: DType,
+    /// Emit `UnknownDimension` + `ShapeRange` for `Dim::Dynamic` inputs.
+    pub flexible_inputs: bool,
+    /// Keep GGUF weights quantized in the model and dequant on device.
+    pub ondevice_dequant: bool,
+}
+
+impl Default for LowerOptions {
+    fn default() -> Self {
+        Self {
+            float_dtype: DType::F32,
+            flexible_inputs: false,
+            ondevice_dequant: true,
+        }
+    }
+}
+
+/// CoreML model I/O features are MLMultiArrays, which require rank ≥ 1. Map a
+/// rank-0 (scalar) IR shape to `[1]` for the model interface; rank ≥ 1 passes
+/// through unchanged. Used only at the input/output boundary — internal MIL
+/// values keep their true (possibly rank-0) shape, which the program supports.
+/// Scalars show up in training graphs (the loss and its `d_output` cotangent).
+fn io_feature_shape(shape: &Shape) -> Shape {
+    if shape.rank() == 0 {
+        Shape::new(&[1], shape.dtype())
+    } else {
+        shape.clone()
+    }
+}
+
 /// Lower `graph` to a CoreML ML Program. `params` maps IR `Param` names to
 /// their f32 weights; `typed_params` carries non-f32 (GGUF-quantized)
 /// weights as raw bytes. CoreML bakes weights into the model at build
@@ -68,7 +132,16 @@ pub fn lower_graph(
     params: &HashMap<String, Vec<f32>>,
     typed_params: &TypedParams,
 ) -> Result<LoweredProgram> {
-    let mut ctx = LowerCtx::new(graph, params, typed_params);
+    lower_graph_with_options(graph, params, typed_params, &LowerOptions::default())
+}
+
+pub fn lower_graph_with_options(
+    graph: &Graph,
+    params: &HashMap<String, Vec<f32>>,
+    typed_params: &TypedParams,
+    opts: &LowerOptions,
+) -> Result<LoweredProgram> {
+    let mut ctx = LowerCtx::new(graph, params, typed_params, *opts);
     ctx.run()?;
     ctx.finish()
 }
@@ -78,6 +151,7 @@ struct LowerCtx<'a> {
     graph: &'a Graph,
     params: &'a HashMap<String, Vec<f32>>,
     typed_params: &'a TypedParams,
+    opts: LowerOptions,
     /// NodeId → MIL value name.
     names: HashMap<u32, String>,
     func_inputs: Vec<proto::NamedValueType>,
@@ -92,11 +166,13 @@ impl<'a> LowerCtx<'a> {
         graph: &'a Graph,
         params: &'a HashMap<String, Vec<f32>>,
         typed_params: &'a TypedParams,
+        opts: LowerOptions,
     ) -> Self {
         LowerCtx {
             graph,
             params,
             typed_params,
+            opts,
             names: HashMap::new(),
             func_inputs: Vec::new(),
             operations: Vec::new(),
@@ -154,24 +230,48 @@ impl<'a> LowerCtx<'a> {
                 // CoreML I/O has no I64 type, so declare integer/bool inputs as F32.
                 // Int-consuming ops (e.g. Gather indices) cast back as needed.
                 let io_dtype = if node.shape.dtype().is_float() {
-                    node.shape.dtype()
+                    if self.opts.float_dtype == DType::F16 {
+                        DType::F16
+                    } else {
+                        node.shape.dtype()
+                    }
                 } else {
                     DType::F32
                 };
-                let io_shape = node.shape.clone().with_dtype(io_dtype);
-                let dims = static_dims(&io_shape)?;
-                self.func_inputs.push(named_value_type(&feat, &io_shape)?);
+                // CoreML model features (an MLMultiArray) need rank ≥ 1, but a
+                // scalar-loss gradient seed (`d_output`) and other training
+                // cotangents arrive rank-0. Declare them as `[1]` at the
+                // interface; the value broadcasts like a scalar for every
+                // elementwise/reduce consumer downstream.
+                let io_shape = io_feature_shape(&node.shape).with_dtype(io_dtype);
+                let (dims, flex_dims) = io_dims(&io_shape, self.opts.flexible_inputs)?;
+                self.func_inputs
+                    .push(named_value_type_flex(&feat, &io_shape, &flex_dims)?);
                 self.inputs.push(IoTensor {
                     ir_name: name.clone(),
                     feature_name: feat.clone(),
                     dims,
                     dtype: io_dtype,
+                    flex_dims,
                 });
                 self.names.insert(id.0, feat);
             }
             Op::Param { name } => {
                 if let Some(data) = self.params.get(name) {
-                    let op = make_const(&mut self.blob, &out_name, &node.shape, data)?;
+                    let shape = if self.opts.float_dtype == DType::F16
+                        && node.shape.dtype() == DType::F32
+                    {
+                        node.shape.clone().with_dtype(DType::F16)
+                    } else {
+                        node.shape.clone()
+                    };
+                    let op = make_const_float(
+                        &mut self.blob,
+                        &out_name,
+                        &shape,
+                        data,
+                        self.opts.float_dtype,
+                    )?;
                     self.operations.push(op);
                     self.names.insert(id.0, out_name);
                 } else if self.typed_params.contains_key(name) {
@@ -201,7 +301,7 @@ impl<'a> LowerCtx<'a> {
             Op::MatMul => {
                 let x = self.val(node.inputs[0]);
                 let y = self.val(node.inputs[1]);
-                let op = simple_op(
+                let op = self.simple_op(
                     "matmul",
                     &out_name,
                     &node.shape,
@@ -218,7 +318,7 @@ impl<'a> LowerCtx<'a> {
                 let ty = binary_mil(*b);
                 let x = self.val_numeric(node.inputs[0])?;
                 let y = self.val_numeric(node.inputs[1])?;
-                let op = simple_op(
+                let op = self.simple_op(
                     ty,
                     &out_name,
                     &node.shape,
@@ -231,7 +331,7 @@ impl<'a> LowerCtx<'a> {
             }
             Op::Softmax { axis } => {
                 let x = self.val(node.inputs[0]);
-                let op = simple_op(
+                let op = self.simple_op(
                     "softmax",
                     &out_name,
                     &node.shape,
@@ -245,7 +345,7 @@ impl<'a> LowerCtx<'a> {
             Op::Reshape { new_shape } => {
                 let x = self.val(node.inputs[0]);
                 let shp: Vec<i32> = new_shape.iter().map(|&d| d as i32).collect();
-                let op = simple_op(
+                let op = self.simple_op(
                     "reshape",
                     &out_name,
                     &node.shape,
@@ -256,7 +356,7 @@ impl<'a> LowerCtx<'a> {
             Op::Transpose { perm } => {
                 let x = self.val(node.inputs[0]);
                 let p: Vec<i32> = perm.iter().map(|&d| d as i32).collect();
-                let op = simple_op(
+                let op = self.simple_op(
                     "transpose",
                     &out_name,
                     &node.shape,
@@ -270,6 +370,121 @@ impl<'a> LowerCtx<'a> {
             Op::RmsNorm { axis, eps } => {
                 self.lower_rms_norm(id, *axis, *eps, &out_name)?;
             }
+            // Native MIL backward kernels (training). Tighter than the autodiff
+            // decomposition (implicit broadcasting in place of `Expand`-with-ones);
+            // mirror `rlx_autodiff::*::compose_rms_norm_backward_*` exactly so ANE
+            // gradients stay consistent with the other backends' training path.
+            #[cfg(feature = "training")]
+            Op::RmsNormBackwardInput { axis, eps } => {
+                self.lower_rms_norm_backward_input(id, *axis, *eps, &out_name)?;
+            }
+            #[cfg(feature = "training")]
+            Op::RmsNormBackwardGamma { axis, eps } => {
+                self.lower_rms_norm_backward_gamma(id, *axis, *eps, &out_name)?;
+            }
+            #[cfg(feature = "training")]
+            Op::RmsNormBackwardBeta { axis, eps } => {
+                self.lower_rms_norm_backward_beta(id, *axis, *eps, &out_name)?;
+            }
+            // LayerNorm backward input + gamma — the mean-subtracting sibling of the
+            // RMSNorm kernels. Native composed MIL (~18 ops) vs the decomposition's
+            // expand-heavy graph; beta backward stays on decompose (just a reduce_sum).
+            #[cfg(feature = "training")]
+            Op::LayerNormBackwardInput { axis, eps } => {
+                self.lower_layer_norm_backward_input(id, *axis, *eps, &out_name)?;
+            }
+            #[cfg(feature = "training")]
+            Op::LayerNormBackwardGamma { axis, eps } => {
+                self.lower_layer_norm_backward_gamma(id, *axis, *eps, &out_name)?;
+            }
+            // GroupNorm backward (NCHW). Native composed MIL: reshape [N,C,H,W] →
+            // [N,G,M] (M = C/G·H·W) so each group's stats are one last-axis reduce —
+            // no per-group narrow/concat loop (the decompose builds O(num_groups)
+            // narrows + a concat).
+            #[cfg(feature = "training")]
+            Op::GroupNormBackwardInput { num_groups, eps } => {
+                self.lower_group_norm_backward_input(id, *num_groups, *eps, &out_name)?;
+            }
+            #[cfg(feature = "training")]
+            Op::GroupNormBackwardGamma { num_groups, eps } => {
+                self.lower_group_norm_backward_gamma(id, *num_groups, *eps, &out_name)?;
+            }
+            #[cfg(feature = "training")]
+            Op::GroupNormBackwardBeta { .. } => {
+                self.lower_group_norm_backward_beta(id, &out_name)?;
+            }
+            // Fused attention backward (dQ/dK/dV) for the canonical [B,H,S,D] +
+            // None/Causal training path. Other layouts / masks return Unsupported
+            // (same common-case-native precedent as MaxPool2dBackward).
+            #[cfg(feature = "training")]
+            Op::AttentionBackward {
+                num_heads,
+                head_dim,
+                mask_kind,
+                wrt,
+            } => {
+                self.lower_attention_backward(
+                    id, *num_heads, *head_dim, *mask_kind, *wrt, &out_name,
+                )?;
+            }
+            #[cfg(feature = "training")]
+            Op::MaxPool2dBackward {
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                self.lower_max_pool2d_backward(id, kernel_size, stride, padding, &out_name)?;
+            }
+            // Conv2d backward w.r.t. input = transposed convolution of the upstream
+            // gradient with the forward weight (the conv adjoint). Inputs [dy, w];
+            // output = the original input shape. Native because the autodiff
+            // decomposition emits a plain `conv` (wrong gradient — and CoreML
+            // rejects its channel layout); `conv_transpose` is the correct adjoint.
+            #[cfg(feature = "training")]
+            Op::Conv2dBackwardInput {
+                stride,
+                padding,
+                dilation,
+                groups,
+                ..
+            } => {
+                self.lower_conv(
+                    id,
+                    true,
+                    stride,
+                    padding,
+                    dilation,
+                    &[0, 0],
+                    *groups,
+                    &out_name,
+                )?;
+            }
+            // Conv2d backward w.r.t. weight = convolution of the input with the
+            // upstream gradient: dW = transpose(conv(xᵀ, dyᵀ, dilation=stride)).
+            // Inputs [x, dy]; output = forward weight shape [Cout,Cin,kh,kw].
+            #[cfg(feature = "training")]
+            Op::Conv2dBackwardWeight {
+                stride,
+                padding,
+                groups,
+                ..
+            } => {
+                self.lower_conv2d_backward_weight(id, stride, padding, *groups, &out_name)?;
+            }
+            // Softmax-cross-entropy forward (integer labels) + backward, both native
+            // for the same reason: the decompose builds the one-hot by concatenating
+            // C class columns — O(C) graph ops that explode at LLM vocab sizes. MIL's
+            // `one_hot` op is a single node. Lowering BOTH keeps the loss op out of
+            // the `bad` set so the shared `LowerSoftmaxCrossEntropy` pass never fires
+            // and re-decomposes the backward.
+            #[cfg(feature = "training")]
+            Op::SoftmaxCrossEntropyWithLogits => {
+                self.lower_softmax_cross_entropy_with_logits(id, &out_name)?;
+            }
+            #[cfg(feature = "training")]
+            Op::SoftmaxCrossEntropyBackward => {
+                self.lower_softmax_cross_entropy_backward(id, &out_name)?;
+            }
             Op::Reduce { op, axes, keep_dim } => {
                 let ty = match op {
                     ReduceOp::Sum => "reduce_sum",
@@ -280,7 +495,7 @@ impl<'a> LowerCtx<'a> {
                 };
                 let x = self.val(node.inputs[0]);
                 let ax: Vec<i32> = axes.iter().map(|&a| a as i32).collect();
-                let op = simple_op(
+                let op = self.simple_op(
                     ty,
                     &out_name,
                     &node.shape,
@@ -294,7 +509,7 @@ impl<'a> LowerCtx<'a> {
             }
             Op::Concat { axis } => {
                 let names: Vec<String> = node.inputs.iter().map(|&i| self.val(i)).collect();
-                let op = simple_op(
+                let op = self.simple_op(
                     "concat",
                     &out_name,
                     &node.shape,
@@ -324,7 +539,7 @@ impl<'a> LowerCtx<'a> {
                     ],
                 )?;
                 let idx = ic;
-                let op = simple_op(
+                let op = self.simple_op(
                     "gather",
                     &out_name,
                     &node.shape,
@@ -343,7 +558,7 @@ impl<'a> LowerCtx<'a> {
                 let mut size = vec![-1i32; rank];
                 begin[*axis] = *start as i32;
                 size[*axis] = *len as i32;
-                let op = simple_op(
+                let op = self.simple_op(
                     "slice_by_size",
                     &out_name,
                     &node.shape,
@@ -355,7 +570,9 @@ impl<'a> LowerCtx<'a> {
                 )?;
                 self.push_named(id, out_name, op);
             }
-            Op::Rope { head_dim, n_rot } => {
+            Op::Rope {
+                head_dim, n_rot, ..
+            } => {
                 self.lower_rope(id, *head_dim, *n_rot, &out_name)?;
             }
             Op::Attention {
@@ -378,7 +595,7 @@ impl<'a> LowerCtx<'a> {
             Op::Cast { to } => {
                 let x = self.val(node.inputs[0]);
                 let dt = mil_cast_dtype(*to)?;
-                let op = simple_op(
+                let op = self.simple_op(
                     "cast",
                     &out_name,
                     &node.shape,
@@ -397,7 +614,7 @@ impl<'a> LowerCtx<'a> {
                 };
                 let x = self.val(node.inputs[0]);
                 let y = self.val(node.inputs[1]);
-                let op = simple_op(
+                let op = self.simple_op(
                     ty,
                     &out_name,
                     &node.shape,
@@ -423,7 +640,7 @@ impl<'a> LowerCtx<'a> {
                 }
                 let a = self.val(node.inputs[1]);
                 let b = self.val(node.inputs[2]);
-                let op = simple_op(
+                let op = self.simple_op(
                     "select",
                     &out_name,
                     &node.shape,
@@ -457,7 +674,7 @@ impl<'a> LowerCtx<'a> {
                         &f32_shape,
                         vec![("x", bind_name(&xf)), ("y", bind_name(&ones))],
                     )?;
-                    let op = simple_op(
+                    let op = self.simple_op(
                         "cast",
                         &out_name,
                         &node.shape,
@@ -483,7 +700,7 @@ impl<'a> LowerCtx<'a> {
                         &oshape,
                         &vec![1.0f32; n],
                     )?);
-                    let op = simple_op(
+                    let op = self.simple_op(
                         "mul",
                         &out_name,
                         &oshape,
@@ -494,7 +711,7 @@ impl<'a> LowerCtx<'a> {
             }
             Op::Cumsum { axis, exclusive } => {
                 let x = self.val(node.inputs[0]);
-                let op = simple_op(
+                let op = self.simple_op(
                     "cumsum",
                     &out_name,
                     &node.shape,
@@ -531,7 +748,7 @@ impl<'a> LowerCtx<'a> {
                     &node.shape,
                     &vec![0.0f32; n],
                 )?);
-                let op = simple_op(
+                let op = self.simple_op(
                     "scatter",
                     &out_name,
                     &node.shape,
@@ -627,7 +844,7 @@ impl<'a> LowerCtx<'a> {
             Op::ResizeNearest2x => {
                 // NCHW 2× nearest-neighbour upsample over the H/W axes.
                 let x = self.val(node.inputs[0]);
-                let op = simple_op(
+                let op = self.simple_op(
                     "upsample_nearest_neighbor",
                     &out_name,
                     &node.shape,
@@ -643,7 +860,7 @@ impl<'a> LowerCtx<'a> {
                 // Inference no-op; emit `identity` so the value keeps a
                 // distinct name (it may be a graph output).
                 let x = self.val(node.inputs[0]);
-                let op = simple_op(
+                let op = self.simple_op(
                     "identity",
                     &out_name,
                     &node.shape,
@@ -655,13 +872,21 @@ impl<'a> LowerCtx<'a> {
                 self.lower_grouped_matmul(id, &out_name)?;
             }
             Op::DequantMatMul { scheme } => {
-                self.lower_dequant_matmul(id, *scheme, &out_name)?;
+                if self.opts.ondevice_dequant && scheme_supports_ondevice_block_dequant(*scheme) {
+                    self.lower_dequant_matmul_ondevice(id, *scheme, &out_name)?;
+                } else {
+                    self.lower_dequant_matmul(id, *scheme, &out_name)?;
+                }
             }
             Op::DequantMoEWeights { scheme } => {
                 self.lower_dequant_moe_weights(id, *scheme, &out_name)?;
             }
             Op::DequantGroupedMatMul { scheme } => {
-                self.lower_dequant_grouped_matmul(id, *scheme, &out_name)?;
+                if self.opts.ondevice_dequant && scheme_supports_ondevice_block_dequant(*scheme) {
+                    self.lower_dequant_grouped_matmul_ondevice(id, *scheme, &out_name)?;
+                } else {
+                    self.lower_dequant_grouped_matmul(id, *scheme, &out_name)?;
+                }
             }
             Op::Dequantize {
                 axis,
@@ -686,6 +911,15 @@ impl<'a> LowerCtx<'a> {
             } => {
                 self.lower_gated_delta_net(id, *state_size, *carry_state, &out_name)?;
             }
+            Op::ArgMax { axis, keep_dim } => {
+                self.lower_argreduce(id, *axis, *keep_dim, true, &out_name)?;
+            }
+            Op::ArgMin { axis, keep_dim } => {
+                self.lower_argreduce(id, *axis, *keep_dim, false, &out_name)?;
+            }
+            Op::Reverse { axes } => {
+                self.lower_reverse(id, axes, &out_name)?;
+            }
             other => {
                 return Err(CoremlError::Unsupported(format!(
                     "op {:?} (node {})",
@@ -706,7 +940,11 @@ impl<'a> LowerCtx<'a> {
             Activation::Sigmoid => Some(("sigmoid", vec![])),
             Activation::Tanh => Some(("tanh", vec![])),
             Activation::Exp => Some(("exp", vec![])),
-            Activation::Log => Some(("log", vec![])),
+            // MIL `log` is `log(x + epsilon)` and — like `rsqrt` — requires the
+            // param explicitly (CoreML rejects the model otherwise). Use CoreML's
+            // own default 1e-45 so the result is unperturbed (negligible for x≥1,
+            // e.g. the log-sum-exp in softmax-cross-entropy that surfaced this).
+            Activation::Log => Some(("log", vec![("epsilon", bind_value(scalar_f32(1e-45)))])),
             Activation::Sqrt => Some(("sqrt", vec![])),
             Activation::Rsqrt => Some(("rsqrt", vec![("epsilon", bind_value(scalar_f32(1e-12)))])),
             Activation::Abs => Some(("abs", vec![])),
@@ -727,7 +965,7 @@ impl<'a> LowerCtx<'a> {
         if let Some((ty, mut params)) = direct {
             let mut binds = vec![("x", bind_name(&x))];
             binds.append(&mut params);
-            let op = simple_op(ty, out_name, &node.shape, binds)?;
+            let op = self.simple_op(ty, out_name, &node.shape, binds)?;
             self.push_named(id, out_name.to_string(), op);
             return Ok(());
         }
@@ -736,9 +974,10 @@ impl<'a> LowerCtx<'a> {
             // silu(x) = x * sigmoid(x)
             Activation::Silu => {
                 let sig = format!("{out_name}_sig");
-                let sig_op = simple_op("sigmoid", &sig, &node.shape, vec![("x", bind_name(&x))])?;
+                let sig_op =
+                    self.simple_op("sigmoid", &sig, &node.shape, vec![("x", bind_name(&x))])?;
                 self.operations.push(sig_op);
-                let op = simple_op(
+                let op = self.simple_op(
                     "mul",
                     out_name,
                     &node.shape,
@@ -748,7 +987,7 @@ impl<'a> LowerCtx<'a> {
             }
             // neg(x) = mul(x, -1)
             Activation::Neg => {
-                let op = simple_op(
+                let op = self.simple_op(
                     "mul",
                     out_name,
                     &node.shape,
@@ -784,7 +1023,7 @@ impl<'a> LowerCtx<'a> {
             let b = self.val(node.inputs[2]);
             binds.push(("beta", bind_name(&b)));
         }
-        let op = simple_op("layer_norm", out_name, &node.shape, binds)?;
+        let op = self.simple_op("layer_norm", out_name, &node.shape, binds)?;
         self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
@@ -802,7 +1041,7 @@ impl<'a> LowerCtx<'a> {
 
         // sq = x * x
         let sq = format!("{out_name}_sq");
-        self.operations.push(simple_op(
+        self.operations.push(self.simple_op(
             "mul",
             &sq,
             &node.shape,
@@ -810,7 +1049,7 @@ impl<'a> LowerCtx<'a> {
         )?);
         // ms = reduce_mean(sq, axes, keep_dims=true)
         let ms = format!("{out_name}_ms");
-        self.operations.push(simple_op(
+        self.operations.push(self.simple_op(
             "reduce_mean",
             &ms,
             &red_shape,
@@ -822,7 +1061,7 @@ impl<'a> LowerCtx<'a> {
         )?);
         // ms_eps = ms + eps
         let mse = format!("{out_name}_mse");
-        self.operations.push(simple_op(
+        self.operations.push(self.simple_op(
             "add",
             &mse,
             &red_shape,
@@ -830,7 +1069,7 @@ impl<'a> LowerCtx<'a> {
         )?);
         // inv = rsqrt(ms_eps)  (eps already folded into ms_eps above)
         let inv = format!("{out_name}_inv");
-        self.operations.push(simple_op(
+        self.operations.push(self.simple_op(
             "rsqrt",
             &inv,
             &red_shape,
@@ -852,7 +1091,7 @@ impl<'a> LowerCtx<'a> {
         } else {
             out_name.to_string()
         };
-        self.operations.push(simple_op(
+        self.operations.push(self.simple_op(
             "mul",
             &xn_name,
             &node.shape,
@@ -867,7 +1106,7 @@ impl<'a> LowerCtx<'a> {
             } else {
                 out_name.to_string()
             };
-            self.operations.push(simple_op(
+            self.operations.push(self.simple_op(
                 "mul",
                 &name,
                 &node.shape,
@@ -877,7 +1116,7 @@ impl<'a> LowerCtx<'a> {
         }
         if has_beta {
             let b = self.val(node.inputs[2]);
-            self.operations.push(simple_op(
+            self.operations.push(self.simple_op(
                 "add",
                 out_name,
                 &node.shape,
@@ -885,6 +1124,1234 @@ impl<'a> LowerCtx<'a> {
             )?);
         }
         self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
+
+    /// RMSNorm backward w.r.t. input. Inputs `[x, gamma, beta, dy]`, output = `x`.
+    /// Mirrors `compose_rms_norm_backward_input`:
+    ///   inv = rsqrt(mean(x², ax) + eps);  dy_g = dy·gamma
+    ///   dot = mean(x·dy_g, ax);  dx = inv·(dy_g − x·dot·inv³)
+    /// All reductions keep dims so `[...,1]` factors broadcast over `[...,H]`.
+    #[cfg(feature = "training")]
+    fn lower_rms_norm_backward_input(
+        &mut self,
+        id: NodeId,
+        axis: i32,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let gamma = self.val(node.inputs[1]);
+        // node.inputs[2] = beta — additive in the forward, so absent from dx.
+        let dy = self.val(node.inputs[3]);
+        let full = node.shape.clone();
+        let rank = full.rank();
+        let norm_axis = if axis < 0 { axis + rank as i32 } else { axis } as usize;
+        let axes: Vec<i32> = (norm_axis..rank).map(|a| a as i32).collect();
+        let red = reduced_shape(&full, norm_axis);
+        let red_axes = || bind_value(vec_i32(&axes));
+        let keep = || bind_value(scalar_bool(true));
+
+        // inv = rsqrt(mean(x*x, axes) + eps)
+        let x2 = format!("{out_name}_x2");
+        self.emit(
+            "mul",
+            &x2,
+            &full,
+            vec![("x", bind_name(&x)), ("y", bind_name(&x))],
+        )?;
+        let mx2 = format!("{out_name}_mx2");
+        self.emit(
+            "reduce_mean",
+            &mx2,
+            &red,
+            vec![
+                ("x", bind_name(&x2)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let ve = format!("{out_name}_ve");
+        self.emit(
+            "add",
+            &ve,
+            &red,
+            vec![("x", bind_name(&mx2)), ("y", bind_value(scalar_f32(eps)))],
+        )?;
+        let inv = format!("{out_name}_inv");
+        self.emit(
+            "rsqrt",
+            &inv,
+            &red,
+            vec![
+                ("x", bind_name(&ve)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?;
+        let inv2 = format!("{out_name}_inv2");
+        self.emit(
+            "mul",
+            &inv2,
+            &red,
+            vec![("x", bind_name(&inv)), ("y", bind_name(&inv))],
+        )?;
+
+        // dy_g = dy * gamma  (gamma [H] broadcasts over [...,H])
+        let dyg = format!("{out_name}_dyg");
+        self.emit(
+            "mul",
+            &dyg,
+            &full,
+            vec![("x", bind_name(&dy)), ("y", bind_name(&gamma))],
+        )?;
+        // dot = mean(x * dy_g, axes)
+        let xdyg = format!("{out_name}_xdyg");
+        self.emit(
+            "mul",
+            &xdyg,
+            &full,
+            vec![("x", bind_name(&x)), ("y", bind_name(&dyg))],
+        )?;
+        let dot = format!("{out_name}_dot");
+        self.emit(
+            "reduce_mean",
+            &dot,
+            &red,
+            vec![
+                ("x", bind_name(&xdyg)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        // term2 = x * dot * inv²  (the outer `* inv` below makes the cross term inv³, not inv⁴)
+        let xdot = format!("{out_name}_xdot");
+        self.emit(
+            "mul",
+            &xdot,
+            &full,
+            vec![("x", bind_name(&x)), ("y", bind_name(&dot))],
+        )?;
+        let term2 = format!("{out_name}_t2");
+        self.emit(
+            "mul",
+            &term2,
+            &full,
+            vec![("x", bind_name(&xdot)), ("y", bind_name(&inv2))],
+        )?;
+        // diff = dy_g - term2;  dx = diff * inv
+        let diff = format!("{out_name}_diff");
+        self.emit(
+            "sub",
+            &diff,
+            &full,
+            vec![("x", bind_name(&dyg)), ("y", bind_name(&term2))],
+        )?;
+        let op = self.simple_op(
+            "mul",
+            out_name,
+            &full,
+            vec![("x", bind_name(&diff)), ("y", bind_name(&inv))],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// RMSNorm backward w.r.t. gamma. Inputs `[x, gamma, beta, dy]`, output =
+    /// `gamma` (`[H]`). Mirrors `compose_rms_norm_backward_gamma`:
+    ///   `dgamma = sum_batch(dy · x · rsqrt(mean(x², ax) + eps))`.
+    #[cfg(feature = "training")]
+    fn lower_rms_norm_backward_gamma(
+        &mut self,
+        id: NodeId,
+        axis: i32,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let dy = self.val(node.inputs[3]);
+        let gamma_shape = node.shape.clone();
+        let x_shape = self.graph.shape(node.inputs[0]).clone();
+        let rank = x_shape.rank();
+        let norm_axis = if axis < 0 { axis + rank as i32 } else { axis } as usize;
+        let axes: Vec<i32> = (norm_axis..rank).map(|a| a as i32).collect();
+        let red = reduced_shape(&x_shape, norm_axis);
+        let batch_axes: Vec<i32> = (0..rank as i32)
+            .filter(|&i| i as usize != norm_axis)
+            .collect();
+
+        let x2 = format!("{out_name}_x2");
+        self.emit(
+            "mul",
+            &x2,
+            &x_shape,
+            vec![("x", bind_name(&x)), ("y", bind_name(&x))],
+        )?;
+        let mx2 = format!("{out_name}_mx2");
+        self.emit(
+            "reduce_mean",
+            &mx2,
+            &red,
+            vec![
+                ("x", bind_name(&x2)),
+                ("axes", bind_value(vec_i32(&axes))),
+                ("keep_dims", bind_value(scalar_bool(true))),
+            ],
+        )?;
+        let ve = format!("{out_name}_ve");
+        self.emit(
+            "add",
+            &ve,
+            &red,
+            vec![("x", bind_name(&mx2)), ("y", bind_value(scalar_f32(eps)))],
+        )?;
+        let inv = format!("{out_name}_inv");
+        self.emit(
+            "rsqrt",
+            &inv,
+            &red,
+            vec![
+                ("x", bind_name(&ve)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?;
+        let xinv = format!("{out_name}_xinv");
+        self.emit(
+            "mul",
+            &xinv,
+            &x_shape,
+            vec![("x", bind_name(&x)), ("y", bind_name(&inv))],
+        )?;
+        let prod = format!("{out_name}_prod");
+        self.emit(
+            "mul",
+            &prod,
+            &x_shape,
+            vec![("x", bind_name(&dy)), ("y", bind_name(&xinv))],
+        )?;
+        let op = self.simple_op(
+            "reduce_sum",
+            out_name,
+            &gamma_shape,
+            vec![
+                ("x", bind_name(&prod)),
+                ("axes", bind_value(vec_i32(&batch_axes))),
+                ("keep_dims", bind_value(scalar_bool(false))),
+            ],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// RMSNorm backward w.r.t. beta. Inputs `[x, gamma, beta, dy]`, output =
+    /// `beta` (`[H]`). `dbeta = sum_batch(dy)`.
+    #[cfg(feature = "training")]
+    fn lower_rms_norm_backward_beta(
+        &mut self,
+        id: NodeId,
+        _axis: i32,
+        _eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let dy = self.val(node.inputs[3]);
+        let beta_shape = node.shape.clone();
+        let rank = self.graph.shape(node.inputs[3]).rank();
+        // beta is over the last (feature) axis; reduce every batch axis.
+        let batch_axes: Vec<i32> = (0..rank as i32 - 1).collect();
+        let op = self.simple_op(
+            "reduce_sum",
+            out_name,
+            &beta_shape,
+            vec![
+                ("x", bind_name(&dy)),
+                ("axes", bind_value(vec_i32(&batch_axes))),
+                ("keep_dims", bind_value(scalar_bool(false))),
+            ],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// Native LayerNorm backward w.r.t. input (axis = -1). Inputs `[x, gamma, dy]`,
+    /// output matches `x`. Mirrors `compose_layer_norm_backward_input`:
+    ///   `dx = inv_std·(sy − mean(sy) − x_hat·mean(sy·x_hat))`, `sy = dy·γ`,
+    ///   `x_hat = (x − mean)·inv_std`, `inv_std = rsqrt(var + eps)`. Composed MIL
+    /// with implicit broadcasting (reduced `[..,1]` tensors broadcast over the norm
+    /// axis), no decomposition `expand`s.
+    #[cfg(feature = "training")]
+    fn lower_layer_norm_backward_input(
+        &mut self,
+        id: NodeId,
+        axis: i32,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let gamma = self.val(node.inputs[1]);
+        let dy = self.val(node.inputs[2]);
+        let full = node.shape.clone();
+        let rank = full.rank();
+        let norm_axis = if axis < 0 { axis + rank as i32 } else { axis } as usize;
+        let axes: Vec<i32> = (norm_axis..rank).map(|a| a as i32).collect();
+        let red = reduced_shape(&full, norm_axis);
+        let red_axes = || bind_value(vec_i32(&axes));
+        let keep = || bind_value(scalar_bool(true));
+
+        // mean, centered x
+        let mean = format!("{out_name}_mean");
+        self.emit(
+            "reduce_mean",
+            &mean,
+            &red,
+            vec![
+                ("x", bind_name(&x)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let xc = format!("{out_name}_xc");
+        self.emit(
+            "sub",
+            &xc,
+            &full,
+            vec![("x", bind_name(&x)), ("y", bind_name(&mean))],
+        )?;
+        // var, inv_std = rsqrt(var + eps)
+        let xc2 = format!("{out_name}_xc2");
+        self.emit(
+            "mul",
+            &xc2,
+            &full,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&xc))],
+        )?;
+        let var = format!("{out_name}_var");
+        self.emit(
+            "reduce_mean",
+            &var,
+            &red,
+            vec![
+                ("x", bind_name(&xc2)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let ve = format!("{out_name}_ve");
+        self.emit(
+            "add",
+            &ve,
+            &red,
+            vec![("x", bind_name(&var)), ("y", bind_value(scalar_f32(eps)))],
+        )?;
+        let inv_std = format!("{out_name}_invs");
+        self.emit(
+            "rsqrt",
+            &inv_std,
+            &red,
+            vec![
+                ("x", bind_name(&ve)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?;
+        let x_hat = format!("{out_name}_xhat");
+        self.emit(
+            "mul",
+            &x_hat,
+            &full,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&inv_std))],
+        )?;
+
+        // sy = dy·γ; its mean; and mean(sy·x_hat)
+        let sy = format!("{out_name}_sy");
+        self.emit(
+            "mul",
+            &sy,
+            &full,
+            vec![("x", bind_name(&dy)), ("y", bind_name(&gamma))],
+        )?;
+        let m_sy = format!("{out_name}_msy");
+        self.emit(
+            "reduce_mean",
+            &m_sy,
+            &red,
+            vec![
+                ("x", bind_name(&sy)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let sy_xh = format!("{out_name}_syxh");
+        self.emit(
+            "mul",
+            &sy_xh,
+            &full,
+            vec![("x", bind_name(&sy)), ("y", bind_name(&x_hat))],
+        )?;
+        let m_sxh = format!("{out_name}_msxh");
+        self.emit(
+            "reduce_mean",
+            &m_sxh,
+            &red,
+            vec![
+                ("x", bind_name(&sy_xh)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+
+        // dx = inv_std·(sy − mean(sy) − x_hat·mean(sy·x_hat))
+        let t1 = format!("{out_name}_t1");
+        self.emit(
+            "sub",
+            &t1,
+            &full,
+            vec![("x", bind_name(&sy)), ("y", bind_name(&m_sy))],
+        )?;
+        let t2 = format!("{out_name}_t2");
+        self.emit(
+            "mul",
+            &t2,
+            &full,
+            vec![("x", bind_name(&x_hat)), ("y", bind_name(&m_sxh))],
+        )?;
+        let t3 = format!("{out_name}_t3");
+        self.emit(
+            "sub",
+            &t3,
+            &full,
+            vec![("x", bind_name(&t1)), ("y", bind_name(&t2))],
+        )?;
+        let op = self.simple_op(
+            "mul",
+            out_name,
+            &full,
+            vec![("x", bind_name(&inv_std)), ("y", bind_name(&t3))],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// Native LayerNorm backward w.r.t. gamma. Inputs `[x, dy]`, output = gamma
+    /// shape. Mirrors `compose_layer_norm_backward_gamma`:
+    ///   `dgamma = Σ_batch(dy · x_hat)`, `x_hat = (x − mean)·rsqrt(var + eps)`.
+    #[cfg(feature = "training")]
+    fn lower_layer_norm_backward_gamma(
+        &mut self,
+        id: NodeId,
+        axis: i32,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let dy = self.val(node.inputs[1]);
+        let gamma_shape = node.shape.clone();
+        let x_shape = self.graph.shape(node.inputs[0]).clone();
+        let rank = x_shape.rank();
+        let norm_axis = if axis < 0 { axis + rank as i32 } else { axis } as usize;
+        let axes: Vec<i32> = (norm_axis..rank).map(|a| a as i32).collect();
+        let red = reduced_shape(&x_shape, norm_axis);
+        let batch_axes: Vec<i32> = (0..rank as i32)
+            .filter(|&i| i as usize != norm_axis)
+            .collect();
+        let red_axes = || bind_value(vec_i32(&axes));
+        let keep = || bind_value(scalar_bool(true));
+
+        let mean = format!("{out_name}_mean");
+        self.emit(
+            "reduce_mean",
+            &mean,
+            &red,
+            vec![
+                ("x", bind_name(&x)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let xc = format!("{out_name}_xc");
+        self.emit(
+            "sub",
+            &xc,
+            &x_shape,
+            vec![("x", bind_name(&x)), ("y", bind_name(&mean))],
+        )?;
+        let xc2 = format!("{out_name}_xc2");
+        self.emit(
+            "mul",
+            &xc2,
+            &x_shape,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&xc))],
+        )?;
+        let var = format!("{out_name}_var");
+        self.emit(
+            "reduce_mean",
+            &var,
+            &red,
+            vec![
+                ("x", bind_name(&xc2)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let ve = format!("{out_name}_ve");
+        self.emit(
+            "add",
+            &ve,
+            &red,
+            vec![("x", bind_name(&var)), ("y", bind_value(scalar_f32(eps)))],
+        )?;
+        let inv_std = format!("{out_name}_invs");
+        self.emit(
+            "rsqrt",
+            &inv_std,
+            &red,
+            vec![
+                ("x", bind_name(&ve)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?;
+        let x_hat = format!("{out_name}_xhat");
+        self.emit(
+            "mul",
+            &x_hat,
+            &x_shape,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&inv_std))],
+        )?;
+        let prod = format!("{out_name}_prod");
+        self.emit(
+            "mul",
+            &prod,
+            &x_shape,
+            vec![("x", bind_name(&dy)), ("y", bind_name(&x_hat))],
+        )?;
+        let op = self.simple_op(
+            "reduce_sum",
+            out_name,
+            &gamma_shape,
+            vec![
+                ("x", bind_name(&prod)),
+                ("axes", bind_value(vec_i32(&batch_axes))),
+                ("keep_dims", bind_value(scalar_bool(false))),
+            ],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// Native GroupNorm backward w.r.t. input (NCHW). Inputs `[x, gamma, beta, dy]`,
+    /// output matches `x`. Reshapes `[N,C,H,W] → [N,G,M]` (M = C/G·H·W) so the group
+    /// stats are a single last-axis reduce; the affine `sy = dy·γ` is done in NCHW
+    /// (γ broadcasts over H,W) before the reshape. Same math as
+    /// `compose_group_norm_backward_input`, without the per-group narrow/concat loop.
+    #[cfg(feature = "training")]
+    fn lower_group_norm_backward_input(
+        &mut self,
+        id: NodeId,
+        num_groups: usize,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let gamma = self.val(node.inputs[1]);
+        // inputs[2] = beta (additive in the forward, absent from dx)
+        let dy = self.val(node.inputs[3]);
+        let full = node.shape.clone(); // [N,C,H,W]
+        let (n, c, h, w) = (
+            full.dim(0).unwrap_static(),
+            full.dim(1).unwrap_static(),
+            full.dim(2).unwrap_static(),
+            full.dim(3).unwrap_static(),
+        );
+        let dt = full.dtype();
+        let m = (c / num_groups) * h * w;
+        let grouped = Shape::new(&[n, num_groups, m], dt);
+        let red = Shape::new(&[n, num_groups, 1], dt);
+        let g3 = || bind_value(vec_i32(&[n as i32, num_groups as i32, m as i32]));
+        let red_axis = || bind_value(vec_i32(&[2]));
+        let keep = || bind_value(scalar_bool(true));
+
+        // sy = dy·γ in NCHW (γ [C] → [1,C,1,1] broadcasts over H,W)
+        let gr = format!("{out_name}_gr");
+        self.emit(
+            "reshape",
+            &gr,
+            &Shape::new(&[1, c, 1, 1], dt),
+            vec![
+                ("x", bind_name(&gamma)),
+                ("shape", bind_value(vec_i32(&[1, c as i32, 1, 1]))),
+            ],
+        )?;
+        let sy_nchw = format!("{out_name}_synchw");
+        self.emit(
+            "mul",
+            &sy_nchw,
+            &full,
+            vec![("x", bind_name(&dy)), ("y", bind_name(&gr))],
+        )?;
+
+        // group the channels: x, sy → [N,G,M]
+        let xf = format!("{out_name}_xf");
+        self.emit(
+            "reshape",
+            &xf,
+            &grouped,
+            vec![("x", bind_name(&x)), ("shape", g3())],
+        )?;
+        let syf = format!("{out_name}_syf");
+        self.emit(
+            "reshape",
+            &syf,
+            &grouped,
+            vec![("x", bind_name(&sy_nchw)), ("shape", g3())],
+        )?;
+
+        // mean, var, inv_std over the group axis
+        let mean = format!("{out_name}_mean");
+        self.emit(
+            "reduce_mean",
+            &mean,
+            &red,
+            vec![
+                ("x", bind_name(&xf)),
+                ("axes", red_axis()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let xc = format!("{out_name}_xc");
+        self.emit(
+            "sub",
+            &xc,
+            &grouped,
+            vec![("x", bind_name(&xf)), ("y", bind_name(&mean))],
+        )?;
+        let xc2 = format!("{out_name}_xc2");
+        self.emit(
+            "mul",
+            &xc2,
+            &grouped,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&xc))],
+        )?;
+        let var = format!("{out_name}_var");
+        self.emit(
+            "reduce_mean",
+            &var,
+            &red,
+            vec![
+                ("x", bind_name(&xc2)),
+                ("axes", red_axis()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let ve = format!("{out_name}_ve");
+        self.emit(
+            "add",
+            &ve,
+            &red,
+            vec![("x", bind_name(&var)), ("y", bind_value(scalar_f32(eps)))],
+        )?;
+        let inv_std = format!("{out_name}_invs");
+        self.emit(
+            "rsqrt",
+            &inv_std,
+            &red,
+            vec![
+                ("x", bind_name(&ve)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?;
+        let x_hat = format!("{out_name}_xhat");
+        self.emit(
+            "mul",
+            &x_hat,
+            &grouped,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&inv_std))],
+        )?;
+
+        // mean(sy), mean(sy·x_hat) over the group axis
+        let m_sy = format!("{out_name}_msy");
+        self.emit(
+            "reduce_mean",
+            &m_sy,
+            &red,
+            vec![
+                ("x", bind_name(&syf)),
+                ("axes", red_axis()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let sy_xh = format!("{out_name}_syxh");
+        self.emit(
+            "mul",
+            &sy_xh,
+            &grouped,
+            vec![("x", bind_name(&syf)), ("y", bind_name(&x_hat))],
+        )?;
+        let m_sxh = format!("{out_name}_msxh");
+        self.emit(
+            "reduce_mean",
+            &m_sxh,
+            &red,
+            vec![
+                ("x", bind_name(&sy_xh)),
+                ("axes", red_axis()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+
+        // flat_dx = inv_std·(sy − mean(sy) − x_hat·mean(sy·x_hat)); reshape to NCHW
+        let t1 = format!("{out_name}_t1");
+        self.emit(
+            "sub",
+            &t1,
+            &grouped,
+            vec![("x", bind_name(&syf)), ("y", bind_name(&m_sy))],
+        )?;
+        let t2 = format!("{out_name}_t2");
+        self.emit(
+            "mul",
+            &t2,
+            &grouped,
+            vec![("x", bind_name(&x_hat)), ("y", bind_name(&m_sxh))],
+        )?;
+        let t3 = format!("{out_name}_t3");
+        self.emit(
+            "sub",
+            &t3,
+            &grouped,
+            vec![("x", bind_name(&t1)), ("y", bind_name(&t2))],
+        )?;
+        let flat_dx = format!("{out_name}_fdx");
+        self.emit(
+            "mul",
+            &flat_dx,
+            &grouped,
+            vec![("x", bind_name(&t3)), ("y", bind_name(&inv_std))],
+        )?;
+        let op = self.simple_op(
+            "reshape",
+            out_name,
+            &full,
+            vec![
+                ("x", bind_name(&flat_dx)),
+                (
+                    "shape",
+                    bind_value(vec_i32(&[n as i32, c as i32, h as i32, w as i32])),
+                ),
+            ],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// Native GroupNorm backward w.r.t. gamma (NCHW). Inputs `[x, dy]`, output =
+    /// gamma `[C]`. `dgamma[c] = Σ_{n,h,w} dy·x_hat`, with `x_hat` the group-
+    /// normalized `x` (computed in the `[N,G,M]` layout, then reshaped back to NCHW
+    /// so the channel reduction over axes {N,H,W} is exact for any batch size).
+    #[cfg(feature = "training")]
+    fn lower_group_norm_backward_gamma(
+        &mut self,
+        id: NodeId,
+        num_groups: usize,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let dy = self.val(node.inputs[1]);
+        let gamma_shape = node.shape.clone(); // [C]
+        let xs = self.graph.shape(node.inputs[0]).clone(); // [N,C,H,W]
+        let (n, c, h, w) = (
+            xs.dim(0).unwrap_static(),
+            xs.dim(1).unwrap_static(),
+            xs.dim(2).unwrap_static(),
+            xs.dim(3).unwrap_static(),
+        );
+        let dt = xs.dtype();
+        let m = (c / num_groups) * h * w;
+        let grouped = Shape::new(&[n, num_groups, m], dt);
+        let red = Shape::new(&[n, num_groups, 1], dt);
+        let g3 = || bind_value(vec_i32(&[n as i32, num_groups as i32, m as i32]));
+        let red_axis = || bind_value(vec_i32(&[2]));
+        let keep = || bind_value(scalar_bool(true));
+
+        let xf = format!("{out_name}_xf");
+        self.emit(
+            "reshape",
+            &xf,
+            &grouped,
+            vec![("x", bind_name(&x)), ("shape", g3())],
+        )?;
+        let mean = format!("{out_name}_mean");
+        self.emit(
+            "reduce_mean",
+            &mean,
+            &red,
+            vec![
+                ("x", bind_name(&xf)),
+                ("axes", red_axis()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let xc = format!("{out_name}_xc");
+        self.emit(
+            "sub",
+            &xc,
+            &grouped,
+            vec![("x", bind_name(&xf)), ("y", bind_name(&mean))],
+        )?;
+        let xc2 = format!("{out_name}_xc2");
+        self.emit(
+            "mul",
+            &xc2,
+            &grouped,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&xc))],
+        )?;
+        let var = format!("{out_name}_var");
+        self.emit(
+            "reduce_mean",
+            &var,
+            &red,
+            vec![
+                ("x", bind_name(&xc2)),
+                ("axes", red_axis()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let ve = format!("{out_name}_ve");
+        self.emit(
+            "add",
+            &ve,
+            &red,
+            vec![("x", bind_name(&var)), ("y", bind_value(scalar_f32(eps)))],
+        )?;
+        let inv_std = format!("{out_name}_invs");
+        self.emit(
+            "rsqrt",
+            &inv_std,
+            &red,
+            vec![
+                ("x", bind_name(&ve)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?;
+        let x_hat_g = format!("{out_name}_xhatg");
+        self.emit(
+            "mul",
+            &x_hat_g,
+            &grouped,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&inv_std))],
+        )?;
+        // back to NCHW so the channel-aligned reduction is unambiguous
+        let x_hat = format!("{out_name}_xhat");
+        self.emit(
+            "reshape",
+            &x_hat,
+            &xs,
+            vec![
+                ("x", bind_name(&x_hat_g)),
+                (
+                    "shape",
+                    bind_value(vec_i32(&[n as i32, c as i32, h as i32, w as i32])),
+                ),
+            ],
+        )?;
+        let prod = format!("{out_name}_prod");
+        self.emit(
+            "mul",
+            &prod,
+            &xs,
+            vec![("x", bind_name(&dy)), ("y", bind_name(&x_hat))],
+        )?;
+        let op = self.simple_op(
+            "reduce_sum",
+            out_name,
+            &gamma_shape,
+            vec![
+                ("x", bind_name(&prod)),
+                ("axes", bind_value(vec_i32(&[0, 2, 3]))),
+                ("keep_dims", bind_value(scalar_bool(false))),
+            ],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// Native GroupNorm backward w.r.t. beta (NCHW). Inputs `[x, dy]` (x unused),
+    /// output = beta `[C] = Σ_{n,h,w} dy` — a single channel-aligned reduce_sum.
+    #[cfg(feature = "training")]
+    fn lower_group_norm_backward_beta(&mut self, id: NodeId, out_name: &str) -> Result<()> {
+        let node = self.graph.node(id);
+        let dy = self.val(node.inputs[1]);
+        let beta_shape = node.shape.clone();
+        let op = self.simple_op(
+            "reduce_sum",
+            out_name,
+            &beta_shape,
+            vec![
+                ("x", bind_name(&dy)),
+                ("axes", bind_value(vec_i32(&[0, 2, 3]))),
+                ("keep_dims", bind_value(scalar_bool(false))),
+            ],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// Native softmax-cross-entropy-with-logits forward. Inputs `[logits [N,C],
+    /// labels [N]]`, output per-row loss `[N] = logsumexp(logits) − logits[label]`.
+    /// Mirrors `rlx_fusion::lower_softmax_cross_entropy_with_logits` but selects the
+    /// label logit with one `one_hot`+`reduce_sum` instead of concatenating C columns.
+    /// Pairs with the native backward so a full SCE training step stays off the O(C)
+    /// decompose path on the ANE.
+    #[cfg(feature = "training")]
+    fn lower_softmax_cross_entropy_with_logits(
+        &mut self,
+        id: NodeId,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let logits_id = node.inputs[0];
+        let labels_id = node.inputs[1];
+        let logits_shape = self.graph.shape(logits_id).clone(); // [N, C]
+        let out_shape = node.shape.clone(); // [N]
+        let n = logits_shape.dim(0).unwrap_static();
+        let c = logits_shape.dim(1).unwrap_static() as i32;
+        let dt = logits_shape.dtype();
+        let logits = self.val(logits_id);
+        let kept = Shape::new(&[n, 1], dt); // [N,1]
+
+        // lse = max + log(sum(exp(logits − max)))  (the numerically-stable logsumexp)
+        let m = format!("{out_name}_max");
+        self.emit(
+            "reduce_max",
+            &m,
+            &kept,
+            vec![
+                ("x", bind_name(&logits)),
+                ("axes", bind_value(vec_i32(&[-1]))),
+                ("keep_dims", bind_value(scalar_bool(true))),
+            ],
+        )?;
+        let shifted = format!("{out_name}_sh");
+        self.emit(
+            "sub",
+            &shifted,
+            &logits_shape,
+            vec![("x", bind_name(&logits)), ("y", bind_name(&m))],
+        )?;
+        let exp_d = format!("{out_name}_exp");
+        self.emit(
+            "exp",
+            &exp_d,
+            &logits_shape,
+            vec![("x", bind_name(&shifted))],
+        )?;
+        let sum_exp = format!("{out_name}_se");
+        self.emit(
+            "reduce_sum",
+            &sum_exp,
+            &out_shape,
+            vec![
+                ("x", bind_name(&exp_d)),
+                ("axes", bind_value(vec_i32(&[-1]))),
+                ("keep_dims", bind_value(scalar_bool(false))),
+            ],
+        )?;
+        let log_sum = format!("{out_name}_ls");
+        self.emit(
+            "log",
+            &log_sum,
+            &out_shape,
+            vec![
+                ("x", bind_name(&sum_exp)),
+                ("epsilon", bind_value(scalar_f32(1e-45))),
+            ],
+        )?;
+        let m_flat = format!("{out_name}_mf");
+        self.emit(
+            "reshape",
+            &m_flat,
+            &out_shape,
+            vec![
+                ("x", bind_name(&m)),
+                ("shape", bind_value(vec_i32(&[n as i32]))),
+            ],
+        )?;
+        let lse = format!("{out_name}_lse");
+        self.emit(
+            "add",
+            &lse,
+            &out_shape,
+            vec![("x", bind_name(&m_flat)), ("y", bind_name(&log_sum))],
+        )?;
+
+        // label_logit[n] = Σ_c logits[n,c]·onehot(labels)[n,c]
+        let idx = format!("{out_name}_idx");
+        let lshape = self.graph.shape(labels_id).clone().with_dtype(DType::I32);
+        self.emit(
+            "cast",
+            &idx,
+            &lshape,
+            vec![
+                ("x", bind_name(&self.val(labels_id))),
+                ("dtype", bind_value(scalar_str("int32"))),
+            ],
+        )?;
+        let oh = format!("{out_name}_oh");
+        self.emit(
+            "one_hot",
+            &oh,
+            &logits_shape,
+            vec![
+                ("indices", bind_name(&idx)),
+                ("one_hot_vector_size", bind_value(scalar_i32(c))),
+                ("axis", bind_value(scalar_i32(-1))),
+                ("on_value", bind_value(scalar_f32(1.0))),
+                ("off_value", bind_value(scalar_f32(0.0))),
+            ],
+        )?;
+        let masked = format!("{out_name}_msk");
+        self.emit(
+            "mul",
+            &masked,
+            &logits_shape,
+            vec![("x", bind_name(&logits)), ("y", bind_name(&oh))],
+        )?;
+        let label_logit = format!("{out_name}_ll");
+        self.emit(
+            "reduce_sum",
+            &label_logit,
+            &out_shape,
+            vec![
+                ("x", bind_name(&masked)),
+                ("axes", bind_value(vec_i32(&[-1]))),
+                ("keep_dims", bind_value(scalar_bool(false))),
+            ],
+        )?;
+
+        let op = self.simple_op(
+            "sub",
+            out_name,
+            &out_shape,
+            vec![("x", bind_name(&lse)), ("y", bind_name(&label_logit))],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// Native softmax-cross-entropy backward. Inputs `[logits [N,C], labels [N],
+    /// d_loss [N]]`, output `dlogits [N,C] = (softmax(logits) − onehot(labels))·d_loss`.
+    /// Mirrors `rlx_fusion::lower_softmax_cross_entropy_backward`, but emits MIL's
+    /// single `one_hot` op instead of concatenating C class columns — the decompose
+    /// path is O(C) graph nodes, which is unusable at LLM vocab sizes.
+    #[cfg(feature = "training")]
+    fn lower_softmax_cross_entropy_backward(&mut self, id: NodeId, out_name: &str) -> Result<()> {
+        let node = self.graph.node(id);
+        let logits_id = node.inputs[0];
+        let labels_id = node.inputs[1];
+        let d_loss_id = node.inputs[2];
+        let full = node.shape.clone(); // [N, C]
+        let n = full.dim(0).unwrap_static();
+        let c = full.dim(1).unwrap_static() as i32;
+        let logits = self.val(logits_id);
+
+        // sm = softmax(logits, axis=-1)
+        let sm = format!("{out_name}_sm");
+        self.emit(
+            "softmax",
+            &sm,
+            &full,
+            vec![
+                ("x", bind_name(&logits)),
+                ("axis", bind_value(scalar_i32(-1))),
+            ],
+        )?;
+
+        // onehot(labels): CoreML one_hot needs int indices; labels are f32-encoded.
+        let idx = format!("{out_name}_idx");
+        let lshape = self.graph.shape(labels_id).clone().with_dtype(DType::I32);
+        self.emit(
+            "cast",
+            &idx,
+            &lshape,
+            vec![
+                ("x", bind_name(&self.val(labels_id))),
+                ("dtype", bind_value(scalar_str("int32"))),
+            ],
+        )?;
+        let oh = format!("{out_name}_oh");
+        self.emit(
+            "one_hot",
+            &oh,
+            &full,
+            vec![
+                ("indices", bind_name(&idx)),
+                ("one_hot_vector_size", bind_value(scalar_i32(c))),
+                ("axis", bind_value(scalar_i32(-1))),
+                ("on_value", bind_value(scalar_f32(1.0))),
+                ("off_value", bind_value(scalar_f32(0.0))),
+            ],
+        )?;
+
+        // diff = sm − onehot
+        let diff = format!("{out_name}_diff");
+        self.emit(
+            "sub",
+            &diff,
+            &full,
+            vec![("x", bind_name(&sm)), ("y", bind_name(&oh))],
+        )?;
+
+        // dlogits = diff · d_loss, with d_loss [N] reshaped to [N,1] to broadcast over C.
+        let dl2 = format!("{out_name}_dl2");
+        let dl2_shape = Shape::new(&[n, 1], full.dtype());
+        self.emit(
+            "reshape",
+            &dl2,
+            &dl2_shape,
+            vec![
+                ("x", bind_name(&self.val(d_loss_id))),
+                ("shape", bind_value(vec_i32(&[n as i32, 1]))),
+            ],
+        )?;
+        let op = self.simple_op(
+            "mul",
+            out_name,
+            &full,
+            vec![("x", bind_name(&diff)), ("y", bind_name(&dl2))],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// Native MaxPool2d backward (training). Routes each window's upstream
+    /// gradient to its max position(s) via reshape + reduce_max + select —
+    /// O(input size), no dense scatter. On ties EVERY maximum receives the
+    /// gradient, matching the shared autodiff decomposition
+    /// (`compose_max_pool2d_backward`) — important for the common relu→maxpool
+    /// all-zero window (every element equals the max), and keeps ANE gradients
+    /// consistent with the CPU/GPU training path.
+    ///
+    /// Supports the non-overlapping, unpadded case (stride == kernel, pad == 0,
+    /// dims divisible by the kernel) — what CNN training uses (e.g. MNIST 2×2/2).
+    /// Other configs return `Unsupported` rather than a silently wrong result.
+    #[cfg(feature = "training")]
+    fn lower_max_pool2d_backward(
+        &mut self,
+        id: NodeId,
+        kernel: &[usize],
+        stride: &[usize],
+        padding: &[usize],
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let dy = self.val(node.inputs[1]);
+        let out_shape = node.shape.clone();
+        let dt = out_shape.dtype();
+        if out_shape.rank() != 4 {
+            return Err(CoremlError::Unsupported(
+                "max_pool2d_backward: expected NCHW (rank 4)".into(),
+            ));
+        }
+        let dim = |i: usize| out_shape.dim(i).unwrap_static();
+        let (n, c, h, w) = (dim(0), dim(1), dim(2), dim(3));
+        let (kh, kw) = (kernel[0], kernel[1]);
+        if stride.first() != Some(&kh)
+            || stride.get(1) != Some(&kw)
+            || padding.iter().any(|&p| p != 0)
+            || h % kh != 0
+            || w % kw != 0
+        {
+            return Err(CoremlError::Unsupported(format!(
+                "max_pool2d_backward native kernel handles only non-overlapping, \
+                 unpadded pooling with divisible dims (stride==kernel, pad==0); got \
+                 kernel={kernel:?} stride={stride:?} pad={padding:?} on {h}x{w}"
+            )));
+        }
+        let (ho, wo) = (h / kh, w / kw);
+        // Keep every tensor rank ≤ 4 (the ANE reshape limit): fold N·C·Ho into one
+        // batch dim. The window view is [B, kh, Wo, kw] with B = N·C·Ho, and each
+        // pooling window is the (kh, kw) pair at axes [1, 3].
+        let b = n * c * ho;
+        let win = Shape::new(&[b, kh, wo, kw], dt);
+        let red = Shape::new(&[b, 1, wo, 1], dt);
+        let win_b = win.clone().with_dtype(DType::Bool);
+        // Reshape [N,C,H,W] → [B,kh,Wo,kw] is a pure reinterpret (row-major) since
+        // H=Ho·kh, W=Wo·kw; the final reshape inverts it back to [N,C,H,W].
+        let win_dims =
+            |kdim: usize, wdim: usize| vec_i32(&[b as i32, kdim as i32, wo as i32, wdim as i32]);
+
+        let xr = format!("{out_name}_xr");
+        self.emit(
+            "reshape",
+            &xr,
+            &win,
+            vec![
+                ("x", bind_name(&x)),
+                ("shape", bind_value(win_dims(kh, kw))),
+            ],
+        )?;
+        let ymax = format!("{out_name}_ymax");
+        self.emit(
+            "reduce_max",
+            &ymax,
+            &red,
+            vec![
+                ("x", bind_name(&xr)),
+                ("axes", bind_value(vec_i32(&[1, 3]))),
+                ("keep_dims", bind_value(scalar_bool(true))),
+            ],
+        )?;
+        // mask = (xr >= ymax) ⟺ (xr == max). On ties, every maximum is marked —
+        // matching the shared autodiff decomposition (`compose_max_pool2d_backward`
+        // routes dy to all maxima), so ANE gradients stay consistent with the
+        // CPU/GPU training path.
+        let mask = format!("{out_name}_mask");
+        self.emit(
+            "greater_equal",
+            &mask,
+            &win_b,
+            vec![("x", bind_name(&xr)), ("y", bind_name(&ymax))],
+        )?;
+        let zero = format!("{out_name}_zero");
+        let zero_op = make_const(&mut self.blob, &zero, &Shape::new(&[1], dt), &[0.0])?;
+        self.operations.push(zero_op);
+        // route dy (broadcast over the window) to every max position, 0 elsewhere.
+        let dyr = format!("{out_name}_dyr");
+        self.emit(
+            "reshape",
+            &dyr,
+            &red,
+            vec![("x", bind_name(&dy)), ("shape", bind_value(win_dims(1, 1)))],
+        )?;
+        let dxr = format!("{out_name}_dxr");
+        self.emit(
+            "select",
+            &dxr,
+            &win,
+            vec![
+                ("cond", bind_name(&mask)),
+                ("a", bind_name(&dyr)),
+                ("b", bind_name(&zero)),
+            ],
+        )?;
+        let op = self.simple_op(
+            "reshape",
+            out_name,
+            &out_shape,
+            vec![
+                ("x", bind_name(&dxr)),
+                (
+                    "shape",
+                    bind_value(vec_i32(&[n as i32, c as i32, h as i32, w as i32])),
+                ),
+            ],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
 
@@ -896,9 +2363,19 @@ impl<'a> LowerCtx<'a> {
         shape: &Shape,
         binds: Vec<(&str, proto::Argument)>,
     ) -> Result<()> {
-        let op = simple_op(ty, name, shape, binds)?;
+        let op = simple_op_flex(ty, name, shape, binds, self.opts.flexible_inputs)?;
         self.operations.push(op);
         Ok(())
+    }
+
+    fn simple_op(
+        &self,
+        ty: &str,
+        out_name: &str,
+        out_shape: &Shape,
+        inputs: Vec<(&str, proto::Argument)>,
+    ) -> Result<proto::Operation> {
+        simple_op_flex(ty, out_name, out_shape, inputs, self.opts.flexible_inputs)
     }
 
     /// Emit `dst = src[..., start..start+len]` along the last axis.
@@ -1192,8 +2669,66 @@ impl<'a> LowerCtx<'a> {
         }
         let last = dim_static(&out_shape, rank - 1)?;
 
-        // ── split layout: last axis is already `head_dim` ──
+        // ── split layout: last axis is `head_dim` ──
+        //
+        // The IR's `Op::Attention` is used with TWO different rank-4 operand
+        // layouts across models (both end in `head_dim`, so they can't be told
+        // apart by the last axis — disambiguate by which axis equals `num_heads`):
+        //
+        //   * `[B, S, H, D]` — heads at axis 2 (the CPU/Metal/MLX/wgpu convention;
+        //     e.g. Moshi, Llama-style reshapes). `attention_core` wants the heads
+        //     at axis 1, so we transpose `[B,S,H,D] → [B,H,S,D]`, attend, then
+        //     transpose the `[B,H,Sq,D]` result back to `[B,Sq,H,D]`. Without this
+        //     it would attend over the HEADS axis — wrong results, and once
+        //     `s_q != s_k` (KV-cache decode) the QKᵀ batch dims mismatch and the
+        //     CoreML predict fails outright.
+        //   * `[B, H, S, D]` — heads at axis 1 (already canonical). Passed straight
+        //     through to `attention_core`.
+        //
+        // Rank-3 `[B, S, D]` (single head) is likewise already canonical.
         if last == head_dim {
+            // Identify the heads axis via the canonical `attention_geom` helper
+            // (same disambiguation the MLX/wgpu backends use). `bhsd` = heads are
+            // already at axis 1 (`[B,H,S,D]`, canonical for `attention_core`);
+            // otherwise a rank-4 operand is `[B,S,H,D]` (heads at axis 2).
+            let k_in_shape = self.graph.shape(in1).clone();
+            let geom = rlx_ir::attention_geom(&out_shape, &k_in_shape, num_heads, head_dim);
+            if rank == 4 && !geom.bhsd {
+                // `[B, S, H, D]` → canonical `[B, H, S, D]`, attend, transpose back.
+                let (b, s_q, h, s_k) = (geom.batch, geom.seq_q, geom.heads, geom.seq_k);
+                let qc = self.bshd_to_bhsd(in0, b, s_q, h, head_dim, &format!("{out_name}_q"))?;
+                let kc = self.bshd_to_bhsd(in1, b, s_k, h, head_dim, &format!("{out_name}_k"))?;
+                let vc = self.bshd_to_bhsd(in2, b, s_k, h, head_dim, &format!("{out_name}_v"))?;
+                let q_canon = bhsd_shape(b, h, s_q, head_dim);
+                let k_canon = bhsd_shape(b, h, s_k, head_dim);
+                let core = format!("{out_name}_attn");
+                self.attention_core(
+                    &qc,
+                    &kc,
+                    &vc,
+                    &q_canon,
+                    &k_canon,
+                    head_dim,
+                    mask_kind,
+                    mask_in,
+                    score_scale,
+                    softcap,
+                    &core,
+                )?;
+                // [B,H,Sq,D] → [B,Sq,H,D]
+                self.emit(
+                    "transpose",
+                    out_name,
+                    &out_shape,
+                    vec![
+                        ("x", bind_name(&core)),
+                        ("perm", bind_value(vec_i32(&[0, 2, 1, 3]))),
+                    ],
+                )?;
+                self.names.insert(id.0, out_name.to_string());
+                return Ok(());
+            }
+            // Canonical `[B, H, S, D]` (heads at axis 1) or rank-3 `[B, S, D]`.
             let q = self.val(in0);
             let k = self.val(in1);
             let v = self.val(in2);
@@ -1271,6 +2806,30 @@ impl<'a> LowerCtx<'a> {
         )))
     }
 
+    /// Transpose a `[B,S,H,D]` operand to canonical `[B,H,S,D]` (perm `[0,2,1,3]`).
+    fn bshd_to_bhsd(
+        &mut self,
+        in_id: NodeId,
+        b: usize,
+        s: usize,
+        h: usize,
+        d: usize,
+        prefix: &str,
+    ) -> Result<String> {
+        let x = self.val(in_id);
+        let t = format!("{prefix}_bhsd");
+        self.emit(
+            "transpose",
+            &t,
+            &bhsd_shape(b, h, s, d),
+            vec![
+                ("x", bind_name(&x)),
+                ("perm", bind_value(vec_i32(&[0, 2, 1, 3]))),
+            ],
+        )?;
+        Ok(t)
+    }
+
     /// Reshape+transpose a fused `[B,S,H·D]` operand to canonical `[B,H,S,D]`.
     fn fused_to_bhsd(
         &mut self,
@@ -1328,53 +2887,21 @@ impl<'a> LowerCtx<'a> {
     /// serves both the split and (pre-canonicalized) fused paths. Writes
     /// `out_name` in `q_shape`; the caller registers the node name.
     #[allow(clippy::too_many_arguments)]
-    fn attention_core(
+    /// Add the attention mask to scaled scores `[..,Sq,Sk]`, returning the masked
+    /// name (or the input unchanged for `None`). Shared by the forward
+    /// `attention_core` and the native attention backward so both build `P` from an
+    /// identical pre-softmax tensor.
+    fn apply_score_mask(
         &mut self,
-        q: &str,
-        k: &str,
-        v: &str,
-        q_shape: &Shape,
-        k_shape: &Shape,
-        head_dim: usize,
+        scaled: &str,
+        scores_shape: &Shape,
+        s_q: usize,
+        s_k: usize,
         mask_kind: MaskKind,
         mask_in: Option<NodeId>,
-        score_scale: Option<f32>,
-        softcap: Option<f32>,
         out_name: &str,
-    ) -> Result<()> {
-        let rank = q_shape.rank();
-        let s_q = dim_static(q_shape, rank - 2)?;
-        let s_k = dim_static(k_shape, k_shape.rank() - 2)?;
-        let scores_shape = {
-            let mut d = q_shape.dims().to_vec();
-            d[rank - 1] = Dim::Static(s_k); // [..,Sq,Sk]
-            Shape::from_dims(&d, DType::F32)
-        };
-        let scale = score_scale.unwrap_or((head_dim as f32).powf(-0.5));
-
-        // raw = q @ kᵀ  (transpose_y batches over [B,H])
-        let raw = format!("{out_name}_qk");
-        self.emit(
-            "matmul",
-            &raw,
-            &scores_shape,
-            vec![
-                ("x", bind_name(q)),
-                ("y", bind_name(k)),
-                ("transpose_x", bind_value(scalar_bool(false))),
-                ("transpose_y", bind_value(scalar_bool(true))),
-            ],
-        )?;
-        // scaled = raw * scale
-        let mut cur = format!("{out_name}_sc");
-        self.emit(
-            "mul",
-            &cur,
-            &scores_shape,
-            vec![("x", bind_name(&raw)), ("y", bind_value(scalar_f32(scale)))],
-        )?;
-
-        // mask
+    ) -> Result<String> {
+        let mut cur = scaled.to_string();
         match mask_kind {
             MaskKind::None => {}
             MaskKind::Causal => {
@@ -1390,7 +2917,7 @@ impl<'a> LowerCtx<'a> {
                 self.emit(
                     "add",
                     &masked,
-                    &scores_shape,
+                    scores_shape,
                     vec![("x", bind_name(&cur)), ("y", bind_name(&mask_name))],
                 )?;
                 cur = masked;
@@ -1403,7 +2930,7 @@ impl<'a> LowerCtx<'a> {
                 self.emit(
                     "add",
                     &masked,
-                    &scores_shape,
+                    scores_shape,
                     vec![("x", bind_name(&cur)), ("y", bind_name(&bias))],
                 )?;
                 cur = masked;
@@ -1453,17 +2980,82 @@ impl<'a> LowerCtx<'a> {
                 self.emit(
                     "add",
                     &masked,
-                    &scores_shape,
+                    scores_shape,
                     vec![("x", bind_name(&cur)), ("y", bind_name(&bias))],
                 )?;
                 cur = masked;
             }
-            other => {
-                return Err(CoremlError::Unsupported(format!(
-                    "attention mask {other:?}"
-                )));
+            MaskKind::SlidingWindow(w) => {
+                let mask_name = format!("{out_name}_mask");
+                let mask = sliding_window_mask(s_q, s_k, w);
+                self.operations.push(make_const(
+                    &mut self.blob,
+                    &mask_name,
+                    &Shape::new(&[s_q, s_k], DType::F32),
+                    &mask,
+                )?);
+                let masked = format!("{out_name}_msk");
+                self.emit(
+                    "add",
+                    &masked,
+                    scores_shape,
+                    vec![("x", bind_name(&cur)), ("y", bind_name(&mask_name))],
+                )?;
+                cur = masked;
             }
         }
+        Ok(cur)
+    }
+
+    fn attention_core(
+        &mut self,
+        q: &str,
+        k: &str,
+        v: &str,
+        q_shape: &Shape,
+        k_shape: &Shape,
+        head_dim: usize,
+        mask_kind: MaskKind,
+        mask_in: Option<NodeId>,
+        score_scale: Option<f32>,
+        softcap: Option<f32>,
+        out_name: &str,
+    ) -> Result<()> {
+        let rank = q_shape.rank();
+        let s_q = dim_static(q_shape, rank - 2)?;
+        let s_k = dim_static(k_shape, k_shape.rank() - 2)?;
+        let scores_shape = {
+            let mut d = q_shape.dims().to_vec();
+            d[rank - 1] = Dim::Static(s_k); // [..,Sq,Sk]
+            Shape::from_dims(&d, DType::F32)
+        };
+        let scale = score_scale.unwrap_or((head_dim as f32).powf(-0.5));
+
+        // raw = q @ kᵀ  (transpose_y batches over [B,H])
+        let raw = format!("{out_name}_qk");
+        self.emit(
+            "matmul",
+            &raw,
+            &scores_shape,
+            vec![
+                ("x", bind_name(q)),
+                ("y", bind_name(k)),
+                ("transpose_x", bind_value(scalar_bool(false))),
+                ("transpose_y", bind_value(scalar_bool(true))),
+            ],
+        )?;
+        // scaled = raw * scale
+        let cur = format!("{out_name}_sc");
+        self.emit(
+            "mul",
+            &cur,
+            &scores_shape,
+            vec![("x", bind_name(&raw)), ("y", bind_value(scalar_f32(scale)))],
+        )?;
+
+        // mask (factored so the native attention backward recomputes P identically)
+        let mut cur =
+            self.apply_score_mask(&cur, &scores_shape, s_q, s_k, mask_kind, mask_in, out_name)?;
 
         // softcap: cap * tanh(scores / cap)
         if let Some(cap) = softcap {
@@ -1512,6 +3104,309 @@ impl<'a> LowerCtx<'a> {
                 ("transpose_y", bind_value(scalar_bool(false))),
             ],
         )?;
+        Ok(())
+    }
+
+    /// Fused scaled-dot-product attention backward (`dQ`/`dK`/`dV`). Canonicalizes
+    /// any of the three operand layouts the forward accepts — `[B,H,S,D]`,
+    /// `[B,S,H,D]`, fused `[B,S,H·D]` — to `[B,H,S,D]`, runs
+    /// [`attention_backward_core`](Self::attention_backward_core) (every mask kind via
+    /// the shared [`apply_score_mask`](Self::apply_score_mask)), then maps the
+    /// gradient back to the `wrt` operand's layout. MHA only (q/k/v share the head
+    /// count); GQA (`kv heads ≠ num_heads`) returns `Unsupported`.
+    #[cfg(feature = "training")]
+    fn lower_attention_backward(
+        &mut self,
+        id: NodeId,
+        num_heads: usize,
+        head_dim: usize,
+        mask_kind: MaskKind,
+        wrt: rlx_ir::op::AttentionBwdWrt,
+        out_name: &str,
+    ) -> Result<()> {
+        use rlx_ir::op::AttentionBwdWrt;
+        let (q_in, k_in, v_in, dy_in, mask_in, q_shape, k_shape, out_shape) = {
+            let node = self.graph.node(id);
+            let mask_in = match mask_kind {
+                MaskKind::Bias | MaskKind::Custom => node.inputs.get(4).copied(),
+                _ => None,
+            };
+            (
+                node.inputs[0],
+                node.inputs[1],
+                node.inputs[2],
+                node.inputs[3],
+                mask_in,
+                self.graph.shape(node.inputs[0]).clone(),
+                self.graph.shape(node.inputs[1]).clone(),
+                node.shape.clone(),
+            )
+        };
+        let (h, d) = (num_heads, head_dim);
+        let rank = q_shape.rank();
+        let last = dim_static(&q_shape, rank - 1)?;
+        // Gradient sequence length depends on which operand we differentiate.
+        let s_wrt_of = |s_q: usize, s_k: usize| match wrt {
+            AttentionBwdWrt::Query => s_q,
+            AttentionBwdWrt::Key | AttentionBwdWrt::Value => s_k,
+        };
+
+        if rank == 4 && last == d {
+            let geom = rlx_ir::attention_geom(&q_shape, &k_shape, num_heads, head_dim);
+            let (b, s_q, s_k) = (geom.batch, geom.seq_q, geom.seq_k);
+            let k_heads = if geom.bhsd {
+                dim_static(&k_shape, 1)?
+            } else {
+                dim_static(&k_shape, 2)?
+            };
+            if k_heads != num_heads {
+                return Err(CoremlError::Unsupported(
+                    "attention backward: GQA (kv heads ≠ num_heads) not supported".into(),
+                ));
+            }
+            if geom.bhsd {
+                // Canonical `[B,H,S,D]` — compute straight into `out_name`.
+                let (q, k, v, dy) = (
+                    self.val(q_in),
+                    self.val(k_in),
+                    self.val(v_in),
+                    self.val(dy_in),
+                );
+                self.attention_backward_core(
+                    &q, &k, &v, &dy, b, h, s_q, s_k, d, mask_kind, mask_in, wrt, out_name,
+                )?;
+            } else {
+                // `[B,S,H,D]` → canonical, compute, transpose the gradient back.
+                let qc = self.bshd_to_bhsd(q_in, b, s_q, h, d, &format!("{out_name}_qc"))?;
+                let kc = self.bshd_to_bhsd(k_in, b, s_k, h, d, &format!("{out_name}_kc"))?;
+                let vc = self.bshd_to_bhsd(v_in, b, s_k, h, d, &format!("{out_name}_vc"))?;
+                let dyc = self.bshd_to_bhsd(dy_in, b, s_q, h, d, &format!("{out_name}_dyc"))?;
+                let core = format!("{out_name}_core");
+                self.attention_backward_core(
+                    &qc, &kc, &vc, &dyc, b, h, s_q, s_k, d, mask_kind, mask_in, wrt, &core,
+                )?;
+                let s_wrt = s_wrt_of(s_q, s_k);
+                self.emit(
+                    "transpose",
+                    out_name,
+                    &bhsd_shape(b, s_wrt, h, d),
+                    vec![
+                        ("x", bind_name(&core)),
+                        ("perm", bind_value(vec_i32(&[0, 2, 1, 3]))),
+                    ],
+                )?;
+            }
+            self.names.insert(id.0, out_name.to_string());
+            return Ok(());
+        }
+
+        if rank == 3 && num_heads > 0 && last == num_heads * head_dim {
+            // Fused `[B,S,H·D]` → canonical, compute, transpose + reshape back.
+            let b = dim_static(&q_shape, 0)?;
+            let s_q = dim_static(&q_shape, 1)?;
+            let s_k = dim_static(&k_shape, 1)?;
+            if dim_static(&k_shape, 2)? / d != num_heads {
+                return Err(CoremlError::Unsupported(
+                    "attention backward: fused GQA (kv heads ≠ num_heads) not supported".into(),
+                ));
+            }
+            let qc = self.fused_to_bhsd(q_in, b, s_q, h, d, &format!("{out_name}_qc"))?;
+            let kc = self.fused_to_bhsd(k_in, b, s_k, h, d, &format!("{out_name}_kc"))?;
+            let vc = self.fused_to_bhsd(v_in, b, s_k, h, d, &format!("{out_name}_vc"))?;
+            let dyc = self.fused_to_bhsd(dy_in, b, s_q, h, d, &format!("{out_name}_dyc"))?;
+            let core = format!("{out_name}_core");
+            self.attention_backward_core(
+                &qc, &kc, &vc, &dyc, b, h, s_q, s_k, d, mask_kind, mask_in, wrt, &core,
+            )?;
+            let s_wrt = s_wrt_of(s_q, s_k);
+            let t = format!("{out_name}_t");
+            self.emit(
+                "transpose",
+                &t,
+                &bhsd_shape(b, s_wrt, h, d),
+                vec![
+                    ("x", bind_name(&core)),
+                    ("perm", bind_value(vec_i32(&[0, 2, 1, 3]))),
+                ],
+            )?;
+            self.emit(
+                "reshape",
+                out_name,
+                &out_shape,
+                vec![
+                    ("x", bind_name(&t)),
+                    (
+                        "shape",
+                        bind_value(vec_i32(&[b as i32, s_wrt as i32, (h * d) as i32])),
+                    ),
+                ],
+            )?;
+            self.names.insert(id.0, out_name.to_string());
+            return Ok(());
+        }
+
+        Err(CoremlError::Unsupported(format!(
+            "attention backward: unsupported operand layout (rank {rank}, last {last})"
+        )))
+    }
+
+    /// Canonical `[B,H,S,D]` attention backward, emitting the single `wrt` gradient
+    /// to `result`. Recompute `P = softmax(scale·QKᵀ [+ mask])`, then:
+    ///   `dV = Pᵀ·dO`,  `dP = dO·Vᵀ`,
+    ///   `ds = scale · P⊙(dP − rowsum(P⊙dP))` (softmax-Jacobian–vector product),
+    ///   `dQ = ds·K`,  `dK = dsᵀ·Q`.
+    /// Masked positions get `P≈0`, so `ds` there vanishes automatically.
+    #[cfg(feature = "training")]
+    #[allow(clippy::too_many_arguments)]
+    fn attention_backward_core(
+        &mut self,
+        q: &str,
+        k: &str,
+        v: &str,
+        dy: &str,
+        b: usize,
+        h: usize,
+        s_q: usize,
+        s_k: usize,
+        d: usize,
+        mask_kind: MaskKind,
+        mask_in: Option<NodeId>,
+        wrt: rlx_ir::op::AttentionBwdWrt,
+        result: &str,
+    ) -> Result<()> {
+        use rlx_ir::op::AttentionBwdWrt;
+        let scores_shape = bhsd_shape(b, h, s_q, s_k);
+        let scale = (d as f32).powf(-0.5);
+
+        let raw = format!("{result}_qk");
+        self.emit(
+            "matmul",
+            &raw,
+            &scores_shape,
+            vec![
+                ("x", bind_name(q)),
+                ("y", bind_name(k)),
+                ("transpose_x", bind_value(scalar_bool(false))),
+                ("transpose_y", bind_value(scalar_bool(true))),
+            ],
+        )?;
+        let scaled = format!("{result}_scl");
+        self.emit(
+            "mul",
+            &scaled,
+            &scores_shape,
+            vec![("x", bind_name(&raw)), ("y", bind_value(scalar_f32(scale)))],
+        )?;
+        let pre =
+            self.apply_score_mask(&scaled, &scores_shape, s_q, s_k, mask_kind, mask_in, result)?;
+        let p = format!("{result}_p");
+        self.emit(
+            "softmax",
+            &p,
+            &scores_shape,
+            vec![("x", bind_name(&pre)), ("axis", bind_value(scalar_i32(-1)))],
+        )?;
+
+        match wrt {
+            AttentionBwdWrt::Value => {
+                // dV = Pᵀ · dO  → [B,H,Sk,D]
+                self.emit(
+                    "matmul",
+                    result,
+                    &bhsd_shape(b, h, s_k, d),
+                    vec![
+                        ("x", bind_name(&p)),
+                        ("y", bind_name(dy)),
+                        ("transpose_x", bind_value(scalar_bool(true))),
+                        ("transpose_y", bind_value(scalar_bool(false))),
+                    ],
+                )?;
+            }
+            AttentionBwdWrt::Query | AttentionBwdWrt::Key => {
+                let dp = format!("{result}_dp");
+                self.emit(
+                    "matmul",
+                    &dp,
+                    &scores_shape,
+                    vec![
+                        ("x", bind_name(dy)),
+                        ("y", bind_name(v)),
+                        ("transpose_x", bind_value(scalar_bool(false))),
+                        ("transpose_y", bind_value(scalar_bool(true))),
+                    ],
+                )?;
+                let pdp = format!("{result}_pdp");
+                self.emit(
+                    "mul",
+                    &pdp,
+                    &scores_shape,
+                    vec![("x", bind_name(&dp)), ("y", bind_name(&p))],
+                )?;
+                let rowsum = format!("{result}_rs");
+                self.emit(
+                    "reduce_sum",
+                    &rowsum,
+                    &bhsd_shape(b, h, s_q, 1),
+                    vec![
+                        ("x", bind_name(&pdp)),
+                        ("axes", bind_value(vec_i32(&[3]))),
+                        ("keep_dims", bind_value(scalar_bool(true))),
+                    ],
+                )?;
+                let dpm = format!("{result}_dpm");
+                self.emit(
+                    "sub",
+                    &dpm,
+                    &scores_shape,
+                    vec![("x", bind_name(&dp)), ("y", bind_name(&rowsum))],
+                )?;
+                let dsm = format!("{result}_dsm");
+                self.emit(
+                    "mul",
+                    &dsm,
+                    &scores_shape,
+                    vec![("x", bind_name(&p)), ("y", bind_name(&dpm))],
+                )?;
+                let ds = format!("{result}_ds");
+                self.emit(
+                    "mul",
+                    &ds,
+                    &scores_shape,
+                    vec![("x", bind_name(&dsm)), ("y", bind_value(scalar_f32(scale)))],
+                )?;
+                match wrt {
+                    AttentionBwdWrt::Query => {
+                        // dQ = ds · K  → [B,H,Sq,D]
+                        self.emit(
+                            "matmul",
+                            result,
+                            &bhsd_shape(b, h, s_q, d),
+                            vec![
+                                ("x", bind_name(&ds)),
+                                ("y", bind_name(k)),
+                                ("transpose_x", bind_value(scalar_bool(false))),
+                                ("transpose_y", bind_value(scalar_bool(false))),
+                            ],
+                        )?;
+                    }
+                    AttentionBwdWrt::Key => {
+                        // dK = dsᵀ · Q  → [B,H,Sk,D]
+                        self.emit(
+                            "matmul",
+                            result,
+                            &bhsd_shape(b, h, s_k, d),
+                            vec![
+                                ("x", bind_name(&ds)),
+                                ("y", bind_name(q)),
+                                ("transpose_x", bind_value(scalar_bool(true))),
+                                ("transpose_y", bind_value(scalar_bool(false))),
+                            ],
+                        )?;
+                    }
+                    AttentionBwdWrt::Value => unreachable!(),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1875,7 +3770,7 @@ impl<'a> LowerCtx<'a> {
                 ],
             )?;
             let out_dims: Vec<i32> = static_dims(&shape)?.iter().map(|&v| v as i32).collect();
-            let op = simple_op(
+            let op = self.simple_op(
                 "reshape",
                 out_name,
                 &shape,
@@ -1908,7 +3803,86 @@ impl<'a> LowerCtx<'a> {
             let out_dims: Vec<i32> = static_dims(&shape)?.iter().map(|&v| v as i32).collect();
             binds.push(("output_shape", bind_value(vec_i32(&out_dims))));
         }
-        let op = simple_op(ty, out_name, &shape, binds)?;
+        let op = self.simple_op(ty, out_name, &shape, binds)?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
+    /// Conv2d backward w.r.t. weight (NCHW, groups == 1). The weight gradient is a
+    /// convolution of the input by the upstream gradient: with N folded as the
+    /// contraction channel and the gradient as the (stride-dilated) kernel,
+    ///   dWᵀ = conv(xᵀ[Cin,N,H,W], dyᵀ[Cout,N,Hout,Wout], dilation = forward stride)
+    /// gives [Cin,Cout,kh,kw]; transpose back to [Cout,Cin,kh,kw]. Inputs [x, dy].
+    #[cfg(feature = "training")]
+    fn lower_conv2d_backward_weight(
+        &mut self,
+        id: NodeId,
+        stride: &[usize],
+        padding: &[usize],
+        groups: usize,
+        out_name: &str,
+    ) -> Result<()> {
+        if groups != 1 {
+            return Err(CoremlError::Unsupported(
+                "conv2d backward weight: only groups == 1".into(),
+            ));
+        }
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let dy = self.val(node.inputs[1]);
+        let x_shape = self.graph.shape(node.inputs[0]).clone();
+        let dy_shape = self.graph.shape(node.inputs[1]).clone();
+        let out_shape = node.shape.clone();
+        let dt = out_shape.dtype();
+        let xd = |i: usize| x_shape.dim(i).unwrap_static();
+        let dd = |i: usize| dy_shape.dim(i).unwrap_static();
+        let od = |i: usize| out_shape.dim(i).unwrap_static();
+        let (n, cin, h, w) = (xd(0), xd(1), xd(2), xd(3));
+        let (cout, hout, wout) = (dd(1), dd(2), dd(3));
+        let (kh, kw) = (od(2), od(3));
+        let perm = || bind_value(vec_i32(&[1, 0, 2, 3]));
+
+        // xᵀ = [Cin, N, H, W], dyᵀ = [Cout, N, Hout, Wout]
+        let xt = format!("{out_name}_xt");
+        self.emit(
+            "transpose",
+            &xt,
+            &Shape::new(&[cin, n, h, w], dt),
+            vec![("x", bind_name(&x)), ("perm", perm())],
+        )?;
+        let dyt = format!("{out_name}_dyt");
+        self.emit(
+            "transpose",
+            &dyt,
+            &Shape::new(&[cout, n, hout, wout], dt),
+            vec![("x", bind_name(&dy)), ("perm", perm())],
+        )?;
+        // conv(xᵀ, dyᵀ): kernel = dyᵀ over the N contraction channel, dilated by the
+        // forward stride so it samples the strided receptive field → [Cin,Cout,kh,kw].
+        let dwt = format!("{out_name}_dwt");
+        self.emit(
+            "conv",
+            &dwt,
+            &Shape::new(&[cin, cout, kh, kw], dt),
+            vec![
+                ("x", bind_name(&xt)),
+                ("weight", bind_name(&dyt)),
+                ("strides", bind_value(vec_i32(&[1, 1]))),
+                ("pad_type", bind_value(scalar_str("custom"))),
+                ("pad", bind_value(vec_i32(&pad_begin_end(padding)))),
+                (
+                    "dilations",
+                    bind_value(vec_i32(&[stride[0] as i32, stride[1] as i32])),
+                ),
+                ("groups", bind_value(scalar_i32(1))),
+            ],
+        )?;
+        let op = self.simple_op(
+            "transpose",
+            out_name,
+            &out_shape,
+            vec![("x", bind_name(&dwt)), ("perm", perm())],
+        )?;
         self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
@@ -1945,7 +3919,7 @@ impl<'a> LowerCtx<'a> {
                 bind_value(scalar_bool(false)),
             ));
         }
-        let op = simple_op(ty, out_name, &shape, binds)?;
+        let op = self.simple_op(ty, out_name, &shape, binds)?;
         self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
@@ -1991,6 +3965,104 @@ impl<'a> LowerCtx<'a> {
             ],
         )?;
         self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
+
+    /// `ArgMax` / `ArgMin` along one axis; indices are f32-encoded at the IR boundary.
+    fn lower_argreduce(
+        &mut self,
+        id: NodeId,
+        axis: usize,
+        keep_dim: bool,
+        is_max: bool,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let in_shape = self.graph.shape(node.inputs[0]).clone();
+        let rank = in_shape.rank();
+        let ax = axis as i32;
+        let _ = rank;
+        let mut x = self.val(node.inputs[0]);
+        if !is_max {
+            let neg = format!("{out_name}_neg");
+            self.emit(
+                "mul",
+                &neg,
+                &in_shape,
+                vec![("x", bind_name(&x)), ("y", bind_value(scalar_f32(-1.0)))],
+            )?;
+            x = neg;
+        }
+        let idx_i32 = format!("{out_name}_idx_i32");
+        let idx_shape = node.shape.clone().with_dtype(DType::I32);
+        self.emit(
+            "reduce_argmax",
+            &idx_i32,
+            &idx_shape,
+            vec![
+                ("x", bind_name(&x)),
+                ("axis", bind_value(scalar_i32(ax))),
+                ("keep_dims", bind_value(scalar_bool(keep_dim))),
+            ],
+        )?;
+        self.emit(
+            "cast",
+            out_name,
+            &node.shape,
+            vec![
+                ("x", bind_name(&idx_i32)),
+                ("dtype", bind_value(scalar_str("fp32"))),
+            ],
+        )?;
+        self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
+
+    /// Batch-general flip along `axes` via per-axis `gather` with reversed indices.
+    fn lower_reverse(&mut self, id: NodeId, axes: &[usize], out_name: &str) -> Result<()> {
+        let node = self.graph.node(id);
+        let in_shape = self.graph.shape(node.inputs[0]).clone();
+        if axes.is_empty() {
+            let x = self.val(node.inputs[0]);
+            self.names.insert(id.0, x);
+            return Ok(());
+        }
+        let mut cur = self.val(node.inputs[0]);
+        let shape = in_shape.clone();
+        for &ax in axes {
+            let d = dim_static(&shape, ax)?;
+            let idx_f: Vec<f32> = (0..d).rev().map(|i| i as f32).collect();
+            let idx_name = format!("{out_name}_rev_{ax}");
+            self.operations.push(make_const(
+                &mut self.blob,
+                &idx_name,
+                &Shape::new(&[d], DType::F32),
+                &idx_f,
+            )?);
+            let idx_i32 = format!("{idx_name}_i32");
+            self.emit(
+                "cast",
+                &idx_i32,
+                &Shape::new(&[d], DType::I32),
+                vec![
+                    ("x", bind_name(&idx_name)),
+                    ("dtype", bind_value(scalar_str("int32"))),
+                ],
+            )?;
+            let next = format!("{out_name}_g{ax}");
+            self.emit(
+                "gather",
+                &next,
+                &shape,
+                vec![
+                    ("x", bind_name(&cur)),
+                    ("indices", bind_name(&idx_i32)),
+                    ("axis", bind_value(scalar_i32(ax as i32))),
+                ],
+            )?;
+            cur = next;
+        }
+        self.names.insert(id.0, cur);
         Ok(())
     }
 
@@ -2178,6 +4250,113 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    /// Bake on-device dequantized weights `[n,k]` as MIL constants + `mul`/`sub`.
+    ///
+    /// Supports Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4NL, Q4/5/8_K, Q2/3/6_K. Scale tensors are
+    /// `[nb,1]` or `[nb,32]` depending on scheme (see `split_gguf_ondevice`).
+    /// Documented in [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
+    fn bake_ondevice_weight(
+        &mut self,
+        prefix: &str,
+        scheme: QuantScheme,
+        bytes: &[u8],
+        n: usize,
+        k: usize,
+    ) -> Result<String> {
+        const QK: usize = 32;
+        let nb = (k * n) / QK;
+        if nb * QK != k * n {
+            return Err(CoremlError::Runtime(format!(
+                "ondevice dequant: {n}x{k} not divisible by {QK}"
+            )));
+        }
+        let (qs, scales, offsets) = split_gguf_ondevice(scheme, bytes, nb)?;
+        let per_elem_scales = scales.len() == nb * QK;
+        let sc_shape = if per_elem_scales {
+            Shape::new(&[nb, QK], DType::F32)
+        } else {
+            Shape::new(&[nb, 1], DType::F32)
+        };
+        let q_name = format!("{prefix}_q");
+        self.operations.push(make_const(
+            &mut self.blob,
+            &q_name,
+            &Shape::new(&[nb, QK], DType::F32),
+            &qs,
+        )?);
+        let sc_name = format!("{prefix}_sc");
+        self.operations
+            .push(make_const(&mut self.blob, &sc_name, &sc_shape, &scales)?);
+        let mul_name = format!("{prefix}_mul");
+        self.emit(
+            "mul",
+            &mul_name,
+            &Shape::new(&[nb, QK], DType::F32),
+            vec![("x", bind_name(&q_name)), ("y", bind_name(&sc_name))],
+        )?;
+        let dq = if offsets.iter().any(|&o| o != 0.0) {
+            let per_elem_offsets = offsets.len() == nb * QK;
+            let off_shape = if per_elem_offsets {
+                Shape::new(&[nb, QK], DType::F32)
+            } else {
+                Shape::new(&[nb, 1], DType::F32)
+            };
+            let off_name = format!("{prefix}_off");
+            self.operations
+                .push(make_const(&mut self.blob, &off_name, &off_shape, &offsets)?);
+            let sub_name = format!("{prefix}_dq");
+            self.emit(
+                "sub",
+                &sub_name,
+                &Shape::new(&[nb, QK], DType::F32),
+                vec![("x", bind_name(&mul_name)), ("y", bind_name(&off_name))],
+            )?;
+            sub_name
+        } else {
+            mul_name
+        };
+        let wc = format!("{prefix}_w");
+        self.reshape_to(
+            &dq,
+            &[n as i64, k as i64],
+            &Shape::new(&[n, k], DType::F32),
+            &wc,
+        )?;
+        Ok(wc)
+    }
+
+    /// On-device block dequant for supported GGUF schemes, then MIL matmul.
+    fn lower_dequant_matmul_ondevice(
+        &mut self,
+        id: NodeId,
+        scheme: QuantScheme,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let out_shape = node.shape.clone();
+        let x_id = node.inputs[0];
+        let w_id = node.inputs[1];
+        let n = dim_static(&out_shape, out_shape.rank() - 1)?;
+        let m = out_shape.num_elements().unwrap_or(0) / n.max(1);
+        let k = self.graph.shape(x_id).num_elements().unwrap_or(0) / m.max(1);
+        let bytes = self.quant_bytes(w_id)?.to_vec();
+        let wc = self.bake_ondevice_weight(out_name, scheme, &bytes, n, k)?;
+        let x = self.val(x_id);
+        let op = self.simple_op(
+            "matmul",
+            out_name,
+            &out_shape,
+            vec![
+                ("x", bind_name(&x)),
+                ("y", bind_name(&wc)),
+                ("transpose_x", bind_value(scalar_bool(false))),
+                ("transpose_y", bind_value(scalar_bool(true))),
+            ],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
+        Ok(())
+    }
+
     /// `x @ dequant(W)ᵀ`. GGUF weights are stored `[N, K]` (B-transposed),
     /// so we host-dequantize to f32 `[N, K]`, bake it, and matmul with
     /// `transpose_y`. The dequant happens at finalize (weights present),
@@ -2205,7 +4384,7 @@ impl<'a> LowerCtx<'a> {
             &Shape::new(&[n, k], DType::F32),
             &wf,
         )?);
-        let op = simple_op(
+        let op = self.simple_op(
             "matmul",
             out_name,
             &out_shape,
@@ -2233,6 +4412,141 @@ impl<'a> LowerCtx<'a> {
         let wf = dequant_scheme(scheme, self.quant_bytes(node.inputs[0])?, total)?;
         self.operations
             .push(make_const(&mut self.blob, out_name, &shape, &wf)?);
+        self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
+
+    /// MoE grouped matmul with on-device Q8_0 / Q4_0 / IQ4NL / K-quant dequant.
+    fn lower_dequant_grouped_matmul_ondevice(
+        &mut self,
+        id: NodeId,
+        scheme: QuantScheme,
+        out_name: &str,
+    ) -> Result<()> {
+        const QK: usize = 32;
+        let node = self.graph.node(id);
+        let out_shape = node.shape.clone();
+        let in_shape = self.graph.shape(node.inputs[0]).clone();
+        let m = dim_static(&in_shape, in_shape.rank() - 2)?;
+        let k = dim_static(&in_shape, in_shape.rank() - 1)?;
+        let n = dim_static(&out_shape, out_shape.rank() - 1)?;
+        let bytes = self.quant_bytes(node.inputs[1])?;
+        let block_elems = scheme.gguf_block_size() as usize;
+        let block_bytes = scheme.gguf_block_bytes() as usize;
+        let slab_bytes = (k * n) / block_elems.max(1) * block_bytes;
+        let num_experts = bytes.len() / slab_bytes.max(1);
+        let nb_per_expert = (k * n) / QK;
+        if nb_per_expert * QK != k * n {
+            return self.lower_dequant_grouped_matmul(id, scheme, out_name);
+        }
+
+        let mut all_qs = Vec::with_capacity(num_experts * nb_per_expert * QK);
+        let mut all_sc = Vec::with_capacity(num_experts * nb_per_expert);
+        let mut all_off = Vec::with_capacity(num_experts * nb_per_expert);
+        for e in 0..num_experts {
+            let slab = &bytes[e * slab_bytes..(e + 1) * slab_bytes];
+            let (qs, sc, off) = split_gguf_ondevice(scheme, slab, nb_per_expert)?;
+            all_qs.extend(qs);
+            all_sc.extend(sc);
+            all_off.extend(off);
+        }
+        let nb_total = num_experts * nb_per_expert;
+        let q_name = format!("{out_name}_q");
+        self.operations.push(make_const(
+            &mut self.blob,
+            &q_name,
+            &Shape::new(&[nb_total, QK], DType::F32),
+            &all_qs,
+        )?);
+        let sc_name = format!("{out_name}_sc");
+        self.operations.push(make_const(
+            &mut self.blob,
+            &sc_name,
+            &Shape::new(&[nb_total, 1], DType::F32),
+            &all_sc,
+        )?);
+        let mul_name = format!("{out_name}_mul");
+        self.emit(
+            "mul",
+            &mul_name,
+            &Shape::new(&[nb_total, QK], DType::F32),
+            vec![("x", bind_name(&q_name)), ("y", bind_name(&sc_name))],
+        )?;
+        let dq = if all_off.iter().any(|&o| o != 0.0) {
+            let off_name = format!("{out_name}_off");
+            self.operations.push(make_const(
+                &mut self.blob,
+                &off_name,
+                &Shape::new(&[nb_total, 1], DType::F32),
+                &all_off,
+            )?);
+            let sub_name = format!("{out_name}_dq");
+            self.emit(
+                "sub",
+                &sub_name,
+                &Shape::new(&[nb_total, QK], DType::F32),
+                vec![("x", bind_name(&mul_name)), ("y", bind_name(&off_name))],
+            )?;
+            sub_name
+        } else {
+            mul_name
+        };
+        let weight = format!("{out_name}_wdq");
+        self.reshape_to(
+            &dq,
+            &[num_experts as i64, n as i64, k as i64],
+            &Shape::new(&[num_experts, n, k], DType::F32),
+            &weight,
+        )?;
+
+        let input = self.val(node.inputs[0]);
+        let eidx = self.val(node.inputs[2]);
+        let eidx_i32 = format!("{out_name}_eidx");
+        let eidx_shape = self
+            .graph
+            .shape(node.inputs[2])
+            .clone()
+            .with_dtype(DType::I32);
+        self.emit(
+            "cast",
+            &eidx_i32,
+            &eidx_shape,
+            vec![
+                ("x", bind_name(&eidx)),
+                ("dtype", bind_value(scalar_str("int32"))),
+            ],
+        )?;
+        let wsel = format!("{out_name}_wsel");
+        self.emit(
+            "gather",
+            &wsel,
+            &Shape::new(&[m, n, k], DType::F32),
+            vec![
+                ("x", bind_name(&weight)),
+                ("indices", bind_name(&eidx_i32)),
+                ("axis", bind_value(scalar_i32(0))),
+            ],
+        )?;
+        let in3 = format!("{out_name}_in3");
+        self.reshape_to(
+            &input,
+            &[m as i64, 1, k as i64],
+            &Shape::new(&[m, 1, k], DType::F32),
+            &in3,
+        )?;
+        let mm = format!("{out_name}_mm");
+        self.emit(
+            "matmul",
+            &mm,
+            &Shape::new(&[m, 1, n], DType::F32),
+            vec![
+                ("x", bind_name(&in3)),
+                ("y", bind_name(&wsel)),
+                ("transpose_x", bind_value(scalar_bool(false))),
+                ("transpose_y", bind_value(scalar_bool(true))),
+            ],
+        )?;
+        self.reshape_to(&mm, &[m as i64, n as i64], &out_shape, out_name)?;
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
@@ -2862,21 +5176,48 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-    fn finish(self) -> Result<LoweredProgram> {
+    fn finish(mut self) -> Result<LoweredProgram> {
+        // `graph` is a shared reference (Copy); this rebinds it without moving
+        // out of `self`, so the scalar-output reshape below can still `emit`.
         let graph = self.graph;
 
         // Outputs: one feature per graph output node.
         let mut output_names = Vec::new();
         let mut outputs = Vec::new();
         for &out_id in &graph.outputs {
-            let vname = self.val(out_id);
+            let mut vname = self.val(out_id);
+            let out_shape = graph.shape(out_id);
+            // CoreML features need rank ≥ 1, so a scalar output (e.g. a training
+            // loss) is reshaped to `[1]` before it crosses the interface.
+            let exposed = if out_shape.rank() == 0 {
+                let one = Shape::new(&[1], out_shape.dtype());
+                let reshaped = format!("{vname}_io1");
+                self.emit(
+                    "reshape",
+                    &reshaped,
+                    &one,
+                    vec![
+                        ("x", bind_name(&vname)),
+                        ("shape", bind_value(vec_i32(&[1]))),
+                    ],
+                )?;
+                vname = reshaped;
+                one
+            } else {
+                out_shape.clone()
+            };
             output_names.push(vname.clone());
-            let shape = graph.shape(out_id);
+            let (dims, flex_dims) = if self.opts.flexible_inputs {
+                io_dims(&exposed, true)?
+            } else {
+                (static_dims(&exposed)?, vec![false; exposed.rank()])
+            };
             outputs.push(IoTensor {
                 ir_name: vname.clone(),
                 feature_name: vname.clone(),
-                dims: static_dims(shape)?,
-                dtype: shape.dtype(),
+                dims,
+                dtype: exposed.dtype(),
+                flex_dims,
             });
         }
 

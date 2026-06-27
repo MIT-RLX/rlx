@@ -14,7 +14,7 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.9" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
 
 [dev-dependencies]
 # Back-edge dev-deps on later-tier crates: keep these PATH-ONLY (no

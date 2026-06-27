@@ -47,7 +47,7 @@ maturin develop --release \
   compiled in — the message names the cargo feature to enable.
 - The same graph + same inputs across two backends produces the
   *same* output up to numerical precision. See
-  `pyrlx/examples/cross_backend_parity.py` for the canonical check.
+  `examples/cross_backend_parity.py` for the canonical check.
 - `Session(precision="f16")` requests reduced-precision compute;
   backends that don't support the requested precision fall back to
   F32 silently (this matches the Rust contract).
@@ -88,6 +88,29 @@ router = rlx.DeviceRouter(g, policy=rlx.DevicePolicy.from_env())
 Full reference: [`docs/backend-selection.md`](../../docs/backend-selection.md).
 
 Tests: `pytest tests/test_graph_devices.py`.
+
+## GGUF cargo features
+
+| Feature | Purpose |
+|---------|---------|
+| `gguf-convert` (default) | `convert_to_gguf` via `rlx-gguf-convert` (safetensors) |
+| `gguf-onnx` | ONNX checkpoint import for `convert_to_gguf` |
+| `gguf-pt` | PyTorch `.pt` / `.pth` import for `convert_to_gguf` |
+
+Pack/unpack and file I/O need no compute backend:
+
+```python
+import pyrlx as rlx
+
+packed = rlx.quantize(weights, dtype="Q4_K")
+f = rlx.load_gguf("model.gguf")
+w = f.dequant_tensor("token_embd.weight")
+rlx.convert_to_gguf("in.safetensors", "out.gguf", "Q4_K", architecture="llama")
+```
+
+Tests: `tests/test_gguf_quantize.py`, `test_gguf_file.py`, `test_gguf_convert.py`.
+Runtime dequant on Metal / CUDA / WGPU: [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
+
 ## License
 
 GPL-3.0-only.

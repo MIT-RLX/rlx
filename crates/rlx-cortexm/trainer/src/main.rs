@@ -209,6 +209,22 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Write trained fp32 weights as raw little-endian f32, concatenated in the
+/// fixed param order the CoreML/ANE bench expects.
+fn dump_f32_weights(m: &train::TrainedModel, path: &str) -> Result<(), String> {
+    let mut buf = Vec::new();
+    for t in [
+        &m.conv1_w, &m.conv1_b, &m.conv2_w, &m.conv2_b, &m.fc_w, &m.fc_b,
+    ] {
+        for &v in t.iter() {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    std::fs::write(path, &buf).map_err(|e| format!("dump f32 weights to {path}: {e}"))?;
+    eprintln!("wrote {} f32 weights -> {path}", buf.len() / 4);
+    Ok(())
+}
+
 fn run(args: &Args) -> Result<(), String> {
     let dataset = mnist::load(&args.data_dir).map_err(|e| {
         format!(
@@ -227,6 +243,12 @@ fn run(args: &Args) -> Result<(), String> {
     );
 
     let trained = train::run(&dataset, args)?;
+    // Optional: dump the trained fp32 weights (for the CoreML/ANE inference
+    // bench, which can't train on-device). Raw little-endian f32, concatenated
+    // in param order: conv1_w, conv1_b, conv2_w, conv2_b, fc_w, fc_b.
+    if let Ok(path) = std::env::var("RLX_F32_DUMP") {
+        dump_f32_weights(&trained, &path)?;
+    }
     let calibrated = quant::calibrate_and_quantize(&trained, &dataset, args)?;
     emit::write_model_weights(&calibrated, &args.out_path)?;
     emit::write_test_set(&dataset, args)?;

@@ -231,6 +231,7 @@ fn main() {
             rlx_ir::Op::Rope {
                 head_dim: 8,
                 n_rot: 8,
+                style: rlx_ir::RopeStyle::NeoX,
             },
             vec![x, cos, sin],
             Shape::new(&[1, 2, 4, 8], f),

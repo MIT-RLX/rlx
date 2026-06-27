@@ -24,9 +24,14 @@ no FFI, no submodules.
 - **`kernels/mod.rs`** — `OnceLock`-cached pipeline + bind-group layout.
   First dispatch pays the WGSL → SPIR-V/MSL/HLSL translation cost
   (~ms); subsequent dispatches reuse the compiled pipeline.
-- **`backend.rs`** — `WgpuExecutable`. Anything not in the supported op
-  set panics at compile time with a clear "fall back to CPU/Metal/MLX"
-  diagnostic.
+- **`backend.rs`** — `WgpuExecutable`. Unsupported ops panic at compile
+  time with a clear "fall back to CPU/Metal/MLX" diagnostic.
+- **GGUF dequant** — `kernels/dequant_gguf.wgsl` + `gguf_gpu.rs`: GPU
+  dequant into arena scratch, then `matmul_bt`. Falls back to `gguf_host`
+  when scratch exceeds device limits or for grouped MoE GGUF matmul.
+  Scheme ids 0–23 match Metal/CUDA. Grouped MoE uses GPU path when scratch
+  fits. Details:
+  [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
 - **FFT** — `fft_gpu.wgsl` multi-kernel pow-2 dispatch (in-pass with
   per-op uniforms). Non-pow2 / f64 / C64 use `fft_host.rs` partial sync.
   `RLX_BENCH_DISPATCH_ONLY=1` skips output readback for micro-benchmarks.
@@ -34,14 +39,10 @@ no FFI, no submodules.
 
 ## Op coverage
 
-Today: `MatMul` (2D), `Op::Input`, `Op::Param`, `Op::Constant`.
-Anything else fails at compile time with a clear "fall back to
-CPU/Metal/MLX" diagnostic.
-
-The roadmap is to land ops in BERT-shaped order: element-wise binary,
-layer norm, softmax, attention, gather, transpose. Adding an op means:
-WGSL source, a `MatmulPipeline`-style cache entry, a `Step` variant, a
-dispatch in `run`. PRs welcome.
+Broad inference surface (matmul, norms, attention, conv, vision, RNN/SSM,
+quantized matmul, etc.) — see [docs/op-coverage.md](../../docs/op-coverage.md).
+GGUF `DequantMatMul` uses the GPU path when arena scratch fits; otherwise
+CPU dequant via `gguf_host`. MoE grouped GGUF remains host-only on WGPU.
 
 ## Install
 

@@ -530,12 +530,160 @@ pub fn run_fusion_pipeline(
     })
 }
 
+impl FusionOptions {
+    /// Canonical option set for a target, matching what each backend's
+    /// compile path uses: CPU unfuses element-wise regions (it executes them
+    /// as per-op thunks), Metal/MLX keep matmul/norm fusions but unfuse long
+    /// element-wise chains, wgpu unfuses for its modulus-broadcast kernel, and
+    /// the remaining GPU-class targets take the defaults (native FKL regions
+    /// are then enabled by [`apply_native_fk_defaults`](Self::apply_native_fk_defaults)).
+    /// This is the option set the one-call [`fuse`] / [`Fuse`] entries pick.
+    pub fn for_target(target: FusionTarget) -> Self {
+        match target {
+            FusionTarget::Cpu => Self::for_cpu(),
+            FusionTarget::Metal | FusionTarget::Mlx => Self::for_metal(),
+            FusionTarget::Wgpu => Self::for_wgpu(),
+            FusionTarget::Cuda | FusionTarget::Rocm | FusionTarget::Tpu => Self::default(),
+        }
+    }
+}
+
+/// One-call fusion: optimize `graph` for `target` with canonical defaults.
+///
+/// The ergonomic front door over [`run_fusion_pipeline`]. Callers no longer
+/// assemble the supported-op table or pick a per-target [`FusionOptions`] —
+/// both easy to get wrong. Exactly equivalent to:
+///
+/// ```ignore
+/// run_fusion_pipeline(
+///     graph, target,
+///     supported_for_target(target),
+///     FusionOptions::for_target(target),
+/// )
+/// ```
+///
+/// `Op::Input` / `Op::Param` leaves survive fusion, so recover handles into
+/// the rewritten graph by name with [`rlx_ir::Graph::node_id_by_name`];
+/// outputs stay positionally stable in `graph.outputs`. For custom limits,
+/// skip-fusion, or a change report, use the [`Fuse`] builder.
+pub fn fuse(graph: Graph, target: FusionTarget) -> Graph {
+    Fuse::new(target).run(graph)
+}
+
+/// Fluent fusion builder. `Fuse::new(target)` starts from the canonical
+/// [`FusionOptions::for_target`] defaults; setters override individual toggles
+/// before [`run`](Self::run) / [`run_with_report`](Self::run_with_report).
+///
+/// ```ignore
+/// let (fused, report) = Fuse::new(FusionTarget::Cpu)
+///     .limits(FusionLimits::UNBOUNDED)
+///     .run_with_report(graph);
+/// eprintln!("{}", report.summary_line());
+/// ```
+#[derive(Debug, Clone)]
+pub struct Fuse {
+    target: FusionTarget,
+    options: FusionOptions,
+}
+
+impl Fuse {
+    /// Start from the canonical defaults for `target`.
+    pub fn new(target: FusionTarget) -> Self {
+        Self {
+            target,
+            options: FusionOptions::for_target(target),
+        }
+    }
+
+    /// Replace the whole option set.
+    pub fn options(mut self, options: FusionOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Override the element-wise fusion limits.
+    pub fn limits(mut self, limits: FusionLimits) -> Self {
+        self.options.fusion_limits = limits;
+        self
+    }
+
+    /// Disable all pattern fusion (lowering legalization only).
+    pub fn skip_fusion(mut self, skip: bool) -> Self {
+        self.options.skip_fusion = skip;
+        self
+    }
+
+    /// Layer compile-time env overrides (`RLX_*`) on top of the builder state.
+    pub fn merge_env(mut self) -> Self {
+        self.options = self.options.merge_env();
+        self
+    }
+
+    /// Run the pipeline, returning the optimized graph.
+    pub fn run(self, graph: Graph) -> Graph {
+        run_fusion_pipeline(
+            graph,
+            self.target,
+            supported_for_target(self.target),
+            self.options,
+        )
+    }
+
+    /// Run the pipeline and also return a [`FusionReport`] describing the
+    /// before→after change (op/region deltas, fusions left on the table) for
+    /// logging or assertions.
+    ///
+    /// [`FusionReport`]: rlx_fusion::fusion_report::FusionReport
+    pub fn run_with_report(self, graph: Graph) -> (Graph, rlx_fusion::fusion_report::FusionReport) {
+        let before = graph.clone();
+        let after = self.run(graph);
+        let report = rlx_fusion::fusion_report::FusionReport::analyze(&before, &after);
+        (after, report)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
     static ENV_FK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The one-call `fuse` / `Fuse` API folds matmul+bias+act on CPU and keeps
+    /// Input/Param leaves recoverable by name in the rewritten graph — the
+    /// ergonomic contract callers rely on instead of threading a remap table.
+    #[test]
+    fn fuse_one_call_collapses_matmul_bias_act_and_keeps_handles() {
+        use rlx_ir::op::{Activation, BinaryOp};
+        use rlx_ir::{DType, Graph, Shape};
+
+        let f = DType::F32;
+        let mut g = Graph::new("mm_bias_act");
+        let x = g.input("x", Shape::new(&[4, 8], f));
+        let w = g.param("w", Shape::new(&[8, 16], f));
+        let bias = g.param("bias", Shape::new(&[16], f));
+        let mm = g.matmul(x, w, Shape::new(&[4, 16], f));
+        let ba = g.binary(BinaryOp::Add, mm, bias, Shape::new(&[4, 16], f));
+        let act = g.activation(Activation::Relu, ba, Shape::new(&[4, 16], f));
+        g.set_outputs(vec![act]);
+        let before = g.len();
+
+        let (fused, report) = Fuse::new(FusionTarget::Cpu).run_with_report(g);
+
+        assert!(
+            fused.len() < before,
+            "matmul+bias+relu should fuse on CPU: {before} -> {} ({})",
+            fused.len(),
+            report.summary_line()
+        );
+        // Leaves survive a fusion rewrite; handles recoverable by name.
+        assert!(fused.input_id("x").is_some(), "input x lost after fusion");
+        assert!(fused.param_id("w").is_some(), "param w lost after fusion");
+        assert!(fused.param_id("bias").is_some(), "param bias lost");
+        assert!(fused.node_id_by_name("w").is_some());
+        // Outputs stay positionally stable.
+        assert_eq!(fused.outputs.len(), 1);
+    }
 
     #[test]
     fn cpu_pipeline_includes_attention_block() {

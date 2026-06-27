@@ -516,6 +516,8 @@ kernel void rope_h(
     constant uint& src_row_stride [[buffer(8)]],
     constant uint& seq_stride     [[buffer(9)]],
     constant uint& n_rot          [[buffer(10)]],
+    constant uint& cos_per_token  [[buffer(11)]],
+    constant uint& interleaved    [[buffer(12)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     uint half_dh = head_dim / 2;
@@ -531,20 +533,131 @@ kernel void rope_h(
     uint hi = gid.y;
     if (hi >= nh) return;
 
+    // Per-seq-position table by default; per global token for ragged decode.
+    uint cos_row = (cos_per_token != 0u) ? bs : si;
+
     // PLAN L1 — `seq_stride` is the compile-time full extent for buffer
     // offsets; `seq` is the (possibly scaled) iteration bound.
     uint src_base = bi * seq_stride * src_row_stride + si * src_row_stride + hi * head_dim;
     uint dst_base = bi * seq_stride * hidden + si * hidden + hi * head_dim;
     uint d = gid.x;
-    if (d < rot_half) {
+    if (interleaved != 0u) {
+        // GPT-J / llama.cpp-NORM: pairs are adjacent (2d, 2d+1). cos/sin
+        // row index is the freq d (0..rot_half).
+        if (d < rot_half) {
+            uint a = 2u * d;
+            uint b = 2u * d + 1u;
+            float x1 = float(x[src_base + a]);
+            float x2 = float(x[src_base + b]);
+            float c = float(cos[cos_row * half_dh + d]);
+            float s = float(sin[cos_row * half_dh + d]);
+            out[dst_base + a] = half(x1 * c - x2 * s);
+            out[dst_base + b] = half(x2 * c + x1 * s);
+        } else if (d >= n_rot) {
+            out[dst_base + d] = x[src_base + d];
+        }
+    } else if (d < rot_half) {
         float x1 = float(x[src_base + d]);
         float x2 = float(x[src_base + rot_half + d]);
-        float c = float(cos[si * half_dh + d]);
-        float s = float(sin[si * half_dh + d]);
+        float c = float(cos[cos_row * half_dh + d]);
+        float s = float(sin[cos_row * half_dh + d]);
         out[dst_base + d] = half(x1 * c - x2 * s);
         out[dst_base + rot_half + d] = half(x2 * c + x1 * s);
     } else if (d >= n_rot) {
         out[dst_base + d] = x[src_base + d];
+    }
+}
+
+// Native f32 fused-attention core for `Op::FusedAttentionBlock` (no-bias
+// path). Reads the PACKED QKV projection `[B,S,3*inner]` (per token
+// `[Q(inner)|K(inner)|V(inner)]`, heads interleaved), applies optional NeoX
+// RoPE to Q/K inline, runs softmax SDPA with the score matrix resident in
+// threadgroup memory (one threadgroup per batch·head), and writes the
+// attention output `[B,S,inner]`. Collapses narrow×3 + transpose×3 + rope×2
+// + attention into a single dispatch; the QKV / out projections stay GEMMs.
+// mask_kind: 0=None, 1=Causal, 2=Custom (binary [B,S], <0.5 ⇒ drop).
+kernel void fused_attn_block(
+    device const float* QKV  [[buffer(0)]],
+    device const float* M    [[buffer(1)]],
+    device const float* COS  [[buffer(2)]],
+    device const float* SIN  [[buffer(3)]],
+    device float* OUT        [[buffer(4)]],
+    constant uint& batch     [[buffer(5)]],
+    constant uint& seq       [[buffer(6)]],
+    constant uint& heads     [[buffer(7)]],
+    constant uint& head_dim  [[buffer(8)]],
+    constant uint& mask_kind [[buffer(9)]],
+    constant uint& scale_bits[[buffer(10)]],
+    constant uint& has_rope  [[buffer(11)]],
+    uint tgid  [[threadgroup_position_in_grid]],
+    uint tid   [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    threadgroup float scores[64 * 64];   // seq ≤ 64 (gated in rlx-metal)
+    uint inner = heads * head_dim;
+    uint bi = tgid / heads;
+    uint hi = tgid % heads;
+    if (bi >= batch) return;
+    float scale = as_type<float>(scale_bits);
+    uint half_d = head_dim / 2;
+    uint tok = 3u * inner;                // per-token stride in QKV
+
+    uint total = seq * seq;
+    for (uint idx = tid; idx < total; idx += tsize) {
+        uint qi = idx / seq;
+        uint ki = idx % seq;
+        uint qb = (bi * seq + qi) * tok + hi * head_dim;            // Q
+        uint kb = (bi * seq + ki) * tok + inner + hi * head_dim;    // K
+        float dot = 0.0f;
+        if (has_rope != 0u) {
+            uint qc = qi * half_d;
+            uint kc = ki * half_d;
+            for (uint i = 0; i < half_d; ++i) {
+                float q1 = QKV[qb + i],        q2 = QKV[qb + half_d + i];
+                float k1 = QKV[kb + i],        k2 = QKV[kb + half_d + i];
+                float cq = COS[qc + i], sq = SIN[qc + i];
+                float ck = COS[kc + i], sk = SIN[kc + i];
+                float qr1 = q1 * cq - q2 * sq, qr2 = q2 * cq + q1 * sq;
+                float kr1 = k1 * ck - k2 * sk, kr2 = k2 * ck + k1 * sk;
+                dot += qr1 * kr1 + qr2 * kr2;
+            }
+        } else {
+            for (uint d = 0; d < head_dim; ++d) dot += QKV[qb + d] * QKV[kb + d];
+        }
+        float s = dot * scale;
+        if (mask_kind == 1u) {
+            if (ki > qi) s = -1e9f;
+        } else if (mask_kind == 2u) {
+            if (M[bi * seq + ki] < 0.5f) s = -1e9f;
+        }
+        scores[qi * seq + ki] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint qi = tid; qi < seq; qi += tsize) {
+        float mx = -1e30f;
+        for (uint ki = 0; ki < seq; ++ki) mx = max(mx, scores[qi * seq + ki]);
+        float sum = 0.0f;
+        for (uint ki = 0; ki < seq; ++ki) {
+            float e = precise::exp(scores[qi * seq + ki] - mx);
+            scores[qi * seq + ki] = e;
+            sum += e;
+        }
+        float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        for (uint ki = 0; ki < seq; ++ki) scores[qi * seq + ki] *= inv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint otot = seq * head_dim;
+    for (uint idx = tid; idx < otot; idx += tsize) {
+        uint qi = idx / head_dim;
+        uint d = idx % head_dim;
+        float acc = 0.0f;
+        for (uint ki = 0; ki < seq; ++ki) {
+            uint vb = (bi * seq + ki) * tok + 2u * inner + hi * head_dim;
+            acc += scores[qi * seq + ki] * QKV[vb + d];
+        }
+        OUT[(bi * seq + qi) * inner + hi * head_dim + d] = acc;
     }
 }
 
@@ -2124,6 +2237,217 @@ kernel void pool2d(
     dst[((n * c_total) + c) * h_out * w_out + ho * w_out + wo] = acc;
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Training backward kernels. All three are OUTPUT-PARALLEL: each thread owns
+// exactly one output element and writes it once — no atomics, no pre-zeroing,
+// no scratch buffers, and (critically) no GPU→CPU sync. They mirror the CPU
+// reference (crates/rlx-cpu/src/{conv_bwd,training_bwd}.rs) bit-for-bit,
+// including the max-pool strict-`>` first-in-scan arg-max tie-break.
+// ──────────────────────────────────────────────────────────────────────
+
+// Max-pool backward. One thread per INPUT element (n,c,ih,iw); it accumulates
+// dy from every output window in which it is the arg-max. Handles overlapping
+// windows and padding. Race-free: distinct threads write distinct dx.
+kernel void maxpool2d_backward(
+    device const float* x   [[buffer(0)]],
+    device const float* dy  [[buffer(1)]],
+    device float* dx        [[buffer(2)]],
+    constant uint4& p0      [[buffer(3)]],  // [N, C, H, W]
+    constant uint4& p1      [[buffer(4)]],  // [H_out, W_out, kh, kw]
+    constant uint4& p2      [[buffer(5)]],  // [sh, sw, ph, pw]
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint N = p0.x, C = p0.y, H = p0.z, W = p0.w;
+    uint h_out = p1.x, w_out = p1.y, kh = p1.z, kw = p1.w;
+    uint sh = p2.x, sw = p2.y, ph = p2.z, pw = p2.w;
+    uint iw = gid.x, ih = gid.y, nc = gid.z;
+    if (nc >= N * C || ih >= H || iw >= W) return;
+
+    int p_h = (int)ih + (int)ph;
+    int p_w = (int)iw + (int)pw;
+    int oh_max = p_h / (int)sh;
+    int ow_max = p_w / (int)sw;
+    if (oh_max >= (int)h_out) oh_max = (int)h_out - 1;
+    if (ow_max >= (int)w_out) ow_max = (int)w_out - 1;
+    // floor((p - k)/s)+1, clamped: integer div is floor only for non-neg args.
+    int oh_min = (p_h - (int)kh < 0) ? 0 : (p_h - (int)kh) / (int)sh + 1;
+    int ow_min = (p_w - (int)kw < 0) ? 0 : (p_w - (int)kw) / (int)sw + 1;
+
+    uint in_chan = nc * H * W;
+    uint out_chan = nc * h_out * w_out;
+    float acc = 0.0f;
+    for (int oh = oh_min; oh <= oh_max; ++oh) {
+        for (int ow = ow_min; ow <= ow_max; ++ow) {
+            float best_v = -INFINITY;
+            int best_h = -1, best_w = -1;
+            for (uint ki = 0; ki < kh; ++ki) {
+                int hh = oh * (int)sh + (int)ki - (int)ph;
+                if (hh < 0 || hh >= (int)H) continue;
+                for (uint kj = 0; kj < kw; ++kj) {
+                    int ww = ow * (int)sw + (int)kj - (int)pw;
+                    if (ww < 0 || ww >= (int)W) continue;
+                    float v = x[in_chan + (uint)hh * W + (uint)ww];
+                    if (v > best_v) { best_v = v; best_h = hh; best_w = ww; }
+                }
+            }
+            if (best_h == (int)ih && best_w == (int)iw)
+                acc += dy[out_chan + (uint)oh * w_out + (uint)ow];
+        }
+    }
+    dx[in_chan + ih * W + iw] = acc;
+}
+
+// Conv2d backward-input (transposed-conv gather). One thread per dx element
+// (n, ci, ih, iw); gathers from every (co,ki,kj) whose forward map lands here.
+kernel void conv2d_backward_input(
+    device const float* dy  [[buffer(0)]],
+    device const float* wt  [[buffer(1)]],
+    device float* dx        [[buffer(2)]],
+    constant uint4& a       [[buffer(3)]],  // [N, C_in, H, W_in]
+    constant uint4& b       [[buffer(4)]],  // [C_out, H_out, W_out, kh]
+    constant uint4& cc      [[buffer(5)]],  // [kw, sh, sw, ph]
+    constant uint4& d       [[buffer(6)]],  // [pw, dh, dw, groups]
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint N=a.x, C_in=a.y, H=a.z, W_in=a.w;
+    uint C_out=b.x, H_out=b.y, W_out=b.z, kh=b.w;
+    uint kw=cc.x, sh=cc.y, sw=cc.z, ph=cc.w;
+    uint pw=d.x, dh=d.y, dw=d.z, groups=d.w;
+
+    uint iw = gid.x, ih = gid.y, nci = gid.z;
+    if (nci >= N * C_in || ih >= H || iw >= W_in) return;
+    uint n = nci / C_in;
+    uint ci = nci % C_in;
+    uint c_in_per_g = C_in / groups;
+    uint c_out_per_g = C_out / groups;
+    uint g = ci / c_in_per_g;
+    uint ci_local = ci % c_in_per_g;
+
+    float acc = 0.0f;
+    for (uint ki = 0; ki < kh; ++ki) {
+        int num_h = (int)ih + (int)ph - (int)(ki * dh);
+        if (num_h < 0 || (num_h % (int)sh) != 0) continue;
+        int ho = num_h / (int)sh;
+        if (ho >= (int)H_out) continue;
+        for (uint kj = 0; kj < kw; ++kj) {
+            int num_w = (int)iw + (int)pw - (int)(kj * dw);
+            if (num_w < 0 || (num_w % (int)sw) != 0) continue;
+            int wo = num_w / (int)sw;
+            if (wo >= (int)W_out) continue;
+            for (uint col = 0; col < c_out_per_g; ++col) {
+                uint co = g * c_out_per_g + col;
+                uint w_idx = ((co * c_in_per_g + ci_local) * kh + ki) * kw + kj;
+                uint dy_idx = ((n * C_out + co) * H_out + (uint)ho) * W_out + (uint)wo;
+                acc += wt[w_idx] * dy[dy_idx];
+            }
+        }
+    }
+    dx[((n * C_in + ci) * H + ih) * W_in + iw] = acc;
+}
+
+// Conv2d backward-weight (direct, batch-reduced). One thread per dw element
+// (co, ci_local, ki, kj); sums dy*x over (n, ho, wo).
+kernel void conv2d_backward_weight(
+    device const float* x   [[buffer(0)]],
+    device const float* dy  [[buffer(1)]],
+    device float* dw        [[buffer(2)]],
+    constant uint4& a       [[buffer(3)]],  // [N, C_in, H, W]
+    constant uint4& b       [[buffer(4)]],  // [C_out, H_out, W_out, kh]
+    constant uint4& cc      [[buffer(5)]],  // [kw, sh, sw, ph]
+    constant uint4& d       [[buffer(6)]],  // [pw, dh, dw_dil, groups]
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint N=a.x, C_in=a.y, H=a.z, W=a.w;
+    uint C_out=b.x, H_out=b.y, W_out=b.z, kh=b.w;
+    uint kw=cc.x, sh=cc.y, sw=cc.z, ph=cc.w;
+    uint pw=d.x, dh=d.y, dwd=d.z, groups=d.w;
+
+    uint kj = gid.x, ki = gid.y, coci = gid.z;
+    uint c_in_per_g = C_in / groups;
+    uint c_out_per_g = C_out / groups;
+    if (kj >= kw || ki >= kh || coci >= C_out * c_in_per_g) return;
+    uint co = coci / c_in_per_g;
+    uint ci_local = coci % c_in_per_g;
+    uint g = co / c_out_per_g;
+    uint ci = g * c_in_per_g + ci_local;
+
+    float acc = 0.0f;
+    for (uint n = 0; n < N; ++n) {
+        for (uint ho = 0; ho < H_out; ++ho) {
+            int hh = (int)(ho * sh + ki * dh) - (int)ph;
+            if (hh < 0 || hh >= (int)H) continue;
+            for (uint wo = 0; wo < W_out; ++wo) {
+                int ww = (int)(wo * sw + kj * dwd) - (int)pw;
+                if (ww < 0 || ww >= (int)W) continue;
+                uint x_idx = ((n * C_in + ci) * H + (uint)hh) * W + (uint)ww;
+                uint dy_idx = ((n * C_out + co) * H_out + ho) * W_out + wo;
+                acc += x[x_idx] * dy[dy_idx];
+            }
+        }
+    }
+    dw[((co * c_in_per_g + ci_local) * kh + ki) * kw + kj] = acc;
+}
+
+// Conv2d backward-weight, pass 1 (batch-parallel). One thread per
+// (n, co, ci_local, ki, kj) writes a per-sample partial sum into `part`,
+// laid out [N, C_out, c_in_per_g, kh, kw]. Threads scale with N, so small
+// kernels (conv1: 288 dw elems) no longer starve the GPU.
+kernel void conv2d_backward_weight_partial(
+    device const float* x   [[buffer(0)]],
+    device const float* dy  [[buffer(1)]],
+    device float* part      [[buffer(2)]],
+    constant uint4& a       [[buffer(3)]],  // [N, C_in, H, W]
+    constant uint4& b       [[buffer(4)]],  // [C_out, H_out, W_out, kh]
+    constant uint4& cc      [[buffer(5)]],  // [kw, sh, sw, ph]
+    constant uint4& d       [[buffer(6)]],  // [pw, dh, dw_dil, groups]
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint N=a.x, C_in=a.y, H=a.z, W=a.w;
+    uint C_out=b.x, H_out=b.y, W_out=b.z, kh=b.w;
+    uint kw=cc.x, sh=cc.y, sw=cc.z, ph=cc.w;
+    uint pw=d.x, dh=d.y, dwd=d.z, groups=d.w;
+    uint c_in_per_g = C_in / groups;
+    uint c_out_per_g = C_out / groups;
+    uint wsz = c_in_per_g * kh * kw;   // per-(n,co) weight slab
+
+    uint j = gid.x, co = gid.y, n = gid.z;
+    if (j >= wsz || co >= C_out || n >= N) return;
+    uint kj = j % kw;
+    uint ki = (j / kw) % kh;
+    uint ci_local = j / (kw * kh);
+    uint g = co / c_out_per_g;
+    uint ci = g * c_in_per_g + ci_local;
+
+    float acc = 0.0f;
+    for (uint ho = 0; ho < H_out; ++ho) {
+        int hh = (int)(ho * sh + ki * dh) - (int)ph;
+        if (hh < 0 || hh >= (int)H) continue;
+        for (uint wo = 0; wo < W_out; ++wo) {
+            int ww = (int)(wo * sw + kj * dwd) - (int)pw;
+            if (ww < 0 || ww >= (int)W) continue;
+            uint x_idx = ((n * C_in + ci) * H + (uint)hh) * W + (uint)ww;
+            uint dy_idx = ((n * C_out + co) * H_out + ho) * W_out + wo;
+            acc += x[x_idx] * dy[dy_idx];
+        }
+    }
+    part[(n * C_out + co) * wsz + j] = acc;
+}
+
+// Conv2d backward-weight, pass 2: sum the per-sample partials over the batch.
+// One thread per dw element. `wslab` = C_out * c_in_per_g * kh * kw.
+kernel void conv2d_backward_weight_reduce(
+    device const float* part [[buffer(0)]],
+    device float* dw         [[buffer(1)]],
+    constant uint2& dims     [[buffer(2)]],   // [N, wslab]
+    uint gid [[thread_position_in_grid]]
+) {
+    uint N = dims.x, wslab = dims.y;
+    if (gid >= wslab) return;
+    float acc = 0.0f;
+    for (uint n = 0; n < N; ++n) acc += part[n * wslab + gid];
+    dw[gid] = acc;
+}
+
 // Gather along an arbitrary axis. One thread per output element. Output
 // is laid out as [outer, num_idx, trailing]; source as [outer, axis_dim, trailing].
 kernel void gather_axis(
@@ -2503,6 +2827,20 @@ kernel void elem_where(
     out[gid] = cond[gid] != 0.0f ? a[gid] : b[gid];
 }
 
+// Single-rounded fused multiply-add: out = fma(a, b, c). MSL `fma` is a true
+// fused op (one rounding) — required for compensated / error-free-transform math.
+kernel void elem_fma(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device const float* c [[buffer(2)]],
+    device float* out     [[buffer(3)]],
+    constant uint& len    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    out[gid] = fma(a[gid], b[gid], c[gid]);
+}
+
 // In-place ReLU: data = max(0, data)
 kernel void relu_inplace(
     device float* data [[buffer(0)]],
@@ -2665,6 +3003,156 @@ kernel void softmax_lastax(
     // Pass 3: normalize.
     for (uint i = tid; i < cols; i += tsize) {
         data[base + i] *= inv_sum;
+    }
+}
+
+// Fused dense / soft-label softmax cross-entropy along the last axis.
+// One threadgroup per row computes, numerically stably,
+//   loss[n] = logsumexp(logits[n]) - Σ_c targets[n,c]·logits[n,c]
+// via three threadgroup reductions (row max, Σexp, Σtargets·logits).
+// `cols` is the class count C; output is one scalar per row.
+kernel void softmax_cross_entropy_dense(
+    device const float* logits  [[buffer(0)]],
+    device const float* targets [[buffer(1)]],
+    device float* out           [[buffer(2)]],
+    constant uint& cols         [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    uint base = row * cols;
+
+    // Pass 1: row max for numerical stability.
+    float local_max = -INFINITY;
+    for (uint i = tid; i < cols; i += tsize) {
+        local_max = max(local_max, logits[base + i]);
+    }
+    partial[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] = max(partial[tid], partial[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = partial[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 2: Σ exp(x - max) and Σ targets·logits in one sweep.
+    float local_sum = 0.0f;
+    float local_dot = 0.0f;
+    for (uint i = tid; i < cols; i += tsize) {
+        float v = logits[base + i];
+        local_sum += exp(v - row_max);
+        local_dot += targets[base + i] * v;
+    }
+    partial[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum_exp = partial[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    partial[tid] = local_dot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float dot = partial[0];
+
+    if (tid == 0) {
+        out[row] = (row_max + log(sum_exp)) - dot;
+    }
+}
+
+// Softmax cross-entropy with integer labels (forward). One threadgroup per row.
+// loss[row] = logsumexp(logits[row]) - logits[row, label]. Replaces the
+// softmax + one-hot(compare/where) + gather decomposition on Metal.
+kernel void softmax_cross_entropy_with_logits(
+    device const float* logits [[buffer(0)]],
+    device const float* labels [[buffer(1)]],
+    device float* out          [[buffer(2)]],
+    constant uint& cols        [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    uint base = row * cols;
+
+    float local_max = -INFINITY;
+    for (uint i = tid; i < cols; i += tsize) local_max = max(local_max, logits[base + i]);
+    partial[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) partial[tid] = max(partial[tid], partial[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = partial[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < cols; i += tsize) local_sum += exp(logits[base + i] - row_max);
+    partial[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        uint label = (uint)labels[row];
+        out[row] = (row_max + log(partial[0])) - logits[base + label];
+    }
+}
+
+// Softmax cross-entropy backward (integer labels). One threadgroup per row.
+// dlogits[row,k] = (softmax(logits[row])[k] - [k==label]) * d_loss[row].
+kernel void softmax_cross_entropy_backward(
+    device const float* logits [[buffer(0)]],
+    device const float* labels [[buffer(1)]],
+    device const float* d_loss [[buffer(2)]],
+    device float* dlogits      [[buffer(3)]],
+    constant uint& cols        [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    uint base = row * cols;
+
+    float local_max = -INFINITY;
+    for (uint i = tid; i < cols; i += tsize) local_max = max(local_max, logits[base + i]);
+    partial[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) partial[tid] = max(partial[tid], partial[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = partial[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < cols; i += tsize) local_sum += exp(logits[base + i] - row_max);
+    partial[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / partial[0];
+    float scale = d_loss[row];
+    uint label = (uint)labels[row];
+    for (uint k = tid; k < cols; k += tsize) {
+        float p = exp(logits[base + k] - row_max) * inv_sum;
+        dlogits[base + k] = (p - (k == label ? 1.0f : 0.0f)) * scale;
     }
 }
 
@@ -2895,6 +3383,57 @@ kernel void concat_segment_lastax_h(
     uint j = gid.x;
     if (i >= outer || j >= src_axis) return;
     dst[i * dst_axis + dst_col + j] = src[i * src_axis + j];
+}
+
+// Mid-axis concat (inner > 1): copy one segment src[outer][src_axis][inner]
+// into dst[outer][dst_axis][inner] starting at axis offset `dst_col`. One 1D
+// dispatch per segment, encoded into the live command buffer (NO commit/wait)
+// — the host-copy fallback used to commit+wait per concat, serializing a
+// decode step into ~100 tiny GPU submissions (the dominant cost on GGUF KV
+// caches). `arena` bound at 0 + ulong byte offsets so it is correct on
+// >4 GiB arenas (task #50). Generic: subsumes last-axis concat when inner==1.
+kernel void concat_midaxis_seg(
+    device char* arena       [[buffer(0)]],
+    constant ulong& dst_byte [[buffer(1)]],
+    constant ulong& src_byte [[buffer(2)]],
+    constant uint& outer     [[buffer(3)]],
+    constant uint& dst_axis  [[buffer(4)]],
+    constant uint& src_axis  [[buffer(5)]],
+    constant uint& inner     [[buffer(6)]],
+    constant uint& dst_col   [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = outer * src_axis * inner;
+    if (gid >= total) return;
+    uint ii = gid % inner;
+    uint tmp = gid / inner;
+    uint a = tmp % src_axis;
+    uint o = tmp / src_axis;
+    device const float* src = (device const float*)(arena + src_byte);
+    device float* dst       = (device float*)(arena + dst_byte);
+    dst[(o * dst_axis + dst_col + a) * inner + ii] = src[(o * src_axis + a) * inner + ii];
+}
+
+kernel void concat_midaxis_seg_h(
+    device char* arena       [[buffer(0)]],
+    constant ulong& dst_byte [[buffer(1)]],
+    constant ulong& src_byte [[buffer(2)]],
+    constant uint& outer     [[buffer(3)]],
+    constant uint& dst_axis  [[buffer(4)]],
+    constant uint& src_axis  [[buffer(5)]],
+    constant uint& inner     [[buffer(6)]],
+    constant uint& dst_col   [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = outer * src_axis * inner;
+    if (gid >= total) return;
+    uint ii = gid % inner;
+    uint tmp = gid / inner;
+    uint a = tmp % src_axis;
+    uint o = tmp / src_axis;
+    device const half* src = (device const half*)(arena + src_byte);
+    device half* dst       = (device half*)(arena + dst_byte);
+    dst[(o * dst_axis + dst_col + a) * inner + ii] = src[(o * src_axis + a) * inner + ii];
 }
 
 // Fused residual + LN: out = LN(x + residual + bias, gamma, beta)
@@ -3460,6 +3999,8 @@ kernel void rope(
     constant uint& src_row_stride [[buffer(8)]],
     constant uint& seq_stride     [[buffer(9)]],
     constant uint& n_rot          [[buffer(10)]],
+    constant uint& cos_per_token  [[buffer(11)]],
+    constant uint& interleaved    [[buffer(12)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     // gid.x = dim index within head (0..head_dim)
@@ -3478,6 +4019,11 @@ kernel void rope(
     uint hi = gid.y;
     if (hi >= nh) return;
 
+    // RoPE table row: per-seq-position by default; per global (batch·seq)
+    // token for ragged batched decode, where each sequence sits at its own
+    // absolute position.
+    uint cos_row = (cos_per_token != 0u) ? bs : si;
+
     // PLAN L1 — `seq_stride` is the compile-time full extent for buffer
     // offsets; `seq` is the (possibly scaled) iteration bound. This
     // separation lets active-extent dispatch shrink the loop without
@@ -3485,16 +4031,454 @@ kernel void rope(
     uint src_base = bi * seq_stride * src_row_stride + si * src_row_stride + hi * head_dim;
     uint dst_base = bi * seq_stride * hidden + si * hidden + hi * head_dim;
     uint d = gid.x;
-    if (d < rot_half) {
+    if (interleaved != 0u) {
+        // GPT-J / llama.cpp-NORM: rotated pairs are adjacent (2d, 2d+1);
+        // cos/sin indexed by freq d. GGUF Llama weights need this flavor.
+        if (d < rot_half) {
+            uint a = 2u * d;
+            uint b = 2u * d + 1u;
+            float x1 = x[src_base + a];
+            float x2 = x[src_base + b];
+            float c = cos[cos_row * half_dh + d];
+            float s = sin[cos_row * half_dh + d];
+            out[dst_base + a] = x1 * c - x2 * s;
+            out[dst_base + b] = x2 * c + x1 * s;
+        } else if (d >= n_rot) {
+            out[dst_base + d] = x[src_base + d];
+        }
+    } else if (d < rot_half) {
         float x1 = x[src_base + d];
         float x2 = x[src_base + rot_half + d];
-        float c = cos[si * half_dh + d];
-        float s = sin[si * half_dh + d];
+        float c = cos[cos_row * half_dh + d];
+        float s = sin[cos_row * half_dh + d];
         out[dst_base + d] = x1 * c - x2 * s;
         out[dst_base + rot_half + d] = x2 * c + x1 * s;
     } else if (d >= n_rot) {
         out[dst_base + d] = x[src_base + d];
     }
+}
+
+// ArgMax / ArgMin along the middle axis of [outer, reduced, inner], emitting
+// the winning index (f32). One thread per (outer, inner) output element. Strict
+// comparison with first-best tie-break — matches rlx-cpu execute_argreduce_f32.
+kernel void argreduce(
+    device const float* src [[buffer(0)]],
+    device float* out       [[buffer(1)]],
+    constant uint& outer    [[buffer(2)]],
+    constant uint& reduced  [[buffer(3)]],
+    constant uint& inner    [[buffer(4)]],
+    constant uint& is_max   [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = outer * inner;
+    if (gid >= total) return;
+    uint o = gid / inner;
+    uint i = gid % inner;
+    uint base = o * reduced * inner + i;
+    float best = src[base];
+    uint best_idx = 0u;
+    for (uint r = 1u; r < reduced; ++r) {
+        float v = src[base + r * inner];
+        bool better = (is_max != 0u) ? (v > best) : (v < best);
+        if (better) { best = v; best_idx = r; }
+    }
+    out[o * inner + i] = float(best_idx);
+}
+
+// Cooperative last-axis ArgMax/ArgMin: one threadgroup reduces one `outer`
+// row over the `reduced` axis (inner == 1 — the decode logits case, where the
+// naive one-thread-per-output `argreduce` would loop a 128k-vocab row on a
+// single GPU lane). Tie-break = lowest index wins, matching the strict `>`/`<`
+// in rlx-cpu execute_argreduce_f32. Threadgroup size must be a power of two.
+kernel void argreduce_lastaxis(
+    device const float* src [[buffer(0)]],
+    device float* out       [[buffer(1)]],
+    constant uint& outer    [[buffer(2)]],
+    constant uint& reduced  [[buffer(3)]],
+    constant uint& is_max   [[buffer(4)]],
+    uint tg       [[threadgroup_position_in_grid]],
+    uint tid      [[thread_position_in_threadgroup]],
+    uint nthreads [[threads_per_threadgroup]]
+) {
+    if (tg >= outer) return;
+    device const float* row = src + (ulong)tg * (ulong)reduced;
+
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+
+    float best = (is_max != 0u) ? -INFINITY : INFINITY;
+    uint  bidx = 0u;
+    // Strided scan: within a lane, strict comparison keeps the lowest index.
+    for (uint r = tid; r < reduced; r += nthreads) {
+        float v = row[r];
+        bool better = (is_max != 0u) ? (v > best) : (v < best);
+        if (better) { best = v; bidx = r; }
+    }
+    sval[tid] = best;
+    sidx[tid] = bidx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = nthreads >> 1; s > 0u; s >>= 1) {
+        if (tid < s) {
+            float v  = sval[tid + s];
+            uint  i  = sidx[tid + s];
+            float cv = sval[tid];
+            uint  ci = sidx[tid];
+            bool better = (is_max != 0u) ? (v > cv) : (v < cv);
+            // Equal value → keep the lower source index (CPU first-best).
+            if (better || (v == cv && i < ci)) { sval[tid] = v; sidx[tid] = i; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) out[tg] = float(sidx[0]);
+}
+
+// On-GPU logit sampling: temperature -> top-k -> softmax -> top-p -> Philox
+// inverse-CDF draw. One threadgroup per batch row. Mirrors the CPU algorithm
+// in rlx-cpu `sample_row` / `execute_sample_f32` exactly, including the
+// Philox4x32 stream (rlx_ir::rng), so a fixed seed is bit-comparable.
+//
+// top-k / top-p cutoffs are found by parallel bisection on the value/prob
+// range rather than a full sort: for distinct logits this selects the
+// identical kept set (the cutoff lands strictly between the two order
+// statistics that bracket it). The final inverse-CDF walk (thread 0) recomputes
+// each token's filtered probability in original index order so the sequential
+// float accumulation matches the CPU reference element-for-element.
+//
+// Threadgroup size must be a power of two (dispatched at 256).
+kernel void sample_logits(
+    device float* arena         [[buffer(0)]],
+    constant ulong& logits_off  [[buffer(1)]],
+    constant ulong& dst_off     [[buffer(2)]],
+    constant uint& batch        [[buffer(3)]],
+    constant uint& vocab        [[buffer(4)]],
+    constant uint& top_k        [[buffer(5)]],
+    constant float& top_p       [[buffer(6)]],
+    constant float& temperature [[buffer(7)]],
+    constant ulong& seed        [[buffer(8)]],
+    uint tg       [[threadgroup_position_in_grid]],
+    uint tid      [[thread_position_in_threadgroup]],
+    uint nthreads [[threads_per_threadgroup]]
+) {
+    if (tg >= batch) return;
+    device const float* logits =
+        (device const float*)((device char*)arena + logits_off);
+    device float* dst = (device float*)((device char*)arena + dst_off);
+    device const float* row = logits + (ulong)tg * (ulong)vocab;
+
+    const uint v = vocab;
+    const float MIN_POS = 1.1754944e-38f;          // f32::MIN_POSITIVE
+    const float temp = max(temperature, 1e-6f);
+    const uint  kk   = min(top_k, v);
+    const bool use_topk = (kk > 0u) && (kk < v);
+    const bool use_topp = (top_p < 1.0f);
+
+    if (v == 0u) { if (tid == 0u) dst[tg] = 0.0f; return; }
+
+    // `red` is the reduction scratch; `bounds[0..1]` carries the bisection
+    // lo/hi (an array, so per-element-init warnings don't fire). All cross-lane
+    // values are read back from `red[0]` after the reduction barrier.
+    threadgroup float red[256];
+    threadgroup float bounds[2];
+
+    // ── max(scaled) ────────────────────────────────────────────────
+    float lmax = -INFINITY;
+    for (uint i = tid; i < v; i += nthreads) lmax = max(lmax, row[i]);
+    red[tid] = lmax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nthreads >> 1; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float max_l = red[0] / temp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── min(scaled) (bisection lower bound) ────────────────────────
+    float lmin = INFINITY;
+    for (uint i = tid; i < v; i += nthreads) lmin = min(lmin, row[i]);
+    red[tid] = lmin;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nthreads >> 1; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] = min(red[tid], red[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float min_l = red[0] / temp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── top-k cutoff = kk-th largest scaled value (bisection) ──────
+    float cutoff = -INFINITY;
+    if (use_topk) {
+        if (tid == 0u) { bounds[0] = min_l; bounds[1] = max_l; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint it = 0u; it < 50u; ++it) {
+            float mid = 0.5f * (bounds[0] + bounds[1]);
+            float cnt = 0.0f;
+            for (uint i = tid; i < v; i += nthreads)
+                if (row[i] / temp >= mid) cnt += 1.0f;
+            red[tid] = cnt;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = nthreads >> 1; s > 0u; s >>= 1) {
+                if (tid < s) red[tid] += red[tid + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0u) {
+                if (red[0] >= float(kk)) bounds[0] = mid; else bounds[1] = mid;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        cutoff = bounds[0];
+    }
+
+    // ── softmax denom over the top-k set ───────────────────────────
+    float s1 = 0.0f;
+    for (uint i = tid; i < v; i += nthreads) {
+        float sc = row[i] / temp;
+        if (!use_topk || sc >= cutoff) s1 += exp(sc - max_l);
+    }
+    red[tid] = s1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nthreads >> 1; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float sum1 = red[0];
+    const float inv1 = 1.0f / max(sum1, MIN_POS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── top-p prob cutoff (bisection over [0,1]) ───────────────────
+    float pcut = 0.0f;
+    if (use_topp) {
+        if (tid == 0u) { bounds[0] = 0.0f; bounds[1] = 1.0f; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint it = 0u; it < 60u; ++it) {
+            float mid = 0.5f * (bounds[0] + bounds[1]);
+            float psum = 0.0f;
+            for (uint i = tid; i < v; i += nthreads) {
+                float sc = row[i] / temp;
+                if (use_topk && sc < cutoff) continue;
+                float p = exp(sc - max_l) * inv1;
+                if (p >= mid) psum += p;
+            }
+            red[tid] = psum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = nthreads >> 1; s > 0u; s >>= 1) {
+                if (tid < s) red[tid] += red[tid + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0u) {
+                if (red[0] >= top_p) bounds[0] = mid; else bounds[1] = mid;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        pcut = bounds[0];
+    }
+
+    // ── renorm denom over the top-p set ────────────────────────────
+    float sum2 = 1.0f;
+    if (use_topp) {
+        float s2 = 0.0f;
+        for (uint i = tid; i < v; i += nthreads) {
+            float sc = row[i] / temp;
+            if (use_topk && sc < cutoff) continue;
+            float p = exp(sc - max_l) * inv1;
+            if (p >= pcut) s2 += p;
+        }
+        red[tid] = s2;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = nthreads >> 1; s > 0u; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        sum2 = red[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── thread 0: Philox draw + sequential inverse-CDF in index order ─
+    if (tid == 0u) {
+        ulong sd  = (seed == 0ul) ? 0xDEADBEEFul : seed;
+        uint  k0  = (uint)(sd & 0xFFFFFFFFul);
+        uint  k1  = (uint)(sd >> 32);
+        uint  st0 = (uint)(tg / 4u), st1 = 0u, st2 = 0u, st3 = 0u;
+        for (uint rr = 0u; rr < 10u; ++rr) {
+            ulong p0 = (ulong)st0 * 0xD2561A75ul;
+            ulong p1 = (ulong)st2 * 0xCD9E8D57ul;
+            uint hi0 = (uint)(p0 >> 32), lo0 = (uint)(p0 & 0xFFFFFFFFul);
+            uint hi1 = (uint)(p1 >> 32), lo1 = (uint)(p1 & 0xFFFFFFFFul);
+            uint n0 = hi1 ^ st1 ^ k0;
+            uint n1 = lo1;
+            uint n2 = hi0 ^ st3 ^ k1;
+            uint n3 = lo0;
+            st0 = n0; st1 = n1; st2 = n2; st3 = n3;
+            k0 += 0x9E3779B9u; k1 += 0xBB67AE85u;
+        }
+        uint lane = tg % 4u;
+        uint bits = (lane == 0u ? st0 : (lane == 1u ? st1 : (lane == 2u ? st2 : st3))) >> 8;
+        float r = (float)bits / 16777216.0f;
+
+        float inv2 = use_topp ? (1.0f / max(sum2, MIN_POS)) : 1.0f;
+        float acc = 0.0f;
+        uint chosen = v - 1u;
+        for (uint i = 0u; i < v; ++i) {
+            float sc = row[i] / temp;
+            float p;
+            if (use_topk && sc < cutoff) {
+                p = 0.0f;
+            } else {
+                p = exp(sc - max_l) * inv1;
+                if (use_topp) { p = (p >= pcut) ? (p * inv2) : 0.0f; }
+            }
+            acc += p;
+            if (r <= acc) { chosen = i; break; }
+        }
+        dst[tg] = float(chosen);
+    }
+}
+
+// Block-quantized int8 weight matmul: out[m,n] = x[m,k] @ dequant(wq[k,n]).
+// Per-(block-of-k, n) scale (+ optional zero-point). One thread per output
+// element. Matches rlx-cpu dequant_matmul_int8.
+kernel void dequant_matmul_int8(
+    device const float* x      [[buffer(0)]],
+    device const char*  wq     [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device const float* zps    [[buffer(3)]],
+    device float* out          [[buffer(4)]],
+    constant uint& m           [[buffer(5)]],
+    constant uint& k           [[buffer(6)]],
+    constant uint& n           [[buffer(7)]],
+    constant uint& block_size  [[buffer(8)]],
+    constant uint& asym        [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= m * n) return;
+    uint i = gid / n;
+    uint j = gid % n;
+    float acc = 0.0f;
+    for (uint p = 0; p < k; ++p) {
+        uint block = p / block_size;
+        float s = scales[block * n + j];
+        float z = (asym != 0u) ? zps[block * n + j] : 0.0f;
+        float q = float(wq[p * n + j]);
+        acc += x[i * k + p] * ((q - z) * s);
+    }
+    out[i * n + j] = acc;
+}
+
+// Block-quantized int4 (two nibbles per byte) weight matmul. Low nibble first.
+kernel void dequant_matmul_int4(
+    device const float* x      [[buffer(0)]],
+    device const uchar* wq     [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device const float* zps    [[buffer(3)]],
+    device float* out          [[buffer(4)]],
+    constant uint& m           [[buffer(5)]],
+    constant uint& k           [[buffer(6)]],
+    constant uint& n           [[buffer(7)]],
+    constant uint& block_size  [[buffer(8)]],
+    constant uint& asym        [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= m * n) return;
+    uint i = gid / n;
+    uint j = gid % n;
+    float acc = 0.0f;
+    for (uint p = 0; p < k; ++p) {
+        uint block = p / block_size;
+        float s = scales[block * n + j];
+        float z = (asym != 0u) ? zps[block * n + j] : 0.0f;
+        uint idx = p * n + j;
+        uchar byte = wq[idx >> 1];
+        uint nib = ((idx & 1u) == 0u) ? (uint(byte) & 0x0Fu) : (uint(byte) >> 4);
+        acc += x[i * k + p] * ((float(nib) - z) * s);
+    }
+    out[i * n + j] = acc;
+}
+
+inline float dq_fp8_e4m3(uchar byte) {
+    uint sign = (uint(byte) >> 7) & 1u;
+    uint exp_v = (uint(byte) >> 3) & 0x0Fu;
+    uint mant = uint(byte) & 0x7u;
+    float v;
+    if (exp_v == 0u) {
+        v = (mant == 0u) ? 0.0f : (float(mant) / 8.0f) * exp2(-6.0f);
+    } else if (exp_v == 0x0Fu && mant == 0x7u) {
+        v = 0.0f;
+    } else {
+        v = (1.0f + float(mant) / 8.0f) * exp2(float(int(exp_v) - 7));
+    }
+    return (sign != 0u) ? -v : v;
+}
+
+inline float dq_fp8_e5m2(uchar byte) {
+    uint sign = (uint(byte) >> 7) & 1u;
+    uint exp_v = (uint(byte) >> 2) & 0x1Fu;
+    uint mant = uint(byte) & 0x3u;
+    float v;
+    if (exp_v == 0u) {
+        v = (mant == 0u) ? 0.0f : (float(mant) / 4.0f) * exp2(-14.0f);
+    } else if (exp_v == 0x1Fu) {
+        v = 0.0f;
+    } else {
+        v = (1.0f + float(mant) / 4.0f) * exp2(float(int(exp_v) - 15));
+    }
+    return (sign != 0u) ? -v : v;
+}
+
+constant float DQ_FP4_E2M1[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+kernel void dequant_matmul_fp8(
+    device const float* x      [[buffer(0)]],
+    device const uchar* wq     [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device float* out          [[buffer(4)]],
+    constant uint& m           [[buffer(5)]],
+    constant uint& k           [[buffer(6)]],
+    constant uint& n           [[buffer(7)]],
+    constant uint& e5m2        [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= m * n) return;
+    uint i = gid / n;
+    uint j = gid % n;
+    float acc = 0.0f;
+    float col_scale = scales[j];
+    for (uint p = 0u; p < k; ++p) {
+        uchar byte = wq[p * n + j];
+        float w = (e5m2 != 0u) ? dq_fp8_e5m2(byte) : dq_fp8_e4m3(byte);
+        acc += x[i * k + p] * w * col_scale;
+    }
+    out[i * n + j] = acc;
+}
+
+kernel void dequant_matmul_nvfp4(
+    device const float* x      [[buffer(0)]],
+    device const uchar* wq     [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device const float* gs_ptr [[buffer(3)]],
+    device float* out          [[buffer(4)]],
+    constant uint& m           [[buffer(5)]],
+    constant uint& k           [[buffer(6)]],
+    constant uint& n           [[buffer(7)]],
+    constant uint& group_size  [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= m * n) return;
+    uint i = gid / n;
+    uint j = gid % n;
+    float gs = gs_ptr[0];
+    float acc = 0.0f;
+    for (uint p = 0u; p < k; ++p) {
+        uint idx = p * n + j;
+        uint byte_idx = idx >> 1;
+        uint nib = ((idx & 1u) == 0u) ? (uint(wq[byte_idx]) & 0x0Fu) : (uint(wq[byte_idx]) >> 4);
+        uint block = p / group_size;
+        float s = dq_fp8_e4m3(scales[block * n + j]);
+        acc += x[i * k + p] * DQ_FP4_E2M1[nib] * s * gs;
+    }
+    out[i * n + j] = acc;
 }
 
 // in-place SiLU: x * sigmoid(x)
@@ -4226,6 +5210,54 @@ kernel void gated_delta_net(
     }
 }
 
+// ── Selective scan (Mamba SSM, f32) ─────────────────────────────────
+// One thread per (batch, channel); each thread owns a private state
+// vector of size n (n ≤ SSM_MAX_N) and scans sequentially over seq.
+// Inputs (float indices): x, delta [b,s,h]; a [h,n]; b, c [b,s,n].
+// Output [b,s,h]. Matches `execute_selective_scan_f32` on CPU:
+//   h[t] = exp(Δ·A)·h[t-1] + Δ·B·x;   y[t] = Σ_n C·h[t]
+#define SSM_MAX_N 128u
+kernel void selective_scan(
+    device float* arena       [[buffer(0)]],
+    constant uint& x_off      [[buffer(1)]],
+    constant uint& delta_off  [[buffer(2)]],
+    constant uint& a_off      [[buffer(3)]],
+    constant uint& b_off      [[buffer(4)]],
+    constant uint& c_off      [[buffer(5)]],
+    constant uint& dst_off    [[buffer(6)]],
+    constant uint4& dims      [[buffer(7)]], // batch, seq, hidden, n
+    uint gid [[thread_position_in_grid]]
+) {
+    uint b = dims.x, s = dims.y, h = dims.z, n = dims.w;
+    if (n > SSM_MAX_N || gid >= b * h) return;
+
+    uint bi = gid / h;
+    uint ci = gid % h;
+
+    float state[SSM_MAX_N];
+    for (uint i = 0; i < n; ++i) {
+        state[i] = 0.0f;
+    }
+
+    // a[ci, :] is constant across the sequence for this channel.
+    uint a_base = a_off + ci * n;
+
+    for (uint si = 0; si < s; ++si) {
+        uint bsh = bi * s * h + si * h + ci;   // x/delta/out element offset
+        uint bsn = (bi * s + si) * n;          // b/c row base
+        float d = arena[delta_off + bsh];
+        float xv = arena[x_off + bsh];
+        float acc = 0.0f;
+        for (uint ni = 0; ni < n; ++ni) {
+            float da = exp(d * arena[a_base + ni]);
+            float st = da * state[ni] + d * arena[b_off + bsn + ni] * xv;
+            state[ni] = st;
+            acc += arena[c_off + bsn + ni] * st;
+        }
+        arena[dst_off + bsh] = acc;
+    }
+}
+
 // Single-layer unidirectional LSTM (gate order i, f, g, o; h0 = c0 = 0).
 // One threadgroup per batch item; thread `k` owns hidden unit `k` and
 // keeps c[k] in a register; h_prev lives in threadgroup memory so every
@@ -4284,6 +5316,150 @@ kernel void lstm(
     }
 }
 
+// Single-layer unidirectional GRU (gate order r, z, n; linear_before_reset=1;
+// separate b_ih/b_hh; h0 = 0). One threadgroup per batch item; thread `k` owns
+// hidden unit `k`. Matches `execute_gru_f32` on CPU.
+#define GRU_MAX_H 1024u
+kernel void gru(
+    device float* arena      [[buffer(0)]],
+    constant uint& x_off     [[buffer(1)]],
+    constant uint& wih_off   [[buffer(2)]],
+    constant uint& whh_off   [[buffer(3)]],
+    constant uint& bih_off   [[buffer(4)]],
+    constant uint& bhh_off   [[buffer(5)]],
+    constant uint& dst_off   [[buffer(6)]],
+    constant uint4& dims     [[buffer(7)]], // batch, seq, input, hidden
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    uint b = dims.x, s = dims.y, in_sz = dims.z, h = dims.w;
+    if (h > GRU_MAX_H || gid >= b || tid >= h) return;
+    uint bi = gid, k = tid;
+
+    threadgroup float h_sh[GRU_MAX_H];
+    h_sh[k] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = 0; t < s; ++t) {
+        uint x_base = x_off + (bi * s + t) * in_sz;
+        // Gate rows r=k, z=h+k, n=2h+k. Input and hidden parts kept separate
+        // because the reset gate multiplies the hidden term after its bias.
+        float xi[3], hi[3];
+        for (uint g = 0u; g < 3u; ++g) {
+            uint r = g * h + k;
+            float ax = arena[bih_off + r];
+            uint wih_row = wih_off + r * in_sz;
+            for (uint j = 0u; j < in_sz; ++j) {
+                ax += arena[wih_row + j] * arena[x_base + j];
+            }
+            float ah = arena[bhh_off + r];
+            uint whh_row = whh_off + r * h;
+            for (uint j = 0u; j < h; ++j) {
+                ah += arena[whh_row + j] * h_sh[j];
+            }
+            xi[g] = ax;
+            hi[g] = ah;
+        }
+        float rg = 1.0f / (1.0f + exp(-(xi[0] + hi[0])));
+        float zg = 1.0f / (1.0f + exp(-(xi[1] + hi[1])));
+        float ng = tanh(xi[2] + rg * hi[2]);
+        float h_k = (1.0f - zg) * ng + zg * h_sh[k];
+        // Finish reading h_prev across all threads before overwriting.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        h_sh[k] = h_k;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        arena[dst_off + (bi * s + t) * h + k] = h_k;
+    }
+}
+
+// Single-layer unidirectional Elman RNN (`relu_flag` ? relu : tanh; h0 = 0).
+// One threadgroup per batch item; thread `k` owns hidden unit `k`. Matches
+// `execute_rnn_f32` on CPU.
+#define RNN_MAX_H 1024u
+kernel void rnn(
+    device float* arena       [[buffer(0)]],
+    constant uint& x_off      [[buffer(1)]],
+    constant uint& wih_off    [[buffer(2)]],
+    constant uint& whh_off    [[buffer(3)]],
+    constant uint& bias_off   [[buffer(4)]],
+    constant uint& dst_off    [[buffer(5)]],
+    constant uint4& dims      [[buffer(6)]], // batch, seq, input, hidden
+    constant uint& relu_flag  [[buffer(7)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    uint b = dims.x, s = dims.y, in_sz = dims.z, h = dims.w;
+    if (h > RNN_MAX_H || gid >= b || tid >= h) return;
+    uint bi = gid, k = tid;
+
+    threadgroup float h_sh[RNN_MAX_H];
+    h_sh[k] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = 0; t < s; ++t) {
+        uint x_base = x_off + (bi * s + t) * in_sz;
+        float acc = arena[bias_off + k];
+        uint wih_row = wih_off + k * in_sz;
+        for (uint j = 0u; j < in_sz; ++j) {
+            acc += arena[wih_row + j] * arena[x_base + j];
+        }
+        uint whh_row = whh_off + k * h;
+        for (uint j = 0u; j < h; ++j) {
+            acc += arena[whh_row + j] * h_sh[j];
+        }
+        float h_k = relu_flag != 0u ? fmax(acc, 0.0f) : tanh(acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        h_sh[k] = h_k;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        arena[dst_off + (bi * s + t) * h + k] = h_k;
+    }
+}
+
+// Mamba-2 / SSD scalar-decay scan. One thread per (batch, head, head_dim_pos);
+// each owns a private N-state vector and scans the sequence. Matches
+// `execute_mamba2_f32` on CPU. n ≤ MAMBA2_MAX_N.
+#define MAMBA2_MAX_N 128u
+kernel void mamba2(
+    device float* arena      [[buffer(0)]],
+    constant uint& x_off     [[buffer(1)]],
+    constant uint& dt_off    [[buffer(2)]],
+    constant uint& a_off     [[buffer(3)]],
+    constant uint& b_off     [[buffer(4)]],
+    constant uint& c_off     [[buffer(5)]],
+    constant uint& dst_off   [[buffer(6)]],
+    constant uint4& dims     [[buffer(7)]], // batch, seq, heads, (head_dim<<16 | state_size)
+    uint gid [[thread_position_in_grid]]
+) {
+    uint bn = dims.x, s = dims.y, hh = dims.z;
+    uint p = dims.w >> 16, n = dims.w & 0xffffu;
+    if (n > MAMBA2_MAX_N || gid >= bn * hh * p) return;
+
+    uint pi = gid % p;
+    uint hi = (gid / p) % hh;
+    uint bi = gid / (p * hh);
+
+    float state[MAMBA2_MAX_N];
+    for (uint i = 0u; i < n; ++i) {
+        state[i] = 0.0f;
+    }
+    float ah = arena[a_off + hi];
+
+    for (uint t = 0u; t < s; ++t) {
+        uint bsh = (bi * s + t) * hh + hi;
+        float dt_t = arena[dt_off + bsh];
+        float da = exp(dt_t * ah);
+        float dtx = dt_t * arena[x_off + bsh * p + pi];
+        uint bc = bsh * n;
+        float acc = 0.0f;
+        for (uint ni = 0u; ni < n; ++ni) {
+            float st = da * state[ni] + dtx * arena[b_off + bc + ni];
+            state[ni] = st;
+            acc += st * arena[c_off + bc + ni];
+        }
+        arena[dst_off + bsh * p + pi] = acc;
+    }
+}
+
 // RMSNorm backward (wrt: 0=dx, 1=dgamma, 2=dbeta). One threadgroup per row.
 kernel void rms_norm_bwd(
     device const float* x [[buffer(0)]],
@@ -4326,12 +5502,14 @@ kernel void rms_norm_bwd(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float inv_r = rsqrt(partial[0] / float(inner) + eps);
-    float inv_r3 = inv_r * inv_r * inv_r;
+    // Cross term is inv_r³ (= inv_r2·inv_r below), NOT inv_r⁴: outer ·inv_r already supplies
+    // one factor, so the inner term uses inv_r2. The prior inv_r3-then-·inv_r was a stray 1/r.
+    float inv_r2 = inv_r * inv_r;
     for (uint i = tid; i < inner; i += tsize) {
         float xv = x[row * inner + i];
         float gv = gamma[i];
         float dyv = dy[row * inner + i];
-        float term = gv * dyv - xv * dot * inv_r3;
+        float term = gv * dyv - xv * dot * inv_r2;
         out[row * inner + i] = term * inv_r;
     }
 }
@@ -4942,6 +6120,8 @@ pub struct Kernels {
     pub gather_axis0_h: ComputePipelineState,
     pub narrow_lastax_h: ComputePipelineState,
     pub sdpa_h: ComputePipelineState,
+    /// Native f32 fused-attention core for `Op::FusedAttentionBlock`.
+    pub fused_attn_block: ComputePipelineState,
     pub rope_h: ComputePipelineState,
     pub cast_f32_to_f16: ComputePipelineState,
     pub cast_f16_to_f32: ComputePipelineState,
@@ -4991,6 +6171,17 @@ pub struct Kernels {
     pub sdpa: ComputePipelineState,
     pub sdpa_long: ComputePipelineState,
     pub sdpa_fa_f32: ComputePipelineState,
+    pub argreduce: ComputePipelineState,
+    /// Cooperative last-axis ArgMax/ArgMin (one threadgroup per row) — used
+    /// for `inner == 1` (decode logits) instead of the serial `argreduce`.
+    pub argreduce_lastaxis: ComputePipelineState,
+    /// On-GPU temperature/top-k/top-p/Philox logit sampler (one threadgroup
+    /// per batch row). Replaces the unified-memory host fallback.
+    pub sample_logits: ComputePipelineState,
+    pub dequant_matmul_int8: ComputePipelineState,
+    pub dequant_matmul_int4: ComputePipelineState,
+    pub dequant_matmul_fp8: ComputePipelineState,
+    pub dequant_matmul_nvfp4: ComputePipelineState,
     pub rope: ComputePipelineState,
     pub fused_swiglu: ComputePipelineState,
     pub fused_swiglu_h: ComputePipelineState,
@@ -5005,6 +6196,8 @@ pub struct Kernels {
     pub concat_lastax_multi: ComputePipelineState,
     pub concat_lastax_multi4: ComputePipelineState,
     pub concat_segment_lastax_h: ComputePipelineState,
+    pub concat_midaxis_seg: ComputePipelineState,
+    pub concat_midaxis_seg_h: ComputePipelineState,
     pub elem_sub: ComputePipelineState,
     pub elem_div: ComputePipelineState,
     pub elem_max: ComputePipelineState,
@@ -5012,6 +6205,7 @@ pub struct Kernels {
     pub elem_pow: ComputePipelineState,
     pub elem_compare: ComputePipelineState,
     pub elem_where: ComputePipelineState,
+    pub elem_fma: ComputePipelineState,
     pub reduce_axes: ComputePipelineState,
     pub topk_lastax: ComputePipelineState,
     pub grouped_matmul: ComputePipelineState,
@@ -5026,6 +6220,11 @@ pub struct Kernels {
     pub transpose_swap12_batched_trail_tiled_f32: ComputePipelineState,
     pub gather_axis: ComputePipelineState,
     pub pool2d: ComputePipelineState,
+    pub maxpool2d_backward: ComputePipelineState,
+    pub conv2d_backward_input: ComputePipelineState,
+    pub conv2d_backward_weight: ComputePipelineState,
+    pub conv2d_backward_weight_partial: ComputePipelineState,
+    pub conv2d_backward_weight_reduce: ComputePipelineState,
     pub conv2d: ComputePipelineState,
     pub conv2d_w1: ComputePipelineState,
     pub layer_norm2d: ComputePipelineState,
@@ -5047,23 +6246,55 @@ pub struct Kernels {
     pub tan_inplace: ComputePipelineState,
     pub atan_inplace: ComputePipelineState,
     pub softmax_lastax: ComputePipelineState,
+    pub softmax_cross_entropy_dense: ComputePipelineState,
+    pub softmax_cross_entropy_with_logits: ComputePipelineState,
+    pub softmax_cross_entropy_backward: ComputePipelineState,
     pub fft_radix2_full_f32: ComputePipelineState,
     pub fft_bit_reverse_f32: ComputePipelineState,
     pub fft_inner_f32: ComputePipelineState,
     pub fft_outer_r4_f32: ComputePipelineState,
     pub fft_outer_r2_f32: ComputePipelineState,
     pub gated_delta_net: ComputePipelineState,
+    pub selective_scan: ComputePipelineState,
     pub lstm: ComputePipelineState,
+    pub gru: ComputePipelineState,
+    pub rnn: ComputePipelineState,
+    pub mamba2: ComputePipelineState,
     pub dequant_gguf: ComputePipelineState,
     /// Fused Q4_K_M GEMV — skips the f32 dequant scratch and produces
     /// `dst[n] = sum_k x[k] * dequant(w[n,k])` in a single pass. Used
     /// for `m == 1` (decode) GgufQ4K matmuls; m > 1 still goes through
     /// `dequant_gguf + encode_mps_sgemm_bt`.
     pub q4k_mv_f32: ComputePipelineState,
+    pub q4k_readbw_probe: ComputePipelineState,
+    pub q4k_flatread_probe: ComputePipelineState,
+    pub q4_0_mv_f32: ComputePipelineState,
+    pub q4_1_mv_f32: ComputePipelineState,
+    pub q8_0_mv_f32: ComputePipelineState,
+    pub iq4_nl_mv_f32: ComputePipelineState,
+    pub iq2_xxs_mv_f32: ComputePipelineState,
+    pub iq2_xs_mv_f32: ComputePipelineState,
+    pub iq2_s_mv_f32: ComputePipelineState,
+    pub iq3_xxs_mv_f32: ComputePipelineState,
+    pub iq3_s_mv_f32: ComputePipelineState,
+    pub iq1_s_mv_f32: ComputePipelineState,
+    pub iq1_m_mv_f32: ComputePipelineState,
     /// Simdgroup-cooperative Q4_K_M GEMV: 32 threads cooperate on 8
     /// output columns with `simd_sum`. Better x cache reuse than the
     /// single-thread-per-output `q4k_mv_f32`. Used when `n_dim % 8 == 0`.
     pub q4k_mv_f32_sg: ComputePipelineState,
+    /// Fused Q4_K / Q6_K GEMM (m > 1, prefill) — reads packed weight directly,
+    /// dequants in-register and accumulates a row tile, replacing the
+    /// `dequant_gguf` f32 scratch + MPS sgemm path for these two schemes.
+    pub q4k_mm_f32: ComputePipelineState,
+    pub q6k_mm_f32: ComputePipelineState,
+    /// Fused decode-layer MLP GEMVs (m == 1). `q4k_swiglu_mv_f32` fuses
+    /// gate+up Q4_K GEMVs with the silu·mul epilogue; the `*_mv_residual_f32`
+    /// pair fuse the down-projection GEMV with the residual add. Produced by
+    /// the `fuse_decode_mlp` thunk pass (off-switch RLX_METAL_FUSE_DECODE).
+    pub q4k_swiglu_mv_f32: ComputePipelineState,
+    pub q4k_mv_residual_f32: ComputePipelineState,
+    pub q6k_mv_residual_f32: ComputePipelineState,
     /// Device buffer holding the concatenated IQ grid LUTs. Built once
     /// at Kernels init from `rlx_gguf::iq_grids::*`. Layout — see
     /// `dequant_gguf.msl` `IQ_GRID_OFF_*` constants.
@@ -5148,6 +6379,7 @@ impl Kernels {
             gather_axis0_h: pipeline("gather_axis0_h"),
             narrow_lastax_h: pipeline("narrow_lastax_h"),
             sdpa_h: pipeline("sdpa_h"),
+            fused_attn_block: pipeline("fused_attn_block"),
             rope_h: pipeline("rope_h"),
             cast_f32_to_f16: pipeline("cast_f32_to_f16"),
             cast_f16_to_f32: pipeline("cast_f16_to_f32"),
@@ -5197,6 +6429,13 @@ impl Kernels {
             sdpa: pipeline("sdpa"),
             sdpa_long: pipeline("sdpa_long"),
             sdpa_fa_f32: pipeline("sdpa_fa_f32"),
+            argreduce: pipeline("argreduce"),
+            argreduce_lastaxis: pipeline("argreduce_lastaxis"),
+            sample_logits: pipeline("sample_logits"),
+            dequant_matmul_int8: pipeline("dequant_matmul_int8"),
+            dequant_matmul_int4: pipeline("dequant_matmul_int4"),
+            dequant_matmul_fp8: pipeline("dequant_matmul_fp8"),
+            dequant_matmul_nvfp4: pipeline("dequant_matmul_nvfp4"),
             rope: pipeline("rope"),
             fused_swiglu: pipeline("fused_swiglu"),
             fused_swiglu_h: pipeline("fused_swiglu_h"),
@@ -5209,6 +6448,8 @@ impl Kernels {
             concat_lastax_multi: pipeline("concat_lastax_multi"),
             concat_lastax_multi4: pipeline("concat_lastax_multi4"),
             concat_segment_lastax_h: pipeline("concat_segment_lastax_h"),
+            concat_midaxis_seg: pipeline("concat_midaxis_seg"),
+            concat_midaxis_seg_h: pipeline("concat_midaxis_seg_h"),
             elem_sub: pipeline("elem_sub"),
             elem_div: pipeline("elem_div"),
             elem_max: pipeline("elem_max"),
@@ -5216,6 +6457,7 @@ impl Kernels {
             elem_pow: pipeline("elem_pow"),
             elem_compare: pipeline("elem_compare"),
             elem_where: pipeline("elem_where"),
+            elem_fma: pipeline("elem_fma"),
             reduce_axes: pipeline("reduce_axes"),
             topk_lastax: pipeline("topk_lastax"),
             grouped_matmul: pipeline("grouped_matmul"),
@@ -5232,6 +6474,11 @@ impl Kernels {
             ),
             gather_axis: pipeline("gather_axis"),
             pool2d: pipeline("pool2d"),
+            maxpool2d_backward: pipeline("maxpool2d_backward"),
+            conv2d_backward_input: pipeline("conv2d_backward_input"),
+            conv2d_backward_weight: pipeline("conv2d_backward_weight"),
+            conv2d_backward_weight_partial: pipeline("conv2d_backward_weight_partial"),
+            conv2d_backward_weight_reduce: pipeline("conv2d_backward_weight_reduce"),
             conv2d: pipeline("conv2d"),
             conv2d_w1: pipeline("conv2d_w1"),
             layer_norm2d: pipeline("layer_norm2d"),
@@ -5253,16 +6500,41 @@ impl Kernels {
             tan_inplace: pipeline("tan_inplace"),
             atan_inplace: pipeline("atan_inplace"),
             softmax_lastax: pipeline("softmax_lastax"),
+            softmax_cross_entropy_dense: pipeline("softmax_cross_entropy_dense"),
+            softmax_cross_entropy_with_logits: pipeline("softmax_cross_entropy_with_logits"),
+            softmax_cross_entropy_backward: pipeline("softmax_cross_entropy_backward"),
             fft_radix2_full_f32: pipeline("fft_radix2_full_f32"),
             fft_bit_reverse_f32: pipeline("fft_bit_reverse_f32"),
             fft_inner_f32: pipeline("fft_inner_f32"),
             fft_outer_r4_f32: pipeline("fft_outer_r4_f32"),
             fft_outer_r2_f32: pipeline("fft_outer_r2_f32"),
             gated_delta_net: pipeline("gated_delta_net"),
+            selective_scan: pipeline("selective_scan"),
             lstm: pipeline("lstm"),
+            gru: pipeline("gru"),
+            rnn: pipeline("rnn"),
+            mamba2: pipeline("mamba2"),
             dequant_gguf: pipeline("dequant_gguf"),
             q4k_mv_f32: pipeline("q4k_mv_f32"),
+            q4k_readbw_probe: pipeline("q4k_readbw_probe"),
+            q4k_flatread_probe: pipeline("q4k_flatread_probe"),
+            q4_0_mv_f32: pipeline("q4_0_mv_f32"),
+            q4_1_mv_f32: pipeline("q4_1_mv_f32"),
+            q8_0_mv_f32: pipeline("q8_0_mv_f32"),
+            iq4_nl_mv_f32: pipeline("iq4_nl_mv_f32"),
+            iq2_xxs_mv_f32: pipeline("iq2_xxs_mv_f32"),
+            iq2_xs_mv_f32: pipeline("iq2_xs_mv_f32"),
+            iq2_s_mv_f32: pipeline("iq2_s_mv_f32"),
+            iq3_xxs_mv_f32: pipeline("iq3_xxs_mv_f32"),
+            iq3_s_mv_f32: pipeline("iq3_s_mv_f32"),
+            iq1_s_mv_f32: pipeline("iq1_s_mv_f32"),
+            iq1_m_mv_f32: pipeline("iq1_m_mv_f32"),
             q4k_mv_f32_sg: pipeline("q4k_mv_f32_sg"),
+            q4k_mm_f32: pipeline("q4k_mm_f32"),
+            q6k_mm_f32: pipeline("q6k_mm_f32"),
+            q4k_swiglu_mv_f32: pipeline("q4k_swiglu_mv_f32"),
+            q4k_mv_residual_f32: pipeline("q4k_mv_residual_f32"),
+            q6k_mv_residual_f32: pipeline("q6k_mv_residual_f32"),
             rms_norm_bwd: pipeline("rms_norm_bwd"),
             rms_norm_bwd_param: pipeline("rms_norm_bwd_param"),
             rms_norm_bwd_inv_r_f32: pipeline("rms_norm_bwd_inv_r_f32"),

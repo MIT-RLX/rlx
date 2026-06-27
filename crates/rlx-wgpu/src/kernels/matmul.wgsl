@@ -207,3 +207,96 @@ fn matmul(
         }
     }
 }
+
+// C[m,n] = A[m,k] @ B^T where B is stored row-major as [n,k] (GGUF dequant layout).
+@compute @workgroup_size(8, 8)
+fn matmul_bt(
+    @builtin(global_invocation_id)   gid: vec3<u32>,
+    @builtin(local_invocation_id)    lid: vec3<u32>,
+    @builtin(workgroup_id)           wid: vec3<u32>,
+) {
+    let bz = gid.z;
+    if (bz >= params.batch) { return; }
+
+    let lr = lid.y;
+    let lc = lid.x;
+    let row_base = wid.y * TILE_M + lr * RM;
+    let col_base = wid.x * TILE_N + lc * RN;
+
+    let a_base = params.a_off + bz * params.a_batch_stride;
+    let b_base = params.b_off + bz * params.b_batch_stride;
+    let c_base = params.c_off + bz * params.c_batch_stride;
+
+    var acc: array<array<f32, 4>, 4>;
+    for (var i: u32 = 0u; i < RM; i = i + 1u) {
+        for (var j: u32 = 0u; j < RN; j = j + 1u) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    let n_tiles = (params.k + TILE_K - 1u) / TILE_K;
+
+    for (var t: u32 = 0u; t < n_tiles; t = t + 1u) {
+        for (var i: u32 = 0u; i < RM; i = i + 1u) {
+            let m_local = lr * RM + i;
+            let global_row = wid.y * TILE_M + m_local;
+            for (var j: u32 = 0u; j < 2u; j = j + 1u) {
+                let k_local = lc * 2u + j;
+                let global_k = t * TILE_K + k_local;
+                if (global_row < params.m && global_k < params.k) {
+                    tile_a[m_local][k_local] = arena[a_base + global_row * params.k + global_k];
+                } else {
+                    tile_a[m_local][k_local] = 0.0;
+                }
+            }
+        }
+        for (var i: u32 = 0u; i < 2u; i = i + 1u) {
+            let k_local = lr * 2u + i;
+            let global_k = t * TILE_K + k_local;
+            for (var j: u32 = 0u; j < RN; j = j + 1u) {
+                let n_local = lc * RN + j;
+                let global_col = wid.x * TILE_N + n_local;
+                if (global_k < params.k && global_col < params.n) {
+                    tile_b[k_local][n_local] = arena[b_base + global_col * params.k + global_k];
+                } else {
+                    tile_b[k_local][n_local] = 0.0;
+                }
+            }
+        }
+
+        workgroupBarrier();
+
+        for (var k: u32 = 0u; k < TILE_K; k = k + 1u) {
+            var a_reg: array<f32, 4>;
+            var b_reg: array<f32, 4>;
+            for (var i: u32 = 0u; i < RM; i = i + 1u) {
+                a_reg[i] = tile_a[lr * RM + i][k];
+            }
+            for (var j: u32 = 0u; j < RN; j = j + 1u) {
+                b_reg[j] = tile_b[k][lc * RN + j];
+            }
+            for (var i: u32 = 0u; i < RM; i = i + 1u) {
+                for (var j: u32 = 0u; j < RN; j = j + 1u) {
+                    acc[i][j] = acc[i][j] + a_reg[i] * b_reg[j];
+                }
+            }
+        }
+
+        workgroupBarrier();
+    }
+
+    for (var i: u32 = 0u; i < RM; i = i + 1u) {
+        let global_row = row_base + i;
+        if (global_row >= params.m) { continue; }
+        for (var j: u32 = 0u; j < RN; j = j + 1u) {
+            let global_col = col_base + j;
+            if (global_col >= params.n) { continue; }
+            var v = acc[i][j];
+            if (params.has_bias != 0u) {
+                v = v + arena[params.bias_off + global_col];
+            }
+            v = apply_act(v);
+            arena[c_base + global_row * params.n + global_col] = v;
+        }
+    }
+}

@@ -805,6 +805,7 @@ fn rope_partial_dim_passes_tail_through() {
         Op::Rope {
             head_dim: 4,
             n_rot: 4,
+            style: rlx_ir::RopeStyle::NeoX,
         },
         vec![x, cos, sin],
         Shape::new(&[1, 1, 1, 6], DType::F32),
@@ -1417,6 +1418,7 @@ fn rope_matches_reference() {
         Op::Rope {
             head_dim: 4,
             n_rot: 4,
+            style: rlx_ir::RopeStyle::NeoX,
         },
         vec![x, cos, sin],
         Shape::new(&[1, 1, 2, 4], DType::F32),
@@ -1447,6 +1449,48 @@ fn rope_matches_reference() {
     assert!(
         close(&got, &want, 1e-5),
         "rope mismatch: got {got:?} want {want:?}"
+    );
+}
+
+#[test]
+fn rope_gptj_interleaved_matches_reference() {
+    // Same shape as `rope_matches_reference` but GPT-J (interleaved) pairing:
+    // the rotated pairs are (x[0],x[1]) and (x[2],x[3]) — adjacent elements —
+    // not (x[0],x[2])/(x[1],x[3]). GGUF Llama weights need this flavor.
+    let mut g = Graph::new("rope_gptj");
+    let x = g.input("x", Shape::new(&[1, 1, 2, 4], DType::F32));
+    let cos = g.input("cos", Shape::new(&[2, 2], DType::F32));
+    let sin = g.input("sin", Shape::new(&[2, 2], DType::F32));
+    let y = g.add_node(
+        Op::Rope {
+            head_dim: 4,
+            n_rot: 4,
+            style: rlx_ir::RopeStyle::GptJ,
+        },
+        vec![x, cos, sin],
+        Shape::new(&[1, 1, 2, 4], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+
+    let mut exe = MlxExecutable::compile(g);
+    // Position 0: cos=(1,1), sin=(0,0) → identity. Position 1: cos=(0,0), sin=(1,1) → 90°.
+    let cos_d = vec![1.0, 1.0, 0.0, 0.0];
+    let sin_d = vec![0.0, 0.0, 1.0, 1.0];
+    // pos 1, pair 0 = (a,b): y_even = a*0 - b*1 = -b, y_odd = b*0 + a*1 = a → (-b, a)
+    //        pair 1 = (c,d): → (-d, c)
+    let xs = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+    let got = exe
+        .run(&[("x", &xs), ("cos", &cos_d), ("sin", &sin_d)])
+        .into_iter()
+        .next()
+        .unwrap();
+    let want = vec![
+        1.0, 2.0, 3.0, 4.0, // pos 0 unchanged
+        -20.0, 10.0, -40.0, 30.0,
+    ]; // pos 1 interleaved 90° rotation
+    assert!(
+        close(&got, &want, 1e-5),
+        "gptj rope mismatch: got {got:?} want {want:?}"
     );
 }
 

@@ -1,0 +1,44 @@
+[package]
+name = "rlx-oneapi"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Intel oneAPI Level Zero backend for RLX (Arc / Data Center Max via libze_loader + SPIR-V compute kernels)"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.10", default-features = false, features = ["compile"] }
+rlx-compile = { path = "../rlx-compile", version = "0.2.10" }
+# CPU reference kernels for the host-fallback path. On a host with no Intel
+# Level Zero device (this macOS dev box, CI), the whole legalized graph runs on
+# the `rlx-cpu` reference so results are bit-for-bit the ground truth; on Intel
+# hardware the same path serves any op without a native SPIR-V kernel yet.
+# `default-features = false` drops rlx-cpu's `blas` link requirement so the
+# standalone build needs no BLAS; built alongside rlx-runtime (which enables
+# `cpu`→`blas`), Cargo's additive unification restores the platform BLAS.
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", default-features = false }
+
+# The Level Zero loader (`libze_loader.so.1` / `ze_loader.dll`) is opened at
+# runtime with `libloading` — no link-time dependency on the oneAPI runtime, so
+# the crate compiles + `cargo build`s on hosts with no Level Zero driver (macOS,
+# CI). `OneApiDevice::new` returns `Err` there and the backend reports itself
+# unavailable, mirroring rlx-cuda/rlx-rocm/rlx-vulkan.
+libloading = "0.8"
+half = "2"
+
+[dev-dependencies]
+half = "2"
+
+[lints]
+workspace = true

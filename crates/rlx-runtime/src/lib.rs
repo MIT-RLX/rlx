@@ -59,8 +59,12 @@ pub mod backends_manifest;
 pub mod compile_cache;
 pub mod compile_config;
 pub mod compiled;
+// On-device (ANE) gradient-based training + MLUpdateTask eligibility probe.
+#[cfg(all(feature = "coreml", feature = "training"))]
+pub mod coreml_training;
 pub mod cost;
 mod cpu_low_precision;
+mod deferred;
 pub mod device_bench;
 pub mod device_ext;
 pub mod device_parse;
@@ -135,6 +139,10 @@ pub use compile_config::{
     set_compile_output_cap,
 };
 pub use compiled::CompiledGraph;
+#[cfg(all(feature = "coreml", feature = "training"))]
+pub use coreml_training::{
+    CoremlTrainingSession, MlUpdateEligibility, Optimizer, StepReport, TrainConfig, UpdatePath,
+};
 pub use cost::fastest_device_for;
 pub use device_bench::{DeviceBenchResult, benchmark_devices, warm_all};
 #[cfg(feature = "apple")]
@@ -205,6 +213,9 @@ pub fn reset_mlx_compile_output_cap() {
 pub use rlx_cpu::moe_residency::MoeResidencyStats;
 #[cfg(feature = "cpu")]
 pub use rlx_cpu::moe_topk_capture::MoeTopkCapture;
+pub use rlx_driver::{
+    DEFAULT_HEAP_BYTES, NetTransport, ProcessGroup, TcpTransport, ThunderboltTransport, Transport,
+};
 pub use rlx_driver::{ReduceKind, all_gather, all_reduce, reduce_scatter};
 pub use rlx_ir::env::{self, RlxEnv, RuntimeOverrides};
 pub use session::Session;

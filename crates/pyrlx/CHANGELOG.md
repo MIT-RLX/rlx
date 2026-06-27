@@ -6,6 +6,13 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **GGUF Python surface** — `quantize` / `dequant`, `load_gguf` / `write_gguf`,
+  `convert_to_gguf` (safetensors → GGUF), and `GgufFile` metadata helpers.
+- Cargo features `gguf-convert` (default), `gguf-onnx`, `gguf-pt` for optional
+  checkpoint readers.
+
 ## [0.2.7] — 2026-06
 
 ### Changed
@@ -26,7 +33,7 @@ and the project follows [Semantic Versioning](https://semver.org/).
 - **DSL** — `pyrlx.graph()` context manager, `pyrlx.Node` operator overloads
   (`+`, `-`, `*`, `/`, `@`, `**`, comparisons), scalar literal promotion
   (`x * 2.0`), and `g.outputs = [...]` sugar. Implementation lives in
-  `pyrlx/dsl.py`; see `pyrlx/docs/dsl.md`.
+  `python/pyrlx/dsl.py`; see `docs/dsl.md`.
 - **`Graph.constant`** — broadcastable rank-0 literals; validated on the
   Python binding before IR insertion (via `GraphExt::try_constant`).
 - **Graph ops** — `gelu_approx`, `stop_gradient`, `conv2d`, `conv_transpose2d`,
@@ -35,7 +42,7 @@ and the project follows [Semantic Versioning](https://semver.org/).
   `eq_` / `lt_`.
 - **`rlx-ir::GraphExt::try_constant`** — fallible scalar literal builder for
   Rust callers.
-- **`pyrlx/examples/dsl_quickstart.py`** — minimal runnable DSL example.
+- **`examples/dsl_quickstart.py`** — minimal runnable DSL example.
 - **`py.typed`** marker for PEP 561 typed-package metadata.
 - Integer literal OOB rules: range, integrality, float-on-int-dtype promotion,
   rejection of `abs(int) > 2**53`.
@@ -45,7 +52,7 @@ and the project follows [Semantic Versioning](https://semver.org/).
 ### Changed
 - Type stubs (`_pyrlx.pyi`) synced with the full native binding surface.
 - `jacfwd` docstring updated — `vmap` is available; use it for large Jacobians.
-- Module docs in `pyrlx/__init__.py`, `pyrlx/src/graph.rs`, and `rlx` prelude
+- Module docs in `python/pyrlx/__init__.py`, `src/graph.rs`, and `rlx` prelude
   document scalar literals and the DSL entry points.
 - `Graph.constant` Python binding delegates to `GraphExt::try_constant`.
 

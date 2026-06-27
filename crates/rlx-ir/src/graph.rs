@@ -209,6 +209,37 @@ impl Graph {
         self.nodes.iter().filter(|n| n.inputs.contains(&id)).count()
     }
 
+    /// Find a node by the name on its [`Op::Input`] or [`Op::Param`].
+    ///
+    /// Input/Param leaves are the graph's roots and survive optimizer passes
+    /// (fusion, DCE), so a *name* is the stable way to recover a handle into a
+    /// **rewritten** graph whose `NodeId`s have been renumbered — e.g. after
+    /// [`fuse`](../../rlx_compile/fusion_pipeline/fn.fuse.html). Outputs are
+    /// already positionally stable in [`outputs`](Self::outputs). Returns the
+    /// first match (names are expected unique).
+    pub fn node_id_by_name(&self, name: &str) -> Option<NodeId> {
+        self.nodes.iter().find_map(|n| match &n.op {
+            Op::Input { name: nm } | Op::Param { name: nm } if nm == name => Some(n.id),
+            _ => None,
+        })
+    }
+
+    /// [`node_id_by_name`](Self::node_id_by_name) restricted to graph inputs.
+    pub fn input_id(&self, name: &str) -> Option<NodeId> {
+        self.nodes.iter().find_map(|n| match &n.op {
+            Op::Input { name: nm } if nm == name => Some(n.id),
+            _ => None,
+        })
+    }
+
+    /// [`node_id_by_name`](Self::node_id_by_name) restricted to parameters.
+    pub fn param_id(&self, name: &str) -> Option<NodeId> {
+        self.nodes.iter().find_map(|n| match &n.op {
+            Op::Param { name: nm } if nm == name => Some(n.id),
+            _ => None,
+        })
+    }
+
     /// Topological order (already guaranteed by construction — just node indices).
     pub fn topo_order(&self) -> impl Iterator<Item = NodeId> + '_ {
         (0..self.nodes.len()).map(|i| NodeId(i as u32))

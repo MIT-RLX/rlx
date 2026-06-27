@@ -2317,7 +2317,7 @@ impl SparseTensor {
 // segment-at-CustomOp dispatch is wired (which it is, as of the
 // owned-encoder refactor).
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
 mod metal_kernels {
     use super::*;
     use rlx_ir::DType;
@@ -2784,7 +2784,7 @@ pub fn register() {
         register_cpu_kernel(Arc::new(SparseLsqrCpu));
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
     {
         use rlx_metal::op_registry::register_metal_kernel;
         register_metal_kernel(Arc::new(metal_kernels::SparseLuMetal));

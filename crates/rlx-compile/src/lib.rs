@@ -29,6 +29,7 @@ pub mod promote_params;
 pub mod quant_insert;
 pub mod quant_propagate;
 pub mod rewrite;
+pub mod scaled_quant_insert;
 pub mod svg;
 
 #[cfg(feature = "training")]

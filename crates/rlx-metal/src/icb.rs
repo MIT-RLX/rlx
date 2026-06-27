@@ -209,6 +209,7 @@ fn thunk_kind(t: &Thunk) -> &'static str {
         Thunk::LayerNorm { .. } => "LayerNorm",
         Thunk::RmsNorm { .. } => "RmsNorm",
         Thunk::Softmax { .. } => "Softmax",
+        Thunk::SoftmaxCrossEntropyDense { .. } => "SoftmaxCrossEntropy",
         Thunk::Reduce { .. } => "Reduce",
         Thunk::Gather { .. } => "Gather",
         Thunk::Narrow { .. } => "Narrow",
@@ -685,9 +686,11 @@ fn encode_thunk_into_icb(
             head_dim,
             n_rot,
             src_row_stride,
+            cos_per_token,
+            interleaved,
             ..
         } => {
-            // Layout: [batch, seq, hidden, head_dim, src_row_stride, seq_stride, n_rot]
+            // Layout: [batch, seq, hidden, head_dim, src_row_stride, seq_stride, n_rot, cos_per_token, interleaved]
             write_u32s(&[
                 *batch,
                 *seq,
@@ -696,6 +699,8 @@ fn encode_thunk_into_icb(
                 *src_row_stride,
                 *seq,
                 *n_rot,
+                *cos_per_token as u32,
+                *interleaved as u32,
             ]);
             cmd.set_compute_pipeline_state(&k.rope);
             cmd.set_kernel_buffer(0, Some(&**arena), *src as u64);
@@ -709,6 +714,8 @@ fn encode_thunk_into_icb(
             cmd.set_kernel_buffer(8, Some(&**constants_buf), cb_arg(4));
             cmd.set_kernel_buffer(9, Some(&**constants_buf), cb_arg(5));
             cmd.set_kernel_buffer(10, Some(&**constants_buf), cb_arg(6));
+            cmd.set_kernel_buffer(11, Some(&**constants_buf), cb_arg(7));
+            cmd.set_kernel_buffer(12, Some(&**constants_buf), cb_arg(8));
             let nh = *hidden / *head_dim;
             let grid = MTLSize {
                 width: *head_dim as u64,

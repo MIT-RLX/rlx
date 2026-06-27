@@ -550,6 +550,29 @@ unsafe extern "C" {
     pub fn rlx_mlx_compile_output_cap() -> usize;
     pub fn rlx_mlx_set_compile_output_cap(cap: usize);
     pub fn rlx_mlx_reset_compile_output_cap();
+
+    // ── Distributed (multi-node) ─────────────────────────────────
+    pub fn rlx_mlx_dist_is_available(out: *mut c_int) -> c_int;
+    pub fn rlx_mlx_dist_init(
+        strict: c_int,
+        backend: *const c_char,
+        out_rank: *mut c_int,
+        out_size: *mut c_int,
+    ) -> c_int;
+    pub fn rlx_mlx_dist_rank(out_rank: *mut c_int) -> c_int;
+    pub fn rlx_mlx_dist_size(out_size: *mut c_int) -> c_int;
+    pub fn rlx_mlx_dist_all_sum_f32(inp: *const c_float, out: *mut c_float, nelems: usize)
+    -> c_int;
+    pub fn rlx_mlx_dist_all_gather_f32(
+        inp: *const c_float,
+        nelems: usize,
+        out: *mut c_float,
+        out_cap: usize,
+    ) -> c_int;
+    pub fn rlx_mlx_dist_send_f32(data: *const c_float, nelems: usize, dst: c_int) -> c_int;
+    pub fn rlx_mlx_dist_recv_f32(out: *mut c_float, nelems: usize, src: c_int) -> c_int;
+    pub fn rlx_mlx_dist_barrier() -> c_int;
+    pub fn rlx_mlx_dist_all_sum_array(inp: *mut mlx_array_t, out: *mut *mut mlx_array_t) -> c_int;
 }
 
 #[repr(C)]

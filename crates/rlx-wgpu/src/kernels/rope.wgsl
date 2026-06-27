@@ -40,7 +40,7 @@ struct Params {
     // PLAN L1 — full-extent fields for offset math, set at compile time.
     batch: u32,
     seq_stride: u32, // full seq, used for per-batch buffer offset.
-    _p2: u32,
+    style: u32,      // 0 = NeoX rotate-half, 1 = GPT-J interleaved (2i, 2i+1)
 };
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
@@ -63,6 +63,26 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let buf_q1 = bi * params.seq_stride + si;
     let buf_idx = buf_q1 * params.last_dim + d;
     let head_base = buf_idx - d_in_head;
+
+    if (params.style == 1u) {
+        // GPT-J / llama.cpp-NORM: adjacent pairs (2i, 2i+1) rotate by angle i.
+        // cos/sin row index is the freq i = d_in_head / 2 (0..half). One thread
+        // per output element: even lane writes the first of its pair, odd lane
+        // the second, mirroring the CPU reference exactly.
+        let i = d_in_head / 2u;
+        let c = arena[params.cos_off + pos * half + i];
+        let s = arena[params.sin_off + pos * half + i];
+        if ((d_in_head & 1u) == 0u) {
+            let x1 = arena[params.in_off + buf_idx];        // x[2i]
+            let x2 = arena[params.in_off + buf_idx + 1u];   // x[2i+1]
+            arena[params.out_off + buf_idx] = x1 * c - x2 * s;
+        } else {
+            let x2 = arena[params.in_off + buf_idx];        // x[2i+1]
+            let x1 = arena[params.in_off + buf_idx - 1u];   // x[2i]
+            arena[params.out_off + buf_idx] = x2 * c + x1 * s;
+        }
+        return;
+    }
 
     if (d_in_head < half) {
         let xf = arena[params.in_off + buf_idx];

@@ -30,11 +30,35 @@ use rlx_ir::{Graph, NodeId, Op, Shape};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Instrumentation: count of `FusedNomicLayer` thunks emitted by the full-layer
+/// fusion in this process. The fusion is otherwise invisible through the
+/// `Session` API, so out-of-tree model tests (rlx-models' Nomic parity test)
+/// load this to confirm the fusion actually fired (non-vacuous parity). Reset
+/// by storing 0 before a compile.
+pub static FUSED_NOMIC_LAYER_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// A pre-compiled kernel call with all args resolved to arena offsets.
 #[derive(Clone)]
 pub enum Thunk {
     /// Skip (Input/Param already in arena)
     Nop,
+    /// Fused element-wise region: ONE pass applies the whole `chain` of scalar
+    /// steps per output element (bias-add → relu → … collapse into a single
+    /// kernel, no intermediate tensors). This is RLX's XLA-style auto-fusion
+    /// path on CPU — the GPU backends already run the same `ElementwiseRegion`
+    /// IR via a generated kernel; this is the scalar interpreter twin so any
+    /// fused chain runs without a hand-written per-op kernel.
+    /// `dst`/`input_offs` are byte offsets; `input_modulus[i]` is input i's
+    /// broadcast period (0 ⇒ read element `gid`; scalar inputs read element 0).
+    ElementwiseRegion {
+        dst: usize,
+        len: u32,
+        input_offs: Vec<usize>,
+        chain: Vec<rlx_ir::op::ChainStep>,
+        scalar_input_mask: u32,
+        input_modulus: [u32; 16],
+    },
     /// C = A @ B (BLAS sgemm)
     Sgemm {
         a: usize,
@@ -43,6 +67,38 @@ pub enum Thunk {
         m: u32,
         k: u32,
         n: u32,
+    },
+    /// `C[m,n] = op(A) @ op(B)` with optional transpose of each operand,
+    /// done via cblas trans flags (no materialized transpose). Emitted when
+    /// the thunk compiler folds a last-two-axis `Op::Transpose` feeding a
+    /// matmul (the dominant cost in matmul backprop). `a`/`b` are the
+    /// *pre-transpose* operands. lda/ldb are derived from the trans flags.
+    SgemmT {
+        a: usize,
+        b: usize,
+        c: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        ta: bool,
+        tb: bool,
+    },
+    /// Fused SGD-with-momentum parameter update, one pass per param.
+    /// Computes `v' = mom·v + g ; p' = p − lr·v'` reading `param`/`vel`/
+    /// `grad` and writing `p_out`/`v_out`. Emitted when the thunk compiler
+    /// folds the in-graph SGD chain `Sub(p, Mul(Add(Mul(v,mom),g), lr))`
+    /// (4 `BinaryFull` ops + 2 full-size constants per param) into a single
+    /// kernel — the dominant cost of the fully-fused training step. All
+    /// fields are arena byte offsets except the scalar hyperparameters.
+    SgdMomentum {
+        param: usize,
+        vel: usize,
+        grad: usize,
+        p_out: usize,
+        v_out: usize,
+        lr: f32,
+        mom: f32,
+        len: u32,
     },
     /// Complex (C64) dense GEMM `C = A·B`. Operands are interleaved
     /// `[re, im]` f32; `a`/`b`/`c` are byte offsets, `m`/`k`/`n` are
@@ -550,6 +606,16 @@ pub enum Thunk {
         inner: u32,
         elem_bytes: u8,
     },
+    /// Reverse (flip) element order along the axes in `rev_mask`. `dims` is the
+    /// row-major input shape; output shape is identical. Dtype-agnostic
+    /// (byte-copy of `elem_bytes` per element).
+    Reverse {
+        src: usize,
+        dst: usize,
+        dims: Vec<u32>,
+        rev_mask: Vec<bool>,
+        elem_bytes: u8,
+    },
     /// Copy (reshape, expand)
     Copy {
         src: usize,
@@ -755,6 +821,54 @@ pub enum Thunk {
         bidirectional: bool,
         carry: bool,
     },
+    /// GRU (gate order r, z, n) with separate `b_ih`/`b_hh`. See `Op::Gru`.
+    Gru {
+        x: usize,
+        w_ih: usize,
+        w_hh: usize,
+        b_ih: usize,
+        b_hh: usize,
+        h0: usize,
+        dst: usize,
+        batch: u32,
+        seq: u32,
+        input_size: u32,
+        hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        carry: bool,
+    },
+    /// Elman RNN (`tanh`/`relu`), single merged bias. See `Op::Rnn`.
+    Rnn {
+        x: usize,
+        w_ih: usize,
+        w_hh: usize,
+        bias: usize,
+        h0: usize,
+        dst: usize,
+        batch: u32,
+        seq: u32,
+        input_size: u32,
+        hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        carry: bool,
+        relu: bool,
+    },
+    /// Mamba-2 / SSD scalar-decay SSM scan. See `Op::Mamba2`.
+    Mamba2 {
+        x: usize,
+        dt: usize,
+        a: usize,
+        b: usize,
+        c: usize,
+        dst: usize,
+        batch: u32,
+        seq: u32,
+        heads: u32,
+        head_dim: u32,
+        state_size: u32,
+    },
 
     /// 1×1 conv fast path (plan #26). The general Conv2D thunk
     /// runs the textbook 7-deep loop; a 1×1 stride-1 padding-0
@@ -846,6 +960,56 @@ pub enum Thunk {
         m: u32,
         k: u32,
         n: u32,
+    },
+
+    /// Native low-precision scaled GEMM (FP8/FP6/FP4) — CPU reference oracle.
+    /// TN layout: lhs [m,k], rhs [n,k] codes, out [m,n] f32.
+    ScaledMatMul {
+        lhs: usize,
+        rhs: usize,
+        lhs_scale: usize,
+        rhs_scale: usize,
+        bias: usize, // valid iff has_bias
+        dst: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        lhs_fmt: rlx_ir::ScaledFormat,
+        rhs_fmt: rlx_ir::ScaledFormat,
+        layout: rlx_ir::ScaleLayout,
+        has_bias: bool,
+    },
+
+    /// Quantize f32 → packed low-precision codes (reads the scale tensor).
+    ScaledQuantize {
+        x: usize,
+        scale: usize,
+        dst: usize,
+        rows: u32,
+        cols: u32,
+        fmt: rlx_ir::ScaledFormat,
+        layout: rlx_ir::ScaleLayout,
+    },
+
+    /// Compute the per-tensor / per-block scale tensor for `Op::ScaledQuantize`.
+    ScaledQuantScale {
+        x: usize,
+        dst: usize,
+        rows: u32,
+        cols: u32,
+        fmt: rlx_ir::ScaledFormat,
+        layout: rlx_ir::ScaleLayout,
+    },
+
+    /// Reconstruct f32 from packed codes (`Op::ScaledDequantize`).
+    ScaledDequantize {
+        codes: usize,
+        scale: usize,
+        dst: usize,
+        rows: u32,
+        cols: u32,
+        fmt: rlx_ir::ScaledFormat,
+        layout: rlx_ir::ScaleLayout,
     },
 
     /// Fused LoRA matmul (plan #9): out = x·W + scale * (x·A)·B.
@@ -968,6 +1132,9 @@ pub enum Thunk {
         n_rot: u32,
         cos_len: u32,
         src_row_stride: u32,
+        /// `true` = GPT-J / llama.cpp-NORM interleaved pairs `(2i, 2i+1)`;
+        /// `false` = HF / NeoX rotate-half pairs `(i, i+n_rot/2)`.
+        interleaved: bool,
     },
     /// Fused attention block: QKV proj → split → \[RoPE\] → SDPA → output proj.
     /// All intermediates stay in L1 cache. Zero arena writes between ops.
@@ -976,6 +1143,14 @@ pub enum Thunk {
         qkv_w: usize,
         out_w: usize,
         mask: usize,
+        /// How to mask attention scores. `Custom` reads the per-key `mask`
+        /// buffer (BERT-style padding); `Causal` / `SlidingWindow` are
+        /// synthesized in-kernel with no buffer; `None` applies no mask.
+        /// Mirrors [`Thunk::Attention`]'s `mask_kind` — the attention-block
+        /// fusion MUST carry it through, otherwise a causal decoder silently
+        /// attends to future tokens (the fused kernel would only ever apply
+        /// the per-key padding mask).
+        mask_kind: rlx_ir::op::MaskKind,
         out: usize,
         qkv_b: usize,
         out_b: usize, // 0 = no bias
@@ -989,6 +1164,11 @@ pub enum Thunk {
         dh: u32,
         has_bias: bool,
         has_rope: bool,
+        /// RoPE pairing: `true` = GPT-J interleaved `(2i,2i+1)`, `false` = NeoX
+        /// rotate-half `(i,i+d/2)`. Captured from the fused `Op::Rope` so the
+        /// inline rope matches the standalone kernel (a GptJ model must not be
+        /// silently rotated NeoX-style by the fused path).
+        interleaved: bool,
     },
     /// Fused ENTIRE transformer layer: attention + residual + LN + FFN + residual + LN.
     /// Combines ~10 thunks into 1. All intermediates on stack. Zero arena traffic.
@@ -1048,6 +1228,9 @@ pub enum Thunk {
         nh: u32,
         dh: u32,
         int_dim: u32,
+        /// RoPE pairing, threaded from the consumed `FusedAttnBlock`
+        /// (`true` = GPT-J interleaved, `false` = NeoX rotate-half).
+        interleaved: bool,
     },
     /// Fused SwiGLU: out\[r,i\] = x\[r,i\] * silu(x[r, n_half+i]).
     /// Input: [outer, 2*n_half] — concatenated up||gate per row.
@@ -1176,6 +1359,16 @@ pub enum Thunk {
         elem_bytes: u8,
         /// Element size for cond (1 = Bool mask, 4 = F32 0/1).
         cond_elem_bytes: u8,
+    },
+    /// Single-rounded fused multiply-add: `dst = a*b + c` (one rounding —
+    /// enables error-free transforms / compensated arithmetic).
+    Fma {
+        a: usize,
+        b: usize,
+        c: usize,
+        dst: usize,
+        len: u32,
+        elem_bytes: u8,
     },
     /// General N-D transpose / broadcast. `out_dims[i]` is the output's dim
     /// i length; `in_strides[i]` is the input stride (in elements) used to
@@ -1674,6 +1867,18 @@ pub enum Thunk {
         dw_dil: u32,
     },
 
+    /// Fused softmax + cross-entropy loss against a dense target
+    /// distribution. `logits [N, C]`, `targets [N, C]`, output `[N]`
+    /// per-row loss `lse(logits[n]) - Σ_c targets[n,c]·logits[n,c]`.
+    /// Numerically stable (max-subtract before exp).
+    SoftmaxCrossEntropyDense {
+        logits: usize,
+        targets: usize,
+        dst: usize,
+        n: u32,
+        c: u32,
+    },
+
     /// Fused softmax + cross-entropy loss with f32-encoded integer
     /// labels. `logits [N, C]`, `labels [N]`, output `[N]` per-row loss.
     /// Numerically stable (max-subtract before exp).
@@ -1916,12 +2121,17 @@ fn node_offset(arena: &Arena, id: NodeId) -> usize {
 fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
     match t {
         Thunk::Sgemm { a, b, .. } => vec![*a, *b],
+        Thunk::SgemmT { a, b, .. } => vec![*a, *b],
+        Thunk::SgdMomentum {
+            param, vel, grad, ..
+        } => vec![*param, *vel, *grad],
         Thunk::DenseSolveF64 { a, b, .. } => vec![*a, *b],
         Thunk::DenseSolveF32 { a, b, .. } => vec![*a, *b],
         Thunk::BatchedDenseSolveF64 { a, b, .. } => vec![*a, *b],
         Thunk::BatchedDgemmF64 { a, b, .. } => vec![*a, *b],
         Thunk::BatchedSgemm { a, b, .. } => vec![*a, *b],
         Thunk::FusedMmBiasAct { a, w, bias, .. } => vec![*a, *w, *bias],
+        Thunk::ElementwiseRegion { input_offs, .. } => input_offs.clone(),
         Thunk::BiasAdd { src, bias, .. } => vec![*src, *bias],
         Thunk::BinaryFull { lhs, rhs, .. } => vec![*lhs, *rhs],
         Thunk::BinaryFullF64 { lhs, rhs, .. } => vec![*lhs, *rhs],
@@ -2010,6 +2220,24 @@ fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             global_scale,
             ..
         } => vec![*x, *w_q, *scale, *global_scale],
+        Thunk::ScaledMatMul {
+            lhs,
+            rhs,
+            lhs_scale,
+            rhs_scale,
+            bias,
+            has_bias,
+            ..
+        } => {
+            let mut v = vec![*lhs, *rhs, *lhs_scale, *rhs_scale];
+            if *has_bias {
+                v.push(*bias);
+            }
+            v
+        }
+        Thunk::ScaledQuantize { x, scale, .. } => vec![*x, *scale],
+        Thunk::ScaledQuantScale { x, .. } => vec![*x],
+        Thunk::ScaledDequantize { codes, scale, .. } => vec![*codes, *scale],
         Thunk::Conv2D1x1 { src, weight, .. } => vec![*src, *weight],
         Thunk::SelectiveScan {
             x, delta, a, b, c, ..
@@ -2244,6 +2472,193 @@ pub fn dequant_matmul_nvfp4(
     }
 }
 
+// ── Native low-precision (FP8/FP6/FP4) scaled GEMM — CPU reference oracle ──
+//
+// Decode-and-accumulate *reference* for `Op::ScaledMatMul` + its quantize
+// producers. CPUs have no fp8 matrix units; correctness, not speed, is the
+// point — every GPU backend's native tensor-core path is checked against these.
+// Layout is TN: lhs [m,k], rhs [n,k] (K-last), out = lhs·rhsᵀ. Block scales
+// (when any) run along the last/contraction axis of each operand.
+
+/// Blocks along a `len`-element axis (1 for per-tensor).
+#[inline]
+fn lowp_nblk(len: usize, layout: rlx_ir::ScaleLayout) -> usize {
+    match layout {
+        rlx_ir::ScaleLayout::PerTensor => 1,
+        _ => len.div_ceil(layout.block() as usize),
+    }
+}
+
+/// Snap a raw f32 scale to the grid storable for `layout`, so quantizer and
+/// matmul agree bit-for-bit on the reconstructed value.
+#[inline]
+fn lowp_snap_scale(layout: rlx_ir::ScaleLayout, s: f32) -> f32 {
+    use rlx_ir::lowp_codec;
+    match layout {
+        rlx_ir::ScaleLayout::PerTensor => s,
+        rlx_ir::ScaleLayout::BlockMxE8M0 { .. } => {
+            lowp_codec::e8m0_to_f32(lowp_codec::f32_to_e8m0(s))
+        }
+        rlx_ir::ScaleLayout::Nvfp4 { .. } => lowp_codec::decode(
+            rlx_ir::ScaledFormat::F8E4M3,
+            lowp_codec::encode(rlx_ir::ScaledFormat::F8E4M3, s),
+        ),
+    }
+}
+
+/// Scale for element (`free`, `contract`) given decoded raw scales.
+#[inline]
+fn lowp_scale_at(
+    layout: rlx_ir::ScaleLayout,
+    scales: &[f32],
+    free: usize,
+    contract: usize,
+    nblk: usize,
+) -> f32 {
+    match layout {
+        rlx_ir::ScaleLayout::PerTensor => scales.first().copied().unwrap_or(1.0),
+        _ => scales[free * nblk + contract / layout.block() as usize],
+    }
+}
+
+/// Compute (snapped) raw f32 scales for `x` (`[rows, cols]`, blocks along
+/// `cols` = contraction). PerTensor → 1 value; block → `rows*nblk` row-major.
+fn lowp_compute_scales(
+    x: &[f32],
+    fmt: rlx_ir::ScaledFormat,
+    layout: rlx_ir::ScaleLayout,
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
+    let maxf = fmt.max_finite();
+    let to_scale = |amax: f32| if amax > 0.0 { amax / maxf } else { 1.0 };
+    match layout {
+        rlx_ir::ScaleLayout::PerTensor => {
+            let amax = x.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            vec![to_scale(amax)]
+        }
+        _ => {
+            let block = layout.block() as usize;
+            let nblk = cols.div_ceil(block);
+            let mut out = vec![1.0f32; rows * nblk];
+            for r in 0..rows {
+                for b in 0..nblk {
+                    let lo = b * block;
+                    let hi = (lo + block).min(cols);
+                    let mut amax = 0.0f32;
+                    for c in lo..hi {
+                        amax = amax.max(x[r * cols + c].abs());
+                    }
+                    out[r * nblk + b] = lowp_snap_scale(layout, to_scale(amax));
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Quantize `x` (`[rows, cols]`, blocks along cols) to packed codes using the
+/// already-snapped, decoded raw `scales`.
+fn lowp_quantize(
+    x: &[f32],
+    scales: &[f32],
+    fmt: rlx_ir::ScaledFormat,
+    layout: rlx_ir::ScaleLayout,
+    rows: usize,
+    cols: usize,
+    out: &mut [u8],
+) {
+    let nblk = lowp_nblk(cols, layout);
+    for r in 0..rows {
+        for c in 0..cols {
+            let s = lowp_scale_at(layout, scales, r, c, nblk);
+            let v = if s != 0.0 { x[r * cols + c] / s } else { 0.0 };
+            out[r * cols + c] = rlx_ir::lowp_codec::encode(fmt, v);
+        }
+    }
+}
+
+/// TN scaled GEMM: lhs [m,k] codes, rhs [n,k] codes, out [m,n] f32.
+#[allow(clippy::too_many_arguments)]
+fn lowp_scaled_matmul(
+    lhs: &[u8],
+    rhs: &[u8],
+    lhs_scales: &[f32],
+    rhs_scales: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    layout: rlx_ir::ScaleLayout,
+    lhs_fmt: rlx_ir::ScaledFormat,
+    rhs_fmt: rlx_ir::ScaledFormat,
+) {
+    use rlx_ir::lowp_codec::decode;
+    let nblk = lowp_nblk(k, layout);
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0f32;
+            for p in 0..k {
+                let a =
+                    decode(lhs_fmt, lhs[i * k + p]) * lowp_scale_at(layout, lhs_scales, i, p, nblk);
+                let b =
+                    decode(rhs_fmt, rhs[j * k + p]) * lowp_scale_at(layout, rhs_scales, j, p, nblk);
+                acc += a * b;
+            }
+            out[i * n + j] = acc + bias.map_or(0.0, |bb| bb[j]);
+        }
+    }
+}
+
+/// Reconstruct f32 from packed codes: `out[i] = decode(code[i]) · scale(block)`.
+/// `[rows, cols]`, blocks along cols. Inverse of [`lowp_quantize`].
+fn lowp_dequantize(
+    codes: &[u8],
+    scales: &[f32],
+    fmt: rlx_ir::ScaledFormat,
+    layout: rlx_ir::ScaleLayout,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    use rlx_ir::lowp_codec::decode;
+    let nblk = lowp_nblk(cols, layout);
+    for r in 0..rows {
+        for c in 0..cols {
+            let s = lowp_scale_at(layout, scales, r, c, nblk);
+            out[r * cols + c] = decode(fmt, codes[r * cols + c]) * s;
+        }
+    }
+}
+
+/// Decode a stored scale tensor (f32 for per-tensor, E8M0/E4M3 bytes for block
+/// layouts) into raw f32 scales. `n` is the scale-element count.
+unsafe fn lowp_read_scales(
+    layout: rlx_ir::ScaleLayout,
+    base: *mut u8,
+    offset: usize,
+    n: usize,
+) -> Vec<f32> {
+    use rlx_ir::lowp_codec;
+    match layout {
+        rlx_ir::ScaleLayout::PerTensor => {
+            unsafe { std::slice::from_raw_parts(base.add(offset) as *const f32, n) }.to_vec()
+        }
+        rlx_ir::ScaleLayout::BlockMxE8M0 { .. } => {
+            let bytes = unsafe { std::slice::from_raw_parts(base.add(offset), n) };
+            bytes.iter().map(|&b| lowp_codec::e8m0_to_f32(b)).collect()
+        }
+        rlx_ir::ScaleLayout::Nvfp4 { .. } => {
+            let bytes = unsafe { std::slice::from_raw_parts(base.add(offset), n) };
+            bytes
+                .iter()
+                .map(|&b| lowp_codec::decode(rlx_ir::ScaledFormat::F8E4M3, b))
+                .collect()
+        }
+    }
+}
+
 /// Fused sampling step: logits → top-k filter → top-p truncation
 /// → softmax → multinomial sample. Operates on one row of length
 /// `vocab` and returns the sampled index. Plan #42.
@@ -2407,11 +2822,147 @@ pub fn compile_thunks_with_rng(
     let rng_shared = Arc::new(std::sync::RwLock::new(rng));
     let mut thunks = Vec::with_capacity(graph.len());
 
+    // ── Auto-fuse last-two-axis Transpose → MatMul into a trans-Sgemm ──
+    // Matmul backprop emits `Transpose(operand) → MatMul` for `dA=g·Bᵀ` and
+    // `dB=Aᵀ·g`; the transpose is a full copy (the dominant backward cost).
+    // Fold it into cblas trans flags (no copy). Guarded to the safe 2-D F32
+    // case where the transpose is used only by this matmul.
+    let mut use_counts: std::collections::HashMap<NodeId, usize> = std::collections::HashMap::new();
+    for n in graph.nodes() {
+        for &i in &n.inputs {
+            *use_counts.entry(i).or_insert(0) += 1;
+        }
+    }
+    let is_t2 = |g: &Graph, id: NodeId| -> bool {
+        matches!(&g.node(id).op, Op::Transpose { perm } if perm.as_slice() == [1, 0])
+            && g.node(id).shape.rank() == 2
+    };
+    let mut folded_transpose: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    let mut matmul_fold: std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)> =
+        std::collections::HashMap::new();
+    for n in graph.nodes() {
+        if !matches!(n.op, Op::MatMul) {
+            continue;
+        }
+        let (a_id, b_id) = (n.inputs[0], n.inputs[1]);
+        if graph.node(a_id).shape.rank() != 2
+            || graph.node(b_id).shape.rank() != 2
+            || n.shape.dtype() != rlx_ir::DType::F32
+        {
+            continue;
+        }
+        let fold_a = is_t2(graph, a_id) && use_counts.get(&a_id) == Some(&1);
+        let fold_b = is_t2(graph, b_id) && use_counts.get(&b_id) == Some(&1);
+        if !fold_a && !fold_b {
+            continue;
+        }
+        let (asrc, ta) = if fold_a {
+            (graph.node(a_id).inputs[0], true)
+        } else {
+            (a_id, false)
+        };
+        let (bsrc, tb) = if fold_b {
+            (graph.node(b_id).inputs[0], true)
+        } else {
+            (b_id, false)
+        };
+        matmul_fold.insert(n.id, (asrc, ta, bsrc, tb));
+        if fold_a {
+            folded_transpose.insert(a_id);
+        }
+        if fold_b {
+            folded_transpose.insert(b_id);
+        }
+    }
+
+    // ── Auto-fuse the in-graph SGD-with-momentum update into one kernel ──
+    // The fully-fused training step appends, per parameter, the chain
+    //   v' = Add(Mul(vel, momᶜ), grad) ;  p' = Sub(param, Mul(v', lrᶜ))
+    // where `momᶜ`/`lrᶜ` are full-size constant tensors. That lowers to 4
+    // `BinaryFull` ops (+2 constants) per param and dominates the step
+    // (~60% of CPU time on the MLP). Collapse the whole chain into a single
+    // `SgdMomentum` thunk attached to the `Sub` (p'), which also writes v''s
+    // slot. Guarded to exactly this shape: both p' and v' are graph outputs,
+    // the inner nodes have a single in-graph use, and the scalars are
+    // uniform full-size F32 constants.
+    let out_set: std::collections::HashSet<NodeId> = graph.outputs.iter().copied().collect();
+    let const_scalar = |g: &Graph, id: NodeId, n: usize| -> Option<f32> {
+        if let Op::Constant { data } = &g.node(id).op {
+            if data.len() == n * 4 {
+                return Some(f32::from_le_bytes([data[0], data[1], data[2], data[3]]));
+            }
+        }
+        None
+    };
+    // p' node → (param, vel, grad, v' node, lr, mom, len)
+    let mut sgd_fold: std::collections::HashMap<
+        NodeId,
+        (NodeId, NodeId, NodeId, NodeId, f32, f32, usize),
+    > = std::collections::HashMap::new();
+    let mut sgd_elim: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    for n in graph.nodes() {
+        // p' = Sub(param, lr_v)
+        if !matches!(n.op, Op::Binary(BinaryOp::Sub)) || n.shape.dtype() != rlx_ir::DType::F32 {
+            continue;
+        }
+        if !out_set.contains(&n.id) {
+            continue;
+        }
+        let len = match n.shape.num_elements() {
+            Some(l) => l,
+            None => continue,
+        };
+        let (param, lr_v) = (n.inputs[0], n.inputs[1]);
+        // lr_v = Mul(v', lrᶜ), single in-graph use
+        let lrv = graph.node(lr_v);
+        if !matches!(lrv.op, Op::Binary(BinaryOp::Mul)) || use_counts.get(&lr_v) != Some(&1) {
+            continue;
+        }
+        let (v_new, lr_c) = (lrv.inputs[0], lrv.inputs[1]);
+        let lr = match const_scalar(graph, lr_c, len) {
+            Some(v) => v,
+            None => continue,
+        };
+        // v' = Add(v_scaled, grad), graph output, single in-graph use
+        let vnew = graph.node(v_new);
+        if !matches!(vnew.op, Op::Binary(BinaryOp::Add))
+            || use_counts.get(&v_new) != Some(&1)
+            || !out_set.contains(&v_new)
+        {
+            continue;
+        }
+        let (v_scaled, grad) = (vnew.inputs[0], vnew.inputs[1]);
+        // v_scaled = Mul(vel, momᶜ), single in-graph use
+        let vs = graph.node(v_scaled);
+        if !matches!(vs.op, Op::Binary(BinaryOp::Mul)) || use_counts.get(&v_scaled) != Some(&1) {
+            continue;
+        }
+        let (vel, mom_c) = (vs.inputs[0], vs.inputs[1]);
+        let mom = match const_scalar(graph, mom_c, len) {
+            Some(v) => v,
+            None => continue,
+        };
+        sgd_fold.insert(n.id, (param, vel, grad, v_new, lr, mom, len));
+        sgd_elim.insert(v_scaled);
+        sgd_elim.insert(v_new);
+        sgd_elim.insert(lr_v);
+    }
+
     for node in graph.nodes() {
         // View ops (Reshape / same-dtype Cast / axis-0 Narrow) are aliased
         // to their parent's slot by the memory planner — no copy needed.
         // Plan #46.
         if rlx_opt::is_pure_view(graph, node) {
+            thunks.push(Thunk::Nop);
+            continue;
+        }
+        // Transpose folded into a downstream matmul's trans flag — skip it.
+        if folded_transpose.contains(&node.id) {
+            thunks.push(Thunk::Nop);
+            continue;
+        }
+        // Inner nodes of an SGD chain folded into one SgdMomentum thunk.
+        if sgd_elim.contains(&node.id) {
             thunks.push(Thunk::Nop);
             continue;
         }
@@ -2572,20 +3123,52 @@ pub fn compile_thunks_with_rng(
                                 k: k_dim as u32,
                                 n: n as u32,
                             },
-                            _ => Thunk::Sgemm {
-                                a: node_offset(arena, node.inputs[0]),
-                                b: node_offset(arena, node.inputs[1]),
-                                c: node_offset(arena, node.id),
-                                m: m as u32,
-                                k: k_dim as u32,
-                                n: n as u32,
-                            },
+                            _ => {
+                                if let Some(&(asrc, ta, bsrc, tb)) = matmul_fold.get(&node.id) {
+                                    // Folded Transpose→MatMul: read pre-transpose
+                                    // operands, do the transpose via cblas flags.
+                                    Thunk::SgemmT {
+                                        a: node_offset(arena, asrc),
+                                        b: node_offset(arena, bsrc),
+                                        c: node_offset(arena, node.id),
+                                        m: m as u32,
+                                        k: k_dim as u32,
+                                        n: n as u32,
+                                        ta,
+                                        tb,
+                                    }
+                                } else {
+                                    Thunk::Sgemm {
+                                        a: node_offset(arena, node.inputs[0]),
+                                        b: node_offset(arena, node.inputs[1]),
+                                        c: node_offset(arena, node.id),
+                                        m: m as u32,
+                                        k: k_dim as u32,
+                                        n: n as u32,
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
 
             Op::Binary(op) => {
+                if let Some(&(param, vel, grad, v_new, lr, mom, len)) = sgd_fold.get(&node.id) {
+                    // Folded SGD-momentum: this `Sub` (p') drives a single
+                    // SgdMomentum thunk that also writes v''s slot.
+                    thunks.push(Thunk::SgdMomentum {
+                        param: node_offset(arena, param),
+                        vel: node_offset(arena, vel),
+                        grad: node_offset(arena, grad),
+                        p_out: node_offset(arena, node.id),
+                        v_out: node_offset(arena, v_new),
+                        lr,
+                        mom,
+                        len: len as u32,
+                    });
+                    continue;
+                }
                 let lhs_len = get_len(graph, node.inputs[0]);
                 let rhs_len = get_len(graph, node.inputs[1]);
                 let out_len = node.shape.num_elements().unwrap();
@@ -2827,6 +3410,27 @@ pub fn compile_thunks_with_rng(
                     dst_stride: (*len * inner) as u32,    // elements per outer step in dest
                     inner: (*len * inner) as u32,         // elements to copy per outer step
                     elem_bytes,
+                }
+            }
+
+            Op::Reverse { axes } => {
+                let in_shape = &graph.node(node.inputs[0]).shape;
+                let rank = in_shape.rank();
+                let dims: Vec<u32> = (0..rank)
+                    .map(|i| in_shape.dim(i).unwrap_static() as u32)
+                    .collect();
+                let mut rev_mask = vec![false; rank];
+                for &a in axes {
+                    if a < rank {
+                        rev_mask[a] = true;
+                    }
+                }
+                Thunk::Reverse {
+                    src: node_offset(arena, node.inputs[0]),
+                    dst: node_offset(arena, node.id),
+                    dims,
+                    rev_mask,
+                    elem_bytes: in_shape.dtype().size_bytes() as u8,
                 }
             }
 
@@ -3447,6 +4051,100 @@ pub fn compile_thunks_with_rng(
                 }
             }
 
+            Op::Gru {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                carry,
+            } => {
+                let x_shape = &graph.node(node.inputs[0]).shape;
+                let (batch, seq, input_size) = (
+                    x_shape.dim(0).unwrap_static(),
+                    x_shape.dim(1).unwrap_static(),
+                    x_shape.dim(2).unwrap_static(),
+                );
+                // Inputs: x, w_ih, w_hh, b_ih, b_hh (+ h0 when carry).
+                let h0 = if *carry {
+                    node_offset(arena, node.inputs[5])
+                } else {
+                    0
+                };
+                Thunk::Gru {
+                    x: node_offset(arena, node.inputs[0]),
+                    w_ih: node_offset(arena, node.inputs[1]),
+                    w_hh: node_offset(arena, node.inputs[2]),
+                    b_ih: node_offset(arena, node.inputs[3]),
+                    b_hh: node_offset(arena, node.inputs[4]),
+                    h0,
+                    dst: node_offset(arena, node.id),
+                    batch: batch as u32,
+                    seq: seq as u32,
+                    input_size: input_size as u32,
+                    hidden: *hidden_size as u32,
+                    num_layers: *num_layers as u32,
+                    bidirectional: *bidirectional,
+                    carry: *carry,
+                }
+            }
+
+            Op::Rnn {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                carry,
+                relu,
+            } => {
+                let x_shape = &graph.node(node.inputs[0]).shape;
+                let (batch, seq, input_size) = (
+                    x_shape.dim(0).unwrap_static(),
+                    x_shape.dim(1).unwrap_static(),
+                    x_shape.dim(2).unwrap_static(),
+                );
+                // Inputs: x, w_ih, w_hh, bias (+ h0 when carry).
+                let h0 = if *carry {
+                    node_offset(arena, node.inputs[4])
+                } else {
+                    0
+                };
+                Thunk::Rnn {
+                    x: node_offset(arena, node.inputs[0]),
+                    w_ih: node_offset(arena, node.inputs[1]),
+                    w_hh: node_offset(arena, node.inputs[2]),
+                    bias: node_offset(arena, node.inputs[3]),
+                    h0,
+                    dst: node_offset(arena, node.id),
+                    batch: batch as u32,
+                    seq: seq as u32,
+                    input_size: input_size as u32,
+                    hidden: *hidden_size as u32,
+                    num_layers: *num_layers as u32,
+                    bidirectional: *bidirectional,
+                    carry: *carry,
+                    relu: *relu,
+                }
+            }
+
+            Op::Mamba2 {
+                head_dim,
+                state_size,
+            } => {
+                // x [B,S,H,P]; dt [B,S,H]; a [H]; b,c [B,S,H,N].
+                let x_shape = &graph.node(node.inputs[0]).shape;
+                Thunk::Mamba2 {
+                    x: node_offset(arena, node.inputs[0]),
+                    dt: node_offset(arena, node.inputs[1]),
+                    a: node_offset(arena, node.inputs[2]),
+                    b: node_offset(arena, node.inputs[3]),
+                    c: node_offset(arena, node.inputs[4]),
+                    dst: node_offset(arena, node.id),
+                    batch: x_shape.dim(0).unwrap_static() as u32,
+                    seq: x_shape.dim(1).unwrap_static() as u32,
+                    heads: x_shape.dim(2).unwrap_static() as u32,
+                    head_dim: *head_dim as u32,
+                    state_size: *state_size as u32,
+                }
+            }
+
             Op::QMatMul {
                 x_zp,
                 w_zp,
@@ -3612,6 +4310,92 @@ pub fn compile_thunks_with_rng(
                             "DequantMatMul on CPU supports Int8/Int4/FP8/NVFP4 legacy or GGUF schemes; got {other}"
                         ),
                     }
+                }
+            }
+
+            Op::ScaledMatMul {
+                lhs_format,
+                rhs_format,
+                scale_layout,
+                has_bias,
+            } => {
+                // TN: lhs [m,k], rhs [n,k], out [m,n].
+                let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                let total = node.shape.num_elements().unwrap();
+                let m = total / n.max(1);
+                let lhs_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+                let k = lhs_total / m.max(1);
+                Thunk::ScaledMatMul {
+                    lhs: node_offset(arena, node.inputs[0]),
+                    rhs: node_offset(arena, node.inputs[1]),
+                    lhs_scale: node_offset(arena, node.inputs[2]),
+                    rhs_scale: node_offset(arena, node.inputs[3]),
+                    bias: if *has_bias {
+                        node_offset(arena, node.inputs[4])
+                    } else {
+                        0
+                    },
+                    dst: node_offset(arena, node.id),
+                    m: m as u32,
+                    k: k as u32,
+                    n: n as u32,
+                    lhs_fmt: *lhs_format,
+                    rhs_fmt: *rhs_format,
+                    layout: *scale_layout,
+                    has_bias: *has_bias,
+                }
+            }
+
+            Op::ScaledQuantize {
+                format,
+                scale_layout,
+            } => {
+                let xs = &graph.node(node.inputs[0]).shape;
+                let cols = xs.dim(xs.rank() - 1).unwrap_static();
+                let rows = xs.num_elements().unwrap() / cols.max(1);
+                Thunk::ScaledQuantize {
+                    x: node_offset(arena, node.inputs[0]),
+                    scale: node_offset(arena, node.inputs[1]),
+                    dst: node_offset(arena, node.id),
+                    rows: rows as u32,
+                    cols: cols as u32,
+                    fmt: *format,
+                    layout: *scale_layout,
+                }
+            }
+
+            Op::ScaledQuantScale {
+                format,
+                scale_layout,
+            } => {
+                let xs = &graph.node(node.inputs[0]).shape;
+                let cols = xs.dim(xs.rank() - 1).unwrap_static();
+                let rows = xs.num_elements().unwrap() / cols.max(1);
+                Thunk::ScaledQuantScale {
+                    x: node_offset(arena, node.inputs[0]),
+                    dst: node_offset(arena, node.id),
+                    rows: rows as u32,
+                    cols: cols as u32,
+                    fmt: *format,
+                    layout: *scale_layout,
+                }
+            }
+
+            Op::ScaledDequantize {
+                format,
+                scale_layout,
+            } => {
+                let xs = &graph.node(node.inputs[0]).shape;
+                let cols = xs.dim(xs.rank() - 1).unwrap_static();
+                let rows = xs.num_elements().unwrap() / cols.max(1);
+                Thunk::ScaledDequantize {
+                    codes: node_offset(arena, node.inputs[0]),
+                    scale: node_offset(arena, node.inputs[1]),
+                    dst: node_offset(arena, node.id),
+                    rows: rows as u32,
+                    cols: cols as u32,
+                    fmt: *format,
+                    layout: *scale_layout,
                 }
             }
 
@@ -3913,6 +4697,10 @@ pub fn compile_thunks_with_rng(
                     qkv_w: node_offset(arena, node.inputs[1]),
                     out_w: node_offset(arena, node.inputs[2]),
                     mask: node_offset(arena, node.inputs[3]),
+                    // The MIR `Op::FusedAttentionBlock` is emitted only for the
+                    // BERT-style per-key padding mask (the MIR fusion pass is
+                    // `Custom`-only), so the buffer mask is authoritative here.
+                    mask_kind: rlx_ir::op::MaskKind::Custom,
                     out: node_offset(arena, node.id),
                     qkv_b: qkv_b_off,
                     out_b: out_b_off,
@@ -3926,10 +4714,16 @@ pub fn compile_thunks_with_rng(
                     dh: *head_dim as u32,
                     has_bias: *has_bias,
                     has_rope: *has_rope,
+                    // The MIR `Op::FusedAttentionBlock` is BERT-only (NeoX rope).
+                    interleaved: false,
                 }
             }
 
-            Op::Rope { head_dim, n_rot } => {
+            Op::Rope {
+                head_dim,
+                n_rot,
+                style,
+            } => {
                 let x_shape = &graph.node(node.inputs[0]).shape;
                 let (batch, seq, hidden) = if x_shape.rank() >= 3 {
                     (
@@ -3961,6 +4755,7 @@ pub fn compile_thunks_with_rng(
                     // by the Narrow→Rope fusion pass below if Rope ends
                     // up reading from a wider parent like QKV).
                     src_row_stride: hidden as u32,
+                    interleaved: matches!(style, rlx_ir::op::RopeStyle::GptJ),
                 }
             }
 
@@ -4379,6 +5174,18 @@ pub fn compile_thunks_with_rng(
                     len: len as u32,
                     elem_bytes,
                     cond_elem_bytes,
+                }
+            }
+
+            Op::Fma => {
+                let len = node.shape.num_elements().unwrap();
+                Thunk::Fma {
+                    a: node_offset(arena, node.inputs[0]),
+                    b: node_offset(arena, node.inputs[1]),
+                    c: node_offset(arena, node.inputs[2]),
+                    dst: node_offset(arena, node.id),
+                    len: len as u32,
+                    elem_bytes: node.shape.dtype().size_bytes() as u8,
                 }
             }
 
@@ -4833,6 +5640,21 @@ pub fn compile_thunks_with_rng(
                         pw,
                         dh,
                         dw_dil,
+                    }
+                } else {
+                    Thunk::Nop
+                }
+            }
+
+            Op::SoftmaxCrossEntropy => {
+                let logits_shape = &graph.node(node.inputs[0]).shape;
+                if logits_shape.rank() == 2 {
+                    Thunk::SoftmaxCrossEntropyDense {
+                        logits: node_offset(arena, node.inputs[0]),
+                        targets: node_offset(arena, node.inputs[1]),
+                        dst: node_offset(arena, node.id),
+                        n: logits_shape.dim(0).unwrap_static() as u32,
+                        c: logits_shape.dim(1).unwrap_static() as u32,
                     }
                 } else {
                     Thunk::Nop
@@ -5958,6 +6780,34 @@ pub fn compile_thunks_with_rng(
                 }
             }
 
+            Op::ElementwiseRegion {
+                chain,
+                scalar_input_mask,
+                input_modulus,
+                prologue,
+                ..
+            } => {
+                // The scalar interpreter handles plain chains; prologue (resize)
+                // regions are GPU-only and never reach here on the CPU path
+                // (the graphfused fusion options disable prologue/FK fusion).
+                if *prologue != rlx_ir::op::RegionPrologue::None {
+                    Thunk::Nop
+                } else {
+                    let input_offs: Vec<usize> = node
+                        .inputs
+                        .iter()
+                        .map(|&id| node_offset(arena, id))
+                        .collect();
+                    Thunk::ElementwiseRegion {
+                        dst: node_offset(arena, node.id),
+                        len: node.shape.num_elements().unwrap_or(0) as u32,
+                        input_offs,
+                        chain: chain.clone(),
+                        scalar_input_mask: *scalar_input_mask,
+                        input_modulus: *input_modulus,
+                    }
+                }
+            }
             _ => Thunk::Nop,
         };
         thunks.push(t);
@@ -6200,6 +7050,49 @@ pub fn compile_thunks_with_rng(
                     elem_bytes,
                 } => {
                     narrow_thunk_closure(src, dst, outer, src_stride, dst_stride, inner, elem_bytes)
+                }
+
+                Thunk::Reverse {
+                    src,
+                    dst,
+                    dims,
+                    rev_mask,
+                    elem_bytes,
+                } => {
+                    let eb = elem_bytes as usize;
+                    let rank = dims.len();
+                    let total: usize = dims.iter().map(|&d| d as usize).product::<usize>().max(1);
+                    // Row-major element strides.
+                    let mut strides = vec![1usize; rank];
+                    for i in (0..rank.saturating_sub(1)).rev() {
+                        strides[i] = strides[i + 1] * dims[i + 1] as usize;
+                    }
+                    let dims_u: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let src_base = base.add(src);
+                        let dst_base = base.add(dst);
+                        for o in 0..total {
+                            // Output flat index → multi-index → (axis-reversed)
+                            // input flat index.
+                            let mut rem = o;
+                            let mut in_flat = 0usize;
+                            for ax in 0..rank {
+                                let idx = rem / strides[ax];
+                                rem %= strides[ax];
+                                let in_idx = if rev_mask[ax] {
+                                    dims_u[ax] - 1 - idx
+                                } else {
+                                    idx
+                                };
+                                in_flat += in_idx * strides[ax];
+                            }
+                            std::ptr::copy_nonoverlapping(
+                                src_base.add(in_flat * eb),
+                                dst_base.add(o * eb),
+                                eb,
+                            );
+                        }
+                    })
                 }
 
                 Thunk::Copy { src, dst, len } => {
@@ -6461,6 +7354,127 @@ pub fn compile_thunks_with_rng(
                         let gs = sl(global_scale, base, 1)[0];
                         let out = sl_mut(dst, base, m * n);
                         dequant_matmul_nvfp4(xs, w_bytes, scale_bytes, gs, out, m, k, n);
+                    })
+                }
+
+                Thunk::ScaledMatMul {
+                    lhs,
+                    rhs,
+                    lhs_scale,
+                    rhs_scale,
+                    bias,
+                    dst,
+                    m,
+                    k,
+                    n,
+                    lhs_fmt,
+                    rhs_fmt,
+                    layout,
+                    has_bias,
+                } => {
+                    let (m, k, n) = (m as usize, k as usize, n as usize);
+                    let nblk = lowp_nblk(k, layout);
+                    let per_tensor = matches!(layout, rlx_ir::ScaleLayout::PerTensor);
+                    let n_lscale = if per_tensor { 1 } else { m * nblk };
+                    let n_rscale = if per_tensor { 1 } else { n * nblk };
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let lhs_b = std::slice::from_raw_parts(base.add(lhs) as *const u8, m * k);
+                        let rhs_b = std::slice::from_raw_parts(base.add(rhs) as *const u8, n * k);
+                        let ls = lowp_read_scales(layout, base, lhs_scale, n_lscale);
+                        let rs = lowp_read_scales(layout, base, rhs_scale, n_rscale);
+                        let bias_s = if has_bias { Some(sl(bias, base, n)) } else { None };
+                        let out = sl_mut(dst, base, m * n);
+                        lowp_scaled_matmul(
+                            lhs_b, rhs_b, &ls, &rs, bias_s, out, m, n, k, layout, lhs_fmt, rhs_fmt,
+                        );
+                    })
+                }
+
+                Thunk::ScaledQuantize {
+                    x,
+                    scale,
+                    dst,
+                    rows,
+                    cols,
+                    fmt,
+                    layout,
+                } => {
+                    let (rows, cols) = (rows as usize, cols as usize);
+                    let nblk = lowp_nblk(cols, layout);
+                    let n_scale = if matches!(layout, rlx_ir::ScaleLayout::PerTensor) {
+                        1
+                    } else {
+                        rows * nblk
+                    };
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let xs = sl(x, base, rows * cols);
+                        let scales = lowp_read_scales(layout, base, scale, n_scale);
+                        let out =
+                            std::slice::from_raw_parts_mut(base.add(dst), rows * cols);
+                        lowp_quantize(xs, &scales, fmt, layout, rows, cols, out);
+                    })
+                }
+
+                Thunk::ScaledQuantScale {
+                    x,
+                    dst,
+                    rows,
+                    cols,
+                    fmt,
+                    layout,
+                } => {
+                    let (rows, cols) = (rows as usize, cols as usize);
+                    let nblk = lowp_nblk(cols, layout);
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let xs = sl(x, base, rows * cols);
+                        let scales = lowp_compute_scales(xs, fmt, layout, rows, cols);
+                        match layout {
+                            rlx_ir::ScaleLayout::PerTensor => {
+                                sl_mut(dst, base, 1)[0] = scales[0];
+                            }
+                            rlx_ir::ScaleLayout::BlockMxE8M0 { .. } => {
+                                let out = std::slice::from_raw_parts_mut(
+                                    base.add(dst),
+                                    rows * nblk,
+                                );
+                                for (o, &s) in out.iter_mut().zip(&scales) {
+                                    *o = rlx_ir::lowp_codec::f32_to_e8m0(s);
+                                }
+                            }
+                            rlx_ir::ScaleLayout::Nvfp4 { .. } => {
+                                let out = std::slice::from_raw_parts_mut(
+                                    base.add(dst),
+                                    rows * nblk,
+                                );
+                                for (o, &s) in out.iter_mut().zip(&scales) {
+                                    *o = rlx_ir::lowp_codec::encode(rlx_ir::ScaledFormat::F8E4M3, s);
+                                }
+                            }
+                        }
+                    })
+                }
+
+                Thunk::ScaledDequantize {
+                    codes,
+                    scale,
+                    dst,
+                    rows,
+                    cols,
+                    fmt,
+                    layout,
+                } => {
+                    let (rows, cols) = (rows as usize, cols as usize);
+                    let nblk = lowp_nblk(cols, layout);
+                    let n_scale = if matches!(layout, rlx_ir::ScaleLayout::PerTensor) {
+                        1
+                    } else {
+                        rows * nblk
+                    };
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let cs = std::slice::from_raw_parts(base.add(codes) as *const u8, rows * cols);
+                        let scales = lowp_read_scales(layout, base, scale, n_scale);
+                        let out = sl_mut(dst, base, rows * cols);
+                        lowp_dequantize(cs, &scales, fmt, layout, rows, cols, out);
                     })
                 }
 
@@ -7163,6 +8177,22 @@ pub fn compile_thunks_with_rng(
                     );
                 }),
 
+                Thunk::SgdMomentum { param, vel, grad, p_out, v_out, lr, mom, len } => {
+                    let len = len as usize;
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let p = sl(param, base, len);
+                        let v = sl(vel, base, len);
+                        let g = sl(grad, base, len);
+                        let po = sl_mut(p_out, base, len);
+                        let vo = sl_mut(v_out, base, len);
+                        for i in 0..len {
+                            let vn = mom * v[i] + g[i];
+                            vo[i] = vn;
+                            po[i] = p[i] - lr * vn;
+                        }
+                    })
+                }
+
                 _ => Arc::new(|_: *mut u8| {}),
             }
         })
@@ -7232,41 +8262,62 @@ pub fn compile_thunks_with_rng(
                     return None;
                 }
 
-                // Look for optional Rope×2 then Attention
-                let (has_rope, attn_ai, cos_off, sin_off, cl) = if let Some((
+                // Look for optional Rope×2 then Attention. Capture the rope
+                // pairing (`interleaved` = GPT-J) from the q-rope thunk and
+                // require the k-rope to agree — the fused kernel applies one
+                // pairing to both.
+                let (has_rope, attn_ai, cos_off, sin_off, cl, rope_interleaved) = if let Some((
                     _,
                     Thunk::Rope {
-                        cos, sin, cos_len, ..
+                        cos,
+                        sin,
+                        cos_len,
+                        interleaved,
+                        ..
                     },
                 )) = a(4)
                 {
-                    if matches!(a(5).map(|x| x.1), Some(Thunk::Rope { .. })) {
-                        if matches!(a(6).map(|x| x.1), Some(Thunk::Attention { .. })) {
-                            (true, 6, *cos, *sin, *cos_len)
-                        } else {
-                            return None;
+                    let q_il = *interleaved;
+                    match a(5).map(|x| x.1) {
+                        Some(Thunk::Rope {
+                            interleaved: k_il, ..
+                        }) if *k_il == q_il => {
+                            if matches!(a(6).map(|x| x.1), Some(Thunk::Attention { .. })) {
+                                (true, 6, *cos, *sin, *cos_len, q_il)
+                            } else {
+                                return None;
+                            }
                         }
-                    } else {
-                        return None;
+                        _ => return None,
                     }
                 } else if matches!(a(4).map(|x| x.1), Some(Thunk::Attention { .. })) {
-                    (false, 4, 0, 0, 0)
+                    (false, 4, 0, 0, 0, false)
                 } else {
                     return None;
                 };
 
                 let (_attn_real_idx, attn_t) = a(attn_ai)?;
-                let (batch, seq, heads, head_dim, mask) = match attn_t {
+                let (batch, seq, heads, head_dim, mask, mask_kind, kv_seq) = match attn_t {
                     Thunk::Attention {
                         batch,
                         seq,
                         heads,
                         head_dim,
                         mask,
+                        mask_kind,
+                        kv_seq,
                         ..
-                    } => (*batch, *seq, *heads, *head_dim, *mask),
+                    } => (*batch, *seq, *heads, *head_dim, *mask, *mask_kind, *kv_seq),
                     _ => return None,
                 };
+                // The fused kernel synthesizes Causal / SlidingWindow in-kernel
+                // and reads the buffer for Custom; it has no additive-`Bias`
+                // path, and its in-kernel position math assumes prefill
+                // (`q_seq == kv_seq`, i.e. no KV cache). Fall back to the
+                // unfused Attention thunk for anything else.
+                if matches!(mask_kind, rlx_ir::op::MaskKind::Bias) || kv_seq != seq {
+                    return None;
+                }
 
                 // Next active must be out projection (FusedMmBiasAct or Sgemm)
                 let (_out_real_idx, out_t) = a(attn_ai + 1)?;
@@ -7292,6 +8343,7 @@ pub fn compile_thunks_with_rng(
                         qkv_w,
                         out_w,
                         mask,
+                        mask_kind,
                         out: out_dst,
                         qkv_b: if has_b { qkv_b } else { 0 },
                         out_b: if has_b { out_b } else { 0 },
@@ -7305,6 +8357,7 @@ pub fn compile_thunks_with_rng(
                         dh: head_dim,
                         has_bias: has_b,
                         has_rope,
+                        interleaved: rope_interleaved,
                     },
                 ))
             })();
@@ -7382,6 +8435,10 @@ pub fn compile_thunks_with_rng(
                         out_w,
                         out_b,
                         mask,
+                        // FusedBertLayer applies only the per-key padding mask;
+                        // it has no synthesized causal/sliding path, so it must
+                        // not swallow a non-`Custom` attention block.
+                        mask_kind: rlx_ir::op::MaskKind::Custom,
                         batch,
                         seq,
                         hs,
@@ -7458,95 +8515,132 @@ pub fn compile_thunks_with_rng(
                 continue;
             }
 
-            // Nomic full layer fusion — disabled pending SwiGLU stride debugging.
-            // Nomic still benefits from FusedAttnBlock (attention-level fusion).
-            // The body below is kept as reference for when the stride bug is fixed.
-            #[allow(unreachable_code)]
+            // Nomic full-layer fusion — DISABLED. The matcher below targets a
+            // stale pipeline shape (`FusedAttnBlock → FusedResidualLN → Sgemm →
+            // Narrow×2 → SiLU → Mul → Sgemm → FusedResidualLN`). The current CPU
+            // pipeline collapses the SwiGLU itself (`FuseSwiGLU` → one
+            // `Op::FusedSwiGLU`/`Thunk::FusedSwiGLU`) and emits a runtime weight
+            // `Concat` (runtime weight concat) before the fused fc matmul. So the
+            // current post-fusion shape is:
+            //   FusedAttnBlock(rope,no-bias) → FusedResidualLN(LN1) → [Concat] →
+            //   Sgemm(fc11‖fc12) → FusedSwiGLU → Sgemm(fc2) → FusedResidualLN(LN2)
+            // which this matches (the weight `Concat`s are kept — they produce the
+            // fused fc weight the kernel reads). The `FusedNomicLayer` exec only
+            // implements the up‖gate SwiGLU (`gate_first == false`, what real
+            // Nomic emits: `up=fc11`, `gate=silu(fc12)`) and a per-key (`Custom`)
+            // mask, so the match bails otherwise. Escape hatch:
+            // `RLX_DISABLE_NOMIC_FUSION`. Validated against the real model in
+            // `../rlx-models/crates/rlx-nomic` (CPU fused-vs-unfused parity).
             let nomic_match = (|| -> Option<usize> {
-                return None; // TODO: fix SwiGLU strided fc2 output mismatch
-                let fab = a(ai)?;
-                let (hidden, qkv_w, out_w, mask, cos, sin, cos_len, batch, seq, hs, nh, dh) =
-                    match fab {
-                        Thunk::FusedAttnBlock {
-                            hidden,
-                            qkv_w,
-                            out_w,
-                            mask,
-                            cos,
-                            sin,
-                            cos_len,
-                            batch,
-                            seq,
-                            hs,
-                            nh,
-                            dh,
-                            has_bias: false,
-                            has_rope: true,
-                            ..
-                        } => (
-                            *hidden, *qkv_w, *out_w, *mask, *cos, *sin, *cos_len, *batch, *seq,
-                            *hs, *nh, *dh,
-                        ),
-                        _ => return None,
-                    };
+                if rlx_ir::env::flag("RLX_DISABLE_NOMIC_FUSION") {
+                    return None;
+                }
+                let (
+                    hidden,
+                    qkv_w,
+                    out_w,
+                    mask,
+                    cos,
+                    sin,
+                    cos_len,
+                    batch,
+                    seq,
+                    hs,
+                    nh,
+                    dh,
+                    interleaved,
+                ) = match a(ai)? {
+                    Thunk::FusedAttnBlock {
+                        hidden,
+                        qkv_w,
+                        out_w,
+                        mask,
+                        cos,
+                        sin,
+                        cos_len,
+                        batch,
+                        seq,
+                        hs,
+                        nh,
+                        dh,
+                        has_bias: false,
+                        has_rope: true,
+                        mask_kind: rlx_ir::op::MaskKind::Custom,
+                        interleaved,
+                        ..
+                    } => (
+                        *hidden,
+                        *qkv_w,
+                        *out_w,
+                        *mask,
+                        *cos,
+                        *sin,
+                        *cos_len,
+                        *batch,
+                        *seq,
+                        *hs,
+                        *nh,
+                        *dh,
+                        *interleaved,
+                    ),
+                    _ => return None,
+                };
                 // FusedResidualLN for LN1
                 let (ln1_g, ln1_b, eps1) = match a(ai + 1)? {
                     Thunk::FusedResidualLN { g, b, eps, .. } => (*g, *b, *eps),
                     _ => return None,
                 };
-                // Sgemm (fused fc11+fc12)
-                let fused_fc_w = match a(ai + 2)? {
+                // Consumed active thunks to remove (the kept weight `Concat`s are
+                // NOT added here — the fused kernel still reads their output).
+                let mut kills: Vec<usize> = vec![ai, ai + 1];
+                // Optional runtime weight Concat (fc11‖fc12), then Sgemm.
+                let mut o = 2;
+                if matches!(a(ai + o)?, Thunk::Concat { .. }) {
+                    o += 1;
+                }
+                let fused_fc_w = match a(ai + o)? {
                     Thunk::Sgemm { b: w, .. } => *w,
                     _ => return None,
                 };
-                // Narrow×2 for split
-                if !matches!(a(ai + 3)?, Thunk::Narrow { .. }) {
-                    return None;
-                }
-                if !matches!(a(ai + 4)?, Thunk::Narrow { .. }) {
-                    return None;
-                }
-                // SiLU
-                if !matches!(
-                    a(ai + 5)?,
-                    Thunk::ActivationInPlace {
-                        act: Activation::Silu,
+                kills.push(ai + o);
+                o += 1;
+                // FusedSwiGLU — int_dim is its half width; the exec only handles
+                // up‖gate (gate is the SECOND half), so require !gate_first.
+                let int_dim = match a(ai + o)? {
+                    Thunk::FusedSwiGLU {
+                        n_half,
+                        gate_first: false,
                         ..
-                    }
-                ) {
-                    return None;
-                }
-                // BinaryFull(Mul) for gate
-                if !matches!(
-                    a(ai + 6)?,
-                    Thunk::BinaryFull {
-                        op: BinaryOp::Mul,
-                        ..
-                    }
-                ) {
-                    return None;
-                }
+                    } => *n_half,
+                    _ => return None,
+                };
+                kills.push(ai + o);
+                o += 1;
                 // Sgemm (fc2)
-                let fc2_w = match a(ai + 7)? {
+                let fc2_w = match a(ai + o)? {
                     Thunk::Sgemm { b: w, .. } => *w,
                     _ => return None,
                 };
-                // Get int_dim from the Narrow (inner = int_dim for last-axis narrow)
-                let int_dim = match a(ai + 3)? {
-                    Thunk::Narrow { inner, .. } => *inner,
-                    _ => return None,
-                };
+                kills.push(ai + o);
+                o += 1;
                 // FusedResidualLN for LN2
-                let (ln2_g, ln2_b, eps2, out) = match a(ai + 8)? {
+                let (ln2_g, ln2_b, eps2, out) = match a(ai + o)? {
                     Thunk::FusedResidualLN { g, b, eps, out, .. } => (*g, *b, *eps, *out),
                     _ => return None,
                 };
+                kills.push(ai + o);
+                let consumed = o + 1;
 
-                for off in 0..9 {
-                    kill[active[ai + off]] = true;
+                for ki in kills {
+                    kill[active[ki]] = true;
                 }
+                FUSED_NOMIC_LAYER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Insert at the LAST consumed position (LN2), NOT the first
+                // (FusedAttnBlock): the fused kernel reads the runtime weight
+                // `Concat` (fc11‖fc12, and qkv for split-qkv models) that sits
+                // between them, so it must execute AFTER those concats run.
                 insertions.push((
-                    active[ai],
+                    active[ai + o],
                     Thunk::FusedNomicLayer {
                         hidden,
                         qkv_w,
@@ -7571,9 +8665,10 @@ pub fn compile_thunks_with_rng(
                         nh,
                         dh,
                         int_dim,
+                        interleaved,
                     },
                 ));
-                Some(9)
+                Some(consumed)
             })();
             if let Some(n) = nomic_match {
                 ai += n;
@@ -8031,10 +9126,13 @@ fn thunk_kind_name(t: &Thunk) -> &'static str {
         Thunk::Transpose { .. } => "Transpose",
         Thunk::TransposeF64 { .. } => "TransposeF64",
         Thunk::Where { .. } => "Where",
+        Thunk::Fma { .. } => "Fma",
         Thunk::Compare { .. } => "Compare",
         Thunk::BinaryFull { .. } => "BinaryFull",
         Thunk::BinaryFullF64 { .. } => "BinaryFullF64",
         Thunk::Sgemm { .. } => "Sgemm",
+        Thunk::SgemmT { .. } => "SgemmT",
+        Thunk::SgdMomentum { .. } => "SgdMomentum",
         Thunk::Dgemm { .. } => "Dgemm",
         Thunk::FusedMmBiasAct { .. } => "FusedMmBiasAct",
         Thunk::BiasAdd { .. } => "BiasAdd",
@@ -8053,7 +9151,52 @@ fn thunk_kind_name(t: &Thunk) -> &'static str {
         Thunk::Dequantize { .. } => "Dequantize",
         Thunk::ConvTranspose2d { .. } => "ConvTranspose2d",
         Thunk::ResizeNearest2x { .. } => "ResizeNearest2x",
+        Thunk::ElementwiseRegion { .. } => "ElementwiseRegion",
+        Thunk::Conv2dBackwardInput { .. } => "Conv2dBackwardInput",
+        Thunk::Conv2dBackwardWeight { .. } => "Conv2dBackwardWeight",
+        Thunk::Pool2D { .. } => "Pool2D",
+        Thunk::MaxPool2dBackward { .. } => "MaxPool2dBackward",
+        Thunk::ReluBackward { .. } => "ReluBackward",
+        Thunk::ActivationBackward { .. } => "ActivationBackward",
+        Thunk::Im2Col { .. } => "Im2Col",
+        Thunk::SoftmaxCrossEntropyDense { .. } => "SoftmaxCrossEntropyDense",
+        Thunk::SoftmaxCrossEntropy { .. } => "SoftmaxCrossEntropy",
+        Thunk::SoftmaxCrossEntropyBackward { .. } => "SoftmaxCrossEntropyBackward",
         _ => "Other",
+    }
+}
+
+/// Per-thunk-kind wall-time accumulator, populated only when the env var
+/// `RLX_PROFILE_THUNKS` is set. Used to see which ops dominate a step so the
+/// optimizer/kernels can target the real hotspots rather than guesses.
+static THUNK_PROFILE: std::sync::Mutex<
+    Option<std::collections::BTreeMap<&'static str, (u128, u64)>>,
+> = std::sync::Mutex::new(None);
+
+#[inline]
+fn profile_record(name: &'static str, d: std::time::Duration) {
+    let mut g = THUNK_PROFILE.lock().unwrap();
+    let map = g.get_or_insert_with(std::collections::BTreeMap::new);
+    let e = map.entry(name).or_insert((0, 0));
+    e.0 += d.as_nanos();
+    e.1 += 1;
+}
+
+/// Print and clear the per-thunk-kind time profile gathered under
+/// `RLX_PROFILE_THUNKS`. Call after a run to see where the time went.
+pub fn dump_thunk_profile() {
+    let mut g = THUNK_PROFILE.lock().unwrap();
+    if let Some(map) = g.take() {
+        let mut v: Vec<_> = map.into_iter().collect();
+        v.sort_by_key(|b| std::cmp::Reverse(b.1.0));
+        let total: u128 = v.iter().map(|(_, (ns, _))| *ns).sum();
+        eprintln!(
+            "[thunk-profile] total {:.1}ms across kinds:",
+            total as f64 / 1e6
+        );
+        for (name, (ns, c)) in v.iter().take(25) {
+            eprintln!("  {name:<28} {:>8.1}ms  ({c} calls)", *ns as f64 / 1e6);
+        }
     }
 }
 
@@ -8163,14 +9306,68 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             max_units * max_seq * max_seq
         );
     }
+    let profile = std::env::var_os("RLX_PROFILE_THUNKS").is_some();
+    // Time the previous thunk at the top of each iteration (avoids touching the
+    // giant match's many arms). The last thunk's tail is folded into the next
+    // step's first sample — negligible over a training run.
+    let mut prof_prev: Option<(&'static str, std::time::Instant)> = None;
     for i in 0..len {
+        if profile {
+            if let Some((pn, pt)) = prof_prev.take() {
+                profile_record(pn, pt.elapsed());
+            }
+        }
         let thunk = unsafe { thunks.get_unchecked(i) };
         if trace_thunks && (i < 120 || i % 200 == 0 || i + 1 == len) {
             eprintln!("[thunk {i}/{len}] {}", thunk_kind_name(thunk));
         }
         let trace_done = trace_thunks && i < 120;
+        if profile {
+            prof_prev = Some((thunk_kind_name(thunk), std::time::Instant::now()));
+        }
         match thunk {
             Thunk::Nop => {}
+
+            Thunk::ElementwiseRegion {
+                dst,
+                len,
+                input_offs,
+                chain,
+                scalar_input_mask,
+                input_modulus,
+            } => {
+                let len = *len as usize;
+                if !chain.is_empty() && len > 0 {
+                    let base_addr = base as usize;
+                    let dst = *dst;
+                    let scalar_mask = *scalar_input_mask;
+                    // Each output element is independent → fan over the range.
+                    let eval = |gid: usize| {
+                        let v = region_eval_elem(
+                            gid,
+                            base_addr as *const u8,
+                            input_offs,
+                            chain,
+                            scalar_mask,
+                            input_modulus,
+                        );
+                        unsafe {
+                            *((base_addr as *mut u8).add(dst) as *mut f32).add(gid) = v;
+                        }
+                    };
+                    if fast_conv_enabled() && crate::pool::should_parallelize(len) {
+                        crate::pool::par_for(len, crate::pool::chunk_floor(len), &|off, cnt| {
+                            for gid in off..off + cnt {
+                                eval(gid);
+                            }
+                        });
+                    } else {
+                        for gid in 0..len {
+                            eval(gid);
+                        }
+                    }
+                }
+            }
 
             Thunk::GaussianSplatRender {
                 positions_off,
@@ -8561,6 +9758,112 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         c_sl.copy_from_slice(&tmp);
                     } else {
                         crate::blas::sgemm_auto(a_sl, b_sl, c_sl, m, k, n);
+                    }
+                }
+            }
+
+            Thunk::SgemmT {
+                a,
+                b,
+                c,
+                m,
+                k,
+                n,
+                ta,
+                tb,
+            } => {
+                // C[m,n] = op(A) @ op(B). RowMajor cblas: lda/ldb = stored
+                // row-length of each operand → m if A is transposed else k;
+                // k if B is transposed else n. Element counts are m*k / k*n
+                // regardless of layout.
+                let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                let lda = if *ta { m } else { k };
+                let ldb = if *tb { k } else { n };
+                let arena_len = arena_buf.len();
+                let a_len = (m * k).min((arena_len.saturating_sub(*a)) / 4);
+                let b_len = (k * n).min((arena_len.saturating_sub(*b)) / 4);
+                let c_len = (m * n).min((arena_len.saturating_sub(*c)) / 4);
+                unsafe {
+                    let a_sl = sl(*a, base, a_len);
+                    let b_sl = sl(*b, base, b_len);
+                    let c_sl = sl_mut(*c, base, c_len);
+                    let (ap, bp) = (a_sl.as_ptr(), b_sl.as_ptr());
+                    if std::ptr::eq(ap, c_sl.as_ptr()) || std::ptr::eq(bp, c_sl.as_ptr()) {
+                        let mut tmp = vec![0.0f32; c_len];
+                        crate::blas::sgemm_general(
+                            ap,
+                            bp,
+                            tmp.as_mut_ptr(),
+                            m,
+                            n,
+                            k,
+                            1.0,
+                            0.0,
+                            lda,
+                            ldb,
+                            n,
+                            *ta,
+                            *tb,
+                        );
+                        c_sl.copy_from_slice(&tmp);
+                    } else {
+                        crate::blas::sgemm_general(
+                            ap,
+                            bp,
+                            c_sl.as_mut_ptr(),
+                            m,
+                            n,
+                            k,
+                            1.0,
+                            0.0,
+                            lda,
+                            ldb,
+                            n,
+                            *ta,
+                            *tb,
+                        );
+                    }
+                }
+            }
+
+            Thunk::SgdMomentum {
+                param,
+                vel,
+                grad,
+                p_out,
+                v_out,
+                lr,
+                mom,
+                len,
+            } => {
+                // v' = mom·v + g ;  p' = p − lr·v'  — one fused pass per param,
+                // replacing the 4 BinaryFull ops the in-graph SGD chain lowers
+                // to. Element-wise, so in-place aliasing (p_out==param etc.) is
+                // safe: read index i, write index i.
+                let len = *len as usize;
+                let (lr, mom) = (*lr, *mom);
+                unsafe {
+                    let p = sl(*param, base, len);
+                    let v = sl(*vel, base, len);
+                    let g = sl(*grad, base, len);
+                    let po = sl_mut(*p_out, base, len);
+                    let vo = sl_mut(*v_out, base, len);
+                    if fast_conv_enabled() && crate::pool::should_parallelize(len) {
+                        let poa = po.as_mut_ptr() as usize;
+                        let voa = vo.as_mut_ptr() as usize;
+                        crate::pool::par_for(len, crate::pool::chunk_floor(len), &|off, cnt| {
+                            for i in off..off + cnt {
+                                let vn = mom * v[i] + g[i];
+                                *((voa as *mut f32).add(i)) = vn;
+                                *((poa as *mut f32).add(i)) = p[i] - lr * vn;
+                            }
+                        });
+                    } else {
+                        for i in 0..len {
+                            let vn = mom * v[i] + g[i];
+                            vo[i] = vn;
+                            po[i] = p[i] - lr * vn;
+                        }
                     }
                 }
             }
@@ -10197,11 +11500,16 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let (n, c, h, w) = (*n as usize, *c as usize, *h as usize, *w as usize);
                 let plane = c * h * w;
                 unsafe {
+                    // Per-batch plane stride is `plane` *f32 elements*; `base`
+                    // is a byte pointer, so advance by `plane * size_of::<f32>()`.
+                    // (Was `base.add(ni * plane)` — a 4× under-advance that read
+                    // batch row 1+ from the wrong offset; only n=1 was tested.)
+                    let stride = plane * std::mem::size_of::<f32>();
                     for ni in 0..n {
-                        let input = sl(*src, base.add(ni * plane), plane);
+                        let input = sl(*src, base.add(ni * stride), plane);
                         let gamma = sl(*g, base, c);
                         let beta = sl(*b, base, c);
-                        let output = sl_mut(*dst, base.add(ni * plane), plane);
+                        let output = sl_mut(*dst, base.add(ni * stride), plane);
                         crate::kernels::group_norm_nchw(
                             input,
                             gamma,
@@ -10339,10 +11647,14 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let (n, c, h, w) = (*n as usize, *c as usize, *h as usize, *w as usize);
                 let in_plane = c * h * w;
                 let out_plane = c * h * 2 * w * 2;
+                // `base` is a byte pointer; batch planes are f32 elements, so
+                // advance by `plane * size_of::<f32>()`. (Was `base.add(ni *
+                // plane)` — a 4× under-advance; only n=1 was ever tested.)
+                let fsz = std::mem::size_of::<f32>();
                 unsafe {
                     for ni in 0..n {
-                        let input = sl(*src, base.add(ni * in_plane), in_plane);
-                        let output = sl_mut(*dst, base.add(ni * out_plane), out_plane);
+                        let input = sl(*src, base.add(ni * in_plane * fsz), in_plane);
+                        let output = sl_mut(*dst, base.add(ni * out_plane * fsz), out_plane);
                         crate::kernels::resize_nearest_2x_nchw(input, output, c, h, w);
                     }
                 }
@@ -10366,10 +11678,14 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let hdim = *head_dim as usize;
                 let nh = *num_heads as usize;
                 let plane = s * (*hidden as usize);
+                // `base` is a byte pointer; advance per-batch by element-stride
+                // bytes. (Was `base.add(bi * plane)` — 4× under-advance for
+                // batch>1; matches the corrected `execute_axial_rope2d_f32`.)
+                let plane_bytes = plane * std::mem::size_of::<f32>();
                 unsafe {
                     for bi in 0..b {
-                        let input = sl(*src, base.add(bi * plane), plane);
-                        let output = sl_mut(*dst, base.add(bi * plane), plane);
+                        let input = sl(*src, base.add(bi * plane_bytes), plane);
+                        let output = sl_mut(*dst, base.add(bi * plane_bytes), plane);
                         let rotated = rlx_ir::ops::axial_rope2d::apply_axial_rope2d(
                             input,
                             nh,
@@ -10464,20 +11780,19 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 top_p,
                 temperature,
                 seed,
-            } => {
-                let (b, v) = (*batch as usize, *vocab as usize);
-                let k = (*top_k as usize).min(v);
-                unsafe {
-                    let lg = sl(*logits, base, b * v);
-                    let out = sl_mut(*dst, base, b);
-                    let mut rng =
-                        rlx_ir::Philox4x32::new(if *seed == 0 { 0xDEADBEEF } else { *seed });
-                    for bi in 0..b {
-                        let row = &lg[bi * v..(bi + 1) * v];
-                        out[bi] = sample_row(row, k, *top_p, *temperature, &mut rng) as f32;
-                    }
-                }
-            }
+            } => unsafe {
+                execute_sample_f32(
+                    *logits,
+                    *dst,
+                    *batch as usize,
+                    *vocab as usize,
+                    *top_k as usize,
+                    *top_p,
+                    *temperature,
+                    *seed,
+                    base,
+                );
+            },
 
             Thunk::RngNormal {
                 dst,
@@ -10575,6 +11890,105 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 );
             },
 
+            Thunk::Gru {
+                x,
+                w_ih,
+                w_hh,
+                b_ih,
+                b_hh,
+                h0,
+                dst,
+                batch,
+                seq,
+                input_size,
+                hidden,
+                num_layers,
+                bidirectional,
+                carry,
+            } => unsafe {
+                execute_gru_f32(
+                    *x,
+                    *w_ih,
+                    *w_hh,
+                    *b_ih,
+                    *b_hh,
+                    *h0,
+                    *dst,
+                    *batch as usize,
+                    *seq as usize,
+                    *input_size as usize,
+                    *hidden as usize,
+                    *num_layers as usize,
+                    *bidirectional,
+                    *carry,
+                    base,
+                );
+            },
+
+            Thunk::Rnn {
+                x,
+                w_ih,
+                w_hh,
+                bias,
+                h0,
+                dst,
+                batch,
+                seq,
+                input_size,
+                hidden,
+                num_layers,
+                bidirectional,
+                carry,
+                relu,
+            } => unsafe {
+                execute_rnn_f32(
+                    *x,
+                    *w_ih,
+                    *w_hh,
+                    *bias,
+                    *h0,
+                    *dst,
+                    *batch as usize,
+                    *seq as usize,
+                    *input_size as usize,
+                    *hidden as usize,
+                    *num_layers as usize,
+                    *bidirectional,
+                    *carry,
+                    *relu,
+                    base,
+                );
+            },
+
+            Thunk::Mamba2 {
+                x,
+                dt,
+                a,
+                b,
+                c,
+                dst,
+                batch,
+                seq,
+                heads,
+                head_dim,
+                state_size,
+            } => unsafe {
+                execute_mamba2_f32(
+                    *x,
+                    *dt,
+                    *a,
+                    *b,
+                    *c,
+                    *dst,
+                    *batch as usize,
+                    *seq as usize,
+                    *heads as usize,
+                    *head_dim as usize,
+                    *state_size as usize,
+                    base,
+                );
+            },
+
             Thunk::SelectiveScan {
                 x,
                 delta,
@@ -10586,54 +12000,21 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 seq,
                 hidden,
                 state_size,
-            } => {
-                let (b, s, h, n) = (
+            } => unsafe {
+                execute_selective_scan_f32(
+                    *x,
+                    *delta,
+                    *a,
+                    *bp,
+                    *cp,
+                    *dst,
                     *batch as usize,
                     *seq as usize,
                     *hidden as usize,
                     *state_size as usize,
+                    base,
                 );
-                unsafe {
-                    let xs = sl(*x, base, b * s * h);
-                    let dt = sl(*delta, base, b * s * h);
-                    let am = sl(*a, base, h * n);
-                    let bm = sl(*bp, base, b * s * n);
-                    let cm = sl(*cp, base, b * s * n);
-                    let out = sl_mut(*dst, base, b * s * h);
-
-                    // State buffer per-batch: h channels × n state.
-                    // Sequential along the seq dimension; could
-                    // parallelize over batch+channel later.
-                    let mut state = vec![0f32; h * n];
-                    for bi in 0..b {
-                        // Reset state at the start of each batch row.
-                        for v in state.iter_mut() {
-                            *v = 0.0;
-                        }
-                        for si in 0..s {
-                            let x_row = &xs[bi * s * h + si * h..bi * s * h + (si + 1) * h];
-                            let dt_row = &dt[bi * s * h + si * h..bi * s * h + (si + 1) * h];
-                            let b_row = &bm[bi * s * n + si * n..bi * s * n + (si + 1) * n];
-                            let c_row = &cm[bi * s * n + si * n..bi * s * n + (si + 1) * n];
-                            let out_row = &mut out[bi * s * h + si * h..bi * s * h + (si + 1) * h];
-
-                            for ci in 0..h {
-                                let d = dt_row[ci];
-                                let xv = x_row[ci];
-                                let mut acc = 0f32;
-                                for ni in 0..n {
-                                    // Discretize: exp(d * a) and d * b.
-                                    let da = (d * am[ci * n + ni]).exp();
-                                    state[ci * n + ni] =
-                                        da * state[ci * n + ni] + d * b_row[ni] * xv;
-                                    acc += c_row[ni] * state[ci * n + ni];
-                                }
-                                out_row[ci] = acc;
-                            }
-                        }
-                    }
-                }
-            }
+            },
 
             Thunk::DequantMatMul {
                 x,
@@ -10771,6 +12152,124 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     dequant_matmul_nvfp4(xs, w_bytes, scale_bytes, gs, out, m, k, n);
                 }
             }
+
+            Thunk::ScaledMatMul {
+                lhs,
+                rhs,
+                lhs_scale,
+                rhs_scale,
+                bias,
+                dst,
+                m,
+                k,
+                n,
+                lhs_fmt,
+                rhs_fmt,
+                layout,
+                has_bias,
+            } => {
+                let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                let layout = *layout;
+                let nblk = lowp_nblk(k, layout);
+                let per_tensor = matches!(layout, rlx_ir::ScaleLayout::PerTensor);
+                let n_lscale = if per_tensor { 1 } else { m * nblk };
+                let n_rscale = if per_tensor { 1 } else { n * nblk };
+                unsafe {
+                    let lhs_b = std::slice::from_raw_parts(base.add(*lhs) as *const u8, m * k);
+                    let rhs_b = std::slice::from_raw_parts(base.add(*rhs) as *const u8, n * k);
+                    let ls = lowp_read_scales(layout, base, *lhs_scale, n_lscale);
+                    let rs = lowp_read_scales(layout, base, *rhs_scale, n_rscale);
+                    let bias_s = if *has_bias {
+                        Some(sl(*bias, base, n))
+                    } else {
+                        None
+                    };
+                    let out = sl_mut(*dst, base, m * n);
+                    lowp_scaled_matmul(
+                        lhs_b, rhs_b, &ls, &rs, bias_s, out, m, n, k, layout, *lhs_fmt, *rhs_fmt,
+                    );
+                }
+            }
+
+            Thunk::ScaledQuantize {
+                x,
+                scale,
+                dst,
+                rows,
+                cols,
+                fmt,
+                layout,
+            } => {
+                let (rows, cols) = (*rows as usize, *cols as usize);
+                let layout = *layout;
+                let nblk = lowp_nblk(cols, layout);
+                let n_scale = if matches!(layout, rlx_ir::ScaleLayout::PerTensor) {
+                    1
+                } else {
+                    rows * nblk
+                };
+                unsafe {
+                    let xs = sl(*x, base, rows * cols);
+                    let scales = lowp_read_scales(layout, base, *scale, n_scale);
+                    let out = std::slice::from_raw_parts_mut(base.add(*dst), rows * cols);
+                    lowp_quantize(xs, &scales, *fmt, layout, rows, cols, out);
+                }
+            }
+
+            Thunk::ScaledQuantScale {
+                x,
+                dst,
+                rows,
+                cols,
+                fmt,
+                layout,
+            } => {
+                let (rows, cols) = (*rows as usize, *cols as usize);
+                let layout = *layout;
+                let nblk = lowp_nblk(cols, layout);
+                unsafe {
+                    let xs = sl(*x, base, rows * cols);
+                    let scales = lowp_compute_scales(xs, *fmt, layout, rows, cols);
+                    match layout {
+                        rlx_ir::ScaleLayout::PerTensor => {
+                            sl_mut(*dst, base, 1)[0] = scales[0];
+                        }
+                        rlx_ir::ScaleLayout::BlockMxE8M0 { .. } => {
+                            let out = std::slice::from_raw_parts_mut(base.add(*dst), rows * nblk);
+                            for (o, &s) in out.iter_mut().zip(&scales) {
+                                *o = rlx_ir::lowp_codec::f32_to_e8m0(s);
+                            }
+                        }
+                        rlx_ir::ScaleLayout::Nvfp4 { .. } => {
+                            let out = std::slice::from_raw_parts_mut(base.add(*dst), rows * nblk);
+                            for (o, &s) in out.iter_mut().zip(&scales) {
+                                *o = rlx_ir::lowp_codec::encode(rlx_ir::ScaledFormat::F8E4M3, s);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Thunk::ScaledDequantize {
+                codes,
+                scale,
+                dst,
+                rows,
+                cols,
+                fmt,
+                layout,
+            } => unsafe {
+                execute_scaled_dequantize_f32(
+                    *codes,
+                    *scale,
+                    *dst,
+                    *rows as usize,
+                    *cols as usize,
+                    *fmt,
+                    *layout,
+                    base,
+                );
+            },
 
             Thunk::LoraMatMul {
                 x,
@@ -11294,6 +12793,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 qkv_w,
                 out_w,
                 mask,
+                mask_kind,
                 out,
                 qkv_b,
                 out_b,
@@ -11307,17 +12807,29 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 dh,
                 has_bias,
                 has_rope,
+                interleaved,
             } => {
                 let (b, s) = (*batch as usize, *seq as usize);
                 let (h, n_h, d_h) = (*hs as usize, *nh as usize, *dh as usize);
+                let interleaved = *interleaved;
                 let m = b * s;
                 let scale = (d_h as f32).powf(-0.5);
                 let half = d_h / 2;
+                // Only `Custom` consumes the per-key padding buffer; `Causal` /
+                // `SlidingWindow` are synthesized from (qi, ki) below, and have
+                // no mask buffer (so reading one would touch unrelated arena
+                // bytes). q_seq == kv_seq here (guaranteed at fusion time), so
+                // the absolute query position is just `qi`.
+                let use_custom_mask = matches!(mask_kind, rlx_ir::op::MaskKind::Custom);
                 unsafe {
                     let inp = sl(*hidden, base, m * h);
                     let wq = sl(*qkv_w, base, h * 3 * h);
                     let wo = sl(*out_w, base, h * h);
-                    let mk = sl(*mask, base, b * s);
+                    let mk = if use_custom_mask {
+                        sl(*mask, base, b * s)
+                    } else {
+                        &[]
+                    };
                     let dst = sl_mut(*out, base, m * h);
 
                     // Stack-allocated intermediates — all fit in L1 cache for small batch
@@ -11354,13 +12866,21 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                         let k_cos = ki * half;
                                         let cos_tab = sl(*cos, base, *cos_len as usize);
                                         let sin_tab = sl(*sin, base, *cos_len as usize);
-                                        // First half: (q1*c - q2*s) * (k1*c - k2*s)
-                                        // Second half: (q2*c + q1*s) * (k2*c + k1*s)
+                                        // Rotate per pair, then dot. The q·k sum
+                                        // is layout-independent, so only the pair
+                                        // element offsets differ by style:
+                                        //   NeoX:  (i, i+half)   GPT-J: (2i, 2i+1)
+                                        // angle index is the pair index `i` for both.
                                         for i in 0..half {
-                                            let q1 = qkv[q_base + i];
-                                            let q2 = qkv[q_base + half + i];
-                                            let k1 = qkv[k_base + i];
-                                            let k2 = qkv[k_base + half + i];
+                                            let (qo1, qo2, ko1, ko2) = if interleaved {
+                                                (2 * i, 2 * i + 1, 2 * i, 2 * i + 1)
+                                            } else {
+                                                (i, half + i, i, half + i)
+                                            };
+                                            let q1 = qkv[q_base + qo1];
+                                            let q2 = qkv[q_base + qo2];
+                                            let k1 = qkv[k_base + ko1];
+                                            let k2 = qkv[k_base + ko2];
                                             let c_q = cos_tab[q_cos + i];
                                             let s_q = sin_tab[q_cos + i];
                                             let c_k = cos_tab[k_cos + i];
@@ -11396,7 +12916,18 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     }
 
                                     scores_buf[qi * s + ki] = dot * scale;
-                                    if mk[bi * s + ki] < mask_thr {
+                                    // Synthesized position masks (q_offset == 0):
+                                    //   Causal         → mask future keys ki > qi
+                                    //   SlidingWindow  → also mask ki + w < qi
+                                    let pos_masked = match mask_kind {
+                                        rlx_ir::op::MaskKind::Causal => ki > qi,
+                                        rlx_ir::op::MaskKind::SlidingWindow(w) => {
+                                            ki > qi || ki + *w < qi
+                                        }
+                                        _ => false,
+                                    };
+                                    if pos_masked || (use_custom_mask && mk[bi * s + ki] < mask_thr)
+                                    {
                                         scores_buf[qi * s + ki] = mask_neg;
                                     }
                                 }
@@ -11461,7 +12992,9 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 n_rot,
                 cos_len,
                 src_row_stride,
+                interleaved,
             } => {
+                let interleaved = *interleaved;
                 let (b, s, hs, dh, nr) = (
                     *batch as usize,
                     *seq as usize,
@@ -11474,6 +13007,12 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let nh = hs / dh;
                 let cl = *cos_len as usize;
                 let src_rs = *src_row_stride as usize;
+                // Number of rows in the RoPE table. A per-(batch·seq) table
+                // (`cos_rows == b*s`, distinct from the shared per-seq table) is
+                // indexed by the *global* token so ragged batched decode can
+                // give each sequence its own absolute position.
+                let cos_rows = cl / tab_half.max(1);
+                let per_token = cos_rows == b * s && cos_rows != s;
                 unsafe {
                     let x = sl(*src, base, b * s * src_rs);
                     let cos_tab = sl(*cos, base, cl);
@@ -11490,7 +13029,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         for idx in off..off + cnt {
                             let bi = idx / s;
                             let si = idx % s;
-                            let tab_off = si * tab_half;
+                            let tab_off = if per_token { idx } else { si } * tab_half;
 
                             for hi in 0..nh {
                                 let src_base = bi * s * src_rs + si * src_rs + hi * dh;
@@ -11500,13 +13039,27 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 let cp = (c_ptr as *const f32).add(tab_off);
                                 let sp = (s_ptr as *const f32).add(tab_off);
 
-                                for i in 0..rot_half {
-                                    let x1 = *xp.add(i);
-                                    let x2 = *xp.add(rot_half + i);
-                                    let cv = *cp.add(i);
-                                    let sv = *sp.add(i);
-                                    *op.add(i) = x1 * cv - x2 * sv;
-                                    *op.add(rot_half + i) = x2 * cv + x1 * sv;
+                                if interleaved {
+                                    // GPT-J / llama.cpp-NORM: rotate adjacent
+                                    // pairs (2i, 2i+1) by angle i.
+                                    for i in 0..rot_half {
+                                        let x1 = *xp.add(2 * i);
+                                        let x2 = *xp.add(2 * i + 1);
+                                        let cv = *cp.add(i);
+                                        let sv = *sp.add(i);
+                                        *op.add(2 * i) = x1 * cv - x2 * sv;
+                                        *op.add(2 * i + 1) = x2 * cv + x1 * sv;
+                                    }
+                                } else {
+                                    // HF / NeoX rotate-half: pair (i, i+rot_half).
+                                    for i in 0..rot_half {
+                                        let x1 = *xp.add(i);
+                                        let x2 = *xp.add(rot_half + i);
+                                        let cv = *cp.add(i);
+                                        let sv = *sp.add(i);
+                                        *op.add(i) = x1 * cv - x2 * sv;
+                                        *op.add(rot_half + i) = x2 * cv + x1 * sv;
+                                    }
                                 }
                                 for j in nr..dh {
                                     *op.add(j) = *xp.add(j);
@@ -11780,7 +13333,9 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 nh,
                 dh,
                 int_dim,
+                interleaved,
             } => {
+                let interleaved = *interleaved;
                 let (b, s, h, n_h, d_h) = (
                     *batch as usize,
                     *seq as usize,
@@ -11822,10 +13377,16 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let k_base = bi * s * 3 * h + ki * 3 * h + h + hi * d_h;
                                     let mut dot = 0f32;
                                     for i in 0..half_dh {
-                                        let q1 = qkv[q_base + i];
-                                        let q2 = qkv[q_base + half_dh + i];
-                                        let k1 = qkv[k_base + i];
-                                        let k2 = qkv[k_base + half_dh + i];
+                                        // NeoX pairs (i, i+half); GPT-J pairs (2i, 2i+1).
+                                        let (o1, o2) = if interleaved {
+                                            (2 * i, 2 * i + 1)
+                                        } else {
+                                            (i, half_dh + i)
+                                        };
+                                        let q1 = qkv[q_base + o1];
+                                        let q2 = qkv[q_base + o2];
+                                        let k1 = qkv[k_base + o1];
+                                        let k2 = qkv[k_base + o2];
                                         let cq = cos_tab[qi * half_dh + i];
                                         let sq = sin_tab[qi * half_dh + i];
                                         let ck = cos_tab[ki * half_dh + i];
@@ -11912,24 +13473,24 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         }
                     }
 
-                    // fc2 (no bias) + residual  — read from first id cols of ffn_concat
-                    // Need contiguous [m, id] for sgemm. Copy or use strided sgemm.
-                    // The up*gate result is at ffn_concat[row * 2*id .. row * 2*id + id]
-                    // Stride = 2*id. Use sgemm_general with lda = 2*id.
-                    crate::blas::sgemm_general(
-                        ffn_concat.as_ptr(),
-                        sl(*fc2_w, base, id * h).as_ptr(),
-                        res.as_mut_ptr(),
+                    // fc2 (no bias) + residual. The up*silu(gate) product lives in
+                    // the FIRST `id` cols of each 2*id-wide ffn_concat row; gather
+                    // it contiguous and run the SAME `sgemm` dispatch the unfused
+                    // path uses (a strided `sgemm_general` here would force the
+                    // BLAS/scalar path and diverge from the unfused NEON sgemm).
+                    let mut swiglu_contig = vec![0f32; m * id];
+                    for row in 0..m {
+                        let bo = row * 2 * id;
+                        swiglu_contig[row * id..(row + 1) * id]
+                            .copy_from_slice(&ffn_concat[bo..bo + id]);
+                    }
+                    crate::blas::sgemm(
+                        &swiglu_contig,
+                        sl(*fc2_w, base, id * h),
+                        &mut res,
                         m,
-                        h,
                         id,
-                        1.0,
-                        0.0,
-                        2 * id,
                         h,
-                        h,
-                        false,
-                        false,
                     );
                     for i in 0..m * h {
                         res[i] += normed[i];
@@ -12185,6 +13746,43 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         let o = sl_mut(*dst, base, len);
                         for i in 0..len {
                             o[i] = if c[i] != 0.0 { t[i] } else { e[i] };
+                        }
+                    }
+                }
+            }
+
+            Thunk::Fma {
+                a,
+                b,
+                c,
+                dst,
+                len,
+                elem_bytes,
+            } => {
+                let len = *len as usize;
+                let eb = (*elem_bytes).max(1) as usize;
+                let arena_len = arena_buf.len();
+                let len = len
+                    .min(arena_len.saturating_sub(*a) / eb)
+                    .min(arena_len.saturating_sub(*b) / eb)
+                    .min(arena_len.saturating_sub(*c) / eb)
+                    .min(arena_len.saturating_sub(*dst) / eb);
+                unsafe {
+                    if *elem_bytes == 8 {
+                        let av = sl_f64(*a, base, len);
+                        let bv = sl_f64(*b, base, len);
+                        let cv = sl_f64(*c, base, len);
+                        let o = sl_mut_f64(*dst, base, len);
+                        for i in 0..len {
+                            o[i] = av[i].mul_add(bv[i], cv[i]);
+                        }
+                    } else {
+                        let av = sl(*a, base, len);
+                        let bv = sl(*b, base, len);
+                        let cv = sl(*c, base, len);
+                        let o = sl_mut(*dst, base, len);
+                        for i in 0..len {
+                            o[i] = av[i].mul_add(bv[i], cv[i]);
                         }
                     }
                 }
@@ -12459,28 +14057,49 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 unsafe {
                     let inp = sl(*src, base, in_total);
                     let out = sl_mut(*dst, base, out_total);
-                    for o in 0..outer {
-                        for i in 0..inner {
-                            let mut acc = match op {
-                                ReduceOp::Max => f32::NEG_INFINITY,
-                                ReduceOp::Min => f32::INFINITY,
-                                ReduceOp::Prod => 1.0f32,
-                                _ => 0.0f32, // Sum / Mean
+                    // Each output element reduces a disjoint strided strip, so
+                    // the output range parallelizes (the bias-gradient reductions
+                    // read the big [N,C,H,W] tensors down to [C]; that's C-way).
+                    let reduce_one = |oi: usize| -> f32 {
+                        let o = oi / inner;
+                        let i = oi % inner;
+                        let mut acc = match op {
+                            ReduceOp::Max => f32::NEG_INFINITY,
+                            ReduceOp::Min => f32::INFINITY,
+                            ReduceOp::Prod => 1.0f32,
+                            _ => 0.0f32, // Sum / Mean
+                        };
+                        for r in 0..reduced {
+                            let v = inp[o * reduced * inner + r * inner + i];
+                            acc = match op {
+                                ReduceOp::Sum | ReduceOp::Mean => acc + v,
+                                ReduceOp::Max => acc.max(v),
+                                ReduceOp::Min => acc.min(v),
+                                ReduceOp::Prod => acc * v,
                             };
-                            // Walk the reduced axis with stride `inner`.
-                            for r in 0..reduced {
-                                let v = inp[o * reduced * inner + r * inner + i];
-                                acc = match op {
-                                    ReduceOp::Sum | ReduceOp::Mean => acc + v,
-                                    ReduceOp::Max => acc.max(v),
-                                    ReduceOp::Min => acc.min(v),
-                                    ReduceOp::Prod => acc * v,
-                                };
-                            }
-                            if matches!(op, ReduceOp::Mean) {
-                                acc /= reduced as f32;
-                            }
-                            out[o * inner + i] = acc;
+                        }
+                        if matches!(op, ReduceOp::Mean) {
+                            acc /= reduced as f32;
+                        }
+                        acc
+                    };
+                    if fast_conv_enabled()
+                        && crate::pool::should_parallelize(in_total)
+                        && out_total > 1
+                    {
+                        let out_addr = out.as_mut_ptr() as usize;
+                        crate::pool::par_for(
+                            out_total,
+                            crate::pool::outer_chunk(out_total),
+                            &|off, cnt| {
+                                for oi in off..off + cnt {
+                                    *((out_addr as *mut f32).add(oi)) = reduce_one(oi);
+                                }
+                            },
+                        );
+                    } else {
+                        for oi in 0..out_total {
+                            out[oi] = reduce_one(oi);
                         }
                     }
                 }
@@ -12594,44 +14213,40 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let dw = *dw as usize;
                 let groups = *groups as usize;
                 let c_in_per_g = c_in / groups;
-                let c_out_per_g = c_out / groups;
                 unsafe {
                     let inp = sl(*src, base, n * c_in * h * w);
                     let wt = sl(*weight, base, c_out * c_in_per_g * kh * kw);
                     let out = sl_mut(*dst, base, n * c_out * h_out * w_out);
-                    for ni in 0..n {
-                        for co in 0..c_out {
-                            let g = co / c_out_per_g;
-                            let ci_start = g * c_in_per_g;
-                            for ho in 0..h_out {
-                                for wo in 0..w_out {
-                                    let mut acc = 0f32;
-                                    for ci_off in 0..c_in_per_g {
-                                        let ci = ci_start + ci_off;
-                                        let in_chan = ((ni * c_in) + ci) * h * w;
-                                        let wt_chan = ((co * c_in_per_g) + ci_off) * kh * kw;
-                                        for ki in 0..kh {
-                                            for kj in 0..kw {
-                                                let hi = ho * sh + ki * dh;
-                                                let wi = wo * sw + kj * dw;
-                                                if hi < ph || wi < pw {
-                                                    continue;
-                                                }
-                                                let hi = hi - ph;
-                                                let wi = wi - pw;
-                                                if hi >= h || wi >= w {
-                                                    continue;
-                                                }
-                                                acc += inp[in_chan + hi * w + wi]
-                                                    * wt[wt_chan + ki * kw + kj];
-                                            }
-                                        }
-                                    }
-                                    out[((ni * c_out) + co) * h_out * w_out + ho * w_out + wo] =
-                                        acc;
-                                }
-                            }
-                        }
+                    // Forward conv has two interchangeable kernels:
+                    //   * a reference scalar nested loop (default), and
+                    //   * im2col + BLAS sgemm, enabled with RLX_FAST_CONV=1.
+                    // The fast path mirrors Conv2D1x1 / Conv2dBackwardWeight:
+                    // gather patches per (batch, group) then dispatch one
+                    // sgemm. Results match up to float reassociation.
+                    // Eligibility: stride-1, no padding, dilation-1 — the direct
+                    // kernel's no-bounds SAXPY form (and Winograd's tiling).
+                    let s1_nopad = sh == 1 && sw == 1 && ph == 0 && pw == 0 && dh == 1 && dw == 1;
+                    let winograd_ok = s1_nopad && kh == 3 && kw == 3 && groups == 1;
+                    // im2col+BLAS is the measured CPU optimum for these shapes;
+                    // Winograd (RLX_WINOGRAD) and the direct kernel
+                    // (RLX_DIRECT_CONV) are opt-in alternatives that win only at
+                    // higher channel counts — both measured slower on TinyConv.
+                    if fast_conv_enabled() && winograd_enabled() && winograd_ok {
+                        conv2d_forward_winograd(inp, wt, out, n, c_in, h, w, c_out, h_out, w_out);
+                    } else if fast_conv_enabled() && direct_conv_enabled() && s1_nopad {
+                        conv2d_forward_direct(
+                            inp, wt, out, n, c_in, h, w, c_out, h_out, w_out, kh, kw, groups,
+                        );
+                    } else if fast_conv_enabled() {
+                        conv2d_forward_im2col(
+                            inp, wt, out, n, c_in, h, w, c_out, h_out, w_out, kh, kw, sh, sw, ph,
+                            pw, dh, dw, groups,
+                        );
+                    } else {
+                        conv2d_forward_naive(
+                            inp, wt, out, n, c_in, h, w, c_out, h_out, w_out, kh, kw, sh, sw, ph,
+                            pw, dh, dw, groups,
+                        );
                     }
                 }
             }
@@ -12669,21 +14284,46 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 unsafe {
                     let inp = sl(*src, base, n * c * h * w);
                     let out = sl_mut(*dst, base, n * c * h_out * w_out);
-                    for ni in 0..n {
-                        for ci in 0..c {
-                            let in_chan = ni * c * h * w + ci * h * w;
-                            let out_chan = ni * c * h_out * w_out + ci * h_out * w_out;
-                            for ho in 0..h_out {
-                                for wo in 0..w_out {
-                                    let mut acc = match kind {
-                                        ReduceOp::Max => f32::NEG_INFINITY,
-                                        _ => 0f32, // Mean (and Sum/Min/Prod fall back here)
-                                    };
+                    // Each (n, c) plane is independent and writes a disjoint
+                    // output region, so pooling fans out over the channel-batch
+                    // when RLX_FAST_CONV is set.
+                    let out_addr = out.as_mut_ptr() as usize;
+                    let is_max = matches!(kind, ReduceOp::Max);
+                    let is_mean = matches!(kind, ReduceOp::Mean);
+                    // No-padding windows (the conv-net case) are always fully
+                    // in-bounds, so the hot path drops the per-element bounds
+                    // branches and hoists the reduce-op choice out of the loop.
+                    let nopad = ph == 0 && pw == 0;
+                    let pool_plane = |nc: usize| {
+                        let ni = nc / c;
+                        let ci = nc % c;
+                        let in_chan = ni * c * h * w + ci * h * w;
+                        let out_chan = ni * c * h_out * w_out + ci * h_out * w_out;
+                        let op = out_addr as *mut f32;
+                        for ho in 0..h_out {
+                            for wo in 0..w_out {
+                                let acc = if nopad {
+                                    let row0 = in_chan + (ho * sh) * w + wo * sw;
+                                    let mut a = if is_max { f32::NEG_INFINITY } else { 0.0 };
+                                    for ki in 0..kh {
+                                        let row = row0 + ki * w;
+                                        if is_max {
+                                            for kj in 0..kw {
+                                                a = a.max(inp[row + kj]);
+                                            }
+                                        } else {
+                                            for kj in 0..kw {
+                                                a += inp[row + kj];
+                                            }
+                                        }
+                                    }
+                                    a
+                                } else {
+                                    let mut a = if is_max { f32::NEG_INFINITY } else { 0.0 };
                                     for ki in 0..kh {
                                         for kj in 0..kw {
                                             let hi = ho * sh + ki;
                                             let wi = wo * sw + kj;
-                                            // Padded-zero region.
                                             if hi < ph || wi < pw {
                                                 continue;
                                             }
@@ -12693,18 +14333,34 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                                 continue;
                                             }
                                             let v = inp[in_chan + hi * w + wi];
-                                            match kind {
-                                                ReduceOp::Max => acc = acc.max(v),
-                                                _ => acc += v,
+                                            if is_max {
+                                                a = a.max(v);
+                                            } else {
+                                                a += v;
                                             }
                                         }
                                     }
-                                    if matches!(kind, ReduceOp::Mean) {
-                                        acc /= kernel_area;
-                                    }
-                                    out[out_chan + ho * w_out + wo] = acc;
-                                }
+                                    a
+                                };
+                                let acc = if is_mean { acc / kernel_area } else { acc };
+                                *op.add(out_chan + ho * w_out + wo) = acc;
                             }
+                        }
+                    };
+                    if fast_conv_enabled() && crate::pool::should_parallelize(n * c * h_out * w_out)
+                    {
+                        crate::pool::par_for(
+                            n * c,
+                            crate::pool::outer_chunk(n * c),
+                            &|off, cnt| {
+                                for nc in off..off + cnt {
+                                    pool_plane(nc);
+                                }
+                            },
+                        );
+                    } else {
+                        for nc in 0..n * c {
+                            pool_plane(nc);
                         }
                     }
                 }
@@ -12716,8 +14372,17 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let xs = sl(*x, base, len);
                     let dys = sl(*dy, base, len);
                     let out = sl_mut(*dx, base, len);
-                    for i in 0..len {
-                        out[i] = if xs[i] > 0.0 { dys[i] } else { 0.0 };
+                    if fast_conv_enabled() && crate::pool::should_parallelize(len) {
+                        let oa = out.as_mut_ptr() as usize;
+                        crate::pool::par_for(len, crate::pool::chunk_floor(len), &|off, cnt| {
+                            for i in off..off + cnt {
+                                *((oa as *mut f32).add(i)) = if xs[i] > 0.0 { dys[i] } else { 0.0 };
+                            }
+                        });
+                    } else {
+                        for i in 0..len {
+                            out[i] = if xs[i] > 0.0 { dys[i] } else { 0.0 };
+                        }
                     }
                 }
             }
@@ -13820,53 +15485,94 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         *v = 0.0;
                     }
 
-                    // Reused scratch buffer for the [m_dim, n_dim] dcol.
-                    let mut dcol = vec![0f32; m_dim * n_dim];
+                    // Each (ni, g) writes a disjoint dx_n_g region (col2im
+                    // scatter-adds into the freshly-zeroed slice), so the batch
+                    // loop fans out over the pool when RLX_FAST_CONV is set —
+                    // each worker owns a `dcol` scratch and a raw pointer it
+                    // offsets into its own dx window.
+                    if fast_conv_enabled() {
+                        let dx_addr = dxs.as_mut_ptr() as usize;
+                        crate::pool::par_for(n, 1, &|off, cnt| {
+                            let mut dcol = vec![0f32; m_dim * n_dim];
+                            for ni in off..off + cnt {
+                                for g in 0..groups {
+                                    let w_g_off = g * w_stride_g;
+                                    let dy_n_g_off = ni * dy_stride_n + g * dy_stride_g;
+                                    let dx_n_g_off = ni * dx_stride_n + g * dx_stride_g;
+                                    crate::blas::sgemm_general(
+                                        ws.as_ptr().add(w_g_off),
+                                        dys.as_ptr().add(dy_n_g_off),
+                                        dcol.as_mut_ptr(),
+                                        m_dim,
+                                        n_dim,
+                                        k_dim,
+                                        1.0,
+                                        0.0,
+                                        m_dim,
+                                        n_dim,
+                                        n_dim,
+                                        true,
+                                        false,
+                                    );
+                                    let dx_g = std::slice::from_raw_parts_mut(
+                                        (dx_addr as *mut f32).add(dx_n_g_off),
+                                        dx_stride_g,
+                                    );
+                                    col2im(
+                                        &dcol, dx_g, c_in_per_g, h, w_in, h_out, w_out, kh, kw, sh,
+                                        sw, ph, pw, dh, dw,
+                                    );
+                                }
+                            }
+                        });
+                    } else {
+                        // Reused scratch buffer for the [m_dim, n_dim] dcol.
+                        let mut dcol = vec![0f32; m_dim * n_dim];
+                        for ni in 0..n {
+                            for g in 0..groups {
+                                let w_g_off = g * w_stride_g;
+                                let dy_n_g_off = ni * dy_stride_n + g * dy_stride_g;
+                                let dx_n_g_off = ni * dx_stride_n + g * dx_stride_g;
 
-                    for ni in 0..n {
-                        for g in 0..groups {
-                            let w_g_off = g * w_stride_g;
-                            let dy_n_g_off = ni * dy_stride_n + g * dy_stride_g;
-                            let dx_n_g_off = ni * dx_stride_n + g * dx_stride_g;
+                                // dcol = w_g^T @ dy_n_g
+                                // w_g  is stored as [k_dim rows, m_dim cols] row-major
+                                // (i.e. K×M storage with lda = M = m_dim — exactly what
+                                // sgemm_general wants for trans_a=true).
+                                crate::blas::sgemm_general(
+                                    ws.as_ptr().add(w_g_off),
+                                    dys.as_ptr().add(dy_n_g_off),
+                                    dcol.as_mut_ptr(),
+                                    m_dim,
+                                    n_dim,
+                                    k_dim,
+                                    1.0,
+                                    0.0,
+                                    /*lda=*/ m_dim,
+                                    /*ldb=*/ n_dim,
+                                    /*ldc=*/ n_dim,
+                                    /*trans_a=*/ true,
+                                    /*trans_b=*/ false,
+                                );
 
-                            // dcol = w_g^T @ dy_n_g
-                            // w_g  is stored as [k_dim rows, m_dim cols] row-major
-                            // (i.e. K×M storage with lda = M = m_dim — exactly what
-                            // sgemm_general wants for trans_a=true).
-                            crate::blas::sgemm_general(
-                                ws.as_ptr().add(w_g_off),
-                                dys.as_ptr().add(dy_n_g_off),
-                                dcol.as_mut_ptr(),
-                                m_dim,
-                                n_dim,
-                                k_dim,
-                                1.0,
-                                0.0,
-                                /*lda=*/ m_dim,
-                                /*ldb=*/ n_dim,
-                                /*ldc=*/ n_dim,
-                                /*trans_a=*/ true,
-                                /*trans_b=*/ false,
-                            );
-
-                            // dx_n_g += col2im(dcol)
-                            col2im(
-                                &dcol,
-                                &mut dxs[dx_n_g_off..dx_n_g_off + dx_stride_g],
-                                c_in_per_g,
-                                h,
-                                w_in,
-                                h_out,
-                                w_out,
-                                kh,
-                                kw,
-                                sh,
-                                sw,
-                                ph,
-                                pw,
-                                dh,
-                                dw,
-                            );
+                                // dx_n_g += col2im(dcol)
+                                col2im(
+                                    &dcol,
+                                    &mut dxs[dx_n_g_off..dx_n_g_off + dx_stride_g],
+                                    c_in_per_g,
+                                    h,
+                                    w_in,
+                                    h_out,
+                                    w_out,
+                                    kh,
+                                    kw,
+                                    sh,
+                                    sw,
+                                    ph,
+                                    pw,
+                                    dh,
+                                    dw,
+                                );
+                            }
                         }
                     }
                 }
@@ -13940,54 +15646,117 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         *v = 0.0;
                     }
 
-                    let mut col = vec![0f32; n_dim * k_dim];
+                    // dw is a cross-batch reduction (β=1 accumulate), so the
+                    // parallel path gives each worker a private `local` dw,
+                    // accumulates into it over its slice of the batch, then adds
+                    // it into the shared `dws` once under a lock — O(threads)
+                    // contention, not O(batch). RLX_FAST_CONV gates it.
+                    if fast_conv_enabled() {
+                        let dw_len = dws.len();
+                        let dws_addr = dws.as_mut_ptr() as usize;
+                        let lock = std::sync::Mutex::new(());
+                        crate::pool::par_for(n, 1, &|off, cnt| {
+                            let mut col = vec![0f32; n_dim * k_dim];
+                            let mut local = vec![0f32; dw_len];
+                            for ni in off..off + cnt {
+                                for g in 0..groups {
+                                    let x_n_g_off = ni * x_stride_n + g * x_stride_g;
+                                    let dy_n_g_off = ni * dy_stride_n + g * dy_stride_g;
+                                    let dw_g_off = g * dw_stride_g;
+                                    // Rows-layout im2col: col is [P, K] row-major, so
+                                    // the GEMM dy[c_out,P] @ col[P,K] reads col
+                                    // contiguously (trans_b=false) instead of the
+                                    // strided transposed read the [K,P] layout forced.
+                                    crate::im2col::im2col_rows_layout(
+                                        &xs[x_n_g_off..x_n_g_off + x_stride_g],
+                                        &mut col,
+                                        1,
+                                        c_in_per_g,
+                                        h,
+                                        w,
+                                        h_out,
+                                        w_out,
+                                        kh,
+                                        kw,
+                                        sh,
+                                        sw,
+                                        ph,
+                                        pw,
+                                        dh,
+                                        dw_dil,
+                                    );
+                                    crate::blas::sgemm_general(
+                                        dys.as_ptr().add(dy_n_g_off),
+                                        col.as_ptr(),
+                                        local.as_mut_ptr().add(dw_g_off),
+                                        m_dim,
+                                        n_dim,
+                                        k_dim,
+                                        1.0,
+                                        1.0,
+                                        k_dim,
+                                        n_dim,
+                                        n_dim,
+                                        false,
+                                        false,
+                                    );
+                                }
+                            }
+                            let _guard = lock.lock().unwrap();
+                            let dws = std::slice::from_raw_parts_mut(dws_addr as *mut f32, dw_len);
+                            for (d, l) in dws.iter_mut().zip(local.iter()) {
+                                *d += *l;
+                            }
+                        });
+                    } else {
+                        let mut col = vec![0f32; n_dim * k_dim];
+                        for ni in 0..n {
+                            for g in 0..groups {
+                                let x_n_g_off = ni * x_stride_n + g * x_stride_g;
+                                im2col(
+                                    &xs[x_n_g_off..x_n_g_off + x_stride_g],
+                                    &mut col,
+                                    c_in_per_g,
+                                    h,
+                                    w,
+                                    h_out,
+                                    w_out,
+                                    kh,
+                                    kw,
+                                    sh,
+                                    sw,
+                                    ph,
+                                    pw,
+                                    dh,
+                                    dw_dil,
+                                );
 
-                    for ni in 0..n {
-                        for g in 0..groups {
-                            let x_n_g_off = ni * x_stride_n + g * x_stride_g;
-                            im2col(
-                                &xs[x_n_g_off..x_n_g_off + x_stride_g],
-                                &mut col,
-                                c_in_per_g,
-                                h,
-                                w,
-                                h_out,
-                                w_out,
-                                kh,
-                                kw,
-                                sh,
-                                sw,
-                                ph,
-                                pw,
-                                dh,
-                                dw_dil,
-                            );
+                                let dy_n_g_off = ni * dy_stride_n + g * dy_stride_g;
+                                let dw_g_off = g * dw_stride_g;
 
-                            let dy_n_g_off = ni * dy_stride_n + g * dy_stride_g;
-                            let dw_g_off = g * dw_stride_g;
-
-                            // dw_g += dy_n_g @ col^T
-                            //
-                            // Output shape m × n_out = c_out_per_g × (c_in_per_g·kh·kw).
-                            // dy_n_g is stored M×K row-major (lda = K = k_dim).
-                            // col is stored as N×K row-major; with trans_b=true,
-                            // sgemm_general uses ldb = K = k_dim and treats it as
-                            // transposed. β=1 accumulates across the batch loop.
-                            crate::blas::sgemm_general(
-                                dys.as_ptr().add(dy_n_g_off),
-                                col.as_ptr(),
-                                dws.as_mut_ptr().add(dw_g_off),
-                                m_dim,
-                                n_dim,
-                                k_dim,
-                                1.0,
-                                1.0,
-                                /*lda=*/ k_dim,
-                                /*ldb=*/ k_dim,
-                                /*ldc=*/ n_dim,
-                                /*trans_a=*/ false,
-                                /*trans_b=*/ true,
-                            );
+                                // dw_g += dy_n_g @ col^T
+                                //
+                                // Output shape m × n_out = c_out_per_g × (c_in_per_g·kh·kw).
+                                // dy_n_g is stored M×K row-major (lda = K = k_dim).
+                                // col is stored as N×K row-major; with trans_b=true,
+                                // sgemm_general uses ldb = K = k_dim and treats it as
+                                // transposed. β=1 accumulates across the batch loop.
+                                crate::blas::sgemm_general(
+                                    dys.as_ptr().add(dy_n_g_off),
+                                    col.as_ptr(),
+                                    dws.as_mut_ptr().add(dw_g_off),
+                                    m_dim,
+                                    n_dim,
+                                    k_dim,
+                                    1.0,
+                                    1.0,
+                                    /*lda=*/ k_dim,
+                                    /*ldb=*/ k_dim,
+                                    /*ldc=*/ n_dim,
+                                    /*trans_a=*/ false,
+                                    /*trans_b=*/ true,
+                                );
+                            }
                         }
                     }
                 }
@@ -14044,6 +15813,44 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     crate::im2col::im2col_rows_layout(
                         xs, cols, n, c_in, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw, dh, dw_dil,
                     );
+                }
+            }
+
+            Thunk::SoftmaxCrossEntropyDense {
+                logits,
+                targets,
+                dst,
+                n,
+                c,
+            } => {
+                let n = *n as usize;
+                let c = *c as usize;
+                unsafe {
+                    let lg = sl(*logits, base, n * c);
+                    let tg = sl(*targets, base, n * c);
+                    let out = sl_mut(*dst, base, n);
+                    for ni in 0..n {
+                        let row = &lg[ni * c..(ni + 1) * c];
+                        let trow = &tg[ni * c..(ni + 1) * c];
+                        // log-sum-exp: max-subtract for stability.
+                        let mut m = f32::NEG_INFINITY;
+                        for &v in row {
+                            if v > m {
+                                m = v;
+                            }
+                        }
+                        let mut sum = 0f32;
+                        for &v in row {
+                            sum += (v - m).exp();
+                        }
+                        let lse = m + sum.ln();
+                        // loss = lse - Σ_c targets[c]·logits[c].
+                        let mut dot = 0f32;
+                        for k in 0..c {
+                            dot += trow[k] * row[k];
+                        }
+                        out[ni] = lse - dot;
+                    }
                 }
             }
 
@@ -14260,19 +16067,124 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     } else {
                         let inp = sl(*src, base, in_total);
                         let out = sl_mut(*dst, base, total);
-                        let mut idx = vec![0usize; rank];
-                        for o in 0..total {
-                            let mut src_idx = 0usize;
-                            for d in 0..rank {
-                                src_idx += idx[d] * in_strides[d] as usize;
-                            }
-                            out[o] = inp[broadcast_src_index(src_idx, in_total)];
-                            for d in (0..rank).rev() {
-                                idx[d] += 1;
-                                if idx[d] < out_dims[d] as usize {
-                                    break;
+                        if rank == 4
+                            && in_strides[0] == 0
+                            && in_strides[2] == 0
+                            && in_strides[3] == 0
+                            && in_strides[1] != 0
+                        {
+                            // Per-channel broadcast out[n,c,h,w] = in[c*sc] — how
+                            // a conv bias `[C]` reaches `[N,C,H,W]` (and its
+                            // recompute in the backward graph). Fill each (n,c)
+                            // plane with its scalar instead of an N-D index walk
+                            // over every element; parallel over the channel-batch.
+                            let d1 = out_dims[1] as usize;
+                            let sc = in_strides[1] as usize;
+                            let plane = (out_dims[2] as usize) * (out_dims[3] as usize);
+                            let nc_total = (out_dims[0] as usize) * d1;
+                            let out_addr = out.as_mut_ptr() as usize;
+                            let fill = |nc0: usize, nc1: usize| {
+                                let op = out_addr as *mut f32;
+                                for nc in nc0..nc1 {
+                                    let v = inp[(nc % d1) * sc];
+                                    let base_off = nc * plane;
+                                    for k in 0..plane {
+                                        *op.add(base_off + k) = v;
+                                    }
                                 }
-                                idx[d] = 0;
+                            };
+                            if fast_conv_enabled() && crate::pool::should_parallelize(total) {
+                                crate::pool::par_for(
+                                    nc_total,
+                                    crate::pool::outer_chunk(nc_total),
+                                    &|off, cnt| fill(off, off + cnt),
+                                );
+                            } else {
+                                fill(0, nc_total);
+                            }
+                        } else if rank == 2 && in_strides[0] != 0 && in_strides[1] != 0 {
+                            // Fast 2D transpose (the common matmul-backward case:
+                            // xᵀ, wᵀ). out[i,j] = in[i*s0 + j*s1]; tiled over
+                            // columns for write-locality, parallel over rows. Far
+                            // cheaper than the general per-element index walk.
+                            let d0 = out_dims[0] as usize;
+                            let d1 = out_dims[1] as usize;
+                            let s0 = in_strides[0] as usize;
+                            let s1 = in_strides[1] as usize;
+                            let out_addr = out.as_mut_ptr() as usize;
+                            let tile = |i0: usize, i1: usize| {
+                                let op = out_addr as *mut f32;
+                                const T: usize = 32;
+                                let mut j0 = 0;
+                                while j0 < d1 {
+                                    let j1 = (j0 + T).min(d1);
+                                    for i in i0..i1 {
+                                        let inb = i * s0;
+                                        let outb = i * d1;
+                                        for j in j0..j1 {
+                                            *op.add(outb + j) = inp[inb + j * s1];
+                                        }
+                                    }
+                                    j0 = j1;
+                                }
+                            };
+                            if fast_conv_enabled() && crate::pool::should_parallelize(total) {
+                                crate::pool::par_for(
+                                    d0,
+                                    crate::pool::outer_chunk(d0),
+                                    &|off, cnt| tile(off, off + cnt),
+                                );
+                            } else {
+                                tile(0, d0);
+                            }
+                        } else if fast_conv_enabled() && crate::pool::should_parallelize(total) {
+                            // Parallel: each chunk seeds its starting multi-index
+                            // from `off`, then walks incrementally. Output writes
+                            // are disjoint per `o`.
+                            let out_addr = out.as_mut_ptr() as usize;
+                            crate::pool::par_for(
+                                total,
+                                crate::pool::chunk_floor(total),
+                                &|off, cnt| {
+                                    let mut idx = vec![0usize; rank];
+                                    let mut rem = off;
+                                    for d in (0..rank).rev() {
+                                        let dim = out_dims[d] as usize;
+                                        idx[d] = rem % dim;
+                                        rem /= dim;
+                                    }
+                                    for o in off..off + cnt {
+                                        let mut src_idx = 0usize;
+                                        for d in 0..rank {
+                                            src_idx += idx[d] * in_strides[d] as usize;
+                                        }
+                                        let v = inp[broadcast_src_index(src_idx, in_total)];
+                                        *((out_addr as *mut f32).add(o)) = v;
+                                        for d in (0..rank).rev() {
+                                            idx[d] += 1;
+                                            if idx[d] < out_dims[d] as usize {
+                                                break;
+                                            }
+                                            idx[d] = 0;
+                                        }
+                                    }
+                                },
+                            );
+                        } else {
+                            let mut idx = vec![0usize; rank];
+                            for o in 0..total {
+                                let mut src_idx = 0usize;
+                                for d in 0..rank {
+                                    src_idx += idx[d] * in_strides[d] as usize;
+                                }
+                                out[o] = inp[broadcast_src_index(src_idx, in_total)];
+                                for d in (0..rank).rev() {
+                                    idx[d] += 1;
+                                    if idx[d] < out_dims[d] as usize {
+                                        break;
+                                    }
+                                    idx[d] = 0;
+                                }
                             }
                         }
                     }
@@ -14295,6 +16207,45 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     dispatch_custom_op(
                         &**kernel, inputs, *out_off, *out_len, out_shape, attrs, base,
                     );
+                }
+            }
+
+            Thunk::Reverse {
+                src,
+                dst,
+                dims,
+                rev_mask,
+                elem_bytes,
+            } => {
+                let eb = *elem_bytes as usize;
+                let rank = dims.len();
+                let total: usize = dims.iter().map(|&d| d as usize).product::<usize>().max(1);
+                let mut strides = vec![1usize; rank];
+                for i in (0..rank.saturating_sub(1)).rev() {
+                    strides[i] = strides[i + 1] * dims[i + 1] as usize;
+                }
+                unsafe {
+                    let src_base = base.add(*src);
+                    let dst_base = base.add(*dst);
+                    for o in 0..total {
+                        let mut rem = o;
+                        let mut in_flat = 0usize;
+                        for ax in 0..rank {
+                            let idx = rem / strides[ax];
+                            rem %= strides[ax];
+                            let in_idx = if rev_mask[ax] {
+                                dims[ax] as usize - 1 - idx
+                            } else {
+                                idx
+                            };
+                            in_flat += in_idx * strides[ax];
+                        }
+                        std::ptr::copy_nonoverlapping(
+                            src_base.add(in_flat * eb),
+                            dst_base.add(o * eb),
+                            eb,
+                        );
+                    }
                 }
             }
         }
@@ -14521,13 +16472,12 @@ unsafe fn cgemm_c64(
     n: usize,
     base: *mut u8,
 ) {
-    use rayon::prelude::*;
     let bptr = base as usize;
     unsafe {
         let a = std::slice::from_raw_parts((bptr + a_off) as *const f32, 2 * m * k);
         let b = std::slice::from_raw_parts((bptr + b_off) as *const f32, 2 * k * n);
         let c_base = bptr + c_off;
-        (0..m).into_par_iter().for_each(|i| {
+        crate::pool::par_range(m, |i| {
             let crow = std::slice::from_raw_parts_mut((c_base + i * n * 8) as *mut f32, 2 * n);
             for j in 0..n {
                 let mut re = 0f32;
@@ -14572,8 +16522,6 @@ pub unsafe fn execute_lstm_f32(
     carry: bool,
     base: *mut u8,
 ) {
-    use rayon::prelude::*;
-
     #[inline]
     fn sigmoid(z: f32) -> f32 {
         1.0 / (1.0 + (-z).exp())
@@ -14610,7 +16558,7 @@ pub unsafe fn execute_lstm_f32(
                 let h0p = bptr + h0 + ld * batch * hidden * 4;
                 let c0p = bptr + c0 + ld * batch * hidden * 4;
 
-                (0..batch).into_par_iter().for_each(|b| {
+                crate::pool::par_range(batch, |b| {
                     let lo = lo_ptr as *mut f32;
                     let mut h = vec![0f32; hidden];
                     let mut c = vec![0f32; hidden];
@@ -14682,8 +16630,446 @@ pub unsafe fn execute_lstm_f32(
     }
 }
 
+/// Reference / host-fallback for `Op::Gru` (PyTorch GRU; gate order r, z, n;
+/// multi-layer / bidirectional / carry). Separate `b_ih`/`b_hh` because the
+/// reset gate is applied to the hidden term *after* its bias:
+/// `n = tanh(x·W_inᵀ+b_in + r ⊙ (h·W_hnᵀ+b_hn))`,
+/// `h' = (1-z)⊙n + z⊙h`. Packing mirrors `Op::Lstm` with `3*hidden` gate rows.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_gru_f32(
+    x: usize,
+    w_ih: usize,
+    w_hh: usize,
+    b_ih: usize,
+    b_hh: usize,
+    h0: usize,
+    dst: usize,
+    batch: usize,
+    seq: usize,
+    input_size: usize,
+    hidden: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    carry: bool,
+    base: *mut u8,
+) {
+    #[inline]
+    fn sigmoid(z: f32) -> f32 {
+        1.0 / (1.0 + (-z).exp())
+    }
+
+    let bptr = base as usize;
+    let three_h = 3 * hidden;
+    let dirs = if bidirectional { 2 } else { 1 };
+
+    unsafe {
+        let f32s = |off: usize, n: usize| -> &[f32] {
+            std::slice::from_raw_parts((bptr + off) as *const f32, n)
+        };
+
+        let mut layer_in: Vec<f32> = f32s(x, batch * seq * input_size).to_vec();
+        let mut in_l = input_size;
+        let mut wih_cursor = 0usize;
+
+        for l in 0..num_layers {
+            let out_width = dirs * hidden;
+            let mut layer_out = vec![0f32; batch * seq * out_width];
+            let lo_ptr = layer_out.as_mut_ptr() as usize;
+            let li_ref: &[f32] = &layer_in;
+            let wih_block = three_h * in_l;
+
+            for dir in 0..dirs {
+                let ld = l * dirs + dir;
+                let wih = f32s((w_ih / 4 + wih_cursor + dir * wih_block) * 4, wih_block);
+                let whh = f32s(w_hh + ld * three_h * hidden * 4, three_h * hidden);
+                let bih = f32s(b_ih + ld * three_h * 4, three_h);
+                let bhh = f32s(b_hh + ld * three_h * 4, three_h);
+                let h0p = bptr + h0 + ld * batch * hidden * 4;
+
+                crate::pool::par_range(batch, |b| {
+                    let lo = lo_ptr as *mut f32;
+                    let mut h = vec![0f32; hidden];
+                    if carry {
+                        let hin = std::slice::from_raw_parts(
+                            (h0p + b * hidden * 4) as *const f32,
+                            hidden,
+                        );
+                        h.copy_from_slice(hin);
+                    }
+                    let mut xi = vec![0f32; three_h]; // x·W_ihᵀ + b_ih
+                    let mut hi = vec![0f32; three_h]; // h·W_hhᵀ + b_hh
+                    for step in 0..seq {
+                        let t = if dir == 0 { step } else { seq - 1 - step };
+                        let x_t = &li_ref[(b * seq + t) * in_l..(b * seq + t + 1) * in_l];
+                        for r in 0..three_h {
+                            let wr = &wih[r * in_l..(r + 1) * in_l];
+                            let mut a = bih[r];
+                            for j in 0..in_l {
+                                a += wr[j] * x_t[j];
+                            }
+                            xi[r] = a;
+                            let hr = &whh[r * hidden..(r + 1) * hidden];
+                            let mut bb = bhh[r];
+                            for (j, &hj) in h.iter().enumerate() {
+                                bb += hr[j] * hj;
+                            }
+                            hi[r] = bb;
+                        }
+                        for k in 0..hidden {
+                            let rg = sigmoid(xi[k] + hi[k]);
+                            let zg = sigmoid(xi[hidden + k] + hi[hidden + k]);
+                            // Reset applied to hidden term after its bias.
+                            let ng = (xi[2 * hidden + k] + rg * hi[2 * hidden + k]).tanh();
+                            let h_new = (1.0 - zg) * ng + zg * h[k];
+                            h[k] = h_new;
+                            *lo.add((b * seq + t) * out_width + dir * hidden + k) = h_new;
+                        }
+                    }
+                    if carry {
+                        let hout = std::slice::from_raw_parts_mut(
+                            (h0p + b * hidden * 4) as *mut f32,
+                            hidden,
+                        );
+                        hout.copy_from_slice(&h);
+                    }
+                });
+            }
+
+            wih_cursor += dirs * wih_block;
+            layer_in = layer_out;
+            in_l = out_width;
+        }
+
+        let dst_slice = std::slice::from_raw_parts_mut((bptr + dst) as *mut f32, layer_in.len());
+        dst_slice.copy_from_slice(&layer_in);
+    }
+}
+
+/// Reference / host-fallback for `Op::Rnn` (Elman; `act = relu` when `relu`
+/// else `tanh`; multi-layer / bidirectional / carry). Single merged bias.
+/// `h' = act(x·W_ihᵀ + h·W_hhᵀ + bias)`. Packing mirrors `Op::Lstm` with
+/// `hidden` gate rows.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_rnn_f32(
+    x: usize,
+    w_ih: usize,
+    w_hh: usize,
+    bias: usize,
+    h0: usize,
+    dst: usize,
+    batch: usize,
+    seq: usize,
+    input_size: usize,
+    hidden: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    carry: bool,
+    relu: bool,
+    base: *mut u8,
+) {
+    let bptr = base as usize;
+    let dirs = if bidirectional { 2 } else { 1 };
+
+    unsafe {
+        let f32s = |off: usize, n: usize| -> &[f32] {
+            std::slice::from_raw_parts((bptr + off) as *const f32, n)
+        };
+
+        let mut layer_in: Vec<f32> = f32s(x, batch * seq * input_size).to_vec();
+        let mut in_l = input_size;
+        let mut wih_cursor = 0usize;
+
+        for l in 0..num_layers {
+            let out_width = dirs * hidden;
+            let mut layer_out = vec![0f32; batch * seq * out_width];
+            let lo_ptr = layer_out.as_mut_ptr() as usize;
+            let li_ref: &[f32] = &layer_in;
+            let wih_block = hidden * in_l;
+
+            for dir in 0..dirs {
+                let ld = l * dirs + dir;
+                let wih = f32s((w_ih / 4 + wih_cursor + dir * wih_block) * 4, wih_block);
+                let whh = f32s(w_hh + ld * hidden * hidden * 4, hidden * hidden);
+                let bs = f32s(bias + ld * hidden * 4, hidden);
+                let h0p = bptr + h0 + ld * batch * hidden * 4;
+
+                crate::pool::par_range(batch, |b| {
+                    let lo = lo_ptr as *mut f32;
+                    let mut h = vec![0f32; hidden];
+                    if carry {
+                        let hin = std::slice::from_raw_parts(
+                            (h0p + b * hidden * 4) as *const f32,
+                            hidden,
+                        );
+                        h.copy_from_slice(hin);
+                    }
+                    for step in 0..seq {
+                        let t = if dir == 0 { step } else { seq - 1 - step };
+                        let x_t = &li_ref[(b * seq + t) * in_l..(b * seq + t + 1) * in_l];
+                        let mut h_new = vec![0f32; hidden];
+                        for k in 0..hidden {
+                            let wr = &wih[k * in_l..(k + 1) * in_l];
+                            let mut acc = bs[k];
+                            for j in 0..in_l {
+                                acc += wr[j] * x_t[j];
+                            }
+                            let hr = &whh[k * hidden..(k + 1) * hidden];
+                            for (j, &hj) in h.iter().enumerate() {
+                                acc += hr[j] * hj;
+                            }
+                            h_new[k] = if relu { acc.max(0.0) } else { acc.tanh() };
+                        }
+                        for k in 0..hidden {
+                            h[k] = h_new[k];
+                            *lo.add((b * seq + t) * out_width + dir * hidden + k) = h_new[k];
+                        }
+                    }
+                    if carry {
+                        let hout = std::slice::from_raw_parts_mut(
+                            (h0p + b * hidden * 4) as *mut f32,
+                            hidden,
+                        );
+                        hout.copy_from_slice(&h);
+                    }
+                });
+            }
+
+            wih_cursor += dirs * wih_block;
+            layer_in = layer_out;
+            in_l = out_width;
+        }
+
+        let dst_slice = std::slice::from_raw_parts_mut((bptr + dst) as *mut f32, layer_in.len());
+        dst_slice.copy_from_slice(&layer_in);
+    }
+}
+
+/// Reference for `Op::ArgMax`/`Op::ArgMin` (f32-encoded indices, first-hit
+/// tie-break). Reduces the middle `reduced` axis: input is logically
+/// `[outer, reduced, inner]`, output `[outer, inner]`. Shared by the CPU thunk
+/// and the Metal/WGPU host paths.
+pub unsafe fn execute_argreduce_f32(
+    src: usize,
+    dst: usize,
+    outer: usize,
+    reduced: usize,
+    inner: usize,
+    is_max: bool,
+    base: *mut u8,
+) {
+    let bptr = base as usize;
+    unsafe {
+        let inp = std::slice::from_raw_parts((bptr + src) as *const f32, outer * reduced * inner);
+        let out = std::slice::from_raw_parts_mut((bptr + dst) as *mut f32, outer * inner);
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut best = inp[o * reduced * inner + i];
+                let mut best_idx = 0usize;
+                for r in 1..reduced {
+                    let v = inp[o * reduced * inner + r * inner + i];
+                    let better = if is_max { v > best } else { v < best };
+                    if better {
+                        best = v;
+                        best_idx = r;
+                    }
+                }
+                out[o * inner + i] = best_idx as f32;
+            }
+        }
+    }
+}
+
+/// Reference for `Op::Mamba2` — SSD scalar-decay SSM scan. Inputs (f32):
+/// `x [B,S,H,P]`, `dt [B,S,H]`, `a [H]`, `b/c [B,S,H,N]`. Per `(batch, head)`
+/// the state `S[P,N]` is zero-init: `dA=exp(dt·a)`, `S=dA·S + (dt·x)⊗b`,
+/// `y=Σ_n S[:,n]·c[n]`. Output `[B,S,H,P]`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_mamba2_f32(
+    x: usize,
+    dt: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    dst: usize,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    state_size: usize,
+    base: *mut u8,
+) {
+    let (bn, s, h, p, n) = (batch, seq, heads, head_dim, state_size);
+    let bptr = base as usize;
+    unsafe {
+        let f32s = |off: usize, len: usize| -> &[f32] {
+            std::slice::from_raw_parts((bptr + off) as *const f32, len)
+        };
+        let xs = f32s(x, bn * s * h * p);
+        let dts = f32s(dt, bn * s * h);
+        let am = f32s(a, h);
+        let bm = f32s(b, bn * s * h * n);
+        let cm = f32s(c, bn * s * h * n);
+        let out_ptr = bptr + dst;
+
+        // Independent per (batch, head).
+        crate::pool::par_range(bn * h, |bh| {
+            let bi = bh / h;
+            let hi = bh % h;
+            let out = out_ptr as *mut f32;
+            let mut state = vec![0f32; p * n];
+            for t in 0..s {
+                let dt_t = dts[(bi * s + t) * h + hi];
+                let da = (dt_t * am[hi]).exp();
+                let x_off = ((bi * s + t) * h + hi) * p;
+                let bc_off = ((bi * s + t) * h + hi) * n;
+                for pi in 0..p {
+                    let dtx = dt_t * xs[x_off + pi];
+                    for ni in 0..n {
+                        state[pi * n + ni] = da * state[pi * n + ni] + dtx * bm[bc_off + ni];
+                    }
+                }
+                for pi in 0..p {
+                    let mut acc = 0f32;
+                    for ni in 0..n {
+                        acc += state[pi * n + ni] * cm[bc_off + ni];
+                    }
+                    *out.add(x_off + pi) = acc;
+                }
+            }
+        });
+    }
+}
+
 /// Host-fallback entry for `Op::GatedDeltaNet` (Metal / unified memory).
 /// When `state == 0`, uses a zero-initialized scratch state per batch item.
+/// Batch-general reverse/flip (dtype-agnostic, byte-copy). Shared by the CPU
+/// `Thunk::Reverse` arm and the Metal/WGPU host paths. `dims` is the row-major
+/// input shape; `rev_mask[a]` flips axis `a`. `src`/`dst` are byte offsets.
+pub unsafe fn execute_reverse(
+    src: usize,
+    dst: usize,
+    dims: &[u32],
+    rev_mask: &[bool],
+    elem_bytes: usize,
+    base: *mut u8,
+) {
+    let rank = dims.len();
+    let total: usize = dims.iter().map(|&d| d as usize).product::<usize>().max(1);
+    let mut strides = vec![1usize; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * dims[i + 1] as usize;
+    }
+    unsafe {
+        let src_base = base.add(src);
+        let dst_base = base.add(dst);
+        for o in 0..total {
+            let mut rem = o;
+            let mut in_flat = 0usize;
+            for ax in 0..rank {
+                let idx = rem / strides[ax];
+                rem %= strides[ax];
+                let in_idx = if rev_mask[ax] {
+                    dims[ax] as usize - 1 - idx
+                } else {
+                    idx
+                };
+                in_flat += in_idx * strides[ax];
+            }
+            std::ptr::copy_nonoverlapping(
+                src_base.add(in_flat * elem_bytes),
+                dst_base.add(o * elem_bytes),
+                elem_bytes,
+            );
+        }
+    }
+}
+
+/// Token-sampling reference. Shared by the CPU `Thunk::Sample` arm and the
+/// Metal unified-memory host fallback. `logits` is `[batch, vocab]` f32;
+/// writes one f32-encoded index per batch row to `dst`. With a fixed `seed`
+/// (and same top_k/top_p/temperature) the result is deterministic.
+pub unsafe fn execute_sample_f32(
+    logits: usize,
+    dst: usize,
+    batch: usize,
+    vocab: usize,
+    top_k: usize,
+    top_p: f32,
+    temperature: f32,
+    seed: u64,
+    base: *mut u8,
+) {
+    let (b, v) = (batch, vocab);
+    let k = top_k.min(v);
+    unsafe {
+        let lg = sl(logits, base, b * v);
+        let out = sl_mut(dst, base, b);
+        let mut rng = rlx_ir::Philox4x32::new(if seed == 0 { 0xDEADBEEF } else { seed });
+        for bi in 0..b {
+            let row = &lg[bi * v..(bi + 1) * v];
+            out[bi] = sample_row(row, k, top_p, temperature, &mut rng) as f32;
+        }
+    }
+}
+
+/// Mamba selective-scan reference (f32). Shared by the CPU `Thunk::SelectiveScan`
+/// arm and the Metal unified-memory host fallback. `base` is the arena byte
+/// pointer; the five inputs (`x`, `delta`, `a`, `b`, `c`) and `dst` are byte
+/// offsets into it. Recurrence per `(batch, seq, channel, state)`:
+/// `h[t] = exp(Δ·A)·h[t-1] + Δ·B·x;  y = Σ_n C·h`. State resets per batch row.
+pub unsafe fn execute_selective_scan_f32(
+    x: usize,
+    delta: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    dst: usize,
+    batch: usize,
+    seq: usize,
+    hidden: usize,
+    state_size: usize,
+    base: *mut u8,
+) {
+    let (bn, s, h, n) = (batch, seq, hidden, state_size);
+    unsafe {
+        let xs = sl(x, base, bn * s * h);
+        let dt = sl(delta, base, bn * s * h);
+        let am = sl(a, base, h * n);
+        let bm = sl(b, base, bn * s * n);
+        let cm = sl(c, base, bn * s * n);
+        let out = sl_mut(dst, base, bn * s * h);
+
+        // State buffer per-batch: h channels × n state. Sequential along
+        // the seq dimension; reset at the start of each batch row.
+        let mut state = vec![0f32; h * n];
+        for bi in 0..bn {
+            for v in state.iter_mut() {
+                *v = 0.0;
+            }
+            for si in 0..s {
+                let x_row = &xs[bi * s * h + si * h..bi * s * h + (si + 1) * h];
+                let dt_row = &dt[bi * s * h + si * h..bi * s * h + (si + 1) * h];
+                let b_row = &bm[bi * s * n + si * n..bi * s * n + (si + 1) * n];
+                let c_row = &cm[bi * s * n + si * n..bi * s * n + (si + 1) * n];
+                let out_row = &mut out[bi * s * h + si * h..bi * s * h + (si + 1) * h];
+
+                for ci in 0..h {
+                    let d = dt_row[ci];
+                    let xv = x_row[ci];
+                    let mut acc = 0f32;
+                    for ni in 0..n {
+                        // Discretize: exp(d * a) and d * b.
+                        let da = (d * am[ci * n + ni]).exp();
+                        state[ci * n + ni] = da * state[ci * n + ni] + d * b_row[ni] * xv;
+                        acc += c_row[ni] * state[ci * n + ni];
+                    }
+                    out_row[ci] = acc;
+                }
+            }
+        }
+    }
+}
+
 pub unsafe fn execute_gated_delta_net_f32(
     q: usize,
     k: usize,
@@ -14698,8 +17084,6 @@ pub unsafe fn execute_gated_delta_net_f32(
     state_size: usize,
     base: *mut u8,
 ) {
-    use rayon::prelude::*;
-
     #[derive(Copy, Clone)]
     struct ArenaPtr(usize);
     unsafe impl Send for ArenaPtr {}
@@ -14758,7 +17142,7 @@ pub unsafe fn execute_gated_delta_net_f32(
         // better occupancy than head-outer when prompt length dominates.
         if !use_external && s > 1 {
             for bi in 0..b {
-                (0..h).into_par_iter().for_each(|hi| {
+                crate::pool::par_range(h, |hi| {
                     let mut sk_buf = [0f32; crate::gdn::GDN_MAX_STATE];
                     let sk = &mut sk_buf[..n];
                     let mut local_state =
@@ -14773,7 +17157,7 @@ pub unsafe fn execute_gated_delta_net_f32(
 
         if use_external {
             let state_bytes = state;
-            (0..b * h).into_par_iter().for_each(|bhi| {
+            crate::pool::par_range(b * h, |bhi| {
                 let bi = bhi / h;
                 let hi = bhi % h;
                 let elem_off = bi * h * n * n + hi * n * n;
@@ -14788,13 +17172,27 @@ pub unsafe fn execute_gated_delta_net_f32(
         } else {
             for bi in 0..b {
                 owned_state.fill(0.0);
-                owned_state
-                    .par_chunks_mut(n * n)
-                    .enumerate()
-                    .for_each(|(hi, s_mat)| {
-                        let mut sk_buf = [0f32; crate::gdn::GDN_MAX_STATE];
-                        run_head(bi, hi, s_mat, &mut sk_buf[..n]);
-                    });
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    use rayon::prelude::*;
+                    owned_state
+                        .par_chunks_mut(n * n)
+                        .enumerate()
+                        .for_each(|(hi, s_mat)| {
+                            let mut sk_buf = [0f32; crate::gdn::GDN_MAX_STATE];
+                            run_head(bi, hi, s_mat, &mut sk_buf[..n]);
+                        });
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    owned_state
+                        .chunks_mut(n * n)
+                        .enumerate()
+                        .for_each(|(hi, s_mat)| {
+                            let mut sk_buf = [0f32; crate::gdn::GDN_MAX_STATE];
+                            run_head(bi, hi, s_mat, &mut sk_buf[..n]);
+                        });
+                }
             }
         }
     }
@@ -14976,9 +17374,35 @@ pub unsafe fn execute_maxpool2d_backward_f32(
     let xs = sl(x, base, n * c * h * w);
     let dys = sl(dy, base, n * c * h_out * w_out);
     let dxs = sl_mut(dx, base, n * c * h * w);
-    crate::training_bwd::maxpool2d_backward_nchw(
-        xs, dys, dxs, n, c, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw,
-    );
+    // Each (n, c) plane is independent — under RLX_FAST_CONV, fan the existing
+    // per-plane kernel out over the channel-batch (disjoint dx windows).
+    if fast_conv_enabled() && crate::pool::should_parallelize(n * c * h * w) {
+        let (in_plane, out_plane) = (h * w, h_out * w_out);
+        let x_addr = xs.as_ptr() as usize;
+        let dy_addr = dys.as_ptr() as usize;
+        let dx_addr = dxs.as_mut_ptr() as usize;
+        crate::pool::par_for(n * c, crate::pool::outer_chunk(n * c), &|off, cnt| {
+            for nc in off..off + cnt {
+                let xp =
+                    std::slice::from_raw_parts((x_addr as *const f32).add(nc * in_plane), in_plane);
+                let dyp = std::slice::from_raw_parts(
+                    (dy_addr as *const f32).add(nc * out_plane),
+                    out_plane,
+                );
+                let dxp = std::slice::from_raw_parts_mut(
+                    (dx_addr as *mut f32).add(nc * in_plane),
+                    in_plane,
+                );
+                crate::training_bwd::maxpool2d_backward_nchw(
+                    xp, dyp, dxp, 1, 1, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw,
+                );
+            }
+        });
+    } else {
+        crate::training_bwd::maxpool2d_backward_nchw(
+            xs, dys, dxs, n, c, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw,
+        );
+    }
 }
 
 pub unsafe fn execute_rope_backward_f32(
@@ -15236,6 +17660,136 @@ pub unsafe fn execute_dequant_matmul_nvfp4_f32(
         let gs = sl(global_scale, base, 1)[0];
         let out = sl_mut(dst, base, m * n);
         dequant_matmul_nvfp4(xs, w_bytes, scale_bytes, gs, out, m, k, n);
+    }
+}
+
+// ── Native low-precision ScaledMatMul host fallbacks (unified-memory) ──
+// Reuse the CPU oracle kernels so Metal (no FP8 matrix HW) runs the exact same
+// decode-and-accumulate reference. TN layout: lhs [m,k], rhs [n,k].
+
+/// Host fallback for `Op::ScaledQuantScale`. Byte offsets into `base`.
+pub unsafe fn execute_scaled_quant_scale_f32(
+    x: usize,
+    dst: usize,
+    rows: usize,
+    cols: usize,
+    fmt: rlx_ir::ScaledFormat,
+    layout: rlx_ir::ScaleLayout,
+    base: *mut u8,
+) {
+    unsafe {
+        let xs = sl(x, base, rows * cols);
+        let scales = lowp_compute_scales(xs, fmt, layout, rows, cols);
+        let nblk = lowp_nblk(cols, layout);
+        match layout {
+            rlx_ir::ScaleLayout::PerTensor => {
+                sl_mut(dst, base, 1)[0] = scales[0];
+            }
+            rlx_ir::ScaleLayout::BlockMxE8M0 { .. } => {
+                let out = std::slice::from_raw_parts_mut(base.add(dst), rows * nblk);
+                for (o, &s) in out.iter_mut().zip(&scales) {
+                    *o = rlx_ir::lowp_codec::f32_to_e8m0(s);
+                }
+            }
+            rlx_ir::ScaleLayout::Nvfp4 { .. } => {
+                let out = std::slice::from_raw_parts_mut(base.add(dst), rows * nblk);
+                for (o, &s) in out.iter_mut().zip(&scales) {
+                    *o = rlx_ir::lowp_codec::encode(rlx_ir::ScaledFormat::F8E4M3, s);
+                }
+            }
+        }
+    }
+}
+
+/// Host fallback for `Op::ScaledQuantize`. Byte offsets into `base`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_scaled_quantize_f32(
+    x: usize,
+    scale: usize,
+    dst: usize,
+    rows: usize,
+    cols: usize,
+    fmt: rlx_ir::ScaledFormat,
+    layout: rlx_ir::ScaleLayout,
+    base: *mut u8,
+) {
+    unsafe {
+        let xs = sl(x, base, rows * cols);
+        let nblk = lowp_nblk(cols, layout);
+        let n_scale = if matches!(layout, rlx_ir::ScaleLayout::PerTensor) {
+            1
+        } else {
+            rows * nblk
+        };
+        let scales = lowp_read_scales(layout, base, scale, n_scale);
+        let out = std::slice::from_raw_parts_mut(base.add(dst), rows * cols);
+        lowp_quantize(xs, &scales, fmt, layout, rows, cols, out);
+    }
+}
+
+/// Host fallback for `Op::ScaledDequantize` — packed codes (`U8`) → f32, the
+/// inverse of [`execute_scaled_quantize_f32`]. Byte offsets into `base`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_scaled_dequantize_f32(
+    codes: usize,
+    scale: usize,
+    dst: usize,
+    rows: usize,
+    cols: usize,
+    fmt: rlx_ir::ScaledFormat,
+    layout: rlx_ir::ScaleLayout,
+    base: *mut u8,
+) {
+    unsafe {
+        let nblk = lowp_nblk(cols, layout);
+        let n_scale = if matches!(layout, rlx_ir::ScaleLayout::PerTensor) {
+            1
+        } else {
+            rows * nblk
+        };
+        let cs = std::slice::from_raw_parts(base.add(codes), rows * cols);
+        let scales = lowp_read_scales(layout, base, scale, n_scale);
+        let out = std::slice::from_raw_parts_mut(base.add(dst) as *mut f32, rows * cols);
+        lowp_dequantize(cs, &scales, fmt, layout, rows, cols, out);
+    }
+}
+
+/// Host fallback for `Op::ScaledMatMul` (TN). Byte offsets into `base`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_scaled_matmul_f32(
+    lhs: usize,
+    rhs: usize,
+    lhs_scale: usize,
+    rhs_scale: usize,
+    bias: usize,
+    dst: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    has_bias: bool,
+    lhs_fmt: rlx_ir::ScaledFormat,
+    rhs_fmt: rlx_ir::ScaledFormat,
+    layout: rlx_ir::ScaleLayout,
+    base: *mut u8,
+) {
+    unsafe {
+        let lhs_b = std::slice::from_raw_parts(base.add(lhs), m * k);
+        let rhs_b = std::slice::from_raw_parts(base.add(rhs), n * k);
+        let nblk = lowp_nblk(k, layout);
+        let per_tensor = matches!(layout, rlx_ir::ScaleLayout::PerTensor);
+        let n_l = if per_tensor { 1 } else { m * nblk };
+        let n_r = if per_tensor { 1 } else { n * nblk };
+        let ls = lowp_read_scales(layout, base, lhs_scale, n_l);
+        let rs = lowp_read_scales(layout, base, rhs_scale, n_r);
+        let bias_s = if has_bias {
+            Some(sl(bias, base, n))
+        } else {
+            None
+        };
+        let out = sl_mut(dst, base, m * n);
+        lowp_scaled_matmul(
+            lhs_b, rhs_b, &ls, &rs, bias_s, out, m, n, k, layout, lhs_fmt, rhs_fmt,
+        );
     }
 }
 
@@ -16297,11 +18851,134 @@ unsafe fn sl_mut_typed<T>(offset: usize, base: *mut u8, len: usize) -> &'static 
     unsafe { std::slice::from_raw_parts_mut(base.add(offset) as *mut T, len) }
 }
 
+/// Scalar activation for the fused-region interpreter. Matches the GPU region
+/// kernel's math (e.g. tanh-approx GELU) so CPU/GPU region results agree.
+#[inline]
+fn region_activation_scalar(act: rlx_ir::op::Activation, x: f32) -> f32 {
+    use rlx_ir::op::Activation as A;
+    const GC: f32 = 0.797_884_6; // sqrt(2/pi)
+    match act {
+        A::Relu => x.max(0.0),
+        A::Gelu | A::GeluApprox => 0.5 * x * (1.0 + (GC * (x + 0.044715 * x * x * x)).tanh()),
+        A::Silu => x / (1.0 + (-x).exp()),
+        A::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+        A::Tanh => x.tanh(),
+        A::Exp => x.exp(),
+        A::Log => x.ln(),
+        A::Sqrt => x.sqrt(),
+        A::Rsqrt => 1.0 / x.sqrt(),
+        A::Neg => -x,
+        A::Abs => x.abs(),
+        A::Sin => x.sin(),
+        A::Cos => x.cos(),
+        A::Tan => x.tan(),
+        A::Atan => x.atan(),
+        A::Round => x.round(),
+    }
+}
+
+#[inline]
+fn region_binary_scalar(op: rlx_ir::op::BinaryOp, l: f32, r: f32) -> f32 {
+    use rlx_ir::op::BinaryOp as B;
+    match op {
+        B::Add => l + r,
+        B::Sub => l - r,
+        B::Mul => l * r,
+        B::Div => l / r,
+        B::Max => l.max(r),
+        B::Min => l.min(r),
+        B::Pow => l.powf(r),
+    }
+}
+
+#[inline]
+fn region_compare_scalar(op: rlx_ir::op::CmpOp, l: f32, r: f32) -> bool {
+    use rlx_ir::op::CmpOp as C;
+    match op {
+        C::Eq => l == r,
+        C::Ne => l != r,
+        C::Lt => l < r,
+        C::Le => l <= r,
+        C::Gt => l > r,
+        C::Ge => l >= r,
+    }
+}
+
+/// Resolve one chain operand for output element `gid`: a previous step result
+/// (`scratch[s]`) or an external input read with broadcast (`input[gid % mod]`,
+/// scalar inputs read element 0). `base` is the arena byte base.
+#[inline]
+fn region_resolve_operand(
+    op: &rlx_ir::op::ChainOperand,
+    gid: usize,
+    base: *const u8,
+    input_offs: &[usize],
+    scalar_mask: u32,
+    modulus: &[u32; 16],
+    scratch: &[f32; 32],
+) -> f32 {
+    use rlx_ir::op::ChainOperand as O;
+    match op {
+        O::Step(s) => scratch[*s as usize],
+        O::Input(i) => {
+            let i = *i as usize;
+            let row = if (scalar_mask >> i) & 1 == 1 {
+                0
+            } else if modulus[i] != 0 {
+                gid % modulus[i] as usize
+            } else {
+                gid
+            };
+            unsafe { *(base.add(input_offs[i]) as *const f32).add(row) }
+        }
+    }
+}
+
+/// Evaluate a fused element-wise chain for output element `gid`, returning the
+/// final step's value (what gets written to `dst[gid]`).
+#[inline]
+fn region_eval_elem(
+    gid: usize,
+    base: *const u8,
+    input_offs: &[usize],
+    chain: &[rlx_ir::op::ChainStep],
+    scalar_mask: u32,
+    modulus: &[u32; 16],
+) -> f32 {
+    use rlx_ir::op::ChainStep as S;
+    let mut scratch = [0f32; 32];
+    let r = |o: &rlx_ir::op::ChainOperand, sc: &[f32; 32]| {
+        region_resolve_operand(o, gid, base, input_offs, scalar_mask, modulus, sc)
+    };
+    for (k, step) in chain.iter().enumerate() {
+        scratch[k] = match step {
+            S::Activation(a, x) => region_activation_scalar(*a, r(x, &scratch)),
+            S::Cast(_, x) => r(x, &scratch), // f32→f32 identity (chains are same-dtype)
+            S::Binary(op, l, rr) => region_binary_scalar(*op, r(l, &scratch), r(rr, &scratch)),
+            S::Compare(op, l, rr) => {
+                if region_compare_scalar(*op, r(l, &scratch), r(rr, &scratch)) {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            S::Where(c, t, f) => {
+                if r(c, &scratch) != 0.0 {
+                    r(t, &scratch)
+                } else {
+                    r(f, &scratch)
+                }
+            }
+        };
+    }
+    scratch[chain.len() - 1]
+}
+
 // Unsafe helpers to create slices from arena base + offset
-#[inline(always)]
 /// In-place per-element activation. Mirrors the dispatch in
 /// `Thunk::ActivationInPlace`. Used by `Thunk::FusedMmBiasAct` to
 /// apply the activation after `bias_add` for all non-Gelu cases.
+#[inline(always)]
 fn apply_activation_inplace(d: &mut [f32], act: rlx_ir::op::Activation) {
     use rlx_ir::op::Activation;
     match act {
@@ -16390,6 +19067,467 @@ fn apply_activation_inplace(d: &mut [f32], act: rlx_ir::op::Activation) {
 /// `col[(ci · kH · kW + ki · kW + kj) · n_dim + ho · W_out + wo] =
 ///    x[ci, ho·sh + ki·dh − ph, wo·sw + kj·dw_dil − pw]`
 #[allow(clippy::too_many_arguments)]
+/// Is the im2col+BLAS forward-conv kernel enabled? Read once from
+/// `RLX_FAST_CONV` (1/on/true/yes). When off (the default), forward conv
+/// runs the reference scalar loop. The flag is process-global so the two
+/// benchmark configurations ("fused"/optimized vs reference) are produced
+/// by separate process invocations — see the cortexm trainer.
+fn fast_conv_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FAST_CONV: OnceLock<bool> = OnceLock::new();
+    *FAST_CONV.get_or_init(|| {
+        matches!(
+            rlx_ir::env::var("RLX_FAST_CONV").as_deref(),
+            Some("1") | Some("on") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// Reference forward convolution: a direct scalar nested loop. Correct and
+/// dependency-free, but leaves the CPU idle (scalar, single-threaded, a
+/// bounds-check branch in the hot loop). Kept as the parity oracle for
+/// `conv2d_forward_im2col` and as the default kernel.
+#[allow(clippy::too_many_arguments)]
+fn conv2d_forward_naive(
+    inp: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c_in: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    h_out: usize,
+    w_out: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    dh: usize,
+    dw: usize,
+    groups: usize,
+) {
+    let c_in_per_g = c_in / groups;
+    let c_out_per_g = c_out / groups;
+    for ni in 0..n {
+        for co in 0..c_out {
+            let g = co / c_out_per_g;
+            let ci_start = g * c_in_per_g;
+            for ho in 0..h_out {
+                for wo in 0..w_out {
+                    let mut acc = 0f32;
+                    for ci_off in 0..c_in_per_g {
+                        let ci = ci_start + ci_off;
+                        let in_chan = ((ni * c_in) + ci) * h * w;
+                        let wt_chan = ((co * c_in_per_g) + ci_off) * kh * kw;
+                        for ki in 0..kh {
+                            for kj in 0..kw {
+                                let hi = ho * sh + ki * dh;
+                                let wi = wo * sw + kj * dw;
+                                if hi < ph || wi < pw {
+                                    continue;
+                                }
+                                let hi = hi - ph;
+                                let wi = wi - pw;
+                                if hi >= h || wi >= w {
+                                    continue;
+                                }
+                                acc += inp[in_chan + hi * w + wi] * wt[wt_chan + ki * kw + kj];
+                            }
+                        }
+                    }
+                    out[((ni * c_out) + co) * h_out * w_out + ho * w_out + wo] = acc;
+                }
+            }
+        }
+    }
+}
+
+/// Winograd F(2×2,3×3) enabled? Read once from `RLX_WINOGRAD`. Applies only to
+/// 3×3 stride-1 no-dilation groups-1 convs (the conv-net hot case).
+fn winograd_enabled() -> bool {
+    use std::sync::OnceLock;
+    static W: OnceLock<bool> = OnceLock::new();
+    *W.get_or_init(|| {
+        matches!(
+            rlx_ir::env::var("RLX_WINOGRAD").as_deref(),
+            Some("1") | Some("on") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// Direct (no-im2col) forward conv enabled? `RLX_DIRECT_CONV`. Off by default —
+/// im2col+BLAS is faster for low-channel convs; this wins only at high channels.
+fn direct_conv_enabled() -> bool {
+    use std::sync::OnceLock;
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| {
+        matches!(
+            rlx_ir::env::var("RLX_DIRECT_CONV").as_deref(),
+            Some("1") | Some("on") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// Filter transform U = G·g·Gᵀ for one 3×3 filter → 4×4 (row-major).
+#[inline]
+fn winograd_filter_transform(g: &[f32]) -> [f32; 16] {
+    let mut tmp = [0f32; 12]; // 4×3 = G·g
+    for j in 0..3 {
+        let (g0, g1, g2) = (g[j], g[3 + j], g[6 + j]);
+        tmp[j] = g0;
+        tmp[3 + j] = 0.5 * (g0 + g1 + g2);
+        tmp[6 + j] = 0.5 * (g0 - g1 + g2);
+        tmp[9 + j] = g2;
+    }
+    let mut u = [0f32; 16];
+    for i in 0..4 {
+        let (t0, t1, t2) = (tmp[i * 3], tmp[i * 3 + 1], tmp[i * 3 + 2]);
+        u[i * 4] = t0;
+        u[i * 4 + 1] = 0.5 * (t0 + t1 + t2);
+        u[i * 4 + 2] = 0.5 * (t0 - t1 + t2);
+        u[i * 4 + 3] = t2;
+    }
+    u
+}
+
+/// Input transform V = Bᵀ·d·B for one 4×4 tile → 4×4 (row-major).
+#[inline]
+fn winograd_input_transform(d: &[f32; 16]) -> [f32; 16] {
+    let mut t = [0f32; 16];
+    for j in 0..4 {
+        let (d0, d1, d2, d3) = (d[j], d[4 + j], d[8 + j], d[12 + j]);
+        t[j] = d0 - d2;
+        t[4 + j] = d1 + d2;
+        t[8 + j] = d2 - d1;
+        t[12 + j] = d1 - d3;
+    }
+    let mut v = [0f32; 16];
+    for i in 0..4 {
+        let (a0, a1, a2, a3) = (t[i * 4], t[i * 4 + 1], t[i * 4 + 2], t[i * 4 + 3]);
+        v[i * 4] = a0 - a2;
+        v[i * 4 + 1] = a1 + a2;
+        v[i * 4 + 2] = a2 - a1;
+        v[i * 4 + 3] = a1 - a3;
+    }
+    v
+}
+
+/// Output transform Y = Aᵀ·m·A for one 4×4 accumulator → 2×2 (row-major).
+#[inline]
+fn winograd_output_transform(m: &[f32; 16]) -> [f32; 4] {
+    let mut s = [0f32; 8];
+    for j in 0..4 {
+        let (m0, m1, m2, m3) = (m[j], m[4 + j], m[8 + j], m[12 + j]);
+        s[j] = m0 + m1 + m2;
+        s[4 + j] = m1 - m2 - m3;
+    }
+    let mut y = [0f32; 4];
+    for i in 0..2 {
+        let (a0, a1, a2, a3) = (s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3]);
+        y[i * 2] = a0 + a1 + a2;
+        y[i * 2 + 1] = a1 - a2 - a3;
+    }
+    y
+}
+
+/// Winograd F(2×2,3×3) forward convolution (3×3, stride 1, no dilation, groups
+/// 1, valid). ~2.25× fewer multiplies than im2col by working on 4×4 tiles:
+/// transform filter (G·g·Gᵀ) and input (Bᵀ·d·B), 16 channel-GEMMs (one per
+/// tile position), then output transform (Aᵀ·m·A). Boundary tiles zero-pad the
+/// input read and skip out-of-range output writes (handles odd H_out/W_out).
+#[allow(clippy::too_many_arguments)]
+fn conv2d_forward_winograd(
+    inp: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c_in: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    h_out: usize,
+    w_out: usize,
+) {
+    let th = h_out.div_ceil(2);
+    let tw = w_out.div_ceil(2);
+    let tiles_per = th * tw;
+    let nt = n * tiles_per;
+    if nt == 0 {
+        return;
+    }
+
+    // Filter transform U[p][co][ci]  (p = 0..16).
+    let mut u = vec![0f32; 16 * c_out * c_in];
+    for co in 0..c_out {
+        for ci in 0..c_in {
+            let uu = winograd_filter_transform(&wt[(co * c_in + ci) * 9..(co * c_in + ci) * 9 + 9]);
+            for (p, &val) in uu.iter().enumerate() {
+                u[p * c_out * c_in + co * c_in + ci] = val;
+            }
+        }
+    }
+
+    // Input transform V[p][ci][tile].
+    let mut v = vec![0f32; 16 * c_in * nt];
+    let v_addr = v.as_mut_ptr() as usize;
+    let in_xform = |tile: usize| {
+        let ni = tile / tiles_per;
+        let rem = tile % tiles_per;
+        let (h0, w0) = (2 * (rem / tw), 2 * (rem % tw));
+        for ci in 0..c_in {
+            let mut d = [0f32; 16];
+            for di in 0..4 {
+                let hh = h0 + di;
+                if hh >= h {
+                    continue;
+                }
+                let base = ((ni * c_in + ci) * h + hh) * w;
+                for dj in 0..4 {
+                    let ww = w0 + dj;
+                    if ww < w {
+                        d[di * 4 + dj] = inp[base + ww];
+                    }
+                }
+            }
+            let vv = winograd_input_transform(&d);
+            for (p, &val) in vv.iter().enumerate() {
+                unsafe {
+                    *((v_addr as *mut f32).add(p * c_in * nt + ci * nt + tile)) = val;
+                }
+            }
+        }
+    };
+    if fast_conv_enabled() && crate::pool::should_parallelize(nt * c_in * 16) {
+        crate::pool::par_for(nt, crate::pool::outer_chunk(nt), &|off, cnt| {
+            for t in off..off + cnt {
+                in_xform(t);
+            }
+        });
+    } else {
+        for t in 0..nt {
+            in_xform(t);
+        }
+    }
+
+    // 16 channel-GEMMs: M[p] = U[p]·V[p]  → [c_out, nt].
+    let mut m = vec![0f32; 16 * c_out * nt];
+    for p in 0..16 {
+        crate::blas::sgemm(
+            &u[p * c_out * c_in..(p + 1) * c_out * c_in],
+            &v[p * c_in * nt..(p + 1) * c_in * nt],
+            &mut m[p * c_out * nt..(p + 1) * c_out * nt],
+            c_out,
+            c_in,
+            nt,
+        );
+    }
+
+    // Output transform + scatter.
+    let out_addr = out.as_mut_ptr() as usize;
+    let out_xform = |tile: usize| {
+        let ni = tile / tiles_per;
+        let rem = tile % tiles_per;
+        let (ho0, wo0) = (2 * (rem / tw), 2 * (rem % tw));
+        for co in 0..c_out {
+            let mut mm = [0f32; 16];
+            for (p, slot) in mm.iter_mut().enumerate() {
+                *slot = m[p * c_out * nt + co * nt + tile];
+            }
+            let y = winograd_output_transform(&mm);
+            for yi in 0..2 {
+                let oh = ho0 + yi;
+                if oh >= h_out {
+                    continue;
+                }
+                for yj in 0..2 {
+                    let ow = wo0 + yj;
+                    if ow < w_out {
+                        unsafe {
+                            *((out_addr as *mut f32)
+                                .add(((ni * c_out + co) * h_out + oh) * w_out + ow)) =
+                                y[yi * 2 + yj];
+                        }
+                    }
+                }
+            }
+        }
+    };
+    if fast_conv_enabled() && crate::pool::should_parallelize(nt * c_out * 16) {
+        crate::pool::par_for(nt, crate::pool::outer_chunk(nt), &|off, cnt| {
+            for t in off..off + cnt {
+                out_xform(t);
+            }
+        });
+    } else {
+        for t in 0..nt {
+            out_xform(t);
+        }
+    }
+}
+
+/// Direct forward convolution for the stride-1, no-padding, dilation-1 case
+/// (the conv-net hot path). Unlike im2col it never materialises the 9×-expanded
+/// patch buffer — each output plane stays L1-resident while we accumulate over
+/// (c_in, kh, kw), and the innermost loop is a contiguous SAXPY over the output
+/// row (`out[wo] += w * in[wo+kj]`) that autovectorizes. Compute-bound, not
+/// bandwidth-bound — the win over im2col for low-channel convs. Parallel over
+/// (batch × c_out); caller guarantees stride/pad/dilation eligibility.
+#[allow(clippy::too_many_arguments)]
+fn conv2d_forward_direct(
+    inp: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c_in: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    h_out: usize,
+    w_out: usize,
+    kh: usize,
+    kw: usize,
+    groups: usize,
+) {
+    let c_in_per_g = c_in / groups;
+    let c_out_per_g = c_out / groups;
+    let out_plane = h_out * w_out;
+    let in_plane = h * w;
+    let out_addr = out.as_mut_ptr() as usize;
+    let compute = |nco: usize| {
+        let ni = nco / c_out;
+        let co = nco % c_out;
+        let ci_start = (co / c_out_per_g) * c_in_per_g;
+        let out_base = (ni * c_out + co) * out_plane;
+        let op = unsafe {
+            std::slice::from_raw_parts_mut((out_addr as *mut f32).add(out_base), out_plane)
+        };
+        for v in op.iter_mut() {
+            *v = 0.0;
+        }
+        for ci_off in 0..c_in_per_g {
+            let in_base = (ni * c_in + ci_start + ci_off) * in_plane;
+            let wt_base = (co * c_in_per_g + ci_off) * kh * kw;
+            for ki in 0..kh {
+                for kj in 0..kw {
+                    let wv = wt[wt_base + ki * kw + kj];
+                    for ho in 0..h_out {
+                        let in_row = in_base + (ho + ki) * w + kj;
+                        let dst = &mut op[ho * w_out..ho * w_out + w_out];
+                        let src = &inp[in_row..in_row + w_out];
+                        for wo in 0..w_out {
+                            dst[wo] += wv * src[wo];
+                        }
+                    }
+                }
+            }
+        }
+    };
+    if fast_conv_enabled() && crate::pool::should_parallelize(n * c_out * out_plane) {
+        crate::pool::par_for(
+            n * c_out,
+            crate::pool::outer_chunk(n * c_out),
+            &|off, cnt| {
+                for nco in off..off + cnt {
+                    compute(nco);
+                }
+            },
+        );
+    } else {
+        for nco in 0..n * c_out {
+            compute(nco);
+        }
+    }
+}
+
+/// im2col + BLAS forward convolution. For each (batch, group) we gather the
+/// receptive-field patches into a `[c_in_per_g·kH·kW, H_out·W_out]` column
+/// matrix and dispatch a single `sgemm`:
+///
+/// ```text
+///   out_n_g [c_out_per_g, P]  =  weight_g [c_out_per_g, K]  @  col [K, P]
+/// ```
+///
+/// The result lands in NCHW directly (matching `Conv2D1x1`). The batch loop
+/// is embarrassingly parallel — each image writes a disjoint output region —
+/// so it fans out over the thread pool, each worker owning a `col` scratch.
+#[allow(clippy::too_many_arguments)]
+fn conv2d_forward_im2col(
+    inp: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c_in: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    h_out: usize,
+    w_out: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    dh: usize,
+    dw: usize,
+    groups: usize,
+) {
+    let c_in_per_g = c_in / groups;
+    let c_out_per_g = c_out / groups;
+    let k_dim = c_in_per_g * kh * kw; // im2col rows (contraction dim)
+    let p_dim = h_out * w_out; // spatial positions
+    let x_stride_n = c_in * h * w;
+    let x_stride_g = c_in_per_g * h * w;
+    let out_stride_n = c_out * h_out * w_out;
+    let out_stride_g = c_out_per_g * p_dim;
+    let w_stride_g = c_out_per_g * k_dim;
+
+    // Hand each worker the output base as a raw address: every (ni, g) writes
+    // a disjoint `[out_stride_g]` window, so the aliasing is provably safe.
+    let out_addr = out.as_mut_ptr() as usize;
+    crate::pool::par_for(n, 1, &|off, cnt| {
+        let mut col = vec![0f32; k_dim * p_dim];
+        for ni in off..off + cnt {
+            for g in 0..groups {
+                let x_off = ni * x_stride_n + g * x_stride_g;
+                im2col(
+                    &inp[x_off..x_off + x_stride_g],
+                    &mut col,
+                    c_in_per_g,
+                    h,
+                    w,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw,
+                );
+                let w_off = g * w_stride_g;
+                let o_off = ni * out_stride_n + g * out_stride_g;
+                let out_g = unsafe {
+                    std::slice::from_raw_parts_mut((out_addr as *mut f32).add(o_off), out_stride_g)
+                };
+                crate::blas::sgemm(
+                    &wt[w_off..w_off + w_stride_g],
+                    &col,
+                    out_g,
+                    c_out_per_g,
+                    k_dim,
+                    p_dim,
+                );
+            }
+        }
+    });
+}
+
 fn im2col(
     x: &[f32],
     col: &mut [f32],
@@ -17099,6 +20237,199 @@ mod tests {
     use super::*;
     use rlx_ir::*;
 
+    /// The im2col+BLAS forward conv must match the reference scalar loop
+    /// (up to float reassociation) across a range of shapes — strided,
+    /// dilated, padded, grouped, and multi-batch. Guards the RLX_FAST_CONV
+    /// fast path used by the "fused" benchmark configuration.
+    #[test]
+    fn conv2d_im2col_matches_naive() {
+        // (n, c_in, h, w, c_out, kh, kw, sh, sw, ph, pw, dh, dw, groups)
+        let cases = [
+            (1, 1, 28, 28, 8, 3, 3, 1, 1, 0, 0, 1, 1, 1), // TinyConv layer 1
+            (4, 8, 13, 13, 16, 3, 3, 1, 1, 0, 0, 1, 1, 1), // TinyConv layer 2, batched
+            (2, 3, 16, 16, 6, 3, 3, 2, 2, 1, 1, 1, 1, 1), // stride 2, pad 1
+            (1, 4, 12, 12, 4, 3, 3, 1, 1, 2, 2, 2, 2, 1), // dilation 2
+            (3, 8, 10, 10, 8, 3, 3, 1, 1, 1, 1, 1, 1, 2), // groups = 2
+            (1, 2, 7, 7, 5, 1, 1, 1, 1, 0, 0, 1, 1, 1),   // 1x1
+        ];
+        for (idx, &(n, c_in, h, w, c_out, kh, kw, sh, sw, ph, pw, dh, dw, groups)) in
+            cases.iter().enumerate()
+        {
+            let c_in_per_g = c_in / groups;
+            let h_out = (h + 2 * ph - dh * (kh - 1) - 1) / sh + 1;
+            let w_out = (w + 2 * pw - dw * (kw - 1) - 1) / sw + 1;
+            // Deterministic pseudo-random inputs (no rng dep in tests).
+            let mut s: u32 = 0x9e37_79b9 ^ (idx as u32 + 1);
+            let mut rand = || {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s as f32 / u32::MAX as f32) - 0.5
+            };
+            let inp: Vec<f32> = (0..n * c_in * h * w).map(|_| rand()).collect();
+            let wt: Vec<f32> = (0..c_out * c_in_per_g * kh * kw).map(|_| rand()).collect();
+            let mut out_ref = vec![0f32; n * c_out * h_out * w_out];
+            let mut out_fast = vec![0f32; n * c_out * h_out * w_out];
+
+            conv2d_forward_naive(
+                &inp,
+                &wt,
+                &mut out_ref,
+                n,
+                c_in,
+                h,
+                w,
+                c_out,
+                h_out,
+                w_out,
+                kh,
+                kw,
+                sh,
+                sw,
+                ph,
+                pw,
+                dh,
+                dw,
+                groups,
+            );
+            conv2d_forward_im2col(
+                &inp,
+                &wt,
+                &mut out_fast,
+                n,
+                c_in,
+                h,
+                w,
+                c_out,
+                h_out,
+                w_out,
+                kh,
+                kw,
+                sh,
+                sw,
+                ph,
+                pw,
+                dh,
+                dw,
+                groups,
+            );
+
+            let max_abs = out_ref
+                .iter()
+                .zip(&out_fast)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_abs < 1e-3,
+                "case {idx}: im2col vs naive max abs diff {max_abs}"
+            );
+        }
+    }
+
+    /// Direct forward conv (stride-1, no-pad) must match the reference scalar
+    /// conv exactly-ish across channel/batch/group shapes.
+    #[test]
+    fn conv2d_direct_matches_naive() {
+        // (n, c_in, h, w, c_out, kh, kw, groups)
+        let cases = [
+            (1, 1, 28, 28, 8, 3, 3, 1),  // TinyConv L1
+            (4, 8, 13, 13, 16, 3, 3, 1), // TinyConv L2, batched
+            (2, 6, 10, 10, 9, 3, 3, 3),  // groups=3
+            (1, 4, 9, 9, 4, 5, 5, 1),    // 5×5 kernel
+            (3, 2, 7, 7, 2, 1, 1, 1),    // 1×1
+        ];
+        for (idx, &(n, c_in, h, w, c_out, kh, kw, groups)) in cases.iter().enumerate() {
+            let h_out = h - kh + 1;
+            let w_out = w - kw + 1;
+            let c_in_per_g = c_in / groups;
+            let mut s: u32 = 0xfeed_1234 ^ (idx as u32 + 1);
+            let mut rand = || {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s as f32 / u32::MAX as f32) - 0.5
+            };
+            let inp: Vec<f32> = (0..n * c_in * h * w).map(|_| rand()).collect();
+            let wt: Vec<f32> = (0..c_out * c_in_per_g * kh * kw).map(|_| rand()).collect();
+            let mut r = vec![0f32; n * c_out * h_out * w_out];
+            let mut d = vec![0f32; n * c_out * h_out * w_out];
+            conv2d_forward_naive(
+                &inp, &wt, &mut r, n, c_in, h, w, c_out, h_out, w_out, kh, kw, 1, 1, 0, 0, 1, 1,
+                groups,
+            );
+            conv2d_forward_direct(
+                &inp, &wt, &mut d, n, c_in, h, w, c_out, h_out, w_out, kh, kw, groups,
+            );
+            let mx = r
+                .iter()
+                .zip(&d)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(mx < 1e-4, "case {idx}: direct vs naive max abs diff {mx}");
+        }
+    }
+
+    /// Winograd F(2,3) forward conv must match the reference scalar conv (up to
+    /// the transform's float reassociation) for 3×3 stride-1 valid convs,
+    /// including odd output dims (boundary tiles) and multiple channels/batches.
+    #[test]
+    fn conv2d_winograd_matches_naive() {
+        // (n, c_in, h, w, c_out)  — all 3×3 stride1 valid; covers even (26) and
+        // odd (11) output dims and the TinyConv channel shapes.
+        let cases = [
+            (1, 1, 28, 28, 8),  // TinyConv layer 1: out 26×26 (even)
+            (4, 8, 13, 13, 16), // TinyConv layer 2: out 11×11 (odd) — boundary tiles
+            (2, 3, 9, 9, 5),    // out 7×7 (odd)
+            (1, 4, 8, 8, 4),    // out 6×6 (even)
+        ];
+        for (idx, &(n, c_in, h, w, c_out)) in cases.iter().enumerate() {
+            let h_out = h - 2;
+            let w_out = w - 2;
+            let mut s: u32 = 0x1234_5678 ^ (idx as u32 + 1);
+            let mut rand = || {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s as f32 / u32::MAX as f32) - 0.5
+            };
+            let inp: Vec<f32> = (0..n * c_in * h * w).map(|_| rand()).collect();
+            let wt: Vec<f32> = (0..c_out * c_in * 9).map(|_| rand()).collect();
+            let mut out_ref = vec![0f32; n * c_out * h_out * w_out];
+            let mut out_win = vec![0f32; n * c_out * h_out * w_out];
+            conv2d_forward_naive(
+                &inp,
+                &wt,
+                &mut out_ref,
+                n,
+                c_in,
+                h,
+                w,
+                c_out,
+                h_out,
+                w_out,
+                3,
+                3,
+                1,
+                1,
+                0,
+                0,
+                1,
+                1,
+                1,
+            );
+            conv2d_forward_winograd(&inp, &wt, &mut out_win, n, c_in, h, w, c_out, h_out, w_out);
+            let max_abs = out_ref
+                .iter()
+                .zip(&out_win)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_abs < 1e-3,
+                "case {idx}: winograd vs naive max abs diff {max_abs}"
+            );
+        }
+    }
+
     /// Plan #45: when a Narrow's only consumer is a Rope, the thunk
     /// fusion pass collapses them — the Narrow becomes Nop, and the
     /// Rope reads from the parent buffer with its row stride. This
@@ -17677,6 +21008,110 @@ mod tests {
             Some((192, 192, 192)),
             "Attention should walk Q/K/V with parent row stride 192"
         );
+    }
+
+    /// Regression: when the QKV→Narrow×3→RoPE×2→Attention→OutProj chain
+    /// collapses into a single `FusedAttnBlock` (small batch·seq), the fused
+    /// kernel must honor a **causal** mask. It previously applied only the
+    /// per-key padding mask and dropped `mask_kind`, so a later token leaked
+    /// into earlier positions (decoder attention attended to the future).
+    #[test]
+    fn fused_attn_block_respects_causal_mask() {
+        let f = DType::F32;
+        let (s, d, nh, dh) = (5usize, 8usize, 2usize, 4usize);
+        let half = dh / 2;
+
+        let mut g = Graph::new("fused_causal");
+        let hidden = g.input("hidden", Shape::new(&[s, d], f));
+        let wqkv = g.input("wqkv", Shape::new(&[d, 3 * d], f));
+        let wo = g.input("wo", Shape::new(&[d, d], f));
+        let cos = g.input("cos", Shape::new(&[s, half], f));
+        let sin = g.input("sin", Shape::new(&[s, half], f));
+        let qkv = g.matmul(hidden, wqkv, Shape::new(&[s, 3 * d], f));
+        let q = g.narrow_(qkv, 1, 0, d);
+        let k = g.narrow_(qkv, 1, d, d);
+        let v = g.narrow_(qkv, 1, 2 * d, d);
+        let q3 = g.reshape(q, vec![1, s as i64, d as i64], Shape::new(&[1, s, d], f));
+        let k3 = g.reshape(k, vec![1, s as i64, d as i64], Shape::new(&[1, s, d], f));
+        let v3 = g.reshape(v, vec![1, s as i64, d as i64], Shape::new(&[1, s, d], f));
+        let qr = g.rope(q3, cos, sin, dh);
+        let kr = g.rope(k3, cos, sin, dh);
+        let attn = g.attention_kind(
+            qr,
+            kr,
+            v3,
+            nh,
+            dh,
+            rlx_ir::op::MaskKind::Causal,
+            Shape::new(&[1, s, d], f),
+        );
+        let a2 = g.reshape(attn, vec![s as i64, d as i64], Shape::new(&[s, d], f));
+        let out = g.matmul(a2, wo, Shape::new(&[s, d], f));
+        g.set_outputs(vec![out]);
+
+        // The fusion must actually fire AND carry the causal kind.
+        let plan = rlx_opt::memory::plan_memory(&g);
+        let arena = crate::arena::Arena::from_plan(plan);
+        let sched = compile_thunks(&g, &arena);
+        assert!(
+            sched.thunks.iter().any(|t| matches!(
+                t,
+                Thunk::FusedAttnBlock {
+                    mask_kind: rlx_ir::op::MaskKind::Causal,
+                    ..
+                }
+            )),
+            "expected a FusedAttnBlock carrying MaskKind::Causal"
+        );
+
+        let wqkv_d: Vec<f32> = (0..d * 3 * d)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+            .collect();
+        let wo_d: Vec<f32> = (0..d * d).map(|i| ((i % 5) as f32 - 2.0) * 0.05).collect();
+        let mut cos_d = vec![0f32; s * half];
+        let mut sin_d = vec![0f32; s * half];
+        for p in 0..s {
+            for i in 0..half {
+                let fr = 1.0f32 / 10000f32.powf(2.0 * i as f32 / dh as f32);
+                cos_d[p * half + i] = (p as f32 * fr).cos();
+                sin_d[p * half + i] = (p as f32 * fr).sin();
+            }
+        }
+        let base_h: Vec<f32> = (0..s * d).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
+        let run = |hin: &[f32]| {
+            run_graph(
+                &g,
+                &[
+                    (hidden, hin),
+                    (wqkv, &wqkv_d),
+                    (wo, &wo_d),
+                    (cos, &cos_d),
+                    (sin, &sin_d),
+                ],
+                out,
+                s * d,
+            )
+        };
+        let a = run(&base_h);
+        // Perturb only the LAST position's hidden row.
+        let mut changed = base_h.clone();
+        for j in 0..d {
+            changed[4 * d + j] += 1.0;
+        }
+        let b = run(&changed);
+        for pos in 0..4 {
+            for j in 0..d {
+                let i = pos * d + j;
+                assert!(
+                    (a[i] - b[i]).abs() < 1e-5,
+                    "causal leak at pos {pos}: {} vs {}",
+                    a[i],
+                    b[i]
+                );
+            }
+        }
+        let last: f32 = (0..d).map(|j| (a[4 * d + j] - b[4 * d + j]).abs()).sum();
+        assert!(last > 1e-4, "last position must react to its own token");
     }
 
     // ── Backward / training op parity tests ────────────────────
@@ -22445,5 +25880,339 @@ mod tests {
         );
         assert!((up[0] - 2.0).abs() < 1e-5);
         assert!((up[3] - 2.0).abs() < 1e-5);
+    }
+
+    /// End-to-end native-low-precision GEMM oracle: build the full
+    /// ScaledQuantScale → ScaledQuantize → ScaledMatMul pipeline through the
+    /// thunk path and check the f32-accumulated result tracks a plain f32 TN
+    /// matmul (cosine), for every format × scale-layout. This exercises shape
+    /// inference, memory planning, the build arms, and both execute paths.
+    #[test]
+    fn scaled_matmul_oracle_matches_f32() {
+        use rlx_ir::ScaledFormat::*;
+        use rlx_ir::{ScaleLayout, ScaledFormat};
+
+        fn cosine(a: &[f32], b: &[f32]) -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn run_scaled(
+            lhs: &[f32],
+            rhs: &[f32],
+            m: usize,
+            k: usize,
+            n: usize,
+            lf: ScaledFormat,
+            rf: ScaledFormat,
+            layout: ScaleLayout,
+        ) -> Vec<f32> {
+            let f = DType::F32;
+            let u8t = DType::U8;
+            let mut g = Graph::new("scaled");
+            let lhs_in = g.input("lhs", Shape::new(&[m, k], f));
+            let rhs_in = g.input("rhs", Shape::new(&[n, k], f));
+            let (ls_shape, rs_shape) = match layout {
+                ScaleLayout::PerTensor => (Shape::new(&[1], f), Shape::new(&[1], f)),
+                _ => {
+                    let nb = k.div_ceil(layout.block() as usize);
+                    (Shape::new(&[m, nb], u8t), Shape::new(&[n, nb], u8t))
+                }
+            };
+            let ls = g.add_node(
+                Op::ScaledQuantScale {
+                    format: lf,
+                    scale_layout: layout,
+                },
+                vec![lhs_in],
+                ls_shape,
+            );
+            let lq = g.add_node(
+                Op::ScaledQuantize {
+                    format: lf,
+                    scale_layout: layout,
+                },
+                vec![lhs_in, ls],
+                Shape::new(&[m, k], u8t),
+            );
+            let rs = g.add_node(
+                Op::ScaledQuantScale {
+                    format: rf,
+                    scale_layout: layout,
+                },
+                vec![rhs_in],
+                rs_shape,
+            );
+            let rq = g.add_node(
+                Op::ScaledQuantize {
+                    format: rf,
+                    scale_layout: layout,
+                },
+                vec![rhs_in, rs],
+                Shape::new(&[n, k], u8t),
+            );
+            let out = g.add_node(
+                Op::ScaledMatMul {
+                    lhs_format: lf,
+                    rhs_format: rf,
+                    scale_layout: layout,
+                    has_bias: false,
+                },
+                vec![lq, rq, ls, rs],
+                Shape::new(&[m, n], f),
+            );
+            g.set_outputs(vec![out]);
+
+            let plan = rlx_opt::memory::plan_memory(&g);
+            let mut arena = crate::arena::Arena::from_plan(plan);
+            let sched = compile_thunks(&g, &arena);
+            let lhs_off = arena.byte_offset(lhs_in);
+            let rhs_off = arena.byte_offset(rhs_in);
+            let out_off = arena.byte_offset(out);
+            let buf = arena.raw_buf_mut();
+            unsafe {
+                let lp = buf.as_mut_ptr().add(lhs_off) as *mut f32;
+                for (i, &v) in lhs.iter().enumerate() {
+                    *lp.add(i) = v;
+                }
+                let rp = buf.as_mut_ptr().add(rhs_off) as *mut f32;
+                for (i, &v) in rhs.iter().enumerate() {
+                    *rp.add(i) = v;
+                }
+            }
+            execute_thunks(&sched, arena.raw_buf_mut());
+            unsafe {
+                let p = arena.raw_buf().as_ptr().add(out_off) as *const f32;
+                (0..m * n).map(|i| *p.add(i)).collect()
+            }
+        }
+
+        let (m, k, n) = (4usize, 64usize, 8usize);
+        let lhs: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.13).sin() * 1.5).collect();
+        let rhs: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.07).cos() * 1.2).collect();
+        let mut reference = vec![0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for p in 0..k {
+                    acc += lhs[i * k + p] * rhs[j * k + p];
+                }
+                reference[i * n + j] = acc;
+            }
+        }
+
+        // Per-tensor scaling across all 7 element formats.
+        let cases = [
+            (F8E4M3, 0.999f32),
+            (F8E5M2, 0.99),
+            (F8E4M3Fnuz, 0.999),
+            (F8E5M2Fnuz, 0.99),
+            (F6E2M3, 0.99),
+            (F6E3M2, 0.98),
+            (F4E2M1, 0.90),
+        ];
+        for (fmt, thresh) in cases {
+            let out = run_scaled(&lhs, &rhs, m, k, n, fmt, fmt, ScaleLayout::PerTensor);
+            let c = cosine(&out, &reference);
+            assert!(c >= thresh, "{fmt} per-tensor cosine {c} < {thresh}");
+        }
+
+        // Block layouts: MX E8M0 (FP8) and NVFP4 (FP4) — finer scaling, higher fidelity.
+        let out_mx = run_scaled(&lhs, &rhs, m, k, n, F8E4M3, F8E4M3, ScaleLayout::mx());
+        let c_mx = cosine(&out_mx, &reference);
+        assert!(c_mx >= 0.999, "mx-e8m0 e4m3 cosine {c_mx}");
+        let out_nv = run_scaled(&lhs, &rhs, m, k, n, F4E2M1, F4E2M1, ScaleLayout::nvfp4());
+        let c_nv = cosine(&out_nv, &reference);
+        assert!(c_nv >= 0.95, "nvfp4 e2m1 cosine {c_nv}");
+    }
+
+    /// `Op::ScaledDequantize` (`decode(code)·scale`) must invert
+    /// `Op::ScaledQuantize`: a quantize→dequantize round-trip reconstructs the
+    /// original f32 within the format's resolution. Exercises the standalone
+    /// dequantizer the `ScaledMatMul` backward graph relies on.
+    #[test]
+    fn scaled_dequantize_inverts_quantize() {
+        use rlx_ir::ScaledFormat::*;
+        use rlx_ir::{ScaleLayout, ScaledFormat};
+
+        fn cosine(a: &[f32], b: &[f32]) -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        }
+
+        fn roundtrip(x: &[f32], rows: usize, cols: usize, fmt: ScaledFormat) -> Vec<f32> {
+            let f = DType::F32;
+            let u8t = DType::U8;
+            let layout = ScaleLayout::PerTensor;
+            let mut g = Graph::new("dequant_rt");
+            let x_in = g.input("x", Shape::new(&[rows, cols], f));
+            let scale = g.add_node(
+                Op::ScaledQuantScale {
+                    format: fmt,
+                    scale_layout: layout,
+                },
+                vec![x_in],
+                Shape::new(&[1], f),
+            );
+            let codes = g.add_node(
+                Op::ScaledQuantize {
+                    format: fmt,
+                    scale_layout: layout,
+                },
+                vec![x_in, scale],
+                Shape::new(&[rows, cols], u8t),
+            );
+            let recon = g.add_node(
+                Op::ScaledDequantize {
+                    format: fmt,
+                    scale_layout: layout,
+                },
+                vec![codes, scale],
+                Shape::new(&[rows, cols], f),
+            );
+            g.set_outputs(vec![recon]);
+
+            let plan = rlx_opt::memory::plan_memory(&g);
+            let mut arena = crate::arena::Arena::from_plan(plan);
+            let sched = compile_thunks(&g, &arena);
+            let x_off = arena.byte_offset(x_in);
+            let r_off = arena.byte_offset(recon);
+            unsafe {
+                let p = arena.raw_buf_mut().as_mut_ptr().add(x_off) as *mut f32;
+                for (i, &v) in x.iter().enumerate() {
+                    *p.add(i) = v;
+                }
+            }
+            execute_thunks(&sched, arena.raw_buf_mut());
+            unsafe {
+                let p = arena.raw_buf().as_ptr().add(r_off) as *const f32;
+                (0..rows * cols).map(|i| *p.add(i)).collect()
+            }
+        }
+
+        let (rows, cols) = (4usize, 16usize);
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.21).sin() * 1.7)
+            .collect();
+        // FP8 reconstructs tightly; FP4 is coarse but still strongly correlated.
+        for (fmt, min_cos) in [(F8E4M3, 0.999f32), (F8E5M2, 0.99), (F4E2M1, 0.93)] {
+            let recon = roundtrip(&x, rows, cols, fmt);
+            assert_eq!(recon.len(), x.len());
+            assert!(
+                recon.iter().all(|v| v.is_finite()),
+                "{fmt:?} produced non-finite"
+            );
+            let c = cosine(&recon, &x);
+            assert!(c >= min_cos, "{fmt:?} round-trip cosine {c} < {min_cos}");
+        }
+    }
+
+    /// `Op::Fma` computes the single-rounded `a*b + c` elementwise. Verify it
+    /// matches `f32::mul_add` (the hardware FMA), and that the `LowerFma`
+    /// fallback (`Mul` + `Add`) stays close on a benign case.
+    #[test]
+    fn fma_matches_mul_add() {
+        let f = DType::F32;
+        let n = 9usize;
+        let a: Vec<f32> = vec![1.5, -2.0, 0.0, 3.25, -1.1, 7.0, -0.5, 2.2, 9.9];
+        let b: Vec<f32> = vec![2.0, 0.5, 4.0, -1.0, 6.0, -2.5, 8.0, -3.3, 0.1];
+        let c: Vec<f32> = vec![0.25, 1.0, -3.0, 2.0, -0.5, 4.0, 1.5, -2.2, 0.0];
+
+        let mut g = Graph::new("fma");
+        let an = g.input("a", Shape::new(&[n], f));
+        let bn = g.input("b", Shape::new(&[n], f));
+        let cn = g.input("c", Shape::new(&[n], f));
+        let out = g.add_node(Op::Fma, vec![an, bn, cn], Shape::new(&[n], f));
+        g.set_outputs(vec![out]);
+
+        let actual = run_graph(&g, &[(an, &a), (bn, &b), (cn, &c)], out, n);
+        for i in 0..n {
+            let expected = a[i].mul_add(b[i], c[i]);
+            assert!(
+                (actual[i] - expected).abs() <= f32::EPSILON * (1.0 + expected.abs()),
+                "fma[{i}]: {} vs mul_add {expected}",
+                actual[i]
+            );
+        }
+    }
+
+    /// End-to-end AMP-FP8: take a plain `MatMul` graph, run the
+    /// `insert_scaled_matmul` compile pass, then execute the rewritten graph on
+    /// CPU and confirm it tracks the f32 matmul. Proves the pass emits a
+    /// runnable, numerically-sound graph (rhs transpose + dynamic quantize).
+    #[test]
+    fn scaled_quant_pass_runs_end_to_end() {
+        use rlx_opt::rlx_compile::scaled_quant_insert::{ScaledQuantConfig, insert_scaled_matmul};
+
+        let f = DType::F32;
+        let (m, k, n) = (3usize, 16usize, 5usize);
+        let mut g = Graph::new("amp_fp8");
+        let x = g.input("x", Shape::new(&[m, k], f));
+        let w = g.param("w", Shape::new(&[k, n], f));
+        let mm = g.matmul(x, w, Shape::new(&[m, n], f));
+        g.set_outputs(vec![mm]);
+
+        let g = insert_scaled_matmul(g, ScaledQuantConfig::fp8_e4m3());
+
+        let x_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.11).sin()).collect();
+        let w_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.05).cos()).collect();
+        // reference NN matmul: out[i,j] = Σ_p x[i,p]·w[p,j]
+        let mut reference = vec![0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for p in 0..k {
+                    acc += x_data[i * k + p] * w_data[p * n + j];
+                }
+                reference[i * n + j] = acc;
+            }
+        }
+
+        // Locate the (preserved) input/param + output nodes in the rewritten graph.
+        let mut x_id = None;
+        let mut w_id = None;
+        for node in g.nodes() {
+            match &node.op {
+                Op::Input { name } if name == "x" => x_id = Some(node.id),
+                Op::Param { name } if name == "w" => w_id = Some(node.id),
+                _ => {}
+            }
+        }
+        let (x_id, w_id) = (x_id.unwrap(), w_id.unwrap());
+        let out_id = g.outputs[0];
+
+        let plan = rlx_opt::memory::plan_memory(&g);
+        let mut arena = crate::arena::Arena::from_plan(plan);
+        let sched = compile_thunks(&g, &arena);
+        let x_off = arena.byte_offset(x_id);
+        let w_off = arena.byte_offset(w_id);
+        let out_off = arena.byte_offset(out_id);
+        let buf = arena.raw_buf_mut();
+        unsafe {
+            let xp = buf.as_mut_ptr().add(x_off) as *mut f32;
+            for (i, &v) in x_data.iter().enumerate() {
+                *xp.add(i) = v;
+            }
+            let wp = buf.as_mut_ptr().add(w_off) as *mut f32;
+            for (i, &v) in w_data.iter().enumerate() {
+                *wp.add(i) = v;
+            }
+        }
+        execute_thunks(&sched, arena.raw_buf_mut());
+        let actual: Vec<f32> = unsafe {
+            let p = arena.raw_buf().as_ptr().add(out_off) as *const f32;
+            (0..m * n).map(|i| *p.add(i)).collect()
+        };
+
+        let dot: f32 = actual.iter().zip(&reference).map(|(a, b)| a * b).sum();
+        let na = actual.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb = reference.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cos = dot / (na * nb);
+        assert!(cos >= 0.999, "AMP-fp8 e2e cosine {cos}");
     }
 }

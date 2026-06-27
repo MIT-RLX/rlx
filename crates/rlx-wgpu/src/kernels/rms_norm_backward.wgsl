@@ -51,12 +51,13 @@ fn rms_norm_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     dot = dot * n_inv;
     let inv_r = inverseSqrt(sumsq * n_inv + eps);
-    let inv_r3 = inv_r * inv_r * inv_r;
+    // Cross term is inv_r³ (inv_r2 here, ·inv_r below), not inv_r⁴ — drop the stray 1/r.
+    let inv_r2 = inv_r * inv_r;
     for (var i: u32 = 0u; i < params.inner; i++) {
         let xv = arena[x_base + i];
         let gv = arena[params.gamma_off + i];
         let dyv = arena[dy_base + i];
-        let term = gv * dyv - xv * dot * inv_r3;
+        let term = gv * dyv - xv * dot * inv_r2;
         arena[out_base + i] = term * inv_r;
     }
 }

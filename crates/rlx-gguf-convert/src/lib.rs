@@ -116,6 +116,10 @@ pub use source::{NamedTensor, TensorReader};
 /// | `Q4_K`  | 4.5         | Standard 4-bit; ~7× shrink vs F32 source. |
 /// | `Q4_0`  | 4.5         | Legacy; faster decode kernels, slightly worse accuracy. |
 /// | `Q3_K`, `Q2_K` | 3.4 / 2.6 | Aggressive shrink; only for tolerant models. |
+/// | `IQ4_NL`, `IQ4_XS` | ~4.5 | Non-linear IQ4; GPU dequant on all backends. |
+/// | `IQ2_XXS` … `IQ1_M` | 1.6–2.5 | Ultra-low-bit IQ; slower encode, smallest files. |
+/// | `TQ1_0`, `TQ2_0` | ~2.5–3.4 | Ternary quants. |
+/// | `MXFP4`, `NVFP4` | 4.25 / 4.5 | Microscaling FP4 (OCP / NVIDIA layouts). |
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
@@ -133,6 +137,19 @@ pub enum Scheme {
     Q5_K,
     Q6_K,
     Q8_K,
+    IQ4_NL,
+    IQ4_XS,
+    IQ2_XXS,
+    IQ2_XS,
+    IQ2_S,
+    IQ3_XXS,
+    IQ3_S,
+    IQ1_S,
+    IQ1_M,
+    TQ1_0,
+    TQ2_0,
+    MXFP4,
+    NVFP4,
 }
 
 impl Scheme {
@@ -152,6 +169,19 @@ impl Scheme {
             Self::Q5_K => GgmlType::Q5K,
             Self::Q6_K => GgmlType::Q6K,
             Self::Q8_K => GgmlType::Q8K,
+            Self::IQ4_NL => GgmlType::IQ4NL,
+            Self::IQ4_XS => GgmlType::IQ4XS,
+            Self::IQ2_XXS => GgmlType::IQ2XXS,
+            Self::IQ2_XS => GgmlType::IQ2XS,
+            Self::IQ2_S => GgmlType::IQ2S,
+            Self::IQ3_XXS => GgmlType::IQ3XXS,
+            Self::IQ3_S => GgmlType::IQ3S,
+            Self::IQ1_S => GgmlType::IQ1S,
+            Self::IQ1_M => GgmlType::IQ1M,
+            Self::TQ1_0 => GgmlType::TQ1_0,
+            Self::TQ2_0 => GgmlType::TQ2_0,
+            Self::MXFP4 => GgmlType::MXFP4,
+            Self::NVFP4 => GgmlType::NVFP4,
         }
     }
 
@@ -172,6 +202,19 @@ impl Scheme {
             "Q5_K" => Self::Q5_K,
             "Q6_K" => Self::Q6_K,
             "Q8_K" => Self::Q8_K,
+            "IQ4_NL" => Self::IQ4_NL,
+            "IQ4_XS" => Self::IQ4_XS,
+            "IQ2_XXS" => Self::IQ2_XXS,
+            "IQ2_XS" => Self::IQ2_XS,
+            "IQ2_S" => Self::IQ2_S,
+            "IQ3_XXS" => Self::IQ3_XXS,
+            "IQ3_S" => Self::IQ3_S,
+            "IQ1_S" => Self::IQ1_S,
+            "IQ1_M" => Self::IQ1_M,
+            "TQ1_0" => Self::TQ1_0,
+            "TQ2_0" => Self::TQ2_0,
+            "MXFP4" => Self::MXFP4,
+            "NVFP4" => Self::NVFP4,
             other => bail!("unknown scheme {other}"),
         })
     }
@@ -181,8 +224,30 @@ impl Scheme {
     pub fn block_size(self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q8_0 | Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 => 32,
-            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::Q8_K => 256,
+            Self::Q8_0
+            | Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::IQ4_NL
+            | Self::MXFP4 => 32,
+            Self::NVFP4 => 16,
+            Self::Q2_K
+            | Self::Q3_K
+            | Self::Q4_K
+            | Self::Q5_K
+            | Self::Q6_K
+            | Self::Q8_K
+            | Self::IQ4_XS
+            | Self::IQ2_XXS
+            | Self::IQ2_XS
+            | Self::IQ2_S
+            | Self::IQ3_XXS
+            | Self::IQ3_S
+            | Self::IQ1_S
+            | Self::IQ1_M
+            | Self::TQ1_0
+            | Self::TQ2_0 => 256,
         }
     }
 }
@@ -535,12 +600,44 @@ mod tests {
             Scheme::Q8_0,
             Scheme::Q4_K,
             Scheme::Q6_K,
+            Scheme::IQ4_NL,
+            Scheme::IQ2_XXS,
+            Scheme::TQ2_0,
+            Scheme::MXFP4,
+            Scheme::NVFP4,
         ] {
             let name = format!("{s:?}");
-            // Skip variants Rust prints with caps that don't match parse
-            // exactly (e.g. `Q4_K` is already canonical).
             let parsed = Scheme::parse(&name).unwrap();
             assert_eq!(parsed, s);
         }
+    }
+
+    #[test]
+    fn iq2_xxs_convert_roundtrips() {
+        let n = 512;
+        let data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.015).sin() * 0.5).collect();
+        let mut tensors = HashMap::new();
+        tensors.insert("w".to_string(), (data.clone(), vec![2, 256], GgmlType::F32));
+        let reader = StubReader {
+            names: vec!["w".into()],
+            tensors,
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let report = Converter::from_reader(Box::new(reader))
+            .default_scheme(Scheme::IQ2_XXS)
+            .architecture("test")
+            .write_gguf(tmp.path())
+            .unwrap();
+        assert_eq!(report.tensors, 1);
+        let parsed = rlx_gguf::GgufFile::from_path(tmp.path()).unwrap();
+        let (out, shape) = parsed.dequant_f32("w").unwrap();
+        assert_eq!(shape, vec![2, 256]);
+        let cos: f32 = {
+            let dot: f32 = data.iter().zip(&out).map(|(a, b)| a * b).sum();
+            let na: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        };
+        assert!(cos > 0.75, "IQ2_XXS conversion cosine {cos}");
     }
 }

@@ -68,6 +68,8 @@ pub struct CompileOptions {
     pub dim_binding: Option<rlx_ir::DimBinding>,
     /// Bake fixed param tensors into constants before DCE / constant folding.
     pub param_bindings: Option<HashMap<String, Vec<f32>>>,
+    /// Packed U8 GGUF weights for `Op::Param` nodes in `DequantMatMul` (TPU HLO bake).
+    pub quant_param_bindings: Option<HashMap<String, Vec<u8>>>,
     /// Native vs common IR lowering ([`KernelDispatchConfig`], `RLX_KERNEL_DISPATCH=common`).
     pub kernel_dispatch: KernelDispatchConfig,
 }
@@ -88,6 +90,7 @@ impl Default for CompileOptions {
             supported_ops: None,
             dim_binding: None,
             param_bindings: None,
+            quant_param_bindings: None,
             kernel_dispatch: KernelDispatchConfig::from_env(),
         }
     }
@@ -160,6 +163,11 @@ impl CompileOptions {
     }
     pub fn param_bindings(mut self, bindings: HashMap<String, Vec<f32>>) -> Self {
         self.param_bindings = Some(bindings);
+        self
+    }
+    /// Packed U8 weights for TPU GGUF `DequantMatMul` param bake at compile time.
+    pub fn quant_param_bindings(mut self, bindings: HashMap<String, Vec<u8>>) -> Self {
+        self.quant_param_bindings = Some(bindings);
         self
     }
     pub fn kernel_dispatch(mut self, policy: KernelDispatchPolicy) -> Self {

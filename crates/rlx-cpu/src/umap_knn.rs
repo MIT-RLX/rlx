@@ -21,10 +21,13 @@
 //! - **Small `n`**: tight serial row loop (low fixed cost).
 //! - **Large `n`**: Rayon row parallelism when `n * n` is big enough to amortize.
 
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 const INFINITY: f32 = f32::MAX;
 /// Parallelize rows when the pairwise matrix has at least this many elements.
+/// (Unused on wasm — the browser is single-threaded, so rows run serially.)
+#[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_MIN_ELEMS: usize = 64 * 64;
 
 /// Forward k-NN: for each row, select `k` smallest off-diagonal distances.
@@ -36,6 +39,7 @@ pub fn knn_forward_packed(pairwise: &[f32], n: usize, k: usize, packed: &mut [f3
     assert_eq!(packed.len(), n * 2 * k);
     assert!(k < n, "k ({k}) must be strictly less than n ({n})");
 
+    #[cfg(not(target_arch = "wasm32"))]
     if n * n >= PARALLEL_MIN_ELEMS {
         packed
             .par_chunks_mut(2 * k)
@@ -43,17 +47,18 @@ pub fn knn_forward_packed(pairwise: &[f32], n: usize, k: usize, packed: &mut [f3
             .for_each(|(row, out_row)| {
                 knn_row(&pairwise[row * n..(row + 1) * n], row, n, k, out_row);
             });
-    } else {
-        for row in 0..n {
-            let base = row * 2 * k;
-            knn_row(
-                &pairwise[row * n..(row + 1) * n],
-                row,
-                n,
-                k,
-                &mut packed[base..base + 2 * k],
-            );
-        }
+        return;
+    }
+
+    for row in 0..n {
+        let base = row * 2 * k;
+        knn_row(
+            &pairwise[row * n..(row + 1) * n],
+            row,
+            n,
+            k,
+            &mut packed[base..base + 2 * k],
+        );
     }
 }
 
@@ -102,6 +107,7 @@ pub fn knn_backward_pairwise(
     let eps = 1e-8f32;
     d_pairwise.fill(0.0);
 
+    #[cfg(not(target_arch = "wasm32"))]
     if n * n >= PARALLEL_MIN_ELEMS {
         d_pairwise
             .par_chunks_mut(n)
@@ -121,22 +127,23 @@ pub fn knn_backward_pairwise(
                     &mut scratch_dist,
                 );
             });
-    } else {
-        let mut scratch_idx = vec![0f32; k];
-        let mut scratch_dist = vec![INFINITY; k];
-        for row in 0..n {
-            knn_backward_row(
-                pairwise,
-                d_dist,
-                row,
-                n,
-                k,
-                eps,
-                &mut d_pairwise[row * n..(row + 1) * n],
-                &mut scratch_idx,
-                &mut scratch_dist,
-            );
-        }
+        return;
+    }
+
+    let mut scratch_idx = vec![0f32; k];
+    let mut scratch_dist = vec![INFINITY; k];
+    for row in 0..n {
+        knn_backward_row(
+            pairwise,
+            d_dist,
+            row,
+            n,
+            k,
+            eps,
+            &mut d_pairwise[row * n..(row + 1) * n],
+            &mut scratch_idx,
+            &mut scratch_dist,
+        );
     }
 }
 

@@ -47,6 +47,7 @@ pub struct Qwen3DecodeLayerStage {
     pub spec: Qwen3DecodeLayerSpec,
     pub layer_idx: usize,
     pub kv_out: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+    pub qk_out: Option<Arc<Mutex<Vec<rlx_ir::HirNodeId>>>>,
 }
 
 impl Qwen3DecodeLayerStage {
@@ -60,6 +61,22 @@ impl Qwen3DecodeLayerStage {
             spec,
             layer_idx,
             kv_out,
+            qk_out: None,
+        }
+    }
+
+    pub fn layer_with_qk(
+        layer_idx: usize,
+        spec: Qwen3DecodeLayerSpec,
+        kv_out: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+        qk_out: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+    ) -> Self {
+        Self {
+            layer_prefix: format!("model.layers.{layer_idx}"),
+            spec,
+            layer_idx,
+            kv_out,
+            qk_out: Some(qk_out),
         }
     }
 }
@@ -150,6 +167,10 @@ impl BlockStage for Qwen3DecodeLayerStage {
 
         let k_rep = repeat_kv(&mut gb, new_k, nkv, dh, spec.kv_group_size);
         let v_rep = repeat_kv(&mut gb, new_v, nkv, dh, spec.kv_group_size);
+        if let Some(ref sink) = self.qk_out {
+            sink.lock().expect("qwen3 decode qk out").push(q_rope);
+            sink.lock().expect("qwen3 decode qk out").push(k_rep);
+        }
 
         let attn_shape = shape::attention_shape(gb.shape(q_rope));
         let attn = if spec.use_custom_mask {

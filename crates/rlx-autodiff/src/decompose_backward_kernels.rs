@@ -130,9 +130,8 @@ pub fn compose_rms_norm_backward_input(
         g.node(var_eps).shape.clone(),
     );
     let inv_r2 = g.mul(inv_r, inv_r);
-    let inv_r3 = g.mul(inv_r2, inv_r);
     let inv_r_b = broadcast_scalar(g, inv_r, out_shape);
-    let inv_r3_full = broadcast_scalar(g, inv_r3, out_shape);
+    let inv_r2_full = broadcast_scalar(g, inv_r2, out_shape);
 
     let g_b = broadcast_scalar(g, gamma, out_shape);
     let dy_g = g.mul(dy, g_b);
@@ -140,9 +139,13 @@ pub fn compose_rms_norm_backward_input(
     let dot = g.mean(x_dy_g, axes, true);
     let dot_b = broadcast_scalar(g, dot, out_shape);
 
+    // dx = inv·(γ·dy − inv²·x·dot), where dot = mean(x·γ·dy) over the axis. The
+    // cross term is inv²·x·dot and the whole thing is scaled by inv once — earlier
+    // this used inv³·x·dot then ×inv, an extra 1/r factor (the documented
+    // "rms_norm_backward 1/r bug" — wrong gradient on every backend).
     let term1 = g.mul(g_b, dy);
     let x_dot = g.mul(x, dot_b);
-    let term2 = g.mul(x_dot, inv_r3_full);
+    let term2 = g.mul(x_dot, inv_r2_full);
     let diff = g.sub(term1, term2);
     g.mul(diff, inv_r_b)
 }
@@ -640,8 +643,19 @@ pub fn compose_softmax_cross_entropy_backward(
         let col = g.add_node(Op::Where, vec![eq, one_b, zero_b], labels_shape.clone());
         cols.push(col);
     }
+    // `cols[ci]` is `[N]`; concatenating along axis 0 yields a CLASS-major
+    // `[C*N]` buffer (all of class 0's N entries, then class 1's, …). That is a
+    // `[C, N]` matrix — reshaping it directly to `[N, C]` row-major scrambles
+    // the one-hot (the old bug: SCE-backward produced a transposed one-hot, so
+    // decompose-path backends — Metal/wgpu — never learned). Reshape to `[C, N]`
+    // then transpose to `[N, C]`.
     let one_hot_flat = g.concat_(cols, 0);
-    let one_hot = g.reshape_(one_hot_flat, vec![n as i64, c as i64]);
+    let one_hot_cn = g.reshape_(one_hot_flat, vec![c as i64, n as i64]);
+    let one_hot = g.add_node(
+        Op::Transpose { perm: vec![1, 0] },
+        vec![one_hot_cn],
+        Shape::new(&[n, c], dt),
+    );
     let diff = g.sub(sm, one_hot);
     let dl_b = broadcast_scalar(g, d_loss, out_shape);
     g.mul(diff, dl_b)
@@ -1407,6 +1421,36 @@ fn argmax_window_flat(
     best_i.expect("maxpool window has no in-bounds positions")
 }
 
+/// Nearest-neighbour upsample of an NCHW tensor by integer factors (kh, kw):
+/// each `[ho,wo]` element is repeated into a `kh×kw` block. Implemented with
+/// reshape → expand (broadcast) → reshape, so it lowers on every backend.
+fn nn_upsample_nchw(
+    g: &mut Graph,
+    t: NodeId,
+    n: usize,
+    c: usize,
+    ho: usize,
+    wo: usize,
+    kh: usize,
+    kw: usize,
+    dt: rlx_ir::DType,
+) -> NodeId {
+    let r1 = g.reshape_(t, vec![n as i64, c as i64, ho as i64, 1, wo as i64, 1]);
+    let ex = g.add_node(
+        Op::Expand {
+            target_shape: vec![
+                n as i64, c as i64, ho as i64, kh as i64, wo as i64, kw as i64,
+            ],
+        },
+        vec![r1],
+        Shape::new(&[n, c, ho, kh, wo, kw], dt),
+    );
+    g.reshape_(
+        ex,
+        vec![n as i64, c as i64, (ho * kh) as i64, (wo * kw) as i64],
+    )
+}
+
 /// `MaxPool2dBackward` via runtime argmax + dy scatter (static NCHW).
 pub fn compose_max_pool2d_backward(
     g: &mut Graph,
@@ -1423,14 +1467,71 @@ pub fn compose_max_pool2d_backward(
     let (kh, kw) = (kernel_size[0], kernel_size[1]);
     let (sh, sw) = (stride[0], stride[1]);
     let (ph, pw) = (padding[0], padding[1]);
+    let dt = out_shape.dtype();
+
+    // Non-overlapping pools (stride == kernel, no padding) — the common CNN
+    // case — decompose in O(input) instead of the quadratic dense scatter:
+    //   pooled = maxpool(x);  dx = (x == upsample(pooled)) ? upsample(dy) : 0
+    // Upsample is nearest by the kernel factor. Inputs outside the covered
+    // region (odd dims) get zero gradient (zero-pad via concat). Ties route dy
+    // to all maxima — measure-zero for real inputs, matches frameworks that
+    // split tie gradients. This is what makes GPU/decompose-path training work
+    // at real sizes (the old dense path capped out at 4096 elements).
+    if sh == kh && sw == kw && ph == 0 && pw == 0 {
+        let (ch, cw) = (h_out * kh, w_out * kw);
+        let pooled = g.add_node(
+            Op::Pool {
+                kind: rlx_ir::op::ReduceOp::Max,
+                kernel_size: vec![kh, kw],
+                stride: vec![sh, sw],
+                padding: vec![0, 0],
+            },
+            vec![x],
+            g.node(dy).shape.clone(),
+        );
+        let pooled_up = nn_upsample_nchw(g, pooled, n, c, h_out, w_out, kh, kw, dt);
+        let dy_up = nn_upsample_nchw(g, dy, n, c, h_out, w_out, kh, kw, dt);
+        let mut x_crop = x;
+        if ch != h {
+            x_crop = g.narrow_(x_crop, 2, 0, ch);
+        }
+        if cw != w_in {
+            x_crop = g.narrow_(x_crop, 3, 0, cw);
+        }
+        let eq = compare_eq(g, x_crop, pooled_up);
+        let zero = f32_tensor_const(vec![0.0], Shape::scalar(dt), g);
+        let mut dx = where_select(g, eq, dy_up, zero); // [n, c, ch, cw]
+        if ch != h {
+            let pad = h - ch;
+            let z = f32_tensor_const(
+                vec![0.0; n * c * pad * cw],
+                Shape::new(&[n, c, pad, cw], dt),
+                g,
+            );
+            dx = g.concat_(vec![dx, z], 2);
+        }
+        if cw != w_in {
+            let pad = w_in - cw;
+            let z = f32_tensor_const(
+                vec![0.0; n * c * h * pad],
+                Shape::new(&[n, c, h, pad], dt),
+                g,
+            );
+            dx = g.concat_(vec![dx, z], 3);
+        }
+        return dx;
+    }
+
+    // Fallback (overlapping / padded pools): dense argmax + scatter. Still
+    // capped — only toy sizes use this path now.
     let flat_n = n * c * h * w_in;
     let num_windows = n * c * h_out * w_out;
     assert!(
         flat_n.saturating_mul(num_windows) <= 4096,
-        "compose_max_pool2d_backward: scatter too large ({flat_n}x{num_windows})"
+        "compose_max_pool2d_backward: dense scatter too large ({flat_n}x{num_windows}); \
+         only non-overlapping pools (stride==kernel, no pad) have the O(input) decomposition"
     );
 
-    let dt = out_shape.dtype();
     let flat_x = g.reshape_(x, vec![flat_n as i64]);
     let flat_dy = g.reshape_(dy, vec![num_windows as i64]);
     let zero = f32_tensor_const(vec![0.0], Shape::scalar(dt), g);
@@ -1624,12 +1725,31 @@ pub fn compose_conv2d_backward_input(
     dilation: [usize; 2],
     groups: usize,
 ) -> NodeId {
+    // dx = conv_transpose(dy, W). The transposed convolution IS the adjoint of the
+    // forward (cross-correlation) conv — i.e. the input gradient. (A plain forward
+    // `conv` here was a long-standing bug: the wrong gradient on every backend, and
+    // CoreML rejected its channel layout.) The forward weight `[Cout, Cin, kH, kW]`
+    // is already in conv_transpose layout — dim 0 (Cout) is the transpose's input
+    // channels, matching `dy`. Solve `output_padding` so the transposed output
+    // recovers the original input spatial size (conv's floor division can drop up
+    // to stride-1 pixels): from `out = (in-1)·s + op + d·(k-1) - 2p + 1`.
+    let dy_shape = g.node(dy).shape.clone();
+    let out_pad = |axis: usize| -> usize {
+        let in_sz = dy_shape.dim(axis + 2).unwrap_static() as i64;
+        let out = out_shape.dim(axis + 2).unwrap_static() as i64;
+        let base = (in_sz - 1) * stride[axis] as i64
+            + dilation[axis] as i64 * (kernel_size[axis] as i64 - 1)
+            + 1
+            - 2 * padding[axis] as i64;
+        (out - base).max(0) as usize
+    };
     g.add_node(
-        Op::Conv {
+        Op::ConvTranspose2d {
             kernel_size: kernel_size.to_vec(),
             stride: stride.to_vec(),
             padding: padding.to_vec(),
             dilation: dilation.to_vec(),
+            output_padding: vec![out_pad(0), out_pad(1)],
             groups,
         },
         vec![dy, w],

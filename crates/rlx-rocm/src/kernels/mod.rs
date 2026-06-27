@@ -112,6 +112,42 @@ kernel_cache!(
     "cast_f32_to_half"
 );
 kernel_cache!(
+    SCALED_QUANT_SCALE,
+    scaled_quant_scale_kernel,
+    SCALED_LOWP_CU,
+    "scaled_quant_scale_per_tensor"
+);
+kernel_cache!(
+    SCALED_QUANTIZE_FP8,
+    scaled_quantize_fp8_kernel,
+    SCALED_LOWP_CU,
+    "scaled_quantize_fp8_per_tensor"
+);
+kernel_cache!(
+    SCALED_QUANT_SCALE_GENERAL,
+    scaled_quant_scale_general_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "scaled_quant_scale_general"
+);
+kernel_cache!(
+    SCALED_QUANTIZE_GENERAL,
+    scaled_quantize_general_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "scaled_quantize_general"
+);
+kernel_cache!(
+    SCALED_DEQUANTIZE_GENERAL,
+    scaled_dequantize_general_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "scaled_dequantize_general"
+);
+kernel_cache!(
+    SCALED_MATMUL_DECODE,
+    scaled_matmul_decode_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "scaled_matmul_decode"
+);
+kernel_cache!(
     UNARY,
     unary_kernel,
     rlx_gpu_kernels::unary_cuda_src(),

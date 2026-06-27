@@ -1,0 +1,57 @@
+[package]
+name = "rlx-vulkan"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Native Vulkan compute backend for RLX (raw `ash` + embedded SPIR-V compute kernels)"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[features]
+default = []
+# Emit Vulkan validation layers when `VK_INSTANCE_LAYERS` is unset (debug aid).
+validation = []
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.10", default-features = false, features = ["compile"] }
+rlx-compile = { path = "../rlx-compile", version = "0.2.10" }
+# CPU reference kernels for the host-fallback path (sequential / specialized
+# ops with no native SPIR-V kernel yet: RNN family, Mamba2, GatedDeltaNet,
+# ConvTranspose2d, FFT, GGUF dequant). The host-visible arena lets the CPU
+# read/write it directly, so the fallback is a plain in-place compute — no
+# staging. `default-features = false` drops rlx-cpu's `blas` link requirement
+# (OpenBLAS on Linux) so the standalone Linux/Docker build needs no BLAS; when
+# built alongside rlx-runtime (which enables `cpu`→`blas`), Cargo's additive
+# feature unification restores the platform BLAS, so host-fallback numerics
+# match the CPU reference exactly.
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", default-features = false }
+
+# Raw Vulkan. `loaded` = libloading-based dynamic load of the system
+# Vulkan loader at runtime via `Entry::load()`; no link-time dependency on
+# libvulkan, so the crate compiles + `cargo build`s on hosts with no Vulkan
+# driver (macOS without MoltenVK, CI). `Entry::load()` returns Err there and
+# the backend reports itself unavailable — mirrors rlx-cuda/rlx-rocm.
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
+bytemuck = { version = "1", features = ["derive"] }
+half = "2"
+
+[build-dependencies]
+# Compile the GLSL `.comp` compute shaders to SPIR-V at BUILD time (pure
+# Rust — no glslang/shaderc/Vulkan SDK needed on the build host). The
+# resulting `.spv` words are written to OUT_DIR and `include_bytes!`d into
+# the crate, so there is no runtime shader compilation. GLSL stays the
+# source of record under `shaders/`.
+naga = { version = "29", features = ["glsl-in", "spv-out"] }
+
+[dev-dependencies]
+half = "2"
+
+[lints]
+workspace = true

@@ -27,6 +27,12 @@ static void rlx_set_err(char *err, int err_len, NSError *e) {
   err[err_len - 1] = '\0';
 }
 
+static float rlx_half_bits_to_f32(uint16_t bits) {
+  __fp16 h;
+  memcpy(&h, &bits, sizeof(uint16_t));
+  return (float)h;
+}
+
 // Whether `a` is laid out as a dense row-major (C-contiguous) buffer.
 // CoreML/ANE frequently pads the inner dimension for alignment, in which
 // case the backing buffer has gaps and a flat memcpy is wrong.
@@ -60,11 +66,34 @@ RlxCoremlModel *rlx_coreml_load(const char *mlpackage_path, int compute_units,
                           ? [NSURL fileURLWithPath:@(compiled_cache_path)]
                           : nil;
 
+    MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
+    config.computeUnits = rlx_compute_units(compute_units);
+
+    MLModel *model = nil;
     NSURL *compiled = nil;
+
+    // Try the cached .mlmodelc first. A stale or version-incompatible cache must
+    // NOT permanently break loading — if it fails to load (either nil+NSError or
+    // a thrown NSException), drop it and recompile from the .mlpackage.
     if (cacheURL && [fm fileExistsAtPath:cacheURL.path]) {
-      // Cache hit: reuse the previously compiled .mlmodelc, skip compile.
-      compiled = cacheURL;
-    } else {
+      @try {
+        model = [MLModel modelWithContentsOfURL:cacheURL
+                                  configuration:config
+                                          error:&e];
+      } @catch (NSException *ex) {
+        model = nil;
+      }
+      if (model && !e) {
+        compiled = cacheURL;
+      } else {
+        model = nil;
+        e = nil;
+        [fm removeItemAtURL:cacheURL error:nil]; // discard the bad cache entry
+      }
+    }
+
+    // Cache miss / invalid cache → compile from the .mlpackage, persist, load.
+    if (!model) {
       NSURL *url = [NSURL fileURLWithPath:@(mlpackage_path)];
       NSURL *tmp = [MLModel compileModelAtURL:url error:&e];
       if (!tmp || e) {
@@ -83,17 +112,13 @@ RlxCoremlModel *rlx_coreml_load(const char *mlpackage_path, int compute_units,
           compiled = cacheURL;
         }
       }
-    }
-
-    MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
-    config.computeUnits = rlx_compute_units(compute_units);
-
-    MLModel *model = [MLModel modelWithContentsOfURL:compiled
-                                       configuration:config
-                                               error:&e];
-    if (!model || e) {
-      rlx_set_err(err, err_len, e);
-      return NULL;
+      model = [MLModel modelWithContentsOfURL:compiled
+                                configuration:config
+                                        error:&e];
+      if (!model || e) {
+        rlx_set_err(err, err_len, e);
+        return NULL;
+      }
     }
 
     struct RlxCoremlModel *handle = malloc(sizeof(struct RlxCoremlModel));
@@ -105,11 +130,11 @@ RlxCoremlModel *rlx_coreml_load(const char *mlpackage_path, int compute_units,
 }
 
 int rlx_coreml_predict(RlxCoremlModel *handle, int n_inputs,
-                       const char *const *in_names, const float *const *in_data,
+                       const char *const *in_names, const void *const *in_data,
                        const int64_t *const *in_shapes, const int *in_ranks,
-                       int n_outputs, const char *const *out_names,
-                       float *const *out_data, const int *out_len, char *err,
-                       int err_len) {
+                       const int *in_dtypes, int n_outputs,
+                       const char *const *out_names, float *const *out_data,
+                       const int *out_len, char *err, int err_len) {
   @autoreleasepool {
     MLModel *model = (__bridge MLModel *)handle->model;
     NSError *e = nil;
@@ -127,15 +152,22 @@ int rlx_coreml_predict(RlxCoremlModel *handle, int n_inputs,
         [shape addObject:@(s)];
         count *= (NSUInteger)s;
       }
+      int idt = (in_dtypes && in_dtypes[i] == 1) ? 1 : 0;
+      MLMultiArrayDataType arr_type =
+          idt ? MLMultiArrayDataTypeFloat16 : MLMultiArrayDataTypeFloat32;
       MLMultiArray *arr =
           [[MLMultiArray alloc] initWithShape:shape
-                                     dataType:MLMultiArrayDataTypeFloat32
+                                     dataType:arr_type
                                         error:&e];
       if (!arr || e) {
         rlx_set_err(err, err_len, e);
         return 1;
       }
-      memcpy(arr.dataPointer, in_data[i], count * sizeof(float));
+      if (idt) {
+        memcpy(arr.dataPointer, in_data[i], count * sizeof(uint16_t));
+      } else {
+        memcpy(arr.dataPointer, in_data[i], count * sizeof(float));
+      }
       NSString *name = [NSString stringWithUTF8String:in_names[i]];
       feats[name] = [MLFeatureValue featureValueWithMultiArray:arr];
     }
@@ -179,6 +211,13 @@ int rlx_coreml_predict(RlxCoremlModel *handle, int n_inputs,
       // strides; output buffers are small relative to compute.
       if (arr.dataType == MLMultiArrayDataTypeFloat32 && rlx_is_contiguous(arr)) {
         memcpy(out_data[o], arr.dataPointer, copy * sizeof(float));
+      } else if (arr.dataType == MLMultiArrayDataTypeFloat16 &&
+                 rlx_is_contiguous(arr)) {
+        const uint16_t *src = (const uint16_t *)arr.dataPointer;
+        float *dst = out_data[o];
+        for (NSUInteger k = 0; k < copy; k++) {
+          dst[k] = rlx_half_bits_to_f32(src[k]);
+        }
       } else {
         // Strided / non-f32 backing: index logically (row-major) so the
         // inner-dim padding CoreML adds for ANE alignment is skipped.

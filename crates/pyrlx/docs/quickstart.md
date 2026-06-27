@@ -90,9 +90,30 @@ device, outs = router.run(inputs)
 See [`docs/backend-selection.md`](../../docs/backend-selection.md).
 
 The compiled output of every backend is the same up to numerical
-precision — that's the parity test (`pyrlx/examples/cross_backend_parity.py`).
+precision — that's the parity test (`examples/cross_backend_parity.py`).
 
-Full DSL reference: [`dsl.md`](dsl.md). Runnable demo: `python examples/dsl_quickstart.py`.
+Full DSL reference: [`dsl.md`](dsl.md). Runnable demo:
+`python examples/dsl_quickstart.py`.
+
+## GGUF pack / convert
+
+No backend session needed for quantize, file I/O, or safetensors conversion:
+
+```python
+import pyrlx as rlx
+
+packed = rlx.quantize(weights_f32, dtype="IQ2_XXS")
+back = rlx.dequant(packed, dtype="IQ2_XXS", num_elements=len(weights_f32))
+
+rlx.convert_to_gguf("model.safetensors", "model.q4_k.gguf", "Q4_K")
+f = rlx.load_gguf("model.q4_k.gguf")
+meta = f.tensor_names()
+w = f.dequant_tensor("token_embd.weight")
+```
+
+Build with `maturin develop --features cpu,gguf-convert` (default). Add
+`gguf-onnx` / `gguf-pt` for ONNX / PyTorch sources. Runtime inference on
+quantized weights uses the same backends as Rust (`Session` + GGUF-loaded graphs).
 
 ## License
 

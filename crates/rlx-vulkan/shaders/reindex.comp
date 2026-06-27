@@ -1,0 +1,49 @@
+#version 450
+// Generic strided copy over a mixed-radix iteration shape. One kernel covers
+// Narrow, Concat (per input), Expand (broadcast), and Transpose: for each
+// element of the iteration `shape`, map it to an input linear index and an
+// output linear index via per-axis strides, then copy. rank ≤ 6.
+//
+//   out[out_off + out_idx] = data[in_off + in_idx]
+//
+// NOTE: push-constant members are individual scalars (NOT `uint[6]` arrays).
+// Array members in a push-constant block get a compiler-chosen std140/std430
+// stride that does not match a tightly-packed host layout (this bit the
+// transpose kernel under MoltenVK); scalars have a stable, contiguous layout.
+// The 22 scalars are reassembled into local arrays here. Field order matches
+// the host packer in `backend.rs`.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float data[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint rank;
+    uint in_off;
+    uint out_off;
+    uint s0; uint s1; uint s2; uint s3; uint s4; uint s5;       // iteration shape
+    uint i0; uint i1; uint i2; uint i3; uint i4; uint i5;       // input strides
+    uint o0; uint o1; uint o2; uint o3; uint o4; uint o5;       // output strides
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    uint shape[6] = uint[6](pc.s0, pc.s1, pc.s2, pc.s3, pc.s4, pc.s5);
+    uint istr[6]  = uint[6](pc.i0, pc.i1, pc.i2, pc.i3, pc.i4, pc.i5);
+    uint ostr[6]  = uint[6](pc.o0, pc.o1, pc.o2, pc.o3, pc.o4, pc.o5);
+
+    uint rem = i;
+    uint in_idx = 0u;
+    uint out_idx = 0u;
+    // Walk axes from innermost (last) to outermost.
+    for (uint a = 0u; a < pc.rank; a++) {
+        uint ax = pc.rank - 1u - a;
+        uint dim = shape[ax];
+        uint c = rem % dim;
+        rem = rem / dim;
+        in_idx += c * istr[ax];
+        out_idx += c * ostr[ax];
+    }
+    data[pc.out_off + out_idx] = data[pc.in_off + in_idx];
+}

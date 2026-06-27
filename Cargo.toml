@@ -14,6 +14,9 @@ members = [
     # Driver layer (devices, arenas, buffers, streams)
     "crates/rlx-driver",
 
+    # In-graph collective ops (tensor-parallel all-reduce)
+    "crates/rlx-collectives",
+
     # CPU backend
     "crates/rlx-cpu",         # SIMD kernels, BLAS FFI, thread pool, arena executor
 
@@ -34,11 +37,21 @@ members = [
     # FPGA backend
     "crates/rlx-fpga",        # IR → Verilog → bitstream (per-graph datapath, integer-only Q0.31 requant)
 
-    # GPU backends (future)
-    # "rlx-vulkan",    # Vulkan compute
-    # "rlx-opengl",    # OpenGL compute (legacy)
-    # "rlx-directx",   # DirectX 12 compute
-    # "rlx-webgpu",    # WebGPU/WASM
+    # Cerebras Wafer-Scale Engine backend
+    "crates/rlx-cerebras",    # IR → CSL → fabric simulator (single-PE matmul; multi-PE tiling WIP)
+
+    # Native Vulkan compute backend (raw `ash` + embedded SPIR-V kernels)
+    "crates/rlx-vulkan",
+
+    # Qualcomm Hexagon NPU backend (AI Engine Direct / QNN)
+    "crates/rlx-qnn",        # IR → QNN model C++ → qnn-net-run on the x86 reference backend (Adreno is rlx-vulkan)
+
+    # Intel oneAPI Level Zero backend (Arc / Data Center Max) — dynamic-loaded
+    # `libze_loader` + OpenCL-C→SPIR-V compute kernels (peak Intel path).
+    "crates/rlx-oneapi",
+
+    # GPU/accelerator backends (future, ranked by hardware-coverage gap)
+    # "rlx-directml",  # Windows NPUs (Copilot+ / Hexagon / Intel-AMD NPU) via DirectML
 
     "crates/rlx-gguf",        # GGUF parser + dequant + quant encoders + writer
     "crates/rlx-gguf-convert", # safetensors / ONNX → GGUF conversion with per-tensor quant
@@ -59,11 +72,6 @@ members = [
     # Downstream packages (registered against the custom-op scaffold)
     "crates/rlx-sparse",      # Sparse linear algebra (CSR LU/MatVec/CG) — JAX-style downstream
     "crates/rlx-linalg",      # Dense linalg (eigh/svd/qr/cholesky/solve_triangular) via LAPACK
-    # rlx-splat* temporarily moved out of the tree; references commented out to
-    # keep the workspace resolvable. Restore these 3 lines when splat returns.
-    # "rlx-splat",       # 3D Gaussian splatting (CPU reference render custom op)
-    # "rlx-splat-web",   # wasm-bindgen wrapper for rlx-splat — browser-renderable PLY scenes
-    # "rlx-splat-anim",  # offline pipeline: multi-view render → SAM3 prompts → per-splat skin weights
     "crates/rlx-fdm",         # Force density method — pin-jointed form-finding (jax_fdm port)
     "crates/rlx-rl",          # Flow-map policies + FMQ / QGBS (offline-to-online RL)
     "crates/rlx-bbo",         # Black-box + trust-region Q-guidance / QGBS (domain-agnostic f64)
@@ -80,6 +88,14 @@ members = [
 
     # Python bindings
     "crates/pyrlx",           # PyO3 + maturin: run any RLX backend from Python
+
+    # WebAssembly entry point — run models in the browser (CPU backend +
+    # async WebGPU device bring-up via rlx-wgpu)
+    "crates/rlx-web",
+
+    # WebGL2 GPGPU backend — render-to-texture execution in the browser
+    # (no compute shaders on WebGL2), forward + backward.
+    "crates/rlx-webgl",
 ]
 
 # ── Sanitizer / debug profiles (plan #41) ────────────────────────
@@ -116,7 +132,7 @@ incremental = false
 # Add them as crates reach individual readiness.
 
 [workspace.package]
-version       = "0.2.9"
+version       = "0.2.10"
 edition       = "2024"
 rust-version  = "1.87"  # edition=2024 needs ≥1.85; we use `is_multiple_of` (stable in 1.87)
 license       = "GPL-3.0-only"

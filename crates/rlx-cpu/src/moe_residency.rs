@@ -19,8 +19,7 @@
 //! `run`. [`crate::thunk::GroupedMatMul`] reads the mask for accounting;
 //! numerics still use the full expert stack in the arena (lossless on CPU).
 
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, RwLock};
 
 /// Per-expert host pointers for one MoE layer (gate/up/down).
@@ -47,8 +46,16 @@ unsafe impl Sync for MoeHostBind {}
 
 static HOST_BIND: RwLock<Option<MoeHostBind>> = RwLock::new(None);
 static LAST_STATS: RwLock<Option<MoeResidencyStats>> = RwLock::new(None);
-/// Monotonic GroupedMatMul ordinal within one forward (layer = ord/3, matrix = ord%3).
-static GMM_ORD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Monotonic GroupedMatMul ordinal within one forward (layer = ord/3,
+    /// matrix = ord%3). **Thread-local** to match the residency [`CTX`]: forwards
+    /// run per-thread, so a process-global counter would let one thread's
+    /// `reset_gmm_counters` / `next_gmm_ord` clobber another's in-flight ordinal
+    /// sequence — corrupting the layer/matrix decode (wrong TIDE host-expert
+    /// weights + residency accounting).
+    static GMM_ORD: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct MoeResidencyStats {
@@ -101,12 +108,16 @@ pub fn bind_host_weights(bind: Option<MoeHostBind>) {
 }
 
 pub fn reset_gmm_counters() {
-    GMM_ORD.store(0, Ordering::Relaxed);
+    GMM_ORD.with(|c| c.set(0));
 }
 
 /// Next MoE GroupedMatMul ordinal for this forward (call once per kernel).
 pub fn next_gmm_ord() -> usize {
-    GMM_ORD.fetch_add(1, Ordering::Relaxed)
+    GMM_ORD.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    })
 }
 
 /// Host expert weight pointer for `ord` (gate/up/down = ord%3, layer = ord/3).
@@ -195,6 +206,32 @@ pub fn take_stats() -> Option<MoeResidencyStats> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn gmm_ordinal_is_thread_local() {
+        use std::sync::Barrier;
+        // Each forward runs on its own thread and expects its own ordinal
+        // sequence. Two threads resetting + advancing concurrently must not
+        // clobber each other (the old process-global atomic did).
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    reset_gmm_counters();
+                    b.wait(); // both reset, then race the increments
+                    (0..5).map(|_| next_gmm_ord()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(
+                h.join().unwrap(),
+                vec![0, 1, 2, 3, 4],
+                "GroupedMatMul ordinal must be per-thread monotonic"
+            );
+        }
+    }
 
     #[test]
     fn per_layer_masks_are_layer_local() {

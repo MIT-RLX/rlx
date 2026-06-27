@@ -51,8 +51,27 @@ impl MetalDevice {
     /// Allocate a shared (CPU+GPU accessible) buffer. On Apple Silicon
     /// unified memory, this is zero-copy.
     pub fn alloc_shared(&self, bytes: usize) -> metal::Buffer {
-        self.device
-            .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        let buf = self
+            .device
+            .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+        // Metal `new_buffer` leaves contents undefined. Ops that read unwritten
+        // arena regions (e.g. conv halo padding) would otherwise pick up
+        // per-process garbage — a nondeterminism / correctness bug. Shared
+        // storage is CPU-visible, so zero it cheaply up front.
+        if bytes > 0 {
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+        }
+        if std::env::var_os("RLX_METAL_DEBUG").is_some() && bytes > 1 << 30 {
+            eprintln!(
+                "[rlx-metal] alloc_shared {:.2} GB (maxBufferLength {:.2} GB) → length {:.2} GB",
+                bytes as f64 / 1e9,
+                self.device.max_buffer_length() as f64 / 1e9,
+                buf.length() as f64 / 1e9,
+            );
+        }
+        buf
     }
 
     /// Allocate a private (GPU-only) buffer. Lower latency for GPU access.
@@ -77,7 +96,7 @@ pub fn metal_device() -> Option<&'static MetalDevice> {
 ///
 /// Call after dropping compiled graphs or on GPU fault recovery so later
 /// submissions are not rejected with `SubmissionsIgnored`.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 pub fn drain_command_queue() {
     if let Some(dev) = metal_device() {
         let cb = dev.queue.new_command_buffer();
@@ -86,7 +105,7 @@ pub fn drain_command_queue() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
 pub fn drain_command_queue() {}
 
 /// True if a Metal device is available on this system.

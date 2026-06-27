@@ -1413,6 +1413,7 @@ fn rope_identity_passes_through() {
         Op::Rope {
             head_dim: 4,
             n_rot: 4,
+            style: rlx_ir::RopeStyle::NeoX,
         },
         vec![x, cos, sin],
         Shape::new(&[1, 1, 1, 4], DType::F32),
@@ -1443,6 +1444,7 @@ fn rope_90_degree_rotation_matches_reference() {
         Op::Rope {
             head_dim: 4,
             n_rot: 4,
+            style: rlx_ir::RopeStyle::NeoX,
         },
         vec![x, cos, sin],
         Shape::new(&[1, 1, 1, 4], DType::F32),
@@ -1462,6 +1464,82 @@ fn rope_90_degree_rotation_matches_reference() {
         "rope90 mismatch: got {:?} want {want:?}",
         r[0]
     );
+}
+
+/// GPT-J / llama.cpp-NORM interleaved RoPE (`RopeStyle::GptJ`): rotated pairs
+/// are adjacent `(2i, 2i+1)` rather than NeoX rotate-half `(i, i+d/2)`. GGUF
+/// Llama weights need this flavor; the wgpu kernel must match CPU and produce
+/// a result distinct from NeoX. Mirrors `metal_rope_gptj_interleaved_matches_cpu`.
+#[test]
+fn rope_gptj_interleaved_matches_cpu() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    use rlx::prelude::*;
+
+    let (b, s, h, d) = (1usize, 64usize, 32usize, 128usize);
+    let half = d / 2;
+    let w = h * d;
+
+    let build = |style: rlx_ir::RopeStyle| {
+        let mut g = Graph::new("rope_styled");
+        let x = g.input("x", Shape::new(&[b, s, w], DType::F32));
+        let cos = g.input("cos", Shape::new(&[s, half], DType::F32));
+        let sin = g.input("sin", Shape::new(&[s, half], DType::F32));
+        let y = g.add_node(
+            Op::Rope {
+                head_dim: d,
+                n_rot: d,
+                style,
+            },
+            vec![x, cos, sin],
+            Shape::new(&[b, s, w], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        g
+    };
+
+    let x: Vec<f32> = (0..b * s * w)
+        .map(|i| ((i as f32) * 0.0007).sin())
+        .collect();
+    let mut cos = vec![0f32; s * half];
+    let mut sin = vec![0f32; s * half];
+    for p in 0..s {
+        for j in 0..half {
+            let freq = 1.0f32 / (100_000_000.0f32).powf((2 * j) as f32 / d as f32);
+            let ang = p as f32 * freq;
+            cos[p * half + j] = ang.cos();
+            sin[p * half + j] = ang.sin();
+        }
+    }
+
+    let g_gptj = build(rlx_ir::RopeStyle::GptJ);
+    let mut wgpu_exe = WgpuExecutable::compile(g_gptj.clone());
+    let got = wgpu_exe
+        .run(&[("x", &x), ("cos", &cos), ("sin", &sin)])
+        .remove(0);
+
+    let cpu = Session::new(Device::Cpu);
+    let mut cc = cpu.compile(g_gptj);
+    let want = cc.run(&[("x", &x), ("cos", &cos), ("sin", &sin)]).remove(0);
+
+    let max_abs = want
+        .iter()
+        .zip(got.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("gptj rope (hd=128): max_abs={max_abs:.6}");
+    assert!(max_abs < 1e-4, "gptj rope wgpu vs CPU max_abs={max_abs}");
+
+    // Interleaved must differ from NeoX with identical inputs.
+    let cpu2 = Session::new(Device::Cpu);
+    let mut cn = cpu2.compile(build(rlx_ir::RopeStyle::NeoX));
+    let cpu_neox = cn.run(&[("x", &x), ("cos", &cos), ("sin", &sin)]).remove(0);
+    let differ = cpu_neox
+        .iter()
+        .zip(got.iter())
+        .any(|(a, b)| (a - b).abs() > 1e-3);
+    assert!(differ, "GptJ output identical to NeoX => style ignored");
 }
 
 #[test]

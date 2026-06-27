@@ -205,6 +205,35 @@ impl Arena {
         self.copy_node_f32_prefix(dst, src, dst_len.min(src_len));
     }
 
+    /// Copy `n` f32 from `src` (starting at element `src_elem`) into `dst`
+    /// (starting at `dst_elem`), clamped to both node element counts. Used by the
+    /// resident KV *row* feed to drop one new-token row (output row `upper`) into
+    /// the resident `past_k_*` slot at the active row, in unified memory.
+    pub fn copy_node_f32_range(
+        &self,
+        dst: NodeId,
+        dst_elem: usize,
+        src: NodeId,
+        src_elem: usize,
+        n: usize,
+    ) {
+        let dst_cap = *self.element_counts.get(&dst).unwrap_or(&0);
+        let src_cap = *self.element_counts.get(&src).unwrap_or(&0);
+        if n == 0 || dst_elem + n > dst_cap || src_elem + n > src_cap {
+            return;
+        }
+        let dst_off = self.byte_offset(dst);
+        let src_off = self.byte_offset(src);
+        unsafe {
+            let base = self.buffer.contents() as *mut u8;
+            let src_p = (base.add(src_off) as *const f32).add(src_elem);
+            let dst_p = (base.add(dst_off) as *mut f32).add(dst_elem);
+            if src_p as *const () != dst_p as *const () {
+                std::ptr::copy(src_p, dst_p, n);
+            }
+        }
+    }
+
     /// Copy the first `elems` floats from `src` into `dst` (KV prefix after active-extent).
     pub fn copy_node_f32_prefix(&self, dst: NodeId, src: NodeId, elems: usize) {
         if elems == 0 {

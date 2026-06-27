@@ -155,34 +155,33 @@ impl SymmetricHeap {
 pub struct LocalTransport {
     heap: Arc<SymmetricHeap>,
     me: Rank,
-    barrier_count: Arc<std::sync::atomic::AtomicU32>,
-    barrier_target: u32,
+    /// Shared, reusable rendezvous barrier across all ranks from the same
+    /// [`fan_out`](Self::fan_out). A real `std::sync::Barrier` (auto-reset
+    /// after every rank passes), so multi-step collectives — ring all-reduce
+    /// in particular — synchronize correctly across threads.
+    barrier: Arc<std::sync::Barrier>,
 }
 
 impl LocalTransport {
     pub fn new(num_ranks: u32, heap_size: usize, this_rank: Rank) -> Self {
         let heap = Arc::new(SymmetricHeap::new(num_ranks, heap_size));
-        Self::with_heap(heap, this_rank)
+        let barrier = Arc::new(std::sync::Barrier::new(num_ranks as usize));
+        Self::with_heap(heap, this_rank, barrier)
     }
 
-    /// Construct multiple `LocalTransport`s sharing one heap —
-    /// `Vec` of length `num_ranks`, each with its own `me`.
-    /// Tests typically iterate this list to drive each rank.
+    /// Construct multiple `LocalTransport`s sharing one heap **and one
+    /// barrier** — `Vec` of length `num_ranks`, each with its own `me`.
+    /// Drive each on its own thread for multi-rank collective tests.
     pub fn fan_out(num_ranks: u32, heap_size: usize) -> Vec<Self> {
         let heap = Arc::new(SymmetricHeap::new(num_ranks, heap_size));
+        let barrier = Arc::new(std::sync::Barrier::new(num_ranks as usize));
         (0..num_ranks)
-            .map(|i| Self::with_heap(heap.clone(), Rank(i)))
+            .map(|i| Self::with_heap(heap.clone(), Rank(i), barrier.clone()))
             .collect()
     }
 
-    fn with_heap(heap: Arc<SymmetricHeap>, me: Rank) -> Self {
-        let n = heap.num_ranks();
-        Self {
-            heap,
-            me,
-            barrier_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            barrier_target: n,
-        }
+    fn with_heap(heap: Arc<SymmetricHeap>, me: Rank, barrier: Arc<std::sync::Barrier>) -> Self {
+        Self { heap, me, barrier }
     }
 
     fn check_buf(&self, buf: SymmetricBuffer) -> Result<(), CollectiveError> {
@@ -241,18 +240,9 @@ impl SymmetricTransport for LocalTransport {
     }
 
     fn barrier(&self) -> Result<(), CollectiveError> {
-        // Each rank bumps the counter; spin until we observe
-        // num_ranks bumps, then move on. This isn't a "real"
-        // barrier (no rendezvous) — it's an arrival counter,
-        // sufficient for single-thread tests where each rank
-        // calls barrier in turn.
-        use std::sync::atomic::Ordering;
-        self.barrier_count.fetch_add(1, Ordering::AcqRel);
-        // For LocalTransport in single-thread tests this returns
-        // immediately; concurrent multi-thread tests can spin.
-        while self.barrier_count.load(Ordering::Acquire) < self.barrier_target {
-            std::hint::spin_loop();
-        }
+        // Real rendezvous: blocks until every rank from the same `fan_out`
+        // reaches here, then all proceed. Reusable across collective steps.
+        self.barrier.wait();
         Ok(())
     }
 }

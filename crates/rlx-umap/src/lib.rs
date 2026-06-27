@@ -88,7 +88,7 @@ pub mod weights;
 #[cfg(all(feature = "optim", feature = "full"))]
 pub mod optim_adapter;
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
 mod metal_kernels;
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]

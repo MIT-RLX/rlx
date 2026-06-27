@@ -18,6 +18,8 @@ PrecisionPolicy Y?"
   - `bench_fft` — batch × N sweep across backends; set
     `RLX_BENCH_DISPATCH_ONLY=1` on wgpu to skip readback and isolate
     dispatch time.
+  - `bench_gguf_dequant` — per-scheme dequant + matmul sweep (CPU / Metal / WGPU /
+    CUDA when enabled); use `just throttle` before timing runs.
   - `bench_mlx_wgpu` — matmul: `Device::Cpu` vs `Device::Mlx` (set
     `RLX_MLX_DEVICE=cpu` on Linux for MLX CPU path).
   - `bench_mlx_devices` — MLX device legs (Metal / Linux CPU / Linux CUDA);

@@ -91,6 +91,25 @@ const ATTR_PREF_MAX_WORKSPACE_BYTES: c_int = 0;
 const LAYOUT_ATTR_BATCH_COUNT: c_int = 4;
 const LAYOUT_ATTR_STRIDED_BATCH_OFFSET: c_int = 5;
 
+// ── Native FP8 GEMM constants (CDNA3 / MI300) ────────────────────────
+// hipBLASLt mirrors cuBLASLt's binary layout (see note above), so these
+// attribute IDs match the verified cuBLASLt values. The fp8 *data-type*
+// integers, the compute-type, and the transpose-op encoding are the parts most
+// likely to drift across ROCm versions — VERIFY them against the installed
+// hipblaslt headers on the MI300 before trusting numerical results. A wrong
+// value makes hipBLASLt fail layout/heuristic creation (a loud `.ok()?` error),
+// not a silent miscompute.
+const ATTR_TRANSA: c_int = 3; // CUBLASLT_MATMUL_DESC_TRANSA
+const ATTR_TRANSB: c_int = 4; // CUBLASLT_MATMUL_DESC_TRANSB
+const ATTR_A_SCALE_POINTER: c_int = 17;
+const ATTR_B_SCALE_POINTER: c_int = 18;
+const OP_T_LT: c_int = 1; // cuBLASLt-style cublasOperation_t (T)
+const OP_N_LT: c_int = 0; // cuBLASLt-style cublasOperation_t (N)
+const HIPBLAS_COMPUTE_32F: c_int = 68; // f32 accumulate (no TF32 down-convert)
+/// hipDataType FP8 FNUZ — CDNA3 (MI300). CDNA4 adds OCP variants (28/29).
+const HIP_R_8F_E4M3_FNUZ: c_int = 1000;
+const HIP_R_8F_E5M2_FNUZ: c_int = 1001;
+
 // ── Function-pointer signatures ──────────────────────────────────────
 
 type FnHipblasLtCreate = unsafe extern "C" fn(*mut HipblasLtHandle) -> HipblasLtError;
@@ -463,6 +482,184 @@ pub unsafe fn matmul_fused(
         let _ = (rt.pref_destroy)(pref);
         let _ = (rt.matmul_desc_destroy)(desc);
         let _ = (rt.matrix_layout_destroy)(c_layout);
+        let _ = (rt.matrix_layout_destroy)(b_layout);
+        let _ = (rt.matrix_layout_destroy)(a_layout);
+
+        result.ok()
+    }
+}
+
+/// Native **FP8 (FNUZ) tensor-core GEMM** via hipBLASLt — CDNA3 (MI300). Mirror
+/// of the CUDA `cublaslt_matmul_fp8` path: TN layout `D[m,n] = (lhs[m,k] ·
+/// rhs[n,k]ᵀ) · lhs_scale · rhs_scale`, both operands FP8 codes, per-tensor f32
+/// scale pointers, f32 accumulation. Offsets are BYTES (codes are 1 byte;
+/// scales/out/bias f32). cuBLASLt mapping: A = rhs (col-major `[k,n]`, op T),
+/// B = lhs (col-major `[k,m]`, op N), D col-major `[n,m]`; A_SCALE = rhs_scale.
+///
+/// NOTE: the fp8 datatype + compute-type + scale/transpose attribute constants
+/// are best-effort and **must be verified on the MI300** (see the const block).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matmul_fused_fp8(
+    lt: &HipblasLtContext,
+    workspace_dev_ptr: u64,
+    workspace_size: usize,
+    arena_dev_ptr: u64,
+    m: u32,
+    k: u32,
+    n: u32,
+    lhs_byte_off: u64,
+    rhs_byte_off: u64,
+    lhs_scale_byte_off: u64,
+    rhs_scale_byte_off: u64,
+    out_byte_off: u64,
+    has_bias: bool,
+    bias_byte_off: u64,
+    lhs_e5m2: bool,
+    rhs_e5m2: bool,
+    stream: HipStream,
+) -> Result<(), HipblasLtError> {
+    use core::mem;
+    let rt = &lt.runtime;
+    let fp8 = |e5m2: bool| {
+        if e5m2 {
+            HIP_R_8F_E5M2_FNUZ
+        } else {
+            HIP_R_8F_E4M3_FNUZ
+        }
+    };
+    let a_dt = fp8(rhs_e5m2); // A = rhs
+    let b_dt = fp8(lhs_e5m2); // B = lhs
+
+    let a_ptr = (arena_dev_ptr + rhs_byte_off) as *const c_void;
+    let b_ptr = (arena_dev_ptr + lhs_byte_off) as *const c_void;
+    let c_ptr = (arena_dev_ptr + out_byte_off) as *const c_void;
+    let d_ptr = c_ptr as *mut c_void;
+
+    unsafe {
+        let mut a_layout: HipblasLtMatrixLayout = ptr::null_mut();
+        let mut b_layout: HipblasLtMatrixLayout = ptr::null_mut();
+        let mut cd_layout: HipblasLtMatrixLayout = ptr::null_mut();
+        let mut desc: HipblasLtMatmulDesc = ptr::null_mut();
+        let mut pref: HipblasLtMatmulPref = ptr::null_mut();
+
+        (rt.matrix_layout_create)(&mut a_layout, a_dt, k as u64, n as u64, k as i64).ok()?;
+        (rt.matrix_layout_create)(&mut b_layout, b_dt, k as u64, m as u64, k as i64).ok()?;
+        (rt.matrix_layout_create)(&mut cd_layout, HIPBLAS_R_32F, n as u64, m as u64, n as i64)
+            .ok()?;
+        (rt.matmul_desc_create)(&mut desc, HIPBLAS_COMPUTE_32F, HIPBLAS_R_32F).ok()?;
+
+        // FP8 requires transa = T, transb = N.
+        (rt.matmul_desc_set_attr)(
+            desc,
+            ATTR_TRANSA,
+            &OP_T_LT as *const _ as *const _,
+            mem::size_of::<c_int>(),
+        )
+        .ok()?;
+        (rt.matmul_desc_set_attr)(
+            desc,
+            ATTR_TRANSB,
+            &OP_N_LT as *const _ as *const _,
+            mem::size_of::<c_int>(),
+        )
+        .ok()?;
+
+        // Per-tensor dequant scales: D = a_scale · b_scale · (A·B).
+        let a_scale = arena_dev_ptr + rhs_scale_byte_off;
+        let b_scale = arena_dev_ptr + lhs_scale_byte_off;
+        (rt.matmul_desc_set_attr)(
+            desc,
+            ATTR_A_SCALE_POINTER,
+            &a_scale as *const _ as *const _,
+            mem::size_of::<u64>(),
+        )
+        .ok()?;
+        (rt.matmul_desc_set_attr)(
+            desc,
+            ATTR_B_SCALE_POINTER,
+            &b_scale as *const _ as *const _,
+            mem::size_of::<u64>(),
+        )
+        .ok()?;
+
+        if has_bias {
+            let epi = HipblasLtEpilogue::Bias;
+            (rt.matmul_desc_set_attr)(
+                desc,
+                ATTR_EPILOGUE,
+                &epi as *const _ as *const _,
+                mem::size_of::<HipblasLtEpilogue>(),
+            )
+            .ok()?;
+            let bias_dev = arena_dev_ptr + bias_byte_off;
+            (rt.matmul_desc_set_attr)(
+                desc,
+                ATTR_BIAS_POINTER,
+                &bias_dev as *const _ as *const _,
+                mem::size_of::<u64>(),
+            )
+            .ok()?;
+        }
+
+        (rt.pref_create)(&mut pref).ok()?;
+        (rt.pref_set_attr)(
+            pref,
+            ATTR_PREF_MAX_WORKSPACE_BYTES,
+            &workspace_size as *const _ as *const _,
+            mem::size_of::<usize>(),
+        )
+        .ok()?;
+
+        let mut heuristic = mem::MaybeUninit::<HipblasLtMatmulHeuristicResult>::uninit();
+        let mut returned: c_int = 0;
+        (rt.algo_get_heuristic)(
+            lt.handle,
+            desc,
+            a_layout,
+            b_layout,
+            cd_layout,
+            cd_layout,
+            pref,
+            1,
+            heuristic.as_mut_ptr(),
+            &mut returned,
+        )
+        .ok()?;
+        if returned == 0 {
+            let _ = (rt.pref_destroy)(pref);
+            let _ = (rt.matmul_desc_destroy)(desc);
+            let _ = (rt.matrix_layout_destroy)(cd_layout);
+            let _ = (rt.matrix_layout_destroy)(b_layout);
+            let _ = (rt.matrix_layout_destroy)(a_layout);
+            return Err(HipblasLtError(-1));
+        }
+        let heuristic = heuristic.assume_init();
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let workspace_ptr = workspace_dev_ptr as *mut c_void;
+        let result = (rt.matmul)(
+            lt.handle,
+            desc,
+            &alpha as *const _ as *const c_void,
+            a_ptr,
+            a_layout,
+            b_ptr,
+            b_layout,
+            &beta as *const _ as *const c_void,
+            c_ptr,
+            cd_layout,
+            d_ptr,
+            cd_layout,
+            heuristic.algo.as_ptr(),
+            workspace_ptr,
+            workspace_size,
+            stream,
+        );
+
+        let _ = (rt.pref_destroy)(pref);
+        let _ = (rt.matmul_desc_destroy)(desc);
+        let _ = (rt.matrix_layout_destroy)(cd_layout);
         let _ = (rt.matrix_layout_destroy)(b_layout);
         let _ = (rt.matrix_layout_destroy)(a_layout);
 

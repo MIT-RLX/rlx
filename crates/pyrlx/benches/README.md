@@ -8,7 +8,7 @@ Frameworks supported: **pyrlx**, **PyTorch**, **JAX**, **tinygrad**.
 ## Run
 
 ```sh
-# from pyrlx/
+# from crates/pyrlx/
 python benches/bench_vs_torch_jax.py
 ```
 

@@ -31,7 +31,7 @@ rlx.set_param(compiled, "b", np.zeros(3, dtype=np.float32))
 out, = rlx.run(compiled, x=np.ones((2, 4), dtype=np.float32))
 ```
 
-See also `pyrlx/examples/dsl_quickstart.py`.
+See also `examples/dsl_quickstart.py`.
 
 ## Scalar promotion
 

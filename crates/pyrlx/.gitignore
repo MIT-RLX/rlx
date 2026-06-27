@@ -3,3 +3,7 @@ __pycache__/
 *.egg-info/
 dist/
 target/
+# maturin build artifacts (rebuilt by `maturin develop`)
+python/pyrlx/_pyrlx*.so
+python/pyrlx/_pyrlx*.dylib
+python/pyrlx/_pyrlx*.pyd

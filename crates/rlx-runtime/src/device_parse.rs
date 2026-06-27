@@ -42,12 +42,14 @@ pub fn parse_device(s: &str) -> Result<Device, ParseDeviceError> {
         "ane" | "neural-engine" => Ok(Device::Ane),
         "cuda" | "nvidia" => Ok(Device::Cuda),
         "rocm" | "hip" | "amd" => Ok(Device::Rocm),
+        "oneapi" | "levelzero" | "level-zero" | "l0" | "intel" | "sycl" => Ok(Device::OneApi),
         "gpu" | "wgpu" => Ok(Device::Gpu),
         "vulkan" | "vk" => Ok(Device::Vulkan),
         "opengl" | "gl" => Ok(Device::OpenGl),
         "directx" | "dx12" | "d3d12" => Ok(Device::DirectX),
         "webgpu" => Ok(Device::WebGpu),
         "tpu" => Ok(Device::Tpu),
+        "hexagon" | "htp" | "qnn" => Ok(Device::Hexagon),
         "" => Err(ParseDeviceError {
             input: s.to_string(),
             message: "empty device name".into(),
@@ -70,12 +72,14 @@ pub fn device_label(device: Device) -> &'static str {
         Device::Ane => "ane",
         Device::Cuda => "cuda",
         Device::Rocm => "rocm",
+        Device::OneApi => "oneapi",
         Device::Gpu => "gpu",
         Device::Vulkan => "vulkan",
         Device::OpenGl => "opengl",
         Device::DirectX => "directx",
         Device::WebGpu => "webgpu",
         Device::Tpu => "tpu",
+        Device::Hexagon => "hexagon",
     }
 }
 

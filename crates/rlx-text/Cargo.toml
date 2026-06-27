@@ -14,8 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-runtime  = { path = "../rlx-runtime", version = "0.2.9" }
-rlx-gguf     = { path = "../rlx-gguf",    version = "0.2.9" }
+rlx-runtime  = { path = "../rlx-runtime", version = "0.2.10" }
+rlx-gguf     = { path = "../rlx-gguf",    version = "0.2.10" }
 anyhow       = "1"
 minijinja    = { version = "2", default-features = false, features = ["builtins", "macros", "serde"] }
 serde        = { version = "1", features = ["derive"] }

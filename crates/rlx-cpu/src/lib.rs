@@ -36,6 +36,8 @@ pub mod dispatch;
 pub mod executor;
 pub mod gdn;
 pub mod gguf_matmul;
+pub mod gguf_scheme;
+pub use gguf_scheme::quant_scheme_for_ggml;
 pub mod im2col;
 pub mod intrinsics;
 pub mod kernel_config;

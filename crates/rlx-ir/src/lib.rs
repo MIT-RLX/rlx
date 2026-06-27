@@ -52,6 +52,7 @@ pub mod inspect;
 pub mod layout;
 pub mod lir;
 pub mod logical_kernel;
+pub mod lowp_codec;
 pub mod measure;
 pub mod mir;
 pub mod module;
@@ -98,7 +99,10 @@ pub use dynamic::{
 pub use env::{RlxEnv, RuntimeOverrides, flag, is_unset, parse_or, set, unset, var, var_os};
 pub use fft::{FftGpuPlan, FftMeta, FftNorm, fft_meta, fftn_axes_all, normalize_fftn_axes};
 pub use graph::{Graph, Node, NodeId};
-pub use hir::{FusionPolicy, HirGraphExt, HirModule, HirMut, HirNode, HirNodeId, HirOp};
+pub use hir::{
+    FusionPolicy, HirGraphExt, HirModule, HirMut, HirNode, HirNodeId, HirOp,
+    window_token_gather_bsn, window_token_scatter_bsn,
+};
 pub use infer::GraphExt;
 pub use inspect::{
     inspect_buffer_plan, inspect_graph, inspect_graph_diff, inspect_hir, inspect_hir_stats,
@@ -115,7 +119,7 @@ pub use logical_kernel::{
 pub use measure::{CacheBuster, Tick, time_ns};
 pub use mir::{MirModule, MirNode, MirNodeId, MirOp};
 pub use module::{GraphModule, GraphStage};
-pub use op::{ChainOperand, ChainStep, Op, OpKind, RegionPrologue, TransformStep};
+pub use op::{ChainOperand, ChainStep, Op, OpKind, RegionPrologue, RopeStyle, TransformStep};
 pub use op_registry::{
     JvpContext, OpExtension, OpRegistry, VjpContext, VmapContext, global_registry, lookup_op,
     register_op,
@@ -123,7 +127,7 @@ pub use op_registry::{
 pub use ops::attention::attention_kind_op;
 pub use phase::{Phase, PhaseSchedule, derive_phases};
 pub use provenance::{NodeOrigin, node_label, stamp_pass_origins};
-pub use quant::{QuantMap, QuantScheme};
+pub use quant::{QuantMap, QuantScheme, ScaleLayout, ScaledFormat};
 pub use region_encode::{
     FK_BATCH_SINGLE_KERNEL_MAX, PrologueLaunchGrid, REGION_META_WORDS, REGION_PROLOGUE_NONE,
     REGION_PROLOGUE_RESIZE_NEAREST_2X_NCHW, RegionNchwDims, batch_region_slice_dst_off_f32,

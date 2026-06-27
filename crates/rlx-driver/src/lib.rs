@@ -43,17 +43,21 @@ pub mod buffer;
 pub mod collective;
 pub mod device;
 pub mod handle;
+pub mod net;
 pub mod stream;
 pub mod symmetric;
+pub mod transport;
 
 pub use arena::DeviceArena;
 pub use buffer::Buffer;
-pub use collective::{ReduceKind, all_gather, all_reduce, reduce_scatter};
+pub use collective::{ReduceKind, all_gather, all_reduce, reduce_scatter, ring_all_reduce};
 pub use device::{
     BackendSupport, Device, DeviceFromStrError, STANDARD_DEVICES, StandardBackends, validate_device,
 };
 pub use handle::BufferHandle;
+pub use net::{DEFAULT_HEAP_BYTES, NetTransport, TcpTransport, ThunderboltTransport};
 pub use stream::{CommandStream, SyncStream};
 pub use symmetric::{
     CollectiveError, LocalTransport, Rank, SymmetricBuffer, SymmetricHeap, SymmetricTransport,
 };
+pub use transport::{ProcessGroup, Transport, default_barrier};

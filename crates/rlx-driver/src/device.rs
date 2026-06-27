@@ -41,9 +41,17 @@ pub enum Device {
     /// AMD GPU via ROCm/HIP.
     Rocm,
 
+    // ── Intel ───────────────────────────────────────────────
+    /// Intel GPU (Arc / Data Center Max) via oneAPI Level Zero.
+    OneApi,
+
     // ── Google ──────────────────────────────────────────────
     /// Google TPU via libtpu's PJRT plugin (no Python).
     Tpu,
+
+    // ── Qualcomm ────────────────────────────────────────────
+    /// Qualcomm Hexagon NPU via QNN (AI Engine Direct).
+    Hexagon,
 
     // ── Cross-platform GPU ──────────────────────────────────
     /// Portable GPU via wgpu (Metal/Vulkan/DX12/WebGPU).
@@ -71,12 +79,37 @@ impl Device {
             Device::Ane => "ANE",
             Device::Cuda => "CUDA",
             Device::Rocm => "ROCm",
+            Device::OneApi => "oneAPI (Level Zero)",
             Device::Tpu => "TPU",
+            Device::Hexagon => "Hexagon NPU",
             Device::Gpu => "GPU (wgpu)",
             Device::Vulkan => "Vulkan",
             Device::OpenGl => "OpenGL",
             Device::DirectX => "DirectX 12",
             Device::WebGpu => "WebGPU",
+        }
+    }
+
+    /// Canonical lowercase token that round-trips through [`FromStr`].
+    /// Use this when forwarding a device across a CLI / `--device`
+    /// boundary; [`name`](Self::name) is human-facing and does not always
+    /// round-trip (e.g. `"GPU (wgpu)"`).
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Device::Cpu => "cpu",
+            Device::Metal => "metal",
+            Device::Mlx => "mlx",
+            Device::Ane => "ane",
+            Device::Cuda => "cuda",
+            Device::Rocm => "rocm",
+            Device::OneApi => "oneapi",
+            Device::Tpu => "tpu",
+            Device::Hexagon => "hexagon",
+            Device::Gpu => "gpu",
+            Device::Vulkan => "vulkan",
+            Device::OpenGl => "opengl",
+            Device::DirectX => "directx",
+            Device::WebGpu => "webgpu",
         }
     }
 
@@ -91,7 +124,9 @@ impl Device {
             Device::Ane,
             Device::Cuda,
             Device::Rocm,
+            Device::OneApi,
             Device::Tpu,
+            Device::Hexagon,
             Device::Gpu,
             Device::Vulkan,
             Device::OpenGl,
@@ -116,7 +151,7 @@ impl std::fmt::Display for DeviceFromStrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unknown device '{}' (try: cpu, metal, mlx, ane, cuda, rocm, gpu, vulkan, opengl, directx, webgpu, tpu)",
+            "unknown device '{}' (try: cpu, metal, mlx, ane, cuda, rocm, oneapi, gpu, vulkan, opengl, directx, webgpu, tpu)",
             self.0
         )
     }
@@ -136,12 +171,14 @@ impl std::str::FromStr for Device {
             "ane" | "neural-engine" => Device::Ane,
             "cuda" | "nvidia" => Device::Cuda,
             "rocm" | "hip" | "amd" => Device::Rocm,
+            "oneapi" | "levelzero" | "level-zero" | "l0" | "intel" | "sycl" => Device::OneApi,
             "gpu" | "wgpu" => Device::Gpu,
             "vulkan" | "vk" => Device::Vulkan,
             "opengl" | "gl" => Device::OpenGl,
             "directx" | "dx12" | "d3d12" => Device::DirectX,
             "webgpu" => Device::WebGpu,
             "tpu" => Device::Tpu,
+            "hexagon" | "htp" | "qnn" => Device::Hexagon,
             _ => return Err(DeviceFromStrError(s.to_string())),
         })
     }
@@ -216,6 +253,19 @@ mod from_str_tests {
         assert_eq!(Device::from_str("mps").unwrap(), Device::Metal);
         assert_eq!(Device::from_str("wgpu").unwrap(), Device::Gpu);
         assert!(Device::from_str("nothing").is_err());
+    }
+
+    #[test]
+    fn as_arg_round_trips_through_from_str() {
+        // The canonical CLI token must parse back to the same device for
+        // every variant (unlike `name`, e.g. "GPU (wgpu)").
+        for &d in Device::all() {
+            assert_eq!(
+                Device::from_str(d.as_arg()).unwrap(),
+                d,
+                "round-trip failed for {d:?}"
+            );
+        }
     }
 
     #[test]

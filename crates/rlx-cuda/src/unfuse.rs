@@ -65,17 +65,26 @@ pub fn unfuse(graph: Graph) -> Graph {
                 head_dim,
                 has_bias,
                 has_rope,
-            } => expand_fab(
-                &mut out,
-                &graph,
-                &node.inputs,
-                &new_inputs,
-                &node.shape,
-                *num_heads,
-                *head_dim,
-                *has_bias,
-                *has_rope,
-            ),
+            } => {
+                // Keep the block intact when the native `fused_attn_block`
+                // kernel can serve it (score matrix fits shared memory);
+                // otherwise decompose to the primitive chain.
+                if fab_native_supported(&graph, &node.shape) {
+                    out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+                } else {
+                    expand_fab(
+                        &mut out,
+                        &graph,
+                        &node.inputs,
+                        &new_inputs,
+                        &node.shape,
+                        *num_heads,
+                        *head_dim,
+                        *has_bias,
+                        *has_rope,
+                    )
+                }
+            }
             Op::FusedTransformerLayer {
                 num_heads,
                 head_dim,
@@ -195,6 +204,8 @@ fn should_unfuse(op: &Op) -> bool {
     // FusedMatMulBiasAct, FusedResidualLN, and FusedResidualRmsNorm are
     // lowered natively — matmul folds bias + activation into its epilogue,
     // and `fused_residual_{ln,rms_norm}.cu` fuse Add[+bias] + norm in one pass.
+    // FusedAttentionBlock is listed so the rewrite visits it; the arm keeps
+    // it native (kernel) or expands it per `fab_native_supported`.
     matches!(
         op,
         Op::FusedSwiGLU { .. }
@@ -205,6 +216,20 @@ fn should_unfuse(op: &Op) -> bool {
             | Op::If { .. }
             | Op::While { .. }
     )
+}
+
+/// True when the native `fused_attn_block` kernel can serve this block: the
+/// `[seq, seq]` score matrix must fit the GPU's default 48 KB dynamic
+/// shared-memory budget (with margin). Larger sequences decompose to the
+/// primitive chain. The CUDA arena is f32-uniform, so dtype is always fine.
+fn fab_native_supported(_graph: &Graph, out_shape: &Shape) -> bool {
+    let dims = out_shape.dims();
+    if dims.len() != 3 {
+        return false;
+    }
+    let s = dims[1].unwrap_static();
+    // seq*seq*4 bytes of shared memory; 96 → 36 KB, comfortably under 48 KB.
+    s > 0 && s <= 96
 }
 
 /// True if the node is a rank-3 Op::Attention — those need to be
@@ -450,6 +475,9 @@ fn expand_fab(
             Op::Rope {
                 head_dim,
                 n_rot: head_dim,
+                // Unfusing fused attention — NeoX was the only style
+                // pre-fusion; thread the source style once fused ops carry it.
+                style: rlx_ir::op::RopeStyle::NeoX,
             },
             vec![q4, inputs[cos_idx], inputs[sin_idx]],
             bhsd_shape.clone(),
@@ -458,6 +486,9 @@ fn expand_fab(
             Op::Rope {
                 head_dim,
                 n_rot: head_dim,
+                // Unfusing fused attention — NeoX was the only style
+                // pre-fusion; thread the source style once fused ops carry it.
+                style: rlx_ir::op::RopeStyle::NeoX,
             },
             vec![k4, inputs[cos_idx], inputs[sin_idx]],
             bhsd_shape.clone(),

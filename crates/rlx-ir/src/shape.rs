@@ -653,7 +653,8 @@ pub fn conv_transpose2d_output_shape(
     if input.rank() != 4 || weight.rank() != 4 {
         return Err("conv_transpose2d requires NCHW input and 4-D weight".into());
     }
-    let n = input.dim(0).unwrap_static();
+    // Preserve the batch dim (it may be dynamic) — mirror `conv2d_output_shape`.
+    let n = input.dim(0);
     let c_in = input.dim(1).unwrap_static();
     let h = input.dim(2).unwrap_static();
     let w = input.dim(3).unwrap_static();
@@ -680,8 +681,13 @@ pub fn conv_transpose2d_output_shape(
         dilation[1],
         output_padding[1],
     );
-    Ok(Shape::new(
-        &[n, c_out_per_g * groups, h_out, w_out],
+    Ok(Shape::from_dims(
+        &[
+            n,
+            Dim::Static(c_out_per_g * groups),
+            Dim::Static(h_out),
+            Dim::Static(w_out),
+        ],
         input.dtype(),
     ))
 }

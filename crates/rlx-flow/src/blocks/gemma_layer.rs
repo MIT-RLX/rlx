@@ -62,6 +62,8 @@ pub fn gemma_attn_spec(
         mask,
         score_scale,
         attn_logit_softcap,
+        // Gemma uses HF NeoX rotate-half rope.
+        rope_style: rlx_ir::op::RopeStyle::NeoX,
     }
 }
 

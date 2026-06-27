@@ -62,6 +62,86 @@ pub(crate) enum Step {
         bias_off_f32: u32,
         act_id: u32,
     },
+    /// Native FP8 (FNUZ) tensor-core GEMM via hipBLASLt. TN: lhs[m,k]·rhs[n,k]ᵀ.
+    /// All offsets are BYTES (codes u8; scales/out/bias f32).
+    ScaledMatMul {
+        m: u32,
+        k: u32,
+        n: u32,
+        lhs_byte_off: u32,
+        rhs_byte_off: u32,
+        lhs_scale_byte_off: u32,
+        rhs_scale_byte_off: u32,
+        out_byte_off: u32,
+        has_bias: u32,
+        bias_byte_off: u32,
+        lhs_e5m2: u32,
+        rhs_e5m2: u32,
+    },
+    /// Per-tensor amax → f32 scale for a tensor about to be FP8-quantized.
+    ScaledQuantScale {
+        x_off_f32: u32,
+        scale_off_f32: u32,
+        n: u32,
+        max_finite: f32,
+    },
+    /// Encode f32 → FP8 codes (per-tensor scale). `e5m2`: 0=E4M3, 1=E5M2.
+    ScaledQuantizeFp8 {
+        x_off_f32: u32,
+        scale_off_f32: u32,
+        out_byte_off: u32,
+        n: u32,
+        e5m2: u32,
+    },
+    /// Decode-and-accumulate GEMM fallback (non-tensor-core) for block / FP4 /
+    /// FP6 configs hipBLASLt can't do.
+    ScaledMatMulDecode {
+        m: u32,
+        k: u32,
+        n: u32,
+        lhs_byte_off: u32,
+        rhs_byte_off: u32,
+        lhs_scale_byte_off: u32,
+        rhs_scale_byte_off: u32,
+        out_off_f32: u32,
+        lhs_fmt: u32,
+        rhs_fmt: u32,
+        scale_mode: u32,
+        block: u32,
+        has_bias: u32,
+        bias_off_f32: u32,
+    },
+    /// General (all-format/all-layout) scale producer.
+    ScaledQuantScaleGeneral {
+        x_off_f32: u32,
+        scale_byte_off: u32,
+        rows: u32,
+        cols: u32,
+        fmt: u32,
+        scale_mode: u32,
+        block: u32,
+    },
+    /// General (all-format/all-layout) quantize producer.
+    ScaledQuantizeGeneral {
+        x_off_f32: u32,
+        scale_byte_off: u32,
+        out_byte_off: u32,
+        rows: u32,
+        cols: u32,
+        fmt: u32,
+        scale_mode: u32,
+        block: u32,
+    },
+    ScaledDequantizeGeneral {
+        codes_byte_off: u32,
+        scale_byte_off: u32,
+        out_off_f32: u32,
+        rows: u32,
+        cols: u32,
+        fmt: u32,
+        scale_mode: u32,
+        block: u32,
+    },
     Binary {
         n: u32,
         a_off: u32,
@@ -241,6 +321,7 @@ pub(crate) enum Step {
         sin_off: u32,
         out_off: u32,
         last_dim: u32,
+        interleaved: u32,
     },
     Cumsum {
         outer: u32,
@@ -415,6 +496,37 @@ pub(crate) enum Step {
         dh: u32,
         dw_dil: u32,
         use_gpu: bool,
+    },
+    /// Host-staged batch-general reverse/flip.
+    ReverseHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        dims: Vec<u32>,
+        rev_mask: Vec<bool>,
+        elem_bytes: u32,
+    },
+    /// Host-staged ArgMax/ArgMin (f32-encoded indices).
+    ArgReduceHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        reduced: u32,
+        inner: u32,
+        is_max: bool,
+    },
+    /// Host-staged axial 2-D RoPE.
+    AxialRope2dHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        batch: u32,
+        seq: u32,
+        hidden: u32,
+        end_x: u32,
+        end_y: u32,
+        head_dim: u32,
+        num_heads: u32,
+        theta: f32,
+        repeat_factor: u32,
     },
     GatedDeltaNet {
         q_byte_off: u32,
@@ -898,6 +1010,13 @@ fn rocm_fft_dtype_from_tag(tag: u32) -> rlx_ir::DType {
 pub(crate) fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Matmul { .. } => "rlx::Matmul",
+        Step::ScaledMatMul { .. } => "rlx::ScaledMatMul",
+        Step::ScaledQuantScale { .. } => "rlx::ScaledQuantScale",
+        Step::ScaledQuantizeFp8 { .. } => "rlx::ScaledQuantizeFp8",
+        Step::ScaledMatMulDecode { .. } => "rlx::ScaledMatMulDecode",
+        Step::ScaledQuantScaleGeneral { .. } => "rlx::ScaledQuantScaleGeneral",
+        Step::ScaledQuantizeGeneral { .. } => "rlx::ScaledQuantizeGeneral",
+        Step::ScaledDequantizeGeneral { .. } => "rlx::ScaledDequantizeGeneral",
         Step::Binary { .. } => "rlx::Binary",
         Step::Compare { .. } => "rlx::Compare",
         Step::Unary { .. } => "rlx::Unary",
@@ -934,6 +1053,9 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::WelchPeaksHost { .. } => "rlx::WelchPeaksHost",
         Step::WelchPeaksGpu { .. } => "rlx::WelchPeaksGpu",
         Step::Im2ColHost { .. } => "rlx::Im2ColHost",
+        Step::ReverseHost { .. } => "rlx::ReverseHost",
+        Step::ArgReduceHost { .. } => "rlx::ArgReduceHost",
+        Step::AxialRope2dHost { .. } => "rlx::AxialRope2dHost",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Lstm { .. } => "rlx::Lstm",
         Step::Llada2GroupLimitedGate { .. } => "rlx::Llada2GroupLimitedGate",
@@ -983,6 +1105,82 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             }
             (r, vec![*c_off_f32])
         }
+        Step::ScaledMatMul {
+            lhs_byte_off,
+            rhs_byte_off,
+            lhs_scale_byte_off,
+            rhs_scale_byte_off,
+            out_byte_off,
+            has_bias,
+            bias_byte_off,
+            ..
+        } => {
+            let mut r = vec![
+                *lhs_byte_off / 4,
+                *rhs_byte_off / 4,
+                *lhs_scale_byte_off / 4,
+                *rhs_scale_byte_off / 4,
+            ];
+            if *has_bias != 0 {
+                r.push(*bias_byte_off / 4);
+            }
+            (r, vec![*out_byte_off / 4])
+        }
+        Step::ScaledQuantScale {
+            x_off_f32,
+            scale_off_f32,
+            ..
+        } => (vec![*x_off_f32], vec![*scale_off_f32]),
+        Step::ScaledQuantizeFp8 {
+            x_off_f32,
+            scale_off_f32,
+            out_byte_off,
+            ..
+        } => (vec![*x_off_f32, *scale_off_f32], vec![*out_byte_off / 4]),
+        Step::ScaledMatMulDecode {
+            lhs_byte_off,
+            rhs_byte_off,
+            lhs_scale_byte_off,
+            rhs_scale_byte_off,
+            out_off_f32,
+            has_bias,
+            bias_off_f32,
+            ..
+        } => {
+            let mut r = vec![
+                *lhs_byte_off / 4,
+                *rhs_byte_off / 4,
+                *lhs_scale_byte_off / 4,
+                *rhs_scale_byte_off / 4,
+            ];
+            if *has_bias != 0 {
+                r.push(*bias_off_f32);
+            }
+            (r, vec![*out_off_f32])
+        }
+        Step::ScaledQuantScaleGeneral {
+            x_off_f32,
+            scale_byte_off,
+            ..
+        } => (vec![*x_off_f32], vec![*scale_byte_off / 4]),
+        Step::ScaledQuantizeGeneral {
+            x_off_f32,
+            scale_byte_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![*x_off_f32, *scale_byte_off / 4],
+            vec![*out_byte_off / 4],
+        ),
+        Step::ScaledDequantizeGeneral {
+            codes_byte_off,
+            scale_byte_off,
+            out_off_f32,
+            ..
+        } => (
+            vec![*codes_byte_off / 4, *scale_byte_off / 4],
+            vec![*out_off_f32],
+        ),
         Step::Binary {
             a_off,
             b_off,
@@ -1205,6 +1403,21 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             col_byte_off,
             ..
         } => (vec![*x_byte_off / 4], vec![*col_byte_off / 4]),
+        Step::ReverseHost {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        }
+        | Step::ArgReduceHost {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        }
+        | Step::AxialRope2dHost {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
         Step::GatedDeltaNet {
             q_byte_off,
             k_byte_off,
@@ -1948,6 +2161,9 @@ impl Step {
             | Step::WelchPeaksHost { .. }
             | Step::RngNormal { .. }
             | Step::RngUniform { .. }
+            | Step::ReverseHost { .. }
+            | Step::ArgReduceHost { .. }
+            | Step::AxialRope2dHost { .. }
             | Step::GaussianSplatRender { .. }
             | Step::GaussianSplatRenderBackward { .. }
             | Step::GaussianSplatPrepare { .. }
@@ -2101,8 +2317,153 @@ impl RocmExecutable {
             let elems = node.shape.num_elements().unwrap_or(0) as u32;
             match &node.op {
                 Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => continue,
-                Op::Reshape { .. } | Op::Cast { .. } => {
-                    // No-op: arena planner aliased the slot.
+                Op::Reshape { .. } | Op::Cast { .. } | Op::StopGradient => {
+                    // No-op: arena planner aliased the slot. StopGradient is a
+                    // pure forward identity (AD already consumed its semantics).
+                }
+                Op::ScaledMatMul {
+                    lhs_format,
+                    rhs_format,
+                    scale_layout,
+                    has_bias,
+                } => {
+                    let out_dims = node.shape.dims();
+                    let m = out_dims[0].unwrap_static() as u32;
+                    let n = out_dims[1].unwrap_static() as u32;
+                    let k = graph.node(node.inputs[0]).shape.dims()[1].unwrap_static() as u32;
+                    let bias_byte = if *has_bias {
+                        arena.offset(node.inputs[4]) as u32
+                    } else {
+                        0
+                    };
+                    let native = lhs_format.is_native_fp8()
+                        && rhs_format.is_native_fp8()
+                        && matches!(scale_layout, rlx_ir::ScaleLayout::PerTensor);
+                    if native {
+                        schedule.push(Step::ScaledMatMul {
+                            m,
+                            k,
+                            n,
+                            lhs_byte_off: arena.offset(node.inputs[0]) as u32,
+                            rhs_byte_off: arena.offset(node.inputs[1]) as u32,
+                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u32,
+                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                            has_bias: u32::from(*has_bias),
+                            bias_byte_off: bias_byte,
+                            lhs_e5m2: u32::from(*lhs_format == rlx_ir::ScaledFormat::F8E5M2),
+                            rhs_e5m2: u32::from(*rhs_format == rlx_ir::ScaledFormat::F8E5M2),
+                        });
+                    } else {
+                        let (scale_mode, block) = scale_layout.mode_block();
+                        schedule.push(Step::ScaledMatMulDecode {
+                            m,
+                            k,
+                            n,
+                            lhs_byte_off: arena.offset(node.inputs[0]) as u32,
+                            rhs_byte_off: arena.offset(node.inputs[1]) as u32,
+                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u32,
+                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u32,
+                            out_off_f32: (arena.offset(node.id) / 4) as u32,
+                            lhs_fmt: lhs_format.kernel_id(),
+                            rhs_fmt: rhs_format.kernel_id(),
+                            scale_mode,
+                            block,
+                            has_bias: u32::from(*has_bias),
+                            bias_off_f32: bias_byte / 4,
+                        });
+                    }
+                }
+                Op::ScaledQuantScale {
+                    format,
+                    scale_layout,
+                } => {
+                    let x_id = node.inputs[0];
+                    if format.is_native_fp8()
+                        && matches!(scale_layout, rlx_ir::ScaleLayout::PerTensor)
+                    {
+                        let n = graph.node(x_id).shape.num_elements().unwrap() as u32;
+                        schedule.push(Step::ScaledQuantScale {
+                            x_off_f32: (arena.offset(x_id) / 4) as u32,
+                            scale_off_f32: (arena.offset(node.id) / 4) as u32,
+                            n,
+                            max_finite: format.max_finite(),
+                        });
+                    } else {
+                        let xs = graph.node(x_id).shape.dims();
+                        let cols = xs[xs.len() - 1].unwrap_static() as u32;
+                        let rows =
+                            graph.node(x_id).shape.num_elements().unwrap() as u32 / cols.max(1);
+                        let (scale_mode, block) = scale_layout.mode_block();
+                        schedule.push(Step::ScaledQuantScaleGeneral {
+                            x_off_f32: (arena.offset(x_id) / 4) as u32,
+                            scale_byte_off: arena.offset(node.id) as u32,
+                            rows,
+                            cols,
+                            fmt: format.kernel_id(),
+                            scale_mode,
+                            block,
+                        });
+                    }
+                }
+                Op::ScaledQuantize {
+                    format,
+                    scale_layout,
+                } => {
+                    let x_id = node.inputs[0];
+                    let scale_id = node.inputs[1];
+                    if format.is_native_fp8()
+                        && matches!(scale_layout, rlx_ir::ScaleLayout::PerTensor)
+                    {
+                        let n = graph.node(x_id).shape.num_elements().unwrap() as u32;
+                        schedule.push(Step::ScaledQuantizeFp8 {
+                            x_off_f32: (arena.offset(x_id) / 4) as u32,
+                            scale_off_f32: (arena.offset(scale_id) / 4) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                            n,
+                            e5m2: u32::from(*format == rlx_ir::ScaledFormat::F8E5M2),
+                        });
+                    } else {
+                        let xs = graph.node(x_id).shape.dims();
+                        let cols = xs[xs.len() - 1].unwrap_static() as u32;
+                        let rows =
+                            graph.node(x_id).shape.num_elements().unwrap() as u32 / cols.max(1);
+                        let (scale_mode, block) = scale_layout.mode_block();
+                        schedule.push(Step::ScaledQuantizeGeneral {
+                            x_off_f32: (arena.offset(x_id) / 4) as u32,
+                            scale_byte_off: arena.offset(scale_id) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                            rows,
+                            cols,
+                            fmt: format.kernel_id(),
+                            scale_mode,
+                            block,
+                        });
+                    }
+                }
+                Op::ScaledDequantize {
+                    format,
+                    scale_layout,
+                } => {
+                    // codes (U8, input 0) + scale (input 1) → f32; one general
+                    // kernel covers all layouts. Shape follows the codes.
+                    let codes_id = node.inputs[0];
+                    let scale_id = node.inputs[1];
+                    let xs = graph.node(codes_id).shape.dims();
+                    let cols = xs[xs.len() - 1].unwrap_static() as u32;
+                    let rows =
+                        graph.node(codes_id).shape.num_elements().unwrap() as u32 / cols.max(1);
+                    let (scale_mode, block) = scale_layout.mode_block();
+                    schedule.push(Step::ScaledDequantizeGeneral {
+                        codes_byte_off: arena.offset(codes_id) as u32,
+                        scale_byte_off: arena.offset(scale_id) as u32,
+                        out_off_f32: (arena.offset(node.id) / 4) as u32,
+                        rows,
+                        cols,
+                        fmt: format.kernel_id(),
+                        scale_mode,
+                        block,
+                    });
                 }
                 Op::MatMul => {
                     let (m, k, n, batch, a_bs, b_bs, c_bs, a_id, b_id) =
@@ -2764,7 +3125,11 @@ impl RocmExecutable {
                         wrt: wrt_id,
                     });
                 }
-                Op::Rope { head_dim, n_rot: _ } => {
+                Op::Rope {
+                    head_dim,
+                    n_rot: _,
+                    style,
+                } => {
                     let x_id = node.inputs[0];
                     let cos_id = node.inputs[1];
                     let sin_id = node.inputs[2];
@@ -2781,6 +3146,10 @@ impl RocmExecutable {
                     }
                     let total: u32 = x_shape.iter().map(|d| d.unwrap_static() as u32).product();
                     let seq = x_shape[x_shape.len() - 2].unwrap_static() as u32;
+                    let interleaved = match style {
+                        rlx_ir::op::RopeStyle::NeoX => 0u32,
+                        rlx_ir::op::RopeStyle::GptJ => 1u32,
+                    };
                     schedule.push(Step::Rope {
                         n_total: total,
                         seq,
@@ -2791,6 +3160,7 @@ impl RocmExecutable {
                         sin_off: (arena.offset(sin_id) / 4) as u32,
                         out_off: (arena.offset(node.id) / 4) as u32,
                         last_dim: last as u32,
+                        interleaved,
                     });
                 }
                 Op::Cumsum { axis: _, exclusive } => {
@@ -3105,6 +3475,70 @@ impl RocmExecutable {
                         dh,
                         dw_dil,
                         use_gpu: im2col_use_gpu(n, exec_mode),
+                    });
+                }
+                Op::Reverse { axes } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let dims: Vec<u32> = (0..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static() as u32)
+                        .collect();
+                    let mut rev_mask = vec![false; rank];
+                    for &a in axes {
+                        if a < rank {
+                            rev_mask[a] = true;
+                        }
+                    }
+                    schedule.push(Step::ReverseHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        dims,
+                        rev_mask,
+                        elem_bytes: in_shape.dtype().size_bytes() as u32,
+                    });
+                }
+                Op::ArgMax { axis, keep_dim: _ } | Op::ArgMin { axis, keep_dim: _ } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let outer: usize = (0..*axis)
+                        .map(|i| in_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let reduced = in_shape.dim(*axis).unwrap_static();
+                    let inner: usize = (*axis + 1..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    schedule.push(Step::ArgReduceHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        outer: outer as u32,
+                        reduced: reduced as u32,
+                        inner: inner as u32,
+                        is_max: matches!(node.op, Op::ArgMax { .. }),
+                    });
+                }
+                Op::AxialRope2d {
+                    end_x,
+                    end_y,
+                    head_dim,
+                    num_heads,
+                    theta,
+                    repeat_factor,
+                } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::AxialRope2dHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        batch: in_shape.dim(0).unwrap_static() as u32,
+                        seq: in_shape.dim(1).unwrap_static() as u32,
+                        hidden: in_shape.dim(2).unwrap_static() as u32,
+                        end_x: *end_x as u32,
+                        end_y: *end_y as u32,
+                        head_dim: *head_dim as u32,
+                        num_heads: *num_heads as u32,
+                        theta: *theta,
+                        repeat_factor: *repeat_factor as u32,
                     });
                 }
                 Op::GatedDeltaNet {
@@ -4850,6 +5284,7 @@ impl RocmExecutable {
                     sin_off,
                     out_off,
                     last_dim,
+                    interleaved,
                 } => {
                     let kernel = rope_kernel(&self.ctx);
                     let (grid, block) = dispatch_grid_1d(*n_total, 256);
@@ -4868,7 +5303,8 @@ impl RocmExecutable {
                             cos_off,
                             sin_off,
                             out_off,
-                            last_dim
+                            last_dim,
+                            interleaved
                         ]
                     );
                 }
@@ -5032,6 +5468,236 @@ impl RocmExecutable {
                             scale_bits,
                             window,
                             wrt
+                        ]
+                    );
+                }
+                Step::ScaledQuantScale {
+                    x_off_f32,
+                    scale_off_f32,
+                    n,
+                    max_finite,
+                } => {
+                    let kernel = crate::kernels::scaled_quant_scale_kernel(&self.ctx);
+                    let mut arena_ptr = arena_base;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (1, 1, 1),
+                        (256, 1, 1),
+                        [&mut arena_ptr, x_off_f32, scale_off_f32, n, max_finite]
+                    );
+                }
+                Step::ScaledQuantizeFp8 {
+                    x_off_f32,
+                    scale_off_f32,
+                    out_byte_off,
+                    n,
+                    e5m2,
+                } => {
+                    let kernel = crate::kernels::scaled_quantize_fp8_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    let mut arena_ptr = arena_base;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            x_off_f32,
+                            scale_off_f32,
+                            out_byte_off,
+                            n,
+                            e5m2
+                        ]
+                    );
+                }
+                Step::ScaledMatMul {
+                    m,
+                    k,
+                    n,
+                    lhs_byte_off,
+                    rhs_byte_off,
+                    lhs_scale_byte_off,
+                    rhs_scale_byte_off,
+                    out_byte_off,
+                    has_bias,
+                    bias_byte_off,
+                    lhs_e5m2,
+                    rhs_e5m2,
+                } => {
+                    let lt = self
+                        .blas_lt
+                        .as_ref()
+                        .expect("rlx-rocm ScaledMatMul: hipBLASLt required for FP8 GEMM");
+                    let workspace = self
+                        .blas_lt_workspace
+                        .as_ref()
+                        .expect("rlx-rocm ScaledMatMul: hipBLASLt workspace required");
+                    let r = unsafe {
+                        crate::hipblaslt::matmul_fused_fp8(
+                            lt,
+                            workspace.ptr,
+                            HIPBLASLT_WORKSPACE_BYTES,
+                            arena_base,
+                            *m,
+                            *k,
+                            *n,
+                            *lhs_byte_off as u64,
+                            *rhs_byte_off as u64,
+                            *lhs_scale_byte_off as u64,
+                            *rhs_scale_byte_off as u64,
+                            *out_byte_off as u64,
+                            *has_bias != 0,
+                            *bias_byte_off as u64,
+                            *lhs_e5m2 != 0,
+                            *rhs_e5m2 != 0,
+                            stream,
+                        )
+                    };
+                    r.expect(
+                        "rlx-rocm: hipBLASLt FP8 GEMM failed (needs CDNA3+ and verified fp8 \
+                         constants — see hipblaslt.rs)",
+                    );
+                }
+                Step::ScaledQuantScaleGeneral {
+                    x_off_f32,
+                    scale_byte_off,
+                    rows,
+                    cols,
+                    fmt,
+                    scale_mode,
+                    block,
+                } => {
+                    let nblk = if *scale_mode == 0 {
+                        1
+                    } else {
+                        cols.div_ceil(*block)
+                    };
+                    let total = if *scale_mode == 0 { 1 } else { rows * nblk };
+                    let kernel = crate::kernels::scaled_quant_scale_general_kernel(&self.ctx);
+                    let (grid, blk) = dispatch_grid_1d(total, 128);
+                    let mut arena_ptr = arena_base;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (blk, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            x_off_f32,
+                            scale_byte_off,
+                            rows,
+                            cols,
+                            fmt,
+                            scale_mode,
+                            block
+                        ]
+                    );
+                }
+                Step::ScaledQuantizeGeneral {
+                    x_off_f32,
+                    scale_byte_off,
+                    out_byte_off,
+                    rows,
+                    cols,
+                    fmt,
+                    scale_mode,
+                    block,
+                } => {
+                    let total = rows * cols;
+                    let kernel = crate::kernels::scaled_quantize_general_kernel(&self.ctx);
+                    let (grid, blk) = dispatch_grid_1d(total, 256);
+                    let mut arena_ptr = arena_base;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (blk, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            x_off_f32,
+                            scale_byte_off,
+                            out_byte_off,
+                            rows,
+                            cols,
+                            fmt,
+                            scale_mode,
+                            block
+                        ]
+                    );
+                }
+                Step::ScaledDequantizeGeneral {
+                    codes_byte_off,
+                    scale_byte_off,
+                    out_off_f32,
+                    rows,
+                    cols,
+                    fmt,
+                    scale_mode,
+                    block,
+                } => {
+                    let total = rows * cols;
+                    let kernel = crate::kernels::scaled_dequantize_general_kernel(&self.ctx);
+                    let (grid, blk) = dispatch_grid_1d(total, 256);
+                    let mut arena_ptr = arena_base;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (blk, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            codes_byte_off,
+                            scale_byte_off,
+                            out_off_f32,
+                            rows,
+                            cols,
+                            fmt,
+                            scale_mode,
+                            block
+                        ]
+                    );
+                }
+                Step::ScaledMatMulDecode {
+                    m,
+                    k,
+                    n,
+                    lhs_byte_off,
+                    rhs_byte_off,
+                    lhs_scale_byte_off,
+                    rhs_scale_byte_off,
+                    out_off_f32,
+                    lhs_fmt,
+                    rhs_fmt,
+                    scale_mode,
+                    block,
+                    has_bias,
+                    bias_off_f32,
+                } => {
+                    let kernel = crate::kernels::scaled_matmul_decode_kernel(&self.ctx);
+                    let mut arena_ptr = arena_base;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        ((*n).div_ceil(16), (*m).div_ceil(16), 1),
+                        (16, 16, 1),
+                        [
+                            &mut arena_ptr,
+                            lhs_byte_off,
+                            rhs_byte_off,
+                            lhs_scale_byte_off,
+                            rhs_scale_byte_off,
+                            out_off_f32,
+                            m,
+                            k,
+                            n,
+                            lhs_fmt,
+                            rhs_fmt,
+                            scale_mode,
+                            block,
+                            has_bias,
+                            bias_off_f32
                         ]
                     );
                 }
@@ -5747,6 +6413,71 @@ impl RocmExecutable {
                             *dw_dil,
                         );
                     }
+                }
+                Step::ReverseHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    dims,
+                    rev_mask,
+                    elem_bytes,
+                } => {
+                    crate::host_misc::run_reverse(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        dims,
+                        rev_mask,
+                        *elem_bytes as usize,
+                    );
+                }
+                Step::ArgReduceHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    outer,
+                    reduced,
+                    inner,
+                    is_max,
+                } => {
+                    crate::host_misc::run_argreduce(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *reduced as usize,
+                        *inner as usize,
+                        *is_max,
+                    );
+                }
+                Step::AxialRope2dHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    hidden,
+                    end_x,
+                    end_y,
+                    head_dim,
+                    num_heads,
+                    theta,
+                    repeat_factor,
+                } => {
+                    crate::host_misc::run_axial_rope2d(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *hidden as usize,
+                        *end_x as usize,
+                        *end_y as usize,
+                        *head_dim as usize,
+                        *num_heads as usize,
+                        *theta,
+                        *repeat_factor as usize,
+                    );
                 }
                 Step::GatedDeltaNet {
                     q_byte_off,

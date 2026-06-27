@@ -18,14 +18,13 @@ first dispatch (same pattern as rlx-wgpu's WGSL kernels).
 - **Multi-stream** — async copy + compute overlap.
 - **NVTX** — span markers wired through Perfetto export.
 - **GGUF dequant on device** — `dequant_gguf.cu` covers every GGUF
-  scheme that rlx-gguf supports: Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_K,
-  IQ4_NL / IQ4_XS, IQ2_XXS / IQ2_XS / IQ2_S, IQ3_XXS / IQ3_S,
-  IQ1_S / IQ1_M, TQ1_0 / TQ2_0, MXFP4, NVFP4. The IQ-family grid LUTs
-  (~33 KB total) are staged into one CUDA buffer per context by
-  `rlx_cuda::iq_grid::cuda_iq_grid_buffer` and passed to the kernel as
-  the 6th argument; non-IQ schemes ignore it. Layout mirrors
-  `rlx-metal/src/dequant_gguf.msl` byte-for-byte — see the scheme-id
-  table at the top of both files.
+  scheme that rlx-gguf supports (ids 0–23), including Q4_0 (19), Q8_0 (20),
+  Q4_1 (21), Q5_0 (22), Q5_1 (23),
+  and Q4_1 (21). IQ-family grid LUTs (~33 KB) are staged per context by
+  `rlx_cuda::iq_grid::cuda_iq_grid_buffer`. Layout mirrors
+  `rlx-metal/src/dequant_gguf.msl` — see
+  [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md) for the
+  full scheme-id table and CUDA/ROCm notes.
 
 ## Install
 

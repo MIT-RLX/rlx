@@ -99,25 +99,25 @@ until 1.0.
 
 `rlx_ir::quant::QuantScheme` describes how a packed weight tensor is
 laid out so the dequant kernel can decode it without a side lookup.
-Variants:
 
-| Variant | Block size | Bits/elem (×10) | Notes |
-|---|---|---|---|
-| `Int8Block { block_size }` | configurable | 80 | Symmetric INT8, GPTQ-style |
-| `Int8BlockAsym { block_size }` | configurable | 80 | + per-block zero-point |
-| `Int4Block { block_size }` | configurable | 40 | INT4 packed two-per-byte |
-| `Fp8E4m3`, `Fp8E5m2` | n/a | 80 | per-tensor FP8 |
-| `GgufQ4K`, `GgufQ5K`, `GgufQ6K`, `GgufQ8K` | 256 | 45 / 55 / 66 / 91 | llama.cpp K-quant super-blocks; scales / mins live inside the packed bytes |
+| Family | Schemes |
+|--------|---------|
+| Linear int | `Int8Block`, `Int8BlockAsym`, `Int4Block` |
+| FP8 / FP4 | `Fp8E4m3`, `Fp8E5m2`, `Nvfp4Block` |
+| GGUF K-quant | `GgufQ2K` … `GgufQ8K` (256-element super-blocks) |
+| GGUF legacy | `GgufQ4_0`, `GgufQ4_1`, `GgufQ5_0`, `GgufQ5_1`, `GgufQ8_0` |
+| GGUF IQ / ternary / micro | `GgufIQ*`, `GgufTQ*`, `GgufMXFP4`, `GgufNVFP4` |
 
-`Op::DequantMatMul { scheme }` takes 4 inputs for the legacy Int8
-schemes (`x`, `w_q`, `scale`, `zp`) or 2 for the GGUF schemes (`x`,
-`packed_w_bytes`) — `num_inputs()` switches on `scheme.is_gguf()`.
+`Op::DequantMatMul { scheme }` takes **4** inputs for legacy int/FP8
+(`x`, `w_q`, `scale`, `zp`) or **2** for GGUF (`x`, `packed_w`) —
+see `scheme.is_gguf()` and `Graph::dequant_matmul_packed`.
 
-The CPU backend handles all listed schemes today; Metal lowering for
-the GGUF schemes is on the roadmap (`Op::DequantMatMul` falls through
-to the per-op thunk path, which dequants the weight to F32 scratch
-once before matmul — correct but doesn't keep packed bytes on the
-GPU).
+**Backend paths** (GPU scheme ids, fused GEMV, ANE constexpr, TPU
+compile-time bake): [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
+
+The CPU backend dequants every scheme; GPU backends use native
+`dequant_gguf` kernels where listed in that doc. Metal additionally
+exposes fused decode GEMV for Q4_K / Q4_0 / Q8_0 when `m == 1`.
 
 ## Gotchas
 

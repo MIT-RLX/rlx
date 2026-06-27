@@ -68,7 +68,13 @@ fn arange_constructor() {
 fn metal_is_auto_selected_and_computes() {
     use rlx_tensor::{Device, fastest_device, is_available};
     assert!(is_available(Device::Metal), "Metal backend should be live");
-    assert_eq!(fastest_device(), Device::Metal, "GPU should outrank CPU");
+    // A GPU backend should outrank CPU. (Don't hard-code Metal: with `eval-mlx` also
+    // enabled MLX is the fastest device, which is fine.)
+    assert_ne!(
+        fastest_device(),
+        Device::Cpu,
+        "a GPU backend should outrank CPU"
+    );
     // End-to-end on GPU via the auto path.
     let a = Tensor::from_vec(vec![1.0, 2.0, 3.0], [3]);
     let b = Tensor::from_vec(vec![4.0, 5.0, 6.0], [3]);

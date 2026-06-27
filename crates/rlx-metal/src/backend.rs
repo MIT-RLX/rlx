@@ -105,6 +105,11 @@ pub struct MetalExecutable {
     gpu_handle_feeds: HashMap<String, usize>,
     /// Handles whose arena input slots are authoritative (skip host mirror ping-pong).
     gpu_handle_resident: std::collections::HashSet<String>,
+    /// `handle_name → output index` for the resident-KV *row* feed (decode graphs
+    /// that emit the new token at the last bucket-padded output row, e.g. llama32
+    /// `concat(past_k, k_new)`). Driven via [`feed_kv_row`]; kept separate from
+    /// `gpu_handle_feeds` so the generic prefix propagation never fires for these.
+    kv_row_feeds: HashMap<String, usize>,
 }
 
 unsafe impl Send for MetalExecutable {}
@@ -229,6 +234,18 @@ impl MetalExecutable {
             None => fused,
         };
 
+        // `FusedAttentionBlock` is a claimed op (the fusion pipeline / upstream
+        // stages may emit it). Keep the native `fused_attn_block` kernel path
+        // for f32, no-bias blocks whose `[seq,seq]` scores fit threadgroup
+        // memory (`seq ≤ 64`); decompose every other FAB to the primitive
+        // chain (matmul → narrow → rope → attention → matmul). Runs after AMP
+        // so the f32 gate sees the final dtype. FAB-only — Metal's native
+        // FusedMatMulBiasAct / FusedResidualLN / FusedSwiGLU survive.
+        let fused = lower_fab_for_metal(fused);
+        // Per-node (qkv, attn) BYTE offsets for the surviving native FAB nodes,
+        // relative to the FAB scratch base (resolved against the arena below).
+        let (fab_scratch_bytes, fab_scratch_rel) = fab_scratch_layout(&fused);
+
         if verbose {
             eprintln!("[rlx-metal] after fusion: {} nodes", fused.len());
         }
@@ -244,7 +261,47 @@ impl MetalExecutable {
         } else {
             0
         };
-        let mut plan = memory::plan_memory_aligned(&fused, 128);
+        // Plan with the conservative output-ancestor liveness pin — correct for
+        // every op, including recurrent ones (GRU) on the not-strictly-in-order
+        // MPSGraph. Only if the resulting arena would exceed the device's
+        // single-buffer limit (`maxBufferLength`) do we re-plan WITHOUT the pin to
+        // restore slot reuse and shrink the arena. That's required for deep
+        // feed-forward decoders (e.g. the Moshi 7B temporal stack, which emits a KV
+        // tensor per layer so almost every node becomes an output-ancestor → 45 GB
+        // pinned vs 27 GB reused) and is safe for them (no buffer is read after a
+        // later op has reused its slot).
+        let mut plan = memory::plan_memory_with_options(
+            &fused,
+            128,
+            memory::MemoryPlanOptions {
+                // CPU-fallback thunks (conv/maxpool backward) read arena buffers
+                // AFTER the whole command buffer completes — including later GPU
+                // ops that reused those slots. Slot reuse is unsafe in that mix;
+                // RLX_ARENA_NO_REUSE pins every buffer to avoid the clobber.
+                arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
+                ..Default::default()
+            },
+        );
+        let max_buffer = crate::device::metal_device()
+            .map(|d| d.device.max_buffer_length() as usize)
+            .unwrap_or(usize::MAX);
+        if plan.arena_size > max_buffer {
+            if verbose {
+                eprintln!(
+                    "[rlx-metal] arena {} B > maxBufferLength {} B with output-ancestor pin; \
+                     re-planning without it to restore slot reuse",
+                    plan.arena_size, max_buffer
+                );
+            }
+            plan = memory::plan_memory_with_options(
+                &fused,
+                128,
+                memory::MemoryPlanOptions {
+                    pin_output_ancestors: false,
+                    ..Default::default()
+                },
+            );
+        }
         let mut tail = plan.arena_size;
         let gdn_scratch_off = if gdn_scratch > 0 {
             tail = (tail + 127) & !127;
@@ -294,7 +351,24 @@ impl MetalExecutable {
         } else {
             0
         };
+        // Native `Op::FusedAttentionBlock` packed-QKV + attn scratch.
+        let fab_scratch_off = if fab_scratch_bytes > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + fab_scratch_bytes;
+            off
+        } else {
+            0
+        };
         plan.arena_size = tail;
+        // Resolve per-node relative offsets to absolute arena byte offsets.
+        let fab_scratch: std::collections::HashMap<rlx_ir::NodeId, (usize, usize)> =
+            fab_scratch_rel
+                .iter()
+                .map(|(id, qkv_rel, attn_rel)| {
+                    (*id, (fab_scratch_off + qkv_rel, fab_scratch_off + attn_rel))
+                })
+                .collect();
         if verbose && gdn_scratch > 0 {
             eprintln!(
                 "[rlx-metal] GatedDeltaNet scratch: {} bytes @ offset {}",
@@ -338,6 +412,35 @@ impl MetalExecutable {
                 plan.assignments.len()
             );
         }
+        if std::env::var_os("RLX_METAL_DEBUG").is_some() {
+            let mut sizes: Vec<(usize, usize)> = plan
+                .assignments
+                .values()
+                .map(|s| (s.offset, s.size))
+                .collect();
+            sizes.sort_by_key(|&(_, sz)| std::cmp::Reverse(sz));
+            let total: usize = plan.assignments.values().map(|s| s.size).sum();
+            let max_end = plan
+                .assignments
+                .values()
+                .map(|s| s.offset + s.size)
+                .max()
+                .unwrap_or(0);
+            eprintln!(
+                "[rlx-metal] arena_size={:.2} GB, {} buffers, sum_slot_bytes={:.2} GB, max_end={:.2} GB",
+                plan.arena_size as f64 / 1e9,
+                plan.assignments.len(),
+                total as f64 / 1e9,
+                max_end as f64 / 1e9,
+            );
+            for (off, sz) in sizes.iter().take(6) {
+                eprintln!(
+                    "    slot off={:.2}GB size={:.3}GB",
+                    *off as f64 / 1e9,
+                    *sz as f64 / 1e9
+                );
+            }
+        }
         // Build precision-aware arena: per-node DType drives buffer sizing
         // and downstream kernel dispatch.
         let arena = Arena::from_plan_with_graph(plan, Some(&fused));
@@ -362,7 +465,7 @@ impl MetalExecutable {
             }
         }
 
-        let schedule = ThunkSchedule::compile_with_rng(&fused, &arena, rng);
+        let schedule = ThunkSchedule::compile_with_rng_fab(&fused, &arena, rng, &fab_scratch);
 
         if verbose {
             let nop_count = schedule
@@ -504,6 +607,7 @@ impl MetalExecutable {
             gpu_handles: HashMap::new(),
             gpu_handle_feeds: HashMap::new(),
             gpu_handle_resident: std::collections::HashSet::new(),
+            kv_row_feeds: HashMap::new(),
         };
         // Bind the MPSGraph executable's input/output arrays to the
         // arena once. After this, run_cached() avoids all per-call
@@ -1035,6 +1139,45 @@ impl MetalExecutable {
             .insert(handle_name.to_string(), output_index);
     }
 
+    /// Register a resident-KV *row* feed (vs the generic prefix feed): row
+    /// `src_row` of output `output_index` is folded into handle `handle_name`'s
+    /// input slot at `dst_row` by [`feed_kv_row`]. For decode graphs that emit
+    /// the new token at the last bucket-padded output row (llama32).
+    pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) {
+        self.kv_row_feeds
+            .insert(handle_name.to_string(), output_index);
+    }
+
+    /// Fold each registered row feed's new-token row into its resident handle
+    /// slot, in-place on the unified-memory arena. Call after a logits-only run.
+    pub fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) {
+        let feeds: Vec<(String, usize)> = self
+            .kv_row_feeds
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for (name, out_idx) in feeds {
+            if out_idx >= self.graph.outputs.len() {
+                continue;
+            }
+            let out_id = self.graph.outputs[out_idx];
+            let Some(&in_id) = self.input_ids.get(name.as_str()) else {
+                continue;
+            };
+            if in_id != out_id {
+                self.arena.copy_node_f32_range(
+                    in_id,
+                    dst_row * row_elems,
+                    out_id,
+                    src_row * row_elems,
+                    row_elems,
+                );
+            }
+            self.gpu_handle_resident.insert(name.clone());
+            self.gpu_handles.insert(name.clone(), Vec::new());
+        }
+    }
+
     pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         if let Some(&out_idx) = self.gpu_handle_feeds.get(name) {
             if out_idx < self.graph.outputs.len() {
@@ -1112,6 +1255,9 @@ impl MetalExecutable {
         }
         for (name, &idx) in &self.gpu_handle_feeds {
             exe.set_gpu_handle_feed(name, idx);
+        }
+        for (name, &idx) in &self.kv_row_feeds {
+            exe.register_kv_row_feed(name, idx);
         }
         exe.set_active_extent(self.active_extent);
         exe
@@ -1233,7 +1379,20 @@ impl MetalExecutable {
         // ICB segments (if any) are dispatched inline by encode_commit.
         let t0 = Instant::now();
         let _ = self.encode_commit(true, None, None);
-        crate::mps_profile::record("encode_path:thunks_only", t0.elapsed());
+        let wall = t0.elapsed();
+        crate::mps_profile::record("encode_path:thunks_only", wall);
+        // RLX_METAL_GPU_TIME=1: print true GPU-busy vs wall for the whole step.
+        // GPU-busy ≈ wall ⇒ compute-bound; GPU-busy ≪ wall ⇒ the cost is CPU
+        // orchestration (encode/commit/sync), not the kernels.
+        if rlx_ir::env::flag("RLX_METAL_GPU_TIME") {
+            let gpu = crate::gpu_time::take_last();
+            eprintln!(
+                "[metal-gpu] step: GPU-busy {:.2} ms | wall {:.2} ms | CPU/sync {:.2} ms",
+                gpu.as_secs_f64() * 1e3,
+                wall.as_secs_f64() * 1e3,
+                (wall.as_secs_f64() - gpu.as_secs_f64()).max(0.0) * 1e3,
+            );
+        }
     }
 
     /// Sequential per-thunk GPU timing (`RLX_METAL_THUNK_PROFILE=1`).
@@ -1248,7 +1407,9 @@ impl MetalExecutable {
             }
             let t0 = Instant::now();
             let _ = self.encode_commit(true, None, Some(i..i + 1));
-            crate::thunk_profile::record(name, t0.elapsed());
+            let wall = t0.elapsed();
+            let gpu = crate::gpu_time::take_last();
+            crate::thunk_profile::record_split(name, wall, gpu);
         }
         crate::thunk_profile::print_summary();
     }
@@ -1291,6 +1452,43 @@ impl MetalExecutable {
                 state_size: u32,
                 f16: bool,
             },
+            SelectiveScan {
+                x: usize,
+                delta: usize,
+                a: usize,
+                b: usize,
+                c: usize,
+                dst: usize,
+                batch: u32,
+                seq: u32,
+                hidden: u32,
+                state_size: u32,
+            },
+            Sample {
+                logits: usize,
+                dst: usize,
+                batch: u32,
+                vocab: u32,
+                top_k: u32,
+                top_p: f32,
+                temperature: f32,
+                seed: u64,
+            },
+            Reverse {
+                src: usize,
+                dst: usize,
+                dims: Vec<u32>,
+                rev_mask: Vec<bool>,
+                elem_bytes: u8,
+            },
+            ArgReduce {
+                src: usize,
+                dst: usize,
+                outer: u32,
+                reduced: u32,
+                inner: u32,
+                is_max: bool,
+            },
             Lstm {
                 x: usize,
                 w_ih: usize,
@@ -1306,6 +1504,51 @@ impl MetalExecutable {
                 num_layers: u32,
                 bidirectional: bool,
                 carry: bool,
+            },
+            Gru {
+                x: usize,
+                w_ih: usize,
+                w_hh: usize,
+                b_ih: usize,
+                b_hh: usize,
+                h0: usize,
+                dst: usize,
+                batch: u32,
+                seq: u32,
+                input_size: u32,
+                hidden: u32,
+                num_layers: u32,
+                bidirectional: bool,
+                carry: bool,
+            },
+            Rnn {
+                x: usize,
+                w_ih: usize,
+                w_hh: usize,
+                bias: usize,
+                h0: usize,
+                dst: usize,
+                batch: u32,
+                seq: u32,
+                input_size: u32,
+                hidden: u32,
+                num_layers: u32,
+                bidirectional: bool,
+                carry: bool,
+                relu: bool,
+            },
+            Mamba2 {
+                x: usize,
+                dt: usize,
+                a: usize,
+                b: usize,
+                c: usize,
+                dst: usize,
+                batch: u32,
+                seq: u32,
+                heads: u32,
+                head_dim: u32,
+                state_size: u32,
             },
             DequantMatMulGguf {
                 x: usize,
@@ -1370,6 +1613,47 @@ impl MetalExecutable {
                 m: usize,
                 k: usize,
                 n: usize,
+            },
+            ScaledMatMul {
+                lhs: usize,
+                rhs: usize,
+                lhs_scale: usize,
+                rhs_scale: usize,
+                bias: usize,
+                dst: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+                has_bias: bool,
+                lhs_fmt: rlx_ir::ScaledFormat,
+                rhs_fmt: rlx_ir::ScaledFormat,
+                layout: rlx_ir::ScaleLayout,
+            },
+            ScaledQuantize {
+                x: usize,
+                scale: usize,
+                dst: usize,
+                rows: usize,
+                cols: usize,
+                fmt: rlx_ir::ScaledFormat,
+                layout: rlx_ir::ScaleLayout,
+            },
+            ScaledDequantize {
+                codes: usize,
+                scale: usize,
+                dst: usize,
+                rows: usize,
+                cols: usize,
+                fmt: rlx_ir::ScaledFormat,
+                layout: rlx_ir::ScaleLayout,
+            },
+            ScaledQuantScale {
+                x: usize,
+                dst: usize,
+                rows: usize,
+                cols: usize,
+                fmt: rlx_ir::ScaledFormat,
+                layout: rlx_ir::ScaleLayout,
             },
             /// Unified-memory memcpy — batched to avoid GPU dispatch on slices.
             Memcpy {
@@ -1444,6 +1728,30 @@ impl MetalExecutable {
         let dev = metal_device().expect("Metal device required");
         let mut cmd_buf = dev.queue.new_command_buffer().to_owned();
         let k = kernels();
+
+        // Counter-profile (RLX_METAL_COUNTER_PROFILE=1): wrap each thunk in its
+        // own compute encoder with start/end timestamp sample attachments, all
+        // in THIS one command buffer, for true per-op GPU-busy time without the
+        // per-command-buffer ramp / commit distortion of the thunk profiler.
+        // Full-step path only (thunk_range none); needs the timestamp counter
+        // set + AtStageBoundary support (Apple Silicon).
+        let cp_want = thunk_range.is_none() && crate::counter_profile::enabled();
+        let cp_cap = self.schedule.thunks.len() + 4;
+        let mut cp_names: Vec<&'static str> = Vec::new();
+        let cp_sbuf: Option<metal::CounterSampleBuffer> = if cp_want {
+            crate::counter_profile::timestamp_counter_set(&dev.device).and_then(|set| {
+                let desc = metal::CounterSampleBufferDescriptor::new();
+                desc.set_counter_set(&set);
+                desc.set_sample_count((cp_cap * 2) as u64);
+                desc.set_storage_mode(metal::MTLStorageMode::Shared);
+                dev.device
+                    .new_counter_sample_buffer_with_descriptor(&desc)
+                    .ok()
+            })
+        } else {
+            None
+        };
+        let cp_active = cp_sbuf.is_some();
 
         // Lazy compute encoder — created on first MSL thunk, ended right
         // before any MPS call. Two consecutive MPS calls don't pay an
@@ -1525,6 +1833,88 @@ impl MetalExecutable {
                                 );
                             }
                         },
+                        DeferredHostOp::SelectiveScan {
+                            x,
+                            delta,
+                            a,
+                            b,
+                            c,
+                            dst,
+                            batch,
+                            seq,
+                            hidden,
+                            state_size,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_selective_scan_f32(
+                                x,
+                                delta,
+                                a,
+                                b,
+                                c,
+                                dst,
+                                batch as usize,
+                                seq as usize,
+                                hidden as usize,
+                                state_size as usize,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::Sample {
+                            logits,
+                            dst,
+                            batch,
+                            vocab,
+                            top_k,
+                            top_p,
+                            temperature,
+                            seed,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_sample_f32(
+                                logits,
+                                dst,
+                                batch as usize,
+                                vocab as usize,
+                                top_k as usize,
+                                top_p,
+                                temperature,
+                                seed,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::Reverse {
+                            src,
+                            dst,
+                            dims,
+                            rev_mask,
+                            elem_bytes,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_reverse(
+                                src,
+                                dst,
+                                &dims,
+                                &rev_mask,
+                                elem_bytes as usize,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::ArgReduce {
+                            src,
+                            dst,
+                            outer,
+                            reduced,
+                            inner,
+                            is_max,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_argreduce_f32(
+                                src,
+                                dst,
+                                outer as usize,
+                                reduced as usize,
+                                inner as usize,
+                                is_max,
+                                arena_ptr,
+                            );
+                        },
                         DeferredHostOp::Lstm {
                             x,
                             w_ih,
@@ -1556,6 +1946,102 @@ impl MetalExecutable {
                                 num_layers as usize,
                                 bidirectional,
                                 carry,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::Gru {
+                            x,
+                            w_ih,
+                            w_hh,
+                            b_ih,
+                            b_hh,
+                            h0,
+                            dst,
+                            batch,
+                            seq,
+                            input_size,
+                            hidden,
+                            num_layers,
+                            bidirectional,
+                            carry,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_gru_f32(
+                                x,
+                                w_ih,
+                                w_hh,
+                                b_ih,
+                                b_hh,
+                                h0,
+                                dst,
+                                batch as usize,
+                                seq as usize,
+                                input_size as usize,
+                                hidden as usize,
+                                num_layers as usize,
+                                bidirectional,
+                                carry,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::Rnn {
+                            x,
+                            w_ih,
+                            w_hh,
+                            bias,
+                            h0,
+                            dst,
+                            batch,
+                            seq,
+                            input_size,
+                            hidden,
+                            num_layers,
+                            bidirectional,
+                            carry,
+                            relu,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_rnn_f32(
+                                x,
+                                w_ih,
+                                w_hh,
+                                bias,
+                                h0,
+                                dst,
+                                batch as usize,
+                                seq as usize,
+                                input_size as usize,
+                                hidden as usize,
+                                num_layers as usize,
+                                bidirectional,
+                                carry,
+                                relu,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::Mamba2 {
+                            x,
+                            dt,
+                            a,
+                            b,
+                            c,
+                            dst,
+                            batch,
+                            seq,
+                            heads,
+                            head_dim,
+                            state_size,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_mamba2_f32(
+                                x,
+                                dt,
+                                a,
+                                b,
+                                c,
+                                dst,
+                                batch as usize,
+                                seq as usize,
+                                heads as usize,
+                                head_dim as usize,
+                                state_size as usize,
                                 arena_ptr,
                             );
                         },
@@ -1682,6 +2168,64 @@ impl MetalExecutable {
                                 k,
                                 n,
                                 arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::ScaledMatMul {
+                            lhs,
+                            rhs,
+                            lhs_scale,
+                            rhs_scale,
+                            bias,
+                            dst,
+                            m,
+                            k,
+                            n,
+                            has_bias,
+                            lhs_fmt,
+                            rhs_fmt,
+                            layout,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_scaled_matmul_f32(
+                                lhs, rhs, lhs_scale, rhs_scale, bias, dst, m, k, n, has_bias,
+                                lhs_fmt, rhs_fmt, layout, arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::ScaledQuantize {
+                            x,
+                            scale,
+                            dst,
+                            rows,
+                            cols,
+                            fmt,
+                            layout,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_scaled_quantize_f32(
+                                x, scale, dst, rows, cols, fmt, layout, arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::ScaledDequantize {
+                            codes,
+                            scale,
+                            dst,
+                            rows,
+                            cols,
+                            fmt,
+                            layout,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_scaled_dequantize_f32(
+                                codes, scale, dst, rows, cols, fmt, layout, arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::ScaledQuantScale {
+                            x,
+                            dst,
+                            rows,
+                            cols,
+                            fmt,
+                            layout,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_scaled_quant_scale_f32(
+                                x, dst, rows, cols, fmt, layout, arena_ptr,
                             );
                         },
                         DeferredHostOp::Memcpy { src, dst, bytes } => unsafe {
@@ -1884,9 +2428,26 @@ impl MetalExecutable {
         // and skip past those indices instead of encoding them per-op.
         let segments = &self.icb_segments;
         let thunks = &self.schedule.thunks;
+        if rlx_ir::env::flag("RLX_DUMP_SCHED") {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static DONE: AtomicBool = AtomicBool::new(false);
+            if !DONE.swap(true, Ordering::Relaxed) {
+                for (i, t) in thunks.iter().enumerate() {
+                    let nm = crate::thunk::thunk_name(t);
+                    if nm != "nop" {
+                        eprintln!("[sched {i}] {nm}");
+                    }
+                }
+            }
+        }
         let mut seg_iter = segments.iter().peekable();
         let loop_end = thunk_range.as_ref().map(|r| r.end).unwrap_or(thunks.len());
         let mut i = thunk_range.as_ref().map(|r| r.start).unwrap_or(0);
+        // Per-step CPU-encode profile (RLX_METAL_ENCODE_PROFILE=1): reset at
+        // the start of a full-range step; printed after the final commit.
+        if thunk_range.is_none() {
+            crate::encode_profile::reset();
+        }
         while i < loop_end {
             if thunk_range.is_none()
                 && active.is_none()
@@ -1900,6 +2461,33 @@ impl MetalExecutable {
             }
             let thunk = &thunks[i];
             i += 1;
+            // Counter-profile: open a fresh sampled encoder for this thunk so
+            // its GPU start/end timestamps bracket exactly this op. The thunk's
+            // own `e!()` then reuses this encoder. (Decode has no in-graph host
+            // ops, so deferred_host is empty here and the single command buffer
+            // is preserved.)
+            if cp_active {
+                if let Some(active) = enc.take() {
+                    active.end_encoding();
+                }
+                flush_deferred_host(&mut cmd_buf, &mut enc, &mut deferred_host);
+                let idx = cp_names.len();
+                if idx < cp_cap {
+                    cp_names.push(crate::thunk::thunk_name(thunk));
+                    let pd = metal::ComputePassDescriptor::new();
+                    pd.set_dispatch_type(metal::MTLDispatchType::Serial);
+                    if let Some(att) = pd.sample_buffer_attachments().object_at(0) {
+                        att.set_sample_buffer(cp_sbuf.as_ref().unwrap());
+                        att.set_start_of_encoder_sample_index((idx * 2) as u64);
+                        att.set_end_of_encoder_sample_index((idx * 2 + 1) as u64);
+                    }
+                    enc = Some(
+                        cmd_buf
+                            .compute_command_encoder_with_descriptor(pd)
+                            .to_owned(),
+                    );
+                }
+            }
             if !matches!(thunk, Thunk::Narrow { .. } | Thunk::SplitLastAxis { .. })
                 && narrow_batch.is_some()
             {
@@ -1908,6 +2496,9 @@ impl MetalExecutable {
             // PLAN L3: per-thunk Perfetto span. No-op when env var
             // RLX_TRACE_PERFETTO unset.
             let _span = rlx_ir::perfetto::TraceSpan::new(crate::thunk::thunk_name(thunk), "metal");
+            // CPU-encode timing (RLX_METAL_ENCODE_PROFILE=1) — RAII so it
+            // records even for arms that `continue` early.
+            let _enc_t = crate::encode_profile::EncodeTimer::new(crate::thunk::thunk_name(thunk));
             match thunk {
                 Thunk::Nop => {}
                 Thunk::Cast {
@@ -3291,17 +3882,27 @@ impl MetalExecutable {
                     if n_eff == 0 {
                         continue;
                     }
-                    end_msl!();
-                    cmd_buf.commit();
-                    cmd_buf.wait_until_completed();
-                    let arena_ptr = self.arena.buffer.contents() as *mut u8;
-                    unsafe {
-                        rlx_cpu::thunk::execute_maxpool2d_backward_f32(
-                            *x, *dy, *dx, n_eff, *c, *h, *w, *h_out, *w_out, *kh, *kw, *sh, *sw,
-                            *ph, *pw, arena_ptr,
-                        );
-                    }
-                    cmd_buf = dev.queue.new_command_buffer().to_owned();
+                    // Native GPU max-pool backward (output-parallel, no sync).
+                    encode_maxpool2d_backward(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *dy,
+                        *dx,
+                        n_eff,
+                        *c,
+                        *h,
+                        *w,
+                        *h_out,
+                        *w_out,
+                        *kh,
+                        *kw,
+                        *sh,
+                        *sw,
+                        *ph,
+                        *pw,
+                    );
                 }
                 Thunk::Conv2dBackwardInput {
                     dy,
@@ -3328,8 +3929,11 @@ impl MetalExecutable {
                     if n == 0 {
                         continue;
                     }
-                    // Same lowering as decomposed `Op::Conv(dy, w)` → `Conv2D`.
-                    encode_conv2d(
+                    // The input gradient is a *transposed* convolution (gather of
+                    // `dy` through the weight). Native GPU kernel — one thread per
+                    // dx element, no atomics, no sync (replaces the old CPU
+                    // fallback that stalled the command-buffer pipeline).
+                    encode_conv2d_backward_input(
                         e!(),
                         k,
                         &self.arena.buffer,
@@ -3337,12 +3941,12 @@ impl MetalExecutable {
                         *w,
                         *dx,
                         n,
-                        *c_out,
-                        *h_out,
-                        *w_out,
                         *c_in,
                         *h,
                         *w_in,
+                        *c_out,
+                        *h_out,
+                        *w_out,
                         *kh,
                         *kw,
                         *sh,
@@ -3379,14 +3983,65 @@ impl MetalExecutable {
                     if n == 0 {
                         continue;
                     }
-                    if n > 1 || self.conv_bwd_scratch_off == 0 {
-                        unsafe {
-                            let base = self.arena.buffer.contents() as *mut u8;
-                            rlx_cpu::conv_bwd::execute_conv2d_backward_weight_f32(
-                                base, *x, *dy, *dw, n, *c_in, *h, *w, *c_out, *h_out, *w_out, *kh,
-                                *kw, *sh, *sw, *ph, *pw, *dh, *dw_dil, *groups,
-                            );
-                        }
+                    if n > 1 && self.conv_bwd_scratch_off != 0 {
+                        // Native GPU weight-grad, two-pass (batch-parallel):
+                        //   pass 1 — one thread per (n, co, ci, ki, kj) writes a
+                        //            per-sample partial into scratch (threads scale
+                        //            with N, fixing conv1's 288-thread starvation);
+                        //   pass 2 — one thread per dw element reduces over N.
+                        // Deterministic (no atomics), no GPU→CPU sync.
+                        encode_conv2d_backward_weight_2pass(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            self.conv_bwd_scratch_off,
+                            *x,
+                            *dy,
+                            *dw,
+                            n,
+                            *c_in,
+                            *h,
+                            *w,
+                            *c_out,
+                            *h_out,
+                            *w_out,
+                            *kh,
+                            *kw,
+                            *sh,
+                            *sw,
+                            *ph,
+                            *pw,
+                            *dh,
+                            *dw_dil,
+                            *groups,
+                        );
+                    } else if self.conv_bwd_scratch_off == 0 {
+                        // Scratch unavailable (rare): single-pass direct kernel —
+                        // one thread per dw element sums dy*x over the batch.
+                        encode_conv2d_backward_weight(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *x,
+                            *dy,
+                            *dw,
+                            n,
+                            *c_in,
+                            *h,
+                            *w,
+                            *c_out,
+                            *h_out,
+                            *w_out,
+                            *kh,
+                            *kw,
+                            *sh,
+                            *sw,
+                            *ph,
+                            *pw,
+                            *dh,
+                            *dw_dil,
+                            *groups,
+                        );
                     } else {
                         let c_in_per_g = *c_in / *groups;
                         let c_out_per_g = *c_out / *groups;
@@ -3532,6 +4187,54 @@ impl MetalExecutable {
                         *attn_logit_softcap,
                     );
                 }
+                Thunk::FusedAttn {
+                    qkv,
+                    mask,
+                    cos,
+                    sin,
+                    out,
+                    batch,
+                    seq,
+                    heads,
+                    head_dim,
+                    mask_kind,
+                    scale_bits,
+                    has_rope,
+                } => {
+                    let enc = e!();
+                    let buffer = &self.arena.buffer;
+                    enc.set_compute_pipeline_state(&k.fused_attn_block);
+                    // Small FAB scratch (gated to seq ≤ 64): bind each buffer at
+                    // its byte offset directly. The >4 GB `set_buffer`-offset
+                    // write-drop (task #50) doesn't bite here — these are small,
+                    // low arena offsets.
+                    enc.set_buffer(0, Some(buffer), *qkv as u64);
+                    enc.set_buffer(1, Some(buffer), *mask as u64);
+                    enc.set_buffer(2, Some(buffer), *cos as u64);
+                    enc.set_buffer(3, Some(buffer), *sin as u64);
+                    enc.set_buffer(4, Some(buffer), *out as u64);
+                    let u4 = std::mem::size_of::<u32>() as u64;
+                    enc.set_bytes(5, u4, batch as *const u32 as *const _);
+                    enc.set_bytes(6, u4, seq as *const u32 as *const _);
+                    enc.set_bytes(7, u4, heads as *const u32 as *const _);
+                    enc.set_bytes(8, u4, head_dim as *const u32 as *const _);
+                    enc.set_bytes(9, u4, mask_kind as *const u32 as *const _);
+                    enc.set_bytes(10, u4, scale_bits as *const u32 as *const _);
+                    enc.set_bytes(11, u4, has_rope as *const u32 as *const _);
+                    let groups = (*batch * *heads).max(1) as u64;
+                    enc.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: groups,
+                            height: 1,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 256,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
                 Thunk::Rope {
                     src,
                     cos,
@@ -3544,6 +4247,8 @@ impl MetalExecutable {
                     n_rot,
                     dt,
                     src_row_stride,
+                    cos_per_token,
+                    interleaved,
                 } => {
                     // Active-extent: seq is the runtime-scaled loop bound.
                     // seq_stride stays at compile-time full extent so per-
@@ -3569,6 +4274,8 @@ impl MetalExecutable {
                         *dt,
                         *src_row_stride,
                         seq_stride,
+                        *cos_per_token,
+                        *interleaved,
                     );
                 }
                 Thunk::Softmax {
@@ -3582,6 +4289,74 @@ impl MetalExecutable {
                         continue;
                     }
                     encode_softmax(e!(), k, &self.arena.buffer, *data, rows, *cols, *dt);
+                }
+                Thunk::SoftmaxCrossEntropyDense {
+                    logits,
+                    targets,
+                    dst,
+                    n,
+                    c,
+                } => {
+                    let rows = scale(*n);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_softmax_cross_entropy_dense(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *logits,
+                        *targets,
+                        *dst,
+                        rows,
+                        *c,
+                    );
+                }
+                Thunk::SoftmaxCrossEntropyWithLogits {
+                    logits,
+                    labels,
+                    dst,
+                    n,
+                    c,
+                } => {
+                    let rows = scale(*n);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_softmax_cross_entropy_with_logits(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *logits,
+                        *labels,
+                        *dst,
+                        rows,
+                        *c,
+                    );
+                }
+                Thunk::SoftmaxCrossEntropyBackward {
+                    logits,
+                    labels,
+                    d_loss,
+                    dlogits,
+                    n,
+                    c,
+                } => {
+                    let rows = scale(*n);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_softmax_cross_entropy_backward(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *logits,
+                        *labels,
+                        *d_loss,
+                        *dlogits,
+                        rows,
+                        *c,
+                    );
                 }
                 Thunk::Cumsum {
                     src,
@@ -3672,6 +4447,26 @@ impl MetalExecutable {
                             *dt,
                             inputs,
                         );
+                    } else if rlx_ir::env::flag("RLX_METAL_CONCAT_GPU") {
+                        // Opt-in GPU mid-axis concat — encodes into the live
+                        // command buffer (no commit/wait), unlike the host
+                        // fallback below which syncs per concat. Measured
+                        // net-neutral-to-slightly-slower on GGUF KV decode
+                        // (the step is GPU-bound; the per-concat sync was
+                        // really CPU-blocking-on-GPU, not CPU work), so it is
+                        // NOT the default — but it's a correct, reusable
+                        // variant for genuinely encode-bound graphs.
+                        encode_concat_midaxis(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *dst,
+                            outer,
+                            *dst_axis,
+                            *inner,
+                            *dt,
+                            inputs,
+                        );
                     } else {
                         // Mid-shape concat — sync + host copy fallback.
                         end_msl!();
@@ -3737,6 +4532,13 @@ impl MetalExecutable {
                         *dst,
                         len,
                     );
+                }
+                Thunk::Fma { a, b, c, dst, len } => {
+                    let len = scale(*len);
+                    if len == 0 {
+                        continue;
+                    }
+                    encode_fma(e!(), k, &self.arena.buffer, *a, *b, *c, *dst, len);
                 }
                 Thunk::Reduce {
                     src,
@@ -4854,6 +5656,202 @@ impl MetalExecutable {
                     }
                 }
 
+                Thunk::SelectiveScan {
+                    x,
+                    delta,
+                    a,
+                    b,
+                    c,
+                    dst,
+                    batch,
+                    seq,
+                    hidden,
+                    state_size,
+                } => {
+                    // Native MSL kernel covers f32 with state_size ≤ 128
+                    // (SSM_MAX_N in kernels.rs). Larger state or the
+                    // RLX_METAL_SSM_HOST_FALLBACK / RLX_METAL_SSM_CPU opt-out
+                    // take the verified CPU kernel on the unified-memory arena.
+                    let force_host = rlx_ir::env::flag("RLX_METAL_SSM_HOST_FALLBACK")
+                        || rlx_ir::env::flag("RLX_METAL_SSM_CPU");
+                    if !force_host && *state_size <= 128 {
+                        let enc = e!();
+                        encode_selective_scan(
+                            enc,
+                            k,
+                            &self.arena.buffer,
+                            *x,
+                            *delta,
+                            *a,
+                            *b,
+                            *c,
+                            *dst,
+                            *batch,
+                            *seq,
+                            *hidden,
+                            *state_size,
+                        );
+                    } else {
+                        deferred_host.push(DeferredHostOp::SelectiveScan {
+                            x: *x,
+                            delta: *delta,
+                            a: *a,
+                            b: *b,
+                            c: *c,
+                            dst: *dst,
+                            batch: *batch,
+                            seq: *seq,
+                            hidden: *hidden,
+                            state_size: *state_size,
+                        });
+                    }
+                }
+
+                Thunk::Sample {
+                    logits,
+                    dst,
+                    batch,
+                    vocab,
+                    top_k,
+                    top_p,
+                    temperature,
+                    seed,
+                } => {
+                    // Native on-GPU sample: temperature -> top-k -> softmax ->
+                    // top-p -> Philox inverse-CDF, one threadgroup per batch
+                    // row (`sample_logits`). Matches the CPU `sample_row`
+                    // algorithm and Philox stream bit-for-bit. Falls back to the
+                    // host kernel only when a deferred host op precedes it in
+                    // this segment (ordering) or via RLX_METAL_SAMPLE_HOST=1.
+                    if deferred_host.is_empty() && !rlx_ir::env::flag("RLX_METAL_SAMPLE_HOST") {
+                        let enc = e!();
+                        enc.set_compute_pipeline_state(&k.sample_logits);
+                        enc.set_buffer(0, Some(&self.arena.buffer), 0);
+                        let lg = *logits as u64;
+                        enc.set_bytes(1, 8, &lg as *const u64 as *const _);
+                        let ds = *dst as u64;
+                        enc.set_bytes(2, 8, &ds as *const u64 as *const _);
+                        let (bt, vc, tk) = (*batch, *vocab, *top_k);
+                        enc.set_bytes(3, 4, &bt as *const u32 as *const _);
+                        enc.set_bytes(4, 4, &vc as *const u32 as *const _);
+                        enc.set_bytes(5, 4, &tk as *const u32 as *const _);
+                        let tp = *top_p;
+                        enc.set_bytes(6, 4, &tp as *const f32 as *const _);
+                        let tm = *temperature;
+                        enc.set_bytes(7, 4, &tm as *const f32 as *const _);
+                        let sd = *seed;
+                        enc.set_bytes(8, 8, &sd as *const u64 as *const _);
+                        let grid = metal::MTLSize {
+                            width: bt as u64,
+                            height: 1,
+                            depth: 1,
+                        };
+                        let tg = metal::MTLSize {
+                            width: 256,
+                            height: 1,
+                            depth: 1,
+                        };
+                        enc.dispatch_thread_groups(grid, tg);
+                    } else {
+                        deferred_host.push(DeferredHostOp::Sample {
+                            logits: *logits,
+                            dst: *dst,
+                            batch: *batch,
+                            vocab: *vocab,
+                            top_k: *top_k,
+                            top_p: *top_p,
+                            temperature: *temperature,
+                            seed: *seed,
+                        });
+                    }
+                }
+
+                Thunk::Reverse {
+                    src,
+                    dst,
+                    dims,
+                    rev_mask,
+                    elem_bytes,
+                } => {
+                    deferred_host.push(DeferredHostOp::Reverse {
+                        src: *src,
+                        dst: *dst,
+                        dims: dims.clone(),
+                        rev_mask: rev_mask.clone(),
+                        elem_bytes: *elem_bytes,
+                    });
+                }
+
+                Thunk::ArgReduce {
+                    src,
+                    dst,
+                    outer,
+                    reduced,
+                    inner,
+                    is_max,
+                } => {
+                    // Native GPU dispatch when this op's inputs are all
+                    // GPU-produced (no host op queued before it in this
+                    // segment). If a deferred host op precedes it, fall back to
+                    // host so the end-of-segment ordering stays correct.
+                    if deferred_host.is_empty() {
+                        let (o, r, inn, im) = (*outer, *reduced, *inner, *is_max as u32);
+                        if inn == 1 {
+                            // Cooperative last-axis reduction — one threadgroup
+                            // folds the whole row (decode: vocab ~128k on a
+                            // single lane via the serial kernel was the stall).
+                            let enc = e!();
+                            enc.set_compute_pipeline_state(&k.argreduce_lastaxis);
+                            enc.set_buffer(0, Some(&self.arena.buffer), *src as u64);
+                            enc.set_buffer(1, Some(&self.arena.buffer), *dst as u64);
+                            enc.set_bytes(2, 4, &o as *const u32 as *const _);
+                            enc.set_bytes(3, 4, &r as *const u32 as *const _);
+                            enc.set_bytes(4, 4, &im as *const u32 as *const _);
+                            let grid = metal::MTLSize {
+                                width: o as u64,
+                                height: 1,
+                                depth: 1,
+                            };
+                            let tg = metal::MTLSize {
+                                width: 256,
+                                height: 1,
+                                depth: 1,
+                            };
+                            enc.dispatch_thread_groups(grid, tg);
+                        } else {
+                            let enc = e!();
+                            enc.set_compute_pipeline_state(&k.argreduce);
+                            enc.set_buffer(0, Some(&self.arena.buffer), *src as u64);
+                            enc.set_buffer(1, Some(&self.arena.buffer), *dst as u64);
+                            enc.set_bytes(2, 4, &o as *const u32 as *const _);
+                            enc.set_bytes(3, 4, &r as *const u32 as *const _);
+                            enc.set_bytes(4, 4, &inn as *const u32 as *const _);
+                            enc.set_bytes(5, 4, &im as *const u32 as *const _);
+                            let total = (o * inn) as u64;
+                            let grid = metal::MTLSize {
+                                width: total,
+                                height: 1,
+                                depth: 1,
+                            };
+                            let tg = metal::MTLSize {
+                                width: total.min(256),
+                                height: 1,
+                                depth: 1,
+                            };
+                            enc.dispatch_threads(grid, tg);
+                        }
+                    } else {
+                        deferred_host.push(DeferredHostOp::ArgReduce {
+                            src: *src,
+                            dst: *dst,
+                            outer: *outer,
+                            reduced: *reduced,
+                            inner: *inner,
+                            is_max: *is_max,
+                        });
+                    }
+                }
+
                 Thunk::Lstm {
                     x,
                     w_ih,
@@ -4914,6 +5912,165 @@ impl MetalExecutable {
                     }
                 }
 
+                Thunk::Gru {
+                    x,
+                    w_ih,
+                    w_hh,
+                    b_ih,
+                    b_hh,
+                    h0,
+                    dst,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                } => {
+                    // Native MSL for single-layer/unidir/no-carry, hidden ≤ 1024.
+                    let force_host = rlx_ir::env::flag("RLX_METAL_RNN_HOST_FALLBACK");
+                    let simple = *num_layers == 1 && !*bidirectional && !*carry;
+                    if !force_host && simple && *hidden <= 1024 {
+                        encode_gru(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *x,
+                            *w_ih,
+                            *w_hh,
+                            *b_ih,
+                            *b_hh,
+                            *dst,
+                            *batch,
+                            *seq,
+                            *input_size,
+                            *hidden,
+                        );
+                    } else {
+                        deferred_host.push(DeferredHostOp::Gru {
+                            x: *x,
+                            w_ih: *w_ih,
+                            w_hh: *w_hh,
+                            b_ih: *b_ih,
+                            b_hh: *b_hh,
+                            h0: *h0,
+                            dst: *dst,
+                            batch: *batch,
+                            seq: *seq,
+                            input_size: *input_size,
+                            hidden: *hidden,
+                            num_layers: *num_layers,
+                            bidirectional: *bidirectional,
+                            carry: *carry,
+                        });
+                    }
+                }
+
+                Thunk::Rnn {
+                    x,
+                    w_ih,
+                    w_hh,
+                    bias,
+                    h0,
+                    dst,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                    relu,
+                } => {
+                    let force_host = rlx_ir::env::flag("RLX_METAL_RNN_HOST_FALLBACK");
+                    let simple = *num_layers == 1 && !*bidirectional && !*carry;
+                    if !force_host && simple && *hidden <= 1024 {
+                        encode_rnn(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *x,
+                            *w_ih,
+                            *w_hh,
+                            *bias,
+                            *dst,
+                            *batch,
+                            *seq,
+                            *input_size,
+                            *hidden,
+                            *relu,
+                        );
+                    } else {
+                        deferred_host.push(DeferredHostOp::Rnn {
+                            x: *x,
+                            w_ih: *w_ih,
+                            w_hh: *w_hh,
+                            bias: *bias,
+                            h0: *h0,
+                            dst: *dst,
+                            batch: *batch,
+                            seq: *seq,
+                            input_size: *input_size,
+                            hidden: *hidden,
+                            num_layers: *num_layers,
+                            bidirectional: *bidirectional,
+                            carry: *carry,
+                            relu: *relu,
+                        });
+                    }
+                }
+
+                Thunk::Mamba2 {
+                    x,
+                    dt,
+                    a,
+                    b,
+                    c,
+                    dst,
+                    batch,
+                    seq,
+                    heads,
+                    head_dim,
+                    state_size,
+                } => {
+                    // Native MSL for state_size ≤ 128 (MAMBA2_MAX_N).
+                    let force_host = rlx_ir::env::flag("RLX_METAL_SSM_HOST_FALLBACK")
+                        || rlx_ir::env::flag("RLX_METAL_SSM_CPU");
+                    if !force_host && *state_size <= 128 {
+                        encode_mamba2(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *x,
+                            *dt,
+                            *a,
+                            *b,
+                            *c,
+                            *dst,
+                            *batch,
+                            *seq,
+                            *heads,
+                            *head_dim,
+                            *state_size,
+                        );
+                    } else {
+                        deferred_host.push(DeferredHostOp::Mamba2 {
+                            x: *x,
+                            dt: *dt,
+                            a: *a,
+                            b: *b,
+                            c: *c,
+                            dst: *dst,
+                            batch: *batch,
+                            seq: *seq,
+                            heads: *heads,
+                            head_dim: *head_dim,
+                            state_size: *state_size,
+                        });
+                    }
+                }
+
                 Thunk::DequantMatMulGguf {
                     x,
                     w_q,
@@ -4935,18 +6092,93 @@ impl MetalExecutable {
                     // Fused single-pass Q4_K GEMV — skips the f32 scratch
                     // entirely. Decode-only and k%256==0 (always true for
                     // GGUF Q4K). Off-switch: RLX_METAL_Q4K_FUSED_DISABLE=1.
+                    // Q4_0 / Q8_0 fused GEMV: m==1, k%32==0; disable via
+                    // RLX_METAL_Q40_FUSED_DISABLE / RLX_METAL_Q80_FUSED_DISABLE.
                     let use_fused_q4k_mv = use_gpu_dequant
                         && m_u == 1
                         && k_u.is_multiple_of(256)
                         && matches!(scheme, rlx_ir::QuantScheme::GgufQ4K)
                         && !rlx_ir::env::flag("RLX_METAL_Q4K_FUSED_DISABLE");
+                    let use_fused_q4_0_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(32)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufQ4_0)
+                        && !rlx_ir::env::flag("RLX_METAL_Q40_FUSED_DISABLE");
+                    let use_fused_q4_1_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(32)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufQ4_1)
+                        && !rlx_ir::env::flag("RLX_METAL_Q41_FUSED_DISABLE");
+                    let use_fused_q8_0_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(32)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufQ8_0)
+                        && !rlx_ir::env::flag("RLX_METAL_Q80_FUSED_DISABLE");
+                    let use_fused_iq4_nl_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(32)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufIQ4NL)
+                        && !rlx_ir::env::flag("RLX_METAL_IQ4NL_FUSED_DISABLE");
+                    let use_fused_iq2_xxs_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufIQ2XXS)
+                        && !rlx_ir::env::flag("RLX_METAL_IQ2XXS_FUSED_DISABLE");
+                    let use_fused_iq2_xs_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufIQ2XS)
+                        && !rlx_ir::env::flag("RLX_METAL_IQ2XS_FUSED_DISABLE");
+                    let use_fused_iq3_xxs_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufIQ3XXS)
+                        && !rlx_ir::env::flag("RLX_METAL_IQ3XXS_FUSED_DISABLE");
+                    let use_fused_iq2_s_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufIQ2S)
+                        && !rlx_ir::env::flag("RLX_METAL_IQ2S_FUSED_DISABLE");
+                    let use_fused_iq3_s_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufIQ3S)
+                        && !rlx_ir::env::flag("RLX_METAL_IQ3S_FUSED_DISABLE");
+                    let use_fused_iq1_s_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufIQ1S)
+                        && !rlx_ir::env::flag("RLX_METAL_IQ1S_FUSED_DISABLE");
+                    let use_fused_iq1_m_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufIQ1M)
+                        && !rlx_ir::env::flag("RLX_METAL_IQ1M_FUSED_DISABLE");
                     // Simdgroup-cooperative variant: 8 outputs per simdgroup
                     // with simd_sum. Requires n%8==0. Off-switch:
                     // RLX_METAL_Q4K_SG_DISABLE=1.
                     let use_q4k_mv_sg = use_fused_q4k_mv
                         && n_u.is_multiple_of(8)
                         && !rlx_ir::env::flag("RLX_METAL_Q4K_SG_DISABLE");
-                    if !use_gpu_dequant || self.dequant_scratch_off == 0 {
+                    // Fused Q4_K / Q6_K prefill GEMM (m > 1): reads packed
+                    // weight directly, dequants in-register, accumulates a row
+                    // tile — replaces the dequant-to-f32-scratch + MPS sgemm
+                    // path. Off-switch: RLX_METAL_Q4K_GEMM_DISABLE /
+                    // RLX_METAL_Q6K_GEMM_DISABLE (→ legacy MPS path).
+                    let use_fused_q4k_mm = use_gpu_dequant
+                        && m_u > 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufQ4K)
+                        && !rlx_ir::env::flag("RLX_METAL_Q4K_GEMM_DISABLE");
+                    let use_fused_q6k_mm = use_gpu_dequant
+                        && m_u > 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufQ6K)
+                        && !rlx_ir::env::flag("RLX_METAL_Q6K_GEMM_DISABLE");
+                    if !use_gpu_dequant
+                        || self.dequant_scratch_off == 0
+                        || !has_metal_dequant_kernel(*scheme)
+                    {
                         deferred_host.push(DeferredHostOp::DequantMatMulGguf {
                             x: *x,
                             w_q: *w_q,
@@ -4956,6 +6188,66 @@ impl MetalExecutable {
                             n: n_u,
                             scheme: *scheme,
                         });
+                    } else if use_q4k_mv_sg && rlx_ir::env::flag("RLX_METAL_Q4K_PROBE") {
+                        // DIAGNOSTIC: read-bandwidth probe (no dequant math).
+                        // PROBE=flat → perfectly-coalesced max-MLP flat read;
+                        // otherwise → row-per-thread read (matches q4k_mv_f32).
+                        let flat =
+                            rlx_ir::env::var("RLX_METAL_Q4K_PROBE").as_deref() == Some("flat");
+                        let enc = e!();
+                        if flat {
+                            let nblocks = k_u / 256;
+                            let total_words = (n_u as u64) * (nblocks as u64) * 144u64 / 4u64;
+                            enc.set_compute_pipeline_state(&k.q4k_flatread_probe);
+                            enc.set_buffer(0, Some(&self.arena.buffer), 0);
+                            let x_b = *x as u64;
+                            let w_b = *w_q as u64;
+                            let d_b = *dst as u64;
+                            let k32 = k_u as u32;
+                            let n32 = n_u as u32;
+                            enc.set_bytes(1, 8, &x_b as *const u64 as *const _);
+                            enc.set_bytes(2, 8, &w_b as *const u64 as *const _);
+                            enc.set_bytes(3, 8, &d_b as *const u64 as *const _);
+                            enc.set_bytes(4, 4, &k32 as *const u32 as *const _);
+                            enc.set_bytes(5, 4, &n32 as *const u32 as *const _);
+                            let grid = metal::MTLSize {
+                                width: total_words,
+                                height: 1,
+                                depth: 1,
+                            };
+                            let tg = metal::MTLSize {
+                                width: 256u64.min(total_words).max(1),
+                                height: 1,
+                                depth: 1,
+                            };
+                            enc.dispatch_threads(grid, tg);
+                            end_msl!();
+                            continue;
+                        }
+                        enc.set_compute_pipeline_state(&k.q4k_readbw_probe);
+                        enc.set_buffer(0, Some(&self.arena.buffer), 0);
+                        let x_b = *x as u64;
+                        let w_b = *w_q as u64;
+                        let d_b = *dst as u64;
+                        let k32 = k_u as u32;
+                        let n32 = n_u as u32;
+                        enc.set_bytes(1, 8, &x_b as *const u64 as *const _);
+                        enc.set_bytes(2, 8, &w_b as *const u64 as *const _);
+                        enc.set_bytes(3, 8, &d_b as *const u64 as *const _);
+                        enc.set_bytes(4, 4, &k32 as *const u32 as *const _);
+                        enc.set_bytes(5, 4, &n32 as *const u32 as *const _);
+                        let grid = metal::MTLSize {
+                            width: n_u as u64,
+                            height: 1,
+                            depth: 1,
+                        };
+                        let tg = metal::MTLSize {
+                            width: 64u64.min(n_u as u64).max(1),
+                            height: 1,
+                            depth: 1,
+                        };
+                        enc.dispatch_threads(grid, tg);
+                        end_msl!();
                     } else if use_q4k_mv_sg {
                         let enc = e!();
                         encode_q4k_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
@@ -4963,6 +6255,78 @@ impl MetalExecutable {
                     } else if use_fused_q4k_mv {
                         let enc = e!();
                         encode_q4k_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_q4_0_mv {
+                        let enc = e!();
+                        encode_q4_0_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_q4_1_mv {
+                        let enc = e!();
+                        encode_q4_1_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_q8_0_mv {
+                        let enc = e!();
+                        encode_q8_0_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_iq4_nl_mv {
+                        let enc = e!();
+                        encode_iq4_nl_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_iq2_xxs_mv {
+                        let enc = e!();
+                        encode_iq2_xxs_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_iq2_xs_mv {
+                        let enc = e!();
+                        encode_iq2_xs_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_iq3_xxs_mv {
+                        let enc = e!();
+                        encode_iq3_xxs_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_iq2_s_mv {
+                        let enc = e!();
+                        encode_iq2_s_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_iq3_s_mv {
+                        let enc = e!();
+                        encode_iq3_s_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_iq1_s_mv {
+                        let enc = e!();
+                        encode_iq1_s_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_iq1_m_mv {
+                        let enc = e!();
+                        encode_iq1_m_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                        end_msl!();
+                    } else if use_fused_q4k_mm {
+                        let enc = e!();
+                        encode_qk_mm_f32(
+                            enc,
+                            &k.q4k_mm_f32,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *dst,
+                            m_u,
+                            k_u,
+                            n_u,
+                        );
+                        end_msl!();
+                    } else if use_fused_q6k_mm {
+                        let enc = e!();
+                        encode_qk_mm_f32(
+                            enc,
+                            &k.q6k_mm_f32,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *dst,
+                            m_u,
+                            k_u,
+                            n_u,
+                        );
                         end_msl!();
                     } else {
                         let enc = e!();
@@ -4991,6 +6355,61 @@ impl MetalExecutable {
                     }
                 }
 
+                Thunk::FusedMlpGateUpSwiGLU {
+                    x,
+                    gate_w,
+                    up_w,
+                    dst,
+                    k: kk,
+                    n,
+                } => {
+                    let enc = e!();
+                    encode_q4k_swiglu_mv_f32(
+                        enc,
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *gate_w,
+                        *up_w,
+                        *dst,
+                        *kk as usize,
+                        *n as usize,
+                    );
+                    end_msl!();
+                }
+
+                Thunk::FusedMlpDownResidual {
+                    x,
+                    w,
+                    res,
+                    dst,
+                    k: kk,
+                    n,
+                    scheme,
+                } => {
+                    let pipeline = match scheme {
+                        rlx_ir::QuantScheme::GgufQ4K => &k.q4k_mv_residual_f32,
+                        rlx_ir::QuantScheme::GgufQ6K => &k.q6k_mv_residual_f32,
+                        other => panic!(
+                            "FusedMlpDownResidual: unsupported scheme {other:?} \
+                             (fuse_decode_mlp only emits Q4_K / Q6_K)"
+                        ),
+                    };
+                    let enc = e!();
+                    encode_q4k_mv_residual_f32(
+                        enc,
+                        pipeline,
+                        &self.arena.buffer,
+                        *x,
+                        *w,
+                        *res,
+                        *dst,
+                        *kk as usize,
+                        *n as usize,
+                    );
+                    end_msl!();
+                }
+
                 Thunk::DequantGroupedMatMulGguf {
                     input,
                     w_q,
@@ -5009,7 +6428,10 @@ impl MetalExecutable {
                     // Matches Thunk::DequantMatMulGguf above — GPU default,
                     // RLX_METAL_DEQUANT_GPU_DISABLE=1 to revert.
                     let use_gpu_dequant = !rlx_ir::env::flag("RLX_METAL_DEQUANT_GPU_DISABLE");
-                    if !use_gpu_dequant || self.dequant_scratch_off == 0 {
+                    if !use_gpu_dequant
+                        || self.dequant_scratch_off == 0
+                        || !has_metal_dequant_kernel(*scheme)
+                    {
                         deferred_host.push(DeferredHostOp::DequantGroupedMatMulGguf {
                             input: *input,
                             w_q: *w_q,
@@ -5059,18 +6481,38 @@ impl MetalExecutable {
                     block_size,
                     is_asymmetric,
                 } => {
-                    deferred_host.push(DeferredHostOp::DequantMatMulInt8 {
-                        x: *x,
-                        w_q: *w_q,
-                        scale: *scale,
-                        zp: *zp,
-                        dst: *dst,
-                        m: *m as usize,
-                        k: *kk as usize,
-                        n: *n as usize,
-                        block_size: *block_size,
-                        is_asymmetric: *is_asymmetric,
-                    });
+                    // Native GPU dequant-matmul when inputs are GPU-produced;
+                    // defer to host otherwise (ordering with prior host ops).
+                    if deferred_host.is_empty() {
+                        encode_dequant_matmul(
+                            e!(),
+                            &k.dequant_matmul_int8,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *scale,
+                            *zp,
+                            *dst,
+                            *m,
+                            *kk,
+                            *n,
+                            *block_size,
+                            *is_asymmetric as u32,
+                        );
+                    } else {
+                        deferred_host.push(DeferredHostOp::DequantMatMulInt8 {
+                            x: *x,
+                            w_q: *w_q,
+                            scale: *scale,
+                            zp: *zp,
+                            dst: *dst,
+                            m: *m as usize,
+                            k: *kk as usize,
+                            n: *n as usize,
+                            block_size: *block_size,
+                            is_asymmetric: *is_asymmetric,
+                        });
+                    }
                 }
 
                 Thunk::DequantMatMulInt4 {
@@ -5085,18 +6527,36 @@ impl MetalExecutable {
                     block_size,
                     is_asymmetric,
                 } => {
-                    deferred_host.push(DeferredHostOp::DequantMatMulInt4 {
-                        x: *x,
-                        w_q: *w_q,
-                        scale: *scale,
-                        zp: *zp,
-                        dst: *dst,
-                        m: *m as usize,
-                        k: *kk as usize,
-                        n: *n as usize,
-                        block_size: *block_size,
-                        is_asymmetric: *is_asymmetric,
-                    });
+                    if deferred_host.is_empty() {
+                        encode_dequant_matmul(
+                            e!(),
+                            &k.dequant_matmul_int4,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *scale,
+                            *zp,
+                            *dst,
+                            *m,
+                            *kk,
+                            *n,
+                            *block_size,
+                            *is_asymmetric as u32,
+                        );
+                    } else {
+                        deferred_host.push(DeferredHostOp::DequantMatMulInt4 {
+                            x: *x,
+                            w_q: *w_q,
+                            scale: *scale,
+                            zp: *zp,
+                            dst: *dst,
+                            m: *m as usize,
+                            k: *kk as usize,
+                            n: *n as usize,
+                            block_size: *block_size,
+                            is_asymmetric: *is_asymmetric,
+                        });
+                    }
                 }
 
                 Thunk::DequantMatMulFp8 {
@@ -5109,16 +6569,32 @@ impl MetalExecutable {
                     n,
                     e5m2,
                 } => {
-                    deferred_host.push(DeferredHostOp::DequantMatMulFp8 {
-                        x: *x,
-                        w_q: *w_q,
-                        scale: *scale,
-                        dst: *dst,
-                        m: *m as usize,
-                        k: *kk as usize,
-                        n: *n as usize,
-                        e5m2: *e5m2,
-                    });
+                    if deferred_host.is_empty() {
+                        encode_dequant_matmul_fp8(
+                            e!(),
+                            &k.dequant_matmul_fp8,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *scale,
+                            *dst,
+                            *m,
+                            *kk,
+                            *n,
+                            *e5m2 as u32,
+                        );
+                    } else {
+                        deferred_host.push(DeferredHostOp::DequantMatMulFp8 {
+                            x: *x,
+                            w_q: *w_q,
+                            scale: *scale,
+                            dst: *dst,
+                            m: *m as usize,
+                            k: *kk as usize,
+                            n: *n as usize,
+                            e5m2: *e5m2,
+                        });
+                    }
                 }
 
                 Thunk::DequantMatMulNvfp4 {
@@ -5131,15 +6607,120 @@ impl MetalExecutable {
                     k: kk,
                     n,
                 } => {
-                    deferred_host.push(DeferredHostOp::DequantMatMulNvfp4 {
-                        x: *x,
-                        w_q: *w_q,
-                        scale: *scale,
-                        global_scale: *global_scale,
+                    if deferred_host.is_empty() {
+                        encode_dequant_matmul_nvfp4(
+                            e!(),
+                            &k.dequant_matmul_nvfp4,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *scale,
+                            *global_scale,
+                            *dst,
+                            *m,
+                            *kk,
+                            *n,
+                        );
+                    } else {
+                        deferred_host.push(DeferredHostOp::DequantMatMulNvfp4 {
+                            x: *x,
+                            w_q: *w_q,
+                            scale: *scale,
+                            global_scale: *global_scale,
+                            dst: *dst,
+                            m: *m as usize,
+                            k: *kk as usize,
+                            n: *n as usize,
+                        });
+                    }
+                }
+                // Native low-precision GEMM + quantize: Apple GPUs have no FP8
+                // matrix HW, so these always run as the host decode-and-accumulate
+                // reference on unified memory (ordered after GPU compute).
+                Thunk::ScaledMatMul {
+                    lhs,
+                    rhs,
+                    lhs_scale,
+                    rhs_scale,
+                    bias,
+                    dst,
+                    m,
+                    k: kk,
+                    n,
+                    lhs_fmt,
+                    rhs_fmt,
+                    layout,
+                    has_bias,
+                } => {
+                    deferred_host.push(DeferredHostOp::ScaledMatMul {
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        lhs_scale: *lhs_scale,
+                        rhs_scale: *rhs_scale,
+                        bias: *bias,
                         dst: *dst,
                         m: *m as usize,
                         k: *kk as usize,
                         n: *n as usize,
+                        has_bias: *has_bias,
+                        lhs_fmt: *lhs_fmt,
+                        rhs_fmt: *rhs_fmt,
+                        layout: *layout,
+                    });
+                }
+                Thunk::ScaledQuantize {
+                    x,
+                    scale,
+                    dst,
+                    rows,
+                    cols,
+                    fmt,
+                    layout,
+                } => {
+                    deferred_host.push(DeferredHostOp::ScaledQuantize {
+                        x: *x,
+                        scale: *scale,
+                        dst: *dst,
+                        rows: *rows as usize,
+                        cols: *cols as usize,
+                        fmt: *fmt,
+                        layout: *layout,
+                    });
+                }
+                Thunk::ScaledDequantize {
+                    codes,
+                    scale,
+                    dst,
+                    rows,
+                    cols,
+                    fmt,
+                    layout,
+                } => {
+                    deferred_host.push(DeferredHostOp::ScaledDequantize {
+                        codes: *codes,
+                        scale: *scale,
+                        dst: *dst,
+                        rows: *rows as usize,
+                        cols: *cols as usize,
+                        fmt: *fmt,
+                        layout: *layout,
+                    });
+                }
+                Thunk::ScaledQuantScale {
+                    x,
+                    dst,
+                    rows,
+                    cols,
+                    fmt,
+                    layout,
+                } => {
+                    deferred_host.push(DeferredHostOp::ScaledQuantScale {
+                        x: *x,
+                        dst: *dst,
+                        rows: *rows as usize,
+                        cols: *cols as usize,
+                        fmt: *fmt,
+                        layout: *layout,
                     });
                 }
             }
@@ -5181,6 +6762,21 @@ impl MetalExecutable {
         };
         if wait {
             cmd_buf.wait_until_completed();
+            // True GPU-busy time (GPUStartTime/GPUEndTime) — read after
+            // completion, stashed for the profiler / per-step reporter which
+            // no longer hold the buffer. Avoids the wall-clock sync distortion.
+            if crate::gpu_time::enabled() {
+                crate::gpu_time::set_last(&cmd_buf);
+            }
+            if thunk_range.is_none() {
+                crate::encode_profile::print_summary();
+            }
+            if cp_active {
+                let busy_ms = crate::gpu_time::busy_seconds(&cmd_buf) * 1e3;
+                let nsamp = (cp_names.len() * 2) as u64;
+                let ticks = crate::counter_profile::resolve(cp_sbuf.as_deref().unwrap(), nsamp);
+                crate::counter_profile::aggregate_and_print(&cp_names, &ticks, busy_ms);
+            }
             if !tail_host.is_empty() {
                 let arena_ptr = self.arena.buffer.contents() as *mut u8;
                 for op in tail_host.drain(..) {
@@ -5401,26 +6997,54 @@ impl MetalExecutable {
 fn max_matmul_flops_in(graph: &Graph) -> u64 {
     let mut best: u64 = 0;
     for node in graph.nodes() {
-        if !matches!(node.op, Op::MatMul | Op::FusedMatMulBiasAct { .. }) {
-            continue;
-        }
-        let out_shape = &node.shape;
-        let n_dim = match out_shape.dim(out_shape.rank().saturating_sub(1)) {
-            d if d.is_static() => d.unwrap_static(),
+        let flops = match &node.op {
+            Op::MatMul | Op::FusedMatMulBiasAct { .. } => {
+                let out_shape = &node.shape;
+                let n_dim = match out_shape.dim(out_shape.rank().saturating_sub(1)) {
+                    d if d.is_static() => d.unwrap_static(),
+                    _ => continue,
+                };
+                let out_total: usize = match out_shape.num_elements() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let m_dim = out_total / n_dim.max(1);
+                let a_shape = &graph.node(node.inputs[0]).shape;
+                let a_total: usize = match a_shape.num_elements() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let k_dim = a_total / m_dim.max(1);
+                (m_dim as u64) * (k_dim as u64) * (n_dim as u64)
+            }
+            // Conv (forward + gradients) is the bulk of a CNN's compute but was
+            // invisible here — so a conv-heavy graph looked "tiny" (matmul-only)
+            // and the adaptive dispatch skipped its own MPSGraph plan, losing the
+            // ~2.6× fusion win. Count conv as out_elems × per-output MACs
+            // (C_in/g·kH·kW = weight elems / C_out); the gradients are the same
+            // order, so the forward conv alone is enough to cross the threshold.
+            Op::Conv { .. } | Op::Conv2dBackwardInput { .. } | Op::Conv2dBackwardWeight { .. } => {
+                let out_total: usize = match node.shape.num_elements() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                // weight is input[1] for Conv / BackwardInput, input shapes vary
+                // for BackwardWeight (output IS the weight) — use the largest
+                // input's per-element fan to stay an order-of-magnitude estimate.
+                let w_id = *node.inputs.last().unwrap_or(&node.inputs[0]);
+                let w_shape = &graph.node(w_id).shape;
+                let w_total: usize = match w_shape.num_elements() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let c_out = match w_shape.dim(0) {
+                    d if d.is_static() => d.unwrap_static().max(1),
+                    _ => 1,
+                };
+                (out_total as u64) * (w_total as u64 / c_out as u64).max(1)
+            }
             _ => continue,
         };
-        let out_total: usize = match out_shape.num_elements() {
-            Some(v) => v,
-            None => continue,
-        };
-        let m_dim = out_total / n_dim.max(1);
-        let a_shape = &graph.node(node.inputs[0]).shape;
-        let a_total: usize = match a_shape.num_elements() {
-            Some(v) => v,
-            None => continue,
-        };
-        let k_dim = a_total / m_dim.max(1);
-        let flops = (m_dim as u64) * (k_dim as u64) * (n_dim as u64);
         if flops > best {
             best = flops;
         }
@@ -7509,6 +9133,129 @@ fn encode_sdpa(
     enc.dispatch_thread_groups(tg_count, tg);
 }
 
+/// Native block-quantized (int8 / int4) weight matmul over the unified-memory
+/// arena. `out[m,n] = x[m,k] @ dequant(wq)`, one GPU thread per output element.
+#[allow(clippy::too_many_arguments)]
+fn encode_dequant_matmul(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    zp: usize,
+    dst: usize,
+    m: u32,
+    k: u32,
+    n: u32,
+    block_size: u32,
+    asym: u32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), w_q as u64);
+    enc.set_buffer(2, Some(buffer), scale as u64);
+    enc.set_buffer(3, Some(buffer), zp as u64);
+    enc.set_buffer(4, Some(buffer), dst as u64);
+    let sz = std::mem::size_of::<u32>() as u64;
+    enc.set_bytes(5, sz, &m as *const u32 as *const _);
+    enc.set_bytes(6, sz, &k as *const u32 as *const _);
+    enc.set_bytes(7, sz, &n as *const u32 as *const _);
+    enc.set_bytes(8, sz, &block_size as *const u32 as *const _);
+    enc.set_bytes(9, sz, &asym as *const u32 as *const _);
+    let total = (m * n) as u64;
+    let grid = metal::MTLSize {
+        width: total,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: total.min(256),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_dequant_matmul_fp8(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    dst: usize,
+    m: u32,
+    k: u32,
+    n: u32,
+    e5m2: u32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), w_q as u64);
+    enc.set_buffer(2, Some(buffer), scale as u64);
+    enc.set_buffer(4, Some(buffer), dst as u64);
+    let sz = std::mem::size_of::<u32>() as u64;
+    enc.set_bytes(5, sz, &m as *const u32 as *const _);
+    enc.set_bytes(6, sz, &k as *const u32 as *const _);
+    enc.set_bytes(7, sz, &n as *const u32 as *const _);
+    enc.set_bytes(8, sz, &e5m2 as *const u32 as *const _);
+    let total = (m * n) as u64;
+    let grid = metal::MTLSize {
+        width: total,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: total.min(256),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_dequant_matmul_nvfp4(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    global_scale: usize,
+    dst: usize,
+    m: u32,
+    k: u32,
+    n: u32,
+) {
+    use rlx_ir::NVFP4_GROUP_SIZE;
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), w_q as u64);
+    enc.set_buffer(2, Some(buffer), scale as u64);
+    enc.set_buffer(3, Some(buffer), global_scale as u64);
+    enc.set_buffer(4, Some(buffer), dst as u64);
+    let sz = std::mem::size_of::<u32>() as u64;
+    enc.set_bytes(5, sz, &m as *const u32 as *const _);
+    enc.set_bytes(6, sz, &k as *const u32 as *const _);
+    enc.set_bytes(7, sz, &n as *const u32 as *const _);
+    let gs = NVFP4_GROUP_SIZE as u32;
+    enc.set_bytes(8, sz, &gs as *const u32 as *const _);
+    let total = (m * n) as u64;
+    let grid = metal::MTLSize {
+        width: total,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: total.min(256),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
 fn encode_rope(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -7525,6 +9272,8 @@ fn encode_rope(
     dt: crate::thunk::HalfFlag,
     src_row_stride: u32,
     seq_stride: u32,
+    cos_per_token: bool,
+    interleaved: bool,
 ) {
     use crate::thunk::HalfFlag;
     let pipeline = match dt {
@@ -7570,6 +9319,18 @@ fn encode_rope(
         10,
         std::mem::size_of::<u32>() as u64,
         &n_rot as *const u32 as *const _,
+    );
+    let cos_per_token_u32: u32 = cos_per_token as u32;
+    enc.set_bytes(
+        11,
+        std::mem::size_of::<u32>() as u64,
+        &cos_per_token_u32 as *const u32 as *const _,
+    );
+    let interleaved_u32: u32 = interleaved as u32;
+    enc.set_bytes(
+        12,
+        std::mem::size_of::<u32>() as u64,
+        &interleaved_u32 as *const u32 as *const _,
     );
     let nh = hidden / head_dim;
     let grid = metal::MTLSize {
@@ -7765,6 +9526,110 @@ fn encode_rms_norm_bwd_param(
     );
 }
 
+/// True when the native `fused_attn_block` MSL kernel can serve this
+/// `Op::FusedAttentionBlock`: f32, no bias, rank-3, even head_dim, and a
+/// `[seq,seq]` score matrix that fits the kernel's `threadgroup float[64*64]`
+/// (`seq ≤ 64`). Everything else decomposes to the primitive chain.
+fn fab_is_native(node: &rlx_ir::Node) -> bool {
+    if let Op::FusedAttentionBlock {
+        head_dim, has_bias, ..
+    } = &node.op
+    {
+        let dims = node.shape.dims();
+        dims.len() == 3
+            && !*has_bias
+            && node.shape.dtype() == rlx_ir::DType::F32
+            && dims[1].unwrap_static() <= 64
+            && *head_dim % 2 == 0
+    } else {
+        false
+    }
+}
+
+/// Decompose non-native `Op::FusedAttentionBlock` nodes to the primitive chain
+/// (via the shared `expand_attention_block`), leaving native-eligible blocks
+/// intact for the `fused_attn_block` kernel. No rewrite when there is no FAB,
+/// or when every FAB is already native.
+fn lower_fab_for_metal(g: Graph) -> Graph {
+    let has_fab = g
+        .nodes()
+        .iter()
+        .any(|n| matches!(n.op, Op::FusedAttentionBlock { .. }));
+    if !has_fab {
+        return g;
+    }
+    let all_native = g
+        .nodes()
+        .iter()
+        .all(|n| !matches!(n.op, Op::FusedAttentionBlock { .. }) || fab_is_native(n));
+    if all_native {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: std::collections::HashMap<NodeId, NodeId> = std::collections::HashMap::new();
+    let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
+    for node in &nodes {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_id = if let Op::FusedAttentionBlock {
+            num_heads,
+            head_dim,
+            has_bias,
+            has_rope,
+        } = &node.op
+        {
+            if fab_is_native(node) {
+                out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+            } else {
+                rlx_opt::unfuse::expand_attention_block(
+                    &mut out,
+                    &new_inputs,
+                    *num_heads,
+                    *head_dim,
+                    *has_bias,
+                    *has_rope,
+                )
+            }
+        } else {
+            out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+/// Per native-FAB-node `(qkv, attn)` BYTE offsets *relative to the FAB scratch
+/// base*, plus the total scratch size in bytes. `qkv = [B,S,3*inner]` and
+/// `attn = [B,S,inner]` (both f32), each block 128-byte aligned.
+fn fab_scratch_layout(graph: &Graph) -> (usize, Vec<(NodeId, usize, usize)>) {
+    let mut rel: Vec<(NodeId, usize, usize)> = Vec::new();
+    let mut cur: usize = 0;
+    for node in graph.nodes() {
+        if !fab_is_native(node) {
+            continue;
+        }
+        if let Op::FusedAttentionBlock {
+            num_heads,
+            head_dim,
+            ..
+        } = &node.op
+        {
+            let dims = node.shape.dims();
+            let b = dims[0].unwrap_static();
+            let s = dims[1].unwrap_static();
+            let inner = num_heads * head_dim;
+            cur = (cur + 127) & !127;
+            let qkv_off = cur;
+            cur += b * s * 3 * inner * 4;
+            cur = (cur + 127) & !127;
+            let attn_off = cur;
+            cur += b * s * inner * 4;
+            rel.push((node.id, qkv_off, attn_off));
+        }
+    }
+    (cur, rel)
+}
+
 fn rms_norm_bwd_scratch_bytes(graph: &Graph) -> usize {
     let mut max_rows = 0usize;
     for node in graph.nodes() {
@@ -7958,6 +9823,9 @@ fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
     max
 }
 
+/// Maps [`QuantScheme`] to the shared GPU `dequant_gguf` MSL kernel scheme id (0–23).
+///
+/// See [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md) for the full table.
 pub(crate) fn gguf_scheme_id(scheme: rlx_ir::quant::QuantScheme) -> u32 {
     use rlx_ir::quant::QuantScheme;
     match scheme {
@@ -7980,13 +9848,21 @@ pub(crate) fn gguf_scheme_id(scheme: rlx_ir::quant::QuantScheme) -> u32 {
         QuantScheme::GgufIQ3S => 16,
         QuantScheme::GgufIQ1S => 17,
         QuantScheme::GgufIQ1M => 18,
+        QuantScheme::GgufQ4_0 => 19,
+        QuantScheme::GgufQ8_0 => 20,
+        QuantScheme::GgufQ4_1 => 21,
+        QuantScheme::GgufQ5_0 => 22,
+        QuantScheme::GgufQ5_1 => 23,
         other => panic!("gguf_scheme_id: unsupported {other:?} — use CPU dequant path"),
     }
 }
 
 /// Returns `true` when this scheme has a native on-device dequant kernel
 /// in the `dequant_gguf` MSL shader, `false` when callers should route
-/// through the CPU dequant path (rlx-gguf::dequant_*) instead.
+/// through the CPU dequant path (`rlx_gguf::dequant_*`) instead.
+///
+/// Fused GEMV (`q4k_mv_f32`, `q4_0_mv_f32`, `q8_0_mv_f32`) is separate — see
+/// [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 pub fn has_metal_dequant_kernel(scheme: rlx_ir::quant::QuantScheme) -> bool {
     use rlx_ir::quant::QuantScheme;
     matches!(
@@ -8010,6 +9886,11 @@ pub fn has_metal_dequant_kernel(scheme: rlx_ir::quant::QuantScheme) -> bool {
             | QuantScheme::GgufIQ3S
             | QuantScheme::GgufIQ1S
             | QuantScheme::GgufIQ1M
+            | QuantScheme::GgufQ4_0
+            | QuantScheme::GgufQ4_1
+            | QuantScheme::GgufQ5_0
+            | QuantScheme::GgufQ5_1
+            | QuantScheme::GgufQ8_0
     )
 }
 
@@ -8058,6 +9939,52 @@ pub(crate) fn encode_q4k_mv_f32_sg(
     enc.dispatch_threads(grid, tg);
 }
 
+/// Fused Q4_K / Q6_K GEMM (`m > 1`, prefill): `C[m,n] = A[m,k] @ dequant(w)^T`
+/// straight from the packed weight — no f32 scratch, no MPS sgemm. Grid is
+/// `(n columns) × ceil(m / TM)` row-tiles; threadgroup = up to 64 columns.
+/// Caller must guarantee `k_dim % 256 == 0`. Used for `m > 1` GgufQ4K/Q6K.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_qk_mm_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let m_u = m_dim as u32;
+    enc.set_bytes(4, 4, &m_u as *const u32 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
+    // TM must match Q4K_MM_TM / Q6K_MM_TM in dequant_gguf.msl.
+    const TM: u64 = 8;
+    let row_tiles = (m_dim as u64).div_ceil(TM);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: row_tiles,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: (n_dim as u64).min(64),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
 /// Fused Q4_K_M GEMV: `dst[n] = sum_k x[k] * dequant(w[n,k])` in one
 /// pass, skipping the f32 dequant scratch the dequant + MPS sgemm path
 /// would write. Caller must guarantee `k_dim % 256 == 0`. Decode-only
@@ -8084,6 +10011,482 @@ pub(crate) fn encode_q4k_mv_f32(
     enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// Fused decode MLP gate+up Q4_K GEMV with SwiGLU epilogue (`m == 1`).
+/// `dst[i] = up[i] * silu(gate[i])`. Grid: one thread per intermediate
+/// column. Caller guarantees `k_dim % 256 == 0` and gate/up share `x`/`k`/`n`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q4k_swiglu_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    gate_w: usize,
+    up_w: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.q4k_swiglu_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let g_u = gate_w as u64;
+    enc.set_bytes(2, 8, &g_u as *const u64 as *const _);
+    let u_u = up_w as u64;
+    enc.set_bytes(3, 8, &u_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(4, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// Fused decode MLP down-projection GEMV + residual add (`m == 1`).
+/// `dst[j] = res[j] + down(x)[j]`. `pipeline` selects Q4_K vs Q6_K. Grid:
+/// one thread per output column. Caller guarantees `k_dim % 256 == 0`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q4k_mv_residual_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    res: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let r_u = res as u64;
+    enc.set_bytes(4, 8, &r_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_q4_0_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.q4_0_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_q4_1_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.q4_1_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_q8_0_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.q8_0_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_iq4_nl_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.iq4_nl_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_iq2_xxs_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.iq2_xxs_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_iq2_xs_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.iq2_xs_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_iq3_xxs_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.iq3_xxs_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_iq2_s_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.iq2_s_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_iq3_s_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.iq3_s_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_iq1_s_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.iq1_s_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
+    let grid = metal::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_iq1_m_mv_f32(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.iq1_m_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
     let grid = metal::MTLSize {
         width: n_dim as u64,
         height: 1,
@@ -8304,6 +10707,58 @@ fn encode_gated_delta_net(
     enc.dispatch_thread_groups(grid, tg);
 }
 
+/// Native MSL selective scan (f32, `state_size <= SSM_MAX_N = 128`). One
+/// thread per `(batch, channel)`; each owns a private state vector and
+/// scans sequentially over the seq axis. Matches `execute_selective_scan_f32`.
+#[allow(clippy::too_many_arguments)]
+fn encode_selective_scan(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    delta: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    dst: usize,
+    batch: u32,
+    seq: u32,
+    hidden: u32,
+    state_size: u32,
+) {
+    let f32_idx = |byte_off: usize| -> u32 { (byte_off / 4) as u32 };
+    let p = &k.selective_scan;
+    enc.set_compute_pipeline_state(p);
+    enc.set_buffer(0, Some(buffer), 0);
+    let offs = [
+        f32_idx(x),
+        f32_idx(delta),
+        f32_idx(a),
+        f32_idx(b),
+        f32_idx(c),
+        f32_idx(dst),
+    ];
+    for (i, off) in offs.iter().enumerate() {
+        enc.set_bytes((i + 1) as u64, 4, off as *const u32 as *const _);
+    }
+    let dims = [batch, seq, hidden, state_size];
+    enc.set_bytes(7, 16, dims.as_ptr() as *const _);
+    let threads = (batch * hidden) as u64;
+    let tg_w = p.thread_execution_width().min(threads.max(1));
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// Native MSL forward LSTM (f32, `hidden <= LSTM_MAX_H = 1024`). One
 /// threadgroup per batch item, `hidden` threads each.
 #[allow(clippy::too_many_arguments)]
@@ -8349,6 +10804,153 @@ fn encode_lstm(
     enc.dispatch_thread_groups(grid, tg);
 }
 
+/// Native MSL GRU (f32, single-layer/unidir/no-carry, `hidden ≤ 1024`).
+#[allow(clippy::too_many_arguments)]
+fn encode_gru(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_ih: usize,
+    w_hh: usize,
+    b_ih: usize,
+    b_hh: usize,
+    dst: usize,
+    batch: u32,
+    seq: u32,
+    input_size: u32,
+    hidden: u32,
+) {
+    let f32_idx = |o: usize| -> u32 { (o / 4) as u32 };
+    enc.set_compute_pipeline_state(&k.gru);
+    enc.set_buffer(0, Some(buffer), 0);
+    let offs = [
+        f32_idx(x),
+        f32_idx(w_ih),
+        f32_idx(w_hh),
+        f32_idx(b_ih),
+        f32_idx(b_hh),
+        f32_idx(dst),
+    ];
+    for (i, o) in offs.iter().enumerate() {
+        enc.set_bytes((i + 1) as u64, 4, o as *const u32 as *const _);
+    }
+    let dims = [batch, seq, input_size, hidden];
+    enc.set_bytes(7, 16, dims.as_ptr() as *const _);
+    let grid = metal::MTLSize {
+        width: batch as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: hidden as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
+/// Native MSL Elman RNN (f32, single-layer/unidir/no-carry, `hidden ≤ 1024`).
+#[allow(clippy::too_many_arguments)]
+fn encode_rnn(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_ih: usize,
+    w_hh: usize,
+    bias: usize,
+    dst: usize,
+    batch: u32,
+    seq: u32,
+    input_size: u32,
+    hidden: u32,
+    relu: bool,
+) {
+    let f32_idx = |o: usize| -> u32 { (o / 4) as u32 };
+    enc.set_compute_pipeline_state(&k.rnn);
+    enc.set_buffer(0, Some(buffer), 0);
+    let offs = [
+        f32_idx(x),
+        f32_idx(w_ih),
+        f32_idx(w_hh),
+        f32_idx(bias),
+        f32_idx(dst),
+    ];
+    for (i, o) in offs.iter().enumerate() {
+        enc.set_bytes((i + 1) as u64, 4, o as *const u32 as *const _);
+    }
+    let dims = [batch, seq, input_size, hidden];
+    enc.set_bytes(6, 16, dims.as_ptr() as *const _);
+    let relu_u: u32 = if relu { 1 } else { 0 };
+    enc.set_bytes(7, 4, &relu_u as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: batch as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: hidden as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
+/// Native MSL Mamba-2 SSD scan (f32, `state_size ≤ 128`). One thread per
+/// `(batch, head, head_dim_pos)`.
+#[allow(clippy::too_many_arguments)]
+fn encode_mamba2(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    dt: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    dst: usize,
+    batch: u32,
+    seq: u32,
+    heads: u32,
+    head_dim: u32,
+    state_size: u32,
+) {
+    let f32_idx = |o: usize| -> u32 { (o / 4) as u32 };
+    let p = &k.mamba2;
+    enc.set_compute_pipeline_state(p);
+    enc.set_buffer(0, Some(buffer), 0);
+    let offs = [
+        f32_idx(x),
+        f32_idx(dt),
+        f32_idx(a),
+        f32_idx(b),
+        f32_idx(c),
+        f32_idx(dst),
+    ];
+    for (i, o) in offs.iter().enumerate() {
+        enc.set_bytes((i + 1) as u64, 4, o as *const u32 as *const _);
+    }
+    // dims.w packs head_dim (high 16) | state_size (low 16).
+    let packed = (head_dim << 16) | (state_size & 0xffff);
+    let dims = [batch, seq, heads, packed];
+    enc.set_bytes(7, 16, dims.as_ptr() as *const _);
+    let threads = (batch * heads * head_dim) as u64;
+    let tg_w = p.thread_execution_width().min(threads.max(1));
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 fn conv_bwd_scratch_bytes(graph: &Graph) -> usize {
     let mut max = 0usize;
     for node in graph.nodes() {
@@ -8372,7 +10974,14 @@ fn conv_bwd_scratch_bytes(graph: &Graph) -> usize {
             let c_in_per_g = c_in / groups;
             let n_dim = c_in_per_g * kh * kw;
             let k_dim = h_out * w_out;
-            max = max.max(n_dim * k_dim * std::mem::size_of::<f32>());
+            // n==1 im2col path needs n_dim*k_dim f32; the batch-parallel
+            // two-pass path needs N*C_out*c_in_per_g*kh*kw f32 partials.
+            // Size the shared scratch for whichever is larger.
+            let n_batch = x_shape.dim(0).unwrap_static();
+            let c_out = dy_shape.dim(1).unwrap_static();
+            let two_pass = n_batch * c_out * c_in_per_g * kh * kw;
+            let need = (n_dim * k_dim).max(two_pass);
+            max = max.max(need * std::mem::size_of::<f32>());
         }
     }
     max
@@ -8776,6 +11385,231 @@ fn encode_pool2d(
         depth: 1,
     };
     enc.dispatch_threads(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_maxpool2d_backward(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    dy: usize,
+    dx: usize,
+    n: u32,
+    c: u32,
+    h: u32,
+    w: u32,
+    h_out: u32,
+    w_out: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    ph: u32,
+    pw: u32,
+) {
+    let p0: [u32; 4] = [n, c, h, w];
+    let p1: [u32; 4] = [h_out, w_out, kh, kw];
+    let p2: [u32; 4] = [sh, sw, ph, pw];
+    enc.set_compute_pipeline_state(&k.maxpool2d_backward);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), dy as u64);
+    enc.set_buffer(2, Some(buffer), dx as u64);
+    enc.set_bytes(3, 16, p0.as_ptr() as *const _);
+    enc.set_bytes(4, 16, p1.as_ptr() as *const _);
+    enc.set_bytes(5, 16, p2.as_ptr() as *const _);
+    let grid = metal::MTLSize {
+        width: w as u64,
+        height: h as u64,
+        depth: (n * c) as u64,
+    };
+    let tg = metal::MTLSize {
+        width: 8.min(w as u64),
+        height: 8.min(h as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_conv2d_backward_input(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    dy: usize,
+    w: usize,
+    dx: usize,
+    n: u32,
+    c_in: u32,
+    h: u32,
+    w_in: u32,
+    c_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    ph: u32,
+    pw: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+) {
+    let a: [u32; 4] = [n, c_in, h, w_in];
+    let b: [u32; 4] = [c_out, h_out, w_out, kh];
+    let cc: [u32; 4] = [kw, sh, sw, ph];
+    let d: [u32; 4] = [pw, dh, dw, groups];
+    enc.set_compute_pipeline_state(&k.conv2d_backward_input);
+    enc.set_buffer(0, Some(buffer), dy as u64);
+    enc.set_buffer(1, Some(buffer), w as u64);
+    enc.set_buffer(2, Some(buffer), dx as u64);
+    enc.set_bytes(3, 16, a.as_ptr() as *const _);
+    enc.set_bytes(4, 16, b.as_ptr() as *const _);
+    enc.set_bytes(5, 16, cc.as_ptr() as *const _);
+    enc.set_bytes(6, 16, d.as_ptr() as *const _);
+    let grid = metal::MTLSize {
+        width: w_in as u64,
+        height: h as u64,
+        depth: (n * c_in) as u64,
+    };
+    let tg = metal::MTLSize {
+        width: 8.min(w_in as u64),
+        height: 8.min(h as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_conv2d_backward_weight(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    dy: usize,
+    dw: usize,
+    n: u32,
+    c_in: u32,
+    h: u32,
+    w: u32,
+    c_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    ph: u32,
+    pw: u32,
+    dh: u32,
+    dw_dil: u32,
+    groups: u32,
+) {
+    let a: [u32; 4] = [n, c_in, h, w];
+    let b: [u32; 4] = [c_out, h_out, w_out, kh];
+    let cc: [u32; 4] = [kw, sh, sw, ph];
+    let d: [u32; 4] = [pw, dh, dw_dil, groups];
+    let c_in_per_g = c_in / groups;
+    enc.set_compute_pipeline_state(&k.conv2d_backward_weight);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), dy as u64);
+    enc.set_buffer(2, Some(buffer), dw as u64);
+    enc.set_bytes(3, 16, a.as_ptr() as *const _);
+    enc.set_bytes(4, 16, b.as_ptr() as *const _);
+    enc.set_bytes(5, 16, cc.as_ptr() as *const _);
+    enc.set_bytes(6, 16, d.as_ptr() as *const _);
+    let grid = metal::MTLSize {
+        width: kw as u64,
+        height: kh as u64,
+        depth: (c_out * c_in_per_g) as u64,
+    };
+    let tg = metal::MTLSize {
+        width: kw as u64,
+        height: kh as u64,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+// Two-pass batch-parallel conv2d weight-grad. `part_off` is the conv-bwd
+// scratch slot, sized (by conv_bwd_scratch_bytes) to hold N*C_out*c_in_per_g*
+// kh*kw f32 partials. Pass 1 fills it (one thread per per-sample weight elem),
+// pass 2 reduces over N. Both run in the same serial encoder, so pass 2 sees
+// pass 1's writes with no explicit barrier.
+#[allow(clippy::too_many_arguments)]
+fn encode_conv2d_backward_weight_2pass(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    part_off: usize,
+    x: usize,
+    dy: usize,
+    dw: usize,
+    n: u32,
+    c_in: u32,
+    h: u32,
+    w: u32,
+    c_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    ph: u32,
+    pw: u32,
+    dh: u32,
+    dw_dil: u32,
+    groups: u32,
+) {
+    let a: [u32; 4] = [n, c_in, h, w];
+    let b: [u32; 4] = [c_out, h_out, w_out, kh];
+    let cc: [u32; 4] = [kw, sh, sw, ph];
+    let d: [u32; 4] = [pw, dh, dw_dil, groups];
+    let c_in_per_g = c_in / groups;
+    let wsz = c_in_per_g * kh * kw; // per-(n,co) slab
+    let wslab = c_out * wsz; // per-sample slab
+
+    // Pass 1: per-sample partials → scratch.
+    enc.set_compute_pipeline_state(&k.conv2d_backward_weight_partial);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), dy as u64);
+    enc.set_buffer(2, Some(buffer), part_off as u64);
+    enc.set_bytes(3, 16, a.as_ptr() as *const _);
+    enc.set_bytes(4, 16, b.as_ptr() as *const _);
+    enc.set_bytes(5, 16, cc.as_ptr() as *const _);
+    enc.set_bytes(6, 16, d.as_ptr() as *const _);
+    let grid1 = metal::MTLSize {
+        width: wsz as u64,
+        height: c_out as u64,
+        depth: n as u64,
+    };
+    let tgw = 8.min(wsz as u64).max(1);
+    let tg1 = metal::MTLSize {
+        width: tgw,
+        height: 8.min(c_out as u64).max(1),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid1, tg1);
+
+    // Pass 2: reduce partials over the batch → dw.
+    let dims: [u32; 2] = [n, wslab];
+    enc.set_compute_pipeline_state(&k.conv2d_backward_weight_reduce);
+    enc.set_buffer(0, Some(buffer), part_off as u64);
+    enc.set_buffer(1, Some(buffer), dw as u64);
+    enc.set_bytes(2, 8, dims.as_ptr() as *const _);
+    let grid2 = metal::MTLSize {
+        width: wslab as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg2 = metal::MTLSize {
+        width: 64.min(wslab as u64).max(1),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid2, tg2);
 }
 
 fn encode_gather_axis(
@@ -9521,6 +12355,38 @@ fn encode_where(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn encode_fma(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    a: usize,
+    b: usize,
+    c: usize,
+    dst: usize,
+    len: u32,
+) {
+    enc.set_compute_pipeline_state(&k.elem_fma);
+    enc.set_buffer(0, Some(buffer), a as u64);
+    enc.set_buffer(1, Some(buffer), b as u64);
+    enc.set_buffer(2, Some(buffer), c as u64);
+    enc.set_buffer(3, Some(buffer), dst as u64);
+    enc.set_bytes(4, 4, &len as *const u32 as *const _);
+    let tg_w = k.elem_fma.thread_execution_width().min(len as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// Standalone softmax: one threadgroup per row, in-place exp+normalize.
 /// Threadgroup size must be a power of 2 and ≤256 (the kernel's reduction
 /// buffer). Picks the largest pow2 ≤ cols, capped at 256.
@@ -9565,6 +12431,117 @@ fn encode_softmax(
     enc.dispatch_threads(grid, tg);
 }
 
+/// Fused dense softmax cross-entropy: one threadgroup per row, three
+/// threadgroup reductions (row max, Σexp, Σtargets·logits). `cols` is
+/// the class count C. Threadgroup width is the largest pow2 ≤ cols,
+/// capped at 256 (the kernel's reduction buffer). f32 only.
+#[allow(clippy::too_many_arguments)]
+fn encode_softmax_cross_entropy_dense(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    logits: usize,
+    targets: usize,
+    dst: usize,
+    rows: u32,
+    cols: u32,
+) {
+    let mut tg_w: u64 = 1;
+    while tg_w * 2 <= cols as u64 && tg_w * 2 <= 256 {
+        tg_w *= 2;
+    }
+    enc.set_compute_pipeline_state(&k.softmax_cross_entropy_dense);
+    enc.set_buffer(0, Some(buffer), logits as u64);
+    enc.set_buffer(1, Some(buffer), targets as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(
+        3,
+        std::mem::size_of::<u32>() as u64,
+        &cols as *const u32 as *const _,
+    );
+    // 1D dispatch: pack rows along width so threadgroup_position_in_grid.x
+    // is the row index (same gotcha as encode_softmax / encode_layer_norm).
+    let grid = metal::MTLSize {
+        width: tg_w * rows as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: tg_w,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_softmax_cross_entropy_with_logits(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    logits: usize,
+    labels: usize,
+    dst: usize,
+    rows: u32,
+    cols: u32,
+) {
+    let mut tg_w: u64 = 1;
+    while tg_w * 2 <= cols as u64 && tg_w * 2 <= 256 {
+        tg_w *= 2;
+    }
+    enc.set_compute_pipeline_state(&k.softmax_cross_entropy_with_logits);
+    enc.set_buffer(0, Some(buffer), logits as u64);
+    enc.set_buffer(1, Some(buffer), labels as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 4, &cols as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: tg_w * rows as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: tg_w,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_softmax_cross_entropy_backward(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    logits: usize,
+    labels: usize,
+    d_loss: usize,
+    dlogits: usize,
+    rows: u32,
+    cols: u32,
+) {
+    let mut tg_w: u64 = 1;
+    while tg_w * 2 <= cols as u64 && tg_w * 2 <= 256 {
+        tg_w *= 2;
+    }
+    enc.set_compute_pipeline_state(&k.softmax_cross_entropy_backward);
+    enc.set_buffer(0, Some(buffer), logits as u64);
+    enc.set_buffer(1, Some(buffer), labels as u64);
+    enc.set_buffer(2, Some(buffer), d_loss as u64);
+    enc.set_buffer(3, Some(buffer), dlogits as u64);
+    enc.set_bytes(4, 4, &cols as *const u32 as *const _);
+    let grid = metal::MTLSize {
+        width: tg_w * rows as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: tg_w,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
 fn metal_concat_multi_enabled() -> bool {
     !rlx_ir::env::flag("RLX_METAL_CONCAT_MULTI")
 }
@@ -9581,6 +12558,67 @@ struct ConcatSegGpu {
 }
 
 /// Dispatch a concat-along-last-axis. Uses one multi-segment kernel when possible.
+/// Mid-axis concat (inner > 1) encoded entirely into the live command buffer
+/// — one 1D dispatch per input segment, NO commit/wait. Replaces the
+/// per-concat `commit + wait_until_completed` host-copy fallback that
+/// serialized a decode step into one GPU submission per concat (the dominant
+/// Metal decode cost on KV caches). Offsets are element offsets within the
+/// f32/f16 arena; the kernel takes ulong byte offsets so it is correct on
+/// >4 GiB arenas (task #50). `dst`/`inputs` offsets are byte offsets into the
+/// arena (as stored in the thunk).
+fn encode_concat_midaxis(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    dst: usize,
+    outer: u32,
+    dst_axis: u32,
+    inner: u32,
+    dt: crate::thunk::HalfFlag,
+    inputs: &[(usize, u32)],
+) {
+    use crate::thunk::HalfFlag;
+    // `dst`/`src_off` are byte offsets into the arena (the kernel adds them to
+    // a char* base, then indexes elements), so no element-size scaling here.
+    let pipeline = match dt {
+        HalfFlag::F32 => &k.concat_midaxis_seg,
+        HalfFlag::F16 => &k.concat_midaxis_seg_h,
+    };
+    let inner_e = inner as u64;
+    let mut axis_off: u32 = 0;
+    for &(src_off, src_axis) in inputs {
+        let total = outer as u64 * src_axis as u64 * inner_e;
+        if total == 0 {
+            axis_off += src_axis;
+            continue;
+        }
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(buffer), 0);
+        let dst_byte = dst as u64; // already a byte offset
+        let src_byte = src_off as u64;
+        enc.set_bytes(1, 8, &dst_byte as *const u64 as *const _);
+        enc.set_bytes(2, 8, &src_byte as *const u64 as *const _);
+        enc.set_bytes(3, 4, &outer as *const u32 as *const _);
+        enc.set_bytes(4, 4, &dst_axis as *const u32 as *const _);
+        enc.set_bytes(5, 4, &src_axis as *const u32 as *const _);
+        enc.set_bytes(6, 4, &inner as *const u32 as *const _);
+        enc.set_bytes(7, 4, &axis_off as *const u32 as *const _);
+        let tg = 256u64.min(total);
+        let grid = metal::MTLSize {
+            width: total,
+            height: 1,
+            depth: 1,
+        };
+        let tgs = metal::MTLSize {
+            width: tg.max(1),
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threads(grid, tgs);
+        axis_off += src_axis;
+    }
+}
+
 fn encode_concat_lastax(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,

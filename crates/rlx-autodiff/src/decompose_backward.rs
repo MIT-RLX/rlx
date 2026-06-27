@@ -974,12 +974,14 @@ mod tests {
         );
         g.set_outputs(vec![dx]);
         let decomposed = decompose_backward_ops(g);
+        // The input gradient is the conv adjoint = a transposed convolution
+        // (was incorrectly a plain `Conv` — the wrong gradient).
         assert!(
             decomposed
                 .nodes()
                 .iter()
-                .any(|n| matches!(n.op, Op::Conv { .. })),
-            "expected Conv in dynamic conv di decompose"
+                .any(|n| matches!(n.op, Op::ConvTranspose2d { .. })),
+            "expected ConvTranspose2d in dynamic conv di decompose"
         );
         assert_input_backward_decomposed(&decomposed);
     }

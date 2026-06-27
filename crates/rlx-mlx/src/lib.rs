@@ -75,7 +75,14 @@ pub mod batched_lu_kernel;
 
 #[cfg(rlx_mlx_host)]
 pub mod llada2_gate;
+// Host-only: depends on `op_registry` (itself `rlx_mlx_host`-gated). Without
+// this gate the module leaks onto non-host targets (e.g. iOS) and fails to
+// resolve `crate::op_registry`.
+#[cfg(rlx_mlx_host)]
 pub mod ms_deform_attn;
+
+#[cfg(rlx_mlx_host)]
+pub mod distributed;
 
 #[cfg(rlx_mlx_host)]
 pub use array::{Array, MlxError, eval, version};
@@ -88,6 +95,8 @@ pub use config::{
     COMPILE_OUTPUT_CAP_ENV, DEFAULT_COMPILE_OUTPUT_CAP, compile_output_cap,
     reset_compile_output_cap, set_compile_output_cap,
 };
+#[cfg(rlx_mlx_host)]
+pub use distributed::MlxTransport;
 #[cfg(rlx_mlx_host)]
 pub use lower::MlxMode;
 

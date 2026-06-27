@@ -39,6 +39,7 @@ pub struct BlobWriter {
 }
 
 const BLOB_SENTINEL: u32 = 0xDEAD_BEEF;
+const BLOB_DTYPE_FLOAT16: u32 = 1;
 const BLOB_DTYPE_FLOAT32: u32 = 2;
 
 impl BlobWriter {
@@ -74,6 +75,28 @@ impl BlobWriter {
         self.buf.reserve(data.len() * 4);
         for &v in data {
             self.buf.extend_from_slice(&v.to_le_bytes());
+        }
+        self.count += 1;
+        meta_off
+    }
+
+    /// Append an f16 tensor; returns its metadata record offset.
+    pub fn write_f16(&mut self, data: &[half::f16]) -> u64 {
+        self.align64();
+        let meta_off = self.buf.len() as u64;
+        let data_off = meta_off + 64;
+        let size = (data.len() * 2) as u64;
+
+        let mut meta = [0u8; 64];
+        meta[0..4].copy_from_slice(&BLOB_SENTINEL.to_le_bytes());
+        meta[4..8].copy_from_slice(&BLOB_DTYPE_FLOAT16.to_le_bytes());
+        meta[8..16].copy_from_slice(&size.to_le_bytes());
+        meta[16..24].copy_from_slice(&data_off.to_le_bytes());
+        self.buf.extend_from_slice(&meta);
+
+        self.buf.reserve(data.len() * 2);
+        for &v in data {
+            self.buf.extend_from_slice(&v.to_bits().to_le_bytes());
         }
         self.count += 1;
         meta_off

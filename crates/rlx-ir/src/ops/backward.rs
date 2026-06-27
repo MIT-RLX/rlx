@@ -400,6 +400,29 @@ impl Graph {
         )
     }
 
+    /// Fused softmax + cross-entropy against a dense target distribution
+    /// (soft labels / one-hot probabilities). `logits [N, C]`,
+    /// `targets [N, C]` → `[N]` per-row loss
+    /// `loss[n] = logsumexp(logits[n]) - Σ_c targets[n,c]·logits[n,c]`.
+    pub fn softmax_cross_entropy(&mut self, logits: NodeId, targets: NodeId) -> NodeId {
+        let logits_shape = self.shape(logits);
+        debug_assert_eq!(logits_shape.rank(), 2, "sce: logits must be 2-D [N, C]");
+        debug_assert_eq!(
+            self.shape(targets).dims(),
+            logits_shape.dims(),
+            "sce: targets must match logits shape [N, C]"
+        );
+        let n = logits_shape.dim(0);
+        let dtype = logits_shape.dtype();
+        let out_shape = Shape::from_dims(&[n], dtype);
+        self.push(
+            Op::SoftmaxCrossEntropy,
+            vec![logits, targets],
+            out_shape,
+            None,
+        )
+    }
+
     /// Fused softmax + cross-entropy with f32-encoded integer labels.
     /// `logits [N, C]`, `labels [N]` → `[N]` per-row loss.
     pub fn softmax_cross_entropy_with_logits(&mut self, logits: NodeId, labels: NodeId) -> NodeId {

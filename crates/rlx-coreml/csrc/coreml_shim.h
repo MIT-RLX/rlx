@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
 // C ABI exposed by csrc/coreml_shim.m. Consumed from Rust via the FFI
-// declarations in src/ffi.rs. All tensor I/O is contiguous float32.
+// declarations in src/ffi.rs. Tensor I/O is contiguous row-major f32 or f16.
 #ifndef RLX_COREML_SHIM_H
 #define RLX_COREML_SHIM_H
 
@@ -24,15 +24,17 @@ RlxCoremlModel *rlx_coreml_load(const char *mlpackage_path, int compute_units,
                                 const char *compiled_cache_path, char *err,
                                 int err_len);
 
-// Runs one prediction. Inputs/outputs are matched by name. Every buffer is
-// contiguous float32. `out_data[i]` must hold at least `out_len[i]` floats.
+// Runs one prediction. Inputs/outputs are matched by name.
+// `in_dtypes[i]`: 0 = float32, 1 = float16 (NULL → all float32).
+// Output buffers are always float32; f16 model outputs are converted.
+// `out_data[i]` must hold at least `out_len[i]` floats.
 // Returns 0 on success, non-zero on error (message written to `err`).
 int rlx_coreml_predict(RlxCoremlModel *model, int n_inputs,
-                       const char *const *in_names, const float *const *in_data,
+                       const char *const *in_names, const void *const *in_data,
                        const int64_t *const *in_shapes, const int *in_ranks,
-                       int n_outputs, const char *const *out_names,
-                       float *const *out_data, const int *out_len, char *err,
-                       int err_len);
+                       const int *in_dtypes, int n_outputs,
+                       const char *const *out_names, float *const *out_data,
+                       const int *out_len, char *err, int err_len);
 
 void rlx_coreml_free(RlxCoremlModel *model);
 

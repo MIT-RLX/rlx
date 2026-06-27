@@ -46,7 +46,7 @@ pub fn register_umap_ops() {
         register_op(Arc::new(KnnBackwardExt));
         register_cpu_kernel(Arc::new(KnnBackwardCpu));
     }
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
     crate::metal_kernels::register_metal_kernels();
     #[cfg(all(feature = "mlx", target_os = "macos"))]
     crate::mlx_kernels::register_mlx_kernels();
