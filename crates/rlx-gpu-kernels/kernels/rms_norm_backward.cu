@@ -69,7 +69,8 @@ extern "C" __global__ void rlx_rms_norm_bwd(
     }
     float ss = rnb_block_sum(local_ss, s, tid, bsz);
     float inv_r = rsqrtf(ss * n_inv + eps);
-    float inv_r3 = inv_r * inv_r * inv_r;
+    // Cross term is inv_r³ (inv_r2 here, ·inv_r below), not inv_r⁴ — drop the stray 1/r.
+    float inv_r2 = inv_r * inv_r;
 
     if (wrt == 0u) {
         unsigned int out_base = out_off + row * inner;
@@ -77,7 +78,7 @@ extern "C" __global__ void rlx_rms_norm_bwd(
             float xv = arena[x_base + i];
             float gv = arena[gamma_off + i];
             float dyv = arena[dy_base + i];
-            float term = gv * dyv - xv * dot * inv_r3;
+            float term = gv * dyv - xv * dot * inv_r2;
             arena[out_base + i] = term * inv_r;
         }
     } else if (wrt == 1u) {

@@ -1,0 +1,24 @@
+# Convenience wrapper for the rlx-vulkan Linux validation container.
+#
+#   docker compose -f docker/docker-compose.yml run --rm validate
+#
+# Mounts the repo at /work and caches the Linux target dir + cargo registry in
+# named volumes so repeat runs are fast. To validate against a real GPU instead
+# of lavapipe, pass the device through (see docker/README.md).
+services:
+  validate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rlx-vulkan-linux
+    working_dir: /work
+    volumes:
+      - ../:/work
+      - rlx-vulkan-target:/target
+      - rlx-vulkan-cargo:/usr/local/cargo/registry
+    environment:
+      CARGO_TARGET_DIR: /target
+
+volumes:
+  rlx-vulkan-target:
+  rlx-vulkan-cargo:

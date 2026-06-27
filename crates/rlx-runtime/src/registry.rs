@@ -70,7 +70,7 @@ fn register_builtin(r: &Registry) {
         Box::new(crate::backend::cpu_backend::CpuBackend) as Box<dyn Backend>
     });
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
     map.insert(Device::Metal, || {
         Box::new(crate::backend::metal_backend::MetalBackend) as Box<dyn Backend>
     });
@@ -80,7 +80,11 @@ fn register_builtin(r: &Registry) {
         Box::new(crate::backend::mlx_backend::MlxBackend) as Box<dyn Backend>
     });
 
-    #[cfg(all(feature = "coreml", any(target_os = "macos", target_os = "ios")))]
+    #[cfg(all(
+        feature = "coreml",
+        target_vendor = "apple",
+        not(target_os = "watchos")
+    ))]
     map.insert(Device::Ane, || {
         Box::new(crate::backend::coreml_backend::CoremlBackend) as Box<dyn Backend>
     });
@@ -92,8 +96,7 @@ fn register_builtin(r: &Registry) {
 
     #[cfg(feature = "vulkan")]
     map.insert(Device::Vulkan, || {
-        rlx_wgpu::select_vulkan_backend();
-        Box::new(crate::backend::wgpu_backend::WgpuBackend) as Box<dyn Backend>
+        Box::new(crate::backend::vulkan_backend::VulkanBackend) as Box<dyn Backend>
     });
 
     #[cfg(feature = "cuda")]
@@ -106,9 +109,19 @@ fn register_builtin(r: &Registry) {
         Box::new(crate::backend::rocm_backend::RocmBackend) as Box<dyn Backend>
     });
 
+    #[cfg(feature = "oneapi")]
+    map.insert(Device::OneApi, || {
+        Box::new(crate::backend::oneapi_backend::OneApiBackend) as Box<dyn Backend>
+    });
+
     #[cfg(feature = "tpu")]
     map.insert(Device::Tpu, || {
         Box::new(crate::backend::tpu_backend::TpuBackend) as Box<dyn Backend>
+    });
+
+    #[cfg(feature = "qnn")]
+    map.insert(Device::Hexagon, || {
+        Box::new(crate::backend::qnn_backend::QnnBackend) as Box<dyn Backend>
     });
 }
 

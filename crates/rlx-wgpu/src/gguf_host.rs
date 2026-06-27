@@ -12,11 +12,17 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-//! Host-side GGUF K-quant `Op::DequantMatMul` for wgpu arenas.
+//! Host-side GGUF `Op::DequantMatMul` for wgpu arenas (CPU dequant fallback).
+//!
+//! Used when GPU scratch does not fit or for grouped MoE GGUF. Scheme ids
+//! match Metal/CUDA — see [`gguf_scheme_id`] and
+//! [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
+//! Prefer [`crate::gguf_gpu`] when arena planning reserves dequant scratch.
 
 use crate::buffer::Arena;
 use rlx_ir::quant::QuantScheme;
 
+/// Maps [`QuantScheme`] to the shared GPU `dequant_gguf` kernel scheme id (0–23).
 pub fn gguf_scheme_id(scheme: QuantScheme) -> u32 {
     match scheme {
         QuantScheme::GgufQ4K => 0,
@@ -40,6 +46,9 @@ pub fn gguf_scheme_id(scheme: QuantScheme) -> u32 {
         QuantScheme::GgufIQ1M => 18,
         QuantScheme::GgufQ4_0 => 19,
         QuantScheme::GgufQ8_0 => 20,
+        QuantScheme::GgufQ4_1 => 21,
+        QuantScheme::GgufQ5_0 => 22,
+        QuantScheme::GgufQ5_1 => 23,
         other => panic!("rlx-wgpu gguf_host: unsupported scheme {other:?}"),
     }
 }
@@ -67,6 +76,9 @@ pub fn scheme_from_id(scheme_id: u32) -> QuantScheme {
         18 => QuantScheme::GgufIQ1M,
         19 => QuantScheme::GgufQ4_0,
         20 => QuantScheme::GgufQ8_0,
+        21 => QuantScheme::GgufQ4_1,
+        22 => QuantScheme::GgufQ5_0,
+        23 => QuantScheme::GgufQ5_1,
         _ => panic!("rlx-wgpu gguf_host: bad scheme_id {scheme_id}"),
     }
 }

@@ -4,8 +4,8 @@
 // GPL-3.0-only. See LICENSE.
 //
 // GGUF dequant — one thread per GGUF block. Block size varies per scheme;
-// see rlx_metal/src/dequant_gguf.msl for the scheme_id table (mirrored
-// byte-for-byte here).
+// see rlx_metal/src/dequant_gguf.msl for the scheme_id table (ids 0–23,
+// mirrored byte-for-byte here). Backend matrix: docs/gguf-backend-paths.md
 //
 // IQ-family schemes (12..=18) read grid tables from `iq_lut`. Same
 // concatenated layout as the Metal kernel — see IQ_GRID_OFF_* constants.
@@ -75,7 +75,9 @@ extern "C" __global__ void dequant_gguf(
     unsigned char* w_base = reinterpret_cast<unsigned char*>(arena) + w_byte_off;
 
     // ── 256-elem block schemes ──
-    if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u) {
+    if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u
+        && scheme_id != 19u && scheme_id != 20u
+        && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u) {
         float* dst = arena + dst_f32_off + gid * 256u;
 
         if (scheme_id == 3u) {
@@ -539,7 +541,84 @@ extern "C" __global__ void dequant_gguf(
         return;
     }
 
-    // ── 32-elem schemes: IQ4_NL, MXFP4 ──
+    // ── 32-elem schemes: IQ4_NL, Q4_0, Q8_0, MXFP4 ──
+    if (scheme_id == 19u) {
+        unsigned int off = gid * 18u;
+        float d = dq_read_f16(w_base, off);
+        const unsigned char* qs = w_base + off + 2u;
+        float* dst = arena + dst_f32_off + gid * 32u;
+        for (unsigned int j = 0u; j < 16u; ++j) {
+            unsigned char bx = qs[j];
+            dst[j] = d * (float)((int)(bx & 0x0Fu) - 8);
+            dst[j + 16u] = d * (float)((int)(bx >> 4) - 8);
+        }
+        return;
+    }
+
+    if (scheme_id == 20u) {
+        unsigned int off = gid * 34u;
+        float d = dq_read_f16(w_base, off);
+        const unsigned char* qs = w_base + off + 2u;
+        float* dst = arena + dst_f32_off + gid * 32u;
+        for (unsigned int j = 0u; j < 32u; ++j) {
+            dst[j] = d * (float)(signed char)qs[j];
+        }
+        return;
+    }
+
+    if (scheme_id == 21u) {
+        unsigned int off = gid * 20u;
+        float d = dq_read_f16(w_base, off);
+        float m = dq_read_f16(w_base, off + 2u);
+        const unsigned char* qs = w_base + off + 4u;
+        float* dst = arena + dst_f32_off + gid * 32u;
+        for (unsigned int j = 0u; j < 16u; ++j) {
+            unsigned char bx = qs[j];
+            dst[j] = d * (float)(bx & 0x0Fu) + m;
+            dst[j + 16u] = d * (float)(bx >> 4) + m;
+        }
+        return;
+    }
+
+    if (scheme_id == 22u) {
+        unsigned int off = gid * 22u;
+        float d = dq_read_f16(w_base, off);
+        unsigned int qh = (unsigned int)w_base[off + 2u]
+            | ((unsigned int)w_base[off + 3u] << 8u)
+            | ((unsigned int)w_base[off + 4u] << 16u)
+            | ((unsigned int)w_base[off + 5u] << 24u);
+        const unsigned char* qs = w_base + off + 6u;
+        float* dst = arena + dst_f32_off + gid * 32u;
+        for (unsigned int j = 0u; j < 16u; ++j) {
+            unsigned char bx = qs[j];
+            unsigned int xh0 = ((qh >> j) & 0x01u) << 4u;
+            unsigned int xh1 = ((qh >> (j + 16u)) & 0x01u) << 4u;
+            dst[j] = d * (float)((int)((bx & 0x0Fu) | xh0) - 16);
+            dst[j + 16u] = d * (float)((int)((bx >> 4) | xh1) - 16);
+        }
+        return;
+    }
+
+    if (scheme_id == 23u) {
+        unsigned int off = gid * 24u;
+        float d = dq_read_f16(w_base, off);
+        float m = dq_read_f16(w_base, off + 2u);
+        unsigned int qh = (unsigned int)w_base[off + 4u]
+            | ((unsigned int)w_base[off + 5u] << 8u)
+            | ((unsigned int)w_base[off + 6u] << 16u)
+            | ((unsigned int)w_base[off + 7u] << 24u);
+        const unsigned char* qs = w_base + off + 8u;
+        float* dst = arena + dst_f32_off + gid * 32u;
+        for (unsigned int j = 0u; j < 16u; ++j) {
+            unsigned char bx = qs[j];
+            unsigned int xh0 = ((qh >> j) & 0x01u) << 4u;
+            unsigned int xh1 = ((qh >> (j + 16u)) & 0x01u) << 4u;
+            dst[j] = d * (float)((bx & 0x0Fu) | xh0) + m;
+            dst[j + 16u] = d * (float)((bx >> 4) | xh1) + m;
+        }
+        return;
+    }
+
     if (scheme_id == 6u) {
         unsigned int off = gid * 18u;
         float d = dq_read_f16(w_base, off);

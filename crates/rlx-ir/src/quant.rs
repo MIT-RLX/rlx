@@ -14,15 +14,18 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Quantization metadata as graph annotations (plan #57).
-//! lives as per-tensor metadata on the IR rather than spawning a
-//! parallel "quantized graph" type. Ops can read the scheme and
-//! dispatch to fused-dequant kernels (the eventual #5 win) when
-//! present, or fall through to the standard f32/f16 path when not.
 //!
-//! The metadata is held *outside* the [`crate::Node`] type itself, in a
-//! [`crate::Graph`]-level [`QuantMap`]. This keeps Node small (every node
-//! pays for the rare quantization annotation otherwise) and makes
-//! quant info easy to query / clear without rewriting nodes.
+//! Schemes attach per-tensor via [`QuantMap`] on [`crate::Graph`], not inside
+//! [`crate::Node`], so the common case stays lean.
+//!
+//! # GGUF schemes and backends
+//!
+//! All `Gguf*` variants use two-input `Op::DequantMatMul` (`x`, packed weights).
+//! GPU backends share integer **scheme ids** (0–23) in `dequant_gguf` kernels;
+//! legacy tail: Q4_0 = 19, Q8_0 = 20, Q4_1 = 21, Q5_0 = 22, Q5_1 = 23.
+//!
+//! Per-backend dispatch (GPU dequant, fused GEMV, ANE constexpr, TPU compile-time
+//! bake, env toggles): [`docs/gguf-backend-paths.md`](../../docs/gguf-backend-paths.md).
 
 use crate::NodeId;
 use std::collections::HashMap;
@@ -67,8 +70,17 @@ pub enum QuantScheme {
     GgufQ2K,
     /// GGUF Q3_K (256 / 110 bytes). 3-bit quants with hmask high bit plane.
     GgufQ3K,
-    /// GGUF Q4_0 (32 / 18 bytes). Legacy llama.cpp block: f16 scale + nibbles.
+    /// GGUF Q4_0 (32 / 18 bytes). Legacy llama.cpp block: f16 scale + signed nibbles (−8..7).
     GgufQ4_0,
+    /// GGUF Q4_1 (32 / 20 bytes). Legacy block: f16 scale + f16 min + unsigned nibbles (0..15).
+    /// GPU kernel scheme id **21** (shared with Metal/CUDA/ROCm/WGPU).
+    GgufQ4_1,
+    /// GGUF Q5_0 (32 / 22 bytes). Legacy block: f16 scale + 32-bit high plane + signed 5-bit quants.
+    /// GPU kernel scheme id **22**.
+    GgufQ5_0,
+    /// GGUF Q5_1 (32 / 24 bytes). Legacy block: f16 scale + f16 min + high plane + unsigned 5-bit quants.
+    /// GPU kernel scheme id **23**.
+    GgufQ5_1,
     /// GGUF Q8_0 (32 / 34 bytes). Legacy block: f16 scale + 32×i8 quants.
     GgufQ8_0,
     /// NVIDIA FP4 (E2M1) block — fixed 16-element groups, FP8 E4M3 block
@@ -120,6 +132,9 @@ impl QuantScheme {
             Self::GgufQ2K => 26,  // 84 / 256 × 8 ≈ 2.625 → 26
             Self::GgufQ3K => 34,  // 110 / 256 × 8 ≈ 3.4375 → 34
             Self::GgufQ4_0 => 45, // 18 / 32 × 8 = 4.5 bpe
+            Self::GgufQ4_1 => 50, // 20 / 32 × 8 = 5.0 bpe
+            Self::GgufQ5_0 => 55, // 22 / 32 × 8 = 5.5 bpe
+            Self::GgufQ5_1 => 60, // 24 / 32 × 8 = 6.0 bpe
             Self::GgufQ8_0 => 85, // 34 / 32 × 8 = 8.5 bpe
             Self::Nvfp4Block => 40,
             Self::GgufIQ4NL => 45,
@@ -193,7 +208,13 @@ impl QuantScheme {
             | Self::GgufIQ1M
             | Self::GgufTQ1_0
             | Self::GgufTQ2_0 => 256,
-            Self::GgufQ4_0 | Self::GgufQ8_0 | Self::GgufIQ4NL | Self::GgufMXFP4 => 32,
+            Self::GgufQ4_0
+            | Self::GgufQ4_1
+            | Self::GgufQ5_0
+            | Self::GgufQ5_1
+            | Self::GgufQ8_0
+            | Self::GgufIQ4NL
+            | Self::GgufMXFP4 => 32,
             Self::GgufNVFP4 => 16,
             _ => 0,
         }
@@ -209,6 +230,9 @@ impl QuantScheme {
             Self::GgufQ2K => 84,  // f16 d + f16 dmin + 16 scales + 64 qs
             Self::GgufQ3K => 110, // f16 d + 12 scales + 32 hmask + 64 qs
             Self::GgufQ4_0 => 18, // f16 d + 16 packed nibbles
+            Self::GgufQ4_1 => 20, // f16 d + f16 min + 16 packed nibbles
+            Self::GgufQ5_0 => 22, // f16 d + 32-bit qh + 16 packed nibbles
+            Self::GgufQ5_1 => 24, // f16 d + f16 min + 32-bit qh + 16 packed nibbles
             Self::GgufQ8_0 => 34, // f16 d + 32 i8 quants
             Self::GgufIQ4NL => 18,
             Self::GgufIQ4XS => 136,
@@ -241,6 +265,9 @@ impl QuantScheme {
                 | Self::GgufQ2K
                 | Self::GgufQ3K
                 | Self::GgufQ4_0
+                | Self::GgufQ4_1
+                | Self::GgufQ5_0
+                | Self::GgufQ5_1
                 | Self::GgufQ8_0
                 | Self::GgufIQ4NL
                 | Self::GgufIQ4XS
@@ -274,6 +301,9 @@ impl std::fmt::Display for QuantScheme {
             Self::GgufQ2K => write!(f, "gguf_q2k"),
             Self::GgufQ3K => write!(f, "gguf_q3k"),
             Self::GgufQ4_0 => write!(f, "gguf_q4_0"),
+            Self::GgufQ4_1 => write!(f, "gguf_q4_1"),
+            Self::GgufQ5_0 => write!(f, "gguf_q5_0"),
+            Self::GgufQ5_1 => write!(f, "gguf_q5_1"),
             Self::GgufQ8_0 => write!(f, "gguf_q8_0"),
             Self::Nvfp4Block => write!(f, "nvfp4/16"),
             Self::GgufIQ4NL => write!(f, "gguf_iq4_nl"),
@@ -289,6 +319,185 @@ impl std::fmt::Display for QuantScheme {
             Self::GgufTQ2_0 => write!(f, "gguf_tq2_0"),
             Self::GgufMXFP4 => write!(f, "gguf_mxfp4"),
             Self::GgufNVFP4 => write!(f, "gguf_nvfp4"),
+        }
+    }
+}
+
+/// Element format for a **native low-precision tensor-core GEMM** operand
+/// (see [`crate::op::Op::ScaledMatMul`]).
+///
+/// Distinct from [`QuantScheme`]: a `QuantScheme` is block-scaled *storage*
+/// that the CPU/GPU decodes to f32 *before* a normal sgemm. A `ScaledFormat`
+/// is the raw element encoding hardware tensor cores consume **directly**, with
+/// f32 accumulation — the whole point of FP8/FP6/FP4 on Hopper / Ada /
+/// Blackwell / CDNA3 / CDNA4. The per-block/per-tensor scale layout is
+/// orthogonal and lives in [`ScaleLayout`].
+///
+/// Operands flow through the graph as `DType::U8` byte buffers (one code per
+/// byte on the CPU oracle; packed on GPU); the format is carried on the op,
+/// not the dtype, so no `DType` variant is needed.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScaledFormat {
+    /// OCP FP8 E4M3 — bias 7, no infinities, only `S.1111.111` is NaN.
+    /// Max ±448. Hopper / Ada / Blackwell; weights + forward activations.
+    F8E4M3,
+    /// OCP FP8 E5M2 — bias 15, IEEE-like inf/NaN at max exponent.
+    /// Max ±57344. Wider range — the gradient format.
+    F8E5M2,
+    /// AMD "FNUZ" FP8 E4M3 — bias 8, single NaN at `0x80`, no inf, no −0.
+    /// Max ±240. CDNA3 / MI300.
+    F8E4M3Fnuz,
+    /// AMD "FNUZ" FP8 E5M2 — bias 16, single NaN at `0x80`, no inf, no −0.
+    /// Max ±57344. CDNA3 / MI300.
+    F8E5M2Fnuz,
+    /// MX FP6 E2M3 — bias 1, all 64 codes finite. Max ±7.5. Blackwell / CDNA4.
+    F6E2M3,
+    /// MX FP6 E3M2 — bias 3, all 64 codes finite. Max ±28. Blackwell / CDNA4.
+    F6E3M2,
+    /// FP4 E2M1 — all 16 codes finite. Max ±6. Blackwell / CDNA4.
+    /// Shared by NVFP4 and MXFP4 — the [`ScaleLayout`] tells them apart.
+    F4E2M1,
+}
+
+impl ScaledFormat {
+    /// Total bit width of one element code (4, 6, or 8).
+    pub const fn bit_width(self) -> u32 {
+        match self {
+            Self::F8E4M3 | Self::F8E5M2 | Self::F8E4M3Fnuz | Self::F8E5M2Fnuz => 8,
+            Self::F6E2M3 | Self::F6E3M2 => 6,
+            Self::F4E2M1 => 4,
+        }
+    }
+
+    /// `(exponent_bits, mantissa_bits, exponent_bias)`.
+    pub const fn fields(self) -> (u32, u32, i32) {
+        match self {
+            Self::F8E4M3 => (4, 3, 7),
+            Self::F8E5M2 => (5, 2, 15),
+            Self::F8E4M3Fnuz => (4, 3, 8),
+            Self::F8E5M2Fnuz => (5, 2, 16),
+            Self::F6E2M3 => (2, 3, 1),
+            Self::F6E3M2 => (3, 2, 3),
+            Self::F4E2M1 => (2, 1, 1),
+        }
+    }
+
+    /// AMD OCP-FNUZ encoding (single NaN at `0x80`, no inf, no −0).
+    pub const fn is_fnuz(self) -> bool {
+        matches!(self, Self::F8E4M3Fnuz | Self::F8E5M2Fnuz)
+    }
+
+    /// True for IEEE-like formats carrying inf / NaN at the max exponent
+    /// (OCP E5M2 only — E4M3 is finite-with-one-NaN, FP6/FP4 are all-finite).
+    pub const fn has_inf(self) -> bool {
+        matches!(self, Self::F8E5M2)
+    }
+
+    /// Largest finite magnitude representable (used as the amax divisor when
+    /// computing a per-tensor / per-block scale).
+    pub fn max_finite(self) -> f32 {
+        crate::lowp_codec::max_finite(self)
+    }
+
+    /// Stable integer id passed to GPU kernels (matches `rlx_decode_lowp` in
+    /// `scaled_lowp_general.cu`): e4m3=0, e5m2=1, e4m3fnuz=2, e5m2fnuz=3,
+    /// e2m3=4, e3m2=5, e2m1=6.
+    pub const fn kernel_id(self) -> u32 {
+        match self {
+            Self::F8E4M3 => 0,
+            Self::F8E5M2 => 1,
+            Self::F8E4M3Fnuz => 2,
+            Self::F8E5M2Fnuz => 3,
+            Self::F6E2M3 => 4,
+            Self::F6E3M2 => 5,
+            Self::F4E2M1 => 6,
+        }
+    }
+
+    /// True for the OCP FP8 variants that the native cublasLt / hipBLASLt FP8
+    /// GEMM accepts (per-tensor only). Other formats use the decode fallback.
+    pub const fn is_native_fp8(self) -> bool {
+        matches!(self, Self::F8E4M3 | Self::F8E5M2)
+    }
+}
+
+impl std::fmt::Display for ScaledFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::F8E4M3 => "f8e4m3",
+            Self::F8E5M2 => "f8e5m2",
+            Self::F8E4M3Fnuz => "f8e4m3fnuz",
+            Self::F8E5M2Fnuz => "f8e5m2fnuz",
+            Self::F6E2M3 => "f6e2m3",
+            Self::F6E3M2 => "f6e3m2",
+            Self::F4E2M1 => "f4e2m1",
+        };
+        f.write_str(s)
+    }
+}
+
+/// How scale factors are laid out for an [`crate::op::Op::ScaledMatMul`]
+/// operand. The reconstructed value of element `i` is
+/// `decode(code[i]) * scale(block_of(i))`.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScaleLayout {
+    /// One f32 amax scale for the whole operand (classic per-tensor FP8 GEMM).
+    PerTensor,
+    /// OCP microscaling: one power-of-two **E8M0** scale per `block`
+    /// consecutive elements along K (MXFP8 / MXFP6 / MXFP4). Scale tensor
+    /// is `DType::U8` (E8M0 bytes).
+    BlockMxE8M0 { block: u32 },
+    /// NVFP4: one FP8 **E4M3** scale per `group` (16) elements along K, plus
+    /// an optional per-tensor f32 global. Scale tensor is `DType::U8`.
+    Nvfp4 { group: u32 },
+}
+
+impl ScaleLayout {
+    /// OCP microscaling default (32-element blocks).
+    pub const fn mx() -> Self {
+        Self::BlockMxE8M0 { block: 32 }
+    }
+    /// NVFP4 default (16-element groups).
+    pub fn nvfp4() -> Self {
+        Self::Nvfp4 {
+            group: crate::nvfp4::NVFP4_GROUP_SIZE as u32,
+        }
+    }
+    /// Element dtype of the scale tensor for this layout.
+    pub const fn scale_dtype(self) -> crate::DType {
+        match self {
+            Self::PerTensor => crate::DType::F32,
+            Self::BlockMxE8M0 { .. } | Self::Nvfp4 { .. } => crate::DType::U8,
+        }
+    }
+    /// Number of consecutive elements sharing one scale (1 for per-tensor).
+    pub const fn block(self) -> u32 {
+        match self {
+            Self::PerTensor => 1,
+            Self::BlockMxE8M0 { block } => block,
+            Self::Nvfp4 { group } => group,
+        }
+    }
+
+    /// `(scale_mode, block)` for GPU kernels (`scaled_lowp_general.cu`):
+    /// per-tensor=0, block-E8M0=1, NVFP4-E4M3=2.
+    pub const fn mode_block(self) -> (u32, u32) {
+        match self {
+            Self::PerTensor => (0, 1),
+            Self::BlockMxE8M0 { block } => (1, block),
+            Self::Nvfp4 { group } => (2, group),
+        }
+    }
+}
+
+impl std::fmt::Display for ScaleLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PerTensor => write!(f, "per_tensor"),
+            Self::BlockMxE8M0 { block } => write!(f, "mx_e8m0/{block}"),
+            Self::Nvfp4 { group } => write!(f, "nvfp4/{group}"),
         }
     }
 }

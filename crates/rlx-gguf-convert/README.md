@@ -12,8 +12,10 @@ handling.
 
 * Reads source tensors as f32 (lifting from F16/BF16/F64/I32/...).
 * Quantizes each tensor to a chosen GGML scheme: F32 / F16 / BF16,
-  the legacy formats Q8_0 / Q4_0 / Q4_1 / Q5_0 / Q5_1, or the K-quant
-  family Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_K.
+  the legacy formats Q8_0 / Q4_0 / Q4_1 / Q5_0 / Q5_1, the K-quant
+  family Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_K, the IQ family
+  IQ4_NL / IQ4_XS / IQ2_XXS … IQ1_M, ternary TQ1_0 / TQ2_0, and
+  microscaling MXFP4 / NVFP4.
 * Writes a v3 GGUF file with metadata + tensors, ready to be served
   by any GGUF-aware runtime (including RLX's own).
 
@@ -115,6 +117,22 @@ another source format is one trait impl.
   cache the GGUF — subsequent loads are smaller in both disk + RAM.
 * **Pipeline integration.** Enable `rlx`'s `gguf-convert` feature to
   access the same API as `rlx::gguf_convert::Converter`.
+* **Python (pyrlx).** Same converter from notebooks / CI:
+
+```python
+import pyrlx as rlx
+
+report = rlx.convert_to_gguf(
+    "model.safetensors",
+    "model.q4_k.gguf",
+    "Q4_K",
+    architecture="llama",
+)
+print(report.compression_ratio)
+```
+
+Build pyrlx with `maturin develop --features cpu,gguf-convert` (add `gguf-onnx`
+for ONNX sources). See `crates/pyrlx/tests/test_gguf_convert.py`.
 * **Hardware-targeted variants.** Q5_K_M for memory-constrained edge,
   Q8_0 for fastest decode, Q6_K for highest fidelity at < 7 bits.
 

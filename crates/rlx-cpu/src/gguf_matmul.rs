@@ -31,6 +31,15 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
         QuantScheme::GgufQ2K => rlx_gguf::dequant_q2_k_block(block, out),
         QuantScheme::GgufQ3K => rlx_gguf::dequant_q3_k_block(block, out),
         QuantScheme::GgufQ4_0 => rlx_gguf::dequant_q4_0_block(block, &mut out[..rlx_gguf::QK4_0]),
+        QuantScheme::GgufQ4_1 => {
+            rlx_gguf::dequant_q4_1_block(block, &mut out[..32]);
+        }
+        QuantScheme::GgufQ5_0 => {
+            rlx_gguf::dequant_q5_0_block(block, &mut out[..32]);
+        }
+        QuantScheme::GgufQ5_1 => {
+            rlx_gguf::dequant_q5_1_block(block, &mut out[..32]);
+        }
         QuantScheme::GgufQ8_0 => rlx_gguf::dequant_q8_0_block(block, &mut out[..rlx_gguf::QK8_0]),
         // Block-level fast paths for the new schemes that share QK_K.
         QuantScheme::GgufTQ1_0 => rlx_gguf::tq_dequant::dequant_tq1_0_block(block, out),
@@ -139,16 +148,29 @@ pub fn gguf_matmul_bt(
 
     if m == 1 {
         let x_row = x;
-        for bi in 0..num_blocks {
-            let off = bi * block_bytes;
-            dequant_block(scheme, &w_bytes[off..off + block_bytes], &mut block_f32);
-            let idx0 = bi * block_elems;
-            for t in 0..block_elems {
-                let idx = idx0 + t;
-                let j = idx / k;
-                let p = idx % k;
-                out[j] += x_row[p] * block_f32[t];
-            }
+        if num_blocks >= 32 && crate::pool::num_threads() > 1 {
+            gguf_matmul_bt_m1_parallel(
+                x_row,
+                w_bytes,
+                out,
+                k,
+                n,
+                scheme,
+                num_blocks,
+                block_bytes,
+                block_elems,
+            );
+        } else {
+            gguf_matmul_bt_m1_sequential(
+                x_row,
+                w_bytes,
+                out,
+                scheme,
+                num_blocks,
+                block_bytes,
+                block_elems,
+                k,
+            );
         }
         return;
     }
@@ -238,6 +260,9 @@ pub fn dequant_moe_weights_to_grouped_f32(
             QuantScheme::GgufQ2K => rlx_gguf::dequant_q2_k(slab, k * n),
             QuantScheme::GgufQ3K => rlx_gguf::dequant_q3_k(slab, k * n),
             QuantScheme::GgufQ4_0 => rlx_gguf::dequant_q4_0(slab, k * n),
+            QuantScheme::GgufQ4_1 => rlx_gguf::dequant_q4_1(slab, k * n),
+            QuantScheme::GgufQ5_0 => rlx_gguf::dequant_q5_0(slab, k * n),
+            QuantScheme::GgufQ5_1 => rlx_gguf::dequant_q5_1(slab, k * n),
             QuantScheme::GgufQ8_0 => rlx_gguf::dequant_q8_0(slab, k * n),
             QuantScheme::GgufIQ4NL => rlx_gguf::iq_dequant::dequant_iq4_nl(slab, k * n),
             QuantScheme::GgufIQ4XS => rlx_gguf::iq_dequant::dequant_iq4_xs(slab, k * n),
@@ -308,7 +333,7 @@ pub fn grouped_moe_unpermute_out(
     }
 }
 
-/// Parallel fused matmul for large `n` decode matvecs (e.g. LM head).
+/// Parallel fused matmul — delegates to [`gguf_matmul_bt`] (m=1 uses Rayon).
 pub fn gguf_matmul_bt_parallel(
     x: &[f32],
     w_bytes: &[u8],
@@ -319,6 +344,98 @@ pub fn gguf_matmul_bt_parallel(
     scheme: QuantScheme,
 ) {
     gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
+}
+
+/// Decode GEMV (`m == 1`): single-threaded block fold.
+fn gguf_matmul_bt_m1_sequential(
+    x_row: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    scheme: QuantScheme,
+    num_blocks: usize,
+    block_bytes: usize,
+    block_elems: usize,
+    k: usize,
+) {
+    let mut block_f32 = [0f32; QK_K];
+    for bi in 0..num_blocks {
+        let off = bi * block_bytes;
+        dequant_block(scheme, &w_bytes[off..off + block_bytes], &mut block_f32);
+        let idx0 = bi * block_elems;
+        for t in 0..block_elems {
+            let idx = idx0 + t;
+            let j = idx / k;
+            let p = idx % k;
+            out[j] += x_row[p] * block_f32[t];
+        }
+    }
+}
+
+/// Decode GEMV (`m == 1`): fold/reduce over GGUF super-blocks across Rayon workers.
+fn gguf_matmul_bt_m1_parallel(
+    x_row: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    k: usize,
+    n: usize,
+    scheme: QuantScheme,
+    num_blocks: usize,
+    block_bytes: usize,
+    block_elems: usize,
+) {
+    // wasm: single-threaded serial accumulate (no Rayon thread pool).
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = n;
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        let mut block_f32 = [0f32; QK_K];
+        for bi in 0..num_blocks {
+            let off = bi * block_bytes;
+            dequant_block(scheme, &w_bytes[off..off + block_bytes], &mut block_f32);
+            let idx0 = bi * block_elems;
+            for t in 0..block_elems {
+                let idx = idx0 + t;
+                let j = idx / k;
+                let p = idx % k;
+                out[j] += x_row[p] * block_f32[t];
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+
+        let partial = (0..num_blocks)
+            .into_par_iter()
+            .fold(
+                || vec![0f32; n],
+                |mut local, bi| {
+                    let off = bi * block_bytes;
+                    let mut block_f32 = [0f32; QK_K];
+                    dequant_block(scheme, &w_bytes[off..off + block_bytes], &mut block_f32);
+                    let idx0 = bi * block_elems;
+                    for t in 0..block_elems {
+                        let idx = idx0 + t;
+                        let j = idx / k;
+                        let p = idx % k;
+                        local[j] += x_row[p] * block_f32[t];
+                    }
+                    local
+                },
+            )
+            .reduce(
+                || vec![0f32; n],
+                |mut acc, chunk| {
+                    for (a, b) in acc.iter_mut().zip(chunk) {
+                        *a += b;
+                    }
+                    acc
+                },
+            );
+        out.copy_from_slice(&partial);
+    }
 }
 
 #[cfg(test)]
@@ -362,6 +479,67 @@ mod tests {
                 "i={i}: {} vs {}",
                 fused[i],
                 expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_m1_matches_sequential_q8k() {
+        let k = 512;
+        let n = 128;
+        let scale = 0.5f32;
+        let mut packed = Vec::new();
+        for _ in 0..n {
+            for _ in 0..(k / QK_K) {
+                packed.extend_from_slice(&scale.to_le_bytes());
+                for i in 0..QK_K {
+                    let q = (i as i32 - 128).clamp(-128, 127) as i8;
+                    packed.push(q as u8);
+                }
+                for _ in 0..(QK_K / 16) {
+                    packed.extend_from_slice(&0i16.to_le_bytes());
+                }
+            }
+        }
+        let x: Vec<f32> = (0..k).map(|i| 0.01 * i as f32).collect();
+        let scheme = QuantScheme::GgufQ8K;
+        let block_elems = scheme.gguf_block_size() as usize;
+        let block_bytes = scheme.gguf_block_bytes() as usize;
+        let num_blocks = (k * n / block_elems).min(packed.len() / block_bytes);
+        let mut seq = vec![0f32; n];
+        let mut par = vec![0f32; n];
+        gguf_matmul_bt_m1_sequential(
+            &x,
+            &packed,
+            &mut seq,
+            scheme,
+            num_blocks,
+            block_bytes,
+            block_elems,
+            k,
+        );
+        if num_blocks >= 32 && crate::pool::num_threads() > 1 {
+            gguf_matmul_bt_m1_parallel(
+                &x,
+                &packed,
+                &mut par,
+                k,
+                n,
+                scheme,
+                num_blocks,
+                block_bytes,
+                block_elems,
+            );
+        } else {
+            par.copy_from_slice(&seq);
+        }
+        for i in 0..n {
+            let tol = seq[i].abs().max(1.0) * 1e-5 + 1e-3;
+            assert!(
+                (seq[i] - par[i]).abs() <= tol,
+                "parallel mismatch at {i}: {} vs {} (tol {tol})",
+                seq[i],
+                par[i]
             );
         }
     }

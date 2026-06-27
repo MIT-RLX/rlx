@@ -148,7 +148,7 @@ Variants include `session_default_pipeline` (production `CompileOptions`),
 `session_native_batch` (`native_fk_regions` on the same primitive graph), and pre-fused IR
 (`skip_fusion` in bench opts). Set `FK_BENCH_OPS=1` to print post-pipeline op counts without timing.
 
-Python timing demo: `pyrlx/examples/fk_fusion_bench.py` (`--batch` for narrow+relu+concat).
+Python timing demo: `crates/pyrlx/examples/fk_fusion_bench.py` (`--batch` for narrow+relu+concat).
 
 ### Session API (native batch)
 

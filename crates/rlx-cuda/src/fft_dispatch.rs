@@ -27,6 +27,16 @@ use crate::kernels::{
 
 const WG: u32 = 256;
 
+/// CUDA caps `gridDim.y`/`gridDim.z` at 65535, but FFT rows (`outer`) can far
+/// exceed that (e.g. batch 128k). Split the row count across the y and z grid
+/// dimensions; kernels recover the row as `blockIdx.y + blockIdx.z * gridDim.y`.
+#[inline]
+pub(crate) fn row_grid(outer: u32) -> (u32, u32) {
+    let y = outer.clamp(1, 65535);
+    let z = outer.div_ceil(y);
+    (y, z)
+}
+
 /// Run native GPU FFT on the device arena (f32, pow-2 `n`).
 pub fn run_fft_gpu(
     ctx: &Arc<CudaContext>,
@@ -69,8 +79,9 @@ pub fn run_fft_gpu(
     if plan.single_inner_only() {
         let kernel = fft_radix2_full_kernel(ctx);
         let block = n.min(256);
+        let (row_y, row_z) = row_grid(outer);
         let cfg = LaunchConfig {
-            grid_dim: (1, outer, 1),
+            grid_dim: (1, row_y, row_z),
             block_dim: (block, 1, 1),
             shared_mem_bytes: 8192,
         };
@@ -95,8 +106,9 @@ pub fn run_fft_gpu(
     {
         let kernel = fft_bit_reverse_kernel(ctx);
         let (grid, block) = dispatch_grid_1d(n, WG);
+        let (row_y, row_z) = row_grid(outer);
         let cfg = LaunchConfig {
-            grid_dim: (grid, outer, 1),
+            grid_dim: (grid, row_y, row_z),
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -121,8 +133,9 @@ pub fn run_fft_gpu(
 
     {
         let kernel = fft_inner_kernel(ctx);
+        let (row_y, row_z) = row_grid(outer);
         let cfg = LaunchConfig {
-            grid_dim: (num_tiles, outer, 1),
+            grid_dim: (num_tiles, row_y, row_z),
             block_dim: (wg_threads, 1, 1),
             shared_mem_bytes: tile * 8,
         };
@@ -153,8 +166,9 @@ pub fn run_fft_gpu(
         };
         let kernel = fft_outer_r4_kernel(ctx);
         let (grid, block) = dispatch_grid_1d((n / 4).max(1), WG);
+        let (row_y, row_z) = row_grid(outer);
         let cfg = LaunchConfig {
-            grid_dim: (grid, outer, 1),
+            grid_dim: (grid, row_y, row_z),
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -178,8 +192,9 @@ pub fn run_fft_gpu(
         let hs_u = hs as u32;
         let kernel = fft_outer_r2_kernel(ctx);
         let (grid, block) = dispatch_grid_1d(n / 2, WG);
+        let (row_y, row_z) = row_grid(outer);
         let cfg = LaunchConfig {
-            grid_dim: (grid, outer, 1),
+            grid_dim: (grid, row_y, row_z),
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };

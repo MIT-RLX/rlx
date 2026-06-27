@@ -187,10 +187,10 @@ pub fn estimate(graph: &Graph, registry: &WeightRegistry) -> MemoryEstimate {
 }
 
 /// Available unified-memory budget on the running machine. On
-/// macOS reads `hw.memsize` via sysctl; everywhere else returns
+/// macOS / iOS reads `hw.memsize` via sysctl; everywhere else returns
 /// `None` so callers can fall back to a user-supplied budget.
 pub fn available_unified_memory() -> Option<usize> {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         use std::ffi::CString;
         let cname = CString::new("hw.memsize").ok()?;
@@ -216,7 +216,7 @@ pub fn available_unified_memory() -> Option<usize> {
         };
         if rc == 0 { Some(val as usize) } else { None }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     {
         None
     }
@@ -249,7 +249,7 @@ pub fn soft_memory_budget_bytes() -> Option<usize> {
 
 /// Current process resident set size, when available.
 pub fn process_rss_bytes() -> Option<usize> {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         use std::mem::MaybeUninit;
         unsafe extern "C" {
@@ -293,7 +293,7 @@ pub fn process_rss_bytes() -> Option<usize> {
         let resident_pages = statm.split_whitespace().nth(1)?.parse::<usize>().ok()?;
         Some(resident_pages.saturating_mul(page_size()))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {
         None
     }
@@ -323,23 +323,34 @@ pub fn would_exceed_soft_budget(additional_bytes: usize) -> bool {
         return false;
     };
     let rss = process_rss_bytes().unwrap_or(0);
-    rss.saturating_add(additional_bytes) > budget
+    exceeds_budget(rss, additional_bytes, budget)
+}
+
+/// Pure boundary predicate behind [`would_exceed_soft_budget`]: would a process
+/// already using `rss` bytes exceed `budget` after allocating `additional`
+/// more? Split out from the live RSS/budget probes so it is deterministically
+/// testable (the live values fluctuate under concurrent allocation).
+fn exceeds_budget(rss: usize, additional: usize, budget: usize) -> bool {
+    rss.saturating_add(additional) > budget
 }
 
 /// Conservative peak for one LLaMA decode graph compile with F32 params (3B class).
+/// Computed in `u64` and clamped — the raw constants exceed 32-bit `usize` (wasm).
 pub fn llama_decode_bucket_compile_peak_bytes() -> usize {
     std::env::var("RLX_DECODE_BUCKET_PEAK_BYTES")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(12 * 1024 * 1024 * 1024)
+        .min(usize::MAX as u64) as usize
 }
 
 /// Lazy per-step decode compile (GGUF on demand, no resident param cache).
 pub fn llama_decode_oneshot_compile_peak_bytes() -> usize {
     std::env::var("RLX_DECODE_ONESHOT_PEAK_BYTES")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(4 * 1024 * 1024 * 1024)
+        .min(usize::MAX as u64) as usize
 }
 
 #[cfg(test)]
@@ -417,9 +428,9 @@ mod tests {
 
     #[test]
     fn available_memory_returns_something_on_macos() {
-        // basic test — on macOS this should return Some(>0).
-        // Elsewhere (CI) we accept None.
-        if cfg!(target_os = "macos") {
+        // basic test — on macOS / iOS this should return Some(>0)
+        // (both read `hw.memsize`). Elsewhere (CI) we accept None.
+        if cfg!(target_vendor = "apple") {
             let mem = available_unified_memory();
             assert!(mem.is_some());
             assert!(mem.unwrap() > 0);
@@ -437,12 +448,31 @@ mod tests {
 
     #[test]
     fn would_exceed_respects_headroom() {
-        if soft_memory_budget_bytes().is_none() {
-            return;
+        // Deterministic boundary check on the pure predicate — independent of
+        // the live process RSS (which fluctuates under concurrent test
+        // execution and previously made this assertion flaky).
+        let budget = 1_000_usize;
+        let rss = 600_usize;
+        let headroom = budget - rss; // 400
+
+        // Exactly filling the headroom does NOT exceed; one byte over does.
+        assert!(!exceeds_budget(rss, headroom, budget));
+        assert!(exceeds_budget(rss, headroom + 1, budget));
+
+        // Allocating nothing never exceeds, even at the budget edge.
+        assert!(!exceeds_budget(budget, 0, budget));
+        assert!(exceeds_budget(budget, 1, budget));
+
+        // Saturating add: a huge request can't wrap to a small value.
+        assert!(exceeds_budget(usize::MAX, 1, budget));
+    }
+
+    #[test]
+    fn would_exceed_soft_budget_smoke() {
+        // The live path must not panic and must agree with the pure predicate
+        // for an obviously-too-large request.
+        if soft_memory_budget_bytes().is_some() {
+            assert!(would_exceed_soft_budget(usize::MAX));
         }
-        let budget = soft_memory_budget_bytes().unwrap();
-        let rss = process_rss_bytes().unwrap_or(0);
-        assert!(!would_exceed_soft_budget(budget.saturating_sub(rss)));
-        assert!(would_exceed_soft_budget(budget.saturating_sub(rss) + 1));
     }
 }

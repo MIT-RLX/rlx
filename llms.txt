@@ -79,7 +79,9 @@ layered crates.
 - `pyrlx` — PyO3 + maturin Python bindings. Run any RLX backend
   from Python. Graph builders: explicit `Graph` (int node ids) or
   DSL `with pyrlx.graph(...) as g:` + `Node` operators (`x @ w + b`,
-  scalar literals `x * 2.0`, `Graph.constant`) — see `pyrlx/docs/dsl.md`.
+  scalar literals `x * 2.0`, `Graph.constant`) — see `crates/pyrlx/docs/dsl.md`.
+  **GGUF:** `quantize` / `dequant`, `load_gguf` / `write_gguf`,
+  `convert_to_gguf` — see `docs/gguf-backend-paths.md`.
   Multi-backend: `GraphDevices`, `DeviceRouter`, `DevicePolicy`,
   `FlexibleSession`, `backends_manifest()`. FKL fusion: `FusionOptions`,
   `Session.compile_with`, `Graph.resize_nearest_2x`,
@@ -98,9 +100,11 @@ layered crates.
 - `docs/README.md` — doc index.
 - `docs/backend-selection.md` — `DevicePolicy`, `GraphDevices`,
   `DeviceRouter`, `FlexibleSession`, env vars, Python API, calibration caches.
+- `docs/gguf-backend-paths.md` — GGUF `DequantMatMul` per-backend paths,
+  shared GPU scheme ids (0–23), ANE constexpr, TPU compile bake, env toggles.
 - `Justfile` — dev recipes. `just --list` shows everything; key
   ones: `build`, `build-all`, `test`, `lint`, `fmt`, `bench MODEL`,
-  `micro NAME`, `throttle`, `ci`.
+  `micro NAME`, `throttle`, `ci`, `test-gguf-grouped`, `test-pyrlx`.
 
 ## Bench harness
 

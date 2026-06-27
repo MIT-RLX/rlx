@@ -38,12 +38,17 @@ pub fn llama_prefill_layer_attn_only(layer_idx: usize, spec: LlamaDecoderSpec) -
     LayerStack::named(format!("layer{layer_idx}"))
         .residual_save()
         .rms_norm(format!("{prefix}.input_layernorm.weight"), spec.eps)
-        .self_attn_prefill(SelfAttnPrefillSpec::hf_layer(
-            &prefix,
-            spec.num_heads,
-            spec.head_dim,
-            spec.num_kv_heads,
-        ))
+        .self_attn_prefill(
+            SelfAttnPrefillSpec::hf_layer(
+                &prefix,
+                spec.num_heads,
+                spec.head_dim,
+                spec.num_kv_heads,
+            )
+            // Match the (style-aware) decode path so GGUF-Llama prefill rotates
+            // GPT-J-style, not NeoX.
+            .with_rope_style(spec.rope_style),
+        )
         .linear(format!("{prefix}.self_attn.o_proj.weight"), true)
         .residual_add()
         .build()
@@ -69,12 +74,17 @@ pub fn llama_prefill_layer_composed(layer_idx: usize, spec: LlamaDecoderSpec) ->
     LayerStack::named(format!("layer{layer_idx}"))
         .residual_save()
         .rms_norm(format!("{prefix}.input_layernorm.weight"), spec.eps)
-        .self_attn_prefill(SelfAttnPrefillSpec::hf_layer(
-            &prefix,
-            spec.num_heads,
-            spec.head_dim,
-            spec.num_kv_heads,
-        ))
+        .self_attn_prefill(
+            SelfAttnPrefillSpec::hf_layer(
+                &prefix,
+                spec.num_heads,
+                spec.head_dim,
+                spec.num_kv_heads,
+            )
+            // Match the (style-aware) decode path so GGUF-Llama prefill rotates
+            // GPT-J-style, not NeoX.
+            .with_rope_style(spec.rope_style),
+        )
         .linear(format!("{prefix}.self_attn.o_proj.weight"), true)
         .residual_add()
         .residual_save()

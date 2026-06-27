@@ -12,10 +12,15 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-//! End-to-end test: `Op::DequantGroupedMatMul { scheme: GgufQ8K }` on a
-//! synthetic MoE expert stack (no real GGUF file). Compares the in-graph
-//! op against per-token expert dequant + matmul reference.
+//! End-to-end test: `Op::DequantGroupedMatMul` on synthetic MoE expert stacks.
+//!
+//! GPU backend tests acquire [`common::GpuTestGuard`] so they stay safe under
+//! the default parallel `cargo test` harness (Metal + wgpu init races otherwise
+//! SIGSEGV on Apple Silicon).
 
+mod common;
+
+use common::GpuTestGuard;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
@@ -80,6 +85,7 @@ fn reference_grouped_q8k(
 }
 
 fn run_grouped_q8k_case(device: Device) {
+    let _gpu_guard = GpuTestGuard::acquire(device);
     let k = 256;
     let n = 4;
     let m = 5;
@@ -212,4 +218,503 @@ fn dequant_grouped_matmul_q8k_matches_f32_grouped_matmul() {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn dequant_grouped_matmul_q8k_metal_matches_cpu() {
     run_grouped_q8k_case(Device::Metal);
+}
+
+const QK4: usize = 32;
+
+/// Packed expert stack: `num_experts` slabs of shape `[n, k]` in GGUF Q4_0 layout.
+fn build_q4_0_expert_stack(
+    num_experts: usize,
+    k: usize,
+    n: usize,
+    expert_scales: &[f32],
+) -> Vec<u8> {
+    assert_eq!(expert_scales.len(), num_experts);
+    assert_eq!((k * n) % QK4, 0);
+    let mut packed = Vec::new();
+    for (e, &scale) in expert_scales.iter().enumerate() {
+        let slab: Vec<f32> = (0..n * k)
+            .map(|i| scale * ((i as f32 + e as f32 * 0.1).sin() * 0.5))
+            .collect();
+        packed.extend(rlx_gguf::quantize::quantize_q4_0(&slab).expect("quantize_q4_0"));
+    }
+    packed
+}
+
+fn reference_grouped_q4_0(
+    x: &[f32],
+    packed: &[u8],
+    expert_idx: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+) -> Vec<f32> {
+    let block_bytes = QuantScheme::GgufQ4_0.gguf_block_bytes() as usize;
+    let slab = (k * n) / QK4 * block_bytes;
+    let mut out = vec![0f32; m * n];
+    for row in 0..m {
+        let e = expert_idx[row] as usize;
+        assert!(e < num_experts);
+        let w_ref = rlx_gguf::dequant_q4_0(&packed[e * slab..(e + 1) * slab], k * n).unwrap();
+        for c in 0..n {
+            let mut acc = 0f32;
+            for i in 0..k {
+                acc += x[row * k + i] * w_ref[c * k + i];
+            }
+            out[row * n + c] = acc;
+        }
+    }
+    out
+}
+
+fn run_grouped_q4_0_case(device: Device) {
+    let _gpu_guard = GpuTestGuard::acquire(device);
+    let k = 32;
+    let n = 4;
+    let m = 5;
+    let num_experts = 3;
+    let expert_scales = [0.12f32, 0.24, 0.36];
+    let packed = build_q4_0_expert_stack(num_experts, k, n, &expert_scales);
+    let x: Vec<f32> = (0..m * k).map(|i| 0.02 * (i as f32 + 1.0)).collect();
+    let expert_idx = vec![2.0, 0.0, 1.0, 2.0, 0.0];
+    let expected = reference_grouped_q4_0(&x, &packed, &expert_idx, m, k, n, num_experts);
+
+    let mut g = Graph::new("dq_grouped_matmul_q4_0");
+    let x_in = g.input("x", Shape::new(&[m, k], DType::F32));
+    let w_packed = g.param("w_packed", Shape::new(&[packed.len()], DType::U8));
+    let idx_in = g.input("expert_idx", Shape::new(&[m], DType::F32));
+    let y = g.add_node(
+        Op::DequantGroupedMatMul {
+            scheme: QuantScheme::GgufQ4_0,
+        },
+        vec![x_in, w_packed, idx_in],
+        Shape::new(&[m, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+
+    let session = Session::new(device);
+    let mut compiled = session.compile(g);
+    compiled.set_param_typed("w_packed", &packed, DType::U8);
+    let actual = compiled
+        .run(&[("x", x.as_slice()), ("expert_idx", expert_idx.as_slice())])
+        .pop()
+        .unwrap();
+
+    assert_eq!(actual.len(), expected.len());
+    for i in 0..actual.len() {
+        let diff = (actual[i] - expected[i]).abs();
+        let rel = diff / expected[i].abs().max(1.0);
+        assert!(
+            rel < 1e-3,
+            "{device:?} grouped Q4_0 mismatch at {i}: got {} expected {} (rel {:.2e})",
+            actual[i],
+            expected[i],
+            rel
+        );
+    }
+}
+
+#[test]
+fn dequant_grouped_matmul_q4_0_matches_per_expert_reference() {
+    run_grouped_q4_0_case(Device::Cpu);
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn dequant_grouped_matmul_q4_0_metal_matches_cpu() {
+    run_grouped_q4_0_case(Device::Metal);
+}
+
+#[test]
+#[cfg(feature = "gpu")]
+fn dequant_grouped_matmul_q4_0_wgpu_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Gpu) {
+        eprintln!("wgpu adapter unavailable, skipping");
+        return;
+    }
+    run_grouped_q4_0_case(Device::Gpu);
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+fn dequant_grouped_matmul_q4_0_cuda_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Cuda) {
+        eprintln!("CUDA unavailable, skipping");
+        return;
+    }
+    run_grouped_q4_0_case(Device::Cuda);
+}
+
+const QK256: usize = 256;
+
+fn build_iq_expert_stack(
+    num_experts: usize,
+    k: usize,
+    n: usize,
+    ggml: rlx_gguf::GgmlType,
+    expert_scales: &[f32],
+) -> Vec<u8> {
+    assert_eq!(expert_scales.len(), num_experts);
+    assert_eq!((k * n) % QK256, 0);
+    let mut packed = Vec::new();
+    for (e, &scale) in expert_scales.iter().enumerate() {
+        let slab: Vec<f32> = (0..n * k)
+            .map(|i| scale * ((i as f32 + e as f32 * 0.1).sin() * 0.5))
+            .collect();
+        packed.extend(rlx_gguf::quantize(&slab, ggml).expect("quantize"));
+    }
+    packed
+}
+
+fn reference_grouped_iq(
+    x: &[f32],
+    packed: &[u8],
+    expert_idx: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    scheme: QuantScheme,
+) -> Vec<f32> {
+    let block_bytes = scheme.gguf_block_bytes() as usize;
+    let block_elems = scheme.gguf_block_size() as usize;
+    let slab = (k * n) / block_elems * block_bytes;
+    let mut out = vec![0f32; m * n];
+    for row in 0..m {
+        let e = expert_idx[row] as usize;
+        assert!(e < num_experts);
+        let w_ref = rlx_cpu::dequant_cache::gguf_weight_f32(
+            0,
+            &packed[e * slab..(e + 1) * slab],
+            k,
+            n,
+            scheme,
+        );
+        for c in 0..n {
+            let mut acc = 0f32;
+            for i in 0..k {
+                acc += x[row * k + i] * w_ref[c * k + i];
+            }
+            out[row * n + c] = acc;
+        }
+    }
+    out
+}
+
+fn run_grouped_iq_case(device: Device, scheme: QuantScheme, ggml: rlx_gguf::GgmlType) {
+    let _gpu_guard = GpuTestGuard::acquire(device);
+    let k = 256;
+    let n = 4;
+    let m = 5;
+    let num_experts = 3;
+    let expert_scales = [0.15f32, 0.30, 0.45];
+    let packed = build_iq_expert_stack(num_experts, k, n, ggml, &expert_scales);
+    let x: Vec<f32> = (0..m * k).map(|i| 0.02 * (i as f32 + 1.0)).collect();
+    let expert_idx = vec![2.0, 0.0, 1.0, 2.0, 0.0];
+    let expected = reference_grouped_iq(&x, &packed, &expert_idx, m, k, n, num_experts, scheme);
+
+    let mut g = Graph::new("dq_grouped_matmul_iq");
+    let x_in = g.input("x", Shape::new(&[m, k], DType::F32));
+    let w_packed = g.param("w_packed", Shape::new(&[packed.len()], DType::U8));
+    let idx_in = g.input("expert_idx", Shape::new(&[m], DType::F32));
+    let y = g.add_node(
+        Op::DequantGroupedMatMul { scheme },
+        vec![x_in, w_packed, idx_in],
+        Shape::new(&[m, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+
+    let session = Session::new(device);
+    let mut compiled = session.compile(g);
+    compiled.set_param_typed("w_packed", &packed, DType::U8);
+    let actual = compiled
+        .run(&[("x", x.as_slice()), ("expert_idx", expert_idx.as_slice())])
+        .pop()
+        .unwrap();
+
+    assert_eq!(actual.len(), expected.len());
+    for i in 0..actual.len() {
+        let diff = (actual[i] - expected[i]).abs();
+        let rel = diff / expected[i].abs().max(1.0);
+        assert!(
+            rel < 5e-2,
+            "{device:?} grouped {scheme:?} mismatch at {i}: got {} expected {} (rel {:.2e})",
+            actual[i],
+            expected[i],
+            rel
+        );
+    }
+}
+
+#[test]
+fn dequant_grouped_matmul_iq2_xxs_matches_per_expert_reference() {
+    run_grouped_iq_case(
+        Device::Cpu,
+        QuantScheme::GgufIQ2XXS,
+        rlx_gguf::GgmlType::IQ2XXS,
+    );
+}
+
+#[test]
+fn dequant_grouped_matmul_iq3_xxs_matches_per_expert_reference() {
+    run_grouped_iq_case(
+        Device::Cpu,
+        QuantScheme::GgufIQ3XXS,
+        rlx_gguf::GgmlType::IQ3XXS,
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn dequant_grouped_matmul_iq2_xxs_metal_matches_cpu() {
+    run_grouped_iq_case(
+        Device::Metal,
+        QuantScheme::GgufIQ2XXS,
+        rlx_gguf::GgmlType::IQ2XXS,
+    );
+}
+
+#[test]
+#[cfg(feature = "gpu")]
+fn dequant_grouped_matmul_iq2_xxs_wgpu_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Gpu) {
+        eprintln!("wgpu adapter unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Gpu,
+        QuantScheme::GgufIQ2XXS,
+        rlx_gguf::GgmlType::IQ2XXS,
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn dequant_grouped_matmul_iq3_xxs_metal_matches_cpu() {
+    run_grouped_iq_case(
+        Device::Metal,
+        QuantScheme::GgufIQ3XXS,
+        rlx_gguf::GgmlType::IQ3XXS,
+    );
+}
+
+#[test]
+#[cfg(feature = "gpu")]
+fn dequant_grouped_matmul_iq3_xxs_wgpu_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Gpu) {
+        eprintln!("wgpu adapter unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Gpu,
+        QuantScheme::GgufIQ3XXS,
+        rlx_gguf::GgmlType::IQ3XXS,
+    );
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+fn dequant_grouped_matmul_iq2_xxs_cuda_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Cuda) {
+        eprintln!("CUDA unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Cuda,
+        QuantScheme::GgufIQ2XXS,
+        rlx_gguf::GgmlType::IQ2XXS,
+    );
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+fn dequant_grouped_matmul_iq3_xxs_cuda_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Cuda) {
+        eprintln!("CUDA unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Cuda,
+        QuantScheme::GgufIQ3XXS,
+        rlx_gguf::GgmlType::IQ3XXS,
+    );
+}
+
+#[test]
+#[cfg(feature = "rocm")]
+fn dequant_grouped_matmul_iq2_xxs_rocm_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Rocm) {
+        eprintln!("ROCm unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Rocm,
+        QuantScheme::GgufIQ2XXS,
+        rlx_gguf::GgmlType::IQ2XXS,
+    );
+}
+
+#[test]
+#[cfg(feature = "rocm")]
+fn dequant_grouped_matmul_iq3_xxs_rocm_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Rocm) {
+        eprintln!("ROCm unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Rocm,
+        QuantScheme::GgufIQ3XXS,
+        rlx_gguf::GgmlType::IQ3XXS,
+    );
+}
+
+#[test]
+fn dequant_grouped_matmul_iq2_s_matches_per_expert_reference() {
+    run_grouped_iq_case(Device::Cpu, QuantScheme::GgufIQ2S, rlx_gguf::GgmlType::IQ2S);
+}
+
+#[test]
+fn dequant_grouped_matmul_iq3_s_matches_per_expert_reference() {
+    run_grouped_iq_case(Device::Cpu, QuantScheme::GgufIQ3S, rlx_gguf::GgmlType::IQ3S);
+}
+
+#[test]
+fn dequant_grouped_matmul_tq2_0_matches_per_expert_reference() {
+    run_grouped_iq_case(
+        Device::Cpu,
+        QuantScheme::GgufTQ2_0,
+        rlx_gguf::GgmlType::TQ2_0,
+    );
+}
+
+#[test]
+fn dequant_grouped_matmul_iq1_s_matches_per_expert_reference() {
+    run_grouped_iq_case(Device::Cpu, QuantScheme::GgufIQ1S, rlx_gguf::GgmlType::IQ1S);
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn dequant_grouped_matmul_iq2_s_metal_matches_cpu() {
+    run_grouped_iq_case(
+        Device::Metal,
+        QuantScheme::GgufIQ2S,
+        rlx_gguf::GgmlType::IQ2S,
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn dequant_grouped_matmul_iq3_s_metal_matches_cpu() {
+    run_grouped_iq_case(
+        Device::Metal,
+        QuantScheme::GgufIQ3S,
+        rlx_gguf::GgmlType::IQ3S,
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn dequant_grouped_matmul_tq2_0_metal_matches_cpu() {
+    run_grouped_iq_case(
+        Device::Metal,
+        QuantScheme::GgufTQ2_0,
+        rlx_gguf::GgmlType::TQ2_0,
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn dequant_grouped_matmul_iq1_s_metal_matches_cpu() {
+    run_grouped_iq_case(
+        Device::Metal,
+        QuantScheme::GgufIQ1S,
+        rlx_gguf::GgmlType::IQ1S,
+    );
+}
+
+#[test]
+#[cfg(feature = "gpu")]
+fn dequant_grouped_matmul_iq2_s_wgpu_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Gpu) {
+        eprintln!("wgpu adapter unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(Device::Gpu, QuantScheme::GgufIQ2S, rlx_gguf::GgmlType::IQ2S);
+}
+
+#[test]
+#[cfg(feature = "gpu")]
+fn dequant_grouped_matmul_iq3_s_wgpu_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Gpu) {
+        eprintln!("wgpu adapter unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(Device::Gpu, QuantScheme::GgufIQ3S, rlx_gguf::GgmlType::IQ3S);
+}
+
+#[test]
+#[cfg(feature = "gpu")]
+fn dequant_grouped_matmul_tq2_0_wgpu_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Gpu) {
+        eprintln!("wgpu adapter unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Gpu,
+        QuantScheme::GgufTQ2_0,
+        rlx_gguf::GgmlType::TQ2_0,
+    );
+}
+
+#[test]
+#[cfg(feature = "gpu")]
+fn dequant_grouped_matmul_iq1_s_wgpu_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Gpu) {
+        eprintln!("wgpu adapter unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(Device::Gpu, QuantScheme::GgufIQ1S, rlx_gguf::GgmlType::IQ1S);
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+fn dequant_grouped_matmul_iq2_s_cuda_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Cuda) {
+        eprintln!("CUDA unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Cuda,
+        QuantScheme::GgufIQ2S,
+        rlx_gguf::GgmlType::IQ2S,
+    );
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+fn dequant_grouped_matmul_iq3_s_cuda_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Cuda) {
+        eprintln!("CUDA unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Cuda,
+        QuantScheme::GgufIQ3S,
+        rlx_gguf::GgmlType::IQ3S,
+    );
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+fn dequant_grouped_matmul_tq2_0_cuda_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Cuda) {
+        eprintln!("CUDA unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Cuda,
+        QuantScheme::GgufTQ2_0,
+        rlx_gguf::GgmlType::TQ2_0,
+    );
 }

@@ -20,7 +20,7 @@ use rlx_ir::{DType, Graph, NodeId, Op};
 
 use crate::backend::{compile_pjrt_executable, destroy_buffer, download_buffer, upload_buffer};
 use crate::device::tpu_context;
-use crate::lower::{HloModule, lower_graph_with_rng};
+use crate::lower::{HloModule, LowerParamBytes, lower_graph_with_rng_and_params};
 use crate::segment::{Segment, plan};
 use crate::splat_host::{HostTensors, run_splat_backward, run_splat_render};
 
@@ -57,6 +57,15 @@ impl OrchestratedExecutable {
     }
 
     pub fn compile_rng(graph: Graph, rng: rlx_ir::RngOptions, uses_xla_rng: bool) -> Self {
+        Self::compile_rng_with_param_bytes(graph, rng, uses_xla_rng, None)
+    }
+
+    pub fn compile_rng_with_param_bytes(
+        graph: Graph,
+        rng: rlx_ir::RngOptions,
+        uses_xla_rng: bool,
+        param_bytes: Option<&LowerParamBytes>,
+    ) -> Self {
         let segments = plan(&graph);
         let mut compiled = Vec::new();
         for seg in segments {
@@ -66,7 +75,7 @@ impl OrchestratedExecutable {
                     output_orig,
                 } => {
                     let seg_graph = crate::ir_passes::prepare_graph_for_hlo(seg_graph);
-                    let module = lower_graph_with_rng(&seg_graph, rng);
+                    let module = lower_graph_with_rng_and_params(&seg_graph, rng, param_bytes);
                     let executable = compile_pjrt_executable(&module.bytes);
                     let n_params = module.param_names.len();
                     compiled.push(CompiledSegment::Hlo {
@@ -101,11 +110,44 @@ impl OrchestratedExecutable {
                 .to_vec();
         self.params.insert(name.to_string(), bytes);
         self.param_dtypes.insert(name.to_string(), DType::F32);
+        for seg in &mut self.segments {
+            if let CompiledSegment::Hlo {
+                params_uploaded, ..
+            } = seg
+            {
+                *params_uploaded = false;
+            }
+        }
     }
 
     pub fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: DType) {
+        for seg in &mut self.segments {
+            if let CompiledSegment::Hlo {
+                module,
+                params_uploaded,
+                ..
+            } = seg
+            {
+                if let Some((bytes, dt)) =
+                    crate::lower::gguf_param_bytes_from_u8(&module.gguf_deferred, name, data, dtype)
+                {
+                    self.params.insert(name.to_string(), bytes);
+                    self.param_dtypes.insert(name.to_string(), dt);
+                    *params_uploaded = false;
+                    return;
+                }
+            }
+        }
         self.params.insert(name.to_string(), data.to_vec());
         self.param_dtypes.insert(name.to_string(), dtype);
+        for seg in &mut self.segments {
+            if let CompiledSegment::Hlo {
+                params_uploaded, ..
+            } = seg
+            {
+                *params_uploaded = false;
+            }
+        }
     }
 
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
@@ -236,6 +278,9 @@ fn run_hlo_segment(
             let bytes = params.get(name).unwrap_or_else(|| {
                 panic!("rlx-tpu: parameter '{name}' was never set; call set_param before run")
             });
+            if !param_buffers[i].is_null() {
+                crate::backend::destroy_buffer(ctx, param_buffers[i]);
+            }
             param_buffers[i] = upload_buffer(ctx, bytes, dtype, &dims);
         }
         *params_uploaded = true;

@@ -79,7 +79,7 @@
 //!   - **Zero metal-rs in the trait surface**: keeps rlx-metal's
 //!     dependency on `metal-rs` an implementation detail.
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};

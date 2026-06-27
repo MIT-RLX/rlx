@@ -1,0 +1,26 @@
+#version 450
+// Ternary select: cond != 0 ? a : b. Operands broadcast by trailing modulus.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float data[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint cond_off;
+    uint a_off;
+    uint b_off;
+    uint out_off;
+    uint cond_mod;
+    uint a_mod;
+    uint b_mod;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    uint ci = (pc.cond_mod == 0u) ? i : (i % pc.cond_mod);
+    uint ai = (pc.a_mod == 0u) ? i : (i % pc.a_mod);
+    uint bi = (pc.b_mod == 0u) ? i : (i % pc.b_mod);
+    float c = data[pc.cond_off + ci];
+    data[pc.out_off + i] = (c != 0.0) ? data[pc.a_off + ai] : data[pc.b_off + bi];
+}

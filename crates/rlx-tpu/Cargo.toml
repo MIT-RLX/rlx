@@ -15,11 +15,12 @@ documentation.workspace = true
 build = "build.rs"
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.9" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.9" }
-rlx-compile = { path = "../rlx-compile", version = "0.2.9" }
-rlx-fusion = { path = "../rlx-fusion", version = "0.2.9" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.9", features = ["splat"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.10" }
+rlx-compile = { path = "../rlx-compile", version = "0.2.10" }
+rlx-fusion = { path = "../rlx-fusion", version = "0.2.10" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", features = ["splat"] }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.10" }
 
 # libloading dlopens libtpu.so at runtime so the crate compiles + tests
 # cleanly on Mac/Windows hosts that don't have it installed.

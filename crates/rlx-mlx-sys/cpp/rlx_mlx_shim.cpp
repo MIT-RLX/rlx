@@ -25,6 +25,8 @@
 #include "mlx/array.h"
 #include "mlx/compile.h"
 #include "mlx/device.h"
+#include "mlx/distributed/distributed.h"
+#include "mlx/distributed/ops.h"
 #include "mlx/dtype.h"
 #include "mlx/fast.h"
 #include "mlx/fft.h"
@@ -47,8 +49,22 @@
 #include <vector>
 
 namespace mc = mlx::core;
+namespace mcd = mlx::core::distributed;
 
 namespace {
+
+// Process-global distributed group, set by rlx_mlx_dist_init. Held as
+// optional because there is no group until init runs.
+std::optional<mcd::Group> g_dist_group;
+
+const mcd::Group& dist_group() {
+    if (!g_dist_group) {
+        throw std::runtime_error(
+            "distributed not initialized — call rlx_mlx_dist_init first");
+    }
+    return *g_dist_group;
+}
+
 
 // Per-thread last-error string. Cleared on every successful call so a
 // stale message from a prior failure can't be read by accident.
@@ -1487,6 +1503,89 @@ int rlx_mlx_compiled_call(
 
 void rlx_mlx_compiled_free(rlx_mlx_compiled_t* compiled) {
     if (compiled) delete compiled;
+}
+
+// ── Distributed (multi-node) ─────────────────────────────────────
+
+int rlx_mlx_dist_is_available(int* out) {
+    return guarded([&] { *out = mcd::is_available() ? 1 : 0; });
+}
+
+int rlx_mlx_dist_init(int strict, const char* backend, int* out_rank, int* out_size) {
+    return guarded([&] {
+        std::string bk = (backend && *backend) ? std::string(backend) : std::string("any");
+        mcd::Group g = mcd::init(strict != 0, bk);
+        g_dist_group = g;
+        if (out_rank) *out_rank = g.rank();
+        if (out_size) *out_size = g.size();
+    });
+}
+
+int rlx_mlx_dist_rank(int* out_rank) {
+    return guarded([&] { *out_rank = dist_group().rank(); });
+}
+
+int rlx_mlx_dist_size(int* out_size) {
+    return guarded([&] { *out_size = dist_group().size(); });
+}
+
+int rlx_mlx_dist_all_sum_f32(const float* in, float* out, size_t nelems) {
+    return guarded([&] {
+        mc::array x(in, mc::Shape{static_cast<int>(nelems)}, mc::float32);
+        mc::array y = mcd::all_sum(x, dist_group());
+        mc::eval(y);
+        std::memcpy(out, y.data<float>(), nelems * sizeof(float));
+    });
+}
+
+int rlx_mlx_dist_all_gather_f32(
+    const float* in, size_t nelems, float* out, size_t out_cap)
+{
+    return guarded([&] {
+        mc::array x(in, mc::Shape{static_cast<int>(nelems)}, mc::float32);
+        mc::array y = mcd::all_gather(x, dist_group());
+        mc::eval(y);
+        size_t total = static_cast<size_t>(y.size());
+        if (total > out_cap) {
+            throw std::runtime_error("all_gather: output capacity too small");
+        }
+        std::memcpy(out, y.data<float>(), total * sizeof(float));
+    });
+}
+
+int rlx_mlx_dist_send_f32(const float* data, size_t nelems, int dst) {
+    return guarded([&] {
+        mc::array x(data, mc::Shape{static_cast<int>(nelems)}, mc::float32);
+        mc::array y = mcd::send(x, dst, dist_group());
+        mc::eval(y); // forces the transmission
+    });
+}
+
+int rlx_mlx_dist_recv_f32(float* out, size_t nelems, int src) {
+    return guarded([&] {
+        mc::array y = mcd::recv(
+            mc::Shape{static_cast<int>(nelems)}, mc::float32, src, dist_group());
+        mc::eval(y);
+        std::memcpy(out, y.data<float>(), nelems * sizeof(float));
+    });
+}
+
+int rlx_mlx_dist_barrier(void) {
+    return guarded([&] {
+        float one = 1.0f;
+        mc::array x(&one, mc::Shape{1}, mc::float32);
+        mc::array y = mcd::all_sum(x, dist_group());
+        mc::eval(y);
+    });
+}
+
+int rlx_mlx_dist_all_sum_array(rlx_mlx_array_t* in, rlx_mlx_array_t** out) {
+    return guarded([&] {
+        // Lazy all_sum on the device array — no eval, no host copy. The new
+        // array node joins the surrounding MLX graph.
+        mc::array y = mcd::all_sum(unwrap(in), dist_group());
+        *out = wrap(std::move(y));
+    });
 }
 
 } // extern "C"

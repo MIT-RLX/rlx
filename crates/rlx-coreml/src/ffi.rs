@@ -25,9 +25,10 @@ unsafe extern "C" {
         model: *mut RlxCoremlModel,
         n_inputs: c_int,
         in_names: *const *const c_char,
-        in_data: *const *const f32,
+        in_data: *const *const c_void,
         in_shapes: *const *const i64,
         in_ranks: *const c_int,
+        in_dtypes: *const c_int,
         n_outputs: c_int,
         out_names: *const *const c_char,
         out_data: *const *mut f32,
@@ -102,16 +103,21 @@ impl CoremlModel {
 
     /// Run one prediction. `inputs`/`outputs` are `(feature_name, shape,
     /// buffer)` tuples; output buffers are written in place and must be
-    /// pre-sized to the expected element count.
+    /// pre-sized to the expected element count. Input buffers may be f32
+    /// or f16 (`half::f16` bit patterns) per `dtypes`.
     pub fn predict(
         &mut self,
-        inputs: &[(CString, Vec<i64>, &[f32])],
+        inputs: &[(CString, Vec<i64>, &[u8], i32)],
         outputs: &mut [(CString, &mut [f32])],
     ) -> Result<()> {
-        let in_names: Vec<*const c_char> = inputs.iter().map(|(n, _, _)| n.as_ptr()).collect();
-        let in_data: Vec<*const f32> = inputs.iter().map(|(_, _, d)| d.as_ptr()).collect();
-        let in_shapes: Vec<*const i64> = inputs.iter().map(|(_, s, _)| s.as_ptr()).collect();
-        let in_ranks: Vec<c_int> = inputs.iter().map(|(_, s, _)| s.len() as c_int).collect();
+        let in_names: Vec<*const c_char> = inputs.iter().map(|(n, _, _, _)| n.as_ptr()).collect();
+        let in_data: Vec<*const c_void> = inputs
+            .iter()
+            .map(|(_, _, d, _)| d.as_ptr() as *const c_void)
+            .collect();
+        let in_shapes: Vec<*const i64> = inputs.iter().map(|(_, s, _, _)| s.as_ptr()).collect();
+        let in_ranks: Vec<c_int> = inputs.iter().map(|(_, s, _, _)| s.len() as c_int).collect();
+        let in_dtypes: Vec<c_int> = inputs.iter().map(|(_, _, _, dt)| *dt).collect();
 
         let out_names: Vec<*const c_char> = outputs.iter().map(|(n, _)| n.as_ptr()).collect();
         let out_len: Vec<c_int> = outputs.iter().map(|(_, b)| b.len() as c_int).collect();
@@ -128,6 +134,7 @@ impl CoremlModel {
                 in_data.as_ptr(),
                 in_shapes.as_ptr(),
                 in_ranks.as_ptr(),
+                in_dtypes.as_ptr(),
                 outputs.len() as c_int,
                 out_names.as_ptr(),
                 out_data.as_ptr(),

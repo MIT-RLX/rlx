@@ -740,7 +740,9 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
             //     `cos_len / tab_half = 1`, so `s = c % 1 = 0` is the right
             //     value and matches the runtime-computed slice for absolute
             //     position `past_seq`.
-            Op::Rope { head_dim, n_rot } => {
+            Op::Rope {
+                head_dim, n_rot, ..
+            } => {
                 let head_dim = *head_dim;
                 let n_rot = *n_rot;
                 let x = get_data(arena, external, node.inputs[0]);
@@ -805,24 +807,31 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                         x_shape.dims()
                     );
                 }
+                // Total tokens across the flattened (batch · seq) grid: each
+                // token contributes `heads_per_seq` chunks.
+                let total_tokens = num_chunks / heads_per_seq.max(1);
                 for chunk in 0..num_chunks {
                     let off = chunk * head_dim;
-                    // Position derivation:
-                    //   - Packed [B, S, H*D]: chunk = ((b*S)+s)*H + h, so
-                    //     s = (chunk / heads_per_seq) % s_dim.
-                    //   - [B, H, S, D] / [B, S, D]: chunks per seq run contig,
-                    //     s = chunk % s_dim.
-                    let pos = if heads_per_seq > 1 {
-                        (chunk / heads_per_seq) % s_dim
+                    // Global token index of this chunk.
+                    //   - Packed [B, S, H*D]: chunk = ((b*S)+s)*H + h ⇒ token = chunk / H.
+                    //   - [B, H, S, D] / [B, S, D]: chunks per seq run contig ⇒ token = chunk.
+                    let token = if heads_per_seq > 1 {
+                        chunk / heads_per_seq
                     } else {
-                        chunk % s_dim
+                        chunk
                     };
-                    // For the decode-slice case (cos has a single row), force
-                    // pos = 0 so we always index the supplied past_seq slice.
                     let pos = if cos_rows == 1 {
+                        // Single supplied RoPE row (uniform decode slice): always row 0.
                         0
+                    } else if cos_rows == total_tokens && total_tokens != s_dim {
+                        // Per-token RoPE table — one row per (batch · seq) token.
+                        // Used by *ragged* batched decode, where each sequence in
+                        // the batch sits at a different absolute position. Index
+                        // by the global token, not the (collapsed) seq position.
+                        token.min(cos_rows - 1)
                     } else {
-                        pos.min(cos_rows.saturating_sub(1))
+                        // Per-seq-position table shared across the batch.
+                        (token % s_dim).min(cos_rows.saturating_sub(1))
                     };
                     if std::env::var("RLX_ROPE_DEBUG").is_ok() && chunk < 4 {
                         eprintln!("[rope]   chunk={chunk} pos={pos}");

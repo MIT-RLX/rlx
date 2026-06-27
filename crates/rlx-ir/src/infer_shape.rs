@@ -44,6 +44,10 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
                 .ok()
                 .map(|s| s.with_dtype(branches.dtype()))
         }
+        Op::Fma => {
+            let ab = shape::binary_shape(in_shape(0), in_shape(1)).ok()?;
+            shape::binary_shape(&ab, in_shape(2)).ok()
+        }
 
         Op::Activation(_) | Op::ReluBackward | Op::Conjugate => {
             Some(shape::unary_shape(in_shape(0)))
@@ -76,6 +80,8 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             shape::concat_shape(&inputs, *axis).ok()
         }
         Op::Gather { axis } => shape::gather_shape(in_shape(0), in_shape(1), *axis).ok(),
+        // Reverse flips element order along axes; shape is unchanged.
+        Op::Reverse { .. } => Some(shape::unary_shape(in_shape(0))),
         Op::Expand { target_shape } => shape::expand_shape(in_shape(0), target_shape).ok(),
 
         Op::LayerNorm { .. } | Op::LayerNorm2d { .. } | Op::GroupNorm { .. } => {
@@ -136,6 +142,56 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
 
         Op::DequantMatMul { .. } | Op::LoraMatMul { .. } | Op::QMatMul { .. } => {
             shape::matmul_shape(in_shape(0), in_shape(1)).ok()
+        }
+
+        // Native low-precision GEMM, TN layout: lhs [m,k], rhs [n,k] (K-last),
+        // out = [m,n] f32 (f32 is the accumulation type — operands are U8 codes).
+        Op::ScaledMatMul { .. } => {
+            let lhs = in_shape(0);
+            let rhs = in_shape(1);
+            if lhs.rank() < 2 || rhs.rank() < 2 {
+                None
+            } else {
+                let m = lhs.dims()[lhs.rank() - 2];
+                let n = rhs.dims()[rhs.rank() - 2];
+                Some(Shape::from_dims(&[m, n], DType::F32))
+            }
+        }
+
+        // Quantize keeps the logical shape, switches dtype to packed U8 codes.
+        Op::ScaledQuantize { .. } => Some(shape::unary_shape(in_shape(0)).with_dtype(DType::U8)),
+
+        // Dequantize: codes (U8) → f32, same logical shape.
+        Op::ScaledDequantize { .. } => Some(shape::unary_shape(in_shape(0)).with_dtype(DType::F32)),
+
+        // Scale tensor: one value (per-tensor), or one per block along the
+        // last (K) axis (block / NVFP4). Dtype follows the layout.
+        Op::ScaledQuantScale {
+            scale_layout,
+            format,
+        } => {
+            let _ = format;
+            let sd = scale_layout.scale_dtype();
+            match scale_layout {
+                crate::ScaleLayout::PerTensor => Some(Shape::new(&[1], sd)),
+                crate::ScaleLayout::BlockMxE8M0 { block }
+                | crate::ScaleLayout::Nvfp4 { group: block } => {
+                    let x = in_shape(0);
+                    let dims = x.dims();
+                    match dims.last() {
+                        Some(Dim::Static(k)) => {
+                            let mut out: Vec<usize> = dims[..dims.len() - 1]
+                                .iter()
+                                .map(|d| d.unwrap_static())
+                                .collect();
+                            out.push((*k).div_ceil(*block as usize));
+                            Some(Shape::new(&out, sd))
+                        }
+                        // Dynamic K: builder must supply the shape explicitly.
+                        _ => None,
+                    }
+                }
+            }
         }
 
         Op::GaussianSplatRender { width, height, .. } => Some(Shape::new(
@@ -226,7 +282,9 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
                 Some(shape::unary_shape(carry))
             }
         }
-        Op::ElementwiseRegion { prologue, .. } => {
+        Op::ElementwiseRegion {
+            prologue, chain, ..
+        } => {
             // A fused elementwise chain broadcasts across ALL of its inputs, not
             // just input 0 — e.g. `(g[1,C,1] + g2[1,C,1]) + x[1,C,T]) * mask[1,1,T]`
             // is `[1,C,T]`. Folding only input 0 mis-infers `[1,C,1]` and trips the
@@ -247,6 +305,12 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
                     ],
                     in_s.dtype(),
                 );
+            }
+            // Output dtype = dtype of the chain's final step, NOT input 0's:
+            // input 0 may be a bool `Where` condition (`where(cond, a, b) + …`),
+            // so inheriting its dtype mis-types the region as bool.
+            if let Some(dt) = chain_output_dtype(chain, &|i| in_shape(i).dtype()) {
+                in_s = in_s.with_dtype(dt);
             }
             Some(in_s)
         }
@@ -309,6 +373,33 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         | Op::FftButterflyStage { .. } => None,
         _ => None,
     }
+}
+
+/// Output dtype of a fused elementwise `chain`, by walking each step:
+/// `Compare → Bool`, `Cast → its dtype`, everything else → the dtype of its
+/// (value) operand. `input_dtype(i)` resolves a chain input's dtype.
+fn chain_output_dtype(
+    chain: &[ChainStep],
+    input_dtype: &dyn Fn(usize) -> crate::DType,
+) -> Option<crate::DType> {
+    let operand = |o: &ChainOperand, step_dt: &[crate::DType]| -> crate::DType {
+        match o {
+            ChainOperand::Input(i) => input_dtype(*i as usize),
+            ChainOperand::Step(j) => step_dt[*j as usize],
+        }
+    };
+    let mut step_dt: Vec<crate::DType> = Vec::with_capacity(chain.len());
+    for step in chain {
+        let dt = match step {
+            ChainStep::Compare(..) => crate::DType::Bool,
+            ChainStep::Cast(d, _) => *d,
+            ChainStep::Activation(_, o) => operand(o, &step_dt),
+            ChainStep::Binary(_, l, _) => operand(l, &step_dt),
+            ChainStep::Where(_, t, _) => operand(t, &step_dt),
+        };
+        step_dt.push(dt);
+    }
+    step_dt.last().copied()
 }
 
 #[cfg(test)]

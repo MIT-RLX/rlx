@@ -100,8 +100,7 @@ pub fn output_depends_on_differentiable(g: &Graph, output: NodeId, wrt: NodeId) 
             continue;
         }
         let node = g.node(id);
-        let inputs = diff_inputs(&node.op, &node.inputs);
-        for &inp in inputs {
+        for inp in diff_inputs(&node.op, &node.inputs) {
             q.push_back(inp);
         }
     }
@@ -109,23 +108,93 @@ pub fn output_depends_on_differentiable(g: &Graph, output: NodeId, wrt: NodeId) 
 }
 
 /// Inputs that can carry gradients w.r.t. continuous variables.
-fn diff_inputs<'a>(op: &'a Op, inputs: &'a [NodeId]) -> &'a [NodeId] {
+///
+/// Non-differentiable ops (`Compare`, `TopK`, sampling, RNG) cut all of
+/// their operands; `Where` ignores its predicate; a non-float `Cast`
+/// truncates the gradient. Fused [`Op::ElementwiseRegion`] chains hide
+/// these cuts behind a single opaque op, so we trace the chain to report
+/// only the external inputs that differentiably reach its output —
+/// otherwise the higher-order driver mistakes a `Compare`-cut path (e.g.
+/// the decomposed MaxPool backward) for a live gradient and panics.
+fn diff_inputs(op: &Op, inputs: &[NodeId]) -> Vec<NodeId> {
     match op {
         Op::Compare(_)
         | Op::TopK { .. }
         | Op::Sample { .. }
         | Op::RngNormal { .. }
-        | Op::RngUniform { .. } => &[],
+        | Op::RngUniform { .. } => Vec::new(),
         Op::Where => {
             if inputs.len() >= 3 {
-                &inputs[1..3]
+                inputs[1..3].to_vec()
             } else {
-                &[]
+                Vec::new()
             }
         }
-        Op::Cast { to } if !to.is_float() => &[],
-        _ => inputs,
+        Op::Cast { to } if !to.is_float() => Vec::new(),
+        Op::ElementwiseRegion {
+            chain, num_inputs, ..
+        } => {
+            let keep = region_diff_input_indices(chain, *num_inputs);
+            inputs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| keep.contains(&(*i as u32)))
+                .map(|(_, &id)| id)
+                .collect()
+        }
+        _ => inputs.to_vec(),
     }
+}
+
+/// External-input indices that the final step of an `ElementwiseRegion`
+/// chain differentiably depends on. Mirrors the per-op cuts in
+/// [`diff_inputs`] (`Compare` kills its operands, `Where` ignores `cond`,
+/// non-float `Cast` truncates) but applied *inside* the fused chain. The
+/// region's output is the last step's result (see `Op::ElementwiseRegion`).
+fn region_diff_input_indices(
+    chain: &[rlx_ir::op::ChainStep],
+    num_inputs: u32,
+) -> std::collections::HashSet<u32> {
+    use rlx_ir::op::{ChainOperand, ChainStep};
+    use std::collections::HashSet;
+
+    // diff-set of each step's result, in chain order (a step only refers
+    // to inputs and to strictly-earlier steps).
+    let mut step_sets: Vec<HashSet<u32>> = Vec::with_capacity(chain.len());
+    let resolve = |operand: &ChainOperand, step_sets: &[HashSet<u32>]| -> HashSet<u32> {
+        match operand {
+            ChainOperand::Input(i) if *i < num_inputs => HashSet::from([*i]),
+            ChainOperand::Input(_) => HashSet::new(),
+            ChainOperand::Step(j) => step_sets.get(*j as usize).cloned().unwrap_or_default(),
+        }
+    };
+    for step in chain {
+        let set = match step {
+            ChainStep::Activation(_, a) => resolve(a, &step_sets),
+            ChainStep::Cast(to, a) => {
+                if to.is_float() {
+                    resolve(a, &step_sets)
+                } else {
+                    HashSet::new()
+                }
+            }
+            ChainStep::Binary(_, a, b) => {
+                let mut s = resolve(a, &step_sets);
+                s.extend(resolve(b, &step_sets));
+                s
+            }
+            // Comparison output carries no gradient to its operands.
+            ChainStep::Compare(_, _, _) => HashSet::new(),
+            // Select flows gradient to the branches, never the predicate.
+            ChainStep::Where(_cond, t, f) => {
+                let mut s = resolve(t, &step_sets);
+                s.extend(resolve(f, &step_sets));
+                s
+            }
+        };
+        step_sets.push(set);
+    }
+    step_sets.last().cloned().unwrap_or_default()
 }
 
 /// Structural-equality CSE for pure (non-leaf) ops.

@@ -368,3 +368,116 @@ fn dequant_matmul_q4k_matches_reference() {
 fn dequant_matmul_q4k_metal_matches_cpu() {
     run_q4k_case(Device::Metal);
 }
+
+/// Decode-shaped (`m == 1`) GGUF GEMV on wgpu: exercises the fused
+/// `dequant_gemv_gguf` kernel (windowed bindings, no f32 scratch) for the two
+/// schemes Llama Q4_K_M uses. Multi-row matmul `m>1` keeps the scratch path;
+/// this targets the native decode GEMV added for `Device::Gpu`.
+#[cfg(feature = "gpu")]
+fn run_gguf_gemv_case(scheme: QuantScheme, k: usize, n: usize) {
+    use half::f16;
+    if !rlx_runtime::is_available(Device::Gpu) {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    }
+    assert_eq!(k % QK_K, 0, "k must be a multiple of {QK_K}");
+    let nbk = k / QK_K;
+    let m = 1usize;
+
+    // Row-major blocks: row r occupies `nbk` consecutive 256-elem blocks.
+    let mut packed = Vec::new();
+    let mut blk = |row: usize, b: usize| match scheme {
+        QuantScheme::GgufQ4K => {
+            const K_SCALE_SIZE: usize = 12;
+            packed.extend_from_slice(&f16::from_f32(1.0).to_le_bytes());
+            packed.extend_from_slice(&f16::from_f32(0.25).to_le_bytes());
+            let mut scales = [0u8; K_SCALE_SIZE];
+            for (i, s) in scales[0..8].iter_mut().enumerate() {
+                *s = (1 + ((row + b + i) % 4)) as u8;
+            }
+            packed.extend_from_slice(&scales);
+            for i in 0..(QK_K / 2) {
+                packed.push((((row + b + i) % 13) as u8) | ((((row * 2 + b + i) % 11) as u8) << 4));
+            }
+        }
+        QuantScheme::GgufQ6K => {
+            for i in 0..(QK_K / 2) {
+                packed.push(((row + b + i) % 251) as u8);
+            }
+            for i in 0..(QK_K / 4) {
+                packed.push(((row * 3 + b + i) % 251) as u8);
+            }
+            for i in 0..(QK_K / 16) {
+                packed.push(((i as i32 - 8) as i8) as u8);
+            }
+            packed.extend_from_slice(&f16::from_f32(0.5).to_le_bytes());
+        }
+        other => panic!("unsupported gemv test scheme {other:?}"),
+    };
+    for row in 0..n {
+        for b in 0..nbk {
+            blk(row, b);
+        }
+    }
+
+    let w_ref = match scheme {
+        QuantScheme::GgufQ4K => rlx_gguf::dequant_q4_k(&packed, k * n).unwrap(),
+        QuantScheme::GgufQ6K => rlx_gguf::dequant_q6_k(&packed, k * n).unwrap(),
+        _ => unreachable!(),
+    };
+    let x: Vec<f32> = (0..(m * k))
+        .map(|i| 0.01 * (i as f32 + 1.0) - 1.0)
+        .collect();
+    let mut expected = vec![0f32; m * n];
+    for c in 0..n {
+        let mut acc = 0f32;
+        for i in 0..k {
+            acc += x[i] * w_ref[c * k + i];
+        }
+        expected[c] = acc;
+    }
+
+    let mut g = Graph::new("gguf_gemv");
+    let x_in = g.input("x", Shape::new(&[m, k], DType::F32));
+    let w_packed = g.param("w_packed", Shape::new(&[packed.len()], DType::U8));
+    let y = g.add_node(
+        Op::DequantMatMul { scheme },
+        vec![x_in, w_packed],
+        Shape::new(&[m, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+
+    let session = Session::new(Device::Gpu);
+    let mut compiled = session.compile(g);
+    compiled.set_param_typed("w_packed", &packed, DType::U8);
+    let actual = compiled.run(&[("x", x.as_slice())]).pop().unwrap();
+    assert_eq!(actual.len(), expected.len());
+    let mut max_rel = 0f32;
+    for i in 0..actual.len() {
+        let rel = (actual[i] - expected[i]).abs() / expected[i].abs().max(1.0);
+        max_rel = max_rel.max(rel);
+        assert!(
+            rel < 1e-3,
+            "{scheme:?} gemv mismatch at {i}: {} vs {} (rel {rel:.2e})",
+            actual[i],
+            expected[i]
+        );
+    }
+    eprintln!("{scheme:?} wgpu gemv (k={k} n={n}) max_rel={max_rel:.2e}");
+}
+
+#[test]
+#[cfg(feature = "gpu")]
+fn dequant_matmul_q4k_gemv_wgpu_matches_cpu() {
+    run_gguf_gemv_case(QuantScheme::GgufQ4K, 256, 5);
+    // Multi-block rows (k=768 → 3 blocks/row) exercise the per-block accumulate.
+    run_gguf_gemv_case(QuantScheme::GgufQ4K, 768, 7);
+}
+
+#[test]
+#[cfg(feature = "gpu")]
+fn dequant_matmul_q6k_gemv_wgpu_matches_cpu() {
+    // Even row count → 210-byte Q6_K blocks pack to a 4-aligned param upload.
+    run_gguf_gemv_case(QuantScheme::GgufQ6K, 256, 6);
+    run_gguf_gemv_case(QuantScheme::GgufQ6K, 768, 6);
+}

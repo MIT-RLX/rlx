@@ -13,12 +13,12 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.9" }
-rlx-ir = { path = "../rlx-ir", version = "0.2.9" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.9" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.9", features = ["splat"] }
+rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.10" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.10" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", features = ["splat"] }
 # IQ-family grid LUTs staged into a device buffer by `iq_grid.rs`.
-rlx-gguf = { path = "../rlx-gguf", version = "0.2.9" }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.10" }
 
 # `dynamic-loading` lets the crate compile and link on hosts without a
 # CUDA SDK installed — libcuda is dlopen()'d at runtime. That's what
@@ -69,6 +69,14 @@ path = "src/lib.rs"
 [features]
 default = []
 native-splat = []
+# Route pow-2 f32 GPU FFT through NVIDIA cuFFT instead of the native butterfly
+# kernels. cudarc dynamically loads libcufft at runtime (same as libcuda), so no
+# extra link step. Toggle at runtime with `RLX_FFT_CUFFT=0` to A/B vs native.
+cufft = ["cudarc/cufft"]
+# Native single-kernel Stockham FFT (cuFFT-parity for n<=1024, no external dep).
+# Routes pow-2 f32 FFT (n<=4096) through on-chip butterflies; larger n falls back
+# to the multi-kernel path. Takes precedence over `cufft` for its size range.
+native-cuda-fft = []
 # Opt-in: enable cudarc's nvtx feature + the per-step `scoped_range`
 # call in `backend.rs`. CUDA 13 removed `nvToolsExt.dll`, so leaving
 # this off by default keeps builds runnable on modern installs. Turn

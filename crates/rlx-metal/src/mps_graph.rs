@@ -47,6 +47,7 @@ unsafe extern "C" {}
 mod mps_dtype {
     pub const Float32: u32 = 0x10000000 | 32;
     pub const Float16: u32 = 0x10000000 | 16;
+    pub const Int32: u32 = 0x20000000 | 32; // MPSDataTypeSignedBit | 32
 }
 
 /// True iff MPSGraph is available on this macOS version.
@@ -745,6 +746,27 @@ impl MpsGraph {
         }
     }
 
+    /// One-hot encode integer-valued `indices` (cast to int32) along `axis`
+    /// with width `depth`; on/off = 1.0/0.0, output f32.
+    pub fn one_hot(&self, indices: &MpsTensor, depth: u64, axis: u64) -> MpsTensor {
+        unsafe {
+            let idx_i = self.cast(indices, mps_dtype::Int32);
+            let nsname = ns_string("one_hot");
+            let t: *mut Object = msg_send![self.obj,
+                oneHotWithIndicesTensor: idx_i.obj
+                depth: depth
+                axis: axis
+                dataType: mps_dtype::Float32
+                onValue: 1.0f64
+                offValue: 0.0f64
+                name: nsname];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
     /// Cast tensor to a new dtype.
     pub fn cast(&self, x: &MpsTensor, to_dtype: u32) -> MpsTensor {
         unsafe {
@@ -1217,6 +1239,191 @@ impl MpsGraph {
             let t: *mut Object = msg_send![self.obj,
                 convolution2DWithSourceTensor: source.obj
                 weightsTensor: weights.obj
+                descriptor: desc
+                name: nsname];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
+    /// Build an `MPSGraphConvolution2DOpDescriptor` for the NCHW / OIHW layout
+    /// RLX uses (`x [N,C,H,W]`, `w [O,I,kH,kW]`). Returned `*mut Object` is an
+    /// autoreleased descriptor — pass straight into a conv / conv-gradient op.
+    unsafe fn conv2d_desc(
+        &self,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+    ) -> *mut Object {
+        let cls = class!(MPSGraphConvolution2DOpDescriptor);
+        msg_send![cls,
+            descriptorWithStrideInX: stride.1 as u64
+            strideInY: stride.0 as u64
+            dilationRateInX: dilation.1 as u64
+            dilationRateInY: dilation.0 as u64
+            groups: groups as u64
+            paddingLeft: padding.1 as u64
+            paddingRight: padding.1 as u64
+            paddingTop: padding.0 as u64
+            paddingBottom: padding.0 as u64
+            paddingStyle: 0i64  // MPSGraphPaddingStyleExplicit
+            dataLayout: 0i64    // NCHW
+            weightsLayout: 2i64 // OIHW
+        ]
+    }
+
+    /// Forward 2-D convolution in NCHW/OIHW (training layout). Mirrors
+    /// [`conv2d`] but with the NCHW data layout the autodiff CNN uses, and
+    /// exposes dilation/groups so the matching gradient descriptors agree.
+    pub fn conv2d_nchw(
+        &self,
+        source: &MpsTensor,
+        weights: &MpsTensor,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+    ) -> MpsTensor {
+        unsafe {
+            let desc = self.conv2d_desc(stride, padding, dilation, groups);
+            let nsname = ns_string("conv2d_nchw");
+            let t: *mut Object = msg_send![self.obj,
+                convolution2DWithSourceTensor: source.obj
+                weightsTensor: weights.obj
+                descriptor: desc
+                name: nsname];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
+    /// Conv backward w.r.t. input: `dx = ∂L/∂x` given upstream `grad` (dy) and
+    /// the forward `weights`. `out_shape` is `x`'s NCHW shape. Uses the same
+    /// forward descriptor so MPSGraph reconstructs the transposed conv exactly.
+    pub fn conv2d_data_grad(
+        &self,
+        grad: &MpsTensor,
+        weights: &MpsTensor,
+        out_shape: &[usize],
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+    ) -> MpsTensor {
+        unsafe {
+            let desc = self.conv2d_desc(stride, padding, dilation, groups);
+            let nsshape = ns_array_of_numbers(out_shape);
+            let nsname = ns_string("conv2d_data_grad");
+            let t: *mut Object = msg_send![self.obj,
+                convolution2DDataGradientWithIncomingGradientTensor: grad.obj
+                weightsTensor: weights.obj
+                outputShape: nsshape
+                forwardConvolutionDescriptor: desc
+                name: nsname];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
+    /// Conv backward w.r.t. weights: `dw = ∂L/∂w` given upstream `grad` (dy) and
+    /// the forward `source` (x). `out_shape` is `w`'s OIHW shape.
+    pub fn conv2d_weights_grad(
+        &self,
+        grad: &MpsTensor,
+        source: &MpsTensor,
+        out_shape: &[usize],
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+    ) -> MpsTensor {
+        unsafe {
+            let desc = self.conv2d_desc(stride, padding, dilation, groups);
+            let nsshape = ns_array_of_numbers(out_shape);
+            let nsname = ns_string("conv2d_weights_grad");
+            let t: *mut Object = msg_send![self.obj,
+                convolution2DWeightsGradientWithIncomingGradientTensor: grad.obj
+                sourceTensor: source.obj
+                outputShape: nsshape
+                forwardConvolutionDescriptor: desc
+                name: nsname];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
+    /// Build an `MPSGraphPooling2DOpDescriptor` (NCHW, explicit padding).
+    unsafe fn pool2d_desc(
+        &self,
+        kernel: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> *mut Object {
+        let cls = class!(MPSGraphPooling2DOpDescriptor);
+        msg_send![cls,
+            descriptorWithKernelWidth: kernel.1 as u64
+            kernelHeight: kernel.0 as u64
+            strideInX: stride.1 as u64
+            strideInY: stride.0 as u64
+            dilationRateInX: 1u64
+            dilationRateInY: 1u64
+            paddingLeft: padding.1 as u64
+            paddingRight: padding.1 as u64
+            paddingTop: padding.0 as u64
+            paddingBottom: padding.0 as u64
+            paddingStyle: 0i64 // Explicit
+            dataLayout: 0i64   // NCHW
+        ]
+    }
+
+    /// Forward 2-D max pooling, NCHW.
+    pub fn maxpool2d(
+        &self,
+        source: &MpsTensor,
+        kernel: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> MpsTensor {
+        unsafe {
+            let desc = self.pool2d_desc(kernel, stride, padding);
+            let nsname = ns_string("maxpool2d");
+            let t: *mut Object = msg_send![self.obj,
+                maxPooling2DWithSourceTensor: source.obj
+                descriptor: desc
+                name: nsname];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
+    /// Max-pool backward: routes `grad` (dy) back to the argmax positions in
+    /// `source` (x), recomputed from the descriptor. Matches RLX's
+    /// `MaxPool2dBackward` (inputs `[x, dy]`).
+    pub fn maxpool2d_grad(
+        &self,
+        grad: &MpsTensor,
+        source: &MpsTensor,
+        kernel: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> MpsTensor {
+        unsafe {
+            let desc = self.pool2d_desc(kernel, stride, padding);
+            let nsname = ns_string("maxpool2d_grad");
+            let t: *mut Object = msg_send![self.obj,
+                maxPooling2DGradientWithGradientTensor: grad.obj
+                sourceTensor: source.obj
                 descriptor: desc
                 name: nsname];
             MpsTensor {
@@ -1778,6 +1985,14 @@ unsafe fn mps_tensor_data_from_buffer(
             length: bytes as u64
             options: 0u64 // MTLResourceStorageModeShared
             deallocator: std::ptr::null::<Object>()];
+            if std::env::var_os("RLX_METAL_DEBUG").is_some() && view.is_null() {
+                eprintln!(
+                    "[rlx-metal] newBufferWithBytesNoCopy NIL: offset={offset} bytes={bytes} \
+                     ptr_page_aligned={} len_page_aligned={}",
+                    (raw_ptr as usize).is_multiple_of(16384),
+                    bytes.is_multiple_of(16384),
+                );
+            }
             msg_send![alloc,
             initWithMTLBuffer: view
             shape: nsshape

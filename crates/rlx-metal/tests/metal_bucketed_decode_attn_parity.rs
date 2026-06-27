@@ -206,6 +206,7 @@ fn metal_decode_rope_single_row_hd128_matches_cpu() {
         rlx_ir::Op::Rope {
             head_dim: dh,
             n_rot: dh,
+            style: rlx_ir::RopeStyle::NeoX,
         },
         vec![x, cos, sin],
         Shape::new(&[b, seq, hs], f),

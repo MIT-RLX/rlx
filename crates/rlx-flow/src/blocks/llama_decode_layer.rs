@@ -31,6 +31,9 @@ pub struct LlamaDecodeLayerSpec {
     pub eps: f32,
     pub use_custom_mask: bool,
     pub hidden_shape: rlx_ir::Shape,
+    /// RoPE pairing flavor. GGUF Llama weights need [`rlx_ir::RopeStyle::GptJ`];
+    /// HF-safetensors checkpoints use [`rlx_ir::RopeStyle::NeoX`] (default).
+    pub rope_style: rlx_ir::RopeStyle,
 }
 
 #[derive(Debug, Clone)]
@@ -107,8 +110,8 @@ impl BlockStage for LlamaDecodeLayerStage {
         let k = gb.mm(normed_in, k_w);
         let v = gb.mm(normed_in, v_w);
 
-        let q_rope = gb.rope(q, decode.cos, decode.sin, spec.head_dim);
-        let k_rope = gb.rope(k, decode.cos, decode.sin, spec.head_dim);
+        let q_rope = gb.rope_styled(q, decode.cos, decode.sin, spec.head_dim, spec.rope_style);
+        let k_rope = gb.rope_styled(k, decode.cos, decode.sin, spec.head_dim, spec.rope_style);
 
         let (new_k, new_v) = match (past_k, past_v) {
             (Some(past_k), Some(past_v)) => (

@@ -49,6 +49,10 @@ pub struct SelfAttnPrefillSpec {
     pub mask: MaskKind,
     pub score_scale: Option<f32>,
     pub attn_logit_softcap: Option<f32>,
+    /// RoPE pairing flavor. Defaults to NeoX (HF rotate-half); set
+    /// [`rlx_ir::op::RopeStyle::GptJ`] for GGUF-Llama-style interleaved pairs so
+    /// prefill matches the (already style-aware) decode path.
+    pub rope_style: rlx_ir::op::RopeStyle,
 }
 
 impl SelfAttnPrefillSpec {
@@ -72,7 +76,14 @@ impl SelfAttnPrefillSpec {
             mask: MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,
+            rope_style: rlx_ir::op::RopeStyle::NeoX,
         }
+    }
+
+    /// Builder-style override for the RoPE pairing flavor (GGUF Llama → GptJ).
+    pub fn with_rope_style(mut self, style: rlx_ir::op::RopeStyle) -> Self {
+        self.rope_style = style;
+        self
     }
 
     /// Builder-style override for partial RoPE. Pass `n_rot < head_dim`
@@ -130,8 +141,8 @@ impl BlockStage for SelfAttnPrefillStage {
             Some(w) => gb.mm(input.id, w),
             None => k,
         };
-        let q_rope = gb.rope_n(q, cos, sin, spec.head_dim, spec.n_rot);
-        let k_rope = gb.rope_n(k, cos, sin, spec.head_dim, spec.n_rot);
+        let q_rope = gb.rope_n_styled(q, cos, sin, spec.head_dim, spec.n_rot, spec.rope_style);
+        let k_rope = gb.rope_n_styled(k, cos, sin, spec.head_dim, spec.n_rot, spec.rope_style);
 
         let group = spec.num_heads / spec.num_kv_heads;
         let k_rep = repeat_kv(&mut gb, k_rope, spec.num_kv_heads, spec.head_dim, group);

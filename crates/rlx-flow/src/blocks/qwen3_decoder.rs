@@ -39,6 +39,9 @@ pub struct Qwen3DecoderSpec {
     pub qk_norm: bool,
     /// Explicit Q/K/V bias vectors (Qwen2); Qwen3 typically false.
     pub attention_bias: bool,
+    /// Attention mask — `Causal` for standard Qwen3, `SlidingWindow(w)` for
+    /// sliding-window models (Mistral / Gemma-style).
+    pub mask: MaskKind,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +49,8 @@ pub struct Qwen3DecoderStage {
     pub layer_prefix: String,
     pub spec: Qwen3DecoderSpec,
     pub kv_sink: Option<Arc<Mutex<Vec<rlx_ir::HirNodeId>>>>,
+    /// Optional side tap: post-RoPE Q and GQA-expanded K per layer (AIF probe).
+    pub qk_sink: Option<Arc<Mutex<Vec<rlx_ir::HirNodeId>>>>,
 }
 
 impl Qwen3DecoderStage {
@@ -54,6 +59,7 @@ impl Qwen3DecoderStage {
             layer_prefix: format!("model.layers.{layer_idx}"),
             spec,
             kv_sink: None,
+            qk_sink: None,
         }
     }
 
@@ -66,6 +72,21 @@ impl Qwen3DecoderStage {
             layer_prefix: format!("model.layers.{layer_idx}"),
             spec,
             kv_sink: Some(kv_sink),
+            qk_sink: None,
+        }
+    }
+
+    pub fn layer_with_kv_qk(
+        layer_idx: usize,
+        spec: Qwen3DecoderSpec,
+        kv_sink: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+        qk_sink: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+    ) -> Self {
+        Self {
+            layer_prefix: format!("model.layers.{layer_idx}"),
+            spec,
+            kv_sink: Some(kv_sink),
+            qk_sink: Some(qk_sink),
         }
     }
 }
@@ -175,9 +196,13 @@ impl BlockStage for Qwen3DecoderStage {
         }
         let k_rep = repeat_kv(&mut gb, k_rope, nkv, dh, group);
         let v_rep = repeat_kv(&mut gb, v, nkv, dh, group);
+        if let Some(ref sink) = self.qk_sink {
+            sink.lock().expect("qwen3 qk sink").push(q_rope);
+            sink.lock().expect("qwen3 qk sink").push(k_rep);
+        }
 
         let attn_shape = shape::attention_shape(gb.shape(q_rope));
-        let attn = gb.attention_kind(q_rope, k_rep, v_rep, nh, dh, MaskKind::Causal, attn_shape);
+        let attn = gb.attention_kind(q_rope, k_rep, v_rep, nh, dh, spec.mask, attn_shape);
         let attn_out = gb.mm(attn, o_w);
         let post_attn = gb.add(skip, attn_out);
         let normed_post = gb.rms_norm(post_attn, post_ln_g, zero_beta_h, spec.eps);

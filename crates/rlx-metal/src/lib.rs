@@ -37,82 +37,92 @@
 //! - 273 GB/s memory bandwidth (vs 120 on CPU)
 //! - MPSMatrixMultiplication uses dedicated matmul hardware
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod device;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod arena;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod blas;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod mps_blas;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod mps_graph;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod mps_graph_hybrid;
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod mps_graph_lower;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod mps_gelu;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod icb;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod kernels;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod fft_dispatch;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod llada2_gate;
+#[cfg(rlx_metal_host)]
 pub mod ms_deform_attn;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod cost;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod calibrate;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod thunk;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod backend;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod attention_bwd_gpu;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod thunk_profile;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
+pub mod gpu_time;
+
+#[cfg(rlx_metal_host)]
+pub mod encode_profile;
+
+#[cfg(rlx_metal_host)]
+pub mod counter_profile;
+
+#[cfg(rlx_metal_host)]
 pub mod mps_profile;
 
-#[cfg(all(feature = "native-splat", target_os = "macos"))]
+#[cfg(all(feature = "native-splat", rlx_metal_host))]
 pub mod splat_adam;
-#[cfg(all(feature = "native-splat", target_os = "macos"))]
+#[cfg(all(feature = "native-splat", rlx_metal_host))]
 pub mod splat_native;
-#[cfg(all(feature = "native-splat", target_os = "macos"))]
+#[cfg(all(feature = "native-splat", rlx_metal_host))]
 pub mod splat_training;
-#[cfg(all(feature = "native-splat", target_os = "macos"))]
+#[cfg(all(feature = "native-splat", rlx_metal_host))]
 pub mod splat_training_pipeline;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod pipeline_cache;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod onnx_qmatmul;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod async_copy;
 
-#[cfg(target_os = "macos")]
+#[cfg(rlx_metal_host)]
 pub mod op_registry;
 
 /// PLAN: Schedule splitting for the Metal MPSGraph path. Splits the
@@ -124,13 +134,13 @@ pub mod op_registry;
 /// compilation is the next chunk.
 pub mod segmented;
 
-/// Stub when not on macOS — Metal is only available on Apple platforms.
-#[cfg(not(target_os = "macos"))]
-pub fn is_available() -> bool {
-    false
-}
-
-#[cfg(target_os = "macos")]
+/// Whether a usable Metal device is present. `rlx-metal` is a Metal-only
+/// dependency (its consumers gate it to `cfg(all(target_vendor = "apple",
+/// not(target_os = "watchos")))` — every Apple platform with Metal: macOS,
+/// iOS, tvOS, visionOS), so this is never a non-Apple `false` stub — callers
+/// on other platforms (and watchOS) report Metal availability via the
+/// runtime's own device-feature check, not this crate.
+#[cfg(rlx_metal_host)]
 pub fn is_available() -> bool {
     device::has_metal_device()
 }

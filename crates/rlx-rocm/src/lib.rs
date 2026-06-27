@@ -38,6 +38,7 @@ pub mod gguf_host;
 pub mod hip;
 pub mod hipblas;
 pub mod hipblaslt;
+pub mod host_misc;
 pub mod host_staging;
 pub mod im2col_host;
 pub mod kernels;

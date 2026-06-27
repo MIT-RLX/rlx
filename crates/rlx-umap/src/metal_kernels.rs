@@ -7,7 +7,7 @@
 
 //! Metal host-side kernels for `umap.knn` (unified memory roundtrip).
 
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
 
 use std::sync::Arc;
 

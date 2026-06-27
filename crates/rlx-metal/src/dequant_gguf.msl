@@ -21,6 +21,13 @@
 //     16      | IQ3_S     | 256         | 110   (uses grid LUT)
 //     17      | IQ1_S     | 256         | 50    (uses grid LUT)
 //     18      | IQ1_M     | 256         | 56    (uses grid LUT)
+//     19      | Q4_0      | 32          | 18
+//     20      | Q8_0      | 32          | 34
+//     21      | Q4_1      | 32          | 20
+//     22      | Q5_0      | 32          | 22
+//     23      | Q5_1      | 32          | 24
+//
+// Full backend matrix: docs/gguf-backend-paths.md
 //
 // Caller passes `num_blocks = total_elements / scheme.block_elems`.
 //
@@ -121,7 +128,9 @@ kernel void dequant_gguf(
     device uchar* w_base = (device uchar*)((device char*)arena + w_byte_off);
 
     // ── 256-elem block schemes (K-quants, IQ4_XS, IQ2/3/1, TQ) ─────
-    if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u) {
+    if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u
+        && scheme_id != 19u && scheme_id != 20u
+        && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u) {
         device float* dst = arena + dst_f32_off + gid * DQ_QK_K;
 
         if (scheme_id == 3u) {
@@ -612,7 +621,85 @@ kernel void dequant_gguf(
         return;
     }
 
-    // ── 32-elem block schemes: IQ4_NL, MXFP4 ──────────────────────
+    // ── 32-elem block schemes: IQ4_NL, Q4_0, Q8_0, MXFP4 ──────────
+    if (scheme_id == 19u) {
+        // Q4_0: f16 d | 16 packed nibbles (18 bytes / 32 elements).
+        uint off = gid * 18u;
+        float d = dq_read_f16(w_base, off);
+        device const uchar* qs = w_base + off + 2u;
+        device float* dst = arena + dst_f32_off + gid * DQ_QK4_NL;
+        for (uint j = 0u; j < DQ_QK4_NL / 2u; ++j) {
+            uchar bx = qs[j];
+            dst[j] = d * float(int(bx & 0x0Fu) - 8);
+            dst[j + DQ_QK4_NL / 2u] = d * float(int(bx >> 4) - 8);
+        }
+        return;
+    }
+
+    if (scheme_id == 20u) {
+        // Q8_0: f16 d | 32 i8 quants (34 bytes / 32 elements).
+        uint off = gid * 34u;
+        float d = dq_read_f16(w_base, off);
+        device const uchar* qs = w_base + off + 2u;
+        device float* dst = arena + dst_f32_off + gid * DQ_QK4_NL;
+        for (uint j = 0u; j < DQ_QK4_NL; ++j) {
+            dst[j] = d * float(int8_t(qs[j]));
+        }
+        return;
+    }
+
+    if (scheme_id == 21u) {
+        // Q4_1: f16 d | f16 min | 16 packed nibbles (20 bytes / 32 elements).
+        uint off = gid * 20u;
+        float d = dq_read_f16(w_base, off);
+        float m = dq_read_f16(w_base, off + 2u);
+        device const uchar* qs = w_base + off + 4u;
+        device float* dst = arena + dst_f32_off + gid * DQ_QK4_NL;
+        for (uint j = 0u; j < DQ_QK4_NL / 2u; ++j) {
+            uchar bx = qs[j];
+            dst[j] = d * float(bx & 0x0Fu) + m;
+            dst[j + DQ_QK4_NL / 2u] = d * float(bx >> 4) + m;
+        }
+        return;
+    }
+
+    if (scheme_id == 22u) {
+        // Q5_0: f16 d | u32 qh | 16 packed nibbles (22 bytes / 32 elements).
+        uint off = gid * 22u;
+        float d = dq_read_f16(w_base, off);
+        uint qh = uint(w_base[off + 2u]) | (uint(w_base[off + 3u]) << 8u)
+            | (uint(w_base[off + 4u]) << 16u) | (uint(w_base[off + 5u]) << 24u);
+        device const uchar* qs = w_base + off + 6u;
+        device float* dst = arena + dst_f32_off + gid * DQ_QK4_NL;
+        for (uint j = 0u; j < DQ_QK4_NL / 2u; ++j) {
+            uchar bx = qs[j];
+            uint xh0 = ((qh >> j) & 0x01u) << 4u;
+            uint xh1 = ((qh >> (j + 16u)) & 0x01u) << 4u;
+            dst[j] = d * float(int((bx & 0x0Fu) | xh0) - 16);
+            dst[j + DQ_QK4_NL / 2u] = d * float(int((bx >> 4) | xh1) - 16);
+        }
+        return;
+    }
+
+    if (scheme_id == 23u) {
+        // Q5_1: f16 d | f16 min | u32 qh | 16 packed nibbles (24 bytes / 32 elements).
+        uint off = gid * 24u;
+        float d = dq_read_f16(w_base, off);
+        float m = dq_read_f16(w_base, off + 2u);
+        uint qh = uint(w_base[off + 4u]) | (uint(w_base[off + 5u]) << 8u)
+            | (uint(w_base[off + 6u]) << 16u) | (uint(w_base[off + 7u]) << 24u);
+        device const uchar* qs = w_base + off + 8u;
+        device float* dst = arena + dst_f32_off + gid * DQ_QK4_NL;
+        for (uint j = 0u; j < DQ_QK4_NL / 2u; ++j) {
+            uchar bx = qs[j];
+            uint xh0 = ((qh >> j) & 0x01u) << 4u;
+            uint xh1 = ((qh >> (j + 16u)) & 0x01u) << 4u;
+            dst[j] = d * float((bx & 0x0Fu) | xh0) + m;
+            dst[j + DQ_QK4_NL / 2u] = d * float((bx >> 4) | xh1) + m;
+        }
+        return;
+    }
+
     if (scheme_id == 6u) {
         // IQ4_NL: 18 bytes / 32 elements.
         uint off = gid * 18u;
@@ -679,6 +766,170 @@ kernel void dequant_gguf(
             dst[2u * j + 1u] = s * FP4[bx >> 4];
         }
         return;
+    }
+}
+
+// ── Fused Q4_0 / Q8_0 GEMV (m == 1, k % 32 == 0) ───────────────────────────
+
+kernel void q4_0_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / 32u;
+    const uint BLK_BYTES = 18u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float4 acc4 = float4(0.0f);
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d = dq_read_f16(w0, off);
+        device const uchar* qs = w0 + off + 2u;
+        for (uint l = 0u; l < 32u; l += 4u) {
+            float4 ww;
+            for (uint i = 0u; i < 4u; ++i) {
+                uint idx = l + i;
+                uint byte_idx = idx >> 1;
+                uint nib = (idx & 1u) == 0u ? (uint(qs[byte_idx]) & 0x0Fu) : (uint(qs[byte_idx]) >> 4);
+                float w = d * float(int(nib) - 8);
+                if (i == 0u) ww.x = w;
+                else if (i == 1u) ww.y = w;
+                else if (i == 2u) ww.z = w;
+                else ww.w = w;
+            }
+            float4 xv = *(device const float4*)(x + x_idx);
+            acc4 += xv * ww;
+            x_idx += 4u;
+        }
+    }
+    dst[gid] = acc4.x + acc4.y + acc4.z + acc4.w;
+}
+
+kernel void q4_1_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / 32u;
+    const uint BLK_BYTES = 20u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d = dq_read_f16(w0, off);
+        float m = dq_read_f16(w0, off + 2u);
+        device const uchar* qs = w0 + off + 4u;
+        for (uint j = 0u; j < 16u; ++j) {
+            acc += x[x_idx++] * (d * float(qs[j] & 0x0Fu) + m);
+        }
+        for (uint j = 0u; j < 16u; ++j) {
+            acc += x[x_idx++] * (d * float(qs[j] >> 4) + m);
+        }
+    }
+    dst[gid] = acc;
+}
+
+kernel void q8_0_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / 32u;
+    const uint BLK_BYTES = 34u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float4 acc4 = float4(0.0f);
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d = dq_read_f16(w0, off);
+        device const char* qs = (device const char*)(w0 + off + 2u);
+        for (uint l = 0u; l < 32u; l += 4u) {
+            float4 ww;
+            ww.x = d * float(qs[l]);
+            ww.y = d * float(qs[l + 1u]);
+            ww.z = d * float(qs[l + 2u]);
+            ww.w = d * float(qs[l + 3u]);
+            float4 xv = *(device const float4*)(x + x_idx);
+            acc4 += xv * ww;
+            x_idx += 4u;
+        }
+    }
+    dst[gid] = acc4.x + acc4.y + acc4.z + acc4.w;
+}
+
+// ── DIAGNOSTIC: pure read-bandwidth probe (RLX_METAL_Q4K_PROBE=1) ─────────
+// Reads the exact same Q4K weight bytes as `q4k_mv_f32` (one thread per
+// output row, full row streamed) but does NO dequant math / no x — just XORs
+// raw u32 words. Compare its GPU-busy to the real GEMV: if the probe is far
+// faster, the GEMV is compute-bound (dequant ALU); if equal, memory-bound.
+// Not wired into any real path except behind the probe flag.
+kernel void q4k_readbw_probe(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks   = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 2u + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 2u; // 144
+    device const uint* w = (device const uint*)((device char*)arena + w_off
+                            + (ulong)gid * nblocks * BLK_BYTES);
+    const uint nwords = nblocks * BLK_BYTES / 4u;
+    uint acc = 0u;
+    for (uint i = 0u; i < nwords; ++i) acc ^= w[i];
+    device float* dst = (device float*)((device char*)arena + dst_off);
+    dst[gid] = float(acc & 1u);
+}
+
+// DIAGNOSTIC: perfectly-coalesced, max-MLP flat read of the weight region
+// (RLX_METAL_Q4K_PROBE=flat). Thread `gid` reads flat word `gid` of the whole
+// [n_dim, nblocks*144] weight — consecutive threads = consecutive words =
+// ideal coalescing, millions of threads = max memory-level parallelism. If
+// this hits ~peak GB/s but the row-per-thread probe doesn't, the GEMV is
+// coalescing/occupancy-limited (rewrite helps); if this is ALSO slow, the
+// arena memory itself is the ceiling (rewrite can't help).
+kernel void q4k_flatread_probe(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    const uint nblocks = k_dim / DQ_QK_K;
+    const ulong total_words = (ulong)n_dim * nblocks * 144u / 4u;
+    if ((ulong)gid >= total_words) return;
+    device const uint* w = (device const uint*)((device char*)arena + w_off);
+    uint v = w[gid];
+    if (v == 0xDEADBEEFu) {
+        device float* dst = (device float*)((device char*)arena + dst_off);
+        dst[gid % n_dim] = 1.0f;
     }
 }
 
@@ -894,4 +1145,742 @@ kernel void q4k_mv_f32_sg(
             dst[row_idx] = total;
         }
     }
+}
+
+// ── Fused Q4_K / Q6_K GEMM (m > 1, prefill) ────────────────────────────────
+//
+// Computes C[m,n] = A[m,k] @ dequant(B)[n,k]^T directly from the packed GGUF
+// weight — no f32 dequant scratch, no MPS sgemm. Mirrors the m==1 GEMV kernels
+// (`q4k_mv_f32`) but accumulates a tile of up to TM rows per output column, so
+// each weight super-block is dequantized once and reused across the tile.
+//
+// Grid: x = output column j (0..n), y = row-tile (0..ceil(m/TM)). Each thread
+// owns one (column, row-tile). Loads of x are clamped to a valid row so the
+// fixed-TM unroll keeps `acc[]` in registers (out-of-tile rows simply don't
+// accumulate). Matches the CPU reference in rlx-cpu gguf_matmul (`gguf_matmul_bt`).
+
+constant uint Q4K_MM_TM = 8u;
+
+kernel void q4k_mm_f32(
+    device float* arena    [[buffer(0)]],
+    constant ulong& x_off  [[buffer(1)]],
+    constant ulong& w_off  [[buffer(2)]],
+    constant ulong& dst_off[[buffer(3)]],
+    constant uint& m_dim   [[buffer(4)]],
+    constant uint& k_dim   [[buffer(5)]],
+    constant uint& n_dim   [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint col  = gid.x;
+    const uint row0 = gid.y * Q4K_MM_TM;
+    if (col >= n_dim || row0 >= m_dim) return;
+
+    const uint nblocks   = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 144u;        // 2+2+12+128
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off
+                            + (ulong)col * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+
+    float4 acc[Q4K_MM_TM];
+    for (uint r = 0u; r < Q4K_MM_TM; ++r) acc[r] = float4(0.0f);
+
+    uint p = 0u;  // running k position within the row
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d    = dq_read_f16(w0, off);
+        float dmin = dq_read_f16(w0, off + 2u);
+        device const uchar* scales = w0 + off + 4u;
+        device const uchar* qs     = w0 + off + 4u + DQ_K_SCALE_SIZE;
+        uint is = 0u;
+        for (uint j = 0u; j < 8u; j += 2u) {
+            uint sc0, m0, sc1, m1;
+            dq_get_scale_min_k4(scales, j,      sc0, m0);
+            dq_get_scale_min_k4(scales, j + 1u, sc1, m1);
+            float d0 = d * float(sc0), m0f = dmin * float(m0);
+            float d1 = d * float(sc1), m1f = dmin * float(m1);
+            // low-nibble half (32 elements, 8 float4 chunks)
+            for (uint l = 0u; l < 32u; l += 4u) {
+                uint q4 = *(device const uint*)(qs + is + l);
+                float4 ww;
+                ww.x = d0 * float(q4         & 0x0Fu) - m0f;
+                ww.y = d0 * float((q4 >>  8) & 0x0Fu) - m0f;
+                ww.z = d0 * float((q4 >> 16) & 0x0Fu) - m0f;
+                ww.w = d0 * float((q4 >> 24) & 0x0Fu) - m0f;
+                for (uint r = 0u; r < Q4K_MM_TM; ++r) {
+                    uint rr = row0 + r;
+                    uint rc = min(rr, m_dim - 1u);
+                    float4 xv = *(device const float4*)(x + (ulong)rc * k_dim + p);
+                    if (rr < m_dim) acc[r] += xv * ww;
+                }
+                p += 4u;
+            }
+            // high-nibble half
+            for (uint l = 0u; l < 32u; l += 4u) {
+                uint q4 = *(device const uint*)(qs + is + l);
+                float4 ww;
+                ww.x = d1 * float((q4 >>  4) & 0x0Fu) - m1f;
+                ww.y = d1 * float((q4 >> 12) & 0x0Fu) - m1f;
+                ww.z = d1 * float((q4 >> 20) & 0x0Fu) - m1f;
+                ww.w = d1 * float((q4 >> 28) & 0x0Fu) - m1f;
+                for (uint r = 0u; r < Q4K_MM_TM; ++r) {
+                    uint rr = row0 + r;
+                    uint rc = min(rr, m_dim - 1u);
+                    float4 xv = *(device const float4*)(x + (ulong)rc * k_dim + p);
+                    if (rr < m_dim) acc[r] += xv * ww;
+                }
+                p += 4u;
+            }
+            is += 32u;
+        }
+    }
+
+    for (uint r = 0u; r < Q4K_MM_TM; ++r) {
+        uint rr = row0 + r;
+        if (rr < m_dim)
+            dst[(ulong)rr * n_dim + col] = acc[r].x + acc[r].y + acc[r].z + acc[r].w;
+    }
+}
+
+constant uint Q6K_MM_TM = 8u;
+
+kernel void q6k_mm_f32(
+    device float* arena    [[buffer(0)]],
+    constant ulong& x_off  [[buffer(1)]],
+    constant ulong& w_off  [[buffer(2)]],
+    constant ulong& dst_off[[buffer(3)]],
+    constant uint& m_dim   [[buffer(4)]],
+    constant uint& k_dim   [[buffer(5)]],
+    constant uint& n_dim   [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint col  = gid.x;
+    const uint row0 = gid.y * Q6K_MM_TM;
+    if (col >= n_dim || row0 >= m_dim) return;
+
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK     = 210u;          // 128 ql + 64 qh + 16 sc + 2 d(f16)
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off
+                            + (ulong)col * nblocks * BLK;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+
+    float acc[Q6K_MM_TM];
+    for (uint r = 0u; r < Q6K_MM_TM; ++r) acc[r] = 0.0f;
+
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK;
+        uint pbase = b * DQ_QK_K;
+        device const uchar* ql = w0 + off;
+        device const uchar* qh = w0 + off + 128u;
+        device const uchar* sc = w0 + off + 192u;
+        float d = dq_read_f16(w0, off + 208u);
+        for (uint h = 0u; h < 2u; ++h) {
+            uint dst_base = h * 128u, ql_off = h * 64u, qh_off_h = h * 32u, sc_off = h * 8u;
+            for (uint l = 0u; l < 32u; ++l) {
+                uint is = l / 16u;
+                uchar qh_b = qh[qh_off_h + l];
+                float q1 = float(int(((ql[ql_off + l] & 0x0Fu)        | (((qh_b >> 0) & 3u) << 4u))) - 32);
+                float q2 = float(int(((ql[ql_off + l + 32u] & 0x0Fu)  | (((qh_b >> 2) & 3u) << 4u))) - 32);
+                float q3 = float(int(((ql[ql_off + l] >> 4)           | (((qh_b >> 4) & 3u) << 4u))) - 32);
+                float q4 = float(int(((ql[ql_off + l + 32u] >> 4)     | (((qh_b >> 6) & 3u) << 4u))) - 32);
+                float w1 = d * float(int8_t(sc[sc_off + is]))       * q1;
+                float w2 = d * float(int8_t(sc[sc_off + is + 2u]))  * q2;
+                float w3 = d * float(int8_t(sc[sc_off + is + 4u]))  * q3;
+                float w4 = d * float(int8_t(sc[sc_off + is + 6u]))  * q4;
+                uint p1 = pbase + dst_base + l;
+                uint p2 = p1 + 32u;
+                uint p3 = p1 + 64u;
+                uint p4 = p1 + 96u;
+                for (uint r = 0u; r < Q6K_MM_TM; ++r) {
+                    uint rr = row0 + r;
+                    uint rc = min(rr, m_dim - 1u);
+                    device const float* xr = x + (ulong)rc * k_dim;
+                    float a = xr[p1] * w1 + xr[p2] * w2 + xr[p3] * w3 + xr[p4] * w4;
+                    if (rr < m_dim) acc[r] += a;
+                }
+            }
+        }
+    }
+
+    for (uint r = 0u; r < Q6K_MM_TM; ++r) {
+        uint rr = row0 + r;
+        if (rr < m_dim) dst[(ulong)rr * n_dim + col] = acc[r];
+    }
+}
+
+// ── Fused IQ4_NL / IQ2_XXS GEMV (m == 1) ───────────────────────────────────
+
+kernel void iq4_nl_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK4_NL;
+    const uint BLK_BYTES = 18u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d = dq_read_f16(w0, off);
+        device const uchar* qs = w0 + off + 2u;
+        for (uint j = 0u; j < 16u; ++j) {
+            uint nib = uint(qs[j]) & 0x0Fu;
+            acc += x[x_idx++] * (d * float(kvalues_iq4nl_lut[nib]));
+        }
+        for (uint j = 0u; j < 16u; ++j) {
+            uint nib = uint(qs[j]) >> 4;
+            acc += x[x_idx++] * (d * float(kvalues_iq4nl_lut[nib]));
+        }
+    }
+    dst[gid] = acc;
+}
+
+kernel void iq2_xxs_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    device const uchar* iq_lut   [[buffer(6)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 66u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d = dq_read_f16(w0, off);
+        device const uchar* qs = w0 + off + 2u;
+        for (uint ib32 = 0u; ib32 < 8u; ++ib32) {
+            uint base = 8u * ib32;
+            uint aux32_0 = uint(qs[base + 0u]) | (uint(qs[base + 1u]) << 8u)
+                         | (uint(qs[base + 2u]) << 16u) | (uint(qs[base + 3u]) << 24u);
+            uint aux32_1 = uint(qs[base + 4u]) | (uint(qs[base + 5u]) << 8u)
+                         | (uint(qs[base + 6u]) << 16u) | (uint(qs[base + 7u]) << 24u);
+            uchar a0 = uchar(aux32_0 & 0xFFu);
+            uchar a1 = uchar((aux32_0 >> 8) & 0xFFu);
+            uchar a2 = uchar((aux32_0 >> 16) & 0xFFu);
+            uchar a3 = uchar((aux32_0 >> 24) & 0xFFu);
+            float db = d * (0.5f + float(aux32_1 >> 28)) * 0.25f;
+            uchar grid_bytes[4] = { a0, a1, a2, a3 };
+            for (uint l = 0u; l < 4u; ++l) {
+                uint grid_off = IQ_GRID_OFF_IQ2XXS + uint(grid_bytes[l]) * 8u;
+                uchar signs = lut_u8(iq_lut, IQ_GRID_OFF_KSIGNS + ((aux32_1 >> (7u * l)) & 127u));
+                for (uint j = 0u; j < 8u; ++j) {
+                    int gv = lut_i8(iq_lut, grid_off + j);
+                    uchar mask = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j);
+                    float s = (signs & mask) != 0u ? -1.0f : 1.0f;
+                    acc += x[x_idx] * (db * float(gv) * s);
+                    x_idx += 1u;
+                }
+            }
+        }
+    }
+    dst[gid] = acc;
+}
+
+kernel void iq2_xs_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    device const uchar* iq_lut   [[buffer(6)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 74u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d = dq_read_f16(w0, off);
+        device const uchar* qs = w0 + off + 2u;
+        device const uchar* scales = w0 + off + 2u + 64u;
+        for (uint ib32 = 0u; ib32 < 8u; ++ib32) {
+            float db0 = d * (0.5f + float(scales[ib32] & 0xFu)) * 0.25f;
+            float db1 = d * (0.5f + float(scales[ib32] >> 4u)) * 0.25f;
+            for (uint l = 0u; l < 4u; ++l) {
+                uint pos = (4u * ib32 + l) * 2u;
+                uint q = uint(qs[pos]) | (uint(qs[pos + 1u]) << 8u);
+                uint grid_off = IQ_GRID_OFF_IQ2XS + (q & 511u) * 8u;
+                uchar signs = lut_u8(iq_lut, IQ_GRID_OFF_KSIGNS + (q >> 9));
+                float dl = (l / 2u == 0u) ? db0 : db1;
+                for (uint j = 0u; j < 8u; ++j) {
+                    int gv = lut_i8(iq_lut, grid_off + j);
+                    uchar mask = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j);
+                    float s = (signs & mask) != 0u ? -1.0f : 1.0f;
+                    acc += x[x_idx] * (dl * float(gv) * s);
+                    x_idx += 1u;
+                }
+            }
+        }
+    }
+    dst[gid] = acc;
+}
+
+kernel void iq3_xxs_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    device const uchar* iq_lut   [[buffer(6)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 98u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d = dq_read_f16(w0, off);
+        device const uchar* qs = w0 + off + 2u;
+        device const uchar* sas = w0 + off + 2u + 64u;
+        uint qs_idx = 0u;
+        for (uint ib32 = 0u; ib32 < 8u; ++ib32) {
+            uint aux32 = uint(sas[4u * ib32]) | (uint(sas[4u * ib32 + 1u]) << 8u)
+                       | (uint(sas[4u * ib32 + 2u]) << 16u) | (uint(sas[4u * ib32 + 3u]) << 24u);
+            float db = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+            for (uint l = 0u; l < 4u; ++l) {
+                uchar signs = lut_u8(iq_lut, IQ_GRID_OFF_KSIGNS + ((aux32 >> (7u * l)) & 127u));
+                uint g1_off = IQ_GRID_OFF_IQ3XXS + uint(qs[qs_idx + 2u * l]) * 4u;
+                uint g2_off = IQ_GRID_OFF_IQ3XXS + uint(qs[qs_idx + 2u * l + 1u]) * 4u;
+                for (uint j = 0u; j < 4u; ++j) {
+                    int g1 = lut_i8(iq_lut, g1_off + j);
+                    uchar m0 = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j);
+                    float s0 = (signs & m0) != 0u ? -1.0f : 1.0f;
+                    acc += x[x_idx] * (db * float(g1) * s0);
+                    x_idx += 1u;
+                }
+                for (uint j = 0u; j < 4u; ++j) {
+                    int g2 = lut_i8(iq_lut, g2_off + j);
+                    uchar m1 = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j + 4u);
+                    float s1 = (signs & m1) != 0u ? -1.0f : 1.0f;
+                    acc += x[x_idx] * (db * float(g2) * s1);
+                    x_idx += 1u;
+                }
+            }
+            qs_idx += 8u;
+        }
+    }
+    dst[gid] = acc;
+}
+
+kernel void iq2_s_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    device const uchar* iq_lut   [[buffer(6)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 82u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d = dq_read_f16(w0, off);
+        device const uchar* qs = w0 + off + 2u;
+        device const uchar* qh = w0 + off + 2u + 64u;
+        device const uchar* scales = w0 + off + 2u + 64u + 8u;
+        uint qs_idx = 0u, signs_idx = 32u;
+        for (uint ib32 = 0u; ib32 < 8u; ++ib32) {
+            float db0 = d * (0.5f + float(scales[ib32] & 0xFu)) * 0.25f;
+            float db1 = d * (0.5f + float(scales[ib32] >> 4u)) * 0.25f;
+            for (uint l = 0u; l < 4u; ++l) {
+                float dl = (l / 2u == 0u) ? db0 : db1;
+                uint q = uint(qs[qs_idx + l]);
+                uint qh_b = uint(qh[ib32]);
+                uint idx = q | ((qh_b << (8u - 2u * l)) & 0x300u);
+                uint grid_off = IQ_GRID_OFF_IQ2S + idx * 8u;
+                uchar sign = qs[signs_idx + l];
+                for (uint j = 0u; j < 8u; ++j) {
+                    int gv = lut_i8(iq_lut, grid_off + j);
+                    uchar mask = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j);
+                    float s = (sign & mask) != 0u ? -1.0f : 1.0f;
+                    acc += x[x_idx] * (dl * float(gv) * s);
+                    x_idx += 1u;
+                }
+            }
+            qs_idx += 4u;
+            signs_idx += 4u;
+        }
+    }
+    dst[gid] = acc;
+}
+
+kernel void iq3_s_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    device const uchar* iq_lut   [[buffer(6)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 110u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d = dq_read_f16(w0, off);
+        device const uchar* qs = w0 + off + 2u;
+        device const uchar* qh = w0 + off + 2u + 64u;
+        device const uchar* signs = w0 + off + 2u + 64u + 8u;
+        device const uchar* scales = w0 + off + 2u + 64u + 8u + 32u;
+        uint qs_walk = 0u, signs_walk = 0u, qh_walk = 0u;
+        for (uint ib32 = 0u; ib32 < 8u; ib32 += 2u) {
+            float db1 = d * (1.0f + 2.0f * float(scales[ib32 / 2u] & 0xFu));
+            float db2 = d * (1.0f + 2.0f * float(scales[ib32 / 2u] >> 4u));
+            for (uint half_iter = 0u; half_iter < 2u; ++half_iter) {
+                float dl = (half_iter == 0u) ? db1 : db2;
+                uint qh_byte = uint(qh[qh_walk + half_iter]);
+                for (uint l = 0u; l < 4u; ++l) {
+                    uint idx1 = uint(qs[qs_walk + 2u * l]) | (((qh_byte << (8u - 2u * l)) & 256u));
+                    uint idx2 = uint(qs[qs_walk + 2u * l + 1u]) | (((qh_byte << (7u - 2u * l)) & 256u));
+                    uint g1_off = IQ_GRID_OFF_IQ3S + idx1 * 4u;
+                    uint g2_off = IQ_GRID_OFF_IQ3S + idx2 * 4u;
+                    uchar sign = signs[signs_walk + l];
+                    for (uint j = 0u; j < 4u; ++j) {
+                        int g1 = lut_i8(iq_lut, g1_off + j);
+                        uchar m0 = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j);
+                        float s0 = (sign & m0) != 0u ? -1.0f : 1.0f;
+                        acc += x[x_idx] * (dl * float(g1) * s0);
+                        x_idx += 1u;
+                    }
+                    for (uint j = 0u; j < 4u; ++j) {
+                        int g2 = lut_i8(iq_lut, g2_off + j);
+                        uchar m1 = lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j + 4u);
+                        float s1 = (sign & m1) != 0u ? -1.0f : 1.0f;
+                        acc += x[x_idx] * (dl * float(g2) * s1);
+                        x_idx += 1u;
+                    }
+                }
+                qs_walk += 8u;
+                signs_walk += 4u;
+            }
+            qh_walk += 2u;
+        }
+    }
+    dst[gid] = acc;
+}
+
+kernel void iq1_s_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    device const uchar* iq_lut   [[buffer(6)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 50u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d = dq_read_f16(w0, off);
+        device const uchar* qs = w0 + off + 2u;
+        device const uchar* qh_bytes = w0 + off + 2u + 32u;
+        uint qs_idx = 0u;
+        for (uint ib = 0u; ib < 8u; ++ib) {
+            uint qh = uint(qh_bytes[2u * ib]) | (uint(qh_bytes[2u * ib + 1u]) << 8u);
+            float dl = d * (2.0f * float((qh >> 12) & 7u) + 1.0f);
+            float delta = (qh & 0x8000u) != 0u ? -0.125f : 0.125f;
+            for (uint l = 0u; l < 4u; ++l) {
+                uint idx = uint(qs[qs_idx + l]) | (((qh >> (3u * l)) & 7u) << 8u);
+                uint grid_off = IQ_GRID_OFF_IQ1S + idx * 8u;
+                for (uint j = 0u; j < 8u; ++j) {
+                    int gv = lut_i8(iq_lut, grid_off + j);
+                    acc += x[x_idx] * (dl * (float(gv) + delta));
+                    x_idx += 1u;
+                }
+            }
+            qs_idx += 4u;
+        }
+    }
+    dst[gid] = acc;
+}
+
+kernel void iq1_m_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    device const uchar* iq_lut   [[buffer(6)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 56u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        device const uchar* qs = w0 + off;
+        device const uchar* qh = w0 + off + 32u;
+        device const uchar* scales_b = w0 + off + 48u;
+        uint sc0 = lut_u16(scales_b, 0u);
+        uint sc1 = lut_u16(scales_b, 2u);
+        uint sc2 = lut_u16(scales_b, 4u);
+        uint sc3 = lut_u16(scales_b, 6u);
+        uint sc_u16 = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0u)
+                    | ((sc2 >> 4) & 0x0F00u) | (sc3 & 0xF000u);
+        uint sign = (sc_u16 >> 15) & 1u;
+        uint exp_v = (sc_u16 >> 10) & 0x1Fu;
+        uint mant = sc_u16 & 0x3FFu;
+        float d;
+        if (exp_v == 0u) d = float(mant) / 1024.0f * exp2(-14.0f);
+        else if (exp_v == 31u) d = (mant == 0u) ? INFINITY : 0.0f;
+        else d = (1.0f + float(mant) / 1024.0f) * exp2(float(int(exp_v) - 15));
+        if (sign != 0u) d = -d;
+        uint sc_arr[4] = { sc0, sc1, sc2, sc3 };
+        uint qs_walk = 0u, qh_walk = 0u;
+        for (uint ib = 0u; ib < 8u; ++ib) {
+            float dl1 = d * (2.0f * float((sc_arr[ib / 2u] >> (6u * (ib % 2u))) & 0x7u) + 1.0f);
+            float dl2 = d * (2.0f * float((sc_arr[ib / 2u] >> (6u * (ib % 2u) + 3u)) & 0x7u) + 1.0f);
+            uint idx[4];
+            idx[0] = uint(qs[qs_walk]) | ((uint(qh[qh_walk]) << 8) & 0x700u);
+            idx[1] = uint(qs[qs_walk + 1u]) | ((uint(qh[qh_walk]) << 4) & 0x700u);
+            idx[2] = uint(qs[qs_walk + 2u]) | ((uint(qh[qh_walk + 1u]) << 8) & 0x700u);
+            idx[3] = uint(qs[qs_walk + 3u]) | ((uint(qh[qh_walk + 1u]) << 4) & 0x700u);
+            float delta[4];
+            delta[0] = (qh[qh_walk] & 0x08u) != 0u ? -0.125f : 0.125f;
+            delta[1] = (qh[qh_walk] & 0x80u) != 0u ? -0.125f : 0.125f;
+            delta[2] = (qh[qh_walk + 1u] & 0x08u) != 0u ? -0.125f : 0.125f;
+            delta[3] = (qh[qh_walk + 1u] & 0x80u) != 0u ? -0.125f : 0.125f;
+            float dls[4] = { dl1, dl1, dl2, dl2 };
+            for (uint l = 0u; l < 4u; ++l) {
+                uint grid_off = IQ_GRID_OFF_IQ1S + idx[l] * 8u;
+                for (uint j = 0u; j < 8u; ++j) {
+                    int gv = lut_i8(iq_lut, grid_off + j);
+                    acc += x[x_idx] * (dls[l] * (float(gv) + delta[l]));
+                    x_idx += 1u;
+                }
+            }
+            qs_walk += 4u;
+            qh_walk += 2u;
+        }
+    }
+    dst[gid] = acc;
+}
+
+// ── Fused decode-layer MLP kernels (m == 1) ────────────────────────────────
+//
+// These collapse the per-layer SwiGLU MLP op chain
+//   rms_norm → gate(DequantMatMul) → up(DequantMatMul) → silu(gate) →
+//   mul(silu,up) → down(DequantMatMul) → add(residual)
+// into TWO dispatches instead of the unfused six. The GEMV math is a
+// byte-for-byte copy of `q4k_mv_f32` / `q6k_mm_f32` (m==1 row), so with the
+// simdgroup GEMV disabled the fused output is bit-identical to the unfused
+// per-op path. Off-switch lives in the Rust scheduler (RLX_METAL_FUSE_DECODE).
+
+// One Q4_K GEMV output column: `dst = sum_k x[k] * dequant(w_row[k])`.
+// Identical accumulation order to `q4k_mv_f32` (float4 acc, low/high nibble).
+inline float q4k_gemv_row_f32(device const float* x, device const uchar* w0, uint nblocks) {
+    const uint BLK_BYTES = 144u;        // 2 d + 2 dmin + 12 scales + 128 qs
+    float4 acc4 = float4(0.0f);
+    uint  x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        float d    = dq_read_f16(w0, off);
+        float dmin = dq_read_f16(w0, off + 2u);
+        device const uchar* scales = w0 + off + 4u;
+        device const uchar* qs     = w0 + off + 4u + DQ_K_SCALE_SIZE;
+        uint is = 0u;
+        for (uint j = 0u; j < 8u; j += 2u) {
+            uint sc0, m0, sc1, m1;
+            dq_get_scale_min_k4(scales, j,      sc0, m0);
+            dq_get_scale_min_k4(scales, j + 1u, sc1, m1);
+            float d0  = d * float(sc0);
+            float m0f = dmin * float(m0);
+            float d1  = d * float(sc1);
+            float m1f = dmin * float(m1);
+            for (uint l = 0u; l < 32u; l += 4u) {
+                uint q4 = *(device const uint*)(qs + is + l);
+                float4 ww;
+                ww.x = d0 * float(q4         & 0x0Fu) - m0f;
+                ww.y = d0 * float((q4 >>  8) & 0x0Fu) - m0f;
+                ww.z = d0 * float((q4 >> 16) & 0x0Fu) - m0f;
+                ww.w = d0 * float((q4 >> 24) & 0x0Fu) - m0f;
+                float4 xv = *(device const float4*)(x + x_idx);
+                acc4 += xv * ww;
+                x_idx += 4;
+            }
+            for (uint l = 0u; l < 32u; l += 4u) {
+                uint q4 = *(device const uint*)(qs + is + l);
+                float4 ww;
+                ww.x = d1 * float((q4 >>  4) & 0x0Fu) - m1f;
+                ww.y = d1 * float((q4 >> 12) & 0x0Fu) - m1f;
+                ww.z = d1 * float((q4 >> 20) & 0x0Fu) - m1f;
+                ww.w = d1 * float((q4 >> 28) & 0x0Fu) - m1f;
+                float4 xv = *(device const float4*)(x + x_idx);
+                acc4 += xv * ww;
+                x_idx += 4;
+            }
+            is += 32u;
+        }
+    }
+    return acc4.x + acc4.y + acc4.z + acc4.w;
+}
+
+// One Q6_K GEMV output column. Identical accumulation order to the m==1 row of
+// `q6k_mm_f32` (the prefill GEMM already validated against the CPU reference).
+inline float q6k_gemv_row_f32(device const float* x, device const uchar* w0, uint nblocks) {
+    const uint BLK = 210u;              // 128 ql + 64 qh + 16 sc + 2 d(f16)
+    float acc = 0.0f;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK;
+        uint pbase = b * DQ_QK_K;
+        device const uchar* ql = w0 + off;
+        device const uchar* qh = w0 + off + 128u;
+        device const uchar* sc = w0 + off + 192u;
+        float d = dq_read_f16(w0, off + 208u);
+        for (uint h = 0u; h < 2u; ++h) {
+            uint dst_base = h * 128u, ql_off = h * 64u, qh_off_h = h * 32u, sc_off = h * 8u;
+            for (uint l = 0u; l < 32u; ++l) {
+                uint is = l / 16u;
+                uchar qh_b = qh[qh_off_h + l];
+                float q1 = float(int(((ql[ql_off + l] & 0x0Fu)        | (((qh_b >> 0) & 3u) << 4u))) - 32);
+                float q2 = float(int(((ql[ql_off + l + 32u] & 0x0Fu)  | (((qh_b >> 2) & 3u) << 4u))) - 32);
+                float q3 = float(int(((ql[ql_off + l] >> 4)           | (((qh_b >> 4) & 3u) << 4u))) - 32);
+                float q4 = float(int(((ql[ql_off + l + 32u] >> 4)     | (((qh_b >> 6) & 3u) << 4u))) - 32);
+                float w1 = d * float(int8_t(sc[sc_off + is]))       * q1;
+                float w2 = d * float(int8_t(sc[sc_off + is + 2u]))  * q2;
+                float w3 = d * float(int8_t(sc[sc_off + is + 4u]))  * q3;
+                float w4 = d * float(int8_t(sc[sc_off + is + 6u]))  * q4;
+                uint p1 = pbase + dst_base + l;
+                uint p2 = p1 + 32u;
+                uint p3 = p1 + 64u;
+                uint p4 = p1 + 96u;
+                acc += x[p1] * w1 + x[p2] * w2 + x[p3] * w3 + x[p4] * w4;
+            }
+        }
+    }
+    return acc;
+}
+
+// Fused gate_proj + up_proj + silu + mul (Q4_K, m == 1).
+//   dst[i] = up[i] * (gate[i] / (1 + exp(-gate[i])))
+// One thread per intermediate column i; each thread runs two Q4_K GEMVs over
+// the shared (rms-normed) input row. Replaces 4 unfused dispatches
+// (gate matmul, up matmul, silu, elementwise mul) with one.
+kernel void q4k_swiglu_mv_f32(
+    device float* arena       [[buffer(0)]],
+    constant ulong& x_off     [[buffer(1)]],
+    constant ulong& gate_off  [[buffer(2)]],
+    constant ulong& up_off    [[buffer(3)]],
+    constant ulong& dst_off   [[buffer(4)]],
+    constant uint& k_dim      [[buffer(5)]],
+    constant uint& n_dim      [[buffer(6)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 144u;
+    device const float* x  = (device const float*)((device char*)arena + x_off);
+    device const uchar* wg = (device const uchar*)arena + gate_off + (ulong)gid * nblocks * BLK_BYTES;
+    device const uchar* wu = (device const uchar*)arena + up_off   + (ulong)gid * nblocks * BLK_BYTES;
+    device float* dst       = (device float*)((device char*)arena + dst_off);
+    float gate = q4k_gemv_row_f32(x, wg, nblocks);
+    float up   = q4k_gemv_row_f32(x, wu, nblocks);
+    // Match `silu_inplace` (gate/(1+exp(-gate))) then commutative `* up`.
+    dst[gid] = up * (gate / (1.0f + exp(-gate)));
+}
+
+// Fused down_proj + residual add (Q4_K, m == 1).
+//   dst[j] = res[j] + sum_k h[k] * dequant(w[j,k])
+// Replaces the down matmul + residual-add elementwise with one dispatch.
+kernel void q4k_mv_residual_f32(
+    device float* arena       [[buffer(0)]],
+    constant ulong& x_off     [[buffer(1)]],
+    constant ulong& w_off     [[buffer(2)]],
+    constant ulong& dst_off   [[buffer(3)]],
+    constant ulong& res_off   [[buffer(4)]],
+    constant uint& k_dim      [[buffer(5)]],
+    constant uint& n_dim      [[buffer(6)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 144u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + (ulong)gid * nblocks * BLK_BYTES;
+    device float* dst        = (device float*)((device char*)arena + dst_off);
+    device const float* res = (device const float*)((device char*)arena + res_off);
+    float acc = q4k_gemv_row_f32(x, w0, nblocks);
+    // Match BinaryFull Add (lhs=residual, rhs=down): res + acc.
+    dst[gid] = res[gid] + acc;
+}
+
+// Fused down_proj + residual add (Q6_K, m == 1).
+kernel void q6k_mv_residual_f32(
+    device float* arena       [[buffer(0)]],
+    constant ulong& x_off     [[buffer(1)]],
+    constant ulong& w_off     [[buffer(2)]],
+    constant ulong& dst_off   [[buffer(3)]],
+    constant ulong& res_off   [[buffer(4)]],
+    constant uint& k_dim      [[buffer(5)]],
+    constant uint& n_dim      [[buffer(6)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK = 210u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + (ulong)gid * nblocks * BLK;
+    device float* dst        = (device float*)((device char*)arena + dst_off);
+    device const float* res = (device const float*)((device char*)arena + res_off);
+    float acc = q6k_gemv_row_f32(x, w0, nblocks);
+    dst[gid] = res[gid] + acc;
 }

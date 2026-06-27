@@ -41,6 +41,23 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let mlx_src = manifest_dir.join("vendor").join("mlx");
 
+    // MLX builds where `rlx-mlx` exposes a real backend (`rlx_mlx_host`):
+    // macOS, Linux, Windows and iOS (device + simulator — MLX's CMake has a
+    // native iOS branch and the Metal backend runs on-device / in the sim).
+    // Every other target (tvOS / watchOS / visionOS / wasm / android) gets the
+    // stub that links no MLX symbols, so skip the CMake cross-compile entirely.
+    // Returning before the submodule check also means those builds don't
+    // require `vendor/mlx` to be populated.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target = env::var("TARGET").unwrap_or_default();
+    if !matches!(target_os.as_str(), "macos" | "linux" | "windows" | "ios") {
+        return;
+    }
+    // iOS: arm64 device (aarch64-apple-ios) vs the arm64 simulator
+    // (aarch64-apple-ios-sim). They differ only by SDK.
+    let is_ios = target_os == "ios";
+    let ios_sim = is_ios && target.ends_with("-sim");
+
     if !mlx_src.join("CMakeLists.txt").exists() {
         panic!(
             "rlx-mlx-sys: vendor/mlx is empty — run:\n\
@@ -52,7 +69,6 @@ fn main() {
         );
     }
 
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let is_macos = target_os == "macos";
 
     if is_macos
@@ -79,7 +95,10 @@ fn main() {
         .define("MLX_BUILD_BENCHMARKS", "OFF")
         .define("MLX_BUILD_PYTHON_BINDINGS", "OFF")
         .define("MLX_BUILD_PYTHON_STUBS", "OFF")
-        .define("MLX_BUILD_METAL", if is_macos { "ON" } else { "OFF" })
+        .define(
+            "MLX_BUILD_METAL",
+            if is_macos || is_ios { "ON" } else { "OFF" },
+        )
         .define("MLX_BUILD_CPU", "ON")
         .define("MLX_BUILD_GGUF", "OFF")
         .define("MLX_BUILD_SAFETENSORS", "OFF")
@@ -96,7 +115,28 @@ fn main() {
         None
     };
 
-    let use_ccache = is_macos
+    // iOS cross-compile: drive CMake into its `CMAKE_SYSTEM_NAME == iOS`
+    // branch and point it at the device or simulator SDK. arm64 only (the
+    // x86_64 sim is not an RLX target). MLX uses Accelerate for BLAS/LAPACK on
+    // Apple, so no OpenBLAS bootstrap is needed.
+    let ios_deploy = if is_ios {
+        let sdk = if ios_sim {
+            "iphonesimulator"
+        } else {
+            "iphoneos"
+        };
+        let deploy = env::var("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "16.0".into());
+        mlx_cfg
+            .define("CMAKE_SYSTEM_NAME", "iOS")
+            .define("CMAKE_OSX_SYSROOT", sdk)
+            .define("CMAKE_OSX_ARCHITECTURES", "arm64")
+            .define("CMAKE_OSX_DEPLOYMENT_TARGET", deploy.as_str());
+        Some(deploy)
+    } else {
+        None
+    };
+
+    let use_ccache = (is_macos || is_ios)
         && env_flag("RLX_MLX_NO_CCACHE") != Some(true)
         && Command::new("ccache")
             .arg("--version")
@@ -168,6 +208,14 @@ fn main() {
     if let Some(ref deploy) = macos_deploy {
         shim.flag(format!("-mmacosx-version-min={deploy}"));
     }
+    if let Some(ref deploy) = ios_deploy {
+        // Match the deployment target MLX was built at, per SDK.
+        shim.flag(if ios_sim {
+            format!("-mios-simulator-version-min={deploy}")
+        } else {
+            format!("-miphoneos-version-min={deploy}")
+        });
+    }
     if target_os == "windows" {
         shim.define("NOMINMAX", None)
             .define("WIN32_LEAN_AND_MEAN", None)
@@ -189,10 +237,31 @@ fn main() {
         for fw in &["Metal", "Foundation", "QuartzCore", "Accelerate"] {
             println!("cargo:rustc-link-lib=framework={fw}");
         }
+        // JACCL (Thunderbolt RDMA + TCP distributed backend) builds as a
+        // separate static lib when the macOS SDK is >= 26.2; libmlx.a
+        // references its symbols. It installs next to libmlx.a (covered by
+        // the link-search dir above). Its RDMA/Thunderbolt device path uses
+        // IOKit + CoreFoundation. Link it only when actually present.
+        if mlx_lib_dir.join("libjaccl.a").exists() {
+            println!("cargo:rustc-link-lib=static=jaccl");
+            println!("cargo:rustc-link-lib=framework=IOKit");
+            println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        }
         // C++ runtime
         println!("cargo:rustc-link-lib=c++");
         // MLX Metal uses __builtin_available → ___isPlatformVersionAtLeast (compiler-rt).
-        link_macos_clang_rt();
+        link_apple_clang_rt("osx");
+    } else if is_ios {
+        // iOS links the same Apple frameworks as macOS, minus the macOS-only
+        // JACCL / IOKit Thunderbolt distributed path (not built on iOS).
+        if let Some(deploy) = ios_deploy {
+            println!("cargo:rustc-env=IPHONEOS_DEPLOYMENT_TARGET={deploy}");
+        }
+        for fw in &["Metal", "Foundation", "QuartzCore", "Accelerate"] {
+            println!("cargo:rustc-link-lib=framework={fw}");
+        }
+        println!("cargo:rustc-link-lib=c++");
+        link_apple_clang_rt(if ios_sim { "iossim" } else { "ios" });
     } else if target_os == "linux" {
         println!("cargo:rustc-link-lib=stdc++");
         println!("cargo:rustc-link-lib=dl");
@@ -213,38 +282,50 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/mlx/mlx/version.h");
 }
 
-/// `libclang_rt.osx` — required for `___isPlatformVersionAtLeast` from MLX
-/// `__builtin_available` checks. Rust's default link line omits it (`-nodefaultlibs`).
-fn link_macos_clang_rt() {
+/// `libclang_rt.<variant>` — required for `___isPlatformVersionAtLeast` from
+/// MLX `__builtin_available` checks. Rust's default link line omits it
+/// (`-nodefaultlibs`). `variant` is the Apple runtime suffix: `"osx"` (macOS),
+/// `"ios"` (device) or `"iossim"` (simulator).
+fn link_apple_clang_rt(variant: &str) {
+    let libname = format!("libclang_rt.{variant}.a");
     let output = match Command::new("clang")
-        .arg("--print-file-name=libclang_rt.osx.a")
+        .arg(format!("--print-file-name={libname}"))
         .output()
     {
         Ok(o) if o.status.success() => o,
         _ => {
             eprintln!(
-                "cargo:warning=rlx-mlx-sys: could not run `clang --print-file-name=libclang_rt.osx.a`"
+                "cargo:warning=rlx-mlx-sys: could not run `clang --print-file-name={libname}`"
             );
             return;
         }
     };
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() || path == "libclang_rt.osx.a" {
-        eprintln!("cargo:warning=rlx-mlx-sys: clang did not resolve libclang_rt.osx.a");
+    if path.is_empty() || path == libname {
+        eprintln!("cargo:warning=rlx-mlx-sys: clang did not resolve {libname}");
         return;
     }
     let path = PathBuf::from(path);
     if !path.is_file() {
         eprintln!(
-            "cargo:warning=rlx-mlx-sys: libclang_rt.osx.a not found at {}",
+            "cargo:warning=rlx-mlx-sys: {libname} not found at {}",
             path.display()
         );
         return;
     }
-    if let Some(parent) = path.parent() {
-        println!("cargo:rustc-link-search=native={}", parent.display());
+    if variant == "osx" {
+        // Proven path on macOS: search dir + static lib.
+        if let Some(parent) = path.parent() {
+            println!("cargo:rustc-link-search=native={}", parent.display());
+        }
+        println!("cargo:rustc-link-lib=static=clang_rt.{variant}");
+    } else {
+        // iOS / simulator clang_rt archives are universal (fat) Mach-O. rustc's
+        // own static-archive reader rejects those ("Unsupported archive
+        // identifier"), so hand the full path straight to the linker (ld64),
+        // which is fat-aware and slices the right arch.
+        println!("cargo:rustc-link-arg={}", path.display());
     }
-    println!("cargo:rustc-link-lib=static=clang_rt.osx");
 }
 
 fn linux_build_cuda(target_os: &str) -> bool {

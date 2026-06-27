@@ -28,6 +28,8 @@ pub struct LlamaKvTapStage {
     pub head_dim: usize,
     pub eps: f32,
     pub outputs: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+    /// RoPE pairing flavor (GGUF Llama → [`rlx_ir::RopeStyle::GptJ`]).
+    pub rope_style: rlx_ir::RopeStyle,
 }
 
 impl LlamaKvTapStage {
@@ -36,12 +38,14 @@ impl LlamaKvTapStage {
         head_dim: usize,
         eps: f32,
         sink: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+        rope_style: rlx_ir::RopeStyle,
     ) -> Self {
         Self {
             layer_prefix: format!("model.layers.{layer_idx}"),
             head_dim,
             eps,
             outputs: sink,
+            rope_style,
         }
     }
 
@@ -68,7 +72,7 @@ impl LlamaKvTapStage {
         let normed_in = gb.rms_norm(input.id, in_ln_g, zero_beta, self.eps);
         let k = gb.mm(normed_in, k_w);
         let v = gb.mm(normed_in, v_w);
-        let k_rope = gb.rope(k, cos, sin, self.head_dim);
+        let k_rope = gb.rope_styled(k, cos, sin, self.head_dim, self.rope_style);
 
         self.outputs.lock().expect("kv tap sink").push(k_rope);
         self.outputs.lock().expect("kv tap sink").push(v);

@@ -785,9 +785,35 @@ impl Tensor {
 
     /// Compile + run on an explicit device.
     pub fn to_vec_on(&self, device: rlx_runtime::Device) -> Vec<f32> {
+        // A raw constant's realized value is its own host data — device-independent,
+        // so return it directly and skip backend compilation. This is both an
+        // optimization (no GPU round-trip for a constant) and a robustness fix: the
+        // MLX backend crashes when asked to compile a constant-only trace.
+        if let Some((bytes, DType::F32)) = self.constant_payload() {
+            return bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+        }
         let compiled = self.compiled_on(device);
         let mut outputs = compiled.borrow_mut().run(&[]);
         outputs.pop().expect("eval produced no output")
+    }
+
+    /// If this tensor's output node is a raw `Op::Constant` that physically holds its
+    /// full contiguous payload, returns `(bytes, dtype)` — its realized value with no
+    /// computation to run. (Views/slices of a constant are *not* raw constants, so
+    /// they fall through to normal evaluation.)
+    fn constant_payload(&self) -> Option<(Vec<u8>, DType)> {
+        self.handle.with_graph(|g| {
+            let node = g.node(self.id);
+            if let Op::Constant { data } = &node.op {
+                if node.shape.size_bytes() == Some(data.len()) {
+                    return Some((data.clone(), node.shape.dtype()));
+                }
+            }
+            None
+        })
     }
 
     /// Fastest available backend that can run this tensor's graph (no clone).
@@ -854,6 +880,10 @@ impl Tensor {
     /// Compile + run, returning the output's raw little-endian bytes + dtype.
     /// Device is auto-selected; backs the typed `to_vec_*` readers.
     fn eval_typed(&self) -> (Vec<u8>, DType) {
+        // Raw constant → its bytes are the result (see `to_vec_on`).
+        if let Some(ct) = self.constant_payload() {
+            return ct;
+        }
         let compiled = self.compiled_on(self.auto_device());
         let mut outputs = compiled.borrow_mut().run_typed(&[]);
         outputs.pop().expect("eval produced no output")

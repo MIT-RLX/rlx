@@ -1,0 +1,88 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Tensor-core (cooperative-matrix) batched matmul C[b,m,n] = sum_k A·B.
+//
+// One subgroup per workgroup computes one 16x16 output tile: it streams 16x16
+// blocks of A and B from the f32 arena through shared memory as f16, multiplies
+// them on the matrix units (f16·f16 with f32 accumulation), and writes the f32
+// result back. It reads/writes the SAME f32 arena (binding 0) as every other
+// kernel — the f32→f16 narrowing happens while staging into shared memory, so
+// no separate f16 buffer or descriptor binding is needed and the kernel reuses
+// the shared pipeline layout.
+//
+// Shape handling: M and N MUST be 16-aligned — the cooperative store writes a
+// full 16x16 output tile per workgroup, so a partial M/N tile would write out
+// of bounds. K is arbitrary: the final partial K-tile is zero-padded while
+// staging into shared (below), so the accumulation stays correct. The matmul
+// scheduler therefore selects this kernel only when the device advertises a
+// 16x16x16 f16·f16→f32 subgroup config (device.rs) AND M%16==N%16==0; it routes
+// non-16-aligned M/N to the exact tiled fp32 kernel (a better fit for those
+// shapes than a zero-padded coop tile, and fp32-exact).
+//
+// naga cannot compile cooperative-matrix GLSL, so this kernel is compiled to
+// SPIR-V offline with glslang and the .spv committed + embedded. Regenerate
+// (run from this directory):
+//   glslangValidator -V --target-env vulkan1.3 matmul_coop.comp -o matmul_coop.spv
+#define TS 16u
+
+layout(local_size_x = 32) in; // one NVIDIA subgroup holds the 16x16 matrices
+
+layout(std430, binding = 0) buffer Arena { float data[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint k;
+    uint n;
+    uint a_off;
+    uint b_off;
+    uint c_off;
+    uint batch;
+    uint a_bs;   // A batch stride (0 ⇒ broadcast)
+    uint b_bs;   // B batch stride (0 ⇒ broadcast)
+    uint c_bs;   // C batch stride
+} pc;
+
+shared float16_t As[256]; // TS*TS, A block row-major
+shared float16_t Bs[256]; // TS*TS, B block row-major
+
+void main() {
+    uint tile_col = gl_WorkGroupID.x; // n tile
+    uint tile_row = gl_WorkGroupID.y; // m tile
+    uint bz       = gl_WorkGroupID.z; // batch
+    uint lid      = gl_LocalInvocationID.x; // 0..31
+
+    uint a_base = pc.a_off + bz * pc.a_bs + tile_row * TS * pc.k;
+    uint b_base = pc.b_off + bz * pc.b_bs + tile_col * TS;
+
+    coopmat<float, gl_ScopeSubgroup, TS, TS, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, TS, TS, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint kt = 0u; kt < pc.k; kt += TS) {
+        // Stage a 16x16 block of A and B, narrowing f32 → f16 into shared.
+        // M and N are 16-aligned (routing guarantees it), so only K can have a
+        // partial final tile — zero-pad it past the K bound so the
+        // multiply-accumulate stays correct for arbitrary K.
+        for (uint i = lid; i < TS * TS; i += 32u) {
+            uint r = i / TS;
+            uint c = i % TS;
+            As[i] = (kt + c < pc.k)
+                ? float16_t(data[a_base + r * pc.k + (kt + c)]) : float16_t(0.0);
+            Bs[i] = (kt + r < pc.k)
+                ? float16_t(data[b_base + (kt + r) * pc.n + c]) : float16_t(0.0);
+        }
+        memoryBarrierShared();
+        barrier();
+
+        coopmat<float16_t, gl_ScopeSubgroup, TS, TS, gl_MatrixUseA> a;
+        coopmat<float16_t, gl_ScopeSubgroup, TS, TS, gl_MatrixUseB> b;
+        coopMatLoad(a, As, 0u, TS, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, Bs, 0u, TS, gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(a, b, acc);
+        barrier();
+    }
+
+    uint c_base = pc.c_off + bz * pc.c_bs + tile_row * TS * pc.n + tile_col * TS;
+    coopMatStore(acc, data, c_base, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+}

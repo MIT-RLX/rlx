@@ -36,7 +36,7 @@ pub fn fusion_target_for(device: Device) -> FusionTarget {
         Device::Mlx => FusionTarget::Mlx,
         Device::Cuda => FusionTarget::Cuda,
         Device::Rocm => FusionTarget::Rocm,
-        Device::Gpu | Device::Vulkan | Device::WebGpu => FusionTarget::Wgpu,
+        Device::Gpu | Device::Vulkan | Device::WebGpu | Device::OneApi => FusionTarget::Wgpu,
         Device::Tpu => FusionTarget::Tpu,
         // CoreML runs its own graph optimizer, so we want minimal RLX-side
         // fusion: the CPU fusion target only synthesizes Fused* ops the

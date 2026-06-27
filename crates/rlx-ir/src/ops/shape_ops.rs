@@ -34,4 +34,11 @@ impl Graph {
     pub fn concat(&mut self, inputs: Vec<NodeId>, axis: usize, shape: Shape) -> NodeId {
         self.push(Op::Concat { axis }, inputs, shape, None)
     }
+
+    /// Reverse (flip) element order along each axis in `axes`. Output shape is
+    /// the same as the input; only the listed axes flip (batch-general).
+    pub fn reverse(&mut self, input: NodeId, axes: Vec<usize>) -> NodeId {
+        let shape = self.node(input).shape.clone();
+        self.push(Op::Reverse { axes }, vec![input], shape, None)
+    }
 }

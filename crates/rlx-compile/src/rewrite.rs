@@ -24,6 +24,7 @@ use rlx_fusion::control_flow::LowerControlFlow;
 use rlx_fusion::fusion::UnfuseElementwiseRegions;
 use rlx_fusion::lower_backward_ops::LowerBackwardOps;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
+use rlx_fusion::lower_fma::LowerFma;
 use rlx_fusion::lower_logical_kernels;
 use rlx_fusion::lower_loss_ops::LowerSoftmaxCrossEntropy;
 use rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
@@ -35,6 +36,10 @@ use rlx_ir::{Graph, Op, OpKind};
 
 use crate::legalize::legalize_for_backend;
 
+// Kinds that trigger the `unfuse` pass (which holds their decomposition arm).
+// Not all are "fused" — `LoraMatMul`/`FakeQuantize`/`AxialRope2d` are plain ops
+// whose decomposition lives in `unfuse` and would otherwise never fire on a
+// backend that lacks a native kernel (the op would hard-fail at legalization).
 const FUSED_KINDS: &[OpKind] = &[
     OpKind::FusedMatMulBiasAct,
     OpKind::FusedSwiGLU,
@@ -48,6 +53,7 @@ const FUSED_KINDS: &[OpKind] = &[
     OpKind::Rnn,
     OpKind::Mamba2,
     OpKind::SelectiveScan,
+    OpKind::LoraMatMul,
 ];
 
 fn unsupported_kinds(graph: &Graph, supported: &[OpKind]) -> HashSet<OpKind> {
@@ -64,6 +70,12 @@ fn needs_unfuse(kinds: &HashSet<OpKind>) -> bool {
 #[cfg(feature = "training")]
 fn needs_backward_decompose(bad: &HashSet<OpKind>) -> bool {
     use OpKind::*;
+    // Every `*Backward` kind that `rlx_autodiff::decompose_backward_ops_except`
+    // can lower to primitives (mirror `contains_training_backward_except`).
+    // This only ever fires for a kind the target backend does NOT claim (it's in
+    // `bad`), so backends with a native kernel — which list the kind in their
+    // `supported_ops()` and so keep it out of `bad` — are unaffected; for the
+    // rest it turns an unsupported-op error into a working decomposition.
     bad.iter().any(|k| {
         matches!(
             k,
@@ -72,6 +84,16 @@ fn needs_backward_decompose(bad: &HashSet<OpKind>) -> bool {
                 | MaxPool2dBackward
                 | LayerNormBackwardInput
                 | LayerNormBackwardGamma
+                | RmsNormBackwardInput
+                | RmsNormBackwardGamma
+                | RmsNormBackwardBeta
+                | GroupNormBackwardInput
+                | GroupNormBackwardGamma
+                | GroupNormBackwardBeta
+                | RopeBackward
+                | AttentionBackward
+                | CumsumBackward
+                | GatherBackward
                 | BatchNormInferenceBackwardInput
                 | BatchNormInferenceBackwardGamma
                 | BatchNormInferenceBackwardBeta
@@ -136,6 +158,12 @@ pub fn rewrite_for_backend_with_config(
             graph = LowerDotGeneral.run(graph);
             changed = true;
         }
+        if bad.contains(&OpKind::Fma) {
+            // Backends without a native single-rounding FMA fall back to
+            // mul+add (two roundings — loses the compensated-arithmetic benefit).
+            graph = LowerFma.run(graph);
+            changed = true;
+        }
         if bad.contains(&OpKind::If) || bad.contains(&OpKind::While) {
             graph = LowerControlFlow.run(graph);
             changed = true;
@@ -144,7 +172,8 @@ pub fn rewrite_for_backend_with_config(
             graph = UnfuseElementwiseRegions::FOR_CPU.run(graph);
             changed = true;
         }
-        if bad.contains(&OpKind::SoftmaxCrossEntropyWithLogits)
+        if bad.contains(&OpKind::SoftmaxCrossEntropy)
+            || bad.contains(&OpKind::SoftmaxCrossEntropyWithLogits)
             || bad.contains(&OpKind::SoftmaxCrossEntropyBackward)
         {
             graph = LowerSoftmaxCrossEntropy.run(graph);

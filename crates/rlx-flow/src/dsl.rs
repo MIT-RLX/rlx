@@ -494,6 +494,9 @@ impl ModelFlow {
                 head_dim,
                 eps,
                 sink.inner(),
+                // NeoX preserves pre-refactor behavior; callers needing GptJ
+                // (GGUF Llama) should thread the style through this DSL method.
+                rlx_ir::RopeStyle::NeoX,
             )));
         self
     }

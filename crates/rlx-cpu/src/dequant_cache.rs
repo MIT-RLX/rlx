@@ -62,6 +62,9 @@ fn scheme_tag(scheme: QuantScheme) -> u8 {
         QuantScheme::GgufTQ2_0 => 19,
         QuantScheme::GgufMXFP4 => 20,
         QuantScheme::GgufNVFP4 => 21,
+        QuantScheme::GgufQ4_1 => 22,
+        QuantScheme::GgufQ5_0 => 23,
+        QuantScheme::GgufQ5_1 => 24,
         _ => 255,
     }
 }
@@ -76,6 +79,9 @@ fn dequant_gguf(w_bytes: &[u8], k: usize, n: usize, scheme: QuantScheme) -> Vec<
         QuantScheme::GgufQ2K => rlx_gguf::dequant_q2_k(w_bytes, n_elems),
         QuantScheme::GgufQ3K => rlx_gguf::dequant_q3_k(w_bytes, n_elems),
         QuantScheme::GgufQ4_0 => rlx_gguf::dequant_q4_0(w_bytes, n_elems),
+        QuantScheme::GgufQ4_1 => rlx_gguf::dequant_q4_1(w_bytes, n_elems),
+        QuantScheme::GgufQ5_0 => rlx_gguf::dequant_q5_0(w_bytes, n_elems),
+        QuantScheme::GgufQ5_1 => rlx_gguf::dequant_q5_1(w_bytes, n_elems),
         QuantScheme::GgufQ8_0 => rlx_gguf::dequant_q8_0(w_bytes, n_elems),
         QuantScheme::GgufIQ4NL => rlx_gguf::iq_dequant::dequant_iq4_nl(w_bytes, n_elems),
         QuantScheme::GgufIQ4XS => rlx_gguf::iq_dequant::dequant_iq4_xs(w_bytes, n_elems),
@@ -172,5 +178,21 @@ mod tests {
         other[0] ^= 0x01;
         let c = gguf_weight_f32(w_off, &other, k, n, QuantScheme::GgufQ4K);
         assert!(!Arc::ptr_eq(&a, &c), "different bytes should miss: {hash}");
+    }
+
+    #[test]
+    fn gguf_dequant_cache_q4_1_q5_hits() {
+        clear_dequant_cache();
+        let w: Vec<f32> = (0..512).map(|i| (i as f32 * 0.01).sin()).collect();
+        for (scheme, ggml) in [
+            (QuantScheme::GgufQ4_1, rlx_gguf::GgmlType::Q4_1),
+            (QuantScheme::GgufQ5_0, rlx_gguf::GgmlType::Q5_0),
+            (QuantScheme::GgufQ5_1, rlx_gguf::GgmlType::Q5_1),
+        ] {
+            let packed = rlx_gguf::quantize(&w, ggml).unwrap();
+            let a = gguf_weight_f32(0, &packed, 32, 16, scheme);
+            let b = gguf_weight_f32(8192, &packed, 32, 16, scheme);
+            assert!(Arc::ptr_eq(&a, &b), "cache hit expected for {scheme:?}");
+        }
     }
 }

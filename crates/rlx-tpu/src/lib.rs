@@ -57,6 +57,7 @@ pub mod splat_host;
 pub mod unfuse;
 
 pub use backend::TpuExecutable;
+pub use lower::{GgufDeferredParam, LowerParamBytes, lower_graph_with_rng_and_params};
 
 /// True iff a PJRT plugin is loaded *and* Plugin_Initialize +
 /// Client_Create succeeded. False on Mac, headless CI, and any host

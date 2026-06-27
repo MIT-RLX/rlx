@@ -24,31 +24,40 @@ Python bindings for RLX via [PyO3](https://pyo3.rs/) +
 - **In-graph RNG (0.2.7+)** — ONNX `Random*` via upstream `rlx-runtime`
   (`CompileOptions::rng`, `CompiledGraph::set_rng`). See [`CHANGELOG.md`](../CHANGELOG.md).
 - **FFT helpers** — `fft`, `fft_norm`, `rfft`, `irfft`, `fftfreq`,
-  `rfftfreq`, `psd_real` on `Graph` (see `pyrlx/tests/test_fft.py`).
+  `rfftfreq`, `psd_real` on `Graph` (see `tests/test_fft.py`).
 - **Autodiff** — `pyrlx.grad(graph, wrt=[…])` returns the backward
   graph, ready to compile.
 - **JVP / vmap** — `pyrlx.jvp` + `pyrlx.vmap` for forward-mode AD and
   batched function transforms.
+- **GGUF** — `rlx.quantize(weights, dtype="IQ2_XXS")` and
+  `rlx.dequant(packed, dtype=…)` pack/unpack via `rlx-gguf` (no backend required).
+- **GGUF file I/O** — `rlx.load_gguf(path)`, `rlx.write_gguf(path, tensors, …)`,
+  and `rlx.GgufFile` for tensor metadata / dequant / raw bytes.
+- **GGUF convert** — `rlx.convert_to_gguf("model.safetensors", "out.gguf", "Q4_K")`
+  wraps `rlx-gguf-convert` (safetensors by default; `gguf-onnx` / `gguf-pt` cargo
+  features for ONNX / PyTorch checkpoints).
+  See `tests/test_gguf_quantize.py`, `test_gguf_file.py`, `test_gguf_convert.py`.
 
 ## Install (from source)
 
 ```sh
-cd pyrlx
+cd crates/pyrlx
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin numpy pytest
-maturin develop --features cpu   # add metal,mlx,cuda,… as needed
+maturin develop --features cpu,gguf-convert   # add metal,mlx,cuda,… as needed
 ```
 
-From the repo root you can also use `maturin develop --release -m pyrlx/Cargo.toml`
+From the repo root you can also use
+`maturin develop --release -m crates/pyrlx/Cargo.toml`
 inside an activated virtualenv.
 
 ## Tests
 
-Run from `pyrlx/` after `maturin develop` (not from the repo root without a
-venv — the bare `pyrlx/` directory is a namespace package and lacks `Graph`):
+Run from `crates/pyrlx/` after `maturin develop` (not from the repo root without a
+venv — the bare top-level `pyrlx/` namespace package lacks `Graph`):
 
 ```sh
-cd pyrlx && source .venv/bin/activate
+cd crates/pyrlx && source .venv/bin/activate
 pytest tests/ -q
 ```
 
@@ -96,8 +105,8 @@ device, outs = router.run({"x": x})
 ```
 
 See [`docs/backend-selection.md`](../docs/backend-selection.md),
-[`pyrlx/docs/dsl.md`](docs/dsl.md) (DSL reference), and
-[`pyrlx/docs/backends.md`](docs/backends.md).
+[`docs/dsl.md`](docs/dsl.md) (DSL reference), and
+[`docs/backends.md`](docs/backends.md).
 
 ## Graph builder notes
 

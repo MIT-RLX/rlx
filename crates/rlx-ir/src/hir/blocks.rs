@@ -15,6 +15,7 @@ use crate::shape::{self, Dim};
 use crate::{DType, Graph, NodeId, Shape};
 
 /// Lower [`super::HirOp::LlamaDecoderBlock`].
+#[allow(clippy::too_many_arguments)]
 pub fn lower_llama_decoder_block(
     g: &mut Graph,
     inputs: &[NodeId],
@@ -23,6 +24,7 @@ pub fn lower_llama_decoder_block(
     num_kv_heads: usize,
     eps: f32,
     mask: MaskKind,
+    rope_style: crate::op::RopeStyle,
     out_shape: Shape,
 ) -> Result<NodeId, LowerError> {
     let need_mask = matches!(mask, MaskKind::Custom | MaskKind::Bias);
@@ -53,8 +55,8 @@ pub fn lower_llama_decoder_block(
     let q = g.mm(normed_in, q_w);
     let k = g.mm(normed_in, k_w);
     let v = g.mm(normed_in, v_w);
-    let q_rope = g.rope(q, cos, sin, head_dim);
-    let k_rope = g.rope(k, cos, sin, head_dim);
+    let q_rope = g.rope_styled(q, cos, sin, head_dim, rope_style);
+    let k_rope = g.rope_styled(k, cos, sin, head_dim, rope_style);
 
     let group = num_heads / num_kv_heads;
     let k_rep = repeat_kv(g, k_rope, num_kv_heads, head_dim, group);

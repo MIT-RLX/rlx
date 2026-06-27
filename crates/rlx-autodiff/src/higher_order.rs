@@ -173,6 +173,36 @@ mod tests {
     use rlx_ir::op::BinaryOp;
     use rlx_ir::{DType, Graph, Op, Shape};
 
+    /// A piecewise-linear op (MaxPool) has a genuinely-zero second
+    /// derivative: after the first backward is decomposed, the only path
+    /// back to `x` runs through a `Compare` mask, which elementwise fusion
+    /// folds into an opaque `ElementwiseRegion`. The higher-order driver
+    /// must see through that region and short-circuit to zero rather than
+    /// hand a no-gradient graph to reverse mode (which would panic).
+    #[test]
+    fn maxpool_second_order_is_zero_not_panic() {
+        use rlx_ir::op::ReduceOp;
+        let f = DType::F32;
+        let mut g = Graph::new("pool_ho");
+        let x = g.input("x", Shape::new(&[1, 1, 4, 4], f));
+        let p = g.add_node(
+            Op::Pool {
+                kind: ReduceOp::Max,
+                kernel_size: vec![2, 2],
+                stride: vec![2, 2],
+                padding: vec![0, 0],
+            },
+            vec![x],
+            Shape::new(&[1, 1, 2, 2], f),
+        );
+        let loss = g.reduce(p, ReduceOp::Sum, vec![0, 1, 2, 3], false, Shape::scalar(f));
+        g.set_outputs(vec![loss]);
+        // Must not panic; second derivative collapses to a zero constant.
+        let hg = nth_order_grad(&g, "x", 2);
+        assert_eq!(hg.outputs.len(), 1);
+        assert!(matches!(hg.node(hg.outputs[0]).op, Op::Constant { .. }));
+    }
+
     #[test]
     fn nth_order_x_cubed_graph_shape() {
         let mut g = Graph::new("x3");

@@ -5,6 +5,261 @@ All notable changes to RLX. Format loosely follows
 tracks SemVer with the understanding that any `0.x → 0.(x+1)`
 bump may carry breaking changes per `0.x`-semver convention.
 
+## [Unreleased]
+
+### Added
+
+- **GGUF IQ / TQ / MX end-to-end.** Encoders in `rlx-gguf`; `rlx-gguf-convert` scheme
+  enum; GPU dequant parity on Metal / WGPU / CUDA / ROCm; CoreML MIL on-device splits
+  for IQ / TQ / MX and K-quants; TPU compile-time and runtime Param bake paths.
+- **Metal fused IQ GEMV (`m = 1`).** `iq4_nl`, `iq2_xxs/xs/s`, `iq3_xxs/s`, `iq1_s/m`
+  MV kernels with per-scheme disable env vars.
+- **Grouped MoE GGUF tests.** Q4_0 / Q8_K / IQ2 / IQ3 / TQ2 / IQ1 expert stacks on
+  CPU / Metal / WGPU / CUDA / ROCm (`dequant_grouped_matmul_gguf.rs`).
+- **pyrlx GGUF.** `quantize` / `dequant`, `load_gguf` / `write_gguf`, `convert_to_gguf`
+  (safetensors → GGUF via `rlx-gguf-convert`); tests in `crates/pyrlx/tests/test_gguf_*.py`.
+- **Docs.** Canonical GGUF backend matrix in `docs/gguf-backend-paths.md`; op coverage
+  updates in `docs/op-coverage.md`; `just test-gguf-grouped` recipe.
+- **`FusedAttentionBlock` is first-class on every inference backend.** All backends now
+  declare `OpKind::FusedAttentionBlock` and lower it — CPU/MLX natively, everyone else
+  by decomposing to the primitive chain (matmul → narrow → reshape/transpose → \[rope\]
+  → attention → matmul). New FAB-only `rlx_fusion::unfuse::unfuse_attention_block` pass
+  (shared decomposition with the autodiff unfuse): CUDA/ROCm/TPU/WGPU decompose through
+  their own crate `unfuse`, Metal/Vulkan/oneAPI/CoreML through an explicit pre-lowering
+  pass (FAB-only, so each backend's native `FusedMatMulBiasAct` / `FusedResidualLN` /
+  `LoraMatMul` survive). Cross-backend parity test
+  `crates/rlx-runtime/tests/fused_attention_block_parity.rs`. WebGL and QNN stay
+  excluded — neither can lower the resulting `Op::Attention`.
+- **Native CUDA + Metal fused-attention kernels.** A `fused_attn_block` kernel
+  (CUDA `fused_attn.cu`; Metal MSL in `kernels.rs`) fuses inline NeoX RoPE + softmax
+  SDPA over the packed QKV projection — one block/threadgroup per batch·head, score
+  matrix in shared/threadgroup memory — collapsing the decompose chain's narrow×3 +
+  transpose×3 + rope×2 + attention into a single launch; the QKV / output projections
+  stay as GEMMs into appended arena scratch. Each backend keeps the block native when
+  the `[seq,seq]` scores fit (`seq ≤ 96` CUDA / `≤ 64` Metal; Metal additionally gates
+  to f32 + no-bias) and otherwise falls back to the primitive decomposition. Validated
+  vs the CPU reference: CUDA on an RTX 3080 Ti (identity / bias / rope), Metal on Apple
+  Silicon (identity / rope native; bias decomposes).
+
+### Performance
+
+- **`rlx-vulkan` dependency-aware barriers.** The scheduler emitted a global
+  shader-memory barrier between *every* dispatch; it now emits one only on a real
+  read/write hazard, tracked by arena slot offset (safe given the unique-slot bump
+  allocator — aliasing shares an offset). On MoltenVK, where each barrier forces a
+  Metal compute-encoder restart, this is ~25% faster on the resident-MLP MNIST
+  step (135 dispatches, most independent) with bit-identical results. New env
+  knobs: `RLX_VULKAN_DEBUG=1` (per-step dispatch histogram), `RLX_VULKAN_FULLBARRIER=1`
+  (restore the old between-every-pair behaviour), `RLX_VULKAN_NOBARRIER=1` (drop all
+  — unsafe, diagnostic only).
+- **`rlx-vulkan` pre-recorded command buffers.** The static schedule (kernels,
+  push constants, workgroup counts are fixed; inputs flow through the host-visible
+  arena, not the command stream) is now recorded once into reusable command
+  buffers and resubmitted with a persistent fence, instead of allocating a command
+  buffer + recording + creating/destroying a fence every step. Neutral on MoltenVK
+  (re-encodes per submit) but a real latency win on native Vulkan drivers
+  (Linux/NVIDIA). `RLX_VULKAN_NOCACHE=1` restores the per-step record path.
+- Combined with a larger batch (the `rlx-mnist-device` bench gained an `RLX_BATCH`
+  knob), native Vulkan resident-MLP MNIST goes from ~55–87k to ~340–395k img/s on
+  an M4 Pro at *higher* accuracy (0.944 → 0.963).
+
+### Fixed
+
+- **`dequant_gguf` routing for legacy 32-byte schemes.** Q4_1 / Q5_0 / Q5_1 no longer
+  fall into the 256-element K-quant branch (MSL / CUDA / WGSL).
+- **IQ3 fused GEMV element order.** MV kernels now match dequant layout (g1 block then
+  g2 block per sub-quant).
+- **MLX GGUF dequant cache.** Cache key includes scheme and packed bytes hash.
+- **WGPU TQ1_0 / IQ1_M dequant.** Trit u8-wrap and scale-word fixes in WGSL.
+
+## [0.2.10] — 2026-06-25
+
+### Added
+
+- **Distributed / multi-node transport (`rlx-driver`).** New `transport.rs` +
+  `net.rs` add a two-sided point-to-point `Transport` trait and a `ProcessGroup`
+  layering tensor-shaped `all_reduce` / `all_gather` / `broadcast` / `barrier` on
+  top, plus a full-mesh TCP `NetTransport` (one connection per rank pair, a demux
+  reader thread per connection routing `SEND` / `PUT` / `GETREQ` / `GETRESP`
+  frames). `NetTransport` implements both the two-sided `Transport`
+  (pipeline-parallel hidden-state handoff) and the one-sided `SymmetricTransport`
+  (put/get/barrier) surfaces, so the existing symmetric collectives run over it
+  unchanged. `TcpTransport` and a `ThunderboltTransport` (same wire protocol,
+  intended for the macOS Thunderbolt Bridge link, with a `looks_like_thunderbolt`
+  IP heuristic) are exposed; re-exported from `rlx-runtime`. Verified by
+  multi-rank loopback tests (pipeline handoff, all-reduce / broadcast / barrier
+  over TCP, remote put/get). Real multi-node hardware not exercised in this
+  environment.
+- **`rlx-driver::ring_all_reduce`** — bandwidth-optimal ring all-reduce over a
+  symmetric heap (reduce-scatter ring + all-gather ring, Baidu / NCCL pattern)
+  expressed with one-sided `put` + `barrier`; each rank moves ~`2(N-1)/N` of the
+  vector vs the naïve gather-to-root `O(N²)`. Verified multi-threaded (Sum + Mean)
+  against the serial reference.
+- **New crate `rlx-collectives`** — an in-graph `collective.all_reduce` custom op
+  for tensor-parallel layers: the op carries a `u64` group id in its attrs, each
+  rank registers its `ProcessGroup` under an id, and the CPU kernel resolves it
+  and sums across ranks at execution time (blocking rendezvous). Validated
+  end-to-end by tensor-parallel matmul, Megatron-style SwiGLU MLP, and a Qwen3
+  decoder-layer shard test against hand-computed references.
+- **`rlx-mlx::MlxTransport` (`distributed.rs`)** — a `Transport` backed by MLX's
+  distributed module (`jaccl` RDMA-over-Thunderbolt / `ring` TCP / `mpi`,
+  auto-selected), with native `all_sum` / `all_gather` plus two-sided
+  length-prefixed byte send/recv and barrier over the MLX C ABI. Also registers a
+  **device-resident** `collective.all_reduce` MLX kernel that composes
+  `mc::distributed::all_sum` on the lazy device array (no host round-trip), so a
+  tensor-parallel layer's all-reduce stays on-GPU. New C-ABI shim entry points in
+  `rlx-mlx-sys` (`rlx_mlx_dist_*`). Singleton (no-launcher) path tested; multi-rank
+  jaccl / ring needs MLX's launcher.
+- **`Op::Reverse { axes }`** — batch-general flip along listed axes (output shape
+  unchanged; non-listed axes pass through). Native kernels on CPU, Metal, MLX, and
+  WGPU; host-staged on CUDA / ROCm. Reverses a `[batch, seq, …]` sequence without
+  a `batch == 1` assumption.
+- **`Op::Gru`, `Op::Rnn`, `Op::Mamba2` native GPU kernels.** Single-layer /
+  unidirectional / no-carry kernels: Metal MSL `gru` / `rnn` / `mamba2` (hidden
+  ≤ 1024, Mamba2 state ≤ 128) and native WGSL `gru` / `rnn` / `mamba2` (hidden /
+  state ≤ 256), each with a host-staged CPU fallback for the multi-layer /
+  bidirectional / carry / oversized cases. The CPU references
+  (`execute_gru_f32` / `execute_rnn_f32` / `execute_mamba2_f32`) back the
+  fallbacks. HIR gains a `Gru` op + lowering. Validated by `metal_rnn_native` /
+  `wgpu_rnn_native` parity tests against the CPU reference.
+- **Native Metal `selective_scan` MSL kernel** (f32, state ≤ 128) replacing the
+  host fallback for Mamba S6 on Metal, plus native Metal `argreduce`, `sample`,
+  and `reverse` paths. Their CPU references (`execute_selective_scan_f32`,
+  `execute_sample_f32`, `execute_argreduce_f32`) are now shared host-delegate
+  functions.
+- **Native Metal block-quantized matmul** (`dequant_matmul_int8` /
+  `dequant_matmul_int4` MSL kernels) — dequant-on-the-fly over the unified-memory
+  arena for int8 / int4 block schemes, matching the CPU reference (new
+  `metal_dequant_matmul_int_parity` test).
+- **WGPU vision + recurrent op coverage.** Host-staged `ConvTranspose2d`,
+  `GroupNorm`, `LayerNorm2d`, `ResizeNearest2x`, `Reverse`, and `ArgMax` / `ArgMin`
+  (readback → verified CPU kernel → writeback, mirroring the existing
+  `im2col_host` pattern; new `vision_host.rs` / `conv_transpose2d_host.rs`),
+  closing the correctness gap for SAM / U-Net decoders on cross-platform GPU. New
+  `wgpu_vision_ops_parity` test.
+- **CUDA / ROCm host-staged `Reverse`, `ArgMax`, `ArgMin`, `AxialRope2d`, and
+  `StopGradient`** (`host_misc.rs` on both backends: sync → dtoh → verified
+  rlx-cpu kernel → htod). TPU also gains `StopGradient` (forward-identity HLO
+  alias). **Compile-verified only; not run on NVIDIA / AMD / TPU hardware** (no
+  device in this environment).
+- **MLX op coverage** — native `Reverse`, `ArgMax`, `ArgMin`, `Im2Col`
+  (NCHW → rows), `GroupNorm` (NCHW), and `GroupNorm` backward (input / gamma /
+  beta) lowerings.
+- **CoreML / ANE fused-attention layouts** — `lower_attention` now disambiguates
+  the `[B,S,H,D]` (heads at axis 2) vs `[B,H,S,D]` (canonical) operand layouts via
+  `attention_geom`, transposing the former to canonical, attending, and
+  transposing back — without it CoreML would attend over the heads axis and fail
+  once `s_q != s_k` (KV-cache decode).
+- **Dynamic-shape support on every backend (`rlx-runtime::deferred`).**
+  `Session::compile` now detects `Dim::Dynamic` graphs and wraps them in a
+  `DeferredExecutable` that infers the concrete shape from input lengths on each
+  `run`, specializes to a static graph, and caches the most recent specialization
+  — giving CPU / Metal / CUDA / ROCm the multi-shape support wgpu / MLX already
+  had internally, with no recompile when a shape repeats.
+- **`rlx-text` streaming detokenization + tool-call parsing.** New
+  `StreamingDetokenizer` (`detokenize.rs`) re-decodes the full id sequence each
+  step and emits only the newly-stable suffix, holding back trailing U+FFFD runs —
+  fixes byte-level-BPE multi-byte splits and SentencePiece context-dependent
+  spacing that per-token decode mangles. New `tool_parse.rs` parses model-emitted
+  tool/function calls (Hermes / Qwen `<tool_call>` blocks, bare JSON, and Pythonic
+  `[fn(a="x")]`) into `{name, arguments}`, with a `detect_and_parse` helper.
+- **Min-p sampling + logit bias (`rlx-runtime`).** New `MinP` sampler (keep tokens
+  with prob ≥ `p · p_max`, with a `min_keep` floor; Nguyen et al. 2024) wired
+  through `SampleOpts::min_p`, and a host-side `apply_logit_bias` (OpenAI
+  `logit_bias` semantics, bounds-checked, additive).
+- **Host-driven logits decode + prompt-cache session reuse (`LmRunner`).** New
+  default-implemented `prefill_logits` / `decode_logits` (caller owns sampling,
+  logit bias, log-probs, stop detection — for the HTTP server), plus
+  `export_session` / `restore_session` / `prefill_logits_reusing` over a new
+  `SessionSnapshot` (KV cache + token history) for prefix reuse.
+- **Streaming attention over a quantized KV cache (`rlx-runtime::quantized_kv`).**
+  `attend_quantized` does single-query GQA-aware attention directly over the
+  quantized layer, dequantizing one row at a time so peak extra memory is
+  `O(kv_dim)` not `O(past_len · kv_dim)`; new `read_rows(start, count)`
+  generalizes `read_window`. Validated against full-dequant attention.
+- **Sliding-window decode masking.** `attn_mask::bucket_decode_mask_windowed`
+  masks cached keys outside `[past_seq − window, past_seq]` for incremental decode
+  (reduces to the causal mask when the window is wide), and the Qwen3 decoder block
+  (`rlx-flow`) now takes a configurable `MaskKind` (`Causal` or
+  `SlidingWindow(w)`) instead of hard-coded causal — enabling Mistral / Gemma-style
+  sliding-window models.
+- **`Device::as_arg`** — canonical lowercase CLI token that round-trips through
+  `FromStr` (unlike the human-facing `name`, e.g. `"GPU (wgpu)"`).
+- **New parity / coverage tests** across backends (argreduce, conv2d-groups,
+  conv-bias, conv-transpose2d, GRU, group-norm-backward, LoRA-matmul-decompose,
+  LSQ-quant, native RNN on Metal/WGPU, im2col on MLX, multi-shape / dynamic,
+  reverse, sample, vision-ops, sliding-window-attn, dequant-matmul-int, expand,
+  CPU selective-scan), a `bench_new_ops.rs` example, and a new
+  [`docs/op-coverage.md`](docs/op-coverage.md) — the single-source-of-truth
+  op × backend matrix (113 `OpKind`s).
+
+### Performance
+
+- **CPU executor: per-run arena reset is now O(scratch), not O(params).**
+  `restore_arena_baseline` previously cloned and rewrote the entire (multi-GB)
+  weight region on every `run()`, making large models swap-thrash. Params /
+  constants now live solely in their dedicated never-aliased arena slots (no
+  redundant CPU-side copy that doubled the weight footprint), and only the
+  complement of the persistent byte ranges is zeroed each run. Constants are
+  written once.
+- **`Op::GroupedMatMul` on CPU is now a real segmented GEMM** — counting-sort
+  tokens by expert, one GEMM per expert, then unpermute — replacing the naive
+  per-token implementation. (GPU backends dispatch a dedicated grouped kernel.)
+- **`OpKind::LoraMatMul` added to `FUSED_KINDS`** so its `unfuse` decomposition
+  actually fires on backends without a native LoRA kernel (Metal / WGPU / CUDA /
+  ROCm / TPU). Standalone LoRA previously failed legalization unless another fused
+  op happened to be present (verified exact vs CPU).
+
+### Fixed
+
+- **Per-token (ragged) RoPE on CPU and Metal.** The RoPE kernels now index the
+  cos/sin table per token (one row per batch·seq element) when the table has
+  `total_tokens` rows, so ragged batched decode — each sequence in the batch at a
+  different absolute position — gets its own RoPE row instead of collapsing to row
+  0. New Metal `cos_per_token` kernel path; `device_ext::supports_ragged_rope`
+  gates this to CPU + Metal (other GPU RoPE kernels still index by seq position, so
+  callers fall back to per-length uniform grouping there). Validated by the new
+  ragged `metal_rope_parity` test against CPU.
+- **`ElementwiseRegion` output dtype mis-inference.** A fused elementwise chain now
+  takes the dtype of its final chain step (walking `Compare → Bool`,
+  `Cast → its dtype`, …) rather than input 0's — input 0 may be a bool `Where`
+  condition (`where(cond, a, b) + …`), which previously mis-typed the whole region
+  as bool.
+- **`conv_transpose2d` dynamic-batch shape inference** now preserves a dynamic
+  batch dim (mirroring `conv2d_output_shape`) instead of force-unwrapping it to a
+  static value.
+- **Metal uninitialized-buffer reads.** `new_buffer` (shared storage) is now zeroed
+  on allocation — ops that read unwritten arena regions (e.g. conv halo padding)
+  previously picked up per-process garbage, a nondeterminism / correctness bug.
+- **`rlx-coreml` stale `.mlmodelc` cache** — a version-incompatible or corrupt
+  compiled-model cache no longer permanently breaks loading; a load failure
+  discards the cache entry and recompiles from the `.mlpackage`.
+- **`moe_residency` GroupedMatMul ordinal made thread-local.** The process-global
+  atomic let one thread's `reset` / `next` ordinal sequence clobber another
+  in-flight forward's (corrupting layer/matrix decode → wrong TIDE host-expert
+  weights + residency accounting); forwards run per-thread, so the counter is now
+  thread-local.
+- **`LocalTransport` barrier is now a real rendezvous** (`std::sync::Barrier`,
+  auto-reset) instead of an arrival counter, so multi-step collectives (ring
+  all-reduce) synchronize correctly across threads.
+- **`memory_estimate::would_exceed_soft_budget`** boundary logic split into a pure,
+  deterministically-testable `exceeds_budget` predicate (the prior test was flaky
+  against live fluctuating RSS).
+
+### Changed
+
+- **CPU now declares `Reverse`, `Gru`, `Rnn`, `Mamba2`, `FakeQuantizeLSQ` (+ LSQ
+  backward X/scale), and `GroupNorm` backward (input/gamma/beta)** in
+  `CPU_SUPPORTED_OPS` — the kernels already existed in `thunk.rs` / training-bwd,
+  but the legalization const omitted them, so compiled CPU graphs couldn't use
+  them. CPU is once again the reference that lowers every `OpKind` any backend does.
+- Backend `supported_ops()` consts updated to reflect the new native / host
+  kernels above; the canonical per-backend op counts now live in
+  [`docs/op-coverage.md`](docs/op-coverage.md) (CPU 104, MLX 84, MTL 76, WGPU 75,
+  CUDA 71, ROCm 68, TPU 50 of 113 `OpKind`s).
+- New env opt-out: `RLX_METAL_RNN_HOST_FALLBACK` forces the Metal GRU / RNN host
+  path.
+
 ## [0.2.9] — 2026-06-22
 
 ### Performance
@@ -172,6 +427,11 @@ bump may carry breaking changes per `0.x`-semver convention.
   `GgufIQ1S`, `GgufIQ1M`, `GgufTQ1_0`, `GgufTQ2_0`, `GgufMXFP4`,
   `GgufNVFP4`) with byte-counts wired into `gguf_block_size` /
   `gguf_block_bytes` / `is_gguf` / `bits_per_element_x10`.
+- **`rlx-gguf` encoders**: IQ/TQ/MX quantize path (`iq_quantize`,
+  `iq2_encode`, `iq3_encode`, `iq1_encode`, `tq_quantize`, `mx_quantize`).
+  IQ2 uses llama.cpp kmap + sign-extraction; parallel block encoding via
+  `rayon`. CoreML on-device dequant for NVFP4 + IQ2/3/1
+  (`split_*_ondevice` in `rlx-coreml/src/mil/helpers.rs`).
 
 ### Added — Samplers
 
@@ -302,7 +562,7 @@ bump may carry breaking changes per `0.x`-semver convention.
 - **Examples**: `rlx-runtime/examples/graph_devices_demo.rs`.
 - **Tests**: full `hip_cpu_validate` suite (38 kernel families), `rlx-rocm/tests/basic.rs`
   GatedDeltaNet, `rlx-runtime/tests/rocm_op_parity.rs`,
-  `rlx-runtime/tests/graph_devices_parity.rs`, `pyrlx/tests/test_graph_devices.py`,
+  `rlx-runtime/tests/graph_devices_parity.rs`, `crates/pyrlx/tests/test_graph_devices.py`,
   ROCm suites in higher-order / autodiff GPU parity tests, `prologue_input` on region op
   literals in Metal/MLX/wgpu parity tests.
 - **CI**: `just test-rocm`, `just test-hip-cpu-validate`, ROCm arm in `just ci` /
@@ -619,7 +879,8 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 Initial release. Tracked at [git history root].
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.9...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.10...HEAD
+[0.2.10]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.10
 [0.2.9]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.9
 [0.2.8]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.8
 [0.2.7]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.7

@@ -565,6 +565,60 @@ const char* rlx_mlx_version(void);
 // it. Returns "" if the info isn't available.
 const char* rlx_mlx_device_name(void);
 
+// ── Distributed (multi-node) ─────────────────────────────────────
+//
+// Thin C ABI over mlx::core::distributed. `init` discovers the process
+// group via MLX's launcher (env-configured) and selects a backend:
+// "jaccl" (RDMA over Thunderbolt, macOS SDK >= 26.2), "ring" (TCP),
+// "mpi", or "any" to let MLX choose what's available. The group is held
+// process-globally in the shim; subsequent calls operate on it.
+//
+// Collectives and point-to-point work on host-side f32 buffers: the
+// shim wraps each as a 1-D array, runs the distributed op against the
+// group, eval()s it (which forces the actual transfer), and copies the
+// result back. SPMD semantics — every rank must call the same
+// collective in the same order.
+
+// Is a distributed backend available in this build/run? *out = 0|1.
+int rlx_mlx_dist_is_available(int* out);
+
+// Initialize the distributed backend. `backend` is one of
+// "any"|"jaccl"|"ring"|"mpi" (NULL or "" means "any"). When `strict` is
+// 0 and no backend is available, MLX returns a singleton group (size 1)
+// and ops become no-ops. Writes this process's rank and the world size.
+int rlx_mlx_dist_init(int strict, const char* backend, int* out_rank, int* out_size);
+
+// Rank / size of the initialized group.
+int rlx_mlx_dist_rank(int* out_rank);
+int rlx_mlx_dist_size(int* out_size);
+
+// AllReduce(sum): out[i] = sum over ranks of in[i]. `out` may not alias
+// `in`; both hold `nelems` f32.
+int rlx_mlx_dist_all_sum_f32(const float* in, float* out, size_t nelems);
+
+// AllGather: out = concat of every rank's `in` (nelems each), in rank
+// order. `out_cap` must be >= nelems * world_size.
+int rlx_mlx_dist_all_gather_f32(
+    const float* in, size_t nelems, float* out, size_t out_cap);
+
+// Point-to-point. `send` transmits `nelems` f32 to rank `dst`; `recv`
+// receives exactly `nelems` f32 from rank `src` (shape must match the
+// sender). FIFO per peer pair — issue matched send/recv in order.
+int rlx_mlx_dist_send_f32(const float* data, size_t nelems, int dst);
+int rlx_mlx_dist_recv_f32(float* out, size_t nelems, int src);
+
+// Barrier: synchronize all ranks (implemented as an all_sum of one
+// element, matching the mlx-lm startup-barrier idiom).
+int rlx_mlx_dist_barrier(void);
+
+// Device-resident AllReduce(sum) on array handles. Unlike the f32 variant
+// above (which copies to/from host), this composes `mlx::core::distributed::
+// all_sum` directly on the lazy MLX array and returns a new lazy array — no
+// host round-trip. This is the in-graph tensor-parallel collective: it stays
+// device-resident and rides MLX's jaccl/ring transport. The result is lazy;
+// the caller evals it as part of the surrounding graph.
+int rlx_mlx_dist_all_sum_array(rlx_mlx_array_t* in, rlx_mlx_array_t** out);
+
 #ifdef __cplusplus
 }
 #endif

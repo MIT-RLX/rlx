@@ -18,7 +18,7 @@ pub struct ChipInfo {
     pub ane: bool,
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 mod sys {
     use std::os::raw::{c_char, c_int};
 
@@ -47,24 +47,24 @@ mod sys {
 /// when this is `false` for the ANE specifically, CoreML can still run on
 /// CPU/GPU — see [`ane_available`] for the narrower ANE check.
 pub fn is_available() -> bool {
-    cfg!(any(target_os = "macos", target_os = "ios"))
+    cfg!(all(target_vendor = "apple", not(target_os = "watchos")))
 }
 
 /// Whether a Neural Engine is present and targetable by CoreML.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 pub fn ane_available() -> bool {
     // SAFETY: pure sysctl probe in the shim, no arguments.
     unsafe { sys::rlx_coreml_ane_available() != 0 }
 }
 
 /// Whether a Neural Engine is present and targetable by CoreML.
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
 pub fn ane_available() -> bool {
     false
 }
 
 /// Probe the host SoC, OS, and ANE presence.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 pub fn chip_info() -> ChipInfo {
     ChipInfo {
         brand: sys::fill_string(sys::rlx_coreml_chip_brand),
@@ -75,7 +75,7 @@ pub fn chip_info() -> ChipInfo {
 }
 
 /// Probe the host SoC, OS, and ANE presence.
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
 pub fn chip_info() -> ChipInfo {
     ChipInfo {
         brand: "unknown".into(),

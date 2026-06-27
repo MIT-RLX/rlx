@@ -21,6 +21,8 @@
 //! ```text
 //! cargo run --example convert -p rlx-gguf-convert -- \
 //!     model.safetensors model.q4_k.gguf Q4_K
+//! cargo run --example convert -p rlx-gguf-convert -- \
+//!     model.safetensors model.iq2_xxs.gguf IQ2_XXS llama
 //! cargo run --example convert -p rlx-gguf-convert --features pt -- \
 //!     pytorch_model.bin model.q4_k.gguf Q4_K
 //! ```

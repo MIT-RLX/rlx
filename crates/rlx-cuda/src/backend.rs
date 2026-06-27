@@ -46,14 +46,15 @@ use crate::kernels::{
     batch_elementwise_region_kernel, binary_kernel, compare_kernel, concat_kernel,
     conv_transpose2d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, cumsum_backward_kernel,
     cumsum_kernel, dequant_matmul_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw,
-    elementwise_region_kernel, expand_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
-    fused_residual_rms_norm_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
-    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, layer_norm2d_kernel, layernorm_kernel,
-    matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel, narrow_kernel, pool1d_kernel,
-    pool2d_kernel, pool3d_kernel, reduce_kernel, resize_nearest_2x_kernel,
-    rms_norm_backward_kernel, rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel,
-    sample_kernel, scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel,
-    softmax_kernel, topk_kernel, transpose_kernel, unary_kernel, where_kernel,
+    elementwise_region_kernel, expand_kernel, fused_attn_kernel, fused_binary_unary_kernel,
+    fused_residual_ln_kernel, fused_residual_rms_norm_kernel, gather_axis_kernel,
+    gather_backward_kernel, gather_kernel, group_norm_kernel, grouped_matmul_kernel, im2col_kernel,
+    layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel, matmul_kernel,
+    matmul_wmma_kernel, maxpool2d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel,
+    pool3d_kernel, reduce_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
+    rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
+    scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel, softmax_kernel,
+    topk_kernel, transpose_kernel, unary_kernel, where_kernel,
 };
 
 /// Opt-in WMMA Tensor Core matmul. Reads `RLX_CUDA_WMMA=1` from env at
@@ -100,6 +101,87 @@ enum Step {
         has_bias: u32,
         bias_off_f32: u32,
         act_id: u32,
+    },
+    /// Native FP8 tensor-core GEMM (cublasLt). TN: lhs[m,k]·rhs[n,k]ᵀ. All
+    /// offsets are BYTES into the arena (codes are u8, scales/out/bias f32).
+    ScaledMatMul {
+        m: u32,
+        k: u32,
+        n: u32,
+        lhs_byte_off: u32,
+        rhs_byte_off: u32,
+        lhs_scale_byte_off: u32,
+        rhs_scale_byte_off: u32,
+        out_byte_off: u32,
+        has_bias: u32,
+        bias_byte_off: u32,
+        lhs_e5m2: u32,
+        rhs_e5m2: u32,
+    },
+    /// Per-tensor amax → f32 scale for a tensor about to be FP8-quantized.
+    ScaledQuantScale {
+        x_off_f32: u32,
+        scale_off_f32: u32,
+        n: u32,
+        max_finite: f32,
+    },
+    /// Encode f32 → FP8 codes (per-tensor scale). `e5m2`: 0=E4M3, 1=E5M2.
+    ScaledQuantizeFp8 {
+        x_off_f32: u32,
+        scale_off_f32: u32,
+        out_byte_off: u32,
+        n: u32,
+        e5m2: u32,
+    },
+    /// Decode-and-accumulate GEMM fallback (non-tensor-core) for block / FP4 /
+    /// FP6 configs cublasLt can't do. Byte offsets for codes/scales; f32-element
+    /// offsets for out/bias.
+    ScaledMatMulDecode {
+        m: u32,
+        k: u32,
+        n: u32,
+        lhs_byte_off: u32,
+        rhs_byte_off: u32,
+        lhs_scale_byte_off: u32,
+        rhs_scale_byte_off: u32,
+        out_off_f32: u32,
+        lhs_fmt: u32,
+        rhs_fmt: u32,
+        scale_mode: u32,
+        block: u32,
+        has_bias: u32,
+        bias_off_f32: u32,
+    },
+    /// General (all-format/all-layout) scale producer.
+    ScaledQuantScaleGeneral {
+        x_off_f32: u32,
+        scale_byte_off: u32,
+        rows: u32,
+        cols: u32,
+        fmt: u32,
+        scale_mode: u32,
+        block: u32,
+    },
+    /// General (all-format/all-layout) quantize producer.
+    ScaledQuantizeGeneral {
+        x_off_f32: u32,
+        scale_byte_off: u32,
+        out_byte_off: u32,
+        rows: u32,
+        cols: u32,
+        fmt: u32,
+        scale_mode: u32,
+        block: u32,
+    },
+    ScaledDequantizeGeneral {
+        codes_byte_off: u32,
+        scale_byte_off: u32,
+        out_off_f32: u32,
+        rows: u32,
+        cols: u32,
+        fmt: u32,
+        scale_mode: u32,
+        block: u32,
     },
     Binary {
         n: u32,
@@ -265,6 +347,25 @@ enum Step {
         o_head_stride: u32,
         o_seq_stride: u32,
     },
+    /// Native fused-attention core (`fused_attn_block` kernel): inline RoPE +
+    /// SDPA over the packed QKV scratch `[B,S,3*inner]` → attn scratch
+    /// `[B,S,inner]`. One block per (batch·head); `seq*seq` f32 of shared
+    /// memory hold the score matrix. The QKV / out projections are separate
+    /// `Step::Matmul`s emitted by the same `Op::FusedAttentionBlock` arm.
+    FusedAttn {
+        qkv_off: u32,
+        mask_off: u32,
+        cos_off: u32,
+        sin_off: u32,
+        out_off: u32,
+        batch: u32,
+        seq: u32,
+        heads: u32,
+        head_dim: u32,
+        mask_kind: u32,
+        scale_bits: u32,
+        has_rope: u32,
+    },
     AttentionBackward {
         batch: u32,
         heads: u32,
@@ -292,6 +393,7 @@ enum Step {
         sin_off: u32,
         out_off: u32,
         last_dim: u32,
+        interleaved: u32,
     },
     Cumsum {
         outer: u32,
@@ -412,6 +514,12 @@ enum Step {
         norm_tag: u32,
         dtype_tag: u32,
         use_gpu: bool,
+        /// When true, `src_byte_off` points at an `n`-wide **real** signal (row
+        /// stride `n`) instead of the 2N `[re|im]` block — the native FFT kernel
+        /// reads `re` from it and uses `im = 0`, fusing the real→complex
+        /// `Sub`+`Concat` zero-pad away. Only set by the native-cuda-fft fusion
+        /// for stockham-eligible sizes.
+        real_input: bool,
     },
     /// Log-mel from block-layout FFT spectrum — host fallback.
     LogMelHost {
@@ -471,6 +579,37 @@ enum Step {
         dh: u32,
         dw_dil: u32,
         use_gpu: bool,
+    },
+    /// Host-staged batch-general reverse/flip.
+    ReverseHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        dims: Vec<u32>,
+        rev_mask: Vec<bool>,
+        elem_bytes: u32,
+    },
+    /// Host-staged ArgMax/ArgMin (f32-encoded indices).
+    ArgReduceHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        reduced: u32,
+        inner: u32,
+        is_max: bool,
+    },
+    /// Host-staged axial 2-D RoPE.
+    AxialRope2dHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        batch: u32,
+        seq: u32,
+        hidden: u32,
+        end_x: u32,
+        end_y: u32,
+        head_dim: u32,
+        num_heads: u32,
+        theta: f32,
+        repeat_factor: u32,
     },
     /// Gated-DeltaNet — host scan between GPU segments (qwen35 linear layers).
     GatedDeltaNet {
@@ -1055,6 +1194,9 @@ pub struct CudaExecutable {
     output_staging: Vec<F32HostSlot>,
     /// Pinned/pageable host staging for fixed-size graph inputs.
     input_staging: HashMap<String, F32HostSlot>,
+    /// cuFFT plan cache + interleaved scratch (only with the `cufft` feature).
+    #[cfg(feature = "cufft")]
+    cufft_state: crate::cufft_dispatch::CufftState,
     /// Reused event for graph replay completion (avoids full stream sync when possible).
     replay_event: Option<cudarc::driver::CudaEvent>,
     /// Persistent KV inputs (host mirror + device upload each run).
@@ -1131,6 +1273,9 @@ impl Step {
             | Step::WelchPeaksHost { .. }
             | Step::RngNormal { .. }
             | Step::RngUniform { .. }
+            | Step::ReverseHost { .. }
+            | Step::ArgReduceHost { .. }
+            | Step::AxialRope2dHost { .. }
             | Step::GaussianSplatRender { .. }
             | Step::GaussianSplatRenderBackward { .. }
             | Step::GaussianSplatPrepare { .. } => false,
@@ -1459,6 +1604,177 @@ unsafe fn cublaslt_matmul_fused(
     result
 }
 
+/// Native **FP8 tensor-core GEMM** via cuBLASLt (Hopper/Ada sm_89+).
+/// Computes row-major `D[m,n] = (lhs[m,k] · rhs[n,k]ᵀ) · lhs_scale · rhs_scale`
+/// where `lhs`/`rhs` are FP8 (E4M3/E5M2) codes and the scales are device f32
+/// scalars. This is RLX's `Op::ScaledMatMul` (TN layout) — the operands are fed
+/// straight into the tensor cores with f32 accumulation, the real low-precision
+/// throughput win that the decode-then-sgemm storage path leaves on the table.
+///
+/// Mapping to cuBLASLt's column-major `D = op(A)·op(B)`: we compute the
+/// transpose `Dᵀ[n,m]` in column-major (= our row-major `D[m,n]`) with
+///   A = rhs  (col-major `[k,n]`, op = **T**)   — FP8 requires transa=T
+///   B = lhs  (col-major `[k,m]`, op = **N**)   — FP8 requires transb=N
+/// so A↔scale: A_SCALE = rhs_scale, B_SCALE = lhs_scale. Offsets are **bytes**
+/// (FP8 codes are 1 byte; scales/out/bias are f32).
+#[allow(clippy::too_many_arguments)]
+unsafe fn cublaslt_matmul_fp8(
+    handle: cublaslt_sys::cublasLtHandle_t,
+    workspace_dev_ptr: u64,
+    workspace_size: usize,
+    arena_dev_ptr: u64,
+    m: u32,
+    k: u32,
+    n: u32,
+    lhs_byte_off: u64,
+    rhs_byte_off: u64,
+    lhs_scale_byte_off: u64,
+    rhs_scale_byte_off: u64,
+    out_byte_off: u64,
+    has_bias: bool,
+    bias_byte_off: u64,
+    lhs_e5m2: bool,
+    rhs_e5m2: bool,
+    cu_stream: cudarc::driver::sys::CUstream,
+) -> Result<(), cublaslt_result::CublasError> {
+    use core::ffi::c_void;
+    use core::mem;
+
+    let fp8 = |e5m2: bool| {
+        if e5m2 {
+            cublaslt_sys::cudaDataType_t::CUDA_R_8F_E5M2
+        } else {
+            cublaslt_sys::cudaDataType_t::CUDA_R_8F_E4M3
+        }
+    };
+    let a_dt = fp8(rhs_e5m2); // A = rhs
+    let b_dt = fp8(lhs_e5m2); // B = lhs
+    let out_dt = cublaslt_sys::cudaDataType_t::CUDA_R_32F;
+
+    let a_ptr = (arena_dev_ptr + rhs_byte_off) as *const c_void;
+    let b_ptr = (arena_dev_ptr + lhs_byte_off) as *const c_void;
+    let c_ptr = (arena_dev_ptr + out_byte_off) as *const c_void;
+    let d_ptr = c_ptr as *mut c_void;
+
+    // A = rhs col-major [k,n] ld=k; B = lhs col-major [k,m] ld=k;
+    // D = col-major [n,m] ld=n  (== row-major [m,n]).
+    let a_layout = cublaslt_result::create_matrix_layout(a_dt, k as u64, n as u64, k as i64)?;
+    let b_layout = cublaslt_result::create_matrix_layout(b_dt, k as u64, m as u64, k as i64)?;
+    let cd_layout = cublaslt_result::create_matrix_layout(out_dt, n as u64, m as u64, n as i64)?;
+
+    // FP8 accumulation is f32; scale type (alpha/beta) f32.
+    let compute_type = cublaslt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
+    let matmul_desc = cublaslt_result::create_matmul_desc(
+        compute_type,
+        cublaslt_sys::cudaDataType_t::CUDA_R_32F,
+    )?;
+
+    // cuBLASLt FP8 requires transa = T, transb = N (cublasOperation_t as i32).
+    let op_t: i32 = 1; // CUBLAS_OP_T
+    let op_n: i32 = 0; // CUBLAS_OP_N
+    unsafe {
+        cublaslt_result::set_matmul_desc_attribute(
+            matmul_desc,
+            cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+            &op_t as *const i32 as *const _,
+            mem::size_of::<i32>(),
+        )?;
+        cublaslt_result::set_matmul_desc_attribute(
+            matmul_desc,
+            cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+            &op_n as *const i32 as *const _,
+            mem::size_of::<i32>(),
+        )?;
+
+        // Per-tensor dequant scales: D = a_scale · b_scale · (A·B).
+        let a_scale_ptr = arena_dev_ptr + rhs_scale_byte_off;
+        let b_scale_ptr = arena_dev_ptr + lhs_scale_byte_off;
+        cublaslt_result::set_matmul_desc_attribute(
+            matmul_desc,
+            cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            &a_scale_ptr as *const u64 as *const _,
+            mem::size_of::<u64>(),
+        )?;
+        cublaslt_result::set_matmul_desc_attribute(
+            matmul_desc,
+            cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            &b_scale_ptr as *const u64 as *const _,
+            mem::size_of::<u64>(),
+        )?;
+
+        if has_bias {
+            let epi = cublaslt_sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
+            cublaslt_result::set_matmul_desc_attribute(
+                matmul_desc,
+                cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+                &epi as *const _ as *const _,
+                mem::size_of::<cublaslt_sys::cublasLtEpilogue_t>(),
+            )?;
+            let bias_ptr = arena_dev_ptr + bias_byte_off;
+            cublaslt_result::set_matmul_desc_attribute(
+                matmul_desc,
+                cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                &bias_ptr as *const u64 as *const _,
+                mem::size_of::<u64>(),
+            )?;
+        }
+    }
+
+    let matmul_pref = cublaslt_result::create_matmul_pref()?;
+    unsafe {
+        cublaslt_result::set_matmul_pref_attribute(
+            matmul_pref,
+            cublaslt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &workspace_size as *const _ as *const _,
+            mem::size_of::<usize>(),
+        )?;
+    }
+
+    let heuristic = unsafe {
+        cublaslt_result::get_matmul_algo_heuristic(
+            handle,
+            matmul_desc,
+            a_layout,
+            b_layout,
+            cd_layout,
+            cd_layout,
+            matmul_pref,
+        )
+    }?;
+
+    let alpha = 1.0_f32;
+    let beta = 0.0_f32;
+    let result = unsafe {
+        cublaslt_result::matmul(
+            handle,
+            matmul_desc,
+            &alpha as *const _ as *const c_void,
+            &beta as *const _ as *const c_void,
+            a_ptr,
+            a_layout,
+            b_ptr,
+            b_layout,
+            c_ptr,
+            cd_layout,
+            d_ptr,
+            cd_layout,
+            &heuristic.algo as *const _,
+            workspace_dev_ptr as *mut c_void,
+            workspace_size,
+            cu_stream as cublaslt_sys::cudaStream_t,
+        )
+    };
+
+    unsafe {
+        let _ = cublaslt_result::destroy_matmul_pref(matmul_pref);
+        let _ = cublaslt_result::destroy_matmul_desc(matmul_desc);
+        let _ = cublaslt_result::destroy_matrix_layout(cd_layout);
+        let _ = cublaslt_result::destroy_matrix_layout(b_layout);
+        let _ = cublaslt_result::destroy_matrix_layout(a_layout);
+    }
+    result
+}
+
 /// cuDNN forward 2D convolution against arena offsets. NCHW input,
 /// KCRS filter, NCHW output. Uses the v7 algorithm heuristic to pick
 /// the fastest algo that fits in the supplied workspace. Returns
@@ -1606,6 +1922,282 @@ unsafe fn cudnn_conv2d_forward(
         let _ = cudnn_result::destroy_tensor_descriptor(x_desc);
     }
 
+    result
+}
+
+/// cuDNN backward-data 2-D convolution: dx (input grad) from dy and w.
+/// Mirrors `cudnn_conv2d_forward`; returns Err so the caller can fall back
+/// to the host reference.
+#[allow(clippy::too_many_arguments)]
+unsafe fn cudnn_conv2d_backward_data(
+    handle: cudnn_sys::cudnnHandle_t,
+    workspace_dev_ptr: u64,
+    workspace_size: usize,
+    arena_dev_ptr: u64,
+    n: u32,
+    c_in: u32,
+    c_out: u32,
+    h: u32,
+    w: u32,
+    h_out: u32,
+    w_out: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    ph: u32,
+    pw: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+    dy_off_f32: u32,
+    w_off_f32: u32,
+    dx_off_f32: u32,
+) -> Result<(), cudnn_result::CudnnError> {
+    use core::ffi::c_void;
+    let dt = cudnn_sys::cudnnDataType_t::CUDNN_DATA_FLOAT;
+    let fmt = cudnn_sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW;
+    let dx_desc = cudnn_result::create_tensor_descriptor()?;
+    let dy_desc = cudnn_result::create_tensor_descriptor()?;
+    let conv_desc = cudnn_result::create_convolution_descriptor()?;
+    let w_desc = unsafe {
+        let mut u = std::mem::MaybeUninit::uninit();
+        cudnn_sys::cudnnCreateFilterDescriptor(u.as_mut_ptr()).result()?;
+        u.assume_init()
+    };
+    let setup = unsafe {
+        cudnn_result::set_tensor4d_descriptor(
+            dx_desc,
+            fmt,
+            dt,
+            [n as i32, c_in as i32, h as i32, w as i32],
+        )?;
+        cudnn_result::set_tensor4d_descriptor(
+            dy_desc,
+            fmt,
+            dt,
+            [n as i32, c_out as i32, h_out as i32, w_out as i32],
+        )?;
+        cudnn_result::set_filter4d_descriptor(
+            w_desc,
+            dt,
+            fmt,
+            [
+                c_out as i32,
+                (c_in / groups.max(1)) as i32,
+                kh as i32,
+                kw as i32,
+            ],
+        )?;
+        cudnn_result::set_convolution2d_descriptor(
+            conv_desc,
+            ph as i32,
+            pw as i32,
+            sh as i32,
+            sw as i32,
+            dh as i32,
+            dw as i32,
+            cudnn_sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
+            dt,
+        )?;
+        if groups > 1 {
+            cudnn_sys::cudnnSetConvolutionGroupCount(conv_desc, groups as i32).result()?;
+        }
+        Ok::<(), cudnn_result::CudnnError>(())
+    };
+    let result = setup.and_then(|()| unsafe {
+        let mut returned_count: i32 = 0;
+        let mut perf =
+            std::mem::MaybeUninit::<cudnn_sys::cudnnConvolutionBwdDataAlgoPerf_t>::uninit();
+        cudnn_result::get_convolution_backward_data_algorithm(
+            handle,
+            w_desc,
+            dy_desc,
+            conv_desc,
+            dx_desc,
+            1,
+            &mut returned_count,
+            perf.as_mut_ptr(),
+        )?;
+        if returned_count == 0 {
+            return Err(cudnn_result::CudnnError(
+                cudnn_sys::cudnnStatus_t::CUDNN_STATUS_NOT_SUPPORTED,
+            ));
+        }
+        let algo = perf.assume_init().algo;
+        let needed = cudnn_result::get_convolution_backward_data_workspace_size(
+            handle, w_desc, dy_desc, conv_desc, dx_desc, algo,
+        )?;
+        if needed > workspace_size {
+            return Err(cudnn_result::CudnnError(
+                cudnn_sys::cudnnStatus_t::CUDNN_STATUS_NOT_SUPPORTED,
+            ));
+        }
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let w_ptr = (arena_dev_ptr + (w_off_f32 as u64) * 4) as *const c_void;
+        let dy_ptr = (arena_dev_ptr + (dy_off_f32 as u64) * 4) as *const c_void;
+        let dx_ptr = (arena_dev_ptr + (dx_off_f32 as u64) * 4) as *mut c_void;
+        let workspace_ptr = workspace_dev_ptr as *mut c_void;
+        cudnn_result::convolution_backward_data(
+            handle,
+            &alpha as *const _ as *const c_void,
+            w_desc,
+            w_ptr,
+            dy_desc,
+            dy_ptr,
+            conv_desc,
+            algo,
+            workspace_ptr,
+            workspace_size,
+            &beta as *const _ as *const c_void,
+            dx_desc,
+            dx_ptr,
+        )
+    });
+    unsafe {
+        let _ = cudnn_result::destroy_convolution_descriptor(conv_desc);
+        let _ = cudnn_result::destroy_filter_descriptor(w_desc);
+        let _ = cudnn_result::destroy_tensor_descriptor(dy_desc);
+        let _ = cudnn_result::destroy_tensor_descriptor(dx_desc);
+    }
+    result
+}
+
+/// cuDNN backward-filter 2-D convolution: dw (weight grad) from x and dy.
+#[allow(clippy::too_many_arguments)]
+unsafe fn cudnn_conv2d_backward_filter(
+    handle: cudnn_sys::cudnnHandle_t,
+    workspace_dev_ptr: u64,
+    workspace_size: usize,
+    arena_dev_ptr: u64,
+    n: u32,
+    c_in: u32,
+    c_out: u32,
+    h: u32,
+    w: u32,
+    h_out: u32,
+    w_out: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    ph: u32,
+    pw: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+    x_off_f32: u32,
+    dy_off_f32: u32,
+    dw_off_f32: u32,
+) -> Result<(), cudnn_result::CudnnError> {
+    use core::ffi::c_void;
+    let dt = cudnn_sys::cudnnDataType_t::CUDNN_DATA_FLOAT;
+    let fmt = cudnn_sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW;
+    let x_desc = cudnn_result::create_tensor_descriptor()?;
+    let dy_desc = cudnn_result::create_tensor_descriptor()?;
+    let conv_desc = cudnn_result::create_convolution_descriptor()?;
+    let dw_desc = unsafe {
+        let mut u = std::mem::MaybeUninit::uninit();
+        cudnn_sys::cudnnCreateFilterDescriptor(u.as_mut_ptr()).result()?;
+        u.assume_init()
+    };
+    let setup = unsafe {
+        cudnn_result::set_tensor4d_descriptor(
+            x_desc,
+            fmt,
+            dt,
+            [n as i32, c_in as i32, h as i32, w as i32],
+        )?;
+        cudnn_result::set_tensor4d_descriptor(
+            dy_desc,
+            fmt,
+            dt,
+            [n as i32, c_out as i32, h_out as i32, w_out as i32],
+        )?;
+        cudnn_result::set_filter4d_descriptor(
+            dw_desc,
+            dt,
+            fmt,
+            [
+                c_out as i32,
+                (c_in / groups.max(1)) as i32,
+                kh as i32,
+                kw as i32,
+            ],
+        )?;
+        cudnn_result::set_convolution2d_descriptor(
+            conv_desc,
+            ph as i32,
+            pw as i32,
+            sh as i32,
+            sw as i32,
+            dh as i32,
+            dw as i32,
+            cudnn_sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
+            dt,
+        )?;
+        if groups > 1 {
+            cudnn_sys::cudnnSetConvolutionGroupCount(conv_desc, groups as i32).result()?;
+        }
+        Ok::<(), cudnn_result::CudnnError>(())
+    };
+    let result = setup.and_then(|()| unsafe {
+        let mut returned_count: i32 = 0;
+        let mut perf =
+            std::mem::MaybeUninit::<cudnn_sys::cudnnConvolutionBwdFilterAlgoPerf_t>::uninit();
+        cudnn_result::get_convolution_backward_filter_algorithm(
+            handle,
+            x_desc,
+            dy_desc,
+            conv_desc,
+            dw_desc,
+            1,
+            &mut returned_count,
+            perf.as_mut_ptr(),
+        )?;
+        if returned_count == 0 {
+            return Err(cudnn_result::CudnnError(
+                cudnn_sys::cudnnStatus_t::CUDNN_STATUS_NOT_SUPPORTED,
+            ));
+        }
+        let algo = perf.assume_init().algo;
+        let needed = cudnn_result::get_convolution_backward_filter_workspace_size(
+            handle, x_desc, dy_desc, conv_desc, dw_desc, algo,
+        )?;
+        if needed > workspace_size {
+            return Err(cudnn_result::CudnnError(
+                cudnn_sys::cudnnStatus_t::CUDNN_STATUS_NOT_SUPPORTED,
+            ));
+        }
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let x_ptr = (arena_dev_ptr + (x_off_f32 as u64) * 4) as *const c_void;
+        let dy_ptr = (arena_dev_ptr + (dy_off_f32 as u64) * 4) as *const c_void;
+        let dw_ptr = (arena_dev_ptr + (dw_off_f32 as u64) * 4) as *mut c_void;
+        let workspace_ptr = workspace_dev_ptr as *mut c_void;
+        cudnn_result::convolution_backward_filter(
+            handle,
+            &alpha as *const _ as *const c_void,
+            x_desc,
+            x_ptr,
+            dy_desc,
+            dy_ptr,
+            conv_desc,
+            algo,
+            workspace_ptr,
+            workspace_size,
+            &beta as *const _ as *const c_void,
+            dw_desc,
+            dw_ptr,
+        )
+    });
+    unsafe {
+        let _ = cudnn_result::destroy_convolution_descriptor(conv_desc);
+        let _ = cudnn_result::destroy_filter_descriptor(dw_desc);
+        let _ = cudnn_result::destroy_tensor_descriptor(dy_desc);
+        let _ = cudnn_result::destroy_tensor_descriptor(x_desc);
+    }
     result
 }
 
@@ -1771,6 +2363,36 @@ unsafe fn cudnn_conv3d_forward(
     }
 
     result
+}
+
+/// Per-`Op::FusedAttentionBlock` scratch: packed QKV `[B,S,3*inner]` followed
+/// by the attention output `[B,S,inner]`, both f32, 16-byte aligned per block.
+/// Returns the total scratch size in BYTES and a map from each surviving FAB
+/// node to its `(qkv, attn)` f32-element offsets *relative to the scratch
+/// base*. Empty when the unfuse pass decomposed every FAB to primitives.
+fn fab_scratch_plan(graph: &Graph) -> (usize, HashMap<rlx_ir::NodeId, (u32, u32)>) {
+    let mut map = HashMap::new();
+    let mut cur: usize = 0; // f32 elements
+    for node in graph.nodes() {
+        if let Op::FusedAttentionBlock {
+            num_heads,
+            head_dim,
+            ..
+        } = &node.op
+        {
+            let dims = node.shape.dims();
+            let b = dims[0].unwrap_static();
+            let s = dims[1].unwrap_static();
+            let inner = num_heads * head_dim;
+            let qkv_rel = cur as u32;
+            cur += b * s * 3 * inner;
+            let attn_rel = cur as u32;
+            cur += b * s * inner;
+            cur = (cur + 3) & !3; // 16-byte align the next block's region
+            map.insert(node.id, (qkv_rel, attn_rel));
+        }
+    }
+    (cur * 4, map)
 }
 
 /// Decode a Matmul/FusedMatMulBiasAct node's input shapes into the
@@ -2076,6 +2698,13 @@ fn fft_dtype_from_tag(tag: u32) -> rlx_ir::DType {
 fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Matmul { .. } => "rlx::Matmul",
+        Step::ScaledMatMul { .. } => "rlx::ScaledMatMul",
+        Step::ScaledQuantScale { .. } => "rlx::ScaledQuantScale",
+        Step::ScaledQuantizeFp8 { .. } => "rlx::ScaledQuantizeFp8",
+        Step::ScaledMatMulDecode { .. } => "rlx::ScaledMatMulDecode",
+        Step::ScaledQuantScaleGeneral { .. } => "rlx::ScaledQuantScaleGeneral",
+        Step::ScaledQuantizeGeneral { .. } => "rlx::ScaledQuantizeGeneral",
+        Step::ScaledDequantizeGeneral { .. } => "rlx::ScaledDequantizeGeneral",
         Step::Binary { .. } => "rlx::Binary",
         Step::Compare { .. } => "rlx::Compare",
         Step::Unary { .. } => "rlx::Unary",
@@ -2093,6 +2722,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::Expand { .. } => "rlx::Expand",
         Step::Argmax { .. } => "rlx::Argmax",
         Step::Attention { .. } => "rlx::Attention",
+        Step::FusedAttn { .. } => "rlx::FusedAttn",
         Step::AttentionBackward { .. } => "rlx::AttentionBackward",
         Step::Rope { .. } => "rlx::Rope",
         Step::Cumsum { .. } => "rlx::Cumsum",
@@ -2113,6 +2743,9 @@ fn step_name(step: &Step) -> &'static str {
         Step::WelchPeaksHost { .. } => "rlx::WelchPeaksHost",
         Step::WelchPeaksGpu { .. } => "rlx::WelchPeaksGpu",
         Step::Im2ColHost { .. } => "rlx::Im2ColHost",
+        Step::ReverseHost { .. } => "rlx::ReverseHost",
+        Step::ArgReduceHost { .. } => "rlx::ArgReduceHost",
+        Step::AxialRope2dHost { .. } => "rlx::AxialRope2dHost",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Lstm { .. } => "rlx::Lstm",
         Step::Llada2GroupLimitedGate { .. } => "rlx::Llada2GroupLimitedGate",
@@ -2230,6 +2863,84 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             }
             (r, vec![*c_off_f32])
         }
+        // Offsets here are coarse f32-element slot keys; byte offsets ÷4 land in
+        // the right slot since the planner aligns each tensor's slot.
+        Step::ScaledMatMul {
+            lhs_byte_off,
+            rhs_byte_off,
+            lhs_scale_byte_off,
+            rhs_scale_byte_off,
+            out_byte_off,
+            has_bias,
+            bias_byte_off,
+            ..
+        } => {
+            let mut r = vec![
+                *lhs_byte_off / 4,
+                *rhs_byte_off / 4,
+                *lhs_scale_byte_off / 4,
+                *rhs_scale_byte_off / 4,
+            ];
+            if *has_bias != 0 {
+                r.push(*bias_byte_off / 4);
+            }
+            (r, vec![*out_byte_off / 4])
+        }
+        Step::ScaledQuantScale {
+            x_off_f32,
+            scale_off_f32,
+            ..
+        } => (vec![*x_off_f32], vec![*scale_off_f32]),
+        Step::ScaledQuantizeFp8 {
+            x_off_f32,
+            scale_off_f32,
+            out_byte_off,
+            ..
+        } => (vec![*x_off_f32, *scale_off_f32], vec![*out_byte_off / 4]),
+        Step::ScaledMatMulDecode {
+            lhs_byte_off,
+            rhs_byte_off,
+            lhs_scale_byte_off,
+            rhs_scale_byte_off,
+            out_off_f32,
+            has_bias,
+            bias_off_f32,
+            ..
+        } => {
+            let mut r = vec![
+                *lhs_byte_off / 4,
+                *rhs_byte_off / 4,
+                *lhs_scale_byte_off / 4,
+                *rhs_scale_byte_off / 4,
+            ];
+            if *has_bias != 0 {
+                r.push(*bias_off_f32);
+            }
+            (r, vec![*out_off_f32])
+        }
+        Step::ScaledQuantScaleGeneral {
+            x_off_f32,
+            scale_byte_off,
+            ..
+        } => (vec![*x_off_f32], vec![*scale_byte_off / 4]),
+        Step::ScaledQuantizeGeneral {
+            x_off_f32,
+            scale_byte_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![*x_off_f32, *scale_byte_off / 4],
+            vec![*out_byte_off / 4],
+        ),
+        Step::ScaledDequantizeGeneral {
+            codes_byte_off,
+            scale_byte_off,
+            out_off_f32,
+            ..
+        } => (
+            vec![*codes_byte_off / 4, *scale_byte_off / 4],
+            vec![*out_off_f32],
+        ),
         Step::Binary {
             a_off,
             b_off,
@@ -2348,6 +3059,26 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             let mut r = vec![*q_off, *k_off, *v_off];
             if *mask_kind == 2 || *mask_kind == 4 {
                 r.push(*mask_off);
+            }
+            (r, vec![*out_off])
+        }
+        Step::FusedAttn {
+            qkv_off,
+            mask_off,
+            cos_off,
+            sin_off,
+            out_off,
+            mask_kind,
+            has_rope,
+            ..
+        } => {
+            let mut r = vec![*qkv_off];
+            if *mask_kind == 2 {
+                r.push(*mask_off);
+            }
+            if *has_rope != 0 {
+                r.push(*cos_off);
+                r.push(*sin_off);
             }
             (r, vec![*out_off])
         }
@@ -2473,6 +3204,21 @@ fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             col_byte_off,
             ..
         } => (vec![*x_byte_off / 4], vec![*col_byte_off / 4]),
+        Step::ReverseHost {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        }
+        | Step::ArgReduceHost {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        }
+        | Step::AxialRope2dHost {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
         Step::GatedDeltaNet {
             q_byte_off,
             k_byte_off,
@@ -2963,6 +3709,10 @@ impl CudaExecutable {
         let graph = LowerNonLastAxisReduce.run(crate::unfuse::unfuse(graph));
 
         let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
+        // Native `Op::FusedAttentionBlock`: per-block packed-QKV + attn scratch
+        // (the projections are GEMMs into these buffers, read by the
+        // `fused_attn_block` kernel). Empty when every FAB was decomposed.
+        let (fab_scratch_bytes, fab_scratch_map) = fab_scratch_plan(&graph);
         let mut plan = plan_f32_uniform(&graph, 16);
         let dequant_scratch_off = if dequant_scratch > 0 {
             let aligned = plan.arena_size.div_ceil(16) * 16;
@@ -2971,6 +3721,14 @@ impl CudaExecutable {
         } else {
             0
         };
+        let fab_scratch_off = if fab_scratch_bytes > 0 {
+            let aligned = plan.arena_size.div_ceil(16) * 16;
+            plan.arena_size = aligned + fab_scratch_bytes;
+            aligned
+        } else {
+            0
+        };
+        let fab_scratch_base_f32 = (fab_scratch_off / 4) as u32;
         let mut arena = Arena::from_plan(&ctx, &plan);
         for node in graph.nodes() {
             let elems = node.shape.num_elements().unwrap_or(0);
@@ -3032,14 +3790,230 @@ impl CudaExecutable {
                 }
             }
         }
+        // #6 real→complex fusion analysis (native-cuda-fft): find forward FFTs
+        // whose input is `Concat([signal, Sub(x,x)])` (a real signal zero-padded
+        // to the 2N complex block), where the Concat and the zeros are
+        // single-use. Such FFTs read `signal` directly (im=0), and the Concat +
+        // Sub are dropped from the schedule — eliminating two memory-bound
+        // kernels that together cost more than the FFT itself. Conservative:
+        // only fuses stockham-eligible sizes; `RLX_FFT_FUSE_REAL=0` disables.
+        #[cfg(feature = "native-cuda-fft")]
+        let (fft_real_skip, fft_real_src) = {
+            let mut skip: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+            let mut srcmap: HashMap<NodeId, NodeId> = HashMap::new();
+            let fuse = !rlx_ir::env::var("RLX_FFT_FUSE_REAL")
+                .is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("off"));
+            if fuse {
+                let mut uses: HashMap<NodeId, u32> = HashMap::new();
+                for node in graph.nodes() {
+                    for &inp in &node.inputs {
+                        *uses.entry(inp).or_insert(0) += 1;
+                    }
+                }
+                for node in graph.nodes() {
+                    let Op::Fft { inverse: false, .. } = &node.op else {
+                        continue;
+                    };
+                    let meta = rlx_ir::fft::fft_meta(&graph.node(node.inputs[0]).shape);
+                    if !crate::native_fft_dispatch::stockham_eligible(meta.n_complex as u32) {
+                        continue;
+                    }
+                    let concat_id = node.inputs[0];
+                    let cnode = graph.node(concat_id);
+                    let Op::Concat { axis } = &cnode.op else {
+                        continue;
+                    };
+                    if cnode.inputs.len() != 2
+                        || *axis != cnode.shape.rank() - 1
+                        || uses.get(&concat_id) != Some(&1)
+                    {
+                        continue;
+                    }
+                    let (x_id, z_id) = (cnode.inputs[0], cnode.inputs[1]);
+                    let znode = graph.node(z_id);
+                    let is_zeros = matches!(&znode.op, Op::Binary(BinaryOp::Sub))
+                        && znode.inputs.len() == 2
+                        && znode.inputs[0] == znode.inputs[1];
+                    // The FFT now reads `signal` at a point the arena planned its
+                    // liveness only up to the (skipped) Concat — so require it to
+                    // be a resident Input/Param, whose region is never aliased
+                    // away mid-run. (Covers the real-FFT graph; conservative.)
+                    let xnode = graph.node(x_id);
+                    let x_resident = matches!(&xnode.op, Op::Input { .. } | Op::Param { .. });
+                    // signal must hold exactly the `n` real values the FFT consumes.
+                    let x_ok = x_resident
+                        && xnode.shape.dim(xnode.shape.rank() - 1).unwrap_static()
+                            == meta.n_complex;
+                    if is_zeros && uses.get(&z_id) == Some(&1) && x_ok {
+                        skip.insert(concat_id);
+                        skip.insert(z_id);
+                        srcmap.insert(node.id, x_id);
+                    }
+                }
+            }
+            (skip, srcmap)
+        };
+
         for node in graph.nodes() {
+            #[cfg(feature = "native-cuda-fft")]
+            if fft_real_skip.contains(&node.id) {
+                continue; // fused into the real-input FFT below
+            }
             let elems = node.shape.num_elements().unwrap_or(0) as u32;
             match &node.op {
                 Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => continue,
-                Op::Reshape { .. } | Op::Cast { .. } => {
+                Op::Reshape { .. } | Op::Cast { .. } | Op::StopGradient => {
                     // No-op: arena.plan_f32_uniform already aliased the
                     // output slot to the input. The same row-major bytes
-                    // are visible under the new node ID.
+                    // are visible under the new node ID. StopGradient is a
+                    // pure identity in the forward pass (the AD pass already
+                    // consumed its gradient-blocking semantics upstream).
+                }
+                Op::ScaledMatMul {
+                    lhs_format,
+                    rhs_format,
+                    scale_layout,
+                    has_bias,
+                } => {
+                    let out_dims = node.shape.dims();
+                    let m = out_dims[0].unwrap_static() as u32;
+                    let n = out_dims[1].unwrap_static() as u32;
+                    let k = graph.node(node.inputs[0]).shape.dims()[1].unwrap_static() as u32;
+                    let bias_byte = if *has_bias {
+                        arena.offset(node.inputs[4]) as u32
+                    } else {
+                        0
+                    };
+                    let native = lhs_format.is_native_fp8()
+                        && rhs_format.is_native_fp8()
+                        && matches!(scale_layout, rlx_ir::ScaleLayout::PerTensor);
+                    if native {
+                        // Per-tensor FP8 → native cublasLt tensor-core GEMM.
+                        schedule.push(Step::ScaledMatMul {
+                            m,
+                            k,
+                            n,
+                            lhs_byte_off: arena.offset(node.inputs[0]) as u32,
+                            rhs_byte_off: arena.offset(node.inputs[1]) as u32,
+                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u32,
+                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                            has_bias: u32::from(*has_bias),
+                            bias_byte_off: bias_byte,
+                            lhs_e5m2: u32::from(*lhs_format == rlx_ir::ScaledFormat::F8E5M2),
+                            rhs_e5m2: u32::from(*rhs_format == rlx_ir::ScaledFormat::F8E5M2),
+                        });
+                    } else {
+                        // Block / FP4 / FP6 → on-device decode-and-accumulate.
+                        let (scale_mode, block) = scale_layout.mode_block();
+                        schedule.push(Step::ScaledMatMulDecode {
+                            m,
+                            k,
+                            n,
+                            lhs_byte_off: arena.offset(node.inputs[0]) as u32,
+                            rhs_byte_off: arena.offset(node.inputs[1]) as u32,
+                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u32,
+                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u32,
+                            out_off_f32: (arena.offset(node.id) / 4) as u32,
+                            lhs_fmt: lhs_format.kernel_id(),
+                            rhs_fmt: rhs_format.kernel_id(),
+                            scale_mode,
+                            block,
+                            has_bias: u32::from(*has_bias),
+                            bias_off_f32: bias_byte / 4,
+                        });
+                    }
+                }
+                Op::ScaledQuantScale {
+                    format,
+                    scale_layout,
+                } => {
+                    let x_id = node.inputs[0];
+                    if format.is_native_fp8()
+                        && matches!(scale_layout, rlx_ir::ScaleLayout::PerTensor)
+                    {
+                        let n = graph.node(x_id).shape.num_elements().unwrap() as u32;
+                        schedule.push(Step::ScaledQuantScale {
+                            x_off_f32: (arena.offset(x_id) / 4) as u32,
+                            scale_off_f32: (arena.offset(node.id) / 4) as u32,
+                            n,
+                            max_finite: format.max_finite(),
+                        });
+                    } else {
+                        let xs = graph.node(x_id).shape.dims();
+                        let cols = xs[xs.len() - 1].unwrap_static() as u32;
+                        let rows =
+                            graph.node(x_id).shape.num_elements().unwrap() as u32 / cols.max(1);
+                        let (scale_mode, block) = scale_layout.mode_block();
+                        schedule.push(Step::ScaledQuantScaleGeneral {
+                            x_off_f32: (arena.offset(x_id) / 4) as u32,
+                            scale_byte_off: arena.offset(node.id) as u32,
+                            rows,
+                            cols,
+                            fmt: format.kernel_id(),
+                            scale_mode,
+                            block,
+                        });
+                    }
+                }
+                Op::ScaledQuantize {
+                    format,
+                    scale_layout,
+                } => {
+                    let x_id = node.inputs[0];
+                    let scale_id = node.inputs[1];
+                    if format.is_native_fp8()
+                        && matches!(scale_layout, rlx_ir::ScaleLayout::PerTensor)
+                    {
+                        let n = graph.node(x_id).shape.num_elements().unwrap() as u32;
+                        schedule.push(Step::ScaledQuantizeFp8 {
+                            x_off_f32: (arena.offset(x_id) / 4) as u32,
+                            scale_off_f32: (arena.offset(scale_id) / 4) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                            n,
+                            e5m2: u32::from(*format == rlx_ir::ScaledFormat::F8E5M2),
+                        });
+                    } else {
+                        let xs = graph.node(x_id).shape.dims();
+                        let cols = xs[xs.len() - 1].unwrap_static() as u32;
+                        let rows =
+                            graph.node(x_id).shape.num_elements().unwrap() as u32 / cols.max(1);
+                        let (scale_mode, block) = scale_layout.mode_block();
+                        schedule.push(Step::ScaledQuantizeGeneral {
+                            x_off_f32: (arena.offset(x_id) / 4) as u32,
+                            scale_byte_off: arena.offset(scale_id) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                            rows,
+                            cols,
+                            fmt: format.kernel_id(),
+                            scale_mode,
+                            block,
+                        });
+                    }
+                }
+                Op::ScaledDequantize {
+                    format,
+                    scale_layout,
+                } => {
+                    // codes (U8, input 0) + scale (input 1) → f32. Logical shape
+                    // follows the codes. One general kernel covers all layouts.
+                    let codes_id = node.inputs[0];
+                    let scale_id = node.inputs[1];
+                    let xs = graph.node(codes_id).shape.dims();
+                    let cols = xs[xs.len() - 1].unwrap_static() as u32;
+                    let rows =
+                        graph.node(codes_id).shape.num_elements().unwrap() as u32 / cols.max(1);
+                    let (scale_mode, block) = scale_layout.mode_block();
+                    schedule.push(Step::ScaledDequantizeGeneral {
+                        codes_byte_off: arena.offset(codes_id) as u32,
+                        scale_byte_off: arena.offset(scale_id) as u32,
+                        out_off_f32: (arena.offset(node.id) / 4) as u32,
+                        rows,
+                        cols,
+                        fmt: format.kernel_id(),
+                        scale_mode,
+                        block,
+                    });
                 }
                 Op::MatMul => {
                     let (m, k, n, batch, a_bs, b_bs, c_bs, a_id, b_id) =
@@ -3701,6 +4675,106 @@ impl CudaExecutable {
                         o_seq_stride: st.o_seq,
                     });
                 }
+                Op::FusedAttentionBlock {
+                    num_heads,
+                    head_dim,
+                    has_bias,
+                    has_rope,
+                } => {
+                    // Native lowering (the unfuse pass only keeps FAB nodes
+                    // the `fused_attn_block` kernel can serve): two GEMMs into
+                    // packed scratch around the fused RoPE+SDPA kernel.
+                    //   1. qkv = hidden @ qkv_w [+ qkv_b]   → qkv scratch [B,S,3I]
+                    //   2. attn = fused_attn(qkv, mask, cos, sin) → attn scratch [B,S,I]
+                    //   3. out  = attn @ out_w [+ out_b]    → node output [B,S,I]
+                    let nh = *num_heads as u32;
+                    let hd = *head_dim as u32;
+                    let inner = (*num_heads * *head_dim) as u32;
+                    let dims = node.shape.dims();
+                    let b = dims[0].unwrap_static() as u32;
+                    let s = dims[1].unwrap_static() as u32;
+                    let m = b * s;
+
+                    if rlx_ir::env::flag("RLX_CUDA_TRACE_FAB") {
+                        eprintln!(
+                            "[rlx-cuda] native fused_attn_block: b={b} s={s} heads={nh} \
+                             head_dim={hd} rope={has_rope} bias={has_bias}"
+                        );
+                    }
+                    let (qkv_rel, attn_rel) = *fab_scratch_map
+                        .get(&node.id)
+                        .expect("rlx-cuda: FusedAttentionBlock scratch offset missing");
+                    let qkv_off = fab_scratch_base_f32 + qkv_rel;
+                    let attn_off = fab_scratch_base_f32 + attn_rel;
+
+                    let hidden_off = (arena.offset(node.inputs[0]) / 4) as u32;
+                    let qkv_w_off = (arena.offset(node.inputs[1]) / 4) as u32;
+                    let out_w_off = (arena.offset(node.inputs[2]) / 4) as u32;
+                    let mask_off = (arena.offset(node.inputs[3]) / 4) as u32;
+                    let mut next = 4usize;
+                    let (qkv_b_off, out_b_off) = if *has_bias {
+                        let q = (arena.offset(node.inputs[next]) / 4) as u32;
+                        let o = (arena.offset(node.inputs[next + 1]) / 4) as u32;
+                        next += 2;
+                        (q, o)
+                    } else {
+                        (0u32, 0u32)
+                    };
+                    let (cos_off, sin_off) = if *has_rope {
+                        let c = (arena.offset(node.inputs[next]) / 4) as u32;
+                        let si = (arena.offset(node.inputs[next + 1]) / 4) as u32;
+                        (c, si)
+                    } else {
+                        (0u32, 0u32)
+                    };
+
+                    let bias_flag = u32::from(*has_bias);
+                    schedule.push(Step::Matmul {
+                        m,
+                        k: inner,
+                        n: 3 * inner,
+                        batch: 1,
+                        a_batch_stride: 0,
+                        b_batch_stride: 0,
+                        c_batch_stride: 0,
+                        a_off_f32: hidden_off,
+                        b_off_f32: qkv_w_off,
+                        c_off_f32: qkv_off,
+                        has_bias: bias_flag,
+                        bias_off_f32: qkv_b_off,
+                        act_id: 0xFFFF,
+                    });
+                    let scale = 1.0f32 / (hd as f32).sqrt();
+                    schedule.push(Step::FusedAttn {
+                        qkv_off,
+                        mask_off,
+                        cos_off,
+                        sin_off,
+                        out_off: attn_off,
+                        batch: b,
+                        seq: s,
+                        heads: nh,
+                        head_dim: hd,
+                        mask_kind: 2, // Custom binary [B,S] — the only FAB mask
+                        scale_bits: scale.to_bits(),
+                        has_rope: u32::from(*has_rope),
+                    });
+                    schedule.push(Step::Matmul {
+                        m,
+                        k: inner,
+                        n: inner,
+                        batch: 1,
+                        a_batch_stride: 0,
+                        b_batch_stride: 0,
+                        c_batch_stride: 0,
+                        a_off_f32: attn_off,
+                        b_off_f32: out_w_off,
+                        c_off_f32: (arena.offset(node.id) / 4) as u32,
+                        has_bias: bias_flag,
+                        bias_off_f32: out_b_off,
+                        act_id: 0xFFFF,
+                    });
+                }
                 Op::AttentionBackward {
                     num_heads: _,
                     head_dim,
@@ -3753,7 +4827,11 @@ impl CudaExecutable {
                         wrt: wrt_id,
                     });
                 }
-                Op::Rope { head_dim, n_rot: _ } => {
+                Op::Rope {
+                    head_dim,
+                    n_rot: _,
+                    style,
+                } => {
                     let x_id = node.inputs[0];
                     let cos_id = node.inputs[1];
                     let sin_id = node.inputs[2];
@@ -3770,6 +4848,10 @@ impl CudaExecutable {
                     }
                     let total: u32 = x_shape.iter().map(|d| d.unwrap_static() as u32).product();
                     let seq = x_shape[x_shape.len() - 2].unwrap_static() as u32;
+                    let interleaved = match style {
+                        rlx_ir::op::RopeStyle::NeoX => 0u32,
+                        rlx_ir::op::RopeStyle::GptJ => 1u32,
+                    };
                     schedule.push(Step::Rope {
                         n_total: total,
                         seq,
@@ -3780,6 +4862,7 @@ impl CudaExecutable {
                         sin_off: (arena.offset(sin_id) / 4) as u32,
                         out_off: (arena.offset(node.id) / 4) as u32,
                         last_dim: last as u32,
+                        interleaved,
                     });
                 }
                 Op::Cumsum { axis: _, exclusive } => {
@@ -3964,8 +5047,18 @@ impl CudaExecutable {
                     let use_gpu = matches!(dtype, rlx_ir::DType::F32)
                         && meta.n_complex.is_power_of_two()
                         && meta.n_complex >= 2;
+                    // #6: if this forward FFT's input is a fused real→complex
+                    // zero-pad (`Concat([signal, zeros])`), read `signal` directly
+                    // with `im = 0` and skip the Concat+Sub entirely.
+                    #[cfg(feature = "native-cuda-fft")]
+                    let (src_id, real_input) = match fft_real_src.get(&node.id) {
+                        Some(&sig) => (sig, true),
+                        None => (in_id, false),
+                    };
+                    #[cfg(not(feature = "native-cuda-fft"))]
+                    let (src_id, real_input) = (in_id, false);
                     schedule.push(Step::Fft {
-                        src_byte_off: arena.offset(in_id) as u32,
+                        src_byte_off: arena.offset(src_id) as u32,
                         dst_byte_off: arena.offset(node.id) as u32,
                         outer: meta.outer as u32,
                         n_complex: meta.n_complex as u32,
@@ -3973,6 +5066,7 @@ impl CudaExecutable {
                         norm_tag: norm.tag(),
                         dtype_tag: fft_dtype_tag(dtype),
                         use_gpu,
+                        real_input,
                     });
                 }
                 Op::LogMel => {
@@ -4094,6 +5188,70 @@ impl CudaExecutable {
                         dh,
                         dw_dil,
                         use_gpu: im2col_use_gpu(n, exec_mode),
+                    });
+                }
+                Op::Reverse { axes } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let dims: Vec<u32> = (0..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static() as u32)
+                        .collect();
+                    let mut rev_mask = vec![false; rank];
+                    for &a in axes {
+                        if a < rank {
+                            rev_mask[a] = true;
+                        }
+                    }
+                    schedule.push(Step::ReverseHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        dims,
+                        rev_mask,
+                        elem_bytes: in_shape.dtype().size_bytes() as u32,
+                    });
+                }
+                Op::ArgMax { axis, keep_dim: _ } | Op::ArgMin { axis, keep_dim: _ } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let outer: usize = (0..*axis)
+                        .map(|i| in_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let reduced = in_shape.dim(*axis).unwrap_static();
+                    let inner: usize = (*axis + 1..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    schedule.push(Step::ArgReduceHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        outer: outer as u32,
+                        reduced: reduced as u32,
+                        inner: inner as u32,
+                        is_max: matches!(node.op, Op::ArgMax { .. }),
+                    });
+                }
+                Op::AxialRope2d {
+                    end_x,
+                    end_y,
+                    head_dim,
+                    num_heads,
+                    theta,
+                    repeat_factor,
+                } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::AxialRope2dHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        batch: in_shape.dim(0).unwrap_static() as u32,
+                        seq: in_shape.dim(1).unwrap_static() as u32,
+                        hidden: in_shape.dim(2).unwrap_static() as u32,
+                        end_x: *end_x as u32,
+                        end_y: *end_y as u32,
+                        head_dim: *head_dim as u32,
+                        num_heads: *num_heads as u32,
+                        theta: *theta,
+                        repeat_factor: *repeat_factor as u32,
                     });
                 }
                 Op::GatedDeltaNet {
@@ -4947,7 +6105,9 @@ impl CudaExecutable {
             .iter()
             .map(|&id| {
                 let elems = graph.node(id).shape.num_elements().unwrap_or(0);
-                F32HostSlot::new(&ctx, elems, pinned_output_staging_enabled())
+                // Cacheable pinned (not write-combined) so the host-read side
+                // of the D2H readback runs at full bandwidth.
+                F32HostSlot::new_output(&ctx, elems, pinned_output_staging_enabled())
             })
             .collect();
 
@@ -5010,6 +6170,8 @@ impl CudaExecutable {
             active_extent: None,
             output_staging,
             input_staging,
+            #[cfg(feature = "cufft")]
+            cufft_state: crate::cufft_dispatch::CufftState::new(),
             replay_event,
             gpu_handles: HashMap::new(),
             gpu_handle_feeds: HashMap::new(),
@@ -5549,6 +6711,263 @@ impl CudaExecutable {
                 }
             }
             match step {
+                Step::ScaledQuantScale {
+                    x_off_f32,
+                    scale_off_f32,
+                    n,
+                    max_finite,
+                } => {
+                    let kernel = crate::kernels::scaled_quant_scale_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(x_off_f32)
+                        .arg(scale_off_f32)
+                        .arg(n)
+                        .arg(max_finite);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: scaled_quant_scale launch failed");
+                    }
+                }
+                Step::ScaledQuantizeFp8 {
+                    x_off_f32,
+                    scale_off_f32,
+                    out_byte_off,
+                    n,
+                    e5m2,
+                } => {
+                    let kernel = crate::kernels::scaled_quantize_fp8_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(x_off_f32)
+                        .arg(scale_off_f32)
+                        .arg(out_byte_off)
+                        .arg(n)
+                        .arg(e5m2);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: scaled_quantize_fp8 launch failed");
+                    }
+                }
+                Step::ScaledMatMul {
+                    m,
+                    k,
+                    n,
+                    lhs_byte_off,
+                    rhs_byte_off,
+                    lhs_scale_byte_off,
+                    rhs_scale_byte_off,
+                    out_byte_off,
+                    has_bias,
+                    bias_byte_off,
+                    lhs_e5m2,
+                    rhs_e5m2,
+                } => {
+                    let lt_handle = self
+                        .blas_lt
+                        .expect("rlx-cuda ScaledMatMul: cublasLt handle required for FP8 GEMM");
+                    let mut workspace = self
+                        .blas_lt_workspace
+                        .as_ref()
+                        .expect("rlx-cuda ScaledMatMul: cublasLt workspace required")
+                        .lock()
+                        .unwrap();
+                    let (workspace_ptr, _ws_record) = workspace.device_ptr_mut(&stream);
+                    let (arena_ptr, _record) = self.arena.f32_buf_mut().device_ptr_mut(&stream);
+                    let cu_stream = stream.cu_stream();
+                    let r = unsafe {
+                        cublaslt_matmul_fp8(
+                            lt_handle,
+                            workspace_ptr,
+                            CUBLASLT_WORKSPACE_BYTES,
+                            arena_ptr,
+                            *m,
+                            *k,
+                            *n,
+                            *lhs_byte_off as u64,
+                            *rhs_byte_off as u64,
+                            *lhs_scale_byte_off as u64,
+                            *rhs_scale_byte_off as u64,
+                            *out_byte_off as u64,
+                            *has_bias != 0,
+                            *bias_byte_off as u64,
+                            *lhs_e5m2 != 0,
+                            *rhs_e5m2 != 0,
+                            cu_stream,
+                        )
+                    };
+                    r.expect(
+                        "rlx-cuda: cublasLt FP8 GEMM failed (needs sm_89+ and 16B-aligned operands)",
+                    );
+                }
+                Step::ScaledQuantScaleGeneral {
+                    x_off_f32,
+                    scale_byte_off,
+                    rows,
+                    cols,
+                    fmt,
+                    scale_mode,
+                    block,
+                } => {
+                    let nblk = if *scale_mode == 0 {
+                        1
+                    } else {
+                        cols.div_ceil(*block)
+                    };
+                    let total = if *scale_mode == 0 { 1 } else { rows * nblk };
+                    let kernel = crate::kernels::scaled_quant_scale_general_kernel(&self.ctx);
+                    let (grid, blk) = dispatch_grid_1d(total, 128);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (blk, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(x_off_f32)
+                        .arg(scale_byte_off)
+                        .arg(rows)
+                        .arg(cols)
+                        .arg(fmt)
+                        .arg(scale_mode)
+                        .arg(block);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: scaled_quant_scale_general launch failed");
+                    }
+                }
+                Step::ScaledQuantizeGeneral {
+                    x_off_f32,
+                    scale_byte_off,
+                    out_byte_off,
+                    rows,
+                    cols,
+                    fmt,
+                    scale_mode,
+                    block,
+                } => {
+                    let total = rows * cols;
+                    let kernel = crate::kernels::scaled_quantize_general_kernel(&self.ctx);
+                    let (grid, blk) = dispatch_grid_1d(total, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (blk, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(x_off_f32)
+                        .arg(scale_byte_off)
+                        .arg(out_byte_off)
+                        .arg(rows)
+                        .arg(cols)
+                        .arg(fmt)
+                        .arg(scale_mode)
+                        .arg(block);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: scaled_quantize_general launch failed");
+                    }
+                }
+                Step::ScaledDequantizeGeneral {
+                    codes_byte_off,
+                    scale_byte_off,
+                    out_off_f32,
+                    rows,
+                    cols,
+                    fmt,
+                    scale_mode,
+                    block,
+                } => {
+                    let total = rows * cols;
+                    let kernel = crate::kernels::scaled_dequantize_general_kernel(&self.ctx);
+                    let (grid, blk) = dispatch_grid_1d(total, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (blk, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(codes_byte_off)
+                        .arg(scale_byte_off)
+                        .arg(out_off_f32)
+                        .arg(rows)
+                        .arg(cols)
+                        .arg(fmt)
+                        .arg(scale_mode)
+                        .arg(block);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: scaled_dequantize_general launch failed");
+                    }
+                }
+                Step::ScaledMatMulDecode {
+                    m,
+                    k,
+                    n,
+                    lhs_byte_off,
+                    rhs_byte_off,
+                    lhs_scale_byte_off,
+                    rhs_scale_byte_off,
+                    out_off_f32,
+                    lhs_fmt,
+                    rhs_fmt,
+                    scale_mode,
+                    block,
+                    has_bias,
+                    bias_off_f32,
+                } => {
+                    let kernel = crate::kernels::scaled_matmul_decode_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: ((*n).div_ceil(16), (*m).div_ceil(16), 1),
+                        block_dim: (16, 16, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(lhs_byte_off)
+                        .arg(rhs_byte_off)
+                        .arg(lhs_scale_byte_off)
+                        .arg(rhs_scale_byte_off)
+                        .arg(out_off_f32)
+                        .arg(m)
+                        .arg(k)
+                        .arg(n)
+                        .arg(lhs_fmt)
+                        .arg(rhs_fmt)
+                        .arg(scale_mode)
+                        .arg(block)
+                        .arg(has_bias)
+                        .arg(bias_off_f32);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: scaled_matmul_decode launch failed");
+                    }
+                }
                 Step::Matmul {
                     m,
                     k,
@@ -6624,6 +8043,50 @@ impl CudaExecutable {
                             .expect("rlx-cuda: attention launch failed");
                     }
                 }
+                Step::FusedAttn {
+                    qkv_off,
+                    mask_off,
+                    cos_off,
+                    sin_off,
+                    out_off,
+                    batch,
+                    seq,
+                    heads,
+                    head_dim,
+                    mask_kind,
+                    scale_bits,
+                    has_rope,
+                } => {
+                    let kernel = fused_attn_kernel(&self.ctx);
+                    // One block per (batch·head); score matrix [seq·seq] in
+                    // dynamic shared memory. The native gate (rlx-cuda unfuse)
+                    // keeps `seq` small enough to fit the 48 KB default budget.
+                    let cfg = LaunchConfig {
+                        grid_dim: (batch * heads, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: seq * seq * 4,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(qkv_off)
+                        .arg(mask_off)
+                        .arg(cos_off)
+                        .arg(sin_off)
+                        .arg(out_off)
+                        .arg(batch)
+                        .arg(seq)
+                        .arg(heads)
+                        .arg(head_dim)
+                        .arg(mask_kind)
+                        .arg(scale_bits)
+                        .arg(has_rope);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: fused_attn launch failed");
+                    }
+                }
                 Step::AttentionBackward {
                     batch,
                     heads,
@@ -6683,6 +8146,7 @@ impl CudaExecutable {
                     sin_off,
                     out_off,
                     last_dim,
+                    interleaved,
                 } => {
                     let kernel = rope_kernel(&self.ctx);
                     let (grid, block) = dispatch_grid_1d(*n_total, 256);
@@ -6702,7 +8166,8 @@ impl CudaExecutable {
                         .arg(cos_off)
                         .arg(sin_off)
                         .arg(out_off)
-                        .arg(last_dim);
+                        .arg(last_dim)
+                        .arg(interleaved);
                     unsafe {
                         launcher.launch(cfg).expect("rlx-cuda: rope launch failed");
                     }
@@ -7186,21 +8651,71 @@ impl CudaExecutable {
                     norm_tag,
                     dtype_tag,
                     use_gpu,
+                    real_input,
                 } => {
                     if *use_gpu {
                         let norm = rlx_ir::fft::FftNorm::from_tag(*norm_tag);
                         let scale = norm.output_scale(*n_complex as usize, *inverse) as f32;
-                        crate::fft_dispatch::run_fft_gpu(
-                            &self.ctx,
-                            &stream,
-                            self.arena.f32_buf_mut(),
-                            *src_byte_off / 4,
-                            *dst_byte_off / 4,
-                            *outer,
-                            *n_complex,
-                            *inverse,
-                            scale,
-                        );
+                        // Backend precedence for the GPU FFT op: native Stockham
+                        // (n≤4096) → cuFFT → native multi/single-kernel. Each is
+                        // behind its own feature; with none on, only the last arm
+                        // compiles. `real_input` (the fused real→complex path) is
+                        // only the native kernel can read, so it forces this arm.
+                        #[allow(unused_mut)]
+                        let mut handled = false;
+                        let _ = real_input;
+
+                        #[cfg(feature = "native-cuda-fft")]
+                        if !handled
+                            && (*real_input
+                                || (crate::native_fft_dispatch::stockham_enabled()
+                                    && crate::native_fft_dispatch::stockham_eligible(*n_complex)))
+                        {
+                            crate::native_fft_dispatch::run_fft_native_stockham(
+                                &self.ctx,
+                                &stream,
+                                self.arena.f32_buf_mut(),
+                                *src_byte_off / 4,
+                                *dst_byte_off / 4,
+                                *outer,
+                                *n_complex,
+                                *inverse,
+                                scale,
+                                *real_input,
+                            );
+                            handled = true;
+                        }
+
+                        #[cfg(feature = "cufft")]
+                        if !handled && crate::cufft_dispatch::cufft_should_use(*n_complex) {
+                            crate::cufft_dispatch::run_fft_cufft(
+                                &self.ctx,
+                                &stream,
+                                &mut self.cufft_state,
+                                self.arena.f32_buf_mut(),
+                                *src_byte_off / 4,
+                                *dst_byte_off / 4,
+                                *outer,
+                                *n_complex,
+                                *inverse,
+                                scale,
+                            );
+                            handled = true;
+                        }
+
+                        if !handled {
+                            crate::fft_dispatch::run_fft_gpu(
+                                &self.ctx,
+                                &stream,
+                                self.arena.f32_buf_mut(),
+                                *src_byte_off / 4,
+                                *dst_byte_off / 4,
+                                *outer,
+                                *n_complex,
+                                *inverse,
+                                scale,
+                            );
+                        }
                     } else {
                         let (buf, arena_size) = self.arena.f32_buf_and_size();
                         crate::fft_host::run_fft1d(
@@ -7320,6 +8835,71 @@ impl CudaExecutable {
                             *dw_dil,
                         );
                     }
+                }
+                Step::ReverseHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    dims,
+                    rev_mask,
+                    elem_bytes,
+                } => {
+                    crate::host_misc::run_reverse(
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        dims,
+                        rev_mask,
+                        *elem_bytes as usize,
+                    );
+                }
+                Step::ArgReduceHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    outer,
+                    reduced,
+                    inner,
+                    is_max,
+                } => {
+                    crate::host_misc::run_argreduce(
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *reduced as usize,
+                        *inner as usize,
+                        *is_max,
+                    );
+                }
+                Step::AxialRope2dHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    hidden,
+                    end_x,
+                    end_y,
+                    head_dim,
+                    num_heads,
+                    theta,
+                    repeat_factor,
+                } => {
+                    crate::host_misc::run_axial_rope2d(
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *hidden as usize,
+                        *end_x as usize,
+                        *end_y as usize,
+                        *head_dim as usize,
+                        *num_heads as usize,
+                        *theta,
+                        *repeat_factor as usize,
+                    );
                 }
                 Step::GatedDeltaNet {
                     q_byte_off,
@@ -8010,26 +9590,40 @@ impl CudaExecutable {
                     ph,
                     pw,
                 } => {
-                    let buf = self.arena.f32_buf_mut();
-                    crate::training_bwd_host::run_maxpool2d_backward(
-                        &stream,
-                        buf,
-                        *x_byte_off as usize / 4,
-                        *dy_byte_off as usize / 4,
-                        *dx_byte_off as usize / 4,
-                        *n,
-                        *c,
-                        *h,
-                        *w,
-                        *h_out,
-                        *w_out,
-                        *kh,
-                        *kw,
-                        *sh,
-                        *sw,
-                        *ph,
-                        *pw,
-                    );
+                    let kernel = maxpool2d_backward_kernel(&self.ctx);
+                    let total = n * c * h * w;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let x_o = *x_byte_off / 4;
+                    let dy_o = *dy_byte_off / 4;
+                    let dx_o = *dx_byte_off / 4;
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(c)
+                        .arg(h)
+                        .arg(w)
+                        .arg(h_out)
+                        .arg(w_out)
+                        .arg(kh)
+                        .arg(kw)
+                        .arg(sh)
+                        .arg(sw)
+                        .arg(ph)
+                        .arg(pw)
+                        .arg(&x_o)
+                        .arg(&dy_o)
+                        .arg(&dx_o);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: maxpool2d_backward launch failed");
+                    }
                 }
                 Step::Conv2dBackwardInput {
                     dy_byte_off,
@@ -8052,30 +9646,72 @@ impl CudaExecutable {
                     dw,
                     groups,
                 } => {
-                    let buf = self.arena.f32_buf_mut();
-                    crate::training_bwd_host::run_conv2d_backward_input(
-                        &stream,
-                        buf,
-                        *dy_byte_off as usize / 4,
-                        *w_byte_off as usize / 4,
-                        *dx_byte_off as usize / 4,
-                        *n,
-                        *c_in,
-                        *h,
-                        *w_in,
-                        *c_out,
-                        *h_out,
-                        *w_out,
-                        *kh,
-                        *kw,
-                        *sh,
-                        *sw,
-                        *ph,
-                        *pw,
-                        *dh,
-                        *dw,
-                        *groups,
-                    );
+                    let used_cudnn = if let (Some(handle), Some(workspace)) =
+                        (self.dnn, self.dnn_workspace.as_ref())
+                    {
+                        let mut workspace = workspace.lock().unwrap();
+                        let (ws_ptr, _wr) = workspace.device_ptr_mut(&stream);
+                        let (arena_ptr, _ar) = self.arena.f32_buf_mut().device_ptr_mut(&stream);
+                        let r = unsafe {
+                            cudnn_conv2d_backward_data(
+                                handle,
+                                ws_ptr,
+                                CUDNN_WORKSPACE_BYTES,
+                                arena_ptr,
+                                *n,
+                                *c_in,
+                                *c_out,
+                                *h,
+                                *w_in,
+                                *h_out,
+                                *w_out,
+                                *kh,
+                                *kw,
+                                *sh,
+                                *sw,
+                                *ph,
+                                *pw,
+                                *dh,
+                                *dw,
+                                *groups,
+                                *dy_byte_off / 4,
+                                *w_byte_off / 4,
+                                *dx_byte_off / 4,
+                            )
+                        };
+                        if let Err(ref e) = r {
+                            log_fallback("conv2d_bwd_data.cudnn", e);
+                        }
+                        r.is_ok()
+                    } else {
+                        false
+                    };
+                    if !used_cudnn {
+                        let buf = self.arena.f32_buf_mut();
+                        crate::training_bwd_host::run_conv2d_backward_input(
+                            &stream,
+                            buf,
+                            *dy_byte_off as usize / 4,
+                            *w_byte_off as usize / 4,
+                            *dx_byte_off as usize / 4,
+                            *n,
+                            *c_in,
+                            *h,
+                            *w_in,
+                            *c_out,
+                            *h_out,
+                            *w_out,
+                            *kh,
+                            *kw,
+                            *sh,
+                            *sw,
+                            *ph,
+                            *pw,
+                            *dh,
+                            *dw,
+                            *groups,
+                        );
+                    }
                 }
                 Step::Conv2dBackwardWeight {
                     x_byte_off,
@@ -8098,30 +9734,72 @@ impl CudaExecutable {
                     dw_dil,
                     groups,
                 } => {
-                    let buf = self.arena.f32_buf_mut();
-                    crate::training_bwd_host::run_conv2d_backward_weight(
-                        &stream,
-                        buf,
-                        *x_byte_off as usize / 4,
-                        *dy_byte_off as usize / 4,
-                        *dw_byte_off as usize / 4,
-                        *n,
-                        *c_in,
-                        *h,
-                        *w,
-                        *c_out,
-                        *h_out,
-                        *w_out,
-                        *kh,
-                        *kw,
-                        *sh,
-                        *sw,
-                        *ph,
-                        *pw,
-                        *dh,
-                        *dw_dil,
-                        *groups,
-                    );
+                    let used_cudnn = if let (Some(handle), Some(workspace)) =
+                        (self.dnn, self.dnn_workspace.as_ref())
+                    {
+                        let mut workspace = workspace.lock().unwrap();
+                        let (ws_ptr, _wr) = workspace.device_ptr_mut(&stream);
+                        let (arena_ptr, _ar) = self.arena.f32_buf_mut().device_ptr_mut(&stream);
+                        let r = unsafe {
+                            cudnn_conv2d_backward_filter(
+                                handle,
+                                ws_ptr,
+                                CUDNN_WORKSPACE_BYTES,
+                                arena_ptr,
+                                *n,
+                                *c_in,
+                                *c_out,
+                                *h,
+                                *w,
+                                *h_out,
+                                *w_out,
+                                *kh,
+                                *kw,
+                                *sh,
+                                *sw,
+                                *ph,
+                                *pw,
+                                *dh,
+                                *dw_dil,
+                                *groups,
+                                *x_byte_off / 4,
+                                *dy_byte_off / 4,
+                                *dw_byte_off / 4,
+                            )
+                        };
+                        if let Err(ref e) = r {
+                            log_fallback("conv2d_bwd_filter.cudnn", e);
+                        }
+                        r.is_ok()
+                    } else {
+                        false
+                    };
+                    if !used_cudnn {
+                        let buf = self.arena.f32_buf_mut();
+                        crate::training_bwd_host::run_conv2d_backward_weight(
+                            &stream,
+                            buf,
+                            *x_byte_off as usize / 4,
+                            *dy_byte_off as usize / 4,
+                            *dw_byte_off as usize / 4,
+                            *n,
+                            *c_in,
+                            *h,
+                            *w,
+                            *c_out,
+                            *h_out,
+                            *w_out,
+                            *kh,
+                            *kw,
+                            *sh,
+                            *sw,
+                            *ph,
+                            *pw,
+                            *dh,
+                            *dw_dil,
+                            *groups,
+                        );
+                    }
                 }
                 Step::Pool1d {
                     n,

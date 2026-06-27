@@ -26,8 +26,8 @@ use std::collections::{HashMap, HashSet};
 
 use rlx_ir::RegionPrologue;
 use rlx_ir::op::{
-    Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp, ScaleMode, SteKind,
-    TransformStep,
+    Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp, RopeStyle, ScaleMode,
+    SteKind, TransformStep,
 };
 use rlx_ir::shape::{Dim, DimBinding, Shape};
 use rlx_ir::{DType, Graph, NodeId, Op};
@@ -822,6 +822,26 @@ pub fn lower_with_env(
                 let idx = mlx_indices_i64(lookup(&env, node.inputs[1])?)?;
                 ops::take(x, &idx, *axis as i32)?
             }
+            Op::Reverse { axes } => {
+                // Batch-general flip: `take` along each axis with reversed
+                // indices [d-1, …, 0]. Only the listed axes move.
+                let x0 = lookup(&env, node.inputs[0])?;
+                let shape = node_input_shape(graph, node.inputs[0]);
+                if axes.is_empty() {
+                    x0.clone_handle()?
+                } else {
+                    let mut cur: Option<Array> = None;
+                    for &ax in axes {
+                        let d = shape[ax];
+                        let idx_f: Vec<f32> = (0..d).rev().map(|i| i as f32).collect();
+                        let idx_arr = Array::from_f32_slice(&idx_f, &[d as usize], DType::F32)?;
+                        let idx = mlx_indices_i64(&idx_arr)?;
+                        let src = cur.as_ref().unwrap_or(x0);
+                        cur = Some(ops::take(src, &idx, ax as i32)?);
+                    }
+                    cur.unwrap()
+                }
+            }
             Op::Reduce {
                 op: rop,
                 axes,
@@ -837,6 +857,20 @@ pub fn lower_with_env(
                 };
                 let ax: Vec<i32> = axes.iter().map(|&a| a as i32).collect();
                 ops::reduce(x, kind, &ax, *keep_dim)?
+            }
+            Op::ArgMax { axis, keep_dim } => {
+                // rlx encodes indices as f32 at the I/O boundary.
+                let x = lookup(&env, node.inputs[0])?;
+                let idx = ops::argmax(x, *axis as i32, *keep_dim)?;
+                ops::cast(&idx, DType::F32)?
+            }
+            Op::ArgMin { axis, keep_dim } => {
+                // argmin(x) = argmax(-x); first-hit tie-break matches CPU.
+                let x = lookup(&env, node.inputs[0])?;
+                let neg1 = Array::from_f32_slice(&[-1.0], &[1], DType::F32)?;
+                let neg = ops::mul(x, &neg1)?;
+                let idx = ops::argmax(&neg, *axis as i32, *keep_dim)?;
+                ops::cast(&idx, DType::F32)?
             }
             Op::Cumsum { axis, exclusive } => {
                 let x = lookup(&env, node.inputs[0])?;
@@ -1139,10 +1173,19 @@ pub fn lower_with_env(
                 let g = mlx_norm_scale_1d(lookup(&env, node.inputs[g_idx])?)?;
                 ops::rms_norm(&summed, &g, *eps)?
             }
-            Op::Rope { head_dim, n_rot } => {
+            Op::Rope {
+                head_dim,
+                n_rot,
+                style,
+            } => {
                 let x = lookup(&env, node.inputs[0])?;
                 let cos = lookup(&env, node.inputs[1])?;
                 let sin = lookup(&env, node.inputs[2])?;
+                // GGUF Llama Q/K weights are permuted for interleaved (GPT-J) RoPE —
+                // pairs `(2i, 2i+1)` — whereas HF safetensors use rotate-half (NeoX) —
+                // pairs `(i, i+half)`. The cos/sin tables are identical; only how the
+                // last axis is paired differs.
+                let interleaved = matches!(style, RopeStyle::GptJ);
 
                 let graph_x = node_input_shape(graph, node.inputs[0]);
                 let x_shape = runtime_shape_or_graph(x, &graph_x)?;
@@ -1189,6 +1232,32 @@ pub fn lower_with_env(
                     let seq_cos = seq_v.min(cos_rows.max(1));
                     let cos_seq = ops::slice(cos, &[0, 0], &[seq_cos, pairs])?;
                     let sin_seq = ops::slice(sin, &[0, 0], &[seq_cos, pairs])?;
+                    if interleaved {
+                        // GPT-J: reshape the rotation axis `[2*pairs]` -> `[pairs, 2]`
+                        // so even/odd elements sit on a new trailing axis; rotate the
+                        // pair, then reshape back (which re-interleaves `2i`/`2i+1`).
+                        let mut pair_shape = rot_shape.to_vec();
+                        pair_shape[rn - 1] = pairs;
+                        pair_shape.push(2);
+                        let x_pairs = ops::reshape(x_rot, &pair_shape)?;
+                        let mut even_stop = pair_shape.clone();
+                        even_stop[rn] = 1;
+                        let x_even = ops::slice(&x_pairs, &vec![0i32; rn + 1], &even_stop)?;
+                        let mut odd_start = vec![0i32; rn + 1];
+                        odd_start[rn] = 1;
+                        let x_odd = ops::slice(&x_pairs, &odd_start, &pair_shape)?;
+                        let mut bshape = vec![1i32; rn + 1];
+                        bshape[seq_axis] = seq_cos;
+                        bshape[rn - 1] = pairs;
+                        let cos_b = ops::reshape(&cos_seq, &bshape)?;
+                        let sin_b = ops::reshape(&sin_seq, &bshape)?;
+                        let y_even =
+                            ops::sub(&ops::mul(&x_even, &cos_b)?, &ops::mul(&x_odd, &sin_b)?)?;
+                        let y_odd =
+                            ops::add(&ops::mul(&x_odd, &cos_b)?, &ops::mul(&x_even, &sin_b)?)?;
+                        let y_pairs = ops::concat(&[&y_even, &y_odd], rn as i32)?;
+                        return ops::reshape(&y_pairs, rot_shape);
+                    }
                     let mut bshape = vec![1i32; rn];
                     bshape[seq_axis] = seq_cos;
                     bshape[rn - 1] = pairs;
@@ -1396,9 +1465,102 @@ pub fn lower_with_env(
                 let c = shape[1];
                 let h = shape[2];
                 let w = shape[3];
-                let flat = ops::reshape(x, &[(n * h * w) as i32, c as i32])?;
+                // LayerNorm2d normalizes over the CHANNEL axis per spatial
+                // position. In NCHW the channels are strided by h*w, so a direct
+                // reshape to [n*h*w, c] would group the wrong elements. Transpose
+                // NCHW→NHWC (channel last/contiguous), normalize, transpose back.
+                // `contiguous` materializes the view (mlx::compile elides it).
+                let nhwc = ops::contiguous(&ops::transpose(x, &[0, 2, 3, 1])?)?;
+                let flat = ops::reshape(&nhwc, &[(n * h * w) as i32, c as i32])?;
                 let y = ops::layer_norm(&flat, &g, Some(&b), *eps)?;
-                ops::reshape(&y, &[n as i32, c as i32, h as i32, w as i32])?
+                let y_nhwc = ops::reshape(&y, &[n as i32, h as i32, w as i32, c as i32])?;
+                ops::contiguous(&ops::transpose(&y_nhwc, &[0, 3, 1, 2])?)?
+            }
+            Op::GroupNorm { num_groups, eps } => {
+                // NCHW GroupNorm: normalize over (c/g, h, w) per (n, group),
+                // then apply per-channel affine. Same math + primitives as the
+                // `GroupNormBackwardInput` arm (which MLX already lowers).
+                let x = lookup(&env, node.inputs[0])?;
+                let gamma = lookup(&env, node.inputs[1])?;
+                let beta = lookup(&env, node.inputs[2])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let dtype = node.shape.dtype();
+                if x_shape.len() != 4 {
+                    return Err(MlxError(
+                        "GroupNorm on MLX: expects NCHW rank-4 input".into(),
+                    ));
+                }
+                let n = x_shape[0];
+                let c = x_shape[1];
+                let h = x_shape[2];
+                let w = x_shape[3];
+                let g = *num_groups as i32;
+                let inner = (c / g) * h * w;
+                let x3 = ops::reshape(x, &[n, g, inner])?;
+                let eps_arr = Array::from_f32_slice(&[*eps], &[1], dtype)?;
+                let mean = ops::reduce(&x3, MlxReduce::Mean, &[2], true)?;
+                let x_c = ops::sub(&x3, &mean)?;
+                let var = ops::reduce(&ops::mul(&x_c, &x_c)?, MlxReduce::Mean, &[2], true)?;
+                let inv_std = ops::unary(&ops::add(&var, &eps_arr)?, MlxUnary::Rsqrt)?;
+                let x_hat = ops::reshape(&ops::mul(&x_c, &inv_std)?, &[n, c, h, w])?;
+                let gamma_b = ops::reshape(gamma, &[1, c, 1, 1])?;
+                let beta_b = ops::reshape(beta, &[1, c, 1, 1])?;
+                ops::add(&ops::mul(&x_hat, &gamma_b)?, &beta_b)?
+            }
+            Op::Im2Col {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+            } => {
+                // NCHW im2col → rows layout `[N·H_out·W_out, C·kH·kW]`, K-axis
+                // ordered (c, ki, kj). Same windowing the MLX Pool path uses:
+                // zero-pad, then strided-slice one [n,c,h_out,w_out] window per
+                // kernel offset; stack the windows instead of reducing them.
+                let x = lookup(&env, node.inputs[0])?;
+                let s = node_input_shape(graph, node.inputs[0]);
+                if s.len() != 4 {
+                    return Err(MlxError("Im2Col on MLX: NCHW rank-4 only".into()));
+                }
+                let (n, c, h, w) = (s[0], s[1], s[2], s[3]);
+                let kh = kernel_size[0] as i32;
+                let kw = kernel_size[1] as i32;
+                let sh = stride[0] as i32;
+                let sw = stride[1] as i32;
+                let ph = padding[0] as i32;
+                let pw = padding[1] as i32;
+                let dh = dilation[0] as i32;
+                let dw = dilation[1] as i32;
+                let h_out = (h + 2 * ph - (dh * (kh - 1) + 1)) / sh + 1;
+                let w_out = (w + 2 * pw - (dw * (kw - 1) + 1)) / sw + 1;
+                let x_pad_owned;
+                let x_pad: &Array = if ph > 0 || pw > 0 {
+                    x_pad_owned = ops::pad(x, &[0, 0, ph, pw], &[0, 0, ph, pw], 0.0)?;
+                    &x_pad_owned
+                } else {
+                    x
+                };
+                let mut patches: Vec<Array> = Vec::with_capacity((kh * kw) as usize);
+                for ki in 0..kh {
+                    for kj in 0..kw {
+                        let start = [0, 0, ki * dh, kj * dw];
+                        let stop = [
+                            n,
+                            c,
+                            ki * dh + (h_out - 1) * sh + 1,
+                            kj * dw + (w_out - 1) * sw + 1,
+                        ];
+                        let strides = [1, 1, sh, sw];
+                        let win = ops::slice_strided(x_pad, &start, &stop, &strides)?;
+                        patches.push(ops::reshape(&win, &[n, c, h_out, w_out, 1])?);
+                    }
+                }
+                let refs: Vec<&Array> = patches.iter().collect();
+                // [n, c, h_out, w_out, kh*kw] (last axis ki-major, then kj).
+                let stacked = ops::concat(&refs, 4)?;
+                // → [n, h_out, w_out, c, kh*kw] then flatten to [M, C·kH·kW].
+                let t = ops::contiguous(&ops::transpose(&stacked, &[0, 2, 3, 1, 4])?)?;
+                ops::reshape(&t, &[n * h_out * w_out, c * kh * kw])?
             }
             Op::ConvTranspose2d {
                 kernel_size,
@@ -1502,10 +1664,17 @@ pub fn lower_with_env(
                     let y_ncl = ops::transpose(&adjusted, &[0, 2, 1])?;
                     ops::reshape(&y_ncl, &out_shape)?
                 } else {
+                    // MLX models a transposed conv as conv_general with
+                    // input_dilation = stride, stride = 1, flip = true, and SYMMETRIC
+                    // padding `dilation*(k-1) - pad_orig` on both sides (+ output_padding
+                    // on the high side) — exactly like the 1D path above. The old
+                    // asymmetric `in-1 - s*(out-1) + p` pad_hi was a large negative for
+                    // upsampling, which MLX rejects (it crops to an empty window →
+                    // input shape (1,0,0,C)).
                     let pad_lo: Vec<i32> = vec![d(0) * (kh - 1) - p(0), d(1) * (kw - 1) - p(1)];
                     let pad_hi: Vec<i32> = vec![
-                        h - 1 - s(0) * (h_out - 1) + p(0) + opad(0),
-                        w_in - 1 - s(1) * (w_out - 1) + p(1) + opad(1),
+                        d(0) * (kh - 1) - p(0) + opad(0),
+                        d(1) * (kw - 1) - p(1) + opad(1),
                     ];
                     let x_nhwc = ops::transpose(x, &[0, 2, 3, 1])?;
                     let needs_inflate = g > 1 && (s(0) > 1 || s(1) > 1);
@@ -1515,13 +1684,24 @@ pub fn lower_with_env(
                     } else {
                         (x_nhwc.clone_handle()?, [s(0), s(1)])
                     };
-                    // Weight [C_in, C_out/g, kH, kW] → MLX [C_in, kH, kW, C_out/g]
+                    // MLX `conv_general` weight convention is [C_out, ...kernel...,
+                    // C_in/g] (output channels first, input-per-group last) — the same
+                    // layout as a forward conv, regardless of `flip`. The IR
+                    // transposed-conv weight is [C_in, C_out/g, kH, kW], so move C_out
+                    // to the front and C_in to the back. (The 1D path above already
+                    // does this with perm [1, 2, 0]; the 2D path used to emit
+                    // [C_in, kH, kW, C_out/g], which made MLX read C_in as C_out and
+                    // reject any C_in != C_out — e.g. the U-Net decoder's 256→128
+                    // upsample.)
                     let w_t = if g == 1 {
-                        ops::transpose(w, &[0, 2, 3, 1])?
+                        // [C_in, C_out, kH, kW] → [C_out, kH, kW, C_in]
+                        ops::transpose(w, &[1, 2, 3, 0])?
                     } else {
+                        // [C_in, C_out/g, kH, kW] → [g, C_in/g, C_out/g, kH, kW]
+                        // → [g, C_out/g, kH, kW, C_in/g] → [C_out, kH, kW, C_in/g]
                         let split = ops::reshape(w, &[g, c_in_per_g, c_out_per_g, kh, kw])?;
-                        let perm = ops::transpose(&split, &[0, 1, 3, 4, 2])?;
-                        ops::reshape(&perm, &[c_in, kh, kw, c_out_per_g])?
+                        let perm = ops::transpose(&split, &[0, 2, 3, 4, 1])?;
+                        ops::reshape(&perm, &[c_out, kh, kw, c_in_per_g])?
                     };
                     let raw = ops::conv_general(
                         &x_input,
@@ -1534,19 +1714,17 @@ pub fn lower_with_env(
                         g,
                         true,
                     )?;
-                    let needs_slice = pad_lo.iter().chain(pad_hi.iter()).any(|&p| p < 0);
-                    let adjusted = if needs_slice {
-                        let cur: Vec<i32> = raw.shape()?.iter().map(|&d| d as i32).collect();
-                        let mut start = vec![0i32; cur.len()];
+                    // conv_general may overshoot the declared output by a few samples
+                    // (padding/output_padding rounding); trim the NHWC H,W axes to
+                    // exactly (h_out, w_out). Mirrors the 1D length trim above.
+                    let cur: Vec<i32> = raw.shape()?.iter().map(|&d| d as i32).collect();
+                    let adjusted = if cur.get(1).copied().unwrap_or(0) > h_out
+                        || cur.get(2).copied().unwrap_or(0) > w_out
+                    {
+                        let start = vec![0i32; cur.len()];
                         let mut stop = cur.clone();
-                        for i in 0..2 {
-                            if pad_lo[i] < 0 {
-                                start[1 + i] = -pad_lo[i];
-                            }
-                            if pad_hi[i] < 0 {
-                                stop[1 + i] += pad_hi[i];
-                            }
-                        }
+                        stop[1] = h_out;
+                        stop[2] = w_out;
                         ops::slice(&raw, &start, &stop)?
                     } else {
                         raw
@@ -1718,7 +1896,9 @@ pub fn lower_with_env(
                         // generate() calls because the Param bytes are stable.
                         let w_node = graph.node(node.inputs[1]);
                         let cache_key = match &w_node.op {
-                            rlx_ir::Op::Param { name } => Some(format!("{name}#kn")),
+                            rlx_ir::Op::Param { name } => {
+                                Some(mlx_dequant_cache_key(name, k, n, scheme, &w_bytes))
+                            }
                             _ => None,
                         };
                         let w_kn = if let Some(ref key) = cache_key {
@@ -2769,6 +2949,30 @@ pub fn lower_with_env(
                 activation_backward_compose(x, dy, *kind, dtype)?
             }
 
+            Op::SoftmaxCrossEntropy => {
+                // logits: [N, C], targets: [N, C] (dense distribution).
+                // loss[n] = lse(logits[n]) - Σ_c targets[n,c]·logits[n,c].
+                let logits = lookup(&env, node.inputs[0])?;
+                let targets = lookup(&env, node.inputs[1])?;
+                let logits_shape = node_input_shape(graph, node.inputs[0]);
+                let n = logits_shape[0];
+
+                // Numerically-stable logsumexp along axis 1.
+                let m = ops::reduce(logits, MlxReduce::Max, &[1], /*keep_dim=*/ true)?;
+                let shifted = ops::sub(logits, &m)?;
+                let exp_d = ops::unary(&shifted, MlxUnary::Exp)?;
+                let sum_exp = ops::reduce(&exp_d, MlxReduce::Sum, &[1], /*keep_dim=*/ false)?;
+                let log_sum = ops::unary(&sum_exp, MlxUnary::Log)?;
+                let m_squeezed = ops::reshape(&m, &[n])?;
+                let lse = ops::add(&m_squeezed, &log_sum)?;
+
+                // Σ_c targets[n,c]·logits[n,c] along the class axis.
+                let prod = ops::mul(logits, targets)?;
+                let dot = ops::reduce(&prod, MlxReduce::Sum, &[1], /*keep_dim=*/ false)?;
+
+                ops::sub(&lse, &dot)?
+            }
+
             Op::SoftmaxCrossEntropyWithLogits => {
                 // logits: [N, C], labels: [N] (f32-encoded indices).
                 // loss[n] = lse(logits[n]) - logits[n, labels[n]].
@@ -3337,12 +3541,13 @@ pub fn lower_with_env(
                 let mean_sq = ops::reduce(&x_sq, MlxReduce::Mean, &[last], true)?;
                 let var_eps = ops::add(&mean_sq, &eps_arr)?;
                 let inv_r = ops::unary(&var_eps, MlxUnary::Rsqrt)?;
-                let inv_r3 = ops::mul(&inv_r, &ops::mul(&inv_r, &inv_r)?)?;
+                // Cross term is inv_r² here; the outer `inv_r *` makes it inv_r³, not inv_r⁴.
+                let inv_r2 = ops::mul(&inv_r, &inv_r)?;
                 let dy_g = ops::mul(dy, gamma)?;
                 let dy_gx = ops::mul(&dy_g, x)?;
                 let dot = ops::reduce(&dy_gx, MlxReduce::Mean, &[last], true)?;
                 let x_dot = ops::mul(x, &dot)?;
-                let term = ops::sub(&dy_g, &ops::mul(&x_dot, &inv_r3)?)?;
+                let term = ops::sub(&dy_g, &ops::mul(&x_dot, &inv_r2)?)?;
                 ops::mul(&inv_r, &term)?
             }
 
@@ -4313,6 +4518,19 @@ fn dequant_cache() -> &'static Mutex<HashMap<String, Array>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn mlx_dequant_cache_key(
+    name: &str,
+    k: usize,
+    n: usize,
+    scheme: &rlx_ir::QuantScheme,
+    w_bytes: &[u8],
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    w_bytes.hash(&mut hasher);
+    format!("{name}#kn:{k}x{n}:{scheme:?}:{}", hasher.finish())
+}
+
 fn mlx_dequant_cache_get(key: &str) -> Result<Option<Array>, MlxError> {
     if dequant_cache_disabled() {
         return Ok(None);
@@ -4383,6 +4601,12 @@ fn dequant_gguf_weight(
             .map_err(|e| MlxError(format!("GGUF Q3_K dequant: {e}"))),
         Q::GgufQ4_0 => rlx_gguf::dequant_q4_0(w_bytes, elems)
             .map_err(|e| MlxError(format!("GGUF Q4_0 dequant: {e}"))),
+        Q::GgufQ4_1 => rlx_gguf::dequant_q4_1(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF Q4_1 dequant: {e}"))),
+        Q::GgufQ5_0 => rlx_gguf::dequant_q5_0(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF Q5_0 dequant: {e}"))),
+        Q::GgufQ5_1 => rlx_gguf::dequant_q5_1(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF Q5_1 dequant: {e}"))),
         Q::GgufQ8_0 => rlx_gguf::dequant_q8_0(w_bytes, elems)
             .map_err(|e| MlxError(format!("GGUF Q8_0 dequant: {e}"))),
         Q::GgufIQ4NL => rlx_gguf::iq_dequant::dequant_iq4_nl(w_bytes, elems)
@@ -4649,6 +4873,12 @@ fn mlx_narrow_axis1(arr: &Array, len: usize) -> Result<Array, MlxError> {
 
 /// Normalize rank-3 tensors to batch-major; seq-first `[S,1,C]` → `[1,S,C]`.
 /// Feature-first `[H,1,L]` (H > 128) → `[1,L,H]`.
+/// True if two equal-rank shapes broadcast under standard NumPy rules
+/// (each aligned axis pair is equal, or one side is 1).
+fn rank3_broadcasts_cleanly(a: &[usize], b: &[usize]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| x == y || x == 1 || y == 1)
+}
+
 fn mlx_batch_major_rank3(arr: &Array) -> Result<Array, MlxError> {
     let s = arr.shape()?;
     if s.len() != 3 {
@@ -4719,6 +4949,17 @@ fn mlx_align_rank3_seq_pair(a: &Array, b: &Array) -> Result<(Array, Array), MlxE
     let as_ = a.shape()?;
     let bs = b.shape()?;
     if as_.len() != 3 || bs.len() != 3 {
+        return Ok((a.clone_handle()?, b.clone_handle()?));
+    }
+    // If the operands already broadcast under standard NumPy rules, no
+    // seq-alignment is needed — and applying the heuristic would destructively
+    // reorder a valid pair. The alignment exists only for padded-decode seq
+    // buckets (a stale compile seq vs the active runtime seq), which never
+    // broadcast cleanly. Example it used to break: the OCR recognition head,
+    // logits [S,1,C] + per-class bias [1,1,C] with S>128 and C<=128 —
+    // `mlx_batch_major_rank3` flips [163,1,97] to [1,97,163], so the [1,1,97]
+    // bias can no longer broadcast.
+    if rank3_broadcasts_cleanly(&as_, &bs) {
         return Ok((a.clone_handle()?, b.clone_handle()?));
     }
     let mut a = mlx_batch_major_rank3(a)?;

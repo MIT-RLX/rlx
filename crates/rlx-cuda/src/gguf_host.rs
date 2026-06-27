@@ -15,12 +15,20 @@
 //! Host-side GGUF K-quant `Op::DequantMatMul` for CUDA device arenas.
 //!
 //! CUDA's f32 arena stores packed U8 weights inline (first `N` bytes of
-//! each param slot). This module D2H → `rlx_cpu::gguf_matmul` → H2D.
+//! each param slot). This module D2H → `rlx_cpu::gguf_matmul` → H2D when
+//! the GPU `dequant_gguf` path is unavailable.
+//!
+//! Scheme ids for the GPU kernel are shared with Metal/ROCm/WGPU — see
+//! [`gguf_scheme_id`] and [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 
 use cudarc::driver::{CudaSlice, CudaStream};
 use rlx_ir::quant::QuantScheme;
 use std::sync::Arc;
 
+/// Maps [`QuantScheme`] to the shared GPU `dequant_gguf` kernel scheme id (0–23).
+///
+/// Legacy tail: Q4_0 = 19, Q8_0 = 20, Q4_1 = 21. Table:
+/// [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 pub fn gguf_scheme_id(scheme: QuantScheme) -> u32 {
     match scheme {
         QuantScheme::GgufQ4K => 0,
@@ -42,6 +50,11 @@ pub fn gguf_scheme_id(scheme: QuantScheme) -> u32 {
         QuantScheme::GgufIQ3S => 16,
         QuantScheme::GgufIQ1S => 17,
         QuantScheme::GgufIQ1M => 18,
+        QuantScheme::GgufQ4_0 => 19,
+        QuantScheme::GgufQ8_0 => 20,
+        QuantScheme::GgufQ4_1 => 21,
+        QuantScheme::GgufQ5_0 => 22,
+        QuantScheme::GgufQ5_1 => 23,
         other => panic!("rlx-cuda gguf_host: unsupported scheme {other:?}"),
     }
 }
@@ -67,6 +80,11 @@ pub fn scheme_from_id(scheme_id: u32) -> QuantScheme {
         16 => QuantScheme::GgufIQ3S,
         17 => QuantScheme::GgufIQ1S,
         18 => QuantScheme::GgufIQ1M,
+        19 => QuantScheme::GgufQ4_0,
+        20 => QuantScheme::GgufQ8_0,
+        21 => QuantScheme::GgufQ4_1,
+        22 => QuantScheme::GgufQ5_0,
+        23 => QuantScheme::GgufQ5_1,
         _ => panic!("rlx-cuda gguf_host: bad scheme_id {scheme_id}"),
     }
 }

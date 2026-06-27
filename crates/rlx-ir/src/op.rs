@@ -228,6 +228,7 @@ pub enum OpKind {
     Binary,
     Compare,
     Where,
+    Fma,
     ElementwiseRegion,
     /// Fused sampling / geometry chain (FKL-style transform region).
     TransformRegion,
@@ -252,6 +253,7 @@ pub enum OpKind {
     Concat,
     Expand,
     Gather,
+    Reverse,
     Reduce,
     Softmax,
     Cumsum,
@@ -276,6 +278,7 @@ pub enum OpKind {
     MaxPool2dBackward,
     Conv2dBackwardInput,
     Conv2dBackwardWeight,
+    SoftmaxCrossEntropy,
     SoftmaxCrossEntropyWithLogits,
     SoftmaxCrossEntropyBackward,
     AttentionBackward,
@@ -301,6 +304,10 @@ pub enum OpKind {
     DequantMatMul,
     QMatMul,
     QConv2d,
+    ScaledMatMul,
+    ScaledQuantize,
+    ScaledQuantScale,
+    ScaledDequantize,
     SelectiveScan,
     GatedDeltaNet,
     Lstm,
@@ -389,6 +396,23 @@ pub enum RegionPrologue {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransformStep {
     ResizeNearest2x(ChainOperand),
+}
+
+/// Pairing convention for [`Op::Rope`]. Different model families bake RoPE
+/// into their weights differently, so the rotation kernel needs a flavor:
+///
+/// - [`RopeStyle::NeoX`] (default): HF / GPT-NeoX "rotate-half" — dimension `i`
+///   pairs with `i + n_rot/2`. Used by HF-safetensors checkpoints (Llama, Qwen,
+///   Gemma, …).
+/// - [`RopeStyle::GptJ`]: GPT-J / llama.cpp `NORM` — adjacent pairs `(2i, 2i+1)`.
+///   GGUF Llama weights are permuted by the HF→GGUF converter for this layout,
+///   so GGUF-backed Llama inference must rotate with this flavor.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RopeStyle {
+    #[default]
+    NeoX,
+    GptJ,
 }
 
 /// An operation in the RLX IR graph.
@@ -531,6 +555,17 @@ pub enum Op {
     /// Select elements: cond (Bool), on_true, on_false → output.
     Where,
 
+    /// Fused multiply-add with a SINGLE rounding: `a*b + c`. Distinct from a
+    /// `mul` then `add` (two roundings) — the single rounding is what makes
+    /// error-free transforms (TwoProduct) and compensated/double-word
+    /// arithmetic possible. Inputs: a, b, c.
+    ///
+    /// The native (single-rounding) kernel is **elementwise on equal-shaped
+    /// operands** — broadcast a scalar to the common shape first. Backends
+    /// without a native FMA fall back to `mul`+`add` via `LowerFma` (two
+    /// roundings, but broadcasts), so this only constrains the precise path.
+    Fma,
+
     /// Fused element-wise region (PLAN L2). Holds an N-step chain of
     /// element-wise operations. Inputs are referenced by index 0..num_inputs;
     /// each step's result can be referenced by later steps via
@@ -670,6 +705,23 @@ pub enum Op {
     /// `s` instead of the default `1/sqrt(head_dim)` (Gemma uses `head_dim^-0.5`
     /// explicitly in config). `attn_logit_softcap`: when `Some(c)`, applies
     /// `c * tanh(s/c)` to scores before softmax (Gemma 2).
+    ///
+    /// ## Operand layout
+    ///
+    /// Q/K/V (and the output) carry the heads explicitly and are accepted in two
+    /// rank-4 layouts — both end in `head_dim`, so backends disambiguate by which
+    /// axis equals `num_heads`:
+    ///
+    /// - **`[B, S, H, D]`** (heads at axis 2) — the dominant convention, produced
+    ///   by Llama/Moshi-style `reshape([B, S, H, D])` after the QKV projection.
+    ///   The CPU/Metal/MLX/wgpu kernels attend over axis 1 (`S`); CoreML
+    ///   transposes to `[B, H, S, D]` first (see `rlx-coreml`).
+    /// - **`[B, H, S, D]`** (heads at axis 1) — already head-canonical.
+    ///
+    /// Rank-3 `[B, S, D]` is single-head and head-canonical. `K`/`V` may have a
+    /// different sequence length than `Q` (`S_k >= S_q`) for KV-cache decode; the
+    /// causal mask places the `S_q` queries at the **end** of the `S_k` keys
+    /// (query `qi` is at absolute position `S_k - S_q + qi`).
     Attention {
         num_heads: usize,
         head_dim: usize,
@@ -685,6 +737,8 @@ pub enum Op {
     Rope {
         head_dim: usize,
         n_rot: usize,
+        /// Rotation pairing convention (default [`RopeStyle::NeoX`]).
+        style: RopeStyle,
     },
 
     /// SAM2 axial 2-D RoPE on `[batch, seq, num_heads * head_dim]`.
@@ -721,6 +775,14 @@ pub enum Op {
     /// Gather elements by index along an axis (embedding lookup).
     Gather {
         axis: usize,
+    },
+    /// Reverse (flip) the element order along each listed axis. Output shape
+    /// equals the input shape; element `[…, i, …]` on a reversed axis of size
+    /// `d` reads input `[…, d-1-i, …]`. Batch-general — only the listed axes
+    /// flip, all others pass through unchanged (the right primitive for
+    /// reversing a `[batch, seq, …]` sequence without a batch=1 assumption).
+    Reverse {
+        axes: Vec<usize>,
     },
 
     // ── Reduction ───────────────────────────────────────────────
@@ -964,6 +1026,64 @@ pub enum Op {
         mult: f32,
     },
 
+    /// **Native low-precision tensor-core GEMM** with f32 accumulation —
+    /// both operands are sub-f16 codes fed *directly* into the matmul, the
+    /// opposite of `DequantMatMul` (which decodes weights to f32 first and
+    /// keeps `x` in f32). This is the path that wins on Hopper / Ada /
+    /// Blackwell (cublasLt FP8/FP4) and CDNA3 / CDNA4 (hipBLASLt). On CPU /
+    /// Metal it is the decode-and-accumulate *reference* (no fp8 matrix HW).
+    ///
+    /// Layout is **TN** — both operands are K-last (`out = lhs · rhsᵀ`) so
+    /// every block scale runs along the last/contraction axis uniformly, which
+    /// is also cuBLASLt / hipBLASLt FP8's preferred layout.
+    ///
+    /// Inputs (in order):
+    ///   `lhs   [m, k]`  U8 — packed [`crate::ScaledFormat`] codes (logical dims)
+    ///   `rhs   [n, k]`  U8 — packed codes (K-last, i.e. weight transposed)
+    ///   `lhs_s        `  scale tensor, dtype per [`crate::ScaleLayout::scale_dtype`]
+    ///   `rhs_s        `  scale tensor
+    ///   `bias  [n]    `  f32, present iff `has_bias`
+    /// Output: `[m, n]` f32. Reconstruction: `decode(code)·scale(block)`.
+    ///
+    /// Operand `Shape`s carry **logical** element dims with `dtype = U8`; the
+    /// physical byte layout (1 code/byte on the CPU oracle, packed nibbles on
+    /// GPU) is a backend-paired detail shared by `ScaledQuantize` and the
+    /// matmul kernel, so it never needs a `DType` variant.
+    ScaledMatMul {
+        lhs_format: crate::quant::ScaledFormat,
+        rhs_format: crate::quant::ScaledFormat,
+        scale_layout: crate::quant::ScaleLayout,
+        has_bias: bool,
+    },
+
+    /// Quantize an f32/f16 tensor to packed low-precision codes for
+    /// [`Op::ScaledMatMul`]. Inputs: `x` (f32) and `scale` (from
+    /// [`Op::ScaledQuantScale`]); output is `DType::U8` codes of the same
+    /// logical shape as `x`. `code[i] = encode(format, x[i] / scale(block_of(i)))`.
+    ScaledQuantize {
+        format: crate::quant::ScaledFormat,
+        scale_layout: crate::quant::ScaleLayout,
+    },
+
+    /// Compute the (per-tensor or per-block) scale tensor for a tensor about
+    /// to be quantized to `format`. Input: `x` (f32). Output dtype follows
+    /// [`crate::ScaleLayout::scale_dtype`]. Split from `ScaledQuantize` to keep
+    /// the IR single-output (mirrors the `FakeQuantizeLSQBackwardX/Scale` split).
+    ScaledQuantScale {
+        format: crate::quant::ScaledFormat,
+        scale_layout: crate::quant::ScaleLayout,
+    },
+
+    /// Reconstruct f32 from packed low-precision codes: `decode(code)·scale`.
+    /// The inverse of [`Op::ScaledQuantize`]. Inputs: `codes` (U8), `scale`;
+    /// output is f32 with the same logical shape as `codes`. Used by the
+    /// straight-through VJP of [`Op::ScaledMatMul`] to rebuild operands in the
+    /// backward graph (and as a standalone dequantizer).
+    ScaledDequantize {
+        format: crate::quant::ScaledFormat,
+        scale_layout: crate::quant::ScaleLayout,
+    },
+
     /// Fused LoRA matmul: `out = x·W + scale * x·A·B`.
     /// Inputs (in order): `x [m, k]`, `w [k, n]`, `a [k, r]`, `b [r, n]`.
     /// `r` is the LoRA rank (typically 4-64). `scale` is the
@@ -1060,8 +1180,8 @@ pub enum Op {
     ///   weight      : [num_experts, K, N]   — stacked expert weights
     ///   expert_idx  : \[M\]                   — f32-encoded expert id per token
     /// Output         : [M, N]                — output\[i\] = input\[i\] @ weight[expert_idx\[i\]]
-    /// Naive impl on both backends; future work can replace with a
-    /// segmented/grouped GEMM when there's a real workload.
+    /// CPU is a real segmented GEMM: counting-sort tokens by expert, one GEMM per
+    /// expert, then unpermute. GPU backends dispatch a dedicated grouped kernel.
     GroupedMatMul,
 
     /// Fused GGUF K-quant dequant + [`Op::GroupedMatMul`]. Same three
@@ -1328,6 +1448,19 @@ pub enum Op {
         dilation: Vec<usize>,
         groups: usize,
     },
+
+    /// Fused softmax + cross-entropy against a **dense** target
+    /// distribution (soft labels / one-hot probabilities) — the
+    /// companion to the sparse integer-label
+    /// [`Op::SoftmaxCrossEntropyWithLogits`]. Per-row output:
+    /// `loss[n] = logsumexp(logits[n]) - Σ_c targets[n,c]·logits[n,c]`
+    ///         = -Σ_c targets[n,c]·log_softmax(logits[n])[c]`.
+    /// Inputs: `[logits, targets]`, both `[N, C]`. Output: `[N]`.
+    /// Caller does the `Reduce::Mean` if they want a scalar.
+    /// Numerically stable (max-subtract before exp). Used for label
+    /// smoothing and knowledge distillation where targets are full
+    /// probability rows rather than class indices.
+    SoftmaxCrossEntropy,
 
     /// Fused softmax + cross-entropy loss with integer (f32-encoded)
     /// targets — the standard classification loss. Per-row output:
@@ -1817,6 +1950,7 @@ impl Op {
             Op::Binary(_) => OpKind::Binary,
             Op::Compare(_) => OpKind::Compare,
             Op::Where => OpKind::Where,
+            Op::Fma => OpKind::Fma,
             Op::ElementwiseRegion { .. } => OpKind::ElementwiseRegion,
             Op::TransformRegion { .. } => OpKind::TransformRegion,
             Op::BatchElementwiseRegion { .. } => OpKind::BatchElementwiseRegion,
@@ -1839,6 +1973,7 @@ impl Op {
             Op::Concat { .. } => OpKind::Concat,
             Op::Expand { .. } => OpKind::Expand,
             Op::Gather { .. } => OpKind::Gather,
+            Op::Reverse { .. } => OpKind::Reverse,
             Op::Reduce { .. } => OpKind::Reduce,
             Op::Softmax { .. } => OpKind::Softmax,
             Op::Cumsum { .. } => OpKind::Cumsum,
@@ -1875,6 +2010,7 @@ impl Op {
             Op::MaxPool2dBackward { .. } => OpKind::MaxPool2dBackward,
             Op::Conv2dBackwardInput { .. } => OpKind::Conv2dBackwardInput,
             Op::Conv2dBackwardWeight { .. } => OpKind::Conv2dBackwardWeight,
+            Op::SoftmaxCrossEntropy => OpKind::SoftmaxCrossEntropy,
             Op::SoftmaxCrossEntropyWithLogits => OpKind::SoftmaxCrossEntropyWithLogits,
             Op::SoftmaxCrossEntropyBackward => OpKind::SoftmaxCrossEntropyBackward,
             Op::AttentionBackward { .. } => OpKind::AttentionBackward,
@@ -1886,6 +2022,10 @@ impl Op {
             Op::DequantMatMul { .. } => OpKind::DequantMatMul,
             Op::QMatMul { .. } => OpKind::QMatMul,
             Op::QConv2d { .. } => OpKind::QConv2d,
+            Op::ScaledMatMul { .. } => OpKind::ScaledMatMul,
+            Op::ScaledQuantize { .. } => OpKind::ScaledQuantize,
+            Op::ScaledQuantScale { .. } => OpKind::ScaledQuantScale,
+            Op::ScaledDequantize { .. } => OpKind::ScaledDequantize,
             Op::SelectiveScan { .. } => OpKind::SelectiveScan,
             Op::GatedDeltaNet { .. } => OpKind::GatedDeltaNet,
             Op::Lstm { .. } => OpKind::Lstm,
@@ -1928,6 +2068,7 @@ impl Op {
                 | Op::Binary(_)
                 | Op::Compare(_)
                 | Op::Where
+                | Op::Fma
                 | Op::ElementwiseRegion { .. }
                 | Op::BatchElementwiseRegion { .. }
         )
@@ -1957,6 +2098,7 @@ impl Op {
                 | Op::DequantMatMul { .. }
                 | Op::QMatMul { .. }
                 | Op::QConv2d { .. }
+                | Op::ScaledMatMul { .. }
         )
     }
 
@@ -1992,6 +2134,7 @@ impl Op {
             | Op::Dequantize { .. }
             | Op::Transpose { .. }
             | Op::Narrow { .. }
+            | Op::Reverse { .. }
             | Op::Expand { .. }
             | Op::Reduce { .. }
             | Op::Softmax { .. }
@@ -2026,11 +2169,16 @@ impl Op {
                     4
                 }
             }
-            Op::QMatMul { .. } => 3,       // x, w, bias
-            Op::QConv2d { .. } => 3,       // x, w, bias
-            Op::SelectiveScan { .. } => 5, // x, delta, a, b, c
+            Op::QMatMul { .. } => 3, // x, w, bias
+            Op::QConv2d { .. } => 3, // x, w, bias
+            // lhs_codes, rhs_codes, lhs_scale, rhs_scale (+ bias)
+            Op::ScaledMatMul { has_bias, .. } => 4 + usize::from(*has_bias),
+            Op::ScaledQuantize { .. } => 2,   // x, scale
+            Op::ScaledQuantScale { .. } => 1, // x
+            Op::ScaledDequantize { .. } => 2, // codes, scale
+            Op::SelectiveScan { .. } => 5,    // x, delta, a, b, c
             Op::GatedDeltaNet { carry_state, .. } if *carry_state => 6, // + state in/out
-            Op::GatedDeltaNet { .. } => 5, // q, k, v, g, beta
+            Op::GatedDeltaNet { .. } => 5,    // q, k, v, g, beta
             Op::Lstm { carry, .. } => {
                 if *carry { 6 } else { 4 } // x, w_ih, w_hh, bias (+ h0, c0)
             }
@@ -2042,6 +2190,7 @@ impl Op {
             }
             Op::Mamba2 { .. } => 5, // x, dt, a, b, c
             Op::Where => 3,         // cond, on_true, on_false
+            Op::Fma => 3,           // a, b, c  (a*b + c)
             Op::Attention { mask_kind, .. } => match mask_kind {
                 MaskKind::Custom | MaskKind::Bias => 4, // Q, K, V, mask
                 _ => 3,                                 // Q, K, V (mask synthesized in-kernel)
@@ -2092,6 +2241,7 @@ impl Op {
             Op::MaxPool2dBackward { .. } => 2,               // x, dy
             Op::Conv2dBackwardInput { .. } => 2,             // dy, w
             Op::Conv2dBackwardWeight { .. } => 2,            // x, dy
+            Op::SoftmaxCrossEntropy => 2,                    // logits, targets
             Op::SoftmaxCrossEntropyWithLogits => 2,          // logits, labels
             Op::SoftmaxCrossEntropyBackward => 3,            // logits, labels, d_loss
             Op::Concat { .. } => 0,                          // variadic — checked at graph level
@@ -2178,6 +2328,7 @@ impl std::fmt::Display for Op {
             Op::Binary(op) => write!(f, "{op:?}"),
             Op::Compare(op) => write!(f, "{op:?}"),
             Op::Where => write!(f, "where"),
+            Op::Fma => write!(f, "fma"),
             Op::MatMul => write!(f, "matmul"),
             Op::DotGeneral { .. } => write!(f, "dot_general"),
             Op::DenseSolve => write!(f, "dense_solve"),
@@ -2213,7 +2364,11 @@ impl std::fmt::Display for Op {
                 }
                 write!(f, "{s}")
             }
-            Op::Rope { head_dim, n_rot } => write!(f, "rope(d={head_dim}, n_rot={n_rot})"),
+            Op::Rope {
+                head_dim,
+                n_rot,
+                style,
+            } => write!(f, "rope(d={head_dim}, n_rot={n_rot}, style={style:?})"),
             Op::AxialRope2d {
                 end_x,
                 end_y,
@@ -2228,6 +2383,7 @@ impl std::fmt::Display for Op {
             Op::Reshape { new_shape } => write!(f, "reshape({new_shape:?})"),
             Op::Transpose { perm } => write!(f, "transpose({perm:?})"),
             Op::Narrow { axis, start, len } => write!(f, "narrow({axis},{start},{len})"),
+            Op::Reverse { axes } => write!(f, "reverse({axes:?})"),
             Op::Concat { axis } => write!(f, "concat(axis={axis})"),
             Op::Expand { .. } => write!(f, "expand"),
             Op::Gather { axis } => write!(f, "gather(axis={axis})"),
@@ -2299,6 +2455,28 @@ impl std::fmt::Display for Op {
                 "q_matmul(x_zp={x_zp},w_zp={w_zp},out_zp={out_zp},mult={mult})"
             ),
             Op::QConv2d { kernel_size, .. } => write!(f, "q_conv2d({kernel_size:?})"),
+            Op::ScaledMatMul {
+                lhs_format,
+                rhs_format,
+                scale_layout,
+                has_bias,
+            } => write!(
+                f,
+                "scaled_matmul({lhs_format}×{rhs_format},{scale_layout}{})",
+                if *has_bias { ",bias" } else { "" }
+            ),
+            Op::ScaledQuantize {
+                format,
+                scale_layout,
+            } => write!(f, "scaled_quantize({format},{scale_layout})"),
+            Op::ScaledQuantScale {
+                format,
+                scale_layout,
+            } => write!(f, "scaled_quant_scale({format},{scale_layout})"),
+            Op::ScaledDequantize {
+                format,
+                scale_layout,
+            } => write!(f, "scaled_dequantize({format},{scale_layout})"),
             Op::SelectiveScan { state_size } => write!(f, "ssm_scan(n={state_size})"),
             Op::GatedDeltaNet {
                 state_size,
@@ -2373,6 +2551,7 @@ impl std::fmt::Display for Op {
             Op::Conv2dBackwardWeight { kernel_size, .. } => {
                 write!(f, "conv2d_backward_weight({kernel_size:?})")
             }
+            Op::SoftmaxCrossEntropy => write!(f, "sce"),
             Op::SoftmaxCrossEntropyWithLogits => write!(f, "sce_with_logits"),
             Op::SoftmaxCrossEntropyBackward => write!(f, "sce_backward"),
             Op::AttentionBackward {

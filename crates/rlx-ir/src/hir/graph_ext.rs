@@ -62,6 +62,30 @@ impl<'a> HirMut<'a> {
             shape,
         )
     }
+
+    /// Additive attention bias `[batch, num_heads, query_len, key_len]`.
+    pub fn attention_bias(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        v: HirNodeId,
+        bias: HirNodeId,
+        num_heads: usize,
+        head_dim: usize,
+        shape: Shape,
+    ) -> HirNodeId {
+        self.0.mir(
+            crate::ops::attention::attention_kind_op(
+                num_heads,
+                head_dim,
+                MaskKind::Bias,
+                None,
+                None,
+            ),
+            vec![q, k, v, bias],
+            shape,
+        )
+    }
 }
 
 /// Ergonomic shape-inferred building on [`HirMut`].
@@ -176,6 +200,15 @@ pub trait HirGraphExt {
     ) -> HirNodeId;
 
     fn rope(&mut self, x: HirNodeId, cos: HirNodeId, sin: HirNodeId, head_dim: usize) -> HirNodeId;
+    /// RoPE with an explicit pairing flavor ([`crate::op::RopeStyle`]).
+    fn rope_styled(
+        &mut self,
+        x: HirNodeId,
+        cos: HirNodeId,
+        sin: HirNodeId,
+        head_dim: usize,
+        style: crate::op::RopeStyle,
+    ) -> HirNodeId;
     fn rope_n(
         &mut self,
         x: HirNodeId,
@@ -183,6 +216,16 @@ pub trait HirGraphExt {
         sin: HirNodeId,
         head_dim: usize,
         n_rot: usize,
+    ) -> HirNodeId;
+    /// Partial RoPE (`n_rot`) with an explicit pairing flavor.
+    fn rope_n_styled(
+        &mut self,
+        x: HirNodeId,
+        cos: HirNodeId,
+        sin: HirNodeId,
+        head_dim: usize,
+        n_rot: usize,
+        style: crate::op::RopeStyle,
     ) -> HirNodeId;
 
     fn cast(&mut self, x: HirNodeId, to: DType) -> HirNodeId;
@@ -509,11 +552,24 @@ impl HirGraphExt for HirMut<'_> {
     }
 
     fn rope(&mut self, x: HirNodeId, cos: HirNodeId, sin: HirNodeId, head_dim: usize) -> HirNodeId {
+        self.rope_styled(x, cos, sin, head_dim, crate::op::RopeStyle::NeoX)
+    }
+
+    /// RoPE with an explicit pairing flavor ([`crate::op::RopeStyle`]).
+    fn rope_styled(
+        &mut self,
+        x: HirNodeId,
+        cos: HirNodeId,
+        sin: HirNodeId,
+        head_dim: usize,
+        style: crate::op::RopeStyle,
+    ) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
         self.0.mir(
             Op::Rope {
                 head_dim,
                 n_rot: head_dim,
+                style,
             },
             vec![x, cos, sin],
             s,
@@ -530,6 +586,27 @@ impl HirGraphExt for HirMut<'_> {
     ) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
         HirModule::rope(self.0, x, cos, sin, head_dim, n_rot, s)
+    }
+
+    fn rope_n_styled(
+        &mut self,
+        x: HirNodeId,
+        cos: HirNodeId,
+        sin: HirNodeId,
+        head_dim: usize,
+        n_rot: usize,
+        style: crate::op::RopeStyle,
+    ) -> HirNodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.0.mir(
+            Op::Rope {
+                head_dim,
+                n_rot,
+                style,
+            },
+            vec![x, cos, sin],
+            s,
+        )
     }
 
     fn cast(&mut self, x: HirNodeId, to: DType) -> HirNodeId {

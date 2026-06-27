@@ -298,6 +298,35 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
                 }
             }
 
+            HirOp::Gru {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                carry,
+            } => {
+                let expected = if *carry { 6 } else { 5 };
+                if node.inputs.len() != expected {
+                    return Err(LowerError::WrongInputCount {
+                        op: "Gru",
+                        expected: if *carry { "6" } else { "5" },
+                        got: node.inputs.len(),
+                    });
+                }
+                let h0 = if *carry { Some(inputs[5]) } else { None };
+                g.gru(
+                    inputs[0],
+                    inputs[1],
+                    inputs[2],
+                    inputs[3],
+                    inputs[4],
+                    h0,
+                    *hidden_size,
+                    *num_layers,
+                    *bidirectional,
+                    node.shape,
+                )
+            }
+
             HirOp::RoPE { head_dim, n_rot } => {
                 if node.inputs.len() != 3 {
                     return Err(LowerError::WrongInputCount {
@@ -326,6 +355,7 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
                 num_kv_heads,
                 eps,
                 mask,
+                rope_style,
             } => crate::hir::blocks::lower_llama_decoder_block(
                 &mut g,
                 &inputs,
@@ -334,6 +364,7 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
                 *num_kv_heads,
                 *eps,
                 *mask,
+                *rope_style,
                 node.shape,
             )?,
 

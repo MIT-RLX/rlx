@@ -65,7 +65,7 @@ fn fnv1a64(s: &str) -> u64 {
     h
 }
 
-fn compile(ctx: &Arc<CudaContext>, src: &str, entry: &str) -> CudaKernel {
+pub(crate) fn compile(ctx: &Arc<CudaContext>, src: &str, entry: &str) -> CudaKernel {
     // Try the disk cache first. The cache key folds the kernel entry
     // name into the source hash so different entry-points sharing a
     // .cu file (scatter_add_zero / scatter_add_acc) get distinct
@@ -125,6 +125,42 @@ kernel_cache!(
     cast_f32_to_half_kernel,
     CAST_F32_TO_HALF_CU,
     "cast_f32_to_half"
+);
+kernel_cache!(
+    SCALED_QUANT_SCALE,
+    scaled_quant_scale_kernel,
+    SCALED_LOWP_CU,
+    "scaled_quant_scale_per_tensor"
+);
+kernel_cache!(
+    SCALED_QUANTIZE_FP8,
+    scaled_quantize_fp8_kernel,
+    SCALED_LOWP_CU,
+    "scaled_quantize_fp8_per_tensor"
+);
+kernel_cache!(
+    SCALED_QUANT_SCALE_GENERAL,
+    scaled_quant_scale_general_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "scaled_quant_scale_general"
+);
+kernel_cache!(
+    SCALED_QUANTIZE_GENERAL,
+    scaled_quantize_general_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "scaled_quantize_general"
+);
+kernel_cache!(
+    SCALED_DEQUANTIZE_GENERAL,
+    scaled_dequantize_general_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "scaled_dequantize_general"
+);
+kernel_cache!(
+    SCALED_MATMUL_DECODE,
+    scaled_matmul_decode_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "scaled_matmul_decode"
 );
 kernel_cache!(
     UNARY,
@@ -206,6 +242,12 @@ kernel_cache!(TRANSPOSE, transpose_kernel, TRANSPOSE_CU, "transpose");
 kernel_cache!(EXPAND, expand_kernel, EXPAND_CU, "expand");
 kernel_cache!(ATTENTION, attention_kernel, ATTENTION_CU, "attention");
 kernel_cache!(
+    FUSED_ATTN,
+    fused_attn_kernel,
+    FUSED_ATTN_CU,
+    "fused_attn_block"
+);
+kernel_cache!(
     ATTENTION_ROW,
     attention_row_kernel,
     ATTENTION_ROW_CU,
@@ -260,6 +302,61 @@ kernel_cache!(
 );
 kernel_cache!(POOL1D, pool1d_kernel, POOL1D_CU, "pool1d");
 kernel_cache!(POOL2D, pool2d_kernel, POOL2D_CU, "pool2d");
+const MAXPOOL2D_BWD_CU: &str = r#"
+extern "C" __global__ void maxpool2d_backward(
+    float* arena, unsigned n, unsigned c, unsigned h, unsigned w,
+    unsigned h_out, unsigned w_out, unsigned kh, unsigned kw,
+    unsigned sh, unsigned sw, unsigned ph, unsigned pw,
+    unsigned x_off, unsigned dy_off, unsigned dx_off)
+{
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned total = n*c*h*w;
+    if (idx >= total) return;
+    unsigned iw = idx % w;
+    unsigned ih = (idx / w) % h;
+    unsigned cc = (idx / (w*h)) % c;
+    unsigned nn = idx / (w*h*c);
+    const float* x = arena + x_off;
+    unsigned base_nc = (nn*c + cc)*h*w;
+    int ph_i = (int)ph, pw_i = (int)pw, sh_i = (int)sh, sw_i = (int)sw;
+    // output windows (ho,wo) whose receptive field covers input (ih,iw)
+    int ho_lo = (int)ih + ph_i - (int)kh + 1;
+    ho_lo = ho_lo <= 0 ? 0 : (ho_lo + sh_i - 1) / sh_i;
+    int ho_hi = ((int)ih + ph_i) / sh_i;
+    int wo_lo = (int)iw + pw_i - (int)kw + 1;
+    wo_lo = wo_lo <= 0 ? 0 : (wo_lo + sw_i - 1) / sw_i;
+    int wo_hi = ((int)iw + pw_i) / sw_i;
+    float acc = 0.0f;
+    for (int ho = ho_lo; ho <= ho_hi && ho < (int)h_out; ho++) {
+        int hstart = ho*sh_i - ph_i;
+        for (int wo = wo_lo; wo <= wo_hi && wo < (int)w_out; wo++) {
+            int wstart = wo*sw_i - pw_i;
+            float best = -3.402823466e+38f; int best_idx = -1;
+            for (unsigned i=0;i<kh;i++){
+                int ir = hstart + (int)i;
+                if (ir < 0 || ir >= (int)h) continue;
+                for (unsigned j=0;j<kw;j++){
+                    int ic = wstart + (int)j;
+                    if (ic < 0 || ic >= (int)w) continue;
+                    unsigned id2 = base_nc + (unsigned)ir*w + (unsigned)ic;
+                    float v = x[id2];
+                    if (v > best){ best = v; best_idx = (int)id2; }
+                }
+            }
+            if (best_idx == (int)idx) {
+                acc += arena[dy_off + ((nn*c+cc)*h_out + (unsigned)ho)*w_out + (unsigned)wo];
+            }
+        }
+    }
+    arena[dx_off + idx] = acc;
+}
+"#;
+kernel_cache!(
+    MAXPOOL2D_BWD,
+    maxpool2d_backward_kernel,
+    MAXPOOL2D_BWD_CU,
+    "maxpool2d_backward"
+);
 kernel_cache!(POOL3D, pool3d_kernel, POOL3D_CU, "pool3d");
 kernel_cache!(CONV1D, conv1d_kernel, CONV1D_CU, "conv1d");
 kernel_cache!(CONV2D, conv2d_kernel, CONV2D_CU, "conv2d");
@@ -317,6 +414,51 @@ kernel_cache!(
 kernel_cache!(FFT_INNER, fft_inner_kernel, FFT_CU, "fft_inner");
 kernel_cache!(FFT_OUTER_R4, fft_outer_r4_kernel, FFT_CU, "fft_outer_r4");
 kernel_cache!(FFT_OUTER_R2, fft_outer_r2_kernel, FFT_CU, "fft_outer_r2");
+// cuFFT planar⇄interleaved bridge (only dispatched under the `cufft` feature;
+// lazy NVRTC compile means these cost nothing unless actually used).
+kernel_cache!(
+    FFT_PACK_INTERLEAVE,
+    fft_pack_interleave_kernel,
+    FFT_CU,
+    "fft_pack_interleave"
+);
+kernel_cache!(
+    FFT_UNPACK_PLANAR,
+    fft_unpack_planar_kernel,
+    FFT_CU,
+    "fft_unpack_planar"
+);
+// native-cuda-fft: Stockham single-kernel FFT (cuFFT-parity for n<=1024).
+kernel_cache!(
+    FFT_STOCKHAM_R4,
+    fft_stockham_r4_kernel,
+    FFT_CU,
+    "fft_stockham_r4"
+);
+kernel_cache!(
+    FFT_STOCKHAM_R2,
+    fft_stockham_r2_kernel,
+    FFT_CU,
+    "fft_stockham_r2"
+);
+kernel_cache!(
+    FFT_STOCKHAM_R8,
+    fft_stockham_r8_kernel,
+    FFT_CU,
+    "fft_stockham_r8"
+);
+kernel_cache!(
+    FFT_STOCKHAM_R16,
+    fft_stockham_r16_kernel,
+    FFT_CU,
+    "fft_stockham_r16"
+);
+kernel_cache!(
+    FFT_STOCKHAM_MIXED,
+    fft_stockham_mixed_kernel,
+    FFT_CU,
+    "fft_stockham_mixed"
+);
 kernel_cache!(
     WELCH_PEAKS_GPU,
     welch_peaks_gpu_kernel,

@@ -431,6 +431,9 @@ fn expand_fab(
             Op::Rope {
                 head_dim,
                 n_rot: head_dim,
+                // Unfusing fused attention — NeoX was the only style
+                // pre-fusion; thread the source style once fused ops carry it.
+                style: rlx_ir::op::RopeStyle::NeoX,
             },
             vec![q4, inputs[cos_idx], inputs[sin_idx]],
             bhsd_shape.clone(),
@@ -439,6 +442,9 @@ fn expand_fab(
             Op::Rope {
                 head_dim,
                 n_rot: head_dim,
+                // Unfusing fused attention — NeoX was the only style
+                // pre-fusion; thread the source style once fused ops carry it.
+                style: rlx_ir::op::RopeStyle::NeoX,
             },
             vec![k4, inputs[cos_idx], inputs[sin_idx]],
             bhsd_shape.clone(),

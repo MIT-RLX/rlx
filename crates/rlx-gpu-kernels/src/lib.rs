@@ -21,6 +21,13 @@
 pub const BINARY_CU: &str = include_str!("../kernels/binary.cu");
 pub const FUSED_BINARY_UNARY_CU: &str = include_str!("../kernels/fused_binary_unary.cu");
 pub const CAST_F32_TO_HALF_CU: &str = include_str!("../kernels/cast_f32_to_half.cu");
+/// Native FP8 quantize producers (per-tensor scale + E4M3/E5M2 encode) for
+/// `Op::ScaledMatMul`. Shared by the CUDA (cublasLt) and ROCm (hipBLASLt) paths.
+pub const SCALED_LOWP_CU: &str = include_str!("../kernels/scaled_lowp.cu");
+/// General (all-format, all-scale-layout) low-precision quantize + decode-GEMM
+/// for `Op::ScaledMatMul` — the on-device decode-and-accumulate fallback for
+/// block-scaled / FP4 / FP6 configs the FP8 tensor-core path can't do.
+pub const SCALED_LOWP_GENERAL_CU: &str = include_str!("../kernels/scaled_lowp_general.cu");
 pub const UNARY_CU: &str = include_str!("../kernels/unary.cu");
 pub const COPY_CU: &str = include_str!("../kernels/copy.cu");
 pub const MATMUL_CU: &str = include_str!("../kernels/matmul.cu");
@@ -44,6 +51,7 @@ pub const CONCAT_CU: &str = include_str!("../kernels/concat.cu");
 pub const TRANSPOSE_CU: &str = include_str!("../kernels/transpose.cu");
 pub const EXPAND_CU: &str = include_str!("../kernels/expand.cu");
 pub const ATTENTION_CU: &str = include_str!("../kernels/attention.cu");
+pub const FUSED_ATTN_CU: &str = include_str!("../kernels/fused_attn.cu");
 pub const ATTENTION_ROW_CU: &str = include_str!("../kernels/attention_row.cu");
 pub const ATTENTION_BWD_CU: &str = include_str!("../kernels/attention_bwd.cu");
 pub const ARGMAX_CU: &str = include_str!("../kernels/argmax.cu");

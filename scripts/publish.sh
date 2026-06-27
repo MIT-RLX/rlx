@@ -154,16 +154,25 @@ SKIPPED=(
 # rlx-optim, rlx-autodiff (all earlier tiers) and an optional rlx-runtime
 # (the `eval` backend), so it must follow runtime; the umbrella `rlx`
 # optional-dep's rlx-tensor (`tensor` feature), so it lands before `rlx`.
+#
+# rlx-collectives depends on rlx-ir, rlx-driver, and rlx-cpu — publish
+# after the backend tier, before rlx-runtime (dev-deps on runtime only).
+#
+# rlx-vulkan/rlx-oneapi/rlx-qnn/rlx-cerebras are backends that rlx-runtime
+# optionally depends on, so they ride in the backend tier (after rlx-cpu,
+# which rlx-vulkan/rlx-oneapi depend on). rlx-webgl (rlx-ir/rlx-autodiff/
+# rlx-compile) also lands there. rlx-web pulls in rlx-runtime AND rlx-webgl,
+# so it has to follow runtime — it sits alongside rlx-tensor.
 TIERS=(
     "rlx-ir rlx-gguf rlx-nemo rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim"
     "rlx-flow rlx-fusion rlx-driver"
     "rlx-autodiff"
     "rlx-compile"
     "rlx-opt"
-    "rlx-cpu rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga"
+    "rlx-cpu rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-webgl"
     "rlx-metal"
-    "rlx-runtime"
-    "rlx-tensor rlx-onnx-import rlx-bbo"
+    "rlx-collectives rlx-runtime"
+    "rlx-tensor rlx-onnx-import rlx-bbo rlx-web"
     "rlx-sparse rlx-linalg rlx-umap rlx-text rlx-gguf-convert rlx-onnx-conformance"
     "rlx-onnx"
     "rlx-fdm rlx-bench"

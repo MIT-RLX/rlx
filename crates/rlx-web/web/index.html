@@ -1,0 +1,50 @@
+<!doctype html>
+<!--
+  RLX — versatile ML compiler + runtime.
+  Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna. GPL-3.0-only.
+
+  Browser harness for rlx-web: forward + backward on CPU and (if built with
+  --webgpu) WebGPU. Serve with `just serve-web` (ES modules + wasm need http://).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RLX in the browser — forward & backward</title>
+    <style>
+      body { font: 15px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2.5rem auto; padding: 0 1rem; }
+      h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin-top: 1.6rem; }
+      .row { margin: 0.35rem 0; }
+      .k { color: #666; display: inline-block; min-width: 10rem; vertical-align: top; }
+      .v { font-family: ui-monospace, monospace; }
+      .ok { color: #0a7; } .warn { color: #c70; } .err { color: #c33; }
+      pre { background: #f5f5f5; padding: 0.7rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>RLX in WebAssembly — forward &amp; backward</h1>
+    <p>A two-layer MLP (<code>relu(x·W1 + b1)·W2 + b2</code>, MSE loss) is built
+       as an RLX IR graph. The <b>backward</b> pass is the autodiff gradient
+       graph. The same graphs run on every backend — only the executor differs.</p>
+
+    <div class="row"><span class="k">Status</span><span class="v" id="status">loading…</span></div>
+    <div class="row"><span class="k">CPU backend</span><span class="v" id="backend">—</span></div>
+    <div class="row"><span class="k">WebGPU</span><span class="v" id="webgpu">—</span></div>
+    <div class="row"><span class="k">WebGL2</span><span class="v" id="webgl">—</span></div>
+
+    <h2>CPU — forward</h2>
+    <pre id="cpu-fwd">—</pre>
+    <h2>CPU — backward (loss + gradients)</h2>
+    <pre id="cpu-bwd">—</pre>
+    <h2>CPU — training (SGD)</h2>
+    <pre id="cpu-train">—</pre>
+    <h2>Real transformer — decoder-only (RMSNorm · RoPE · causal attention · SwiGLU)</h2>
+    <pre id="tf">—</pre>
+    <h2>WebGPU — forward &amp; backward (compute shaders)</h2>
+    <pre id="gpu">—</pre>
+    <h2>WebGL2 — forward &amp; backward (render-to-texture)</h2>
+    <pre id="glout">—</pre>
+
+    <script type="module" src="./index.js"></script>
+  </body>
+</html>

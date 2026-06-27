@@ -13,7 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Lower `SoftmaxCrossEntropyWithLogits` / `SoftmaxCrossEntropyBackward` to
+//! Lower `SoftmaxCrossEntropy` (dense / soft-label) /
+//! `SoftmaxCrossEntropyWithLogits` / `SoftmaxCrossEntropyBackward` to
 //! primitives for backends (CUDA, Metal) that lack native kernels.
 
 use std::collections::HashMap;
@@ -64,10 +65,47 @@ fn one_hot_2d(g: &mut Graph, labels: NodeId, n: usize, c: usize, dt: DType) -> N
         let class_b = broadcast_scalar(g, class, &labels_shape);
         let eq = compare_eq(g, labels, class_b);
         let col = g.add_node(Op::Where, vec![eq, one_b, zero_b], labels_shape.clone());
-        cols.push(col);
+        // Each class column is `[N]`; reshape to `[N,1]` and concat along the
+        // class axis so `one_hot[n][ci] = (labels[n] == ci)`. (Concatenating the
+        // `[N]` columns along axis 0 and reshaping to `[N,c]` scrambles the layout
+        // whenever N ≠ c — it interleaves classes across examples.)
+        let col2d = g.reshape_(col, vec![n as i64, 1]);
+        cols.push(col2d);
     }
-    let flat = g.concat_(cols, 0);
-    g.reshape_(flat, vec![n as i64, c as i64])
+    g.concat_(cols, 1)
+}
+
+/// `loss[n] = logsumexp(logits[n]) - Σ_c targets[n,c]·logits[n,c]`
+/// (dense / soft-label cross-entropy).
+fn lower_softmax_cross_entropy_dense(
+    g: &mut Graph,
+    logits: NodeId,
+    targets: NodeId,
+    out_shape: Shape,
+) -> NodeId {
+    let logits_shape = g.shape(logits).clone();
+    let n = logits_shape.dim(0).unwrap_static();
+    let axis = 1usize;
+
+    let m_shape = shape::reduce_shape(&logits_shape, &[axis], true).expect("max reduce");
+    let m = g.reduce(logits, ReduceOp::Max, vec![axis], true, m_shape);
+    let shifted = g.sub(logits, m);
+    let exp_d = g.exp(shifted);
+    let sum_shape = shape::reduce_shape(&logits_shape, &[axis], false).expect("sum reduce");
+    let sum_exp = g.reduce(exp_d, ReduceOp::Sum, vec![axis], false, sum_shape.clone());
+    let log_sum = g.add_node(
+        Op::Activation(Activation::Log),
+        vec![sum_exp],
+        sum_shape.clone(),
+    );
+    let m_squeezed = g.reshape_(m, vec![n as i64]);
+    let lse = g.add(m_squeezed, log_sum);
+
+    // Σ_c targets[n,c]·logits[n,c] along the class axis.
+    let prod = g.mul(logits, targets);
+    let dot = g.reduce(prod, ReduceOp::Sum, vec![axis], false, out_shape.clone());
+
+    g.sub(lse, dot)
 }
 
 /// `loss[n] = logsumexp(logits[n]) - logits[n, labels[n]]`.
@@ -147,7 +185,9 @@ impl Pass for LowerSoftmaxCrossEntropy {
         let needs = graph.nodes().iter().any(|n| {
             matches!(
                 n.op,
-                Op::SoftmaxCrossEntropyWithLogits | Op::SoftmaxCrossEntropyBackward
+                Op::SoftmaxCrossEntropy
+                    | Op::SoftmaxCrossEntropyWithLogits
+                    | Op::SoftmaxCrossEntropyBackward
             )
         });
         if !needs {
@@ -159,6 +199,16 @@ impl Pass for LowerSoftmaxCrossEntropy {
 
         for node in graph.nodes() {
             let new_id = match &node.op {
+                Op::SoftmaxCrossEntropy => {
+                    let logits = id_map[&node.inputs[0]];
+                    let targets = id_map[&node.inputs[1]];
+                    lower_softmax_cross_entropy_dense(
+                        &mut new_graph,
+                        logits,
+                        targets,
+                        node.shape.clone(),
+                    )
+                }
                 Op::SoftmaxCrossEntropyWithLogits => {
                     let logits = id_map[&node.inputs[0]];
                     let labels = id_map[&node.inputs[1]];

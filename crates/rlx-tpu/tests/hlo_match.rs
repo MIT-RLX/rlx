@@ -411,6 +411,7 @@ fn rope_emits_slice_concat_pair() {
         rlx_ir::Op::Rope {
             head_dim: 8,
             n_rot: 8,
+            style: rlx_ir::RopeStyle::NeoX,
         },
         vec![x, cos, sin],
         Shape::new(&[1, 2, 4, 8], f),
@@ -629,6 +630,114 @@ fn dequant_matmul_emits_convert_and_dot() {
     assert!(
         contains_opcode(&b, "dot"),
         "DequantMatMul should still emit a dot"
+    );
+}
+
+#[test]
+fn gguf_dequant_matmul_constant_emits_baked_dot() {
+    use rlx_ir::quant::QuantScheme;
+    let k = 32usize;
+    let n = 2usize;
+    let w_f32: Vec<f32> = (0..k * n).map(|i| 0.03 * (i as f32).sin()).collect();
+    let packed = rlx_gguf::quantize::quantize_q4_0(&w_f32).unwrap();
+    let mut g = Graph::new("gguf_dq");
+    let x = g.input("x", Shape::new(&[1, k], DType::F32));
+    let w = g.add_node(
+        rlx_ir::Op::Constant { data: packed },
+        vec![],
+        Shape::new(&[n, k], DType::U8),
+    );
+    let y = g.add_node(
+        rlx_ir::Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ4_0,
+        },
+        vec![x, w],
+        Shape::new(&[1, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "dot"),
+        "GGUF Constant bake should emit dot_general"
+    );
+    assert!(
+        contains_opcode(&b, "constant"),
+        "GGUF Constant bake should embed f32 weights as constant"
+    );
+    assert!(
+        !contains_opcode(&b, "convert"),
+        "GGUF bake path should not emit per-op convert on packed weights"
+    );
+}
+
+#[test]
+fn gguf_dequant_matmul_param_with_compile_bytes_emits_baked_dot() {
+    use rlx_ir::quant::QuantScheme;
+    use rlx_tpu::lower::{LowerParamBytes, lower_graph_with_rng_and_params};
+    let k = 32usize;
+    let n = 2usize;
+    let w_f32: Vec<f32> = (0..k * n).map(|i| 0.03 * (i as f32).sin()).collect();
+    let packed = rlx_gguf::quantize::quantize_q4_0(&w_f32).unwrap();
+    let mut g = Graph::new("gguf_dq_param");
+    let x = g.input("x", Shape::new(&[1, k], DType::F32));
+    let w = g.param("w", Shape::new(&[n, k], DType::U8));
+    let y = g.add_node(
+        rlx_ir::Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ4_0,
+        },
+        vec![x, w],
+        Shape::new(&[1, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let mut param_bytes: LowerParamBytes = LowerParamBytes::new();
+    param_bytes.insert("w".to_string(), packed);
+    let b =
+        lower_graph_with_rng_and_params(&g, rlx_ir::RngOptions::zero(), Some(&param_bytes)).bytes;
+    assert!(
+        contains_opcode(&b, "dot"),
+        "GGUF Param bake should emit dot_general"
+    );
+    assert!(
+        contains_opcode(&b, "constant"),
+        "GGUF Param bake should embed f32 weights as constant"
+    );
+    assert!(
+        !contains_opcode(&b, "convert"),
+        "GGUF bake path should not emit per-op convert on packed weights"
+    );
+}
+
+#[test]
+fn gguf_dequant_matmul_deferred_param_emits_param_dot() {
+    use rlx_ir::quant::QuantScheme;
+    let k = 32usize;
+    let n = 2usize;
+    let mut g = Graph::new("gguf_dq_deferred");
+    let x = g.input("x", Shape::new(&[1, k], DType::F32));
+    let w = g.param("w", Shape::new(&[72], DType::U8));
+    let y = g.add_node(
+        rlx_ir::Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ4_0,
+        },
+        vec![x, w],
+        Shape::new(&[1, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let module =
+        rlx_tpu::lower::lower_graph_with_rng_and_params(&g, rlx_ir::RngOptions::zero(), None);
+    assert!(
+        module.gguf_deferred.contains_key("w"),
+        "deferred GGUF param metadata"
+    );
+    let b = module.bytes;
+    assert!(contains_opcode(&b, "dot"), "deferred GGUF should emit dot");
+    assert!(
+        contains_opcode(&b, "parameter"),
+        "deferred GGUF should keep weight as HLO parameter"
+    );
+    assert!(
+        !contains_opcode(&b, "constant"),
+        "deferred GGUF should not bake weight constant at compile time"
     );
 }
 

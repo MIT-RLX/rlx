@@ -6,12 +6,15 @@ backend-specific kernels for CPU, Apple Silicon (Metal / MLX), NVIDIA
 (CUDA), AMD (ROCm), Google TPU, cross-platform GPU (wgpu), and
 microcontrollers (Cortex-M).
 
-> Status: **0.2.9**, Apple-Silicon-first. The CPU and Apple GPU paths
+> Status: **0.2.10**, Apple-Silicon-first. The CPU and Apple GPU paths
 > are mature; CUDA / ROCm / TPU / WGPU work but have seen less mileage;
 > Cortex-M is a separate INT8 product. Multi-backend runtime helpers
 > (`GraphDevices`, `DeviceRouter`) — see [`docs/backend-selection.md`](docs/backend-selection.md).
-> In-graph RNG (`Op::RngNormal` / `Op::RngUniform`) with ONNX `Random*` import —
-> see [`CHANGELOG.md`](CHANGELOG.md) and [`rlx-runtime/README.md`](rlx-runtime/README.md).
+> **0.2.10** added tensor-parallel collectives, native `Gru` / `Rnn` /
+> `Mamba2`, and dynamic-shape specialization — see [`docs/op-coverage.md`](docs/op-coverage.md).
+> Unreleased work includes full GGUF IQ / TQ / MX backend parity, Metal fused IQ
+> GEMV, pyrlx GGUF load / save / convert — see [`docs/gguf-backend-paths.md`](docs/gguf-backend-paths.md)
+> and [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Why another one
 
@@ -139,7 +142,7 @@ Pow-2 f32 transforms use native GPU kernels on CUDA / ROCm / wgpu / Metal;
 non-pow2 and f64 / C64 fall back to partial host sync. Bench with
 `cargo run -p rlx-bench --release --example bench_fft --features metal,gpu`.
 Python bindings: `pyrlx.Graph.fft`, `.rfft`, `.irfft`, `.fftfreq` (see
-`pyrlx/tests/test_fft.py`).
+`crates/pyrlx/tests/test_fft.py`).
 
 
 Or depend on each crate directly (`rlx-ir`, `rlx-opt`, `rlx-runtime`,
@@ -306,7 +309,7 @@ new ops land. Pin exact versions in production until 1.0.
 | `vmap`                       | MVP — leading-axis batching                   |
 | QAT (PTQ + STE + LSQ)        | Complete: EMA, Fixed, PerBatch, propagation   |
 | Qwen3 LM (safetensors + GGUF)| End-to-end on Metal: 100% top-1 parity vs HF; matches/beats Python MPS on most prefill shapes. Q4_K_M GGUF loads + runs |
-| Op::DequantMatMul GGUF schemes | Every llama.cpp scheme covered: Q2..Q8 K-quants, Q4_0/Q8_0, IQ4_NL/XS, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M, TQ1_0/TQ2_0, MXFP4, NVFP4. CPU + Metal + CUDA have native fused kernels (per-block dequant + cuBLAS/MPS sgemm); MLX/ROCm/wgpu use host-side dequant via `rlx-cpu::gguf_matmul`. CoreML/ANE covers the K-quant subset via `constexpr_blockwise_shift_scale`. |
+| Op::DequantMatMul GGUF schemes | All llama.cpp schemes (incl. Q4_1, Q5_0, Q5_1, IQ/TQ/MX). GPU dequant on Metal/CUDA/ROCm/WGPU (shared scheme ids 0–23); **Metal fused GEMV** for Q4_K, Q4_0/1, Q8_0, IQ4NL, IQ2/3/1 families (`m=1` prefill); WGPU grouped MoE GPU when scratch fits; ANE MIL constexpr for K/IQ/TQ/MX; TPU compile-time + runtime Param bake. **pyrlx:** `quantize`, `load_gguf`, `convert_to_gguf`. See [docs/gguf-backend-paths.md](docs/gguf-backend-paths.md). |
 | Sampler chain                  | `SamplerChain` in `rlx-runtime::samplers`: Temperature, DynamicTemperature, TopK, TopP, TopNSigma, TypicalP, Mirostat v1/v2, XTC, DRY, RepetitionPenalty. Wired into `SampleOpts::into_chain()`; classic top-k/top-p stay on the fast path via `is_classic()`. |
 | Quantized KV cache             | Per-layer K/V stored as q4_0 / q5_0 / q8_0 / f16 blocks via `rlx-runtime::quantized_kv`. Optional `mmap-kv` feature spills to a file-backed mapping for long contexts. |
 

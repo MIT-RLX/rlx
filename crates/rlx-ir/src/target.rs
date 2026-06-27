@@ -28,9 +28,43 @@
 //!   - `const fn`: can be used in const contexts (lookup tables,
 //!     static assertions).
 
-/// True on Apple Silicon (M-series) Macs.
+/// True on Apple Silicon — M-series Macs and the A/M/S-series chips in
+/// iPhones, iPads, Apple TVs, Apple Watches and Vision Pro (plus the
+/// aarch64 simulators). They ship the AMX coprocessor (and, except the
+/// Watch, a Metal GPU), so the same fast paths apply. The x86_64
+/// simulators are deliberately excluded (they run on Intel Macs).
 pub const fn is_apple_silicon() -> bool {
-    cfg!(all(target_arch = "aarch64", target_os = "macos"))
+    cfg!(all(target_arch = "aarch64", target_vendor = "apple"))
+}
+
+/// True on iOS (iPhone/iPad), device or simulator.
+pub const fn is_ios() -> bool {
+    cfg!(target_os = "ios")
+}
+
+/// True on tvOS (Apple TV), device or simulator.
+pub const fn is_tvos() -> bool {
+    cfg!(target_os = "tvos")
+}
+
+/// True on watchOS (Apple Watch), device or simulator. Note: watchOS has
+/// no Metal — see [`has_metal`].
+pub const fn is_watchos() -> bool {
+    cfg!(target_os = "watchos")
+}
+
+/// True on visionOS (Apple Vision Pro / "xrOS"), device or simulator.
+pub const fn is_visionos() -> bool {
+    cfg!(target_os = "visionos")
+}
+
+/// True on any Apple platform that RLX builds native backends for —
+/// macOS, iOS, tvOS, watchOS or visionOS. The Accelerate (AMX BLAS) and
+/// CoreML/ANE backends compile on all of them; use this instead of
+/// repeating the `target_vendor = "apple"` cfg inline. (Metal is the one
+/// exception — it skips watchOS; see [`has_metal`].)
+pub const fn is_apple_platform() -> bool {
+    cfg!(target_vendor = "apple")
 }
 
 /// True on aarch64 broadly (Apple Silicon + Linux ARM + AWS Graviton).
@@ -72,10 +106,14 @@ pub const fn has_amx() -> bool {
     is_apple_silicon()
 }
 
-/// True on the Metal-capable platform (macOS, plus iOS/tvOS in the
-/// future if RLX adds those targets).
+/// True on a Metal-capable Apple platform — macOS, iOS, tvOS and
+/// visionOS. All ship Metal, MetalPerformanceShaders and MPSGraph, so the
+/// native `rlx-metal` backend builds and runs on each. **watchOS is
+/// excluded**: it has no public Metal API, so the Metal backend never
+/// builds there (Accelerate + CoreML remain available via
+/// [`is_apple_platform`]).
 pub const fn has_metal() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(all(target_vendor = "apple", not(target_os = "watchos")))
 }
 
 #[cfg(test)]
@@ -84,10 +122,29 @@ mod tests {
 
     #[test]
     fn predicates_are_at_least_consistent() {
-        // Consistency: aarch64-on-macos implies apple silicon.
+        // Consistency: Apple Silicon ⇒ aarch64 on an Apple platform, with
+        // the AMX fast path. (Metal is *not* implied — watchOS is Apple
+        // Silicon yet has no Metal.)
         if is_apple_silicon() {
             assert!(is_aarch64());
-            assert!(is_macos());
+            assert!(is_apple_platform());
+            assert!(has_amx());
+        }
+        // Every concrete Apple OS is an Apple platform.
+        if is_macos() || is_ios() || is_tvos() || is_watchos() || is_visionos() {
+            assert!(is_apple_platform());
+        }
+        assert_eq!(
+            is_apple_platform(),
+            is_macos() || is_ios() || is_tvos() || is_watchos() || is_visionos()
+        );
+        // Metal rides on every Apple platform *except* watchOS.
+        assert_eq!(has_metal(), is_apple_platform() && !is_watchos());
+        if has_metal() {
+            assert!(is_apple_platform());
+        }
+        if is_watchos() {
+            assert!(!has_metal());
         }
         // x86 can't be both.
         if is_x86_64() {

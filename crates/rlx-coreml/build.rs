@@ -34,9 +34,14 @@ fn main() {
     println!("cargo:rerun-if-changed=proto/coreml.proto");
 
     // --- Objective-C CoreML shim (Apple only) -----------------------------
+    // CoreML.framework + Foundation ship on macOS, iOS, tvOS and visionOS, so
+    // build + link the shim there. **watchOS is excluded**: it marks the
+    // runtime model-compilation API (`compileModelAtURL:`) unavailable, and
+    // the shim relies on it — watchOS falls back to the CPU/Accelerate backend.
+    let target_vendor = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let is_apple = matches!(target_os.as_str(), "macos" | "ios");
-    if is_apple {
+    let is_coreml_capable = target_vendor == "apple" && target_os != "watchos";
+    if is_coreml_capable {
         cc::Build::new()
             .file("csrc/coreml_shim.m")
             .flag("-fobjc-arc")

@@ -36,28 +36,30 @@ use crate::device::wgpu_device;
 use crate::kernels::{
     ArgmaxParams, AttentionBwdParams, AttentionParams, BatchElementwiseRegionParams, BinaryParams,
     Conv1dParams, Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams,
-    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FusedResidualLnParams,
+    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
     FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupedMatmulParams, Kernel, LayerNormBwdParams, LayerNormParams, MatmulParams,
-    MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams,
-    RmsNormBwdParams, RopeBwdParams, RopeParams, SampleParams, ScatterAddParams,
-    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
-    WelchPeaksGpuParams, WhereParams, argmax_kernel, attention_bwd_kernel, attention_kernel,
-    batch_elementwise_region_kernel, binary_kernel, cast_f32_to_f16_kernel, compare_kernel,
-    concat_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
-    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel,
-    elementwise_region_spatial_kernel, expand_kernel, fused_residual_ln_kernel,
-    fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel, gather_axis_kernel,
-    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel, grouped_matmul_kernel,
+    GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNormBwdParams, LayerNormParams,
+    Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
+    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
+    SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
+    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams, argmax_kernel,
+    attention_bwd_kernel, attention_kernel, batch_elementwise_region_kernel, binary_kernel,
+    cast_f32_to_f16_kernel, compare_kernel, concat_kernel, conv1d_kernel, conv2d_kernel,
+    conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
+    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel, fma_kernel,
+    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
+    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
+    gather_split_kernel, grouped_matmul_kernel, gru_kernel,
     layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
-    layer_norm_backward_input_kernel, layernorm_kernel, matmul_coop_f16_vulkan_active_kernel,
-    matmul_coop_f16_vulkan_kernel, matmul_coop_f32_active_kernel, matmul_coop16_kernel,
-    matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_kernel,
-    matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f16_vk_kernel,
-    matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_active_kernel, matmul_wide_kernel,
-    narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
-    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rope_backward_kernel, rope_kernel,
-    sample_kernel, scatter_add_kernel, selective_scan_kernel, softmax_kernel, topk_kernel,
+    layer_norm_backward_input_kernel, layernorm_kernel, mamba2_kernel,
+    matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
+    matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
+    matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
+    matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
+    matmul_wide_active_kernel, matmul_wide_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel,
+    pool3d_kernel, reduce_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel,
+    rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_kernel,
+    selective_scan_kernel, softmax_cross_entropy_kernel, softmax_kernel, topk_kernel,
     transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
     welch_peaks_gpu_kernel, where_kernel,
 };
@@ -237,11 +239,17 @@ enum Step {
     Where {
         params: WhereParams,
     },
+    Fma {
+        params: FmaParams,
+    },
     Reduce {
         params: ReduceParams,
     },
     Softmax {
         params: SoftmaxParams,
+    },
+    SoftmaxCrossEntropy {
+        params: SceParams,
     },
     LayerNorm {
         params: LayerNormParams,
@@ -338,8 +346,10 @@ enum Step {
     /// stage small param tensors into the tail scratch region so kernels
     /// can bind a ≤4GiB window of the arena.
     BufferCopy {
-        src_byte_off: u32,
-        dst_byte_off: u32,
+        // u64: staging copies for >4 GiB GGUF decode arenas address tensors past
+        // the 4 GiB mark; a u32 byte offset truncates and stages garbage.
+        src_byte_off: u64,
+        dst_byte_off: u64,
         bytes: u32,
     },
     Copy {
@@ -426,8 +436,68 @@ enum Step {
     SelectiveScan {
         params: SelectiveScanParams,
     },
+    /// Native WGSL Mamba-2 SSD scan (state_size ≤ 256).
+    Mamba2 {
+        params: Mamba2Params,
+    },
+    /// Native WGSL GRU (single-layer/unidir/no-carry, hidden ≤ 256).
+    Gru {
+        params: GruParams,
+    },
+    /// Native WGSL Elman RNN (single-layer/unidir/no-carry, hidden ≤ 256).
+    Rnn {
+        params: RnnParams,
+    },
+    /// Host-staged GRU fallback (multi-layer / bidir / carry / hidden > 256).
+    GruHost {
+        x: u32,
+        w_ih: u32,
+        w_hh: u32,
+        b_ih: u32,
+        b_hh: u32,
+        h0: u32,
+        dst: u32,
+        batch: u32,
+        seq: u32,
+        input_size: u32,
+        hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        carry: bool,
+    },
+    /// Host-staged Elman RNN fallback.
+    RnnHost {
+        x: u32,
+        w_ih: u32,
+        w_hh: u32,
+        bias: u32,
+        h0: u32,
+        dst: u32,
+        batch: u32,
+        seq: u32,
+        input_size: u32,
+        hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        carry: bool,
+        relu: bool,
+    },
     DequantMatmul {
         params: DequantMatmulParams,
+    },
+    /// Split-binding embedding gather for >4 GiB arenas. The table and the
+    /// idx/output slots are more than one ≤4 GiB binding window apart, so the
+    /// single-arena-binding `Step::Gather` cannot reach the output. Runs as a
+    /// host segment (its own submission + copy-back), like `DequantMatmulGguf`.
+    /// BYTE offsets are u64 (arena exceeds 4 GiB).
+    GatherSplit {
+        n_out: u32,
+        n_idx: u32,
+        dim: u32,
+        vocab: u32,
+        table_byte_off: u64,
+        idx_byte_off: u64,
+        out_byte_off: u64,
     },
     /// GGUF K-quant — host fused dequant+matmul between GPU segments.
     DequantMatmulGguf {
@@ -435,9 +505,12 @@ enum Step {
         k: u32,
         n: u32,
         scheme_id: u32,
-        x_byte_off: u32,
-        w_byte_off: u32,
-        out_byte_off: u32,
+        // Arena BYTE offsets must be u64: GGUF decode arenas exceed 4 GiB
+        // (Orpheus-3B Q4_K_M is ~10 GiB), so a u32 byte offset truncates for
+        // any tensor past the 4 GiB mark and the host dequant reads garbage.
+        x_byte_off: u64,
+        w_byte_off: u64,
+        out_byte_off: u64,
     },
     /// GGUF K-quant — host fused dequant+grouped matmul between GPU segments.
     DequantGroupedMatmulGguf {
@@ -446,10 +519,10 @@ enum Step {
         n: u32,
         num_experts: u32,
         scheme_id: u32,
-        x_byte_off: u32,
-        w_byte_off: u32,
-        idx_byte_off: u32,
-        out_byte_off: u32,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        idx_byte_off: u64,
+        out_byte_off: u64,
     },
     /// Gated-DeltaNet — host scan between GPU segments (qwen35 linear layers).
     GatedDeltaNet {
@@ -481,6 +554,78 @@ enum Step {
         num_layers: u32,
         bidirectional: bool,
         carry: bool,
+    },
+    ConvTranspose2d {
+        src_byte_off: u32,
+        weight_byte_off: u32,
+        dst_byte_off: u32,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+    },
+    /// Host-staged NCHW GroupNorm (readback → CPU → writeback).
+    GroupNormHost {
+        src_byte_off: u32,
+        gamma_byte_off: u32,
+        beta_byte_off: u32,
+        dst_byte_off: u32,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        num_groups: u32,
+        eps: f32,
+    },
+    /// Host-staged NCHW LayerNorm2d (readback → CPU → writeback).
+    LayerNorm2dHost {
+        src_byte_off: u32,
+        gamma_byte_off: u32,
+        beta_byte_off: u32,
+        dst_byte_off: u32,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        eps: f32,
+    },
+    /// Host-staged nearest 2× upsample on NCHW (readback → CPU → writeback).
+    ResizeNearest2xHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+    },
+    /// Host-staged batch-general reverse/flip (readback → CPU → writeback).
+    ReverseHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        dims: Vec<u32>,
+        rev_mask: Vec<bool>,
+        elem_bytes: u32,
+    },
+    /// Host-staged ArgMax/ArgMin (readback → CPU → writeback).
+    ArgReduceHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        reduced: u32,
+        inner: u32,
+        is_max: bool,
     },
     Llada2GroupLimitedGate {
         sig_byte_off: u32,
@@ -662,6 +807,8 @@ enum Step {
 pub struct WgpuExecutable {
     graph: Graph,
     arena: Arena,
+    /// Byte offset of GGUF dequant scratch slab (0 when host fallback).
+    dequant_scratch_off: usize,
     schedule: Vec<Step>,
     input_offsets: HashMap<String, NodeId>,
     param_offsets: HashMap<String, NodeId>,
@@ -719,6 +866,11 @@ pub struct WgpuExecutable {
     readback_staging: Option<ReadbackStaging>,
     /// Persistent tiny readback buffer for single scalar outputs.
     tiny_readback: Option<TinyReadbackStaging>,
+    /// When set, `run_inner` dispatches + submits all compute but skips the
+    /// blocking output readback (results stay in the arena). Used by the wasm
+    /// `run_async` path, which then reads outputs back asynchronously — the
+    /// browser event loop cannot be blocked. Always false on native.
+    dispatch_only: bool,
     /// Per-`FftGpu` step: isolated uniform buffers + bind groups (one vec entry per op).
     fft_gpu_steps: Vec<crate::fft_dispatch::FftGpuResources>,
     /// Persistent KV inputs (host staging uploaded each run).
@@ -743,8 +895,10 @@ impl Step {
             | Step::Compare { .. }
             | Step::Unary { .. }
             | Step::Where { .. }
+            | Step::Fma { .. }
             | Step::Reduce { .. }
             | Step::Softmax { .. }
+            | Step::SoftmaxCrossEntropy { .. }
             | Step::LayerNorm { .. }
             | Step::FusedResidualLn { .. }
             | Step::FusedResidualLnTee { .. }
@@ -759,12 +913,21 @@ impl Step {
             | Step::Sample { .. }
             | Step::Gather { .. }
             | Step::GatherAxis { .. }
+            | Step::GatherSplit { .. }
             | Step::GroupedMatmul { .. }
             | Step::DequantMatmul { .. }
             | Step::DequantMatmulGguf { .. }
             | Step::DequantGroupedMatmulGguf { .. }
             | Step::GatedDeltaNet { .. }
             | Step::Lstm { .. }
+            | Step::ConvTranspose2d { .. }
+            | Step::GroupNormHost { .. }
+            | Step::LayerNorm2dHost { .. }
+            | Step::ResizeNearest2xHost { .. }
+            | Step::ReverseHost { .. }
+            | Step::ArgReduceHost { .. }
+            | Step::GruHost { .. }
+            | Step::RnnHost { .. }
             | Step::Llada2GroupLimitedGate { .. }
             | Step::UmapKnn { .. }
             | Step::UmapKnnHost { .. }
@@ -810,6 +973,12 @@ impl Step {
             // math; `params.seq` is the loop bound only. Safe at any
             // batch under active-extent scaling of seq.
             Step::SelectiveScan { .. } => true,
+            // Mamba2: same seq_stride discipline as SelectiveScan.
+            Step::Mamba2 { .. } => true,
+            // GRU/RNN: per-batch workgroups; seq_stride is full-extent, seq is
+            // the loop bound only. Safe under active-extent scaling.
+            Step::Gru { .. } => true,
+            Step::Rnn { .. } => true,
             // Narrow + Concat: kernel iterates `params.total` in
             // row-major order with outer as the leading dim. Scaling
             // total by actual/upper effectively scales outer by the
@@ -884,8 +1053,10 @@ fn step_name(step: &Step) -> &'static str {
         Step::Compare { .. } => "compare",
         Step::Unary { .. } => "unary",
         Step::Where { .. } => "where",
+        Step::Fma { .. } => "fma",
         Step::Reduce { .. } => "reduce",
         Step::Softmax { .. } => "softmax",
+        Step::SoftmaxCrossEntropy { .. } => "softmax_cross_entropy",
         Step::LayerNorm { .. } => "layer_norm",
         Step::Cumsum { .. } => "cumsum",
         Step::FftGpu { .. } => "fft_gpu",
@@ -920,11 +1091,23 @@ fn step_name(step: &Step) -> &'static str {
         Step::GroupedMatmul { .. } => "grouped_matmul",
         Step::Sample { .. } => "sample",
         Step::SelectiveScan { .. } => "selective_scan",
+        Step::Mamba2 { .. } => "mamba2",
+        Step::Gru { .. } => "gru",
+        Step::Rnn { .. } => "rnn",
+        Step::GruHost { .. } => "gru_host",
+        Step::RnnHost { .. } => "rnn_host",
         Step::DequantMatmul { .. } => "dequant_matmul",
+        Step::GatherSplit { .. } => "gather_split",
         Step::DequantMatmulGguf { .. } => "dequant_matmul_gguf",
         Step::DequantGroupedMatmulGguf { .. } => "dequant_grouped_matmul_gguf",
         Step::GatedDeltaNet { .. } => "gated_delta_net",
         Step::Lstm { .. } => "lstm",
+        Step::ConvTranspose2d { .. } => "conv_transpose2d",
+        Step::GroupNormHost { .. } => "group_norm_host",
+        Step::LayerNorm2dHost { .. } => "layer_norm2d_host",
+        Step::ResizeNearest2xHost { .. } => "resize_nearest2x_host",
+        Step::ReverseHost { .. } => "reverse_host",
+        Step::ArgReduceHost { .. } => "argreduce_host",
         Step::Llada2GroupLimitedGate { .. } => "llada2_group_limited_gate",
         Step::UmapKnn { .. } => "umap_knn",
         Step::UmapKnnHost { .. } => "umap_knn_host",
@@ -964,10 +1147,19 @@ fn step_is_tail_host(step: &Step) -> bool {
 
 fn step_runs_on_host(step: &Step) -> bool {
     match step {
-        Step::DequantMatmulGguf { .. }
+        Step::GatherSplit { .. }
+        | Step::DequantMatmulGguf { .. }
         | Step::DequantGroupedMatmulGguf { .. }
         | Step::GatedDeltaNet { .. }
         | Step::Lstm { .. }
+        | Step::ConvTranspose2d { .. }
+        | Step::GroupNormHost { .. }
+        | Step::LayerNorm2dHost { .. }
+        | Step::ResizeNearest2xHost { .. }
+        | Step::ReverseHost { .. }
+        | Step::ArgReduceHost { .. }
+        | Step::GruHost { .. }
+        | Step::RnnHost { .. }
         | Step::Llada2GroupLimitedGate { .. }
         | Step::UmapKnnHost { .. }
         | Step::MsDeformAttnHost { .. }
@@ -1071,6 +1263,7 @@ impl WgpuExecutable {
         // unresolved+binding state for the next round.
         self.graph = fresh.graph;
         self.arena = fresh.arena;
+        self.dequant_scratch_off = fresh.dequant_scratch_off;
         self.schedule = fresh.schedule;
         self.input_offsets = fresh.input_offsets;
         self.param_offsets = fresh.param_offsets;
@@ -1200,6 +1393,7 @@ impl WgpuExecutable {
         Self {
             graph: graph.clone(),
             arena,
+            dequant_scratch_off: 0,
             schedule: Vec::new(),
             input_offsets: HashMap::new(),
             param_offsets: HashMap::new(),
@@ -1221,6 +1415,7 @@ impl WgpuExecutable {
             stashed_params: HashMap::new(),
             readback_staging: None,
             tiny_readback: None,
+            dispatch_only: false,
             fft_gpu_steps: Vec::new(),
             gpu_handles: HashMap::new(),
             gpu_handle_feeds: HashMap::new(),
@@ -1256,7 +1451,20 @@ impl WgpuExecutable {
         let graph = crate::unfuse::unfuse(graph);
 
         // f32-uniform slots + liveness reuse (pairwise `[n,n]` graphs).
-        let plan = plan_f32_uniform(&graph, 16);
+        let mut plan = plan_f32_uniform(&graph, 16);
+        let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
+        let dequant_scratch_off = if dequant_scratch > 0 {
+            let aligned = plan.arena_size.div_ceil(16) * 16;
+            let new_size = aligned + dequant_scratch.div_ceil(16) * 16;
+            if (new_size as u64) <= dev.device.limits().max_buffer_size {
+                plan.arena_size = new_size;
+                aligned
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         // Pre-walk to compute the max scratch any single op needs.
         // Currently only `Op::LayerNormBackwardGamma` uses scratch
         // (`num_workgroups * H * 4` bytes for the partial-sums buffer).
@@ -1350,6 +1558,7 @@ impl WgpuExecutable {
         let uk = unary_kernel(&dev.device);
         let ck = compare_kernel(&dev.device);
         let wk = where_kernel(&dev.device);
+        let fk = fma_kernel(&dev.device);
 
         let mut schedule = Vec::new();
         let mut uniforms = Vec::new();
@@ -1584,6 +1793,7 @@ impl WgpuExecutable {
                     {
                         compute_precision = MatmulCompute::F16;
                     }
+                    let b_in_arena = !matmul_b_from_f16(compute_precision, b_is_param);
                     let (mut base, mut size, param_anchor) = arena_matmul_bind_window(
                         &dev.device,
                         &arena,
@@ -1592,20 +1802,21 @@ impl WgpuExecutable {
                         node.id,
                         a_id,
                         b_id,
+                        b_in_arena,
                     );
                     let max_binding = dev.device.limits().max_storage_buffer_binding_size;
-                    arena_expand_bind_window(
-                        &arena,
-                        &[node.id, a_id, b_id],
-                        &mut base,
-                        &mut size,
-                        max_binding,
-                    );
+                    // Only grow to cover B when B is actually bound through the arena.
+                    let expand_ids: &[NodeId] = if b_in_arena {
+                        &[node.id, a_id, b_id]
+                    } else {
+                        &[node.id, a_id]
+                    };
+                    arena_expand_bind_window(&arena, expand_ids, &mut base, &mut size, max_binding);
                     let mut scratch = arena.scratch_off as u64;
                     if param_anchor {
                         arena_ensure_scratch_in_window(&mut scratch, base, size);
                     }
-                    if b_is_param && b_bytes > ARENA_STAGE_CAP {
+                    if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
                         // The invariant we actually need is that the large param
                         // B is addressable in the bound window. That holds either
                         // via an explicit param anchor OR when the whole arena is
@@ -1632,7 +1843,13 @@ impl WgpuExecutable {
                         &mut base,
                         &mut size,
                     );
-                    let b_off_f32 = if b_is_param
+                    let b_off_f32 = if !b_in_arena {
+                        // B is read from the f16 shadow buffer (separate binding);
+                        // never bind/stage it through the arena window. Use the
+                        // global arena word index — build_matmul_bind_group rebases
+                        // it into the f16 weight window.
+                        (arena.offset(b_id) / 4) as u32
+                    } else if b_is_param
                         && b_bytes > ARENA_STAGE_CAP
                         && arena_tensor_in_window(&arena, b_id, base, size)
                     {
@@ -1835,8 +2052,8 @@ impl WgpuExecutable {
                             panic!("rlx-wgpu: Compare staging operand A too large ({a_len} bytes)");
                         }
                         schedule.push(Step::BufferCopy {
-                            src_byte_off: a_src as u32,
-                            dst_byte_off: a_dst as u32,
+                            src_byte_off: a_src,
+                            dst_byte_off: a_dst,
                             bytes: a_len as u32,
                         });
                         ((a_dst.saturating_sub(base)) / 4) as u32
@@ -1848,8 +2065,8 @@ impl WgpuExecutable {
                             panic!("rlx-wgpu: Compare staging operand B too large ({b_len} bytes)");
                         }
                         schedule.push(Step::BufferCopy {
-                            src_byte_off: b_src as u32,
-                            dst_byte_off: b_dst as u32,
+                            src_byte_off: b_src,
+                            dst_byte_off: b_dst,
                             bytes: b_len as u32,
                         });
                         ((b_dst.saturating_sub(base)) / 4) as u32
@@ -1956,8 +2173,8 @@ impl WgpuExecutable {
                             panic!("rlx-wgpu: Where staging cond too large ({cond_len} bytes)");
                         }
                         schedule.push(Step::BufferCopy {
-                            src_byte_off: cond_src as u32,
-                            dst_byte_off: cond_dst as u32,
+                            src_byte_off: cond_src,
+                            dst_byte_off: cond_dst,
                             bytes: cond_len as u32,
                         });
                         ((cond_dst.saturating_sub(base)) / 4) as u32
@@ -1969,8 +2186,8 @@ impl WgpuExecutable {
                             panic!("rlx-wgpu: Where staging x too large ({x_len} bytes)");
                         }
                         schedule.push(Step::BufferCopy {
-                            src_byte_off: x_src as u32,
-                            dst_byte_off: x_dst as u32,
+                            src_byte_off: x_src,
+                            dst_byte_off: x_dst,
                             bytes: x_len as u32,
                         });
                         ((x_dst.saturating_sub(base)) / 4) as u32
@@ -1982,8 +2199,8 @@ impl WgpuExecutable {
                             panic!("rlx-wgpu: Where staging y too large ({y_len} bytes)");
                         }
                         schedule.push(Step::BufferCopy {
-                            src_byte_off: y_src as u32,
-                            dst_byte_off: y_dst as u32,
+                            src_byte_off: y_src,
+                            dst_byte_off: y_dst,
                             bytes: y_len as u32,
                         });
                         ((y_dst.saturating_sub(base)) / 4) as u32
@@ -2001,6 +2218,85 @@ impl WgpuExecutable {
                     schedule.push(Step::Where { params: p });
                     let u = emit_uniform(std::mem::size_of::<WhereParams>());
                     let bg = bind_two_buf0_window(&dev.device, wk, &arena.buffer, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
+
+                Op::Fma => {
+                    let (mut base, size) = arena_window_for_nodes(&dev.device, &arena, &[node.id]);
+                    let a_id = node.inputs[0];
+                    let b_id = node.inputs[1];
+                    let c_id = node.inputs[2];
+                    let a_src = arena.offset(a_id) as u64;
+                    let b_src = arena.offset(b_id) as u64;
+                    let c_src = arena.offset(c_id) as u64;
+                    let a_len = arena.len_of(a_id) as u64;
+                    let b_len = arena.len_of(b_id) as u64;
+                    let c_len = arena.len_of(c_id) as u64;
+                    let a_in = a_src >= base && a_src + a_len <= base + size;
+                    let b_in = b_src >= base && b_src + b_len <= base + size;
+                    let c_in = c_src >= base && c_src + c_len <= base + size;
+                    let a_dst = arena.scratch_off as u64;
+                    let a_aligned = a_len.div_ceil(256) * 256;
+                    let b_dst = a_dst + a_aligned;
+                    let b_aligned = b_len.div_ceil(256) * 256;
+                    let c_dst = b_dst + b_aligned;
+                    if a_dst < base || c_dst + c_len > base + size {
+                        base = (arena.size as u64).saturating_sub(size);
+                        base = (base / 256) * 256;
+                    }
+                    let a_off = if a_in {
+                        arena_local_off_f32(&arena, a_id, base)
+                    } else {
+                        if a_len > 64 * 1024 * 1024 {
+                            panic!("rlx-wgpu: Fma staging a too large ({a_len} bytes)");
+                        }
+                        schedule.push(Step::BufferCopy {
+                            src_byte_off: a_src,
+                            dst_byte_off: a_dst,
+                            bytes: a_len as u32,
+                        });
+                        ((a_dst.saturating_sub(base)) / 4) as u32
+                    };
+                    let b_off = if b_in {
+                        arena_local_off_f32(&arena, b_id, base)
+                    } else {
+                        if b_len > 64 * 1024 * 1024 {
+                            panic!("rlx-wgpu: Fma staging b too large ({b_len} bytes)");
+                        }
+                        schedule.push(Step::BufferCopy {
+                            src_byte_off: b_src,
+                            dst_byte_off: b_dst,
+                            bytes: b_len as u32,
+                        });
+                        ((b_dst.saturating_sub(base)) / 4) as u32
+                    };
+                    let c_off = if c_in {
+                        arena_local_off_f32(&arena, c_id, base)
+                    } else {
+                        if c_len > 64 * 1024 * 1024 {
+                            panic!("rlx-wgpu: Fma staging c too large ({c_len} bytes)");
+                        }
+                        schedule.push(Step::BufferCopy {
+                            src_byte_off: c_src,
+                            dst_byte_off: c_dst,
+                            bytes: c_len as u32,
+                        });
+                        ((c_dst.saturating_sub(base)) / 4) as u32
+                    };
+                    let p = FmaParams {
+                        n: elems,
+                        a_off,
+                        b_off,
+                        c_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        _p0: 0,
+                        _p1: 0,
+                        _p2: 0,
+                    };
+                    schedule.push(Step::Fma { params: p });
+                    let u = emit_uniform(std::mem::size_of::<FmaParams>());
+                    let bg = bind_two_buf0_window(&dev.device, fk, &arena.buffer, base, size, &u);
                     uniforms.push(u);
                     bind_groups.push(bg);
                 }
@@ -2371,6 +2667,79 @@ impl WgpuExecutable {
                     bind_groups.push(bg);
                 }
 
+                Op::SoftmaxCrossEntropy => {
+                    // Dense / soft-label cross-entropy: logits [N,C], targets
+                    // [N,C] → loss [N]. One thread per row (outer=N, inner=C).
+                    // Window must cover both inputs + the [N] output slot;
+                    // mirrors the LayerNorm multi-input arena-window dance.
+                    let logits_id = node.inputs[0];
+                    let targets_id = node.inputs[1];
+                    let logits_shape = graph.node(logits_id).shape.dims();
+                    let inner = logits_shape[logits_shape.len() - 1].unwrap_static() as u32;
+                    let total: u32 = logits_shape
+                        .iter()
+                        .map(|d| d.unwrap_static() as u32)
+                        .product();
+                    let outer = total / inner.max(1);
+
+                    let sce_win = vec![node.id, logits_id, targets_id];
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let sce_fits = arena_span_bytes(&arena, &sce_win) <= max_binding;
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &sce_win,
+                    );
+                    if !sce_fits && !param_anchor {
+                        base = arena_bind_window_covering_scratch_if_needed(
+                            &arena, base, size, scratch,
+                        );
+                    }
+                    let logits_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        logits_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let targets_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        targets_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let p = SceParams {
+                        outer,
+                        inner,
+                        logits_off,
+                        targets_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        _p0: 0,
+                        _p1: 0,
+                        _p2: 0,
+                    };
+                    schedule.push(Step::SoftmaxCrossEntropy { params: p });
+                    let sk = softmax_cross_entropy_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<SceParams>());
+                    let bg = bind_two_buf0_window(&dev.device, sk, &arena.buffer, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
+
                 Op::LayerNorm { axis: _, eps } | Op::RmsNorm { axis: _, eps } => {
                     let in_id = node.inputs[0];
                     let in_shape = graph.node(in_id).shape.dims();
@@ -2601,8 +2970,8 @@ impl WgpuExecutable {
                     if src != dst {
                         let bytes = arena.len_of(in_id).min(arena.len_of(node.id));
                         schedule.push(Step::BufferCopy {
-                            src_byte_off: src as u32,
-                            dst_byte_off: dst as u32,
+                            src_byte_off: src as u64,
+                            dst_byte_off: dst as u64,
                             bytes: bytes as u32,
                         });
                     }
@@ -3243,8 +3612,8 @@ impl WgpuExecutable {
                     });
                     if let Some((tmp_byte, bytes)) = attn_scratch_copy {
                         schedule.push(Step::BufferCopy {
-                            src_byte_off: tmp_byte as u32,
-                            dst_byte_off: out_byte as u32,
+                            src_byte_off: tmp_byte,
+                            dst_byte_off: out_byte,
                             bytes,
                         });
                     }
@@ -3417,7 +3786,11 @@ impl WgpuExecutable {
                     bind_groups.push(bg);
                 }
 
-                Op::Rope { head_dim, n_rot: _ } => {
+                Op::Rope {
+                    head_dim,
+                    n_rot: _,
+                    style,
+                } => {
                     let x_id = node.inputs[0];
                     let cos_id = node.inputs[1];
                     let sin_id = node.inputs[2];
@@ -3506,7 +3879,10 @@ impl WgpuExecutable {
                         last_dim: last as u32,
                         batch,
                         seq_stride: seq,
-                        _p2: 0,
+                        style: match style {
+                            rlx_ir::op::RopeStyle::NeoX => 0,
+                            rlx_ir::op::RopeStyle::GptJ => 1,
+                        },
                     };
                     schedule.push(Step::Rope { params: p });
                     let rk = rope_kernel(&dev.device);
@@ -3668,6 +4044,49 @@ impl WgpuExecutable {
                     let idx_id = node.inputs[1];
                     let table_is_param = tensor_is_graph_param(&graph, &param_offsets, table_id);
                     let table_bytes = arena.len_of(table_id) as u64;
+                    // Split-binding path: on >4 GiB arenas the embedding output and
+                    // its index can lie more than one ≤4 GiB binding window away
+                    // from the (multi-GiB) table. A single arena binding then can't
+                    // cover both — the kernel writes the output OUTSIDE the bound
+                    // window (the write is dropped/clamped) and idx-staging would
+                    // even overwrite part of the table. Route axis-0 embedding
+                    // gathers through a host segment with separate table / idx
+                    // windows and a dedicated output buffer (copied back).
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let gather_needs_split = *axis == 0
+                        && arena_whole_arena_bind(&arena, max_binding).is_none()
+                        && arena_span_bytes(&arena, &[table_id, idx_id, node.id]) > max_binding;
+                    if gather_needs_split {
+                        let table_shape = graph.node(table_id).shape.dims();
+                        let idx_shape = graph.node(idx_id).shape.dims();
+                        let vocab = table_shape[0].unwrap_static() as u32;
+                        let dim: u32 = table_shape[1..]
+                            .iter()
+                            .map(|d| d.unwrap_static() as u32)
+                            .product::<u32>()
+                            .max(1);
+                        let n_idx: u32 =
+                            idx_shape.iter().map(|d| d.unwrap_static() as u32).product();
+                        let table_w = arena.len_of(table_id) as u64;
+                        assert!(
+                            table_w <= max_binding,
+                            "rlx-wgpu gather_split: embedding table {table_w} bytes exceeds \
+                             max_storage_buffer_binding_size {max_binding}"
+                        );
+                        schedule.push(Step::GatherSplit {
+                            n_out: elems,
+                            n_idx,
+                            dim,
+                            vocab,
+                            table_byte_off: arena.offset(table_id) as u64,
+                            idx_byte_off: arena.offset(idx_id) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
+                        });
+                        // Host segment: like DequantMatmulGguf, it builds its own
+                        // bind group at exec time, so do NOT push a uniform/bind
+                        // group lane (those are indexed by GPU-step count).
+                        continue;
+                    }
                     let gather_win: Vec<NodeId> = if table_is_param && table_bytes > ARENA_STAGE_CAP
                     {
                         vec![table_id, node.id, idx_id]
@@ -3852,6 +4271,7 @@ impl WgpuExecutable {
                             MatmulCompute::CoopF32 => MatmulQkvKind::CoopF32,
                             _ => MatmulQkvKind::F32,
                         };
+                        let b_in_arena = !matmul_b_from_f16(compute_precision, b_is_param);
                         let (mut base, mut size, param_anchor) = arena_matmul_bind_window(
                             &dev.device,
                             &arena,
@@ -3860,12 +4280,13 @@ impl WgpuExecutable {
                             q_id,
                             a_id,
                             b_id,
+                            b_in_arena,
                         );
                         let mut scratch = arena.scratch_off as u64;
                         if param_anchor {
                             arena_ensure_scratch_in_window(&mut scratch, base, size);
                         }
-                        if b_is_param && b_bytes > ARENA_STAGE_CAP {
+                        if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
                             assert!(
                                 param_anchor && arena_tensor_in_window(&arena, b_id, base, size),
                                 "rlx-wgpu FusedMatMul QKV: large param B {:?} not in bind window",
@@ -3927,7 +4348,9 @@ impl WgpuExecutable {
                             &mut base,
                             &mut size,
                         );
-                        let b_off_f32 = if b_is_param
+                        let b_off_f32 = if !b_in_arena {
+                            (arena.offset(b_id) / 4) as u32
+                        } else if b_is_param
                             && b_bytes > ARENA_STAGE_CAP
                             && arena_tensor_in_window(&arena, b_id, base, size)
                         {
@@ -4063,6 +4486,7 @@ impl WgpuExecutable {
                             );
                         }
                     } else {
+                        let b_in_arena = !matmul_b_from_f16(compute_precision, b_is_param);
                         let (mut base, mut size, param_anchor) = arena_matmul_bind_window(
                             &dev.device,
                             &arena,
@@ -4071,12 +4495,13 @@ impl WgpuExecutable {
                             node.id,
                             a_id,
                             b_id,
+                            b_in_arena,
                         );
                         let mut scratch = arena.scratch_off as u64;
                         if param_anchor {
                             arena_ensure_scratch_in_window(&mut scratch, base, size);
                         }
-                        if b_is_param && b_bytes > ARENA_STAGE_CAP {
+                        if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
                             assert!(
                                 param_anchor && arena_tensor_in_window(&arena, b_id, base, size),
                                 "rlx-wgpu FusedMatMul: large param B {:?} not in bind window",
@@ -4094,7 +4519,9 @@ impl WgpuExecutable {
                             &mut base,
                             &mut size,
                         );
-                        let b_off_f32 = if b_is_param
+                        let b_off_f32 = if !b_in_arena {
+                            (arena.offset(b_id) / 4) as u32
+                        } else if b_is_param
                             && b_bytes > ARENA_STAGE_CAP
                             && arena_tensor_in_window(&arena, b_id, base, size)
                         {
@@ -4863,6 +5290,169 @@ impl WgpuExecutable {
                     uniforms.push(u);
                     bind_groups.push(bg);
                 }
+                Op::Mamba2 {
+                    head_dim,
+                    state_size,
+                } => {
+                    if *state_size > 256 {
+                        panic!(
+                            "rlx-wgpu Mamba2: state_size {} exceeds compile-time cap of 256",
+                            state_size
+                        );
+                    }
+                    let x_id = node.inputs[0];
+                    let in_dims = graph.node(x_id).shape.dims(); // [B,S,H,P]
+                    let seq = in_dims[1].unwrap_static() as u32;
+                    let p = Mamba2Params {
+                        batch: in_dims[0].unwrap_static() as u32,
+                        seq,
+                        heads: in_dims[2].unwrap_static() as u32,
+                        head_dim: *head_dim as u32,
+                        state_size: *state_size as u32,
+                        x_off: (arena.offset(x_id) / 4) as u32,
+                        dt_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        a_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        b_off: (arena.offset(node.inputs[3]) / 4) as u32,
+                        c_off: (arena.offset(node.inputs[4]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        seq_stride: seq,
+                        _p1: 0,
+                        _p2: 0,
+                        _p3: 0,
+                        _p4: 0,
+                    };
+                    schedule.push(Step::Mamba2 { params: p });
+                    let mk = mamba2_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<Mamba2Params>());
+                    let bg = bind_op_output_window(&dev.device, mk, &arena, node.id, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
+                Op::Gru {
+                    hidden_size,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                } => {
+                    let x_id = node.inputs[0];
+                    let in_dims = graph.node(x_id).shape.dims(); // [B,S,In]
+                    let batch = in_dims[0].unwrap_static() as u32;
+                    let seq = in_dims[1].unwrap_static() as u32;
+                    let input_size = in_dims[2].unwrap_static() as u32;
+                    let hidden = *hidden_size as u32;
+                    let simple = *num_layers == 1 && !*bidirectional && !*carry;
+                    if simple && hidden <= 256 {
+                        let p = GruParams {
+                            batch,
+                            seq,
+                            input_size,
+                            hidden,
+                            x_off: (arena.offset(x_id) / 4) as u32,
+                            wih_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                            whh_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                            bih_off: (arena.offset(node.inputs[3]) / 4) as u32,
+                            bhh_off: (arena.offset(node.inputs[4]) / 4) as u32,
+                            out_off: (arena.offset(node.id) / 4) as u32,
+                            seq_stride: seq,
+                            _p1: 0,
+                            _p2: 0,
+                            _p3: 0,
+                            _p4: 0,
+                            _p5: 0,
+                        };
+                        schedule.push(Step::Gru { params: p });
+                        let gk = gru_kernel(&dev.device);
+                        let u = emit_uniform(std::mem::size_of::<GruParams>());
+                        let bg = bind_op_output_window(&dev.device, gk, &arena, node.id, &u);
+                        uniforms.push(u);
+                        bind_groups.push(bg);
+                    } else {
+                        let h0 = if *carry {
+                            arena.offset(node.inputs[5]) as u32
+                        } else {
+                            0
+                        };
+                        schedule.push(Step::GruHost {
+                            x: arena.offset(x_id) as u32,
+                            w_ih: arena.offset(node.inputs[1]) as u32,
+                            w_hh: arena.offset(node.inputs[2]) as u32,
+                            b_ih: arena.offset(node.inputs[3]) as u32,
+                            b_hh: arena.offset(node.inputs[4]) as u32,
+                            h0,
+                            dst: arena.offset(node.id) as u32,
+                            batch,
+                            seq,
+                            input_size,
+                            hidden,
+                            num_layers: *num_layers as u32,
+                            bidirectional: *bidirectional,
+                            carry: *carry,
+                        });
+                    }
+                }
+                Op::Rnn {
+                    hidden_size,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                    relu,
+                } => {
+                    let x_id = node.inputs[0];
+                    let in_dims = graph.node(x_id).shape.dims();
+                    let batch = in_dims[0].unwrap_static() as u32;
+                    let seq = in_dims[1].unwrap_static() as u32;
+                    let input_size = in_dims[2].unwrap_static() as u32;
+                    let hidden = *hidden_size as u32;
+                    let simple = *num_layers == 1 && !*bidirectional && !*carry;
+                    if simple && hidden <= 256 {
+                        let p = RnnParams {
+                            batch,
+                            seq,
+                            input_size,
+                            hidden,
+                            x_off: (arena.offset(x_id) / 4) as u32,
+                            wih_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                            whh_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                            bias_off: (arena.offset(node.inputs[3]) / 4) as u32,
+                            out_off: (arena.offset(node.id) / 4) as u32,
+                            seq_stride: seq,
+                            relu: u32::from(*relu),
+                            _p1: 0,
+                            _p2: 0,
+                            _p3: 0,
+                            _p4: 0,
+                            _p5: 0,
+                        };
+                        schedule.push(Step::Rnn { params: p });
+                        let rk = rnn_kernel(&dev.device);
+                        let u = emit_uniform(std::mem::size_of::<RnnParams>());
+                        let bg = bind_op_output_window(&dev.device, rk, &arena, node.id, &u);
+                        uniforms.push(u);
+                        bind_groups.push(bg);
+                    } else {
+                        let h0 = if *carry {
+                            arena.offset(node.inputs[4]) as u32
+                        } else {
+                            0
+                        };
+                        schedule.push(Step::RnnHost {
+                            x: arena.offset(x_id) as u32,
+                            w_ih: arena.offset(node.inputs[1]) as u32,
+                            w_hh: arena.offset(node.inputs[2]) as u32,
+                            bias: arena.offset(node.inputs[3]) as u32,
+                            h0,
+                            dst: arena.offset(node.id) as u32,
+                            batch,
+                            seq,
+                            input_size,
+                            hidden,
+                            num_layers: *num_layers as u32,
+                            bidirectional: *bidirectional,
+                            carry: *carry,
+                            relu: *relu,
+                        });
+                    }
+                }
                 Op::GatedDeltaNet {
                     state_size,
                     carry_state,
@@ -4949,6 +5539,127 @@ impl WgpuExecutable {
                     let (u, bg) = gguf_host_pad.as_ref().unwrap();
                     uniforms.push(u.clone());
                     bind_groups.push(bg.clone());
+                }
+                Op::ConvTranspose2d {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    output_padding: _,
+                    groups,
+                } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let out_shape = &node.shape;
+                    schedule.push(Step::ConvTranspose2d {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        weight_byte_off: arena.offset(node.inputs[1]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c_in: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w_in: in_shape.dim(3).unwrap_static() as u32,
+                        c_out: out_shape.dim(1).unwrap_static() as u32,
+                        h_out: out_shape.dim(2).unwrap_static() as u32,
+                        w_out: out_shape.dim(3).unwrap_static() as u32,
+                        kh: kernel_size[0] as u32,
+                        kw: kernel_size[1] as u32,
+                        sh: stride[0] as u32,
+                        sw: stride[1] as u32,
+                        ph: padding[0] as u32,
+                        pw: padding[1] as u32,
+                        dh: dilation[0] as u32,
+                        dw: dilation[1] as u32,
+                        groups: *groups as u32,
+                    });
+                    // Host step: schedule-only, like `MsDeformAttnHost`/`UmapKnnHost`.
+                    // The uniform/bind_group lanes are indexed by GPU-step count
+                    // (`gpu_ui`), so host steps must NOT push to them.
+                }
+                Op::GroupNorm { num_groups, eps } => {
+                    // NCHW: x [n,c,h,w], gamma/beta [c]. Host step (schedule-only).
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::GroupNormHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        gamma_byte_off: arena.offset(node.inputs[1]) as u32,
+                        beta_byte_off: arena.offset(node.inputs[2]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                        num_groups: *num_groups as u32,
+                        eps: *eps,
+                    });
+                }
+                Op::LayerNorm2d { eps } => {
+                    // NCHW: x [n,c,h,w], gamma/beta [c]. Host step (schedule-only).
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::LayerNorm2dHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        gamma_byte_off: arena.offset(node.inputs[1]) as u32,
+                        beta_byte_off: arena.offset(node.inputs[2]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                        eps: *eps,
+                    });
+                }
+                Op::ResizeNearest2x => {
+                    // NCHW nearest 2× upsample. Host step (schedule-only).
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::ResizeNearest2xHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                    });
+                }
+                Op::Reverse { axes } => {
+                    // Batch-general flip. Host step (schedule-only).
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let dims: Vec<u32> = (0..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static() as u32)
+                        .collect();
+                    let mut rev_mask = vec![false; rank];
+                    for &a in axes {
+                        if a < rank {
+                            rev_mask[a] = true;
+                        }
+                    }
+                    schedule.push(Step::ReverseHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        dims,
+                        rev_mask,
+                        elem_bytes: in_shape.dtype().size_bytes() as u32,
+                    });
+                }
+                Op::ArgMax { axis, keep_dim: _ } | Op::ArgMin { axis, keep_dim: _ } => {
+                    // ArgMax/ArgMin. Host step (schedule-only).
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let outer: usize = (0..*axis)
+                        .map(|i| in_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let reduced = in_shape.dim(*axis).unwrap_static();
+                    let inner: usize = (*axis + 1..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    schedule.push(Step::ArgReduceHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        outer: outer as u32,
+                        reduced: reduced as u32,
+                        inner: inner as u32,
+                        is_max: matches!(node.op, Op::ArgMax { .. }),
+                    });
                 }
                 Op::Custom { name, attrs, .. } => match name.as_str() {
                     "llada2.group_limited_gate" => {
@@ -5069,22 +5780,15 @@ impl WgpuExecutable {
                         n,
                         num_experts: ne,
                         scheme_id: crate::gguf_host::gguf_scheme_id(*scheme),
-                        x_byte_off: arena.offset(in_id) as u32,
-                        w_byte_off: arena.offset(w_id) as u32,
-                        idx_byte_off: arena.offset(idx_id) as u32,
-                        out_byte_off: arena.offset(node.id) as u32,
+                        x_byte_off: arena.offset(in_id) as u64,
+                        w_byte_off: arena.offset(w_id) as u64,
+                        idx_byte_off: arena.offset(idx_id) as u64,
+                        out_byte_off: arena.offset(node.id) as u64,
                     });
-                    if gguf_host_pad.is_none() {
-                        let bk = binary_kernel(&dev.device);
-                        let u = emit_uniform(256);
-                        gguf_host_pad = Some((
-                            u.clone(),
-                            bind_op_output_window(&dev.device, bk, &arena, node.id, &u),
-                        ));
-                    }
-                    let (u, bg) = gguf_host_pad.as_ref().unwrap();
-                    uniforms.push(u.clone());
-                    bind_groups.push(bg.clone());
+                    // Host step (builds its own bind groups): schedule-only, like
+                    // `GroupNorm`. The uniform/bind_group lanes are indexed by
+                    // GPU-step count (host steps skipped), so pushing here would
+                    // shift every later GPU op's lane. Do NOT push.
                 }
                 Op::TopK { k } => {
                     let in_id = node.inputs[0];
@@ -5230,32 +5934,34 @@ impl WgpuExecutable {
                     use rlx_ir::QuantScheme;
                     let x_id = node.inputs[0];
                     let w_id = node.inputs[1];
-                    let out_dims = node.shape.dims();
-                    let x_dims = graph.node(x_id).shape.dims();
-                    let m = out_dims[0].unwrap_static() as u32;
-                    let n = out_dims[1].unwrap_static() as u32;
-                    let k = x_dims[1].unwrap_static() as u32;
+                    // Rank-agnostic GEMM dims: `n` = last output dim, `m` = the
+                    // product of the leading output dims (e.g. batch·seq), `k` =
+                    // last input dim. A 2D-only `out_dims[1]` read collapses a 3D
+                    // decode output `[1, 1, hidden]` to `n = 1` (the seq axis),
+                    // which then mis-sizes the weight window. Mirrors
+                    // `gguf_gpu::dequant_gguf_scratch_bytes`.
+                    let out_total = node.shape.num_elements().unwrap_or(0) as u32;
+                    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static() as u32;
+                    let m = out_total / n.max(1);
+                    let x_total = graph.node(x_id).shape.num_elements().unwrap_or(0) as u32;
+                    let k = x_total / m.max(1);
                     if scheme.is_gguf() {
                         schedule.push(Step::DequantMatmulGguf {
                             m,
                             k,
                             n,
                             scheme_id: crate::gguf_host::gguf_scheme_id(*scheme),
-                            x_byte_off: arena.offset(x_id) as u32,
-                            w_byte_off: arena.offset(w_id) as u32,
-                            out_byte_off: arena.offset(node.id) as u32,
+                            x_byte_off: arena.offset(x_id) as u64,
+                            w_byte_off: arena.offset(w_id) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
                         });
-                        if gguf_host_pad.is_none() {
-                            let bk = binary_kernel(&dev.device);
-                            let u = emit_uniform(256);
-                            gguf_host_pad = Some((
-                                u.clone(),
-                                bind_op_output_window(&dev.device, bk, &arena, node.id, &u),
-                            ));
-                        }
-                        let (u, bg) = gguf_host_pad.as_ref().unwrap();
-                        uniforms.push(u.clone());
-                        bind_groups.push(bg.clone());
+                        // Host step (`run_dequant_matmul_gguf_gpu` builds its own
+                        // bind groups): schedule-only, like `GroupNorm`. The
+                        // uniform/bind_group lanes are indexed by GPU-step count
+                        // (`gpu_ui`/`gpu_bi`, host steps skipped), so pushing here
+                        // would shift every later GPU op's lane — fatal in the
+                        // packed decode graph where GGUF ops interleave with
+                        // RmsNorm/RoPE/Attention/SwiGLU. Do NOT push.
                     } else {
                         let (block_size, scheme_id) = match scheme {
                             QuantScheme::Int8Block { block_size } => (*block_size, 0u32),
@@ -5718,6 +6424,28 @@ impl WgpuExecutable {
                         op_seed: *op_seed,
                     });
                 }
+                // Standalone nearest 2× upsample: the region-marking pass wraps
+                // a bare `Op::ResizeNearest2x` into a single-step TransformRegion.
+                // Route that to the host resize helper (mirrors the bare arm).
+                Op::TransformRegion { steps, .. }
+                    if steps.len() == 1
+                        && matches!(
+                            steps[0],
+                            rlx_ir::op::TransformStep::ResizeNearest2x(
+                                rlx_ir::op::ChainOperand::Input(0)
+                            )
+                        ) =>
+                {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::ResizeNearest2xHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                    });
+                }
                 other => panic!(
                     "rlx-wgpu: op {other:?} not yet lowered (v2 covers Matmul, \
                      Binary, Compare, Activation, Where — fall back to CPU/Metal/MLX)"
@@ -5753,6 +6481,7 @@ impl WgpuExecutable {
         Self {
             graph,
             arena,
+            dequant_scratch_off,
             schedule,
             input_offsets,
             param_offsets,
@@ -5774,6 +6503,7 @@ impl WgpuExecutable {
             stashed_params: HashMap::new(),
             readback_staging: None,
             tiny_readback: None,
+            dispatch_only: false,
             fft_gpu_steps,
             gpu_handles: HashMap::new(),
             gpu_handle_feeds: HashMap::new(),
@@ -5937,6 +6667,65 @@ impl WgpuExecutable {
         let outs = self.run_inner(inputs);
         self.pending_read_indices = None;
         outs
+    }
+
+    /// Async sibling of [`Self::run`] for the browser, where GPU→CPU readback
+    /// cannot block the event loop. All compute is dispatched + submitted
+    /// synchronously (via the normal `run_inner` in dispatch-only mode); the
+    /// outputs are then read back from the arena asynchronously.
+    ///
+    /// Supports pure feed-forward graphs only — graphs with host-executed ops
+    /// (GGUF dequant, LSTM/GRU, GatedDeltaNet, FFT-host, …) map intermediate
+    /// results back mid-graph, which would block the browser. Such graphs
+    /// panic with a clear message rather than hang.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn run_async(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        assert!(
+            !self
+                .schedule
+                .iter()
+                .any(|s| step_runs_on_host(s) || step_is_tail_host(s)),
+            "rlx-wgpu run_async: graph contains host-executed ops unsupported on wasm"
+        );
+
+        // 1. Dispatch + submit all compute, skipping the blocking readback.
+        self.dispatch_only = true;
+        let _ = self.run_inner(inputs);
+        self.dispatch_only = false;
+
+        let dev =
+            wgpu_device().expect("rlx-wgpu: device not initialized (call init_wgpu_device first)");
+
+        // 2. Read the selected outputs back from the arena asynchronously.
+        let plan = self.readback_plan();
+        let out_ids_all: Vec<_> = self.graph.outputs.clone();
+        let out_ids: Vec<_> = plan.iter().map(|&i| out_ids_all[i]).collect();
+        let layout = ReadbackLayout::for_nodes(&self.arena, &out_ids);
+        if layout.regions.is_empty() {
+            return Vec::new();
+        }
+        ReadbackStaging::prepare(&dev.device, &mut self.readback_staging, layout.total_bytes);
+        let staging_buf = self
+            .readback_staging
+            .as_ref()
+            .expect("readback staging")
+            .buffer()
+            .clone();
+
+        let mut enc = dev
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rlx-wgpu async readback"),
+            });
+        encode_readback_copies(&mut enc, &self.arena, &staging_buf, &out_ids, &layout);
+        dev.queue.submit(std::iter::once(enc.finish()));
+
+        crate::buffer::wasm_async::map_read_async(&staging_buf, layout.total_bytes)
+            .await
+            .expect("rlx-wgpu async buffer map failed");
+
+        let partial = decode_mapped_readback_f32(&staging_buf, &layout);
+        self.pack_readback_outputs(&plan, partial)
     }
 
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
@@ -6392,6 +7181,12 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::Fma { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::Reduce { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
@@ -6399,6 +7194,12 @@ impl WgpuExecutable {
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Softmax { params } => {
+                        let mut p = *params;
+                        p.outer = scale(p.outer);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::SoftmaxCrossEntropy { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
@@ -6658,16 +7459,43 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::Mamba2 { params } => {
+                        let mut p = *params;
+                        p.seq = scale(p.seq);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::Gru { params } => {
+                        let mut p = *params;
+                        p.seq = scale(p.seq);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::Rnn { params } => {
+                        let mut p = *params;
+                        p.seq = scale(p.seq);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::DequantMatmul { params } => {
                         let mut p = *params;
                         p.m = scale(p.m);
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
-                    Step::DequantMatmulGguf { .. }
+                    Step::GatherSplit { .. }
+                    | Step::DequantMatmulGguf { .. }
                     | Step::DequantGroupedMatmulGguf { .. }
                     | Step::GatedDeltaNet { .. }
                     | Step::Lstm { .. }
+                    | Step::ConvTranspose2d { .. }
+                    | Step::GroupNormHost { .. }
+                    | Step::LayerNorm2dHost { .. }
+                    | Step::ResizeNearest2xHost { .. }
+                    | Step::ReverseHost { .. }
+                    | Step::ArgReduceHost { .. }
+                    | Step::GruHost { .. }
+                    | Step::RnnHost { .. }
                     | Step::Llada2GroupLimitedGate { .. }
                     | Step::UmapKnnHost { .. }
                     | Step::MsDeformAttnHost { .. }
@@ -6728,6 +7556,7 @@ impl WgpuExecutable {
         let uk = unary_kernel(&dev.device);
         let ck = compare_kernel(&dev.device);
         let wk = where_kernel(&dev.device);
+        let fk = fma_kernel(&dev.device);
         let mut step_i = 0;
         let mut gpu_bi = 0usize;
         let mut fft_i = 0usize;
@@ -6955,6 +7784,16 @@ impl WgpuExecutable {
                             let (gx, gy, gz) = dispatch_dims(n_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
+                        Step::Fma { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            pass.set_pipeline(&fk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
                         Step::Reduce { params } => {
                             let outer_s = scale(params.outer);
                             if outer_s == 0 {
@@ -6982,6 +7821,17 @@ impl WgpuExecutable {
                                 continue;
                             }
                             let sk = softmax_kernel(&dev.device);
+                            pass.set_pipeline(&sk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::SoftmaxCrossEntropy { params } => {
+                            let outer_s = scale(params.outer);
+                            if outer_s == 0 {
+                                continue;
+                            }
+                            let sk = softmax_cross_entropy_kernel(&dev.device);
                             pass.set_pipeline(&sk.pipeline);
                             pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(outer_s, 64);
@@ -7469,6 +8319,27 @@ impl WgpuExecutable {
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
+                        Step::Mamba2 { params } => {
+                            let mk = mamba2_kernel(&dev.device);
+                            pass.set_pipeline(&mk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            let total = params.batch * params.heads * params.head_dim;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Gru { params } => {
+                            // One workgroup per batch item (workgroup_size=256).
+                            let gk = gru_kernel(&dev.device);
+                            pass.set_pipeline(&gk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            pass.dispatch_workgroups(params.batch, 1, 1);
+                        }
+                        Step::Rnn { params } => {
+                            let rk = rnn_kernel(&dev.device);
+                            pass.set_pipeline(&rk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            pass.dispatch_workgroups(params.batch, 1, 1);
+                        }
                         Step::DequantMatmul { params } => {
                             let m_s = scale(params.m);
                             if m_s == 0 {
@@ -7575,10 +8446,19 @@ impl WgpuExecutable {
                                 }
                             }
                         }
-                        Step::DequantMatmulGguf { .. }
+                        Step::GatherSplit { .. }
+                        | Step::DequantMatmulGguf { .. }
                         | Step::DequantGroupedMatmulGguf { .. }
                         | Step::GatedDeltaNet { .. }
                         | Step::Lstm { .. }
+                        | Step::ConvTranspose2d { .. }
+                        | Step::GroupNormHost { .. }
+                        | Step::LayerNorm2dHost { .. }
+                        | Step::ResizeNearest2xHost { .. }
+                        | Step::ReverseHost { .. }
+                        | Step::ArgReduceHost { .. }
+                        | Step::GruHost { .. }
+                        | Step::RnnHost { .. }
                         | Step::Llada2GroupLimitedGate { .. }
                         | Step::UmapKnnHost { .. }
                         | Step::MsDeformAttnHost { .. }
@@ -7607,7 +8487,7 @@ impl WgpuExecutable {
                 && step_i > 0
                 && step_needs_pass_flush(&self.schedule[step_i], &self.schedule[step_i - 1]);
             let gpu_schedule_done = step_i >= self.schedule.len();
-            let skip_readback = rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY");
+            let skip_readback = rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") || self.dispatch_only;
             let defer_tail = gpu_schedule_done && self.schedule.iter().any(step_is_tail_host);
             let mut fused_readback: Option<(
                 ReadbackLayout,
@@ -7629,9 +8509,8 @@ impl WgpuExecutable {
                     let tiny = self.tiny_readback.as_ref().expect("tiny readback");
                     encode_readback_copies(&mut enc, &self.arena, tiny.buffer(), &out_ids, &layout);
                     let map_rx = schedule_readback_map(&mut enc, tiny.buffer(), &layout);
-                    dev.queue.submit(std::iter::once(enc.finish()));
-                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-                    wait_readback_map(&dev.device, &map_rx, layout.total_bytes);
+                    let sub = dev.queue.submit(std::iter::once(enc.finish()));
+                    wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                     map_rx.recv().unwrap().unwrap();
                     return self.pack_readback_outputs(
                         &plan,
@@ -7655,7 +8534,7 @@ impl WgpuExecutable {
                     fused_readback = Some((layout, map_rx, plan));
                 }
             }
-            dev.queue.submit(std::iter::once(enc.finish()));
+            let main_submission = dev.queue.submit(std::iter::once(enc.finish()));
             if defer_tail {
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                 self.run_tail_host_audio_ops(dev);
@@ -7685,8 +8564,8 @@ impl WgpuExecutable {
                             &layout,
                         );
                         let map_rx = schedule_readback_map(&mut rb_enc, tiny.buffer(), &layout);
-                        dev.queue.submit(std::iter::once(rb_enc.finish()));
-                        wait_readback_map(&dev.device, &map_rx, layout.total_bytes);
+                        let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
+                        wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                         map_rx.recv().unwrap().unwrap();
                         return self.pack_readback_outputs(
                             &plan,
@@ -7707,8 +8586,8 @@ impl WgpuExecutable {
                             &layout,
                         );
                         let map_rx = schedule_readback_map(&mut rb_enc, staging.buffer(), &layout);
-                        dev.queue.submit(std::iter::once(rb_enc.finish()));
-                        wait_readback_map(&dev.device, &map_rx, layout.total_bytes);
+                        let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
+                        wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                         map_rx.recv().unwrap().unwrap();
                         self.dump_node_stats_if_requested(dev);
                         let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
@@ -7739,7 +8618,7 @@ impl WgpuExecutable {
                 if let (Some((layout, map_rx, plan)), Some(staging)) =
                     (fused_readback, self.readback_staging.as_ref())
                 {
-                    wait_readback_map(&dev.device, &map_rx, layout.total_bytes);
+                    wait_readback_map(&dev.device, main_submission, &map_rx, layout.total_bytes);
                     map_rx.recv().unwrap().unwrap();
                     self.dump_node_stats_if_requested(dev);
                     let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
@@ -7755,13 +8634,31 @@ impl WgpuExecutable {
                 } => {
                     // wgpu forbids `copy_buffer_to_buffer` on the same buffer;
                     // use the generic copy compute kernel instead.
-                    let src = *src_byte_off as u64;
-                    let dst = *dst_byte_off as u64;
+                    let src = *src_byte_off;
+                    let dst = *dst_byte_off;
                     let nbytes = *bytes as u64;
                     let elems = (nbytes / 4).max(1) as u32;
                     let lo = src.min(dst);
                     let hi = src.saturating_add(nbytes).max(dst.saturating_add(nbytes));
                     let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    // On >4 GiB arenas (GGUF decode) src and dst can be more than
+                    // `max_binding` apart, so no single ≤4 GiB compute bind window
+                    // covers both — the kernel copy would silently read/write out
+                    // of its window. Fall back to a host round-trip (small staging
+                    // copies only; capped by ARENA_STAGE_CAP).
+                    if hi.saturating_sub(lo) > max_binding {
+                        let bytes_host = self.arena.read_bytes_range(
+                            &dev.device,
+                            &dev.queue,
+                            src as usize,
+                            nbytes as usize,
+                        );
+                        self.arena
+                            .write_bytes_range(&dev.queue, dst as usize, &bytes_host);
+                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                        step_i += 1;
+                        continue;
+                    }
                     let mut base = (lo / 256) * 256;
                     // The bind window must cover [base, hi]. `base` is floored to 256B
                     // alignment (so base ≤ lo); measuring the size from `lo` instead of
@@ -7813,6 +8710,28 @@ impl WgpuExecutable {
                     dev.queue.submit(std::iter::once(enc.finish()));
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                 }
+                Step::GatherSplit {
+                    n_out,
+                    n_idx,
+                    dim,
+                    vocab,
+                    table_byte_off,
+                    idx_byte_off,
+                    out_byte_off,
+                } => {
+                    run_gather_split(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *n_out,
+                        *n_idx,
+                        *dim,
+                        *vocab,
+                        *table_byte_off as usize,
+                        *idx_byte_off as usize,
+                        *out_byte_off as usize,
+                    );
+                }
                 Step::DequantMatmulGguf {
                     m,
                     k,
@@ -7822,18 +8741,49 @@ impl WgpuExecutable {
                     w_byte_off,
                     out_byte_off,
                 } => {
-                    crate::gguf_host::run_dequant_matmul_gguf(
-                        &self.arena,
-                        &dev.device,
-                        &dev.queue,
-                        *m as usize,
-                        *k as usize,
-                        *n as usize,
-                        *scheme_id,
-                        *x_byte_off as usize,
-                        *w_byte_off as usize,
-                        *out_byte_off as usize,
-                    );
+                    if *m == 1 && crate::gguf_gpu::gemv_supports_scheme(*scheme_id) {
+                        // Decode GEMV: fused dequant+matmul, windowed bindings,
+                        // no f32 scratch (handles arenas larger than the 4 GiB
+                        // single-binding limit).
+                        crate::gguf_gpu::run_dequant_matmul_gguf_gemv(
+                            &self.arena,
+                            &dev.device,
+                            &dev.queue,
+                            *k as usize,
+                            *n as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
+                    } else if self.dequant_scratch_off > 0 {
+                        crate::gguf_gpu::run_dequant_matmul_gguf_gpu(
+                            &self.arena,
+                            &dev.device,
+                            &dev.queue,
+                            *m as usize,
+                            *k as usize,
+                            *n as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            self.dequant_scratch_off,
+                            *out_byte_off as usize,
+                        );
+                    } else {
+                        crate::gguf_host::run_dequant_matmul_gguf(
+                            &self.arena,
+                            &dev.device,
+                            &dev.queue,
+                            *m as usize,
+                            *k as usize,
+                            *n as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
+                    }
                 }
                 Step::DequantGroupedMatmulGguf {
                     m,
@@ -7846,20 +8796,38 @@ impl WgpuExecutable {
                     idx_byte_off,
                     out_byte_off,
                 } => {
-                    crate::gguf_host::run_dequant_grouped_matmul_gguf(
-                        &self.arena,
-                        &dev.device,
-                        &dev.queue,
-                        *m as usize,
-                        *k as usize,
-                        *n as usize,
-                        *num_experts as usize,
-                        *scheme_id,
-                        *x_byte_off as usize,
-                        *w_byte_off as usize,
-                        *idx_byte_off as usize,
-                        *out_byte_off as usize,
-                    );
+                    if self.dequant_scratch_off > 0 {
+                        crate::gguf_gpu::run_dequant_grouped_matmul_gguf_gpu(
+                            &self.arena,
+                            &dev.device,
+                            &dev.queue,
+                            *m as usize,
+                            *k as usize,
+                            *n as usize,
+                            *num_experts as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *idx_byte_off as usize,
+                            self.dequant_scratch_off,
+                            *out_byte_off as usize,
+                        );
+                    } else {
+                        crate::gguf_host::run_dequant_grouped_matmul_gguf(
+                            &self.arena,
+                            &dev.device,
+                            &dev.queue,
+                            *m as usize,
+                            *k as usize,
+                            *n as usize,
+                            *num_experts as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *idx_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
+                    }
                 }
                 Step::GatedDeltaNet {
                     q_byte_off,
@@ -7927,6 +8895,236 @@ impl WgpuExecutable {
                         *num_layers as usize,
                         *bidirectional,
                         *carry,
+                    );
+                }
+                Step::ConvTranspose2d {
+                    src_byte_off,
+                    weight_byte_off,
+                    dst_byte_off,
+                    n,
+                    c_in,
+                    h,
+                    w_in,
+                    c_out,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw,
+                    groups,
+                } => {
+                    crate::conv_transpose2d_host::run_conv_transpose2d(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *src_byte_off as usize,
+                        *weight_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *n as usize,
+                        *c_in as usize,
+                        *h as usize,
+                        *w_in as usize,
+                        *c_out as usize,
+                        *h_out as usize,
+                        *w_out as usize,
+                        *kh as usize,
+                        *kw as usize,
+                        *sh as usize,
+                        *sw as usize,
+                        *ph as usize,
+                        *pw as usize,
+                        *dh as usize,
+                        *dw as usize,
+                        *groups as usize,
+                    );
+                }
+                Step::GroupNormHost {
+                    src_byte_off,
+                    gamma_byte_off,
+                    beta_byte_off,
+                    dst_byte_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                    num_groups,
+                    eps,
+                } => {
+                    crate::vision_host::run_group_norm(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *src_byte_off as usize,
+                        *gamma_byte_off as usize,
+                        *beta_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *n as usize,
+                        *c as usize,
+                        *h as usize,
+                        *w as usize,
+                        *num_groups as usize,
+                        *eps,
+                    );
+                }
+                Step::LayerNorm2dHost {
+                    src_byte_off,
+                    gamma_byte_off,
+                    beta_byte_off,
+                    dst_byte_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                    eps,
+                } => {
+                    crate::vision_host::run_layer_norm2d(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *src_byte_off as usize,
+                        *gamma_byte_off as usize,
+                        *beta_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *n as usize,
+                        *c as usize,
+                        *h as usize,
+                        *w as usize,
+                        *eps,
+                    );
+                }
+                Step::ResizeNearest2xHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                } => {
+                    crate::vision_host::run_resize_nearest_2x(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *n as usize,
+                        *c as usize,
+                        *h as usize,
+                        *w as usize,
+                    );
+                }
+                Step::ReverseHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    dims,
+                    rev_mask,
+                    elem_bytes,
+                } => {
+                    crate::vision_host::run_reverse(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        dims,
+                        rev_mask,
+                        *elem_bytes as usize,
+                    );
+                }
+                Step::ArgReduceHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    outer,
+                    reduced,
+                    inner,
+                    is_max,
+                } => {
+                    crate::vision_host::run_argreduce(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *reduced as usize,
+                        *inner as usize,
+                        *is_max,
+                    );
+                }
+                Step::GruHost {
+                    x,
+                    w_ih,
+                    w_hh,
+                    b_ih,
+                    b_hh,
+                    h0,
+                    dst,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                } => {
+                    crate::vision_host::run_gru(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *x as usize,
+                        *w_ih as usize,
+                        *w_hh as usize,
+                        *b_ih as usize,
+                        *b_hh as usize,
+                        *h0 as usize,
+                        *dst as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *input_size as usize,
+                        *hidden as usize,
+                        *num_layers as usize,
+                        *bidirectional,
+                        *carry,
+                    );
+                }
+                Step::RnnHost {
+                    x,
+                    w_ih,
+                    w_hh,
+                    bias,
+                    h0,
+                    dst,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                    relu,
+                } => {
+                    crate::vision_host::run_rnn(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *x as usize,
+                        *w_ih as usize,
+                        *w_hh as usize,
+                        *bias as usize,
+                        *h0 as usize,
+                        *dst as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *input_size as usize,
+                        *hidden as usize,
+                        *num_layers as usize,
+                        *bidirectional,
+                        *carry,
+                        *relu,
                     );
                 }
                 Step::Llada2GroupLimitedGate {
@@ -8599,6 +9797,125 @@ fn arena_local_off_f32(arena: &Arena, id: NodeId, base: u64) -> u32 {
     (((arena.offset(id) as u64).saturating_sub(base)) / 4) as u32
 }
 
+/// Split-binding embedding gather for >4 GiB arenas (see `Step::GatherSplit`).
+///
+/// The table and the idx/output slots can be more than one ≤4 GiB binding
+/// window apart, so they're bound as separate read-only windows of the arena;
+/// the output goes to a dedicated read-write buffer that is copied back into
+/// the arena afterwards (the arena cannot also be bound read-write in the same
+/// dispatch — wgpu treats STORAGE_READ_WRITE as exclusive per buffer). Mirrors
+/// [`crate::gguf_gpu::run_dequant_matmul_gguf_gemv`].
+#[allow(clippy::too_many_arguments)]
+fn run_gather_split(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    n_out: u32,
+    n_idx: u32,
+    dim: u32,
+    vocab: u32,
+    table_byte_off: usize,
+    idx_byte_off: usize,
+    out_byte_off: usize,
+) {
+    const ALIGN: u64 = 256;
+    let arena_size = arena.size as u64;
+    let max_bind = device.limits().max_storage_buffer_binding_size;
+
+    // Table window: cover [table_byte_off, + vocab*dim*4).
+    let t0 = table_byte_off as u64;
+    let t_bytes = (vocab as u64) * (dim as u64) * 4;
+    let t_base = (t0 / ALIGN) * ALIGN;
+    let t_size = ((t0 + t_bytes - t_base).div_ceil(16) * 16).min(arena_size - t_base);
+
+    // Index window: cover [idx_byte_off, + n_idx*4).
+    let i0 = idx_byte_off as u64;
+    let i_bytes = ((n_idx as u64) * 4).max(4);
+    let i_base = (i0 / ALIGN) * ALIGN;
+    let i_size = ((i0 + i_bytes - i_base).div_ceil(16) * 16).min(arena_size - i_base);
+
+    assert!(
+        t_size <= max_bind && i_size <= max_bind,
+        "rlx-wgpu gather_split: window too large (table={t_size}, idx={i_size}, max={max_bind})"
+    );
+
+    // Separate output buffer (rw) — copied into the arena after the dispatch.
+    let out_bytes = ((n_out as u64) * 4).max(4);
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rlx-wgpu gather_split out"),
+        size: out_bytes.div_ceil(16) * 16,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    let p = GatherParams {
+        n_out,
+        n_idx,
+        dim,
+        vocab,
+        in_off: ((t0 - t_base) / 4) as u32,
+        idx_off: ((i0 - i_base) / 4) as u32,
+        out_off: 0,
+        _p0: 0,
+    };
+    let u = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rlx-wgpu gather_split uniform"),
+        size: std::mem::size_of::<GatherParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+
+    let gk = gather_split_kernel(device);
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rlx-wgpu gather_split bg"),
+        layout: &gk.bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &arena.buffer,
+                    offset: t_base,
+                    size: wgpu::BufferSize::new(t_size),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: u.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &arena.buffer,
+                    offset: i_base,
+                    size: wgpu::BufferSize::new(i_size),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("rlx-wgpu gather_split"),
+    });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("rlx-wgpu gather_split pass"),
+            ..Default::default()
+        });
+        pass.set_pipeline(&gk.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        let (gx, gy, gz) = dispatch_dims(n_out, 64);
+        pass.dispatch_workgroups(gx, gy, gz);
+    }
+    // Copy the embedding back into the arena (distinct buffers → legal).
+    enc.copy_buffer_to_buffer(&out_buf, 0, &arena.buffer, out_byte_off as u64, out_bytes);
+    queue.submit(std::iter::once(enc.finish()));
+}
+
 fn arena_tensor_in_window(arena: &Arena, id: NodeId, base: u64, size: u64) -> bool {
     let src = arena.offset(id) as u64;
     let len = arena.len_of(id) as u64;
@@ -8620,6 +9937,17 @@ fn arena_tensors_overlap(arena: &Arena, a: NodeId, b: NodeId) -> bool {
     a0 < b1 && b0 < a1
 }
 
+/// True when a matmul reads its weight `B` from the separate f16 shadow buffer
+/// (so `B` is NOT bound through the arena binding). For these precisions the
+/// arena window must cover only the activation + output, never the weight.
+fn matmul_b_from_f16(precision: MatmulCompute, b_is_param: bool) -> bool {
+    b_is_param
+        && matches!(
+            precision,
+            MatmulCompute::F16 | MatmulCompute::Coop16 | MatmulCompute::CoopF16Vk
+        )
+}
+
 /// Arena bind window for matmul: when the weight alone fits the bind limit but
 /// activations + weight do not, anchor on the param tensor (e.g. tied `LmHead`).
 fn arena_matmul_bind_window(
@@ -8630,9 +9958,20 @@ fn arena_matmul_bind_window(
     out_id: NodeId,
     a_id: NodeId,
     b_id: NodeId,
+    b_in_arena: bool,
 ) -> (u64, u64, bool) {
     let max_binding = device.limits().max_storage_buffer_binding_size;
     if let Some((base, size)) = arena_whole_arena_bind(arena, max_binding) {
+        return (base, size, false);
+    }
+    if !b_in_arena {
+        // B is read from the separate f16 shadow buffer (F16 / Coop16 /
+        // CoopF16Vk), so the arena binding only carries the activation A and
+        // the output C. Anchor on [out, a] — NOT on B. Anchoring on a >4 GiB
+        // param B (e.g. the tied F32 lm_head/embedding) would push the window
+        // onto the weight and leave C outside it, dropping the output write
+        // (logits stayed mostly zero → argmax = STOP).
+        let (base, size) = arena_window_for_nodes(device, arena, &[out_id, a_id]);
         return (base, size, false);
     }
     let ids = [out_id, a_id, b_id];
@@ -8943,8 +10282,8 @@ fn arena_off_in_window_or_stage(
     let dst = *scratch;
     *scratch = scratch.saturating_add(aligned);
     schedule.push(Step::BufferCopy {
-        src_byte_off: src as u32,
-        dst_byte_off: dst as u32,
+        src_byte_off: src,
+        dst_byte_off: dst,
         bytes: len as u32,
     });
     let lo = (*base).min(dst);

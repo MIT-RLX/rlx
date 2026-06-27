@@ -33,9 +33,11 @@ pub(crate) const DEVICE_PRIORITY: &[Device] = &[
     Device::Tpu,
     Device::Cuda,
     Device::Rocm,
+    Device::OneApi,
     Device::Mlx,
     Device::Metal,
     Device::Ane,
+    Device::Hexagon,
     Device::Gpu,
     Device::Vulkan,
     Device::DirectX,
@@ -61,6 +63,26 @@ pub fn supports_run_slots(device: Device) -> bool {
     )
 }
 
+/// Whether `device`'s RoPE kernel indexes its cos/sin table **per token**
+/// (one row per batch·seq element) instead of per sequence position.
+///
+/// Required for *ragged* batched decode, where each sequence in the batch sits
+/// at a different absolute position and so needs its own RoPE row.
+///
+/// Validated against the CPU reference on:
+///   - **CPU** (`rlx-cpu` executor + thunk), and
+///   - **Metal** (`cos_per_token` kernel path; `metal_rope_parity` ragged test).
+///
+/// The remaining GPU kernels still index by seq position (CUDA `rope.cu`, wgpu
+/// `rope.wgsl`), which collapses for decode (seq = 1) and would apply row 0's
+/// position to the whole batch — so callers (e.g. the server's fused batcher)
+/// fall back to per-length **uniform** grouping there. Add a device here only
+/// once its rope + rope_backward kernels are fixed *and* validated against the
+/// CPU reference.
+pub fn supports_ragged_rope(device: Device) -> bool {
+    matches!(device, Device::Cpu | Device::Metal)
+}
+
 pub fn is_available(device: Device) -> bool {
     #[cfg(feature = "cuda")]
     if device == Device::Cuda {
@@ -76,21 +98,43 @@ pub fn is_available(device: Device) -> bool {
     }
     #[cfg(feature = "vulkan")]
     if device == Device::Vulkan {
-        return rlx_wgpu::is_vulkan_available();
+        return rlx_vulkan::is_available();
+    }
+    #[cfg(feature = "oneapi")]
+    if device == Device::OneApi {
+        return rlx_oneapi::is_available();
     }
     #[cfg(feature = "tpu")]
     if device == Device::Tpu {
         return rlx_tpu::is_available();
     }
+    // Metal / MLX probe the live device, not just the Cargo cfg: a build can
+    // be Metal-capable yet run where no Metal device exists (e.g. a headless
+    // iOS-simulator process), and runtime selection must not pick a dead
+    // backend.
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
+    if device == Device::Metal {
+        return rlx_metal::is_available();
+    }
+    #[cfg(all(feature = "mlx", rlx_mlx_host))]
+    if device == Device::Mlx {
+        return rlx_mlx::is_available();
+    }
 
     let feature_gated = match device {
         Device::Cpu => cfg!(feature = "cpu"),
-        Device::Metal => cfg!(feature = "metal"),
+        Device::Metal => cfg!(all(
+            feature = "metal",
+            target_vendor = "apple",
+            not(target_os = "watchos")
+        )),
         Device::Mlx => cfg!(feature = "mlx"),
         Device::Ane => cfg!(any(feature = "coreml", feature = "ane")),
         Device::Cuda => cfg!(feature = "cuda"),
         Device::Rocm => cfg!(feature = "rocm"),
+        Device::OneApi => cfg!(feature = "oneapi"),
         Device::Tpu => cfg!(feature = "tpu"),
+        Device::Hexagon => cfg!(feature = "qnn"),
         Device::Gpu => cfg!(feature = "gpu"),
         Device::Vulkan => cfg!(feature = "vulkan"),
         Device::OpenGl => cfg!(feature = "opengl"),
@@ -103,9 +147,10 @@ pub fn is_available(device: Device) -> bool {
     crate::registry::registered_devices().contains(&device)
 }
 
-/// Apple backends enabled in this build (`metal`, `mlx`, `gpu`, `ane` on
-/// macOS).
-#[cfg(all(feature = "apple", target_os = "macos"))]
+/// Apple backends enabled in this build (`metal`, `mlx`, `gpu`, `ane`) on
+/// any Apple platform. `is_available` filters per-device, so e.g. watchOS
+/// (no Metal) yields just the CoreML/ANE entry.
+#[cfg(all(feature = "apple", target_vendor = "apple"))]
 pub fn available_apple_devices() -> Vec<Device> {
     [Device::Metal, Device::Mlx, Device::Gpu, Device::Ane]
         .into_iter()
@@ -201,11 +246,105 @@ pub fn supports(device: Device, op: &Op) -> bool {
         Device::Metal => metal_supports(op),
         Device::Ane => coreml_supports(op),
         Device::Gpu | Device::Cuda | Device::Rocm => gpu_family_supports(op),
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan => vulkan_supports(op),
+        #[cfg(feature = "oneapi")]
+        Device::OneApi => oneapi_supports(op),
+        Device::Hexagon => qnn_supports(op),
         // Other backends not yet characterised here. Conservative:
         // assume `false` so callers won't dispatch blind; tighten as
         // each backend grows a `<x>_supports` arm below.
         _ => false,
     }
+}
+
+/// Per-op support for the QNN (Hexagon NPU) backend — the ops the FFI runtime
+/// (`rlx_qnn::runtime`) lowers to QNN: MatMul, element-wise binary, a few
+/// activations, plus the structural input/param/constant tensors.
+fn qnn_supports(op: &Op) -> bool {
+    use rlx_ir::op::Activation;
+    match op {
+        Op::Input { .. }
+        | Op::Param { .. }
+        | Op::Constant { .. }
+        | Op::MatMul
+        | Op::Binary(_)
+        | Op::Softmax { .. }
+        | Op::Reshape { .. }
+        | Op::Transpose { .. }
+        | Op::LayerNorm { .. }
+        | Op::RmsNorm { .. }
+        | Op::Concat { .. }
+        | Op::Narrow { .. }
+        | Op::Rope { .. }
+        | Op::Attention { .. }
+        | Op::Reduce { .. }
+        | Op::Conv { .. }
+        | Op::Gather { .. }
+        | Op::Quantize { .. }
+        | Op::Dequantize { .. } => true,
+        Op::Activation(a) => matches!(
+            a,
+            Activation::Relu
+                | Activation::Gelu
+                | Activation::Sigmoid
+                | Activation::Tanh
+                | Activation::Neg
+        ),
+        _ => false,
+    }
+}
+
+/// Per-op heuristic for the native Vulkan backend: native primitive set plus
+/// the op families `legalize_or_rewrite_for_backend` decomposes into it. The
+/// authoritative check is `supports_graph` (runs the real legalize probe);
+/// this is the cheap single-op approximation.
+#[cfg(feature = "vulkan")]
+fn vulkan_supports(op: &Op) -> bool {
+    use rlx_ir::OpKind::*;
+    let k = op.kind();
+    rlx_vulkan::backend::SUPPORTED_OPS.contains(&k)
+        || matches!(
+            k,
+            // Decomposed to the primitive set by the rewrite pass.
+            DotGeneral
+                | Fma
+                | GroupNorm
+                | BatchNormInference
+                | ResizeNearest2x
+                | ElementwiseRegion
+                | FusedMatMulBiasAct
+                | FusedResidualLN
+                | FusedResidualRmsNorm
+                | FusedSwiGLU
+                | FusedAttentionBlock
+                | FusedTransformerLayer
+        )
+}
+
+/// Per-op heuristic for the native oneAPI (Level Zero) backend — the same
+/// primitive claim set as rlx-vulkan (the rewrite pass decomposes the rest).
+/// The authoritative check remains `supports_graph` (real legalize probe).
+#[cfg(feature = "oneapi")]
+fn oneapi_supports(op: &Op) -> bool {
+    use rlx_ir::OpKind::*;
+    let k = op.kind();
+    rlx_oneapi::backend::SUPPORTED_OPS.contains(&k)
+        || matches!(
+            k,
+            DotGeneral
+                | Fma
+                | GroupNorm
+                | BatchNormInference
+                | ResizeNearest2x
+                | ElementwiseRegion
+                | FusedMatMulBiasAct
+                | FusedResidualLN
+                | FusedResidualRmsNorm
+                | FusedSwiGLU
+                | FusedAttentionBlock
+                | FusedTransformerLayer
+        )
 }
 
 /// Is every op in `graph` lowerable by `device`?
@@ -380,8 +519,24 @@ fn metal_supports(op: &Op) -> bool {
 /// Unlike the GPU backends — whose lowering covers the whole IR surface —
 /// CoreML is an inference compiler with a finite op claim, so we check
 /// membership directly against the backend's published list.
+///
+/// Under the `training` feature the claim also covers the backward ops that the
+/// legalize/rewrite pass decomposes into supported primitives (or, once landed,
+/// lower through native MIL backward kernels) — so device selection picks
+/// `Device::Ane` for autodiff-produced backward graphs. See
+/// [`crate::backend::COREML_BACKWARD_OPS`].
 fn coreml_supports(op: &Op) -> bool {
-    crate::backend::COREML_SUPPORTED_OPS.contains(&op.kind())
+    let kind = op.kind();
+    if crate::backend::COREML_SUPPORTED_OPS.contains(&kind) {
+        return true;
+    }
+    #[cfg(feature = "training")]
+    if crate::backend::COREML_BACKWARD_OPS.contains(&kind)
+        || crate::backend::COREML_NATIVE_BACKWARD_OPS.contains(&kind)
+    {
+        return true;
+    }
+    false
 }
 
 #[allow(unused_variables)]
@@ -396,13 +551,13 @@ fn gpu_family_supports(op: &Op) -> bool {
 /// Block until `device`'s queue is idle. Metal drains the global queue;
 /// other backends are no-ops.
 pub fn drain_device(device: Device) {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(all(target_vendor = "apple", not(target_os = "watchos"), feature = "metal"))]
     {
         if device == Device::Metal {
             rlx_metal::device::drain_command_queue();
         }
     }
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"), feature = "metal")))]
     let _ = device;
 }
 
@@ -431,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
     fn metal_supports_full_activation_set() {
         // After the {sin,cos,tan,atan}_inplace MSL kernels landed in
         // rlx-metal/src/kernels.rs, Metal has every Activation variant

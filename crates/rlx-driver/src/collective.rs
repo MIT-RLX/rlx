@@ -225,6 +225,88 @@ pub fn reduce_scatter<T: SymmetricTransport>(
     Ok(())
 }
 
+/// Bandwidth-optimal **ring** all-reduce over a symmetric heap — the standard
+/// RDMA collective. Each rank moves only ~`2·(N-1)/N` of the vector (vs the
+/// naïve [`all_reduce`]'s `O(N²)`), so it scales to large gradient tensors on
+/// real RDMA fabrics (Thunderbolt/jaccl, InfiniBand). The algorithm is a
+/// reduce-scatter ring followed by an all-gather ring (Baidu / NCCL pattern),
+/// expressed entirely with one-sided `put` + `barrier`.
+///
+/// Requires `local.len() % num_ranks == 0` (pad upstream otherwise).
+/// `mailbox_offset` names a `chunk`-sized scratch region present in every
+/// rank's heap, where `chunk = local.len() / num_ranks` elements; the heap
+/// must hold at least `mailbox_offset + chunk*4` bytes. `local` carries this
+/// rank's contribution on entry and the reduced result on exit.
+pub fn ring_all_reduce<T: SymmetricTransport>(
+    transport: &T,
+    mailbox_offset: usize,
+    local: &mut [f32],
+    op: ReduceKind,
+) -> Result<(), CollectiveError> {
+    let n = transport.num_ranks() as usize;
+    let total = local.len();
+    if n <= 1 {
+        return Ok(());
+    }
+    if !total.is_multiple_of(n) {
+        return Err(CollectiveError::TransportError {
+            reason: format!("ring_all_reduce: len {total} not divisible by {n} ranks"),
+        });
+    }
+    let chunk = total / n;
+    let chunk_bytes = chunk * 4;
+    let me = transport.this_rank().0 as usize;
+    let right = (me + 1) % n;
+    let mailbox = |rank: usize| SymmetricBuffer {
+        rank: Rank(rank as u32),
+        offset: mailbox_offset,
+        len: chunk_bytes,
+    };
+    let mut recv = vec![0u8; chunk_bytes];
+
+    let send_chunk = |local: &[f32], idx: usize| -> *const u8 {
+        local[idx * chunk..idx * chunk + chunk].as_ptr() as *const u8
+    };
+
+    // Reduce-scatter: after N-1 steps, rank `me` owns the fully-reduced
+    // (summed) chunk at index (me + 1) % n.
+    for step in 0..n - 1 {
+        let send_idx = (me + n - step) % n;
+        let recv_idx = (me + n - step - 1) % n;
+        let src = unsafe { std::slice::from_raw_parts(send_chunk(local, send_idx), chunk_bytes) };
+        transport.put(mailbox(right), src)?;
+        transport.barrier()?;
+        transport.get(mailbox(me), &mut recv)?;
+        let incoming = unsafe { std::slice::from_raw_parts(recv.as_ptr() as *const f32, chunk) };
+        let d = recv_idx * chunk;
+        for i in 0..chunk {
+            local[d + i] = op.fold(local[d + i], incoming[i]);
+        }
+        transport.barrier()?;
+    }
+
+    // All-gather: propagate the reduced chunks around the ring (overwrite).
+    for step in 0..n - 1 {
+        let send_idx = (me + n + 1 - step) % n;
+        let recv_idx = (me + n - step) % n;
+        let src = unsafe { std::slice::from_raw_parts(send_chunk(local, send_idx), chunk_bytes) };
+        transport.put(mailbox(right), src)?;
+        transport.barrier()?;
+        transport.get(mailbox(me), &mut recv)?;
+        let incoming = unsafe { std::slice::from_raw_parts(recv.as_ptr() as *const f32, chunk) };
+        let d = recv_idx * chunk;
+        local[d..d + chunk].copy_from_slice(incoming);
+        transport.barrier()?;
+    }
+
+    if op == ReduceKind::Mean {
+        for v in local.iter_mut() {
+            *v /= n as f32;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +423,61 @@ mod tests {
                 vec![0.0, 1.0, 10.0, 11.0, 20.0, 21.0],
                 "rank {r_idx} after all-gather"
             );
+        }
+    }
+
+    #[test]
+    fn ring_all_reduce_sum_matches_expected_multithread() {
+        // N threads, each a rank sharing one heap + barrier; rank r holds
+        // [r*10 + i]. After ring all-reduce(Sum) every rank holds the
+        // element-wise sum. Exercises the reusable barrier across all the
+        // ring's reduce-scatter + all-gather steps.
+        for &n in &[2u32, 4] {
+            let total = 8usize; // divisible by 2 and 4
+            let chunk_bytes = (total / n as usize) * 4;
+            let ts = LocalTransport::fan_out(n, chunk_bytes);
+
+            let expected: Vec<f32> = (0..total)
+                .map(|i| (0..n).map(|r| r as f32 * 10.0 + i as f32).sum())
+                .collect();
+
+            let handles: Vec<_> = ts
+                .into_iter()
+                .enumerate()
+                .map(|(r, t)| {
+                    std::thread::spawn(move || {
+                        let mut local: Vec<f32> =
+                            (0..total).map(|i| r as f32 * 10.0 + i as f32).collect();
+                        ring_all_reduce(&t, 0, &mut local, ReduceKind::Sum).unwrap();
+                        local
+                    })
+                })
+                .collect();
+            for h in handles {
+                assert_eq!(h.join().unwrap(), expected, "n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn ring_all_reduce_mean_divides() {
+        let n = 4u32;
+        let total = 8usize;
+        let chunk_bytes = (total / n as usize) * 4;
+        let ts = LocalTransport::fan_out(n, chunk_bytes);
+        let handles: Vec<_> = ts
+            .into_iter()
+            .enumerate()
+            .map(|(r, t)| {
+                std::thread::spawn(move || {
+                    let mut local = vec![r as f32 + 1.0; total]; // 1,2,3,4
+                    ring_all_reduce(&t, 0, &mut local, ReduceKind::Mean).unwrap();
+                    local
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), vec![2.5f32; total]); // mean(1,2,3,4)
         }
     }
 

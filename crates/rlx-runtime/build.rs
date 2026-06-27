@@ -17,7 +17,10 @@ fn main() {
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     println!("cargo::rustc-check-cfg=cfg(rlx_mlx_host)");
-    if matches!(target_os.as_str(), "macos" | "linux" | "windows") {
+    // Must mirror rlx-mlx's own build.rs: the MLX backend is real on macOS,
+    // Linux, Windows and iOS. Keep in sync, or rlx-runtime gates the MLX
+    // backend module / registry differently from where rlx-mlx actually builds.
+    if matches!(target_os.as_str(), "macos" | "linux" | "windows" | "ios") {
         println!("cargo:rustc-cfg=rlx_mlx_host");
     }
 
@@ -30,6 +33,7 @@ fn main() {
         ("rocm", "rocm"),
         ("tpu", "tpu"),
         ("vulkan", "vulkan"),
+        ("oneapi", "oneapi"),
         ("opengl", "opengl"),
         ("directx", "directx"),
         ("webgpu", "webgpu"),

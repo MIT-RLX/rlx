@@ -35,7 +35,7 @@ pub fn rms_norm_backward_row(
         sumsq += v * v;
     }
     let inv_r = (sumsq * inv_h + eps).sqrt().recip();
-    let inv_r3 = inv_r * inv_r * inv_r;
+    let inv_r2 = inv_r * inv_r;
 
     let mut dot = 0f32;
     for i in 0..h {
@@ -43,8 +43,11 @@ pub fn rms_norm_backward_row(
     }
     dot *= inv_h;
 
+    // dx_i = inv_r·gamma_i·dy_i − inv_r³·x_i·dot. The cross term is inv_r³ (= inv_r2·inv_r
+    // below), NOT inv_r⁴ — the prior code multiplied an already-inv_r³ term by inv_r again,
+    // an extra 1/r factor that made every RMSNorm input gradient wrong.
     for i in 0..h {
-        let term = gamma[i] * dy[i] - x[i] * dot * inv_r3;
+        let term = gamma[i] * dy[i] - x[i] * dot * inv_r2;
         dx[i] = term * inv_r;
         dgamma[i] += dy[i] * x[i] * inv_r;
         dbeta[i] += dy[i];
@@ -293,6 +296,34 @@ pub fn maxpool2d_backward_nchw(
     debug_assert_eq!(dy.len(), dy_len);
     debug_assert_eq!(dx.len(), x_len);
     dx.fill(0.0);
+    // No-padding (conv-net) windows are fully in-bounds: drop the per-element
+    // bounds branches and the Option, and index the argmax tightly.
+    if ph == 0 && pw == 0 {
+        for nc in 0..n * c {
+            let in_chan = nc * h * w;
+            let out_chan = nc * h_out * w_out;
+            for ho in 0..h_out {
+                for wo in 0..w_out {
+                    let row0 = in_chan + (ho * sh) * w + wo * sw;
+                    let mut best_v = x[row0];
+                    let mut best_idx = row0;
+                    for ki in 0..kh {
+                        let row = row0 + ki * w;
+                        for kj in 0..kw {
+                            let idx = row + kj;
+                            let v = x[idx];
+                            if v > best_v {
+                                best_v = v;
+                                best_idx = idx;
+                            }
+                        }
+                    }
+                    dx[best_idx] += dy[out_chan + ho * w_out + wo];
+                }
+            }
+        }
+        return;
+    }
     for ni in 0..n {
         for ci in 0..c {
             let in_chan = (ni * c + ci) * h * w;

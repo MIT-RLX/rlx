@@ -31,10 +31,15 @@
 //!
 //! The lowering and `.mlpackage` writing are pure Rust and build on every
 //! host, so MIL emission can be unit-tested anywhere. Only execution is
-//! gated behind `any(target_os = "macos", target_os = "ios")`.
+//! gated behind `all(target_vendor = "apple", not(target_os = "watchos"))`.
 
+pub mod host_exec;
+pub mod hybrid;
 pub mod mil;
+pub use mil::{LowerOptions, lower_graph, lower_graph_with_options};
 pub mod mlpackage;
+pub mod op_registry;
+pub use op_registry::{CoremlKernel, lookup_coreml_kernel, register_coreml_kernel};
 
 /// prost-generated CoreML protobuf types (`package coreml`).
 pub mod proto {
@@ -44,14 +49,14 @@ pub mod proto {
 mod chip;
 pub use chip::{ChipInfo, ane_available, chip_info, is_available};
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 mod ffi;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 pub mod backend;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub use backend::CoremlExecutable;
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+pub use backend::{CoremlExecutable, default_compute_units, default_lower_options};
 
 /// Which CoreML compute units the model may use. Mirrors
 /// `MLComputeUnits`. The default ([`ComputeUnits::All`]) lets CoreML's

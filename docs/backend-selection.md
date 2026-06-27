@@ -173,7 +173,7 @@ Build with the backends you need:
 maturin develop --features cpu,metal,mlx,gpu
 ```
 
-See also [`pyrlx/docs/backends.md`](../pyrlx/docs/backends.md).
+See also [`crates/pyrlx/docs/backends.md`](../crates/pyrlx/docs/backends.md).
 
 ## Custom backends
 
@@ -209,7 +209,7 @@ Implementation: `rlx-cuda/src/calibrate.rs`, `rlx-rocm/src/calibrate.rs`, `rlx-w
 ```sh
 cargo test -p rlx-runtime --test graph_devices_parity
 cargo test -p rlx-runtime device_router --lib
-cd pyrlx && pytest tests/test_graph_devices.py -q
+cd crates/pyrlx && pytest tests/test_graph_devices.py -q
 ```
 
 ## When to use which API

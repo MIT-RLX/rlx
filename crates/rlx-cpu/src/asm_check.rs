@@ -166,7 +166,7 @@ mod tests {
     /// because objdump isn't always around in CI (in which case
     /// we'd want to log-and-skip rather than fail).
     #[test]
-    #[ignore]
+    #[ignore = "needs objdump in PATH; run with --ignored for codegen disassembly checks"]
     fn disassemble_self_succeeds() {
         match disassemble_self() {
             Ok(d) => assert!(d.len() > 1024, "disassembly suspiciously small"),
@@ -181,7 +181,7 @@ mod tests {
     /// f32 multiply / fused-multiply on aarch64. If the optimizer
     /// regresses and inlines/loses these, the test catches it.
     #[test]
-    #[ignore]
+    #[ignore = "needs objdump in PATH (aarch64 host); run with --ignored for SIMD codegen check"]
     fn cumsum_kernel_keeps_simd_on_aarch64() {
         // On targets where we don't expect SIMD here, accept the
         // miss as "no expected pattern" and move on.

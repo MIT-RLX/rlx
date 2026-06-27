@@ -113,3 +113,92 @@ fn cpu_selective_scan_native_matches_recurrence() {
         );
     }
 }
+
+// ── Cross-backend parity ────────────────────────────────────────────────
+// CPU is the reference. GPU backends must match it for the SSM scan.
+
+#[allow(dead_code)]
+fn ssm_inputs(b: usize, s: usize, h: usize, n: usize) -> [Vec<f32>; 5] {
+    let nx = b * s * h;
+    let na = h * n;
+    let nb = b * s * n;
+    let x: Vec<f32> = (0..nx).map(|i| 0.1 + 0.05 * ((i % 13) as f32)).collect();
+    let delta: Vec<f32> = (0..nx).map(|i| 0.05 + 0.01 * ((i % 7) as f32)).collect();
+    let a: Vec<f32> = (0..na).map(|i| -0.5 + 0.07 * ((i % 11) as f32)).collect();
+    let b_data: Vec<f32> = (0..nb).map(|i| 0.1 + 0.03 * ((i % 9) as f32)).collect();
+    let c_data: Vec<f32> = (0..nb).map(|i| 0.2 + 0.04 * ((i % 5) as f32)).collect();
+    [x, delta, a, b_data, c_data]
+}
+
+#[allow(dead_code)]
+fn run_on(device: Device, b: usize, s: usize, h: usize, n: usize) -> Vec<f32> {
+    let [x, delta, a, b_data, c_data] = ssm_inputs(b, s, h, n);
+    let session = Session::new(device);
+    let mut exe = session.compile(build_ssm_graph(b, s, h, n));
+    exe.run(&[
+        ("x", x.as_slice()),
+        ("delta", delta.as_slice()),
+        ("a", a.as_slice()),
+        ("b", b_data.as_slice()),
+        ("c", c_data.as_slice()),
+    ])
+    .pop()
+    .unwrap()
+}
+
+#[allow(dead_code)]
+fn shapes() -> Vec<(&'static str, usize, usize, usize, usize)> {
+    vec![
+        ("tiny", 1, 4, 2, 3),
+        ("mamba-small", 2, 8, 64, 16),
+        ("seq-long", 1, 32, 16, 8),
+        // state_size > SSM_MAX_N (128) exercises the unified-memory host fallback.
+        ("host-fallback-n130", 1, 4, 4, 130),
+    ]
+}
+
+#[allow(dead_code)]
+fn assert_close(what: &str, actual: &[f32], reference: &[f32]) {
+    assert_eq!(
+        actual.len(),
+        reference.len(),
+        "{what}: length {} vs {}",
+        actual.len(),
+        reference.len()
+    );
+    let mut max_abs = 0f32;
+    for (i, (a, r)) in actual.iter().zip(reference).enumerate() {
+        let abs = (a - r).abs();
+        let rel = abs / r.abs().max(1e-6);
+        assert!(
+            abs < 1e-4 || rel < 1e-4,
+            "{what}: diverges at idx {i}: {a} vs {r} (abs {abs:e}, rel {rel:e})"
+        );
+        max_abs = max_abs.max(abs);
+    }
+    eprintln!("{what}: max abs diff {max_abs:.2e} (n={})", actual.len());
+}
+
+#[test]
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn selective_scan_metal_matches_cpu() {
+    for (name, b, s, h, n) in shapes() {
+        assert_close(
+            &format!("metal {name}"),
+            &run_on(Device::Metal, b, s, h, n),
+            &run_on(Device::Cpu, b, s, h, n),
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "gpu")]
+fn selective_scan_wgpu_matches_cpu() {
+    for (name, b, s, h, n) in shapes() {
+        assert_close(
+            &format!("wgpu {name}"),
+            &run_on(Device::Gpu, b, s, h, n),
+            &run_on(Device::Cpu, b, s, h, n),
+        );
+    }
+}

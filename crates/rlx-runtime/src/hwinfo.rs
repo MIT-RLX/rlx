@@ -27,6 +27,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// Coarse thermal state. Apple Silicon reports CPU speed limit and
@@ -66,6 +67,8 @@ impl HwSnapshot {
             .map(|n| n.get())
             .unwrap_or(2);
 
+        // Mutated only under per-OS cfg blocks below (currently macOS).
+        #[allow(unused_mut)]
         let mut snap = Self {
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
@@ -78,13 +81,20 @@ impl HwSnapshot {
             thermal: ThermalState::Unknown,
         };
 
-        #[cfg(target_os = "macos")]
+        // sysctl is available on every Apple platform; the `hw.*` keys are
+        // readable from the iOS sandbox too (failures degrade to 0 / "").
+        #[cfg(target_vendor = "apple")]
         {
             snap.cpu_brand = sysctl_str("machdep.cpu.brand_string").unwrap_or_default();
             snap.perf_cores = sysctl_usize("hw.perflevel0.physicalcpu").unwrap_or(0);
             snap.l1d_bytes = sysctl_usize("hw.l1dcachesize").unwrap_or(0);
             snap.l2_bytes = sysctl_usize("hw.l2cachesize").unwrap_or(0);
             snap.cache_line = sysctl_usize("hw.cachelinesize").unwrap_or(0);
+        }
+        // `pmset` is a macOS CLI; the iOS sandbox forbids spawning processes,
+        // so iOS leaves `thermal` at `Unknown`.
+        #[cfg(target_os = "macos")]
+        {
             snap.thermal = read_pmset_thermal().unwrap_or(ThermalState::Unknown);
         }
 
@@ -113,7 +123,7 @@ impl HwSnapshot {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn sysctl_usize(name: &str) -> Option<usize> {
     use std::ffi::CString;
     let cname = CString::new(name).ok()?;
@@ -140,7 +150,7 @@ fn sysctl_usize(name: &str) -> Option<usize> {
     if rc == 0 { Some(val as usize) } else { None }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn sysctl_str(name: &str) -> Option<String> {
     use std::ffi::CString;
     let cname = CString::new(name).ok()?;

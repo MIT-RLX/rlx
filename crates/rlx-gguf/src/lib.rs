@@ -64,6 +64,9 @@
 //! For end-to-end safetensors / ONNX → GGUF conversion with per-tensor
 //! scheme rules see the companion [`rlx-gguf-convert`] crate.
 //!
+//! Map GGUF dtypes to RLX `QuantScheme` for `Op::DequantMatMul`:
+//! [`rlx_cpu::quant_scheme_for_ggml`] (requires `rlx-cpu`).
+//!
 //! [`rlx-gguf-convert`]: https://docs.rs/rlx-gguf-convert
 
 use std::collections::HashMap;
@@ -73,11 +76,18 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+mod iq1_encode;
+mod iq2_encode;
+mod iq3_encode;
 pub mod iq_dequant;
+mod iq_encode_common;
 pub mod iq_grids;
+pub mod iq_quantize;
 pub mod mx_dequant;
+pub mod mx_quantize;
 pub mod quantize;
 pub mod tq_dequant;
+pub mod tq_quantize;
 pub mod writer;
 pub use quantize::quantize;
 pub use writer::{GgufWriter, TensorPayload};
@@ -763,7 +773,24 @@ pub fn dequant_q4_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-fn dequant_q4_1(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+/// Dequant one Q4_1 block (`4 + QK4_1/2` bytes → `QK4_1` f32 values).
+pub fn dequant_q4_1_block(block: &[u8], out: &mut [f32]) {
+    assert!(block.len() >= 4 + QK4_1 / 2 && out.len() >= QK4_1);
+    let d = read_f16_le(&block[..2]);
+    let m = read_f16_le(&block[2..4]);
+    let qs = &block[4..4 + QK4_1 / 2];
+    for j in 0..QK4_1 / 2 {
+        let v0 = (qs[j] & 0x0F) as f32;
+        out[j] = d * v0 + m;
+    }
+    for j in 0..QK4_1 / 2 {
+        let v1 = (qs[j] >> 4) as f32;
+        out[QK4_1 / 2 + j] = d * v1 + m;
+    }
+}
+
+/// Full-tensor Q4_1 dequant (element count must be a multiple of 32).
+pub fn dequant_q4_1(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if !n.is_multiple_of(QK4_1) {
         bail!("Q4_1: n={n} not divisible by {QK4_1}");
     }
@@ -772,25 +799,15 @@ fn dequant_q4_1(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if bytes.len() != nb * blk {
         bail!("Q4_1: bad byte count");
     }
-    let mut out = Vec::with_capacity(n);
+    let mut out = vec![0f32; n];
     for i in 0..nb {
         let off = i * blk;
-        let d = read_f16_le(&bytes[off..off + 2]);
-        let m = read_f16_le(&bytes[off + 2..off + 4]);
-        let qs = &bytes[off + 4..off + 4 + QK4_1 / 2];
-        for j in 0..QK4_1 / 2 {
-            let v0 = (qs[j] & 0x0F) as f32;
-            out.push(d * v0 + m);
-        }
-        for j in 0..QK4_1 / 2 {
-            let v1 = (qs[j] >> 4) as f32;
-            out.push(d * v1 + m);
-        }
+        dequant_q4_1_block(&bytes[off..off + blk], &mut out[i * QK4_1..(i + 1) * QK4_1]);
     }
     Ok(out)
 }
 
-fn dequant_q5_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+pub fn dequant_q5_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if !n.is_multiple_of(QK5_0) {
         bail!("Q5_0: n={n} not divisible by {QK5_0}");
     }
@@ -799,32 +816,33 @@ fn dequant_q5_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if bytes.len() != nb * blk {
         bail!("Q5_0: bad byte count");
     }
-    let mut out = Vec::with_capacity(n);
+    let mut out = vec![0f32; n];
     for i in 0..nb {
         let off = i * blk;
-        let d = read_f16_le(&bytes[off..off + 2]);
-        let qh = u32::from_le_bytes([
-            bytes[off + 2],
-            bytes[off + 3],
-            bytes[off + 4],
-            bytes[off + 5],
-        ]);
-        let qs = &bytes[off + 6..off + 6 + QK5_0 / 2];
-        for j in 0..QK5_0 / 2 {
-            let xh0 = (((qh >> j) & 0x01) as u8) << 4;
-            let v0 = ((qs[j] & 0x0F) | xh0) as i32 - 16;
-            out.push(d * v0 as f32);
-        }
-        for j in 0..QK5_0 / 2 {
-            let xh1 = (((qh >> (j + 16)) & 0x01) as u8) << 4;
-            let v1 = ((qs[j] >> 4) | xh1) as i32 - 16;
-            out.push(d * v1 as f32);
-        }
+        dequant_q5_0_block(&bytes[off..off + blk], &mut out[i * QK5_0..(i + 1) * QK5_0]);
     }
     Ok(out)
 }
 
-fn dequant_q5_1(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+/// Decode one Q5_0 block (22 bytes) into 32 f32 values.
+pub fn dequant_q5_0_block(block: &[u8], out: &mut [f32]) {
+    assert!(block.len() >= 22 && out.len() >= QK5_0);
+    let d = read_f16_le(&block[0..2]);
+    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    let qs = &block[6..22];
+    for j in 0..QK5_0 / 2 {
+        let xh0 = (((qh >> j) & 0x01) as u8) << 4;
+        let v0 = ((qs[j] & 0x0F) | xh0) as i32 - 16;
+        out[j] = d * v0 as f32;
+    }
+    for j in 0..QK5_0 / 2 {
+        let xh1 = (((qh >> (j + 16)) & 0x01) as u8) << 4;
+        let v1 = ((qs[j] >> 4) | xh1) as i32 - 16;
+        out[j + QK5_0 / 2] = d * v1 as f32;
+    }
+}
+
+pub fn dequant_q5_1(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if !n.is_multiple_of(QK5_1) {
         bail!("Q5_1: n={n} not divisible by {QK5_1}");
     }
@@ -833,30 +851,31 @@ fn dequant_q5_1(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if bytes.len() != nb * blk {
         bail!("Q5_1: bad byte count");
     }
-    let mut out = Vec::with_capacity(n);
+    let mut out = vec![0f32; n];
     for i in 0..nb {
         let off = i * blk;
-        let d = read_f16_le(&bytes[off..off + 2]);
-        let m = read_f16_le(&bytes[off + 2..off + 4]);
-        let qh = u32::from_le_bytes([
-            bytes[off + 4],
-            bytes[off + 5],
-            bytes[off + 6],
-            bytes[off + 7],
-        ]);
-        let qs = &bytes[off + 8..off + 8 + QK5_1 / 2];
-        for j in 0..QK5_1 / 2 {
-            let xh0 = (((qh >> j) & 0x01) as u8) << 4;
-            let v0 = ((qs[j] & 0x0F) | xh0) as f32;
-            out.push(d * v0 + m);
-        }
-        for j in 0..QK5_1 / 2 {
-            let xh1 = (((qh >> (j + 16)) & 0x01) as u8) << 4;
-            let v1 = ((qs[j] >> 4) | xh1) as f32;
-            out.push(d * v1 + m);
-        }
+        dequant_q5_1_block(&bytes[off..off + blk], &mut out[i * QK5_1..(i + 1) * QK5_1]);
     }
     Ok(out)
+}
+
+/// Decode one Q5_1 block (24 bytes) into 32 f32 values.
+pub fn dequant_q5_1_block(block: &[u8], out: &mut [f32]) {
+    assert!(block.len() >= 24 && out.len() >= QK5_1);
+    let d = read_f16_le(&block[0..2]);
+    let m = read_f16_le(&block[2..4]);
+    let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    let qs = &block[8..24];
+    for j in 0..QK5_1 / 2 {
+        let xh0 = (((qh >> j) & 0x01) as u8) << 4;
+        let v0 = ((qs[j] & 0x0F) | xh0) as f32;
+        out[j] = d * v0 + m;
+    }
+    for j in 0..QK5_1 / 2 {
+        let xh1 = (((qh >> (j + 16)) & 0x01) as u8) << 4;
+        let v1 = ((qs[j] >> 4) | xh1) as f32;
+        out[j + QK5_1 / 2] = d * v1 + m;
+    }
 }
 
 // ─── K-quants ─────────────────────────────────────────────────────

@@ -12,8 +12,13 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-//! GPU GGUF K-quant dequant + cuBLAS matmul for `Op::DequantMatMul` and
-//! grouped MoE `Op::DequantGroupedMatMul`.
+//! GPU GGUF dequant + cuBLAS matmul for `Op::DequantMatMul` and grouped MoE
+//! `Op::DequantGroupedMatMul`.
+//!
+//! Flow: launch `dequant_gguf` into arena scratch, then `C = X @ W^T` via
+//! cuBLAS. Scheme ids via [`crate::gguf_host::gguf_scheme_id`].
+//!
+//! See [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 
 use cudarc::cublas::{CudaBlas, result as cublas_result, sys as cublas_sys};
 use cudarc::driver::{

@@ -288,6 +288,87 @@ pub fn build_train_graph(spec: &Spec) -> TrainGraph {
     }
 }
 
+/// Maxpool-free MLP (784→128→10) train graph — same TrainGraph shape as the CNN
+/// builder, but conv/pool-free so the graphfused CPU step is pure Accelerate
+/// `sgemm` + fused elementwise (the BLAS-bound config that races NumPy).
+pub fn build_train_graph_mlp(spec: &Spec) -> TrainGraph {
+    let f = DType::F32;
+    let b = spec.batch;
+    // HIDDEN env tunes width so the workload can be made compute-bound (the
+    // regime where the Accelerate sgemm dominates and fusion beats NumPy).
+    let h: usize = std::env::var("HIDDEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
+    let mut g = Graph::new("mlp_train");
+    let x = g.input("x", Shape::new(&[b, 784], f));
+    let labels = g.input("labels", Shape::new(&[b], f));
+    let w1 = g.param("w1", Shape::new(&[784, h], f));
+    let b1 = g.param("b1", Shape::new(&[h], f));
+    let w2 = g.param("w2", Shape::new(&[h, 10], f));
+    let b2 = g.param("b2", Shape::new(&[10], f));
+
+    let z = g.matmul(x, w1, Shape::new(&[b, h], f));
+    let z = g.binary(BinaryOp::Add, z, b1, Shape::new(&[b, h], f));
+    let a = g.activation(Activation::Relu, z, Shape::new(&[b, h], f));
+    let mm = g.matmul(a, w2, Shape::new(&[b, 10], f));
+    let logits = g.binary(BinaryOp::Add, mm, b2, Shape::new(&[b, 10], f));
+    let loss_per = g.softmax_cross_entropy_with_logits(logits, labels);
+    let loss = g.add_node(
+        Op::Reduce {
+            op: ReduceOp::Mean,
+            axes: vec![0],
+            keep_dim: false,
+        },
+        vec![loss_per],
+        Shape::from_dims(&[], f),
+    );
+    g.set_outputs(vec![loss]);
+
+    let param_ids = vec![w1, b1, w2, b2];
+    let mut bwd = rlx_autodiff::grad_with_loss(&g, &param_ids);
+    let mut outputs = bwd.outputs.clone();
+    outputs.push(logits);
+    bwd.set_outputs(outputs);
+    let d_output = bwd
+        .nodes()
+        .iter()
+        .find(|n| matches!(&n.op, Op::Input { name } if name == "d_output"))
+        .map(|n| n.id)
+        .expect("autodiff inserts an Input named `d_output`");
+    let bwd_outputs = &bwd.outputs;
+    let loss_id = bwd_outputs[0];
+    let grad_ids: Vec<NodeId> = bwd_outputs[1..1 + param_ids.len()].to_vec();
+    let logits_id = bwd_outputs[1 + param_ids.len()];
+
+    let param_specs: Vec<(&'static str, Vec<usize>, NodeId)> = vec![
+        ("w1", vec![784, h], w1),
+        ("b1", vec![h], b1),
+        ("w2", vec![h, 10], w2),
+        ("b2", vec![10], b2),
+    ];
+    let params: Vec<ParamSlot> = param_specs
+        .into_iter()
+        .zip(grad_ids)
+        .map(|((name, shape, param), grad)| ParamSlot {
+            name,
+            shape,
+            param,
+            grad,
+        })
+        .collect();
+
+    TrainGraph {
+        graph: bwd,
+        input: x,
+        labels,
+        d_output,
+        params,
+        loss: loss_id,
+        logits: logits_id,
+    }
+}
+
 // ─────────────────────────── helpers ────────────────────────────
 
 fn conv2d(

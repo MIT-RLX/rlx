@@ -81,9 +81,31 @@ impl Session {
     ///
     /// Prefer [`Self::compile_hir`] or [`Self::compile_module`] for new code.
     /// This entry wraps the graph as a MIR-stage [`GraphModule`].
+    ///
+    /// If the graph carries `Dim::Dynamic` dims it is compiled lazily: the first
+    /// `run` infers the concrete shape and specializes, so the same graph runs at
+    /// multiple input shapes on every backend. See [`crate::deferred`].
+    ///
+    /// On ANE with `RLX_COREML_NATIVE_FLEX=1`, dynamic graphs compile once with
+    /// CoreML `ShapeRange` and infer shapes at predict time instead.
     pub fn compile(&self, graph: Graph) -> CompiledGraph {
+        if rlx_ir::dynamic::has_dynamic_dims(&graph) && !self.coreml_native_flex() {
+            return self.compile_deferred(graph, self.default_options());
+        }
         self.compile_module(GraphModule::from_graph(graph))
             .expect("compile MIR graph through fusion pipeline")
+    }
+
+    /// Wrap a dynamic-shape graph so it specializes + recompiles per input shape.
+    fn compile_deferred(&self, graph: Graph, options: crate::CompileOptions) -> CompiledGraph {
+        let backend = self.create_backend();
+        let inner = Box::new(crate::deferred::DeferredExecutable::new(
+            graph,
+            backend,
+            options,
+            self.device,
+        ));
+        CompiledGraph::new(inner, self.device)
     }
 
     /// Explicit legacy alias — same as [`Self::compile`].
@@ -96,6 +118,9 @@ impl Session {
     /// `new_with_precision` / `with_policy`. This escape hatch is for
     /// callers that need finer control (e.g., disable DCE for debugging).
     pub fn compile_with(&self, graph: Graph, options: &crate::CompileOptions) -> CompiledGraph {
+        if rlx_ir::dynamic::has_dynamic_dims(&graph) && !self.coreml_native_flex() {
+            return self.compile_deferred(graph, options.clone());
+        }
         self.compile_module_with(GraphModule::from_graph(graph), options)
             .expect("compile MIR graph through fusion pipeline")
     }
@@ -143,6 +168,27 @@ impl Session {
         }
     }
 
+    /// ANE + `RLX_COREML_NATIVE_FLEX=1`: one CoreML model with `ShapeRange`.
+    fn coreml_native_flex(&self) -> bool {
+        #[cfg(all(
+            feature = "coreml",
+            target_vendor = "apple",
+            not(target_os = "watchos")
+        ))]
+        {
+            self.device == Device::Ane
+                && std::env::var("RLX_COREML_NATIVE_FLEX").ok().as_deref() == Some("1")
+        }
+        #[cfg(not(all(
+            feature = "coreml",
+            target_vendor = "apple",
+            not(target_os = "watchos")
+        )))]
+        {
+            false
+        }
+    }
+
     fn create_backend(&self) -> Box<dyn Backend> {
         // Single dispatch point: consult the registry. Backends register
         // themselves (builtins via cfg-gated `register_builtin`; external
@@ -166,7 +212,9 @@ fn feature_name(device: Device) -> &'static str {
         Device::Ane => "ane",
         Device::Cuda => "cuda",
         Device::Rocm => "rocm",
+        Device::OneApi => "oneapi",
         Device::Tpu => "tpu",
+        Device::Hexagon => "qnn",
         Device::Gpu => "gpu",
         Device::Vulkan => "vulkan",
         Device::OpenGl => "opengl",

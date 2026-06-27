@@ -35,6 +35,7 @@
 //! | Execute | `CompiledGraph` — `set_param` / `run` (f32) and `_typed` variants |
 //! | Multi-backend | `GraphDevices`, `DeviceRouter`, `DevicePolicy` |
 //! | Transforms | `grad`, `jvp`, `hvp`, `vmap`, `nth_order_grad` |
+//! | GGUF | `quantize`, `dequant`, `load_gguf`, `write_gguf`, `convert_to_gguf`, `GgufFile` |
 //!
 //! Graphs are consumed at compile time. Use `pyrlx.set_param` / `pyrlx.run` in
 //! Python for dtype-aware NumPy I/O without manual byte packing.
@@ -46,6 +47,9 @@ mod device_router;
 mod dtype;
 mod flexible_session;
 mod fusion_options;
+mod gguf;
+#[cfg(feature = "gguf-convert")]
+mod gguf_convert;
 mod graph;
 mod graph_devices;
 mod session;
@@ -76,6 +80,17 @@ fn _pyrlx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<graph_devices::PyDeviceBenchResult>()?;
     m.add_class::<flexible_session::PyFlexibleSession>()?;
     m.add_class::<device_router::PyDeviceRouter>()?;
+
+    m.add_function(wrap_pyfunction!(gguf::quantize_gguf, m)?)?;
+    m.add_function(wrap_pyfunction!(gguf::dequant_gguf, m)?)?;
+    m.add_class::<gguf::PyGgufFile>()?;
+    m.add_function(wrap_pyfunction!(gguf::load_gguf, m)?)?;
+    m.add_function(wrap_pyfunction!(gguf::write_gguf, m)?)?;
+    #[cfg(feature = "gguf-convert")]
+    {
+        m.add_function(wrap_pyfunction!(gguf_convert::convert_to_gguf, m)?)?;
+        m.add_class::<gguf_convert::PyConvertReport>()?;
+    }
 
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

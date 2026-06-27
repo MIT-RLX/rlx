@@ -96,7 +96,9 @@ pub use nomic_layer::{NomicEncoderLayerSpec, NomicEncoderLayerStage};
 pub use qwen3_decode_layer::{Qwen3DecodeLayerSpec, Qwen3DecodeLayerStage};
 pub use qwen3_decoder::{Qwen3DecoderSpec, Qwen3DecoderStage};
 pub use qwen3_layer::{
-    qwen3_decode_layer_fused, qwen3_prefill_layer_fused, qwen3_prefill_layer_fused_kv,
+    qwen3_decode_layer_fused, qwen3_decode_layer_fused_qk, qwen3_decode_layer_side,
+    qwen3_prefill_layer_fused, qwen3_prefill_layer_fused_kv, qwen3_prefill_layer_fused_kv_qk,
+    qwen3_prefill_layer_side,
 };
 pub use repeat::RepeatStage;
 pub use residual::{ResidualAddStage, ResidualSaveStage};

@@ -406,6 +406,26 @@ pub enum Thunk {
         /// 50.0, Gemma 4 has no attn softcap (handled at final logits).
         attn_logit_softcap: f32,
     },
+    /// Native fused-attention core (`fused_attn_block` MSL kernel): inline
+    /// NeoX RoPE + softmax SDPA over the packed QKV scratch `[B,S,3*inner]`
+    /// → attn scratch `[B,S,inner]`. One threadgroup per (batch·head); score
+    /// matrix in threadgroup memory. The QKV / out projections are separate
+    /// `Sgemm` thunks emitted by the same `Op::FusedAttentionBlock` arm.
+    /// `qkv` / `out` are byte offsets into the FAB scratch region. F32 only.
+    FusedAttn {
+        qkv: usize,
+        mask: usize,
+        cos: usize,
+        sin: usize,
+        out: usize,
+        batch: u32,
+        seq: u32,
+        heads: u32,
+        head_dim: u32,
+        mask_kind: u32,
+        scale_bits: u32,
+        has_rope: u32,
+    },
     /// [`Op::AttentionBackward`] — GPU MSL when scratch fits; CPU fallback otherwise.
     /// on unified-memory arena (F32 only).
     AttentionBackward {
@@ -442,6 +462,15 @@ pub enum Thunk {
         n_rot: u32,
         dt: HalfFlag,
         src_row_stride: u32,
+        /// `true` when the cos/sin tables carry one row per (batch·seq) token
+        /// (ragged batched decode) rather than one row per seq position. Drives
+        /// per-token RoPE indexing in the kernel; `false` for every prefill /
+        /// uniform-decode graph (byte-identical to the prior behavior).
+        cos_per_token: bool,
+        /// `true` = GPT-J / llama.cpp-NORM interleaved pairs `(2i, 2i+1)`;
+        /// `false` = HF / NeoX rotate-half pairs `(i, i+n_rot/2)`. GGUF Llama
+        /// weights need the interleaved flavor.
+        interleaved: bool,
     },
     /// Softmax
     Softmax {
@@ -449,6 +478,35 @@ pub enum Thunk {
         rows: u32,
         cols: u32,
         dt: HalfFlag,
+    },
+    /// Fused dense / soft-label softmax cross-entropy. `logits [N,C]`,
+    /// `targets [N,C]` → per-row loss `[N]`. f32 only (matches the rlx
+    /// SCE contract). One threadgroup per row.
+    SoftmaxCrossEntropyDense {
+        logits: usize,
+        targets: usize,
+        dst: usize,
+        n: u32,
+        c: u32,
+    },
+    /// Softmax cross-entropy with integer labels (forward).
+    /// `loss[row] = logsumexp(logits[row]) - logits[row, label]`.
+    SoftmaxCrossEntropyWithLogits {
+        logits: usize,
+        labels: usize,
+        dst: usize,
+        n: u32,
+        c: u32,
+    },
+    /// Softmax cross-entropy backward (integer labels).
+    /// `dlogits[row,k] = (softmax(logits[row])[k] - [k==label]) * d_loss[row]`.
+    SoftmaxCrossEntropyBackward {
+        logits: usize,
+        labels: usize,
+        d_loss: usize,
+        dlogits: usize,
+        n: u32,
+        c: u32,
     },
     /// Inclusive (or exclusive) cumulative sum along the last axis.
     Cumsum {
@@ -608,6 +666,13 @@ pub enum Thunk {
         dst: usize,
         len: u32,
     },
+    Fma {
+        a: usize,
+        b: usize,
+        c: usize,
+        dst: usize,
+        len: u32,
+    },
     /// PLAN L2 — fused N-ary element-wise region. Lowered from
     /// `Op::ElementwiseRegion`. Kernel interprets the chain encoding
     /// per-element (saves N kernel dispatches + N global-memory
@@ -664,6 +729,49 @@ pub enum Thunk {
         state_size: u32,
         f16: bool,
     },
+    /// Mamba selective scan. Native MSL kernel (`selective_scan`) for f32
+    /// with `state_size ≤ 128`; host fallback otherwise.
+    SelectiveScan {
+        x: usize,
+        delta: usize,
+        a: usize,
+        b: usize,
+        c: usize,
+        dst: usize,
+        batch: u32,
+        seq: u32,
+        hidden: u32,
+        state_size: u32,
+    },
+    /// Logit sampling (top-k / top-p / temperature). Host fallback over the
+    /// unified-memory arena — runs after logits, never the bottleneck.
+    Sample {
+        logits: usize,
+        dst: usize,
+        batch: u32,
+        vocab: u32,
+        top_k: u32,
+        top_p: f32,
+        temperature: f32,
+        seed: u64,
+    },
+    /// Batch-general reverse/flip. Host fallback over the unified-memory arena.
+    Reverse {
+        src: usize,
+        dst: usize,
+        dims: Vec<u32>,
+        rev_mask: Vec<bool>,
+        elem_bytes: u8,
+    },
+    /// ArgMax/ArgMin (f32-encoded indices). Host fallback over unified memory.
+    ArgReduce {
+        src: usize,
+        dst: usize,
+        outer: u32,
+        reduced: u32,
+        inner: u32,
+        is_max: bool,
+    },
     /// Multi-layer (optionally bidirectional/carry) LSTM. Native MSL for
     /// the simple `L=1, unidir, no-carry` case; host fallback otherwise.
     Lstm {
@@ -681,6 +789,54 @@ pub enum Thunk {
         num_layers: u32,
         bidirectional: bool,
         carry: bool,
+    },
+    /// GRU. Native MSL (`gru`) for L=1/unidir/no-carry f32; host fallback else.
+    Gru {
+        x: usize,
+        w_ih: usize,
+        w_hh: usize,
+        b_ih: usize,
+        b_hh: usize,
+        h0: usize,
+        dst: usize,
+        batch: u32,
+        seq: u32,
+        input_size: u32,
+        hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        carry: bool,
+    },
+    /// Elman RNN. Native MSL (`rnn`) for L=1/unidir/no-carry; host fallback else.
+    Rnn {
+        x: usize,
+        w_ih: usize,
+        w_hh: usize,
+        bias: usize,
+        h0: usize,
+        dst: usize,
+        batch: u32,
+        seq: u32,
+        input_size: u32,
+        hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        carry: bool,
+        relu: bool,
+    },
+    /// Mamba-2 SSD scan. Native MSL (`mamba2`) for n ≤ 128; host fallback else.
+    Mamba2 {
+        x: usize,
+        dt: usize,
+        a: usize,
+        b: usize,
+        c: usize,
+        dst: usize,
+        batch: u32,
+        seq: u32,
+        heads: u32,
+        head_dim: u32,
+        state_size: u32,
     },
     /// GGUF K-quant matmul — host fallback dequant + BLAS on unified memory.
     DequantMatMulGguf {
@@ -739,6 +895,78 @@ pub enum Thunk {
         m: u32,
         k: u32,
         n: u32,
+    },
+    /// Fused decode-layer MLP: gate_proj + up_proj Q4_K GEMVs + SwiGLU
+    /// (`dst[i] = up[i] * silu(gate[i])`). m == 1 only. Pattern-merged from
+    /// `gate(DequantMatMul) → up(DequantMatMul) → silu → mul` by
+    /// `fuse_decode_mlp`; one dispatch instead of four. `x` is the (already
+    /// rms-normed) input row of length `k`; `dst` has `n` (intermediate) cols.
+    FusedMlpGateUpSwiGLU {
+        x: usize,
+        gate_w: usize,
+        up_w: usize,
+        dst: usize,
+        k: u32,
+        n: u32,
+    },
+    /// Fused decode-layer MLP: down_proj GEMV + residual add
+    /// (`dst[j] = res[j] + down(h)[j]`). m == 1, Q4_K or Q6_K. Pattern-merged
+    /// from `down(DequantMatMul) → add(residual)` by `fuse_decode_mlp`; one
+    /// dispatch instead of two. `x` is the SwiGLU output of length `k`.
+    FusedMlpDownResidual {
+        x: usize,
+        w: usize,
+        res: usize,
+        dst: usize,
+        k: u32,
+        n: u32,
+        scheme: rlx_ir::quant::QuantScheme,
+    },
+    /// Native low-precision GEMM — CPU host fallback (Apple GPUs have no FP8
+    /// matrix HW; this is the honest decode-and-accumulate reference). TN.
+    ScaledMatMul {
+        lhs: usize,
+        rhs: usize,
+        lhs_scale: usize,
+        rhs_scale: usize,
+        bias: usize,
+        dst: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        lhs_fmt: rlx_ir::ScaledFormat,
+        rhs_fmt: rlx_ir::ScaledFormat,
+        layout: rlx_ir::ScaleLayout,
+        has_bias: bool,
+    },
+    /// `Op::ScaledQuantize` host fallback — f32 → packed FP8 codes.
+    ScaledQuantize {
+        x: usize,
+        scale: usize,
+        dst: usize,
+        rows: u32,
+        cols: u32,
+        fmt: rlx_ir::ScaledFormat,
+        layout: rlx_ir::ScaleLayout,
+    },
+    /// `Op::ScaledDequantize` host fallback — packed FP8 codes → f32.
+    ScaledDequantize {
+        codes: usize,
+        scale: usize,
+        dst: usize,
+        rows: u32,
+        cols: u32,
+        fmt: rlx_ir::ScaledFormat,
+        layout: rlx_ir::ScaleLayout,
+    },
+    /// `Op::ScaledQuantScale` host fallback — per-tensor/block scale.
+    ScaledQuantScale {
+        x: usize,
+        dst: usize,
+        rows: u32,
+        cols: u32,
+        fmt: rlx_ir::ScaledFormat,
+        layout: rlx_ir::ScaleLayout,
     },
     /// Training backward ops — host fallback on unified memory (F32).
     RmsNormBackwardInput {
@@ -1077,6 +1305,10 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
     match t {
         Thunk::Nop => "nop",
         Thunk::Cast { .. } => "cast",
+        Thunk::ScaledMatMul { .. } => "scaled_matmul",
+        Thunk::ScaledQuantize { .. } => "scaled_quantize",
+        Thunk::ScaledDequantize { .. } => "scaled_dequantize",
+        Thunk::ScaledQuantScale { .. } => "scaled_quant_scale",
         Thunk::Sgemm { .. } => "sgemm",
         Thunk::BatchedSgemm { .. } => "batched_sgemm",
         Thunk::FusedMmBiasAct { .. } => "fused_mm_bias_act",
@@ -1101,6 +1333,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::SplitLastAxis { .. } => "split_lastax",
         Thunk::Copy { .. } => "copy",
         Thunk::Attention { .. } => "attention",
+        Thunk::FusedAttn { .. } => "fused_attn",
         Thunk::AttentionBackward { .. } => "attention_bwd",
         Thunk::RmsNormBackwardInput { .. } => "rms_norm_backward_input",
         Thunk::RmsNormBackwardGamma { .. } => "rms_norm_backward_gamma",
@@ -1113,6 +1346,9 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Conv2dBackwardWeight { .. } => "conv2d_backward_weight",
         Thunk::Rope { .. } => "rope",
         Thunk::Softmax { .. } => "softmax",
+        Thunk::SoftmaxCrossEntropyDense { .. } => "softmax_cross_entropy_dense",
+        Thunk::SoftmaxCrossEntropyWithLogits { .. } => "softmax_cross_entropy_with_logits",
+        Thunk::SoftmaxCrossEntropyBackward { .. } => "softmax_cross_entropy_backward",
         Thunk::Cumsum { .. } => "cumsum",
         Thunk::FusedSwiGLU { .. } => "fused_swiglu",
         Thunk::Concat { .. } => "concat",
@@ -1126,6 +1362,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Pool2D { .. } => "pool2d",
         Thunk::Conv2D { .. } => "conv2d",
         Thunk::Where { .. } => "where",
+        Thunk::Fma { .. } => "fma",
         Thunk::ElementwiseRegion { .. } => "elementwise_region",
         Thunk::BatchElementwiseRegion { .. } => "batch_elementwise_region",
         Thunk::CustomOp { .. } => "custom_op",
@@ -1142,13 +1379,22 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::RngNormal { .. } => "rng_normal",
         Thunk::RngUniform { .. } => "rng_uniform",
         Thunk::GatedDeltaNet { .. } => "gated_delta_net",
+        Thunk::SelectiveScan { .. } => "selective_scan",
+        Thunk::Sample { .. } => "sample",
+        Thunk::Reverse { .. } => "reverse",
+        Thunk::ArgReduce { .. } => "argreduce",
         Thunk::Lstm { .. } => "lstm",
+        Thunk::Gru { .. } => "gru",
+        Thunk::Rnn { .. } => "rnn",
+        Thunk::Mamba2 { .. } => "mamba2",
         Thunk::DequantMatMulGguf { .. } => "dequant_matmul_gguf",
         Thunk::DequantGroupedMatMulGguf { .. } => "dequant_grouped_matmul_gguf",
         Thunk::DequantMatMulInt8 { .. } => "dequant_matmul_int8",
         Thunk::DequantMatMulInt4 { .. } => "dequant_matmul_int4",
         Thunk::DequantMatMulFp8 { .. } => "dequant_matmul_fp8",
         Thunk::DequantMatMulNvfp4 { .. } => "dequant_matmul_nvfp4",
+        Thunk::FusedMlpGateUpSwiGLU { .. } => "fused_mlp_gate_up_swiglu",
+        Thunk::FusedMlpDownResidual { .. } => "fused_mlp_down_residual",
     }
 }
 
@@ -1177,6 +1423,7 @@ impl Thunk {
             | Thunk::LayerNorm { .. }
             | Thunk::RmsNorm { .. }
             | Thunk::Softmax { .. }
+            | Thunk::SoftmaxCrossEntropyDense { .. }
             | Thunk::Cumsum { .. }
             | Thunk::FusedResidualLN { .. }
             | Thunk::FusedResidualRmsNorm { .. }
@@ -1216,13 +1463,22 @@ impl Thunk {
             // `batch`/`m` from the thunk (not seq-axis scale); marking
             // safe lets bucketed decode bypass whole-graph MPSGraph.
             Thunk::GatedDeltaNet { .. }
+            | Thunk::SelectiveScan { .. }
+            | Thunk::Sample { .. }
+            | Thunk::Reverse { .. }
+            | Thunk::ArgReduce { .. }
             | Thunk::Lstm { .. }
+            | Thunk::Gru { .. }
+            | Thunk::Rnn { .. }
+            | Thunk::Mamba2 { .. }
             | Thunk::DequantMatMulGguf { .. }
             | Thunk::DequantGroupedMatMulGguf { .. }
             | Thunk::DequantMatMulInt8 { .. }
             | Thunk::DequantMatMulInt4 { .. }
             | Thunk::DequantMatMulFp8 { .. }
-            | Thunk::DequantMatMulNvfp4 { .. } => true,
+            | Thunk::DequantMatMulNvfp4 { .. }
+            | Thunk::FusedMlpGateUpSwiGLU { .. }
+            | Thunk::FusedMlpDownResidual { .. } => true,
             // ScatterAdd: same zero-padding analysis as CPU — padded
             // updates contribute zero to accumulate-into-zeros, so
             // active and full produce the same output for K real
@@ -1250,10 +1506,28 @@ impl Thunk {
 
 impl ThunkSchedule {
     pub fn compile(graph: &Graph, arena: &Arena) -> Self {
-        Self::compile_with_rng(graph, arena, rlx_ir::RngOptions::default())
+        Self::compile_with_rng_fab(
+            graph,
+            arena,
+            rlx_ir::RngOptions::default(),
+            &std::collections::HashMap::new(),
+        )
     }
 
     pub fn compile_with_rng(graph: &Graph, arena: &Arena, rng: rlx_ir::RngOptions) -> Self {
+        Self::compile_with_rng_fab(graph, arena, rng, &std::collections::HashMap::new())
+    }
+
+    /// Like [`Self::compile_with_rng`] but with the native-`FusedAttentionBlock`
+    /// scratch map: each surviving FAB node → its `(qkv, attn)` BYTE offsets in
+    /// the appended FAB scratch region (see `rlx-metal/src/backend.rs`). Empty
+    /// when every FAB was decomposed to primitives upstream.
+    pub fn compile_with_rng_fab(
+        graph: &Graph,
+        arena: &Arena,
+        rng: rlx_ir::RngOptions,
+        fab_scratch: &std::collections::HashMap<rlx_ir::NodeId, (usize, usize)>,
+    ) -> Self {
         let rng_shared = std::sync::Arc::new(std::sync::RwLock::new(rng));
         let mut thunks = Vec::with_capacity(graph.len());
 
@@ -1336,6 +1610,76 @@ impl ThunkSchedule {
                     }
                 }
                 continue;
+            }
+            // Native `Op::FusedAttentionBlock` (no-bias, f32; gated upstream so
+            // only nodes with a scratch slot reach here): two GEMMs into packed
+            // scratch around the fused RoPE+SDPA kernel. Non-native FAB was
+            // decomposed to primitives before the arena was planned.
+            if let Op::FusedAttentionBlock {
+                num_heads,
+                head_dim,
+                has_rope,
+                ..
+            } = &node.op
+            {
+                if let Some(&(qkv_off, attn_off)) = fab_scratch.get(&node.id) {
+                    if rlx_ir::env::flag("RLX_METAL_TRACE_FAB") {
+                        eprintln!(
+                            "[rlx-metal] native fused_attn_block: heads={num_heads} \
+                             head_dim={head_dim} rope={has_rope}"
+                        );
+                    }
+                    let nh = *num_heads;
+                    let hd = *head_dim;
+                    let inner = nh * hd;
+                    let dims = node.shape.dims();
+                    let b = dims[0].unwrap_static();
+                    let s = dims[1].unwrap_static();
+                    let m = (b * s) as u32;
+                    let dt = node.shape.dtype().into();
+                    // 1. qkv = hidden @ qkv_w → qkv scratch [B, S, 3*inner].
+                    thunks.push(Thunk::Sgemm {
+                        a: off(node.inputs[0]),
+                        b: off(node.inputs[1]),
+                        c: qkv_off,
+                        m,
+                        k: inner as u32,
+                        n: (3 * inner) as u32,
+                        dt,
+                    });
+                    // 2. attn = fused RoPE + SDPA(qkv, mask) → attn scratch.
+                    let (cos_off, sin_off) = if *has_rope {
+                        (off(node.inputs[4]), off(node.inputs[5]))
+                    } else {
+                        (0usize, 0usize)
+                    };
+                    let scale = 1.0f32 / (hd as f32).sqrt();
+                    thunks.push(Thunk::FusedAttn {
+                        qkv: qkv_off,
+                        mask: off(node.inputs[3]),
+                        cos: cos_off,
+                        sin: sin_off,
+                        out: attn_off,
+                        batch: b as u32,
+                        seq: s as u32,
+                        heads: nh as u32,
+                        head_dim: hd as u32,
+                        mask_kind: 2, // Custom binary [B,S] — the only FAB mask
+                        scale_bits: scale.to_bits(),
+                        has_rope: u32::from(*has_rope),
+                    });
+                    // 3. out = attn @ out_w → node output [B, S, inner].
+                    thunks.push(Thunk::Sgemm {
+                        a: attn_off,
+                        b: off(node.inputs[2]),
+                        c: off(node.id),
+                        m,
+                        k: inner as u32,
+                        n: inner as u32,
+                        dt,
+                    });
+                    continue;
+                }
             }
             let t = match &node.op {
                 Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => Thunk::Nop,
@@ -1960,7 +2304,11 @@ impl ThunkSchedule {
                     }
                 }
 
-                Op::Rope { head_dim, n_rot } => {
+                Op::Rope {
+                    head_dim,
+                    n_rot,
+                    style,
+                } => {
                     let x_shape = &graph.node(node.inputs[0]).shape;
                     let (batch, seq, hidden) = if x_shape.rank() >= 3 {
                         (
@@ -1974,6 +2322,13 @@ impl ThunkSchedule {
                         (total / (s * head_dim), s, *head_dim)
                     };
                     let _ = node.shape.dtype(); // ensure dtype-aware
+                    // Per-token RoPE when the cos table has one row per
+                    // (batch·seq) token (ragged decode), distinct from the
+                    // shared per-seq-position table.
+                    let half = (head_dim / 2).max(1);
+                    let cos_rows =
+                        graph.node(node.inputs[1]).shape.num_elements().unwrap_or(0) / half;
+                    let cos_per_token = cos_rows == batch * seq && cos_rows != seq;
                     Thunk::Rope {
                         src: off(node.inputs[0]),
                         cos: off(node.inputs[1]),
@@ -1986,6 +2341,8 @@ impl ThunkSchedule {
                         n_rot: *n_rot as u32,
                         dt: node.shape.dtype().into(),
                         src_row_stride: hidden as u32,
+                        cos_per_token,
+                        interleaved: matches!(style, rlx_ir::op::RopeStyle::GptJ),
                     }
                 }
 
@@ -2016,6 +2373,40 @@ impl ThunkSchedule {
                         rows: (total / cols) as u32,
                         cols: cols as u32,
                         dt: node.shape.dtype().into(),
+                    }
+                }
+
+                Op::SoftmaxCrossEntropy => {
+                    let logits_shape = &graph.node(node.inputs[0]).shape;
+                    Thunk::SoftmaxCrossEntropyDense {
+                        logits: off(node.inputs[0]),
+                        targets: off(node.inputs[1]),
+                        dst: off(node.id),
+                        n: logits_shape.dim(0).unwrap_static() as u32,
+                        c: logits_shape.dim(1).unwrap_static() as u32,
+                    }
+                }
+
+                Op::SoftmaxCrossEntropyWithLogits => {
+                    let logits_shape = &graph.node(node.inputs[0]).shape;
+                    Thunk::SoftmaxCrossEntropyWithLogits {
+                        logits: off(node.inputs[0]),
+                        labels: off(node.inputs[1]),
+                        dst: off(node.id),
+                        n: logits_shape.dim(0).unwrap_static() as u32,
+                        c: logits_shape.dim(1).unwrap_static() as u32,
+                    }
+                }
+
+                Op::SoftmaxCrossEntropyBackward => {
+                    let logits_shape = &graph.node(node.inputs[0]).shape;
+                    Thunk::SoftmaxCrossEntropyBackward {
+                        logits: off(node.inputs[0]),
+                        labels: off(node.inputs[1]),
+                        d_loss: off(node.inputs[2]),
+                        dlogits: off(node.id),
+                        n: logits_shape.dim(0).unwrap_static() as u32,
+                        c: logits_shape.dim(1).unwrap_static() as u32,
                     }
                 }
 
@@ -2337,6 +2728,17 @@ impl ThunkSchedule {
                         cond: off(node.inputs[0]),
                         on_true: off(node.inputs[1]),
                         on_false: off(node.inputs[2]),
+                        dst: off(node.id),
+                        len: len as u32,
+                    }
+                }
+
+                Op::Fma => {
+                    let len = node.shape.num_elements().unwrap();
+                    Thunk::Fma {
+                        a: off(node.inputs[0]),
+                        b: off(node.inputs[1]),
+                        c: off(node.inputs[2]),
                         dst: off(node.id),
                         len: len as u32,
                     }
@@ -2779,6 +3181,94 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::Sample {
+                    top_k,
+                    top_p,
+                    temperature,
+                    seed,
+                } => {
+                    // Logits [batch, vocab] (or [vocab] → batch=1).
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let (batch, vocab) = if in_shape.rank() >= 2 {
+                        (
+                            in_shape.dim(0).unwrap_static(),
+                            in_shape.dim(in_shape.rank() - 1).unwrap_static(),
+                        )
+                    } else {
+                        (1, in_shape.num_elements().unwrap_or(0))
+                    };
+                    Thunk::Sample {
+                        logits: off(node.inputs[0]),
+                        dst: off(node.id),
+                        batch: batch as u32,
+                        vocab: vocab as u32,
+                        top_k: *top_k as u32,
+                        top_p: *top_p,
+                        temperature: *temperature,
+                        seed: *seed,
+                    }
+                }
+
+                Op::Reverse { axes } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let dims: Vec<u32> = (0..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static() as u32)
+                        .collect();
+                    let mut rev_mask = vec![false; rank];
+                    for &a in axes {
+                        if a < rank {
+                            rev_mask[a] = true;
+                        }
+                    }
+                    Thunk::Reverse {
+                        src: off(node.inputs[0]),
+                        dst: off(node.id),
+                        dims,
+                        rev_mask,
+                        elem_bytes: in_shape.dtype().size_bytes() as u8,
+                    }
+                }
+
+                Op::ArgMax { axis, keep_dim: _ } | Op::ArgMin { axis, keep_dim: _ } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let outer: usize = (0..*axis)
+                        .map(|i| in_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let reduced = in_shape.dim(*axis).unwrap_static();
+                    let inner: usize = (*axis + 1..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    Thunk::ArgReduce {
+                        src: off(node.inputs[0]),
+                        dst: off(node.id),
+                        outer: outer as u32,
+                        reduced: reduced as u32,
+                        inner: inner as u32,
+                        is_max: matches!(node.op, Op::ArgMax { .. }),
+                    }
+                }
+
+                Op::SelectiveScan { state_size } => {
+                    // x [b, s, h]; delta [b, s, h]; a [h, n]; b,c [b, s, n].
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    Thunk::SelectiveScan {
+                        x: off(node.inputs[0]),
+                        delta: off(node.inputs[1]),
+                        a: off(node.inputs[2]),
+                        b: off(node.inputs[3]),
+                        c: off(node.inputs[4]),
+                        dst: off(node.id),
+                        batch: x_shape.dim(0).unwrap_static() as u32,
+                        seq: x_shape.dim(1).unwrap_static() as u32,
+                        hidden: x_shape.dim(2).unwrap_static() as u32,
+                        state_size: *state_size as u32,
+                    }
+                }
+
                 Op::Lstm {
                     hidden_size,
                     num_layers,
@@ -2809,6 +3299,161 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::Gru {
+                    hidden_size,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let h0 = if *carry { off(node.inputs[5]) } else { 0 };
+                    Thunk::Gru {
+                        x: off(node.inputs[0]),
+                        w_ih: off(node.inputs[1]),
+                        w_hh: off(node.inputs[2]),
+                        b_ih: off(node.inputs[3]),
+                        b_hh: off(node.inputs[4]),
+                        h0,
+                        dst: off(node.id),
+                        batch: x_shape.dim(0).unwrap_static() as u32,
+                        seq: x_shape.dim(1).unwrap_static() as u32,
+                        input_size: x_shape.dim(2).unwrap_static() as u32,
+                        hidden: *hidden_size as u32,
+                        num_layers: *num_layers as u32,
+                        bidirectional: *bidirectional,
+                        carry: *carry,
+                    }
+                }
+
+                Op::Rnn {
+                    hidden_size,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                    relu,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let h0 = if *carry { off(node.inputs[4]) } else { 0 };
+                    Thunk::Rnn {
+                        x: off(node.inputs[0]),
+                        w_ih: off(node.inputs[1]),
+                        w_hh: off(node.inputs[2]),
+                        bias: off(node.inputs[3]),
+                        h0,
+                        dst: off(node.id),
+                        batch: x_shape.dim(0).unwrap_static() as u32,
+                        seq: x_shape.dim(1).unwrap_static() as u32,
+                        input_size: x_shape.dim(2).unwrap_static() as u32,
+                        hidden: *hidden_size as u32,
+                        num_layers: *num_layers as u32,
+                        bidirectional: *bidirectional,
+                        carry: *carry,
+                        relu: *relu,
+                    }
+                }
+
+                Op::Mamba2 {
+                    head_dim,
+                    state_size,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    Thunk::Mamba2 {
+                        x: off(node.inputs[0]),
+                        dt: off(node.inputs[1]),
+                        a: off(node.inputs[2]),
+                        b: off(node.inputs[3]),
+                        c: off(node.inputs[4]),
+                        dst: off(node.id),
+                        batch: x_shape.dim(0).unwrap_static() as u32,
+                        seq: x_shape.dim(1).unwrap_static() as u32,
+                        heads: x_shape.dim(2).unwrap_static() as u32,
+                        head_dim: *head_dim as u32,
+                        state_size: *state_size as u32,
+                    }
+                }
+
+                Op::ScaledMatMul {
+                    lhs_format,
+                    rhs_format,
+                    scale_layout,
+                    has_bias,
+                } => {
+                    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                    let total = node.shape.num_elements().unwrap();
+                    let m = total / n.max(1);
+                    let lhs_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+                    let k = lhs_total / m.max(1);
+                    Thunk::ScaledMatMul {
+                        lhs: off(node.inputs[0]),
+                        rhs: off(node.inputs[1]),
+                        lhs_scale: off(node.inputs[2]),
+                        rhs_scale: off(node.inputs[3]),
+                        bias: if *has_bias {
+                            off(node.inputs[4])
+                        } else {
+                            usize::MAX
+                        },
+                        dst: off(node.id),
+                        m: m as u32,
+                        k: k as u32,
+                        n: n as u32,
+                        lhs_fmt: *lhs_format,
+                        rhs_fmt: *rhs_format,
+                        layout: *scale_layout,
+                        has_bias: *has_bias,
+                    }
+                }
+                Op::ScaledQuantize {
+                    format,
+                    scale_layout,
+                } => {
+                    let xs = &graph.node(node.inputs[0]).shape;
+                    let cols = xs.dim(xs.rank() - 1).unwrap_static();
+                    let rows = xs.num_elements().unwrap() / cols.max(1);
+                    Thunk::ScaledQuantize {
+                        x: off(node.inputs[0]),
+                        scale: off(node.inputs[1]),
+                        dst: off(node.id),
+                        rows: rows as u32,
+                        cols: cols as u32,
+                        fmt: *format,
+                        layout: *scale_layout,
+                    }
+                }
+                Op::ScaledDequantize {
+                    format,
+                    scale_layout,
+                } => {
+                    // Logical shape from the codes (input 0): U8 codes → f32.
+                    let xs = &graph.node(node.inputs[0]).shape;
+                    let cols = xs.dim(xs.rank() - 1).unwrap_static();
+                    let rows = xs.num_elements().unwrap() / cols.max(1);
+                    Thunk::ScaledDequantize {
+                        codes: off(node.inputs[0]),
+                        scale: off(node.inputs[1]),
+                        dst: off(node.id),
+                        rows: rows as u32,
+                        cols: cols as u32,
+                        fmt: *format,
+                        layout: *scale_layout,
+                    }
+                }
+                Op::ScaledQuantScale {
+                    format,
+                    scale_layout,
+                } => {
+                    let xs = &graph.node(node.inputs[0]).shape;
+                    let cols = xs.dim(xs.rank() - 1).unwrap_static();
+                    let rows = xs.num_elements().unwrap() / cols.max(1);
+                    Thunk::ScaledQuantScale {
+                        x: off(node.inputs[0]),
+                        dst: off(node.id),
+                        rows: rows as u32,
+                        cols: cols as u32,
+                        fmt: *format,
+                        layout: *scale_layout,
+                    }
+                }
                 Op::DequantMatMul { scheme } => {
                     use rlx_ir::quant::QuantScheme;
                     let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
@@ -3171,6 +3816,30 @@ impl ThunkSchedule {
                     }
                 }
 
+                // Standalone nearest 2× upsample: the region-marking pass wraps
+                // a bare `Op::ResizeNearest2x` into a single-step TransformRegion.
+                // Emit the native resize thunk (same as the bare arm above).
+                Op::TransformRegion { steps, .. }
+                    if steps.len() == 1
+                        && matches!(
+                            steps[0],
+                            rlx_ir::op::TransformStep::ResizeNearest2x(
+                                rlx_ir::op::ChainOperand::Input(0)
+                            )
+                        ) =>
+                {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    Thunk::ResizeNearest2x {
+                        src: off(node.inputs[0]),
+                        dst: off(node.id),
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                        dt: node.shape.dtype().into(),
+                    }
+                }
+
                 other => panic!(
                     "rlx-metal: Op::{:?} (kind {:?}) not yet implemented on Metal. \
                      Either pin this graph to a backend that supports it (Device::Cpu, \
@@ -3260,6 +3929,12 @@ impl ThunkSchedule {
         rewrite_simple_elementwise_regions(&mut thunks);
         rewrite_dense_binary_broadcast(&mut thunks);
         fuse_narrow_clusters(&mut thunks);
+
+        // Fused decode-layer MLP (m == 1 packed-Q4 SwiGLU). Off-switch:
+        // RLX_METAL_FUSE_DECODE=0. Output offsets stay live (never fused away).
+        let output_offsets: std::collections::HashSet<usize> =
+            graph.outputs.iter().map(|&id| off(id)).collect();
+        fuse_decode_mlp(&mut thunks, &output_offsets);
 
         Self {
             thunks,
@@ -3692,6 +4367,416 @@ fn narrow_segments_partition(src_axis: u32, segments: &[(u32, u32)]) -> bool {
     end == src_axis
 }
 
+/// Count of decode MLP blocks fused so far (process-wide). Lets tests confirm
+/// the fused path actually fired without parsing logs. Monotonic; read the
+/// delta around a compile.
+pub static FUSED_DECODE_MLP_BLOCKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of decode MLP blocks fused across this process's lifetime.
+pub fn fused_decode_mlp_blocks() -> usize {
+    FUSED_DECODE_MLP_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Fully-analyzable per-thunk (reads, writes) for the decode-MLP liveness scan.
+/// `None` ⇒ the variant's data-flow is not enumerated here, so the caller must
+/// treat it as an opaque potential reader/writer and bail (conservative: a
+/// missed fusion is fine, an unsafe one is not). The `reads` list MUST be
+/// complete for every `Some` variant — an under-reported read would let the
+/// pass drop a live intermediate. In-place ops list their slot in BOTH lists.
+fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
+    use Thunk::*;
+    let io = match t {
+        Nop => (vec![], vec![]),
+        Cast { src, dst, .. } => (vec![*src], vec![*dst]),
+        Copy { src, dst, .. } => (vec![*src], vec![*dst]),
+        ActivationInPlace { data, .. } => (vec![*data], vec![*data]),
+        GeluApproxOut { src, dst, .. } | GeluApproxHost { src, dst, .. } => {
+            (vec![*src], vec![*dst])
+        }
+        BinaryFull { lhs, rhs, dst, .. } => (vec![*lhs, *rhs], vec![*dst]),
+        BinaryBroadcast { lhs, rhs, dst, .. } => (vec![*lhs, *rhs], vec![*dst]),
+        FusedBinaryActivation { lhs, rhs, dst, .. } => (vec![*lhs, *rhs], vec![*dst]),
+        FusedTernaryActivation {
+            lhs,
+            rhs0,
+            rhs1,
+            dst,
+            ..
+        } => (vec![*lhs, *rhs0, *rhs1], vec![*dst]),
+        BiasAdd { src, bias, dst, .. } => (vec![*src, *bias], vec![*dst]),
+        Fma { a, b, c, dst, .. } => (vec![*a, *b, *c], vec![*dst]),
+        Where {
+            cond,
+            on_true,
+            on_false,
+            dst,
+            ..
+        } => (vec![*cond, *on_true, *on_false], vec![*dst]),
+        Compare { lhs, rhs, dst, .. } => (vec![*lhs, *rhs], vec![*dst]),
+        RmsNorm { src, g, b, dst, .. } => (vec![*src, *g, *b], vec![*dst]),
+        LayerNorm { src, g, b, dst, .. } => (vec![*src, *g, *b], vec![*dst]),
+        FusedResidualLN {
+            x,
+            res,
+            bias,
+            g,
+            b,
+            out,
+            ..
+        }
+        | FusedResidualRmsNorm {
+            x,
+            res,
+            bias,
+            g,
+            b,
+            out,
+            ..
+        } => (vec![*x, *res, *bias, *g, *b], vec![*out]),
+        FusedSwiGLU { src, dst, .. } => (vec![*src], vec![*dst]),
+        Softmax { data, .. } => (vec![*data], vec![*data]),
+        Rope {
+            src, cos, sin, dst, ..
+        } => (vec![*src, *cos, *sin], vec![*dst]),
+        Attention {
+            q, k, v, mask, out, ..
+        } => (vec![*q, *k, *v, *mask], vec![*out]),
+        FusedAttn {
+            qkv,
+            mask,
+            cos,
+            sin,
+            out,
+            has_rope,
+            ..
+        } => {
+            let mut r = vec![*qkv, *mask];
+            if *has_rope != 0 {
+                r.push(*cos);
+                r.push(*sin);
+            }
+            (r, vec![*out])
+        }
+        Concat { dst, inputs, .. } => (inputs.iter().map(|(o, _)| *o).collect(), vec![*dst]),
+        Narrow { src, dst, .. } => (vec![*src], vec![*dst]),
+        Gather {
+            table, idx, dst, ..
+        }
+        | GatherAxis {
+            table, idx, dst, ..
+        } => (vec![*table, *idx], vec![*dst]),
+        Sgemm { a, b, c, .. } => (vec![*a, *b], vec![*c]),
+        BatchedSgemm { a, b, c, .. } => (vec![*a, *b], vec![*c]),
+        FusedMmBiasAct { a, w, bias, c, .. } => (vec![*a, *w, *bias], vec![*c]),
+        DequantMatMulGguf { x, w_q, dst, .. } => (vec![*x, *w_q], vec![*dst]),
+        FusedMlpGateUpSwiGLU {
+            x,
+            gate_w,
+            up_w,
+            dst,
+            ..
+        } => (vec![*x, *gate_w, *up_w], vec![*dst]),
+        FusedMlpDownResidual { x, w, res, dst, .. } => (vec![*x, *w, *res], vec![*dst]),
+        Reduce { src, dst, .. } => (vec![*src], vec![*dst]),
+        Transpose { src, dst, .. } => (vec![*src], vec![*dst]),
+        _ => return None,
+    };
+    Some(io)
+}
+
+const SENTINEL_OFF: usize = usize::MAX;
+
+/// Last thunk index in `[0, before)` that writes `off`, or `None`.
+/// Returns `Err(())` if an opaque (`mlp_io == None`) thunk is encountered,
+/// since it might also write `off` — caller bails.
+fn mlp_last_writer(thunks: &[Thunk], before: usize, off: usize) -> Result<Option<usize>, ()> {
+    if off == SENTINEL_OFF {
+        return Ok(None);
+    }
+    for i in (0..before).rev() {
+        match mlp_io(&thunks[i]) {
+            None => return Err(()),
+            Some((_, writes)) => {
+                if writes.contains(&off) {
+                    return Ok(Some(i));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// First thunk index in `(after, end)` whose `pred` holds.
+fn mlp_find_forward<F: Fn(&Thunk) -> bool>(
+    thunks: &[Thunk],
+    after: usize,
+    pred: F,
+) -> Option<usize> {
+    (after + 1..thunks.len()).find(|&i| pred(&thunks[i]))
+}
+
+/// True iff the value written into `off` at `producer` is consumed ONLY by
+/// thunks in `allowed` before it is overwritten (its live range stays inside
+/// the fused block). Robust to arena offset reuse across layers: scanning
+/// stops at the first redefinition. Any opaque thunk in the window ⇒ false.
+fn mlp_value_dead_outside(
+    thunks: &[Thunk],
+    producer: usize,
+    off: usize,
+    allowed: &[usize],
+) -> bool {
+    if off == SENTINEL_OFF {
+        return false;
+    }
+    for (i, t) in thunks.iter().enumerate().skip(producer + 1) {
+        let Some((reads, writes)) = mlp_io(t) else {
+            return false; // opaque: could read our value
+        };
+        // A disallowed read of the live value is an external consumer ⇒ unsafe.
+        if reads.contains(&off) && !allowed.contains(&i) {
+            return false;
+        }
+        // Any write (allowed in-place op or a later reuse) overwrites the value,
+        // ending its live range — no external read can reach it past this point.
+        if writes.contains(&off) {
+            return true;
+        }
+    }
+    true
+}
+
+/// Pattern-merge the per-layer decode SwiGLU MLP into two fused GEMV dispatches.
+///
+/// Recognizes (m == 1, gate/up Q4_K, down Q4_K or Q6_K), linked by dataflow:
+///   gate = DequantMatMul(N, Wg);  up = DequantMatMul(N, Wu)
+///   gate_act = silu(gate);  prod = mul(gate_act, up)
+///   down = DequantMatMul(prod, Wd);  out = add(residual, down)
+/// → `FusedMlpGateUpSwiGLU{N,Wg,Wu → prod}` + `FusedMlpDownResidual{prod,Wd,res → out}`.
+/// Six dispatches collapse to two (plus the untouched rms_norm). The leading
+/// rms_norm is NOT required by the matcher — only the matmul/elementwise core.
+fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::HashSet<usize>) {
+    if rlx_ir::env::var("RLX_METAL_FUSE_DECODE").as_deref() == Some("0") {
+        return;
+    }
+    use rlx_ir::quant::QuantScheme;
+    let verbose = rlx_ir::env::flag("RLX_METAL_FUSE_DECODE_LOG");
+
+    // Q4_K decode matmul (m == 1) at `idx` writing `dst`? Return (x, w_q, k, n).
+    let as_q4k_mm = |t: &Thunk| -> Option<(usize, usize, usize, u32, u32)> {
+        if let Thunk::DequantMatMulGguf {
+            x,
+            w_q,
+            dst,
+            m,
+            k,
+            n,
+            scheme: QuantScheme::GgufQ4K,
+        } = *t
+        {
+            if m == 1 {
+                return Some((x, w_q, dst, k, n));
+            }
+        }
+        None
+    };
+
+    let n_thunks = thunks.len();
+    let mut i = 0;
+    while i < n_thunks {
+        // Anchor on the SwiGLU `mul`.
+        let (mul_lhs, mul_rhs, prod) = match &thunks[i] {
+            Thunk::BinaryFull {
+                lhs,
+                rhs,
+                dst,
+                op: BinaryOp::Mul,
+                ..
+            } => (*lhs, *rhs, *dst),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let mul_idx = i;
+
+        // Which mul input is silu(gate)? Its last writer must be a Silu activation.
+        let is_silu = |t: &Thunk| {
+            matches!(
+                t,
+                Thunk::ActivationInPlace {
+                    act: Activation::Silu,
+                    ..
+                }
+            )
+        };
+        let silu_writer = |gate_act: usize| -> Option<usize> {
+            match mlp_last_writer(thunks, mul_idx, gate_act) {
+                Ok(Some(idx)) if is_silu(&thunks[idx]) => Some(idx),
+                _ => None,
+            }
+        };
+        let (gate_act_off, up_off, silu_idx) = if let Some(s) = silu_writer(mul_lhs) {
+            (mul_lhs, mul_rhs, s)
+        } else if let Some(s) = silu_writer(mul_rhs) {
+            (mul_rhs, mul_lhs, s)
+        } else {
+            i += 1;
+            continue;
+        };
+
+        // The silu reads `gate` (its in-place data slot). The value flowing into
+        // that slot came from either the gate matmul directly (in-place silu) or
+        // a Copy (out-of-place silu).
+        let gate_src_off = match &thunks[silu_idx] {
+            Thunk::ActivationInPlace { data, .. } => *data,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let gate_producer = match mlp_last_writer(thunks, silu_idx, gate_src_off) {
+            Ok(Some(idx)) => idx,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let (copy_idx, gate_mm_idx, gate_mm_off) = match &thunks[gate_producer] {
+            Thunk::Copy { src, .. } => {
+                // Out-of-place silu: gate matmul wrote `src`, copy moved it.
+                match mlp_last_writer(thunks, gate_producer, *src) {
+                    Ok(Some(gm)) if as_q4k_mm(&thunks[gm]).is_some() => {
+                        (Some(gate_producer), gm, *src)
+                    }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            t if as_q4k_mm(t).is_some() => (None, gate_producer, gate_src_off),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let (gate_x, gate_w, _g_dst, gate_k, gate_n) = as_q4k_mm(&thunks[gate_mm_idx]).unwrap();
+
+        // up matmul: last writer of `up_off`, must be Q4_K m==1 sharing x/k/n.
+        let up_mm_idx = match mlp_last_writer(thunks, mul_idx, up_off) {
+            Ok(Some(idx)) => idx,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let Some((up_x, up_w, _u_dst, up_k, up_n)) = as_q4k_mm(&thunks[up_mm_idx]) else {
+            i += 1;
+            continue;
+        };
+        if up_x != gate_x || up_k != gate_k || up_n != gate_n {
+            i += 1;
+            continue;
+        }
+
+        // down matmul: first forward consumer of `prod` that is a Q4_K/Q6_K
+        // m==1 matmul reading prod as its activation.
+        let down_mm_idx = mlp_find_forward(
+            thunks,
+            mul_idx,
+            |t| matches!(t, Thunk::DequantMatMulGguf { x, m: 1, scheme: QuantScheme::GgufQ4K | QuantScheme::GgufQ6K, .. } if *x == prod),
+        );
+        let Some(down_mm_idx) = down_mm_idx else {
+            i += 1;
+            continue;
+        };
+        let (down_w, down_dst, down_k, down_n, down_scheme) = match &thunks[down_mm_idx] {
+            Thunk::DequantMatMulGguf {
+                w_q,
+                dst,
+                k,
+                n,
+                scheme,
+                ..
+            } => (*w_q, *dst, *k, *n, *scheme),
+            _ => unreachable!(),
+        };
+
+        // add: first forward consumer of `down_dst` that is an elementwise Add.
+        let add_idx = mlp_find_forward(
+            thunks,
+            down_mm_idx,
+            |t| matches!(t, Thunk::BinaryFull { lhs, rhs, op: BinaryOp::Add, .. } if *lhs == down_dst || *rhs == down_dst),
+        );
+        let Some(add_idx) = add_idx else {
+            i += 1;
+            continue;
+        };
+        let (res_off, out_off) = match &thunks[add_idx] {
+            Thunk::BinaryFull { lhs, rhs, dst, .. } => {
+                let res = if *lhs == down_dst { *rhs } else { *lhs };
+                (res, *dst)
+            }
+            _ => unreachable!(),
+        };
+
+        // Liveness: every intermediate that the fusion stops producing must be
+        // dead outside the matched block (gate, up, gate_act, down output).
+        let dead_ok = mlp_value_dead_outside(
+            thunks,
+            gate_mm_idx,
+            gate_mm_off,
+            &[copy_idx.unwrap_or(silu_idx)],
+        ) && mlp_value_dead_outside(thunks, up_mm_idx, up_off, &[mul_idx])
+            && mlp_value_dead_outside(thunks, silu_idx, gate_act_off, &[mul_idx])
+            && mlp_value_dead_outside(thunks, down_mm_idx, down_dst, &[add_idx]);
+        // None of the dropped intermediates may be a graph output.
+        let no_output_clash = ![gate_mm_off, up_off, gate_act_off, down_dst]
+            .iter()
+            .any(|o| output_offsets.contains(o));
+        if !dead_ok || !no_output_clash {
+            i += 1;
+            continue;
+        }
+
+        // Commit: gate/up/silu/copy/down → Nop; mul → fused1; add → fused2.
+        thunks[gate_mm_idx] = Thunk::Nop;
+        thunks[up_mm_idx] = Thunk::Nop;
+        thunks[silu_idx] = Thunk::Nop;
+        thunks[down_mm_idx] = Thunk::Nop;
+        if let Some(c) = copy_idx {
+            thunks[c] = Thunk::Nop;
+        }
+        thunks[mul_idx] = Thunk::FusedMlpGateUpSwiGLU {
+            x: gate_x,
+            gate_w,
+            up_w,
+            dst: prod,
+            k: gate_k,
+            n: gate_n,
+        };
+        thunks[add_idx] = Thunk::FusedMlpDownResidual {
+            x: prod,
+            w: down_w,
+            res: res_off,
+            dst: out_off,
+            k: down_k,
+            n: down_n,
+            scheme: down_scheme,
+        };
+        FUSED_DECODE_MLP_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if verbose {
+            eprintln!(
+                "[rlx-metal] fuse_decode_mlp: block fused (gate/up Q4_K k={gate_k} n={gate_n}, \
+                 down {down_scheme:?} k={down_k} n={down_n}) — 6 dispatches → 2"
+            );
+        }
+        i += 1;
+    }
+}
+
 /// Merge disjoint last-axis `Narrow` thunks that share a source into `SplitLastAxis`.
 fn fuse_narrow_clusters(thunks: &mut [Thunk]) {
     use std::collections::HashMap;
@@ -3798,8 +4883,33 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             x, res, bias, g, b, ..
         } => vec![*x, *res, *bias, *g, *b],
         Thunk::Softmax { data, .. } => vec![*data],
+        Thunk::SoftmaxCrossEntropyDense {
+            logits, targets, ..
+        } => vec![*logits, *targets],
+        Thunk::SoftmaxCrossEntropyWithLogits { logits, labels, .. } => vec![*logits, *labels],
+        Thunk::SoftmaxCrossEntropyBackward {
+            logits,
+            labels,
+            d_loss,
+            ..
+        } => vec![*logits, *labels, *d_loss],
         Thunk::Cumsum { src, .. } => vec![*src],
         Thunk::Attention { q, k, v, mask, .. } => vec![*q, *k, *v, *mask],
+        Thunk::FusedAttn {
+            qkv,
+            mask,
+            cos,
+            sin,
+            has_rope,
+            ..
+        } => {
+            let mut r = vec![*qkv, *mask];
+            if *has_rope != 0 {
+                r.push(*cos);
+                r.push(*sin);
+            }
+            r
+        }
         Thunk::AttentionBackward {
             q, k, v, dy, mask, ..
         } => {
@@ -3832,6 +4942,10 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::Conv2dBackwardInput { dy, w, .. } => vec![*dy, *w],
         Thunk::Conv2dBackwardWeight { x, dy, .. } => vec![*x, *dy],
         Thunk::FusedSwiGLU { src, .. } => vec![*src],
+        Thunk::FusedMlpGateUpSwiGLU {
+            x, gate_w, up_w, ..
+        } => vec![*x, *gate_w, *up_w],
+        Thunk::FusedMlpDownResidual { x, w, res, .. } => vec![*x, *w, *res],
         Thunk::Concat { inputs, .. } => inputs.iter().map(|(o, _)| *o).collect(),
         Thunk::Narrow { src, .. } | Thunk::SplitLastAxis { src, .. } => vec![*src],
         Thunk::Copy { src, .. } => vec![*src],

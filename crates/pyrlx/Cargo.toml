@@ -1,6 +1,6 @@
 [package]
 name = "pyrlx"
-version                = "0.2.9"
+version                = "0.2.10"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Python bindings for rlx — run RLX graphs and HF models on any RLX backend"
@@ -24,9 +24,12 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # Backend selection mirrors rlx-runtime. Default = whatever's
 # always available everywhere (cpu).
-default = ["cpu"]
+default = ["cpu", "gguf-convert"]
 
 cpu             = ["rlx-runtime/cpu"]
+gguf-convert    = ["rlx-gguf-convert/safetensors"]
+gguf-onnx       = ["rlx-gguf-convert/onnx"]
+gguf-pt         = ["rlx-gguf-convert/pt"]
 blas-accelerate = ["rlx-runtime/blas-accelerate"]
 blas-mkl        = ["rlx-runtime/blas-mkl"]
 blas-openblas   = ["rlx-runtime/blas-openblas"]
@@ -40,8 +43,12 @@ rocm            = ["rlx-runtime/rocm"]
 pyo3      = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 numpy     = "0.22"
 
-rlx-ir = { path = "../rlx-ir", version = "0.2.9" }
-rlx-opt = { path = "../rlx-opt", version = "0.2.9" }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.9", default-features = false }
+rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
+rlx-opt = { path = "../rlx-opt", version = "0.2.10" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.10", default-features = false }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.10" }
+rlx-gguf-convert = { path = "../rlx-gguf-convert", version = "0.2.10", default-features = false, features = ["safetensors"] }
+anyhow = "1"
+bytemuck = "1"
 [lints]
 workspace = true

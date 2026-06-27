@@ -126,8 +126,13 @@ Tier-3 ops (all lowered, full parity with rlx-cuda / rlx-rocm):
   indices reported as f32 per the rlx-ir convention.
 - `GroupedMatMul` — `gather` per-token expert weights along axis 0,
   then a batched `dot_general` with M as batch axis.
-- `DequantMatMul` — `convert(w_q → f32)` + per-block scale/zp tile
-  (`reshape → broadcast → reshape`) + `dot_general`.
+- `DequantMatMul` — two paths:
+  - **Non-GGUF** (Int8/Int4/FP8/NVFP4): `convert(w_q → f32)` + per-block
+    scale/zp tile + `dot_general`.
+  - **GGUF** (`scheme.is_gguf()`): host-dequant at HLO emit via
+    `rlx_gguf`, embed f32 constant, `dot_general`. Requires `Op::Constant`
+    weights; runtime `Param` reload is not supported. See
+    [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
 - `QMatMul` / `QConv2d` — int8 inputs promoted to s32, `subtract`
   zero-points, `dot`/`convolution`, `add` bias, `multiply` by mult,
   `round-nearest-even`, `add` out_zp, clamp to [-128, 127], `convert`

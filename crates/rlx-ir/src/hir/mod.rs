@@ -25,11 +25,13 @@ mod conv;
 mod fusion;
 mod graph_ext;
 mod lower;
+mod window;
 
 pub use blocks::lower_llama_decoder_block;
 pub use blocks::lower_qwen35_mtp_head;
 pub use fusion::FusionPolicy;
 pub use graph_ext::{HirGraphExt, HirMut};
+pub use window::{window_token_gather_bsn, window_token_scatter_bsn};
 
 use crate::mir::MirModule;
 use crate::op::Activation;
@@ -129,6 +131,16 @@ pub enum HirOp {
         carry: bool,
     },
 
+    /// Multi-layer (optionally bidirectional) GRU. Inputs
+    /// `[x, w_ih, w_hh, b_ih, b_hh]` (`+ [h0]` when `carry`). See
+    /// [`crate::Op::Gru`].
+    Gru {
+        hidden_size: usize,
+        num_layers: usize,
+        bidirectional: bool,
+        carry: bool,
+    },
+
     /// Rotary position embedding. Inputs: `[x, cos, sin]`.
     RoPE {
         head_dim: usize,
@@ -150,6 +162,8 @@ pub enum HirOp {
         num_kv_heads: usize,
         eps: f32,
         mask: MaskKind,
+        /// RoPE pairing flavor (GGUF Llama → [`crate::op::RopeStyle::GptJ`]).
+        rope_style: crate::op::RopeStyle,
     },
 
     /// Qwen3.5 MTP draft head: hnorm∥enorm → eh_proj → full-attn → LM.
@@ -517,6 +531,35 @@ impl HirModule {
         )
     }
 
+    /// Multi-layer (optionally bidirectional) GRU. Inputs
+    /// `[x, w_ih, w_hh, b_ih, b_hh]`. `out_shape` = `[batch, seq, D*hidden]`.
+    /// See [`crate::Op::Gru`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gru(
+        &mut self,
+        x: HirNodeId,
+        w_ih: HirNodeId,
+        w_hh: HirNodeId,
+        b_ih: HirNodeId,
+        b_hh: HirNodeId,
+        hidden_size: usize,
+        num_layers: usize,
+        bidirectional: bool,
+        out_shape: Shape,
+    ) -> HirNodeId {
+        self.push_block(
+            HirOp::Gru {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                carry: false,
+            },
+            vec![x, w_ih, w_hh, b_ih, b_hh],
+            out_shape,
+            None,
+        )
+    }
+
     /// LSTM threading decode state: `h0`/`c0` `[L*D, batch, hidden]` in,
     /// `hn`/`cn` written back in place.
     #[allow(clippy::too_many_arguments)]
@@ -604,6 +647,7 @@ impl HirModule {
         num_kv_heads: usize,
         eps: f32,
         mask_kind: MaskKind,
+        rope_style: crate::op::RopeStyle,
         out_shape: Shape,
     ) -> HirNodeId {
         let mut ins = vec![
@@ -619,6 +663,7 @@ impl HirModule {
                 num_kv_heads,
                 eps,
                 mask: mask_kind,
+                rope_style,
             },
             ins,
             out_shape,
@@ -673,6 +718,8 @@ impl HirModule {
             num_kv_heads,
             eps,
             mask_kind,
+            // Generic transformer alias keeps the HF/NeoX rotate-half flavor.
+            crate::op::RopeStyle::NeoX,
             out_shape,
         );
         self.node_mut(id).name = Some("transformer_block".into());
@@ -822,6 +869,7 @@ pub(crate) fn default_hir_block_label(op: &HirOp) -> Option<String> {
         } => "gated_delta_net_carry".into(),
         HirOp::GatedDeltaNet { .. } => "gated_delta_net".into(),
         HirOp::Lstm { .. } => "lstm".into(),
+        HirOp::Gru { .. } => "gru".into(),
         HirOp::RoPE { .. } => "rope".into(),
         HirOp::RmsNorm { .. } => "rms_norm".into(),
         HirOp::Mir(_) => "mir".into(),

@@ -118,8 +118,10 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     let mut schedule = Vec::with_capacity(graph.nodes().len());
     let mut cursor = 0usize;
     for node in graph.nodes() {
-        if matches!(node.op, Op::Reshape { .. } | Op::Cast { .. })
-            && let Some(in_id) = node.inputs.first()
+        if matches!(
+            node.op,
+            Op::Reshape { .. } | Op::Cast { .. } | Op::StopGradient
+        ) && let Some(in_id) = node.inputs.first()
             && let Some(slot) = assignments.get(in_id)
         {
             let aliased = slot.clone();
