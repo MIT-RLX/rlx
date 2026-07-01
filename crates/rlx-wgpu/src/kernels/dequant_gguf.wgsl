@@ -667,7 +667,7 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         let qs_rel = off + 2u;
         let dst_base = params.dst_f32_off + gid * 32u;
         for (var j: u32 = 0u; j < 32u; j = j + 1u) {
-            arena[dst_base + j] = d * f32(i32(read_w(qs_rel + j)));
+            arena[dst_base + j] = d * f32(read_w_i8(qs_rel + j));
         }
         return;
     }

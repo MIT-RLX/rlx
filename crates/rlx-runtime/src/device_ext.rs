@@ -83,6 +83,17 @@ pub fn supports_ragged_rope(device: Device) -> bool {
     matches!(device, Device::Cpu | Device::Metal)
 }
 
+/// Drop backend-held device arena pools between large compiles (CUDA).
+/// No-op on backends without a pool (CPU, Metal unified memory, ROCm, …).
+pub fn trim_accelerator_arena_pool(device: Device) {
+    #[cfg(feature = "cuda")]
+    if device == Device::Cuda {
+        rlx_cuda::trim_device_memory_pool();
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = device;
+}
+
 pub fn is_available(device: Device) -> bool {
     #[cfg(feature = "cuda")]
     if device == Device::Cuda {

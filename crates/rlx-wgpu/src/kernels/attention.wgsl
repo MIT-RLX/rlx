@@ -36,11 +36,11 @@
 // Both index the mask via the per-axis mask strides below. Caller is
 // responsible for normalizing other shapes upstream.
 //
-// `O` is held in a per-thread private array<f32, MAX_HEAD_DIM>. BERT-class
-// models all use head_dim ≤ 128, so this stays well within Apple-Metal's
-// per-thread private storage budget without spilling.
+// `O` is held in a per-thread private array<f32, MAX_HEAD_DIM>. Gemma 3
+// decode uses head_dim=256; keep headroom for Llama-class 128 and future
+// 512-dim heads without spilling on Apple GPUs (private limit ~10 KiB/thread).
 
-const MAX_HEAD_DIM: u32 = 128u;
+const MAX_HEAD_DIM: u32 = 512u;
 
 struct Params {
     batch: u32,
@@ -124,6 +124,7 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         + qi * params.o_seq_stride;
 
     let hd = params.head_dim;
+    if (hd > MAX_HEAD_DIM) { return; }
 
     // Cache Q[qi, :] in registers — read seq_k times by the dot product.
     var q_reg: array<f32, MAX_HEAD_DIM>;

@@ -7265,7 +7265,7 @@ pub fn compile_thunks_with_rng(
                         let w_bytes =
                             std::slice::from_raw_parts(base.add(w_q) as *const u8, total_bytes);
                         let out = sl_mut(dst, base, m * n);
-                        crate::gguf_matmul::gguf_matmul_bt(xs, w_bytes, out, m, k, n, scheme);
+                        crate::gguf_matmul::gguf_matmul_bt_dispatch(xs, w_bytes, out, m, k, n, scheme);
                     })
                 }
 
@@ -12072,7 +12072,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let w_bytes_ptr = base.add(*w_q) as *const u8;
                     let w_bytes = std::slice::from_raw_parts(w_bytes_ptr, total_bytes);
                     let out = sl_mut(*dst, base, m * n);
-                    crate::gguf_matmul::gguf_matmul_bt(xs, w_bytes, out, m, k, n, *scheme);
+                    crate::gguf_matmul::gguf_matmul_bt_dispatch(xs, w_bytes, out, m, k, n, *scheme);
                 }
             }
 
@@ -17519,7 +17519,7 @@ pub unsafe fn execute_dequant_matmul_gguf_f32(
         let xs = sl(x, base, m * k);
         let w_bytes = std::slice::from_raw_parts(base.add(w_q) as *const u8, total_bytes);
         let out = sl_mut(dst, base, m * n);
-        crate::gguf_matmul::gguf_matmul_bt(xs, w_bytes, out, m, k, n, scheme);
+        crate::gguf_matmul::gguf_matmul_bt_dispatch(xs, w_bytes, out, m, k, n, scheme);
     }
 }
 

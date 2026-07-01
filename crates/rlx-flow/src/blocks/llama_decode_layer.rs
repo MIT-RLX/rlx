@@ -26,6 +26,9 @@ use crate::value::FlowValue;
 pub struct LlamaDecodeLayerSpec {
     pub num_heads: usize,
     pub head_dim: usize,
+    /// Leading per-head dims that get rotary-rotated (`head_dim` unless
+    /// partial RoPE — Phi-3 / long-context variants).
+    pub n_rot: usize,
     pub num_kv_heads: usize,
     pub kv_group_size: usize,
     pub eps: f32,
@@ -110,8 +113,22 @@ impl BlockStage for LlamaDecodeLayerStage {
         let k = gb.mm(normed_in, k_w);
         let v = gb.mm(normed_in, v_w);
 
-        let q_rope = gb.rope_styled(q, decode.cos, decode.sin, spec.head_dim, spec.rope_style);
-        let k_rope = gb.rope_styled(k, decode.cos, decode.sin, spec.head_dim, spec.rope_style);
+        let q_rope = gb.rope_n_styled(
+            q,
+            decode.cos,
+            decode.sin,
+            spec.head_dim,
+            spec.n_rot,
+            spec.rope_style,
+        );
+        let k_rope = gb.rope_n_styled(
+            k,
+            decode.cos,
+            decode.sin,
+            spec.head_dim,
+            spec.n_rot,
+            spec.rope_style,
+        );
 
         let (new_k, new_v) = match (past_k, past_v) {
             (Some(past_k), Some(past_v)) => (

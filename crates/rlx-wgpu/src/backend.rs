@@ -3259,7 +3259,7 @@ impl WgpuExecutable {
                     num_heads,
                     head_dim,
                     mask_kind,
-                    score_scale: _,
+                    score_scale,
                     attn_logit_softcap: _,
                 } => {
                     // v5: rank-4 [B, H, S, D] inputs only. SlidingWindow
@@ -3327,7 +3327,7 @@ impl WgpuExecutable {
                                          inputs supported (got rank {other})"
                         ),
                     };
-                    let scale = 1.0_f32 / (hd as f32).sqrt();
+                    let scale = score_scale.unwrap_or(1.0_f32 / (hd as f32).sqrt());
 
                     let (mask_kind_id, mask_buf, window) = match mask_kind {
                         MaskKind::None => (0u32, None, 0u32),

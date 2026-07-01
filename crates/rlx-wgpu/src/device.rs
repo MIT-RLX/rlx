@@ -74,6 +74,7 @@ const ADAPTER_OPTIONS: wgpu::RequestAdapterOptions = wgpu::RequestAdapterOptions
     power_preference: wgpu::PowerPreference::HighPerformance,
     compatible_surface: None,
     force_fallback_adapter: false,
+    apply_limit_buckets: false,
 };
 
 fn device_descriptor(

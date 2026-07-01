@@ -957,20 +957,23 @@ pub fn try_lower_with_constants(
                     let (b, s) = (q_shape[0], q_shape[1]);
                     let k_shape = shape_dims(graph, node.inputs[1])?;
                     let kv_seq = k_shape[1];
+                    let scale = score_scale.unwrap_or(1.0 / (*head_dim as f32).sqrt());
                     match mask_kind {
-                        rlx_ir::op::MaskKind::None => {
-                            mg.attention_unmasked(q, k, v, b, s, kv_seq, *num_heads, *head_dim)
-                        }
+                        rlx_ir::op::MaskKind::None => mg.attention_unmasked(
+                            q, k, v, b, s, kv_seq, *num_heads, *head_dim, scale,
+                        ),
                         rlx_ir::op::MaskKind::Causal => {
                             if kv_seq == s {
-                                mg.attention_causal(q, k, v, b, s, *num_heads, *head_dim)
+                                mg.attention_causal(q, k, v, b, s, *num_heads, *head_dim, scale)
                             } else {
-                                mg.attention_unmasked(q, k, v, b, s, kv_seq, *num_heads, *head_dim)
+                                mg.attention_unmasked(
+                                    q, k, v, b, s, kv_seq, *num_heads, *head_dim, scale,
+                                )
                             }
                         }
                         rlx_ir::op::MaskKind::Custom => {
                             let mask = node_to_tensor.get(&node.inputs[3])?;
-                            mg.attention(q, k, v, mask, b, s, kv_seq, *num_heads, *head_dim)
+                            mg.attention(q, k, v, mask, b, s, kv_seq, *num_heads, *head_dim, scale)
                         }
                         _ => {
                             if trace {

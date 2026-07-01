@@ -424,6 +424,133 @@ impl BucketedCompileCache {
         self.buckets[idx].compiled.as_mut()
     }
 
+    /// D2D seed resident KV from `src_key`'s bucket into `dst_key`'s bucket.
+    /// See `rlx-cuda::CudaExecutable::copy_resident_kv_rows_from` and
+    /// `rlx-llama32/docs/cuda-gguf-decode.md`.
+    pub fn seed_resident_kv_prefix_from_keys(
+        &mut self,
+        src_key: u64,
+        dst_key: u64,
+        prefix_tokens: usize,
+        outgoing_upper: usize,
+        kv_dim: usize,
+        n_layers: usize,
+    ) -> bool {
+        let Some(src_idx) = self.bucket_for(src_key) else {
+            return false;
+        };
+        let Some(dst_idx) = self.bucket_for(dst_key) else {
+            return false;
+        };
+        if src_idx == dst_idx {
+            return true;
+        }
+        if src_idx < dst_idx {
+            let (left, right) = self.buckets.split_at_mut(dst_idx);
+            let Some(src) = left[src_idx].compiled.as_ref() else {
+                return false;
+            };
+            let Some(dst) = right[0].compiled.as_mut() else {
+                return false;
+            };
+            return dst.seed_resident_kv_prefix_from(
+                src,
+                prefix_tokens,
+                outgoing_upper,
+                kv_dim,
+                n_layers,
+            );
+        }
+        let (left, right) = self.buckets.split_at_mut(src_idx);
+        let Some(src) = right[0].compiled.as_ref() else {
+            return false;
+        };
+        let Some(dst) = left[dst_idx].compiled.as_mut() else {
+            return false;
+        };
+        dst.seed_resident_kv_prefix_from(src, prefix_tokens, outgoing_upper, kv_dim, n_layers)
+    }
+
+    /// Hybrid bucket rollover: H2D the host-known prefix once, then copy only rows
+    /// the host cache does not already have from `src` (via `copy_resident_kv_rows_from`).
+    /// Not used by `rlx-llama32` today (generator flush+bind path); kept for experiments.
+    pub fn rebind_resident_kv_hybrid_from_keys(
+        &mut self,
+        src_key: u64,
+        dst_key: u64,
+        host_k: &[Vec<f32>],
+        host_v: &[Vec<f32>],
+        prefix_tokens: usize,
+        outgoing_upper: usize,
+        upper: usize,
+        kv_dim: usize,
+        n_layers: usize,
+    ) -> bool {
+        let Some(src_idx) = self.bucket_for(src_key) else {
+            return false;
+        };
+        let Some(dst_idx) = self.bucket_for(dst_key) else {
+            return false;
+        };
+        if src_idx == dst_idx {
+            return true;
+        }
+        let host_rows = host_k.first().map(|k| k.len() / kv_dim.max(1)).unwrap_or(0);
+        let rebind = |src: &CompiledGraph, dst: &mut CompiledGraph| -> bool {
+            for i in 0..n_layers {
+                let mut kp = vec![0f32; upper * kv_dim];
+                let mut vp = vec![0f32; upper * kv_dim];
+                let nk = host_k[i].len().min(kp.len());
+                let nv = host_v[i].len().min(vp.len());
+                kp[..nk].copy_from_slice(&host_k[i][..nk]);
+                vp[..nv].copy_from_slice(&host_v[i][..nv]);
+                let k_name = format!("past_k_{i}");
+                let v_name = format!("past_v_{i}");
+                if !dst.bind_gpu_handle(&k_name, &kp) || !dst.bind_gpu_handle(&v_name, &vp) {
+                    return false;
+                }
+                dst.register_kv_row_feed(&k_name, 1 + 2 * i);
+                dst.register_kv_row_feed(&v_name, 2 + 2 * i);
+            }
+            dst.stage_bound_gpu_handles_to_arena();
+            if host_rows < prefix_tokens {
+                return dst.copy_resident_kv_rows_from(
+                    src,
+                    host_rows,
+                    prefix_tokens,
+                    outgoing_upper,
+                    kv_dim,
+                    n_layers,
+                );
+            }
+            for i in 0..n_layers {
+                let k_name = format!("past_k_{i}");
+                let v_name = format!("past_v_{i}");
+                dst.prepare_resident_gpu_handle(&k_name);
+                dst.prepare_resident_gpu_handle(&v_name);
+            }
+            true
+        };
+        if src_idx < dst_idx {
+            let (left, right) = self.buckets.split_at_mut(dst_idx);
+            let Some(src) = left[src_idx].compiled.as_ref() else {
+                return false;
+            };
+            let Some(dst) = right[0].compiled.as_mut() else {
+                return false;
+            };
+            return rebind(src, dst);
+        }
+        let (left, right) = self.buckets.split_at_mut(src_idx);
+        let Some(src) = right[0].compiled.as_ref() else {
+            return false;
+        };
+        let Some(dst) = left[dst_idx].compiled.as_mut() else {
+            return false;
+        };
+        rebind(src, dst)
+    }
+
     pub fn total_buckets(&self) -> usize {
         self.buckets.len()
     }

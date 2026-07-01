@@ -844,6 +844,7 @@ impl MpsGraph {
         seq_kv: usize,
         num_heads: usize,
         head_dim: usize,
+        score_scale: f32,
     ) -> MpsTensor {
         // KNOWN BUG (PLAN: MPSGraph attention parity). When Q/K/V are
         // slice-views of a computed parent (e.g., narrows of a
@@ -911,8 +912,14 @@ impl MpsGraph {
         // scores = Q @ K^T → [B, NH, seq_q, seq_kv]
         let scores = self.matmul(&q4, &k4_t);
 
-        // Scale by 1/sqrt(d_h)
-        let scale = self.constant_scalar((head_dim as f32).sqrt().recip());
+        // Scale scores: honour Op::Attention::score_scale (Gemma sets 1.0
+        // after pre-scaling Q); default 1/sqrt(head_dim).
+        let scale = if score_scale > 0.0 {
+            score_scale
+        } else {
+            (head_dim as f32).sqrt().recip()
+        };
+        let scale = self.constant_scalar(scale);
         let scores = self.mul(&scores, &scale);
 
         // Additive mask: (mask - 1) * 1e9 → 0 for valid, -1e9 for pad.
@@ -954,6 +961,7 @@ impl MpsGraph {
         seq_kv: usize,
         num_heads: usize,
         head_dim: usize,
+        score_scale: f32,
     ) -> MpsTensor {
         let r4 = |t: &MpsTensor, seq: usize| {
             let seq = t.infer_attn_seq(batch, num_heads, head_dim, seq);
@@ -966,7 +974,12 @@ impl MpsGraph {
 
         let k4_t = self.transpose(&k4, 2, 3);
         let scores = self.matmul(&q4, &k4_t);
-        let scale = self.constant_scalar((head_dim as f32).sqrt().recip());
+        let scale = if score_scale > 0.0 {
+            score_scale
+        } else {
+            (head_dim as f32).sqrt().recip()
+        };
+        let scale = self.constant_scalar(scale);
         let scores = self.mul(&scores, &scale);
         let weights = self.softmax(&scores, 3);
         let out4 = self.matmul(&weights, &v4);
@@ -998,6 +1011,7 @@ impl MpsGraph {
         seq: usize,
         num_heads: usize,
         head_dim: usize,
+        score_scale: f32,
     ) -> MpsTensor {
         let seq_eff = q.infer_attn_seq(batch, num_heads, head_dim, seq);
         let r4 = |t: &MpsTensor| {
@@ -1021,7 +1035,11 @@ impl MpsGraph {
         }
         let mask =
             self.constant_from_bytes(&mask_bytes, &[1, 1, seq_eff, seq_eff], mps_dtype::Float32);
-        let scale = (head_dim as f32).sqrt().recip();
+        let scale = if score_scale > 0.0 {
+            score_scale
+        } else {
+            (head_dim as f32).sqrt().recip()
+        };
 
         // Prefer Apple's fused SDPA when available (macOS 14.4+) —
         // single Metal command vs the 5-op chain otherwise. Falls back

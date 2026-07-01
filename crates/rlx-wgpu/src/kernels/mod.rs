@@ -64,6 +64,17 @@ pub const ROPE_BWD_WGSL: &str = include_str!("rope_backward.wgsl");
 pub const GATHER_BWD_WGSL: &str = include_str!("gather_backward.wgsl");
 pub const CUMSUM_WGSL: &str = include_str!("cumsum.wgsl");
 pub const FFT_GPU_WGSL: &str = include_str!("fft_gpu.wgsl");
+/// native-gpu-fft: 32 KB on-chip radix-2/4/8 kernels (n<=4096) in a separate
+/// module — only instantiated on devices with >=32 KB workgroup storage.
+#[cfg(feature = "native-gpu-fft")]
+pub const FFT_GPU_BIG_WGSL: &str = include_str!("fft_gpu_big.wgsl");
+/// native-gpu-fft: portable 16 KB radix-4 kernel for n<=2048 (the default
+/// on-chip path on wgpu — higher occupancy than the 32 KB module).
+#[cfg(feature = "native-gpu-fft")]
+pub const FFT_GPU_R4_16K_WGSL: &str = include_str!("fft_gpu_r4_16k.wgsl");
+/// native-gpu-fft: multi-row on-chip FFT for small n (packs rows/workgroup).
+#[cfg(feature = "native-gpu-fft")]
+pub const FFT_GPU_MULTIROW_WGSL: &str = include_str!("fft_gpu_multirow.wgsl");
 pub const COPY_WGSL: &str = include_str!("copy.wgsl");
 pub const ELEMENTWISE_REGION_WGSL: &str = include_str!("elementwise_region.wgsl");
 pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
@@ -1641,6 +1652,18 @@ static GATHER_BWD_ZERO: OnceLock<Kernel> = OnceLock::new();
 static GATHER_BWD_ACC: OnceLock<Kernel> = OnceLock::new();
 static CUMSUM: OnceLock<Kernel> = OnceLock::new();
 static FFT_GPU_RADIX2: OnceLock<Kernel> = OnceLock::new();
+#[cfg(feature = "native-gpu-fft")]
+static FFT_GPU_RADIX2_BIG: OnceLock<Kernel> = OnceLock::new();
+#[cfg(feature = "native-gpu-fft")]
+static FFT_GPU_BIG_R2: OnceLock<Kernel> = OnceLock::new();
+#[cfg(feature = "native-gpu-fft")]
+static FFT_GPU_BIG_R4: OnceLock<Kernel> = OnceLock::new();
+#[cfg(feature = "native-gpu-fft")]
+static FFT_GPU_BIG_R8: OnceLock<Kernel> = OnceLock::new();
+#[cfg(feature = "native-gpu-fft")]
+static FFT_GPU_R4_16K: OnceLock<Kernel> = OnceLock::new();
+#[cfg(feature = "native-gpu-fft")]
+static FFT_GPU_MULTIROW: OnceLock<Kernel> = OnceLock::new();
 static FFT_GPU_BITREV: OnceLock<Kernel> = OnceLock::new();
 static FFT_GPU_INNER: OnceLock<Kernel> = OnceLock::new();
 static FFT_GPU_OUTER_R4: OnceLock<Kernel> = OnceLock::new();
@@ -2106,6 +2129,78 @@ pub fn fft_gpu_radix2_full_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu fft_radix2_full",
             FFT_GPU_WGSL,
             "fft_radix2_full",
+        )
+    })
+}
+/// native-gpu-fft: single-kernel on-chip FFT for n in (1024, 2048] (16 KB).
+#[cfg(feature = "native-gpu-fft")]
+pub fn fft_gpu_radix2_full_big_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_RADIX2_BIG.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_radix2_full_big",
+            FFT_GPU_WGSL,
+            "fft_radix2_full_big",
+        )
+    })
+}
+/// native-gpu-fft: 32 KB on-chip kernels (n<=4096). Only call when the device
+/// reports >=32 KB workgroup storage — pipeline creation otherwise exceeds the
+/// limit.
+#[cfg(feature = "native-gpu-fft")]
+pub fn fft_gpu_big_r2_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_BIG_R2.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_radix2_big",
+            FFT_GPU_BIG_WGSL,
+            "fft_radix2_big",
+        )
+    })
+}
+#[cfg(feature = "native-gpu-fft")]
+pub fn fft_gpu_big_r4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_BIG_R4.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_radix4_big",
+            FFT_GPU_BIG_WGSL,
+            "fft_radix4_big",
+        )
+    })
+}
+#[cfg(feature = "native-gpu-fft")]
+pub fn fft_gpu_big_r8_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_BIG_R8.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_radix8_big",
+            FFT_GPU_BIG_WGSL,
+            "fft_radix8_big",
+        )
+    })
+}
+/// native-gpu-fft: portable 16 KB radix-4 (n<=2048); no device-limit gate.
+#[cfg(feature = "native-gpu-fft")]
+pub fn fft_gpu_r4_16k_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_R4_16K.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_radix4_16k",
+            FFT_GPU_R4_16K_WGSL,
+            "fft_radix4_16k",
+        )
+    })
+}
+/// native-gpu-fft: multi-row small-n FFT (16 KB); no device-limit gate.
+#[cfg(feature = "native-gpu-fft")]
+pub fn fft_gpu_multirow_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_GPU_MULTIROW.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_multirow",
+            FFT_GPU_MULTIROW_WGSL,
+            "fft_multirow",
         )
     })
 }

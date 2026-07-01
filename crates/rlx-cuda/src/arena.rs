@@ -32,7 +32,7 @@ use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaSlice};
-use rlx_ir::{Graph, NodeId, Op};
+use rlx_ir::{DType, Graph, NodeId, Op};
 use rlx_opt::memory::{BufferSlot, MemoryPlan};
 
 /// Half-precision dtype tag. Bit-identical layouts (16 bits each) but
@@ -74,8 +74,37 @@ pub struct Arena {
     pub half_size: usize,
 }
 
-const F32_ARENA_POOL_CAP: usize = 16;
 static F32_ARENA_POOL: OnceLock<Mutex<Vec<(usize, CudaSlice<f32>)>>> = OnceLock::new();
+
+/// Max pooled f32 buffers retained (default 2 — enough for double-buffering,
+/// avoids pinning multiple 10+ GiB Orpheus arenas on 16 GiB GPUs).
+fn pool_enabled() -> bool {
+    rlx_ir::env::flag("RLX_CUDA_ARENA_POOL")
+}
+
+fn pool_max_buffers() -> usize {
+    rlx_ir::env::var("RLX_CUDA_ARENA_POOL_MAX")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
+/// Do not retain individual arenas larger than this in the pool (bytes).
+fn pool_max_chunk_bytes() -> usize {
+    rlx_ir::env::var("RLX_CUDA_ARENA_POOL_CHUNK_BYTES")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512 * 1024 * 1024)
+        .max(1024 * 1024)
+}
+
+/// Drop all pooled device buffers — call between large graph compiles on
+/// memory-constrained GPUs (Orpheus 3B prefill → decode handoff).
+pub fn trim_f32_arena_pool() {
+    let mut pool = f32_arena_pool()
+        .lock()
+        .expect("rlx-cuda: arena pool lock poisoned");
+    pool.clear();
+}
 
 fn f32_arena_pool() -> &'static Mutex<Vec<(usize, CudaSlice<f32>)>> {
     F32_ARENA_POOL.get_or_init(|| Mutex::new(Vec::new()))
@@ -83,26 +112,45 @@ fn f32_arena_pool() -> &'static Mutex<Vec<(usize, CudaSlice<f32>)>> {
 
 fn pool_acquire_f32(ctx: &Arc<CudaContext>, n_f32: usize) -> CudaSlice<f32> {
     let need = n_f32.max(4);
+    if let Some(buf) = try_pool_take(need) {
+        return buf;
+    }
+    match try_alloc_f32(ctx, need) {
+        Ok(buf) => buf,
+        Err(_) => {
+            trim_f32_arena_pool();
+            try_alloc_f32(ctx, need).expect("rlx-cuda: device allocation failed")
+        }
+    }
+}
+
+fn try_pool_take(need: usize) -> Option<CudaSlice<f32>> {
     let mut pool = f32_arena_pool()
         .lock()
         .expect("rlx-cuda: arena pool lock poisoned");
     if let Some(idx) = pool.iter().position(|(cap, _)| *cap >= need) {
         let (_, buf) = pool.swap_remove(idx);
-        return buf;
+        return Some(buf);
     }
-    drop(pool);
-    unsafe {
-        ctx.default_stream()
-            .alloc(need)
-            .expect("rlx-cuda: device allocation failed")
-    }
+    None
+}
+
+fn try_alloc_f32(ctx: &Arc<CudaContext>, n_f32: usize) -> Result<CudaSlice<f32>, ()> {
+    unsafe { ctx.default_stream().alloc(n_f32).map_err(|_| ()) }
 }
 
 fn pool_release_f32(cap_f32: usize, buffer: CudaSlice<f32>) {
+    if !pool_enabled() {
+        return;
+    }
+    let cap_bytes = cap_f32.saturating_mul(4);
+    if cap_bytes > pool_max_chunk_bytes() {
+        return;
+    }
     let mut pool = f32_arena_pool()
         .lock()
         .expect("rlx-cuda: arena pool lock poisoned");
-    if pool.len() >= F32_ARENA_POOL_CAP {
+    while pool.len() >= pool_max_buffers() {
         pool.sort_by_key(|(cap, _)| *cap);
         pool.remove(0);
     }
@@ -130,7 +178,12 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
             continue;
         }
         let elems = node.shape.num_elements().unwrap_or(0);
-        let bytes = elems * 4;
+        // Packed GGUF params use U8 shapes `[bytes.len()]` — reserve byte
+        // storage, not `elems * 4` (that inflated Orpheus 3B arenas ~4×).
+        let bytes = match node.shape.dtype() {
+            DType::U8 | DType::I8 | DType::Bool => elems,
+            _ => elems * 4,
+        };
         let aligned = bytes.div_ceil(align) * align;
         assignments.insert(
             node.id,

@@ -256,6 +256,21 @@ positional inputs, one D2H into a stable **host** buffer (not a GPU-mapped arena
 Use this for inference loops that want to reuse an output `Vec` without `run()` allocating
 each time (e.g. EEG-DINO `eegdino-rs` encoder).
 
+### Resident K/V (bucketed GGUF decode)
+
+For autoregressive packed decode (`past_k_*` / `past_v_*` resident handles):
+
+- **`feed_kv_row`** — after each decode step, fold the new-token K/V row from the
+  output arena into the matching resident input (in-bucket lazy KV).
+- **`read_output_row` / `read_gpu_handle_row`** — row-at-a-time D2H for flush at bucket
+  boundaries (used by `rlx-llama32` `flush_missing_resident_kv_to_cache`).
+- **`copy_resident_kv_rows_from` / `seed_resident_kv_prefix_from`** — seed a wider
+  bucket from the outgoing executable (experimental D2D fast path; see
+  `rlx-llama32/docs/cuda-gguf-decode.md`).
+
+Set `ORPHEUS_RESIDENT_KV=0` or `RLX_CUDA_FULL_KV_READBACK=1` to fall back to full-tensor
+K/V readback per step.
+
 ### EEG-DINO encoder notes
 
 - Attention uses **BSHD** `[B,S,H,D]`; CUDA uses tiled flash (`attention_kernel`) for `head_dim ≤ 128`

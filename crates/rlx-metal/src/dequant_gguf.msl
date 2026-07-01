@@ -879,60 +879,6 @@ kernel void q8_0_mv_f32(
     dst[gid] = acc4.x + acc4.y + acc4.z + acc4.w;
 }
 
-// ── DIAGNOSTIC: pure read-bandwidth probe (RLX_METAL_Q4K_PROBE=1) ─────────
-// Reads the exact same Q4K weight bytes as `q4k_mv_f32` (one thread per
-// output row, full row streamed) but does NO dequant math / no x — just XORs
-// raw u32 words. Compare its GPU-busy to the real GEMV: if the probe is far
-// faster, the GEMV is compute-bound (dequant ALU); if equal, memory-bound.
-// Not wired into any real path except behind the probe flag.
-kernel void q4k_readbw_probe(
-    device float* arena         [[buffer(0)]],
-    constant ulong& x_off         [[buffer(1)]],
-    constant ulong& w_off         [[buffer(2)]],
-    constant ulong& dst_off       [[buffer(3)]],
-    constant uint& k_dim          [[buffer(4)]],
-    constant uint& n_dim          [[buffer(5)]],
-    uint gid                     [[thread_position_in_grid]]
-) {
-    if (gid >= n_dim) return;
-    const uint nblocks   = k_dim / DQ_QK_K;
-    const uint BLK_BYTES = 2u + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 2u; // 144
-    device const uint* w = (device const uint*)((device char*)arena + w_off
-                            + (ulong)gid * nblocks * BLK_BYTES);
-    const uint nwords = nblocks * BLK_BYTES / 4u;
-    uint acc = 0u;
-    for (uint i = 0u; i < nwords; ++i) acc ^= w[i];
-    device float* dst = (device float*)((device char*)arena + dst_off);
-    dst[gid] = float(acc & 1u);
-}
-
-// DIAGNOSTIC: perfectly-coalesced, max-MLP flat read of the weight region
-// (RLX_METAL_Q4K_PROBE=flat). Thread `gid` reads flat word `gid` of the whole
-// [n_dim, nblocks*144] weight — consecutive threads = consecutive words =
-// ideal coalescing, millions of threads = max memory-level parallelism. If
-// this hits ~peak GB/s but the row-per-thread probe doesn't, the GEMV is
-// coalescing/occupancy-limited (rewrite helps); if this is ALSO slow, the
-// arena memory itself is the ceiling (rewrite can't help).
-kernel void q4k_flatread_probe(
-    device float* arena         [[buffer(0)]],
-    constant ulong& x_off         [[buffer(1)]],
-    constant ulong& w_off         [[buffer(2)]],
-    constant ulong& dst_off       [[buffer(3)]],
-    constant uint& k_dim          [[buffer(4)]],
-    constant uint& n_dim          [[buffer(5)]],
-    uint gid                     [[thread_position_in_grid]]
-) {
-    const uint nblocks = k_dim / DQ_QK_K;
-    const ulong total_words = (ulong)n_dim * nblocks * 144u / 4u;
-    if ((ulong)gid >= total_words) return;
-    device const uint* w = (device const uint*)((device char*)arena + w_off);
-    uint v = w[gid];
-    if (v == 0xDEADBEEFu) {
-        device float* dst = (device float*)((device char*)arena + dst_off);
-        dst[gid % n_dim] = 1.0f;
-    }
-}
-
 // ── Fused Q4_K_M GEMV: dst[n] = sum_k x[k] * dequant(w[n,k]) ─────────────
 //
 // Skips the f32 dequant scratch entirely — each thread streams one
@@ -1810,6 +1756,31 @@ inline float q6k_gemv_row_f32(device const float* x, device const uchar* w0, uin
     return acc;
 }
 
+// One Q5_0 GEMV output column (32-elem blocks, 22 bytes/block).
+inline float q5_0_gemv_row_f32(device const float* x, device const uchar* w0, uint nblocks) {
+    const uint BLK = 22u;
+    float acc = 0.0f;
+    uint x_idx = 0u;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK;
+        float d = dq_read_f16(w0, off);
+        uint qh = uint(w0[off + 2u]) | (uint(w0[off + 3u]) << 8u)
+            | (uint(w0[off + 4u]) << 16u) | (uint(w0[off + 5u]) << 24u);
+        device const uchar* qs = w0 + off + 6u;
+        for (uint j = 0u; j < 16u; ++j) {
+            uchar bx = qs[j];
+            uint xh0 = ((qh >> j) & 0x01u) << 4u;
+            uint xh1 = ((qh >> (j + 16u)) & 0x01u) << 4u;
+            float w0v = d * float(int((bx & 0x0Fu) | xh0) - 16);
+            float w1v = d * float(int((bx >> 4) | xh1) - 16);
+            acc += x[x_idx] * w0v;
+            acc += x[x_idx + 1u] * w1v;
+            x_idx += 2u;
+        }
+    }
+    return acc;
+}
+
 // Fused gate_proj + up_proj + silu + mul (Q4_K, m == 1).
 //   dst[i] = up[i] * (gate[i] / (1 + exp(-gate[i])))
 // One thread per intermediate column i; each thread runs two Q4_K GEMVs over
@@ -1836,6 +1807,84 @@ kernel void q4k_swiglu_mv_f32(
     float up   = q4k_gemv_row_f32(x, wu, nblocks);
     // Match `silu_inplace` (gate/(1+exp(-gate))) then commutative `* up`.
     dst[gid] = up * (gate / (1.0f + exp(-gate)));
+}
+
+// Fused gate+up Q4_K GEMV with GELU-approx epilogue (Gemma MLP).
+//   dst[i] = up[i] * gelu_approx(gate[i])
+kernel void q4k_gelu_mv_f32(
+    device float* arena       [[buffer(0)]],
+    constant ulong& x_off     [[buffer(1)]],
+    constant ulong& gate_off  [[buffer(2)]],
+    constant ulong& up_off    [[buffer(3)]],
+    constant ulong& dst_off   [[buffer(4)]],
+    constant uint& k_dim      [[buffer(5)]],
+    constant uint& n_dim      [[buffer(6)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 144u;
+    device const float* x  = (device const float*)((device char*)arena + x_off);
+    device const uchar* wg = (device const uchar*)arena + gate_off + (ulong)gid * nblocks * BLK_BYTES;
+    device const uchar* wu = (device const uchar*)arena + up_off   + (ulong)gid * nblocks * BLK_BYTES;
+    device float* dst       = (device float*)((device char*)arena + dst_off);
+    float gate = q4k_gemv_row_f32(x, wg, nblocks);
+    float up   = q4k_gemv_row_f32(x, wu, nblocks);
+    const float kAlpha = 0.044715f;
+    const float kSqrt2OverPi = 0.7978845608f;
+    float x3 = gate * gate * gate;
+    float gelu = 0.5f * gate * (1.0f + tanh(kSqrt2OverPi * (gate + kAlpha * x3)));
+    dst[gid] = up * gelu;
+}
+
+// Fused gate+up Q5_0 GEMV with SwiGLU epilogue (Gemma 270M gate_up at hidden=640).
+kernel void q5_0_swiglu_mv_f32(
+    device float* arena       [[buffer(0)]],
+    constant ulong& x_off     [[buffer(1)]],
+    constant ulong& gate_off  [[buffer(2)]],
+    constant ulong& up_off    [[buffer(3)]],
+    constant ulong& dst_off   [[buffer(4)]],
+    constant uint& k_dim      [[buffer(5)]],
+    constant uint& n_dim      [[buffer(6)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = (k_dim + 31u) / 32u;
+    const uint BLK_BYTES = 22u;
+    device const float* x  = (device const float*)((device char*)arena + x_off);
+    device const uchar* wg = (device const uchar*)arena + gate_off + (ulong)gid * nblocks * BLK_BYTES;
+    device const uchar* wu = (device const uchar*)arena + up_off   + (ulong)gid * nblocks * BLK_BYTES;
+    device float* dst       = (device float*)((device char*)arena + dst_off);
+    float gate = q5_0_gemv_row_f32(x, wg, nblocks);
+    float up   = q5_0_gemv_row_f32(x, wu, nblocks);
+    dst[gid] = up * (gate / (1.0f + exp(-gate)));
+}
+
+// Fused gate+up Q5_0 GEMV with GELU-approx epilogue.
+kernel void q5_0_gelu_mv_f32(
+    device float* arena       [[buffer(0)]],
+    constant ulong& x_off     [[buffer(1)]],
+    constant ulong& gate_off  [[buffer(2)]],
+    constant ulong& up_off    [[buffer(3)]],
+    constant ulong& dst_off   [[buffer(4)]],
+    constant uint& k_dim      [[buffer(5)]],
+    constant uint& n_dim      [[buffer(6)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = (k_dim + 31u) / 32u;
+    const uint BLK_BYTES = 22u;
+    device const float* x  = (device const float*)((device char*)arena + x_off);
+    device const uchar* wg = (device const uchar*)arena + gate_off + (ulong)gid * nblocks * BLK_BYTES;
+    device const uchar* wu = (device const uchar*)arena + up_off   + (ulong)gid * nblocks * BLK_BYTES;
+    device float* dst       = (device float*)((device char*)arena + dst_off);
+    float gate = q5_0_gemv_row_f32(x, wg, nblocks);
+    float up   = q5_0_gemv_row_f32(x, wu, nblocks);
+    const float kAlpha = 0.044715f;
+    const float kSqrt2OverPi = 0.7978845608f;
+    float x3 = gate * gate * gate;
+    float gelu = 0.5f * gate * (1.0f + tanh(kSqrt2OverPi * (gate + kAlpha * x3)));
+    dst[gid] = up * gelu;
 }
 
 // Fused down_proj + residual add (Q4_K, m == 1).
@@ -1882,5 +1931,27 @@ kernel void q6k_mv_residual_f32(
     device float* dst        = (device float*)((device char*)arena + dst_off);
     device const float* res = (device const float*)((device char*)arena + res_off);
     float acc = q6k_gemv_row_f32(x, w0, nblocks);
+    dst[gid] = res[gid] + acc;
+}
+
+// Fused down_proj + residual add (Q5_0, m == 1).
+kernel void q5_0_mv_residual_f32(
+    device float* arena       [[buffer(0)]],
+    constant ulong& x_off     [[buffer(1)]],
+    constant ulong& w_off     [[buffer(2)]],
+    constant ulong& dst_off   [[buffer(3)]],
+    constant ulong& res_off   [[buffer(4)]],
+    constant uint& k_dim      [[buffer(5)]],
+    constant uint& n_dim      [[buffer(6)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+    const uint nblocks = (k_dim + 31u) / 32u;
+    const uint BLK_BYTES = 22u;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + (ulong)gid * nblocks * BLK_BYTES;
+    device float* dst        = (device float*)((device char*)arena + dst_off);
+    device const float* res = (device const float*)((device char*)arena + res_off);
+    float acc = q5_0_gemv_row_f32(x, w0, nblocks);
     dst[gid] = res[gid] + acc;
 }

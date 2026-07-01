@@ -28,7 +28,7 @@ use rlx_ir::{Graph, Op};
 use std::sync::{Arc, Mutex};
 
 use crate::gguf_host::scheme_from_id;
-use crate::kernels::dequant_gguf_kernel;
+use crate::kernels::{dequant_gguf_kernel, dequant_matmul_gguf_kernel};
 
 fn slab_bytes_for(scheme: rlx_ir::quant::QuantScheme, k: usize, n: usize) -> usize {
     let block_elems = scheme.gguf_block_size() as usize;
@@ -63,6 +63,53 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
     max
 }
 
+/// Fused on-device GEMV for decode (`m == 1`) on Q4_K / Q6_K — matches
+/// rlx-vulkan `dequant_matmul` and rlx-cpu `gguf_matmul_bt`.
+pub fn gguf_fused_gemv_m1_supported(scheme_id: u32, m: usize, k: usize) -> bool {
+    m == 1 && k.is_multiple_of(256) && matches!(scheme_id, 0 | 2)
+}
+
+/// Launch [`dequant_matmul_gguf`] — one thread per output column.
+pub fn run_dequant_matmul_gguf_gemv_m1(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<f32>,
+    n: usize,
+    k: usize,
+    scheme_id: u32,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+) {
+    debug_assert!(gguf_fused_gemv_m1_supported(scheme_id, 1, k));
+    let kernel = dequant_matmul_gguf_kernel(ctx);
+    let (grid, block) = crate::kernels::dispatch_grid_1d(n as u32, 64);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let x_off = (x_byte_off / 4) as u32;
+    let out_off = (out_byte_off / 4) as u32;
+    let w_off = w_byte_off as u32;
+    let n_u = n as u32;
+    let k_u = k as u32;
+    let mut launcher = stream.launch_builder(&kernel.function);
+    launcher
+        .arg(&mut *buffer)
+        .arg(&n_u)
+        .arg(&k_u)
+        .arg(&x_off)
+        .arg(&w_off)
+        .arg(&out_off)
+        .arg(&scheme_id);
+    unsafe {
+        launcher
+            .launch(cfg)
+            .expect("rlx-cuda: dequant_matmul_gguf launch failed");
+    }
+}
+
 /// Launch `dequant_gguf` into arena scratch, then `C = X @ W^T` via cuBLAS.
 pub fn run_dequant_matmul_gguf_gpu(
     ctx: &Arc<CudaContext>,
@@ -82,13 +129,18 @@ pub fn run_dequant_matmul_gguf_gpu(
     let block_elems = scheme.gguf_block_size() as usize;
     let total = k * n;
     let num_blocks = total / block_elems.max(1);
+    if num_blocks == 0 {
+        panic!(
+            "rlx-cuda: dequant_gguf num_blocks=0 (m={m}, k={k}, n={n}, scheme_id={scheme_id}, block_elems={block_elems})"
+        );
+    }
 
     let kernel = dequant_gguf_kernel(ctx);
-    let block = 256u32.min(num_blocks as u32).max(1);
-    let grid = num_blocks.div_ceil(block as usize) as u32;
+    let threads = 256u32.min(num_blocks as u32).max(1);
+    let grid = num_blocks.div_ceil(threads as usize) as u32;
     let cfg = LaunchConfig {
         grid_dim: (grid, 1, 1),
-        block_dim: (block, 1, 1),
+        block_dim: (threads, 1, 1),
         shared_mem_bytes: 0,
     };
     let dst_f32_off = (scratch_byte_off / 4) as u32;

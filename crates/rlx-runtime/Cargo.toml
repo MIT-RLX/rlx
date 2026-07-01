@@ -96,6 +96,11 @@ cufft = ["cuda", "rlx-cuda/cufft"]
 # Native single-kernel Stockham FFT (see rlx-cuda's `native-cuda-fft` feature).
 native-cuda-fft = ["cuda", "rlx-cuda/native-cuda-fft"]
 
+# Single-kernel on-chip FFT for Metal/wgpu (n in (1024, 4096]/(1024, 2048]):
+# whole transform in threadgroup memory, no per-stage DRAM round-trip.
+# Forwards to whichever GPU backend crates are compiled. `RLX_FFT_FAST=0` disables.
+native-gpu-fft = ["rlx-metal?/native-gpu-fft", "rlx-wgpu?/native-gpu-fft"]
+
 # AMD GPU (ROCm/HIP); splat via CPU reference between segments.
 rocm = ["cpu", "dep:rlx-rocm"]
 

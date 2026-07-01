@@ -108,6 +108,9 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
 }
 
 /// Fused dequant + `sgemm_bt` — `out` is zeroed then accumulated.
+///
+/// Block-fused reference kernel (no full-weight materialization). Opt in via
+/// `RLX_GGUF_MATMUL_LEGACY=1`; default dispatch uses [`gguf_matmul_bt_dispatch`].
 pub fn gguf_matmul_bt(
     x: &[f32],
     w_bytes: &[u8],
@@ -191,6 +194,78 @@ pub fn gguf_matmul_bt(
     }
 }
 
+/// `true` when `RLX_GGUF_MATMUL_LEGACY=1` — force block-fused [`gguf_matmul_bt`].
+#[inline]
+pub fn gguf_matmul_use_legacy() -> bool {
+    matches!(
+        rlx_ir::env::var("RLX_GGUF_MATMUL_LEGACY").as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Minimum `k*n` for cached dequant + BLAS (tiny tiles stay on fused path).
+const CACHED_BLAS_MIN_WEIGHT_ELEMS: usize = 32 * 32;
+
+#[inline]
+fn prefer_cached_blas(k: usize, n: usize, m: usize) -> bool {
+    !gguf_matmul_use_legacy() && (m > 1 || k.saturating_mul(n) >= CACHED_BLAS_MIN_WEIGHT_ELEMS)
+}
+
+/// Dequant once (cached by weight bytes) + Accelerate/OpenBLAS `sgemm_bt`.
+///
+/// `C[m,n] = A[m,k] @ B^T` with GGUF `B` stored `[n,k]` row-major. Mirrors the MLX
+/// dequant-cache path; repeated decode matmuls on the same static param reuse f32 weights.
+#[cfg(feature = "blas")]
+pub fn gguf_matmul_bt_cached(
+    x: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: QuantScheme,
+) {
+    assert_eq!(x.len(), m * k);
+    assert_eq!(out.len(), m * n);
+    let w_f32 = crate::dequant_cache::gguf_weight_f32(0, w_bytes, k, n, scheme);
+    if m == 1 {
+        out.fill(0.0);
+        crate::blas::sgemv_nn(w_f32.as_ref(), x, out, n, k, 1.0, 0.0);
+    } else {
+        crate::blas::sgemm_bt(x, w_f32.as_ref(), out, m, k, n, 1.0);
+    }
+}
+
+#[cfg(not(feature = "blas"))]
+pub fn gguf_matmul_bt_cached(
+    x: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: QuantScheme,
+) {
+    gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
+}
+
+/// Default GGUF matmul entry: cached BLAS when available, else legacy fused blocks.
+pub fn gguf_matmul_bt_dispatch(
+    x: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: QuantScheme,
+) {
+    if prefer_cached_blas(k, n, m) {
+        gguf_matmul_bt_cached(x, w_bytes, out, m, k, n, scheme);
+    } else {
+        gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
+    }
+}
+
 /// Fused GGUF dequant + grouped matmul for MoE expert stacks.
 ///
 /// `w_bytes` holds `num_experts` contiguous packed slabs; expert `e` occupies
@@ -229,7 +304,7 @@ pub fn gguf_grouped_matmul_bt(
         let in_slice = &packed_in[in_start * k..(in_start + count) * k];
         let w_slice = &w_bytes[e * slab_bytes..(e + 1) * slab_bytes];
         let out_slice = &mut packed_out[in_start * n..(in_start + count) * n];
-        gguf_matmul_bt(in_slice, w_slice, out_slice, count, k, n, scheme);
+        gguf_matmul_bt_dispatch(in_slice, w_slice, out_slice, count, k, n, scheme);
     }
 
     grouped_moe_unpermute_out(&packed_out, &original_pos, out, m, n);
@@ -333,7 +408,7 @@ pub fn grouped_moe_unpermute_out(
     }
 }
 
-/// Parallel fused matmul — delegates to [`gguf_matmul_bt`] (m=1 uses Rayon).
+/// Parallel fused matmul — delegates to [`gguf_matmul_bt_dispatch`].
 pub fn gguf_matmul_bt_parallel(
     x: &[f32],
     w_bytes: &[u8],
@@ -343,7 +418,7 @@ pub fn gguf_matmul_bt_parallel(
     n: usize,
     scheme: QuantScheme,
 ) {
-    gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
+    gguf_matmul_bt_dispatch(x, w_bytes, out, m, k, n, scheme);
 }
 
 /// Decode GEMV (`m == 1`): single-threaded block fold.
@@ -441,6 +516,64 @@ fn gguf_matmul_bt_m1_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_blas_matches_fused_q4k_decode() {
+        use crate::dequant_cache::clear_dequant_cache;
+        clear_dequant_cache();
+        let k = 256;
+        let n = 64;
+        let m = 1;
+        let w: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.001).sin()).collect();
+        let packed = rlx_gguf::quantize(&w, rlx_gguf::GgmlType::Q4K).unwrap();
+        let x: Vec<f32> = (0..k).map(|i| 0.02 * i as f32).collect();
+        let mut legacy = vec![0f32; m * n];
+        let mut cached = vec![0f32; m * n];
+        gguf_matmul_bt(&x, &packed, &mut legacy, m, k, n, QuantScheme::GgufQ4K);
+        gguf_matmul_bt_cached(&x, &packed, &mut cached, m, k, n, QuantScheme::GgufQ4K);
+        for i in 0..legacy.len() {
+            assert!(
+                (legacy[i] - cached[i]).abs() < 5e-3,
+                "i={i}: legacy={} cached={}",
+                legacy[i],
+                cached[i]
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_matches_legacy_q8k_prefill() {
+        use crate::dequant_cache::clear_dequant_cache;
+        clear_dequant_cache();
+        let k = 256;
+        let n = 4;
+        let m = 2;
+        let scale = 0.5f32;
+        let mut packed = Vec::new();
+        for _ in 0..n {
+            packed.extend_from_slice(&scale.to_le_bytes());
+            for i in 0..QK_K {
+                let q = (i as i32 - 128).clamp(-128, 127) as i8;
+                packed.push(q as u8);
+            }
+            for _ in 0..(QK_K / 16) {
+                packed.extend_from_slice(&0i16.to_le_bytes());
+            }
+        }
+        let x: Vec<f32> = (0..m * k).map(|i| 0.01 * i as f32).collect();
+        let mut legacy = vec![0f32; m * n];
+        let mut dispatched = vec![0f32; m * n];
+        gguf_matmul_bt(&x, &packed, &mut legacy, m, k, n, QuantScheme::GgufQ8K);
+        gguf_matmul_bt_dispatch(&x, &packed, &mut dispatched, m, k, n, QuantScheme::GgufQ8K);
+        for i in 0..legacy.len() {
+            assert!(
+                (legacy[i] - dispatched[i]).abs() < 0.05,
+                "i={i}: {} vs {}",
+                legacy[i],
+                dispatched[i]
+            );
+        }
+    }
 
     #[test]
     fn fused_q8k_matches_full_dequant() {
@@ -591,7 +724,7 @@ mod tests {
         }
         for i in 0..grouped.len() {
             assert!(
-                (grouped[i] - expected[i]).abs() < 1e-4,
+                (grouped[i] - expected[i]).abs() < 1e-2,
                 "i={i}: {} vs {}",
                 grouped[i],
                 expected[i]

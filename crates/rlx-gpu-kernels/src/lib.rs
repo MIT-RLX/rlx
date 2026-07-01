@@ -62,6 +62,7 @@ pub const GROUPED_MATMUL_CU: &str = include_str!("../kernels/grouped_matmul.cu")
 pub const SCATTER_ADD_CU: &str = include_str!("../kernels/scatter_add.cu");
 pub const DEQUANT_MATMUL_CU: &str = include_str!("../kernels/dequant_matmul.cu");
 pub const DEQUANT_GGUF_CU: &str = include_str!("../kernels/dequant_gguf.cu");
+pub const DEQUANT_MATMUL_GGUF_CU: &str = include_str!("../kernels/dequant_matmul_gguf.cu");
 pub const SAMPLE_CU: &str = include_str!("../kernels/sample.cu");
 pub const SELECTIVE_SCAN_CU: &str = include_str!("../kernels/selective_scan.cu");
 pub const POOL1D_CU: &str = include_str!("../kernels/pool1d.cu");

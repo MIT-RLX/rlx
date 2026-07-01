@@ -212,4 +212,221 @@ fn metal_fused_decode_mlp_matches_unfused_and_cpu() {
     run_case(rlx_gguf::GgmlType::Q4K, QuantScheme::GgufQ4K, "all-Q4_K");
     // gate/up Q4_K, down Q6_K (realistic GGUF Q4_K_M layout).
     run_case(rlx_gguf::GgmlType::Q6K, QuantScheme::GgufQ6K, "Q6_K-down");
+    run_q5_combined_gelu_case("Q5_0-combined-gelu-direct-add");
+    run_q5_combined_gelu_post_ffn_case("Q5_0-combined-gelu-post-ffn");
+}
+
+fn run_q5_combined_gelu_case(label: &str) {
+    const H: usize = 640;
+    const I: usize = 1024;
+    let f = DType::F32;
+    let gate_up_p = weight(0.011, H, 2 * I, rlx_gguf::GgmlType::Q5_0);
+    let down_p = weight(0.013, I, H, rlx_gguf::GgmlType::Q5_0);
+
+    let mut g = Graph::new("fused_decode_mlp_q5_gelu");
+    let r = g.input("r", Shape::new(&[1, 1, H], f));
+    let gamma = g.input("gamma", Shape::new(&[H], f));
+    let beta = g.input("beta", Shape::new(&[H], f));
+    let gate_up_w = g.param("gate_up_w", Shape::new(&[gate_up_p.len()], DType::U8));
+    let down_w = g.param("down_w", Shape::new(&[down_p.len()], DType::U8));
+
+    let normed = g.add_node(
+        Op::RmsNorm {
+            axis: -1,
+            eps: 1e-5,
+        },
+        vec![r, gamma, beta],
+        Shape::new(&[1, 1, H], f),
+    );
+    let combined = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ5_0,
+        },
+        vec![normed, gate_up_w],
+        Shape::new(&[1, 1, 2 * I], f),
+    );
+    let gate = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: I,
+        },
+        vec![combined],
+        Shape::new(&[1, 1, I], f),
+    );
+    let up = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: I,
+            len: I,
+        },
+        vec![combined],
+        Shape::new(&[1, 1, I], f),
+    );
+    let gate_act = g.add_node(
+        Op::Activation(Activation::GeluApprox),
+        vec![gate],
+        Shape::new(&[1, 1, I], f),
+    );
+    let prod = g.add_node(
+        Op::Binary(BinaryOp::Mul),
+        vec![gate_act, up],
+        Shape::new(&[1, 1, I], f),
+    );
+    let down = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ5_0,
+        },
+        vec![prod, down_w],
+        Shape::new(&[1, 1, H], f),
+    );
+    let out = g.add_node(
+        Op::Binary(BinaryOp::Add),
+        vec![r, down],
+        Shape::new(&[1, 1, H], f),
+    );
+    g.set_outputs(vec![out]);
+
+    let r_vec: Vec<f32> = (0..H).map(|i| ((i as f32) * 0.03).sin()).collect();
+    let gamma: Vec<f32> = (0..H)
+        .map(|i| 1.0 + ((i as f32) * 0.001).cos() * 0.1)
+        .collect();
+    let beta = vec![0.0f32; H];
+
+    let run = |device: Device| -> Vec<f32> {
+        let mut s = Session::new(device).compile(g.clone());
+        s.set_param_typed("gate_up_w", &gate_up_p, DType::U8);
+        s.set_param_typed("down_w", &down_p, DType::U8);
+        s.run(&[("r", &r_vec), ("gamma", &gamma), ("beta", &beta)])
+            .remove(0)
+    };
+
+    rlx_ir::env::unset("RLX_METAL_FUSE_DECODE");
+    let before = rlx_metal::thunk::fused_decode_mlp_blocks();
+    let fused = run(Device::Metal);
+    let fired = rlx_metal::thunk::fused_decode_mlp_blocks() - before;
+    assert_eq!(
+        fired, 1,
+        "{label}: expected one combined Q5_0 GELU fused block"
+    );
+
+    rlx_ir::env::set("RLX_METAL_FUSE_DECODE", "0");
+    let unfused = run(Device::Metal);
+    rlx_ir::env::unset("RLX_METAL_FUSE_DECODE");
+
+    let cpu = run(Device::Cpu);
+    let fu = max_rel(&fused, &unfused);
+    let fc = max_rel(&fused, &cpu);
+    eprintln!("[Q5_0-combined-gelu] fused-vs-unfused rel={fu:.3e} fused-vs-cpu rel={fc:.3e}");
+    assert!(fu < 5e-3, "fused vs unfused rel {fu}");
+    assert!(fc < 5e-2, "{label}: fused vs cpu rel {fc}");
+}
+
+fn run_q5_combined_gelu_post_ffn_case(label: &str) {
+    const H: usize = 640;
+    const I: usize = 1024;
+    let f = DType::F32;
+    let gate_up_p = weight(0.011, H, 2 * I, rlx_gguf::GgmlType::Q5_0);
+    let down_p = weight(0.013, I, H, rlx_gguf::GgmlType::Q5_0);
+
+    let mut g = Graph::new("fused_decode_mlp_q5_gelu_post_ffn");
+    let r = g.input("r", Shape::new(&[1, 1, H], f));
+    let gamma = g.input("gamma", Shape::new(&[H], f));
+    let beta = g.input("beta", Shape::new(&[H], f));
+    let post_gamma = g.input("post_gamma", Shape::new(&[H], f));
+    let gate_up_w = g.param("gate_up_w", Shape::new(&[gate_up_p.len()], DType::U8));
+    let down_w = g.param("down_w", Shape::new(&[down_p.len()], DType::U8));
+
+    let normed = g.add_node(
+        Op::RmsNorm {
+            axis: -1,
+            eps: 1e-5,
+        },
+        vec![r, gamma, beta],
+        Shape::new(&[1, 1, H], f),
+    );
+    let combined = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ5_0,
+        },
+        vec![normed, gate_up_w],
+        Shape::new(&[1, 1, 2 * I], f),
+    );
+    let gate = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: 0,
+            len: I,
+        },
+        vec![combined],
+        Shape::new(&[1, 1, I], f),
+    );
+    let up = g.add_node(
+        Op::Narrow {
+            axis: 2,
+            start: I,
+            len: I,
+        },
+        vec![combined],
+        Shape::new(&[1, 1, I], f),
+    );
+    let gate_act = g.add_node(
+        Op::Activation(Activation::GeluApprox),
+        vec![gate],
+        Shape::new(&[1, 1, I], f),
+    );
+    let prod = g.add_node(
+        Op::Binary(BinaryOp::Mul),
+        vec![gate_act, up],
+        Shape::new(&[1, 1, I], f),
+    );
+    let down = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ5_0,
+        },
+        vec![prod, down_w],
+        Shape::new(&[1, 1, H], f),
+    );
+    let post_ffn = g.add_node(
+        Op::RmsNorm {
+            axis: -1,
+            eps: 1e-5,
+        },
+        vec![down, post_gamma, beta],
+        Shape::new(&[1, 1, H], f),
+    );
+    let out = g.add_node(
+        Op::Binary(BinaryOp::Add),
+        vec![r, post_ffn],
+        Shape::new(&[1, 1, H], f),
+    );
+    g.set_outputs(vec![out]);
+
+    let r_vec: Vec<f32> = (0..H).map(|i| ((i as f32) * 0.03).sin()).collect();
+    let gamma: Vec<f32> = (0..H)
+        .map(|i| 1.0 + ((i as f32) * 0.001).cos() * 0.1)
+        .collect();
+    let beta = vec![0.0f32; H];
+
+    let run = |device: Device| -> Vec<f32> {
+        let mut s = Session::new(device).compile(g.clone());
+        s.set_param_typed("gate_up_w", &gate_up_p, DType::U8);
+        s.set_param_typed("down_w", &down_p, DType::U8);
+        s.run(&[
+            ("r", &r_vec),
+            ("gamma", &gamma),
+            ("beta", &beta),
+            ("post_gamma", &gamma),
+        ])
+        .remove(0)
+    };
+
+    rlx_ir::env::unset("RLX_METAL_FUSE_DECODE");
+    let before = rlx_metal::thunk::fused_decode_mlp_blocks();
+    let _fused = run(Device::Metal);
+    let fired = rlx_metal::thunk::fused_decode_mlp_blocks() - before;
+    assert_eq!(
+        fired, 1,
+        "{label}: expected gate_up-only fused block with post_ffn norm in the tail"
+    );
 }

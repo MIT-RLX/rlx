@@ -64,7 +64,10 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
             continue;
         }
         let elems = node.shape.num_elements().unwrap_or(0);
-        let bytes = elems * 4;
+        let bytes = match node.shape.dtype() {
+            rlx_ir::DType::U8 | rlx_ir::DType::I8 | rlx_ir::DType::Bool => elems,
+            _ => elems * 4,
+        };
         let aligned = bytes.div_ceil(align) * align;
         assignments.insert(
             node.id,

@@ -281,6 +281,11 @@ pub trait ExecutableGraph: Send {
         None
     }
 
+    /// Read one row from a resident GPU input handle without full-tensor D2H.
+    fn read_gpu_handle_row(&self, _name: &str, _row: usize, _row_inner: usize) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Register a targeted *row* feed for resident KV decode (graphs that emit
     /// the new token at the last bucket-padded output row). Returns false when
     /// the backend has no GPU-resident handle support. See [`feed_kv_row`].
@@ -294,6 +299,53 @@ pub trait ExecutableGraph: Send {
     /// unsupported (caller keeps the host KV path).
     fn feed_kv_row(&mut self, _src_row: usize, _dst_row: usize, _row_elems: usize) -> bool {
         false
+    }
+
+    /// Mark a graph input as a device-resident handle with no host mirror.
+    fn prepare_resident_gpu_handle(&mut self, _name: &str) -> bool {
+        false
+    }
+
+    /// Upload bound (non-resident) GPU handle mirrors into the arena.
+    fn stage_bound_gpu_handles_to_arena(&mut self) {}
+
+    /// D2D seed of resident `past_k_*` / `past_v_*` from another executable's
+    /// resident prefix (bucket rollover without host DRAM round-trip).
+    fn seed_resident_kv_prefix_from(
+        &mut self,
+        _src: &dyn ExecutableGraph,
+        _prefix_tokens: usize,
+        _outgoing_upper: usize,
+        _kv_dim: usize,
+        _n_layers: usize,
+    ) -> bool {
+        false
+    }
+
+    /// D2D copy resident KV rows `[from_row..to_row)` from another executable.
+    fn copy_resident_kv_rows_from(
+        &mut self,
+        _src: &dyn ExecutableGraph,
+        _from_row: usize,
+        _to_row: usize,
+        _outgoing_upper: usize,
+        _kv_dim: usize,
+        _n_layers: usize,
+    ) -> bool {
+        false
+    }
+
+    /// CUDA-only: mutable access for device KV seeding. Default `None`.
+    #[cfg(feature = "cuda")]
+    fn cuda_executable_for_kv_seed(&mut self) -> Option<&mut rlx_cuda::backend::CudaExecutable> {
+        let _ = self;
+        None
+    }
+
+    /// CUDA-only: immutable access for device KV seeding. Default `None`.
+    #[cfg(feature = "cuda")]
+    fn cuda_executable_for_kv_seed_ref(&self) -> Option<&rlx_cuda::backend::CudaExecutable> {
+        None
     }
 
     /// Read one row from a row-major graph output after `run` / `run_read_outputs`.
@@ -2004,6 +2056,15 @@ pub mod vulkan_backend {
             self.inner.read_output_row(out_idx, row, row_inner)
         }
 
+        fn read_gpu_handle_row(
+            &self,
+            name: &str,
+            row: usize,
+            row_inner: usize,
+        ) -> Option<Vec<f32>> {
+            self.inner.read_gpu_handle_row(name, row, row_inner)
+        }
+
         /// The Vulkan arena is f32-uniform: widen F16/BF16/int params to f32.
         fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
             match dtype {
@@ -2418,6 +2479,13 @@ pub mod mlx_backend {
         fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
             self.inner.set_gpu_handle_feed(handle_name, output_index);
             true
+        }
+        fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+            self.inner.register_kv_row_feed(handle_name, output_index);
+            true
+        }
+        fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
+            self.inner.feed_kv_row(src_row, dst_row, row_elems).is_ok()
         }
         fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
             self.inner.read_gpu_handle(name).ok()
@@ -3342,6 +3410,90 @@ pub mod cuda_backend {
         }
         fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
             self.inner.read_gpu_handle(name)
+        }
+        fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+            self.inner.register_kv_row_feed(handle_name, output_index);
+            true
+        }
+        fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
+            self.inner.feed_kv_row(src_row, dst_row, row_elems);
+            true
+        }
+        fn read_output_row(
+            &self,
+            out_idx: usize,
+            row: usize,
+            row_inner: usize,
+        ) -> Option<Vec<f32>> {
+            self.inner.read_output_row(out_idx, row, row_inner)
+        }
+        fn read_gpu_handle_row(
+            &self,
+            name: &str,
+            row: usize,
+            row_inner: usize,
+        ) -> Option<Vec<f32>> {
+            self.inner.read_gpu_handle_row(name, row, row_inner)
+        }
+        fn prepare_resident_gpu_handle(&mut self, name: &str) -> bool {
+            self.inner.prepare_resident_gpu_handle(name)
+        }
+        fn stage_bound_gpu_handles_to_arena(&mut self) {
+            self.inner.stage_bound_gpu_handles_to_arena();
+        }
+        fn seed_resident_kv_prefix_from(
+            &mut self,
+            src: &dyn ExecutableGraph,
+            prefix_tokens: usize,
+            outgoing_upper: usize,
+            kv_dim: usize,
+            n_layers: usize,
+        ) -> bool {
+            let Some(dst_exe) = self.cuda_executable_for_kv_seed() else {
+                return false;
+            };
+            let Some(src_exe) = src.cuda_executable_for_kv_seed_ref() else {
+                return false;
+            };
+            dst_exe.seed_resident_kv_prefix_from(
+                src_exe,
+                prefix_tokens,
+                outgoing_upper,
+                kv_dim,
+                n_layers,
+            )
+        }
+        fn copy_resident_kv_rows_from(
+            &mut self,
+            src: &dyn ExecutableGraph,
+            from_row: usize,
+            to_row: usize,
+            outgoing_upper: usize,
+            kv_dim: usize,
+            n_layers: usize,
+        ) -> bool {
+            let Some(dst_exe) = self.cuda_executable_for_kv_seed() else {
+                return false;
+            };
+            let Some(src_exe) = src.cuda_executable_for_kv_seed_ref() else {
+                return false;
+            };
+            dst_exe.copy_resident_kv_rows_from(
+                src_exe,
+                from_row,
+                to_row,
+                outgoing_upper,
+                kv_dim,
+                n_layers,
+            )
+        }
+        fn cuda_executable_for_kv_seed(
+            &mut self,
+        ) -> Option<&mut rlx_cuda::backend::CudaExecutable> {
+            Some(&mut self.inner)
+        }
+        fn cuda_executable_for_kv_seed_ref(&self) -> Option<&rlx_cuda::backend::CudaExecutable> {
+            Some(&self.inner)
         }
         fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
             self.inner.set_active_extent(extent);

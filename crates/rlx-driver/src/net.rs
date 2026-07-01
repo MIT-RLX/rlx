@@ -66,8 +66,19 @@ fn write_frame<W: Write>(w: &mut W, kind: u8, a: u32, b: u32, payload: &[u8]) ->
     hdr[1..5].copy_from_slice(&a.to_le_bytes());
     hdr[5..9].copy_from_slice(&b.to_le_bytes());
     hdr[9..13].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    w.write_all(&hdr)?;
-    if !payload.is_empty() {
+    // Coalesce header + payload into ONE write for the small frames that
+    // dominate collective latency: with TCP_NODELAY set, two separate
+    // writes became two segments and an extra RTT-coupled syscall. For
+    // large frames the second write is negligible against the payload, so
+    // keep them separate and skip the copy.
+    const COALESCE_MAX: usize = 1 << 16;
+    if payload.len() <= COALESCE_MAX {
+        let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(payload);
+        w.write_all(&buf)?;
+    } else {
+        w.write_all(&hdr)?;
         w.write_all(payload)?;
     }
     w.flush()

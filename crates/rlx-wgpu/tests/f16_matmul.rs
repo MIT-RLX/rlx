@@ -185,7 +185,7 @@ fn matmul_f16w_matches_cpu_reference_within_f16_tolerance() {
     });
     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
     rx.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("buffer slice mapped");
     let c_gpu: Vec<f32> = cast_slice(&mapped).to_vec();
     drop(mapped);
     staging.unmap();

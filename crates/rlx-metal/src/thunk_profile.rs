@@ -29,10 +29,7 @@ static STATS: Mutex<Option<HashMap<&'static str, ThunkStats>>> = Mutex::new(None
 #[derive(Default, Clone)]
 struct ThunkStats {
     count: u64,
-    /// Wall-clock (encode + commit + wait) — includes per-commit sync latency.
     total_ns: u128,
-    /// True GPU-busy (GPUEndTime - GPUStartTime) — device execution only.
-    gpu_ns: u128,
 }
 
 pub fn enabled() -> bool {
@@ -46,11 +43,6 @@ pub fn reset() {
 }
 
 pub fn record(name: &'static str, dt: Duration) {
-    record_split(name, dt, Duration::ZERO);
-}
-
-/// Record one thunk sample with both wall time and true GPU-busy time.
-pub fn record_split(name: &'static str, wall: Duration, gpu: Duration) {
     if !enabled() {
         return;
     }
@@ -58,8 +50,7 @@ pub fn record_split(name: &'static str, wall: Duration, gpu: Duration) {
     let map = guard.get_or_insert_with(HashMap::new);
     let e = map.entry(name).or_default();
     e.count += 1;
-    e.total_ns += wall.as_nanos();
-    e.gpu_ns += gpu.as_nanos();
+    e.total_ns += dt.as_nanos();
 }
 
 pub fn print_summary() {
@@ -74,63 +65,39 @@ pub fn print_summary() {
         eprintln!("[rlx-metal] thunk profile: no samples");
         return;
     }
-    let total_wall: u128 = map.values().map(|s| s.total_ns).sum();
-    let total_gpu: u128 = map.values().map(|s| s.gpu_ns).sum();
-    // Attribution uses GPU-busy when available (it has no per-commit sync
-    // distortion); fall back to wall if no GPU timestamps were captured.
-    let by_gpu = total_gpu > 0;
-    let denom = if by_gpu { total_gpu } else { total_wall } as f64;
+    let total_ns: u128 = map.values().map(|s| s.total_ns).sum();
     let mut rows: Vec<_> = map
         .iter()
         .map(|(name, s)| {
-            let gpu_ms = s.gpu_ns as f64 / 1e6;
-            let wall_ms = s.total_ns as f64 / 1e6;
-            let key = if by_gpu { s.gpu_ns } else { s.total_ns } as f64;
-            let pct = if denom > 0.0 {
-                100.0 * key / denom
+            let ms = s.total_ns as f64 / 1e6;
+            let pct = if total_ns > 0 {
+                100.0 * s.total_ns as f64 / total_ns as f64
             } else {
                 0.0
             };
-            (*name, s.count, gpu_ms, wall_ms, pct)
+            (*name, s.count, ms, pct)
         })
         .collect();
-    rows.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
     eprintln!(
-        "[rlx-metal] thunk profile — GPU-busy {:.2} ms | wall {:.2} ms (sync overhead {:.2} ms), sorted by {}:",
-        total_gpu as f64 / 1e6,
-        total_wall as f64 / 1e6,
-        (total_wall.saturating_sub(total_gpu)) as f64 / 1e6,
-        if by_gpu { "GPU-busy" } else { "wall" }
+        "[rlx-metal] thunk profile (GPU-sync wall time, {:.2} ms total):",
+        total_ns as f64 / 1e6
     );
-    eprintln!(
-        "{:<32} {:>6} {:>10} {:>10} {:>7}",
-        "thunk", "count", "gpu_ms", "wall_ms", "pct"
-    );
-    eprintln!("{}", "-".repeat(70));
-    let mut buckets: HashMap<&'static str, (f64, f64)> = HashMap::new();
-    for (name, count, gpu_ms, wall_ms, pct) in &rows {
-        eprintln!("{name:<32} {count:>6} {gpu_ms:>10.2} {wall_ms:>10.2} {pct:>6.1}%");
+    eprintln!("{:<32} {:>6} {:>10} {:>7}", "thunk", "count", "ms", "pct");
+    eprintln!("{}", "-".repeat(60));
+    let mut buckets: HashMap<&'static str, f64> = HashMap::new();
+    for (name, count, ms, pct) in &rows {
+        eprintln!("{name:<32} {count:>6} {ms:>10.2} {pct:>6.1}%");
         let bucket = bucket_name(name);
-        let e = buckets.entry(bucket).or_default();
-        e.0 += *gpu_ms;
-        e.1 += *wall_ms;
+        *buckets.entry(bucket).or_default() += *ms;
     }
     let mut bucket_rows: Vec<_> = buckets.into_iter().collect();
-    let bkey = |b: &(f64, f64)| if by_gpu { b.0 } else { b.1 };
-    bucket_rows.sort_by(|a, b| {
-        bkey(&b.1)
-            .partial_cmp(&bkey(&a.1))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    eprintln!("\n[rlx-metal] buckets (gpu_ms / wall_ms):");
-    for (name, (gpu_ms, wall_ms)) in bucket_rows {
-        let pct = if denom > 0.0 {
-            100.0 * (if by_gpu { gpu_ms } else { wall_ms }) / (denom / 1e6)
-        } else {
-            0.0
-        };
-        eprintln!("  {name:<28} {gpu_ms:>10.2} {wall_ms:>10.2} ({pct:>5.1}%)");
+    bucket_rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!("\n[rlx-metal] buckets:");
+    for (name, ms) in bucket_rows {
+        let pct = 100.0 * ms / (total_ns as f64 / 1e6);
+        eprintln!("  {name:<28} {ms:>10.2} ms ({pct:>5.1}%)");
     }
 }
 

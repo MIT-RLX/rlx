@@ -93,15 +93,6 @@ pub mod attention_bwd_gpu;
 pub mod thunk_profile;
 
 #[cfg(rlx_metal_host)]
-pub mod gpu_time;
-
-#[cfg(rlx_metal_host)]
-pub mod encode_profile;
-
-#[cfg(rlx_metal_host)]
-pub mod counter_profile;
-
-#[cfg(rlx_metal_host)]
 pub mod mps_profile;
 
 #[cfg(all(feature = "native-splat", rlx_metal_host))]
