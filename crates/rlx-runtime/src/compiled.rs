@@ -133,6 +133,16 @@ impl CompiledGraph {
         self.inner.read_gpu_handle(name)
     }
 
+    /// Read one row from a resident GPU input handle without full-tensor D2H.
+    pub fn read_gpu_handle_row(
+        &self,
+        name: &str,
+        row: usize,
+        row_inner: usize,
+    ) -> Option<Vec<f32>> {
+        self.inner.read_gpu_handle_row(name, row, row_inner)
+    }
+
     /// Register a targeted row feed for resident KV decode (graphs that emit the
     /// new token at the last bucket-padded output row). No-op (false) on
     /// backends without GPU-resident handle support. See [`Self::feed_kv_row`].
@@ -145,6 +155,61 @@ impl CompiledGraph {
     /// in-place on device. Returns false when unsupported.
     pub fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
         self.inner.feed_kv_row(src_row, dst_row, row_elems)
+    }
+
+    /// Mark a graph input as device-resident without host staging.
+    pub fn prepare_resident_gpu_handle(&mut self, name: &str) -> bool {
+        self.inner.prepare_resident_gpu_handle(name)
+    }
+
+    /// Upload bound (non-resident) GPU handle mirrors into the arena.
+    pub fn stage_bound_gpu_handles_to_arena(&mut self) -> bool {
+        self.inner.stage_bound_gpu_handles_to_arena();
+        true
+    }
+
+    /// D2D copy resident KV rows `[from_row..to_row)` from another compiled graph.
+    pub fn seed_resident_kv_prefix_from(
+        &mut self,
+        src: &CompiledGraph,
+        prefix_tokens: usize,
+        outgoing_upper: usize,
+        kv_dim: usize,
+        n_layers: usize,
+    ) -> bool {
+        if self.device != src.device {
+            return false;
+        }
+        self.inner.seed_resident_kv_prefix_from(
+            src.inner.as_ref(),
+            prefix_tokens,
+            outgoing_upper,
+            kv_dim,
+            n_layers,
+        )
+    }
+
+    /// D2D copy resident KV rows `[from_row..to_row)` from another compiled graph.
+    pub fn copy_resident_kv_rows_from(
+        &mut self,
+        src: &CompiledGraph,
+        from_row: usize,
+        to_row: usize,
+        outgoing_upper: usize,
+        kv_dim: usize,
+        n_layers: usize,
+    ) -> bool {
+        if self.device != src.device {
+            return false;
+        }
+        self.inner.copy_resident_kv_rows_from(
+            src.inner.as_ref(),
+            from_row,
+            to_row,
+            outgoing_upper,
+            kv_dim,
+            n_layers,
+        )
     }
 
     /// Run, refresh GPU handle from output, return that output vector.

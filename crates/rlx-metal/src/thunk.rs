@@ -896,7 +896,7 @@ pub enum Thunk {
         k: u32,
         n: u32,
     },
-    /// Fused decode-layer MLP: gate_proj + up_proj Q4_K GEMVs + SwiGLU
+    /// Fused decode-layer MLP: gate_proj + up_proj packed GEMVs + SwiGLU
     /// (`dst[i] = up[i] * silu(gate[i])`). m == 1 only. Pattern-merged from
     /// `gate(DequantMatMul) → up(DequantMatMul) → silu → mul` by
     /// `fuse_decode_mlp`; one dispatch instead of four. `x` is the (already
@@ -908,9 +908,20 @@ pub enum Thunk {
         dst: usize,
         k: u32,
         n: u32,
+        scheme: rlx_ir::quant::QuantScheme,
+    },
+    /// Fused gate+up packed GEMVs + GELU-approx epilogue (`dst[i] = up[i] * gelu(gate[i])`).
+    FusedMlpGateUpGelu {
+        x: usize,
+        gate_w: usize,
+        up_w: usize,
+        dst: usize,
+        k: u32,
+        n: u32,
+        scheme: rlx_ir::quant::QuantScheme,
     },
     /// Fused decode-layer MLP: down_proj GEMV + residual add
-    /// (`dst[j] = res[j] + down(h)[j]`). m == 1, Q4_K or Q6_K. Pattern-merged
+    /// (`dst[j] = res[j] + down(h)[j]`). m == 1, Q4_K / Q5_0 / Q6_K. Pattern-merged
     /// from `down(DequantMatMul) → add(residual)` by `fuse_decode_mlp`; one
     /// dispatch instead of two. `x` is the SwiGLU output of length `k`.
     FusedMlpDownResidual {
@@ -1246,6 +1257,9 @@ pub enum Thunk {
         inverse: bool,
         norm_tag: u32,
         dtype: rlx_ir::DType,
+        /// native-gpu-fft real→complex fusion: `src` is an n-wide real signal
+        /// (the Concat([signal, zeros]) was dropped); read it with im=0.
+        real_input: bool,
     },
     /// Log-mel from block-layout FFT spectrum (host fallback on Metal).
     LogMel {
@@ -1394,6 +1408,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::DequantMatMulFp8 { .. } => "dequant_matmul_fp8",
         Thunk::DequantMatMulNvfp4 { .. } => "dequant_matmul_nvfp4",
         Thunk::FusedMlpGateUpSwiGLU { .. } => "fused_mlp_gate_up_swiglu",
+        Thunk::FusedMlpGateUpGelu { .. } => "fused_mlp_gate_up_gelu",
         Thunk::FusedMlpDownResidual { .. } => "fused_mlp_down_residual",
     }
 }
@@ -1478,6 +1493,7 @@ impl Thunk {
             | Thunk::DequantMatMulFp8 { .. }
             | Thunk::DequantMatMulNvfp4 { .. }
             | Thunk::FusedMlpGateUpSwiGLU { .. }
+            | Thunk::FusedMlpGateUpGelu { .. }
             | Thunk::FusedMlpDownResidual { .. } => true,
             // ScatterAdd: same zero-padding analysis as CPU — padded
             // updates contribute zero to accumulate-into-zeros, so
@@ -1539,7 +1555,81 @@ impl ThunkSchedule {
             }
         };
 
+        // native-gpu-fft real→complex fusion: a forward FFT whose input is
+        // `Concat([signal, zeros])` (a real signal zero-padded to the 2N block)
+        // reads `signal` directly with im=0, and the Concat + zeros Constant are
+        // dropped (replaced by Nop) — eliminating a memory-bound 2N copy that can
+        // cost as much as the now-4×-faster on-chip FFT. Conservative: only
+        // on-chip radix-4/8 sizes (1024<n<=4096, pow2), single-use Concat/zeros,
+        // and `signal` a resident Input/Param (its arena region is never aliased
+        // away, so reading it one step later than planned is safe).
+        // `RLX_FFT_FUSE_REAL=0` disables.
+        #[cfg(feature = "native-gpu-fft")]
+        let (fft_real_src, fft_real_skip): (
+            std::collections::HashMap<rlx_ir::NodeId, rlx_ir::NodeId>,
+            std::collections::HashSet<rlx_ir::NodeId>,
+        ) = {
+            let mut srcmap = std::collections::HashMap::new();
+            let mut skip = std::collections::HashSet::new();
+            let fuse = !rlx_ir::env::var("RLX_FFT_FUSE_REAL")
+                .is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("off"));
+            if fuse {
+                let mut uses: std::collections::HashMap<rlx_ir::NodeId, u32> =
+                    std::collections::HashMap::new();
+                for node in graph.nodes() {
+                    for &inp in &node.inputs {
+                        *uses.entry(inp).or_insert(0) += 1;
+                    }
+                }
+                for node in graph.nodes() {
+                    let Op::Fft { inverse: false, .. } = &node.op else {
+                        continue;
+                    };
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        continue; // on-chip kernels are f32-only
+                    }
+                    let nc = rlx_ir::fft::fft_meta(&graph.node(node.inputs[0]).shape).n_complex;
+                    if !(nc.is_power_of_two() && nc > rlx_ir::fft::FFT_TILE_SIZE && nc <= 4096) {
+                        continue;
+                    }
+                    let concat_id = node.inputs[0];
+                    let cnode = graph.node(concat_id);
+                    let Op::Concat { axis } = &cnode.op else {
+                        continue;
+                    };
+                    if cnode.inputs.len() != 2
+                        || *axis != cnode.shape.rank() - 1
+                        || uses.get(&concat_id) != Some(&1)
+                    {
+                        continue;
+                    }
+                    let (sig_id, z_id) = (cnode.inputs[0], cnode.inputs[1]);
+                    let is_zeros = matches!(
+                        &graph.node(z_id).op,
+                        Op::Constant { data } if data.iter().all(|&b| b == 0)
+                    );
+                    let signode = graph.node(sig_id);
+                    let sig_ok = matches!(&signode.op, Op::Input { .. } | Op::Param { .. })
+                        && signode.shape.dim(signode.shape.rank() - 1).unwrap_static() == nc;
+                    if is_zeros && uses.get(&z_id) == Some(&1) && sig_ok {
+                        skip.insert(concat_id);
+                        skip.insert(z_id);
+                        srcmap.insert(node.id, sig_id);
+                        if rlx_ir::env::flag("RLX_FFT_FUSE_DEBUG") {
+                            eprintln!("rlx-metal: fused real→complex FFT (n_complex={nc})");
+                        }
+                    }
+                }
+            }
+            (srcmap, skip)
+        };
+
         for node in graph.nodes() {
+            #[cfg(feature = "native-gpu-fft")]
+            if fft_real_skip.contains(&node.id) {
+                thunks.push(Thunk::Nop);
+                continue;
+            }
             // View ops alias their parent's slot (planner did this); the
             // GPU thunk path also emits Nop. Plan #46.
             if rlx_opt::is_pure_view(graph, node) {
@@ -3072,14 +3162,23 @@ impl ThunkSchedule {
                         ),
                         "rlx-metal Op::Fft requires F32, F64, or C64, got {dtype:?}"
                     );
+                    // Fused real→complex: read `signal` directly with im=0.
+                    #[cfg(feature = "native-gpu-fft")]
+                    let (src_id, real_input) = match fft_real_src.get(&node.id) {
+                        Some(&sig) => (sig, true),
+                        None => (node.inputs[0], false),
+                    };
+                    #[cfg(not(feature = "native-gpu-fft"))]
+                    let (src_id, real_input) = (node.inputs[0], false);
                     Thunk::Fft1d {
-                        src: off(node.inputs[0]),
+                        src: off(src_id),
                         dst: off(node.id),
                         outer: meta.outer as u32,
                         n_complex: meta.n_complex as u32,
                         inverse: *inverse,
                         norm_tag: norm.tag(),
                         dtype,
+                        real_input,
                     }
                 }
 
@@ -3928,12 +4027,13 @@ impl ThunkSchedule {
 
         rewrite_simple_elementwise_regions(&mut thunks);
         rewrite_dense_binary_broadcast(&mut thunks);
-        fuse_narrow_clusters(&mut thunks);
-
-        // Fused decode-layer MLP (m == 1 packed-Q4 SwiGLU). Off-switch:
-        // RLX_METAL_FUSE_DECODE=0. Output offsets stay live (never fused away).
         let output_offsets: std::collections::HashSet<usize> =
             graph.outputs.iter().map(|&id| off(id)).collect();
+        fuse_decode_mlp_combined_gate_up(&mut thunks, &output_offsets);
+        fuse_narrow_clusters(&mut thunks);
+
+        // Fused decode-layer MLP (m == 1 packed SwiGLU/GeGLU). Off-switch:
+        // RLX_METAL_FUSE_DECODE=0. Output offsets stay live (never fused away).
         fuse_decode_mlp(&mut thunks, &output_offsets);
 
         Self {
@@ -4459,6 +4559,14 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
             (r, vec![*out])
         }
         Concat { dst, inputs, .. } => (inputs.iter().map(|(o, _)| *o).collect(), vec![*dst]),
+        // Reads `src`, writes each output segment's offset. Modeling this (vs
+        // falling through to the opaque `_ => None` bail) lets the MLP-fusion
+        // liveness scan cross the per-layer QKV split — without it, only the
+        // final layers (whose forward dead-scan never reaches another split)
+        // fused, so 26/28 decode MLP blocks silently stayed unfused.
+        SplitLastAxis { src, segments, .. } => {
+            (vec![*src], segments.iter().map(|(o, _, _)| *o).collect())
+        }
         Narrow { src, dst, .. } => (vec![*src], vec![*dst]),
         Gather {
             table, idx, dst, ..
@@ -4471,6 +4579,13 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
         FusedMmBiasAct { a, w, bias, c, .. } => (vec![*a, *w, *bias], vec![*c]),
         DequantMatMulGguf { x, w_q, dst, .. } => (vec![*x, *w_q], vec![*dst]),
         FusedMlpGateUpSwiGLU {
+            x,
+            gate_w,
+            up_w,
+            dst,
+            ..
+        }
+        | FusedMlpGateUpGelu {
             x,
             gate_w,
             up_w,
@@ -4516,34 +4631,375 @@ fn mlp_find_forward<F: Fn(&Thunk) -> bool>(
     (after + 1..thunks.len()).find(|&i| pred(&thunks[i]))
 }
 
-/// True iff the value written into `off` at `producer` is consumed ONLY by
-/// thunks in `allowed` before it is overwritten (its live range stays inside
-/// the fused block). Robust to arena offset reuse across layers: scanning
-/// stops at the first redefinition. Any opaque thunk in the window ⇒ false.
-fn mlp_value_dead_outside(
+/// True iff the value at `off` written by `producer` is read only by `allowed`
+/// thunks before it is redefined, scanning `producer+1..until` (layer-local
+/// when `until` is the next op outside the fused block). Opaque thunk ⇒ false.
+fn mlp_value_dead_in_range(
     thunks: &[Thunk],
     producer: usize,
     off: usize,
     allowed: &[usize],
+    until: usize,
 ) -> bool {
     if off == SENTINEL_OFF {
         return false;
     }
-    for (i, t) in thunks.iter().enumerate().skip(producer + 1) {
+    let until = until.min(thunks.len());
+    for (i, t) in thunks
+        .iter()
+        .enumerate()
+        .skip(producer + 1)
+        .take(until.saturating_sub(producer + 1))
+    {
         let Some((reads, writes)) = mlp_io(t) else {
-            return false; // opaque: could read our value
+            return false;
         };
-        // A disallowed read of the live value is an external consumer ⇒ unsafe.
+        if writes.contains(&off) {
+            break;
+        }
         if reads.contains(&off) && !allowed.contains(&i) {
             return false;
         }
-        // Any write (allowed in-place op or a later reuse) overwrites the value,
-        // ending its live range — no external read can reach it past this point.
-        if writes.contains(&off) {
-            return true;
-        }
     }
     true
+}
+
+/// Packed gate/up weight bytes per output column for fused decode MLP GEMV.
+fn mlp_gate_up_row_bytes(k: u32, scheme: rlx_ir::quant::QuantScheme) -> usize {
+    use rlx_ir::quant::QuantScheme;
+    match scheme {
+        QuantScheme::GgufQ4K => (k as usize / 256) * 144,
+        QuantScheme::GgufQ5_0 => ((k as usize + 31) / 32) * 22,
+        QuantScheme::GgufQ6K => (k as usize / 256) * 210,
+        _ => 0,
+    }
+}
+
+/// Pattern-merge the fused `gate_up` packed matmul path:
+///   combined(DequantMatMul) → narrow(gate) + narrow(up) → silu/gelu → mul
+/// → `FusedMlpGateUpSwiGLU` / `FusedMlpGateUpGelu`, optionally plus
+/// `FusedMlpDownResidual` when down feeds the residual add directly.
+fn fuse_decode_mlp_combined_gate_up(
+    thunks: &mut [Thunk],
+    output_offsets: &std::collections::HashSet<usize>,
+) {
+    if rlx_ir::env::var("RLX_METAL_FUSE_DECODE").as_deref() == Some("0") {
+        return;
+    }
+    use rlx_ir::quant::QuantScheme;
+    let verbose = rlx_ir::env::flag("RLX_METAL_FUSE_DECODE_LOG");
+
+    let as_packed_gate_up_mm = |t: &Thunk| -> Option<(usize, usize, usize, u32, u32, QuantScheme)> {
+        if let Thunk::DequantMatMulGguf {
+            x,
+            w_q,
+            dst,
+            m,
+            k,
+            n,
+            scheme,
+        } = *t
+        {
+            if m == 1 && matches!(scheme, QuantScheme::GgufQ4K | QuantScheme::GgufQ5_0) {
+                return Some((x, w_q, dst, k, n, scheme));
+            }
+        }
+        None
+    };
+
+    let as_narrow = |t: &Thunk| -> Option<(usize, usize, u32, u32)> {
+        if let Thunk::Narrow {
+            src,
+            dst,
+            start,
+            len,
+            ..
+        } = *t
+        {
+            Some((src, dst, start, len))
+        } else {
+            None
+        }
+    };
+
+    let is_silu = |t: &Thunk| {
+        matches!(
+            t,
+            Thunk::ActivationInPlace {
+                act: Activation::Silu,
+                ..
+            }
+        )
+    };
+    let is_gelu = |t: &Thunk| {
+        matches!(
+            t,
+            Thunk::ActivationInPlace {
+                act: Activation::GeluApprox,
+                ..
+            } | Thunk::GeluApproxOut { .. }
+                | Thunk::GeluApproxHost { .. }
+        )
+    };
+
+    let n_thunks = thunks.len();
+    let mut i = 0;
+    while i < n_thunks {
+        let (mul_lhs, mul_rhs, prod) = match &thunks[i] {
+            Thunk::BinaryFull {
+                lhs,
+                rhs,
+                dst,
+                op: BinaryOp::Mul,
+                ..
+            } => (*lhs, *rhs, *dst),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let mul_idx = i;
+
+        let silu_on = |off: usize| -> Option<usize> {
+            match mlp_last_writer(thunks, mul_idx, off) {
+                Ok(Some(idx)) if is_silu(&thunks[idx]) => Some(idx),
+                _ => None,
+            }
+        };
+        let gelu_on = |off: usize| -> Option<usize> {
+            match mlp_last_writer(thunks, mul_idx, off) {
+                Ok(Some(idx)) if is_gelu(&thunks[idx]) => Some(idx),
+                _ => None,
+            }
+        };
+        let (act_idx, up_off, use_gelu) = if let Some(idx) = silu_on(mul_lhs) {
+            (idx, mul_rhs, false)
+        } else if let Some(idx) = silu_on(mul_rhs) {
+            (idx, mul_lhs, false)
+        } else if let Some(idx) = gelu_on(mul_lhs) {
+            (idx, mul_rhs, true)
+        } else if let Some(idx) = gelu_on(mul_rhs) {
+            (idx, mul_lhs, true)
+        } else {
+            i += 1;
+            continue;
+        };
+        if use_gelu && rlx_ir::env::var("RLX_METAL_FUSE_DECODE_GELU").as_deref() != Some("1") {
+            i += 1;
+            continue;
+        }
+
+        let gate_src_off = match &thunks[act_idx] {
+            Thunk::ActivationInPlace { data, .. } => *data,
+            Thunk::GeluApproxOut { src, .. } | Thunk::GeluApproxHost { src, .. } => *src,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let gate_narrow_idx = match mlp_last_writer(thunks, act_idx, gate_src_off) {
+            Ok(Some(idx)) if as_narrow(&thunks[idx]).is_some() => idx,
+            Ok(Some(copy_idx)) if matches!(&thunks[copy_idx], Thunk::Copy { .. }) => {
+                let Thunk::Copy { src, .. } = &thunks[copy_idx] else {
+                    i += 1;
+                    continue;
+                };
+                match mlp_last_writer(thunks, copy_idx, *src) {
+                    Ok(Some(ni)) if as_narrow(&thunks[ni]).is_some() => ni,
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let (combined_off, _gate_dst, gate_start, gate_len) =
+            as_narrow(&thunks[gate_narrow_idx]).unwrap();
+
+        let up_narrow_idx = match mlp_last_writer(thunks, mul_idx, up_off) {
+            Ok(Some(idx)) if as_narrow(&thunks[idx]).is_some() => idx,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let (combined_up, _up_dst, up_start, up_len) = as_narrow(&thunks[up_narrow_idx]).unwrap();
+        if combined_off != combined_up || gate_len != up_len || up_start != gate_start + gate_len {
+            i += 1;
+            continue;
+        }
+        let n_half = gate_len;
+
+        let combined_mm_idx = match mlp_last_writer(thunks, gate_narrow_idx, combined_off) {
+            Ok(Some(idx)) if as_packed_gate_up_mm(&thunks[idx]).is_some() => idx,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let (comb_x, comb_w, _comb_dst, comb_k, comb_n, comb_scheme) =
+            as_packed_gate_up_mm(&thunks[combined_mm_idx]).unwrap();
+        if comb_n != 2 * n_half {
+            i += 1;
+            continue;
+        }
+        if use_gelu && prod == comb_x {
+            i += 1;
+            continue;
+        }
+
+        let row_bytes = mlp_gate_up_row_bytes(comb_k, comb_scheme);
+        if row_bytes == 0 {
+            i += 1;
+            continue;
+        }
+        let gate_w = comb_w;
+        let up_w = comb_w + (n_half as usize) * row_bytes;
+
+        // Down matmul must follow the SwiGLU/GeGLU product (validates MLP context).
+        let down_mm_idx = mlp_find_forward(thunks, mul_idx, |t| {
+            matches!(
+                t,
+                Thunk::DequantMatMulGguf {
+                    x,
+                    m: 1,
+                    scheme: QuantScheme::GgufQ4K
+                        | QuantScheme::GgufQ5_0
+                        | QuantScheme::GgufQ6K,
+                    ..
+                } if *x == prod
+            )
+        });
+        let Some(down_mm_idx) = down_mm_idx else {
+            i += 1;
+            continue;
+        };
+        let (down_w, down_dst, down_k, down_n, down_scheme) = match &thunks[down_mm_idx] {
+            Thunk::DequantMatMulGguf {
+                w_q,
+                dst,
+                k,
+                n,
+                scheme,
+                ..
+            } => (*w_q, *dst, *k, *n, *scheme),
+            _ => unreachable!(),
+        };
+
+        // Full tail: down → add (Phi/Llama). Gemma3 inserts post_ffn RMSNorm
+        // between down and add — fuse gate_up only when that norm is present.
+        let down_add_tail = {
+            let add_idx = mlp_find_forward(thunks, down_mm_idx, |t| {
+                matches!(
+                    t,
+                    Thunk::BinaryFull {
+                        lhs,
+                        rhs,
+                        op: BinaryOp::Add,
+                        ..
+                    } if *lhs == down_dst || *rhs == down_dst
+                )
+            });
+            add_idx.map(|add_idx| {
+                let (res_off, out_off) = match &thunks[add_idx] {
+                    Thunk::BinaryFull { lhs, rhs, dst, .. } => {
+                        let res = if *lhs == down_dst { *rhs } else { *lhs };
+                        (res, *dst)
+                    }
+                    _ => unreachable!(),
+                };
+                (add_idx, res_off, out_off)
+            })
+        };
+
+        let layer_until = down_mm_idx + 1;
+
+        let mut dead_ok =
+            mlp_value_dead_in_range(
+                thunks,
+                combined_mm_idx,
+                combined_off,
+                &[gate_narrow_idx, up_narrow_idx],
+                layer_until,
+            ) && mlp_value_dead_in_range(
+                thunks,
+                gate_narrow_idx,
+                gate_src_off,
+                &[act_idx],
+                layer_until,
+            ) && mlp_value_dead_in_range(thunks, up_narrow_idx, up_off, &[mul_idx], layer_until)
+                && mlp_value_dead_in_range(thunks, act_idx, gate_src_off, &[mul_idx], layer_until);
+        if let Some((add_idx, _, _)) = down_add_tail {
+            dead_ok &=
+                mlp_value_dead_in_range(thunks, down_mm_idx, down_dst, &[add_idx], layer_until);
+        }
+        let no_output_clash = ![combined_off, gate_src_off, up_off]
+            .iter()
+            .any(|o| output_offsets.contains(o));
+        if !dead_ok || !no_output_clash {
+            i += 1;
+            continue;
+        }
+
+        thunks[combined_mm_idx] = Thunk::Nop;
+        thunks[gate_narrow_idx] = Thunk::Nop;
+        thunks[up_narrow_idx] = Thunk::Nop;
+        thunks[act_idx] = Thunk::Nop;
+        thunks[mul_idx] = if use_gelu {
+            Thunk::FusedMlpGateUpGelu {
+                x: comb_x,
+                gate_w,
+                up_w,
+                dst: prod,
+                k: comb_k,
+                n: n_half,
+                scheme: comb_scheme,
+            }
+        } else {
+            Thunk::FusedMlpGateUpSwiGLU {
+                x: comb_x,
+                gate_w,
+                up_w,
+                dst: prod,
+                k: comb_k,
+                n: n_half,
+                scheme: comb_scheme,
+            }
+        };
+        if let Some((add_idx, res_off, out_off)) = down_add_tail {
+            thunks[down_mm_idx] = Thunk::Nop;
+            thunks[add_idx] = Thunk::FusedMlpDownResidual {
+                x: prod,
+                w: down_w,
+                res: res_off,
+                dst: out_off,
+                k: down_k,
+                n: down_n,
+                scheme: down_scheme,
+            };
+        }
+        FUSED_DECODE_MLP_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if verbose {
+            if down_add_tail.is_some() {
+                eprintln!(
+                    "[rlx-metal] fuse_decode_mlp_combined: gate_up {comb_scheme:?} k={comb_k} n={n_half} \
+                     act={} down {down_scheme:?} — 7 dispatches → 2",
+                    if use_gelu { "gelu" } else { "silu" }
+                );
+            } else {
+                eprintln!(
+                    "[rlx-metal] fuse_decode_mlp_combined: gate_up {comb_scheme:?} k={comb_k} n={n_half} \
+                     act={} (post_ffn norm blocks down fuse) — 5 dispatches → 1",
+                    if use_gelu { "gelu" } else { "silu" }
+                );
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Pattern-merge the per-layer decode SwiGLU MLP into two fused GEMV dispatches.
@@ -4563,7 +5019,7 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
     let verbose = rlx_ir::env::flag("RLX_METAL_FUSE_DECODE_LOG");
 
     // Q4_K decode matmul (m == 1) at `idx` writing `dst`? Return (x, w_q, k, n).
-    let as_q4k_mm = |t: &Thunk| -> Option<(usize, usize, usize, u32, u32)> {
+    let as_packed_gate_up_mm = |t: &Thunk| -> Option<(usize, usize, usize, u32, u32, QuantScheme)> {
         if let Thunk::DequantMatMulGguf {
             x,
             w_q,
@@ -4571,11 +5027,11 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
             m,
             k,
             n,
-            scheme: QuantScheme::GgufQ4K,
+            scheme,
         } = *t
         {
-            if m == 1 {
-                return Some((x, w_q, dst, k, n));
+            if m == 1 && matches!(scheme, QuantScheme::GgufQ4K | QuantScheme::GgufQ5_0) {
+                return Some((x, w_q, dst, k, n, scheme));
             }
         }
         None
@@ -4600,7 +5056,7 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
         };
         let mul_idx = i;
 
-        // Which mul input is silu(gate)? Its last writer must be a Silu activation.
+        // Which mul input is silu(gate) or gelu(gate)?
         let is_silu = |t: &Thunk| {
             matches!(
                 t,
@@ -4610,32 +5066,47 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
                 }
             )
         };
-        let silu_writer = |gate_act: usize| -> Option<usize> {
+        let is_gelu = |t: &Thunk| {
+            matches!(
+                t,
+                Thunk::ActivationInPlace {
+                    act: Activation::GeluApprox,
+                    ..
+                } | Thunk::GeluApproxOut { .. }
+                    | Thunk::GeluApproxHost { .. }
+            )
+        };
+        let act_writer = |gate_act: usize| -> Option<(usize, bool)> {
             match mlp_last_writer(thunks, mul_idx, gate_act) {
-                Ok(Some(idx)) if is_silu(&thunks[idx]) => Some(idx),
+                Ok(Some(idx)) if is_silu(&thunks[idx]) => Some((idx, false)),
+                Ok(Some(idx)) if is_gelu(&thunks[idx]) => Some((idx, true)),
                 _ => None,
             }
         };
-        let (gate_act_off, up_off, silu_idx) = if let Some(s) = silu_writer(mul_lhs) {
-            (mul_lhs, mul_rhs, s)
-        } else if let Some(s) = silu_writer(mul_rhs) {
-            (mul_rhs, mul_lhs, s)
-        } else {
+        let (gate_act_off, up_off, act_idx, use_gelu) =
+            if let Some((idx, gelu)) = act_writer(mul_lhs) {
+                (mul_lhs, mul_rhs, idx, gelu)
+            } else if let Some((idx, gelu)) = act_writer(mul_rhs) {
+                (mul_rhs, mul_lhs, idx, gelu)
+            } else {
+                i += 1;
+                continue;
+            };
+        // GeGLU: opt-in until full-graph arena aliasing is resolved (`RLX_METAL_FUSE_DECODE_GELU=1`).
+        if use_gelu && rlx_ir::env::var("RLX_METAL_FUSE_DECODE_GELU").as_deref() != Some("1") {
             i += 1;
             continue;
-        };
+        }
 
-        // The silu reads `gate` (its in-place data slot). The value flowing into
-        // that slot came from either the gate matmul directly (in-place silu) or
-        // a Copy (out-of-place silu).
-        let gate_src_off = match &thunks[silu_idx] {
+        let gate_src_off = match &thunks[act_idx] {
             Thunk::ActivationInPlace { data, .. } => *data,
+            Thunk::GeluApproxOut { src, .. } | Thunk::GeluApproxHost { src, .. } => *src,
             _ => {
                 i += 1;
                 continue;
             }
         };
-        let gate_producer = match mlp_last_writer(thunks, silu_idx, gate_src_off) {
+        let gate_producer = match mlp_last_writer(thunks, act_idx, gate_src_off) {
             Ok(Some(idx)) => idx,
             _ => {
                 i += 1;
@@ -4643,28 +5114,30 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
             }
         };
         let (copy_idx, gate_mm_idx, gate_mm_off) = match &thunks[gate_producer] {
-            Thunk::Copy { src, .. } => {
-                // Out-of-place silu: gate matmul wrote `src`, copy moved it.
-                match mlp_last_writer(thunks, gate_producer, *src) {
-                    Ok(Some(gm)) if as_q4k_mm(&thunks[gm]).is_some() => {
-                        (Some(gate_producer), gm, *src)
-                    }
-                    _ => {
-                        i += 1;
-                        continue;
-                    }
+            Thunk::Copy { src, .. } => match mlp_last_writer(thunks, gate_producer, *src) {
+                Ok(Some(gm)) if as_packed_gate_up_mm(&thunks[gm]).is_some() => {
+                    (Some(gate_producer), gm, *src)
                 }
-            }
-            t if as_q4k_mm(t).is_some() => (None, gate_producer, gate_src_off),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            },
+            t if as_packed_gate_up_mm(t).is_some() => (None, gate_producer, gate_src_off),
             _ => {
                 i += 1;
                 continue;
             }
         };
 
-        let (gate_x, gate_w, _g_dst, gate_k, gate_n) = as_q4k_mm(&thunks[gate_mm_idx]).unwrap();
+        let (gate_x, gate_w, _g_dst, gate_k, gate_n, gate_scheme) =
+            as_packed_gate_up_mm(&thunks[gate_mm_idx]).unwrap();
+        if use_gelu && prod == gate_x {
+            i += 1;
+            continue;
+        }
 
-        // up matmul: last writer of `up_off`, must be Q4_K m==1 sharing x/k/n.
+        // up matmul: last writer of `up_off`, must share x/k/n/scheme.
         let up_mm_idx = match mlp_last_writer(thunks, mul_idx, up_off) {
             Ok(Some(idx)) => idx,
             _ => {
@@ -4672,11 +5145,13 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
                 continue;
             }
         };
-        let Some((up_x, up_w, _u_dst, up_k, up_n)) = as_q4k_mm(&thunks[up_mm_idx]) else {
+        let Some((up_x, up_w, _u_dst, up_k, up_n, up_scheme)) =
+            as_packed_gate_up_mm(&thunks[up_mm_idx])
+        else {
             i += 1;
             continue;
         };
-        if up_x != gate_x || up_k != gate_k || up_n != gate_n {
+        if up_x != gate_x || up_k != gate_k || up_n != gate_n || up_scheme != gate_scheme {
             i += 1;
             continue;
         }
@@ -4686,7 +5161,7 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
         let down_mm_idx = mlp_find_forward(
             thunks,
             mul_idx,
-            |t| matches!(t, Thunk::DequantMatMulGguf { x, m: 1, scheme: QuantScheme::GgufQ4K | QuantScheme::GgufQ6K, .. } if *x == prod),
+            |t| matches!(t, Thunk::DequantMatMulGguf { x, m: 1, scheme: QuantScheme::GgufQ4K | QuantScheme::GgufQ5_0 | QuantScheme::GgufQ6K, .. } if *x == prod),
         );
         let Some(down_mm_idx) = down_mm_idx else {
             i += 1;
@@ -4722,16 +5197,18 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
             _ => unreachable!(),
         };
 
-        // Liveness: every intermediate that the fusion stops producing must be
-        // dead outside the matched block (gate, up, gate_act, down output).
-        let dead_ok = mlp_value_dead_outside(
-            thunks,
-            gate_mm_idx,
-            gate_mm_off,
-            &[copy_idx.unwrap_or(silu_idx)],
-        ) && mlp_value_dead_outside(thunks, up_mm_idx, up_off, &[mul_idx])
-            && mlp_value_dead_outside(thunks, silu_idx, gate_act_off, &[mul_idx])
-            && mlp_value_dead_outside(thunks, down_mm_idx, down_dst, &[add_idx]);
+        // Liveness within this layer (offsets are reused across layers).
+        let layer_until = down_mm_idx + 1;
+        let dead_ok =
+            mlp_value_dead_in_range(
+                thunks,
+                gate_mm_idx,
+                gate_mm_off,
+                &[copy_idx.unwrap_or(act_idx)],
+                layer_until,
+            ) && mlp_value_dead_in_range(thunks, up_mm_idx, up_off, &[mul_idx], layer_until)
+                && mlp_value_dead_in_range(thunks, act_idx, gate_act_off, &[mul_idx], layer_until)
+                && mlp_value_dead_in_range(thunks, down_mm_idx, down_dst, &[add_idx], layer_until);
         // None of the dropped intermediates may be a graph output.
         let no_output_clash = ![gate_mm_off, up_off, gate_act_off, down_dst]
             .iter()
@@ -4744,18 +5221,31 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
         // Commit: gate/up/silu/copy/down → Nop; mul → fused1; add → fused2.
         thunks[gate_mm_idx] = Thunk::Nop;
         thunks[up_mm_idx] = Thunk::Nop;
-        thunks[silu_idx] = Thunk::Nop;
+        thunks[act_idx] = Thunk::Nop;
         thunks[down_mm_idx] = Thunk::Nop;
         if let Some(c) = copy_idx {
             thunks[c] = Thunk::Nop;
         }
-        thunks[mul_idx] = Thunk::FusedMlpGateUpSwiGLU {
-            x: gate_x,
-            gate_w,
-            up_w,
-            dst: prod,
-            k: gate_k,
-            n: gate_n,
+        thunks[mul_idx] = if use_gelu {
+            Thunk::FusedMlpGateUpGelu {
+                x: gate_x,
+                gate_w,
+                up_w,
+                dst: prod,
+                k: gate_k,
+                n: gate_n,
+                scheme: gate_scheme,
+            }
+        } else {
+            Thunk::FusedMlpGateUpSwiGLU {
+                x: gate_x,
+                gate_w,
+                up_w,
+                dst: prod,
+                k: gate_k,
+                n: gate_n,
+                scheme: gate_scheme,
+            }
         };
         thunks[add_idx] = Thunk::FusedMlpDownResidual {
             x: prod,
@@ -4769,8 +5259,9 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
         FUSED_DECODE_MLP_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if verbose {
             eprintln!(
-                "[rlx-metal] fuse_decode_mlp: block fused (gate/up Q4_K k={gate_k} n={gate_n}, \
-                 down {down_scheme:?} k={down_k} n={down_n}) — 6 dispatches → 2"
+                "[rlx-metal] fuse_decode_mlp: block fused (gate/up {gate_scheme:?} k={gate_k} n={gate_n}, \
+                 down {down_scheme:?} k={down_k} n={down_n}, act={}) — 6 dispatches → 2",
+                if use_gelu { "gelu" } else { "silu" }
             );
         }
         i += 1;
@@ -4943,6 +5434,9 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::Conv2dBackwardWeight { x, dy, .. } => vec![*x, *dy],
         Thunk::FusedSwiGLU { src, .. } => vec![*src],
         Thunk::FusedMlpGateUpSwiGLU {
+            x, gate_w, up_w, ..
+        }
+        | Thunk::FusedMlpGateUpGelu {
             x, gate_w, up_w, ..
         } => vec![*x, *gate_w, *up_w],
         Thunk::FusedMlpDownResidual { x, w, res, .. } => vec![*x, *w, *res],

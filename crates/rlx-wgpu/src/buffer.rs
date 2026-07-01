@@ -298,7 +298,7 @@ impl Arena {
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         receiver.recv().unwrap().unwrap();
 
-        let view = slice.get_mapped_range();
+        let view = slice.get_mapped_range().expect("buffer slice mapped");
         let out = view.to_vec();
         drop(view);
         staging.unmap();
@@ -354,7 +354,7 @@ pub fn use_tiny_readback(layout: &ReadbackLayout, num_outputs: usize) -> bool {
 pub fn decode_tiny_mapped_f32(staging: &wgpu::Buffer, len: usize) -> Vec<f32> {
     let len = len.max(4);
     let slice = staging.slice(..len as u64);
-    let view = slice.get_mapped_range();
+    let view = slice.get_mapped_range().expect("buffer slice mapped");
     let out = bytemuck::cast_slice::<u8, f32>(&view[..len]).to_vec();
     drop(view);
     staging.unmap();
@@ -539,7 +539,7 @@ fn map_readback_f32_after_submit(
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     receiver.recv().unwrap().unwrap();
 
-    let view = slice.get_mapped_range();
+    let view = slice.get_mapped_range().expect("buffer slice mapped");
     let bytes = &view[..];
     let mut outs = Vec::with_capacity(layout.regions.len());
     for &(start, len) in &layout.regions {
@@ -561,7 +561,7 @@ pub fn decode_mapped_readback_f32(
     }
     let total = layout.total_bytes;
     let slice = staging.slice(..total as u64);
-    let view = slice.get_mapped_range();
+    let view = slice.get_mapped_range().expect("buffer slice mapped");
     let bytes = &view[..];
     let mut outs = Vec::with_capacity(layout.regions.len());
     for &(start, len) in &layout.regions {
@@ -666,7 +666,7 @@ pub fn read_f32_pooled(
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     receiver.recv().unwrap().unwrap();
 
-    let view = slice.get_mapped_range();
+    let view = slice.get_mapped_range().expect("buffer slice mapped");
     let out: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&view).to_vec();
     drop(view);
     staging.buffer.unmap();

@@ -2258,8 +2258,11 @@ impl RocmExecutable {
         };
         let mut arena = Arena::from_plan(&ctx, &plan);
         for node in graph.nodes() {
-            let elems = node.shape.num_elements().unwrap_or(0);
-            arena.set_actual_len(node.id, elems * 4);
+            let slot_bytes = node
+                .shape
+                .size_bytes()
+                .unwrap_or_else(|| node.shape.num_elements().unwrap_or(0) * 4);
+            arena.set_actual_len(node.id, slot_bytes);
         }
 
         let mut input_offsets = HashMap::new();
@@ -3247,11 +3250,11 @@ impl RocmExecutable {
                     use rlx_ir::quant::QuantScheme;
                     let x_id = node.inputs[0];
                     let w_id = node.inputs[1];
-                    let out_dims = node.shape.dims();
-                    let x_dims = graph.node(x_id).shape.dims();
-                    let m = out_dims[0].unwrap_static() as u32;
-                    let n = out_dims[1].unwrap_static() as u32;
-                    let k = x_dims[1].unwrap_static() as u32;
+                    let out_total = node.shape.num_elements().unwrap_or(0) as u32;
+                    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static() as u32;
+                    let m = out_total / n.max(1);
+                    let x_total = graph.node(x_id).shape.num_elements().unwrap_or(0) as u32;
+                    let k = x_total / m.max(1);
                     if scheme.is_gguf() {
                         schedule.push(Step::DequantMatmulGguf {
                             m,

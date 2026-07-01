@@ -29,8 +29,15 @@ mlx   = ["rlx-runtime/mlx", "dep:rlx-mlx"]
 mlx-cuda = ["mlx", "rlx-mlx/cuda"]
 gpu   = ["rlx-runtime/gpu"]
 cuda  = ["rlx-runtime/cuda"]
+# Single-kernel on-chip FFT for Metal/wgpu (A/B against the multi-kernel path
+# via RLX_FFT_FAST=0). Pair with `metal` and/or `gpu`.
+native-gpu-fft = ["rlx-runtime/native-gpu-fft"]
 rocm  = ["rlx-runtime/rocm"]
 tpu   = ["rlx-runtime/tpu"]
+# Apple CoreML/ANE backend (Device::Ane). FFT runs host-side via rlx-coreml.
+coreml = ["rlx-runtime/coreml"]
+# Apple Accelerate BLAS (Device::Cpu); affects matmul, not FFT.
+accelerate = ["rlx-runtime/blas-accelerate"]
 
 [lints]
 workspace = true

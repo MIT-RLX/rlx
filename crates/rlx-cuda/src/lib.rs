@@ -74,6 +74,11 @@ pub mod welch_peaks_host;
 
 pub use backend::{CompileMode, CudaExecutable, ExecMode};
 
+/// Release pooled CUDA arena buffers (see [`arena::trim_f32_arena_pool`]).
+pub fn trim_device_memory_pool() {
+    arena::trim_f32_arena_pool();
+}
+
 /// HIP-CPU validation path — runs `.cu` kernels on CPU threads so we
 /// can numerically validate them on Mac/Docker without renting a CUDA
 /// box. Strictly a dev feature; never enabled in production.

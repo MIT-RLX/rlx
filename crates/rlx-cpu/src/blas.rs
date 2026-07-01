@@ -1205,6 +1205,27 @@ pub fn sgemm_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
     }
 }
 
+/// `y = alpha * A @ x + beta * y` with `A` row-major `[n, k]` (`lda = k`).
+#[inline]
+pub fn sgemv_nn(a: &[f32], x: &[f32], y: &mut [f32], n: usize, k: usize, alpha: f32, beta: f32) {
+    unsafe {
+        cblas_sgemv(
+            ROW_MAJOR,
+            NO_TRANS,
+            n as i32,
+            k as i32,
+            alpha,
+            a.as_ptr(),
+            k as i32,
+            x.as_ptr(),
+            1,
+            beta,
+            y.as_mut_ptr(),
+            1,
+        );
+    }
+}
+
 /// `y = alpha * A^T @ x + beta * y` with `A` stored row-major `[n,n]`.
 #[inline]
 pub fn sgemv_at(a: &[f32], x: &[f32], y: &mut [f32], n: usize, alpha: f32, beta: f32) {

@@ -50,6 +50,9 @@ impl LlamaDecoderStage {
 pub struct LlamaDecoderSpec {
     pub num_heads: usize,
     pub head_dim: usize,
+    /// Leading per-head dims that get rotary-rotated (`head_dim` for plain
+    /// RoPE; smaller for Phi-3 partial RoPE).
+    pub n_rot: usize,
     pub num_kv_heads: usize,
     pub eps: f32,
     pub mask: MaskKind,

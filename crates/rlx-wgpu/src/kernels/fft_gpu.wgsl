@@ -112,6 +112,79 @@ fn fft_radix2_full(
     }
 }
 
+// native-gpu-fft: single-kernel path for n in (1024, 2048]. Identical math to
+// fft_radix2_full (bit-reverse load + all radix-2 stages in workgroup memory +
+// store), but the workgroup buffers are sized for n=2048 (16 KB total = the
+// portable WebGPU maxComputeWorkgroupStorageSize). Keeps the whole transform
+// on-chip — one DRAM load + store — instead of the multi-kernel path's
+// per-outer-stage DRAM round trips.
+var<workgroup> sre_full_big: array<f32, 2048>;
+var<workgroup> sim_full_big: array<f32, 2048>;
+
+@compute @workgroup_size(256)
+fn fft_radix2_full_big(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let n = params.n;
+    let log2n = params.log2n;
+    let row = wgid.y;
+    if (row >= params.outer) { return; }
+    let src_base = params.off + row * 2u * n;
+    let dst_base = params.dst_off + row * 2u * n;
+    let tid = lid.x;
+    let tg_size = 256u;
+
+    var k: u32 = tid;
+    loop {
+        if (k >= n) { break; }
+        let rev = reverseBits(k) >> (32u - log2n);
+        sre_full_big[rev] = re_at(src_base, k, n);
+        sim_full_big[rev] = im_at(src_base, k, n);
+        k = k + tg_size;
+    }
+    workgroupBarrier();
+
+    let sign = select(-1.0, 1.0, params.inverse != 0u);
+    let two_pi = 6.28318530717958647692;
+    var len: u32 = 2u;
+    loop {
+        if (len > n) { break; }
+        let h2 = len >> 1u;
+        let theta_base = sign * two_pi / f32(len);
+        var b: u32 = tid;
+        loop {
+            if (b >= n / 2u) { break; }
+            let group = b / h2;
+            let k_in = b % h2;
+            let i_lo = group * len + k_in;
+            let i_hi = i_lo + h2;
+            let theta = theta_base * f32(k_in);
+            let wre = cos(theta);
+            let wim = sin(theta);
+            let t_re = wre * sre_full_big[i_hi] - wim * sim_full_big[i_hi];
+            let t_im = wre * sim_full_big[i_hi] + wim * sre_full_big[i_hi];
+            let u_re = sre_full_big[i_lo];
+            let u_im = sim_full_big[i_lo];
+            sre_full_big[i_lo] = u_re + t_re;
+            sim_full_big[i_lo] = u_im + t_im;
+            sre_full_big[i_hi] = u_re - t_re;
+            sim_full_big[i_hi] = u_im - t_im;
+            b = b + tg_size;
+        }
+        workgroupBarrier();
+        len = len << 1u;
+    }
+
+    k = tid;
+    loop {
+        if (k >= n) { break; }
+        set_re(dst_base, k, n, sre_full_big[k] * params.norm_scale);
+        set_im(dst_base, k, n, sim_full_big[k] * params.norm_scale);
+        k = k + tg_size;
+    }
+}
+
 // Bit-reverse one row before multi-kernel outer stages.
 @compute @workgroup_size(256)
 fn fft_bit_reverse(

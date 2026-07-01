@@ -45,6 +45,7 @@ pub fn llama_prefill_layer_attn_only(layer_idx: usize, spec: LlamaDecoderSpec) -
                 spec.head_dim,
                 spec.num_kv_heads,
             )
+            .with_n_rot(spec.n_rot)
             // Match the (style-aware) decode path so GGUF-Llama prefill rotates
             // GPT-J-style, not NeoX.
             .with_rope_style(spec.rope_style),
@@ -81,6 +82,7 @@ pub fn llama_prefill_layer_composed(layer_idx: usize, spec: LlamaDecoderSpec) ->
                 spec.head_dim,
                 spec.num_kv_heads,
             )
+            .with_n_rot(spec.n_rot)
             // Match the (style-aware) decode path so GGUF-Llama prefill rotates
             // GPT-J-style, not NeoX.
             .with_rope_style(spec.rope_style),

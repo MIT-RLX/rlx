@@ -19,6 +19,21 @@ rlx-driver = { path = "../rlx-driver", version = "0.2.10" }
 # dev-deps from the published manifest, so this never resolves against
 # crates.io and needs no per-release pin bump.
 rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cpu"] }
+# The coordinator/worker mode ships serialized IR graphs over the wire, so the
+# example needs rlx-ir's serde derives + a JSON codec (dev-only).
+rlx-ir = { path = "../rlx-ir", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The `dist_node` example drives the native GPU backend of whichever host
+# it runs on. Cargo unions feature sets across these tables, so the crate's
+# dev builds get cpu+metal on macOS and cpu+cuda on Linux, while staying
+# cpu-only everywhere else. Local-only (path dev-dep, stripped on publish).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["metal"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cuda"] }
 
 [lints]
 workspace = true

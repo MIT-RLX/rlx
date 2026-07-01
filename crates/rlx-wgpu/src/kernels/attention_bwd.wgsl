@@ -17,7 +17,7 @@
 // Scaled dot-product attention backward ([B, H, S, D] or strided layouts).
 // `wrt`: 0 = dQ, 1 = dK, 2 = dV.
 
-const MAX_HEAD_DIM: u32 = 128u;
+const MAX_HEAD_DIM: u32 = 512u;
 const MAX_ATTN_SEQ: u32 = 512u;
 
 struct Params {

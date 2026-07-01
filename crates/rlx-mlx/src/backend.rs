@@ -40,6 +40,10 @@ pub struct MlxExecutable {
     gpu_handles: HashMap<String, Array>,
     /// After each `run`, copy `outputs[idx]` into the named GPU handle.
     gpu_handle_feeds: HashMap<String, usize>,
+    /// Row feeds for resident KV: [`feed_kv_row`] copies one output row into the handle.
+    kv_row_feeds: HashMap<String, usize>,
+    /// Last run outputs — used by [`feed_kv_row`] before readback.
+    last_outputs: Vec<Array>,
     /// (byte_offset, num_elements) per output. Slots are ordered to
     /// match `graph.outputs`. Filled at compile time from output
     /// shapes; the offsets are stable across `run_slots` calls so the
@@ -167,6 +171,8 @@ impl MlxExecutable {
             handles: HashMap::new(),
             gpu_handles: HashMap::new(),
             gpu_handle_feeds: HashMap::new(),
+            kv_row_feeds: HashMap::new(),
+            last_outputs: Vec::new(),
             output_slots,
             arena,
             output_names,
@@ -347,6 +353,7 @@ impl MlxExecutable {
         };
 
         self.refresh_gpu_handles_from_outputs(&outs)?;
+        self.last_outputs = outs.iter().filter_map(|a| a.clone_handle().ok()).collect();
         Ok(outs)
     }
 
@@ -676,10 +683,69 @@ impl MlxExecutable {
 
     fn refresh_gpu_handles_from_outputs(&mut self, outs: &[Array]) -> Result<(), MlxError> {
         for (name, &idx) in &self.gpu_handle_feeds {
+            if self.kv_row_feeds.contains_key(name) {
+                continue;
+            }
             let arr = outs
                 .get(idx)
                 .ok_or_else(|| MlxError(format!("gpu feed output {idx} missing")))?;
             self.gpu_handles.insert(name.clone(), arr.clone_handle()?);
+        }
+        Ok(())
+    }
+
+    /// Register a resident-KV row feed: [`feed_kv_row`] copies one output row into the handle.
+    pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) {
+        self.kv_row_feeds
+            .insert(handle_name.to_string(), output_index);
+        self.gpu_handle_feeds.remove(handle_name);
+    }
+
+    /// Fold the new-token K/V row from the last run into resident GPU handles.
+    pub fn feed_kv_row(
+        &mut self,
+        src_row: usize,
+        dst_row: usize,
+        row_elems: usize,
+    ) -> Result<(), MlxError> {
+        if self.kv_row_feeds.is_empty() || self.last_outputs.is_empty() {
+            return Ok(());
+        }
+        let feeds: Vec<(String, usize)> = self
+            .kv_row_feeds
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for (name, out_idx) in feeds {
+            let out_arr = self
+                .last_outputs
+                .get(out_idx)
+                .ok_or_else(|| MlxError(format!("kv row feed output {out_idx} missing")))?;
+            let mut handle = self
+                .gpu_handles
+                .get(&name)
+                .ok_or_else(|| MlxError(format!("no gpu handle '{name}'")))?
+                .clone_handle()?;
+            let out_shape = out_arr.shape()?;
+            let handle_shape = handle.shape()?;
+            let out_data = out_arr.to_f32()?;
+            let mut handle_data = handle.to_f32()?;
+            let src_start = src_row * row_elems;
+            let dst_start = dst_row * row_elems;
+            let src_end = src_start + row_elems;
+            let dst_end = dst_start + row_elems;
+            if src_end > out_data.len() || dst_end > handle_data.len() {
+                return Err(MlxError(format!(
+                    "feed_kv_row {name}: src_row={src_row} dst_row={dst_row} row_elems={row_elems} \
+                     out_len={} handle_len={}",
+                    out_data.len(),
+                    handle_data.len()
+                )));
+            }
+            handle_data[dst_start..dst_end].copy_from_slice(&out_data[src_start..src_end]);
+            handle = Array::from_f32_slice(&handle_data, &handle_shape, DType::F32)?;
+            let _ = out_shape;
+            self.gpu_handles.insert(name, handle);
         }
         Ok(())
     }
@@ -727,6 +793,9 @@ impl MlxExecutable {
         }
         for (k, &idx) in &self.gpu_handle_feeds {
             exe.set_gpu_handle_feed(k, idx);
+        }
+        for (k, &idx) in &self.kv_row_feeds {
+            exe.register_kv_row_feed(k, idx);
         }
         for (k, v) in gpu_snap {
             let _ = exe.bind_gpu_handle(&k, &v);

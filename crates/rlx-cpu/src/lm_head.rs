@@ -247,6 +247,43 @@ pub fn gguf_tied_lm_argmax(
     (best_idx, best_val)
 }
 
+fn lm_head_parallel_enabled() -> bool {
+    !matches!(
+        rlx_ir::env::var("RLX_LM_HEAD_PARALLEL").as_deref(),
+        Some("0") | Some("false") | Some("FALSE")
+    )
+}
+
+/// Like [`gguf_tied_lm_argmax`] but scans vocab rows in parallel (Rayon).
+pub fn gguf_tied_lm_argmax_parallel(
+    hidden: &[f32],
+    w_bytes: &[u8],
+    n_embd: usize,
+    n_vocab: usize,
+    scheme: QuantScheme,
+) -> (u32, f32) {
+    if !lm_head_parallel_enabled() || n_vocab < 4096 || crate::pool::num_threads() <= 1 {
+        return gguf_tied_lm_argmax(hidden, w_bytes, n_embd, n_vocab, scheme);
+    }
+    use rayon::prelude::*;
+    (0..n_vocab)
+        .into_par_iter()
+        .map(|j| {
+            let dot = row_dot_gguf(hidden, w_bytes, j, n_embd, scheme);
+            (j as u32, dot)
+        })
+        .reduce(
+            || (0u32, f32::NEG_INFINITY),
+            |a, b| {
+                if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
+                    b
+                } else {
+                    a
+                }
+            },
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

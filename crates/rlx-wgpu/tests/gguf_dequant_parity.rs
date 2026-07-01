@@ -123,7 +123,7 @@ fn run_wgpu_dequant(scheme_id: u32, block_bytes: &[u8], num_blocks: u32) -> Vec<
     });
     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
     receiver.recv().unwrap().unwrap();
-    let view = slice.get_mapped_range();
+    let view = slice.get_mapped_range().expect("buffer slice mapped");
     let out: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
     drop(view);
     staging.unmap();

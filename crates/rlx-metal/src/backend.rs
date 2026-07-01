@@ -1379,20 +1379,7 @@ impl MetalExecutable {
         // ICB segments (if any) are dispatched inline by encode_commit.
         let t0 = Instant::now();
         let _ = self.encode_commit(true, None, None);
-        let wall = t0.elapsed();
-        crate::mps_profile::record("encode_path:thunks_only", wall);
-        // RLX_METAL_GPU_TIME=1: print true GPU-busy vs wall for the whole step.
-        // GPU-busy ≈ wall ⇒ compute-bound; GPU-busy ≪ wall ⇒ the cost is CPU
-        // orchestration (encode/commit/sync), not the kernels.
-        if rlx_ir::env::flag("RLX_METAL_GPU_TIME") {
-            let gpu = crate::gpu_time::take_last();
-            eprintln!(
-                "[metal-gpu] step: GPU-busy {:.2} ms | wall {:.2} ms | CPU/sync {:.2} ms",
-                gpu.as_secs_f64() * 1e3,
-                wall.as_secs_f64() * 1e3,
-                (wall.as_secs_f64() - gpu.as_secs_f64()).max(0.0) * 1e3,
-            );
-        }
+        crate::mps_profile::record("encode_path:thunks_only", t0.elapsed());
     }
 
     /// Sequential per-thunk GPU timing (`RLX_METAL_THUNK_PROFILE=1`).
@@ -1407,9 +1394,7 @@ impl MetalExecutable {
             }
             let t0 = Instant::now();
             let _ = self.encode_commit(true, None, Some(i..i + 1));
-            let wall = t0.elapsed();
-            let gpu = crate::gpu_time::take_last();
-            crate::thunk_profile::record_split(name, wall, gpu);
+            crate::thunk_profile::record(name, t0.elapsed());
         }
         crate::thunk_profile::print_summary();
     }
@@ -1728,30 +1713,6 @@ impl MetalExecutable {
         let dev = metal_device().expect("Metal device required");
         let mut cmd_buf = dev.queue.new_command_buffer().to_owned();
         let k = kernels();
-
-        // Counter-profile (RLX_METAL_COUNTER_PROFILE=1): wrap each thunk in its
-        // own compute encoder with start/end timestamp sample attachments, all
-        // in THIS one command buffer, for true per-op GPU-busy time without the
-        // per-command-buffer ramp / commit distortion of the thunk profiler.
-        // Full-step path only (thunk_range none); needs the timestamp counter
-        // set + AtStageBoundary support (Apple Silicon).
-        let cp_want = thunk_range.is_none() && crate::counter_profile::enabled();
-        let cp_cap = self.schedule.thunks.len() + 4;
-        let mut cp_names: Vec<&'static str> = Vec::new();
-        let cp_sbuf: Option<metal::CounterSampleBuffer> = if cp_want {
-            crate::counter_profile::timestamp_counter_set(&dev.device).and_then(|set| {
-                let desc = metal::CounterSampleBufferDescriptor::new();
-                desc.set_counter_set(&set);
-                desc.set_sample_count((cp_cap * 2) as u64);
-                desc.set_storage_mode(metal::MTLStorageMode::Shared);
-                dev.device
-                    .new_counter_sample_buffer_with_descriptor(&desc)
-                    .ok()
-            })
-        } else {
-            None
-        };
-        let cp_active = cp_sbuf.is_some();
 
         // Lazy compute encoder — created on first MSL thunk, ended right
         // before any MPS call. Two consecutive MPS calls don't pay an
@@ -2443,11 +2404,6 @@ impl MetalExecutable {
         let mut seg_iter = segments.iter().peekable();
         let loop_end = thunk_range.as_ref().map(|r| r.end).unwrap_or(thunks.len());
         let mut i = thunk_range.as_ref().map(|r| r.start).unwrap_or(0);
-        // Per-step CPU-encode profile (RLX_METAL_ENCODE_PROFILE=1): reset at
-        // the start of a full-range step; printed after the final commit.
-        if thunk_range.is_none() {
-            crate::encode_profile::reset();
-        }
         while i < loop_end {
             if thunk_range.is_none()
                 && active.is_none()
@@ -2461,33 +2417,6 @@ impl MetalExecutable {
             }
             let thunk = &thunks[i];
             i += 1;
-            // Counter-profile: open a fresh sampled encoder for this thunk so
-            // its GPU start/end timestamps bracket exactly this op. The thunk's
-            // own `e!()` then reuses this encoder. (Decode has no in-graph host
-            // ops, so deferred_host is empty here and the single command buffer
-            // is preserved.)
-            if cp_active {
-                if let Some(active) = enc.take() {
-                    active.end_encoding();
-                }
-                flush_deferred_host(&mut cmd_buf, &mut enc, &mut deferred_host);
-                let idx = cp_names.len();
-                if idx < cp_cap {
-                    cp_names.push(crate::thunk::thunk_name(thunk));
-                    let pd = metal::ComputePassDescriptor::new();
-                    pd.set_dispatch_type(metal::MTLDispatchType::Serial);
-                    if let Some(att) = pd.sample_buffer_attachments().object_at(0) {
-                        att.set_sample_buffer(cp_sbuf.as_ref().unwrap());
-                        att.set_start_of_encoder_sample_index((idx * 2) as u64);
-                        att.set_end_of_encoder_sample_index((idx * 2 + 1) as u64);
-                    }
-                    enc = Some(
-                        cmd_buf
-                            .compute_command_encoder_with_descriptor(pd)
-                            .to_owned(),
-                    );
-                }
-            }
             if !matches!(thunk, Thunk::Narrow { .. } | Thunk::SplitLastAxis { .. })
                 && narrow_batch.is_some()
             {
@@ -2496,9 +2425,6 @@ impl MetalExecutable {
             // PLAN L3: per-thunk Perfetto span. No-op when env var
             // RLX_TRACE_PERFETTO unset.
             let _span = rlx_ir::perfetto::TraceSpan::new(crate::thunk::thunk_name(thunk), "metal");
-            // CPU-encode timing (RLX_METAL_ENCODE_PROFILE=1) — RAII so it
-            // records even for arms that `continue` early.
-            let _enc_t = crate::encode_profile::EncodeTimer::new(crate::thunk::thunk_name(thunk));
             match thunk {
                 Thunk::Nop => {}
                 Thunk::Cast {
@@ -4186,6 +4112,9 @@ impl MetalExecutable {
                         *score_scale,
                         *attn_logit_softcap,
                     );
+                    // Commit GPU attention before deferred-host GGUF dequant
+                    // consumers read the output (arena aliasing; task #50).
+                    end_msl!();
                 }
                 Thunk::FusedAttn {
                     qkv,
@@ -4447,15 +4376,14 @@ impl MetalExecutable {
                             *dt,
                             inputs,
                         );
-                    } else if rlx_ir::env::flag("RLX_METAL_CONCAT_GPU") {
-                        // Opt-in GPU mid-axis concat — encodes into the live
-                        // command buffer (no commit/wait), unlike the host
-                        // fallback below which syncs per concat. Measured
-                        // net-neutral-to-slightly-slower on GGUF KV decode
-                        // (the step is GPU-bound; the per-concat sync was
-                        // really CPU-blocking-on-GPU, not CPU work), so it is
-                        // NOT the default — but it's a correct, reusable
-                        // variant for genuinely encode-bound graphs.
+                    } else if !rlx_ir::env::flag("RLX_METAL_CONCAT_HOST") {
+                        // GPU mid-axis concat (default) — encodes into the live
+                        // command buffer, no per-concat commit/wait. The host
+                        // fallback (opt-in `RLX_METAL_CONCAT_HOST=1`) syncs the
+                        // command buffer per concat (~112/step on KV decode);
+                        // once the MLP-fusion fix shrank per-step GPU work, that
+                        // sync dominates, so keeping the whole step in one
+                        // command buffer is the win (decode RTF 21.2 → 19.9).
                         encode_concat_midaxis(
                             e!(),
                             k,
@@ -5351,13 +5279,17 @@ impl MetalExecutable {
                     inverse,
                     norm_tag,
                     dtype,
+                    real_input,
                 } => {
                     // Native multi-kernel MSL path: f32 + power-of-2 N≥2.
                     // f64/C64 and non-pow2 fall through to host CPU FFT.
                     // Set RLX_METAL_FFT_HOST_FALLBACK=1 to force host path.
                     let force_host = rlx_ir::env::flag("RLX_METAL_FFT_HOST_FALLBACK");
                     let n = *n_complex as usize;
-                    let can_native = !force_host
+                    // `real_input` (fused real→complex) requires the native path —
+                    // `src` is the n-wide signal, which the host FFT can't read —
+                    // so it overrides the debug host-fallback flag.
+                    let can_native = (*real_input || !force_host)
                         && matches!(dtype, rlx_ir::DType::F32)
                         && n.is_power_of_two()
                         && n >= 2;
@@ -5375,6 +5307,7 @@ impl MetalExecutable {
                             n as u32,
                             *inverse,
                             norm_scale,
+                            *real_input,
                         );
                     } else {
                         // Host fallback — same sync pattern as
@@ -6188,66 +6121,6 @@ impl MetalExecutable {
                             n: n_u,
                             scheme: *scheme,
                         });
-                    } else if use_q4k_mv_sg && rlx_ir::env::flag("RLX_METAL_Q4K_PROBE") {
-                        // DIAGNOSTIC: read-bandwidth probe (no dequant math).
-                        // PROBE=flat → perfectly-coalesced max-MLP flat read;
-                        // otherwise → row-per-thread read (matches q4k_mv_f32).
-                        let flat =
-                            rlx_ir::env::var("RLX_METAL_Q4K_PROBE").as_deref() == Some("flat");
-                        let enc = e!();
-                        if flat {
-                            let nblocks = k_u / 256;
-                            let total_words = (n_u as u64) * (nblocks as u64) * 144u64 / 4u64;
-                            enc.set_compute_pipeline_state(&k.q4k_flatread_probe);
-                            enc.set_buffer(0, Some(&self.arena.buffer), 0);
-                            let x_b = *x as u64;
-                            let w_b = *w_q as u64;
-                            let d_b = *dst as u64;
-                            let k32 = k_u as u32;
-                            let n32 = n_u as u32;
-                            enc.set_bytes(1, 8, &x_b as *const u64 as *const _);
-                            enc.set_bytes(2, 8, &w_b as *const u64 as *const _);
-                            enc.set_bytes(3, 8, &d_b as *const u64 as *const _);
-                            enc.set_bytes(4, 4, &k32 as *const u32 as *const _);
-                            enc.set_bytes(5, 4, &n32 as *const u32 as *const _);
-                            let grid = metal::MTLSize {
-                                width: total_words,
-                                height: 1,
-                                depth: 1,
-                            };
-                            let tg = metal::MTLSize {
-                                width: 256u64.min(total_words).max(1),
-                                height: 1,
-                                depth: 1,
-                            };
-                            enc.dispatch_threads(grid, tg);
-                            end_msl!();
-                            continue;
-                        }
-                        enc.set_compute_pipeline_state(&k.q4k_readbw_probe);
-                        enc.set_buffer(0, Some(&self.arena.buffer), 0);
-                        let x_b = *x as u64;
-                        let w_b = *w_q as u64;
-                        let d_b = *dst as u64;
-                        let k32 = k_u as u32;
-                        let n32 = n_u as u32;
-                        enc.set_bytes(1, 8, &x_b as *const u64 as *const _);
-                        enc.set_bytes(2, 8, &w_b as *const u64 as *const _);
-                        enc.set_bytes(3, 8, &d_b as *const u64 as *const _);
-                        enc.set_bytes(4, 4, &k32 as *const u32 as *const _);
-                        enc.set_bytes(5, 4, &n32 as *const u32 as *const _);
-                        let grid = metal::MTLSize {
-                            width: n_u as u64,
-                            height: 1,
-                            depth: 1,
-                        };
-                        let tg = metal::MTLSize {
-                            width: 64u64.min(n_u as u64).max(1),
-                            height: 1,
-                            depth: 1,
-                        };
-                        enc.dispatch_threads(grid, tg);
-                        end_msl!();
                     } else if use_q4k_mv_sg {
                         let enc = e!();
                         encode_q4k_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
@@ -6362,12 +6235,39 @@ impl MetalExecutable {
                     dst,
                     k: kk,
                     n,
+                    scheme,
                 } => {
                     let enc = e!();
-                    encode_q4k_swiglu_mv_f32(
+                    encode_fused_mlp_gate_up_swiglu(
                         enc,
                         k,
                         &self.arena.buffer,
+                        *scheme,
+                        *x,
+                        *gate_w,
+                        *up_w,
+                        *dst,
+                        *kk as usize,
+                        *n as usize,
+                    );
+                    end_msl!();
+                }
+
+                Thunk::FusedMlpGateUpGelu {
+                    x,
+                    gate_w,
+                    up_w,
+                    dst,
+                    k: kk,
+                    n,
+                    scheme,
+                } => {
+                    let enc = e!();
+                    encode_fused_mlp_gate_up_gelu(
+                        enc,
+                        k,
+                        &self.arena.buffer,
+                        *scheme,
                         *x,
                         *gate_w,
                         *up_w,
@@ -6389,10 +6289,11 @@ impl MetalExecutable {
                 } => {
                     let pipeline = match scheme {
                         rlx_ir::QuantScheme::GgufQ4K => &k.q4k_mv_residual_f32,
+                        rlx_ir::QuantScheme::GgufQ5_0 => &k.q5_0_mv_residual_f32,
                         rlx_ir::QuantScheme::GgufQ6K => &k.q6k_mv_residual_f32,
                         other => panic!(
                             "FusedMlpDownResidual: unsupported scheme {other:?} \
-                             (fuse_decode_mlp only emits Q4_K / Q6_K)"
+                             (fuse_decode_mlp only emits Q4_K / Q5_0 / Q6_K)"
                         ),
                     };
                     let enc = e!();
@@ -6762,21 +6663,6 @@ impl MetalExecutable {
         };
         if wait {
             cmd_buf.wait_until_completed();
-            // True GPU-busy time (GPUStartTime/GPUEndTime) — read after
-            // completion, stashed for the profiler / per-step reporter which
-            // no longer hold the buffer. Avoids the wall-clock sync distortion.
-            if crate::gpu_time::enabled() {
-                crate::gpu_time::set_last(&cmd_buf);
-            }
-            if thunk_range.is_none() {
-                crate::encode_profile::print_summary();
-            }
-            if cp_active {
-                let busy_ms = crate::gpu_time::busy_seconds(&cmd_buf) * 1e3;
-                let nsamp = (cp_names.len() * 2) as u64;
-                let ticks = crate::counter_profile::resolve(cp_sbuf.as_deref().unwrap(), nsamp);
-                crate::counter_profile::aggregate_and_print(&cp_names, &ticks, busy_ms);
-            }
             if !tail_host.is_empty() {
                 let arena_ptr = self.arena.buffer.contents() as *mut u8;
                 for op in tail_host.drain(..) {
@@ -8918,7 +8804,17 @@ fn encode_sdpa(
         // for benchmarking until the kernel is upgraded to use
         // simdgroup matrix primitives.
         let use_fa = kv_seq >= 256 && head_dim <= 32 && rlx_ir::env::flag("RLX_METAL_FA");
-        let pipeline = if use_fa { &k.sdpa_fa_f32 } else { &k.sdpa_long };
+        let use_decode_m1 = seq == 1
+            && kv_seq != seq
+            && head_dim <= 512
+            && rlx_ir::env::var("RLX_METAL_SDPA_DECODE_M1").as_deref() != Some("0");
+        let pipeline = if use_fa {
+            &k.sdpa_fa_f32
+        } else if use_decode_m1 {
+            &k.sdpa_decode_m1
+        } else {
+            &k.sdpa_long
+        };
         enc.set_compute_pipeline_state(pipeline);
         // Bind to arena base (offset 0) and pass byte offsets via inline
         // constants — large `set_buffer` offsets silently lose kernel writes
@@ -8934,6 +8830,78 @@ fn encode_sdpa(
             std::mem::size_of::<u32>() as u64,
             &batch as *const u32 as *const _,
         );
+        if use_decode_m1 {
+            enc.set_bytes(
+                6,
+                std::mem::size_of::<u32>() as u64,
+                &heads as *const u32 as *const _,
+            );
+            enc.set_bytes(
+                7,
+                std::mem::size_of::<u32>() as u64,
+                &head_dim as *const u32 as *const _,
+            );
+            enc.set_bytes(
+                8,
+                std::mem::size_of::<u32>() as u64,
+                &seq_stride as *const u32 as *const _,
+            );
+            enc.set_bytes(
+                9,
+                std::mem::size_of::<u32>() as u64,
+                &mask_kind as *const u32 as *const _,
+            );
+            enc.set_bytes(
+                10,
+                std::mem::size_of::<u32>() as u64,
+                &kv_seq as *const u32 as *const _,
+            );
+            enc.set_bytes(
+                11,
+                std::mem::size_of::<u32>() as u64,
+                &kv_stride as *const u32 as *const _,
+            );
+            enc.set_bytes(
+                12,
+                std::mem::size_of::<u32>() as u64,
+                &bhsd as *const u32 as *const _,
+            );
+            enc.set_bytes(
+                13,
+                std::mem::size_of::<u32>() as u64,
+                &window as *const u32 as *const _,
+            );
+            enc.set_bytes(
+                14,
+                std::mem::size_of::<f32>() as u64,
+                &kernel_score_scale as *const f32 as *const _,
+            );
+            enc.set_bytes(
+                15,
+                std::mem::size_of::<f32>() as u64,
+                &kernel_softcap as *const f32 as *const _,
+            );
+            let long_offs_pack: [u64; 5] =
+                [q as u64, k_off as u64, v as u64, mask as u64, out as u64];
+            enc.set_bytes(
+                16,
+                (5 * std::mem::size_of::<u64>()) as u64,
+                long_offs_pack.as_ptr() as *const _,
+            );
+            let total = (batch as u64) * (heads as u64);
+            let grid = metal::MTLSize {
+                width: total,
+                height: 1,
+                depth: 1,
+            };
+            let tg = metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatch_threads(grid, tg);
+            return;
+        }
         enc.set_bytes(
             6,
             std::mem::size_of::<u32>() as u64,
@@ -10024,13 +9992,11 @@ pub(crate) fn encode_q4k_mv_f32(
     enc.dispatch_threads(grid, tg);
 }
 
-/// Fused decode MLP gate+up Q4_K GEMV with SwiGLU epilogue (`m == 1`).
-/// `dst[i] = up[i] * silu(gate[i])`. Grid: one thread per intermediate
-/// column. Caller guarantees `k_dim % 256 == 0` and gate/up share `x`/`k`/`n`.
+/// Fused decode MLP gate+up packed GEMV dispatch (`m == 1`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_q4k_swiglu_mv_f32(
+fn encode_fused_mlp_gate_up_mv_f32(
     enc: &metal::ComputeCommandEncoderRef,
-    k: &crate::kernels::Kernels,
+    pipeline: &metal::ComputePipelineState,
     buffer: &metal::Buffer,
     x: usize,
     gate_w: usize,
@@ -10039,7 +10005,7 @@ pub(crate) fn encode_q4k_swiglu_mv_f32(
     k_dim: usize,
     n_dim: usize,
 ) {
-    enc.set_compute_pipeline_state(&k.q4k_swiglu_mv_f32);
+    enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(buffer), 0);
     let x_u = x as u64;
     enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
@@ -10066,8 +10032,54 @@ pub(crate) fn encode_q4k_swiglu_mv_f32(
     enc.dispatch_threads(grid, tg);
 }
 
+/// Fused decode MLP gate+up packed GEMV with SwiGLU epilogue (`m == 1`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fused_mlp_gate_up_swiglu(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    scheme: rlx_ir::quant::QuantScheme,
+    x: usize,
+    gate_w: usize,
+    up_w: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    use rlx_ir::quant::QuantScheme;
+    let pipeline = match scheme {
+        QuantScheme::GgufQ4K => &k.q4k_swiglu_mv_f32,
+        QuantScheme::GgufQ5_0 => &k.q5_0_swiglu_mv_f32,
+        other => panic!("encode_fused_mlp_gate_up_swiglu: unsupported {other:?}"),
+    };
+    encode_fused_mlp_gate_up_mv_f32(enc, pipeline, buffer, x, gate_w, up_w, dst, k_dim, n_dim);
+}
+
+/// Fused decode MLP gate+up packed GEMV with GELU-approx epilogue (`m == 1`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fused_mlp_gate_up_gelu(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    scheme: rlx_ir::quant::QuantScheme,
+    x: usize,
+    gate_w: usize,
+    up_w: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    use rlx_ir::quant::QuantScheme;
+    let pipeline = match scheme {
+        QuantScheme::GgufQ4K => &k.q4k_gelu_mv_f32,
+        QuantScheme::GgufQ5_0 => &k.q5_0_gelu_mv_f32,
+        other => panic!("encode_fused_mlp_gate_up_gelu: unsupported {other:?}"),
+    };
+    encode_fused_mlp_gate_up_mv_f32(enc, pipeline, buffer, x, gate_w, up_w, dst, k_dim, n_dim);
+}
+
 /// Fused decode MLP down-projection GEMV + residual add (`m == 1`).
-/// `dst[j] = res[j] + down(x)[j]`. `pipeline` selects Q4_K vs Q6_K. Grid:
+/// `dst[j] = res[j] + down(x)[j]`. `pipeline` selects Q4_K / Q5_0 / Q6_K.
 /// one thread per output column. Caller guarantees `k_dim % 256 == 0`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_q4k_mv_residual_f32(

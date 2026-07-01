@@ -45,6 +45,8 @@
 //! # }
 //! ```
 
+pub mod planner;
+
 use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_kernel};
 use rlx_driver::{ProcessGroup, ReduceKind};
 use rlx_ir::op_registry::{OpExtension, register_op};

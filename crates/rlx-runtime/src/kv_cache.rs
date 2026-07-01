@@ -23,6 +23,10 @@ pub struct LayerKvCache {
     pub past_len: usize,
     pub layers_k: Vec<Vec<f32>>,
     pub layers_v: Vec<Vec<f32>>,
+    /// Absolute token index of row `0` in each layer's K/V buffer after
+    /// sliding-window trim (Gemma 3/4 ISWA). Zero when the buffer holds
+    /// the full prefix from position `0`.
+    pub layers_kv_base: Vec<usize>,
 }
 
 impl LayerKvCache {
@@ -83,6 +87,7 @@ impl LayerKvCache {
             past_len: past_seq,
             layers_k,
             layers_v,
+            layers_kv_base: vec![0; num_layers],
         })
     }
 
@@ -179,6 +184,10 @@ impl LayerKvCache {
             let drop_bytes = drop_rows * kv_dim;
             self.layers_k[i].drain(..drop_bytes);
             self.layers_v[i].drain(..drop_bytes);
+            if self.layers_kv_base.len() <= i {
+                self.layers_kv_base.resize(self.layers_k.len(), 0);
+            }
+            self.layers_kv_base[i] = self.layers_kv_base[i].saturating_add(drop_rows);
         }
         Ok(())
     }
@@ -232,11 +241,15 @@ mod tests {
             past_len: rows,
             layers_k: vec![(0..(rows * kv_dim)).map(|x| x as f32).collect(); 3],
             layers_v: vec![(0..(rows * kv_dim)).map(|x| x as f32).collect(); 3],
+            layers_kv_base: vec![0; 3],
         };
         // Trim layer 0 to last 2 rows; layer 1 untouched; layer 2 to last 4.
         let spec = [Some((kv_dim, 2)), None, Some((kv_dim, 4))];
         cache.trim_sliding_window_per_layer(&spec).unwrap();
         assert_eq!(cache.layers_k[0].len(), 2 * kv_dim);
+        assert_eq!(cache.layers_kv_base[0], 4);
+        assert_eq!(cache.layers_kv_base[1], 0);
+        assert_eq!(cache.layers_kv_base[2], 2);
         // Layer 0 should now hold the LAST 2 rows: rows 4 and 5.
         assert_eq!(
             cache.layers_k[0],
@@ -258,6 +271,7 @@ mod tests {
             past_len: rows,
             layers_k: vec![vec![1.0f32; rows * kv_dim]],
             layers_v: vec![vec![2.0f32; rows * kv_dim]],
+            layers_kv_base: vec![0],
         };
         cache
             .trim_sliding_window_per_layer(&[Some((kv_dim, 10))])

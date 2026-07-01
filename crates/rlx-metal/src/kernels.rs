@@ -3814,6 +3814,101 @@ kernel void sdpa_long(
     }
 }
 
+// Decode-step SDPA fast path (Lq == 1, Lk arbitrary). Same numerics as
+// `sdpa_long` but qi is always 0 — one thread per (batch, head).
+kernel void sdpa_decode_m1(
+    device const float* arena_q   [[buffer(0)]],
+    device const float* arena_k   [[buffer(1)]],
+    device const float* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& heads       [[buffer(6)]],
+    constant uint& head_dim    [[buffer(7)]],
+    constant uint& q_stride    [[buffer(8)]],
+    constant uint& mask_kind   [[buffer(9)]],
+    constant uint& seq_k       [[buffer(10)]],
+    constant uint& k_stride    [[buffer(11)]],
+    constant uint& bhsd        [[buffer(12)]],
+    constant uint& window      [[buffer(13)]],
+    constant float& score_scale  [[buffer(14)]],
+    constant float& attn_softcap [[buffer(15)]],
+    constant SdpaOffsets& byte_offs [[buffer(16)]],
+    uint tid_x [[thread_position_in_grid]]
+) {
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
+    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+
+    constexpr uint MAX_HEAD_DIM = 512u;
+    uint total = batch * heads;
+    if (tid_x >= total) return;
+
+    uint hi = tid_x % heads;
+    uint bi = tid_x / heads;
+
+    float scale = (score_scale > 0.0f) ? score_scale : 1.0f / precise::sqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+
+    float q_reg[MAX_HEAD_DIM];
+    uint q_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
+    for (uint d = 0; d < head_dim; ++d) q_reg[d] = Q[q_base + d];
+
+    uint q_offset = seq_k - 1u;
+
+    float m_acc = -1e30;
+    float l_acc = 0.0;
+    float o_acc[MAX_HEAD_DIM];
+    for (uint d = 0; d < head_dim; ++d) o_acc[d] = 0.0;
+
+    for (uint ki = 0; ki < seq_k; ++ki) {
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
+        float dot = 0.0;
+        for (uint d = 0; d < head_dim; d += 4u) {
+            if (d + 3u < head_dim) {
+                float4 qv = float4(q_reg[d], q_reg[d+1u], q_reg[d+2u], q_reg[d+3u]);
+                float4 kv = *(device const float4*)(K + k_base + d);
+                dot += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+            } else {
+                for (uint dd = d; dd < head_dim; ++dd) {
+                    dot += q_reg[dd] * K[k_base + dd];
+                }
+            }
+        }
+        float s = dot * scale;
+        if (softcap_inv > 0.0f) {
+            s = precise::tanh(s * softcap_inv) * attn_softcap;
+        }
+        if (mask_kind == 1u) {
+            if (ki > q_offset) s = -1e9;
+        } else if (mask_kind == 2u) {
+            if (M[bi * k_stride + ki] < 0.5) s = -1e9;
+        } else if (mask_kind == 4u) {
+            uint abs_q = q_offset;
+            uint lo = abs_q > window ? abs_q - window : 0u;
+            if (ki < lo || ki > abs_q) s = -1e9;
+        }
+
+        float m_new = max(m_acc, s);
+        float e_old = precise::exp(m_acc - m_new);
+        float e_cur = precise::exp(s - m_new);
+        l_acc = e_old * l_acc + e_cur;
+        uint v_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
+        for (uint d = 0; d < head_dim; ++d) {
+            o_acc[d] = e_old * o_acc[d] + e_cur * V[v_base + d];
+        }
+        m_acc = m_new;
+    }
+
+    float inv_l = 1.0 / l_acc;
+    uint o_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
+    for (uint d = 0; d < head_dim; ++d) {
+        OUT[o_base + d] = o_acc[d] * inv_l;
+    }
+}
+
 // Flash-attention tile kernel with optional additive bias mask.
 //
 // Targets the SAM3 detector decoder image cross-attention where the
@@ -6170,6 +6265,7 @@ pub struct Kernels {
     pub fused_residual_rms_norm: ComputePipelineState,
     pub sdpa: ComputePipelineState,
     pub sdpa_long: ComputePipelineState,
+    pub sdpa_decode_m1: ComputePipelineState,
     pub sdpa_fa_f32: ComputePipelineState,
     pub argreduce: ComputePipelineState,
     /// Cooperative last-axis ArgMax/ArgMin (one threadgroup per row) — used
@@ -6250,6 +6346,18 @@ pub struct Kernels {
     pub softmax_cross_entropy_with_logits: ComputePipelineState,
     pub softmax_cross_entropy_backward: ComputePipelineState,
     pub fft_radix2_full_f32: ComputePipelineState,
+    /// native-gpu-fft: single-kernel on-chip FFT for n in (1024, 4096].
+    #[cfg(feature = "native-gpu-fft")]
+    pub fft_radix2_full_big_f32: ComputePipelineState,
+    /// native-gpu-fft: radix-4 in-place single-kernel FFT (pow-4 and 2·pow-4).
+    #[cfg(feature = "native-gpu-fft")]
+    pub fft_radix4_full_f32: ComputePipelineState,
+    /// native-gpu-fft: radix-8 in-place single-kernel FFT for pow-8 sizes.
+    #[cfg(feature = "native-gpu-fft")]
+    pub fft_radix8_full_f32: ComputePipelineState,
+    /// native-gpu-fft: radix-16 in-place single-kernel FFT for pow-16 sizes.
+    #[cfg(feature = "native-gpu-fft")]
+    pub fft_radix16_full_f32: ComputePipelineState,
     pub fft_bit_reverse_f32: ComputePipelineState,
     pub fft_inner_f32: ComputePipelineState,
     pub fft_outer_r4_f32: ComputePipelineState,
@@ -6266,8 +6374,6 @@ pub struct Kernels {
     /// for `m == 1` (decode) GgufQ4K matmuls; m > 1 still goes through
     /// `dequant_gguf + encode_mps_sgemm_bt`.
     pub q4k_mv_f32: ComputePipelineState,
-    pub q4k_readbw_probe: ComputePipelineState,
-    pub q4k_flatread_probe: ComputePipelineState,
     pub q4_0_mv_f32: ComputePipelineState,
     pub q4_1_mv_f32: ComputePipelineState,
     pub q8_0_mv_f32: ComputePipelineState,
@@ -6288,13 +6394,16 @@ pub struct Kernels {
     /// `dequant_gguf` f32 scratch + MPS sgemm path for these two schemes.
     pub q4k_mm_f32: ComputePipelineState,
     pub q6k_mm_f32: ComputePipelineState,
-    /// Fused decode-layer MLP GEMVs (m == 1). `q4k_swiglu_mv_f32` fuses
-    /// gate+up Q4_K GEMVs with the silu·mul epilogue; the `*_mv_residual_f32`
-    /// pair fuse the down-projection GEMV with the residual add. Produced by
-    /// the `fuse_decode_mlp` thunk pass (off-switch RLX_METAL_FUSE_DECODE).
+    /// Fused decode-layer MLP GEMVs (m == 1). Q4_K / Q5_0 gate+up + silu/gelu;
+    /// Q4_K / Q5_0 / Q6_K down + residual. Produced by `fuse_decode_mlp*`
+    /// (off-switch `RLX_METAL_FUSE_DECODE=0`).
     pub q4k_swiglu_mv_f32: ComputePipelineState,
+    pub q4k_gelu_mv_f32: ComputePipelineState,
+    pub q5_0_swiglu_mv_f32: ComputePipelineState,
+    pub q5_0_gelu_mv_f32: ComputePipelineState,
     pub q4k_mv_residual_f32: ComputePipelineState,
     pub q6k_mv_residual_f32: ComputePipelineState,
+    pub q5_0_mv_residual_f32: ComputePipelineState,
     /// Device buffer holding the concatenated IQ grid LUTs. Built once
     /// at Kernels init from `rlx_gguf::iq_grids::*`. Layout — see
     /// `dequant_gguf.msl` `IQ_GRID_OFF_*` constants.
@@ -6428,6 +6537,7 @@ impl Kernels {
             fused_residual_rms_norm: pipeline("fused_residual_rms_norm"),
             sdpa: pipeline("sdpa"),
             sdpa_long: pipeline("sdpa_long"),
+            sdpa_decode_m1: pipeline("sdpa_decode_m1"),
             sdpa_fa_f32: pipeline("sdpa_fa_f32"),
             argreduce: pipeline("argreduce"),
             argreduce_lastaxis: pipeline("argreduce_lastaxis"),
@@ -6504,6 +6614,14 @@ impl Kernels {
             softmax_cross_entropy_with_logits: pipeline("softmax_cross_entropy_with_logits"),
             softmax_cross_entropy_backward: pipeline("softmax_cross_entropy_backward"),
             fft_radix2_full_f32: pipeline("fft_radix2_full_f32"),
+            #[cfg(feature = "native-gpu-fft")]
+            fft_radix2_full_big_f32: pipeline("fft_radix2_full_big_f32"),
+            #[cfg(feature = "native-gpu-fft")]
+            fft_radix4_full_f32: pipeline("fft_radix4_full_f32"),
+            #[cfg(feature = "native-gpu-fft")]
+            fft_radix8_full_f32: pipeline("fft_radix8_full_f32"),
+            #[cfg(feature = "native-gpu-fft")]
+            fft_radix16_full_f32: pipeline("fft_radix16_full_f32"),
             fft_bit_reverse_f32: pipeline("fft_bit_reverse_f32"),
             fft_inner_f32: pipeline("fft_inner_f32"),
             fft_outer_r4_f32: pipeline("fft_outer_r4_f32"),
@@ -6516,8 +6634,6 @@ impl Kernels {
             mamba2: pipeline("mamba2"),
             dequant_gguf: pipeline("dequant_gguf"),
             q4k_mv_f32: pipeline("q4k_mv_f32"),
-            q4k_readbw_probe: pipeline("q4k_readbw_probe"),
-            q4k_flatread_probe: pipeline("q4k_flatread_probe"),
             q4_0_mv_f32: pipeline("q4_0_mv_f32"),
             q4_1_mv_f32: pipeline("q4_1_mv_f32"),
             q8_0_mv_f32: pipeline("q8_0_mv_f32"),
@@ -6533,8 +6649,12 @@ impl Kernels {
             q4k_mm_f32: pipeline("q4k_mm_f32"),
             q6k_mm_f32: pipeline("q6k_mm_f32"),
             q4k_swiglu_mv_f32: pipeline("q4k_swiglu_mv_f32"),
+            q4k_gelu_mv_f32: pipeline("q4k_gelu_mv_f32"),
+            q5_0_swiglu_mv_f32: pipeline("q5_0_swiglu_mv_f32"),
+            q5_0_gelu_mv_f32: pipeline("q5_0_gelu_mv_f32"),
             q4k_mv_residual_f32: pipeline("q4k_mv_residual_f32"),
             q6k_mv_residual_f32: pipeline("q6k_mv_residual_f32"),
+            q5_0_mv_residual_f32: pipeline("q5_0_mv_residual_f32"),
             rms_norm_bwd: pipeline("rms_norm_bwd"),
             rms_norm_bwd_param: pipeline("rms_norm_bwd_param"),
             rms_norm_bwd_inv_r_f32: pipeline("rms_norm_bwd_inv_r_f32"),

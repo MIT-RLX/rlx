@@ -44,17 +44,18 @@ use crate::host_staging::F32HostSlot;
 use crate::kernels::{
     argmax_kernel, attention_bwd_kernel, attention_kernel, attention_row_kernel,
     batch_elementwise_region_kernel, binary_kernel, compare_kernel, concat_kernel,
-    conv_transpose2d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, cumsum_backward_kernel,
-    cumsum_kernel, dequant_matmul_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw,
-    elementwise_region_kernel, expand_kernel, fused_attn_kernel, fused_binary_unary_kernel,
-    fused_residual_ln_kernel, fused_residual_rms_norm_kernel, gather_axis_kernel,
-    gather_backward_kernel, gather_kernel, group_norm_kernel, grouped_matmul_kernel, im2col_kernel,
-    layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel, matmul_kernel,
-    matmul_wmma_kernel, maxpool2d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel,
-    pool3d_kernel, reduce_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
-    rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
-    scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel, softmax_kernel,
-    topk_kernel, transpose_kernel, unary_kernel, where_kernel,
+    conv_transpose2d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_gguf_kernel, dequant_matmul_kernel,
+    dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel,
+    fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
+    fused_residual_rms_norm_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
+    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, layer_norm2d_kernel, layernorm_kernel,
+    matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel,
+    narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
+    resize_nearest_2x_kernel, rms_norm_backward_kernel, rms_norm_bwd_zero_kernel,
+    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_acc_kernel,
+    scatter_add_zero_kernel, selective_scan_kernel, softmax_kernel, topk_kernel, transpose_kernel,
+    unary_kernel, where_kernel,
 };
 
 /// Opt-in WMMA Tensor Core matmul. Reads `RLX_CUDA_WMMA=1` from env at
@@ -1202,6 +1203,8 @@ pub struct CudaExecutable {
     /// Persistent KV inputs (host mirror + device upload each run).
     gpu_handles: HashMap<String, Vec<f32>>,
     gpu_handle_feeds: HashMap<String, usize>,
+    /// Row feeds: after decode, copy output row `src_row` into handle row `dst_row`.
+    kv_row_feeds: HashMap<String, usize>,
     gpu_handle_resident: std::collections::HashSet<String>,
     /// When set, only these output indices are read back from device (KV feeds stay on GPU).
     pending_read_indices: Option<Vec<usize>>,
@@ -3593,6 +3596,7 @@ fn prewarm_all_kernels(ctx: &Arc<CudaContext>) {
     let _ = scatter_add_zero_kernel(ctx);
     let _ = scatter_add_acc_kernel(ctx);
     let _ = dequant_matmul_kernel(ctx);
+    let _ = dequant_matmul_gguf_kernel(ctx);
     let _ = dequant_gguf_kernel(ctx);
     let _ = sample_kernel(ctx);
     let _ = selective_scan_kernel(ctx);
@@ -3731,8 +3735,11 @@ impl CudaExecutable {
         let fab_scratch_base_f32 = (fab_scratch_off / 4) as u32;
         let mut arena = Arena::from_plan(&ctx, &plan);
         for node in graph.nodes() {
-            let elems = node.shape.num_elements().unwrap_or(0);
-            arena.set_actual_len(node.id, elems * 4);
+            let slot_bytes = node
+                .shape
+                .size_bytes()
+                .unwrap_or_else(|| node.shape.num_elements().unwrap_or(0) * 4);
+            arena.set_actual_len(node.id, slot_bytes);
         }
 
         // Initial param/input offset maps for fast lookup at run time.
@@ -4975,11 +4982,14 @@ impl CudaExecutable {
                     use rlx_ir::quant::QuantScheme;
                     let x_id = node.inputs[0];
                     let w_id = node.inputs[1];
-                    let out_dims = node.shape.dims();
-                    let x_dims = graph.node(x_id).shape.dims();
-                    let m = out_dims[0].unwrap_static() as u32;
-                    let n = out_dims[1].unwrap_static() as u32;
-                    let k = x_dims[1].unwrap_static() as u32;
+                    // Rank-agnostic GEMM dims (mirrors rlx-wgpu / rlx-metal thunk
+                    // lowering). A 2D-only `out_dims[1]` read collapses 3D decode
+                    // output `[1, 1, hidden]` to `n = 1` and breaks GGUF dequant.
+                    let out_total = node.shape.num_elements().unwrap_or(0) as u32;
+                    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static() as u32;
+                    let m = out_total / n.max(1);
+                    let x_total = graph.node(x_id).shape.num_elements().unwrap_or(0) as u32;
+                    let k = x_total / m.max(1);
                     if scheme.is_gguf() {
                         schedule.push(Step::DequantMatmulGguf {
                             m,
@@ -6175,6 +6185,7 @@ impl CudaExecutable {
             replay_event,
             gpu_handles: HashMap::new(),
             gpu_handle_feeds: HashMap::new(),
+            kv_row_feeds: HashMap::new(),
             gpu_handle_resident: std::collections::HashSet::new(),
             pending_read_indices: None,
             readback_plan_buf: Vec::new(),
@@ -6376,6 +6387,12 @@ impl CudaExecutable {
         true
     }
 
+    /// Upload any bound (non-resident) GPU handles from host mirrors into the arena.
+    pub fn stage_bound_gpu_handles_to_arena(&mut self) {
+        let stream = self.ctx.default_stream();
+        self.stage_gpu_handle_inputs(&stream, &[]);
+    }
+
     pub fn has_gpu_handle(&self, name: &str) -> bool {
         self.gpu_handles.contains_key(name)
     }
@@ -6383,6 +6400,129 @@ impl CudaExecutable {
     pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
         self.gpu_handle_feeds
             .insert(handle_name.to_string(), output_index);
+    }
+
+    /// Register a row feed for resident KV decode (mirrors rlx-vulkan).
+    pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) {
+        self.kv_row_feeds
+            .insert(handle_name.to_string(), output_index);
+    }
+
+    fn sync_all_streams(&self) {
+        let _ = self.ctx.default_stream().synchronize();
+        for s in &self.streams {
+            let _ = s.synchronize();
+        }
+    }
+
+    /// In-arena f32 copy (element offsets into the unified arena buffer).
+    fn copy_arena_f32_range(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<cudarc::driver::CudaStream>,
+        buffer: &mut cudarc::driver::CudaSlice<f32>,
+        src_off: usize,
+        dst_off: usize,
+        n: usize,
+    ) {
+        if n == 0 || src_off == dst_off {
+            return;
+        }
+        let kernel = copy_kernel(ctx);
+        let count = n as u32;
+        let src = src_off as u32;
+        let dst = dst_off as u32;
+        let (grid, block) = dispatch_grid_1d(count, 64);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launcher = stream.launch_builder(&kernel.function);
+        launcher.arg(buffer).arg(&count).arg(&src).arg(&dst);
+        unsafe {
+            let _ = launcher.launch(cfg);
+        }
+    }
+
+    /// D2D copy of one KV row from a decode output into its resident handle input.
+    /// Syncs the stream so a subsequent bucket rollover read sees the new row.
+    pub fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) {
+        if row_elems == 0 {
+            return;
+        }
+        let stream = self.ctx.default_stream();
+        let feeds: Vec<(String, usize)> = self
+            .kv_row_feeds
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for (name, out_idx) in &feeds {
+            let Some(&in_id) = self.input_offsets.get(name.as_str()) else {
+                continue;
+            };
+            if *out_idx >= self.graph.outputs.len() {
+                continue;
+            }
+            let out_id = self.graph.outputs[*out_idx];
+            if in_id == out_id {
+                continue;
+            }
+            let base_out = self.arena.offset(out_id) / 4;
+            let base_in = self.arena.offset(in_id) / 4;
+            let rel_src = src_row * row_elems;
+            let rel_dst = dst_row * row_elems;
+            let cap_in = self.arena.len_of(in_id) / 4;
+            let cap_out = self.arena.len_of(out_id) / 4;
+            if rel_src + row_elems > cap_out || rel_dst + row_elems > cap_in {
+                continue;
+            }
+            let src_off = base_out + rel_src;
+            let dst_off = base_in + rel_dst;
+            Self::copy_arena_f32_range(
+                &self.ctx,
+                &stream,
+                self.arena.f32_buf_mut(),
+                src_off,
+                dst_off,
+                row_elems,
+            );
+            self.gpu_handle_resident.insert(name.clone());
+            self.gpu_handles.insert(name.clone(), Vec::new());
+        }
+        let _ = stream.synchronize();
+    }
+
+    /// Read one row from a graph output without full-tensor D2H.
+    /// Caller must ensure GPU work is complete (`run` / `run_read_outputs` syncs).
+    pub fn read_output_row(
+        &self,
+        out_idx: usize,
+        row: usize,
+        row_inner: usize,
+    ) -> Option<Vec<f32>> {
+        if row_inner == 0 || out_idx >= self.graph.outputs.len() {
+            return None;
+        }
+        let id = self.graph.outputs[out_idx];
+        let shape_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+        if shape_elems == 0 {
+            return None;
+        }
+        let rel = row * row_inner;
+        if rel + row_inner > shape_elems {
+            return None;
+        }
+        let base = self.arena.offset(id) / 4;
+        let off = base + rel;
+        let cap_f32 = self.arena.len_of(id) / 4;
+        if off + row_inner > base + cap_f32 {
+            return None;
+        }
+        let stream = self.ctx.default_stream();
+        let mut host = vec![0f32; row_inner];
+        let src = self.arena.f32_buf().slice(off..off + row_inner);
+        stream.memcpy_dtoh(&src, &mut host).ok()?;
+        Some(host)
     }
 
     pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
@@ -6414,6 +6554,209 @@ impl CudaExecutable {
         self.gpu_handles.get(name).cloned()
     }
 
+    /// Mark a graph input as device-resident without a host mirror or H2D upload.
+    pub fn prepare_resident_gpu_handle(&mut self, name: &str) -> bool {
+        if !self.input_offsets.contains_key(name) {
+            return false;
+        }
+        self.gpu_handle_resident.insert(name.to_string());
+        self.gpu_handles.remove(name);
+        true
+    }
+
+    fn copy_f32_dtod_between(
+        stream: &Arc<cudarc::driver::CudaStream>,
+        src: &cudarc::driver::CudaSlice<f32>,
+        src_off: usize,
+        dst: &mut cudarc::driver::CudaSlice<f32>,
+        dst_off: usize,
+        n: usize,
+    ) {
+        if n == 0 {
+            return;
+        }
+        let src_slice = src.slice(src_off..src_off + n);
+        let mut dst_slice = dst.slice_mut(dst_off..dst_off + n);
+        let _ = stream.memcpy_dtod(&src_slice, &mut dst_slice);
+    }
+
+    /// Copy a resident K/V prefix from another executable (bucket rollover).
+    ///
+    /// Rows below `outgoing_upper` are read from the source resident inputs; the
+    /// top-of-bucket row (`g == outgoing_upper` when `to_row > outgoing_upper`) is
+    /// read from decode outputs because `feed_kv_row` cannot write into the last
+    /// resident slot when `dst_row == bucket upper`.
+    ///
+    /// Values are staged host-side (D2H then H2D) to match the flush path used in
+    /// `rlx-llama32` today. Padding rows `[to_row..cap)` are zeroed. A future fast
+    /// path may use pure D2D once parity is proven.
+    pub fn copy_resident_kv_rows_from(
+        &mut self,
+        src: &Self,
+        from_row: usize,
+        to_row: usize,
+        outgoing_upper: usize,
+        kv_dim: usize,
+        n_layers: usize,
+    ) -> bool {
+        if from_row >= to_row || n_layers == 0 || kv_dim == 0 {
+            return true;
+        }
+        let stream = self.ctx.default_stream();
+        let need_top = to_row > outgoing_upper;
+        let top_global = outgoing_upper;
+        if need_top {
+            let _ = stream.synchronize();
+        }
+
+        for i in 0..n_layers {
+            let k_name = format!("past_k_{i}");
+            let v_name = format!("past_v_{i}");
+            let Some(&dst_k) = self.input_offsets.get(k_name.as_str()) else {
+                return false;
+            };
+            let Some(&dst_v) = self.input_offsets.get(v_name.as_str()) else {
+                return false;
+            };
+            let Some(&src_k) = src.input_offsets.get(k_name.as_str()) else {
+                return false;
+            };
+            let Some(&src_v) = src.input_offsets.get(v_name.as_str()) else {
+                return false;
+            };
+            if !self.arena.has(dst_k)
+                || !self.arena.has(dst_v)
+                || !src.arena.has(src_k)
+                || !src.arena.has(src_v)
+            {
+                return false;
+            }
+
+            self.gpu_handle_resident.insert(k_name.clone());
+            self.gpu_handle_resident.insert(v_name.clone());
+            self.gpu_handles.remove(&k_name);
+            self.gpu_handles.remove(&v_name);
+
+            let dst_k_base = self.arena.offset(dst_k) / 4;
+            let dst_v_base = self.arena.offset(dst_v) / 4;
+            let k_out = 1 + 2 * i;
+            let v_out = 2 + 2 * i;
+            if k_out >= src.graph.outputs.len() || v_out >= src.graph.outputs.len() {
+                return false;
+            }
+
+            for g in from_row..to_row {
+                let row_off = g.saturating_mul(kv_dim);
+                let from_output = need_top && g == top_global;
+                if row_off + kv_dim > self.arena.len_of(dst_k) / 4
+                    || row_off + kv_dim > self.arena.len_of(dst_v) / 4
+                {
+                    return false;
+                }
+                let (host_k, host_v) = if from_output {
+                    let Some(host_k) = src.read_output_row(k_out, top_global, kv_dim) else {
+                        return false;
+                    };
+                    let Some(host_v) = src.read_output_row(v_out, top_global, kv_dim) else {
+                        return false;
+                    };
+                    (host_k, host_v)
+                } else {
+                    let Some(host_k) = src.read_gpu_handle_row(k_name.as_str(), g, kv_dim) else {
+                        return false;
+                    };
+                    let Some(host_v) = src.read_gpu_handle_row(v_name.as_str(), g, kv_dim) else {
+                        return false;
+                    };
+                    (host_k, host_v)
+                };
+                let dst_buf = self.arena.f32_buf_mut();
+                let mut dst_k_slice =
+                    dst_buf.slice_mut(dst_k_base + row_off..dst_k_base + row_off + kv_dim);
+                if stream
+                    .memcpy_htod(host_k.as_slice(), &mut dst_k_slice)
+                    .is_err()
+                {
+                    return false;
+                }
+                let dst_buf = self.arena.f32_buf_mut();
+                let mut dst_v_slice =
+                    dst_buf.slice_mut(dst_v_base + row_off..dst_v_base + row_off + kv_dim);
+                if stream
+                    .memcpy_htod(host_v.as_slice(), &mut dst_v_slice)
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+
+            let cap_rows = self.arena.len_of(dst_k) / 4 / kv_dim.max(1);
+            if to_row < cap_rows {
+                let zeros = vec![0f32; kv_dim];
+                for row in to_row..cap_rows {
+                    let row_off = row * kv_dim;
+                    let dst_buf = self.arena.f32_buf_mut();
+                    let mut dst_k_slice =
+                        dst_buf.slice_mut(dst_k_base + row_off..dst_k_base + row_off + kv_dim);
+                    if stream
+                        .memcpy_htod(zeros.as_slice(), &mut dst_k_slice)
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    let dst_buf = self.arena.f32_buf_mut();
+                    let mut dst_v_slice =
+                        dst_buf.slice_mut(dst_v_base + row_off..dst_v_base + row_off + kv_dim);
+                    if stream
+                        .memcpy_htod(zeros.as_slice(), &mut dst_v_slice)
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        let _ = stream.synchronize();
+        true
+    }
+
+    /// D2D copy of a resident KV prefix from another executable (bucket rollover).
+    pub fn seed_resident_kv_prefix_from(
+        &mut self,
+        src: &Self,
+        prefix_tokens: usize,
+        outgoing_upper: usize,
+        kv_dim: usize,
+        n_layers: usize,
+    ) -> bool {
+        self.copy_resident_kv_rows_from(src, 0, prefix_tokens, outgoing_upper, kv_dim, n_layers)
+    }
+
+    /// Read one row from a resident GPU input handle without full-tensor D2H.
+    pub fn read_gpu_handle_row(
+        &self,
+        name: &str,
+        row: usize,
+        row_inner: usize,
+    ) -> Option<Vec<f32>> {
+        if row_inner == 0 {
+            return None;
+        }
+        let &id = self.input_offsets.get(name)?;
+        let cap_f32 = self.arena.len_of(id) / 4;
+        let rel = row * row_inner;
+        if rel + row_inner > cap_f32 {
+            return None;
+        }
+        let base = self.arena.offset(id) / 4;
+        let off = base + rel;
+        let stream = self.ctx.default_stream();
+        let mut host = vec![0f32; row_inner];
+        let src = self.arena.f32_buf().slice(off..off + row_inner);
+        stream.memcpy_dtoh(&src, &mut host).ok()?;
+        Some(host)
+    }
+
     /// Clone into an independent executable (recompiles from the stored graph).
     pub fn clone_for_cache(&self) -> Self {
         let mut exe = Self::compile_with_rng(
@@ -6427,6 +6770,9 @@ impl CudaExecutable {
         }
         for (k, &idx) in &self.gpu_handle_feeds {
             exe.set_gpu_handle_feed(k, idx);
+        }
+        for (k, &idx) in &self.kv_row_feeds {
+            exe.register_kv_row_feed(k, idx);
         }
         exe.set_active_extent(self.active_extent);
         exe
@@ -8448,35 +8794,63 @@ impl CudaExecutable {
                     w_byte_off,
                     out_byte_off,
                 } => {
-                    let use_gpu = self.dequant_scratch_off > 0 && self.blas.is_some();
-                    if use_gpu {
-                        let blas = self.blas.as_ref().unwrap();
-                        crate::gguf_gpu::run_dequant_matmul_gguf_gpu(
+                    // Decode GEMV (m=1, Q4_K/Q6_K): fused on-device kernel — parity
+                    // with rlx-vulkan and rlx-cpu `gguf_matmul_bt`. Prefill (m>1)
+                    // uses dequant_gguf + cuBLAS. Other m=1 schemes stay on host
+                    // unless RLX_CUDA_GGUF_GPU_M1=1.
+                    let fused_gemv = crate::gguf_gpu::gguf_fused_gemv_m1_supported(
+                        *scheme_id,
+                        *m as usize,
+                        *k as usize,
+                    ) && rlx_ir::env::var("ORPHEUS_CUDA_GGUF_FUSED_M1").as_deref()
+                        != Some("0");
+                    if fused_gemv {
+                        crate::gguf_gpu::run_dequant_matmul_gguf_gemv_m1(
                             &self.ctx,
                             &stream,
                             self.arena.f32_buf_mut(),
-                            blas,
-                            *m as usize,
-                            *k as usize,
                             *n as usize,
+                            *k as usize,
                             *scheme_id,
                             *x_byte_off as usize,
                             *w_byte_off as usize,
-                            self.dequant_scratch_off,
                             *out_byte_off as usize,
                         );
                     } else {
-                        crate::gguf_host::run_dequant_matmul_gguf(
-                            &stream,
-                            self.arena.f32_buf_mut(),
-                            *m as usize,
-                            *k as usize,
-                            *n as usize,
-                            *scheme_id,
-                            *x_byte_off as usize,
-                            *w_byte_off as usize,
-                            *out_byte_off as usize,
-                        );
+                        let use_gpu = self.dequant_scratch_off > 0
+                            && self.blas.is_some()
+                            && (*m > 1
+                                || rlx_ir::env::var("RLX_CUDA_GGUF_GPU_M1").as_deref()
+                                    == Some("1"));
+                        if use_gpu {
+                            let blas = self.blas.as_ref().unwrap();
+                            crate::gguf_gpu::run_dequant_matmul_gguf_gpu(
+                                &self.ctx,
+                                &stream,
+                                self.arena.f32_buf_mut(),
+                                blas,
+                                *m as usize,
+                                *k as usize,
+                                *n as usize,
+                                *scheme_id,
+                                *x_byte_off as usize,
+                                *w_byte_off as usize,
+                                self.dequant_scratch_off,
+                                *out_byte_off as usize,
+                            );
+                        } else {
+                            crate::gguf_host::run_dequant_matmul_gguf(
+                                &stream,
+                                self.arena.f32_buf_mut(),
+                                *m as usize,
+                                *k as usize,
+                                *n as usize,
+                                *scheme_id,
+                                *x_byte_off as usize,
+                                *w_byte_off as usize,
+                                *out_byte_off as usize,
+                            );
+                        }
                     }
                 }
                 Step::DequantGroupedMatmulGguf {

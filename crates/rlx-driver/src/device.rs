@@ -168,7 +168,7 @@ impl std::str::FromStr for Device {
             "cpu" => Device::Cpu,
             "metal" | "mps" | "mtl" => Device::Metal,
             "mlx" => Device::Mlx,
-            "ane" | "neural-engine" => Device::Ane,
+            "ane" | "coreml" | "neural-engine" => Device::Ane,
             "cuda" | "nvidia" => Device::Cuda,
             "rocm" | "hip" | "amd" => Device::Rocm,
             "oneapi" | "levelzero" | "level-zero" | "l0" | "intel" | "sycl" => Device::OneApi,

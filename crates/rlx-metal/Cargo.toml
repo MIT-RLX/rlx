@@ -33,6 +33,10 @@ default = []
 # Native MSL raster via `rlx-splat` + `splat.msl` (no `rlx-runtime` on `rlx-splat` — no cycle).
 # rlx-splat moved to ../rlx-splat; no-op feature (was ["dep:rlx-splat"]) — keeps cfg gates valid.
 native-splat = []
+# Single-kernel on-chip FFT for n in (1024, 4096]: keeps the whole transform in
+# threadgroup memory (one DRAM load + store) instead of the multi-launch path
+# that round-trips DRAM per outer stage. Runtime gate `RLX_FFT_FAST=0` disables.
+native-gpu-fft = []
 
 [target.'cfg(all(target_vendor = "apple", not(target_os = "watchos")))'.dependencies]
 metal = "0.30"

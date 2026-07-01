@@ -39,7 +39,7 @@ pub fn parse_device(s: &str) -> Result<Device, ParseDeviceError> {
         "cpu" => Ok(Device::Cpu),
         "metal" | "mtl" => Ok(Device::Metal),
         "mlx" => Ok(Device::Mlx),
-        "ane" | "neural-engine" => Ok(Device::Ane),
+        "ane" | "coreml" | "neural-engine" => Ok(Device::Ane),
         "cuda" | "nvidia" => Ok(Device::Cuda),
         "rocm" | "hip" | "amd" => Ok(Device::Rocm),
         "oneapi" | "levelzero" | "level-zero" | "l0" | "intel" | "sycl" => Ok(Device::OneApi),
@@ -57,7 +57,7 @@ pub fn parse_device(s: &str) -> Result<Device, ParseDeviceError> {
         other => Err(ParseDeviceError {
             input: s.to_string(),
             message: format!(
-                "unknown device '{other}' (try: cpu, metal, mlx, cuda, rocm, gpu, vulkan, tpu)"
+                "unknown device '{other}' (try: cpu, metal, mlx, ane, coreml, cuda, rocm, gpu, vulkan, tpu)"
             ),
         }),
     }
@@ -113,6 +113,7 @@ mod tests {
     fn parse_aliases() {
         assert_eq!(parse_device("CUDA").unwrap(), Device::Cuda);
         assert_eq!(parse_device("wgpu").unwrap(), Device::Gpu);
+        assert_eq!(parse_device("coreml").unwrap(), Device::Ane);
         assert_eq!(
             parse_device_list("cpu, metal;mlx").unwrap(),
             vec![Device::Cpu, Device::Metal, Device::Mlx,]

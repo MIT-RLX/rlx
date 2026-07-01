@@ -293,6 +293,12 @@ kernel_cache!(
     DEQUANT_GGUF_CU,
     "dequant_gguf"
 );
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF,
+    dequant_matmul_gguf_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf"
+);
 kernel_cache!(SAMPLE, sample_kernel, SAMPLE_CU, "sample");
 kernel_cache!(
     SELECTIVE_SCAN,
