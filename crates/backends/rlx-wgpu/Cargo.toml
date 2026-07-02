@@ -1,0 +1,64 @@
+[package]
+name = "rlx-wgpu"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Cross-platform GPU backend for RLX via wgpu (Metal/Vulkan/DX12/WebGPU)"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+[features]
+default = []
+native-splat = []
+# `Op::GaussianSplatRender` via CPU reference (D2H) when `splat` is enabled.
+splat = ["rlx-cpu/splat"]
+# Single-kernel on-chip FFT for n in (1024, 2048]: keeps the whole transform in
+# workgroup memory (one DRAM load + store) instead of the multi-launch path that
+# round-trips DRAM per outer stage. Runtime gate `RLX_FFT_FAST=0` disables.
+native-gpu-fft = []
+
+[dependencies]
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10", default-features = false, features = ["compile"] }
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.10" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", features = ["splat"] }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.10" }
+
+# wgpu 30: WebGPU-spec dispatch/present renames, `get_mapped_range` → Result,
+# signed `%` fix on Vulkan SPIR-V, Metal bindless storage buffers, etc.
+# Backends picked explicitly. DX12 is enabled for native Windows tensor-core
+# paths (preferred over Vulkan when the adapter supports it). GLES excluded.
+wgpu = { version = "30", default-features = false, features = [
+    "std",
+    "parking_lot",
+    "vulkan",
+    "dx12",
+    "metal",
+    "wgsl",
+    "webgpu",
+] }
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+half = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Path-only (no version): test-only cycle on the umbrella crate, which is
+# published last. cargo strips path-only dev-deps from the published manifest,
+# so this never resolves against crates.io and needs no per-release pin bump.
+rlx = { path = "../../rlx", default-features = false, features = ["cpu", "gpu"] }
+rlx-runtime = { path = "../../core/rlx-runtime", features = ["gpu"] }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.10" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
+half = "2"
+pollster = "0.3"
+bytemuck = "1"
+
+[lints]
+workspace = true

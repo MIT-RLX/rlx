@@ -136,13 +136,21 @@ real-input spectra and signal-processing workflows:
 - `fft_real` / `rfft` / `irfft` — Hermitian `irfft` mirrors the conjugate half
 - `fftfreq` / `rfftfreq` — sample-frequency constants
 - `psd` / `psd_real` — power spectral density
-- `stft`, `fft_conv1d` — short-time FFT and frequency-domain convolution
+- `stft`, `fft_conv1d` — short-time FFT (a single batched `rfft` over all frames)
+  and frequency-domain convolution
 
-Pow-2 f32 transforms use native GPU kernels on CUDA / ROCm / wgpu / Metal;
-non-pow2 and f64 / C64 fall back to partial host sync. Bench with
-`cargo run -p rlx-bench --release --example bench_fft --features metal,gpu`.
-Python bindings: `pyrlx.Graph.fft`, `.rfft`, `.irfft`, `.fftfreq` (see
-`crates/pyrlx/tests/test_fft.py`).
+Pow-2 **f32** transforms run native GPU kernels (CUDA / ROCm / Metal / wgpu);
+non-pow2 uses Bluestein/chirp-z, and f64 / C64 run on the host CPU path (wgpu —
+whose arena is f32-only — rejects them). The `native-gpu-fft` feature adds the
+on-chip single-kernel radix-2/4/8 path (Metal / wgpu), CPU radix-4, and rayon
+batch parallelism. Runtime toggles: `RLX_FFT_FAST`, `RLX_FFT_RADIX`,
+`RLX_FFT_CPU_PARALLEL`, `RLX_FFT_RADIX4`, `RLX_FFT_FUSE_REAL`.
+
+Benchmark one size across backends with
+`cargo run -p rlx-bench --release --example bench_fft --features metal,gpu`, or
+the full variant × precision × size × backend matrix (with per-backend CPU-parity
+checks) via `bench_fft_matrix`. Python bindings: `pyrlx.Graph.fft`, `.rfft`,
+`.irfft`, `.fftfreq` (see `crates/pyrlx/tests/test_fft.py`).
 
 
 Or depend on each crate directly (`rlx-ir`, `rlx-opt`, `rlx-runtime`,

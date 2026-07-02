@@ -1,0 +1,35 @@
+[package]
+name = "rlx-cerebras"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Cerebras Wafer-Scale Engine backend for RLX — IR → CSL → fabric simulator."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# Library crate + a single emit binary. No proc-macro, no build script.
+# CSL generation is pure Rust; no Python, no `.csl` templates on disk.
+# The emitted run.py / commands.sh drive the Cerebras SDK fabric simulator
+# (which lives outside this crate, in a Singularity container on a Linux host).
+
+[dependencies]
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rlx-cerebras-emit"
+path = "src/bin/emit.rs"
+
+[lints]
+workspace = true

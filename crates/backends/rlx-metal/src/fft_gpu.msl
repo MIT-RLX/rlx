@@ -1,0 +1,634 @@
+// Multi-kernel f32 FFT (gpu-fft strategy), RLX 2N real-block layout.
+// Grid builtins are scalar-only (Metal requires uniform vector width per kernel).
+
+inline float fft_re(device float* arena, uint base, uint k, uint n) {
+    return arena[base + k];
+}
+inline float fft_im(device float* arena, uint base, uint k, uint n) {
+    return arena[base + n + k];
+}
+inline void fft_set_re(device float* arena, uint base, uint k, uint n, float v) {
+    arena[base + k] = v;
+}
+inline void fft_set_im(device float* arena, uint base, uint k, uint n, float v) {
+    arena[base + n + k] = v;
+}
+
+kernel void fft_radix2_full_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& src_off [[buffer(1)]],
+    constant uint& dst_off [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& log2n [[buffer(4)]],
+    constant uint& inverse [[buffer(5)]],
+    constant float& norm_scale [[buffer(6)]],
+    constant uint& outer [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float sre[1024];
+    threadgroup float sim[1024];
+    if (row >= outer) return;
+    uint src_base = src_off + row * 2u * n;
+    uint dst_base = dst_off + row * 2u * n;
+
+    uint k = tid;
+    while (k < n) {
+        uint rev = reverse_bits(k) >> (32u - log2n);
+        sre[rev] = fft_re(arena, src_base, k, n);
+        sim[rev] = fft_im(arena, src_base, k, n);
+        k += tg_size;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sign = (inverse != 0u) ? 1.0f : -1.0f;
+    float two_pi = 6.28318530717958647692f;
+    for (uint len = 2u; len <= n; len <<= 1u) {
+        uint h2 = len >> 1u;
+        float theta_base = sign * two_pi / float(len);
+        for (uint b = tid; b < n / 2u; b += tg_size) {
+            uint group = b / h2;
+            uint k_in = b % h2;
+            uint i_lo = group * len + k_in;
+            uint i_hi = i_lo + h2;
+            float theta = theta_base * float(k_in);
+            float wre = cos(theta);
+            float wim = sin(theta);
+            float t_re = wre * sre[i_hi] - wim * sim[i_hi];
+            float t_im = wre * sim[i_hi] + wim * sre[i_hi];
+            float u_re = sre[i_lo];
+            float u_im = sim[i_lo];
+            sre[i_lo] = u_re + t_re;
+            sim[i_lo] = u_im + t_im;
+            sre[i_hi] = u_re - t_re;
+            sim[i_hi] = u_im - t_im;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    k = tid;
+    while (k < n) {
+        fft_set_re(arena, dst_base, k, n, sre[k] * norm_scale);
+        fft_set_im(arena, dst_base, k, n, sim[k] * norm_scale);
+        k += tg_size;
+    }
+}
+
+// native-gpu-fft: single-kernel FFT for n in (1024, 4096]. Identical math to
+// fft_radix2_full_f32 (bit-reverse load + all radix-2 stages on-chip + store),
+// but the threadgroup buffers are sized for n=4096 (32 KB total, Apple Silicon's
+// max). This keeps the whole transform in threadgroup memory — one DRAM load +
+// one store — instead of the multi-kernel path's per-outer-stage DRAM round
+// trips. Launched with one threadgroup per FFT row (grid = outer), 256 threads.
+kernel void fft_radix2_full_big_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& src_off [[buffer(1)]],
+    constant uint& dst_off [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& log2n [[buffer(4)]],
+    constant uint& inverse [[buffer(5)]],
+    constant float& norm_scale [[buffer(6)]],
+    constant uint& outer [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float sre[4096];
+    threadgroup float sim[4096];
+    if (row >= outer) return;
+    uint src_base = src_off + row * 2u * n;
+    uint dst_base = dst_off + row * 2u * n;
+
+    uint k = tid;
+    while (k < n) {
+        uint rev = reverse_bits(k) >> (32u - log2n);
+        sre[rev] = fft_re(arena, src_base, k, n);
+        sim[rev] = fft_im(arena, src_base, k, n);
+        k += tg_size;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sign = (inverse != 0u) ? 1.0f : -1.0f;
+    float two_pi = 6.28318530717958647692f;
+    for (uint len = 2u; len <= n; len <<= 1u) {
+        uint h2 = len >> 1u;
+        float theta_base = sign * two_pi / float(len);
+        for (uint b = tid; b < n / 2u; b += tg_size) {
+            uint group = b / h2;
+            uint k_in = b % h2;
+            uint i_lo = group * len + k_in;
+            uint i_hi = i_lo + h2;
+            float theta = theta_base * float(k_in);
+            float wre = cos(theta);
+            float wim = sin(theta);
+            float t_re = wre * sre[i_hi] - wim * sim[i_hi];
+            float t_im = wre * sim[i_hi] + wim * sre[i_hi];
+            float u_re = sre[i_lo];
+            float u_im = sim[i_lo];
+            sre[i_lo] = u_re + t_re;
+            sim[i_lo] = u_im + t_im;
+            sre[i_hi] = u_re - t_re;
+            sim[i_hi] = u_im - t_im;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    k = tid;
+    while (k < n) {
+        fft_set_re(arena, dst_base, k, n, sre[k] * norm_scale);
+        fft_set_im(arena, dst_base, k, n, sim[k] * norm_scale);
+        k += tg_size;
+    }
+}
+
+// native-gpu-fft: radix-4 in-place single-kernel FFT for pure powers of 4
+// (n=4096 in the fast-path range). Base-4 digit-reversal load → log4(n) radix-4
+// DIT stages in threadgroup memory (half the radix-2 stage/barrier count) →
+// store. Same 32 KB budget as the radix-2 big kernel (one float2 per element).
+// Each radix-4 butterfly reads+writes its own disjoint 4 positions, so the
+// in-place stage is race-free; one barrier separates stages.
+inline float2 fft_cmul_msl(float2 a, float2 b) {
+    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+// In-register 4-point DFT (the radix-4 butterfly core). rs=+1 forward, -1
+// inverse (flips the ±i rotation). Inputs x1..x3 are already twiddled.
+inline void fft_dft4_msl(
+    float2 x0, float2 x1, float2 x2, float2 x3, float rs,
+    thread float2& X0, thread float2& X1, thread float2& X2, thread float2& X3
+) {
+    float2 t0 = float2(x0.x + x2.x, x0.y + x2.y), t1 = float2(x0.x - x2.x, x0.y - x2.y);
+    float2 t2 = float2(x1.x + x3.x, x1.y + x3.y), t3 = float2(x1.x - x3.x, x1.y - x3.y);
+    X0 = float2(t0.x + t2.x, t0.y + t2.y);
+    X2 = float2(t0.x - t2.x, t0.y - t2.y);
+    X1 = float2(t1.x + rs * t3.y, t1.y - rs * t3.x);
+    X3 = float2(t1.x - rs * t3.y, t1.y + rs * t3.x);
+}
+
+kernel void fft_radix4_full_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& src_off [[buffer(1)]],
+    constant uint& dst_off [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& log2n [[buffer(4)]],
+    constant uint& inverse [[buffer(5)]],
+    constant float& norm_scale [[buffer(6)]],
+    constant uint& outer [[buffer(7)]],
+    constant uint& real_input [[buffer(8)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float2 sh[4096]; // interleaved complex; 32 KB at n=4096.
+    if (row >= outer) return;
+    // real_input: read the n-wide real signal (row stride n, im=0) instead of
+    // the 2N complex block — the real→complex zero-pad fused into the load.
+    uint src_base = src_off + row * (real_input != 0u ? n : 2u * n);
+    uint dst_base = dst_off + row * 2u * n;
+    uint d = log2n >> 1u;        // radix-4 stages
+    uint has_r2 = log2n & 1u;    // leading radix-2 stage when log2n is odd
+                                 // (mixed n = 2·4^d, e.g. 2048).
+
+    // Mixed-radix digit-reversal load → natural-order output. For n=2·4^d the
+    // radix-2 digit (k&1) is the most-significant reversed digit (weight n/2),
+    // and the d base-4 digits of (k>>1) reverse into the low part.
+    for (uint k = tid; k < n; k += tg_size) {
+        uint r = 0u, kk = has_r2 ? (k >> 1u) : k;
+        for (uint i = 0u; i < d; ++i) { r = (r << 2u) | (kk & 3u); kk >>= 2u; }
+        if (has_r2) r |= (k & 1u) << (log2n - 1u);
+        sh[r] = float2(arena[src_base + k], real_input != 0u ? 0.0f : arena[src_base + n + k]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sgn = (inverse != 0u) ? 1.0f : -1.0f;
+    float rs = (inverse != 0u) ? -1.0f : 1.0f;
+    float two_pi = 6.28318530717958647692f;
+    uint dist = 1u;
+
+    for (uint s = 0u; s < d; ++s) {
+        uint L = dist << 2u; // 4*dist
+        for (uint j = tid; j < n / 4u; j += tg_size) {
+            uint k = j & (dist - 1u); // dist is a power of 2
+            uint base = (j / dist) * L + k;
+            float2 u0 = sh[base];
+            float2 u1 = sh[base + dist];
+            float2 u2 = sh[base + 2u * dist];
+            float2 u3 = sh[base + 3u * dist];
+            float a = sgn * two_pi * (float)k / (float)L;
+            float c1 = cos(a),       s1 = sin(a);
+            float c2 = cos(2.0f * a), s2 = sin(2.0f * a);
+            float c3 = cos(3.0f * a), s3 = sin(3.0f * a);
+            u1 = fft_cmul_msl(u1, float2(c1, s1));
+            u2 = fft_cmul_msl(u2, float2(c2, s2));
+            u3 = fft_cmul_msl(u3, float2(c3, s3));
+            float2 Y0, Y1, Y2, Y3;
+            fft_dft4_msl(u0, u1, u2, u3, rs, Y0, Y1, Y2, Y3);
+            sh[base] = Y0;
+            sh[base + dist] = Y1;
+            sh[base + 2u * dist] = Y2;
+            sh[base + 3u * dist] = Y3;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dist <<= 2u;
+    }
+
+    // Trailing radix-2 combine (outermost stage) for mixed n=2·4^d: the radix-2
+    // factor is innermost in n=2n'+b, so its butterfly is the LAST stage, at
+    // dist=n/2 with twiddle W_n^k. dist == n/2 here after the radix-4 loop.
+    if (has_r2 != 0u) {
+        uint L = dist << 1u; // 2*dist = n
+        for (uint j = tid; j < n / 2u; j += tg_size) {
+            uint k = j & (dist - 1u);
+            uint base = (j / dist) * L + k;
+            float2 u0 = sh[base];
+            float2 u1 = sh[base + dist];
+            float a = sgn * two_pi * (float)k / (float)L;
+            u1 = fft_cmul_msl(u1, float2(cos(a), sin(a)));
+            sh[base]        = float2(u0.x + u1.x, u0.y + u1.y);
+            sh[base + dist] = float2(u0.x - u1.x, u0.y - u1.y);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint k = tid; k < n; k += tg_size) {
+        fft_set_re(arena, dst_base, k, n, sh[k].x * norm_scale);
+        fft_set_im(arena, dst_base, k, n, sh[k].y * norm_scale);
+    }
+}
+
+// 16th root of unity W16^e = exp(sgn·2π·e/16). The 4×4 decomposition only ever
+// needs e ∈ {0,1,2,3,4,6,9}, all baked as immediates; the default is a safety
+// fallback that never fires.
+inline float2 fft_w16_msl(int e, float sgn) {
+    const float C1 = 0.92387953251128676f; // cos(pi/8)
+    const float S1 = 0.38268343236508977f; // sin(pi/8)
+    const float R2 = 0.70710678118654752f; // 1/sqrt2
+    switch (e & 15) {
+        case 0: return float2(1.0f, 0.0f);
+        case 1: return float2(C1, sgn * S1);
+        case 2: return float2(R2, sgn * R2);
+        case 3: return float2(S1, sgn * C1);
+        case 4: return float2(0.0f, sgn);
+        case 6: return float2(-R2, sgn * R2);
+        case 9: return float2(-C1, -sgn * S1);
+        default: {
+            float a = sgn * 6.28318530717958647692f * (float)e / 16.0f;
+            return float2(cos(a), sin(a));
+        }
+    }
+}
+
+// native-gpu-fft: radix-16 in-place single-kernel FFT for pure powers of 16
+// (n=4096 = 16^3 in the fast-path range). Base-16 digit-reversal load → log16(n)
+// radix-16 DIT stages (a quarter of the radix-2 barriers) → store. The 16-point
+// DFT is 4×4 Cooley-Tukey: 4 inner radix-4 + W16 twiddles + 4 outer radix-4,
+// reusing fft_dft4_msl. Heavy register pressure (u[16]+A[16]+Y[16]) — this kernel
+// exists to test whether the fewer-barriers win survives the occupancy hit.
+kernel void fft_radix16_full_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& src_off [[buffer(1)]],
+    constant uint& dst_off [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& log2n [[buffer(4)]],
+    constant uint& inverse [[buffer(5)]],
+    constant float& norm_scale [[buffer(6)]],
+    constant uint& outer [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float2 sh[4096]; // interleaved complex; 32 KB at n=4096.
+    if (row >= outer) return;
+    uint src_base = src_off + row * 2u * n;
+    uint dst_base = dst_off + row * 2u * n;
+    uint d = log2n >> 2u; // base-16 digits = log16(n).
+
+    for (uint k = tid; k < n; k += tg_size) {
+        uint r = 0u, kk = k;
+        for (uint i = 0u; i < d; ++i) { r = (r << 4u) | (kk & 15u); kk >>= 4u; }
+        sh[r] = float2(fft_re(arena, src_base, k, n), fft_im(arena, src_base, k, n));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sgn = (inverse != 0u) ? 1.0f : -1.0f;
+    float rs = (inverse != 0u) ? -1.0f : 1.0f;
+    float two_pi = 6.28318530717958647692f;
+    uint dist = 1u;
+    for (uint s = 0u; s < d; ++s) {
+        uint L = dist << 4u; // 16*dist
+        for (uint j = tid; j < n / 16u; j += tg_size) {
+            uint k = j & (dist - 1u);
+            uint base = (j / dist) * L + k;
+            float2 u[16];
+            for (uint i = 0u; i < 16u; ++i) u[i] = sh[base + i * dist];
+            float a = sgn * two_pi * (float)k / (float)L;
+            for (uint i = 1u; i < 16u; ++i) {
+                float ci = cos((float)i * a), si = sin((float)i * a);
+                u[i] = fft_cmul_msl(u[i], float2(ci, si));
+            }
+            // 4 inner radix-4 over stride-4 groups + W16 twiddle.
+            float2 A[16];
+            for (int n1 = 0; n1 < 4; ++n1) {
+                float2 X0, X1, X2, X3;
+                fft_dft4_msl(u[n1], u[n1 + 4], u[n1 + 8], u[n1 + 12], rs, X0, X1, X2, X3);
+                A[n1 * 4 + 0] = X0;
+                A[n1 * 4 + 1] = fft_cmul_msl(X1, fft_w16_msl(n1 * 1, sgn));
+                A[n1 * 4 + 2] = fft_cmul_msl(X2, fft_w16_msl(n1 * 2, sgn));
+                A[n1 * 4 + 3] = fft_cmul_msl(X3, fft_w16_msl(n1 * 3, sgn));
+            }
+            // 4 outer radix-4 → natural-order Y[4*k1 + k2].
+            float2 Y[16];
+            for (int k2 = 0; k2 < 4; ++k2) {
+                float2 X0, X1, X2, X3;
+                fft_dft4_msl(A[0 * 4 + k2], A[1 * 4 + k2], A[2 * 4 + k2], A[3 * 4 + k2], rs, X0, X1, X2, X3);
+                Y[0 * 4 + k2] = X0; Y[1 * 4 + k2] = X1; Y[2 * 4 + k2] = X2; Y[3 * 4 + k2] = X3;
+            }
+            for (uint i = 0u; i < 16u; ++i) sh[base + i * dist] = Y[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dist <<= 4u;
+    }
+
+    for (uint k = tid; k < n; k += tg_size) {
+        fft_set_re(arena, dst_base, k, n, sh[k].x * norm_scale);
+        fft_set_im(arena, dst_base, k, n, sh[k].y * norm_scale);
+    }
+}
+
+// native-gpu-fft: radix-8 in-place single-kernel FFT for pure powers of 8
+// (n=4096 = 8^4 in the fast-path range). Base-8 digit-reversal load → log8(n)
+// radix-8 DIT stages (a third of the radix-2 stage/barrier count) → store. The
+// 8-point DFT is two radix-4 cores (even/odd) + a radix-2 combine, reusing the
+// verified fft_dft4_msl. Same 32 KB budget as the radix-2/4 big kernels.
+kernel void fft_radix8_full_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& src_off [[buffer(1)]],
+    constant uint& dst_off [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& log2n [[buffer(4)]],
+    constant uint& inverse [[buffer(5)]],
+    constant float& norm_scale [[buffer(6)]],
+    constant uint& outer [[buffer(7)]],
+    constant uint& real_input [[buffer(8)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float2 sh[4096]; // interleaved complex; 32 KB at n=4096.
+    if (row >= outer) return;
+    // real_input: n-wide real signal (row stride n, im=0) — zero-pad fused in.
+    uint src_base = src_off + row * (real_input != 0u ? n : 2u * n);
+    uint dst_base = dst_off + row * 2u * n;
+    uint d = log2n / 3u; // base-8 digits = log8(n).
+
+    // Base-8 digit-reversal permutation on load → natural-order output.
+    for (uint k = tid; k < n; k += tg_size) {
+        uint r = 0u, kk = k;
+        for (uint i = 0u; i < d; ++i) { r = (r << 3u) | (kk & 7u); kk >>= 3u; }
+        sh[r] = float2(arena[src_base + k], real_input != 0u ? 0.0f : arena[src_base + n + k]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sgn = (inverse != 0u) ? 1.0f : -1.0f;
+    float rs = (inverse != 0u) ? -1.0f : 1.0f;
+    float two_pi = 6.28318530717958647692f;
+    const float R2 = 0.70710678118654752f;
+    uint dist = 1u;
+    for (uint s = 0u; s < d; ++s) {
+        uint L = dist << 3u; // 8*dist
+        for (uint j = tid; j < n / 8u; j += tg_size) {
+            uint k = j & (dist - 1u); // dist is a power of 2
+            uint base = (j / dist) * L + k;
+            float2 u[8];
+            for (uint i = 0u; i < 8u; ++i) u[i] = sh[base + i * dist];
+            float a = sgn * two_pi * (float)k / (float)L;
+            for (uint i = 1u; i < 8u; ++i) {
+                float ci = cos((float)i * a), si = sin((float)i * a);
+                u[i] = fft_cmul_msl(u[i], float2(ci, si));
+            }
+            float2 E0, E1, E2, E3, O0, O1, O2, O3;
+            fft_dft4_msl(u[0], u[2], u[4], u[6], rs, E0, E1, E2, E3);
+            fft_dft4_msl(u[1], u[3], u[5], u[7], rs, O0, O1, O2, O3);
+            float2 w1 = float2(R2, sgn * R2), w2 = float2(0.0f, sgn), w3 = float2(-R2, sgn * R2);
+            float2 c0 = O0, c1 = fft_cmul_msl(w1, O1), c2 = fft_cmul_msl(w2, O2), c3 = fft_cmul_msl(w3, O3);
+            sh[base]            = float2(E0.x + c0.x, E0.y + c0.y);
+            sh[base + 4u*dist]  = float2(E0.x - c0.x, E0.y - c0.y);
+            sh[base + 1u*dist]  = float2(E1.x + c1.x, E1.y + c1.y);
+            sh[base + 5u*dist]  = float2(E1.x - c1.x, E1.y - c1.y);
+            sh[base + 2u*dist]  = float2(E2.x + c2.x, E2.y + c2.y);
+            sh[base + 6u*dist]  = float2(E2.x - c2.x, E2.y - c2.y);
+            sh[base + 3u*dist]  = float2(E3.x + c3.x, E3.y + c3.y);
+            sh[base + 7u*dist]  = float2(E3.x - c3.x, E3.y - c3.y);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dist <<= 3u;
+    }
+
+    for (uint k = tid; k < n; k += tg_size) {
+        fft_set_re(arena, dst_base, k, n, sh[k].x * norm_scale);
+        fft_set_im(arena, dst_base, k, n, sh[k].y * norm_scale);
+    }
+}
+
+// Bit-reversal permutation. Reads `src_off`, writes `dst_off`. When src != dst
+// this gathers dst[k] = src[rev(k)] entirely on the GPU — so `src` may be the
+// output of a preceding GPU op (e.g. rfft's Concat) in the same command buffer.
+// (The old path host-memcpy'd src→dst before this kernel, which read STALE data
+// when src wasn't yet materialized — broke rfft for n>4096.) When src == dst it
+// falls back to the classic in-place swap (k < rev) to avoid a gather race.
+kernel void fft_bit_reverse_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& src_off [[buffer(1)]],
+    constant uint& dst_off [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& log2n [[buffer(4)]],
+    constant uint& outer [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tpg [[threadgroup_position_in_grid]]
+) {
+    uint row = tpg.y;
+    if (row >= outer) return;
+    uint k = gid.x;
+    if (k >= n) return;
+    uint rev = reverse_bits(k) >> (32u - log2n);
+    uint src_base = src_off + row * 2u * n;
+    uint dst_base = dst_off + row * 2u * n;
+    if (src_off == dst_off) {
+        if (k >= rev) return;
+        float tr = fft_re(arena, dst_base, k, n);
+        float ti = fft_im(arena, dst_base, k, n);
+        fft_set_re(arena, dst_base, k, n, fft_re(arena, dst_base, rev, n));
+        fft_set_im(arena, dst_base, k, n, fft_im(arena, dst_base, rev, n));
+        fft_set_re(arena, dst_base, rev, n, tr);
+        fft_set_im(arena, dst_base, rev, n, ti);
+    } else {
+        fft_set_re(arena, dst_base, k, n, fft_re(arena, src_base, rev, n));
+        fft_set_im(arena, dst_base, k, n, fft_im(arena, src_base, rev, n));
+    }
+}
+
+kernel void fft_inner_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& off [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& tile [[buffer(3)]],
+    constant uint& inner_stages [[buffer(4)]],
+    constant uint& inverse [[buffer(5)]],
+    constant float& norm_scale [[buffer(6)]],
+    constant uint& outer [[buffer(7)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint local [[thread_index_in_threadgroup]]
+) {
+    uint num_tiles = (n + tile - 1u) / tile;
+    uint row = tg_id / num_tiles;
+    uint tile_id = tg_id % num_tiles;
+    if (row >= outer) return;
+    uint half_tile = tile / 2u;
+    if (tile_id >= num_tiles) return;
+    if (local >= half_tile) return;
+
+    threadgroup float sre[1024];
+    threadgroup float sim[1024];
+    uint row_base = off + row * 2u * n;
+    uint tile_base = tile_id * tile;
+
+    if (tile_base + local < n) {
+        sre[local] = fft_re(arena, row_base, tile_base + local, n);
+        sim[local] = fft_im(arena, row_base, tile_base + local, n);
+    }
+    if (tile_base + local + half_tile < n) {
+        sre[local + half_tile] = fft_re(arena, row_base, tile_base + local + half_tile, n);
+        sim[local + half_tile] = fft_im(arena, row_base, tile_base + local + half_tile, n);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sign = (inverse != 0u) ? 1.0f : -1.0f;
+    float pi = 3.14159265358979323846f;
+    for (uint s = 0u; s < inner_stages; ++s) {
+        uint hs = 1u << s;
+        uint k = local % hs;
+        uint i = (local / hs) * (hs * 2u) + k;
+        uint j = i + hs;
+        float angle = sign * pi * float(k) / float(hs);
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+        float ur = sre[i], ui = sim[i];
+        float vr = cos_a * sre[j] - sin_a * sim[j];
+        float vi = sin_a * sre[j] + cos_a * sim[j];
+        sre[i] = ur + vr; sim[i] = ui + vi;
+        sre[j] = ur - vr; sim[j] = ui - vi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float scale = norm_scale;
+    if (tile_base + local < n) {
+        fft_set_re(arena, row_base, tile_base + local, n, sre[local] * scale);
+        fft_set_im(arena, row_base, tile_base + local, n, sim[local] * scale);
+    }
+    if (tile_base + local + half_tile < n) {
+        fft_set_re(arena, row_base, tile_base + local + half_tile, n, sre[local + half_tile] * scale);
+        fft_set_im(arena, row_base, tile_base + local + half_tile, n, sim[local + half_tile] * scale);
+    }
+}
+
+kernel void fft_outer_r4_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& off [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& q [[buffer(3)]],
+    constant uint& inverse [[buffer(4)]],
+    constant float& norm_scale [[buffer(5)]],
+    constant uint& outer [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tpg [[threadgroup_position_in_grid]]
+) {
+    uint row = tpg.y;
+    if (row >= outer) return;
+    uint tid = gid.x;
+    if (tid >= n / 4u) return;
+    uint base = off + row * 2u * n;
+    uint k = tid % q;
+    uint group = tid / q;
+    uint p = group * (q * 4u) + k;
+
+    float ar = fft_re(arena, base, p, n);
+    float ai = fft_im(arena, base, p, n);
+    float br = fft_re(arena, base, p + q, n);
+    float bi = fft_im(arena, base, p + q, n);
+    float cr = fft_re(arena, base, p + q * 2u, n);
+    float ci = fft_im(arena, base, p + q * 2u, n);
+    float dr = fft_re(arena, base, p + q * 3u, n);
+    float di = fft_im(arena, base, p + q * 3u, n);
+
+    float sign = (inverse != 0u) ? 1.0f : -1.0f;
+    float neg_sign = (inverse != 0u) ? -1.0f : 1.0f;
+    float angle1 = sign * 3.14159265358979323846f * float(k) / float(q);
+    float cos1 = cos(angle1);
+    float sin1 = sin(angle1);
+    float w1b_r = cos1 * br - sin1 * bi;
+    float w1b_i = sin1 * br + cos1 * bi;
+    float w1d_r = cos1 * dr - sin1 * di;
+    float w1d_i = sin1 * dr + cos1 * di;
+
+    float u0r = ar + w1b_r, u0i = ai + w1b_i;
+    float u1r = ar - w1b_r, u1i = ai - w1b_i;
+    float u2r = cr + w1d_r, u2i = ci + w1d_i;
+    float u3r = cr - w1d_r, u3i = ci - w1d_i;
+
+    float angle2a = sign * 3.14159265358979323846f * float(k) / float(q * 2u);
+    float cos2a = cos(angle2a);
+    float sin2a = sin(angle2a);
+    float cos2b = neg_sign * sin2a;
+    float sin2b = sign * cos2a;
+
+    float w2a_u2r = cos2a * u2r - sin2a * u2i;
+    float w2a_u2i = sin2a * u2r + cos2a * u2i;
+    float w2b_u3r = cos2b * u3r - sin2b * u3i;
+    float w2b_u3i = sin2b * u3r + cos2b * u3i;
+
+    float scale = norm_scale;
+    fft_set_re(arena, base, p, n, (u0r + w2a_u2r) * scale);
+    fft_set_im(arena, base, p, n, (u0i + w2a_u2i) * scale);
+    fft_set_re(arena, base, p + q * 2u, n, (u0r - w2a_u2r) * scale);
+    fft_set_im(arena, base, p + q * 2u, n, (u0i - w2a_u2i) * scale);
+    fft_set_re(arena, base, p + q, n, (u1r + w2b_u3r) * scale);
+    fft_set_im(arena, base, p + q, n, (u1i + w2b_u3i) * scale);
+    fft_set_re(arena, base, p + q * 3u, n, (u1r - w2b_u3r) * scale);
+    fft_set_im(arena, base, p + q * 3u, n, (u1i - w2b_u3i) * scale);
+}
+
+kernel void fft_outer_r2_f32(
+    device float* arena [[buffer(0)]],
+    constant uint& off [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& half_stride [[buffer(3)]],
+    constant uint& inverse [[buffer(4)]],
+    constant float& norm_scale [[buffer(5)]],
+    constant uint& outer [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tpg [[threadgroup_position_in_grid]]
+) {
+    uint row = tpg.y;
+    if (row >= outer) return;
+    uint tid = gid.x;
+    if (tid >= n / 2u) return;
+    uint base = off + row * 2u * n;
+    uint k = tid % half_stride;
+    uint i = (tid / half_stride) * (half_stride * 2u) + k;
+    uint j = i + half_stride;
+
+    float sign = (inverse != 0u) ? 1.0f : -1.0f;
+    float angle = sign * 3.14159265358979323846f * float(k) / float(half_stride);
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+
+    float ur = fft_re(arena, base, i, n);
+    float ui = fft_im(arena, base, i, n);
+    float vr = cos_a * fft_re(arena, base, j, n) - sin_a * fft_im(arena, base, j, n);
+    float vi = sin_a * fft_re(arena, base, j, n) + cos_a * fft_im(arena, base, j, n);
+    float scale = norm_scale;
+    fft_set_re(arena, base, i, n, (ur + vr) * scale);
+    fft_set_im(arena, base, i, n, (ui + vi) * scale);
+    fft_set_re(arena, base, j, n, (ur - vr) * scale);
+    fft_set_im(arena, base, j, n, (ui - vi) * scale);
+}

@@ -1,0 +1,35 @@
+# ── A distributed RLX job ────────────────────────────────────────────────────
+# Put this same file on every node. Launch each node with its own rank:
+#
+#   RANK=0 dist_job rlx-dist.toml      # coordinator (and worker 0)
+#   RANK=1 dist_job rlx-dist.toml      # on the next machine
+#   ...
+#
+# Rank 0 is the coordinator. `world` below is the total number of nodes.
+
+[job]
+task  = "train"     # "train" (data-parallel SGD) | "infer" (tensor-parallel matmul)
+world = 2           # total nodes in the job
+steps = 200         # training steps (ignored for infer)
+
+[net]
+device    = "auto"     # "auto" | "cpu" | "metal" | "cuda"  (per node)
+topology  = "mesh"     # "mesh" = every node peers; "star" = workers dial the coordinator
+discovery = "static"   # how nodes find each other — one of:
+
+# ── discovery = "static" ──  hand-listed addresses, one per rank
+peers = ["127.0.0.1:29500", "127.0.0.1:29501"]
+
+# ── discovery = "mdns" ──  zero-config on a LAN (Bonjour/Avahi). Nothing to set:
+#   the coordinator advertises `_rlx-coord._udp.local`, workers browse for it.
+#   (requires building the example with `--features mdns`; forces topology = star)
+
+# ── discovery = "rendezvous" ──  workers unicast a query to a known host and
+#   learn the coordinator's port. Works across NAT / different networks — the
+#   host can be a LAN IP, `host.docker.internal`, or a Tailscale MagicDNS name.
+#   (forces topology = star)
+# coordinator = "AAA.BBB.CCC.DDD"
+
+# Ports (defaults shown): data = TCP transport, disc = UDP discovery.
+# data_port = 29500
+# disc_port = 29600

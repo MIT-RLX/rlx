@@ -1,0 +1,55 @@
+[package]
+name = "rlx-collectives"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+description = "In-graph collective ops (all-reduce) for tensor-parallel RLX execution"
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
+# default-features off: the collective's CPU kernel only needs rlx-cpu's
+# op-registry, not BLAS. Dropping the `blas` feature keeps the openblas link
+# out of the build so it cross-compiles to aarch64 (Raspberry Pi / qemu),
+# where no OpenBLAS exists. (rlx-runtime already links platform BLAS for the
+# actual matmul path where it's wanted.)
+rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.10", default-features = false }
+rlx-driver = { path = "../rlx-driver", version = "0.2.10" }
+
+[features]
+default = []
+# Zero-config LAN node discovery via mDNS-SD (Bonjour/Avahi). Opt-in; the
+# unicast rendezvous path (DISCOVER_HOST) needs no extra deps.
+mdns = ["rlx-driver/mdns"]
+
+[dev-dependencies]
+# Path-only (no version): test-only cycle on rlx-runtime, which publishes
+# right after rlx-collectives in the same tier (7). cargo strips path-only
+# dev-deps from the published manifest, so this never resolves against
+# crates.io and needs no per-release pin bump.
+rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cpu"] }
+# The coordinator/worker mode ships serialized IR graphs over the wire, so the
+# example needs rlx-ir's serde derives + a JSON codec (dev-only).
+rlx-ir = { path = "../rlx-ir", features = ["serialize"] }
+# `WEIGHTS_FMT=q8` demo: quantize + write a GGUF stage weight that the worker
+# loads packed and runs through a DequantMatMul graph (pure Rust, dev-only).
+rlx-gguf = { path = "../../io/rlx-gguf" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `dist_job` example: read the job description from a TOML config file.
+toml = "0.8"
+
+# The `dist_node` example drives the native GPU backend of whichever host
+# it runs on. Cargo unions feature sets across these tables: cpu+metal on
+# macOS, cpu+cuda on x86_64 Linux (msi), and cpu-only elsewhere — notably
+# aarch64 Linux (Raspberry Pi / qemu), which has no CUDA. Local-only.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["metal"] }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cuda"] }
+
+[lints]
+workspace = true

@@ -2,100 +2,101 @@
 resolver = "2"
 members = [
     # Core (no backend dependencies)
-    "crates/rlx-ir",          # Tensor IR: types, shapes, ops, graph, verifier
-    "crates/rlx-tensor",      # Symbolic tensor DSL (operator-overloaded graph building)
-    "crates/rlx-flow",        # Block assembly-line API for model builders
-    "crates/rlx-fusion",      # MIR fusion passes + fused-op unfuse
-    "crates/rlx-autodiff",    # Reverse/forward-mode AD on MIR
-    "crates/rlx-compile",     # HIR → MIR → LIR pipeline
-    "crates/rlx-opt",         # Facade: re-exports fusion + autodiff + compile
-    "crates/rlx-optim",       # Training-step optimizers (Adam, AdamW, Lion, SOAP, Muon, …)
+    "crates/core/rlx-ir",          # Tensor IR: types, shapes, ops, graph, verifier
+    "crates/core/rlx-tensor",      # Symbolic tensor DSL (operator-overloaded graph building)
+    "crates/core/rlx-flow",        # Block assembly-line API for model builders
+    "crates/core/rlx-fusion",      # MIR fusion passes + fused-op unfuse
+    "crates/core/rlx-autodiff",    # Reverse/forward-mode AD on MIR
+    "crates/core/rlx-compile",     # HIR → MIR → LIR pipeline
+    "crates/core/rlx-opt",         # Facade: re-exports fusion + autodiff + compile
+    "crates/core/rlx-optim",       # Training-step optimizers (Adam, AdamW, Lion, SOAP, Muon, …)
 
     # Driver layer (devices, arenas, buffers, streams)
-    "crates/rlx-driver",
+    "crates/core/rlx-driver",
 
     # In-graph collective ops (tensor-parallel all-reduce)
-    "crates/rlx-collectives",
+    "crates/core/rlx-collectives",
 
     # CPU backend
-    "crates/rlx-cpu",         # SIMD kernels, BLAS FFI, thread pool, arena executor
+    "crates/backends/rlx-cpu",         # SIMD kernels, BLAS FFI, thread pool, arena executor
 
     # GPU backends
-    "crates/rlx-metal",       # Apple Metal native (MPS + custom MSL kernels)
-    "crates/rlx-mlx",         # Apple MLX (lazy graph + eager modes, hand-rolled C++ shim)
-    "crates/rlx-coreml",      # Apple CoreML / Neural Engine (ANE) — IR → MIL ML Program
+    "crates/backends/rlx-metal",       # Apple Metal native (MPS + custom MSL kernels)
+    "crates/backends/rlx-mlx",         # Apple MLX (lazy graph + eager modes, hand-rolled C++ shim)
+    "crates/backends/rlx-coreml",      # Apple CoreML / Neural Engine (ANE) — IR → MIL ML Program
 
-    "crates/rlx-wgpu",        # Cross-platform GPU via wgpu (Metal/Vulkan/DX12/WebGPU)
-    "crates/rlx-cuda",        # NVIDIA CUDA (cuBLAS + NVRTC kernels via cudarc)
-    "crates/rlx-rocm",        # AMD ROCm/HIP — same kernels as rlx-cuda
-    "crates/rlx-tpu",         # Google TPU via libtpu's PJRT plugin (no Python)
+    "crates/backends/rlx-wgpu",        # Cross-platform GPU via wgpu (Metal/Vulkan/DX12/WebGPU)
+    "crates/backends/rlx-cuda",        # NVIDIA CUDA (cuBLAS + NVRTC kernels via cudarc)
+    "crates/backends/rlx-rocm",        # AMD ROCm/HIP — same kernels as rlx-cuda
+    "crates/backends/rlx-tpu",         # Google TPU via libtpu's PJRT plugin (no Python)
 
     # Microcontroller backend
-    "crates/rlx-cortexm",     # ARMv7E-M (Cortex-M4/M7) INT8 kernels — nRF52840 etc.
-    "crates/rlx-cortexm/trainer",  # Native fp32 trainer that emits the INT8 model_weights.rs
+    "crates/backends/rlx-cortexm",     # ARMv7E-M (Cortex-M4/M7) INT8 kernels — nRF52840 etc.
+    "crates/backends/rlx-cortexm/trainer",  # Native fp32 trainer that emits the INT8 model_weights.rs
 
     # FPGA backend
-    "crates/rlx-fpga",        # IR → Verilog → bitstream (per-graph datapath, integer-only Q0.31 requant)
+    "crates/backends/rlx-fpga",        # IR → Verilog → bitstream (per-graph datapath, integer-only Q0.31 requant)
 
     # Cerebras Wafer-Scale Engine backend
-    "crates/rlx-cerebras",    # IR → CSL → fabric simulator (single-PE matmul; multi-PE tiling WIP)
+    "crates/backends/rlx-cerebras",    # IR → CSL → fabric simulator (single-PE matmul; multi-PE tiling WIP)
 
     # Native Vulkan compute backend (raw `ash` + embedded SPIR-V kernels)
-    "crates/rlx-vulkan",
+    "crates/backends/rlx-vulkan",
 
     # Qualcomm Hexagon NPU backend (AI Engine Direct / QNN)
-    "crates/rlx-qnn",        # IR → QNN model C++ → qnn-net-run on the x86 reference backend (Adreno is rlx-vulkan)
+    "crates/backends/rlx-qnn",        # IR → QNN model C++ → qnn-net-run on the x86 reference backend (Adreno is rlx-vulkan)
 
     # Intel oneAPI Level Zero backend (Arc / Data Center Max) — dynamic-loaded
     # `libze_loader` + OpenCL-C→SPIR-V compute kernels (peak Intel path).
-    "crates/rlx-oneapi",
+    "crates/backends/rlx-oneapi",
 
     # GPU/accelerator backends (future, ranked by hardware-coverage gap)
     # "rlx-directml",  # Windows NPUs (Copilot+ / Hexagon / Intel-AMD NPU) via DirectML
 
-    "crates/rlx-gguf",        # GGUF parser + dequant + quant encoders + writer
-    "crates/rlx-gguf-convert", # safetensors / ONNX → GGUF conversion with per-tensor quant
-    "crates/rlx-nemo",        # NVIDIA NeMo `.nemo` loader (tar + torch.save ckpt + YAML)
-    "crates/rlx-gpu-kernels", # Shared CUDA/HIP .cu sources for rlx-cuda + rlx-rocm
-    "crates/rlx-mlx-sys",     # Vendored MLX C++ + rlx_mlx_shim C ABI
+    "crates/io/rlx-gguf",        # GGUF parser + dequant + quant encoders + writer
+    "crates/io/rlx-gguf-convert", # safetensors / ONNX → GGUF conversion with per-tensor quant
+    "crates/io/rlx-nemo",        # NVIDIA NeMo `.nemo` loader (tar + torch.save ckpt + YAML)
+    "crates/backends/rlx-gpu-kernels", # Shared CUDA/HIP .cu sources for rlx-cuda + rlx-rocm
+    "crates/backends/rlx-mlx-sys",     # Vendored MLX C++ + rlx_mlx_shim C ABI
 
     # Proc macros
-    "crates/rlx-macros",      # #[rlx_model] AOT compilation macro
+    "crates/core/rlx-macros",      # #[rlx_model] AOT compilation macro
 
     # Runtime (user-facing, feature-gated)
-    "crates/rlx-runtime",     # Session API, backend dispatch
+    "crates/core/rlx-runtime",     # Session API, backend dispatch
 
     # Prelude crate — re-exports IR + optimizer + runtime + companion
     # crates behind feature gates. The `cargo add rlx` entry point.
     "crates/rlx",
 
     # Downstream packages (registered against the custom-op scaffold)
-    "crates/rlx-sparse",      # Sparse linear algebra (CSR LU/MatVec/CG) — JAX-style downstream
-    "crates/rlx-linalg",      # Dense linalg (eigh/svd/qr/cholesky/solve_triangular) via LAPACK
-    "crates/rlx-fdm",         # Force density method — pin-jointed form-finding (jax_fdm port)
-    "crates/rlx-rl",          # Flow-map policies + FMQ / QGBS (offline-to-online RL)
-    "crates/rlx-bbo",         # Black-box + trust-region Q-guidance / QGBS (domain-agnostic f64)
-    "crates/rlx-umap",        # UMAP / fast-umap custom ops (k-NN from pairwise distances, …)
+    "crates/numerics/rlx-sparse",      # Sparse linear algebra (CSR LU/MatVec/CG) — JAX-style downstream
+    "crates/numerics/rlx-linalg",      # Dense linalg (eigh/svd/qr/cholesky/solve_triangular) via LAPACK
+    "crates/numerics/rlx-vq",          # Fused vector-quantization kernel (nearest-codebook cdist→argmin)
+    "crates/numerics/rlx-fdm",         # Force density method — pin-jointed form-finding (jax_fdm port)
+    "crates/numerics/rlx-rl",          # Flow-map policies + FMQ / QGBS (offline-to-online RL)
+    "crates/numerics/rlx-bbo",         # Black-box + trust-region Q-guidance / QGBS (domain-agnostic f64)
+    "crates/numerics/rlx-umap",        # UMAP / fast-umap custom ops (k-NN from pairwise distances, …)
 
     # Benchmark framework (PLAN L5)
-    "crates/rlx-bench",       # BenchmarkPattern + per-backend timing harness
-    "crates/rlx-onnx",        # ONNX Runtime inference for .onnx files (PLAN B7)
-    "crates/rlx-onnx-import", # ONNX → RLX HIR import + op lowering
-    "crates/rlx-onnx-conformance", # ONNX op-level ORT parity harness
+    "crates/tooling/rlx-bench",       # BenchmarkPattern + per-backend timing harness
+    "crates/io/rlx-onnx",        # ONNX Runtime inference for .onnx files (PLAN B7)
+    "crates/io/rlx-onnx-import", # ONNX → RLX HIR import + op lowering
+    "crates/io/rlx-onnx-conformance", # ONNX op-level ORT parity harness
 
     # Text: tokenizer + chat template + sampling (public surface for downstream LM apps)
-    "crates/rlx-text",
+    "crates/io/rlx-text",
 
     # Python bindings
-    "crates/pyrlx",           # PyO3 + maturin: run any RLX backend from Python
+    "crates/bindings/pyrlx",           # PyO3 + maturin: run any RLX backend from Python
 
     # WebAssembly entry point — run models in the browser (CPU backend +
     # async WebGPU device bring-up via rlx-wgpu)
-    "crates/rlx-web",
+    "crates/bindings/rlx-web",
 
     # WebGL2 GPGPU backend — render-to-texture execution in the browser
     # (no compute shaders on WebGL2), forward + backward.
-    "crates/rlx-webgl",
+    "crates/backends/rlx-webgl",
 ]
 
 # ── Sanitizer / debug profiles (plan #41) ────────────────────────
