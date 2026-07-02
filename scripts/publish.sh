@@ -325,7 +325,7 @@ def parse_rlx_deps(toml_path: Path) -> set[str]:
     return deps
 
 violations: list[str] = []
-for toml in sorted(root.glob("crates/rlx-*/Cargo.toml")):
+for toml in sorted(root.glob("crates/*/rlx-*/Cargo.toml")):
     name = toml.parent.name
     if name.endswith("-trainer"):
         continue
@@ -515,7 +515,7 @@ list_tiers() {
                 echo "  - pyrlx                    (PyPI via maturin)"
                 ;;
             rlx-cortexm-trainer)
-                echo "  - rlx-cortexm-trainer      (binary tool; nested under crates/rlx-cortexm/trainer)"
+                echo "  - rlx-cortexm-trainer      (binary tool; nested under crates/backends/rlx-cortexm/trainer)"
                 ;;
             *)
                 echo "  - $s"

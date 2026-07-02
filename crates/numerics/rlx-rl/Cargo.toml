@@ -1,0 +1,52 @@
+[package]
+name = "rlx-rl"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Flow-map generative policies with Flow Map Q-Guidance (FMQ) and QGBS for RLX."
+authors.workspace      = true
+license.workspace      = true
+keywords = ["reinforcement", "flow-matching", "rlx", "offline-rl"]
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["compile"]
+
+# Compiled graphs via rlx-runtime (CPU).
+compile = [
+    "dep:rlx-runtime",
+    "dep:rlx-opt",
+    "dep:rlx-compile",
+]
+
+# Optional toy MDP for examples/tests only.
+toy = []
+
+[dependencies]
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
+rlx-autodiff = { path = "../../core/rlx-autodiff", version = "0.2.10" }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.10", default-features = false, features = ["cpu"], optional = true }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10", default-features = false, features = ["training"], optional = true }
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.10", optional = true }
+
+[[example]]
+name = "fmq_toy"
+required-features = ["compile", "toy"]
+
+[[test]]
+name = "fmq_toy"
+required-features = ["compile", "toy"]
+
+[[test]]
+name = "forward_finite"
+required-features = ["compile", "toy"]
+
+[lints]
+workspace = true

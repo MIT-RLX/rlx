@@ -1,0 +1,58 @@
+[package]
+name = "rlx-coreml"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Apple CoreML / Neural Engine (ANE) backend for RLX — lowers the IR to an ML Program (MIL) and runs it through CoreML.framework"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[features]
+default = []
+# On-device training / backward. Compiles the native MIL backward kernels
+# (mil/mod.rs) and the MLUpdateTask training-session path. Off by default so
+# inference builds keep the lean lowering surface and pay zero cost. Enabled
+# transitively by `rlx-runtime`'s own `training` feature.
+training = []
+
+[dependencies]
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10" }
+# Host-side GGUF dequant fallback for the off-path quant schemes.
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.10" }
+prost = "0.13"
+half = "2"
+bytemuck = { version = "1", features = ["derive"] }
+
+[target.'cfg(all(target_vendor = "apple", not(target_os = "watchos")))'.dependencies]
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", default-features = false }
+
+[build-dependencies]
+prost-build = "0.13"
+# Vendored protoc so the build needs no system install — same crate the
+# rlx-tpu backend uses (macOS aarch64 / linux x86_64 / linux aarch64).
+protoc-bin-vendored = "3"
+# Compiles the Objective-C CoreML shim (csrc/coreml_shim.m) on Apple
+# platforms. No-op elsewhere (the shim is target-gated in build.rs).
+cc = "1"
+
+[dev-dependencies]
+# Back-edge: rlx-runtime (tier 7) publishes AFTER rlx-coreml (tier 5).
+# PATH-ONLY (no `version`) so cargo strips it from the published manifest
+# and `cargo publish -p rlx-coreml` doesn't resolve runtime against crates.io.
+rlx-runtime = { path = "../../core/rlx-runtime", features = ["coreml", "training"] }
+
+[lints]
+workspace = true
+
+# Apple-platform-only at runtime; render docs against the macOS targets.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets        = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+rustdoc-args   = ["--cfg", "docsrs"]

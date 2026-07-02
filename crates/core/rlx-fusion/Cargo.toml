@@ -1,0 +1,28 @@
+[package]
+name = "rlx-fusion"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Fusion passes and fused-op decomposition for RLX MIR"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
+
+[dev-dependencies]
+# Back-edge dev-deps on later-tier crates: keep these PATH-ONLY (no
+# `version`). cargo strips path-only dev-deps from the published manifest,
+# so `cargo publish -p rlx-fusion` (tier 1) does not try to resolve
+# rlx-cpu/rlx-opt (tier 4/5) against crates.io before they exist.
+rlx-cpu = { path = "../../backends/rlx-cpu" }
+rlx-opt = { path = "../rlx-opt", features = ["compile"] }
+
+[lints]
+workspace = true

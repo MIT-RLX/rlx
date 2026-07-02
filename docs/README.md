@@ -4,6 +4,7 @@
 |----------|----------|
 | [fk-fusion.md](fk-fusion.md) | FKL-style region fusion: prologue, batch regions, env/session toggles, kernel tuning |
 | [backend-selection.md](backend-selection.md) | Multi-backend runtime: `DevicePolicy`, `GraphDevices`, `DeviceRouter`, env vars, Python API, calibration |
+| [distributed.md](distributed.md) | **Distributed computing**: the layers (Transport→ProcessGroup→Node), collectives, node discovery (static/mDNS/rendezvous), the `dist_job` + `dist_node` examples, and the `rlx_runtime::dist` ship-graph worker |
 | [op-coverage.md](op-coverage.md) | **Single source of truth** for every IR op: descriptions, per-backend (CPU/Metal/MLX/WGPU/ANE/CUDA/ROCm/TPU) coverage matrix, and op variations (Activation/Binary/Quant schemes/…) |
 | [gguf-backend-paths.md](gguf-backend-paths.md) | **GGUF / `DequantMatMul` execution paths** — shared scheme ids, per-backend GPU/host/ANE/TPU lowering, Metal fused IQ GEMV, pyrlx convert/load, env toggles, P0–P5 + backlog code map |
 | [development.md](development.md) | Dev workflow: `just` recipes, pyrlx, tests, dispatch probes |

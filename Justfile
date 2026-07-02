@@ -98,12 +98,12 @@ qnn-run M="32" K="64" N="32" OUT="qnn-out": (qnn-emit M K N OUT)
 # SDK-free Docker self-test of the QNN host harness (verify.py + plumbing).
 # Needs only Docker; uses a numpy stand-in for qnn-net-run.
 qnn-docker-test M="8" K="16" N="4":
-    python3 crates/rlx-qnn/docker/validate.py harness-test --dims {{M}} {{K}} {{N}}
+    python3 crates/backends/rlx-qnn/docker/validate.py harness-test --dims {{M}} {{K}} {{N}}
 
 # Real Docker validation: build the model lib + run on libQnnCpu.so.
 # Needs Docker AND the proprietary QNN SDK (set QNN_SDK_ROOT).
 qnn-docker-run M="32" K="64" N="32":
-    python3 crates/rlx-qnn/docker/validate.py run --dims {{M}} {{K}} {{N}}
+    python3 crates/backends/rlx-qnn/docker/validate.py run --dims {{M}} {{K}} {{N}}
 
 # FKL region fusion parity (docs/fk-fusion.md). Metal MPS tests skip off macOS.
 test-fk:
@@ -122,11 +122,11 @@ test:
 test-gguf-grouped:
     cargo test -p rlx-runtime --test dequant_grouped_matmul_gguf -- --test-threads=1
 
-# pyrlx: build extension into crates/pyrlx/.venv (first run) and run pytest.
+# pyrlx: build extension into crates/bindings/pyrlx/.venv (first run) and run pytest.
 test-pyrlx:
     #!/usr/bin/env bash
     set -euo pipefail
-    cd "{{justfile_directory()}}/crates/pyrlx"
+    cd "{{justfile_directory()}}/crates/bindings/pyrlx"
     if [[ ! -d .venv ]]; then
         python3 -m venv .venv
         .venv/bin/pip install -q maturin numpy pytest safetensors
@@ -204,14 +204,14 @@ test-apple-sim:
         --target aarch64-apple-ios-sim \
         --test apple_backends_sim -- --nocapture --test-threads=1
 
-# Build the browser bundle (wasm + JS bindings) into crates/rlx-web/web/pkg.
+# Build the browser bundle (wasm + JS bindings) into crates/bindings/rlx-web/web/pkg.
 # Add `--webgpu` to also bring up a WebGPU device. One command, all platforms.
 build-web *ARGS:
-    python3 crates/rlx-web/build.py {{ARGS}}
+    python3 crates/bindings/rlx-web/build.py {{ARGS}}
 
 # Build + serve the demo at http://localhost:8000 (Ctrl-C to stop).
 serve-web *ARGS:
-    python3 crates/rlx-web/build.py --serve {{ARGS}}
+    python3 crates/bindings/rlx-web/build.py --serve {{ARGS}}
 
 # Run burnembed bench for a single model. `just bench minilm6`.
 bench MODEL:
