@@ -461,6 +461,7 @@ fn scalar_const(value: f32, bwd: &mut Graph) -> NodeId {
 /// Per-op VJP rule. Returns (input_index, gradient_node_id) pairs;
 /// inputs not listed receive no gradient (e.g. the labels argument
 /// of `SoftmaxCrossEntropyWithLogits` is non-differentiable).
+#[allow(unused_variables)]
 fn vjp(
     node: &Node,
     upstream: NodeId,
@@ -472,7 +473,291 @@ fn vjp(
         // Leaves — no inputs → no gradients to attribute.
         Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => vec![],
 
-        Op::Binary(BinaryOp::Add) => {
+        Op::Binary(BinaryOp::Add) => vjp_binary_add(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Binary(BinaryOp::Sub) => vjp_binary_sub(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Binary(BinaryOp::Mul) => vjp_binary_mul(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Activation(kind) => vjp_activation(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::MatMul => vjp_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::DenseSolve => vjp_dense_solve(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::BatchedDenseSolve => vjp_batched_dense_solve(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Scan {
+            body,
+            length,
+            save_trajectory,
+            num_bcast: _,
+            num_xs,
+            num_checkpoints,
+        } => vjp_scan(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Conv {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => vjp_conv(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Pool {
+            kind: ReduceOp::Max,
+            kernel_size,
+            stride,
+            padding,
+        } => vjp_pool(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::SoftmaxCrossEntropyWithLogits => vjp_softmax_cross_entropy_with_logits(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::SoftmaxCrossEntropy => vjp_softmax_cross_entropy(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Reduce {
+            op: ReduceOp::Sum,
+            axes,
+            keep_dim,
+        } => vjp_reduce(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Reduce {
+            op: ReduceOp::Mean,
+            axes,
+            keep_dim,
+        } => vjp_reduce_2(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Reshape { .. } => vjp_reshape(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ComplexNormSq => vjp_complex_norm_sq(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Conjugate => vjp_conjugate(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Cast { .. } => vjp_cast(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::StopGradient => vjp_stop_gradient(node, upstream, upstream_shape, fwd_map, bwd),
+        // Straight-through estimator: forward simulates the lossy
+        // round-trip (x → q → x'), backward pretends it was an
+        // identity. `dx = upstream` for both ops. The upstream is the
+        // f32 gradient computed by the consumer; the int8 dtype on
+        // the input/output is ignored for the gradient — we treat
+        // the entire Q/DQ chain as a real-valued no-op for autodiff
+        // purposes. This is the foundation for QAT (quantization-
+        // aware training): the model trains in fp32 but every
+        // forward pass tastes the int8 round-tripped activations,
+        // so the learned weights are robust to deployment-time
+        // quantization.
+        Op::Quantize { .. } | Op::Dequantize { .. } => {
+            vec![(0, upstream)]
+        }
+
+        Op::FakeQuantizeLSQ { bits, axis } => vjp_fake_quantize_l_s_q(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::FakeQuantize {
+            bits, axis, ste, ..
+        } => vjp_fake_quantize(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Expand { .. } => vjp_expand(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::BatchNormInference { eps } => vjp_batch_norm_inference(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::LayerNorm { axis, eps } => vjp_layer_norm(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Softmax { axis } => vjp_softmax(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Transpose { perm } => vjp_transpose(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Concat { axis } => vjp_concat(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Narrow { axis, start, len } => vjp_narrow(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Gather { axis } => vjp_gather(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Compare(_) => vjp_compare(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Where => vjp_where(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Binary(BinaryOp::Div) => vjp_binary_div(node, upstream, upstream_shape, fwd_map, bwd),
+        // ── Reductions: gradient flows to where the reduction "saw" ──
+        Op::Reduce {
+            op: ReduceOp::Max,
+            axes,
+            keep_dim,
+        }
+        | Op::Reduce {
+            op: ReduceOp::Min,
+            axes,
+            keep_dim,
+        } => {
+            // d_x[i] = upstream where x[i] equals the (broadcast)
+            // reduce result, else 0. Composed via
+            // expand(upstream) * (compare(x, expand(y), Eq) → 1.0).
+            let is_max = matches!(
+                node.op,
+                Op::Reduce {
+                    op: ReduceOp::Max,
+                    ..
+                }
+            );
+            let _ = is_max;
+            let x_bwd = fwd_map[&node.inputs[0]];
+            let y_bwd = fwd_map[&node.id];
+            let x_shape = bwd.node(x_bwd).shape.clone();
+            let y_expanded = expand_to(y_bwd, &x_shape, axes, *keep_dim, bwd);
+            let mask_bool = bwd.add_node(
+                Op::Compare(CmpOp::Eq),
+                vec![x_bwd, y_expanded],
+                Shape::from_dims(x_shape.dims(), DType::Bool),
+            );
+            // Convert bool→f32 via Cast (the IR encodes bool/PRED as
+            // F32 in our backends already; this is a no-op cast on
+            // most paths).
+            let mask_f32 = bwd.add_node(
+                Op::Cast {
+                    to: x_shape.dtype(),
+                },
+                vec![mask_bool],
+                x_shape.clone(),
+            );
+            let upstream_expanded = expand_to(upstream, &x_shape, axes, *keep_dim, bwd);
+            let dx = bwd.binary(BinaryOp::Mul, upstream_expanded, mask_f32, x_shape);
+            vec![(0, dx)]
+        }
+
+        Op::Rope {
+            head_dim, n_rot, ..
+        } => vjp_rope(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::RmsNorm { axis, eps } => vjp_rms_norm(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::GroupNorm { num_groups, eps } => vjp_group_norm(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Attention {
+            num_heads,
+            head_dim,
+            mask_kind,
+            score_scale: _,
+            attn_logit_softcap: _,
+        } => vjp_attention(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Reduce {
+            op: ReduceOp::Prod,
+            axes,
+            keep_dim,
+        } => vjp_reduce_3(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Pool {
+            kind: ReduceOp::Mean,
+            kernel_size,
+            stride,
+            padding,
+        } => vjp_pool_2(node, upstream, upstream_shape, fwd_map, bwd),
+        // ── Binary(Min/Max) ─────────────────────────────────────
+        //
+        // Element-wise min/max: gradient flows to whichever input
+        // was selected (ties go to the first operand by convention).
+        //   da = where(a == out, upstream, 0)
+        //   db = where(a == out, 0, upstream)   ← exclusive
+        Op::Binary(BinaryOp::Min) | Op::Binary(BinaryOp::Max) => {
+            let a_bwd = fwd_map[&node.inputs[0]];
+            let b_bwd = fwd_map[&node.inputs[1]];
+            let y_bwd = fwd_map[&node.id];
+            let a_shape = bwd.node(a_bwd).shape.clone();
+            let b_shape = bwd.node(b_bwd).shape.clone();
+            let dtype = upstream_shape.dtype();
+
+            let bool_shape = Shape::from_dims(upstream_shape.dims(), DType::Bool);
+            let mask_pred = bwd.add_node(Op::Compare(CmpOp::Eq), vec![a_bwd, y_bwd], bool_shape);
+            let mask_f32 = bwd.add_node(
+                Op::Cast { to: dtype },
+                vec![mask_pred],
+                upstream_shape.clone(),
+            );
+            let zero_bytes = vec![
+                0u8;
+                upstream_shape
+                    .num_elements()
+                    .expect("Min/Max VJP: dyn shape")
+                    * 4
+            ];
+            let zero = bwd.add_node(
+                Op::Constant { data: zero_bytes },
+                vec![],
+                upstream_shape.clone(),
+            );
+            let g_a_full = bwd.add_node(
+                Op::Where,
+                vec![mask_f32, upstream, zero],
+                upstream_shape.clone(),
+            );
+            let g_b_full = bwd.add_node(Op::Where, vec![mask_f32, zero, upstream], upstream_shape);
+            let g_a = unbroadcast(g_a_full, &a_shape, bwd);
+            let g_b = unbroadcast(g_b_full, &b_shape, bwd);
+            vec![(0, g_a), (1, g_b)]
+        }
+
+        Op::Binary(BinaryOp::Pow) => vjp_binary_pow(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ScaledMatMul {
+            lhs_format,
+            rhs_format,
+            scale_layout,
+            has_bias,
+        } => vjp_scaled_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ScaledQuantize { .. } => vjp_scaled_quantize(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ScaledQuantScale { .. } => vjp_scaled_quant_scale(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::DequantMatMul { scheme: _ } => vjp_dequant_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ScatterAdd => vjp_scatter_add(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Cumsum { axis, exclusive } => vjp_cumsum(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::GroupedMatMul => vjp_grouped_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::DequantGroupedMatMul { scheme } => vjp_dequant_grouped_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::QMatMul {
+            x_zp,
+            w_zp,
+            out_zp: _,
+            mult,
+        } => vjp_q_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::QConv2d {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            x_zp,
+            w_zp,
+            out_zp: _,
+            mult,
+        } => vjp_q_conv2d(node, upstream, upstream_shape, fwd_map, bwd),
+        // ── Sampling-style ops: non-differentiable ──
+        Op::TopK { .. } | Op::Sample { .. } | Op::RngNormal { .. } | Op::RngUniform { .. } => {
+            // TopK selects; Sample multinomial-draws. Gradient w.r.t.
+            // the input distribution is undefined / zero in the
+            // standard sense. Skip propagation.
+            vec![]
+        }
+
+        Op::GaussianSplatRender {
+            width,
+            height,
+            tile_size,
+            radius_scale,
+            alpha_cutoff,
+            max_splat_steps,
+            transmittance_threshold,
+            max_list_entries,
+            ..
+        } => vjp_gaussian_splat_render(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::GaussianSplatRenderBackward { .. } => vjp_gaussian_splat_render_backward(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::GaussianSplatPrepare { .. } | Op::GaussianSplatRasterize { .. } => {
+            panic!(
+                "autodiff: decomposed splat ops must be fused before AD — \
+                 `prepare_graph_for_ad` rewrites Prepare→Rasterize into \
+                 `GaussianSplatRender`, or use `Op::GaussianSplatRender` directly"
+            );
+        }
+
+        Op::CustomFn {
+            vjp_body: Some(vjp_body),
+            num_inputs,
+            ..
+        } => vjp_custom_fn(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::CustomFn { vjp_body: None, .. } => vjp_custom_fn_2(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Custom { name, .. } => vjp_custom(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Conv2dBackwardInput {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => vjp_conv2d_backward_input(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Conv2dBackwardWeight {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => vjp_conv2d_backward_weight(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Fft { inverse, norm } => vjp_fft(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::LogMel => vjp_log_mel(node, upstream, upstream_shape, fwd_map, bwd),
+        // The catch-all below remains as a safety net: if a
+        // future op is added without a VJP rule, this panic
+        // names it for the implementer.
+        other => panic!(
+            "autodiff: no VJP rule for {other}. See the matching \
+             entry in rlx-opt/src/autodiff.rs (catch-all panic) for \
+             a pointer to what's needed to differentiate this op.",
+        ),
+    }
+}
+
+#[allow(unused_variables)]
+fn vjp_binary_add(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Binary(BinaryOp::Add) = &node.op else { unreachable!() };
+    {
             let a_bwd = fwd_map[&node.inputs[0]];
             let b_bwd = fwd_map[&node.inputs[1]];
             let a_shape = bwd.node(a_bwd).shape.clone();
@@ -481,8 +766,12 @@ fn vjp(
             let g_b = unbroadcast(upstream, &b_shape, bwd);
             vec![(0, g_a), (1, g_b)]
         }
+}
 
-        Op::Binary(BinaryOp::Sub) => {
+#[allow(unused_variables)]
+fn vjp_binary_sub(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Binary(BinaryOp::Sub) = &node.op else { unreachable!() };
+    {
             let a_bwd = fwd_map[&node.inputs[0]];
             let b_bwd = fwd_map[&node.inputs[1]];
             let a_shape = bwd.node(a_bwd).shape.clone();
@@ -492,8 +781,12 @@ fn vjp(
             let g_b = unbroadcast(neg, &b_shape, bwd);
             vec![(0, g_a), (1, g_b)]
         }
+}
 
-        Op::Binary(BinaryOp::Mul) => {
+#[allow(unused_variables)]
+fn vjp_binary_mul(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Binary(BinaryOp::Mul) = &node.op else { unreachable!() };
+    {
             let a_bwd = fwd_map[&node.inputs[0]];
             let b_bwd = fwd_map[&node.inputs[1]];
             let a_shape = bwd.node(a_bwd).shape.clone();
@@ -512,8 +805,12 @@ fn vjp(
             let g_b = unbroadcast(g_b_full, &b_shape, bwd);
             vec![(0, g_a), (1, g_b)]
         }
+}
 
-        Op::Activation(kind) => {
+#[allow(unused_variables)]
+fn vjp_activation(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Activation(kind) = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             // Dedicated `ReluBackward` kernel for the most common case
             // (avoids the per-element kind-dispatch in
@@ -525,8 +822,12 @@ fn vjp(
             };
             vec![(0, dx)]
         }
+}
 
-        Op::MatMul => {
+#[allow(unused_variables)]
+fn vjp_mat_mul(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::MatMul = &node.op else { unreachable!() };
+    {
             // y [..batch, M, N] = a [..batch_a, M, K] @ b [..batch_b, K, N]
             //   da = upstream @ b^T   (shape [..batch, M, K])
             //   db = a^T   @ upstream (shape [..batch, K, N])
@@ -593,8 +894,12 @@ fn vjp(
 
             vec![(0, g_a), (1, g_b)]
         }
+}
 
-        Op::DenseSolve => {
+#[allow(unused_variables)]
+fn vjp_dense_solve(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::DenseSolve = &node.op else { unreachable!() };
+    {
             // X = solve(A, B) ⇒ implicit-function VJP:
             //   dB = solve(Aᵀ, upstream)        same shape as B / X
             //   dA = -dB · Xᵀ                   [N, N]
@@ -664,8 +969,12 @@ fn vjp(
 
             vec![(0, neg_outer), (1, d_b)]
         }
+}
 
-        Op::BatchedDenseSolve => {
+#[allow(unused_variables)]
+fn vjp_batched_dense_solve(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::BatchedDenseSolve = &node.op else { unreachable!() };
+    {
             // Per-batch independent. Same implicit-function VJP as
             // DenseSolve, lifted with a leading B axis throughout:
             //   dB = batched_solve(Aᵀ, upstream)        same shape as B/X
@@ -759,15 +1068,19 @@ fn vjp(
 
             vec![(0, neg_outer), (1, d_b)]
         }
+}
 
-        Op::Scan {
+#[allow(unused_variables)]
+fn vjp_scan(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Scan {
             body,
             length,
             save_trajectory,
             num_bcast: _,
             num_xs,
             num_checkpoints,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             // After `convert_scans_for_ad`, every scan reaching the AD
             // walk carries its trajectory. Compile body's VJP once
             // — w.r.t. carry AND every xs — so we can extract dinit
@@ -840,14 +1153,18 @@ fn vjp(
             }
             grads
         }
+}
 
-        Op::Conv {
+#[allow(unused_variables)]
+fn vjp_conv(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Conv {
             kernel_size,
             stride,
             padding,
             dilation,
             groups,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let w_bwd = fwd_map[&node.inputs[1]];
             let x_shape = bwd.node(x_bwd).shape.clone();
@@ -884,13 +1201,17 @@ fn vjp(
             );
             vec![(0, dx), (1, dw)]
         }
+}
 
-        Op::Pool {
+#[allow(unused_variables)]
+fn vjp_pool(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Pool {
             kind: ReduceOp::Max,
             kernel_size,
             stride,
             padding,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let dx = bwd.maxpool2d_backward(
                 x_bwd,
@@ -901,16 +1222,24 @@ fn vjp(
             );
             vec![(0, dx)]
         }
+}
 
-        Op::SoftmaxCrossEntropyWithLogits => {
+#[allow(unused_variables)]
+fn vjp_softmax_cross_entropy_with_logits(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::SoftmaxCrossEntropyWithLogits = &node.op else { unreachable!() };
+    {
             let logits_bwd = fwd_map[&node.inputs[0]];
             let labels_bwd = fwd_map[&node.inputs[1]];
             let dlogits = bwd.softmax_cross_entropy_backward(logits_bwd, labels_bwd, upstream);
             // labels has no gradient.
             vec![(0, dlogits)]
         }
+}
 
-        Op::SoftmaxCrossEntropy => {
+#[allow(unused_variables)]
+fn vjp_softmax_cross_entropy(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::SoftmaxCrossEntropy = &node.op else { unreachable!() };
+    {
             // loss[n] = lse(logits[n]) - Σ_c targets[n,c]·logits[n,c].
             // dlogits = (softmax(logits) - targets) * d_loss[n]
             // dtargets = -logits * d_loss[n]
@@ -928,23 +1257,31 @@ fn vjp(
             let dtargets = bwd.mul(neg_logits, upstream_2d);
             vec![(0, dlogits), (1, dtargets)]
         }
+}
 
-        Op::Reduce {
+#[allow(unused_variables)]
+fn vjp_reduce(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Reduce {
             op: ReduceOp::Sum,
             axes,
             keep_dim,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let x_shape = bwd.node(x_bwd).shape.clone();
             let g = expand_to(upstream, &x_shape, axes, *keep_dim, bwd);
             vec![(0, g)]
         }
+}
 
-        Op::Reduce {
+#[allow(unused_variables)]
+fn vjp_reduce_2(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Reduce {
             op: ReduceOp::Mean,
             axes,
             keep_dim,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             // Mean = Sum / N. Do the Sum-style expansion first, then
             // multiply the broadcast result by 1/N. Multiplying after
             // the expand keeps the broadcast cleanly anchored at the
@@ -964,23 +1301,35 @@ fn vjp(
             let g = bwd.binary(BinaryOp::Mul, expanded, inv_count, x_shape);
             vec![(0, g)]
         }
+}
 
-        Op::Reshape { .. } => {
+#[allow(unused_variables)]
+fn vjp_reshape(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Reshape { .. } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let x_shape = bwd.node(x_bwd).shape.clone();
             let dx = reshape_to(upstream, &x_shape, bwd);
             vec![(0, dx)]
         }
+}
 
-        Op::ComplexNormSq => {
+#[allow(unused_variables)]
+fn vjp_complex_norm_sq(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::ComplexNormSq = &node.op else { unreachable!() };
+    {
             // Wirtinger: ∂|z|²/∂z̄ = z. Cotangent g (real) maps to
             // dz = g·z (complex, element-wise).
             let z_bwd = fwd_map[&node.inputs[0]];
             let dz = bwd.complex_norm_sq_backward(z_bwd, upstream);
             vec![(0, dz)]
         }
+}
 
-        Op::Conjugate => {
+#[allow(unused_variables)]
+fn vjp_conjugate(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Conjugate = &node.op else { unreachable!() };
+    {
             // For w = conj(z): under the JAX-style cotangent (carrying
             // ∂L/∂z̄ for a real-valued L), the rule reduces to
             // cotangent_z = conj(cotangent_w). So the VJP of Conjugate
@@ -989,8 +1338,12 @@ fn vjp(
             let dz = bwd.conjugate(upstream);
             vec![(0, dz)]
         }
+}
 
-        Op::Cast { .. } => {
+#[allow(unused_variables)]
+fn vjp_cast(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Cast { .. } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let x_shape = bwd.node(x_bwd).shape.clone();
             let dx = bwd.add_node(
@@ -1002,29 +1355,22 @@ fn vjp(
             );
             vec![(0, dx)]
         }
+}
 
-        // Stop-gradient (a.k.a. `detach`): forward identity, **no**
-        // gradient contribution to the input. Returning an empty list
-        // here keeps the reverse-mode walker from accumulating any
-        // upstream into `node.inputs[0]`, which is the whole point.
-        Op::StopGradient => vec![],
+// Stop-gradient (a.k.a. `detach`): forward identity, **no**
+// gradient contribution to the input. Returning an empty list
+// here keeps the reverse-mode walker from accumulating any
+// upstream into `node.inputs[0]`, which is the whole point.
+#[allow(unused_variables)]
+fn vjp_stop_gradient(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::StopGradient = &node.op else { unreachable!() };
+    vec![]
+}
 
-        // Straight-through estimator: forward simulates the lossy
-        // round-trip (x → q → x'), backward pretends it was an
-        // identity. `dx = upstream` for both ops. The upstream is the
-        // f32 gradient computed by the consumer; the int8 dtype on
-        // the input/output is ignored for the gradient — we treat
-        // the entire Q/DQ chain as a real-valued no-op for autodiff
-        // purposes. This is the foundation for QAT (quantization-
-        // aware training): the model trains in fp32 but every
-        // forward pass tastes the int8 round-tripped activations,
-        // so the learned weights are robust to deployment-time
-        // quantization.
-        Op::Quantize { .. } | Op::Dequantize { .. } => {
-            vec![(0, upstream)]
-        }
-
-        Op::FakeQuantizeLSQ { bits, axis } => {
+#[allow(unused_variables)]
+fn vjp_fake_quantize_l_s_q(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::FakeQuantizeLSQ { bits, axis } = &node.op else { unreachable!() };
+    {
             // LSQ has TWO gradients: dx (STE-clipped) and dscale
             // (closed-form). Route them to inputs[0] (x) and
             // inputs[1] (scale) respectively.
@@ -1050,14 +1396,18 @@ fn vjp(
             );
             vec![(0, dx), (1, dscale)]
         }
+}
 
-        // FakeQuantize backward depends on the STE variant. The
-        // default `Identity` is a clean passthrough; the others
-        // attenuate the gradient based on `x` and the per-channel
-        // scale, so we emit a dedicated `FakeQuantizeBackward` op.
-        Op::FakeQuantize {
+// FakeQuantize backward depends on the STE variant. The
+// default `Identity` is a clean passthrough; the others
+// attenuate the gradient based on `x` and the per-channel
+// scale, so we emit a dedicated `FakeQuantizeBackward` op.
+#[allow(unused_variables)]
+fn vjp_fake_quantize(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::FakeQuantize {
             bits, axis, ste, ..
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             use rlx_ir::op::SteKind;
             match ste {
                 SteKind::Identity => vec![(0, upstream)],
@@ -1077,15 +1427,23 @@ fn vjp(
                 }
             }
         }
+}
 
-        Op::Expand { .. } => {
+#[allow(unused_variables)]
+fn vjp_expand(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Expand { .. } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let x_shape = bwd.node(x_bwd).shape.clone();
             let dx = unbroadcast(upstream, &x_shape, bwd);
             vec![(0, dx)]
         }
+}
 
-        Op::BatchNormInference { eps } => {
+#[allow(unused_variables)]
+fn vjp_batch_norm_inference(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::BatchNormInference { eps } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let gamma_bwd = fwd_map[&node.inputs[1]];
             let _beta_bwd = fwd_map[&node.inputs[2]];
@@ -1107,8 +1465,12 @@ fn vjp(
             // mean/var are frozen — no gradients.
             vec![(0, dx), (1, dgamma), (2, dbeta)]
         }
+}
 
-        Op::LayerNorm { axis, eps } => {
+#[allow(unused_variables)]
+fn vjp_layer_norm(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::LayerNorm { axis, eps } = &node.op else { unreachable!() };
+    {
             // y = LayerNorm(x, gamma, beta) over the feature axis.
             // d_x via the dedicated `LayerNormBackwardInput` kernel
             // (closed-form, recomputes mean/var/x̂ inline).
@@ -1126,8 +1488,12 @@ fn vjp(
             let dbeta = unbroadcast(upstream, &gamma_shape, bwd);
             vec![(0, dx), (1, dgamma), (2, dbeta)]
         }
+}
 
-        Op::Softmax { axis } => {
+#[allow(unused_variables)]
+fn vjp_softmax(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Softmax { axis } = &node.op else { unreachable!() };
+    {
             // y = softmax(x, axis)  →  dy/dx[i] = y[i] · (g[i] - Σⱼ y[j]·g[j])
             // where the Σⱼ is over the softmax axis. Compose from existing
             // primitives:  yg = y * upstream
@@ -1188,9 +1554,13 @@ fn vjp(
             let dx = bwd.binary(BinaryOp::Mul, y_bwd, diff, y_shape);
             vec![(0, dx)]
         }
+}
 
-        // ── Shape ops: just route the upstream gradient through ──
-        Op::Transpose { perm } => {
+// ── Shape ops: just route the upstream gradient through ──
+#[allow(unused_variables)]
+fn vjp_transpose(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Transpose { perm } = &node.op else { unreachable!() };
+    {
             // Inverse permutation: if forward maps axis i → perm[i],
             // backward maps perm[i] → i.
             let inv: Vec<usize> = {
@@ -1205,8 +1575,12 @@ fn vjp(
             let dx = bwd.add_node(Op::Transpose { perm: inv }, vec![upstream], x_shape);
             vec![(0, dx)]
         }
+}
 
-        Op::Concat { axis } => {
+#[allow(unused_variables)]
+fn vjp_concat(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Concat { axis } = &node.op else { unreachable!() };
+    {
             // Split upstream along the concat axis: each input gets
             // `Narrow(upstream, axis, offset, x_i.dim(axis))`.
             let mut grads = Vec::with_capacity(node.inputs.len());
@@ -1232,8 +1606,12 @@ fn vjp(
             }
             grads
         }
+}
 
-        Op::Narrow { axis, start, len } => {
+#[allow(unused_variables)]
+fn vjp_narrow(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Narrow { axis, start, len } = &node.op else { unreachable!() };
+    {
             // Inverse of slicing: pad upstream with zeros on both
             // sides along `axis` so the result matches input shape.
             // Build via Concat[zeros_pre, upstream, zeros_post].
@@ -1281,8 +1659,12 @@ fn vjp(
             };
             vec![(0, dx)]
         }
+}
 
-        Op::Gather { axis } => {
+#[allow(unused_variables)]
+fn vjp_gather(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Gather { axis } = &node.op else { unreachable!() };
+    {
             let table_bwd = fwd_map[&node.inputs[0]];
             let indices_bwd = fwd_map[&node.inputs[1]];
             let table_shape = bwd.node(table_bwd).shape.clone();
@@ -1299,17 +1681,25 @@ fn vjp(
                 vec![(0, dtable)]
             }
         }
+}
 
-        // ── Non-differentiable predicates / selectors ──
-        Op::Compare(_) => {
+// ── Non-differentiable predicates / selectors ──
+#[allow(unused_variables)]
+fn vjp_compare(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Compare(_) = &node.op else { unreachable!() };
+    {
             // Compare returns a boolean tensor; gradient w.r.t.
             // continuous inputs is zero almost everywhere. We don't
             // propagate (caller will see zero grads for any path
             // that flows through a Compare alone).
             vec![]
         }
+}
 
-        Op::Where => {
+#[allow(unused_variables)]
+fn vjp_where(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Where = &node.op else { unreachable!() };
+    {
             // out = where(cond, a, b). Cond has zero gradient
             // (it's a predicate); a's gradient is `where(cond,
             // upstream, 0)`; b's gradient is `where(cond, 0, upstream)`.
@@ -1338,9 +1728,13 @@ fn vjp(
             let g_b = unbroadcast(g_b_full, &b_shape, bwd);
             vec![(1, g_a), (2, g_b)]
         }
+}
 
-        // ── Element-wise binary ops ──
-        Op::Binary(BinaryOp::Div) => {
+// ── Element-wise binary ops ──
+#[allow(unused_variables)]
+fn vjp_binary_div(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Binary(BinaryOp::Div) = &node.op else { unreachable!() };
+    {
             // Real:  d/da (a/b) = 1/b,        d/db (a/b) = -a/b² = -y/b
             // C64 (Wirtinger):
             //        d/dā = upstream / conj(b)
@@ -1370,68 +1764,30 @@ fn vjp(
 
             vec![(0, g_a), (1, g_b)]
         }
+}
 
-        // ── Reductions: gradient flows to where the reduction "saw" ──
-        Op::Reduce {
-            op: ReduceOp::Max,
-            axes,
-            keep_dim,
-        }
-        | Op::Reduce {
-            op: ReduceOp::Min,
-            axes,
-            keep_dim,
-        } => {
-            // d_x[i] = upstream where x[i] equals the (broadcast)
-            // reduce result, else 0. Composed via
-            // expand(upstream) * (compare(x, expand(y), Eq) → 1.0).
-            let is_max = matches!(
-                node.op,
-                Op::Reduce {
-                    op: ReduceOp::Max,
-                    ..
-                }
-            );
-            let _ = is_max;
-            let x_bwd = fwd_map[&node.inputs[0]];
-            let y_bwd = fwd_map[&node.id];
-            let x_shape = bwd.node(x_bwd).shape.clone();
-            let y_expanded = expand_to(y_bwd, &x_shape, axes, *keep_dim, bwd);
-            let mask_bool = bwd.add_node(
-                Op::Compare(CmpOp::Eq),
-                vec![x_bwd, y_expanded],
-                Shape::from_dims(x_shape.dims(), DType::F32),
-            );
-            // Convert bool→f32 via Cast (the IR encodes bool/PRED as
-            // F32 in our backends already; this is a no-op cast on
-            // most paths).
-            let mask_f32 = bwd.add_node(
-                Op::Cast {
-                    to: x_shape.dtype(),
-                },
-                vec![mask_bool],
-                x_shape.clone(),
-            );
-            let upstream_expanded = expand_to(upstream, &x_shape, axes, *keep_dim, bwd);
-            let dx = bwd.binary(BinaryOp::Mul, upstream_expanded, mask_f32, x_shape);
-            vec![(0, dx)]
-        }
-
-        // ── Rope: backward is forward with negated sin ──
-        //
-        //   forward:  out = x * cos + rotate(x) * sin
-        //   reverse:  dx  = dy * cos + rotate(dy) * (-sin)
-        //         =  rope(dy, cos, neg(sin))
-        Op::Rope {
+// ── Rope: backward is forward with negated sin ──
+//
+//   forward:  out = x * cos + rotate(x) * sin
+//   reverse:  dx  = dy * cos + rotate(dy) * (-sin)
+//         =  rope(dy, cos, neg(sin))
+#[allow(unused_variables)]
+fn vjp_rope(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Rope {
             head_dim, n_rot, ..
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             let cos = fwd_map[&node.inputs[1]];
             let sin = fwd_map[&node.inputs[2]];
             let dx = bwd.rope_backward(upstream, cos, sin, *head_dim, *n_rot);
             vec![(0, dx)]
         }
+}
 
-        Op::RmsNorm { axis, eps } => {
+#[allow(unused_variables)]
+fn vjp_rms_norm(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::RmsNorm { axis, eps } = &node.op else { unreachable!() };
+    {
             let x = fwd_map[&node.inputs[0]];
             let gamma = fwd_map[&node.inputs[1]];
             let beta = fwd_map[&node.inputs[2]];
@@ -1440,8 +1796,12 @@ fn vjp(
             let dbeta = bwd.rms_norm_backward_beta(x, gamma, beta, upstream, *axis, *eps);
             vec![(0, dx), (1, dgamma), (2, dbeta)]
         }
+}
 
-        Op::GroupNorm { num_groups, eps } => {
+#[allow(unused_variables)]
+fn vjp_group_norm(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::GroupNorm { num_groups, eps } = &node.op else { unreachable!() };
+    {
             let x = fwd_map[&node.inputs[0]];
             let gamma = fwd_map[&node.inputs[1]];
             let beta = fwd_map[&node.inputs[2]];
@@ -1452,15 +1812,19 @@ fn vjp(
             let dbeta = bwd.group_norm_backward_beta(x, upstream, beta_shape, *num_groups, *eps);
             vec![(0, dx), (1, dgamma), (2, dbeta)]
         }
+}
 
-        // ── Attention → dedicated backward kernels ──────────────
-        Op::Attention {
+// ── Attention → dedicated backward kernels ──────────────
+#[allow(unused_variables)]
+fn vjp_attention(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Attention {
             num_heads,
             head_dim,
             mask_kind,
             score_scale: _,
             attn_logit_softcap: _,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             let q = fwd_map[&node.inputs[0]];
             let k = fwd_map[&node.inputs[1]];
             let v = fwd_map[&node.inputs[2]];
@@ -1472,18 +1836,22 @@ fn vjp(
                 .attention_backward_all(q, k, v, upstream, *num_heads, *head_dim, *mask_kind, mask);
             vec![(0, dq), (1, dk), (2, dv)]
         }
+}
 
-        // ── Reduce(Prod) ────────────────────────────────────────
-        //
-        // Forward: y[axes_reduced] = ∏ x[axes_reduced…]
-        // Backward: dx[i] = upstream · y / x[i]   (per-row).
-        // (Numerically dicey when any x[i] = 0; production users
-        //  needing zero-safe Prod-grad should pre-mask.)
-        Op::Reduce {
+// ── Reduce(Prod) ────────────────────────────────────────
+//
+// Forward: y[axes_reduced] = ∏ x[axes_reduced…]
+// Backward: dx[i] = upstream · y / x[i]   (per-row).
+// (Numerically dicey when any x[i] = 0; production users
+//  needing zero-safe Prod-grad should pre-mask.)
+#[allow(unused_variables)]
+fn vjp_reduce_3(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Reduce {
             op: ReduceOp::Prod,
             axes,
             keep_dim,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let y_bwd = fwd_map[&node.id];
             let x_shape = bwd.node(x_bwd).shape.clone();
@@ -1499,24 +1867,28 @@ fn vjp(
             let dx = bwd.binary(BinaryOp::Div, num, x_bwd, x_shape);
             vec![(0, dx)]
         }
+}
 
-        // ── Pool(Mean) ──────────────────────────────────────────
-        //
-        // Forward: y[..., h_out, w_out] = mean(window).
-        // Backward: dx[i] = upstream[output_pos(i)] / |window|
-        //   distributed across each pool window.
-        //
-        // Compose via a Conv2dBackwardInput with a constant
-        // 1/|window| kernel of shape [C, 1, kH, kW] and groups=C
-        // (depthwise — no channel mixing). This gives the correct
-        // "spread upstream over window" behavior including stride
-        // and padding handling.
-        Op::Pool {
+// ── Pool(Mean) ──────────────────────────────────────────
+//
+// Forward: y[..., h_out, w_out] = mean(window).
+// Backward: dx[i] = upstream[output_pos(i)] / |window|
+//   distributed across each pool window.
+//
+// Compose via a Conv2dBackwardInput with a constant
+// 1/|window| kernel of shape [C, 1, kH, kW] and groups=C
+// (depthwise — no channel mixing). This gives the correct
+// "spread upstream over window" behavior including stride
+// and padding handling.
+#[allow(unused_variables)]
+fn vjp_pool_2(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Pool {
             kind: ReduceOp::Mean,
             kernel_size,
             stride,
             padding,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             assert_eq!(kernel_size.len(), 2, "Pool(Mean) VJP: 2-D pool only");
             let x_bwd = fwd_map[&node.inputs[0]];
             let x_shape = bwd.node(x_bwd).shape.clone();
@@ -1556,60 +1928,20 @@ fn vjp(
             );
             vec![(0, dx)]
         }
+}
 
-        // ── Binary(Min/Max) ─────────────────────────────────────
-        //
-        // Element-wise min/max: gradient flows to whichever input
-        // was selected (ties go to the first operand by convention).
-        //   da = where(a == out, upstream, 0)
-        //   db = where(a == out, 0, upstream)   ← exclusive
-        Op::Binary(BinaryOp::Min) | Op::Binary(BinaryOp::Max) => {
-            let a_bwd = fwd_map[&node.inputs[0]];
-            let b_bwd = fwd_map[&node.inputs[1]];
-            let y_bwd = fwd_map[&node.id];
-            let a_shape = bwd.node(a_bwd).shape.clone();
-            let b_shape = bwd.node(b_bwd).shape.clone();
-            let dtype = upstream_shape.dtype();
-
-            let bool_shape = Shape::from_dims(upstream_shape.dims(), DType::Bool);
-            let mask_pred = bwd.add_node(Op::Compare(CmpOp::Eq), vec![a_bwd, y_bwd], bool_shape);
-            let mask_f32 = bwd.add_node(
-                Op::Cast { to: dtype },
-                vec![mask_pred],
-                upstream_shape.clone(),
-            );
-            let zero_bytes = vec![
-                0u8;
-                upstream_shape
-                    .num_elements()
-                    .expect("Min/Max VJP: dyn shape")
-                    * 4
-            ];
-            let zero = bwd.add_node(
-                Op::Constant { data: zero_bytes },
-                vec![],
-                upstream_shape.clone(),
-            );
-            let g_a_full = bwd.add_node(
-                Op::Where,
-                vec![mask_f32, upstream, zero],
-                upstream_shape.clone(),
-            );
-            let g_b_full = bwd.add_node(Op::Where, vec![mask_f32, zero, upstream], upstream_shape);
-            let g_a = unbroadcast(g_a_full, &a_shape, bwd);
-            let g_b = unbroadcast(g_b_full, &b_shape, bwd);
-            vec![(0, g_a), (1, g_b)]
-        }
-
-        // ── Binary(Pow) ─────────────────────────────────────────
-        //
-        //   d/da (aᵇ) = b · a^(b-1)
-        //   d/db (aᵇ) = aᵇ · ln(a)
-        //
-        // We don't have a `Pow` activation, but `pow(a, b)` for
-        // positive base equals `exp(b · ln(a))`, and the derivative
-        // simplifies. Express via `Activation::Log / Exp` and `Mul`.
-        Op::Binary(BinaryOp::Pow) => {
+// ── Binary(Pow) ─────────────────────────────────────────
+//
+//   d/da (aᵇ) = b · a^(b-1)
+//   d/db (aᵇ) = aᵇ · ln(a)
+//
+// We don't have a `Pow` activation, but `pow(a, b)` for
+// positive base equals `exp(b · ln(a))`, and the derivative
+// simplifies. Express via `Activation::Log / Exp` and `Mul`.
+#[allow(unused_variables)]
+fn vjp_binary_pow(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Binary(BinaryOp::Pow) = &node.op else { unreachable!() };
+    {
             let a_bwd = fwd_map[&node.inputs[0]];
             let b_bwd = fwd_map[&node.inputs[1]];
             let y_bwd = fwd_map[&node.id]; // a^b
@@ -1632,38 +1964,42 @@ fn vjp(
 
             vec![(0, g_a), (1, g_b)]
         }
+}
 
-        // ── DequantMatMul (QAT-style straight-through) ─────────
-        //
-        // Forward (Int8BlockAsym):
-        //   w_dq = (cast<f32>(w_q) - zp_b) * scale_b
-        //   y    = x @ w_dq
-        //
-        // Backward (QAT convention — scale and zp are typically
-        // frozen during fine-tuning; w_q's int8 cast is treated as
-        // a no-op for the gradient via straight-through):
-        //   dx     = upstream @ w_dq^T
-        //   dw_q   = x^T @ upstream * scale_b   (straight-through;
-        //            the user's optimizer would project back to
-        //            int8 after the step)
-        //   dscale = 0   (frozen)
-        //   dzp    = 0   (frozen)
-        //
-        // For full QAT with learnable scale/zp, replace the zero
-        // gradients with the closed-form ∂y/∂scale / ∂y/∂zp.
-        // Native low-precision GEMM — straight-through QAT VJP. We rebuild the
-        // (quantized) f32 operands with `ScaledDequantize` and run the ordinary
-        // matmul backward; the gradient is routed to the U8 code inputs as if
-        // they were those f32 operands, and `ScaledQuantize`'s STE VJP forwards
-        // it to the original f32 source. TN forward: out[m,n] = lhs[m,k]·rhs[n,k]ᵀ
-        //   d_lhs = upstream @ rhs_recon          ([m,n]·[n,k] → [m,k])
-        //   d_rhs = upstreamᵀ @ lhs_recon         ([n,m]·[m,k] → [n,k])
-        Op::ScaledMatMul {
+// ── DequantMatMul (QAT-style straight-through) ─────────
+//
+// Forward (Int8BlockAsym):
+//   w_dq = (cast<f32>(w_q) - zp_b) * scale_b
+//   y    = x @ w_dq
+//
+// Backward (QAT convention — scale and zp are typically
+// frozen during fine-tuning; w_q's int8 cast is treated as
+// a no-op for the gradient via straight-through):
+//   dx     = upstream @ w_dq^T
+//   dw_q   = x^T @ upstream * scale_b   (straight-through;
+//            the user's optimizer would project back to
+//            int8 after the step)
+//   dscale = 0   (frozen)
+//   dzp    = 0   (frozen)
+//
+// For full QAT with learnable scale/zp, replace the zero
+// gradients with the closed-form ∂y/∂scale / ∂y/∂zp.
+// Native low-precision GEMM — straight-through QAT VJP. We rebuild the
+// (quantized) f32 operands with `ScaledDequantize` and run the ordinary
+// matmul backward; the gradient is routed to the U8 code inputs as if
+// they were those f32 operands, and `ScaledQuantize`'s STE VJP forwards
+// it to the original f32 source. TN forward: out[m,n] = lhs[m,k]·rhs[n,k]ᵀ
+//   d_lhs = upstream @ rhs_recon          ([m,n]·[n,k] → [m,k])
+//   d_rhs = upstreamᵀ @ lhs_recon         ([n,m]·[m,k] → [n,k])
+#[allow(unused_variables)]
+fn vjp_scaled_mat_mul(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::ScaledMatMul {
             lhs_format,
             rhs_format,
             scale_layout,
             has_bias,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             let lhs_codes = fwd_map[&node.inputs[0]];
             let rhs_codes = fwd_map[&node.inputs[1]];
             let lhs_scale = fwd_map[&node.inputs[2]];
@@ -1715,15 +2051,27 @@ fn vjp(
             }
             grads
         }
+}
 
-        // Straight-through: quantize is identity for the gradient (the f32
-        // operand receives the cotangent of the codes); the scale is detached.
-        Op::ScaledQuantize { .. } => vec![(0, upstream)],
+// Straight-through: quantize is identity for the gradient (the f32
+// operand receives the cotangent of the codes); the scale is detached.
+#[allow(unused_variables)]
+fn vjp_scaled_quantize(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::ScaledQuantize { .. } = &node.op else { unreachable!() };
+    vec![(0, upstream)]
+}
 
-        // The scale is a detached statistic (amax) — no gradient to its input.
-        Op::ScaledQuantScale { .. } => vec![],
+// The scale is a detached statistic (amax) — no gradient to its input.
+#[allow(unused_variables)]
+fn vjp_scaled_quant_scale(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::ScaledQuantScale { .. } = &node.op else { unreachable!() };
+    vec![]
+}
 
-        Op::DequantMatMul { scheme: _ } => {
+#[allow(unused_variables)]
+fn vjp_dequant_mat_mul(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::DequantMatMul { scheme: _ } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let w_q_bwd = fwd_map[&node.inputs[1]];
             let scale_bwd = fwd_map[&node.inputs[2]];
@@ -1820,13 +2168,17 @@ fn vjp(
 
             vec![(0, dx), (1, dw_q), (2, dscale), (3, dzp)]
         }
+}
 
-        // ── ScatterAdd ──────────────────────────────────────────
-        //
-        // Forward: out[indices[i], ...] += updates[i, ...].
-        // Backward: d_updates[i, ...] = upstream[indices[i], ...]  (gather).
-        //   Indices are non-differentiable.
-        Op::ScatterAdd => {
+// ── ScatterAdd ──────────────────────────────────────────
+//
+// Forward: out[indices[i], ...] += updates[i, ...].
+// Backward: d_updates[i, ...] = upstream[indices[i], ...]  (gather).
+//   Indices are non-differentiable.
+#[allow(unused_variables)]
+fn vjp_scatter_add(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::ScatterAdd = &node.op else { unreachable!() };
+    {
             let updates_bwd = fwd_map[&node.inputs[0]];
             let indices_bwd = fwd_map[&node.inputs[1]];
             let updates_shape = bwd.node(updates_bwd).shape.clone();
@@ -1837,29 +2189,37 @@ fn vjp(
             );
             vec![(0, dupdates)]
         }
+}
 
-        // ── Cumsum ──────────────────────────────────────────────
-        //
-        Op::Cumsum { axis, exclusive } => {
+// ── Cumsum ──────────────────────────────────────────────
+//
+#[allow(unused_variables)]
+fn vjp_cumsum(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Cumsum { axis, exclusive } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let x_shape = bwd.node(x_bwd).shape.clone();
             let dx = bwd.cumsum_backward(upstream, x_shape, *axis, *exclusive);
             vec![(0, dx)]
         }
+}
 
-        // ── GroupedMatMul (MoE primitive) ──────────────────────
-        //
-        // Forward: y[i] = x[i] @ w[expert[i]]
-        //   x        [M, K]
-        //   w        [E, K, N]
-        //   expert   [M] (f32-encoded indices)
-        //   y        [M, N]
-        //
-        // Backward (composed via Gather + batched-MatMul + ScatterAdd):
-        //   dx[i] = upstream[i] @ w[expert[i]]^T
-        //   dw[e, k, n] = sum_{i : expert[i]=e} x[i,k] · upstream[i,n]
-        //   dexpert: zero (non-differentiable index input).
-        Op::GroupedMatMul => {
+// ── GroupedMatMul (MoE primitive) ──────────────────────
+//
+// Forward: y[i] = x[i] @ w[expert[i]]
+//   x        [M, K]
+//   w        [E, K, N]
+//   expert   [M] (f32-encoded indices)
+//   y        [M, N]
+//
+// Backward (composed via Gather + batched-MatMul + ScatterAdd):
+//   dx[i] = upstream[i] @ w[expert[i]]^T
+//   dw[e, k, n] = sum_{i : expert[i]=e} x[i,k] · upstream[i,n]
+//   dexpert: zero (non-differentiable index input).
+#[allow(unused_variables)]
+fn vjp_grouped_mat_mul(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::GroupedMatMul = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let w_bwd = fwd_map[&node.inputs[1]];
             let expert_bwd = fwd_map[&node.inputs[2]];
@@ -1869,13 +2229,17 @@ fn vjp(
                 grouped_matmul_vjp(bwd, upstream, x_bwd, w_bwd, expert_bwd, &x_shape, &w_shape);
             vec![(0, dx), (1, dw)]
         }
+}
 
-        // ── DequantGroupedMatMul (frozen GGUF MoE weights) ─────
-        //
-        // Materialize w_dq via `Op::DequantMoEWeights`, then reuse the
-        // GroupedMatMul VJP. Packed U8 weights and expert indices are
-        // non-differentiable (inference / QAT-frozen convention).
-        Op::DequantGroupedMatMul { scheme } => {
+// ── DequantGroupedMatMul (frozen GGUF MoE weights) ─────
+//
+// Materialize w_dq via `Op::DequantMoEWeights`, then reuse the
+// GroupedMatMul VJP. Packed U8 weights and expert indices are
+// non-differentiable (inference / QAT-frozen convention).
+#[allow(unused_variables)]
+fn vjp_dequant_grouped_mat_mul(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::DequantGroupedMatMul { scheme } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let w_packed = fwd_map[&node.inputs[1]];
             let expert_bwd = fwd_map[&node.inputs[2]];
@@ -1916,25 +2280,29 @@ fn vjp(
                 grouped_matmul_vjp(bwd, upstream, x_bwd, w_dq, expert_bwd, &x_shape, &w_shape);
             vec![(0, dx)]
         }
+}
 
-        // ── QMatMul / QConv2d (straight-through INT8 backward) ──
-        //
-        // Real INT8 inference kernels. The forward applies
-        //   out = clamp(round((x − x_zp) · (w − w_zp) · mult + bias)
-        //               + out_zp, [-128, 127])
-        // and outputs i8. For training, the standard QAT recipe
-        // treats the round/clamp/quantize as straight-through, so
-        // the gradient is what a plain f32 MatMul (or Conv) backward
-        // would give applied to the dequantized representations.
-        // Zero-points and `mult` are typically frozen (calibration
-        // outputs); we emit zero gradients for them. Bias gets the
-        // standard sum-over-batch gradient.
-        Op::QMatMul {
+// ── QMatMul / QConv2d (straight-through INT8 backward) ──
+//
+// Real INT8 inference kernels. The forward applies
+//   out = clamp(round((x − x_zp) · (w − w_zp) · mult + bias)
+//               + out_zp, [-128, 127])
+// and outputs i8. For training, the standard QAT recipe
+// treats the round/clamp/quantize as straight-through, so
+// the gradient is what a plain f32 MatMul (or Conv) backward
+// would give applied to the dequantized representations.
+// Zero-points and `mult` are typically frozen (calibration
+// outputs); we emit zero gradients for them. Bias gets the
+// standard sum-over-batch gradient.
+#[allow(unused_variables)]
+fn vjp_q_mat_mul(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::QMatMul {
             x_zp,
             w_zp,
             out_zp: _,
             mult,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let w_bwd = fwd_map[&node.inputs[1]];
             let bias_bwd = fwd_map[&node.inputs[2]];
@@ -2063,8 +2431,11 @@ fn vjp(
 
             vec![(0, dx), (1, dw), (2, dbias)]
         }
+}
 
-        Op::QConv2d {
+#[allow(unused_variables)]
+fn vjp_q_conv2d(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::QConv2d {
             kernel_size,
             stride,
             padding,
@@ -2074,7 +2445,8 @@ fn vjp(
             w_zp,
             out_zp: _,
             mult,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             // Same straight-through pattern as QMatMul, lifted to
             // 2-D conv via the existing Conv2dBackwardInput / Weight
             // kernels.
@@ -2176,16 +2548,11 @@ fn vjp(
 
             vec![(0, dx), (1, dw), (2, dbias)]
         }
+}
 
-        // ── Sampling-style ops: non-differentiable ──
-        Op::TopK { .. } | Op::Sample { .. } | Op::RngNormal { .. } | Op::RngUniform { .. } => {
-            // TopK selects; Sample multinomial-draws. Gradient w.r.t.
-            // the input distribution is undefined / zero in the
-            // standard sense. Skip propagation.
-            vec![]
-        }
-
-        Op::GaussianSplatRender {
+#[allow(unused_variables)]
+fn vjp_gaussian_splat_render(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::GaussianSplatRender {
             width,
             height,
             tile_size,
@@ -2195,7 +2562,8 @@ fn vjp(
             transmittance_threshold,
             max_list_entries,
             ..
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             use rlx_ir::ops::splat::{
                 GaussianSplatBackwardParams, GaussianSplatInputs, GaussianSplatRenderParams,
                 unpack_gaussian_splat_packed_grads,
@@ -2256,46 +2624,46 @@ fn vjp(
                 (6, zero_meta),
             ]
         }
+}
 
-        Op::GaussianSplatRenderBackward { .. } => {
+#[allow(unused_variables)]
+fn vjp_gaussian_splat_render_backward(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::GaussianSplatRenderBackward { .. } = &node.op else { unreachable!() };
+    {
             // Scene/meta inputs are not differentiated through this op in v1.
             vec![]
         }
+}
 
-        Op::GaussianSplatPrepare { .. } | Op::GaussianSplatRasterize { .. } => {
-            panic!(
-                "autodiff: decomposed splat ops must be fused before AD — \
-                 `prepare_graph_for_ad` rewrites Prepare→Rasterize into \
-                 `GaussianSplatRender`, or use `Op::GaussianSplatRender` directly"
-            );
-        }
-
-        // ── Anything else: explicit panic with op name ──
-        //
-        // All ops in the IR have either a per-op VJP rule above
-        // or a pre-pass rewrite that decomposes them into ops
-        // that do:
-        //   * Op::If → control_flow::inline_if (Where + inlined
-        //     branches).
-        //   * Op::While → control_flow::unroll_while (bounded
-        //     unroll up to max_iterations).
-        //   * Op::SelectiveScan / Op::FusedTransformerLayer /
-        //     Op::FusedAttentionBlock / Op::FusedSwiGLU /
-        //     Op::LoraMatMul / Op::FusedMatMulBiasAct /
-        //     Op::FusedResidualLN → rlx_fusion::unfuse_fused_for_autodiff.
-        //
-        // User-defined sub-graph (Op::CustomFn) with override AD.
-        // When `vjp_body` is supplied, inline it into `bwd`: each
-        // primal Op::Input maps to the outer forward NodeId for that
-        // primal; the special-named "primal_output" Input maps to the
-        // forward NodeId of this CustomFn node; "d_output" maps to
-        // `upstream`. The body's N outputs become this op's N input
-        // gradients in declaration order.
-        Op::CustomFn {
+// ── Anything else: explicit panic with op name ──
+//
+// All ops in the IR have either a per-op VJP rule above
+// or a pre-pass rewrite that decomposes them into ops
+// that do:
+//   * Op::If → control_flow::inline_if (Where + inlined
+//     branches).
+//   * Op::While → control_flow::unroll_while (bounded
+//     unroll up to max_iterations).
+//   * Op::SelectiveScan / Op::FusedTransformerLayer /
+//     Op::FusedAttentionBlock / Op::FusedSwiGLU /
+//     Op::LoraMatMul / Op::FusedMatMulBiasAct /
+//     Op::FusedResidualLN → rlx_fusion::unfuse_fused_for_autodiff.
+//
+// User-defined sub-graph (Op::CustomFn) with override AD.
+// When `vjp_body` is supplied, inline it into `bwd`: each
+// primal Op::Input maps to the outer forward NodeId for that
+// primal; the special-named "primal_output" Input maps to the
+// forward NodeId of this CustomFn node; "d_output" maps to
+// `upstream`. The body's N outputs become this op's N input
+// gradients in declaration order.
+#[allow(unused_variables)]
+fn vjp_custom_fn(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::CustomFn {
             vjp_body: Some(vjp_body),
             num_inputs,
             ..
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             // Map vjp_body NodeIds → bwd NodeIds.
             let mut sub_to_bwd: HashMap<NodeId, NodeId> = HashMap::new();
 
@@ -2349,21 +2717,29 @@ fn vjp(
             }
             grads
         }
+}
 
-        // CustomFn without vjp_body is inlined by `inline_custom_fn_for_autodiff`
-        // before the reverse walk — reaching here means the pre-pass missed it.
-        Op::CustomFn { vjp_body: None, .. } => {
+// CustomFn without vjp_body is inlined by `inline_custom_fn_for_autodiff`
+// before the reverse walk — reaching here means the pre-pass missed it.
+#[allow(unused_variables)]
+fn vjp_custom_fn_2(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::CustomFn { vjp_body: None, .. } = &node.op else { unreachable!() };
+    {
             panic!(
                 "autodiff: Op::CustomFn has no vjp_body and was not inlined. \
                  This is an internal error in inline_custom_fn_for_autodiff."
             )
         }
+}
 
-        // User-registered custom op — dispatch the VJP through the
-        // op registry. The impl emits gradient nodes via the same
-        // `bwd` builder built-in arms use; default impl returns
-        // `vec![]` (non-differentiable).
-        Op::Custom { name, .. } => {
+// User-registered custom op — dispatch the VJP through the
+// op registry. The impl emits gradient nodes via the same
+// `bwd` builder built-in arms use; default impl returns
+// `vec![]` (non-differentiable).
+#[allow(unused_variables)]
+fn vjp_custom(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Custom { name, .. } = &node.op else { unreachable!() };
+    {
             let ext = rlx_ir::lookup_op(name).unwrap_or_else(|| {
                 panic!(
                     "autodiff: Op::Custom('{name}') is not registered \
@@ -2378,14 +2754,18 @@ fn vjp(
             };
             ext.vjp(node, &mut ctx)
         }
+}
 
-        Op::Conv2dBackwardInput {
+#[allow(unused_variables)]
+fn vjp_conv2d_backward_input(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Conv2dBackwardInput {
             kernel_size,
             stride,
             padding,
             dilation,
             groups,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             let dy_bwd = fwd_map[&node.inputs[0]];
             let w_bwd = fwd_map[&node.inputs[1]];
             let dy_shape = bwd.node(dy_bwd).shape.clone();
@@ -2403,14 +2783,18 @@ fn vjp(
             );
             vec![(0, d_dy)]
         }
+}
 
-        Op::Conv2dBackwardWeight {
+#[allow(unused_variables)]
+fn vjp_conv2d_backward_weight(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Conv2dBackwardWeight {
             kernel_size,
             stride,
             padding,
             dilation,
             groups,
-        } => {
+        } = &node.op else { unreachable!() };
+    {
             let x_bwd = fwd_map[&node.inputs[0]];
             let dy_bwd = fwd_map[&node.inputs[1]];
             let x_shape = bwd.node(x_bwd).shape.clone();
@@ -2438,16 +2822,20 @@ fn vjp(
             );
             vec![(0, d_x), (1, d_dy)]
         }
+}
 
-        // 1D FFT: y = fft(x; inverse). Both forward and inverse are
-        // unnormalized linear operators on the 2N real-block layout,
-        // and the DFT matrix's transpose (over the real-block view)
-        // equals the unnormalized inverse DFT. So:
-        //   VJP(fft)  = ifft(upstream)
-        //   VJP(ifft) = fft(upstream)
-        // No scaling — the choice to leave both directions unnormalized
-        // makes the chain rule a flag flip and nothing else.
-        Op::Fft { inverse, norm } => {
+// 1D FFT: y = fft(x; inverse). Both forward and inverse are
+// unnormalized linear operators on the 2N real-block layout,
+// and the DFT matrix's transpose (over the real-block view)
+// equals the unnormalized inverse DFT. So:
+//   VJP(fft)  = ifft(upstream)
+//   VJP(ifft) = fft(upstream)
+// No scaling — the choice to leave both directions unnormalized
+// makes the chain rule a flag flip and nothing else.
+#[allow(unused_variables)]
+fn vjp_fft(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::Fft { inverse, norm } = &node.op else { unreachable!() };
+    {
             let n = rlx_ir::fft::fft_meta(bwd.shape(node.inputs[0])).n_complex;
             let s = norm.output_scale(n, *inverse) as f32;
             let z = if s != 1.0 {
@@ -2459,23 +2847,17 @@ fn vjp(
             let dx = bwd.fft(z, !*inverse);
             vec![(0, dx)]
         }
+}
 
-        Op::LogMel => {
+#[allow(unused_variables)]
+fn vjp_log_mel(node: &Node, upstream: NodeId, upstream_shape: Shape, fwd_map: &HashMap<NodeId, NodeId>, bwd: &mut Graph) -> Vec<(usize, NodeId)> {
+    let Op::LogMel = &node.op else { unreachable!() };
+    {
             let spec_bwd = fwd_map[&node.inputs[0]];
             let filt_bwd = fwd_map[&node.inputs[1]];
             let dx = bwd.log_mel_backward(spec_bwd, filt_bwd, upstream);
             vec![(0, dx)]
         }
-
-        // The catch-all below remains as a safety net: if a
-        // future op is added without a VJP rule, this panic
-        // names it for the implementer.
-        other => panic!(
-            "autodiff: no VJP rule for {other}. See the matching \
-             entry in rlx-opt/src/autodiff.rs (catch-all panic) for \
-             a pointer to what's needed to differentiate this op.",
-        ),
-    }
 }
 
 /// Decompose tier-2 fused ops back to their primitive components so

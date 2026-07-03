@@ -3,7 +3,7 @@
 Apple GPU backend for RLX — MSL kernels + MPSGraph + ICB-batched
 dispatch. Two coexisting strategies:
 
-1. **Thunk path** (`thunk.rs`) — per-op MSL kernel + dispatch. Fine
+1. **Thunk path** (`thunk/`) — per-op MSL kernel + dispatch. Fine
    control, mature; default for now.
 2. **MPSGraph path** (`mps_graph.rs` + `mps_graph_lower.rs`) — lower
    subgraphs to MPSGraph and let Metal optimize the schedule. Opt-in
@@ -24,8 +24,11 @@ throughput unlock — Phase H made matmul-interleaved schedules use it.
 - **MPS BLAS** (`mps_blas.rs`) — descriptor-cached MPS matrix multiply.
 - **ICB (Indirect Command Buffer) batching** — segmented matmul
   schedules issue as one indirect dispatch instead of N command buffers.
-- **`thunk.rs`** — Thunk enum + Op→Thunk lowering.
-- **`backend.rs`** — top-level Backend impl + execution.
+- **`thunk/`** — Thunk enum + Op→Thunk lowering (`ThunkSchedule` split into
+  submodules; see `mod.rs`).
+- **`backend/`** — top-level Backend impl + execution; `MetalExecutable`
+  decomposed into `compile`/`run`/`encode`/`bind`/`set`/`read`/`output`
+  submodules (each a sibling `impl MetalExecutable`; see `mod.rs`).
 - **`calibrate.rs`** — measured GFLOP/s per kernel variant; cached in
   `~/.cache/rlx/metal-calib-<hwid>.json`. Uses `rlx_ir::Tick`.
 - **`cost.rs`** — cost model that consumes calibration values.

@@ -23,18 +23,13 @@ import re
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ── CONFIG ──────────────────────────────────────────────────────────────
-SRC = os.path.join(ROOT, "crates/core/rlx-fusion/src/unfuse.rs")
-OUTDIR = os.path.join(ROOT, "crates/core/rlx-fusion/src/unfuse")
-REEXPORT_PUB = False                      # internal pub(super) unfuse fns: `use m::*` into mod.rs
+SRC = os.path.join(ROOT, "crates/numerics/rlx-linalg/src/lib.rs")
+OUTDIR = os.path.join(ROOT, "crates/numerics/rlx-linalg/src")
+REEXPORT_PUB = False                      # internal registration types: `use m::*` into lib.rs
 SUPER_REWRITE = {}
-MAP = {
-    "unfuse_gated_delta_net": "rnn", "unfuse_lstm": "rnn", "unfuse_gru": "rnn",
-    "unfuse_rnn": "rnn", "unfuse_mamba2": "rnn", "unfuse_selective_scan": "rnn",
-    "unfuse_fused_mat_mul_bias_act": "fused", "unfuse_fused_residual_l_n": "fused",
-    "unfuse_fused_residual_rms_norm": "fused", "unfuse_fused_attention_block": "fused",
-    "unfuse_fused_transformer_layer": "fused", "unfuse_fused_swi_g_l_u": "fused",
-    "unfuse_lora_mat_mul": "fused",
-}
+# auto-group X{Ext,Cpu} structs + their trait impls by stem X -> op_<x>
+AUTO_STEM = ("Ext", "Cpu")
+MAP = {}
 # ────────────────────────────────────────────────────────────────────────
 
 ITEM_RE = re.compile(
@@ -77,6 +72,24 @@ def main():
 
     bounds = [(attach_back(s), s) for s in starts]
     preamble = lines[:bounds[0][0]]
+
+    if AUTO_STEM:  # group X{Ext,Cpu} (+ their impls) by stem X -> op_<x>
+        stems = {}
+        for _, sl in bounds:
+            kk = item_key(lines[sl])[1]
+            if not kk:
+                continue
+            stem = kk
+            for suf in AUTO_STEM:
+                if kk.endswith(suf) and len(kk) > len(suf):
+                    stem = kk[:-len(suf)]
+                    break
+            stems.setdefault(stem, set()).add(kk)
+        for stem, kks in stems.items():
+            if len(kks) >= 2:
+                mod = "op_" + re.sub(r'(?<!^)(?=[A-Z])', '_', stem).lower()
+                for kk in kks:
+                    MAP[kk] = mod
 
     keep, fam_chunks = [], {}
     moved = []

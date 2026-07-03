@@ -171,7 +171,7 @@ kernel void hgemm_simd_4x4_bias(
             float t = 1.0f / (1.0f + 0.3275911f * xa);
             float y = t * (0.254829592f + t * (-0.284496736f + t * (1.421413741f
                     + t * (-1.453152027f + t * 1.061405429f))));
-            float erf_val = sign * (1.0f - y * exp(-xa * xa));
+            float erf_val = sign * (1.0f - y * exp(-min(xa * xa, 80.0f)));
             v = v * 0.5f * (1.0f + erf_val);
         } else if (act_kind == 2) {
             v = v / (1.0f + exp(-v));
@@ -208,7 +208,7 @@ kernel void gelu_inplace_h(
     float t = 1.0f / (1.0f + 0.3275911f * xa);
     float y = t * (0.254829592f + t * (-0.284496736f + t * (1.421413741f
             + t * (-1.453152027f + t * 1.061405429f))));
-    float erf_val = sign * (1.0f - y * exp(-xa * xa));
+    float erf_val = sign * (1.0f - y * exp(-min(xa * xa, 80.0f)));
     data[gid] = half(x * 0.5f * (1.0f + erf_val));
 }
 
@@ -219,7 +219,10 @@ kernel void gelu_approx_inplace_h(
 ) {
     if (gid >= len) return;
     float x = float(data[gid]);
-    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+    // Clamp to the tanh saturation range: tanh(±15)≈±1 to f32 precision, but a
+    // huge argument (packed-QAT gate outliers → large x³, or +inf) makes Metal's
+    // fast-math tanh return NaN. clamp() also folds ±inf to ±15.
+    float inner = clamp(0.7978845608f * (x + 0.044715f * x * x * x), -15.0f, 15.0f);
     data[gid] = half(0.5f * x * (1.0f + tanh(inner)));
 }
 
@@ -877,7 +880,7 @@ kernel void sgemm_simd_4x4_bias(
             float t = 1.0 / (1.0 + 0.3275911 * xa);
             float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
                     + t * (-1.453152027 + t * 1.061405429))));
-            float erf_val = sign * (1.0 - y * exp(-xa * xa));
+            float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
             v = v * 0.5 * (1.0 + erf_val);
         } else if (act_kind == 2) {
             v = v / (1.0 + exp(-v));
@@ -932,7 +935,7 @@ kernel void sgemm_simd_bias(
             float t = 1.0 / (1.0 + 0.3275911 * xa);
             float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
                     + t * (-1.453152027 + t * 1.061405429))));
-            float erf_val = sign * (1.0 - y * exp(-xa * xa));
+            float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
             v = v * 0.5 * (1.0 + erf_val);
         } else if (act_kind == 2) {
             v = v / (1.0 + exp(-v));
@@ -1003,7 +1006,7 @@ kernel void sgemm_simd_padded_bias(
                 float t = 1.0 / (1.0 + 0.3275911 * xa);
                 float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
                         + t * (-1.453152027 + t * 1.061405429))));
-                float erf_val = sign * (1.0 - y * exp(-xa * xa));
+                float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
                 v = v * 0.5 * (1.0 + erf_val);
             } else if (act_kind == 2) {
                 v = v / (1.0 + exp(-v));
@@ -1162,7 +1165,7 @@ kernel void gelu_inplace(
     float t = 1.0 / (1.0 + 0.3275911 * xa);
     float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
             + t * (-1.453152027 + t * 1.061405429))));
-    float erf_val = sign * (1.0 - y * exp(-xa * xa));
+    float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
     data[gid] = x * 0.5 * (1.0 + erf_val);
 }
 
@@ -1178,7 +1181,10 @@ kernel void gelu_approx_inplace(
     if (gid >= len) return;
     device float* data = (device float*)(arena + data_byte_off);
     float x = data[gid];
-    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+    // Clamp to the tanh saturation range: tanh(±15)≈±1 to f32 precision, but a
+    // huge argument (packed-QAT gate outliers → large x³, or +inf) makes Metal's
+    // fast-math tanh return NaN. clamp() also folds ±inf to ±15.
+    float inner = clamp(0.7978845608f * (x + 0.044715f * x * x * x), -15.0f, 15.0f);
     data[gid] = 0.5f * x * (1.0f + tanh(inner));
 }
 
@@ -1194,7 +1200,10 @@ kernel void gelu_approx_inplace4(
     packed_float4 out;
     for (uint c = 0; c < 4; ++c) {
         float x = px[c];
-        float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+        // Clamp to the tanh saturation range: tanh(±15)≈±1 to f32 precision, but a
+    // huge argument (packed-QAT gate outliers → large x³, or +inf) makes Metal's
+    // fast-math tanh return NaN. clamp() also folds ±inf to ±15.
+    float inner = clamp(0.7978845608f * (x + 0.044715f * x * x * x), -15.0f, 15.0f);
         out[c] = 0.5f * x * (1.0f + tanh(inner));
     }
     data[gid] = out;
@@ -1214,7 +1223,10 @@ kernel void gelu_approx_out4(
     packed_float4 out;
     for (uint c = 0; c < 4; ++c) {
         float x = px[c];
-        float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+        // Clamp to the tanh saturation range: tanh(±15)≈±1 to f32 precision, but a
+    // huge argument (packed-QAT gate outliers → large x³, or +inf) makes Metal's
+    // fast-math tanh return NaN. clamp() also folds ±inf to ±15.
+    float inner = clamp(0.7978845608f * (x + 0.044715f * x * x * x), -15.0f, 15.0f);
         out[c] = 0.5f * x * (1.0f + tanh(inner));
     }
     dst[gid] = out;
@@ -1238,7 +1250,7 @@ kernel void gelu_inplace4(
         float t = 1.0 / (1.0 + 0.3275911 * xa);
         float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
                 + t * (-1.453152027 + t * 1.061405429))));
-        float erf_val = sign * (1.0 - y * exp(-xa * xa));
+        float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
         out[c] = xv * 0.5 * (1.0 + erf_val);
     }
     data[gid] = out;
@@ -1529,7 +1541,7 @@ inline float fused_act(float x, uint act) {
             float t = 1.0 / (1.0 + 0.3275911 * xa);
             float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
                     + t * (-1.453152027 + t * 1.061405429))));
-            float erf_val = sign * (1.0 - y * exp(-xa * xa));
+            float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
             return x * 0.5 * (1.0 + erf_val);
         }
         case 1: return x / (1.0 + exp(-x));

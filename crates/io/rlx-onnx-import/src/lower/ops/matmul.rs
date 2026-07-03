@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+//! `matmul` — extracted from the `ops` module for navigability (see `mod.rs`).
+
 #![allow(unused_imports)]
 
 use std::collections::{HashMap, HashSet};

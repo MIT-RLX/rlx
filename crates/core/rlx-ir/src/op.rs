@@ -268,6 +268,8 @@ pub enum OpKind {
     Conv,
     Im2Col,
     ConvTranspose2d,
+    Conv3d,
+    ConvTranspose3d,
     Pool,
     ReluBackward,
     ActivationBackward,
@@ -1243,6 +1245,26 @@ pub enum Op {
         groups: usize,
     },
 
+    /// 3D convolution on NCDHW tensors (forward / cross-correlation).
+    /// Weight layout: `[C_out, C_in / groups, kD, kH, kW]`. Kernel size is
+    /// derived from the weight shape. Mirrors [`Op::Conv`] with a depth axis.
+    Conv3d {
+        stride: [usize; 3],
+        padding: [usize; 3],
+        dilation: [usize; 3],
+        groups: usize,
+    },
+
+    /// 3D transposed convolution on NCDHW. Weight layout (PyTorch):
+    /// `[C_in, C_out / groups, kD, kH, kW]`. Mirrors [`Op::ConvTranspose2d`].
+    ConvTranspose3d {
+        stride: [usize; 3],
+        padding: [usize; 3],
+        dilation: [usize; 3],
+        output_padding: [usize; 3],
+        groups: usize,
+    },
+
     // ── Pooling ─────────────────────────────────────────────────
     Pool {
         kind: ReduceOp,
@@ -1986,6 +2008,8 @@ impl Op {
             Op::Conv { .. } => OpKind::Conv,
             Op::Im2Col { .. } => OpKind::Im2Col,
             Op::ConvTranspose2d { .. } => OpKind::ConvTranspose2d,
+            Op::Conv3d { .. } => OpKind::Conv3d,
+            Op::ConvTranspose3d { .. } => OpKind::ConvTranspose3d,
             Op::Pool { .. } => OpKind::Pool,
             Op::ReluBackward => OpKind::ReluBackward,
             Op::ActivationBackward { .. } => OpKind::ActivationBackward,
@@ -2090,6 +2114,8 @@ impl Op {
                 | Op::Conv { .. }
                 | Op::Im2Col { .. }
                 | Op::ConvTranspose2d { .. }
+                | Op::Conv3d { .. }
+                | Op::ConvTranspose3d { .. }
                 | Op::FusedMatMulBiasAct { .. }
                 | Op::GroupedMatMul
                 | Op::DequantGroupedMatMul { .. }
@@ -2216,6 +2242,7 @@ impl Op {
                 has_bias: false, ..
             } => 4, // x, residual, gamma, beta
             Op::Conv { .. } | Op::ConvTranspose2d { .. } => 2, // input, weight (bias via Add)
+            Op::Conv3d { .. } | Op::ConvTranspose3d { .. } => 2, // input, weight (bias via Add)
             Op::Im2Col { .. } => 1,
             Op::Pool { .. } => 1,
             Op::ReluBackward => 2,                  // x, dy
@@ -2529,6 +2556,10 @@ impl std::fmt::Display for Op {
             Op::Im2Col { kernel_size, .. } => write!(f, "im2col({kernel_size:?})"),
             Op::ConvTranspose2d { kernel_size, .. } => {
                 write!(f, "conv_transpose2d({kernel_size:?})")
+            }
+            Op::Conv3d { stride, .. } => write!(f, "conv3d(stride={stride:?})"),
+            Op::ConvTranspose3d { stride, .. } => {
+                write!(f, "conv_transpose3d(stride={stride:?})")
             }
             Op::LayerNorm2d { eps } => write!(f, "layer_norm2d(eps={eps})"),
             Op::Pool {

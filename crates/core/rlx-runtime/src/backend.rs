@@ -1642,6 +1642,9 @@ pub mod wgpu_backend {
         OpKind::Mamba2,
         // Transposed conv (vision U-Net decoder) — host fallback via the CPU kernel.
         OpKind::ConvTranspose2d,
+        // 3-D convs (volumetric UNETR-style decoders) — CPU NCDHW kernels.
+        OpKind::Conv3d,
+        OpKind::ConvTranspose3d,
         OpKind::DequantMatMul,
         OpKind::FusedMatMulBiasAct,
         OpKind::FusedResidualLN,

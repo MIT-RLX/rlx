@@ -13,452 +13,26 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Graph → HLO lowering walker.
-//!
-//! Walks an `rlx_ir::Graph`, emits HLO instructions via [`HloBuilder`],
-//! and returns the serialized `HloModuleProto` bytes plus the
-//! per-output / per-input shape metadata the backend needs at run
-//! time.
-//!
-//! Composite ops (LayerNorm, RmsNorm, Softmax, Attention, Rope, Pool,
-//! ElementwiseRegion, TransformRegion, and BatchElementwiseRegion are
-//! lowered inline as primitive HLO (chain walk / per-slice concat).
-//! custom_call. Keeps the emitted module portable across PJRT
-//! plugins (TPU, CPU, GPU). FusedSwiGLU / FusedAttentionBlock /
-//! FusedTransformerLayer / LoraMatMul / If / While are normalized
-//! through `crate::unfuse` before lowering.
-//!
-//! Ops that have no clean HLO decomposition without large blowup
-//! (Sample, TopK, SelectiveScan) panic with a clear message.
-//!
-//! **GGUF `DequantMatMul`:** host-dequant at emit time → f32 constant →
-//! `dot_general` ([`lower_dequant_matmul_gguf`]). See
-//! [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md) (TPU section).
+//! `lower` — extracted from the `lower` module for navigability (see `mod.rs`).
+
+#![allow(unused_imports)]
 
 use std::collections::HashMap;
-
 use rlx_ir::op::{
     Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp, RegionPrologue,
     TransformStep,
 };
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, NodeId, Op};
-
 use crate::hlo::{
     Computation, ConvDimNumbers, DotDimNumbers, GatherDimNumbers, HloBuilder, Literal, LiteralData,
     ProgramShape, ScatterDimNumbers, Shape, Window, WindowDim, prim, prim_of,
 };
 
-/// Compiled-against-this-graph HLO module bytes plus the metadata the
-/// backend needs at run time.
-pub struct HloModule {
-    pub bytes: Vec<u8>,
-    pub output_lens: Vec<usize>,
-    pub output_dtypes: Vec<DType>,
-    pub output_shapes: Vec<Vec<i64>>,
-    pub input_names: Vec<String>,
-    pub input_dtypes: Vec<DType>,
-    pub input_shapes: Vec<Vec<i64>>,
-    pub param_names: Vec<String>,
-    pub param_dtypes: Vec<DType>,
-    pub param_shapes: Vec<Vec<i64>>,
-    /// GGUF `DequantMatMul` weights supplied at runtime via `set_param_typed(U8)`.
-    pub gguf_deferred: HashMap<String, GgufDeferredParam>,
-}
-
-/// Runtime GGUF param: host-dequant to f32 before PJRT upload.
-#[derive(Clone, Debug)]
-pub struct GgufDeferredParam {
-    pub scheme: QuantScheme,
-    pub k: i64,
-    pub n: i64,
-}
-
-pub fn lower_graph(graph: &Graph) -> HloModule {
-    lower_graph_with_rng(graph, rlx_ir::RngOptions::default())
-}
-
-/// Compile-time GGUF weight bytes keyed by `Op::Param` name.
-///
-/// When lowering `DequantMatMul` with a `Param` weight, TPU embeds host-dequantized
-/// f32 as HLO constants. Pass packed bytes here (mirrors CoreML `quant_bytes`).
-pub type LowerParamBytes = HashMap<String, Vec<u8>>;
-
-pub fn lower_graph_with_rng(graph: &Graph, rng: rlx_ir::RngOptions) -> HloModule {
-    lower_graph_with_rng_and_params(graph, rng, None)
-}
-
-pub fn lower_graph_with_rng_and_params(
-    graph: &Graph,
-    rng: rlx_ir::RngOptions,
-    param_bytes: Option<&LowerParamBytes>,
-) -> HloModule {
-    let mut b = HloBuilder::new(&graph.name);
-
-    // Reducer subcomputations cached by (opcode, prim_ty) so multiple
-    // Reduce / ReduceWindow ops share the same body.
-    let mut reducers: HashMap<(String, i32), Computation> = HashMap::new();
-
-    let entry = b.computation("entry");
-    let mut id_map: HashMap<NodeId, i64> = HashMap::new();
-
-    let (inputs, params, others) = partition_nodes(graph);
-    let deferred = collect_gguf_deferred_params(graph, param_bytes);
-
-    let mut input_names = Vec::new();
-    let mut input_dtypes = Vec::new();
-    let mut input_shapes = Vec::new();
-    let mut param_names = Vec::new();
-    let mut param_dtypes = Vec::new();
-    let mut param_shapes = Vec::new();
-    let mut program_param_shapes: Vec<Shape> = Vec::new();
-    let mut program_param_names: Vec<String> = Vec::new();
-
-    for (pi, &nid) in inputs.iter().enumerate() {
-        let n = graph.node(nid);
-        let name = match &n.op {
-            Op::Input { name } => name.clone(),
-            _ => unreachable!(),
-        };
-        let dims = ir_dims(&n.shape);
-        let shape = Shape::array(prim_of(n.shape.dtype()), &dims);
-        let id = entry.parameter(pi as i64, &name, shape.clone());
-        id_map.insert(nid, id);
-        input_names.push(name.clone());
-        input_dtypes.push(n.shape.dtype());
-        input_shapes.push(dims);
-        program_param_shapes.push(shape);
-        program_param_names.push(name);
-    }
-    let next_param_base = inputs.len() as i64;
-    for (i, &nid) in params.iter().enumerate() {
-        let n = graph.node(nid);
-        let name = match &n.op {
-            Op::Param { name } => name.clone(),
-            _ => unreachable!(),
-        };
-        let (dims, dtype) = if let Some(def) = deferred.get(&name) {
-            (vec![def.k, def.n], DType::F32)
-        } else {
-            (ir_dims(&n.shape), n.shape.dtype())
-        };
-        let shape = Shape::array(prim_of(dtype), &dims);
-        let id = entry.parameter(next_param_base + i as i64, &name, shape.clone());
-        id_map.insert(nid, id);
-        param_names.push(name.clone());
-        param_dtypes.push(dtype);
-        param_shapes.push(dims);
-        program_param_shapes.push(shape);
-        program_param_names.push(name);
-    }
-
-    let mut ctx = LowerCtx {
-        graph,
-        entry: &entry,
-        id_map: &mut id_map,
-        reducers: &mut reducers,
-        builder: &mut b,
-        rng,
-        param_bytes,
-    };
-    for &nid in &others {
-        let id = ctx.lower_node(nid);
-        ctx.id_map.insert(nid, id);
-    }
-
-    // Build the entry computation's output.
-    let out_ids: Vec<i64> = graph
-        .outputs
-        .iter()
-        .map(|nid| *id_map.get(nid).expect("output node not lowered"))
-        .collect();
-    let out_shapes_v: Vec<Vec<i64>> = graph
-        .outputs
-        .iter()
-        .map(|nid| ir_dims(&graph.node(*nid).shape))
-        .collect();
-    let out_dtypes: Vec<DType> = graph
-        .outputs
-        .iter()
-        .map(|nid| graph.node(*nid).shape.dtype())
-        .collect();
-    let out_lens: Vec<usize> = out_shapes_v
-        .iter()
-        .map(|d| d.iter().product::<i64>().max(1) as usize)
-        .collect();
-
-    let result_shape = if out_ids.len() == 1 {
-        Shape::array(prim_of(out_dtypes[0]), &out_shapes_v[0])
-    } else {
-        let elems: Vec<Shape> = out_dtypes
-            .iter()
-            .zip(out_shapes_v.iter())
-            .map(|(dt, dims)| Shape::array(prim_of(*dt), dims))
-            .collect();
-        Shape::tuple(elems)
-    };
-    let root_id = if out_ids.len() == 1 {
-        out_ids[0]
-    } else {
-        entry.tuple(&out_ids, result_shape.clone())
-    };
-    entry.set_root(root_id);
-    entry.set_program_shape(ProgramShape {
-        parameters: program_param_shapes,
-        parameter_names: program_param_names,
-        result: result_shape,
-    });
-
-    let bytes = b.finish();
-    HloModule {
-        bytes,
-        output_lens: out_lens,
-        output_dtypes: out_dtypes,
-        output_shapes: out_shapes_v,
-        input_names,
-        input_dtypes,
-        input_shapes,
-        param_names,
-        param_dtypes,
-        param_shapes,
-        gguf_deferred: deferred,
-    }
-}
-
-fn collect_gguf_deferred_params(
-    graph: &Graph,
-    param_bytes: Option<&LowerParamBytes>,
-) -> HashMap<String, GgufDeferredParam> {
-    use rlx_ir::Dim;
-    let mut out = HashMap::new();
-    for node in graph.nodes() {
-        let Op::DequantMatMul { scheme } = &node.op else {
-            continue;
-        };
-        if !scheme.is_gguf() {
-            continue;
-        }
-        let w_id = node.inputs[1];
-        let Op::Param { name } = &graph.node(w_id).op else {
-            continue;
-        };
-        if param_bytes.and_then(|m| m.get(name)).is_some() {
-            continue;
-        }
-        let x_dims = graph.node(node.inputs[0]).shape.dims();
-        let y_dims = node.shape.dims();
-        let k = match x_dims.last() {
-            Some(Dim::Static(k)) => *k as i64,
-            _ => panic!("rlx-tpu: GGUF deferred param requires static k on x input"),
-        };
-        let n = match y_dims.last() {
-            Some(Dim::Static(n)) => *n as i64,
-            _ => panic!("rlx-tpu: GGUF deferred param requires static n on output"),
-        };
-        out.insert(
-            name.clone(),
-            GgufDeferredParam {
-                scheme: *scheme,
-                k,
-                n,
-            },
-        );
-    }
-    out
-}
-
-/// Convert a runtime U8 GGUF upload into f32 bytes for PJRT when the HLO module
-/// was compiled with a deferred GGUF weight parameter.
-pub fn gguf_param_bytes_from_u8(
-    deferred: &HashMap<String, GgufDeferredParam>,
-    name: &str,
-    data: &[u8],
-    dtype: DType,
-) -> Option<(Vec<u8>, DType)> {
-    if dtype != DType::U8 {
-        return None;
-    }
-    let def = deferred.get(name)?;
-    let n_elems = (def.k * def.n) as usize;
-    let w_f32 = dequant_gguf_bytes(def.scheme, data, n_elems)
-        .unwrap_or_else(|e| panic!("rlx-tpu: GGUF runtime dequant for '{name}': {e}"));
-    let mut bytes = Vec::with_capacity(w_f32.len() * 4);
-    for v in &w_f32 {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    Some((bytes, DType::F32))
-}
-
-fn partition_nodes(graph: &Graph) -> (Vec<NodeId>, Vec<NodeId>, Vec<NodeId>) {
-    let mut inputs = Vec::new();
-    let mut params = Vec::new();
-    let mut others = Vec::new();
-    for n in graph.nodes() {
-        match &n.op {
-            Op::Input { .. } => inputs.push(n.id),
-            Op::Param { .. } => params.push(n.id),
-            _ => others.push(n.id),
-        }
-    }
-    (inputs, params, others)
-}
-
-fn ir_dims(shape: &rlx_ir::Shape) -> Vec<i64> {
-    shape
-        .dims()
-        .iter()
-        .map(|d| d.unwrap_static() as i64)
-        .collect()
-}
-
-// ── Lowering context ──────────────────────────────────────────────
-
-/// Context carried through the per-op lowering. Bundles the various
-/// mutable references so the lower_* methods can be ordinary methods
-/// instead of free functions taking eight arguments each.
-struct LowerCtx<'a> {
-    graph: &'a Graph,
-    entry: &'a Computation,
-    id_map: &'a mut HashMap<NodeId, i64>,
-    reducers: &'a mut HashMap<(String, i32), Computation>,
-    builder: &'a mut HloBuilder,
-    rng: rlx_ir::RngOptions,
-    param_bytes: Option<&'a LowerParamBytes>,
-}
+use super::*;
 
 impl<'a> LowerCtx<'a> {
-    /// HLO id for an already-lowered IR node.
-    fn hlo(&self, nid: NodeId) -> i64 {
-        *self
-            .id_map
-            .get(&nid)
-            .unwrap_or_else(|| panic!("rlx-tpu: node {nid:?} referenced before lowering"))
-    }
-
-    fn ir_shape_dims(&self, nid: NodeId) -> Vec<i64> {
-        ir_dims(&self.graph.node(nid).shape)
-    }
-
-    fn ir_shape(&self, nid: NodeId) -> Shape {
-        let n = self.graph.node(nid);
-        Shape::array(prim_of(n.shape.dtype()), &ir_dims(&n.shape))
-    }
-
-    fn dtype(&self, nid: NodeId) -> DType {
-        self.graph.node(nid).shape.dtype()
-    }
-
-    /// Packed GGUF bytes for a weight node used by `DequantMatMul` lowering.
-    /// Packed GGUF bytes for a weight node used by `DequantMatMul` lowering.
-    fn gguf_weight_is_deferred(&self, w_id: NodeId) -> bool {
-        match &self.graph.node(w_id).op {
-            Op::Param { name } => self.param_bytes.and_then(|m| m.get(name)).is_none(),
-            _ => false,
-        }
-    }
-
-    fn gguf_weight_bytes(&self, w_id: NodeId) -> Vec<u8> {
-        match &self.graph.node(w_id).op {
-            Op::Constant { data } => data.to_vec(),
-            Op::Param { name } => {
-                if let Some(map) = self.param_bytes {
-                    if let Some(bytes) = map.get(name) {
-                        return bytes.clone();
-                    }
-                }
-                panic!(
-                    "rlx-tpu: GGUF DequantMatMul weight '{name}' is a runtime Param without \
-                     compile-time bytes. Pass `LowerParamBytes` via \
-                     `lower_graph_with_rng_and_params` or \
-                     `TpuExecutable::compile_rng_with_param_bytes`."
-                );
-            }
-            other => panic!("rlx-tpu: GGUF weight node must be Constant/Param, got {other:?}"),
-        }
-    }
-
-    /// Get-or-create a binary-op reducer subcomputation.
-    fn reducer(&mut self, opcode: &str, prim_ty: i32) -> Computation {
-        let key = (opcode.to_string(), prim_ty);
-        if let Some(c) = self.reducers.get(&key) {
-            return c.clone();
-        }
-        let c = self
-            .builder
-            .make_reducer(&format!("{opcode}_{prim_ty}_red"), opcode, prim_ty);
-        self.reducers.insert(key, c.clone());
-        c
-    }
-
-    /// Broadcast `x` of shape `x_shape` to `target_shape` by aligning
-    /// every axis where x has size 1 vs target's size > 1. HLO's
-    /// `broadcast` only adds new leading dims; we use `broadcast_in_dim`
-    /// semantics by emitting a `reshape` to drop the size-1 dims first
-    /// and then a broadcast that places the surviving dims at their
-    /// original positions.
-    fn broadcast_align(&self, x: i64, x_shape: &[i64], target: Shape) -> i64 {
-        let target_dims = target.dimensions.clone();
-        debug_assert_eq!(
-            x_shape.len(),
-            target_dims.len(),
-            "broadcast_align expects same rank"
-        );
-        // Identity broadcast — x already at target.
-        if x_shape == target_dims.as_slice() {
-            return x;
-        }
-        // Drop size-1 axes that target wants to expand.
-        let surviving_axes: Vec<i64> = (0..x_shape.len() as i64)
-            .filter(|&i| {
-                let xi = x_shape[i as usize];
-                let ti = target_dims[i as usize];
-                xi == ti
-            })
-            .collect();
-        let surviving_dims: Vec<i64> = surviving_axes
-            .iter()
-            .map(|&i| x_shape[i as usize])
-            .collect();
-        let small = if surviving_dims.len() == x_shape.len() {
-            x
-        } else {
-            let elt = target.element_type;
-            self.entry.reshape(x, Shape::array(elt, &surviving_dims))
-        };
-        self.entry.broadcast(small, &surviving_axes, target)
-    }
-
-    /// Constant scalar in an arbitrary primitive type — used for
-    /// reduction inits, normalization eps, RoPE constants.
-    fn const_scalar_f32(&self, v: f32) -> i64 {
-        self.entry.constant_f32_scalar(v)
-    }
-
-    /// Reduce over a single axis with a known reducer opcode.
-    fn reduce_one(
-        &mut self,
-        x: i64,
-        axis: i64,
-        opcode: &str,
-        init_v: f32,
-        x_dt: DType,
-        out_dims: Vec<i64>,
-    ) -> i64 {
-        let prim_ty = prim_of(x_dt);
-        let red = self.reducer(opcode, prim_ty);
-        // The reducer expects a scalar of the input's dtype; we
-        // use f32 init + convert if needed.
-        let init = if x_dt == DType::F32 {
-            self.const_scalar_f32(init_v)
-        } else {
-            let f = self.const_scalar_f32(init_v);
-            self.entry.convert(f, Shape::scalar(prim_ty))
-        };
-        let out_shape = Shape::array(prim_ty, &out_dims);
-        self.entry.reduce(x, init, &red, &[axis], out_shape)
-    }
-
-    fn lower_node(&mut self, nid: NodeId) -> i64 {
+    pub(crate) fn lower_node(&mut self, nid: NodeId) -> i64 {
         let n = self.graph.node(nid);
         let out_shape = self.ir_shape(nid);
         let out_dt = self.dtype(nid);
@@ -917,7 +491,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── Constants ──────────────────────────────────────────────
 
-    fn lower_constant(&self, data: &[u8], shape: Shape, dt: DType) -> i64 {
+
+    pub(crate) fn lower_constant(&self, data: &[u8], shape: Shape, dt: DType) -> i64 {
         // Decode the bytes per dtype into the matching LiteralData
         // variant. Constants in rlx-ir are stored as native-endian
         // bytes, but on the platforms we run (Mac / Linux x86_64 /
@@ -1018,7 +593,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── Activation ─────────────────────────────────────────────
 
-    fn lower_activation(&self, act: Activation, x: i64, shape: Shape) -> i64 {
+
+    pub(crate) fn lower_activation(&self, act: Activation, x: i64, shape: Shape) -> i64 {
         let elt = shape.element_type;
         match act {
             // Direct HLO unary opcodes.
@@ -1095,66 +671,8 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    /// Scalar constant in the given primitive dtype (F32 or down-cast).
-    fn const_in_dtype(&self, prim_ty: i32, v: f32) -> i64 {
-        let f = self.entry.constant_f32_scalar(v);
-        if prim_ty == prim::F32 {
-            f
-        } else {
-            self.entry.convert(f, Shape::scalar(prim_ty))
-        }
-    }
 
-    /// Build a scale/zero-point broadcast for `Op::Quantize` /
-    /// `Op::Dequantize`. `axis = None` → scalar broadcast (per-tensor);
-    /// `axis = Some(d)` → 1-D constant of length `out_dims[d]`
-    /// broadcast along the channel axis.
-    fn broadcast_q_factor(
-        &self,
-        axis: Option<usize>,
-        values: &[f32],
-        out_dims: &[i64],
-        prim_ty: i32,
-    ) -> i64 {
-        let out_shape = Shape::array(prim_ty, out_dims);
-        match axis {
-            None => {
-                let v = values.first().copied().unwrap_or(0.0);
-                let c = self.const_in_dtype(prim_ty, v);
-                self.entry.broadcast(c, &[], out_shape)
-            }
-            Some(d) => {
-                // Materialize a [N] f32 constant where N = out_dims[d].
-                // Convert to target dtype if needed, then broadcast
-                // along axis d (broadcast_dims = [d]).
-                let n = out_dims[d];
-                debug_assert_eq!(
-                    values.len() as i64,
-                    n,
-                    "Quantize/Dequantize: per-channel values len ({}) \
-                     must match output dim[{}] ({})",
-                    values.len(),
-                    d,
-                    n
-                );
-                let lit = crate::hlo::Literal {
-                    shape: Shape::array(prim::F32, &[n]),
-                    data: crate::hlo::LiteralData::F32(values.to_vec()),
-                };
-                let c = self.entry.constant(lit);
-                let c = if prim_ty == prim::F32 {
-                    c
-                } else {
-                    self.entry.convert(c, Shape::array(prim_ty, &[n]))
-                };
-                self.entry.broadcast(c, &[d as i64], out_shape)
-            }
-        }
-    }
-
-    // ── Binary ─────────────────────────────────────────────────
-
-    fn lower_binary(
+    pub(crate) fn lower_binary(
         &self,
         op: BinaryOp,
         a: i64,
@@ -1176,53 +694,8 @@ impl<'a> LowerCtx<'a> {
         self.entry.binary(opcode, a, b, out)
     }
 
-    /// Bring two operands to a common rank-aligned shape against
-    /// `target_dims`. HLO requires both binary operands to have the
-    /// same shape; we use `broadcast_align` to lift each one to target.
-    fn broadcast_pair_to(
-        &self,
-        a: i64,
-        b: i64,
-        a_id: NodeId,
-        b_id: NodeId,
-        target_dims: &[i64],
-    ) -> (i64, i64) {
-        let a_dims = self.ir_shape_dims(a_id);
-        let b_dims = self.ir_shape_dims(b_id);
-        let a_dt = self.dtype(a_id);
-        let b_dt = self.dtype(b_id);
-        let target_a = Shape::array(prim_of(a_dt), target_dims);
-        let target_b = Shape::array(prim_of(b_dt), target_dims);
-        let a2 = self.broadcast_to_target(a, &a_dims, target_a);
-        let b2 = self.broadcast_to_target(b, &b_dims, target_b);
-        (a2, b2)
-    }
 
-    /// Broadcast `x` to `target_shape`. Adds leading dims when
-    /// `x_dims.len() < target.rank()`, or replicates size-1 axes when
-    /// rank matches.
-    fn broadcast_to_target(&self, x: i64, x_dims: &[i64], target: Shape) -> i64 {
-        let target_dims = target.dimensions.clone();
-        if x_dims == target_dims.as_slice() {
-            return x;
-        }
-        if x_dims.len() < target_dims.len() {
-            // Pad to right (broadcast adds leading dims).
-            let target_rank = target_dims.len();
-            let broadcast_dims: Vec<i64> = (target_rank - x_dims.len()..target_rank)
-                .map(|i| i as i64)
-                .collect();
-            // The intermediate shape is x's dims placed at trailing
-            // positions of target, with leading dims taken from
-            // target. HLO infers the result shape from `target`.
-            return self.entry.broadcast(x, &broadcast_dims, target);
-        }
-        self.broadcast_align(x, x_dims, target)
-    }
-
-    // ── ElementwiseRegion ─────────────────────────────────────
-
-    fn lower_elementwise_region(
+    pub(crate) fn lower_elementwise_region(
         &mut self,
         inputs: &[NodeId],
         chain: &[ChainStep],
@@ -1323,21 +796,8 @@ impl<'a> LowerCtx<'a> {
         *step_results.last().unwrap_or(&0)
     }
 
-    fn resize_nearest_2x_shape(&self, input_id: NodeId) -> Shape {
-        let dims = self.ir_shape_dims(input_id);
-        assert_eq!(
-            dims.len(),
-            4,
-            "rlx-tpu resize_nearest_2x: expected NCHW rank 4, got rank {}",
-            dims.len()
-        );
-        Shape::array(
-            prim_of(self.dtype(input_id)),
-            &[dims[0], dims[1], dims[2] * 2, dims[3] * 2],
-        )
-    }
 
-    fn lower_resize_nearest_2x_nchw(&mut self, x: i64, input_id: NodeId, out: Shape) -> i64 {
+    pub(crate) fn lower_resize_nearest_2x_nchw(&mut self, x: i64, input_id: NodeId, out: Shape) -> i64 {
         let dims = self.ir_shape_dims(input_id);
         assert_eq!(dims.len(), 4);
         let dt = prim_of(self.dtype(input_id));
@@ -1351,7 +811,8 @@ impl<'a> LowerCtx<'a> {
         self.entry.reshape(r2, out)
     }
 
-    fn lower_transform_region(
+
+    pub(crate) fn lower_transform_region(
         &mut self,
         inputs: &[NodeId],
         steps: &[TransformStep],
@@ -1387,7 +848,8 @@ impl<'a> LowerCtx<'a> {
         cur
     }
 
-    fn lower_batch_elementwise_region(
+
+    pub(crate) fn lower_batch_elementwise_region(
         &mut self,
         inputs: &[NodeId],
         chain: &[ChainStep],
@@ -1429,7 +891,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── MatMul ─────────────────────────────────────────────────
 
-    fn lower_matmul(&mut self, a_id: NodeId, b_id: NodeId, out: Shape) -> i64 {
+
+    pub(crate) fn lower_matmul(&mut self, a_id: NodeId, b_id: NodeId, out: Shape) -> i64 {
         let a = self.hlo(a_id);
         let b = self.hlo(b_id);
         let a_dims = self.ir_shape_dims(a_id);
@@ -1483,7 +946,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── LayerNorm ──────────────────────────────────────────────
 
-    fn lower_layernorm(
+
+    pub(crate) fn lower_layernorm(
         &mut self,
         x_id: NodeId,
         gamma_id: NodeId,
@@ -1573,34 +1037,8 @@ impl<'a> LowerCtx<'a> {
         self.entry.binary("add", scaled, b_b, out)
     }
 
-    /// Lift a 1-D normalization parameter (shape `[axis_size]`) up to
-    /// the layout `x` uses, by reshaping to size-1 in every axis
-    /// except `axis` then broadcasting.
-    fn broadcast_param_to_axis(
-        &self,
-        p: i64,
-        p_dims: &[i64],
-        axis: i64,
-        x_dims: &[i64],
-        prim_ty: i32,
-    ) -> i64 {
-        let target = Shape::array(prim_ty, x_dims);
-        if p_dims == x_dims {
-            return p;
-        }
-        if p_dims.len() == 1 {
-            // [N] → [1,1,...,N,...,1] then broadcast.
-            let mut padded = vec![1i64; x_dims.len()];
-            padded[axis as usize] = p_dims[0];
-            let r = self.entry.reshape(p, Shape::array(prim_ty, &padded));
-            return self.broadcast_align(r, &padded, target);
-        }
-        self.broadcast_to_target(p, p_dims, target)
-    }
 
-    // ── RmsNorm ────────────────────────────────────────────────
-
-    fn lower_rmsnorm(
+    pub(crate) fn lower_rmsnorm(
         &mut self,
         x_id: NodeId,
         gamma_id: NodeId,
@@ -1656,7 +1094,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── FusedResidualLN ────────────────────────────────────────
 
-    fn lower_fused_residual_ln(
+
+    pub(crate) fn lower_fused_residual_ln(
         &mut self,
         inputs: &[NodeId],
         has_bias: bool,
@@ -1742,7 +1181,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── FusedMatMulBiasAct ─────────────────────────────────────
 
-    fn lower_fused_matmul_bias_act(
+
+    pub(crate) fn lower_fused_matmul_bias_act(
         &mut self,
         inputs: &[NodeId],
         activation: Option<Activation>,
@@ -1761,7 +1201,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── Attention ──────────────────────────────────────────────
 
-    fn lower_attention(
+
+    pub(crate) fn lower_attention(
         &mut self,
         inputs: &[NodeId],
         num_heads: usize,
@@ -1835,78 +1276,8 @@ impl<'a> LowerCtx<'a> {
         self.entry.dot_general(probs, v, av_dn, out)
     }
 
-    /// Synthesize and add a causal mask to QK^T in HLO using
-    /// `iota` + `compare` + `select`. Avoids materializing a mask
-    /// tensor on the host.
-    fn apply_causal_mask(
-        &self,
-        scaled: i64,
-        qk_shape: Shape,
-        _s_q: i64,
-        _s_k: i64,
-        prim_ty: i32,
-    ) -> i64 {
-        let q_idx = self
-            .entry
-            .iota(2, Shape::array(prim::S32, &qk_shape.dimensions));
-        let k_idx = self
-            .entry
-            .iota(3, Shape::array(prim::S32, &qk_shape.dimensions));
-        let mask = self
-            .entry
-            .compare(q_idx, k_idx, "GE", Shape::pred(&qk_shape.dimensions));
-        let neg_inf = self.const_in_dtype(prim_ty, f32::NEG_INFINITY);
-        let neg_inf_b = self.entry.broadcast(neg_inf, &[], qk_shape.clone());
-        self.entry.select(mask, scaled, neg_inf_b, qk_shape)
-    }
 
-    /// Sliding-window mask: q attends to k in [q-w, q].
-    fn apply_sliding_window_mask(
-        &self,
-        scaled: i64,
-        qk_shape: Shape,
-        _s_q: i64,
-        _s_k: i64,
-        w: i64,
-        prim_ty: i32,
-    ) -> i64 {
-        let q_idx = self
-            .entry
-            .iota(2, Shape::array(prim::S32, &qk_shape.dimensions));
-        let k_idx = self
-            .entry
-            .iota(3, Shape::array(prim::S32, &qk_shape.dimensions));
-        let lower = self
-            .entry
-            .compare(q_idx, k_idx, "GE", Shape::pred(&qk_shape.dimensions));
-        // q - k <= w  →  k >= q - w
-        let qmw = self.entry.constant(Literal {
-            shape: Shape::scalar(prim::S32),
-            data: LiteralData::S32(vec![w as i32]),
-        });
-        let qmw_b = self
-            .entry
-            .broadcast(qmw, &[], Shape::array(prim::S32, &qk_shape.dimensions));
-        let q_minus_w = self.entry.binary(
-            "subtract",
-            q_idx,
-            qmw_b,
-            Shape::array(prim::S32, &qk_shape.dimensions),
-        );
-        let upper = self
-            .entry
-            .compare(k_idx, q_minus_w, "GE", Shape::pred(&qk_shape.dimensions));
-        let mask = self
-            .entry
-            .binary("and", lower, upper, Shape::pred(&qk_shape.dimensions));
-        let neg_inf = self.const_in_dtype(prim_ty, f32::NEG_INFINITY);
-        let neg_inf_b = self.entry.broadcast(neg_inf, &[], qk_shape.clone());
-        self.entry.select(mask, scaled, neg_inf_b, qk_shape)
-    }
-
-    // ── Rope ───────────────────────────────────────────────────
-
-    fn lower_rope(
+    pub(crate) fn lower_rope(
         &mut self,
         x_id: NodeId,
         cos_id: NodeId,
@@ -1960,7 +1331,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── FFT ────────────────────────────────────────────────────
 
-    fn lower_fft(
+
+    pub(crate) fn lower_fft(
         &mut self,
         x_id: NodeId,
         inverse: bool,
@@ -2039,7 +1411,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── Gather ─────────────────────────────────────────────────
 
-    fn lower_gather(
+
+    pub(crate) fn lower_gather(
         &mut self,
         table_id: NodeId,
         indices_id: NodeId,
@@ -2087,7 +1460,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── Reduce ─────────────────────────────────────────────────
 
-    fn lower_reduce(
+
+    pub(crate) fn lower_reduce(
         &mut self,
         x_id: NodeId,
         op: ReduceOp,
@@ -2138,12 +1512,14 @@ impl<'a> LowerCtx<'a> {
 
     // ── Softmax ────────────────────────────────────────────────
 
-    fn lower_softmax(&mut self, x_id: NodeId, axis: i32, out: Shape) -> i64 {
+
+    pub(crate) fn lower_softmax(&mut self, x_id: NodeId, axis: i32, out: Shape) -> i64 {
         let x = self.hlo(x_id);
         self.lower_softmax_id(x, out, axis as i64)
     }
 
-    fn lower_softmax_id(&mut self, x: i64, out: Shape, axis: i64) -> i64 {
+
+    pub(crate) fn lower_softmax_id(&mut self, x: i64, out: Shape, axis: i64) -> i64 {
         let dims = out.dimensions.clone();
         let prim_ty = out.element_type;
         let rank = dims.len() as i64;
@@ -2182,7 +1558,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── Cumsum ─────────────────────────────────────────────────
 
-    fn lower_cumsum(&mut self, x_id: NodeId, axis: i32, exclusive: bool, out: Shape) -> i64 {
+
+    pub(crate) fn lower_cumsum(&mut self, x_id: NodeId, axis: i32, exclusive: bool, out: Shape) -> i64 {
         // HLO has no `cumsum` primitive — use `reduce-window` with a
         // window that spans the whole prefix along the chosen axis.
         let x = self.hlo(x_id);
@@ -2246,7 +1623,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── Conv ───────────────────────────────────────────────────
 
-    fn lower_conv(
+
+    pub(crate) fn lower_conv(
         &mut self,
         x_id: NodeId,
         w_id: NodeId,
@@ -2295,7 +1673,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── Pool ───────────────────────────────────────────────────
 
-    fn lower_pool(
+
+    pub(crate) fn lower_pool(
         &mut self,
         x_id: NodeId,
         kind: ReduceOp,
@@ -2356,7 +1735,8 @@ impl<'a> LowerCtx<'a> {
 
     // ── ScatterAdd ─────────────────────────────────────────────
 
-    fn lower_scatter_add(&mut self, updates_id: NodeId, indices_id: NodeId, out: Shape) -> i64 {
+
+    pub(crate) fn lower_scatter_add(&mut self, updates_id: NodeId, indices_id: NodeId, out: Shape) -> i64 {
         // Build a zero-initialized destination of shape `out`, then
         // scatter-add updates rows at indices.
         let updates = self.hlo(updates_id);
@@ -2397,7 +1777,8 @@ impl<'a> LowerCtx<'a> {
     // indices, then slice the leading k. Indices come back as f32
     // because rlx-ir is f32 at the I/O boundary.
 
-    fn lower_topk(&mut self, x_id: NodeId, k: usize, out: Shape) -> i64 {
+
+    pub(crate) fn lower_topk(&mut self, x_id: NodeId, k: usize, out: Shape) -> i64 {
         let x = self.hlo(x_id);
         let dims = self.ir_shape_dims(x_id);
         let prim_ty = prim_of(self.dtype(x_id));
@@ -2452,7 +1833,8 @@ impl<'a> LowerCtx<'a> {
     // Lowered as gather(weight, idx) to materialize per-token weights
     // [M,K,N], then a batched dot_general with batch axis = M.
 
-    fn lower_grouped_matmul(
+
+    pub(crate) fn lower_grouped_matmul(
         &mut self,
         input_id: NodeId,
         weight_id: NodeId,
@@ -2512,7 +1894,8 @@ impl<'a> LowerCtx<'a> {
     // GGUF kernels on TPU — weights must be available when the HLO module is built
     // (`Op::Constant`, or `Op::Param` with bytes in `LowerParamBytes`).
 
-    fn lower_dequant_matmul_gguf(
+
+    pub(crate) fn lower_dequant_matmul_gguf(
         &mut self,
         x_id: NodeId,
         w_id: NodeId,
@@ -2546,7 +1929,8 @@ impl<'a> LowerCtx<'a> {
         self.entry.dot_general(x, w_hlo, dn, out)
     }
 
-    fn lower_dequant_matmul(
+
+    pub(crate) fn lower_dequant_matmul(
         &mut self,
         x_id: NodeId,
         w_id: NodeId,
@@ -2636,7 +2020,8 @@ impl<'a> LowerCtx<'a> {
     // dot, add bias, scale by `mult` in F32, round, +out_zp, clamp
     // to [-128, 127], convert back to S8.
 
-    fn lower_qmatmul(
+
+    pub(crate) fn lower_qmatmul(
         &mut self,
         x_id: NodeId,
         w_id: NodeId,
@@ -2716,7 +2101,8 @@ impl<'a> LowerCtx<'a> {
     // convolution. Inputs are NCHW int8; bias is per-output-channel
     // s32 in accumulator scale.
 
-    fn lower_qconv2d(
+
+    pub(crate) fn lower_qconv2d(
         &mut self,
         x_id: NodeId,
         w_id: NodeId,
@@ -2819,7 +2205,8 @@ impl<'a> LowerCtx<'a> {
     // PJRT/XLA semantics — not bit-identical to RLX Philox/Ort on CPU.
     // `RngBackend::Zero` fills with a broadcast scalar zero instead.
 
-    fn lower_rng_uniform(&self, low: f32, high: f32, out: Shape) -> i64 {
+
+    pub(crate) fn lower_rng_uniform(&self, low: f32, high: f32, out: Shape) -> i64 {
         if self.rng.backend == rlx_ir::RngBackend::Zero {
             let zero = self.entry.constant_f32_scalar(0.0);
             return self.entry.broadcast(zero, &[], out);
@@ -2829,7 +2216,8 @@ impl<'a> LowerCtx<'a> {
         self.entry.rng(a, b, /*RNG_UNIFORM=*/ 1, out)
     }
 
-    fn lower_rng_normal(&self, mean: f32, scale: f32, out: Shape) -> i64 {
+
+    pub(crate) fn lower_rng_normal(&self, mean: f32, scale: f32, out: Shape) -> i64 {
         if self.rng.backend == rlx_ir::RngBackend::Zero {
             let zero = self.entry.constant_f32_scalar(0.0);
             return self.entry.broadcast(zero, &[], out);
@@ -2858,7 +2246,8 @@ impl<'a> LowerCtx<'a> {
     // deliberately don't aim for bit parity here — only that the
     // distribution is correct.
 
-    fn lower_sample(
+
+    pub(crate) fn lower_sample(
         &mut self,
         logits_id: NodeId,
         top_k: usize,
@@ -3090,9 +2479,10 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+
     /// argmax via topk-1 on `x` of shape `dims` (last axis is the
     /// reduction). Returns f32 indices reshaped to `out_shape`.
-    fn lower_topk_inner(
+    pub(crate) fn lower_topk_inner(
         &mut self,
         x: i64,
         dims: &[i64],
@@ -3141,61 +2531,8 @@ impl<'a> LowerCtx<'a> {
         self.entry.convert(sliced, out_shape)
     }
 
-    /// Inclusive scan with a reducer along the last axis. Mirrors
-    /// `lower_cumsum` but parametric on opcode and dtype, used by
-    /// `Sample` for both probs cumsum and bool→count cumsum.
-    fn scan_along_last_axis(
-        &mut self,
-        x: i64,
-        dims: &[i64],
-        prim_ty: i32,
-        opcode: &str,
-        init_v: f32,
-    ) -> i64 {
-        let ax = (dims.len() - 1) as i64;
-        let init = self.const_in_dtype(prim_ty, init_v);
-        let red = self.reducer(opcode, prim_ty);
-        let mut window_dims = vec![
-            WindowDim {
-                size: 1,
-                stride: 1,
-                padding_low: 0,
-                padding_high: 0,
-                window_dilation: 1,
-                base_dilation: 1,
-            };
-            dims.len()
-        ];
-        window_dims[ax as usize] = WindowDim {
-            size: dims[ax as usize],
-            stride: 1,
-            padding_low: dims[ax as usize] - 1,
-            padding_high: 0,
-            window_dilation: 1,
-            base_dilation: 1,
-        };
-        let window = Window {
-            dimensions: window_dims,
-        };
-        self.entry
-            .reduce_window(x, init, &red, window, Shape::array(prim_ty, dims))
-    }
 
-    // ── SelectiveScan ────────────────────────────────────────────
-    //
-    // The Mamba/SSM state-space scan, lowered to an HLO `while` loop.
-    // Inputs:  x [B,L,D], delta [B,L,D], a [D,N], b [B,L,N], c [B,L,N]
-    // Output:  [B, L, D]
-    //
-    // Per timestep t (B elided for clarity):
-    //   decay  = exp(delta[t,:,None] * a)        [D, N]
-    //   update = delta[t,:,None] * b[t,None,:] * x[t,:,None]   [D, N]
-    //   state  = state * decay + update          [D, N]
-    //   y[t]   = sum_n state[d,n] * c[t,n]       [D]
-    //
-    // Loop carry tuple: (i_s32, state[B,D,N], outputs[B,L,D])
-
-    fn lower_selective_scan(
+    pub(crate) fn lower_selective_scan(
         &mut self,
         x_id: NodeId,
         delta_id: NodeId,
@@ -3366,40 +2703,4 @@ impl<'a> LowerCtx<'a> {
             self.entry.convert(outs, out)
         }
     }
-}
-
-/// Host-side GGUF dequant dispatch for TPU lowering (all `Gguf*` schemes).
-///
-/// Used by [`LowerCtx::lower_dequant_matmul_gguf`] to bake f32 weights into HLO
-/// constants. Not invoked at PJRT runtime.
-fn dequant_gguf_bytes(scheme: QuantScheme, bytes: &[u8], n: usize) -> Result<Vec<f32>, String> {
-    use QuantScheme::*;
-    let r = match scheme {
-        GgufQ8_0 => rlx_gguf::dequant_q8_0(bytes, n),
-        GgufQ4_0 => rlx_gguf::dequant_q4_0(bytes, n),
-        GgufQ4_1 => rlx_gguf::dequant_q4_1(bytes, n),
-        GgufQ5_0 => rlx_gguf::dequant_q5_0(bytes, n),
-        GgufQ5_1 => rlx_gguf::dequant_q5_1(bytes, n),
-        GgufQ2K => rlx_gguf::dequant_q2_k(bytes, n),
-        GgufQ3K => rlx_gguf::dequant_q3_k(bytes, n),
-        GgufQ4K => rlx_gguf::dequant_q4_k(bytes, n),
-        GgufQ5K => rlx_gguf::dequant_q5_k(bytes, n),
-        GgufQ6K => rlx_gguf::dequant_q6_k(bytes, n),
-        GgufQ8K => rlx_gguf::dequant_q8_k(bytes, n),
-        GgufIQ4NL => rlx_gguf::iq_dequant::dequant_iq4_nl(bytes, n),
-        GgufIQ4XS => rlx_gguf::iq_dequant::dequant_iq4_xs(bytes, n),
-        GgufIQ2XXS => rlx_gguf::iq_dequant::dequant_iq2_xxs(bytes, n),
-        GgufIQ2XS => rlx_gguf::iq_dequant::dequant_iq2_xs(bytes, n),
-        GgufIQ2S => rlx_gguf::iq_dequant::dequant_iq2_s(bytes, n),
-        GgufIQ3XXS => rlx_gguf::iq_dequant::dequant_iq3_xxs(bytes, n),
-        GgufIQ3S => rlx_gguf::iq_dequant::dequant_iq3_s(bytes, n),
-        GgufIQ1S => rlx_gguf::iq_dequant::dequant_iq1_s(bytes, n),
-        GgufIQ1M => rlx_gguf::iq_dequant::dequant_iq1_m(bytes, n),
-        GgufTQ1_0 => rlx_gguf::tq_dequant::dequant_tq1_0(bytes, n),
-        GgufTQ2_0 => rlx_gguf::tq_dequant::dequant_tq2_0(bytes, n),
-        GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4(bytes, n),
-        GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(bytes, n),
-        other => return Err(format!("unsupported GGUF scheme {other:?}")),
-    };
-    r.map_err(|e| e.to_string())
 }

@@ -24,8 +24,10 @@ no FFI, no submodules.
 - **`kernels/mod.rs`** — `OnceLock`-cached pipeline + bind-group layout.
   First dispatch pays the WGSL → SPIR-V/MSL/HLSL translation cost
   (~ms); subsequent dispatches reuse the compiled pipeline.
-- **`backend.rs`** — `WgpuExecutable`. Unsupported ops panic at compile
-  time with a clear "fall back to CPU/Metal/MLX" diagnostic.
+- **`backend/`** — `WgpuExecutable`, decomposed into `compile`/`run`/`set`/
+  `dispatch` submodules (each a sibling `impl WgpuExecutable`; see `mod.rs`).
+  Unsupported ops panic at compile time with a clear "fall back to
+  CPU/Metal/MLX" diagnostic.
 - **GGUF dequant** — `kernels/dequant_gguf.wgsl` + `gguf_gpu.rs`: GPU
   dequant into arena scratch, then `matmul_bt`. Falls back to `gguf_host`
   when scratch exceeds device limits or for grouped MoE GGUF matmul.
