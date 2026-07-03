@@ -36,8 +36,11 @@ Keep both paths in sync when changing a Thunk variant.
 
 ## What's here
 
-- `thunk.rs` (2.5k LOC, the bulk) — Thunk enum + lowering from `Op` +
-  both execution paths.
+- `thunk.rs` (the bulk) — Thunk enum + lowering from `Op` + both execution
+  paths. The two giant match functions (`compile_thunks_with_rng`,
+  `execute_thunks`) are now compact dispatchers routing to ~200 per-op
+  `compile_<op>` / `exec_<op>` fns (the latter `#[inline(always)]`, verified
+  perf-neutral against the `tests/bench_execute_hotloop.rs` gate).
 - `executor.rs` — alternate non-thunk executor used by old paths and
   some unit tests.
 - `kernels.rs` — NEON intrinsics: softmax, layer norm, RMSNorm, matmul

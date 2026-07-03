@@ -364,6 +364,56 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             }
             Some(in_s)
         }
+        // NCDHW 3-D convs: kernel size comes from the 5-D weight
+        // (`[C_out, C_in/g, kD, kH, kW]` for conv, `[C_in, C_out/g, ...]` for
+        // transpose), so we can re-derive the output shape here (unlike the
+        // 2-D convs, whose kernel size lives on the op).
+        Op::Conv3d {
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => {
+            let w = in_shape(1);
+            if w.rank() != 5 {
+                return None;
+            }
+            let ks = [
+                w.dim(2).unwrap_static(),
+                w.dim(3).unwrap_static(),
+                w.dim(4).unwrap_static(),
+            ];
+            shape::conv3d_output_shape(in_shape(0), w, ks, *stride, *padding, *dilation, *groups).ok()
+        }
+        Op::ConvTranspose3d {
+            stride,
+            padding,
+            dilation,
+            output_padding,
+            groups,
+        } => {
+            let w = in_shape(1);
+            if w.rank() != 5 {
+                return None;
+            }
+            let ks = [
+                w.dim(2).unwrap_static(),
+                w.dim(3).unwrap_static(),
+                w.dim(4).unwrap_static(),
+            ];
+            shape::conv_transpose3d_output_shape(
+                in_shape(0),
+                w,
+                ks,
+                *stride,
+                *padding,
+                *dilation,
+                *output_padding,
+                *groups,
+            )
+            .ok()
+        }
+
         Op::Custom { .. }
         | Op::CustomFn { .. }
         | Op::Conv { .. }

@@ -47,7 +47,8 @@ hlo.rs     — HloModuleProto / HloComputationProto / HloInstructionProto
 unfuse.rs  — composite ops (FusedSwiGLU, FusedAttentionBlock,
              FusedTransformerLayer, LoraMatMul, If, While, rank-3
              Attention) decomposed before lowering
-lower.rs   — Graph → HLO walker covering ~40 ops
+lower/     — Graph → HLO walker covering ~40 ops (LowerCtx split into
+             per-topic submodules; see lower/mod.rs)
 backend.rs — TpuExecutable: compile, set_param, run; param-cache,
              buffer drain, executable destroy on Drop
 ```

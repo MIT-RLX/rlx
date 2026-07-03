@@ -45,7 +45,7 @@ use crate::kernels::{
     argmax_kernel, attention_bwd_kernel, attention_kernel, attention_row_kernel,
     batch_elementwise_region_kernel, binary_kernel, compare_kernel, concat_kernel,
     conv_transpose2d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
-    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_gguf_kernel, dequant_matmul_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
     dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel,
     fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
     fused_residual_rms_norm_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
@@ -390,6 +390,9 @@ enum Step {
         seq: u32,
         head_dim: u32,
         half: u32,
+        /// Partial rotary: half of the rotated width `n_rot` (Gemma 4 global
+        /// layers use n_rot < head_dim). Equals `half` for full rotation.
+        rot_half: u32,
         in_off: u32,
         cos_off: u32,
         sin_off: u32,
@@ -4877,7 +4880,7 @@ impl CudaExecutable {
                 }
                 Op::Rope {
                     head_dim,
-                    n_rot: _,
+                    n_rot,
                     style,
                 } => {
                     let x_id = node.inputs[0];
@@ -4905,6 +4908,9 @@ impl CudaExecutable {
                         seq,
                         head_dim: *head_dim as u32,
                         half: (*head_dim / 2) as u32,
+                        // Partial rotary: rotate only n_rot dims (Gemma 4 global
+                        // layers use n_rot < head_dim). Equals half for full rope.
+                        rot_half: (*n_rot / 2) as u32,
                         in_off: (arena.offset(x_id) / 4) as u32,
                         cos_off: (arena.offset(cos_id) / 4) as u32,
                         sin_off: (arena.offset(sin_id) / 4) as u32,
@@ -6483,6 +6489,7 @@ impl CudaExecutable {
             .insert(handle_name.to_string(), output_index);
     }
 
+    #[allow(dead_code)] // kept for manual stream debugging / future multi-stream sync
     fn sync_all_streams(&self) {
         let _ = self.ctx.default_stream().synchronize();
         for s in &self.streams {
@@ -6639,6 +6646,7 @@ impl CudaExecutable {
         true
     }
 
+    #[allow(dead_code)] // kept for future cross-stream device-to-device copies
     fn copy_f32_dtod_between(
         stream: &Arc<cudarc::driver::CudaStream>,
         src: &cudarc::driver::CudaSlice<f32>,
@@ -8564,6 +8572,7 @@ impl CudaExecutable {
                     seq,
                     head_dim,
                     half,
+                    rot_half,
                     in_off,
                     cos_off,
                     sin_off,
@@ -8585,6 +8594,7 @@ impl CudaExecutable {
                         .arg(seq)
                         .arg(head_dim)
                         .arg(half)
+                        .arg(rot_half)
                         .arg(in_off)
                         .arg(cos_off)
                         .arg(sin_off)

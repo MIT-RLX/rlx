@@ -28,6 +28,7 @@ extern "C" __global__ void rope(
     unsigned int seq,
     unsigned int head_dim,
     unsigned int half,
+    unsigned int rot_half,
     unsigned int in_off,
     unsigned int cos_off,
     unsigned int sin_off,
@@ -42,6 +43,16 @@ extern "C" __global__ void rope(
     unsigned int pos = q1 % seq;
     unsigned int d_in_head = d % head_dim;
     unsigned int head_base = i - d_in_head;
+
+    // Partial rotary (Gemma 4 global layers use n_rot < head_dim): only the
+    // first n_rot = 2*rot_half dims rotate; trailing dims pass through. The
+    // cos/sin row stride stays `half` (head_dim/2), matching the CPU reference.
+    // `rot_half == half` for full rotation, so this guard never fires there.
+    unsigned int n_rot = rot_half * 2u;
+    if (d_in_head >= n_rot) {
+        arena[out_off + i] = arena[in_off + i];
+        return;
+    }
 
     if (interleaved != 0u) {
         // GptJ / llama.cpp NORM: rotated pairs are adjacent (2f, 2f+1); cos/sin
@@ -63,14 +74,14 @@ extern "C" __global__ void rope(
         return;
     }
 
-    if (d_in_head < half) {
+    if (d_in_head < rot_half) {
         float xf = arena[in_off + i];
-        float xs = arena[in_off + head_base + d_in_head + half];
+        float xs = arena[in_off + head_base + d_in_head + rot_half];
         float c  = arena[cos_off + pos * half + d_in_head];
         float s  = arena[sin_off + pos * half + d_in_head];
         arena[out_off + i] = xf * c - xs * s;
     } else {
-        unsigned int dl = d_in_head - half;
+        unsigned int dl = d_in_head - rot_half;
         float xs = arena[in_off + i];
         float xf = arena[in_off + head_base + dl];
         float c  = arena[cos_off + pos * half + dl];

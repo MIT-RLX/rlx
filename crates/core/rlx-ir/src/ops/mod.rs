@@ -31,6 +31,7 @@ pub mod axial_rope2d;
 pub mod backward;
 pub mod blocks;
 pub mod conv2d;
+pub mod conv3d;
 pub mod dsp;
 pub mod elementwise;
 pub mod fft_ops;

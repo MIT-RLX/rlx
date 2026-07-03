@@ -1213,6 +1213,99 @@ pub fn conv_transpose2d_nchw(
     }
 }
 
+/// NCDHW transposed convolution (the depth-axis analogue of
+/// [`conv_transpose2d_nchw`]). Scatter form: each input voxel adds its
+/// weighted kernel into the output. Weight `[C_in, C_out/g, kD, kH, kW]`.
+/// `output_padding` is assumed folded into `d_out/h_out/w_out` by the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn conv_transpose3d_ncdhw(
+    input: &[f32],
+    weight: &[f32],
+    output: &mut [f32],
+    n: usize,
+    c_in: usize,
+    d: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    d_out: usize,
+    h_out: usize,
+    w_out: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    dd: usize,
+    dh: usize,
+    dw: usize,
+    groups: usize,
+) {
+    output.fill(0.0);
+    let c_in_per_g = c_in / groups;
+    let c_out_per_g = c_out / groups;
+    for ni in 0..n {
+        for ic in 0..c_in {
+            let g = ic / c_in_per_g;
+            for id in 0..d {
+                for iy in 0..h {
+                    for ix in 0..w {
+                        let v = input[(((ni * c_in + ic) * d + id) * h + iy) * w + ix];
+                        if v == 0.0 {
+                            continue;
+                        }
+                        for kz in 0..kd {
+                            let oz = id * sd + kz * dd;
+                            if oz < pd || oz >= d_out + pd {
+                                continue;
+                            }
+                            let oz = oz - pd;
+                            if oz >= d_out {
+                                continue;
+                            }
+                            for ky in 0..kh {
+                                let oy = iy * sh + ky * dh;
+                                if oy < ph || oy >= h_out + ph {
+                                    continue;
+                                }
+                                let oy = oy - ph;
+                                if oy >= h_out {
+                                    continue;
+                                }
+                                for kx in 0..kw {
+                                    let ox = ix * sw + kx * dw;
+                                    if ox < pw || ox >= w_out + pw {
+                                        continue;
+                                    }
+                                    let ox = ox - pw;
+                                    if ox >= w_out {
+                                        continue;
+                                    }
+                                    for oc_off in 0..c_out_per_g {
+                                        let oc = g * c_out_per_g + oc_off;
+                                        let w_idx = (((ic * c_out_per_g + oc_off) * kd + kz) * kh
+                                            + ky)
+                                            * kw
+                                            + kx;
+                                        let wt = weight[w_idx];
+                                        output[(((ni * c_out + oc) * d_out + oz) * h_out + oy)
+                                            * w_out
+                                            + ox] += v * wt;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// NCHW group normalization: normalizes each `(C/G)×H×W` group.
 pub fn group_norm_nchw(
     input: &[f32],

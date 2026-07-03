@@ -5,7 +5,7 @@
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, version 3.
 
-//! Decompose tier-2 fused MIR ops into primitives for autodiff and backends.
+//! `fused` — extracted from the `unfuse` module for navigability (see `mod.rs`).
 
 #![allow(unused_imports)]
 

@@ -6,6 +6,8 @@
 // `proto::Model` ready to serialise into a `.mlpackage`. No FFI, so this
 // builds and unit-tests on any host.
 
+//! `rope` — extracted from the `mil` module for navigability (see `mod.rs`).
+
 #![allow(unused_imports)]
 
 use std::collections::HashMap;

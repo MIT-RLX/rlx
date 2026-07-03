@@ -13,58 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Sparse linear algebra for RLX — CSR LU, mat-vec, Conjugate Gradient.
-//!
-//! Downstream package modeled on `jax.experimental.sparse`. Registers
-//! against rlx's custom-op scaffold without requiring any edits to the
-//! framework crates. Three ops + a `SparseTensor` boundary abstraction.
-//!
-//! ## Usage
-//!
-//! ```ignore
-//! // At application startup, once.
-//! rlx_sparse::register();
-//!
-//! // Build graph as usual.
-//! let mut g = Graph::new("photonics");
-//! let v  = g.input("values",  Shape::new(&[nnz], DType::F64));
-//! let ci = ...; // I32 col_idx (Op::Constant or Op::Input)
-//! let rp = ...; // I32 row_ptr
-//! let b  = g.input("b", Shape::new(&[n], DType::F64));
-//!
-//! let a = rlx_sparse::SparseTensor::from_csr(v, ci, rp, n, n);
-//! let x = a.solve(&mut g, b);                 // direct LU
-//! let y = a.mat_vec(&mut g, x);               // sparse matvec
-//! let z = a.cg_solve(&mut g, b, 200, 1e-12);  // iterative CG
-//! ```
-//!
-//! ## What's registered
-//!
-//! - `rlx_sparse.lu_solve` — direct LU via host LAPACK dgesv.
-//!   v1 densifies CSR before solving; performance not yet sparse-fast,
-//!   semantics are correct. Swapping for SuiteSparse UMFPACK or KLU is
-//!   a kernel-body change with zero IR diff.
-//! - `rlx_sparse.mat_vec` — `y = A·x` over CSR.
-//! - `rlx_sparse.cg_solve` — Conjugate Gradient for SPD systems with
-//!   `max_iter` + `tol` baked into the op's `attrs` blob.
-//!
-//! ## Adjoint convention (v1)
-//!
-//! All three ops assume `A` is symmetric. The closed-form adjoint
-//! `dL/db = solve(Aᵀ, dL/dx)` reuses the same CSR triplet as the
-//! forward call. Non-symmetric `A` requires an explicit transpose
-//! triplet — sketch in the `vjp` body of each op. `dL/dvalues` is
-//! non-differentiable in v1; it's `gather(-(dL/db) ⊗ x)` and slots
-//! in as a separate gather op.
-//!
-//! ## Backend support
-//!
-//! | Backend | Status |
-//! |---|---|
-//! | CPU    | Full forward + autodiff. Real LAPACK. |
-//! | Metal  | Trait surface only — full executor dispatch is a follow-up. |
-//! | MLX    | Trait surface only — full executor dispatch is a follow-up. |
-//! | Others | `Op::Custom` rejected at legalize; pin graph to `Device::Cpu`. |
+//! `bicgstab` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
 

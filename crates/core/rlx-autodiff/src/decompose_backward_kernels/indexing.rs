@@ -16,6 +16,8 @@
 //
 // Primitive compositions for training `*Backward` ops (higher-order AD).
 
+//! `indexing` — extracted from the `decompose_backward_kernels` module for navigability (see `mod.rs`).
+
 #![allow(unused_imports)]
 
 use rlx_ir::infer::GraphExt;

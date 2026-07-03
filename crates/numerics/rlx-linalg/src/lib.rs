@@ -64,94 +64,180 @@
 use std::sync::Arc;
 
 use rlx_ir::infer::GraphExt;
-use rlx_ir::{DType, Graph, Node, NodeId, OpExtension, Shape, VjpContext, register_op};
+use rlx_ir::{DType, Graph, NodeId, Shape, register_op};
 
 #[cfg(feature = "cpu")]
-use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_kernel};
+use rlx_cpu::op_registry::register_cpu_kernel;
 
 // ── Op names ─────────────────────────────────────────────────────
 
+mod op_cholesky;
+mod op_cholesky_backward;
+mod op_cholesky_jvp;
+mod op_diag_extract;
+mod op_diag_set;
+mod op_eigh;
+mod op_eigh_backward;
+mod op_eigh_jvp;
+mod op_expm;
+mod op_expm_backward;
+mod op_expm_jvp;
+mod op_log_det;
+mod op_log_det_backward;
+mod op_lstsq;
+mod op_lstsq_backward_a;
+mod op_lstsq_backward_b;
+mod op_pinv;
+mod op_pinv_backward;
+mod op_pinv_jvp;
+mod op_qr;
+mod op_qr_backward;
+mod op_qr_jvp;
+mod op_slog_det;
+mod op_slog_det_backward;
+mod op_solve_triangular;
+mod op_svd;
+mod op_svd_backward;
+mod op_svd_jvp;
+
+use op_cholesky::*;
+use op_cholesky_backward::*;
+use op_cholesky_jvp::*;
+use op_diag_extract::*;
+use op_diag_set::*;
+use op_eigh::*;
+use op_eigh_backward::*;
+use op_eigh_jvp::*;
+use op_expm::*;
+use op_expm_backward::*;
+use op_expm_jvp::*;
+use op_log_det::*;
+use op_log_det_backward::*;
+use op_lstsq::*;
+use op_lstsq_backward_a::*;
+use op_lstsq_backward_b::*;
+use op_pinv::*;
+use op_pinv_backward::*;
+use op_pinv_jvp::*;
+use op_qr::*;
+use op_qr_backward::*;
+use op_qr_jvp::*;
+use op_slog_det::*;
+use op_slog_det_backward::*;
+use op_solve_triangular::*;
+use op_svd::*;
+use op_svd_backward::*;
+use op_svd_jvp::*;
+
 pub const LINALG_CHOLESKY: &str = "rlx_linalg.cholesky";
+
 pub const LINALG_SOLVE_TRIANGULAR: &str = "rlx_linalg.solve_triangular";
+
 pub const LINALG_EIGH: &str = "rlx_linalg.eigh";
+
 pub const LINALG_QR: &str = "rlx_linalg.qr";
+
 pub const LINALG_SVD: &str = "rlx_linalg.svd";
+
 
 /// Log-determinant of a SPD matrix. Forward = `2 · Σ log(diag(chol(A)))`;
 /// VJP `dL/dA = dL/d(logdet) · A⁻¹` (which is symmetric and SPD).
 pub const LINALG_LOGDET: &str = "rlx_linalg.logdet";
 
+
 /// Backward kernel for `cholesky`: takes `(L, dL/dL)` → produces `dL/dA`.
 pub const LINALG_CHOLESKY_BACKWARD: &str = "rlx_linalg.cholesky_backward";
+
 /// Forward Frechet derivative for `cholesky`: `(L, dA) → dL`.
 /// `dL = L · phi(L⁻¹·dA·L⁻ᵀ)` where `phi(M) = strict_lower(M) + ½·diag(M)`.
 pub const LINALG_CHOLESKY_JVP: &str = "rlx_linalg.cholesky_jvp";
+
 /// Backward kernel for `eigh`: takes `(λ, V, dL/dλ, dL/dV)` → produces `dL/dA`.
 pub const LINALG_EIGH_BACKWARD: &str = "rlx_linalg.eigh_backward";
+
 /// Forward Frechet derivative for `eigh`: `(λ, V, dA) → packed [t_λ, t_V_flat]`
 /// of length `n + n²`. Computed via `C = Vᵀ·dA·V`, `t_λ = diag(C)`,
 /// `Ω[i,j] = C[i,j]/(λ[j]-λ[i])` (off-diag), `t_V = V·Ω`.
 pub const LINALG_EIGH_JVP: &str = "rlx_linalg.eigh_jvp";
+
 /// Forward Frechet derivative for `qr`: `(Q, R, dA) → packed [dQ, dR]`
 /// of length `m·k + k·n` (k = min(m, n)). Walter-Lehmann forward
 /// direction via `M = Qᵀ·dA·R⁻¹`, `X = strict_antisym(M)`,
 /// `U = strict_upper_sum(M) + diag(M)`, `dR = U·R`,
 /// `dQ = Q·X + (I - Q·Qᵀ)·dA·R⁻¹`.
 pub const LINALG_QR_JVP: &str = "rlx_linalg.qr_jvp";
+
 /// Forward Frechet derivative for `svd`: `(U, s, Vᵀ, dA) → packed
 /// [dU, ds, dVᵀ]` of length `m·k + k + k·n`. Townsend forward via
 /// `C = Uᵀ·dA·V`, `ds = diag(C)`, `Ω_U/Ω_V` from the 2×2 system.
 pub const LINALG_SVD_JVP: &str = "rlx_linalg.svd_jvp";
+
 /// Forward Frechet derivative for `pinv`: `(A, dA) → dY` (n×m).
 /// Composed via internal SVD: `dY = dV·D·Uᵀ − V·diag(ds/s²)·Uᵀ + V·D·dUᵀ`
 /// where `D = diag(1/s)`.
 pub const LINALG_PINV_JVP: &str = "rlx_linalg.pinv_jvp";
+
 /// Backward kernel for `qr`: takes `(Q, R, dL/dQ, dL/dR)` → produces `dL/dA`.
 pub const LINALG_QR_BACKWARD: &str = "rlx_linalg.qr_backward";
+
 /// Backward kernel for `svd`: takes `(U, s, V^T, dL/dU, dL/ds, dL/dV^T)`
 /// → produces `dL/dA`. Townsend 2016 closed form with degeneracy mask.
 pub const LINALG_SVD_BACKWARD: &str = "rlx_linalg.svd_backward";
+
 /// Backward kernel for `logdet`: takes `(A, dL/d(logdet))` → produces
 /// `dL/dA = dL/d(logdet) · A⁻¹`. Computed via solve(A, I) internally.
 pub const LINALG_LOGDET_BACKWARD: &str = "rlx_linalg.logdet_backward";
+
 
 /// Sign + log|det| of a general square matrix via LU with pivoting.
 /// Output packed `[sign, log|det|]`, length 2 F64.
 /// VJP: `dL/dA = dL/d(log|det|) · A⁻ᵀ` (sign is non-differentiable).
 pub const LINALG_SLOGDET: &str = "rlx_linalg.slogdet";
+
 /// Backward kernel for `slogdet`: `(A, dL/d(log|det|)) → dL/dA`.
 pub const LINALG_SLOGDET_BACKWARD: &str = "rlx_linalg.slogdet_backward";
 
+
 /// Extract the diagonal of a matrix: `[n, n] → [n]`. VJP is `diag_set`.
 pub const LINALG_DIAG_EXTRACT: &str = "rlx_linalg.diag_extract";
+
 /// Build a diagonal matrix from a vector: `[n] → [n, n]`. VJP is `diag_extract`.
 pub const LINALG_DIAG_SET: &str = "rlx_linalg.diag_set";
+
 
 /// Matrix exponential `exp(A)` via Padé-13 with scaling-and-squaring.
 /// VJP via the augmented-matrix trick (Al-Mohy/Higham): the upper-right
 /// n×n block of `exp([[Aᵀ, G], [0, Aᵀ]])` equals the Frechet derivative
 /// adjoint dL/dA. Hence the backward kernel is itself a 2n×2n expm.
 pub const LINALG_EXPM: &str = "rlx_linalg.expm";
+
 /// Backward kernel for `expm`: `(A, dL/d(exp(A))) → dL/dA`.
 pub const LINALG_EXPM_BACKWARD: &str = "rlx_linalg.expm_backward";
+
 /// Forward Frechet derivative for `expm`: `(A, dA) → L_exp(A, dA)`.
 /// Computed as the upper-right block of `exp([[A, dA], [0, A]])`.
 pub const LINALG_EXPM_JVP: &str = "rlx_linalg.expm_jvp";
+
 
 /// Moore-Penrose pseudo-inverse via thin SVD with cutoff:
 ///   Y = V · diag(1/s_filtered) · Uᵀ. Output shape `[n, m]` for
 ///   input `[m, n]`. Full-column-rank case (m ≥ n) is best supported.
 pub const LINALG_PINV: &str = "rlx_linalg.pinv";
+
 /// Backward kernel for `pinv`: `(A, Y, dL/dY) → dL/dA`.
 pub const LINALG_PINV_BACKWARD: &str = "rlx_linalg.pinv_backward";
+
 
 /// Least-squares: `x = argmin ||A·x - b||²` via thin SVD pseudoinverse.
 /// `A: [m, n]`, `b: [m]` (vector RHS only in v1). Output `x: [n]`.
 pub const LINALG_LSTSQ: &str = "rlx_linalg.lstsq";
+
 /// Backward kernel: `(A, x, b, dL/dx) → dL/dA`.
 pub const LINALG_LSTSQ_BACKWARD_A: &str = "rlx_linalg.lstsq_backward_a";
+
 /// Backward kernel: `(A, dL/dx) → dL/db`.
 pub const LINALG_LSTSQ_BACKWARD_B: &str = "rlx_linalg.lstsq_backward_b";
+
 
 // ── Symmetric matrix functions + covariance (exg-source) ────────
 //
@@ -161,6 +247,7 @@ pub const LINALG_LSTSQ_BACKWARD_B: &str = "rlx_linalg.lstsq_backward_b";
 pub mod matfn;
 
 // ── Algos: shared LAPACK-backed kernel bodies ────────────────────
+
 
 #[cfg(feature = "cpu")]
 mod algos {
@@ -1738,1989 +1825,6 @@ mod algos {
 
 // ── Cholesky ─────────────────────────────────────────────────────
 
-struct CholeskyExt;
-
-impl OpExtension for CholeskyExt {
-    fn name(&self) -> &str {
-        LINALG_CHOLESKY
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    } // A: [n, n]
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let a = inputs[0];
-        assert_eq!(a.dtype(), DType::F64, "cholesky: A must be F64");
-        assert_eq!(a.rank(), 2, "cholesky: A must be 2D");
-        a.clone()
-    }
-    fn vjp(&self, node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        // Closed-form Murray 2016 dL/dA via the cholesky_backward op.
-        // Forward L = chol(A); upstream is dL/dL.
-        let l_fwd = ctx.fwd_map[&node.id];
-        let attrs = match &node.op {
-            rlx_ir::Op::Custom { attrs, .. } => attrs.clone(),
-            _ => Vec::new(),
-        };
-        let g_a = ctx
-            .bwd
-            .custom_op(LINALG_CHOLESKY_BACKWARD, attrs, vec![l_fwd, ctx.upstream]);
-        vec![(0, g_a)]
-    }
-    fn jvp(&self, node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // t_L = L · phi(L⁻¹·dA·L⁻ᵀ).
-        let t_a = ctx.tangents[0]?;
-        let l = ctx.fwd_map[&node.id];
-        let attrs = match &node.op {
-            rlx_ir::Op::Custom { attrs, .. } => attrs.clone(),
-            _ => return None,
-        };
-        Some(ctx.bwd.custom_op(LINALG_CHOLESKY_JVP, attrs, vec![l, t_a]))
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct CholeskyCpu;
-
-#[cfg(feature = "cpu")]
-impl CpuKernel for CholeskyCpu {
-    fn name(&self) -> &str {
-        LINALG_CHOLESKY
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("cholesky A")?;
-        let out = output.expect_f64_mut("cholesky out")?;
-        let lower = attrs.first().copied().unwrap_or(1) != 0;
-        let n_sq = a.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("cholesky: A length {n_sq} not n²"));
-        }
-        algos::cholesky(a, n, lower, out)
-    }
-}
-
-// ── Solve Triangular ─────────────────────────────────────────────
-
-struct SolveTriangularExt;
-
-impl OpExtension for SolveTriangularExt {
-    fn name(&self) -> &str {
-        LINALG_SOLVE_TRIANGULAR
-    }
-    fn num_inputs(&self) -> usize {
-        2
-    } // A (n×n), B (n×nrhs)
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let b = inputs[1];
-        b.clone()
-    }
-    fn vjp(&self, node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        // y = solve(op(A), B). Closed form:
-        //   dL/dB = (op(A))⁻ᵀ · upstream
-        // = solve(op(A), upstream, transpose_flag_flipped). Only dL/dB
-        // is implemented in v1; dL/dA is a triangular outer-product
-        // gather (mirrors sparse-LU's values gradient — mechanical
-        // follow-up).
-        let attrs = match &node.op {
-            rlx_ir::Op::Custom { attrs, .. } => attrs.clone(),
-            _ => return vec![],
-        };
-        let lower = attrs.first().copied().unwrap_or(1) != 0;
-        let transpose_a = attrs.get(1).copied().unwrap_or(0) != 0;
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let new_attrs = vec![
-            if lower { 1u8 } else { 0 },
-            if !transpose_a { 1 } else { 0 },
-        ];
-        let g_b = ctx.bwd.custom_op(
-            LINALG_SOLVE_TRIANGULAR,
-            new_attrs,
-            vec![a_bwd, ctx.upstream],
-        );
-        vec![(1, g_b)]
-    }
-    fn jvp(&self, node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // y = solve(A, B); dy = solve(A, dB - dA·y).
-        let attrs = match &node.op {
-            rlx_ir::Op::Custom { attrs, .. } => attrs.clone(),
-            _ => return None,
-        };
-        let a = ctx.fwd_map[&node.inputs[0]];
-        let y = ctx.fwd_map[&node.id];
-        let y_shape = ctx.bwd.shape(y).clone();
-        let rhs = match (ctx.tangents[0], ctx.tangents[1]) {
-            (Some(t_a), Some(t_b)) => {
-                let prod = ctx.bwd.matmul(t_a, y, y_shape.clone());
-                ctx.bwd
-                    .binary(rlx_ir::op::BinaryOp::Sub, t_b, prod, y_shape.clone())
-            }
-            (Some(t_a), None) => {
-                let prod = ctx.bwd.matmul(t_a, y, y_shape.clone());
-                ctx.bwd
-                    .activation(rlx_ir::op::Activation::Neg, prod, y_shape.clone())
-            }
-            (None, Some(t_b)) => t_b,
-            (None, None) => return None,
-        };
-        Some(
-            ctx.bwd
-                .custom_op(LINALG_SOLVE_TRIANGULAR, attrs, vec![a, rhs]),
-        )
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct SolveTriangularCpu;
-
-#[cfg(feature = "cpu")]
-impl CpuKernel for SolveTriangularCpu {
-    fn name(&self) -> &str {
-        LINALG_SOLVE_TRIANGULAR
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("solve_triangular A")?;
-        let b = inputs[1].expect_f64("solve_triangular B")?;
-        let out = output.expect_f64_mut("solve_triangular out")?;
-        let lower = attrs.first().copied().unwrap_or(1) != 0;
-        let transpose_a = attrs.get(1).copied().unwrap_or(0) != 0;
-        let n_sq = a.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("solve_triangular: A length {n_sq} not n²"));
-        }
-        let nrhs = b.len() / n;
-        algos::solve_triangular(a, b, n, nrhs, lower, transpose_a, out)
-    }
-}
-
-// ── Symmetric Eigendecomposition ─────────────────────────────────
-
-struct EighExt;
-
-impl OpExtension for EighExt {
-    fn name(&self) -> &str {
-        LINALG_EIGH
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let a = inputs[0];
-        assert_eq!(a.dtype(), DType::F64, "eigh: A must be F64");
-        assert_eq!(a.rank(), 2, "eigh: A must be 2D");
-        let n = a.num_elements().expect("eigh: A must be statically shaped");
-        let n_dim = (n as f64).sqrt() as usize;
-        assert_eq!(n_dim * n_dim, n, "eigh: A must be square");
-        // Packed: [eigenvalues (n), eigenvectors (n²)] flat 1D.
-        Shape::new(&[n_dim + n], DType::F64)
-    }
-
-    fn vjp(&self, node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        // Forward output is packed [λ (n), V (n²)]. Upstream has the
-        // same layout (built from the user's downstream Narrow + ops).
-        // Unpack both, call eigh_backward(λ, V, dL/dλ, dL/dV).
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let a_shape = ctx.bwd.node(a_bwd).shape.clone();
-        let n = match a_shape.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return Vec::new(),
-        };
-
-        let packed_fwd = ctx.fwd_map[&node.id];
-        let lambda_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: 0,
-                len: n,
-            },
-            vec![packed_fwd],
-            Shape::new(&[n], DType::F64),
-        );
-        let v_flat_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: n,
-                len: n * n,
-            },
-            vec![packed_fwd],
-            Shape::new(&[n * n], DType::F64),
-        );
-
-        let dl_dlambda = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: 0,
-                len: n,
-            },
-            vec![ctx.upstream],
-            Shape::new(&[n], DType::F64),
-        );
-        let dl_dv_flat = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: n,
-                len: n * n,
-            },
-            vec![ctx.upstream],
-            Shape::new(&[n * n], DType::F64),
-        );
-
-        // eigh_backward kernel reads V and dL/dV as flat n²; reshape
-        // not strictly necessary because the kernel computes its
-        // own row/col indexing — but we wrap them so shape inference
-        // for the backward op sees consistent metadata.
-        let g_a = ctx.bwd.custom_op(
-            LINALG_EIGH_BACKWARD,
-            Vec::new(),
-            vec![lambda_fwd, v_flat_fwd, dl_dlambda, dl_dv_flat],
-        );
-        vec![(0, g_a)]
-    }
-    fn jvp(&self, node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // Forward Frechet via the eigh_jvp kernel. Inputs to the kernel:
-        // (λ, V_flat, dA). Output: packed [t_λ, t_V_flat] of length n+n².
-        let t_a = ctx.tangents[0]?;
-        let a = ctx.fwd_map[&node.inputs[0]];
-        let n = match ctx.bwd.shape(a).dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return None,
-        };
-        // Unpack λ and V from forward output (stored in JVP graph at fwd_map[&node.id]).
-        let packed_fwd = ctx.fwd_map[&node.id];
-        let lambda = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: 0,
-                len: n,
-            },
-            vec![packed_fwd],
-            Shape::new(&[n], DType::F64),
-        );
-        let v_flat = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: n,
-                len: n * n,
-            },
-            vec![packed_fwd],
-            Shape::new(&[n * n], DType::F64),
-        );
-        // dA might be 2D [n,n] but the kernel expects flat n²; reshape.
-        let da_flat = ctx.bwd.add_node(
-            rlx_ir::Op::Reshape {
-                new_shape: vec![(n * n) as i64],
-            },
-            vec![t_a],
-            Shape::new(&[n * n], DType::F64),
-        );
-        Some(
-            ctx.bwd
-                .custom_op(LINALG_EIGH_JVP, Vec::new(), vec![lambda, v_flat, da_flat]),
-        )
-    }
-}
-
-struct EighJvpExt;
-
-impl OpExtension for EighJvpExt {
-    fn name(&self) -> &str {
-        LINALG_EIGH_JVP
-    }
-    fn num_inputs(&self) -> usize {
-        3
-    } // λ, V_flat, dA_flat
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let n = inputs[0]
-            .num_elements()
-            .expect("eigh_jvp: λ must have static shape");
-        Shape::new(&[n + n * n], DType::F64)
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct EighJvpCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for EighJvpCpu {
-    fn name(&self) -> &str {
-        LINALG_EIGH_JVP
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _: &[u8],
-    ) -> Result<(), String> {
-        let lambda = inputs[0].expect_f64("eigh_jvp λ")?;
-        let v_flat = inputs[1].expect_f64("eigh_jvp V")?;
-        let da_flat = inputs[2].expect_f64("eigh_jvp dA")?;
-        let out = output.expect_f64_mut("eigh_jvp out")?;
-        let n = lambda.len();
-        algos::eigh_jvp(lambda, v_flat, da_flat, n, out)
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct EighCpu;
-
-#[cfg(feature = "cpu")]
-impl CpuKernel for EighCpu {
-    fn name(&self) -> &str {
-        LINALG_EIGH
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("eigh A")?;
-        let out = output.expect_f64_mut("eigh out")?;
-        let n_sq = a.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("eigh: A length {n_sq} not n²"));
-        }
-        algos::eigh(a, n, out)
-    }
-}
-
-// ── QR ───────────────────────────────────────────────────────────
-
-struct QrExt;
-
-impl OpExtension for QrExt {
-    fn name(&self) -> &str {
-        LINALG_QR
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn infer_shape(&self, inputs: &[&Shape], attrs: &[u8]) -> Shape {
-        // Shapes need both m and n. The infer_shape input is the matrix
-        // A which carries them. We encode no special attrs (yet).
-        let _ = attrs;
-        let a = inputs[0];
-        assert_eq!(a.dtype(), DType::F64, "qr: A must be F64");
-        assert_eq!(a.rank(), 2, "qr: A must be 2D");
-        let m = match a.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("qr: dynamic dim"),
-        };
-        let n = match a.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("qr: dynamic dim"),
-        };
-        let k = m.min(n);
-        Shape::new(&[m * k + k * n], DType::F64)
-    }
-
-    fn vjp(&self, node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        // Walter–Lehmann 2010 closed form via the qr_backward kernel.
-        // Forward output is packed [Q (m·k), R (k·n)]; upstream has
-        // the same layout. Unpack and call qr_backward(Q, R, dQ, dR).
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let a_shape = ctx.bwd.node(a_bwd).shape.clone();
-        let m = match a_shape.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return Vec::new(),
-        };
-        let n = match a_shape.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return Vec::new(),
-        };
-        let k = m.min(n);
-
-        let packed_fwd = ctx.fwd_map[&node.id];
-        let q_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: 0,
-                len: m * k,
-            },
-            vec![packed_fwd],
-            Shape::new(&[m * k], DType::F64),
-        );
-        let r_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: m * k,
-                len: k * n,
-            },
-            vec![packed_fwd],
-            Shape::new(&[k * n], DType::F64),
-        );
-        let dq = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: 0,
-                len: m * k,
-            },
-            vec![ctx.upstream],
-            Shape::new(&[m * k], DType::F64),
-        );
-        let dr = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: m * k,
-                len: k * n,
-            },
-            vec![ctx.upstream],
-            Shape::new(&[k * n], DType::F64),
-        );
-
-        let g_a = ctx
-            .bwd
-            .custom_op(LINALG_QR_BACKWARD, Vec::new(), vec![q_fwd, r_fwd, dq, dr]);
-        vec![(0, g_a)]
-    }
-    fn jvp(&self, node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // Walter-Lehmann forward via qr_jvp kernel. Inputs: (Q_flat,
-        // R_flat, dA_flat); output packed [dQ_flat, dR_flat].
-        let t_a = ctx.tangents[0]?;
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let a_shape = ctx.bwd.node(a_bwd).shape.clone();
-        let m = match a_shape.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return None,
-        };
-        let n = match a_shape.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return None,
-        };
-        let k = m.min(n);
-        let packed_fwd = ctx.fwd_map[&node.id];
-        let q_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: 0,
-                len: m * k,
-            },
-            vec![packed_fwd],
-            Shape::new(&[m * k], DType::F64),
-        );
-        let r_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: m * k,
-                len: k * n,
-            },
-            vec![packed_fwd],
-            Shape::new(&[k * n], DType::F64),
-        );
-        let da_flat = ctx.bwd.add_node(
-            rlx_ir::Op::Reshape {
-                new_shape: vec![(m * n) as i64],
-            },
-            vec![t_a],
-            Shape::new(&[m * n], DType::F64),
-        );
-        Some(
-            ctx.bwd
-                .custom_op(LINALG_QR_JVP, Vec::new(), vec![q_fwd, r_fwd, da_flat]),
-        )
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct QrCpu;
-
-#[cfg(feature = "cpu")]
-impl CpuKernel for QrCpu {
-    fn name(&self) -> &str {
-        LINALG_QR
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("qr A")?;
-        let a_shape = inputs[0].shape();
-        let m = match a_shape.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return Err("qr: dynamic dim 0".into()),
-        };
-        let n = match a_shape.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return Err("qr: dynamic dim 1".into()),
-        };
-        let out = output.expect_f64_mut("qr out")?;
-        algos::qr(a, m, n, out)
-    }
-}
-
-// ── SVD ──────────────────────────────────────────────────────────
-
-struct SvdExt;
-
-impl OpExtension for SvdExt {
-    fn name(&self) -> &str {
-        LINALG_SVD
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let a = inputs[0];
-        assert_eq!(a.dtype(), DType::F64, "svd: A must be F64");
-        assert_eq!(a.rank(), 2, "svd: A must be 2D");
-        let m = match a.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("svd: dynamic dim"),
-        };
-        let n = match a.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("svd: dynamic dim"),
-        };
-        let k = m.min(n);
-        // U (m·k) + S (k) + V^T (k·n)
-        Shape::new(&[m * k + k + k * n], DType::F64)
-    }
-
-    fn vjp(&self, node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        // Forward output is packed [U (m·k), s (k), V^T (k·n)];
-        // upstream has the same layout. Unpack and call svd_backward.
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let a_shape = ctx.bwd.node(a_bwd).shape.clone();
-        let m = match a_shape.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return Vec::new(),
-        };
-        let n = match a_shape.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return Vec::new(),
-        };
-        let k = m.min(n);
-
-        let packed_fwd = ctx.fwd_map[&node.id];
-        let u_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: 0,
-                len: m * k,
-            },
-            vec![packed_fwd],
-            Shape::new(&[m * k], DType::F64),
-        );
-        let s_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: m * k,
-                len: k,
-            },
-            vec![packed_fwd],
-            Shape::new(&[k], DType::F64),
-        );
-        let vt_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: m * k + k,
-                len: k * n,
-            },
-            vec![packed_fwd],
-            Shape::new(&[k * n], DType::F64),
-        );
-        let du = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: 0,
-                len: m * k,
-            },
-            vec![ctx.upstream],
-            Shape::new(&[m * k], DType::F64),
-        );
-        let ds = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: m * k,
-                len: k,
-            },
-            vec![ctx.upstream],
-            Shape::new(&[k], DType::F64),
-        );
-        let dvt = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: m * k + k,
-                len: k * n,
-            },
-            vec![ctx.upstream],
-            Shape::new(&[k * n], DType::F64),
-        );
-
-        let g_a = ctx.bwd.custom_op(
-            LINALG_SVD_BACKWARD,
-            Vec::new(),
-            vec![u_fwd, s_fwd, vt_fwd, du, ds, dvt],
-        );
-        vec![(0, g_a)]
-    }
-    fn jvp(&self, node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // Townsend forward via svd_jvp kernel. Inputs: (U_flat, s,
-        // Vt_flat, dA_flat); output packed [dU, ds, dVt].
-        let t_a = ctx.tangents[0]?;
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let a_shape = ctx.bwd.node(a_bwd).shape.clone();
-        let m = match a_shape.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return None,
-        };
-        let n = match a_shape.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return None,
-        };
-        let k = m.min(n);
-        let packed_fwd = ctx.fwd_map[&node.id];
-        let u_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: 0,
-                len: m * k,
-            },
-            vec![packed_fwd],
-            Shape::new(&[m * k], DType::F64),
-        );
-        let s_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: m * k,
-                len: k,
-            },
-            vec![packed_fwd],
-            Shape::new(&[k], DType::F64),
-        );
-        let vt_fwd = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: m * k + k,
-                len: k * n,
-            },
-            vec![packed_fwd],
-            Shape::new(&[k * n], DType::F64),
-        );
-        let da_flat = ctx.bwd.add_node(
-            rlx_ir::Op::Reshape {
-                new_shape: vec![(m * n) as i64],
-            },
-            vec![t_a],
-            Shape::new(&[m * n], DType::F64),
-        );
-        Some(ctx.bwd.custom_op(
-            LINALG_SVD_JVP,
-            Vec::new(),
-            vec![u_fwd, s_fwd, vt_fwd, da_flat],
-        ))
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct SvdCpu;
-
-#[cfg(feature = "cpu")]
-impl CpuKernel for SvdCpu {
-    fn name(&self) -> &str {
-        LINALG_SVD
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("svd A")?;
-        let a_shape = inputs[0].shape();
-        let m = match a_shape.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return Err("svd: dynamic dim 0".into()),
-        };
-        let n = match a_shape.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return Err("svd: dynamic dim 1".into()),
-        };
-        let out = output.expect_f64_mut("svd out")?;
-        algos::svd(a, m, n, out)
-    }
-}
-
-// ── LogDet ────────────────────────────────────────────────────────
-
-struct LogDetExt;
-
-impl OpExtension for LogDetExt {
-    fn name(&self) -> &str {
-        LINALG_LOGDET
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let a = inputs[0];
-        assert_eq!(a.dtype(), DType::F64, "logdet: A must be F64");
-        assert_eq!(a.rank(), 2, "logdet: A must be 2D");
-        // Scalar output.
-        Shape::new(&[1], DType::F64)
-    }
-    fn vjp(&self, node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        // dL/dA = dL/d(logdet) · A⁻¹  via the logdet_backward kernel.
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let g_a = ctx.bwd.custom_op(
-            LINALG_LOGDET_BACKWARD,
-            Vec::new(),
-            vec![a_bwd, ctx.upstream],
-        );
-        vec![(0, g_a)]
-    }
-    fn jvp(&self, node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // d/dt log|det(A(t))| = tr(A⁻¹·dA) = tr(solve(A, dA)).
-        let t_a = ctx.tangents[0]?;
-        let a = ctx.fwd_map[&node.inputs[0]];
-        let n = match ctx.bwd.shape(a).dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return None,
-        };
-        let x = ctx.bwd.dense_solve(a, t_a, Shape::new(&[n, n], DType::F64));
-        let d = ctx.bwd.custom_op(LINALG_DIAG_EXTRACT, Vec::new(), vec![x]);
-        // forward output is shape [1] (length-1 tensor), so keep_dim=true.
-        Some(ctx.bwd.sum(d, vec![0], true))
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct LogDetCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for LogDetCpu {
-    fn name(&self) -> &str {
-        LINALG_LOGDET
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("logdet A")?;
-        let out = output.expect_f64_mut("logdet out")?;
-        let n_sq = a.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("logdet: A length {n_sq} not n²"));
-        }
-        algos::logdet(a, n, out)
-    }
-}
-
-// ── SlogDet ───────────────────────────────────────────────────────
-
-struct SlogDetExt;
-
-impl OpExtension for SlogDetExt {
-    fn name(&self) -> &str {
-        LINALG_SLOGDET
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let a = inputs[0];
-        assert_eq!(a.dtype(), DType::F64, "slogdet: A must be F64");
-        assert_eq!(a.rank(), 2, "slogdet: A must be 2D");
-        Shape::new(&[2], DType::F64)
-    }
-    fn vjp(&self, node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        // upstream is dL/d(packed[2]). Extract index-1 (logabsdet grad)
-        // via Narrow; sign component is non-differentiable.
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let dl_d_logabs = ctx.bwd.add_node(
-            rlx_ir::Op::Narrow {
-                axis: 0,
-                start: 1,
-                len: 1,
-            },
-            vec![ctx.upstream],
-            Shape::new(&[1], DType::F64),
-        );
-        let g_a = ctx.bwd.custom_op(
-            LINALG_SLOGDET_BACKWARD,
-            Vec::new(),
-            vec![a_bwd, dl_d_logabs],
-        );
-        vec![(0, g_a)]
-    }
-    fn jvp(&self, node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // Output is packed [sign, log|det|]. Sign is non-differentiable
-        // (zero tangent); log|det| tangent is tr(A⁻¹·dA) like logdet.
-        let t_a = ctx.tangents[0]?;
-        let a = ctx.fwd_map[&node.inputs[0]];
-        let n = match ctx.bwd.shape(a).dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => return None,
-        };
-        let x = ctx.bwd.dense_solve(a, t_a, Shape::new(&[n, n], DType::F64));
-        let d = ctx.bwd.custom_op(LINALG_DIAG_EXTRACT, Vec::new(), vec![x]);
-        let t_logabs = ctx.bwd.sum(d, vec![0], true); // [1]
-        let zero = ctx.bwd.add_node(
-            rlx_ir::Op::Constant {
-                data: 0.0_f64.to_le_bytes().to_vec(),
-            },
-            vec![],
-            Shape::new(&[1], DType::F64),
-        );
-        Some(ctx.bwd.add_node(
-            rlx_ir::Op::Concat { axis: 0 },
-            vec![zero, t_logabs],
-            Shape::new(&[2], DType::F64),
-        ))
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct SlogDetCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for SlogDetCpu {
-    fn name(&self) -> &str {
-        LINALG_SLOGDET
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("slogdet A")?;
-        let out = output.expect_f64_mut("slogdet out")?;
-        let n_sq = a.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("slogdet: A length {n_sq} not n²"));
-        }
-        algos::slogdet(a, n, out)
-    }
-}
-
-struct SlogDetBackwardExt;
-
-impl OpExtension for SlogDetBackwardExt {
-    fn name(&self) -> &str {
-        LINALG_SLOGDET_BACKWARD
-    }
-    fn num_inputs(&self) -> usize {
-        2
-    } // A, dL/d(logabsdet)
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        inputs[0].clone()
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct SlogDetBackwardCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for SlogDetBackwardCpu {
-    fn name(&self) -> &str {
-        LINALG_SLOGDET_BACKWARD
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("slogdet_bwd A")?;
-        let dl_d = inputs[1].expect_f64("slogdet_bwd dL/d(logabsdet)")?;
-        let out = output.expect_f64_mut("slogdet_bwd out")?;
-        if dl_d.len() != 1 {
-            return Err(format!(
-                "slogdet_bwd: gradient must be scalar, got {}",
-                dl_d.len()
-            ));
-        }
-        let n_sq = a.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("slogdet_bwd: A length {n_sq} not n²"));
-        }
-        algos::slogdet_backward(a, dl_d[0], n, out)
-    }
-}
-
-// ── Diag extract / set ────────────────────────────────────────────
-
-struct DiagExtractExt;
-
-impl OpExtension for DiagExtractExt {
-    fn name(&self) -> &str {
-        LINALG_DIAG_EXTRACT
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let a = inputs[0];
-        assert_eq!(a.dtype(), DType::F64, "diag_extract: A must be F64");
-        assert_eq!(a.rank(), 2, "diag_extract: A must be 2D");
-        let n = match a.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("diag_extract: dynamic dim"),
-        };
-        Shape::new(&[n], DType::F64)
-    }
-    fn vjp(&self, _node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        // dL/dA = diag_set(upstream).
-        let g_a = ctx
-            .bwd
-            .custom_op(LINALG_DIAG_SET, Vec::new(), vec![ctx.upstream]);
-        vec![(0, g_a)]
-    }
-    fn jvp(&self, _node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // Linear op: dy = diag_extract(dA).
-        let t_a = ctx.tangents[0]?;
-        Some(
-            ctx.bwd
-                .custom_op(LINALG_DIAG_EXTRACT, Vec::new(), vec![t_a]),
-        )
-    }
-    fn vmap(&self, node: &Node, ctx: &mut rlx_ir::VmapContext) -> Option<NodeId> {
-        // Batched A: [B, n, n] → [B, n]. Unroll over the static batch
-        // dim: per batch, Narrow + Reshape + diag_extract + Reshape;
-        // then Concat along axis 0. Works for any dtype (no assumptions
-        // about Gather's f32-only kernel).
-        if !ctx.is_batched[0] {
-            return None;
-        }
-        let n = match node.shape.dim(0) {
-            rlx_ir::Dim::Static(n) => n,
-            _ => return None,
-        };
-        let b = ctx.batch_size;
-        let a_b = ctx.lifted_inputs[0];
-        let mut per_batch: Vec<NodeId> = Vec::with_capacity(b);
-        for k in 0..b {
-            let slice = ctx.out.add_node(
-                rlx_ir::Op::Narrow {
-                    axis: 0,
-                    start: k,
-                    len: 1,
-                },
-                vec![a_b],
-                Shape::new(&[1, n, n], DType::F64),
-            );
-            let mat = ctx.out.add_node(
-                rlx_ir::Op::Reshape {
-                    new_shape: vec![n as i64, n as i64],
-                },
-                vec![slice],
-                Shape::new(&[n, n], DType::F64),
-            );
-            let d = ctx
-                .out
-                .custom_op(LINALG_DIAG_EXTRACT, Vec::new(), vec![mat]);
-            let d_3d = ctx.out.add_node(
-                rlx_ir::Op::Reshape {
-                    new_shape: vec![1, n as i64],
-                },
-                vec![d],
-                Shape::new(&[1, n], DType::F64),
-            );
-            per_batch.push(d_3d);
-        }
-        Some(ctx.out.add_node(
-            rlx_ir::Op::Concat { axis: 0 },
-            per_batch,
-            Shape::new(&[b, n], DType::F64),
-        ))
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct DiagExtractCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for DiagExtractCpu {
-    fn name(&self) -> &str {
-        LINALG_DIAG_EXTRACT
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("diag_extract A")?;
-        let out = output.expect_f64_mut("diag_extract out")?;
-        let n = out.len();
-        if a.len() != n * n {
-            return Err(format!("diag_extract: A {} ≠ n²={}·{}", a.len(), n, n));
-        }
-        algos::diag_extract(a, n, out)
-    }
-}
-
-struct DiagSetExt;
-
-impl OpExtension for DiagSetExt {
-    fn name(&self) -> &str {
-        LINALG_DIAG_SET
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let v = inputs[0];
-        assert_eq!(v.dtype(), DType::F64, "diag_set: v must be F64");
-        assert_eq!(v.rank(), 1, "diag_set: v must be 1D");
-        let n = match v.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("diag_set: dynamic dim"),
-        };
-        Shape::new(&[n, n], DType::F64)
-    }
-    fn vjp(&self, _node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        // dL/dv = diag_extract(upstream).
-        let g_v = ctx
-            .bwd
-            .custom_op(LINALG_DIAG_EXTRACT, Vec::new(), vec![ctx.upstream]);
-        vec![(0, g_v)]
-    }
-    fn jvp(&self, _node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // Linear op: dM = diag_set(dv).
-        let t_v = ctx.tangents[0]?;
-        Some(ctx.bwd.custom_op(LINALG_DIAG_SET, Vec::new(), vec![t_v]))
-    }
-    fn vmap(&self, node: &Node, ctx: &mut rlx_ir::VmapContext) -> Option<NodeId> {
-        // Batched v: [B, n] → [B, n, n]. Per-batch unroll mirroring
-        // diag_extract's vmap.
-        if !ctx.is_batched[0] {
-            return None;
-        }
-        let n = match node.shape.dim(0) {
-            rlx_ir::Dim::Static(n) => n,
-            _ => return None,
-        };
-        let b = ctx.batch_size;
-        let v_b = ctx.lifted_inputs[0];
-        let mut per_batch: Vec<NodeId> = Vec::with_capacity(b);
-        for k in 0..b {
-            let slice = ctx.out.add_node(
-                rlx_ir::Op::Narrow {
-                    axis: 0,
-                    start: k,
-                    len: 1,
-                },
-                vec![v_b],
-                Shape::new(&[1, n], DType::F64),
-            );
-            let vec1d = ctx.out.add_node(
-                rlx_ir::Op::Reshape {
-                    new_shape: vec![n as i64],
-                },
-                vec![slice],
-                Shape::new(&[n], DType::F64),
-            );
-            let m = ctx.out.custom_op(LINALG_DIAG_SET, Vec::new(), vec![vec1d]);
-            let m_3d = ctx.out.add_node(
-                rlx_ir::Op::Reshape {
-                    new_shape: vec![1, n as i64, n as i64],
-                },
-                vec![m],
-                Shape::new(&[1, n, n], DType::F64),
-            );
-            per_batch.push(m_3d);
-        }
-        Some(ctx.out.add_node(
-            rlx_ir::Op::Concat { axis: 0 },
-            per_batch,
-            Shape::new(&[b, n, n], DType::F64),
-        ))
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct DiagSetCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for DiagSetCpu {
-    fn name(&self) -> &str {
-        LINALG_DIAG_SET
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _: &[u8],
-    ) -> Result<(), String> {
-        let v = inputs[0].expect_f64("diag_set v")?;
-        let out = output.expect_f64_mut("diag_set out")?;
-        let n = v.len();
-        if out.len() != n * n {
-            return Err(format!("diag_set: out {} ≠ n²={}·{}", out.len(), n, n));
-        }
-        algos::diag_set(v, n, out)
-    }
-}
-
-// ── Expm ──────────────────────────────────────────────────────────
-
-struct ExpmExt;
-
-impl OpExtension for ExpmExt {
-    fn name(&self) -> &str {
-        LINALG_EXPM
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let a = inputs[0];
-        assert_eq!(a.dtype(), DType::F64, "expm: A must be F64");
-        assert_eq!(a.rank(), 2, "expm: A must be 2D");
-        a.clone()
-    }
-    fn vjp(&self, node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let g_a = ctx
-            .bwd
-            .custom_op(LINALG_EXPM_BACKWARD, Vec::new(), vec![a_bwd, ctx.upstream]);
-        vec![(0, g_a)]
-    }
-    fn jvp(&self, _node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // Frechet derivative via augmented-matrix kernel.
-        let t_a = ctx.tangents[0]?;
-        let a = ctx.fwd_map[&_node.inputs[0]];
-        Some(ctx.bwd.custom_op(LINALG_EXPM_JVP, Vec::new(), vec![a, t_a]))
-    }
-}
-
-struct ExpmJvpExt;
-
-impl OpExtension for ExpmJvpExt {
-    fn name(&self) -> &str {
-        LINALG_EXPM_JVP
-    }
-    fn num_inputs(&self) -> usize {
-        2
-    } // A, dA
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        inputs[0].clone()
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct ExpmJvpCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for ExpmJvpCpu {
-    fn name(&self) -> &str {
-        LINALG_EXPM_JVP
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("expm_jvp A")?;
-        let da = inputs[1].expect_f64("expm_jvp dA")?;
-        let out = output.expect_f64_mut("expm_jvp out")?;
-        let n_sq = a.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("expm_jvp: A length {n_sq} not n²"));
-        }
-        algos::expm_jvp(a, da, n, out)
-    }
-}
-
-// ── QR JVP ────────────────────────────────────────────────────────
-
-struct QrJvpExt;
-
-impl OpExtension for QrJvpExt {
-    fn name(&self) -> &str {
-        LINALG_QR_JVP
-    }
-    fn num_inputs(&self) -> usize {
-        3
-    } // Q_flat, R_flat, dA_flat
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        // Output packed [dQ (m·k), dR (k·n)] — same length as Q + R together.
-        let q_len = inputs[0].num_elements().expect("qr_jvp: dynamic shape");
-        let r_len = inputs[1].num_elements().expect("qr_jvp: dynamic shape");
-        Shape::new(&[q_len + r_len], DType::F64)
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct QrJvpCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for QrJvpCpu {
-    fn name(&self) -> &str {
-        LINALG_QR_JVP
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _: &[u8],
-    ) -> Result<(), String> {
-        let q = inputs[0].expect_f64("qr_jvp Q")?;
-        let r = inputs[1].expect_f64("qr_jvp R")?;
-        let da = inputs[2].expect_f64("qr_jvp dA")?;
-        let out = output.expect_f64_mut("qr_jvp out")?;
-        let r_len = r.len();
-        let n = (r_len as f64).sqrt() as usize;
-        if n * n != r_len {
-            return Err(format!(
-                "qr_jvp: R must be square (m≥n thin QR), got len {r_len}"
-            ));
-        }
-        let m = q.len() / n;
-        algos::qr_jvp(q, r, da, m, n, out)
-    }
-}
-
-// ── SVD JVP ───────────────────────────────────────────────────────
-
-struct SvdJvpExt;
-
-impl OpExtension for SvdJvpExt {
-    fn name(&self) -> &str {
-        LINALG_SVD_JVP
-    }
-    fn num_inputs(&self) -> usize {
-        4
-    } // U_flat, s, Vt_flat, dA_flat
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let u_len = inputs[0].num_elements().expect("svd_jvp: dynamic shape");
-        let s_len = inputs[1].num_elements().expect("svd_jvp: dynamic shape");
-        let vt_len = inputs[2].num_elements().expect("svd_jvp: dynamic shape");
-        Shape::new(&[u_len + s_len + vt_len], DType::F64)
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct SvdJvpCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for SvdJvpCpu {
-    fn name(&self) -> &str {
-        LINALG_SVD_JVP
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _: &[u8],
-    ) -> Result<(), String> {
-        let u = inputs[0].expect_f64("svd_jvp U")?;
-        let s = inputs[1].expect_f64("svd_jvp s")?;
-        let vt = inputs[2].expect_f64("svd_jvp Vt")?;
-        let da = inputs[3].expect_f64("svd_jvp dA")?;
-        let out = output.expect_f64_mut("svd_jvp out")?;
-        let k = s.len();
-        let m = u.len() / k;
-        let n = vt.len() / k;
-        algos::svd_jvp(u, s, vt, da, m, n, out)
-    }
-}
-
-// ── Pinv JVP ──────────────────────────────────────────────────────
-
-struct PinvJvpExt;
-
-impl OpExtension for PinvJvpExt {
-    fn name(&self) -> &str {
-        LINALG_PINV_JVP
-    }
-    fn num_inputs(&self) -> usize {
-        2
-    } // A, dA
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        // Output = pinv shape [n, m] (transpose of A's [m, n]).
-        let a = inputs[0];
-        let m = match a.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("pinv_jvp: dynamic dim"),
-        };
-        let n = match a.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("pinv_jvp: dynamic dim"),
-        };
-        Shape::new(&[n, m], DType::F64)
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct PinvJvpCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for PinvJvpCpu {
-    fn name(&self) -> &str {
-        LINALG_PINV_JVP
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("pinv_jvp A")?;
-        let da = inputs[1].expect_f64("pinv_jvp dA")?;
-        let out = output.expect_f64_mut("pinv_jvp out")?;
-        // Recover m from attrs (encoded by pinv builder).
-        if attrs.len() < 4 {
-            return Err("pinv_jvp: attrs must encode m (u32 LE)".into());
-        }
-        let m = u32::from_le_bytes(attrs[..4].try_into().unwrap()) as usize;
-        if m == 0 || a.len() % m != 0 {
-            return Err(format!("pinv_jvp: bad attrs m={m}"));
-        }
-        let n = a.len() / m;
-        algos::pinv_jvp(a, da, m, n, out)
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct ExpmCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for ExpmCpu {
-    fn name(&self) -> &str {
-        LINALG_EXPM
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("expm A")?;
-        let out = output.expect_f64_mut("expm out")?;
-        let n_sq = a.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("expm: A length {n_sq} not n²"));
-        }
-        algos::expm(a, n, out)
-    }
-}
-
-struct ExpmBackwardExt;
-
-impl OpExtension for ExpmBackwardExt {
-    fn name(&self) -> &str {
-        LINALG_EXPM_BACKWARD
-    }
-    fn num_inputs(&self) -> usize {
-        2
-    } // A, dL/d(exp(A))
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        inputs[0].clone()
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct ExpmBackwardCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for ExpmBackwardCpu {
-    fn name(&self) -> &str {
-        LINALG_EXPM_BACKWARD
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("expm_bwd A")?;
-        let g = inputs[1].expect_f64("expm_bwd dL/d(exp)")?;
-        let out = output.expect_f64_mut("expm_bwd out")?;
-        let n_sq = a.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("expm_bwd: A length {n_sq} not n²"));
-        }
-        algos::expm_backward(a, g, n, out)
-    }
-}
-
-// ── Pinv ──────────────────────────────────────────────────────────
-
-struct PinvExt;
-
-impl OpExtension for PinvExt {
-    fn name(&self) -> &str {
-        LINALG_PINV
-    }
-    fn num_inputs(&self) -> usize {
-        1
-    }
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let a = inputs[0];
-        assert_eq!(a.dtype(), DType::F64, "pinv: A must be F64");
-        assert_eq!(a.rank(), 2, "pinv: A must be 2D");
-        let m = match a.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("pinv: dynamic dim"),
-        };
-        let n = match a.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("pinv: dynamic dim"),
-        };
-        Shape::new(&[n, m], DType::F64)
-    }
-    fn vjp(&self, node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        // Y = pinv(A); pinv_backward needs (A, Y, dL/dY) and the m attr.
-        let attrs = match &node.op {
-            rlx_ir::Op::Custom { attrs, .. } => attrs.clone(),
-            _ => return vec![],
-        };
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let y_bwd = ctx.fwd_map[&node.id];
-        let g_a = ctx.bwd.custom_op(
-            LINALG_PINV_BACKWARD,
-            attrs,
-            vec![a_bwd, y_bwd, ctx.upstream],
-        );
-        vec![(0, g_a)]
-    }
-    fn jvp(&self, node: &Node, ctx: &mut rlx_ir::JvpContext) -> Option<NodeId> {
-        // Forward Frechet via pinv_jvp kernel (does its own internal SVD).
-        let t_a = ctx.tangents[0]?;
-        let attrs = match &node.op {
-            rlx_ir::Op::Custom { attrs, .. } => attrs.clone(),
-            _ => return None,
-        };
-        let a = ctx.fwd_map[&node.inputs[0]];
-        Some(ctx.bwd.custom_op(LINALG_PINV_JVP, attrs, vec![a, t_a]))
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct PinvCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for PinvCpu {
-    fn name(&self) -> &str {
-        LINALG_PINV
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("pinv A")?;
-        let out = output.expect_f64_mut("pinv out")?;
-        // Output shape is [n, m]; recover m, n via known total = m·n
-        // and the fact that sqrt is needed here is ambiguous. Use the
-        // attrs-free convention: square root only works for square A.
-        // Better: forward pass takes m, n from attrs… but we don't have
-        // them. Recover from output length and input length:
-        //   a.len() == m·n,  out.len() == n·m  (same number).
-        // We need m and n separately. Pull from input shape via
-        // OpExtension::infer_shape having already validated it; here
-        // we re-derive from sizes: lacking shape access, encode in
-        // attrs. v1 simplification: assume row-major contiguous and
-        // recover m from output's leading dim later. For now, re-derive
-        // by requiring the kernel be called only when the executor has
-        // already wired inputs sized m·n. We use the approach: factor
-        // out the ambiguity by passing m as the first 4 bytes of attrs.
-        // (Done below via attrs.)
-        // FALLBACK: scan factors of a.len() to find best (m,n) such
-        // that m·n = a.len(); ambiguous. We instead require attrs.
-        let mn = a.len();
-        // Attrs encode m as little-endian u32 (n derived as mn/m).
-        // Builder always sets this.
-        let attrs = _attrs;
-        if attrs.len() < 4 {
-            return Err("pinv: attrs must encode m (u32 LE)".into());
-        }
-        let m = u32::from_le_bytes(attrs[..4].try_into().unwrap()) as usize;
-        if m == 0 || mn % m != 0 {
-            return Err(format!("pinv: bad attrs m={m} for input len {mn}"));
-        }
-        let n = mn / m;
-        algos::pinv(a, m, n, out)
-    }
-}
-
-struct PinvBackwardExt;
-
-impl OpExtension for PinvBackwardExt {
-    fn name(&self) -> &str {
-        LINALG_PINV_BACKWARD
-    }
-    fn num_inputs(&self) -> usize {
-        3
-    } // A, Y, dL/dY
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        inputs[0].clone() // dL/dA shape == A shape
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct PinvBackwardCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for PinvBackwardCpu {
-    fn name(&self) -> &str {
-        LINALG_PINV_BACKWARD
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("pinv_bwd A")?;
-        let y = inputs[1].expect_f64("pinv_bwd Y")?;
-        let g = inputs[2].expect_f64("pinv_bwd dL/dY")?;
-        let out = output.expect_f64_mut("pinv_bwd out")?;
-        // Recover m, n: a.len() = m·n, y.len() = n·m. Need m alone.
-        // Y has shape n×m and a has shape m×n; out has shape m×n.
-        // Use out.len() = m·n, and recover m via gcd? Better: encode
-        // attrs again. v1: take attrs[0..4] as m (u32 LE).
-        let attrs = _attrs;
-        if attrs.len() < 4 {
-            return Err("pinv_bwd: attrs must encode m (u32 LE)".into());
-        }
-        let m = u32::from_le_bytes(attrs[..4].try_into().unwrap()) as usize;
-        if m == 0 || a.len() % m != 0 {
-            return Err(format!("pinv_bwd: bad attrs m={m}"));
-        }
-        let n = a.len() / m;
-        algos::pinv_backward(a, y, g, m, n, out)
-    }
-}
-
-// ── Lstsq ─────────────────────────────────────────────────────────
-
-struct LstsqExt;
-
-impl OpExtension for LstsqExt {
-    fn name(&self) -> &str {
-        LINALG_LSTSQ
-    }
-    fn num_inputs(&self) -> usize {
-        2
-    } // A (m×n), b (m)
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let a = inputs[0];
-        let b = inputs[1];
-        assert_eq!(a.dtype(), DType::F64, "lstsq: A must be F64");
-        assert_eq!(a.rank(), 2, "lstsq: A must be 2D");
-        assert_eq!(b.rank(), 1, "lstsq: b must be 1D");
-        let n = match a.dim(1) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("lstsq: dynamic dim"),
-        };
-        Shape::new(&[n], DType::F64)
-    }
-    fn vjp(&self, node: &Node, ctx: &mut VjpContext) -> Vec<(usize, NodeId)> {
-        let a_bwd = ctx.fwd_map[&node.inputs[0]];
-        let b_bwd = ctx.fwd_map[&node.inputs[1]];
-        let x_bwd = ctx.fwd_map[&node.id];
-        let g_a = ctx.bwd.custom_op(
-            LINALG_LSTSQ_BACKWARD_A,
-            Vec::new(),
-            vec![a_bwd, x_bwd, b_bwd, ctx.upstream],
-        );
-        let g_b = ctx.bwd.custom_op(
-            LINALG_LSTSQ_BACKWARD_B,
-            Vec::new(),
-            vec![a_bwd, ctx.upstream],
-        );
-        vec![(0, g_a), (1, g_b)]
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct LstsqCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for LstsqCpu {
-    fn name(&self) -> &str {
-        LINALG_LSTSQ
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("lstsq A")?;
-        let b = inputs[1].expect_f64("lstsq b")?;
-        let out = output.expect_f64_mut("lstsq out")?;
-        let m = b.len();
-        let n = out.len();
-        if a.len() != m * n {
-            return Err(format!("lstsq: A len {} != m·n = {}·{}", a.len(), m, n));
-        }
-        algos::lstsq(a, b, m, n, out)
-    }
-}
-
-struct LstsqBackwardAExt;
-
-impl OpExtension for LstsqBackwardAExt {
-    fn name(&self) -> &str {
-        LINALG_LSTSQ_BACKWARD_A
-    }
-    fn num_inputs(&self) -> usize {
-        4
-    } // A, x, b, dL/dx
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        inputs[0].clone()
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct LstsqBackwardACpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for LstsqBackwardACpu {
-    fn name(&self) -> &str {
-        LINALG_LSTSQ_BACKWARD_A
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("lstsq_bwd_a A")?;
-        let x = inputs[1].expect_f64("lstsq_bwd_a x")?;
-        let b = inputs[2].expect_f64("lstsq_bwd_a b")?;
-        let dl_dx = inputs[3].expect_f64("lstsq_bwd_a dL/dx")?;
-        let out = output.expect_f64_mut("lstsq_bwd_a out")?;
-        let m = b.len();
-        let n = x.len();
-        if a.len() != m * n || dl_dx.len() != n || out.len() != m * n {
-            return Err(format!("lstsq_bwd_a: shape mismatch (m={m}, n={n})"));
-        }
-        algos::lstsq_backward_a(a, x, b, dl_dx, m, n, out)
-    }
-}
-
-struct LstsqBackwardBExt;
-
-impl OpExtension for LstsqBackwardBExt {
-    fn name(&self) -> &str {
-        LINALG_LSTSQ_BACKWARD_B
-    }
-    fn num_inputs(&self) -> usize {
-        2
-    } // A, dL/dx
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        let a = inputs[0];
-        let m = match a.dim(0) {
-            rlx_ir::Dim::Static(v) => v,
-            _ => panic!("lstsq_bwd_b: dynamic dim"),
-        };
-        Shape::new(&[m], DType::F64)
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct LstsqBackwardBCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for LstsqBackwardBCpu {
-    fn name(&self) -> &str {
-        LINALG_LSTSQ_BACKWARD_B
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("lstsq_bwd_b A")?;
-        let dl_dx = inputs[1].expect_f64("lstsq_bwd_b dL/dx")?;
-        let out = output.expect_f64_mut("lstsq_bwd_b out")?;
-        let m = out.len();
-        let n = dl_dx.len();
-        if a.len() != m * n {
-            return Err(format!("lstsq_bwd_b: A {} ≠ m·n = {}·{}", a.len(), m, n));
-        }
-        algos::lstsq_backward_b(a, dl_dx, m, n, out)
-    }
-}
-
-// ── Cholesky JVP ──────────────────────────────────────────────────
-
-struct CholeskyJvpExt;
-
-impl OpExtension for CholeskyJvpExt {
-    fn name(&self) -> &str {
-        LINALG_CHOLESKY_JVP
-    }
-    fn num_inputs(&self) -> usize {
-        2
-    } // L, dA
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        inputs[0].clone()
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct CholeskyJvpCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for CholeskyJvpCpu {
-    fn name(&self) -> &str {
-        LINALG_CHOLESKY_JVP
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        attrs: &[u8],
-    ) -> Result<(), String> {
-        let l = inputs[0].expect_f64("chol_jvp L")?;
-        let da = inputs[1].expect_f64("chol_jvp dA")?;
-        let out = output.expect_f64_mut("chol_jvp out")?;
-        let lower = attrs.first().copied().unwrap_or(1) != 0;
-        let n_sq = l.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("chol_jvp: n²={n_sq}"));
-        }
-        algos::cholesky_jvp(l, da, n, lower, out)
-    }
-}
-
-// ── Backward ops ──────────────────────────────────────────────────
-
-struct CholeskyBackwardExt;
-
-impl OpExtension for CholeskyBackwardExt {
-    fn name(&self) -> &str {
-        LINALG_CHOLESKY_BACKWARD
-    }
-    fn num_inputs(&self) -> usize {
-        2
-    } // L, dL/dL
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        inputs[0].clone() // dL/dA has the same shape as L (= A)
-    }
-    // No second-order VJP (returns empty).
-}
-
-#[cfg(feature = "cpu")]
-struct CholeskyBackwardCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for CholeskyBackwardCpu {
-    fn name(&self) -> &str {
-        LINALG_CHOLESKY_BACKWARD
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        attrs: &[u8],
-    ) -> Result<(), String> {
-        let l = inputs[0].expect_f64("chol_bwd L")?;
-        let dl_dl = inputs[1].expect_f64("chol_bwd dL/dL")?;
-        let out = output.expect_f64_mut("chol_bwd out")?;
-        let lower = attrs.first().copied().unwrap_or(1) != 0;
-        let n_sq = l.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("chol_bwd: n²={n_sq}"));
-        }
-        algos::cholesky_backward(l, dl_dl, n, lower, out)
-    }
-}
-
-struct EighBackwardExt;
-
-impl OpExtension for EighBackwardExt {
-    fn name(&self) -> &str {
-        LINALG_EIGH_BACKWARD
-    }
-    fn num_inputs(&self) -> usize {
-        4
-    } // λ, V_flat, dL/dλ, dL/dV_flat
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        // dL/dA has shape [n, n] where n = inputs[0].len.
-        let n = inputs[0]
-            .num_elements()
-            .expect("eigh_bwd: λ must have static shape");
-        Shape::new(&[n, n], DType::F64)
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct EighBackwardCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for EighBackwardCpu {
-    fn name(&self) -> &str {
-        LINALG_EIGH_BACKWARD
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let lambda = inputs[0].expect_f64("eigh_bwd λ")?;
-        let v_flat = inputs[1].expect_f64("eigh_bwd V")?;
-        let dl_dl = inputs[2].expect_f64("eigh_bwd dL/dλ")?;
-        let dl_dv = inputs[3].expect_f64("eigh_bwd dL/dV")?;
-        let out = output.expect_f64_mut("eigh_bwd out")?;
-        let n = lambda.len();
-        algos::eigh_backward(lambda, v_flat, dl_dl, dl_dv, n, out)
-    }
-}
-
-struct QrBackwardExt;
-
-impl OpExtension for QrBackwardExt {
-    fn name(&self) -> &str {
-        LINALG_QR_BACKWARD
-    }
-    fn num_inputs(&self) -> usize {
-        4
-    } // Q_flat, R_flat, dL/dQ_flat, dL/dR_flat
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        // Q has m·k flat; R has k·n flat. dL/dA has shape [m, n].
-        // Recover m, n from input lengths assuming k = min(m, n).
-        // For the test cases we know m ≥ n (k = n), so m = q_len / n
-        // and n = r_len / k. Build shape [m, n].
-        let q_len = inputs[0].num_elements().expect("qr_bwd: dynamic shape");
-        let r_len = inputs[1].num_elements().expect("qr_bwd: dynamic shape");
-        // For thin QR with k = n: q_len = m·n, r_len = n·n.
-        let n = (r_len as f64).sqrt() as usize;
-        assert_eq!(n * n, r_len, "qr_bwd: R must be square (m≥n thin QR)");
-        let m = q_len / n;
-        Shape::new(&[m, n], DType::F64)
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct QrBackwardCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for QrBackwardCpu {
-    fn name(&self) -> &str {
-        LINALG_QR_BACKWARD
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let q = inputs[0].expect_f64("qr_bwd Q")?;
-        let r = inputs[1].expect_f64("qr_bwd R")?;
-        let dl_dq = inputs[2].expect_f64("qr_bwd dL/dQ")?;
-        let dl_dr = inputs[3].expect_f64("qr_bwd dL/dR")?;
-        let out = output.expect_f64_mut("qr_bwd out")?;
-        let r_len = r.len();
-        let n = (r_len as f64).sqrt() as usize;
-        if n * n != r_len {
-            return Err(format!("qr_bwd: R must be n²={r_len}"));
-        }
-        let m = q.len() / n;
-        if m * n != q.len() {
-            return Err(format!("qr_bwd: Q shape {}/n={n} not int", q.len()));
-        }
-        algos::qr_backward(q, r, dl_dq, dl_dr, m, n, out)
-    }
-}
-
-struct SvdBackwardExt;
-
-impl OpExtension for SvdBackwardExt {
-    fn name(&self) -> &str {
-        LINALG_SVD_BACKWARD
-    }
-    fn num_inputs(&self) -> usize {
-        6
-    } // U, s, Vt, dU, ds, dVt
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        // dL/dA shape is [m, n]. Recover from input lengths:
-        //   U: m·k flat, s: k flat, Vt: k·n flat. k = s.len.
-        let k = inputs[1].num_elements().expect("svd_bwd: dynamic shape");
-        let u_len = inputs[0].num_elements().expect("svd_bwd: dynamic shape");
-        let vt_len = inputs[2].num_elements().expect("svd_bwd: dynamic shape");
-        let m = u_len / k;
-        let n = vt_len / k;
-        Shape::new(&[m, n], DType::F64)
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct SvdBackwardCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for SvdBackwardCpu {
-    fn name(&self) -> &str {
-        LINALG_SVD_BACKWARD
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let u = inputs[0].expect_f64("svd_bwd U")?;
-        let s = inputs[1].expect_f64("svd_bwd s")?;
-        let vt = inputs[2].expect_f64("svd_bwd Vt")?;
-        let dl_du = inputs[3].expect_f64("svd_bwd dL/dU")?;
-        let dl_ds = inputs[4].expect_f64("svd_bwd dL/ds")?;
-        let dl_dvt = inputs[5].expect_f64("svd_bwd dL/dVt")?;
-        let out = output.expect_f64_mut("svd_bwd out")?;
-        let k = s.len();
-        let m = u.len() / k;
-        let n = vt.len() / k;
-        algos::svd_backward(u, s, vt, dl_du, dl_ds, dl_dvt, m, n, out)
-    }
-}
-
-struct LogDetBackwardExt;
-
-impl OpExtension for LogDetBackwardExt {
-    fn name(&self) -> &str {
-        LINALG_LOGDET_BACKWARD
-    }
-    fn num_inputs(&self) -> usize {
-        2
-    } // A, dL/d(logdet) (scalar)
-    fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
-        inputs[0].clone()
-    }
-}
-
-#[cfg(feature = "cpu")]
-struct LogDetBackwardCpu;
-#[cfg(feature = "cpu")]
-impl CpuKernel for LogDetBackwardCpu {
-    fn name(&self) -> &str {
-        LINALG_LOGDET_BACKWARD
-    }
-    fn execute(
-        &self,
-        inputs: &[CpuTensorRef<'_>],
-        output: CpuTensorMut<'_>,
-        _attrs: &[u8],
-    ) -> Result<(), String> {
-        let a = inputs[0].expect_f64("logdet_bwd A")?;
-        let dl_d_lg = inputs[1].expect_f64("logdet_bwd dL/d(logdet)")?;
-        let out = output.expect_f64_mut("logdet_bwd out")?;
-        if dl_d_lg.len() != 1 {
-            return Err(format!(
-                "logdet_bwd: dL/d(logdet) must be scalar, got len {}",
-                dl_d_lg.len()
-            ));
-        }
-        let n_sq = a.len();
-        let n = (n_sq as f64).sqrt() as usize;
-        if n * n != n_sq {
-            return Err(format!("logdet_bwd: A length {n_sq} not n²"));
-        }
-        algos::logdet_backward(a, dl_d_lg[0], n, out)
-    }
-}
-
-// ── Public builder API ───────────────────────────────────────────
 
 /// `L = cholesky(A)`. A is row-major n×n SPD F64. Returns L (lower
 /// triangular if `lower`, else U upper) of shape `[n, n]` F64 with
@@ -3729,6 +1833,7 @@ pub fn cholesky(g: &mut Graph, a: NodeId, lower: bool) -> NodeId {
     let attrs = vec![if lower { 1 } else { 0 }];
     g.custom_op(LINALG_CHOLESKY, attrs, vec![a])
 }
+
 
 /// Solve `op(A)·X = B` where A is triangular. `lower` selects which
 /// triangle of A is read; `transpose_a` toggles `op(A) = Aᵀ`.
@@ -3743,6 +1848,7 @@ pub fn solve_triangular(
     let attrs = vec![if lower { 1 } else { 0 }, if transpose_a { 1 } else { 0 }];
     g.custom_op(LINALG_SOLVE_TRIANGULAR, attrs, vec![a, b])
 }
+
 
 /// `(eigvals, eigvecs) = eigh(A)`. A is symmetric n×n F64.
 /// Returns:
@@ -3782,6 +1888,7 @@ pub fn eigh(g: &mut Graph, a: NodeId) -> (NodeId, NodeId) {
     );
     (eigvals, eigvecs)
 }
+
 
 /// `(Q, R) = qr(A)`. A is m×n F64. Returns:
 ///   - `Q`: shape `[m, k]` F64 with `k = min(m, n)`
@@ -3833,6 +1940,7 @@ pub fn qr(g: &mut Graph, a: NodeId) -> (NodeId, NodeId) {
     (q, r)
 }
 
+
 /// `logdet(A)` for SPD A — log-determinant computed via Cholesky:
 /// `2 · Σ log L[i,i]` where `L = chol(A, lower)`. Output shape `[1]`
 /// F64. VJP: `dL/dA = dL/d(logdet) · A⁻¹`.
@@ -3840,15 +1948,18 @@ pub fn logdet(g: &mut Graph, a: NodeId) -> NodeId {
     g.custom_op(LINALG_LOGDET, Vec::new(), vec![a])
 }
 
+
 /// Extract the diagonal of a square matrix `A: [n, n]` → `[n]`.
 pub fn diag_extract(g: &mut Graph, a: NodeId) -> NodeId {
     g.custom_op(LINALG_DIAG_EXTRACT, Vec::new(), vec![a])
 }
 
+
 /// Build a diagonal matrix from a vector `v: [n]` → `[n, n]`.
 pub fn diag_set(g: &mut Graph, v: NodeId) -> NodeId {
     g.custom_op(LINALG_DIAG_SET, Vec::new(), vec![v])
 }
+
 
 /// `trace(A)`: sum of diagonal entries. Pure composition of
 /// `diag_extract` + reduction; VJP is the diag_set of the upstream.
@@ -3856,6 +1967,7 @@ pub fn trace(g: &mut Graph, a: NodeId) -> NodeId {
     let d = diag_extract(g, a);
     g.sum(d, vec![0], false)
 }
+
 
 /// Kronecker product `kron(A, B)`. For `A: [m, n]` and `B: [p, q]`
 /// produces `[m·p, n·q]` with `kron[i·p+r, j·q+s] = A[i,j]·B[r,s]`.
@@ -3928,6 +2040,7 @@ pub fn kron(g: &mut Graph, a: NodeId, b: NodeId) -> NodeId {
     )
 }
 
+
 /// Polar decomposition `A = U · H` where U is orthogonal and H is SPD.
 /// Computed via thin SVD: `A = U_svd · S · V^T` ⇒
 ///   `U = U_svd · V^T`,  `H = V · S · V^T`.
@@ -3963,12 +2076,14 @@ pub fn polar(g: &mut Graph, a: NodeId) -> (NodeId, NodeId) {
     (u_orth, h)
 }
 
+
 /// `expm(A)`: matrix exponential via Padé-13 + scaling-and-squaring.
 /// A is square n×n F64; output is n×n F64. VJP via Al-Mohy/Higham
 /// augmented-matrix trick.
 pub fn expm(g: &mut Graph, a: NodeId) -> NodeId {
     g.custom_op(LINALG_EXPM, Vec::new(), vec![a])
 }
+
 
 /// `pinv(A)`: Moore-Penrose pseudo-inverse via thin SVD. A is m×n F64;
 /// output is n×m F64. For full-rank A this is `(AᵀA)⁻¹·Aᵀ` (m≥n) or
@@ -3988,12 +2103,14 @@ pub fn pinv(g: &mut Graph, a: NodeId) -> NodeId {
     g.custom_op(LINALG_PINV, attrs, vec![a])
 }
 
+
 /// `lstsq(A, b)`: x = pinv(A)·b. A is m×n F64; b is m F64; x is n F64.
 /// VJP supports the full-column-rank case (m ≥ n). For under-determined
 /// systems, the same kernel returns the minimum-norm solution.
 pub fn lstsq(g: &mut Graph, a: NodeId, b: NodeId) -> NodeId {
     g.custom_op(LINALG_LSTSQ, Vec::new(), vec![a, b])
 }
+
 
 /// `(sign, log|det|) = slogdet(A)` for general square A. Computed
 /// via LU with partial pivoting. Returns two scalar nodes.
@@ -4020,6 +2137,7 @@ pub fn slogdet(g: &mut Graph, a: NodeId) -> (NodeId, NodeId) {
     );
     (sign, logabsdet)
 }
+
 
 /// `(U, S, Vᵀ) = svd(A)` (thin / "S" mode). A is m×n F64. Returns:
 ///   - `U`:  `[m, k]`  F64
@@ -4084,6 +2202,7 @@ pub fn svd(g: &mut Graph, a: NodeId) -> (NodeId, NodeId, NodeId) {
 
 // ── Host LAPACK (non-graph callers) ──────────────────────────────
 
+
 /// Dense LAPACK wrappers for host-side crates (eda-doa, eda-fullwave, …).
 #[cfg(feature = "cpu")]
 pub mod host {
@@ -4091,6 +2210,7 @@ pub mod host {
 }
 
 // ── Registration ─────────────────────────────────────────────────
+
 
 /// Register every linalg op's IR-level extension and per-backend
 /// kernels enabled at compile time.
@@ -4156,3 +2276,4 @@ pub fn register() {
         register_cpu_kernel(Arc::new(LstsqBackwardBCpu));
     }
 }
+

@@ -692,6 +692,111 @@ pub fn conv_transpose2d_output_shape(
     ))
 }
 
+/// Output shape for NCDHW `Op::Conv3d` given weight `[C_out, C_in/g, kD, kH, kW]`.
+/// Reuses the 1-D `conv2d_spatial_output` formula per spatial axis.
+#[allow(clippy::too_many_arguments)]
+pub fn conv3d_output_shape(
+    input: &Shape,
+    weight: &Shape,
+    kernel_size: [usize; 3],
+    stride: [usize; 3],
+    padding: [usize; 3],
+    dilation: [usize; 3],
+    groups: usize,
+) -> Result<Shape, String> {
+    if input.rank() != 5 || weight.rank() != 5 {
+        return Err("conv3d requires NCDHW input and 5-D weight".into());
+    }
+    let n = input.dim(0);
+    let c_in = input.dim(1).unwrap_static();
+    let d = input.dim(2).unwrap_static();
+    let h = input.dim(3).unwrap_static();
+    let w = input.dim(4).unwrap_static();
+    let c_out = weight.dim(0).unwrap_static();
+    let w_cin = weight.dim(1).unwrap_static();
+    if w_cin * groups != c_in {
+        return Err(format!(
+            "conv3d weight C_in/g={w_cin} * groups={groups} != input C={c_in}"
+        ));
+    }
+    let d_out = conv2d_spatial_output(d, kernel_size[0], stride[0], padding[0], dilation[0]);
+    let h_out = conv2d_spatial_output(h, kernel_size[1], stride[1], padding[1], dilation[1]);
+    let w_out = conv2d_spatial_output(w, kernel_size[2], stride[2], padding[2], dilation[2]);
+    Ok(Shape::from_dims(
+        &[
+            n,
+            Dim::Static(c_out),
+            Dim::Static(d_out),
+            Dim::Static(h_out),
+            Dim::Static(w_out),
+        ],
+        input.dtype(),
+    ))
+}
+
+/// Output shape for NCDHW `Op::ConvTranspose3d` (weight `[C_in, C_out/g, kD, kH, kW]`).
+#[allow(clippy::too_many_arguments)]
+pub fn conv_transpose3d_output_shape(
+    input: &Shape,
+    weight: &Shape,
+    kernel_size: [usize; 3],
+    stride: [usize; 3],
+    padding: [usize; 3],
+    dilation: [usize; 3],
+    output_padding: [usize; 3],
+    groups: usize,
+) -> Result<Shape, String> {
+    if input.rank() != 5 || weight.rank() != 5 {
+        return Err("conv_transpose3d requires NCDHW input and 5-D weight".into());
+    }
+    let n = input.dim(0);
+    let c_in = input.dim(1).unwrap_static();
+    let d = input.dim(2).unwrap_static();
+    let h = input.dim(3).unwrap_static();
+    let w = input.dim(4).unwrap_static();
+    let w_cin = weight.dim(0).unwrap_static();
+    let c_out_per_g = weight.dim(1).unwrap_static();
+    if w_cin != c_in {
+        return Err(format!(
+            "conv_transpose3d weight C_in={w_cin} != input C={c_in}"
+        ));
+    }
+    let d_out = conv_transpose2d_spatial_output(
+        d,
+        kernel_size[0],
+        stride[0],
+        padding[0],
+        dilation[0],
+        output_padding[0],
+    );
+    let h_out = conv_transpose2d_spatial_output(
+        h,
+        kernel_size[1],
+        stride[1],
+        padding[1],
+        dilation[1],
+        output_padding[1],
+    );
+    let w_out = conv_transpose2d_spatial_output(
+        w,
+        kernel_size[2],
+        stride[2],
+        padding[2],
+        dilation[2],
+        output_padding[2],
+    );
+    Ok(Shape::from_dims(
+        &[
+            n,
+            Dim::Static(c_out_per_g * groups),
+            Dim::Static(d_out),
+            Dim::Static(h_out),
+            Dim::Static(w_out),
+        ],
+        input.dtype(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

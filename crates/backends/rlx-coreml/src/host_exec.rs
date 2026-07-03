@@ -404,7 +404,7 @@ fn multinomial(probs: &[f32], rng: &mut rlx_ir::Philox4x32) -> usize {
 /// reference kernels as the CPU backend). Enables IIR (`biquad`) between MIL
 /// segments.
 fn run_scan_f32(
-    graph: &Graph,
+    _graph: &Graph,
     node: &rlx_ir::Node,
     env: &HashMap<u32, Vec<f32>>,
 ) -> Result<Vec<f32>> {
