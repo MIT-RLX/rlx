@@ -44,7 +44,6 @@ use super::*;
 /// drop the epilogue.
 pub struct FuseMatMulBiasAct;
 
-
 impl Pass for FuseMatMulBiasAct {
     fn name(&self) -> &str {
         "fuse_matmul_bias_act"
@@ -136,4 +135,3 @@ impl Pass for FuseMatMulBiasAct {
 }
 
 // ── Pass 2: Add(residual) + LayerNorm → FusedResidualLN ─────────────────
-

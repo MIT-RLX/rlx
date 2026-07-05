@@ -443,8 +443,13 @@ fn run_coordinator(group: &Arc<ProcessGroup>, label: &str, device: Device) -> bo
                 .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
             let path = format!("{dir}/stage_{r}.gguf");
             write_gguf_q8(&path, "W", &wf);
-            dist::StageSpec::new(stage_graph_q8(batch, d, packed.len()), "h", "y", worker_dev.clone())
-                .weight_packed("W", format!("gguf://{path}#W"))
+            dist::StageSpec::new(
+                stage_graph_q8(batch, d, packed.len()),
+                "h",
+                "y",
+                worker_dev.clone(),
+            )
+            .weight_packed("W", format!("gguf://{path}#W"))
         } else {
             let uri = match (&weights_dir, fmt.as_str()) {
                 (Some(dir), "safetensors") => {
@@ -460,14 +465,19 @@ fn run_coordinator(group: &Arc<ProcessGroup>, label: &str, device: Device) -> bo
                 }
                 (None, _) => format!("seed://{r}?len={}", d * d),
             };
-            dist::StageSpec::new(stage_graph(batch, d), "h", "y", worker_dev.clone()).weight("W", uri)
+            dist::StageSpec::new(stage_graph(batch, d), "h", "y", worker_dev.clone())
+                .weight("W", uri)
         };
         dist::ship_stage(group, r as u32, &spec).expect("ship stage");
     }
     eprintln!(
         "[{label}] COORDINATOR: shipped {} StageSpec(s) via rlx_runtime::dist ({}), placement='{worker_dev}'",
         n.saturating_sub(1),
-        if quant { "Q8_0 packed → DequantMatMul" } else { fmt.as_str() }
+        if quant {
+            "Q8_0 packed → DequantMatMul"
+        } else {
+            fmt.as_str()
+        }
     );
 
     // Stage 0 on the coordinator's own device (same graph kind as the workers).
@@ -607,7 +617,13 @@ fn run_fft_coordinator(group: &Arc<ProcessGroup>, label: &str, device: Device) -
     let mut c0 = Session::new(device).compile(fft_graph(rows, nfft));
     let x0 = fft_signal(0, rows, nfft);
     let y0 = c0.run(&[("x", x0.as_slice())]).into_iter().next().unwrap();
-    let mut ok = check_fft(&y0, &x0, rows, nfft, &format!("rank0 [{}]", device_label(device)));
+    let mut ok = check_fft(
+        &y0,
+        &x0,
+        rows,
+        nfft,
+        &format!("rank0 [{}]", device_label(device)),
+    );
 
     for r in 1..n {
         let y = dist::recv_activation(group, r).expect("gather");
@@ -616,7 +632,11 @@ fn run_fft_coordinator(group: &Arc<ProcessGroup>, label: &str, device: Device) -
     }
     eprintln!(
         "[{label}] FFT COORDINATOR: {} across {n} node(s)",
-        if ok { "ALL SPECTRA MATCH DFT REFERENCE ✓" } else { "MISMATCH ✗" }
+        if ok {
+            "ALL SPECTRA MATCH DFT REFERENCE ✓"
+        } else {
+            "MISMATCH ✗"
+        }
     );
     ok
 }
@@ -884,7 +904,7 @@ fn run_training(
         comm_calls += 1;
 
         // ---- single-process full-batch reference step (runs concurrently) ----
-        let mut grad_ref = vec![0.0f32; D];
+        let mut grad_ref = [0.0f32; D];
         for i in 0..M {
             let mut p = 0.0f32;
             for d in 0..D {

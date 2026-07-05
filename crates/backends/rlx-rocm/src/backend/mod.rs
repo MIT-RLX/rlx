@@ -276,6 +276,7 @@ pub(crate) enum Step {
         mask_off: u32,
         mask_kind: u32,
         scale_bits: u32,
+        softcap_bits: u32,
         window: u32,
         seq_q_stride: u32,
         seq_k_stride: u32,
@@ -2252,13 +2253,11 @@ impl RocmExecutable {
         exec.run(inputs)
     }
 
-
     /// Host buffer base for reading outputs after [`Self::run_slots`].
     /// Offsets in the returned slot pairs are **byte** offsets into this buffer.
     pub fn arena_ptr(&self) -> *const u8 {
         self.host_arena.as_ptr() as *const u8
     }
-
 
     pub(crate) fn upload_slot_inputs(&mut self, inputs: &[&[f32]]) {
         let rt = &self.ctx.runtime;
@@ -2291,7 +2290,6 @@ impl RocmExecutable {
         }
     }
 
-
     pub(crate) fn pack_host_arena(&mut self) {
         let plan = self.readback_plan();
         for &i in &plan {
@@ -2310,11 +2308,9 @@ impl RocmExecutable {
         }
     }
 
-
     pub(crate) fn all_safe_for_active(&self) -> bool {
         self.schedule.iter().all(|s| s.safe_for_active_extent())
     }
-
 
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         if !self.input_offsets.contains_key(name) {
@@ -2324,16 +2320,13 @@ impl RocmExecutable {
         true
     }
 
-
     pub fn has_gpu_handle(&self, name: &str) -> bool {
         self.gpu_handles.contains_key(name)
     }
 
-
     pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         self.gpu_handles.get(name).cloned()
     }
-
 
     /// Clone into an independent executable (recompiles from the stored graph).
     pub fn clone_for_cache(&self) -> Self {
@@ -2347,7 +2340,6 @@ impl RocmExecutable {
         exe.set_active_extent(self.active_extent);
         exe
     }
-
 
     pub(crate) fn readback_plan(&self) -> Vec<usize> {
         let n = self.graph.outputs.len();
@@ -2367,7 +2359,6 @@ impl RocmExecutable {
         v.sort_unstable();
         v
     }
-
 
     pub(crate) fn stage_gpu_handle_inputs(&mut self, inputs: &[(&str, &[f32])]) {
         let arena_base = self.arena.buffer.ptr;
@@ -2397,7 +2388,6 @@ impl RocmExecutable {
         }
     }
 
-
     pub(crate) fn refresh_gpu_handles_from_staging(&mut self, plan: &[usize]) {
         for (name, &out_idx) in &self.gpu_handle_feeds {
             if plan.contains(&out_idx) && out_idx < self.output_staging.len() {
@@ -2406,7 +2396,6 @@ impl RocmExecutable {
             }
         }
     }
-
 
     pub(crate) fn finalize_outputs(&mut self) -> Vec<Vec<f32>> {
         let plan = self.readback_plan();
@@ -2418,7 +2407,6 @@ impl RocmExecutable {
         self.refresh_gpu_handles_from_staging(&plan);
         self.outputs_from_staging_plan(&plan)
     }
-
 
     pub(crate) fn outputs_from_staging_plan(&self, plan: &[usize]) -> Vec<Vec<f32>> {
         if self.pending_read_indices.is_none() && plan.len() == self.graph.outputs.len() {
@@ -2434,7 +2422,6 @@ impl RocmExecutable {
             .collect()
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2515,6 +2502,7 @@ mod tests {
             mask_off: 9999,
             mask_kind: 1, // causal — mask_off ignored
             scale_bits: 0,
+            softcap_bits: 0,
             window: 0,
             seq_q_stride: mq,
             seq_k_stride: mk,
@@ -2555,6 +2543,7 @@ mod tests {
             mask_off: 9999,
             mask_kind: 2, // custom mask
             scale_bits: 0,
+            softcap_bits: 0,
             window: 0,
             seq_q_stride: mq,
             seq_k_stride: mk,
@@ -2644,4 +2633,3 @@ mod tests {
         assert_eq!(fused.len(), 3);
     }
 }
-

@@ -1,0 +1,16 @@
+{
+  "name": "mlp",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": [
+        2,
+        4,
+        16
+      ],
+      "dtype": "f32"
+    }
+  ],
+  "output_count": 1,
+  "zero_params": []
+}

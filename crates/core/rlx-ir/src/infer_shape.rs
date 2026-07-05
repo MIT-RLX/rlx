@@ -144,6 +144,18 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             shape::matmul_shape(in_shape(0), in_shape(1)).ok()
         }
 
+        // Full linear convolution: last axis of x (`L`) grows to `L + M − 1`,
+        // where `M` is the rank-1 impulse-response length (input 1).
+        Op::PartitionedConv { .. } => {
+            let x = in_shape(0);
+            let ir = in_shape(1);
+            let l = x.dim(x.rank() - 1).unwrap_static();
+            let m = ir.dim(0).unwrap_static();
+            let mut dims: Vec<Dim> = x.dims().to_vec();
+            *dims.last_mut().unwrap() = Dim::Static(l + m - 1);
+            Some(Shape::from_dims(&dims, x.dtype()))
+        }
+
         // Native low-precision GEMM, TN layout: lhs [m,k], rhs [n,k] (K-last),
         // out = [m,n] f32 (f32 is the accumulation type — operands are U8 codes).
         Op::ScaledMatMul { .. } => {
@@ -383,7 +395,8 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
                 w.dim(3).unwrap_static(),
                 w.dim(4).unwrap_static(),
             ];
-            shape::conv3d_output_shape(in_shape(0), w, ks, *stride, *padding, *dilation, *groups).ok()
+            shape::conv3d_output_shape(in_shape(0), w, ks, *stride, *padding, *dilation, *groups)
+                .ok()
         }
         Op::ConvTranspose3d {
             stride,

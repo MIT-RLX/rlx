@@ -87,3 +87,7 @@ Enable in the runtime with the `oneapi` feature:
 ```sh
 cargo build -p rlx-runtime --features oneapi
 ```
+
+## License
+
+GPL-3.0-only.

@@ -1296,6 +1296,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpi-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b08fa7680045874a2a913fef179ab87a29a4f1bf73a09052e6f5bb9c7555083"
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2019,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "pyrlx"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2298,7 +2304,7 @@ dependencies = [
 
 [[package]]
 name = "rlx"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "rlx-bench",
@@ -2321,7 +2327,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-autodiff"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "half",
  "rlx",
@@ -2331,7 +2337,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bbo"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rand 0.8.6",
  "rand_distr",
@@ -2346,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bench"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-cpu",
  "rlx-driver",
@@ -2360,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cerebras"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-ir",
  "rlx-opt",
@@ -2369,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-collectives"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-cpu",
  "rlx-driver",
@@ -2383,7 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-compile"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-autodiff",
  "rlx-fusion",
@@ -2392,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-coreml"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "bytemuck",
  "cc",
@@ -2409,11 +2415,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-cortexm"
-version = "0.2.10"
+version = "0.2.12"
 
 [[package]]
 name = "rlx-cortexm-trainer"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-autodiff",
  "rlx-cpu",
@@ -2423,7 +2429,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cpu"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "criterion",
  "gemm",
@@ -2438,7 +2444,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cuda"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "bytemuck",
  "cc",
@@ -2454,16 +2460,17 @@ dependencies = [
 
 [[package]]
 name = "rlx-driver"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "half",
  "mdns-sd",
+ "mpi-rs",
  "rlx-ir",
 ]
 
 [[package]]
 name = "rlx-fdm"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "bytemuck",
  "rlx-autodiff",
@@ -2477,7 +2484,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-flow"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -2487,7 +2494,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fpga"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-cortexm",
  "rlx-ir",
@@ -2497,7 +2504,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fusion"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -2506,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2517,7 +2524,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf-convert"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2531,11 +2538,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-kernels"
-version = "0.2.10"
+version = "0.2.12"
 
 [[package]]
 name = "rlx-ir"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -2544,7 +2551,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-linalg"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -2552,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-macros"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2561,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-metal"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "bytemuck",
  "core-graphics-types",
@@ -2580,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "half",
  "rlx-cpu",
@@ -2595,7 +2602,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-sys"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "cc",
  "cmake",
@@ -2603,7 +2610,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nemo"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "flate2",
@@ -2614,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-oneapi"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "half",
  "libloading 0.8.9",
@@ -2626,7 +2633,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2639,7 +2646,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-conformance"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "ort",
@@ -2652,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-import"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2670,7 +2677,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-opt"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -2680,14 +2687,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-optim"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "rlx-qnn"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "cc",
  "rlx-ir",
@@ -2697,7 +2704,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-rl"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -2708,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-rocm"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "cc",
  "libloading 0.8.9",
@@ -2722,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-runtime"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "half",
@@ -2758,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-sparse"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -2768,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tensor"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "ndarray 0.16.1",
  "rlx-autodiff",
@@ -2779,7 +2786,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-text"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "minijinja",
@@ -2791,8 +2798,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-torch-import"
+version = "0.2.12"
+dependencies = [
+ "anyhow",
+ "half",
+ "rlx-cpu",
+ "rlx-ir",
+ "rlx-onnx-import",
+ "rlx-runtime",
+ "safetensors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rlx-tpu"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "libloading 0.8.9",
  "prost",
@@ -2809,7 +2831,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-umap"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "crossbeam-channel",
  "ctrlc",
@@ -2834,7 +2856,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vq"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rayon",
  "rlx-cpu",
@@ -2845,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vulkan"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "ash",
  "bytemuck",
@@ -2859,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-web"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "rlx-autodiff",
  "rlx-ir",
@@ -2873,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-webgl"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "js-sys",
  "rlx-autodiff",
@@ -2886,7 +2908,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wgpu"
-version = "0.2.10"
+version = "0.2.12"
 dependencies = [
  "bytemuck",
  "half",

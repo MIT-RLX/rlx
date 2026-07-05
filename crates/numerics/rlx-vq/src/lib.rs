@@ -101,7 +101,14 @@ pub enum Target {
 /// L2 uses the `‖C‖² − 2·x·Cᵀ` proxy (drops the per-row-constant `‖x‖²`), the
 /// same quantity the composition minimizes, so results match modulo f32
 /// summation order. Parallel over rows; the inner dot auto-vectorizes.
-pub fn fused_vq_assign(x: &[f32], cb: &[f32], n: usize, d: usize, k: usize, metric: Metric) -> Vec<f32> {
+pub fn fused_vq_assign(
+    x: &[f32],
+    cb: &[f32],
+    n: usize,
+    d: usize,
+    k: usize,
+    metric: Metric,
+) -> Vec<f32> {
     use rayon::prelude::*;
     assert_eq!(x.len(), n * d, "vq_assign: x length");
     assert_eq!(cb.len(), k * d, "vq_assign: codebook length");
@@ -113,7 +120,11 @@ pub fn fused_vq_assign(x: &[f32], cb: &[f32], n: usize, d: usize, k: usize, metr
             match metric {
                 Metric::L2 => s,
                 Metric::Cosine => {
-                    if s > 0.0 { 1.0 / s.sqrt() } else { 0.0 }
+                    if s > 0.0 {
+                        1.0 / s.sqrt()
+                    } else {
+                        0.0
+                    }
                 }
             }
         })

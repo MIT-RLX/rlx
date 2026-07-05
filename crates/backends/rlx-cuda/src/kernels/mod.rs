@@ -175,7 +175,12 @@ kernel_cache!(
     rlx_gpu_kernels::matmul_cuda_src(),
     "matmul"
 );
-kernel_cache!(MATMUL_BT, matmul_bt_kernel, rlx_gpu_kernels::MATMUL_BT_CU, "matmul_bt");
+kernel_cache!(
+    MATMUL_BT,
+    matmul_bt_kernel,
+    rlx_gpu_kernels::MATMUL_BT_CU,
+    "matmul_bt"
+);
 kernel_cache!(
     MATMUL_EPILOGUE,
     matmul_epilogue_kernel,

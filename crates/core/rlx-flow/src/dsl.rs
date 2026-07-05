@@ -20,13 +20,14 @@ use std::sync::Arc;
 
 use crate::blocks::{
     AttnMaskStage, BertEncoderLayerSpec, BertEncoderLayerStage, BertQkvStyle,
-    BindDecodeInputsStage, ClsTokenPoolStage, CustomStage, EmbedStage, GatherAddStage,
-    GatherDecodeRopeStage, GatherFromInputStage, GatherLastTokenStage, GeluFfnStage,
-    LayerNormStage, LinearStage, LlamaDecodeLayerStage, LlamaDecoderSpec, LlamaDecoderStage,
-    LlamaKvTapStage, LmHeadStage, NomicEncoderLayerSpec, NomicEncoderLayerStage, RepeatStage,
-    ResidualAddStage, ResidualSaveStage, RmsNormStage, RopeTablesStage, SelfAttnPrefillSpec,
-    SelfAttnPrefillStage, SwiGluStage, dinov2_layer_fused, llama_prefill_layer_composed,
-    llama_prefill_layer_fused, nomic_vision_layer_fused,
+    BindDecodeInputsStage, ClsTokenPoolStage, CustomStage, EmbedStage, FfnActivation,
+    GatherAddStage, GatherDecodeRopeStage, GatherFromInputStage, GatherLastTokenStage,
+    GeluFfnStage, LayerNormStage, LinearStage, LlamaDecodeLayerStage, LlamaDecoderSpec,
+    LlamaDecoderStage, LlamaKvTapStage, LmHeadStage, NomicEncoderLayerSpec, NomicEncoderLayerStage,
+    RepeatStage, ResidualAddStage, ResidualSaveStage, RmsNormStage, RopeTablesStage,
+    SelfAttnPrefillSpec, SelfAttnPrefillStage, SwiGluStage, dinov2_layer_fused,
+    dinov2_layer_fused_exact, llama_prefill_layer_composed, llama_prefill_layer_fused,
+    nomic_vision_layer_fused, transformer_encoder_layer,
 };
 use crate::escape::Emit;
 use crate::flow::ModelFlow;
@@ -176,6 +177,39 @@ impl ModelFlow {
     ) -> Self {
         self.repeat_layers(count, move |i| {
             dinov2_layer_fused(i, hidden_size, num_heads, eps)
+        })
+    }
+
+    /// Like [`repeat_dinov2_layers`] but with exact (erf) GELU in the FFN —
+    /// use for parity with checkpoints trained against `torch.nn.GELU()`
+    /// (e.g. LaBraM, EEGPT); the default uses the faster tanh approximation.
+    pub fn repeat_dinov2_layers_exact(
+        self,
+        count: usize,
+        hidden_size: usize,
+        num_heads: usize,
+        eps: f32,
+    ) -> Self {
+        self.repeat_layers(count, move |i| {
+            dinov2_layer_fused_exact(i, hidden_size, num_heads, eps)
+        })
+    }
+
+    /// Repeat configurable `nn.TransformerEncoderLayer` blocks (pre- or post-norm,
+    /// GELU or ReLU FFN) with `layers.{i}.*` weight keys. `norm_first = false`
+    /// gives the default post-norm topology; `act = FfnActivation::Relu` matches
+    /// PyTorch's default activation. Requires a prior [`Self::attn_mask_ones`].
+    pub fn repeat_transformer_encoder_layers(
+        self,
+        count: usize,
+        hidden_size: usize,
+        num_heads: usize,
+        eps: f32,
+        norm_first: bool,
+        act: FfnActivation,
+    ) -> Self {
+        self.repeat_layers(count, move |i| {
+            transformer_encoder_layer(i, hidden_size, num_heads, eps, norm_first, act)
         })
     }
 

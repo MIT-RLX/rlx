@@ -17,11 +17,6 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::{Graph, NodeId, Op};
-use std::sync::Mutex;
 use crate::arena::{Arena, HalfDtype, plan_f32_uniform};
 use crate::device::{RocmContext, rocm_blas, rocm_blas_lt, rocm_context, rocm_dnn};
 use crate::hip::{HipBuffer, HipDeviceptr};
@@ -31,6 +26,11 @@ use crate::hipblas::{
 use crate::hipblaslt::HipblasLtContext;
 use crate::host_staging::F32HostSlot;
 use crate::miopen::MiopenContext;
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::{Graph, NodeId, Op};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use super::*;
 
@@ -43,11 +43,9 @@ impl RocmExecutable {
         &self.output_slots
     }
 
-
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         self.run_read_outputs(inputs, None)
     }
-
 
     /// Run and read back only selected outputs (+ GPU handle feed outputs).
     pub fn run_read_outputs(
@@ -60,7 +58,6 @@ impl RocmExecutable {
         self.pending_read_indices = None;
         outs
     }
-
 
     pub(crate) fn run_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         use crate::kernels::*;
@@ -842,6 +839,7 @@ impl RocmExecutable {
                     mask_off,
                     mask_kind,
                     scale_bits,
+                    softcap_bits,
                     window,
                     seq_q_stride,
                     seq_k_stride,
@@ -902,7 +900,8 @@ impl RocmExecutable {
                                 v_seq_stride,
                                 o_batch_stride,
                                 o_head_stride,
-                                o_seq_stride
+                                o_seq_stride,
+                                softcap_bits
                             ]
                         );
                     } else {
@@ -942,7 +941,8 @@ impl RocmExecutable {
                                 v_seq_stride,
                                 o_batch_stride,
                                 o_head_stride,
-                                o_seq_stride
+                                o_seq_stride,
+                                softcap_bits
                             ]
                         );
                     }
@@ -3249,7 +3249,6 @@ impl RocmExecutable {
         self.finalize_outputs()
     }
 
-
     pub(crate) fn run_tail_host_audio_ops(&self, pre_sync: bool) {
         if !self.schedule.iter().any(step_is_tail_host) {
             return;
@@ -3331,5 +3330,4 @@ impl RocmExecutable {
             }
         }
     }
-
 }

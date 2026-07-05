@@ -167,7 +167,10 @@ fn fft_wgpu_grid_overflow_matches_cpu() {
         for k in 0..cpu.len() {
             max_diff = max_diff.max((cpu[k] - wgpu[k]).abs());
         }
-        assert!(max_diff < tol, "N={n} batch={batch}: max|Δ|={max_diff} tol={tol}");
+        assert!(
+            max_diff < tol,
+            "N={n} batch={batch}: max|Δ|={max_diff} tol={tol}"
+        );
     }
 }
 

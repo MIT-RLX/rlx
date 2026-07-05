@@ -116,13 +116,21 @@ pub fn unroll_scan(g: Graph) -> Graph {
                     let mut xs_t: Vec<NodeId> = Vec::with_capacity(nx);
                     for &x in &xs {
                         let xsh = out.node(x).shape.clone();
-                        let ps_usize: Vec<usize> =
-                            xsh.dims().iter().skip(1).map(|d| d.unwrap_static()).collect();
+                        let ps_usize: Vec<usize> = xsh
+                            .dims()
+                            .iter()
+                            .skip(1)
+                            .map(|d| d.unwrap_static())
+                            .collect();
                         let ps_i64: Vec<i64> = ps_usize.iter().map(|&d| d as i64).collect();
                         let mut nar_dims = vec![1usize];
                         nar_dims.extend(ps_usize.iter().copied());
                         let narrowed = out.add_node(
-                            Op::Narrow { axis: 0, start: t, len: 1 },
+                            Op::Narrow {
+                                axis: 0,
+                                start: t,
+                                len: 1,
+                            },
                             vec![x],
                             Shape::new(&nar_dims, xsh.dtype()),
                         );
@@ -136,7 +144,7 @@ pub fn unroll_scan(g: Graph) -> Graph {
                     let mut captures = vec![carry];
                     captures.extend(bcasts.iter().copied());
                     captures.extend(xs_t);
-                    let outs = inline_subgraph_into_outputs(&**body, &captures, &mut out);
+                    let outs = inline_subgraph_into_outputs(body, &captures, &mut out);
                     carry = outs[0];
                     if *save_trajectory {
                         rows.push(carry);
@@ -144,8 +152,11 @@ pub fn unroll_scan(g: Graph) -> Graph {
                 }
 
                 if *save_trajectory {
-                    let cdims: Vec<usize> =
-                        carry_shape.dims().iter().map(|d| d.unwrap_static()).collect();
+                    let cdims: Vec<usize> = carry_shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
                     let mut rdims = vec![1usize];
                     rdims.extend(cdims.iter().copied());
                     let ri64: Vec<i64> = rdims.iter().map(|&d| d as i64).collect();

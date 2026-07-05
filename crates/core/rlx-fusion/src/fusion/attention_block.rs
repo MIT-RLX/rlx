@@ -40,7 +40,6 @@ use super::*;
 /// Threshold is configurable via `RLX_FUSE_ATTN_THRESHOLD` (default: 64).
 pub struct FuseAttentionBlock;
 
-
 impl FuseAttentionBlock {
     /// Check if the graph has small enough inputs to benefit from fusion.
     ///
@@ -71,7 +70,6 @@ impl FuseAttentionBlock {
         false
     }
 }
-
 
 impl Pass for FuseAttentionBlock {
     fn name(&self) -> &str {
@@ -298,4 +296,3 @@ impl Pass for FuseAttentionBlock {
 }
 
 // ── Pass 5b: Full BERT layer → FusedTransformerLayer ────────────────────
-

@@ -10,20 +10,25 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use super::helpers::simple_op_flex;
+use super::helpers::*;
+use crate::proto;
+use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use crate::proto;
-use crate::{CoremlError, Result};
-use super::helpers::simple_op_flex;
-use super::helpers::*;
+use std::collections::HashMap;
 
 use super::*;
 
 impl<'a> LowerCtx<'a> {
     /// Lower an activation, composing the ones MIL has no direct op for.
-    pub(crate) fn lower_activation(&mut self, id: NodeId, act: Activation, out_name: &str) -> Result<()> {
+    pub(crate) fn lower_activation(
+        &mut self,
+        id: NodeId,
+        act: Activation,
+        out_name: &str,
+    ) -> Result<()> {
         let node = self.graph.node(id);
         let x = self.val(node.inputs[0]);
         // (mil_type, optional ("param", value)) for the simple unary cases.
@@ -91,5 +96,4 @@ impl<'a> LowerCtx<'a> {
         }
         Ok(())
     }
-
 }

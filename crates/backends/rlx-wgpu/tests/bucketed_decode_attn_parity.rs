@@ -1,7 +1,7 @@
 //! Bucketed decode SDPA on wgpu vs CPU (`MaskKind::Custom`, Lq=1).
 
 use rlx_ir::op::MaskKind;
-use rlx_ir::{DType, Graph, GraphExt, Shape};
+use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
 fn build_decode_attn(b: usize, lq: usize, lk: usize, nh: usize, dh: usize) -> Graph {

@@ -164,7 +164,13 @@ fn flat_f32(out: &[(Vec<u8>, DType)]) -> Vec<f32> {
 }
 
 /// Run a graph on `dev`; returns (flattened output, median ns) or None on panic.
-fn run_dev(variant: Variant, dt: DType, n: usize, batch: usize, dev: Device) -> Option<(Vec<f32>, u64)> {
+fn run_dev(
+    variant: Variant,
+    dt: DType,
+    n: usize,
+    batch: usize,
+    dev: Device,
+) -> Option<(Vec<f32>, u64)> {
     std::panic::catch_unwind(|| {
         let empty: &[(&str, &[u8], DType)] = &[];
         let mut c = Session::new(dev).compile(build(variant, dt, n, batch));

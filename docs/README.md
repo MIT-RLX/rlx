@@ -7,6 +7,7 @@
 | [distributed.md](distributed.md) | **Distributed computing**: the layers (Transport→ProcessGroup→Node), collectives, node discovery (static/mDNS/rendezvous), the `dist_job` + `dist_node` examples, and the `rlx_runtime::dist` ship-graph worker |
 | [op-coverage.md](op-coverage.md) | **Single source of truth** for every IR op: descriptions, per-backend (CPU/Metal/MLX/WGPU/ANE/CUDA/ROCm/TPU) coverage matrix, and op variations (Activation/Binary/Quant schemes/…) |
 | [gguf-backend-paths.md](gguf-backend-paths.md) | **GGUF / `DequantMatMul` execution paths** — shared scheme ids, per-backend GPU/host/ANE/TPU lowering, Metal fused IQ GEMV, pyrlx convert/load, env toggles, P0–P5 + backlog code map |
+| [scaled-matmul-fp8.md](scaled-matmul-fp8.md) | **Native low-precision GEMM (`Op::ScaledMatMul`)** — FP8/FP6/FP4 + the parameterized `fNeXmY` minifloat family (all 28 formats), the `ScaledFormat` API/DX, specifying a format across compose-ops / Tensor DSL / `CompileOptions` / pyrlx, per-backend status (CPU/CUDA/ROCm/Metal/Vulkan) + hardware validation |
 | [development.md](development.md) | Dev workflow: `just` recipes, pyrlx, tests, dispatch probes |
 | [benchmarks/higher-order-ad.md](benchmarks/higher-order-ad.md) | Higher-order autodiff benchmarks |
 | [benchmarks/mlx-linux.md](benchmarks/mlx-linux.md) | MLX on Linux/WSL: compile, CPU vs CUDA, vs `rlx-cpu` matmul benches |

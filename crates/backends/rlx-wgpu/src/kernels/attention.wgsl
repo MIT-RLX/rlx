@@ -70,7 +70,7 @@ struct Params {
     seq_k_stride: u32,
     mask_batch_stride: u32,
     mask_head_stride: u32,
-    _pad_mask_0: u32,
+    kv_heads: u32,     // GQA/MQA: #KV heads query heads share (heads=MHA, 0=unset→MHA)
     _pad_mask_1: u32,
     _pad_mask_2: u32,
 
@@ -116,8 +116,13 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         + b * params.q_batch_stride
         + h * params.q_head_stride
         + qi * params.q_seq_stride;
-    let k_bh   = params.k_off + b * params.k_batch_stride + h * params.k_head_stride;
-    let v_bh   = params.v_off + b * params.v_batch_stride + h * params.v_head_stride;
+    // GQA / MQA: several query heads share one KV head. Map query head `h` to
+    // its KV head. kv_heads is always set (== heads for plain MHA → group 1);
+    // the max() guards protect against a stray 0.
+    let kv_denom = max(params.kv_heads, 1u);
+    let kv_h = h / max(params.heads / kv_denom, 1u);
+    let k_bh   = params.k_off + b * params.k_batch_stride + kv_h * params.k_head_stride;
+    let v_bh   = params.v_off + b * params.v_batch_stride + kv_h * params.v_head_stride;
     let o_base = params.out_off
         + b * params.o_batch_stride
         + h * params.o_head_stride

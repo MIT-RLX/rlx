@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "RLX — native loader for NVIDIA NeMo `.nemo` model files (tar + torch.save ckpt + YAML config)."
 authors.workspace      = true
 license.workspace      = true
+readme                 = "README.md"
 keywords.workspace     = true
 categories.workspace   = true
 repository.workspace   = true

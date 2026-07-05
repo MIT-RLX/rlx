@@ -10,14 +10,14 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use super::helpers::simple_op_flex;
+use super::helpers::*;
+use crate::proto;
+use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use crate::proto;
-use crate::{CoremlError, Result};
-use super::helpers::simple_op_flex;
-use super::helpers::*;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -150,7 +150,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// 2D conv / conv_transpose, NCHW. Inputs `[x, weight]` (no bias in IR).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn lower_conv(
@@ -271,7 +270,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Conv2d backward w.r.t. weight (NCHW, groups == 1). The weight gradient is a
     /// convolution of the input by the upstream gradient: with N folded as the
     /// contraction channel and the gradient as the (stride-dilated) kernel,
@@ -351,7 +349,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// 2D max/avg pool, NCHW. Avg divides by the full window (pad counts).
     pub(crate) fn lower_pool(
         &mut self,
@@ -388,5 +385,4 @@ impl<'a> LowerCtx<'a> {
         self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
-
 }

@@ -16,7 +16,7 @@ fn build_chain(layers: usize, d: usize, seq: usize) -> Graph {
     let mut g = Graph::new("bench_chain");
     let mut x = g.input("x", Shape::new(&[seq, d], f));
     for l in 0..layers {
-        let w = g.input(&format!("w{l}"), Shape::new(&[d, d], f));
+        let w = g.input(format!("w{l}"), Shape::new(&[d, d], f));
         let h = g.matmul(x, w, Shape::new(&[seq, d], f));
         x = g.activation(Activation::Relu, h, Shape::new(&[seq, d], f));
     }

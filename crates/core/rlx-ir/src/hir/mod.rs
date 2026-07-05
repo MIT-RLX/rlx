@@ -30,7 +30,7 @@ mod window;
 pub use blocks::lower_llama_decoder_block;
 pub use blocks::lower_qwen35_mtp_head;
 pub use fusion::FusionPolicy;
-pub use graph_ext::{HirGraphExt, HirMut};
+pub use graph_ext::{GridMode, GridPad, HirGraphExt, HirMut};
 pub use window::{window_token_gather_bsn, window_token_scatter_bsn};
 
 use crate::mir::MirModule;

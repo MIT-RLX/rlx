@@ -84,7 +84,7 @@ mod transform;
 
 pub use array::{cat, stack};
 pub use rlx_ir::op::MaskKind;
-pub use rlx_ir::{DType, Dim, Graph, NodeId, Shape};
+pub use rlx_ir::{DType, Dim, Graph, NodeId, ScaleLayout, ScaledFormat, Shape};
 /// Optimizers for [`Func::train_step`] (re-exported from `rlx_optim`).
 /// Available with the `optim` feature.
 #[cfg(feature = "optim")]

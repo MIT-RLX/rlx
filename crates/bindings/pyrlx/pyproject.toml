@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name            = "pyrlx"
 # Single source of truth — must match `Cargo.toml` `[package].version`.
-version         = "0.2.10"
+version         = "0.2.12"
 description     = "Run RLX (Rust ML compiler) graphs on any backend — CPU, Metal, MLX, CUDA, ROCm, wgpu — from Python."
 readme          = "README.md"
 license         = { text = "GPL-3.0-only" }
@@ -46,13 +46,19 @@ dependencies = [
 hf   = ["huggingface-hub", "tokenizers"]
 test = ["pytest>=7", "numpy>=1.23", "safetensors>=0.4"]
 dev  = ["pytest>=7", "ruff>=0.5", "mypy>=1.10", "maturin>=1.7"]
+torch = ["torch>=2.4", "safetensors>=0.4", "numpy>=1.23"]
+
+[project.scripts]
+# One-command PyTorch → RLX conversion. Wraps `pyrlx.from_torch`; locates the
+# Rust `rlx-torch-import` worker via $RLX_TORCH_IMPORT_BIN or a cargo fallback.
+rlx-torch-import = "pyrlx.torch_import:main"
 
 [project.urls]
-Homepage      = "https://github.com/anthropics/rlx"
-Documentation = "https://github.com/anthropics/rlx/tree/main/pyrlx#readme"
-Repository    = "https://github.com/anthropics/rlx"
-Issues        = "https://github.com/anthropics/rlx/issues"
-Changelog     = "https://github.com/anthropics/rlx/blob/main/pyrlx/CHANGELOG.md"
+Homepage      = "https://github.com/MIT-RLX/rlx"
+Documentation = "https://github.com/MIT-RLX/rlx/tree/main/crates/bindings/pyrlx#readme"
+Repository    = "https://github.com/MIT-RLX/rlx"
+Issues        = "https://github.com/MIT-RLX/rlx/issues"
+Changelog     = "https://github.com/MIT-RLX/rlx/blob/main/crates/bindings/pyrlx/CHANGELOG.md"
 
 # ── maturin ──────────────────────────────────────────────────────
 # Mixed Rust + Python layout. abi3 keeps a single wheel working from

@@ -16,8 +16,6 @@
 //! `solve_triangular` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::infer::GraphExt;
@@ -31,7 +29,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct SolveTriangularExt;
-
 
 impl OpExtension for SolveTriangularExt {
     fn name(&self) -> &str {
@@ -99,10 +96,8 @@ impl OpExtension for SolveTriangularExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SolveTriangularCpu;
-
 
 #[cfg(feature = "cpu")]
 impl CpuKernel for SolveTriangularCpu {
@@ -131,4 +126,3 @@ impl CpuKernel for SolveTriangularCpu {
 }
 
 // ── Symmetric Eigendecomposition ─────────────────────────────────
-

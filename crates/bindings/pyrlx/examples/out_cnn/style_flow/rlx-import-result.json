@@ -1,0 +1,9 @@
+{
+  "model": "cnn",
+  "num_inputs": 1,
+  "num_params": 16,
+  "num_instrs": 37,
+  "bundle_dir": null,
+  "crate_dir": "/Users/Shared/rlx/crates/bindings/pyrlx/examples/out_cnn/style_flow/rlx-cnn",
+  "parity": null
+}

@@ -134,6 +134,25 @@ test-pyrlx:
     fi
     .venv/bin/python -m pytest tests/ -q
 
+# PyTorch → RLX: convert a torch model file to an RLX bundle + generated crate.
+# `MODEL` is a .py exposing `model` + `example_inputs` (or get_model()/build()).
+# Usage: just torch-import path/to/model.py out/
+torch-import MODEL OUT:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{justfile_directory()}}/crates/bindings/pyrlx"
+    if [[ ! -d .venv-torch ]]; then
+        python3 -m venv .venv-torch
+        .venv-torch/bin/pip install -q torch safetensors numpy
+    fi
+    # Run the front-end as a standalone script (no compiled _pyrlx needed); it
+    # shells to the Rust `rlx-torch-import` worker via the cargo fallback.
+    .venv-torch/bin/python python/pyrlx/torch_import.py "{{MODEL}}" -o "{{OUT}}"
+
+# rlx-torch-import: run the aten→rlx importer's Rust tests.
+test-torch-import:
+    cargo test -p rlx-torch-import
+
 # Run a specific filter; use as `just testf narrow_attention`.
 testf FILTER:
     cargo test --release {{FILTER}}

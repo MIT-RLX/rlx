@@ -110,14 +110,12 @@ pub const SPARSE_MAT_VEC: &str = "rlx_sparse.mat_vec";
 
 pub const SPARSE_CG_SOLVE: &str = "rlx_sparse.cg_solve";
 
-
 /// Outer-product gather op (the `dL/dvalues` building block).
 /// Computes `out[k] = u[row_of(k)] * v[col_idx[k]]` for each non-zero
 /// position `k` in the CSR pattern. Used by `SparseLu`/`SparseMatVec`/
 /// `SparseCg`/`SparseGmres` VJPs to gather the dense outer-product
 /// `u ⊗ v` at the matrix's nonzero positions.
 pub const SPARSE_VALUES_GRAD: &str = "rlx_sparse.values_grad";
-
 
 /// Non-symmetric LU solve. Forward `x = A⁻¹·b` (uses A only).
 /// VJP `dL/db = solve(Aᵀ, dL/dx)` — needs an explicit transpose
@@ -126,13 +124,11 @@ pub const SPARSE_VALUES_GRAD: &str = "rlx_sparse.values_grad";
 /// specialization.
 pub const SPARSE_LU_SOLVE_GENERAL: &str = "rlx_sparse.lu_solve_general";
 
-
 /// GMRES solve for non-symmetric systems. Iterative analog of CG
 /// for the asymmetric Maxwell / advection-diffusion regime. Same
 /// 7-input shape as `SPARSE_LU_SOLVE_GENERAL`: forward uses A,
 /// VJP routes the adjoint through Aᵀ.
 pub const SPARSE_GMRES_SOLVE: &str = "rlx_sparse.gmres_solve";
-
 
 /// Permute a CSR `values` vector into the values vector of `Aᵀ`.
 /// 5 inputs: `(values_A, col_idx_A, row_ptr_A, col_idx_AT, row_ptr_AT)`.
@@ -144,7 +140,6 @@ pub const SPARSE_GMRES_SOLVE: &str = "rlx_sparse.gmres_solve";
 /// iteration but the sparsity pattern is fixed.
 pub const SPARSE_TRANSPOSE_VALUES: &str = "rlx_sparse.transpose_values";
 
-
 /// Jacobi-preconditioned CG. Same 4-input shape as `SPARSE_CG_SOLVE`
 /// (values, col_idx, row_ptr, b). The kernel extracts `diag(A)`
 /// internally and uses it as the diagonal preconditioner —
@@ -153,13 +148,11 @@ pub const SPARSE_TRANSPOSE_VALUES: &str = "rlx_sparse.transpose_values";
 /// magnitude. Convergence requires SPD A like CG.
 pub const SPARSE_PCG_SOLVE: &str = "rlx_sparse.pcg_solve";
 
-
 /// BiCGSTAB iterative solver for general (non-symmetric) sparse A·x = b.
 /// 4 inputs (values, col_idx, row_ptr, b) + attrs encoding
 /// (max_iter: u32, tol: f64, transpose_a: u8). When `transpose_a` is
 /// set, the kernel solves Aᵀ·x = b — used by VJPs for adjoint solves.
 pub const SPARSE_BICGSTAB_SOLVE: &str = "rlx_sparse.bicgstab_solve";
-
 
 /// ILU(0)-preconditioned CG. Factors A in-place over its existing
 /// sparsity pattern (zero fill-in) and applies the LU triangular
@@ -168,13 +161,11 @@ pub const SPARSE_BICGSTAB_SOLVE: &str = "rlx_sparse.bicgstab_solve";
 /// dominates the off-diagonal.
 pub const SPARSE_ILU_PCG_SOLVE: &str = "rlx_sparse.ilu_pcg_solve";
 
-
 /// Direct sparse Cholesky for SPD A·x = b. Densifies A and uses
 /// LAPACK `dpotrf` + triangular solves. Same I/O contract as
 /// `SPARSE_LU_SOLVE` but only valid for SPD matrices — ½× factor cost
 /// of LU and numerically more stable.
 pub const SPARSE_CHOLESKY_SOLVE: &str = "rlx_sparse.cholesky_solve";
-
 
 /// LSQR for sparse least-squares `min_x ||A·x - b||₂`. 4 inputs
 /// (values, col_idx, row_ptr, b) + attrs encoding (max_iter, tol,
@@ -182,7 +173,6 @@ pub const SPARSE_CHOLESKY_SOLVE: &str = "rlx_sparse.cholesky_solve";
 /// adjoint requires either AᵀA solve or a recursive LSQR call which
 /// is non-trivial; defer until a use case appears).
 pub const SPARSE_LSQR_SOLVE: &str = "rlx_sparse.lsqr_solve";
-
 
 /// Sparse-sparse matrix multiply (CSR × CSR → CSR). 6 inputs:
 /// (a_values, a_col_idx, a_row_ptr, b_values, b_col_idx, b_row_ptr)
@@ -199,7 +189,6 @@ pub const SPARSE_SPGEMM: &str = "rlx_sparse.spgemm";
 // `CpuTensorRef::expect_*`; the MetalKernel impls extract them by
 // casting raw byte slices (after dtype-checking the accompanying
 // Shape). Both backends end up calling the same arithmetic.
-
 
 #[cfg(feature = "cpu")]
 mod algos {
@@ -1184,7 +1173,6 @@ mod algos {
 
 // ── Sparse LU Solve ───────────────────────────────────────────────
 
-
 /// Encode CG attrs into the opaque `Vec<u8>` blob carried on
 /// `Op::Custom`. Layout: `[max_iter:u32 LE, tol:f64 LE]` — 12 bytes.
 pub fn encode_cg_attrs(max_iter: u32, tol: f64) -> Vec<u8> {
@@ -1193,7 +1181,6 @@ pub fn encode_cg_attrs(max_iter: u32, tol: f64) -> Vec<u8> {
     out.extend_from_slice(&tol.to_le_bytes());
     out
 }
-
 
 /// CSR × CSR → CSR via Gustavson's algorithm. Pure-Rust convenience
 /// wrapper around `algos::spgemm_csr` — exposed outside the IR
@@ -1219,7 +1206,6 @@ pub fn spgemm_csr(
 }
 
 // ── Pure-Rust helper for the structural CSR transpose pattern ─────
-
 
 /// Compute `(col_idx_T, row_ptr_T)` — the sparsity pattern of `Aᵀ`
 /// — from `A`'s pattern. This is the structural step that must
@@ -1257,7 +1243,6 @@ pub fn csr_transpose_pattern(
 
 // ── SparseTensor: the boundary abstraction ────────────────────────
 
-
 /// CSR-format sparse matrix at the IR level. Bundles the three
 /// CSR `NodeId`s with structural shape info known at graph-build time.
 ///
@@ -1277,7 +1262,6 @@ pub struct SparseTensor {
     /// Logical column count of A (`n_rows == n_cols` for square / SPD).
     pub n_cols: usize,
 }
-
 
 impl SparseTensor {
     /// Build from existing CSR `NodeId`s. Caller is responsible for
@@ -1514,7 +1498,6 @@ impl SparseTensor {
 // segment-at-CustomOp dispatch is wired (which it is, as of the
 // owned-encoder refactor).
 
-
 #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
 mod metal_kernels {
     use super::*;
@@ -1728,7 +1711,6 @@ mod metal_kernels {
 // correctly through MLX's pipeline; surrounding ops still benefit
 // from MLX's lazy graph optimizer.
 
-
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 mod mlx_kernels {
     use super::*;
@@ -1936,7 +1918,6 @@ mod mlx_kernels {
 
 // ── Registration ──────────────────────────────────────────────────
 
-
 /// Register every sparse op's IR-level extension and per-backend
 /// kernels enabled at compile time. Idempotent — the underlying
 /// registries already warn on overwrite. Call once at application
@@ -1953,7 +1934,6 @@ pub fn cg_solve(
 ) -> Result<(), String> {
     algos::cg_solve(values, col_idx, row_ptr, b, out, max_iter, tol)
 }
-
 
 pub fn register() {
     register_op(Arc::new(SparseLuExt));
@@ -2007,4 +1987,3 @@ pub fn register() {
         register_mlx_kernel(Arc::new(mlx_kernels::SparseGmresMlx));
     }
 }
-

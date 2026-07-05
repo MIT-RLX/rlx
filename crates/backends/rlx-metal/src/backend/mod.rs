@@ -220,16 +220,13 @@ impl MetalExecutable {
         }
     }
 
-
     pub(crate) fn estimated_max_flops(&self) -> u64 {
         self.max_matmul_flops
     }
 
-
     pub fn arena_ptr(&self) -> *const u8 {
         self.arena.buffer.contents() as *const u8
     }
-
 
     /// Encode + commit a forward pass without waiting for GPU completion.
     ///
@@ -259,14 +256,12 @@ impl MetalExecutable {
         }
     }
 
-
     /// Wait for every command buffer queued by `commit_no_wait`.
     pub fn sync_pending(&mut self) {
         for cb in self.pending_cmd_bufs.drain(..) {
             cb.wait_until_completed();
         }
     }
-
 
     /// Copy all named params from another executable with matching param layout.
     pub fn copy_params_from(&mut self, other: &Self) -> bool {
@@ -285,12 +280,12 @@ impl MetalExecutable {
             if dst_cap != src_cap {
                 return false;
             }
-            self.arena.copy_node_bytes_from(dst_id, &other.arena, src_id);
+            self.arena
+                .copy_node_bytes_from(dst_id, &other.arena, src_id);
         }
         self.preload_qmatmul_weights();
         true
     }
-
 
     /// Warm the in-graph QMatMul weight dequant cache after all params are loaded.
     pub fn preload_qmatmul_weights(&mut self) {
@@ -328,12 +323,10 @@ impl MetalExecutable {
         }
     }
 
-
     /// Current RNG compile/execute policy.
     pub fn rng(&self) -> rlx_ir::RngOptions {
         *self.schedule.rng.read().expect("rng lock")
     }
-
 
     /// True when every thunk in the schedule is safe for active-extent
     /// dispatch — guards `encode_commit`'s bypass of MPSGraph + ICB.
@@ -344,11 +337,9 @@ impl MetalExecutable {
             .all(|t| t.safe_for_active_extent())
     }
 
-
     pub fn has_gpu_handle(&self, name: &str) -> bool {
         self.gpu_handles.contains_key(name)
     }
-
 
     /// Register a resident-KV *row* feed (vs the generic prefix feed): row
     /// `src_row` of output `output_index` is folded into handle `handle_name`'s
@@ -358,7 +349,6 @@ impl MetalExecutable {
         self.kv_row_feeds
             .insert(handle_name.to_string(), output_index);
     }
-
 
     /// Fold each registered row feed's new-token row into its resident handle
     /// slot, in-place on the unified-memory arena. Call after a logits-only run.
@@ -390,7 +380,6 @@ impl MetalExecutable {
         }
     }
 
-
     /// Clone into an independent executable (recompiles from the stored graph).
     pub fn clone_for_cache(&self) -> Self {
         let mut exe = Self::compile_from_fused(
@@ -399,6 +388,13 @@ impl MetalExecutable {
             None,
             rlx_ir::RngOptions::default(),
         );
+        // `compile_from_fused` re-initializes `Op::Constant` slots but leaves the
+        // fresh arena's `Op::Param` (weight) slots zeroed — params are uploaded
+        // externally via `set_param`/`finalize_params` after the first compile and
+        // are NOT part of the graph. Without copying them, a cached/reused clone
+        // (e.g. the in-memory graph cache in a persistent TTS service) runs with
+        // all-zero weights: embeddings/matmuls collapse to zero on the 2nd+ run.
+        exe.copy_params_from(self);
         for (name, data) in &self.gpu_handles {
             if !data.is_empty() {
                 exe.bind_gpu_handle(name, data);
@@ -413,7 +409,6 @@ impl MetalExecutable {
         exe.set_active_extent(self.active_extent);
         exe
     }
-
 
     pub(crate) fn propagate_gpu_handle_feeds_in_arena(&mut self) {
         let extent = self.active_extent;
@@ -439,7 +434,6 @@ impl MetalExecutable {
         }
     }
 
-
     pub(crate) fn refresh_gpu_handles_from_outputs(&mut self) {
         for (name, &out_idx) in &self.gpu_handle_feeds {
             if out_idx >= self.graph.outputs.len() {
@@ -457,7 +451,6 @@ impl MetalExecutable {
             entry.copy_from_slice(src);
         }
     }
-
 
     pub(crate) fn dispatch_mps_plan(
         &self,
@@ -564,7 +557,6 @@ impl MetalExecutable {
         );
     }
 }
-
 
 /// Largest `m·k·n` across every `Op::MatMul` and `Op::FusedMatMulBiasAct`
 /// in the graph. Used by the MPSGraph adaptive-dispatch heuristic to
@@ -765,9 +757,24 @@ fn widen_input_bytes_to_f32(data: &[u8], dt: rlx_ir::DType) -> Vec<f32> {
             let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, n) };
             s.iter().map(|h| h.to_f32()).collect()
         }
+        // Integer/bool inputs widen to f32 — `widen_integer_activations_to_f32`
+        // rewrites their arena slots to F32, so this matches the graph dtype.
+        DType::I64 => data
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        DType::I32 => data
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        DType::U32 => data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        DType::Bool => data.iter().map(|&b| b as f32).collect(),
         other => panic!(
             "rlx-metal widen_input_bytes_to_f32: dtype {other:?} unsupported \
-             (use direct byte write for integer dtypes)"
+             (use direct byte write for F64/U8/I8 dtypes)"
         ),
     }
 }
@@ -6549,4 +6556,3 @@ fn encode_fused_swiglu(
         },
     );
 }
-

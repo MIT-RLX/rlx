@@ -17,12 +17,6 @@
 
 #![allow(unused_imports)]
 
-use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU64;
-use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::shape::DimBinding;
-use rlx_ir::{Graph, NodeId, Op};
 use crate::buffer::{
     Arena, ReadbackLayout, ReadbackStaging, TinyReadbackStaging, decode_mapped_readback_f32,
     decode_tiny_mapped_f32, encode_readback_copies, plan_f32_uniform, read_f32_many_pooled,
@@ -34,21 +28,21 @@ use crate::kernels::{
     Conv1dParams, Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams,
     DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
     FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNormBwdParams, LayerNormParams,
-    Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
-    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
-    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams, argmax_kernel,
-    attention_bwd_kernel, attention_kernel, batch_elementwise_region_kernel, binary_kernel,
-    cast_f32_to_f16_kernel, compare_kernel, concat_kernel, conv1d_kernel, conv2d_kernel,
-    conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel, fma_kernel,
-    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
-    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
-    gather_split_kernel, grouped_matmul_kernel, gru_kernel,
-    layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
-    layer_norm_backward_input_kernel, layernorm_kernel, mamba2_kernel,
-    matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
+    GatherParams, GroupedMatmulParams, GruParams, Im2Col2dParams, Kernel, LayerNormBwdParams,
+    LayerNormParams, Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams,
+    Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
+    RopeParams, SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams,
+    TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
+    argmax_kernel, attention_bwd_kernel, attention_kernel, batch_elementwise_region_kernel,
+    binary_kernel, cast_f32_to_f16_kernel, compare_kernel, concat_kernel, conv1d_kernel,
+    conv1d_tiled_kernel, conv2d_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel,
+    cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel,
+    elementwise_region_spatial_kernel, expand_kernel, fma_kernel, fused_residual_ln_kernel,
+    fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel, gather_axis_kernel,
+    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
+    grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
+    layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layernorm_kernel,
+    mamba2_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
@@ -59,6 +53,12 @@ use crate::kernels::{
     transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
     welch_peaks_gpu_kernel, where_kernel,
 };
+use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::shape::DimBinding;
+use rlx_ir::{Graph, NodeId, Op};
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 
 use super::*;
 
@@ -82,11 +82,9 @@ impl WgpuExecutable {
         Self::compile(fresh)
     }
 
-
     pub fn compile(graph: Graph) -> Self {
         Self::compile_rng(graph, rlx_ir::RngOptions::default())
     }
-
 
     pub fn compile_rng(graph: Graph, rng: rlx_ir::RngOptions) -> Self {
         let rng = std::sync::Arc::new(std::sync::RwLock::new(rng));
@@ -95,7 +93,6 @@ impl WgpuExecutable {
         }
         Self::compile_static_inner(graph, rng)
     }
-
 
     pub(crate) fn compile_static_inner(
         graph: Graph,
@@ -129,7 +126,20 @@ impl WgpuExecutable {
         // Pre-walk to compute the max scratch any single op needs.
         // Currently only `Op::LayerNormBackwardGamma` uses scratch
         // (`num_workgroups * H * 4` bytes for the partial-sums buffer).
-        let scratch_bytes = compute_scratch_bytes(&graph);
+        let base_scratch_bytes = compute_scratch_bytes(&graph);
+        // Reserve tail scratch for the im2col `col` matrix only when the opt-in
+        // im2col+GEMM conv path is enabled (the default tiled/direct convs need
+        // no extra scratch, so the arena stays lean).
+        let conv_col_scratch = if rlx_ir::env::flag("RLX_WGPU_CONV_IM2COL") {
+            conv_im2col_scratch_bytes(
+                &graph,
+                plan.arena_size,
+                dev.device.limits().max_storage_buffer_binding_size,
+            )
+        } else {
+            0
+        };
+        let scratch_bytes = base_scratch_bytes.max(conv_col_scratch);
         let mut arena = Arena::from_plan_with_scratch(&dev.device, &plan, scratch_bytes);
         // Override slot lengths with the actual elem*4 byte counts so
         // readback returns the right element count (slots may be
@@ -1744,7 +1754,7 @@ impl WgpuExecutable {
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                     buffer: &arena.buffer,
                                     offset: base,
-                                    size: NonZeroU64::new(size),
+                                    size: aligned_bind_size(size, base, arena.buffer.size()),
                                 }),
                             },
                             wgpu::BindGroupEntry {
@@ -2063,6 +2073,16 @@ impl WgpuExecutable {
                         rlx_ir::strides_for_shape(shape, heads, hd, seq_extent, bhsd)
                     };
                     let packed_parent = packed_bshd_attn.get(&node.id).copied();
+                    // GQA/MQA: the KV-head count is layout-independent — K's
+                    // element count over B·S_k·D. Packed QKV shares Q's head
+                    // count (uniform strides), so treat it as MHA.
+                    let nkv: u32 = if packed_parent.is_some() {
+                        heads
+                    } else {
+                        let k_numel: u32 =
+                            k_shape.iter().map(|d| d.unwrap_static() as u32).product();
+                        (k_numel / (batch.max(1) * seq_k.max(1) * hd.max(1))).max(1)
+                    };
                     let (q_b, q_h, q_s, k_b, k_h, k_s, v_b, v_h, v_s) =
                         if let Some((_parent, head_width)) = packed_parent {
                             let (batch_stride, head_stride, pack_seq) =
@@ -2080,9 +2100,13 @@ impl WgpuExecutable {
                             )
                         } else {
                             let (qb, qh, qs) = stride(q_shape, seq_q);
-                            let (kb, kh, ks) = stride(k_shape, seq_k);
+                            // K/V carry nkv heads (GQA); strides_for_shape
+                            // detects their BSHD/BHSD layout from nkv·D.
+                            let (kb, kh, ks) =
+                                rlx_ir::strides_for_shape(k_shape, nkv, hd, seq_k, bhsd);
                             let v_shape = graph.node(v_id).shape.dims();
-                            let (vb, vh, vs) = stride(v_shape, seq_k);
+                            let (vb, vh, vs) =
+                                rlx_ir::strides_for_shape(v_shape, nkv, hd, seq_k, bhsd);
                             (qb, qh, qs, kb, kh, ks, vb, vh, vs)
                         };
                     let out_shape = node.shape.dims();
@@ -2252,7 +2276,7 @@ impl WgpuExecutable {
                         seq_k_stride: mask_strides.k,
                         mask_batch_stride: mask_strides.b,
                         mask_head_stride: mask_strides.h,
-                        _pad_mask_0: 0,
+                        kv_heads: nkv,
                         _pad_mask_1: 0,
                         _pad_mask_2: 0,
                         q_batch_stride: q_b,
@@ -2692,7 +2716,7 @@ impl WgpuExecutable {
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                     buffer: &arena.buffer,
                                     offset: base,
-                                    size: NonZeroU64::new(size),
+                                    size: aligned_bind_size(size, base, arena.buffer.size()),
                                 }),
                             },
                             wgpu::BindGroupEntry {
@@ -3668,19 +3692,142 @@ impl WgpuExecutable {
                                 w_off,
                                 out_off,
                             };
-                            schedule.push(Step::Conv2d { params: p2 });
-                            let ck = conv2d_kernel(&dev.device);
-                            let u = emit_uniform(std::mem::size_of::<Conv2dParams>());
-                            let bg = bind_two_buf0_window(
-                                &dev.device,
-                                ck,
-                                &arena.buffer,
-                                base,
-                                size,
-                                &u,
-                            );
-                            uniforms.push(u);
-                            bind_groups.push(bg);
+                            // Two accelerated conv paths for the `one_d`
+                            // (kw==1) vocoder convs:
+                            //   • conv1d_tiled (default): 2D register-blocked
+                            //     direct conv — reuses input across the output-
+                            //     channel tile. Drop-in for the direct conv
+                            //     (same params + bind window); no scratch.
+                            //   • im2col + GEMM (opt-in, RLX_WGPU_CONV_IM2COL):
+                            //     materialize `col` in scratch, run the tiled
+                            //     f32 GEMM. Wins only for GEMM-friendly shapes;
+                            //     needs whole-arena bind + reserved scratch.
+                            // Everything else falls back to the direct conv.
+                            let spatial = (p2.h_out as u64) * (p2.w_out as u64);
+                            let k_total = (p2.c_in as u64) * (p2.kh as u64) * (p2.kw as u64);
+                            let col_bytes = k_total.saturating_mul(spatial).saturating_mul(4);
+                            let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                            let whole = arena_whole_arena_bind(&arena, max_binding);
+                            let im2col_opt_in = rlx_ir::env::flag("RLX_WGPU_CONV_IM2COL");
+                            let use_im2col = im2col_opt_in
+                                && p2.groups == 1
+                                && p2.n == 1
+                                && (p2.kh as u64) * (p2.kw as u64) >= 2
+                                && spatial >= im2col_min_spatial()
+                                && k_total >= im2col_min_k()
+                                && (p2.c_out as u64) >= im2col_min_cout()
+                                && col_bytes <= CONV_IM2COL_MAX_COL_BYTES
+                                && col_bytes <= arena.scratch_bytes as u64
+                                && whole.is_some();
+                            let use_tiled = !use_im2col
+                                && one_d
+                                && p2.kw == 1
+                                && p2.w == 1
+                                && p2.w_out == 1
+                                && p2.groups == 1
+                                && p2.n == 1
+                                && spatial >= conv_tiled_min_spatial()
+                                && !rlx_ir::env::flag("RLX_WGPU_NO_TILED_CONV");
+                            if use_im2col {
+                                let (base_w, size_w) = whole.expect("whole-arena bind");
+                                // col lives at the reserved scratch tail (free of
+                                // live data); consumed immediately by the GEMM.
+                                let col_word_off = (arena.scratch_off / 4) as u32;
+                                let im_params = Im2Col2dParams {
+                                    c_in: p2.c_in,
+                                    h: p2.h,
+                                    w: p2.w,
+                                    h_out: p2.h_out,
+                                    w_out: p2.w_out,
+                                    kh: p2.kh,
+                                    kw: p2.kw,
+                                    sh: p2.sh,
+                                    sw: p2.sw,
+                                    ph: p2.ph,
+                                    pw: p2.pw,
+                                    dh: p2.dh,
+                                    dw: p2.dw,
+                                    in_off: (arena.offset(in_id) / 4) as u32,
+                                    col_off: col_word_off,
+                                    k_total: k_total as u32,
+                                    spatial: spatial as u32,
+                                    _p0: 0,
+                                    _p1: 0,
+                                    _p2: 0,
+                                };
+                                schedule.push(Step::Im2ColGpu { params: im_params });
+                                let imk = im2col2d_kernel(&dev.device);
+                                let u_im = emit_uniform(std::mem::size_of::<Im2Col2dParams>());
+                                // Static params — write once at compile (the
+                                // active-extent rewrite pass is a no-op here).
+                                dev.queue
+                                    .write_buffer(&u_im, 0, bytemuck::bytes_of(&im_params));
+                                let bg_im = bind_two_buf0_window(
+                                    &dev.device,
+                                    imk,
+                                    &arena.buffer,
+                                    base_w,
+                                    size_w,
+                                    &u_im,
+                                );
+                                uniforms.push(u_im);
+                                bind_groups.push(bg_im);
+                                // GEMM: weight[c_out, K] @ col[K, spatial]
+                                //   → out[c_out, spatial]  (NCHW, N==1).
+                                let m = p2.c_out;
+                                let kk = k_total as u32;
+                                let nn2 = spatial as u32;
+                                schedule.push(Step::Matmul {
+                                    m,
+                                    k: kk,
+                                    n: nn2,
+                                    batch: 1,
+                                    a_batch_stride: m.saturating_mul(kk),
+                                    b_batch_stride: kk.saturating_mul(nn2),
+                                    c_batch_stride: m.saturating_mul(nn2),
+                                    a_off_f32: (arena.offset(w_id) / 4) as u32,
+                                    b_off_f32: col_word_off,
+                                    c_off_f32: (arena.offset(node.id) / 4) as u32,
+                                    has_bias: 0,
+                                    bias_off_f32: 0,
+                                    act_id: 0xFFFF,
+                                    b_is_param: false,
+                                    compute_precision: MatmulCompute::F32,
+                                });
+                                let u_mm = emit_uniform(std::mem::size_of::<MatmulParams>());
+                                let bg_mm = bind_two_buf0_window(
+                                    &dev.device,
+                                    mm_k,
+                                    &arena.buffer,
+                                    base_w,
+                                    size_w,
+                                    &u_mm,
+                                );
+                                uniforms.push(u_mm);
+                                bind_groups.push(bg_mm);
+                            } else {
+                                schedule.push(if use_tiled {
+                                    Step::Conv2dTiled { params: p2 }
+                                } else {
+                                    Step::Conv2d { params: p2 }
+                                });
+                                let ck = if use_tiled {
+                                    conv1d_tiled_kernel(&dev.device)
+                                } else {
+                                    conv2d_kernel(&dev.device)
+                                };
+                                let u = emit_uniform(std::mem::size_of::<Conv2dParams>());
+                                let bg = bind_two_buf0_window(
+                                    &dev.device,
+                                    ck,
+                                    &arena.buffer,
+                                    base,
+                                    size,
+                                    &u,
+                                );
+                                uniforms.push(u);
+                                bind_groups.push(bg);
+                            }
                         }
                         (3, 5, 5, 5) => {
                             let p3 = Conv3dParams {
@@ -5231,5 +5378,4 @@ impl WgpuExecutable {
             rng,
         }
     }
-
 }

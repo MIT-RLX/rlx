@@ -17,17 +17,17 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use crate::hlo::{
+    Computation, ConvDimNumbers, DotDimNumbers, GatherDimNumbers, HloBuilder, Literal, LiteralData,
+    ProgramShape, ScatterDimNumbers, Shape, Window, WindowDim, prim, prim_of,
+};
 use rlx_ir::op::{
     Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp, RegionPrologue,
     TransformStep,
 };
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, NodeId, Op};
-use crate::hlo::{
-    Computation, ConvDimNumbers, DotDimNumbers, GatherDimNumbers, HloBuilder, Literal, LiteralData,
-    ProgramShape, ScatterDimNumbers, Shape, Window, WindowDim, prim, prim_of,
-};
+use std::collections::HashMap;
 
 use super::*;
 
@@ -56,7 +56,6 @@ impl<'a> LowerCtx<'a> {
         let neg_inf_b = self.entry.broadcast(neg_inf, &[], qk_shape.clone());
         self.entry.select(mask, scaled, neg_inf_b, qk_shape)
     }
-
 
     /// Sliding-window mask: q attends to k in [q-w, q].
     pub(crate) fn apply_sliding_window_mask(
@@ -103,5 +102,4 @@ impl<'a> LowerCtx<'a> {
     }
 
     // ── Rope ───────────────────────────────────────────────────
-
 }

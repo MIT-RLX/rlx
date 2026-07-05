@@ -17,13 +17,126 @@
 //! matmul+bias+activation (plan #53).
 
 use crate::op::Activation;
-use crate::quant::QuantScheme;
-use crate::{Graph, NodeId, Op, Shape};
+use crate::quant::{QuantScheme, ScaleLayout, ScaledFormat};
+use crate::{DType, Graph, NodeId, Op, Shape};
 
 impl Graph {
     /// Matrix multiply.
     pub fn matmul(&mut self, lhs: NodeId, rhs: NodeId, out_shape: Shape) -> NodeId {
         self.push(Op::MatMul, vec![lhs, rhs], out_shape, None)
+    }
+
+    /// Dynamically quantize `x` (logical `[rows, cols]`, blocks along the last
+    /// axis) to low-precision `fmt` codes plus a scale tensor, per `layout`.
+    /// Returns `(codes, scale)`: `codes` is `DType::U8` with `x`'s shape;
+    /// `scale`'s shape/dtype follow the layout (`[1]` f32 for per-tensor,
+    /// `[rows, cols/block]` u8 for block layouts). The building block of
+    /// [`scaled_matmul`](Self::scaled_matmul); `fmt` may be any
+    /// [`ScaledFormat`], including a parameterized [`ScaledFormat::Custom`].
+    pub fn scaled_quantize(
+        &mut self,
+        x: NodeId,
+        fmt: ScaledFormat,
+        layout: ScaleLayout,
+    ) -> (NodeId, NodeId) {
+        let xs = self.node(x).shape.clone();
+        let cols = xs.dim(xs.rank() - 1).unwrap_static();
+        let rows = xs.num_elements().unwrap() / cols.max(1);
+        let scale_shape = match layout {
+            ScaleLayout::PerTensor => Shape::new(&[1], layout.scale_dtype()),
+            _ => Shape::new(
+                &[rows, cols.div_ceil(layout.block() as usize)],
+                layout.scale_dtype(),
+            ),
+        };
+        let scale = self.push(
+            Op::ScaledQuantScale {
+                format: fmt,
+                scale_layout: layout,
+            },
+            vec![x],
+            scale_shape,
+            None,
+        );
+        let codes = self.push(
+            Op::ScaledQuantize {
+                format: fmt,
+                scale_layout: layout,
+            },
+            vec![x, scale],
+            xs.with_dtype(DType::U8),
+            None,
+        );
+        (codes, scale)
+    }
+
+    /// Reconstruct f32 from packed `codes` + `scale` — the inverse of
+    /// [`scaled_quantize`](Self::scaled_quantize).
+    pub fn scaled_dequantize(
+        &mut self,
+        codes: NodeId,
+        scale: NodeId,
+        fmt: ScaledFormat,
+        layout: ScaleLayout,
+    ) -> NodeId {
+        let shape = self.node(codes).shape.clone().with_dtype(DType::F32);
+        self.push(
+            Op::ScaledDequantize {
+                format: fmt,
+                scale_layout: layout,
+            },
+            vec![codes, scale],
+            shape,
+            None,
+        )
+    }
+
+    /// Native low-precision GEMM (TN: `lhs [m,k] · rhs [n,k]ᵀ → [m,n]` f32).
+    /// Both operands are dynamically quantized to `fmt`/`layout` and fed
+    /// straight into the scaled matmul with f32 accumulation — no hand-wiring of
+    /// [`Op::ScaledQuantScale`]/[`Op::ScaledQuantize`]. `rhs` must already be
+    /// K-last (`[n, k]`); transpose a `[k, n]` weight first. `fmt` may be any
+    /// [`ScaledFormat`], including a parameterized [`ScaledFormat::Custom`]
+    /// (e.g. `ScaledFormat::custom(3, 0)` for `f4e3m0`).
+    pub fn scaled_matmul(
+        &mut self,
+        lhs: NodeId,
+        rhs: NodeId,
+        fmt: ScaledFormat,
+        layout: ScaleLayout,
+    ) -> NodeId {
+        self.scaled_matmul_bias(lhs, rhs, None, fmt, layout)
+    }
+
+    /// [`scaled_matmul`](Self::scaled_matmul) with an optional f32 bias `[n]`
+    /// added to each output row.
+    pub fn scaled_matmul_bias(
+        &mut self,
+        lhs: NodeId,
+        rhs: NodeId,
+        bias: Option<NodeId>,
+        fmt: ScaledFormat,
+        layout: ScaleLayout,
+    ) -> NodeId {
+        let m = self.node(lhs).shape.dim(0).unwrap_static();
+        let n = self.node(rhs).shape.dim(0).unwrap_static();
+        let (lq, ls) = self.scaled_quantize(lhs, fmt, layout);
+        let (rq, rs) = self.scaled_quantize(rhs, fmt, layout);
+        let mut inputs = vec![lq, rq, ls, rs];
+        if let Some(b) = bias {
+            inputs.push(b);
+        }
+        self.push(
+            Op::ScaledMatMul {
+                lhs_format: fmt,
+                rhs_format: fmt,
+                scale_layout: layout,
+                has_bias: bias.is_some(),
+            },
+            inputs,
+            Shape::new(&[m, n], DType::F32),
+            None,
+        )
     }
 
     /// Dense linear solve `x = A⁻¹·b`. `A` must be `[N, N]`; `b` is

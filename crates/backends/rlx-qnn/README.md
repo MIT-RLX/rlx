@@ -123,3 +123,7 @@ Community SDK, builds against the real headers, and runs on `libQnnCpu.so` under
 x86_64 (Rosetta/emulation on Apple Silicon). See
 [`docker/README.md`](docker/README.md) and the `qnn-*` recipes in the workspace
 `Justfile`.
+
+## License
+
+GPL-3.0-only.

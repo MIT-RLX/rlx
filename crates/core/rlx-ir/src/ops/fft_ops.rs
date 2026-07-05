@@ -96,6 +96,98 @@ impl Graph {
         )
     }
 
+    /// Exact real-input FFT for an **arbitrary** length `n` (no power-of-two
+    /// padding): returns the half-spectrum `(re, im)` with `n/2 + 1` complex bins
+    /// along the last axis.
+    ///
+    /// Unlike [`Self::rfft`] — which zero-pads the last axis to `next_pow2(n)` and
+    /// therefore samples the *padded* transform's frequencies — this computes the
+    /// genuine `n`-point real DFT via a **constant DFT-matrix matmul**, exact for
+    /// every `n` (odd, prime, non-pow2). It is a pure decomposition over existing
+    /// graph ops (`Op::Constant`, `Op::MatMul`, elementwise), so it lowers on every
+    /// backend and stays differentiable — the same strategy as
+    /// [`Self::interpolate1d`]. Two baked `[n, n/2+1]` matrices give
+    ///
+    /// ```text
+    ///   re[k] =  Σ_t x[t]·cos(2π k t / n)          COS [n, n/2+1]
+    ///   im[k] = −Σ_t x[t]·sin(2π k t / n)          NSIN[n, n/2+1]  (= −sin)
+    /// ```
+    ///
+    /// matching the sign convention of `torch.fft.rfft` and this crate's radix-2
+    /// [`Self::rfft`] (forward transform `X[k] = Σ x[t] e^{−2πi k t / n}`). The
+    /// last axis of `x` must be the real signal of length `n`; leading axes are
+    /// independent batch dimensions. `norm` scales the forward transform exactly
+    /// as [`Self::rfft`] (`FftNorm::output_scale(n, false)`: `Backward`/`Forward`
+    /// → 1, `Ortho` → 1/√n). PyTorch `norm='forward'`'s `1/n` forward scale is not
+    /// an `FftNorm` variant — apply it explicitly on the result if needed (see
+    /// `rlx-cbramod`'s spectral front-end).
+    ///
+    /// Cost is `O(n²)` per row; for large `n` a Bluestein / mixed-radix kernel
+    /// (the `rlx-fft` butterfly/Stockham path could host one) would be
+    /// asymptotically cheaper. For the small EEG-tokenizer windows this targets
+    /// (`n = 200`, `400`) the exact matmul is both simpler and cheap enough.
+    pub fn rfft_exact(&mut self, x: NodeId, n: usize, norm: FftNorm) -> (NodeId, NodeId) {
+        assert!(n >= 1, "rfft_exact: n must be positive");
+        assert_eq!(
+            self.shape(x).dtype(),
+            DType::F32,
+            "rfft_exact: requires F32 real input"
+        );
+        let xs = self.shape(x).clone();
+        let rank = xs.rank();
+        let last = rank - 1;
+        let l = xs.dim(last).unwrap_static();
+        assert_eq!(l, n, "rfft_exact: last axis {l} != n {n}");
+        let n_freq = n / 2 + 1;
+        let batch: usize = (0..last).map(|i| xs.dim(i).unwrap_static()).product();
+
+        // Host-build the [n, n/2+1] DFT matrices in f64, baked as f32 constants.
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut cos_m = vec![0f32; n * n_freq];
+        let mut nsin_m = vec![0f32; n * n_freq];
+        for t in 0..n {
+            for k in 0..n_freq {
+                let ang = two_pi * (k as f64) * (t as f64) / (n as f64);
+                cos_m[t * n_freq + k] = ang.cos() as f32;
+                nsin_m[t * n_freq + k] = -(ang.sin() as f32);
+            }
+        }
+        let cos = self.const_f32_tensor(cos_m, &[n, n_freq]);
+        let nsin = self.const_f32_tensor(nsin_m, &[n, n_freq]);
+
+        // Flatten leading axes → [batch, n], two matmuls, then restore shape.
+        let x2 = self.reshape_(x, vec![batch as i64, n as i64]);
+        let mut re = self.mm(x2, cos); // [batch, n_freq]
+        let mut im = self.mm(x2, nsin); // [batch, n_freq]
+
+        let scale = norm.output_scale(n, false);
+        if scale != 1.0 {
+            let s = self.constant(scale, DType::F32);
+            re = self.mul(re, s);
+            im = self.mul(im, s);
+        }
+
+        let mut out_dims: Vec<i64> = (0..last)
+            .map(|i| xs.dim(i).unwrap_static() as i64)
+            .collect();
+        out_dims.push(n_freq as i64);
+        let re = self.reshape_(re, out_dims.clone());
+        let im = self.reshape_(im, out_dims);
+        (re, im)
+    }
+
+    /// Magnitude of the exact arbitrary-`n` half-spectrum: `sqrt(re² + im²)`,
+    /// shape `[.., n/2 + 1]`. The imaginary sign is irrelevant to the magnitude,
+    /// so this is the spectral front-end the EEG tokenizers (CBraMod, BrainBERT)
+    /// want. `norm` scales as in [`Self::rfft_exact`].
+    pub fn rfft_exact_mag(&mut self, x: NodeId, n: usize, norm: FftNorm) -> NodeId {
+        let (re, im) = self.rfft_exact(x, n, norm);
+        let re2 = self.mul(re, re);
+        let im2 = self.mul(im, im);
+        let mag2 = self.add(re2, im2);
+        self.sqrt(mag2)
+    }
+
     /// Inverse real FFT from half-spectrum `(re, im)` with Hermitian symmetry.
     ///
     /// Mirrors the conjugate half of the spectrum (excluding DC and Nyquist) before
@@ -274,37 +366,13 @@ impl Graph {
     }
 
     fn reverse_last_axis(&mut self, x: NodeId) -> NodeId {
-        let shape = self.shape(x).clone();
-        let rank = shape.rank();
-        let last = rank - 1;
-        let len = shape.dim(last).unwrap_static();
-        if len <= 1 {
-            return x;
-        }
-        let prefix_elems: usize = shape
-            .dims()
-            .iter()
-            .take(last)
-            .map(|d| d.unwrap_static())
-            .product();
-        // Gather reads its index as either i64 or f32 (never i32 — an i32 index
-        // is misread as f32 ≈ 0 on CPU/Metal, silently returning row 0; wgpu only
-        // worked by accident via its i32→f32 constant widening). Emit an f32 index
-        // (exact for indices < 2^24, far above any FFT length) so the reverse is
-        // correct on every backend — this was the irfft mirror bug.
-        let mut idx_bytes = Vec::with_capacity(prefix_elems * len * 4);
-        for _ in 0..prefix_elems.max(1) {
-            for i in (0..len).rev() {
-                idx_bytes.extend_from_slice(&(i as f32).to_le_bytes());
-            }
-        }
-        let idx_dims: Vec<usize> = shape.dims().iter().map(|d| d.unwrap_static()).collect();
-        let idx = self.add_node(
-            Op::Constant { data: idx_bytes },
-            vec![],
-            Shape::new(&idx_dims, DType::F32),
-        );
-        self.gather_(x, idx, last)
+        // `Op::Reverse` is batch-general (flips only the listed axis, per row)
+        // and lowers on every backend. A previous `Op::Gather`-with-index
+        // implementation reversed the flattened last axis and so corrupted every
+        // batch row but the first — the irfft mirror bug for any rank ≥ 2 real
+        // spectrum (multi-channel `fft_conv1d`, framed convolution, …).
+        let last = self.shape(x).rank() - 1;
+        self.reverse(x, vec![last])
     }
 
     fn pad_axis_to_len(&mut self, x: NodeId, len: usize) -> NodeId {
@@ -335,5 +403,37 @@ impl Graph {
             vec![],
             Shape::scalar(DType::F32),
         )
+    }
+}
+
+#[cfg(test)]
+mod rfft_exact_tests {
+    use super::*;
+    use crate::Shape;
+
+    fn dims(g: &Graph, id: NodeId) -> Vec<usize> {
+        g.shape(id)
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .collect()
+    }
+
+    #[test]
+    fn rfft_exact_shape_non_pow2() {
+        // n = 200 (not a power of two) → n/2+1 = 101 bins; batch axes preserved.
+        let mut g = Graph::new("rfft_exact");
+        let x = g.input("x", Shape::new(&[22, 5, 200], DType::F32));
+        let (re, im) = g.rfft_exact(x, 200, FftNorm::Backward);
+        assert_eq!(dims(&g, re), vec![22, 5, 101]);
+        assert_eq!(dims(&g, im), vec![22, 5, 101]);
+    }
+
+    #[test]
+    fn rfft_exact_mag_shape_400() {
+        let mut g = Graph::new("rfft_exact_mag");
+        let x = g.input("frames", Shape::new(&[7, 400], DType::F32));
+        let mag = g.rfft_exact_mag(x, 400, FftNorm::Backward);
+        assert_eq!(dims(&g, mag), vec![7, 201]);
     }
 }

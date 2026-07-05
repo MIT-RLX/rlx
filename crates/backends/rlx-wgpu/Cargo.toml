@@ -23,11 +23,11 @@ splat = ["rlx-cpu/splat"]
 native-gpu-fft = []
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10", default-features = false, features = ["compile"] }
-rlx-compile = { path = "../../core/rlx-compile", version = "0.2.10" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", features = ["splat"] }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.10" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12", default-features = false, features = ["compile"] }
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.12" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.12", features = ["splat"] }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
 
 # wgpu 30: WebGPU-spec dispatch/present renames, `get_mapped_range` → Result,
 # signed `%` fix on Vulkan SPIR-V, Metal bindless storage buffers, etc.
@@ -54,8 +54,8 @@ serde_json = "1"
 # so this never resolves against crates.io and needs no per-release pin bump.
 rlx = { path = "../../rlx", default-features = false, features = ["cpu", "gpu"] }
 rlx-runtime = { path = "../../core/rlx-runtime", features = ["gpu"] }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.10" }
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
 half = "2"
 pollster = "0.3"
 bytemuck = "1"

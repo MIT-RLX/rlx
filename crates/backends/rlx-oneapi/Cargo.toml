@@ -17,9 +17,9 @@ documentation.workspace = true
 default = []
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10", default-features = false, features = ["compile"] }
-rlx-compile = { path = "../../core/rlx-compile", version = "0.2.10" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12", default-features = false, features = ["compile"] }
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.12" }
 # CPU reference kernels for the host-fallback path. On a host with no Intel
 # Level Zero device (this macOS dev box, CI), the whole legalized graph runs on
 # the `rlx-cpu` reference so results are bit-for-bit the ground truth; on Intel
@@ -27,7 +27,7 @@ rlx-compile = { path = "../../core/rlx-compile", version = "0.2.10" }
 # `default-features = false` drops rlx-cpu's `blas` link requirement so the
 # standalone build needs no BLAS; built alongside rlx-runtime (which enables
 # `cpu`→`blas`), Cargo's additive unification restores the platform BLAS.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", default-features = false }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.12", default-features = false }
 
 # The Level Zero loader (`libze_loader.so.1` / `ze_loader.dll`) is opened at
 # runtime with `libloading` — no link-time dependency on the oneAPI runtime, so

@@ -17,11 +17,6 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::{Graph, NodeId, Op};
-use std::sync::Mutex;
 use crate::arena::{Arena, HalfDtype, plan_f32_uniform};
 use crate::device::{RocmContext, rocm_blas, rocm_blas_lt, rocm_context, rocm_dnn};
 use crate::hip::{HipBuffer, HipDeviceptr};
@@ -31,6 +26,11 @@ use crate::hipblas::{
 use crate::hipblaslt::HipblasLtContext;
 use crate::host_staging::F32HostSlot;
 use crate::miopen::MiopenContext;
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::{Graph, NodeId, Op};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use super::*;
 
@@ -45,11 +45,9 @@ impl RocmExecutable {
         )
     }
 
-
     pub fn compile_rng(graph: Graph, rng: rlx_ir::RngOptions) -> Self {
         Self::compile_with_rng(graph, CompileMode::Jit, ExecMode::Stream, rng)
     }
-
 
     /// Compile with explicit RNG policy (used by [`rlx-runtime`]).
     pub fn compile_with_rng(
@@ -784,7 +782,7 @@ impl RocmExecutable {
                     head_dim,
                     mask_kind,
                     score_scale: _,
-                    attn_logit_softcap: _,
+                    attn_logit_softcap,
                 } => {
                     let q_id = node.inputs[0];
                     let k_id = node.inputs[1];
@@ -803,6 +801,9 @@ impl RocmExecutable {
                     let seq_k = geom.seq_k as u32;
                     let hd = *head_dim as u32;
                     let scale = 1.0_f32 / (hd as f32).sqrt();
+                    // Gemma 2 attention logit soft-cap (0 = disabled). Applied
+                    // pre-mask in the kernel; matches rlx-cpu executor.rs and rlx-cuda.
+                    let softcap_bits = attn_logit_softcap.unwrap_or(0.0).to_bits();
                     let mask_shape = if matches!(mask_kind, MaskKind::Custom | MaskKind::Bias) {
                         Some(graph.node(node.inputs[3]).shape.dims())
                     } else {
@@ -879,6 +880,7 @@ impl RocmExecutable {
                         mask_off,
                         mask_kind: mask_kind_id,
                         scale_bits: scale.to_bits(),
+                        softcap_bits,
                         window,
                         seq_q_stride: st.mask_q,
                         seq_k_stride: st.mask_k,
@@ -2205,7 +2207,6 @@ impl RocmExecutable {
         }
     }
 
-
     pub fn compile_with(graph: Graph, compile_mode: CompileMode, exec_mode: ExecMode) -> Self {
         Self::compile_with_rng(
             graph,
@@ -2214,5 +2215,4 @@ impl RocmExecutable {
             rlx_ir::RngOptions::default(),
         )
     }
-
 }

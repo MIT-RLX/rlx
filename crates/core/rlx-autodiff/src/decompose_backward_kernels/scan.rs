@@ -69,7 +69,6 @@ pub fn compose_scan_backward(
     finalize_scan_backward_carry(g, dcarry, out_shape)
 }
 
-
 /// Unrolled `ScanBackwardXs` — stacks per-step `dxs` along axis 0.
 pub fn compose_scan_backward_xs(
     g: &mut Graph,
@@ -131,4 +130,3 @@ pub fn compose_scan_backward_xs(
     let _ = (dcarry, out_shape);
     stacked
 }
-

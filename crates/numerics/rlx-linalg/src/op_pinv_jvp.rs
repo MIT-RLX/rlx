@@ -16,8 +16,6 @@
 //! `pinv_jvp` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::{DType, OpExtension, Shape};
@@ -30,7 +28,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct PinvJvpExt;
-
 
 impl OpExtension for PinvJvpExt {
     fn name(&self) -> &str {
@@ -53,7 +50,6 @@ impl OpExtension for PinvJvpExt {
         Shape::new(&[n, m], DType::F64)
     }
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct PinvJvpCpu;
@@ -84,4 +80,3 @@ impl CpuKernel for PinvJvpCpu {
         algos::pinv_jvp(a, da, m, n, out)
     }
 }
-

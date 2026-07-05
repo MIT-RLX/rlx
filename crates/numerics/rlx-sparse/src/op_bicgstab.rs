@@ -16,7 +16,6 @@
 //! `bicgstab` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -41,9 +40,7 @@ pub(super) fn decode_bicgstab_attrs(attrs: &[u8]) -> Result<(u32, f64, bool), St
     Ok((max_iter, tol, trans))
 }
 
-
 pub(crate) struct SparseBicgstabExt;
-
 
 impl OpExtension for SparseBicgstabExt {
     fn name(&self) -> &str {
@@ -88,7 +85,6 @@ impl OpExtension for SparseBicgstabExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SparseBicgstabCpu;
 
@@ -114,4 +110,3 @@ impl CpuKernel for SparseBicgstabCpu {
 }
 
 // ── ILU(0)-preconditioned CG ──────────────────────────────────────
-

@@ -18,6 +18,8 @@
 //! Metal (wrong mask) / MLX (NHWC channel mismatch) / wgpu (op unsupported)
 //! bugs surfaced by the OCR detection decoder.
 
+#![allow(dead_code)]
+
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 

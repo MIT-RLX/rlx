@@ -78,7 +78,13 @@ pub fn matrix_invsqrt(a: &[f64], n: usize, rcond: f64, out: &mut [f64]) -> Resul
     let thresh = rcond * lambda_max.max(0.0);
     let fvals: Vec<f64> = evals
         .iter()
-        .map(|&l| if l > thresh && l > 0.0 { 1.0 / l.sqrt() } else { 0.0 })
+        .map(|&l| {
+            if l > thresh && l > 0.0 {
+                1.0 / l.sqrt()
+            } else {
+                0.0
+            }
+        })
         .collect();
     for k in 0..n {
         for l in 0..n {
@@ -243,7 +249,11 @@ pub fn ledoit_wolf(
     }
     b_bar2 /= (n as f64) * (n as f64) * p as f64;
     let b2 = b_bar2.min(d2);
-    let alpha = if d2 > 0.0 { (b2 / d2).clamp(0.0, 1.0) } else { 0.0 };
+    let alpha = if d2 > 0.0 {
+        (b2 / d2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     // Σ_shrunk = (1−α) S + α μ I.
     for i in 0..p {
         for j in 0..p {

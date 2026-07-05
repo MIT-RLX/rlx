@@ -49,6 +49,14 @@ use crate::dtype::parse_dtype;
 
 // ── tiny string parsers ────────────────────────────────────────
 
+/// Parse a scale-layout name for `scaled_matmul` — delegates to
+/// `ScaleLayout: FromStr` ("per_tensor" | "mx" | "nvfp4" | "mx/<block>").
+fn scale_layout_from_py(layout: &str) -> PyResult<rlx_ir::ScaleLayout> {
+    layout
+        .parse::<rlx_ir::ScaleLayout>()
+        .map_err(PyValueError::new_err)
+}
+
 fn shape_from_py(dims: Vec<usize>, dtype: &str) -> PyResult<Shape> {
     Ok(Shape::new(&dims, parse_dtype(dtype)?))
 }
@@ -277,6 +285,24 @@ impl PyGraph {
     ) -> PyResult<u32> {
         let s = shape_from_py(out_shape, dtype)?;
         Ok(self.g()?.matmul(NodeId(lhs), NodeId(rhs), s).0)
+    }
+
+    /// Native low-precision GEMM (TN: `lhs [m,k] · rhs [n,k]ᵀ → [m,n]`). Both
+    /// operands are dynamically quantized to the minifloat `format`. `format` is
+    /// an `fNeXmY` name — a named tensor-core format ("f8e4m3", "f8e5m2",
+    /// "f6e2m3", "f6e3m2", "f4e2m1", the `…fnuz` variants) or a parameterized
+    /// split like "f4e3m0". `layout` is "per_tensor", "mx", or "nvfp4". `rhs`
+    /// must already be K-last (`[n, k]`).
+    #[pyo3(signature = (lhs, rhs, format = "f8e4m3", layout = "per_tensor"))]
+    fn scaled_matmul(&mut self, lhs: u32, rhs: u32, format: &str, layout: &str) -> PyResult<u32> {
+        let fmt: rlx_ir::ScaledFormat = format
+            .parse()
+            .map_err(|e: String| PyValueError::new_err(e))?;
+        let layout = scale_layout_from_py(layout)?;
+        Ok(self
+            .g()?
+            .scaled_matmul(NodeId(lhs), NodeId(rhs), fmt, layout)
+            .0)
     }
 
     fn lora_matmul(

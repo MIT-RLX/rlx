@@ -10,21 +10,27 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use super::helpers::simple_op_flex;
+use super::helpers::*;
+use crate::proto;
+use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use crate::proto;
-use crate::{CoremlError, Result};
-use super::helpers::simple_op_flex;
-use super::helpers::*;
+use std::collections::HashMap;
 
 use super::*;
 
 impl<'a> LowerCtx<'a> {
     /// LayerNorm over the last `axis` dims, with optional affine. The IR
     /// node carries inputs `[x, gamma?, beta?]`.
-    pub(crate) fn lower_layer_norm(&mut self, id: NodeId, axis: i32, eps: f32, out_name: &str) -> Result<()> {
+    pub(crate) fn lower_layer_norm(
+        &mut self,
+        id: NodeId,
+        axis: i32,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
         let node = self.graph.node(id);
         let x = self.val(node.inputs[0]);
         let rank = node.shape.rank() as i32;
@@ -50,11 +56,16 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// RMSNorm over the trailing dims from `axis`: composed from
     /// primitive MIL ops since the base opset has no `rms_norm`.
     /// `y = x · rsqrt(mean(x², axes) + eps) · gamma`. Inputs `[x, gamma?]`.
-    pub(crate) fn lower_rms_norm(&mut self, id: NodeId, axis: i32, eps: f32, out_name: &str) -> Result<()> {
+    pub(crate) fn lower_rms_norm(
+        &mut self,
+        id: NodeId,
+        axis: i32,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
         let node = self.graph.node(id);
         let x = self.val(node.inputs[0]);
         let rank = node.shape.rank();
@@ -149,7 +160,6 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
-
 
     /// RMSNorm backward w.r.t. input. Inputs `[x, gamma, beta, dy]`, output = `x`.
     /// Mirrors `compose_rms_norm_backward_input`:
@@ -281,7 +291,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// RMSNorm backward w.r.t. gamma. Inputs `[x, gamma, beta, dy]`, output =
     /// `gamma` (`[H]`). Mirrors `compose_rms_norm_backward_gamma`:
     ///   `dgamma = sum_batch(dy · x · rsqrt(mean(x², ax) + eps))`.
@@ -369,7 +378,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// RMSNorm backward w.r.t. beta. Inputs `[x, gamma, beta, dy]`, output =
     /// `beta` (`[H]`). `dbeta = sum_batch(dy)`.
     #[cfg(feature = "training")]
@@ -399,7 +407,6 @@ impl<'a> LowerCtx<'a> {
         self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
-
 
     /// Native LayerNorm backward w.r.t. input (axis = -1). Inputs `[x, gamma, dy]`,
     /// output matches `x`. Mirrors `compose_layer_norm_backward_input`:
@@ -560,7 +567,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Native LayerNorm backward w.r.t. gamma. Inputs `[x, dy]`, output = gamma
     /// shape. Mirrors `compose_layer_norm_backward_gamma`:
     ///   `dgamma = Σ_batch(dy · x_hat)`, `x_hat = (x − mean)·rsqrt(var + eps)`.
@@ -667,7 +673,6 @@ impl<'a> LowerCtx<'a> {
         self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
-
 
     /// Native GroupNorm backward w.r.t. input (NCHW). Inputs `[x, gamma, beta, dy]`,
     /// output matches `x`. Reshapes `[N,C,H,W] → [N,G,M]` (M = C/G·H·W) so the group
@@ -875,7 +880,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Native GroupNorm backward w.r.t. gamma (NCHW). Inputs `[x, dy]`, output =
     /// gamma `[C]`. `dgamma[c] = Σ_{n,h,w} dy·x_hat`, with `x_hat` the group-
     /// normalized `x` (computed in the `[N,G,M]` layout, then reshaped back to NCHW
@@ -1009,11 +1013,14 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Native GroupNorm backward w.r.t. beta (NCHW). Inputs `[x, dy]` (x unused),
     /// output = beta `[C] = Σ_{n,h,w} dy` — a single channel-aligned reduce_sum.
     #[cfg(feature = "training")]
-    pub(crate) fn lower_group_norm_backward_beta(&mut self, id: NodeId, out_name: &str) -> Result<()> {
+    pub(crate) fn lower_group_norm_backward_beta(
+        &mut self,
+        id: NodeId,
+        out_name: &str,
+    ) -> Result<()> {
         let node = self.graph.node(id);
         let dy = self.val(node.inputs[1]);
         let beta_shape = node.shape.clone();
@@ -1030,7 +1037,6 @@ impl<'a> LowerCtx<'a> {
         self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
-
 
     /// Inference batch norm with frozen stats. Inputs `[x, gamma, beta,
     /// mean, var]`, channel-last: `(x - mean)·rsqrt(var+eps)·gamma + beta`,
@@ -1094,7 +1100,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// GroupNorm over NCHW. Inputs `[x, gamma, beta]`; normalises over
     /// `(C/G)·H·W` within each of `G` groups, then per-channel affine.
     pub(crate) fn lower_group_norm(
@@ -1127,10 +1132,14 @@ impl<'a> LowerCtx<'a> {
         self.affine_nchw(out_name, &nb, &shape, &gamma, &beta, c)
     }
 
-
     /// LayerNorm over the channel axis of NCHW (per spatial position).
     /// Inputs `[x, gamma, beta]`.
-    pub(crate) fn lower_layer_norm2d(&mut self, id: NodeId, eps: f32, out_name: &str) -> Result<()> {
+    pub(crate) fn lower_layer_norm2d(
+        &mut self,
+        id: NodeId,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
         let node = self.graph.node(id);
         let shape = node.shape.clone();
         let d = static_dims(&shape)?;
@@ -1145,7 +1154,6 @@ impl<'a> LowerCtx<'a> {
         let norm = self.normalize_chain(out_name, &x, &shape, &red, &[1], eps)?;
         self.affine_nchw(out_name, &norm, &shape, &gamma, &beta, c)
     }
-
 
     /// `(in - mean)·rsqrt(var+eps)` reducing over `axes` (keep dims).
     /// Returns the normalised value name.
@@ -1221,7 +1229,6 @@ impl<'a> LowerCtx<'a> {
         Ok(norm)
     }
 
-
     /// Per-channel affine for NCHW: `out = norm·γ[1,C,1,1] + β[1,C,1,1]`.
     pub(crate) fn affine_nchw(
         &mut self,
@@ -1253,5 +1260,4 @@ impl<'a> LowerCtx<'a> {
         // Caller registers the node mapping.
         Ok(())
     }
-
 }

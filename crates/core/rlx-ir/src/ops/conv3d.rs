@@ -58,8 +58,9 @@ impl Graph {
             w_s.dim(3).unwrap_static(),
             w_s.dim(4).unwrap_static(),
         ];
-        let out = crate::shape::conv3d_output_shape(&in_s, &w_s, ks, stride, padding, dilation, groups)
-            .expect("conv3d shape inference");
+        let out =
+            crate::shape::conv3d_output_shape(&in_s, &w_s, ks, stride, padding, dilation, groups)
+                .expect("conv3d shape inference");
         self.push(
             Op::Conv3d {
                 stride,

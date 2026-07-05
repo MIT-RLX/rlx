@@ -434,7 +434,7 @@ fn scale_mean(data: &mut [u8], dtype: DType, n: usize) {
 /// holds f64, else F32 — the safe accumulator (NCCL's default). Ranks that
 /// share a dtype should just reduce in it natively (smaller wire).
 pub fn negotiate_reduce_dtype(dtypes: &[DType]) -> DType {
-    if dtypes.iter().any(|&d| d == DType::F64) {
+    if dtypes.contains(&DType::F64) {
         DType::F64
     } else {
         DType::F32
@@ -597,7 +597,7 @@ impl ProcessGroup {
             });
         }
         let esz = dtype.size_bytes();
-        if esz == 0 || data.len() % esz != 0 {
+        if esz == 0 || !data.len().is_multiple_of(esz) {
             return Err(CollectiveError::TransportError {
                 reason: format!(
                     "all_reduce_typed: {} bytes not a multiple of {esz}",
@@ -954,7 +954,7 @@ mod tests {
     #[test]
     fn all_reduce_typed_f16_sums_across_ranks() {
         run_ranks(4, |g| {
-            let mut bytes = f16_bytes(&vec![g.rank() as f32 + 1.0; 3]); // 1,2,3,4
+            let mut bytes = f16_bytes(&[g.rank() as f32 + 1.0; 3]); // 1,2,3,4
             g.all_reduce_typed(&mut bytes, DType::F16, ReduceKind::Sum)
                 .unwrap();
             assert_eq!(f16_vals(&bytes), vec![10.0; 3], "rank {}", g.rank());
@@ -964,7 +964,7 @@ mod tests {
     #[test]
     fn all_reduce_typed_bf16_mean() {
         run_ranks(4, |g| {
-            let mut bytes: Vec<u8> = vec![g.rank() as f32 + 1.0; 4]
+            let mut bytes: Vec<u8> = [g.rank() as f32 + 1.0; 4]
                 .iter()
                 .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
                 .collect();
@@ -983,7 +983,7 @@ mod tests {
     fn all_reduce_typed_uneven_length() {
         // 5 elems over 4 ranks exercises the remainder chunking.
         run_ranks(4, |g| {
-            let mut bytes = f16_bytes(&vec![g.rank() as f32 + 1.0; 5]);
+            let mut bytes = f16_bytes(&[g.rank() as f32 + 1.0; 5]);
             g.all_reduce_typed(&mut bytes, DType::F16, ReduceKind::Sum)
                 .unwrap();
             assert_eq!(f16_vals(&bytes), vec![10.0; 5], "rank {}", g.rank());

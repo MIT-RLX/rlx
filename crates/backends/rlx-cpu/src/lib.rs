@@ -37,6 +37,8 @@ pub mod executor;
 pub mod gdn;
 pub mod gguf_matmul;
 pub mod gguf_scheme;
+pub mod iir; // IIR biquad zero-phase Butterworth filtering (filter-bank front-end)
+pub mod spd; // SPD-manifold Riemannian kernels (logm/expm/sqrtm, AIRM distance, Karcher mean, batched eigh)
 pub use gguf_scheme::quant_scheme_for_ggml;
 pub mod im2col;
 pub mod intrinsics;

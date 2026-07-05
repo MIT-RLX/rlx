@@ -54,6 +54,7 @@ const FUSED_KINDS: &[OpKind] = &[
     OpKind::Mamba2,
     OpKind::SelectiveScan,
     OpKind::LoraMatMul,
+    OpKind::PartitionedConv,
 ];
 
 fn unsupported_kinds(graph: &Graph, supported: &[OpKind]) -> HashSet<OpKind> {

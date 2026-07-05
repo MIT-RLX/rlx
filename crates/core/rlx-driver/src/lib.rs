@@ -43,6 +43,8 @@ pub mod buffer;
 pub mod collective;
 pub mod device;
 pub mod handle;
+#[cfg(feature = "mpi")]
+pub mod mpi_transport;
 pub mod net;
 pub mod node;
 pub mod stream;
@@ -56,6 +58,8 @@ pub use device::{
     BackendSupport, Device, DeviceFromStrError, STANDARD_DEVICES, StandardBackends, validate_device,
 };
 pub use handle::BufferHandle;
+#[cfg(feature = "mpi")]
+pub use mpi_transport::MpiTransport;
 pub use net::{DEFAULT_HEAP_BYTES, NetTransport, TcpTransport, ThunderboltTransport};
 pub use node::{
     Node, Topology, announce_coordinator, discover_coordinator, discover_peers, local_ip,

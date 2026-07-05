@@ -303,6 +303,7 @@ pub enum OpKind {
     DequantMoEWeights,
     ScatterAdd,
     LoraMatMul,
+    PartitionedConv,
     DequantMatMul,
     QMatMul,
     QConv2d,
@@ -1094,6 +1095,18 @@ pub enum Op {
     /// kernel that keeps the rank-r intermediate in registers.
     LoraMatMul {
         scale: f32,
+    },
+
+    /// Uniform-partitioned overlap-save 1-D convolution (FIR / RIR).
+    /// Inputs `[x, ir]`: signal `x [.., L]` and rank-1 impulse response
+    /// `ir [M]`; output is the full linear convolution `[.., L + M − 1]`.
+    /// `block` sets the partition / FFT size (`2·next_pow2(block)` points).
+    /// Decomposes (via `unfuse`) to `rfft → batched complex matmul over the
+    /// partition axis → irfft`, so the frequency-domain delay line runs on the
+    /// native batched-GEMM kernels (cuBLAS / rocBLAS / MPS). See
+    /// [`crate::Graph::partitioned_conv`].
+    PartitionedConv {
+        block: usize,
     },
 
     /// Fused sampling kernel: logits → optional top-k filter →
@@ -2043,6 +2056,7 @@ impl Op {
             Op::DequantMoEWeights { .. } => OpKind::DequantMoEWeights,
             Op::ScatterAdd => OpKind::ScatterAdd,
             Op::LoraMatMul { .. } => OpKind::LoraMatMul,
+            Op::PartitionedConv { .. } => OpKind::PartitionedConv,
             Op::DequantMatMul { .. } => OpKind::DequantMatMul,
             Op::QMatMul { .. } => OpKind::QMatMul,
             Op::QConv2d { .. } => OpKind::QConv2d,
@@ -2185,6 +2199,7 @@ impl Op {
             Op::DequantGroupedMatMul { .. } => 3, // input, packed_w, expert_idx
             Op::DequantMoEWeights { .. } => 1,    // packed_w
             Op::LoraMatMul { .. } => 4,           // x, w, a, b
+            Op::PartitionedConv { .. } => 2,      // x, ir
             // x, w_q, scale, zp — or x, packed_w_bytes for GGUF
             // schemes (their scales/mins live inside the packed bytes,
             // see `QuantScheme::is_gguf`).
@@ -2471,6 +2486,7 @@ impl std::fmt::Display for Op {
             }
             Op::DequantMoEWeights { scheme } => write!(f, "dequant_moe_weights({scheme})"),
             Op::LoraMatMul { scale } => write!(f, "lora_matmul(scale={scale})"),
+            Op::PartitionedConv { block } => write!(f, "partitioned_conv(block={block})"),
             Op::DequantMatMul { scheme } => write!(f, "dequant_matmul({scheme})"),
             Op::QMatMul {
                 x_zp,

@@ -16,8 +16,6 @@
 //! `svd_backward` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::{DType, OpExtension, Shape};
@@ -30,7 +28,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct SvdBackwardExt;
-
 
 impl OpExtension for SvdBackwardExt {
     fn name(&self) -> &str {
@@ -50,7 +47,6 @@ impl OpExtension for SvdBackwardExt {
         Shape::new(&[m, n], DType::F64)
     }
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct SvdBackwardCpu;
@@ -79,4 +75,3 @@ impl CpuKernel for SvdBackwardCpu {
         algos::svd_backward(u, s, vt, dl_du, dl_ds, dl_dvt, m, n, out)
     }
 }
-

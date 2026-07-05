@@ -17,12 +17,6 @@
 
 #![allow(unused_imports)]
 
-use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU64;
-use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::shape::DimBinding;
-use rlx_ir::{Graph, NodeId, Op};
 use crate::buffer::{
     Arena, ReadbackLayout, ReadbackStaging, TinyReadbackStaging, decode_mapped_readback_f32,
     decode_tiny_mapped_f32, encode_readback_copies, plan_f32_uniform, read_f32_many_pooled,
@@ -59,6 +53,12 @@ use crate::kernels::{
     transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
     welch_peaks_gpu_kernel, where_kernel,
 };
+use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::shape::DimBinding;
+use rlx_ir::{Graph, NodeId, Op};
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 
 use super::*;
 
@@ -74,7 +74,6 @@ impl WgpuExecutable {
             }
         })
     }
-
 
     /// Test hook: `(q_off, k_off, v_off, q_seq_stride)` for the first attention step.
     #[doc(hidden)]
@@ -93,11 +92,9 @@ impl WgpuExecutable {
         })
     }
 
-
     /// Global arena offset in f32 elements (not bind-window-local).
     #[doc(hidden)]
     pub fn test_arena_offset_elems(&self, id: NodeId) -> u32 {
         (self.arena.offset(id) / 4) as u32
     }
-
 }

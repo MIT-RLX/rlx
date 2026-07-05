@@ -1,0 +1,45 @@
+[package]
+name = "rlx-torch-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PyTorch (torch.export) → RLX HIR import: aten→rlx op registry, runnable bundle + generated crate"
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+half = "2"
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12", features = ["serialize"] }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.12", default-features = false, features = ["cpu"], optional = true }
+rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.12", optional = true }
+# ONNX front-end: reuse the mature opset-versioned ONNX→HIR importer (~88 ops)
+# instead of re-porting the ONNX op list. HIR production needs no runtime.
+rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.12", default-features = false, optional = true }
+safetensors = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = ["runtime"]
+# `runtime` pulls in the CPU backend so the crate can compile+run a graph for
+# the parity check and the `run` subcommand. Without it, only the front-end
+# lowering (aten→HIR) + code/bundle emit are available.
+runtime = ["dep:rlx-runtime", "dep:rlx-cpu"]
+# `cuda` runs the parity check / bundle on an NVIDIA GPU (via rlx-runtime/cuda).
+cuda = ["runtime", "rlx-runtime/cuda"]
+# `metal` / `mlx` run the parity check / bundle on Apple GPU backends.
+metal = ["runtime", "rlx-runtime/metal"]
+mlx = ["runtime", "rlx-runtime/mlx"]
+# `onnx` adds an ONNX front-end (`.onnx` → HIR via rlx-onnx-import → same bundle).
+onnx = ["dep:rlx-onnx-import"]
+
+[[bin]]
+name = "rlx-torch-import"
+path = "src/bin/rlx_torch_import.rs"
+required-features = ["runtime"]
+
+[lints]
+workspace = true

@@ -75,3 +75,7 @@ incl. LayerNorm/RmsNorm, GroupNorm/BatchNorm via lowering, LayerNorm backward,
 Cumsum/Concat/Pool/Conv2d, Im2Col, ArgMax/ArgMin, runtime Gather, RoPE). WebGL
 execution is compile-verified and browser-validated via `rlx-web`
 (`just serve-web --webgl`).
+
+## License
+
+GPL-3.0-only.

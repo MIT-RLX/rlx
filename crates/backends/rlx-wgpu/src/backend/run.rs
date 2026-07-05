@@ -17,12 +17,6 @@
 
 #![allow(unused_imports)]
 
-use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU64;
-use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::shape::DimBinding;
-use rlx_ir::{Graph, NodeId, Op};
 use crate::buffer::{
     Arena, ReadbackLayout, ReadbackStaging, TinyReadbackStaging, decode_mapped_readback_f32,
     decode_tiny_mapped_f32, encode_readback_copies, plan_f32_uniform, read_f32_many_pooled,
@@ -40,15 +34,15 @@ use crate::kernels::{
     SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
     TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams, argmax_kernel,
     attention_bwd_kernel, attention_kernel, batch_elementwise_region_kernel, binary_kernel,
-    cast_f32_to_f16_kernel, compare_kernel, concat_kernel, conv1d_kernel, conv2d_kernel,
-    conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel, fma_kernel,
-    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
-    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
-    gather_split_kernel, grouped_matmul_kernel, gru_kernel,
-    layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
-    layer_norm_backward_input_kernel, layernorm_kernel, mamba2_kernel,
-    matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
+    cast_f32_to_f16_kernel, compare_kernel, concat_kernel, conv1d_kernel, conv1d_tiled_kernel,
+    conv2d_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel,
+    dequant_matmul_kernel, elementwise_region_kernel, elementwise_region_spatial_kernel,
+    expand_kernel, fma_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    fused_residual_rms_norm_kernel, gather_axis_kernel, gather_backward_acc_kernel,
+    gather_backward_zero_kernel, gather_kernel, gather_split_kernel, grouped_matmul_kernel,
+    gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
+    layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layernorm_kernel,
+    mamba2_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
@@ -59,6 +53,12 @@ use crate::kernels::{
     transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
     welch_peaks_gpu_kernel, where_kernel,
 };
+use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::shape::DimBinding;
+use rlx_ir::{Graph, NodeId, Op};
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 
 use super::*;
 
@@ -66,7 +66,6 @@ impl WgpuExecutable {
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         self.run_read_outputs(inputs, None)
     }
-
 
     pub fn run_read_outputs(
         &mut self,
@@ -78,7 +77,6 @@ impl WgpuExecutable {
         self.pending_read_indices = None;
         outs
     }
-
 
     /// Async sibling of [`Self::run`] for the browser, where GPU→CPU readback
     /// cannot block the event loop. All compute is dispatched + submitted
@@ -138,7 +136,6 @@ impl WgpuExecutable {
         let partial = decode_mapped_readback_f32(&staging_buf, &layout);
         self.pack_readback_outputs(&plan, partial)
     }
-
 
     pub(crate) fn run_tail_host_audio_ops(&self, dev: &crate::device::WgpuDevice) {
         if !self.schedule.iter().any(step_is_tail_host) {
@@ -219,7 +216,6 @@ impl WgpuExecutable {
             }
         }
     }
-
 
     pub(crate) fn run_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         // Lazy compile path: if we deferred compile waiting for shapes,
@@ -562,7 +558,7 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
-                    Step::Conv2d { params } => {
+                    Step::Conv2d { params } | Step::Conv2dTiled { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
@@ -664,7 +660,10 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
-                    Step::GatherSplit { .. }
+                    // Im2ColGpu params are static (written once at compile);
+                    // no active-extent scaling.
+                    Step::Im2ColGpu { .. }
+                    | Step::GatherSplit { .. }
                     | Step::DequantMatmulGguf { .. }
                     | Step::DequantGroupedMatmulGguf { .. }
                     | Step::GatedDeltaNet { .. }
@@ -1367,6 +1366,30 @@ impl WgpuExecutable {
                             let spatial = params.h_out * params.w_out;
                             let sp_tiles = spatial.div_ceil(CONV2D_TILE);
                             let total = n_s * params.c_out * sp_tiles;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Conv2dTiled { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let ck = conv1d_tiled_kernel(&dev.device);
+                            pass.set_pipeline(&ck.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            // conv1d_tiled.wgsl: one thread per output element
+                            // (c_out * l_out), N == 1, w_out == 1.
+                            let total = n_s * params.c_out * params.h_out;
+                            let (gx, gy, gz) = dispatch_dims(total, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Im2ColGpu { params } => {
+                            // One thread per col element (k_total * spatial);
+                            // the following Step::Matmul consumes the col matrix.
+                            let imk = im2col2d_kernel(&dev.device);
+                            pass.set_pipeline(&imk.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            let total = params.k_total.saturating_mul(params.spatial);
                             let (gx, gy, gz) = dispatch_dims(total, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }

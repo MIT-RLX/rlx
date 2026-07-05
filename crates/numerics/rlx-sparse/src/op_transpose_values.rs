@@ -16,7 +16,6 @@
 //! `transpose_values` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -32,7 +31,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_k
 use super::*;
 
 pub(crate) struct SparseTransposeValuesExt;
-
 
 impl OpExtension for SparseTransposeValuesExt {
     fn name(&self) -> &str {
@@ -64,7 +62,6 @@ impl OpExtension for SparseTransposeValuesExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SparseTransposeValuesCpu;
 
@@ -90,4 +87,3 @@ impl CpuKernel for SparseTransposeValuesCpu {
 }
 
 // ── PCG (Jacobi preconditioner) ───────────────────────────────────
-

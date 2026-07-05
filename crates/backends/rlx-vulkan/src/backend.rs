@@ -92,6 +92,13 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         DequantMatMul,
         DequantGroupedMatMul,
         DequantMoEWeights, // GGUF quant
+        // Native low-precision scaled GEMM (FP8/FP6/FP4 + parameterized `fNeXmY`
+        // minifloats). No FP8/FP4 matrix HW on the current SPIR-V path, so these
+        // decode-and-accumulate on the CPU reference against the mapped arena.
+        ScaledMatMul,
+        ScaledQuantScale,
+        ScaledQuantize,
+        ScaledDequantize,
         RngNormal,
         RngUniform,
         Sample, // RNG / generation
@@ -116,6 +123,10 @@ fn is_host_fallback(op: &Op) -> bool {
             | Op::Fft { .. }
             | Op::DequantGroupedMatMul { .. }
             | Op::DequantMoEWeights { .. }
+            | Op::ScaledMatMul { .. }
+            | Op::ScaledQuantScale { .. }
+            | Op::ScaledQuantize { .. }
+            | Op::ScaledDequantize { .. }
             | Op::RngNormal { .. }
             | Op::RngUniform { .. }
             | Op::Sample { .. }
@@ -348,7 +359,14 @@ fn matmul_kernel(m: usize, k: usize, n: usize) -> &'static str {
         Some("tiled") => "matmul_tiled",
         Some("coop") if coop && coop_eligible(m, k, n) => "matmul_coop",
         Some("coop") => "matmul_tiled",
+        Some("tiled-unsafe") => "matmul_tiled", // opt-in for benching the raw tiled path
         _ if portability => "matmul",
+        // The tiled kernel is exact for aligned K, but mishandles a *trailing
+        // partial* K-tile (full tiles followed by a k%16 remainder), e.g.
+        // 32x50x64 → max|Δ|~0.2 vs CPU while 32x48x64 is exact. Until that shader
+        // bug is root-caused, route non-16-aligned-K shapes to the fully general,
+        // bounds-checked (fp32-exact) scalar kernel. Aligned K keeps the fast path.
+        _ if !k.is_multiple_of(16) => "matmul",
         _ => "matmul_tiled",
     }
 }
@@ -852,8 +870,10 @@ impl VulkanExecutable {
                                 (sh, buf)
                             })
                             .collect();
-                        let result = crate::host::eval(op, out_shape, &in_specs);
-                        self.arena.write_f32(*out, &result);
+                        match crate::host::eval(op, out_shape, &in_specs) {
+                            crate::host::HostOut::F32(v) => self.arena.write_f32(*out, &v),
+                            crate::host::HostOut::Bytes(b) => self.arena.write_bytes(*out, &b),
+                        }
                     }
                 }
             }
@@ -943,8 +963,10 @@ impl VulkanExecutable {
                             (sh, buf)
                         })
                         .collect();
-                    let result = crate::host::eval(&op, &out_shape, &in_specs);
-                    self.arena.write_f32(out, &result);
+                    match crate::host::eval(&op, &out_shape, &in_specs) {
+                        crate::host::HostOut::F32(v) => self.arena.write_f32(out, &v),
+                        crate::host::HostOut::Bytes(b) => self.arena.write_bytes(out, &b),
+                    }
                 }
                 i += 1;
             }
@@ -2094,6 +2116,45 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                             inputs: node.inputs.clone(),
                         });
                     }
+                }
+            }
+
+            // Native on-device FFT for f32 power-of-two rows up to 1024
+            // (one workgroup per batch row, radix-2 in shared memory). Larger
+            // n / non-f32 fall back to the host path. This keeps `Op::Fft` off
+            // the host-fallback path, which crashes on discrete GPUs.
+            Op::Fft { inverse, norm } => {
+                let x = node.inputs[0];
+                let in_shape = graph.node(x).shape.clone();
+                let meta = rlx_ir::fft_meta(&in_shape);
+                let native = matches!(in_shape.dtype(), DType::F32)
+                    && meta.n_complex.is_power_of_two()
+                    && meta.n_complex >= 2
+                    && meta.n_complex <= 1024;
+                if native {
+                    let scale = norm.output_scale(meta.n_complex, *inverse) as f32;
+                    let push = Push::default()
+                        .u(off(x))
+                        .u(off(out))
+                        .u(meta.n_complex as u32)
+                        .u((meta.n_complex as u32).trailing_zeros())
+                        .u(if *inverse { 1 } else { 0 })
+                        .f(scale)
+                        .u(meta.outer as u32)
+                        .u(0)
+                        .bytes();
+                    steps.push(Step::Gpu {
+                        kernel: "fft",
+                        push,
+                        groups: (meta.outer as u32, 1, 1),
+                    });
+                } else {
+                    steps.push(Step::Host {
+                        op: node.op.clone(),
+                        out: node.id,
+                        out_shape: node.shape.clone(),
+                        inputs: node.inputs.clone(),
+                    });
                 }
             }
 

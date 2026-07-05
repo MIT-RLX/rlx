@@ -37,7 +37,11 @@ use crate::lower::options::{ImportOptions, ImportReport};
 
 use super::*;
 
-pub(super) fn lower_softmax(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_softmax(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let axis = node
         .attrs
@@ -49,8 +53,11 @@ pub(super) fn lower_softmax(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &B
     Ok(true)
 }
 
-
-pub(super) fn lower_layer_norm(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_layer_norm(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let mut x = ctx.tensor(&node.inputs[0])?;
     let meta_s = output_shape(ctx, node, m, x);
     if m.shape(x).rank() == 3 && is_blc_rank3(&meta_s) {
@@ -89,7 +96,6 @@ pub(super) fn lower_layer_norm(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node:
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-
 
 pub(super) fn lower_instance_norm(
     m: &mut HirMut<'_>,
@@ -173,8 +179,11 @@ pub(super) fn lower_instance_norm(
     Ok(true)
 }
 
-
-pub(super) fn lower_batch_norm(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_batch_norm(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let gamma = ctx.tensor(&node.inputs[1])?;
     let beta = ctx.tensor(&node.inputs[2])?;
@@ -194,4 +203,3 @@ pub(super) fn lower_batch_norm(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node:
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-

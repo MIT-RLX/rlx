@@ -25,7 +25,7 @@
 //!   RANK=1 dist_job rlx-dist.toml
 //! ```
 
-use rlx_driver::{ProcessGroup, ReduceKind, Node, Topology};
+use rlx_driver::{Node, ProcessGroup, ReduceKind, Topology};
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session, device_label, fastest_device, is_available, parse_device};
 use serde::Deserialize;
@@ -77,7 +77,9 @@ fn default_disc_port() -> u16 {
 
 fn main() {
     // Config path from argv, else ./rlx-dist.toml. RANK from the environment.
-    let path = std::env::args().nth(1).unwrap_or_else(|| "rlx-dist.toml".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "rlx-dist.toml".into());
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         eprintln!("cannot read {path}: {e}");
         std::process::exit(2);
@@ -86,7 +88,10 @@ fn main() {
         eprintln!("bad config {path}: {e}");
         std::process::exit(2);
     });
-    let rank: u32 = std::env::var("RANK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let rank: u32 = std::env::var("RANK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let world = cfg.job.world;
     let device = resolve_device(&cfg.net.device);
 
@@ -123,7 +128,11 @@ fn main() {
 
 fn node_topology(net: &Net) -> &str {
     // mDNS and rendezvous are coordinator-centric → always star.
-    if net.discovery == "static" { &net.topology } else { "star" }
+    if net.discovery == "static" {
+        &net.topology
+    } else {
+        "star"
+    }
 }
 
 /// Catch a placeholder address the user forgot to edit (e.g. the docs'
@@ -149,14 +158,20 @@ fn build_node(rank: u32, world: u32, net: &Net) -> Node {
     match net.discovery.as_str() {
         "static" => {
             if net.peers.is_empty() {
-                config_error("discovery = \"static\" requires [net] peers = [\"host:port\", …]".into());
+                config_error(
+                    "discovery = \"static\" requires [net] peers = [\"host:port\", …]".into(),
+                );
             }
             if let Some(p) = net.peers.iter().find(|p| is_placeholder(p)) {
                 config_error(format!(
                     "[net] peers still has the placeholder '{p}' — set real host:port values (one per rank)"
                 ));
             }
-            let topo = if net.topology == "star" { Topology::Star } else { Topology::Mesh };
+            let topo = if net.topology == "star" {
+                Topology::Star
+            } else {
+                Topology::Mesh
+            };
             Node::new(rank, world)
                 .topology(topo)
                 .peers(net.peers.iter().map(String::as_str))
@@ -249,7 +264,11 @@ fn train(group: &Arc<ProcessGroup>, device: Device, steps: usize) {
 
     for _ in 0..steps {
         compiled.set_param("w", &w);
-        let y = compiled.run(&[("x", x.as_slice())]).into_iter().next().unwrap();
+        let y = compiled
+            .run(&[("x", x.as_slice())])
+            .into_iter()
+            .next()
+            .unwrap();
         // grad of (1/N)·Σ(y-t)²  w.r.t. w  =  (2/N)·Xᵀ(y - t)
         let mut grad = vec![0f32; D];
         for i in 0..N {
@@ -258,7 +277,9 @@ fn train(group: &Arc<ProcessGroup>, device: Device, steps: usize) {
                 grad[j] += 2.0 * e * x[i * D + j] / N as f32;
             }
         }
-        group.all_reduce(&mut grad, ReduceKind::Mean).expect("all_reduce grad");
+        group
+            .all_reduce(&mut grad, ReduceKind::Mean)
+            .expect("all_reduce grad");
         for j in 0..D {
             w[j] -= lr * grad[j];
         }
@@ -266,13 +287,19 @@ fn train(group: &Arc<ProcessGroup>, device: Device, steps: usize) {
 
     // Final loss on the local shard (same globally-averaged w on every node).
     compiled.set_param("w", &w);
-    let y = compiled.run(&[("x", x.as_slice())]).into_iter().next().unwrap();
+    let y = compiled
+        .run(&[("x", x.as_slice())])
+        .into_iter()
+        .next()
+        .unwrap();
     let loss: f32 = (0..N).map(|i| (y[i] - target[i]).powi(2)).sum::<f32>() / N as f32;
     if rank == 0 {
         eprintln!(
             "[rank 0] TRAINED {steps} steps across {world} node(s) on {} → w={:?}, loss={loss:.3e}  {}",
             device_label(device),
-            w.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
+            w.iter()
+                .map(|v| (v * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>(),
             if loss < 1e-3 { "✓" } else { "" }
         );
     }
@@ -283,7 +310,10 @@ fn train(group: &Arc<ProcessGroup>, device: Device, steps: usize) {
 /// them into the full result — the classic TP collective.
 fn infer(group: &Arc<ProcessGroup>, device: Device) {
     let (rank, world) = (group.rank() as usize, group.world_size() as usize);
-    assert!(D % world == 0, "D={D} must divide by world={world} for this demo");
+    assert!(
+        D.is_multiple_of(world),
+        "D={D} must divide by world={world} for this demo"
+    );
     let dr = D / world; // this node's slice of the contraction dim
 
     // Shared full inputs/weights (every node agrees); each keeps only its slice.
@@ -305,10 +335,16 @@ fn infer(group: &Arc<ProcessGroup>, device: Device) {
     g.set_outputs(vec![y]);
     let mut compiled = Session::new(device).compile(g);
     compiled.set_param("w", &w_shard);
-    let mut y_partial = compiled.run(&[("x", x_shard.as_slice())]).into_iter().next().unwrap();
+    let mut y_partial = compiled
+        .run(&[("x", x_shard.as_slice())])
+        .into_iter()
+        .next()
+        .unwrap();
 
     // Sum the per-node partials → full y = x_full @ w_full.
-    group.all_reduce(&mut y_partial, ReduceKind::Sum).expect("all_reduce y");
+    group
+        .all_reduce(&mut y_partial, ReduceKind::Sum)
+        .expect("all_reduce y");
 
     if rank == 0 {
         // Reference on rank 0 to confirm the distributed result.

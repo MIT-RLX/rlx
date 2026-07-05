@@ -45,11 +45,11 @@ use crate::kernels::{
     argmax_kernel, attention_bwd_kernel, attention_kernel, attention_row_kernel,
     batch_elementwise_region_kernel, binary_kernel, compare_kernel, concat_kernel,
     conv_transpose2d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
-    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel,
-    fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
-    fused_residual_rms_norm_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
-    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, layer_norm2d_kernel, layernorm_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dispatch_grid_1d,
+    dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel, fused_attn_kernel,
+    fused_binary_unary_kernel, fused_residual_ln_kernel, fused_residual_rms_norm_kernel,
+    gather_axis_kernel, gather_backward_kernel, gather_kernel, group_norm_kernel,
+    grouped_matmul_kernel, im2col_kernel, layer_norm2d_kernel, layernorm_kernel,
     matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel,
     narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
     resize_nearest_2x_kernel, rms_norm_backward_kernel, rms_norm_bwd_zero_kernel,
@@ -2524,6 +2524,19 @@ fn reduce_op_id(op: ReduceOp) -> u32 {
     }
 }
 
+/// Op code for the `pool{1,2,3}d.cu` kernels, whose legend is `0=max, 1=mean,
+/// 2=sum, 3=min, 4=prod` — this differs from [`reduce_op_id`] (which swaps Max
+/// and Sum). Using `reduce_op_id` here made max-pooling compute the window sum.
+fn pool_op_id(op: ReduceOp) -> u32 {
+    match op {
+        ReduceOp::Max => 0,
+        ReduceOp::Mean => 1,
+        ReduceOp::Sum => 2,
+        ReduceOp::Min => 3,
+        ReduceOp::Prod => 4,
+    }
+}
+
 fn activation_op_id(act: Activation) -> u32 {
     match act {
         Activation::Relu => 0,
@@ -3800,15 +3813,47 @@ impl CudaExecutable {
                 && arena.has(node.id)
                 && !data.is_empty()
             {
-                let bytes_to_write = data.len().min(arena.len_of(node.id));
-                let n_f32 = bytes_to_write / 4;
-                let f32_view: &[f32] =
-                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_f32) };
+                // The arena is f32; widen the constant to f32 by its declared
+                // dtype (e.g. an i64 `arange` constant would otherwise be read
+                // as garbage f32 bit-for-bit).
+                let f32_data: Vec<f32> = match node.shape.dtype() {
+                    rlx_ir::DType::F32 => data
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                    rlx_ir::DType::F64 => data
+                        .chunks_exact(8)
+                        .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+                        .collect(),
+                    rlx_ir::DType::I64 => data
+                        .chunks_exact(8)
+                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+                        .collect(),
+                    rlx_ir::DType::I32 | rlx_ir::DType::U32 => data
+                        .chunks_exact(4)
+                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+                        .collect(),
+                    rlx_ir::DType::I16 => data
+                        .chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32)
+                        .collect(),
+                    rlx_ir::DType::I8 => data.iter().map(|&b| b as i8 as f32).collect(),
+                    rlx_ir::DType::U8 | rlx_ir::DType::Bool => {
+                        data.iter().map(|&b| b as f32).collect()
+                    }
+                    // f16/bf16/c64: raw bytes already narrower/complex — keep the
+                    // bit-reinterpret path.
+                    _ => data
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                };
+                let n_f32 = f32_data.len().min(arena.len_of(node.id) / 4);
                 let off_f32 = arena.offset(node.id) / 4;
                 let stream = ctx.default_stream();
                 let mut slot = arena.f32_buf_mut().slice_mut(off_f32..off_f32 + n_f32);
                 stream
-                    .memcpy_htod(f32_view, &mut slot)
+                    .memcpy_htod(&f32_data[..n_f32], &mut slot)
                     .expect("rlx-cuda: constant upload failed");
             }
         }
@@ -5631,7 +5676,7 @@ impl CudaExecutable {
                     let in_id = node.inputs[0];
                     let in_dims = graph.node(in_id).shape.dims();
                     let out_dims = node.shape.dims();
-                    let op_id = reduce_op_id(*kind);
+                    let op_id = pool_op_id(*kind);
                     let in_off = (arena.offset(in_id) / 4) as u32;
                     let out_off = (arena.offset(node.id) / 4) as u32;
                     match kernel_size.len() {
@@ -11130,6 +11175,7 @@ mod tests {
             mask_off: 9999,
             mask_kind: 1, // causal — mask_off ignored
             scale_bits: 0,
+            softcap_bits: 0,
             window: 0,
             seq_q_stride: mq,
             seq_k_stride: mk,
@@ -11170,6 +11216,7 @@ mod tests {
             mask_off: 9999,
             mask_kind: 2, // custom mask
             scale_bits: 0,
+            softcap_bits: 0,
             window: 0,
             seq_q_stride: mq,
             seq_k_stride: mk,

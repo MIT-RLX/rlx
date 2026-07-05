@@ -16,7 +16,6 @@
 //! `cholesky` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -32,7 +31,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_k
 use super::*;
 
 pub(crate) struct SparseCholeskyExt;
-
 
 impl OpExtension for SparseCholeskyExt {
     fn name(&self) -> &str {
@@ -67,7 +65,6 @@ impl OpExtension for SparseCholeskyExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SparseCholeskyCpu;
 
@@ -92,4 +89,3 @@ impl CpuKernel for SparseCholeskyCpu {
 }
 
 // ── LSQR ──────────────────────────────────────────────────────────
-

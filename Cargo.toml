@@ -83,6 +83,7 @@ members = [
     "crates/io/rlx-onnx",        # ONNX Runtime inference for .onnx files (PLAN B7)
     "crates/io/rlx-onnx-import", # ONNX → RLX HIR import + op lowering
     "crates/io/rlx-onnx-conformance", # ONNX op-level ORT parity harness
+    "crates/io/rlx-torch-import", # PyTorch (torch.export) → RLX HIR import + bundle/crate emit
 
     # Text: tokenizer + chat template + sampling (public surface for downstream LM apps)
     "crates/io/rlx-text",
@@ -133,7 +134,7 @@ incremental = false
 # Add them as crates reach individual readiness.
 
 [workspace.package]
-version       = "0.2.10"
+version       = "0.2.12"
 edition       = "2024"
 rust-version  = "1.87"  # edition=2024 needs ≥1.85; we use `is_multiple_of` (stable in 1.87)
 license       = "GPL-3.0-only"

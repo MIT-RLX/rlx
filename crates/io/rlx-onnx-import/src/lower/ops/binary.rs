@@ -73,8 +73,11 @@ pub(super) fn lower_binary(
     Ok(true)
 }
 
-
-pub(super) fn lower_pow(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_pow(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let a = ctx.tensor(&node.inputs[0])?;
     let b = ctx.tensor(&node.inputs[1])?;
     let s = output_shape(ctx, node, m, a);
@@ -83,8 +86,11 @@ pub(super) fn lower_pow(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bundl
     Ok(true)
 }
 
-
-pub(super) fn lower_clip(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_clip(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let min_v = node
         .attrs
@@ -117,8 +123,11 @@ pub(super) fn lower_clip(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bund
     Ok(true)
 }
 
-
-pub(super) fn lower_where(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_where(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let cond = ctx.tensor(&node.inputs[0])?;
     let on_t = ctx.tensor(&node.inputs[1])?;
     let on_f = ctx.tensor(&node.inputs[2])?;
@@ -136,7 +145,6 @@ pub(super) fn lower_where(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bun
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-
 
 pub(super) fn lower_compare(
     m: &mut HirMut<'_>,
@@ -174,6 +182,17 @@ pub(super) fn lower_compare(
         ctx.env.insert(node.outputs[0].clone(), id);
         return Ok(true);
     }
+    if op == "Or" && node.inputs.len() == 2 {
+        // a ∨ b  ≡  (a + b) ≠ 0  for boolean {0,1} operands.
+        let a = ctx.tensor(&node.inputs[0])?;
+        let b = ctx.tensor(&node.inputs[1])?;
+        let z = ctx.f32_scalar_param(m, &format!("__or_z__/{}", node.name), 0.0);
+        let sum = binary_infer_add(m, a, b, &node.name);
+        let s = output_shape(ctx, node, m, sum).with_dtype(DType::Bool);
+        let id = m.add_node(Op::Compare(CmpOp::Ne), vec![sum, z], s);
+        ctx.env.insert(node.outputs[0].clone(), id);
+        return Ok(true);
+    }
     if node.inputs.len() < 2 {
         ctx.unsupported(op);
         return Ok(false);
@@ -183,6 +202,8 @@ pub(super) fn lower_compare(
     let cmp = match op {
         "Less" => CmpOp::Lt,
         "Greater" => CmpOp::Gt,
+        "LessOrEqual" => CmpOp::Le,
+        "GreaterOrEqual" => CmpOp::Ge,
         _ => CmpOp::Eq,
     };
     let sa = m.shape(a).clone();
@@ -197,8 +218,11 @@ pub(super) fn lower_compare(
     Ok(true)
 }
 
-
-pub(super) fn lower_mod(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_mod(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let a = ctx.tensor(&node.inputs[0])?;
     let b = ctx.tensor(&node.inputs[1])?;
     let fmod = node.attrs.get("fmod").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -217,8 +241,11 @@ pub(super) fn lower_mod(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bundl
     Ok(true)
 }
 
-
-pub(super) fn lower_is_nan(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_is_nan(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let s = output_shape(ctx, node, m, x).with_dtype(DType::Bool);
     let id = m.add_node(
@@ -233,4 +260,3 @@ pub(super) fn lower_is_nan(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bu
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-

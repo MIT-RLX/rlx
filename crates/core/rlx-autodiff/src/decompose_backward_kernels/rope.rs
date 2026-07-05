@@ -42,4 +42,3 @@ pub fn compose_rope_backward(
     let neg_sin = g.mul(sin, neg);
     g.rope_n(dy, cos, neg_sin, head_dim, n_rot)
 }
-

@@ -16,8 +16,6 @@
 //! `log_det_backward` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::infer::GraphExt;
@@ -32,7 +30,6 @@ use super::*;
 
 pub(crate) struct LogDetBackwardExt;
 
-
 impl OpExtension for LogDetBackwardExt {
     fn name(&self) -> &str {
         LINALG_LOGDET_BACKWARD
@@ -44,7 +41,6 @@ impl OpExtension for LogDetBackwardExt {
         inputs[0].clone()
     }
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct LogDetBackwardCpu;
@@ -79,4 +75,3 @@ impl CpuKernel for LogDetBackwardCpu {
 }
 
 // ── Public builder API ───────────────────────────────────────────
-

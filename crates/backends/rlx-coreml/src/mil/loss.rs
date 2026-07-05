@@ -10,14 +10,14 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use super::helpers::simple_op_flex;
+use super::helpers::*;
+use crate::proto;
+use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use crate::proto;
-use crate::{CoremlError, Result};
-use super::helpers::simple_op_flex;
-use super::helpers::*;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -164,14 +164,17 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Native softmax-cross-entropy backward. Inputs `[logits [N,C], labels [N],
     /// d_loss [N]]`, output `dlogits [N,C] = (softmax(logits) − onehot(labels))·d_loss`.
     /// Mirrors `rlx_fusion::lower_softmax_cross_entropy_backward`, but emits MIL's
     /// single `one_hot` op instead of concatenating C class columns — the decompose
     /// path is O(C) graph nodes, which is unusable at LLM vocab sizes.
     #[cfg(feature = "training")]
-    pub(crate) fn lower_softmax_cross_entropy_backward(&mut self, id: NodeId, out_name: &str) -> Result<()> {
+    pub(crate) fn lower_softmax_cross_entropy_backward(
+        &mut self,
+        id: NodeId,
+        out_name: &str,
+    ) -> Result<()> {
         let node = self.graph.node(id);
         let logits_id = node.inputs[0];
         let labels_id = node.inputs[1];
@@ -249,5 +252,4 @@ impl<'a> LowerCtx<'a> {
         self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
-
 }

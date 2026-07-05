@@ -1,0 +1,17 @@
+{
+  "name": "cnn",
+  "inputs": [
+    {
+      "name": "x",
+      "shape": [
+        2,
+        3,
+        16,
+        16
+      ],
+      "dtype": "f32"
+    }
+  ],
+  "output_count": 1,
+  "zero_params": []
+}

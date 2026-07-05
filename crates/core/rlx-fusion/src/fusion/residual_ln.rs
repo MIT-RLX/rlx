@@ -36,7 +36,6 @@ use super::*;
 /// bias variant (used in BERT's output projection).
 pub struct FuseResidualLN;
 
-
 impl Pass for FuseResidualLN {
     fn name(&self) -> &str {
         "fuse_residual_ln"
@@ -110,4 +109,3 @@ impl Pass for FuseResidualLN {
 }
 
 // ── Pass 2b: Add(residual) + RmsNorm → FusedResidualRmsNorm ─────────────
-

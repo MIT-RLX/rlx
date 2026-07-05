@@ -334,11 +334,25 @@ impl CoremlExecutable {
                 "rlx-coreml-{pid}-{seq}-{i}-{}.mlpackage",
                 sanitize(&self.graph.name)
             ));
-            if !cache_path.exists() {
+            // Skip re-serialising the `.mlpackage` (incl. a possibly multi-GB
+            // weight blob) when the compiled-model cache is already warm — the
+            // native loader loads straight from the `.mlmodelc`. But if that
+            // cache turns out to be stale, the native side discards it and
+            // falls back to recompiling from the `.mlpackage`; write it and
+            // retry so a bad cache entry can't permanently wedge loading.
+            let compute = self.compute_units.code();
+            let wrote_pkg = !cache_path.exists();
+            if wrote_pkg {
                 crate::mlpackage::write_mlpackage_bytes(&proto_bytes, &lowered.blob, &dir)?;
             }
-            let model =
-                CoremlModel::load(&dir, self.compute_units.code(), Some(cache_path.as_path()))?;
+            let model = match CoremlModel::load(&dir, compute, Some(cache_path.as_path())) {
+                Ok(m) => m,
+                Err(_) if !wrote_pkg => {
+                    crate::mlpackage::write_mlpackage_bytes(&proto_bytes, &lowered.blob, &dir)?;
+                    CoremlModel::load(&dir, compute, Some(cache_path.as_path()))?
+                }
+                Err(e) => return Err(e),
+            };
             slot.lowered = Some(lowered);
             slot.pkg_dir = Some(dir);
             slot.model = Some(model);

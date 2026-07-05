@@ -27,17 +27,15 @@ use rlx_ir::op::{Activation, BinaryOp, CmpOp, ReduceOp};
 use rlx_ir::shape::DimBinding;
 use rlx_ir::{Graph, NodeId, Op};
 
-use crate::buffer::{
-    Arena, ReadbackStaging, TinyReadbackStaging,
-};
+use crate::buffer::{Arena, ReadbackStaging, TinyReadbackStaging};
 use crate::device::wgpu_device;
 use crate::kernels::{
     ArgmaxParams, AttentionBwdParams, AttentionParams, BatchElementwiseRegionParams, BinaryParams,
     Conv1dParams, Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams,
     DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
     FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNormBwdParams, LayerNormParams,
-    Mamba2Params, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
+    GatherParams, GroupedMatmulParams, GruParams, Im2Col2dParams, Kernel, LayerNormBwdParams,
+    LayerNormParams, Mamba2Params, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
     Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
     SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
     TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
@@ -95,6 +93,146 @@ fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
     // arena exceeds wgpu's binding window. This keeps compile-time simple
     // and avoids per-op scratch sizing plumbing.
     max_bytes.max(64 * 1024 * 1024)
+}
+
+/// Default routing thresholds for the im2col+GEMM conv path. im2col only wins
+/// when the GEMM amortizes the `col` materialization: the compute/col-write
+/// ratio is `c_out`, so a large output-channel count (`min_cout`) is the key
+/// gate, plus a real reduction depth (`min_k = c_in*kh*kw`) and a wide enough
+/// spatial extent (`min_spatial`). Small skinny 1D convs (few channels) are
+/// left on the direct `conv2d.wgsl` kernel, which is faster there. All three
+/// are overridable via env for tuning (`RLX_WGPU_IM2COL_MIN_{COUT,K,SPATIAL}`).
+const CONV_IM2COL_MIN_SPATIAL: u64 = 2048;
+const CONV_IM2COL_MIN_K: u64 = 256;
+const CONV_IM2COL_MIN_COUT: u64 = 64;
+
+/// Hard cap on the col scratch matrix (bytes). Convs whose col would exceed
+/// this fall back to the direct conv kernel (keeps the arena well under the
+/// 4 GiB storage-binding limit).
+const CONV_IM2COL_MAX_COL_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn im2col_min_spatial() -> u64 {
+    rlx_ir::env::parse_or("RLX_WGPU_IM2COL_MIN_SPATIAL", CONV_IM2COL_MIN_SPATIAL)
+}
+fn im2col_min_k() -> u64 {
+    rlx_ir::env::parse_or("RLX_WGPU_IM2COL_MIN_K", CONV_IM2COL_MIN_K)
+}
+fn im2col_min_cout() -> u64 {
+    rlx_ir::env::parse_or("RLX_WGPU_IM2COL_MIN_COUT", CONV_IM2COL_MIN_COUT)
+}
+
+/// Minimum output length for routing a `one_d` conv through the register-blocked
+/// `conv1d_tiled` kernel. Short convs stay on the direct kernel (the tile setup
+/// isn't worth it). Overridable via `RLX_WGPU_TILED_MIN_SPATIAL`.
+const CONV_TILED_MIN_SPATIAL: u64 = 256;
+fn conv_tiled_min_spatial() -> u64 {
+    rlx_ir::env::parse_or("RLX_WGPU_TILED_MIN_SPATIAL", CONV_TILED_MIN_SPATIAL)
+}
+
+/// Element count of the im2col `col[c_in*kh*kw, spatial]` matrix if this conv
+/// node qualifies for the im2col+GEMM path (2D / 1D-as-2D NCHW, `N==1`,
+/// `groups==1`, real spatial kernel, spatial ≥ [`CONV_IM2COL_MIN_SPATIAL`]).
+/// Returns `None` otherwise. Mirrors the shape math in the `Op::Conv` compile
+/// arm so scratch sizing and lowering agree on which convs are routed.
+fn conv_im2col_col_elems(
+    op: &Op,
+    in_shape: &rlx_ir::Shape,
+    w_shape: &rlx_ir::Shape,
+    out_shape: &rlx_ir::Shape,
+) -> Option<u64> {
+    let Op::Conv {
+        kernel_size,
+        groups,
+        ..
+    } = op
+    else {
+        return None;
+    };
+    if *groups != 1 {
+        return None;
+    }
+    if !(kernel_size.len() == 2
+        && in_shape.rank() == 4
+        && w_shape.rank() == 4
+        && out_shape.rank() == 4)
+    {
+        return None;
+    }
+    for d in [
+        in_shape.dim(0),
+        in_shape.dim(1),
+        in_shape.dim(2),
+        in_shape.dim(3),
+    ] {
+        if !d.is_static() {
+            return None;
+        }
+    }
+    if !out_shape.dim(2).is_static() || !out_shape.dim(3).is_static() {
+        return None;
+    }
+    if !out_shape.dim(1).is_static() {
+        return None;
+    }
+    if in_shape.dim(0).unwrap_static() != 1 {
+        return None;
+    }
+    let c_in = in_shape.dim(1).unwrap_static() as u64;
+    let c_out = out_shape.dim(1).unwrap_static() as u64;
+    let h_in = in_shape.dim(2).unwrap_static() as u32;
+    let w_in = in_shape.dim(3).unwrap_static() as u32;
+    let one_d = h_in == 1
+        && w_in > 1
+        && kernel_size[0] > 1
+        && kernel_size.get(1).copied().unwrap_or(1) == 1;
+    let (kh, kw, spatial) = if one_d {
+        (
+            kernel_size[0] as u64,
+            1u64,
+            out_shape.dim(3).unwrap_static() as u64,
+        )
+    } else {
+        (
+            kernel_size[0] as u64,
+            kernel_size.get(1).copied().unwrap_or(1) as u64,
+            out_shape.dim(2).unwrap_static() as u64 * out_shape.dim(3).unwrap_static() as u64,
+        )
+    };
+    let k_total = c_in * kh * kw;
+    if kh * kw < 2 {
+        return None;
+    }
+    if spatial < im2col_min_spatial() || k_total < im2col_min_k() || c_out < im2col_min_cout() {
+        return None;
+    }
+    Some(k_total * spatial)
+}
+
+/// Extra arena scratch (bytes, 256-aligned) needed to hold the largest conv
+/// col matrix that will be routed through im2col+GEMM. Capped so the whole
+/// arena still binds in a single storage-binding window. Returns 0 when no
+/// conv qualifies or none fits.
+fn conv_im2col_scratch_bytes(graph: &Graph, planned_arena_size: usize, max_binding: u64) -> usize {
+    let mut max_col_bytes: u64 = 0;
+    for node in graph.nodes() {
+        if node.inputs.len() < 2 {
+            continue;
+        }
+        let in_shape = &graph.node(node.inputs[0]).shape;
+        let w_shape = &graph.node(node.inputs[1]).shape;
+        let Some(elems) = conv_im2col_col_elems(&node.op, in_shape, w_shape, &node.shape) else {
+            continue;
+        };
+        let col_bytes = elems.saturating_mul(4);
+        if col_bytes > CONV_IM2COL_MAX_COL_BYTES {
+            continue;
+        }
+        if (planned_arena_size as u64).saturating_add(col_bytes) > max_binding {
+            continue;
+        }
+        max_col_bytes = max_col_bytes.max(col_bytes);
+    }
+    (max_col_bytes.div_ceil(256) * 256) as usize
 }
 
 /// FNV-1a over f32 payload bytes — skips redundant `queue.write_buffer`
@@ -395,6 +533,18 @@ enum Step {
         params: Pool2dParams,
     },
     Conv2d {
+        params: Conv2dParams,
+    },
+    /// GPU im2col: gather a conv's receptive fields into a `col` matrix in the
+    /// arena scratch tail. Always immediately followed by a `Step::Matmul`
+    /// (weight @ col → NCHW output) that reuses the tiled f32 GEMM kernels.
+    Im2ColGpu {
+        params: Im2Col2dParams,
+    },
+    /// 2D register-blocked 1D conv (`conv1d_tiled.wgsl`) — same `Conv2dParams`
+    /// as `Conv2d` but a `TCO×TL` output tile per thread that reuses the input
+    /// across output channels. Used for the `one_d` (kw==1) vocoder convs.
+    Conv2dTiled {
         params: Conv2dParams,
     },
     Pool1d {
@@ -925,6 +1075,7 @@ impl Step {
             | Step::MsDeformAttnHost { .. }
             | Step::Conv1d { .. }
             | Step::Conv2d { .. }
+            | Step::Conv2dTiled { .. }
             | Step::Conv3d { .. }
             | Step::Pool1d { .. }
             | Step::Pool2d { .. }
@@ -947,6 +1098,11 @@ impl Step {
             // global_row >= m early-return; per-batch output offsets
             // stay correct. Safe at any batch.
             Step::Matmul { .. } => true,
+            // im2col params (offsets + spatial extents) are baked at compile
+            // time for a fixed conv shape; they cannot be active-extent
+            // scaled. Returning false disables the fast path for any graph
+            // that contains an im2col conv (conv-heavy models don't use it).
+            Step::Im2ColGpu { .. } => false,
             // Same active-extent reasoning as Matmul: per-batch output
             // strides are baked at compile time, scaling m only adjusts
             // the per-thread bound check.
@@ -1072,6 +1228,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::Argmax { .. } => "argmax",
         Step::Pool2d { .. } => "pool2d",
         Step::Conv2d { .. } => "conv2d",
+        Step::Conv2dTiled { .. } => "conv2d_tiled",
+        Step::Im2ColGpu { .. } => "im2col_gpu",
         Step::Pool1d { .. } => "pool1d",
         Step::Pool3d { .. } => "pool3d",
         Step::Conv1d { .. } => "conv1d",
@@ -1289,18 +1447,19 @@ impl WgpuExecutable {
         }
     }
 
-
     /// Current RNG compile/execute policy.
     pub fn rng(&self) -> rlx_ir::RngOptions {
         *self.rng.read().expect("rng lock")
     }
 
-
     /// Compile placeholder for a graph with `Dim::Dynamic` entries.
     /// The real compile happens on the first `run()` once input data
     /// reveals the symbol → size bindings. Buffered params (set via
     /// `set_param` / `set_param_bytes` before run) are replayed.
-    pub(crate) fn deferred(graph: Graph, rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>) -> Self {
+    pub(crate) fn deferred(
+        graph: Graph,
+        rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    ) -> Self {
         let dev = wgpu_device().expect("rlx-wgpu: no compatible adapter found");
         // Minimal valid arena buffer. Replaced on first run().
         let placeholder = dev.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1355,11 +1514,9 @@ impl WgpuExecutable {
         }
     }
 
-
     pub(crate) fn all_safe_for_active(&self) -> bool {
         self.schedule.iter().all(|s| s.safe_for_active_extent())
     }
-
 
     /// Debug helper: run forward, then read every node slot back and
     /// report the first node whose output contains a NaN, plus a
@@ -1402,7 +1559,6 @@ impl WgpuExecutable {
         None
     }
 
-
     /// Declared output dtypes (one per graph output). Used by the
     /// runtime wrapper's `run_typed` to narrow F32 results back to
     /// F16/BF16 etc. on the way out.
@@ -1413,7 +1569,6 @@ impl WgpuExecutable {
             .map(|&id| self.graph.node(id).shape.dtype())
             .collect()
     }
-
 
     pub(crate) fn dump_node_stats_if_requested(&self, dev: &crate::device::WgpuDevice) {
         if !rlx_ir::env::flag("RLX_WGPU_DUMP_NODES") {
@@ -1465,7 +1620,6 @@ impl WgpuExecutable {
         }
     }
 
-
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         if !self.input_offsets.contains_key(name) {
             return false;
@@ -1475,11 +1629,9 @@ impl WgpuExecutable {
         true
     }
 
-
     pub fn has_gpu_handle(&self, name: &str) -> bool {
         self.gpu_handles.contains_key(name)
     }
-
 
     pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         if let Some(&out_idx) = self.gpu_handle_feeds.get(name) {
@@ -1501,7 +1653,6 @@ impl WgpuExecutable {
         }
         self.gpu_handles.get(name).cloned()
     }
-
 
     /// Clone into an independent executable (recompiles from the stored graph).
     pub fn clone_for_cache(&self) -> Self {
@@ -1530,7 +1681,6 @@ impl WgpuExecutable {
         exe
     }
 
-
     pub(crate) fn readback_plan(&self) -> Vec<usize> {
         let n = self.graph.outputs.len();
         if self.pending_read_indices.is_none() && self.gpu_handle_feeds.is_empty() {
@@ -1543,7 +1693,6 @@ impl WgpuExecutable {
         }
         (0..n).collect()
     }
-
 
     pub(crate) fn propagate_gpu_handle_feeds_on_gpu(
         &mut self,
@@ -1580,7 +1729,6 @@ impl WgpuExecutable {
         }
     }
 
-
     pub(crate) fn stage_gpu_handle_inputs(
         &mut self,
         dev: &crate::device::WgpuDevice,
@@ -1599,8 +1747,11 @@ impl WgpuExecutable {
         }
     }
 
-
-    pub(crate) fn pack_readback_outputs(&mut self, plan: &[usize], partial: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    pub(crate) fn pack_readback_outputs(
+        &mut self,
+        plan: &[usize],
+        partial: Vec<Vec<f32>>,
+    ) -> Vec<Vec<f32>> {
         if self.pending_read_indices.is_none() {
             for (pos, &out_i) in plan.iter().enumerate() {
                 if let Some(data) = partial.get(pos) {
@@ -1631,9 +1782,7 @@ impl WgpuExecutable {
             })
             .collect()
     }
-
 }
-
 
 /// Compute a (X, Y, 1) workgroup grid for a 1-D workload.
 ///
@@ -2449,6 +2598,17 @@ fn bind_op_window(
     bind_two_buf0_window(device, kernel, &arena.buffer, base, size, params)
 }
 
+/// Storage-buffer binding size for an arena window. wgpu 30 validates that
+/// storage-buffer binding sizes are a multiple of 4; arena windows can end on
+/// a non-4 byte (u8-packed GGUF / f16 buffers), so round up — clamped to the
+/// buffer's tail so the binding never runs past the buffer end.
+pub(crate) fn aligned_bind_size(size: u64, base: u64, buffer_size: u64) -> Option<NonZeroU64> {
+    // Round the window up to a multiple of 4, clamped to the buffer's 4-aligned
+    // capacity (the arena buffer may itself end on a non-4 byte, so `& !3`).
+    let cap = (buffer_size & !3).saturating_sub(base);
+    NonZeroU64::new(size.next_multiple_of(4).min(cap))
+}
+
 fn bind_two_buf0_window(
     device: &wgpu::Device,
     kernel: &Kernel,
@@ -2466,7 +2626,7 @@ fn bind_two_buf0_window(
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: buf0,
                     offset: buf0_base,
-                    size: NonZeroU64::new(buf0_size),
+                    size: aligned_bind_size(buf0_size, buf0_base, buf0.size()),
                 }),
             },
             wgpu::BindGroupEntry {
@@ -2569,11 +2729,8 @@ fn derive_matmul_compute(
     // vs CPU; forcing the plain F32 kernel restores cos 1.0. GGUF text models
     // dodged this via the DequantMatMul path. Until the kernel is root-caused,
     // Metal CoopF32 is opt-in via RLX_WGPU_FORCE_COOP_F32.
-    let metal_coop = !disabled
-        && has_coop
-        && coop_f32_metal_aligned
-        && traces_to_param(graph, b_id)
-        && forced;
+    let metal_coop =
+        !disabled && has_coop && coop_f32_metal_aligned && traces_to_param(graph, b_id) && forced;
     let _ = backend;
     let vulkan_coop = !disabled
         && has_coop
@@ -3362,4 +3519,3 @@ fn build_matmul_bind_group(
         b_off,
     )
 }
-

@@ -17,13 +17,13 @@
 
 #![allow(unused_imports)]
 
-use rlx_ir::{Graph, NodeId, Op};
-use rlx_opt::memory;
-use std::collections::HashMap;
 use crate::arena::Arena;
 use crate::device::metal_device;
 use crate::kernels::kernels;
 use crate::thunk::{Thunk, ThunkSchedule};
+use rlx_ir::{Graph, NodeId, Op};
+use rlx_opt::memory;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -48,7 +48,6 @@ impl MetalExecutable {
         full[..logical_len].to_vec()
     }
 
-
     /// Read one row from a row-major graph output (bucketed decode K/V).
     pub fn read_graph_output_row(&self, out_idx: usize, row: usize, row_inner: usize) -> Vec<f32> {
         let id = self.graph.outputs[out_idx];
@@ -72,7 +71,6 @@ impl MetalExecutable {
         }
     }
 
-
     pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         if let Some(&out_idx) = self.gpu_handle_feeds.get(name) {
             if out_idx < self.graph.outputs.len() {
@@ -86,5 +84,4 @@ impl MetalExecutable {
         }
         self.gpu_handles.get(name).cloned()
     }
-
 }

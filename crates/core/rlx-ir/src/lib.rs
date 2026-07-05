@@ -125,6 +125,7 @@ pub use op_registry::{
     register_op,
 };
 pub use ops::attention::attention_kind_op;
+pub use ops::dsp::{FirMode, iir_impulse_response};
 pub use phase::{Phase, PhaseSchedule, derive_phases};
 pub use provenance::{NodeOrigin, node_label, stamp_pass_origins};
 pub use quant::{QuantMap, QuantScheme, ScaleLayout, ScaledFormat};

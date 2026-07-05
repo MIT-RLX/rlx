@@ -118,6 +118,16 @@ impl Session {
     /// `new_with_precision` / `with_policy`. This escape hatch is for
     /// callers that need finer control (e.g., disable DCE for debugging).
     pub fn compile_with(&self, graph: Graph, options: &crate::CompileOptions) -> CompiledGraph {
+        // Opt-in native low-precision GEMM: rewrite every 2-D matmul into a
+        // dynamically-quantized `ScaledMatMul` in the requested format before
+        // the rest of the pipeline (must precede constant folding). Requires
+        // static matmul shapes.
+        let graph = match options.scaled_quant {
+            Some(cfg) => {
+                rlx_opt::rlx_compile::scaled_quant_insert::insert_scaled_matmul(graph, cfg)
+            }
+            None => graph,
+        };
         if rlx_ir::dynamic::has_dynamic_dims(&graph) && !self.coreml_native_flex() {
             return self.compile_deferred(graph, options.clone());
         }

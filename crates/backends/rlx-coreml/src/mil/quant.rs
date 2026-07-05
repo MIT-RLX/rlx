@@ -10,14 +10,14 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use super::helpers::simple_op_flex;
+use super::helpers::*;
+use crate::proto;
+use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use crate::proto;
-use crate::{CoremlError, Result};
-use super::helpers::simple_op_flex;
-use super::helpers::*;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -36,7 +36,6 @@ impl<'a> LowerCtx<'a> {
             ))),
         }
     }
-
 
     /// Bake on-device dequantized weights `[n,k]` as MIL constants + `mul`/`sub`.
     ///
@@ -113,7 +112,6 @@ impl<'a> LowerCtx<'a> {
         Ok(wc)
     }
 
-
     /// On-device block dequant for supported GGUF schemes, then MIL matmul.
     pub(crate) fn lower_dequant_matmul_ondevice(
         &mut self,
@@ -145,7 +143,6 @@ impl<'a> LowerCtx<'a> {
         self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
-
 
     /// `x @ dequant(W)ᵀ`. GGUF weights are stored `[N, K]` (B-transposed),
     /// so we host-dequantize to f32 `[N, K]`, bake it, and matmul with
@@ -189,7 +186,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Dequantize packed MoE weights to a plain f32 const (no matmul).
     pub(crate) fn lower_dequant_moe_weights(
         &mut self,
@@ -206,7 +202,6 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
-
 
     /// MoE grouped matmul with on-device Q8_0 / Q4_0 / IQ4NL / K-quant dequant.
     pub(crate) fn lower_dequant_grouped_matmul_ondevice(
@@ -343,7 +338,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// MoE grouped matmul with quantized expert weights. Dequantizes all
     /// `E` expert slabs (`[E, N, K]`), gathers per token, then batched
     /// matmul with `transpose_y`.
@@ -431,7 +425,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Bake an affine (scale / zero-point) parameter as a const that
     /// broadcasts against a rank-`rank` tensor: a scalar for per-tensor
     /// quant, or a `[1,…,C,…,1]` vector along `axis` for per-channel.
@@ -459,7 +452,6 @@ impl<'a> LowerCtx<'a> {
         self.operations.push(op);
         Ok(())
     }
-
 
     /// Dequantize an int8 tensor: `out = (cast(q,f32) - zp) · scale`.
     pub(crate) fn lower_dequantize(
@@ -515,7 +507,6 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
-
 
     /// Quantize a f32 tensor to int8:
     /// `out = cast(clip(round(x/scale) + zp, -128, 127), int8)`.
@@ -576,5 +567,4 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
-
 }

@@ -57,7 +57,11 @@ impl Graph {
     ) -> NodeId {
         let in_s = self.shape(input).clone();
         let w_s = self.shape(weight).clone();
-        assert_eq!(in_s.rank(), 3, "conv_transpose1d: input must be [N, C_in, L]");
+        assert_eq!(
+            in_s.rank(),
+            3,
+            "conv_transpose1d: input must be [N, C_in, L]"
+        );
         assert_eq!(
             w_s.rank(),
             3,
@@ -147,7 +151,11 @@ mod tests {
     use crate::{DType, Shape};
 
     fn dims(g: &Graph, id: NodeId) -> Vec<usize> {
-        g.shape(id).dims().iter().map(|d| d.unwrap_static()).collect()
+        g.shape(id)
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .collect()
     }
     fn input(g: &mut Graph, shape: &[usize]) -> NodeId {
         g.input("x", Shape::new(shape, DType::F32))

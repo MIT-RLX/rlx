@@ -40,10 +40,7 @@ use std::collections::HashMap;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, NodeId, Op};
 
-use crate::hlo::{
-    Computation, HloBuilder,
-    ProgramShape, Shape, Window, WindowDim, prim_of,
-};
+use crate::hlo::{Computation, HloBuilder, ProgramShape, Shape, Window, WindowDim, prim_of};
 
 /// Compiled-against-this-graph HLO module bytes plus the metadata the
 /// backend needs at run time.
@@ -327,6 +324,7 @@ mod broadcast;
 mod const_ops;
 mod gguf;
 mod ir;
+#[allow(clippy::module_inception)]
 mod lower;
 
 impl<'a> LowerCtx<'a> {
@@ -338,11 +336,9 @@ impl<'a> LowerCtx<'a> {
             .unwrap_or_else(|| panic!("rlx-tpu: node {nid:?} referenced before lowering"))
     }
 
-
     pub(crate) fn dtype(&self, nid: NodeId) -> DType {
         self.graph.node(nid).shape.dtype()
     }
-
 
     /// Get-or-create a binary-op reducer subcomputation.
     pub(crate) fn reducer(&mut self, opcode: &str, prim_ty: i32) -> Computation {
@@ -356,7 +352,6 @@ impl<'a> LowerCtx<'a> {
         self.reducers.insert(key, c.clone());
         c
     }
-
 
     /// Reduce over a single axis with a known reducer opcode.
     pub(crate) fn reduce_one(
@@ -382,7 +377,6 @@ impl<'a> LowerCtx<'a> {
         self.entry.reduce(x, init, &red, &[axis], out_shape)
     }
 
-
     pub(crate) fn resize_nearest_2x_shape(&self, input_id: NodeId) -> Shape {
         let dims = self.ir_shape_dims(input_id);
         assert_eq!(
@@ -396,7 +390,6 @@ impl<'a> LowerCtx<'a> {
             &[dims[0], dims[1], dims[2] * 2, dims[3] * 2],
         )
     }
-
 
     /// Inclusive scan with a reducer along the last axis. Mirrors
     /// `lower_cumsum` but parametric on opcode and dtype, used by
@@ -451,9 +444,7 @@ impl<'a> LowerCtx<'a> {
     //   y[t]   = sum_n state[d,n] * c[t,n]       [D]
     //
     // Loop carry tuple: (i_s32, state[B,D,N], outputs[B,L,D])
-
 }
-
 
 /// Host-side GGUF dequant dispatch for TPU lowering (all `Gguf*` schemes).
 ///
@@ -490,4 +481,3 @@ fn dequant_gguf_bytes(scheme: QuantScheme, bytes: &[u8], n: usize) -> Result<Vec
     };
     r.map_err(|e| e.to_string())
 }
-

@@ -98,7 +98,6 @@ pub fn compose_conv2d_backward_weight(
     g.concat_(dw_groups, 0)
 }
 
-
 /// `Conv2dBackwardWeight` via runtime `Op::Im2Col` (dynamic batch NCHW).
 pub fn compose_conv2d_backward_weight_im2col(
     g: &mut Graph,
@@ -156,7 +155,6 @@ pub fn compose_conv2d_backward_weight_im2col(
     g.concat_(dw_groups, 0)
 }
 
-
 pub(super) fn compose_conv2d_backward_weight_im2col_group(
     g: &mut Graph,
     x: NodeId,
@@ -189,7 +187,6 @@ pub(super) fn compose_conv2d_backward_weight_im2col_group(
     let prod = g.matmul(dy_r, x_col, dw_mat_shape);
     g.reshape_(prod, vec![c_out as i64, c_in as i64, kh as i64, kw as i64])
 }
-
 
 /// Single-group (or groups=1) im2col + matmul for `Conv2dBackwardWeight`.
 pub(super) fn compose_conv2d_backward_weight_group(
@@ -277,7 +274,6 @@ pub(super) fn compose_conv2d_backward_weight_group(
     g.reshape_(accum, vec![c_out as i64, c_in as i64, kh as i64, kw as i64])
 }
 
-
 /// Fast path for K×1 conv (codec conv1d with time in H): O(h_out × kh) matmuls.
 pub(super) fn compose_conv2d_backward_weight_w1_h(
     g: &mut Graph,
@@ -330,7 +326,6 @@ pub(super) fn compose_conv2d_backward_weight_w1_h(
     }
     g.concat_(slices, 2)
 }
-
 
 /// `MaxPool2dBackward` via runtime argmax + dy scatter (static NCHW).
 pub fn compose_max_pool2d_backward(
@@ -445,7 +440,6 @@ pub fn compose_max_pool2d_backward(
     g.reshape_(flat_dx, vec![n as i64, c as i64, h as i64, w_in as i64])
 }
 
-
 /// `Conv2dBackwardInput` → forward `Conv` (same as autodiff VJP).
 pub fn compose_conv2d_backward_input(
     g: &mut Graph,
@@ -489,4 +483,3 @@ pub fn compose_conv2d_backward_input(
         out_shape.clone(),
     )
 }
-

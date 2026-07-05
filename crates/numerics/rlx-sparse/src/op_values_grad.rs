@@ -16,7 +16,6 @@
 //! `values_grad` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -32,7 +31,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_k
 use super::*;
 
 pub(crate) struct SparseValuesGradExt;
-
 
 impl OpExtension for SparseValuesGradExt {
     fn name(&self) -> &str {
@@ -58,7 +56,6 @@ impl OpExtension for SparseValuesGradExt {
     // Non-differentiable (it's itself a gradient kernel; second-order
     // derivatives are out of v1 scope).
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct SparseValuesGradCpu;
@@ -91,4 +88,3 @@ impl CpuKernel for SparseValuesGradCpu {
 // adjoint solve `dL/db = solve(Aᵀ, dL/dx)`. Use this for non-
 // symmetric matrices where reusing the forward triplet for the
 // adjoint would be wrong.
-

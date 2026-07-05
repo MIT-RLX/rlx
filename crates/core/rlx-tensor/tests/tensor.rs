@@ -228,3 +228,40 @@ fn tensor_clone_is_shallow() {
     });
     assert_eq!(g.outputs.len(), 1);
 }
+
+/// The lazy Tensor DSL can request a native low-precision matmul in a chosen
+/// minifloat format (`f4e3m0`) via `Tensor::scaled_matmul`; it must evaluate on
+/// CPU and track the plain-f32 matmul. (`--features eval` for `to_vec`.)
+#[cfg(feature = "eval")]
+#[test]
+fn scaled_matmul_tracks_f32() {
+    use rlx_tensor::{ScaleLayout, ScaledFormat};
+
+    let (m, k, n) = (4usize, 32usize, 6usize);
+    let lhs_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.13).sin() * 1.5).collect();
+    let rhs_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.07).cos() * 1.2).collect();
+    let lhs = Tensor::from_vec(lhs_data.clone(), [m, k]);
+    let rhs = Tensor::from_vec(rhs_data.clone(), [n, k]);
+
+    let out = lhs
+        .scaled_matmul(&rhs, ScaledFormat::custom(3, 0), ScaleLayout::mx())
+        .to_vec();
+    assert_eq!(out.len(), m * n);
+    assert!(out.iter().all(|v| v.is_finite()));
+
+    let mut reference = vec![0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0f32;
+            for p in 0..k {
+                acc += lhs_data[i * k + p] * rhs_data[j * k + p];
+            }
+            reference[i * n + j] = acc;
+        }
+    }
+    let dot: f32 = out.iter().zip(&reference).map(|(a, b)| a * b).sum();
+    let na = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb = reference.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let cos = dot / (na * nb);
+    assert!(cos >= 0.9, "tensor scaled_matmul cosine {cos} < 0.9");
+}

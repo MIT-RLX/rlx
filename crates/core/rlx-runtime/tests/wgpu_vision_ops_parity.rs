@@ -17,6 +17,7 @@
 //! `ResizeNearest2x`) added via host-staging. CPU is the reference.
 
 #![cfg(feature = "cpu")]
+#![allow(dead_code)]
 
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};

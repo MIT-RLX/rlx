@@ -25,8 +25,8 @@ use crate::bundle::RlxBundle;
 use crate::bundle::{BundleManifest, BundleNode, topo_sort_nodes};
 use crate::control_flow::{self, DURATION_CARRY};
 use crate::rewrite::rewrite_graph;
-use crate::tensor_data::i64_tensor;
 use crate::tensor_data::TypedParams;
+use crate::tensor_data::i64_tensor;
 
 use super::options::{ImportOptions, ImportReport};
 
@@ -40,6 +40,7 @@ mod generators;
 mod matmul;
 mod norm;
 mod reduce;
+mod rnn;
 mod shape_ops;
 
 use activation::*;
@@ -52,10 +53,10 @@ use generators::*;
 use matmul::*;
 use norm::*;
 use reduce::*;
+use rnn::*;
 use shape_ops::*;
 
 const MAX_STUB_ELEMENTS: usize = 8 * 1024 * 1024;
-
 
 fn is_typical_channel(c: usize) -> bool {
     matches!(
@@ -64,7 +65,6 @@ fn is_typical_channel(c: usize) -> bool {
     )
 }
 
-
 fn normalize_axis(axis: i64, rank: usize) -> usize {
     if axis < 0 {
         (rank as i64 + axis) as usize
@@ -72,7 +72,6 @@ fn normalize_axis(axis: i64, rank: usize) -> usize {
         axis as usize
     }
 }
-
 
 fn channel_axis_for_param(m: &HirMut<'_>, param: HirNodeId, like: HirNodeId) -> usize {
     let c = m.shape(param).dim(0).unwrap_static();
@@ -89,7 +88,6 @@ fn channel_axis_for_param(m: &HirMut<'_>, param: HirNodeId, like: HirNodeId) -> 
     }
 }
 
-
 fn broadcast_1d_param(
     m: &mut HirMut<'_>,
     param: HirNodeId,
@@ -103,12 +101,10 @@ fn broadcast_1d_param(
     m.reshape_(param, dims)
 }
 
-
 fn broadcast_param_channels(m: &mut HirMut<'_>, param: HirNodeId, like: HirNodeId) -> HirNodeId {
     let axis = channel_axis_for_param(m, param, like);
     broadcast_1d_param(m, param, like, axis)
 }
-
 
 fn expand_operand_to_shape(m: &mut HirMut<'_>, x: HirNodeId, target: &Shape) -> HirNodeId {
     let xs = m.shape(x).clone();
@@ -128,7 +124,6 @@ fn expand_operand_to_shape(m: &mut HirMut<'_>, x: HirNodeId, target: &Shape) -> 
         target.clone(),
     )
 }
-
 
 /// Kitten generator ups + noise: batch-1 NCL/NCHW path broadcast to `[B,C,L]`.
 fn try_vocoder_ncl_batch_binary(
@@ -172,11 +167,9 @@ fn try_vocoder_ncl_batch_binary(
     None
 }
 
-
 fn binary_infer_add(m: &mut HirMut<'_>, a: HirNodeId, b: HirNodeId, site: &str) -> HirNodeId {
     binary_infer(m, BinaryOp::Add, a, b, site)
 }
-
 
 /// `[N,L,C]` with `L > C` and typical channel width on the last axis.
 fn is_vocoder_blc(s: &Shape) -> bool {
@@ -186,14 +179,12 @@ fn is_vocoder_blc(s: &Shape) -> bool {
         && s.dim(2).unwrap_static() > 1
 }
 
-
 /// `[N,C,L]` with typical channel width on axis 1 (vocoder NCL blocks).
 fn is_vocoder_ncl(s: &Shape) -> bool {
     s.rank() == 3
         && is_typical_channel(s.dim(1).unwrap_static())
         && s.dim(2).unwrap_static() > s.dim(1).unwrap_static()
 }
-
 
 /// `[N,C,L]` with `C > L` and `L > 1` (excludes bias `[N,C,1]` and BLC blocks).
 fn is_ncl_rank3(s: &Shape) -> bool {
@@ -203,7 +194,6 @@ fn is_ncl_rank3(s: &Shape) -> bool {
         && s.dim(1).unwrap_static() > s.dim(2).unwrap_static()
         && !is_blc_rank3(s)
 }
-
 
 /// `[N,L,C]` with channel on the last axis (ONNX BLC blocks). Requires `L > 1`:
 /// a `[N,1,C]`/`[1,1,L]` operand is a pure broadcast (mask / per-channel bias),
@@ -216,12 +206,10 @@ fn is_blc_rank3(s: &Shape) -> bool {
         && s.dim(2).unwrap_static() > s.dim(1).unwrap_static()
 }
 
-
 /// `[N,C,1]` bias / AdaIN scale (channel on axis 1).
 fn is_nc1_rank3(s: &Shape) -> bool {
     s.rank() == 3 && s.dim(2).unwrap_static() == 1 && s.dim(1).unwrap_static() >= 64
 }
-
 
 /// `[C,L,1]` after `perm=[1,2,0]` on NCL — channel on axis 0.
 fn is_cl1_rank3(s: &Shape) -> bool {
@@ -231,7 +219,6 @@ fn is_cl1_rank3(s: &Shape) -> bool {
         && s.dim(0).unwrap_static() > s.dim(1).unwrap_static()
 }
 
-
 /// ONNX output meta / tensor shape with channel on axis 1 (`[N,C,L]`).
 fn meta_layout_ncl(s: &Shape) -> bool {
     s.rank() == 3
@@ -240,14 +227,12 @@ fn meta_layout_ncl(s: &Shape) -> bool {
         && s.dim(1).unwrap_static() > s.dim(2).unwrap_static()
 }
 
-
 fn is_rank3_ncl_pair(a: &Shape, b: &Shape) -> bool {
     a.rank() == 3
         && b.rank() == 3
         && a.dim(1).unwrap_static() == b.dim(2).unwrap_static()
         && a.dim(2).unwrap_static() == b.dim(1).unwrap_static()
 }
-
 
 fn collapse_duplicate_channel_4d(m: &mut HirMut<'_>, x: HirNodeId) -> HirNodeId {
     let s = m.shape(x).clone();
@@ -286,7 +271,6 @@ fn collapse_duplicate_channel_4d(m: &mut HirMut<'_>, x: HirNodeId) -> HirNodeId 
     x
 }
 
-
 fn repair_duplicate_length_rank3(
     m: &mut HirMut<'_>,
     x: HirNodeId,
@@ -319,7 +303,6 @@ fn repair_duplicate_length_rank3(
     }
     x
 }
-
 
 /// NCL `[1,C,L]` combined with BLC `[1,L,C]` (same channel count `C`).
 fn align_ncl_blc_binary(
@@ -356,7 +339,6 @@ fn align_ncl_blc_binary(
     }
     None
 }
-
 
 fn binary_infer(
     m: &mut HirMut<'_>,
@@ -882,11 +864,9 @@ fn binary_infer(
     }
 }
 
-
 fn is_sequence_dim_label(s: &str) -> bool {
     s == "sequence_length" || s == "?" || (s.starts_with("Cast") && s.contains("duration"))
 }
-
 
 fn resolve_dim_ir(v: &serde_json::Value, opts: &ImportOptions) -> Result<Dim> {
     match v {
@@ -923,14 +903,12 @@ fn resolve_dim_ir(v: &serde_json::Value, opts: &ImportOptions) -> Result<Dim> {
     }
 }
 
-
 pub fn resolve_dim(v: &serde_json::Value, opts: &ImportOptions) -> Result<usize> {
     match resolve_dim_ir(v, opts)? {
         Dim::Static(n) => Ok(n),
         Dim::Dynamic(_) => Ok(opts.sequence_length),
     }
 }
-
 
 fn dim_usize(d: Dim, opts: &ImportOptions) -> usize {
     match d {
@@ -939,7 +917,6 @@ fn dim_usize(d: Dim, opts: &ImportOptions) -> usize {
     }
 }
 
-
 fn shape_dims_i64(shape: &Shape, opts: &ImportOptions) -> Vec<i64> {
     shape
         .dims()
@@ -947,7 +924,6 @@ fn shape_dims_i64(shape: &Shape, opts: &ImportOptions) -> Vec<i64> {
         .map(|&d| dim_usize(d, opts) as i64)
         .collect()
 }
-
 
 pub fn resolve_shape(meta: &serde_json::Value, opts: &ImportOptions) -> Result<Shape> {
     let obj = meta.as_object().context("shape meta object")?;
@@ -974,7 +950,6 @@ pub fn resolve_shape(meta: &serde_json::Value, opts: &ImportOptions) -> Result<S
     };
     Ok(Shape::from_dims(&dims, dtype))
 }
-
 
 fn load_f32_param(
     bundle: &RlxBundle,
@@ -1021,7 +996,6 @@ fn load_f32_param(
     Ok(out)
 }
 
-
 struct LowerCtx<'a> {
     nodes: &'a [BundleNode],
     opts: &'a ImportOptions,
@@ -1033,7 +1007,6 @@ struct LowerCtx<'a> {
     init_shapes: &'a HashMap<String, Vec<usize>>,
     report: ImportReport,
 }
-
 
 impl<'a> LowerCtx<'a> {
     fn tensor(&self, name: &str) -> Result<HirNodeId> {
@@ -1178,7 +1151,6 @@ impl<'a> LowerCtx<'a> {
     }
 }
 
-
 pub fn build_hir_from_bundle(
     bundle: &RlxBundle,
     opts: ImportOptions,
@@ -1226,7 +1198,6 @@ pub fn build_hir_from_bundle(
         opts,
     )
 }
-
 
 /// Lower from manifest + nodes + in-memory initializer tensors.
 pub fn build_hir_from_parts(
@@ -1350,7 +1321,6 @@ pub fn build_hir_from_parts(
     Ok((hir, params, typed_params, report))
 }
 
-
 fn node_inputs_ready(node: &BundleNode, ctx: &LowerCtx<'_>, inits: &HashSet<String>) -> bool {
     let extra: Vec<String> = if node.op == "ConcatFromSequence" {
         control_flow::resolve_duration_align_inputs(ctx.nodes)
@@ -1374,7 +1344,6 @@ fn node_inputs_ready(node: &BundleNode, ctx: &LowerCtx<'_>, inits: &HashSet<Stri
     }
     true
 }
-
 
 fn validate_nchw_ops(m: &HirMut<'_>) -> Result<()> {
     for (idx, node) in m.0.nodes().iter().enumerate() {
@@ -1400,7 +1369,6 @@ fn validate_nchw_ops(m: &HirMut<'_>) -> Result<()> {
     }
     Ok(())
 }
-
 
 fn lower_node(
     m: &mut HirMut<'_>,
@@ -1475,7 +1443,9 @@ fn lower_node(
         "Clip" => lower_clip(m, ctx, node)?,
         "Where" => lower_where(m, ctx, node)?,
         "Expand" => lower_expand(m, ctx, node)?,
-        "Equal" | "Less" | "Greater" | "Not" | "And" => lower_compare(m, ctx, node, op)?,
+        "Equal" | "Less" | "Greater" | "LessOrEqual" | "GreaterOrEqual" | "Not" | "And" | "Or" => {
+            lower_compare(m, ctx, node, op)?
+        }
         "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" | "ReduceProd" => {
             lower_reduce(m, ctx, node, op)?
         }
@@ -1497,6 +1467,7 @@ fn lower_node(
         "NonZero" => lower_non_zero(m, ctx, node)?,
         "CumProd" => lower_cumprod(m, ctx, node)?,
         "Einsum" => lower_einsum(m, ctx, node)?,
+        "LSTM" => lower_lstm(m, ctx, node)?,
         "DynamicQuantizeLSTM" => lower_dynamic_quantize_lstm(m, ctx, node)?,
         "RandomNormalLike" | "RandomUniformLike" => lower_random_like(m, ctx, node)?,
         "RandomNormal" | "RandomUniform" => lower_random(m, ctx, node)?,
@@ -1541,7 +1512,6 @@ fn lower_node(
     Ok(())
 }
 
-
 fn output_shape(
     ctx: &LowerCtx<'_>,
     node: &BundleNode,
@@ -1560,7 +1530,6 @@ fn output_shape(
     }
     shape
 }
-
 
 fn apply_import_shape_fix(
     m: &mut HirMut<'_>,
@@ -1586,7 +1555,6 @@ fn apply_import_shape_fix(
     m.reshape_(id, dims)
 }
 
-
 fn infer_matmul_output_shape(sa: &Shape, sb: &Shape, seq_len: usize) -> Shape {
     if let Ok(s) = rlx_ir::shape::matmul_shape(sa, sb) {
         return s;
@@ -1611,7 +1579,6 @@ fn infer_matmul_output_shape(sa: &Shape, sb: &Shape, seq_len: usize) -> Shape {
     }
     sa.clone()
 }
-
 
 /// Expand the batch (leading) dims of two matmul operands to the broadcasted batch
 /// from the output shape `s`, leaving the trailing `[M,K]`/`[K,N]` intact.
@@ -1644,7 +1611,6 @@ fn broadcast_matmul_batch(
     (a2, b2)
 }
 
-
 fn permuted_shape(in_s: &Shape, perm: &[usize]) -> Shape {
     let dims: Vec<usize> = perm
         .iter()
@@ -1652,7 +1618,6 @@ fn permuted_shape(in_s: &Shape, perm: &[usize]) -> Shape {
         .collect();
     Shape::new(&dims, in_s.dtype())
 }
-
 
 fn unsqueeze_axes(ctx: &LowerCtx<'_>, node: &BundleNode) -> Vec<i64> {
     node.inputs
@@ -1667,13 +1632,11 @@ fn unsqueeze_axes(ctx: &LowerCtx<'_>, node: &BundleNode) -> Vec<i64> {
         .unwrap_or_else(|| vec![0])
 }
 
-
 fn bundle_node_for_output<'a>(nodes: &'a [BundleNode], name: &str) -> Option<&'a BundleNode> {
     nodes
         .iter()
         .find(|n| n.outputs.first().is_some_and(|o| o == name))
 }
-
 
 /// Evaluate ONNX shape tensors (Shape→Gather→Concat chains) at import time.
 fn eval_static_shape_vector(
@@ -1908,7 +1871,6 @@ fn eval_static_shape_vector(
     }
 }
 
-
 /// Shaped int64 mini-interpreter for the small index/shape tensors torch emits
 /// for dynamic ops (notably `F.pad`'s pad-spec construction in VITS relative-
 /// position attention: `ConstantOfShape → Concat → Reshape → Transpose → Slice`).
@@ -2130,7 +2092,6 @@ fn eval_i64_shaped(
     }
 }
 
-
 fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     let mut s = vec![1usize; shape.len()];
     for i in (0..shape.len().saturating_sub(1)).rev() {
@@ -2138,7 +2099,6 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     }
     s
 }
-
 
 fn resolve_reshape_dims(mut dims: Vec<i64>, in_s: &Shape) -> Option<Vec<i64>> {
     let neg = dims.iter().filter(|&&d| d == -1).count();
@@ -2161,7 +2121,6 @@ fn resolve_reshape_dims(mut dims: Vec<i64>, in_s: &Shape) -> Option<Vec<i64>> {
     Some(dims)
 }
 
-
 /// When every 3-D concat input is seq-first `[seq, 1, C]`, keep layout (do not fold to BLC).
 fn concat_inputs_all_seq_first(m: &HirMut<'_>, inputs: &[HirNodeId]) -> bool {
     !inputs.is_empty()
@@ -2169,7 +2128,6 @@ fn concat_inputs_all_seq_first(m: &HirMut<'_>, inputs: &[HirNodeId]) -> bool {
             .iter()
             .all(|&id| crate::layout::is_seq_first_rank3(m.shape(id)))
 }
-
 
 /// Align `[L, 1, C]` with `[1, L, C]` before channel concat on the last axis.
 fn align_concat_rank3_to_blc(m: &mut HirMut<'_>, id: HirNodeId) -> HirNodeId {
@@ -2185,7 +2143,6 @@ fn align_concat_rank3_to_blc(m: &mut HirMut<'_>, id: HirNodeId) -> HirNodeId {
     id
 }
 
-
 fn normalize_concat_input_shape(s: &Shape) -> Shape {
     if s.rank() == 4 && s.dim(2).unwrap_static() == 1 {
         return Shape::new(
@@ -2199,7 +2156,6 @@ fn normalize_concat_input_shape(s: &Shape) -> Shape {
     }
     s.clone()
 }
-
 
 fn concat_output_shape(m: &HirMut<'_>, inputs: &[HirNodeId], axis: usize) -> Shape {
     let shapes: Vec<Shape> = inputs
@@ -2229,7 +2185,6 @@ fn concat_output_shape(m: &HirMut<'_>, inputs: &[HirNodeId], axis: usize) -> Sha
         .collect();
     Shape::new(&out, dt)
 }
-
 
 /// BLC `[1,L,C]` → NCL `[1,C,L]` before channel-axis concat when peers are NCL.
 fn blc_to_ncl_for_channel_concat(m: &HirMut<'_>, id: HirNodeId, peers: &[HirNodeId]) -> bool {
@@ -2261,7 +2216,6 @@ fn blc_to_ncl_for_channel_concat(m: &HirMut<'_>, id: HirNodeId, peers: &[HirNode
     is_vocoder_blc(s)
 }
 
-
 fn reduce_axes(node: &BundleNode, ctx: &LowerCtx<'_>, rank: usize) -> Vec<usize> {
     if node.inputs.len() >= 2 && !node.inputs[1].is_empty() {
         if let Some(v) = i64_tensor(&ctx.i64_params, &ctx.params, &node.inputs[1]) {
@@ -2282,7 +2236,6 @@ fn reduce_axes(node: &BundleNode, ctx: &LowerCtx<'_>, rank: usize) -> Vec<usize>
     }
     vec![rank.saturating_sub(1)]
 }
-
 
 fn onnx_pads(node: &BundleNode) -> ([usize; 2], [usize; 2], [usize; 2], [usize; 2]) {
     let pads = node
@@ -2345,7 +2298,6 @@ fn onnx_pads(node: &BundleNode) -> ([usize; 2], [usize; 2], [usize; 2], [usize; 
     (k, st, pad, di)
 }
 
-
 /// Vocoder path before STFT ConvTranspose: `[1, L, C]` with small `C` (mel bins).
 fn is_generator_blc_vocoder(s: &Shape) -> bool {
     s.rank() == 3
@@ -2354,7 +2306,6 @@ fn is_generator_blc_vocoder(s: &Shape) -> bool {
         && s.dim(1).unwrap_static() > s.dim(2).unwrap_static()
 }
 
-
 fn generator_blc_to_ncl(m: &mut HirMut<'_>, x: HirNodeId) -> HirNodeId {
     let s = m.shape(x).clone();
     if is_generator_blc_vocoder(&s) {
@@ -2362,7 +2313,6 @@ fn generator_blc_to_ncl(m: &mut HirMut<'_>, x: HirNodeId) -> HirNodeId {
     }
     x
 }
-
 
 /// Promote NCL `[N,C,L]` to NCHW `[N,C,1,L]` for RLX 2D conv kernels.
 fn ensure_nchw_4d(m: &mut HirMut<'_>, x: HirNodeId) -> HirNodeId {
@@ -2385,7 +2335,6 @@ fn ensure_nchw_4d(m: &mut HirMut<'_>, x: HirNodeId) -> HirNodeId {
     x
 }
 
-
 fn ncl_to_nchw_shape(out: &Shape) -> Shape {
     if out.rank() == 3 {
         let n = out.dim(0).unwrap_static();
@@ -2395,7 +2344,6 @@ fn ncl_to_nchw_shape(out: &Shape) -> Shape {
     }
     out.clone()
 }
-
 
 /// If `x` is `[N,C,L]` and `target` is `[N,L,C]`, transpose to match ONNX BLC blocks.
 fn ncl_to_blc_if_needed(m: &mut HirMut<'_>, x: HirNodeId, target: &Shape) -> HirNodeId {
@@ -2414,7 +2362,6 @@ fn ncl_to_blc_if_needed(m: &mut HirMut<'_>, x: HirNodeId, target: &Shape) -> Hir
     x
 }
 
-
 fn ncl_channel_axis1_to_blc(m: &mut HirMut<'_>, x: HirNodeId, _peer: &Shape) -> (HirNodeId, Shape) {
     let in_s = m.shape(x).clone();
     if is_ncl_rank3(&in_s) {
@@ -2423,7 +2370,6 @@ fn ncl_channel_axis1_to_blc(m: &mut HirMut<'_>, x: HirNodeId, _peer: &Shape) -> 
     }
     (x, in_s)
 }
-
 
 fn nc1_to_n1c_if_needed(m: &mut HirMut<'_>, x: HirNodeId, target: &Shape) -> HirNodeId {
     let s = m.shape(x).clone();
@@ -2439,7 +2385,6 @@ fn nc1_to_n1c_if_needed(m: &mut HirMut<'_>, x: HirNodeId, target: &Shape) -> Hir
     }
     x
 }
-
 
 fn align_binary_operand(m: &mut HirMut<'_>, x: HirNodeId, peer: HirNodeId) -> HirNodeId {
     let peer_sh = m.shape(peer).clone();
@@ -2521,7 +2466,6 @@ fn align_binary_operand(m: &mut HirMut<'_>, x: HirNodeId, peer: HirNodeId) -> Hi
     x
 }
 
-
 /// Style slices with fixed `[1,C,1]` meta shapes; match zero stubs.
 fn slice_meta_stub_shape(meta: &serde_json::Value, opts: &ImportOptions) -> Option<Shape> {
     let shape = resolve_shape(meta, opts).ok()?;
@@ -2540,7 +2484,6 @@ fn slice_meta_stub_shape(meta: &serde_json::Value, opts: &ImportOptions) -> Opti
     }
 }
 
-
 fn nchw_to_ncl_if_needed(m: &mut HirMut<'_>, x: HirNodeId, target: &Shape) -> HirNodeId {
     if target.rank() == 3 && m.shape(x).rank() == 4 {
         let n = target.dim(0).unwrap_static();
@@ -2550,7 +2493,6 @@ fn nchw_to_ncl_if_needed(m: &mut HirMut<'_>, x: HirNodeId, target: &Shape) -> Hi
     }
     x
 }
-
 
 fn slice_to_output_shape(
     m: &mut HirMut<'_>,
@@ -2573,7 +2515,6 @@ fn slice_to_output_shape(
     Ok(true)
 }
 
-
 fn onnx_slice_axis_start_len(start: i64, end: i64, dim: usize) -> (usize, usize) {
     let d = dim as i64;
     let mut s = if start < 0 { d + start } else { start };
@@ -2582,7 +2523,6 @@ fn onnx_slice_axis_start_len(start: i64, end: i64, dim: usize) -> (usize, usize)
     e = e.clamp(s, d);
     (s as usize, (e - s).max(0) as usize)
 }
-
 
 fn try_lower_slice_narrow(
     m: &mut HirMut<'_>,
@@ -2756,14 +2696,12 @@ fn try_lower_slice_narrow(
     Ok(true)
 }
 
-
 fn lstm_attrs_bytes(hidden_size: usize, bidirectional: bool) -> Vec<u8> {
     let mut v = vec![0u8; 8];
     v[0..4].copy_from_slice(&(hidden_size as u32).to_le_bytes());
     v[4] = u8::from(bidirectional);
     v
 }
-
 
 fn lstm_y_shape(x: &Shape, hidden_size: usize, bidirectional: bool) -> Shape {
     let dirs = if bidirectional { 2 } else { 1 };
@@ -2774,7 +2712,6 @@ fn lstm_y_shape(x: &Shape, hidden_size: usize, bidirectional: bool) -> Shape {
     }
     Shape::new(&[1, dirs, 1, hidden_size], x.dtype())
 }
-
 
 fn resize_output_shape(
     m: &HirMut<'_>,
@@ -2808,4 +2745,3 @@ fn resize_output_shape(
     }
     Ok(Shape::new(&dims, in_s.dtype()))
 }
-

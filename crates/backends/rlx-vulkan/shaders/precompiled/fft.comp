@@ -1,0 +1,90 @@
+#version 450
+// Native f32 FFT — radix-2 Cooley-Tukey, bit-reversal load, all stages in
+// shared memory. One workgroup (256 threads) per batch row; power-of-two n in
+// [2, 1024] (2 x 1024 f32 = 8 KiB shared, under the 16 KiB Vulkan floor).
+// Larger n / non-f32 fall back to the host path. Direct port of rlx-wgpu
+// `fft_radix2_full` (fft_gpu.wgsl) so `Op::Fft` runs on-device on Vulkan (no
+// host fallback → no discrete-GPU crash).
+//
+// PRECOMPILED with glslangValidator (see shaders/precompiled): naga's GLSL
+// frontend has no `memoryBarrierShared`/`groupMemoryBarrier`, and its bare
+// `barrier()` does not enforce cross-subgroup shared visibility on NVIDIA (the
+// stages race). glslang emits the correct OpControlBarrier with WorkgroupMemory
+// semantics — same reason matmul_tiled/matmul_coop are precompiled.
+//   glslangValidator -V --target-env vulkan1.3 fft.comp -o fft.spv
+//
+// Layout: RLX 2N real-block — per row, reals at [base..base+n), imags at
+// [base+n..base+2n). Forward uses e^{-2*pi*i*k/n}; `norm_scale` applies the
+// FftNorm output scaling (e.g. 1/n for a normalized inverse).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Arena { float data[]; };
+
+layout(push_constant) uniform PC {
+    uint off;          // source base offset (f32 elements)
+    uint dst_off;      // destination base offset (f32 elements)
+    uint n;            // FFT length (power of two, <= 1024)
+    uint log2n;        // log2(n)
+    uint inverse;      // 0 = forward, 1 = inverse
+    float norm_scale;  // output scale (FftNorm)
+    uint outer;        // number of batch rows
+    uint _pad;
+} pc;
+
+const uint WG = 256u;
+shared float sre[1024];
+shared float sim[1024];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.outer) { return; }
+
+    uint n = pc.n;
+    uint src = pc.off + row * 2u * n;
+    uint dst = pc.dst_off + row * 2u * n;
+    uint tid = gl_LocalInvocationID.x;
+
+    // Bit-reversed load: s[rev(k)] = (re[k], im[k]).
+    uint shift = 32u - pc.log2n;
+    for (uint k = tid; k < n; k += WG) {
+        uint rev = bitfieldReverse(k) >> shift;
+        sre[rev] = data[src + k];
+        sim[rev] = data[src + n + k];
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // Iterative radix-2 butterflies. Forward: e^{-i...}; inverse: e^{+i...}.
+    float sign = (pc.inverse != 0u) ? 1.0 : -1.0;
+    const float TAU = 6.28318530717958647692;
+    uint half_n = n >> 1u;
+    for (uint len = 2u; len <= n; len <<= 1u) {
+        uint h = len >> 1u;
+        float base_theta = sign * TAU / float(len);
+        for (uint b = tid; b < half_n; b += WG) {
+            uint grp = b / h;
+            uint j = b - grp * h;
+            uint lo = grp * len + j;
+            uint hi = lo + h;
+            float theta = base_theta * float(j);
+            float wre = cos(theta);
+            float wim = sin(theta);
+            float tre = wre * sre[hi] - wim * sim[hi];
+            float tim = wre * sim[hi] + wim * sre[hi];
+            float ure = sre[lo];
+            float uim = sim[lo];
+            sre[lo] = ure + tre;
+            sim[lo] = uim + tim;
+            sre[hi] = ure - tre;
+            sim[hi] = uim - tim;
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    // Store with output scaling.
+    for (uint k = tid; k < n; k += WG) {
+        data[dst + k]      = sre[k] * pc.norm_scale;
+        data[dst + n + k]  = sim[k] * pc.norm_scale;
+    }
+}

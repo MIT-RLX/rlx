@@ -17,13 +17,13 @@
 
 #![allow(unused_imports)]
 
-use rlx_ir::{Graph, NodeId, Op};
-use rlx_opt::memory;
-use std::collections::HashMap;
 use crate::arena::Arena;
 use crate::device::metal_device;
 use crate::kernels::kernels;
 use crate::thunk::{Thunk, ThunkSchedule};
+use rlx_ir::{Graph, NodeId, Op};
+use rlx_opt::memory;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -79,7 +79,6 @@ impl MetalExecutable {
         );
     }
 
-
     /// Persistent input buffer for KV-cache style graphs (unified memory).
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         if !self.input_ids.contains_key(name) {
@@ -98,5 +97,4 @@ impl MetalExecutable {
         self.gpu_handles.insert(name.to_string(), data.to_vec());
         true
     }
-
 }

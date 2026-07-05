@@ -122,6 +122,7 @@ pub fn derive_phases(graph: &Graph) -> PhaseSchedule {
             | Op::DequantGroupedMatMul { .. }
             | Op::DequantMoEWeights { .. }
             | Op::LoraMatMul { .. }
+            | Op::PartitionedConv { .. }
             | Op::DequantMatMul { .. }
             | Op::GatedDeltaNet { .. }
             | Op::Lstm { .. }

@@ -16,8 +16,6 @@
 //! `qr` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::{DType, Node, NodeId, OpExtension, Shape, VjpContext};
@@ -30,7 +28,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct QrExt;
-
 
 impl OpExtension for QrExt {
     fn name(&self) -> &str {
@@ -165,10 +162,8 @@ impl OpExtension for QrExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct QrCpu;
-
 
 #[cfg(feature = "cpu")]
 impl CpuKernel for QrCpu {
@@ -197,4 +192,3 @@ impl CpuKernel for QrCpu {
 }
 
 // ── SVD ──────────────────────────────────────────────────────────
-

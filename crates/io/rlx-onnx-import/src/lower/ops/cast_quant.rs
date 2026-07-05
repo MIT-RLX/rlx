@@ -37,7 +37,11 @@ use crate::lower::options::{ImportOptions, ImportReport};
 
 use super::*;
 
-pub(super) fn lower_cast(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_cast(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let to = node.attrs.get("to").and_then(|v| v.as_i64()).unwrap_or(1);
     let dtype = match to {
@@ -85,7 +89,6 @@ pub(super) fn lower_cast(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bund
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-
 
 pub(super) fn lower_dynamic_quant(
     m: &mut HirMut<'_>,
@@ -138,7 +141,6 @@ pub(super) fn lower_dynamic_quant(
     }
     Ok(true)
 }
-
 
 pub(super) fn lower_dynamic_quantize_lstm(
     m: &mut HirMut<'_>,
@@ -195,4 +197,3 @@ pub(super) fn lower_dynamic_quantize_lstm(
     }
     Ok(true)
 }
-

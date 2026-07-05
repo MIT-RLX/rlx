@@ -122,3 +122,7 @@ let mut session = Session::new(Device::Vulkan);
 ```
 
 Enable via the umbrella crate's `vulkan` feature: `cargo build -p rlx --features vulkan`.
+
+## License
+
+GPL-3.0-only.

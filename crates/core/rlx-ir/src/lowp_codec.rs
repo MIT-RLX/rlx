@@ -88,6 +88,13 @@ pub fn encode(fmt: ScaledFormat, x: f32) -> u8 {
     if x.is_nan() {
         return 0;
     }
+    // ±inf saturates to the largest finite magnitude of the matching sign. We
+    // snap to ±max_finite directly rather than a generic huge value: a value far
+    // outside the grid is equidistant from every finite code in f64, so the
+    // tie-break would wrongly pick code 0.
+    if x.is_infinite() {
+        return encode(fmt, x.signum() * max_finite(fmt));
+    }
     let n_codes: u16 = 1 << fmt.bit_width();
     let mut best: u8 = 0;
     let mut best_err = f64::INFINITY;
@@ -238,6 +245,18 @@ mod tests {
             let v = decode(fmt, encode(fmt, big));
             assert!(v.is_finite(), "{fmt} overflow not finite");
             assert_eq!(v, max_finite(fmt), "{fmt} did not saturate to max");
+            // ±inf saturates too (never encodes to an inf/NaN slot, even for E5M2
+            // which has a representable inf code).
+            assert_eq!(
+                decode(fmt, encode(fmt, f32::INFINITY)),
+                max_finite(fmt),
+                "{fmt} +inf did not saturate"
+            );
+            assert_eq!(
+                decode(fmt, encode(fmt, f32::NEG_INFINITY)),
+                -max_finite(fmt),
+                "{fmt} -inf did not saturate"
+            );
         }
     }
 
@@ -246,6 +265,87 @@ mod tests {
         for p in -10..=10i32 {
             let s = 2f32.powi(p);
             assert_eq!(e8m0_to_f32(f32_to_e8m0(s)), s, "2^{p}");
+        }
+    }
+
+    // --- Parameterized `Custom { exp_bits, mant_bits, bias }` minifloats ---
+
+    #[test]
+    fn custom_f4e3m0_value_table() {
+        // f4e3m0 = 1 sign + 3 exp + 0 mant, IEEE bias 3, all-finite. The 8
+        // non-negative codes are {±0, 0.25, 0.5, 1, 2, 4, 8, 16}; setting the
+        // sign bit (bit 3) negates.
+        let f = ScaledFormat::custom(3, 0);
+        assert_eq!(f.bit_width(), 4);
+        assert_eq!(f.fields(), (3, 0, 3));
+        let pos = [0.0f32, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
+        for (code, &want) in pos.iter().enumerate() {
+            assert_eq!(decode(f, code as u8), want, "code {code}");
+            assert_eq!(decode(f, code as u8 | 0x8), -want, "code {}", code + 8);
+        }
+        assert_eq!(max_finite(f), 16.0);
+        // No NaN/inf slots — every code is finite.
+        assert!((0..16u8).all(|c| decode(f, c).is_finite()));
+    }
+
+    #[test]
+    fn custom_e2m1_matches_named_f4e2m1() {
+        // A Custom built with E2M1's fields must decode bit-identically to the
+        // named F4E2M1 (LUT fast-path) for all 16 codes — proving the generic
+        // formula reproduces the hand-written table.
+        let custom = ScaledFormat::custom(2, 1); // bias 1
+        assert_eq!(custom.fields(), ScaledFormat::F4E2M1.fields());
+        for c in 0..16u8 {
+            let named = decode(ScaledFormat::F4E2M1, c);
+            let generic = decode(custom, c);
+            assert!(
+                named.to_bits() == generic.to_bits(),
+                "e2m1 code {c:#04x}: named {named} vs custom {generic}"
+            );
+        }
+        assert_eq!(max_finite(custom), max_finite(ScaledFormat::F4E2M1));
+    }
+
+    #[test]
+    fn custom_encode_is_nearest_and_saturates() {
+        let f = ScaledFormat::custom(3, 0); // f4e3m0, max finite 16
+        for v in [0.25f32, 0.5, 1.0, 2.0, 8.0, 16.0, -4.0, -0.5] {
+            assert_eq!(decode(f, encode(f, v)), v, "exact grid point {v}");
+        }
+        assert_eq!(
+            decode(f, encode(f, 100.0)),
+            16.0,
+            "finite overflow saturates"
+        );
+        assert_eq!(
+            decode(f, encode(f, f32::INFINITY)),
+            16.0,
+            "+inf saturates to max"
+        );
+        assert_eq!(
+            decode(f, encode(f, f32::NEG_INFINITY)),
+            -16.0,
+            "-inf saturates"
+        );
+        assert_eq!(encode(f, f32::NAN), 0, "NaN encodes to 0");
+    }
+
+    #[test]
+    fn custom_round_trip_every_representable_code() {
+        // decode → encode → decode is a fixed point for a spread of exp/mant
+        // splits, including a 6-bit and an 8-bit custom.
+        for f in [
+            ScaledFormat::custom(3, 0), // f4e3m0
+            ScaledFormat::custom(2, 2), // f5e2m2
+            ScaledFormat::custom(4, 3), // f8e4m3-shaped (finite, no special codes)
+            ScaledFormat::custom(3, 4), // f8e3m4
+        ] {
+            let n = 1u16 << f.bit_width();
+            for c in 0..n {
+                let v = decode(f, c as u8);
+                assert!(v.is_finite(), "{f}: code {c:#04x} unexpectedly non-finite");
+                assert_eq!(decode(f, encode(f, v)), v, "{f}: code {c:#04x} ({v})");
+            }
         }
     }
 }

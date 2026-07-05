@@ -16,7 +16,6 @@
 //! `pcg` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -32,7 +31,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_k
 use super::*;
 
 pub(crate) struct SparsePcgExt;
-
 
 impl OpExtension for SparsePcgExt {
     fn name(&self) -> &str {
@@ -75,7 +73,6 @@ impl OpExtension for SparsePcgExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SparsePcgCpu;
 
@@ -101,4 +98,3 @@ impl CpuKernel for SparsePcgCpu {
 }
 
 // ── BiCGSTAB (non-symmetric) ──────────────────────────────────────
-

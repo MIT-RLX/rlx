@@ -70,6 +70,11 @@ impl CompiledFn {
                  or pre-dequantize the affected weights at load time."
             )));
         }
+        // NB: mlx::compile can still fuse a very deep elementwise chain
+        // (grid_sample) into one kernel that exhausts Metal's argument buffers.
+        // That surfaces lazily when the output is materialized; `run_read_outputs`
+        // catches it and retries in MlxMode::Lazy, which caps fusion via eval
+        // barriers (see `lower_with_env` / `is_fusable`).
         let leaf_order = lower::compile_leaf_order(&graph);
         let state = Box::new(CompiledState {
             graph,
@@ -223,6 +228,7 @@ fn run_callback(
         &empty_params,
         &empty_typed,
         rlx_ir::RngOptions::default(),
+        false, // inside mlx::compile trace — eval barriers are illegal here
     )?;
 
     if outs.len() > cap {

@@ -18,15 +18,15 @@ default = []
 cuda = ["rlx-mlx-sys/cuda"]
 
 [dependencies]
-rlx-mlx-sys = { path = "../rlx-mlx-sys", version = "0.2.10" }
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
-rlx-driver = { path = "../../core/rlx-driver", version = "0.2.10" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10" }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.10" }
+rlx-mlx-sys = { path = "../rlx-mlx-sys", version = "0.2.12" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
+rlx-driver = { path = "../../core/rlx-driver", version = "0.2.12" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12" }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", default-features = false, features = ["blas", "splat"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.12", default-features = false, features = ["blas", "splat"] }
 
 [lints]
 workspace = true

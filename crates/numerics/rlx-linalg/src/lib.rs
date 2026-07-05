@@ -139,11 +139,9 @@ pub const LINALG_QR: &str = "rlx_linalg.qr";
 
 pub const LINALG_SVD: &str = "rlx_linalg.svd";
 
-
 /// Log-determinant of a SPD matrix. Forward = `2 · Σ log(diag(chol(A)))`;
 /// VJP `dL/dA = dL/d(logdet) · A⁻¹` (which is symmetric and SPD).
 pub const LINALG_LOGDET: &str = "rlx_linalg.logdet";
-
 
 /// Backward kernel for `cholesky`: takes `(L, dL/dL)` → produces `dL/dA`.
 pub const LINALG_CHOLESKY_BACKWARD: &str = "rlx_linalg.cholesky_backward";
@@ -188,7 +186,6 @@ pub const LINALG_SVD_BACKWARD: &str = "rlx_linalg.svd_backward";
 /// `dL/dA = dL/d(logdet) · A⁻¹`. Computed via solve(A, I) internally.
 pub const LINALG_LOGDET_BACKWARD: &str = "rlx_linalg.logdet_backward";
 
-
 /// Sign + log|det| of a general square matrix via LU with pivoting.
 /// Output packed `[sign, log|det|]`, length 2 F64.
 /// VJP: `dL/dA = dL/d(log|det|) · A⁻ᵀ` (sign is non-differentiable).
@@ -197,13 +194,11 @@ pub const LINALG_SLOGDET: &str = "rlx_linalg.slogdet";
 /// Backward kernel for `slogdet`: `(A, dL/d(log|det|)) → dL/dA`.
 pub const LINALG_SLOGDET_BACKWARD: &str = "rlx_linalg.slogdet_backward";
 
-
 /// Extract the diagonal of a matrix: `[n, n] → [n]`. VJP is `diag_set`.
 pub const LINALG_DIAG_EXTRACT: &str = "rlx_linalg.diag_extract";
 
 /// Build a diagonal matrix from a vector: `[n] → [n, n]`. VJP is `diag_extract`.
 pub const LINALG_DIAG_SET: &str = "rlx_linalg.diag_set";
-
 
 /// Matrix exponential `exp(A)` via Padé-13 with scaling-and-squaring.
 /// VJP via the augmented-matrix trick (Al-Mohy/Higham): the upper-right
@@ -218,7 +213,6 @@ pub const LINALG_EXPM_BACKWARD: &str = "rlx_linalg.expm_backward";
 /// Computed as the upper-right block of `exp([[A, dA], [0, A]])`.
 pub const LINALG_EXPM_JVP: &str = "rlx_linalg.expm_jvp";
 
-
 /// Moore-Penrose pseudo-inverse via thin SVD with cutoff:
 ///   Y = V · diag(1/s_filtered) · Uᵀ. Output shape `[n, m]` for
 ///   input `[m, n]`. Full-column-rank case (m ≥ n) is best supported.
@@ -226,7 +220,6 @@ pub const LINALG_PINV: &str = "rlx_linalg.pinv";
 
 /// Backward kernel for `pinv`: `(A, Y, dL/dY) → dL/dA`.
 pub const LINALG_PINV_BACKWARD: &str = "rlx_linalg.pinv_backward";
-
 
 /// Least-squares: `x = argmin ||A·x - b||²` via thin SVD pseudoinverse.
 /// `A: [m, n]`, `b: [m]` (vector RHS only in v1). Output `x: [n]`.
@@ -238,7 +231,6 @@ pub const LINALG_LSTSQ_BACKWARD_A: &str = "rlx_linalg.lstsq_backward_a";
 /// Backward kernel: `(A, dL/dx) → dL/db`.
 pub const LINALG_LSTSQ_BACKWARD_B: &str = "rlx_linalg.lstsq_backward_b";
 
-
 // ── Symmetric matrix functions + covariance (exg-source) ────────
 //
 // Host helpers for EEG source localization: whitener (matrix √ / √⁻¹),
@@ -247,7 +239,6 @@ pub const LINALG_LSTSQ_BACKWARD_B: &str = "rlx_linalg.lstsq_backward_b";
 pub mod matfn;
 
 // ── Algos: shared LAPACK-backed kernel bodies ────────────────────
-
 
 #[cfg(feature = "cpu")]
 mod algos {
@@ -1825,7 +1816,6 @@ mod algos {
 
 // ── Cholesky ─────────────────────────────────────────────────────
 
-
 /// `L = cholesky(A)`. A is row-major n×n SPD F64. Returns L (lower
 /// triangular if `lower`, else U upper) of shape `[n, n]` F64 with
 /// the unused triangle zeroed.
@@ -1833,7 +1823,6 @@ pub fn cholesky(g: &mut Graph, a: NodeId, lower: bool) -> NodeId {
     let attrs = vec![if lower { 1 } else { 0 }];
     g.custom_op(LINALG_CHOLESKY, attrs, vec![a])
 }
-
 
 /// Solve `op(A)·X = B` where A is triangular. `lower` selects which
 /// triangle of A is read; `transpose_a` toggles `op(A) = Aᵀ`.
@@ -1848,7 +1837,6 @@ pub fn solve_triangular(
     let attrs = vec![if lower { 1 } else { 0 }, if transpose_a { 1 } else { 0 }];
     g.custom_op(LINALG_SOLVE_TRIANGULAR, attrs, vec![a, b])
 }
-
 
 /// `(eigvals, eigvecs) = eigh(A)`. A is symmetric n×n F64.
 /// Returns:
@@ -1888,7 +1876,6 @@ pub fn eigh(g: &mut Graph, a: NodeId) -> (NodeId, NodeId) {
     );
     (eigvals, eigvecs)
 }
-
 
 /// `(Q, R) = qr(A)`. A is m×n F64. Returns:
 ///   - `Q`: shape `[m, k]` F64 with `k = min(m, n)`
@@ -1940,7 +1927,6 @@ pub fn qr(g: &mut Graph, a: NodeId) -> (NodeId, NodeId) {
     (q, r)
 }
 
-
 /// `logdet(A)` for SPD A — log-determinant computed via Cholesky:
 /// `2 · Σ log L[i,i]` where `L = chol(A, lower)`. Output shape `[1]`
 /// F64. VJP: `dL/dA = dL/d(logdet) · A⁻¹`.
@@ -1948,18 +1934,15 @@ pub fn logdet(g: &mut Graph, a: NodeId) -> NodeId {
     g.custom_op(LINALG_LOGDET, Vec::new(), vec![a])
 }
 
-
 /// Extract the diagonal of a square matrix `A: [n, n]` → `[n]`.
 pub fn diag_extract(g: &mut Graph, a: NodeId) -> NodeId {
     g.custom_op(LINALG_DIAG_EXTRACT, Vec::new(), vec![a])
 }
 
-
 /// Build a diagonal matrix from a vector `v: [n]` → `[n, n]`.
 pub fn diag_set(g: &mut Graph, v: NodeId) -> NodeId {
     g.custom_op(LINALG_DIAG_SET, Vec::new(), vec![v])
 }
-
 
 /// `trace(A)`: sum of diagonal entries. Pure composition of
 /// `diag_extract` + reduction; VJP is the diag_set of the upstream.
@@ -1967,7 +1950,6 @@ pub fn trace(g: &mut Graph, a: NodeId) -> NodeId {
     let d = diag_extract(g, a);
     g.sum(d, vec![0], false)
 }
-
 
 /// Kronecker product `kron(A, B)`. For `A: [m, n]` and `B: [p, q]`
 /// produces `[m·p, n·q]` with `kron[i·p+r, j·q+s] = A[i,j]·B[r,s]`.
@@ -2040,7 +2022,6 @@ pub fn kron(g: &mut Graph, a: NodeId, b: NodeId) -> NodeId {
     )
 }
 
-
 /// Polar decomposition `A = U · H` where U is orthogonal and H is SPD.
 /// Computed via thin SVD: `A = U_svd · S · V^T` ⇒
 ///   `U = U_svd · V^T`,  `H = V · S · V^T`.
@@ -2076,14 +2057,12 @@ pub fn polar(g: &mut Graph, a: NodeId) -> (NodeId, NodeId) {
     (u_orth, h)
 }
 
-
 /// `expm(A)`: matrix exponential via Padé-13 + scaling-and-squaring.
 /// A is square n×n F64; output is n×n F64. VJP via Al-Mohy/Higham
 /// augmented-matrix trick.
 pub fn expm(g: &mut Graph, a: NodeId) -> NodeId {
     g.custom_op(LINALG_EXPM, Vec::new(), vec![a])
 }
-
 
 /// `pinv(A)`: Moore-Penrose pseudo-inverse via thin SVD. A is m×n F64;
 /// output is n×m F64. For full-rank A this is `(AᵀA)⁻¹·Aᵀ` (m≥n) or
@@ -2103,14 +2082,12 @@ pub fn pinv(g: &mut Graph, a: NodeId) -> NodeId {
     g.custom_op(LINALG_PINV, attrs, vec![a])
 }
 
-
 /// `lstsq(A, b)`: x = pinv(A)·b. A is m×n F64; b is m F64; x is n F64.
 /// VJP supports the full-column-rank case (m ≥ n). For under-determined
 /// systems, the same kernel returns the minimum-norm solution.
 pub fn lstsq(g: &mut Graph, a: NodeId, b: NodeId) -> NodeId {
     g.custom_op(LINALG_LSTSQ, Vec::new(), vec![a, b])
 }
-
 
 /// `(sign, log|det|) = slogdet(A)` for general square A. Computed
 /// via LU with partial pivoting. Returns two scalar nodes.
@@ -2137,7 +2114,6 @@ pub fn slogdet(g: &mut Graph, a: NodeId) -> (NodeId, NodeId) {
     );
     (sign, logabsdet)
 }
-
 
 /// `(U, S, Vᵀ) = svd(A)` (thin / "S" mode). A is m×n F64. Returns:
 ///   - `U`:  `[m, k]`  F64
@@ -2202,7 +2178,6 @@ pub fn svd(g: &mut Graph, a: NodeId) -> (NodeId, NodeId, NodeId) {
 
 // ── Host LAPACK (non-graph callers) ──────────────────────────────
 
-
 /// Dense LAPACK wrappers for host-side crates (eda-doa, eda-fullwave, …).
 #[cfg(feature = "cpu")]
 pub mod host {
@@ -2210,7 +2185,6 @@ pub mod host {
 }
 
 // ── Registration ─────────────────────────────────────────────────
-
 
 /// Register every linalg op's IR-level extension and per-backend
 /// kernels enabled at compile time.
@@ -2276,4 +2250,3 @@ pub fn register() {
         register_cpu_kernel(Arc::new(LstsqBackwardBCpu));
     }
 }
-

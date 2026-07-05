@@ -37,7 +37,6 @@ use super::*;
 /// are immediately reshaped to 2-D for matmul.
 pub struct FuseRmsNormReshape;
 
-
 impl Pass for FuseRmsNormReshape {
     fn name(&self) -> &str {
         "fuse_rms_norm_reshape"
@@ -107,4 +106,3 @@ impl Pass for FuseRmsNormReshape {
 }
 
 // ── Pass 3b: Dual MatMul SwiGLU (gate+up before shared-input concat) ─────
-

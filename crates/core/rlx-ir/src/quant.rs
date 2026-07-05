@@ -358,6 +358,28 @@ pub enum ScaledFormat {
     /// FP4 E2M1 — all 16 codes finite. Max ±6. Blackwell / CDNA4.
     /// Shared by NVFP4 and MXFP4 — the [`ScaleLayout`] tells them apart.
     F4E2M1,
+    /// Arbitrary sub-byte minifloat parameterized by exponent / mantissa width
+    /// — the `fNeXmY` family (`N = 1 + exp_bits + mant_bits` total bits).
+    ///
+    /// All-finite (no infinities, no NaN, no AMD FNUZ), IEEE-style gradual
+    /// underflow (subnormals when `exp == 0`), sign in bit `exp_bits +
+    /// mant_bits`, one code per byte. The whole code must fit in a byte, so
+    /// `1 + exp_bits + mant_bits <= 8` and `exp_bits >= 1`.
+    ///
+    /// This is a *research / experimental* encoding: it has no hardware
+    /// tensor-core GEMM, so it always runs the decode-and-accumulate path (CPU
+    /// oracle + generic GPU kernel). Build one with [`ScaledFormat::custom`]
+    /// (IEEE bias `2^(exp_bits-1) - 1`) or [`ScaledFormat::custom_with_bias`],
+    /// or parse a name via `"f4e3m0".parse()`.
+    ///
+    /// Example — `f4e3m0` (`exp_bits: 3, mant_bits: 0, bias: 3`): the 16 codes
+    /// are `±0` and `±{0.25, 0.5, 1, 2, 4, 8, 16}` — a signed power-of-two
+    /// (near-logarithmic) 4-bit format.
+    Custom {
+        exp_bits: u8,
+        mant_bits: u8,
+        bias: i8,
+    },
 }
 
 impl ScaledFormat {
@@ -367,6 +389,11 @@ impl ScaledFormat {
             Self::F8E4M3 | Self::F8E5M2 | Self::F8E4M3Fnuz | Self::F8E5M2Fnuz => 8,
             Self::F6E2M3 | Self::F6E3M2 => 6,
             Self::F4E2M1 => 4,
+            Self::Custom {
+                exp_bits,
+                mant_bits,
+                ..
+            } => 1 + exp_bits as u32 + mant_bits as u32,
         }
     }
 
@@ -380,7 +407,93 @@ impl ScaledFormat {
             Self::F6E2M3 => (2, 3, 1),
             Self::F6E3M2 => (3, 2, 3),
             Self::F4E2M1 => (2, 1, 1),
+            Self::Custom {
+                exp_bits,
+                mant_bits,
+                bias,
+            } => (exp_bits as u32, mant_bits as u32, bias as i32),
         }
+    }
+
+    /// Build an arbitrary all-finite minifloat with `exp_bits` exponent and
+    /// `mant_bits` mantissa bits, using the IEEE-style bias `2^(exp_bits-1) - 1`
+    /// — the convention every named rlx format follows (E4M3 → 7, E5M2 → 15,
+    /// E2M1 → 1, …). The whole code must fit in a byte. `const` — usable in
+    /// `const` contexts and pattern-free construction.
+    ///
+    /// Panics if `exp_bits == 0` or `1 + exp_bits + mant_bits > 8`.
+    ///
+    /// ```
+    /// use rlx_ir::ScaledFormat;
+    /// const F4E3M0: ScaledFormat = ScaledFormat::custom(3, 0);
+    /// assert_eq!(F4E3M0.to_string(), "f4e3m0");
+    /// assert_eq!(F4E3M0.exp_bits(), 3);
+    /// assert_eq!(F4E3M0.mant_bits(), 0);
+    /// // Nearest representable value ("quantize" a single f32):
+    /// assert_eq!(F4E3M0.quantize(1.4), 1.0);
+    /// assert_eq!(F4E3M0.max_finite(), 16.0);
+    /// ```
+    pub const fn custom(exp_bits: u8, mant_bits: u8) -> Self {
+        assert!(exp_bits >= 1, "minifloat needs at least one exponent bit");
+        assert!(
+            1 + exp_bits + mant_bits <= 8,
+            "minifloat code must fit in a byte (1 + exp + mant <= 8)"
+        );
+        let bias = (1i32 << (exp_bits - 1)) - 1;
+        Self::Custom {
+            exp_bits,
+            mant_bits,
+            bias: bias as i8,
+        }
+    }
+
+    /// Like [`custom`](Self::custom) but with an explicit exponent bias
+    /// (for formats that don't use the IEEE `2^(e-1)-1` convention). `const`.
+    pub const fn custom_with_bias(exp_bits: u8, mant_bits: u8, bias: i8) -> Self {
+        assert!(exp_bits >= 1, "minifloat needs at least one exponent bit");
+        assert!(
+            1 + exp_bits + mant_bits <= 8,
+            "minifloat code must fit in a byte (1 + exp + mant <= 8)"
+        );
+        Self::Custom {
+            exp_bits,
+            mant_bits,
+            bias,
+        }
+    }
+
+    /// The seven named hardware element formats, for enumeration / format sweeps.
+    pub const NAMED: [ScaledFormat; 7] = [
+        Self::F8E4M3,
+        Self::F8E5M2,
+        Self::F8E4M3Fnuz,
+        Self::F8E5M2Fnuz,
+        Self::F6E2M3,
+        Self::F6E3M2,
+        Self::F4E2M1,
+    ];
+
+    /// Exponent-field bit count (`X` in `fNeXmY`).
+    pub const fn exp_bits(self) -> u32 {
+        self.fields().0
+    }
+    /// Mantissa-field bit count (`Y` in `fNeXmY`; `0` for a pure power-of-two
+    /// format such as `f4e3m0`).
+    pub const fn mant_bits(self) -> u32 {
+        self.fields().1
+    }
+    /// Exponent bias.
+    pub const fn bias(self) -> i32 {
+        self.fields().2
+    }
+    /// True for a parameterized [`Custom`](Self::Custom) format (no hardware
+    /// tensor core — always runs the decode path).
+    pub const fn is_custom(self) -> bool {
+        matches!(self, Self::Custom { .. })
+    }
+    /// True for one of the seven [`NAMED`](Self::NAMED) hardware formats.
+    pub const fn is_named(self) -> bool {
+        !self.is_custom()
     }
 
     /// AMD OCP-FNUZ encoding (single NaN at `0x80`, no inf, no −0).
@@ -400,9 +513,54 @@ impl ScaledFormat {
         crate::lowp_codec::max_finite(self)
     }
 
-    /// Stable integer id passed to GPU kernels (matches `rlx_decode_lowp` in
-    /// `scaled_lowp_general.cu`): e4m3=0, e5m2=1, e4m3fnuz=2, e5m2fnuz=3,
-    /// e2m3=4, e3m2=5, e2m1=6.
+    /// Decode one packed code to f32 (bit-exact; `±inf` / `NaN` for the formats
+    /// that encode them). Method form of [`crate::lowp_codec::decode`].
+    pub fn decode(self, code: u8) -> f32 {
+        crate::lowp_codec::decode(self, code)
+    }
+
+    /// Encode an f32 to its nearest representable code (round-half-to-even,
+    /// saturating overflow / `±inf` to `±max_finite`, `NaN → 0`). Method form of
+    /// [`crate::lowp_codec::encode`].
+    pub fn encode(self, x: f32) -> u8 {
+        crate::lowp_codec::encode(self, x)
+    }
+
+    /// Round-trip `x` through the format — the nearest value it can represent.
+    /// Handy for eyeballing a format's resolution without building a graph
+    /// (e.g. `ScaledFormat::custom(3, 0).quantize(1.4) == 1.0`).
+    pub fn quantize(self, x: f32) -> f32 {
+        self.decode(self.encode(x))
+    }
+
+    /// Every finite value the format represents, ascending and deduplicated —
+    /// the format's grid. Useful for inspecting a research minifloat, e.g.
+    /// `ScaledFormat::custom(3, 0).representable_values()` yields
+    /// `[-16, -8, -4, -2, -1, -0.5, -0.25, 0, 0.25, 0.5, 1, 2, 4, 8, 16]`.
+    pub fn representable_values(self) -> Vec<f32> {
+        let n = 1u16 << self.bit_width();
+        let mut v: Vec<f32> = (0..n)
+            .map(|c| self.decode(c as u8))
+            .filter(|x| x.is_finite())
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.dedup();
+        v
+    }
+
+    /// The GPU dispatch word passed to `scaled_lowp_general.cu` (`rlx_decode_lowp`).
+    ///
+    /// For the seven named formats this is a small stable id matching the
+    /// kernel's `switch`: e4m3=0, e5m2=1, e4m3fnuz=2, e5m2fnuz=3, e2m3=4,
+    /// e3m2=5, e2m1=6.
+    ///
+    /// For a [`Custom`](Self::Custom) format there is no fixed id, so this
+    /// returns a **packed field descriptor** with the top bit set as a
+    /// sentinel: `0x8000_0000 | exp_bits | mant_bits<<4 | (bias as u8)<<8`.
+    /// The kernel detects the sentinel bit and decodes generically from the
+    /// unpacked `(exp_bits, mant_bits, bias)` — so a new format needs no kernel
+    /// edit. The named ids stay in `0..=6` (top bit clear), so the existing
+    /// hardware `switch` path is unchanged.
     pub const fn kernel_id(self) -> u32 {
         match self {
             Self::F8E4M3 => 0,
@@ -412,6 +570,16 @@ impl ScaledFormat {
             Self::F6E2M3 => 4,
             Self::F6E3M2 => 5,
             Self::F4E2M1 => 6,
+            Self::Custom {
+                exp_bits,
+                mant_bits,
+                bias,
+            } => {
+                0x8000_0000
+                    | (exp_bits as u32 & 0xF)
+                    | ((mant_bits as u32 & 0xF) << 4)
+                    | (((bias as u8) as u32) << 8)
+            }
         }
     }
 
@@ -432,9 +600,67 @@ impl std::fmt::Display for ScaledFormat {
             Self::F6E2M3 => "f6e2m3",
             Self::F6E3M2 => "f6e3m2",
             Self::F4E2M1 => "f4e2m1",
+            // `fNeXmY`, N = 1 + exp + mant. The bias is implied by the width
+            // (IEEE convention) and not rendered; round-trips through `FromStr`.
+            Self::Custom {
+                exp_bits,
+                mant_bits,
+                ..
+            } => {
+                return write!(
+                    f,
+                    "f{}e{}m{}",
+                    1 + exp_bits + mant_bits,
+                    exp_bits,
+                    mant_bits
+                );
+            }
         };
         f.write_str(s)
     }
+}
+
+impl std::str::FromStr for ScaledFormat {
+    type Err = String;
+
+    /// Parse a format name. The seven named formats (`"f8e4m3"`, `"f4e2m1"`,
+    /// the `…fnuz` variants, …) keep their exact hardware semantics (FNUZ,
+    /// inf/NaN); any other `fNeXmY` string becomes an all-finite
+    /// [`Custom`](Self::Custom) with the IEEE bias. `N` must equal `1 + X + Y`
+    /// and the code must fit in a byte (`N <= 8`, `X >= 1`).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "f8e4m3" => return Ok(Self::F8E4M3),
+            "f8e5m2" => return Ok(Self::F8E5M2),
+            "f8e4m3fnuz" => return Ok(Self::F8E4M3Fnuz),
+            "f8e5m2fnuz" => return Ok(Self::F8E5M2Fnuz),
+            "f6e2m3" => return Ok(Self::F6E2M3),
+            "f6e3m2" => return Ok(Self::F6E3M2),
+            "f4e2m1" => return Ok(Self::F4E2M1),
+            _ => {}
+        }
+        let err = || format!("invalid minifloat format {s:?} (expected e.g. \"f4e3m0\")");
+        let rest = s.strip_prefix('f').ok_or_else(err)?;
+        let (total, rest) = take_leading_u32(rest).ok_or_else(err)?;
+        let rest = rest.strip_prefix('e').ok_or_else(err)?;
+        let (exp, rest) = take_leading_u32(rest).ok_or_else(err)?;
+        let rest = rest.strip_prefix('m').ok_or_else(err)?;
+        let (mant, rest) = take_leading_u32(rest).ok_or_else(err)?;
+        if !rest.is_empty() || exp == 0 || total != 1 + exp + mant || 1 + exp + mant > 8 {
+            return Err(err());
+        }
+        Ok(Self::custom(exp as u8, mant as u8))
+    }
+}
+
+/// Split the leading run of ASCII digits off `s`, returning `(value, tail)`.
+/// `None` if `s` doesn't start with a digit.
+fn take_leading_u32(s: &str) -> Option<(u32, &str)> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    Some((s[..end].parse().ok()?, &s[end..]))
 }
 
 /// How scale factors are laid out for an [`crate::op::Op::ScaledMatMul`]
@@ -502,6 +728,35 @@ impl std::fmt::Display for ScaleLayout {
     }
 }
 
+impl std::str::FromStr for ScaleLayout {
+    type Err = String;
+
+    /// Parse a scale-layout name: `"per_tensor"`, `"mx"` (32-element E8M0
+    /// microscaling), `"nvfp4"` (16-element E4M3), or an explicit block size
+    /// `"mx/<block>"` / `"nvfp4/<group>"`. Mirrors [`Display`](Self) round-trip.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "per_tensor" | "pertensor" => return Ok(Self::PerTensor),
+            "mx" | "mxfp8" | "block" => return Ok(Self::mx()),
+            "nvfp4" => return Ok(Self::nvfp4()),
+            _ => {}
+        }
+        if let Some(rest) = s.strip_prefix("mx/").or_else(|| s.strip_prefix("mx_e8m0/")) {
+            if let Ok(block) = rest.parse::<u32>() {
+                return Ok(Self::BlockMxE8M0 { block });
+            }
+        }
+        if let Some(rest) = s.strip_prefix("nvfp4/") {
+            if let Ok(group) = rest.parse::<u32>() {
+                return Ok(Self::Nvfp4 { group });
+            }
+        }
+        Err(format!(
+            "unknown scale layout {s:?} (expected \"per_tensor\", \"mx\", \"nvfp4\", or \"mx/<block>\")"
+        ))
+    }
+}
+
 /// Per-graph map of quantized tensors. Lookup is O(1).
 #[derive(Debug, Clone, Default)]
 pub struct QuantMap {
@@ -550,5 +805,171 @@ mod tests {
         q.insert(id, QuantScheme::Int8Block { block_size: 32 });
         assert_eq!(q.get(id), Some(QuantScheme::Int8Block { block_size: 32 }));
         assert_eq!(q.get(NodeId(99)), None);
+    }
+
+    #[test]
+    fn custom_format_ieee_bias_and_width() {
+        // IEEE bias 2^(e-1)-1, matching every named format.
+        assert_eq!(ScaledFormat::custom(3, 0).fields(), (3, 0, 3)); // f4e3m0
+        assert_eq!(ScaledFormat::custom(4, 3).fields(), (4, 3, 7)); // e4m3 bias
+        assert_eq!(ScaledFormat::custom(5, 2).fields(), (5, 2, 15)); // e5m2 bias
+        assert_eq!(ScaledFormat::custom(2, 1).fields(), (2, 1, 1)); // e2m1 bias
+        assert_eq!(ScaledFormat::custom(3, 0).bit_width(), 4);
+        assert_eq!(ScaledFormat::custom(3, 4).bit_width(), 8);
+    }
+
+    #[test]
+    fn custom_format_parse_display_round_trip() {
+        let f: ScaledFormat = "f4e3m0".parse().unwrap();
+        assert_eq!(f, ScaledFormat::custom(3, 0));
+        assert_eq!(f.to_string(), "f4e3m0");
+        // A few more splits.
+        assert_eq!(
+            "f5e2m2".parse::<ScaledFormat>().unwrap().to_string(),
+            "f5e2m2"
+        );
+        assert_eq!(
+            "f8e3m4".parse::<ScaledFormat>().unwrap().to_string(),
+            "f8e3m4"
+        );
+        // Named formats parse to their exact hardware variants, not Custom.
+        assert_eq!(
+            "f8e4m3".parse::<ScaledFormat>().unwrap(),
+            ScaledFormat::F8E4M3
+        );
+        assert_eq!(
+            "f4e2m1".parse::<ScaledFormat>().unwrap(),
+            ScaledFormat::F4E2M1
+        );
+        assert_eq!(
+            "f8e5m2fnuz".parse::<ScaledFormat>().unwrap(),
+            ScaledFormat::F8E5M2Fnuz
+        );
+    }
+
+    #[test]
+    fn custom_format_parse_rejects_invalid() {
+        assert!("f4e3m1".parse::<ScaledFormat>().is_err()); // 1+3+1 != 4
+        assert!("f9e4m4".parse::<ScaledFormat>().is_err()); // 9 bits > byte
+        assert!("f1e0m0".parse::<ScaledFormat>().is_err()); // 0 exponent bits
+        assert!("e3m0".parse::<ScaledFormat>().is_err()); // missing 'f'
+        assert!("f4e3m0x".parse::<ScaledFormat>().is_err()); // trailing junk
+        assert!("garbage".parse::<ScaledFormat>().is_err());
+    }
+
+    #[test]
+    fn custom_gpu_word_is_packed_descriptor() {
+        // Named formats keep their small ids (top bit clear).
+        assert_eq!(ScaledFormat::F8E4M3.kernel_id(), 0);
+        assert_eq!(ScaledFormat::F4E2M1.kernel_id(), 6);
+        assert!(ScaledFormat::F4E2M1.kernel_id() & 0x8000_0000 == 0);
+        // Custom packs (exp, mant, bias) with the sentinel bit set.
+        let w = ScaledFormat::custom(3, 0).kernel_id(); // e=3, m=0, bias=3
+        assert_eq!(w & 0x8000_0000, 0x8000_0000);
+        assert_eq!(w & 0xF, 3); // exp_bits
+        assert_eq!((w >> 4) & 0xF, 0); // mant_bits
+        assert_eq!((w >> 8) & 0xFF, 3); // bias
+        // Negative bias round-trips through the u8 reinterpretation.
+        let wn = ScaledFormat::custom_with_bias(3, 0, -2).kernel_id();
+        assert_eq!(((wn >> 8) & 0xFF) as u8 as i8, -2);
+    }
+
+    #[test]
+    fn format_is_const_and_introspectable() {
+        // Usable in const context.
+        const F: ScaledFormat = ScaledFormat::custom(3, 0);
+        assert!(F.is_custom() && !F.is_named());
+        assert_eq!((F.exp_bits(), F.mant_bits(), F.bias()), (3, 0, 3));
+        assert!(ScaledFormat::F8E4M3.is_named() && !ScaledFormat::F8E4M3.is_custom());
+        assert_eq!(ScaledFormat::NAMED.len(), 7);
+        assert!(ScaledFormat::NAMED.iter().all(|f| f.is_named()));
+    }
+
+    #[test]
+    fn format_codec_methods_and_quantize() {
+        // Method forms match the free functions for every named format.
+        for f in ScaledFormat::NAMED {
+            for c in 0..(1u16 << f.bit_width()) {
+                assert_eq!(
+                    f.decode(c as u8).to_bits(),
+                    crate::lowp_codec::decode(f, c as u8).to_bits()
+                );
+            }
+        }
+        let cf = ScaledFormat::custom(3, 0); // f4e3m0 grid: ±{0.25,..,16}, ±0
+        assert_eq!(cf.quantize(1.4), 1.0);
+        assert_eq!(cf.quantize(1.6), 2.0);
+        assert_eq!(cf.quantize(-3.0), -2.0); // nearer 2 than 4 in magnitude
+        assert_eq!(cf.decode(cf.encode(100.0)), 16.0); // saturates
+        assert_eq!(cf.decode(cf.encode(f32::INFINITY)), 16.0);
+    }
+
+    #[test]
+    fn representable_values_grid() {
+        assert_eq!(
+            ScaledFormat::custom(3, 0).representable_values(),
+            vec![
+                -16.0, -8.0, -4.0, -2.0, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0,
+                16.0
+            ]
+        );
+        // Named formats: the grid size never exceeds the finite code count.
+        for f in ScaledFormat::NAMED {
+            let g = f.representable_values();
+            assert!(!g.is_empty() && g.windows(2).all(|w| w[0] < w[1]));
+        }
+    }
+
+    #[test]
+    fn enumerate_all_fnexmy() {
+        // Every valid fNeXmY: exp >= 1, mant >= 0, 1 + exp + mant <= 8.
+        let mut all = vec![];
+        for exp in 1u8..=7 {
+            for mant in 0u8..=(7 - exp) {
+                all.push(ScaledFormat::custom(exp, mant));
+            }
+        }
+        assert_eq!(all.len(), 28, "there are exactly 28 fNeXmY formats");
+        eprintln!(
+            "{:<8} {:>4} {:>3} {:>3} {:>4} {:>12} {:>12} {:>5}",
+            "name", "bits", "e", "m", "bias", "max_finite", "min_pos", "vals"
+        );
+        for f in &all {
+            let vals = f.representable_values();
+            let min_pos = vals.iter().copied().find(|&x| x > 0.0).unwrap();
+            assert!(f.bit_width() <= 8 && f.exp_bits() >= 1 && !vals.is_empty());
+            eprintln!(
+                "{:<8} {:>4} {:>3} {:>3} {:>4} {:>12.3e} {:>12.3e} {:>5}",
+                f.to_string(),
+                f.bit_width(),
+                f.exp_bits(),
+                f.mant_bits(),
+                f.bias(),
+                f.max_finite(),
+                min_pos,
+                vals.len()
+            );
+        }
+    }
+
+    #[test]
+    fn scale_layout_parse_round_trip() {
+        assert_eq!(
+            "per_tensor".parse::<ScaleLayout>().unwrap(),
+            ScaleLayout::PerTensor
+        );
+        assert_eq!("mx".parse::<ScaleLayout>().unwrap(), ScaleLayout::mx());
+        assert_eq!(
+            "nvfp4".parse::<ScaleLayout>().unwrap(),
+            ScaleLayout::nvfp4()
+        );
+        assert_eq!(
+            "mx/64".parse::<ScaleLayout>().unwrap(),
+            ScaleLayout::BlockMxE8M0 { block: 64 }
+        );
+        assert!("bogus".parse::<ScaleLayout>().is_err());
+        // Display round-trips through FromStr.
+        let mx = ScaleLayout::mx();
+        assert_eq!(mx.to_string().parse::<ScaleLayout>().unwrap(), mx);
     }
 }

@@ -32,7 +32,6 @@ use super::*;
 
 pub struct MarkElementwiseRegions;
 
-
 impl Pass for MarkElementwiseRegions {
     fn name(&self) -> &str {
         "mark_elementwise_regions"
@@ -380,4 +379,3 @@ impl Pass for MarkElementwiseRegions {
 // missing) without needing to implement region codegen. Run BEFORE
 // the backend's own lowering. No-op when the graph contains no
 // ElementwiseRegion nodes.
-

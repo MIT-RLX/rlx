@@ -37,7 +37,11 @@ use crate::lower::options::{ImportOptions, ImportReport};
 
 use super::*;
 
-pub(super) fn lower_act_copy(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_act_copy(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let s = m.shape(x).clone();
     let id = m.add_node(
@@ -54,7 +58,6 @@ pub(super) fn lower_act_copy(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &
     }
     Ok(true)
 }
-
 
 pub(super) fn lower_activation(
     m: &mut HirMut<'_>,
@@ -83,7 +86,6 @@ pub(super) fn lower_activation(
     Ok(true)
 }
 
-
 pub(super) fn lower_activation_map(
     m: &mut HirMut<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -107,8 +109,11 @@ pub(super) fn lower_activation_map(
     lower_activation(m, ctx, node, act)
 }
 
-
-pub(super) fn lower_leaky_relu(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_leaky_relu(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let alpha = node
         .attrs
         .get("alpha")
@@ -136,8 +141,11 @@ pub(super) fn lower_leaky_relu(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node:
     Ok(true)
 }
 
-
-pub(super) fn lower_identity(_m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_identity(
+    _m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     for out in &node.outputs {
         ctx.env.insert(out.clone(), x);
@@ -145,8 +153,10 @@ pub(super) fn lower_identity(_m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: 
     Ok(true)
 }
 
-
-pub(super) fn lower_dropout(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_dropout(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     lower_identity(m, ctx, node)
 }
-

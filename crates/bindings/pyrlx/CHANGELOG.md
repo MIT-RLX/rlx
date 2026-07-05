@@ -6,12 +6,24 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.12] — 2026-07-06
+
+### Changed
+
+- Dependency pins aligned with RLX workspace **0.2.12**.
+
+## [0.2.11] — 2026-07-05
+
 ### Added
 
 - **GGUF Python surface** — `quantize` / `dequant`, `load_gguf` / `write_gguf`,
   `convert_to_gguf` (safetensors → GGUF), and `GgufFile` metadata helpers.
 - Cargo features `gguf-convert` (default), `gguf-onnx`, `gguf-pt` for optional
   checkpoint readers.
+
+### Changed
+
+- Dependency pins aligned with RLX workspace **0.2.11**.
 
 ## [0.2.7] — 2026-06
 
@@ -84,7 +96,9 @@ and the project follows [Semantic Versioning](https://semver.org/).
   `cpu`, `blas-accelerate`, `blas-mkl`, `blas-openblas`, `metal`,
   `mlx`, `gpu` (wgpu), `cuda`, `rocm`.
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/pyrlx-v0.2.7...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/pyrlx-v0.2.12...HEAD
+[0.2.12]:     https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.12
+[0.2.11]:     https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.11
 [0.2.7]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.7
 [0.2.6]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.6
 [0.2.4]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.4

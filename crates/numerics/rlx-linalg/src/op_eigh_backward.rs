@@ -16,8 +16,6 @@
 //! `eigh_backward` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::{DType, OpExtension, Shape};
@@ -30,7 +28,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct EighBackwardExt;
-
 
 impl OpExtension for EighBackwardExt {
     fn name(&self) -> &str {
@@ -47,7 +44,6 @@ impl OpExtension for EighBackwardExt {
         Shape::new(&[n, n], DType::F64)
     }
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct EighBackwardCpu;
@@ -72,4 +68,3 @@ impl CpuKernel for EighBackwardCpu {
         algos::eigh_backward(lambda, v_flat, dl_dl, dl_dv, n, out)
     }
 }
-

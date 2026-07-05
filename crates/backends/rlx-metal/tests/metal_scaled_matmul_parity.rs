@@ -160,3 +160,12 @@ fn metal_scaled_matmul_nvfp4_block() {
     // FP4 with per-16 E4M3 block scales.
     run_case(ScaledFormat::F4E2M1, ScaleLayout::nvfp4(), 4, 64, 8, 0.95);
 }
+
+#[test]
+fn metal_scaled_matmul_f4e3m0_custom() {
+    // Parameterized `ScaledFormat::Custom` minifloat (f4e3m0 — 3 exp, 0 mant, a
+    // signed power-of-two grid). No FP4 matrix HW on Apple, so this runs the
+    // same CPU decode oracle; the run_case assertion that Metal == CPU
+    // bit-for-bit is the real check. Block-MX scaling keeps fidelity high.
+    run_case(ScaledFormat::custom(3, 0), ScaleLayout::mx(), 4, 64, 8, 0.9);
+}

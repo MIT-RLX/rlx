@@ -16,6 +16,8 @@
 // Element-wise unary / activation. Selector in `op`:
 //   0=relu 1=sigmoid 2=tanh 3=exp 4=log 5=sqrt 6=rsqrt
 //   7=neg  8=abs     9=gelu 10=silu 11=gelu_approx
+//   12=round 13=sin 14=cos 15=tan 16=atan
+// Keep in sync with `activation_op_id` in the CUDA/ROCm backends.
 
 extern "C" __global__ void unary(
     float* arena,
@@ -45,6 +47,11 @@ extern "C" __global__ void unary(
             float nx = fminf(fmaxf(-x, -88.0f), 88.0f);
             y = x / (1.0f + expf(nx));
         } break;
+        case 12: y = rintf(x); break;   // round half-to-even
+        case 13: y = sinf(x); break;
+        case 14: y = cosf(x); break;
+        case 15: y = tanf(x); break;
+        case 16: y = atanf(x); break;
         default: y = x;
     }
     arena[out_off + i] = y;

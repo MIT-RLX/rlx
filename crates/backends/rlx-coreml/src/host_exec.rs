@@ -416,7 +416,13 @@ fn run_scan_f32(
             num_bcast,
             num_xs,
             ..
-        } => (body, *length, *save_trajectory, *num_bcast as usize, *num_xs as usize),
+        } => (
+            body,
+            *length,
+            *save_trajectory,
+            *num_bcast as usize,
+            *num_xs as usize,
+        ),
         _ => unreachable!("run_scan_f32 called on non-Scan op"),
     };
     let load = |nid: NodeId| -> Result<Vec<f32>> {

@@ -16,8 +16,6 @@
 //! `lstsq_backward_a` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::{OpExtension, Shape};
@@ -31,7 +29,6 @@ use super::*;
 
 pub(crate) struct LstsqBackwardAExt;
 
-
 impl OpExtension for LstsqBackwardAExt {
     fn name(&self) -> &str {
         LINALG_LSTSQ_BACKWARD_A
@@ -43,7 +40,6 @@ impl OpExtension for LstsqBackwardAExt {
         inputs[0].clone()
     }
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct LstsqBackwardACpu;
@@ -72,4 +68,3 @@ impl CpuKernel for LstsqBackwardACpu {
         algos::lstsq_backward_a(a, x, b, dl_dx, m, n, out)
     }
 }
-

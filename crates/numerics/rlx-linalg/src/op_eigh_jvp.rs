@@ -16,8 +16,6 @@
 //! `eigh_jvp` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::{DType, OpExtension, Shape};
@@ -30,7 +28,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct EighJvpExt;
-
 
 impl OpExtension for EighJvpExt {
     fn name(&self) -> &str {
@@ -46,7 +43,6 @@ impl OpExtension for EighJvpExt {
         Shape::new(&[n + n * n], DType::F64)
     }
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct EighJvpCpu;
@@ -70,4 +66,3 @@ impl CpuKernel for EighJvpCpu {
         algos::eigh_jvp(lambda, v_flat, da_flat, n, out)
     }
 }
-

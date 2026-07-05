@@ -58,8 +58,11 @@ pub(super) fn lower_constant_of_shape(
     Ok(true)
 }
 
-
-pub(super) fn lower_range(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_range(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     if node.inputs.len() < 3 {
         ctx.passthrough_stub(m, node)?;
         return Ok(true);
@@ -105,10 +108,13 @@ pub(super) fn lower_range(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bun
     Ok(true)
 }
 
-
 /// ONNX `Einsum` (opset 12+). The `equation` attribute is forwarded verbatim
 /// (UTF-8) in the op attrs; the reference kernel parses it at runtime.
-pub(super) fn lower_einsum(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_einsum(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let equation = node
         .attrs
         .get("equation")
@@ -136,8 +142,11 @@ pub(super) fn lower_einsum(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bu
     Ok(true)
 }
 
-
-pub(super) fn lower_resize(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_resize(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x0 = ctx.tensor(&node.inputs[0])?;
     let out_s_final = if node.name.contains("f0_upsamp/Resize") {
         Shape::new(&[1, 9, 300], m.shape(x0).dtype())
@@ -188,7 +197,6 @@ pub(super) fn lower_resize(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bu
     Ok(true)
 }
 
-
 pub(super) fn lower_random_like(
     m: &mut HirMut<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -228,8 +236,11 @@ pub(super) fn lower_random_like(
     Ok(true)
 }
 
-
-pub(super) fn lower_random(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_random(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let tag = crate::random::node_name_tag(&node.name);
     let op_seed = crate::random::op_seed(node);
     let dist = crate::random::distribution(node);
@@ -265,7 +276,6 @@ pub(super) fn lower_random(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bu
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-
 
 pub(super) fn lower_pad_as_concat(
     m: &mut HirMut<'_>,
@@ -335,4 +345,3 @@ pub(super) fn lower_pad_as_concat(
     ctx.env.insert(node.outputs[0].clone(), cur);
     Ok(true)
 }
-

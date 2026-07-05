@@ -16,8 +16,6 @@
 //! `cholesky_jvp` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::infer::GraphExt;
@@ -32,7 +30,6 @@ use super::*;
 
 pub(crate) struct CholeskyJvpExt;
 
-
 impl OpExtension for CholeskyJvpExt {
     fn name(&self) -> &str {
         LINALG_CHOLESKY_JVP
@@ -44,7 +41,6 @@ impl OpExtension for CholeskyJvpExt {
         inputs[0].clone()
     }
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct CholeskyJvpCpu;
@@ -74,4 +70,3 @@ impl CpuKernel for CholeskyJvpCpu {
 }
 
 // ── Backward ops ──────────────────────────────────────────────────
-

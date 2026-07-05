@@ -274,14 +274,19 @@ impl Arena {
         let src_off = src_arena.byte_offset(src);
         let dst_cap = *self.element_counts.get(&dst).unwrap_or(&0);
         let src_cap = src_arena.element_counts.get(&src).copied().unwrap_or(0);
-        let len = dst_cap.min(src_cap);
-        if len == 0 {
+        let elems = dst_cap.min(src_cap);
+        if elems == 0 {
             return;
         }
+        // `element_counts` are ELEMENT counts, so scale by the dtype width to get
+        // bytes — otherwise an F32 param copies only 1 of every 4 bytes (a scalar
+        // scale becomes a denormal ≈0 → div-by-zero → NaN on a reused/cloned graph).
+        let elem_size = self.dtype(dst).size_bytes().max(1);
+        let bytes = elems * elem_size;
         unsafe {
             let dst_base = self.buffer.contents() as *mut u8;
             let src_base = src_arena.buffer.contents() as *const u8;
-            std::ptr::copy(src_base.add(src_off), dst_base.add(dst_off), len);
+            std::ptr::copy(src_base.add(src_off), dst_base.add(dst_off), bytes);
         }
     }
 }

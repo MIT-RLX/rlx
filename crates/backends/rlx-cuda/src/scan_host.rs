@@ -37,7 +37,9 @@ pub fn run_scan(
     bcast_outer: &[(usize, usize)],
 ) {
     let n_f32 = arena_size_bytes / 4;
-    stream.synchronize().expect("rlx-cuda: scan pre-sync failed");
+    stream
+        .synchronize()
+        .expect("rlx-cuda: scan pre-sync failed");
 
     let mut host = vec![0f32; n_f32];
     stream

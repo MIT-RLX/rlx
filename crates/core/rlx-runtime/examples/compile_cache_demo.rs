@@ -18,6 +18,10 @@
 //!
 //! cargo run --release --example compile_cache_demo --features metal -p rlx-runtime
 
+// The demo body (and its helpers/imports) is macOS-only — Device::Metal.
+// On other targets `main` is a stub, so silence the resulting dead-code.
+#![allow(dead_code, unused_imports)]
+
 use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::*;
 use rlx_runtime::{CompileCache, Device, Session};

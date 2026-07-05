@@ -102,7 +102,10 @@ impl Node {
 
     /// Static peer addresses, one per rank (mesh) or just the coordinator
     /// (star, `peers[0]`). Accepts anything `ToSocketAddrs` (host:port or ip:port).
-    pub fn peers<A: ToSocketAddrs>(mut self, addrs: impl IntoIterator<Item = A>) -> io::Result<Self> {
+    pub fn peers<A: ToSocketAddrs>(
+        mut self,
+        addrs: impl IntoIterator<Item = A>,
+    ) -> io::Result<Self> {
         let mut v = Vec::new();
         for a in addrs {
             let sa = a.to_socket_addrs()?.next().ok_or_else(|| {
@@ -163,8 +166,8 @@ impl Node {
             .map_err(|_| "WORLD must be an integer".to_string())?;
         let mut node = Node::new(rank, world);
 
-        let star = var("TOPOLOGY").as_deref() == Some("star")
-            || var("DIAL_OUT").is_some_and(|v| v != "0");
+        let star =
+            var("TOPOLOGY").as_deref() == Some("star") || var("DIAL_OUT").is_some_and(|v| v != "0");
         node = node.topology(if star { Topology::Star } else { Topology::Mesh });
 
         if let Some(mb) = var("HEAP_MB").and_then(|v| v.parse::<usize>().ok()) {
@@ -172,8 +175,12 @@ impl Node {
         }
 
         if var("DISCOVER").is_some_and(|v| v != "0") {
-            let dp = var("DISC_PORT").and_then(|v| v.parse().ok()).unwrap_or(29600);
-            let db = var("DATA_PORT").and_then(|v| v.parse().ok()).unwrap_or(29500);
+            let dp = var("DISC_PORT")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(29600);
+            let db = var("DATA_PORT")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(29500);
             node = node.discover(dp, db);
             if let Some(h) = var("DISCOVER_HOST") {
                 node = node.discover_via(h);
@@ -346,11 +353,18 @@ pub fn announce_coordinator(data_port: u16, disc_port: u16, stop: &AtomicBool) {
 /// announcing host's own IP.
 pub fn discover_coordinator(disc_port: u16, host: Option<&str>) -> io::Result<SocketAddr> {
     let mut buf = [0u8; 64];
-    let no_addr =
-        || io::Error::new(io::ErrorKind::InvalidInput, "discover host resolved to no address");
+    let no_addr = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "discover host resolved to no address",
+        )
+    };
     match host {
         Some(h) => {
-            let target = (h, disc_port).to_socket_addrs()?.next().ok_or_else(no_addr)?;
+            let target = (h, disc_port)
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(no_addr)?;
             let sock = UdpSocket::bind(("0.0.0.0", 0))?;
             sock.set_read_timeout(Some(Duration::from_millis(300))).ok();
             loop {

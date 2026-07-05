@@ -17,17 +17,17 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use crate::hlo::{
+    Computation, ConvDimNumbers, DotDimNumbers, GatherDimNumbers, HloBuilder, Literal, LiteralData,
+    ProgramShape, ScatterDimNumbers, Shape, Window, WindowDim, prim, prim_of,
+};
 use rlx_ir::op::{
     Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp, RegionPrologue,
     TransformStep,
 };
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, NodeId, Op};
-use crate::hlo::{
-    Computation, ConvDimNumbers, DotDimNumbers, GatherDimNumbers, HloBuilder, Literal, LiteralData,
-    ProgramShape, ScatterDimNumbers, Shape, Window, WindowDim, prim, prim_of,
-};
+use std::collections::HashMap;
 
 use super::*;
 
@@ -36,10 +36,8 @@ impl<'a> LowerCtx<'a> {
         ir_dims(&self.graph.node(nid).shape)
     }
 
-
     pub(crate) fn ir_shape(&self, nid: NodeId) -> Shape {
         let n = self.graph.node(nid);
         Shape::array(prim_of(n.shape.dtype()), &ir_dims(&n.shape))
     }
-
 }

@@ -354,7 +354,7 @@ pub fn try_lower_with_constants(
             // back to per-kernel thunks. `dims` is the node's output shape, which
             // is exactly the `outputShape` the conv-gradient ops require.
             Op::Conv {
-                kernel_size: _,
+                kernel_size,
                 stride,
                 padding,
                 dilation,
@@ -371,7 +371,31 @@ pub fn try_lower_with_constants(
                     (dilation[0], dilation[1]),
                     *groups,
                 );
-                f16_compute2(&mg, fp16, x, w, |x, w| mg.conv2d_nchw(x, w, s, p, d, g))
+                // rlx lowers ONNX 1D convs as `[N,C,1,L]` with kernel `[k,1]`, keeping
+                // the length kernel/stride/pad at index 0. A literal 2D conv2d would run
+                // the k-tap kernel over the singleton H axis and ignore the length. Since
+                // `[N,C,1,L]` and `[N,C,L,1]` share row-major layout, relabel the length
+                // onto H (reshape, no copy) so `conv2d_nchw` convolves it with the
+                // index-0 params — matching rlx-cpu, the MLX 1D path, and onnxruntime.
+                let in_dims = mps_shape_dims(graph, node.inputs[0])?;
+                let one_d_w = in_dims.len() == 4
+                    && in_dims[2] == 1
+                    && in_dims[3] > 1
+                    && kernel_size.len() == 2
+                    && kernel_size[0] > 1
+                    && kernel_size[1] == 1;
+                if one_d_w {
+                    let n = in_dims[0];
+                    let c = in_dims[1];
+                    let l = in_dims[3];
+                    let x_nl1 = mg.reshape(x, &[n, c, l, 1]);
+                    let y = f16_compute2(&mg, fp16, &x_nl1, w, |x, w| {
+                        mg.conv2d_nchw(x, w, s, p, d, g)
+                    });
+                    mg.reshape(&y, &dims)
+                } else {
+                    f16_compute2(&mg, fp16, x, w, |x, w| mg.conv2d_nchw(x, w, s, p, d, g))
+                }
             }
             Op::Pool {
                 kind,

@@ -17,6 +17,7 @@
 //! the reference; argmin uses argmax-of-negated on MLX (first-hit tie-break).
 
 #![cfg(feature = "cpu")]
+#![allow(dead_code)]
 
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};

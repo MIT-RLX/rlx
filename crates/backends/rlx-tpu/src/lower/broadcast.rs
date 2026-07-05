@@ -17,17 +17,17 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use crate::hlo::{
+    Computation, ConvDimNumbers, DotDimNumbers, GatherDimNumbers, HloBuilder, Literal, LiteralData,
+    ProgramShape, ScatterDimNumbers, Shape, Window, WindowDim, prim, prim_of,
+};
 use rlx_ir::op::{
     Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp, RegionPrologue,
     TransformStep,
 };
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, NodeId, Op};
-use crate::hlo::{
-    Computation, ConvDimNumbers, DotDimNumbers, GatherDimNumbers, HloBuilder, Literal, LiteralData,
-    ProgramShape, ScatterDimNumbers, Shape, Window, WindowDim, prim, prim_of,
-};
+use std::collections::HashMap;
 
 use super::*;
 
@@ -69,7 +69,6 @@ impl<'a> LowerCtx<'a> {
         };
         self.entry.broadcast(small, &surviving_axes, target)
     }
-
 
     /// Build a scale/zero-point broadcast for `Op::Quantize` /
     /// `Op::Dequantize`. `axis = None` → scalar broadcast (per-tensor);
@@ -120,7 +119,6 @@ impl<'a> LowerCtx<'a> {
 
     // ── Binary ─────────────────────────────────────────────────
 
-
     /// Bring two operands to a common rank-aligned shape against
     /// `target_dims`. HLO requires both binary operands to have the
     /// same shape; we use `broadcast_align` to lift each one to target.
@@ -142,7 +140,6 @@ impl<'a> LowerCtx<'a> {
         let b2 = self.broadcast_to_target(b, &b_dims, target_b);
         (a2, b2)
     }
-
 
     /// Broadcast `x` to `target_shape`. Adds leading dims when
     /// `x_dims.len() < target.rank()`, or replicates size-1 axes when
@@ -167,7 +164,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     // ── ElementwiseRegion ─────────────────────────────────────
-
 
     /// Lift a 1-D normalization parameter (shape `[axis_size]`) up to
     /// the layout `x` uses, by reshaping to size-1 in every axis
@@ -195,5 +191,4 @@ impl<'a> LowerCtx<'a> {
     }
 
     // ── RmsNorm ────────────────────────────────────────────────
-
 }

@@ -336,6 +336,26 @@ impl MlxExecutable {
         inputs: &[(&str, &[f32])],
         read_indices: Option<&[usize]>,
     ) -> Result<Vec<Vec<f32>>, MlxError> {
+        match self.run_read_outputs_inner(inputs, read_indices) {
+            Ok(o) => Ok(o),
+            // A compiled kernel can fail lazily when its output is materialized —
+            // e.g. an over-fused elementwise region (grid_sample) exhausts Metal's
+            // argument buffers. Disable compile and retry in Lazy, which caps
+            // fusion depth with eval barriers. Only retry once (compile now off).
+            Err(e) if self.compile_disabled.is_none() => {
+                self.note_compile_disabled(e.to_string());
+                self.compiled = None;
+                self.run_read_outputs_inner(inputs, read_indices)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn run_read_outputs_inner(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        read_indices: Option<&[usize]>,
+    ) -> Result<Vec<Vec<f32>>, MlxError> {
         let outs = self.run_arrays(inputs)?;
         let indices: Vec<usize> = match read_indices {
             None => (0..outs.len()).collect(),
@@ -503,7 +523,27 @@ impl MlxExecutable {
             leaves.push(leaf);
         }
 
-        compiled.invoke(&leaves)
+        // A compiled kernel can still fail at *invoke* time — e.g. a very deep
+        // fused elementwise region (grid_sample decomposition) exhausts Metal's
+        // argument buffers. Lazy lowering caps fusion depth, so fall back to it.
+        match compiled.invoke(&leaves) {
+            Ok(o) => Ok(o),
+            Err(e) => {
+                self.note_compile_disabled(e.to_string());
+                self.compiled = None;
+                lower::lower_and_run_typed_with_extent(
+                    &self.graph,
+                    &self.params,
+                    &self.params_typed,
+                    input_map,
+                    &self.inputs_typed,
+                    MlxMode::Lazy,
+                    self.active_extent,
+                    Some(&self.gpu_handles),
+                    self.current_rng(),
+                )
+            }
+        }
     }
 
     pub fn arena_ptr(&self) -> *const u8 {
