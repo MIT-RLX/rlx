@@ -87,7 +87,6 @@ pub fn compose_attention_backward(
     bwd
 }
 
-
 /// Merge an attention-backward subgraph into `g` at the given bindings.
 pub fn emit_attention_backward(
     g: &mut Graph,
@@ -127,4 +126,3 @@ pub fn emit_attention_backward(
     let id_map = merge_subgraph(g, &sub, &bind);
     id_map[&sub.outputs[0]]
 }
-

@@ -90,6 +90,8 @@ pub const EXPAND_WGSL: &str = include_str!("expand.wgsl");
 pub const ARGMAX_WGSL: &str = include_str!("argmax.wgsl");
 pub const POOL2D_WGSL: &str = include_str!("pool2d.wgsl");
 pub const CONV2D_WGSL: &str = include_str!("conv2d.wgsl");
+pub const CONV1D_TILED_WGSL: &str = include_str!("conv1d_tiled.wgsl");
+pub const IM2COL2D_WGSL: &str = include_str!("im2col2d.wgsl");
 pub const POOL1D_WGSL: &str = include_str!("pool1d.wgsl");
 pub const POOL3D_WGSL: &str = include_str!("pool3d.wgsl");
 pub const CONV1D_WGSL: &str = include_str!("conv1d.wgsl");
@@ -560,7 +562,9 @@ pub struct AttentionParams {
     pub seq_k_stride: u32,
     pub mask_batch_stride: u32,
     pub mask_head_stride: u32,
-    pub _pad_mask_0: u32,
+    /// GQA/MQA: number of key/value heads that the query heads share. Equals
+    /// `heads` for plain MHA; 0 means unset and the shader falls back to MHA.
+    pub kv_heads: u32,
     pub _pad_mask_1: u32,
     pub _pad_mask_2: u32,
 
@@ -743,6 +747,32 @@ pub struct Conv2dParams {
     pub in_off: u32,
     pub w_off: u32,
     pub out_off: u32,
+}
+
+/// Layout for GPU im2col (NCHW, N==1, groups==1). 80 bytes (20 u32).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Im2Col2dParams {
+    pub c_in: u32,
+    pub h: u32,
+    pub w: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub kh: u32,
+    pub kw: u32,
+    pub sh: u32,
+    pub sw: u32,
+    pub ph: u32,
+    pub pw: u32,
+    pub dh: u32,
+    pub dw: u32,
+    pub in_off: u32,
+    pub col_off: u32,
+    pub k_total: u32,
+    pub spatial: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
 }
 
 /// Layout for Pool1D NCL.
@@ -1689,6 +1719,8 @@ static EXPAND: OnceLock<Kernel> = OnceLock::new();
 static ARGMAX: OnceLock<Kernel> = OnceLock::new();
 static POOL2D: OnceLock<Kernel> = OnceLock::new();
 static CONV2D: OnceLock<Kernel> = OnceLock::new();
+static CONV1D_TILED: OnceLock<Kernel> = OnceLock::new();
+static IM2COL2D: OnceLock<Kernel> = OnceLock::new();
 static POOL1D: OnceLock<Kernel> = OnceLock::new();
 static POOL3D: OnceLock<Kernel> = OnceLock::new();
 static CONV1D: OnceLock<Kernel> = OnceLock::new();
@@ -2395,6 +2427,19 @@ pub fn pool2d_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn conv2d_kernel(device: &wgpu::Device) -> &'static Kernel {
     CONV2D.get_or_init(|| build_kernel(device, "rlx-wgpu conv2d", CONV2D_WGSL, "conv2d"))
+}
+pub fn im2col2d_kernel(device: &wgpu::Device) -> &'static Kernel {
+    IM2COL2D.get_or_init(|| build_kernel(device, "rlx-wgpu im2col2d", IM2COL2D_WGSL, "im2col2d"))
+}
+pub fn conv1d_tiled_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV1D_TILED.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv1d_tiled",
+            CONV1D_TILED_WGSL,
+            "conv1d_tiled",
+        )
+    })
 }
 pub fn pool1d_kernel(device: &wgpu::Device) -> &'static Kernel {
     POOL1D.get_or_init(|| build_kernel(device, "rlx-wgpu pool1d", POOL1D_WGSL, "pool1d"))

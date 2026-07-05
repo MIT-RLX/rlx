@@ -38,13 +38,20 @@ use crate::lower::options::{ImportOptions, ImportReport};
 use super::*;
 
 /// Lower ONNX `If` (subgraph lowering not implemented; stub when import is non-strict).
-pub(super) fn lower_if(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_if(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let _cond = ctx.tensor(&node.inputs[0])?;
     lower_if_stub(m, ctx, node)
 }
 
-
-pub(super) fn lower_if_stub(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_if_stub(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     if ctx.opts.strict {
         anyhow::bail!(
             "If at {} is not lowered to subgraph HIR yet (strict import)",
@@ -63,7 +70,6 @@ pub(super) fn lower_if_stub(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &B
     Ok(true)
 }
 
-
 pub(super) fn lower_sequence_empty(
     m: &mut HirMut<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -78,7 +84,6 @@ pub(super) fn lower_sequence_empty(
     ctx.env.insert(out.clone(), id);
     Ok(true)
 }
-
 
 pub(super) fn lower_control_flow(
     m: &mut HirMut<'_>,
@@ -96,15 +101,17 @@ pub(super) fn lower_control_flow(
     }
 }
 
-
-pub(super) fn lower_scan(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_scan(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     if ctx.opts.strict {
         anyhow::bail!("Scan at {} not implemented", node.name);
     }
     ctx.passthrough_stub(m, node)?;
     Ok(true)
 }
-
 
 pub(super) fn lower_split_to_sequence(
     _m: &mut HirMut<'_>,
@@ -118,7 +125,11 @@ pub(super) fn lower_split_to_sequence(
     Ok(true)
 }
 
-pub(super) fn lower_loop(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_loop(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     // Loop output is consumed by ConcatFromSequence; fusion reads upstream tensors directly.
     let out = node.outputs.first().context("Loop missing output")?;
     let n = control_flow::alignment_frame_upper_bound(
@@ -130,7 +141,6 @@ pub(super) fn lower_loop(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bund
     ctx.env.insert(out.clone(), id);
     Ok(true)
 }
-
 
 pub(super) fn lower_concat_from_sequence(
     m: &mut HirMut<'_>,
@@ -160,4 +170,3 @@ pub(super) fn lower_concat_from_sequence(
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-

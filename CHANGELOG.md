@@ -7,6 +7,239 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ## [Unreleased]
 
+## [0.2.12] — 2026-07-06
+
+### Added
+
+- **FIR / RIR / IIR digital filters across every backend.** New `Graph` builders
+  that compose the existing FFT + elementwise + `Op::Scan` primitives, so they
+  lower on all backends with **no new kernels**:
+  - **FIR** — `fir_conv1d(x, taps, FirMode)` with `Full`/`Same`/`Valid`/`Causal`
+    output modes; `≤ 64` taps use an exact direct time-domain shift-and-add,
+    longer filters the FFT convolution theorem (auto-selected).
+  - **RIR / convolution reverb** — `partitioned_conv1d(x, ir, block)` and
+    `conv_reverb(x, &ir, block)` implement **uniform-partitioned overlap-save
+    (UPOLS)**: the impulse response is split into `⌈M/B⌉` partitions summed in a
+    frequency-domain delay line, keeping every FFT a fixed `2B` points so long
+    room impulse responses stay on the native Metal/WGPU FFT kernels instead of
+    one giant `L+M−1` transform.
+  - **IIR** — `iirfilt(x, b, a)` (arbitrary-order Direct-Form-II-Transposed via
+    `Op::Scan`; native on CPU/MLX, host-fallback on Metal/wgpu) plus
+    `iir_as_fir(..)` / `iir_impulse_response(..)`, which reduce a stable IIR to a
+    truncated impulse response applied as an FIR so IIR runs natively on **every**
+    backend.
+  - **Fused `Op::PartitionedConv`** — a first-class op for the partitioned
+    convolution. `partitioned_conv(x, ir, block)` builds it; it decomposes (via
+    the shared `unfuse` rewrite, before any backend sees it — no per-backend
+    kernel) into a **batched complex matmul over the partition axis**
+    (`partitioned_conv1d_gemm`), routing the frequency-domain delay line through
+    the native batched-GEMM kernels (cuBLAS / rocBLAS / MPS) rather than `P`
+    elementwise multiply-accumulates.
+  - Validated: CPU numeric (vs direct-convolution / DF2T references) and
+    CPU-parity on **Metal, MLX, wgpu, CUDA, and Vulkan** — the last two on a
+    discrete RTX 3080 Ti (incl. `Op::PartitionedConv`); CoreML compile-checked.
+    (Vulkan required the native-FFT kernel below; before it, the FFT filters
+    segfaulted on discrete GPUs via host-fallback.)
+  - Fixed a latent **batched `irfft`** bug uncovered by the framed convolution:
+    the Hermitian mirror reversed the *flattened* last axis via `Op::Gather`,
+    corrupting every batch row but the first (any rank ≥ 2 `rfft`/`irfft`,
+    including multi-channel `fft_conv1d`); it now uses the batch-general
+    `Op::Reverse`, which every backend lowers.
+- **Native Vulkan FFT kernel (`Op::Fft` on-device).** Vulkan previously ran
+  `Op::Fft` via CPU host-fallback, which **crashes on discrete GPUs** (it
+  assumes a host-visible mapped arena the CPU can read the op's inputs from).
+  A new `fft` kernel (radix-2 Cooley-Tukey, one workgroup of 256 threads per
+  batch row, shared-memory butterflies) runs the forward/inverse f32 FFT
+  on-device for power-of-two `n ≤ 1024` (larger `n` / non-f32 still fall back to
+  host); dispatch mirrors the wgpu native-FFT guard. This fixes the discrete-GPU
+  crash and lets the FIR/RIR/IIR filters run on discrete Vulkan (validated on an
+  RTX 3080 Ti). Like `matmul_tiled`/`matmul_coop`, it is **precompiled offline
+  with glslang** to `shaders/precompiled/fft.spv` — naga's GLSL frontend has no
+  `memoryBarrierShared`/`groupMemoryBarrier` and its bare `barrier()` doesn't
+  enforce cross-subgroup shared visibility on NVIDIA, so the shared-memory
+  stages would race. Also adds an opt-in `RLX_VULKAN_VALIDATION=1` env to enable
+  the Khronos validation layer.
+- **Parameterized `fNeXmY` minifloats (`ScaledFormat::Custom`).** Beyond the
+  seven named tensor-core formats (FP8 e4m3/e5m2 + FNUZ, FP6 e2m3/e3m2, FP4
+  e2m1), `ScaledFormat` now carries a `Custom { exp_bits, mant_bits, bias }`
+  variant for an arbitrary all-finite minifloat whose whole code fits in a byte
+  (`1 + exp + mant ≤ 8`). Build one with `ScaledFormat::custom(exp, mant)` (IEEE
+  bias `2^(exp-1)-1`), `custom_with_bias(..)`, or `"f4e3m0".parse()`; `Display`
+  round-trips the `fNeXmY` name. Example — **`f4e3m0`** (3 exp, 0 mant): a signed
+  power-of-two 4-bit grid, `±0` and `±{0.25, 0.5, 1, 2, 4, 8, 16}`.
+  - The f32↔code codec (`lowp_codec`) was already generic over
+    `(exp, mant, bias)`, so `ScaledQuantScale` / `ScaledQuantize` / `ScaledMatMul`
+    / `ScaledDequantize` accept a `Custom` format with **no new kernel** on **CPU**
+    and **Metal** (host decode-and-accumulate reference). Bit-exact CPU round-trip
+    test on the `f4e3m0` grid; codec parity tests (a `Custom{2,1}` decodes
+    identically to the named `F4E2M1`). **Metal hardware-validated** (Apple GPU):
+    `f4e3m0` is bit-for-bit == the CPU oracle (`max_abs = 0`), cosine-vs-f32 0.998.
+  - **CUDA / ROCm**: the decode kernel (`scaled_lowp_general.cu`) gains a generic
+    path — `kernel_id()` packs `(exp, mant, bias)` into the `fmt` word with a
+    top-bit sentinel, which the kernel unpacks and decodes generically. The seven
+    named ids (`0..=6`) keep the existing `switch`, so the hardware FP8 path is
+    byte-for-byte unchanged. No hardware tensor core exists for these research
+    formats — they always take the decode fallback.
+    - **Hardware-validated on CUDA** (RTX 3080 Ti, NVRTC,
+      `crates/backends/rlx-cuda/tests/cuda_scaled_custom.rs`): `f4e3m0` grid GEMM
+      **bit-exact vs f32** (`max_abs = 0`), mx-block cosine 0.998, multi-tile
+      (37×80×45) cosine 0.998; and a **12-format sweep** (6 custom splits + native
+      fp8 + fnuz/fp6/fp4) where on-device quantize→dequantize is **bit-for-bit ==
+      the CPU oracle** for every format.
+    - The decode GEMM (`scaled_matmul_decode`) is now **shared-memory tiled**
+      (16×16 — each code decoded once per tile instead of once per output
+      element): **~5.4× faster** on the 3080 Ti at 1024³ (74.9 → 405 GFLOP/s),
+      same launch config, correctness unchanged.
+    - **ROCm/HIP**: the shared kernels compile cleanly under `hipcc` for a real
+      AMD target (gfx90a / CDNA2); on-device run pending AMD hardware (none
+      reachable here — the rig is NVIDIA).
+    - Fixed two latent NVRTC bugs uncovered by these first on-device runs (the
+      scaled kernels had never actually NVRTC-compiled before): (1) the decode
+      kernel used the `INFINITY` macro, undefined under NVRTC → now
+      `__int_as_float` (`#ifndef`-guarded, so nvcc/hipcc unaffected); (2) the
+      native per-tensor fp8 quantize kernel did `#include <cuda_fp8.h>` /
+      `<hip/hip_fp8.h>` (no NVRTC/hipRTC include path) → the f32→fp8 conversion is
+      now closed-form, matching the oracle bit-for-bit, removing the toolkit-header
+      dependency entirely.
+  - **Vulkan**: the four scaled ops are now wired into `rlx-vulkan` as CPU
+    host-fallbacks (the same `rlx-cpu` oracle Metal uses) against the mapped
+    host-visible arena — added to `SUPPORTED_OPS` + `is_host_fallback`, and the
+    generic host path now writes **U8 outputs** (quant codes / block scales) as
+    raw bytes instead of reinterpreting them as f32. **Validated on a native
+    NVIDIA Vulkan driver** (RTX 3080 Ti): `f4e3m0` grid GEMM bit-exact vs f32,
+    mx-block cosine 0.998 (`tests/vulkan_scaled_custom.rs`). (First native-driver
+    Vulkan validation of any scaled path.)
+
+- **Pick a minifloat format at the high level** — no more hand-wiring the
+  `ScaledQuantScale → ScaledQuantize → ScaledMatMul` chain. The same
+  `ScaledFormat` (any named format or a parameterized `Custom` like `f4e3m0`)
+  now flows through every composition/execution surface:
+  - **Compose ops** — `Graph::scaled_matmul(lhs, rhs, fmt, layout)` (+
+    `scaled_quantize` / `scaled_dequantize` / `scaled_matmul_bias`) on the
+    low-level graph, and the mirror `HirGraphExt::scaled_matmul` on the HIR
+    builder. One call emits the whole quantize→GEMM chain.
+  - **Tensor DSL** — `Tensor::scaled_matmul(&rhs, fmt, layout)` on the lazy
+    `rlx-tensor` tensors (e.g. `a.scaled_matmul(&w, ScaledFormat::custom(3,0),
+    ScaleLayout::mx())`).
+  - **Execute a flow** — `CompileOptions::scaled_quant(ScaledQuantConfig{..})`
+    (re-exported as `rlx_runtime::ScaledQuantConfig`); `Session::compile_with`
+    runs the existing `insert_scaled_matmul` pass so *every* 2-D matmul in a
+    graph is rewritten to the chosen format at compile time.
+  - **Python** — `pyrlx.Graph.scaled_matmul(lhs, rhs, format="f4e3m0",
+    layout="mx")` parses the `fNeXmY` name (via `ScaledFormat: FromStr`) and
+    rejects invalid splits with a clear `ValueError`.
+  - Verified end-to-end on CPU at every layer (builder, Session policy, Tensor
+    DSL, and a pyrlx→CPU run: `f4e3m0` cosine 0.997 vs numpy).
+
+- **`ScaledFormat` Rust API / DX.** Working with the different float formats is
+  now ergonomic without reaching for the free-function codec or tuple `fields()`:
+  - `const` constructors — `ScaledFormat::custom(3, 0)` / `custom_with_bias(..)`
+    are `const fn`, usable in `const` items and pattern-free construction.
+  - Introspection accessors — `exp_bits()`, `mant_bits()`, `bias()`,
+    `is_custom()`, `is_named()`, and a `ScaledFormat::NAMED: [_; 7]` array for
+    format sweeps (all `const`).
+  - Codec methods on the format itself — `fmt.decode(code)`, `fmt.encode(x)`,
+    `fmt.quantize(x)` (round-trip a single f32 to its nearest representable
+    value, e.g. `custom(3,0).quantize(1.4) == 1.0`), and
+    `fmt.representable_values()` to inspect a format's whole grid.
+  - `ScaleLayout: FromStr` (`"mx"`, `"nvfp4"`, `"per_tensor"`, `"mx/<block>"`)
+    to match `ScaledFormat: FromStr` (`"f4e3m0"`); the pyrlx layout arg now
+    delegates to it (one source of truth). Doc-tested.
+
+- **Low-precision `encode(±inf)` now saturates to `±max_finite`** (`lowp_codec`
+  + the GPU `rlx_encode_lowp`), matching the codec's documented contract — it
+  previously returned code `0` because every finite candidate is equidistant from
+  a huge value in f64. Applies to all formats, incl. E5M2 (whose inf code is never
+  emitted). CPU + GPU kept in lockstep.
+
+- **`rlx-torch-import` diffusion-model op coverage.** New aten→rlx lowerings so
+  UNet / DiT image models import cleanly:
+  - `group_norm` / `native_group_norm` → `Op::GroupNorm`.
+  - `upsample_nearest2d` / `_upsample_nearest_exact2d` (`.default` + `.vec`, any
+    2ⁿ× scale) → chained `Op::ResizeNearest2x`.
+  - `constant_pad_nd` (constant mode) → `concat` with `Op::Constant` fills.
+  - `baddbmm` → `beta·input + alpha·(b1@b2)` (the non-SDPA attention score path;
+    `beta = 0` fast path drops the bias).
+  - `split.Tensor` / `chunk` → narrow tuples (GEGLU / adaLN modulation).
+  - `zeros` / `ones` / `empty` (+ `_like` / `new_`) → `Op::Constant`.
+  - `pixel_shuffle` / `pixel_unshuffle` → reshape + permute.
+  - `_scaled_dot_product_{flash,efficient,math}_attention` → same `Op::Attention`
+    as the public op (routes each overload's own arg layout; `decomposition=core`).
+  - `leaky_relu`, `hardswish`, `hardsigmoid`, `hardtanh` → clamp/mul decompositions.
+  - `masked_fill` → `x + mask·(value − x)` (arithmetic; avoids bool-cond `Where`
+    on the f32 arena).
+  - `upsample_{bilinear,bicubic}2d` and their antialiased `_aa` overloads (any
+    output size, `align_corners` either way) via new
+    `HirMut::resize_{bilinear,bicubic}2d[_aa]` builders — every filter is
+    separable, so they lower to two constant-matrix interpolation matmuls
+    (`MatMul`/`reshape`/`transpose`). Bit-exact PyTorch parity on **every backend
+    with no new kernel** (verified CPU + Metal + MLX on Apple).
+
+  Unblocks Stable Diffusion / SDXL (UNet + VAE) and Sana (linear-attention
+  ones-padding). 18 exact-parity CPU tests (+ Metal/MLX resize parity) + README.
+
+- **`rlx-torch-import` dynamic shapes.** A model exported with
+  `torch.export(dynamic_shapes=…)` now imports with symbolic input dims instead of
+  raising. The front-end (`pyrlx.from_torch(..., dynamic_shapes=…)`) emits a
+  per-axis `dynamic` marker (stable symbol id per `SymInt`); the importer builds
+  `Dim::Dynamic(sym)` inputs (`InputDef.dyn_dims` / `hir_shape`), the compile pass
+  re-infers the symbolic graph, and `DimBinding` specializes it per run — so a
+  model is imported **once** and run at any batch/seq (`run_dynamic`; `verify`
+  binds the reference shape). End-to-end verified (Linear+GELU with dynamic batch
+  imports + parity), plus a Rust test running one dynamic-batch HIR at batch 2 & 4.
+- **CPU interpreter `Op::Expand` now broadcasts.** The executor treated `Expand`
+  like `Reshape` (a plain `input.len()` copy), leaving stride-0 axes unfilled — so
+  any imported broadcast (e.g. a `torch.eye` built from `arange`/`eq`) produced
+  garbage. Now does a proper strided broadcast walk.
+- **Importer `sum`/`mean` with an empty dim list reduce all dims.** aten's
+  `sum.dim_IntList(x, [])` / `mean.dim(x, [])` — how bare `Tensor.sum()`/`.mean()`
+  decompose — reduce over *every* dim (→ scalar); the importer reduced *nothing*
+  (returned the input), so e.g. `torch.eye(n) + x.sum()*0` left a rank-2 tensor and
+  broke the downstream broadcast. Now an empty (or absent) dim list reduces all axes.
+- **Importer int/bool intermediates on the f32 arena.** A byte-sized
+  `arange`/compare *intermediate* was mis-read (the f32-uniform arena under-sizes a
+  bool node — `9 bytes → 2 f32 slots` — so a comparison feeding a matmul went OOB).
+  Fixes: integer `arange` is materialized F32 (values exact); comparisons emit
+  `Compare → Cast(F32)` so the consumed value is a properly-sized f32 `{0,1}`
+  tensor (same pattern as grid_sample); non-float node dtypes are tracked as F32.
+  The `torch.eye` (`arange`/`eq`/`mm`) identity now imports with exact parity — the
+  case that surfaced this.
+- **`pyrlx.from_torch` auto-decompose fallback.** When the Rust importer reports
+  ops the RLX registry doesn't cover, the front-end re-exports with those ops
+  decomposed (via torch's full decomposition registry) and retries, up to
+  `max_decompose_rounds` — so torch-decomposable ops are handled automatically
+  (reported in `summary["auto_decomposed_ops"]`). Decompositions that emit
+  `prims.*` (breaking functionalization) are bisected out one at a time, so a bad
+  op degrades to a clean "unsupported op" report instead of a crash. On by default
+  (`auto_decompose=False` to disable). Pure-logic tested in
+  `tests/test_torch_import_autodecomp.py`.
+- **`grid_sampler` / `grid_sampler_2d` — all variations.** New
+  `HirMut::grid_sample2d` decomposes `grid_sample` into universal ops (transpose →
+  axis-0 `Gather` + `Round`-based floor + arithmetic weights, batch unrolled):
+  every interpolation mode (nearest / bilinear / bicubic) × padding
+  (zeros / border / reflection) × `align_corners`. Exact PyTorch parity verified
+  on **CPU, Metal, and MLX** for all mode/padding combos. Also fixed the CPU
+  interpreter `Op::Gather` general-axis path (previously silently zeroed for
+  `axis != 0`).
+- **rlx-mlx fusion cap.** The deep grid_sample decomposition made `mlx::compile`
+  fuse an elementwise region into one Metal kernel that exhausted the
+  argument-buffer limit. Fixed with (a) eval barriers in the Lazy lowering
+  (`lower_with_env`) that materialize a fusable chain every `RLX_MLX_FUSE_CAP`
+  (default 12) ops — non-elementwise ops reset the counter, so ordinary models
+  are untouched, and it's disabled inside the `mlx::compile` trace; and (b) a
+  retry in `run_read_outputs` that, on an over-fused-kernel failure, disables
+  compile and re-runs in barrier'd Lazy.
+
+- **`rlx-ir::HirMut::resize_{bilinear,bicubic}2d[_aa]`.** Separable NCHW
+  bilinear/bicubic resize built from universal ops (constant interpolation matrix
+  + `MatMul`); no per-backend kernel. Bicubic uses PyTorch's Keys cubic kernel
+  (`a = -0.75`) with edge clamping; the `_aa` path widens the filter by the
+  downsampling ratio and renormalizes (and matches plain when upsampling, as
+  PyTorch documents). Unit-tested for shape, partition of unity, sample
+  interpolation, antialias downsample weights, and the aa==plain upsample identity.
+
+## [0.2.11] — 2026-07-05
+
 ### Added
 
 - **GGUF IQ / TQ / MX end-to-end.** Encoders in `rlx-gguf`; `rlx-gguf-convert` scheme
@@ -879,7 +1112,9 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 Initial release. Tracked at [git history root].
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.10...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.12...HEAD
+[0.2.12]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.12
+[0.2.11]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.11
 [0.2.10]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.10
 [0.2.9]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.9
 [0.2.8]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.8

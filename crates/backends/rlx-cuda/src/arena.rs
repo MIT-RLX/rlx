@@ -184,10 +184,13 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
             continue;
         }
         let elems = node.shape.num_elements().unwrap_or(0);
-        // Packed GGUF params use U8 shapes `[bytes.len()]` — reserve byte
-        // storage, not `elems * 4` (that inflated Orpheus 3B arenas ~4×).
+        // Packed GGUF params use U8/I8 shapes `[bytes.len()]` — reserve byte
+        // storage, not `elems * 4` (that inflated Orpheus 3B arenas ~4×). Bool
+        // is NOT byte-packed here: it is a compare/mask output written as f32
+        // (1.0/0.0) into the f32 arena, so it needs the full `elems * 4` — sizing
+        // it as `elems` let the f32 compare kernel overrun its slot.
         let bytes = match node.shape.dtype() {
-            DType::U8 | DType::I8 | DType::Bool => elems,
+            DType::U8 | DType::I8 => elems,
             _ => elems * 4,
         };
         let aligned = bytes.div_ceil(align) * align;

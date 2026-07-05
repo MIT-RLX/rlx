@@ -3,6 +3,8 @@
 //! U-Net's bias broadcast (`[1,C,1,1] → [N,C,H,W]`) diverged on Metal only at
 //! full resolution, implicating a size-dependent Expand kernel bug.
 
+#![allow(dead_code)]
+
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 

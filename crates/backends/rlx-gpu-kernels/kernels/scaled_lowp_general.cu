@@ -17,26 +17,48 @@
 // dequant_matmul.cu: f32 arena base + f32-element offsets for f32 tensors,
 // byte offsets (via reinterpret_cast<unsigned char*>) for U8 code/scale tensors.
 
-// Format ids: 0 e4m3, 1 e5m2, 2 e4m3fnuz, 3 e5m2fnuz, 4 e2m3, 5 e3m2, 6 e2m1.
+// Format word (`fmt`) — matches `ScaledFormat::kernel_id()` in rlx-ir/quant.rs:
+//   Named ids (top bit clear): 0 e4m3, 1 e5m2, 2 e4m3fnuz, 3 e5m2fnuz,
+//                              4 e2m3, 5 e3m2, 6 e2m1.
+//   Custom `fNeXmY` (top bit set): 0x8000_0000 | exp_bits | mant_bits<<4 |
+//     (bias&0xFF)<<8 — an all-finite parameterized minifloat, decoded
+//     generically from the unpacked fields so a new format needs no kernel edit.
 // Scale modes: 0 per-tensor (f32), 1 block E8M0 (u8), 2 NVFP4 E4M3 (u8).
+#define RLX_LOWP_CUSTOM_BIT 0x80000000u
+
+// NVRTC compiles this source without <math.h>, so the `INFINITY` macro is
+// undefined there (host nvcc/hipcc provide it). Supply it via a bit intrinsic.
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000)
+#endif
+
+// Forward decl: rlx_encode_lowp saturates ±inf to ±max_finite (defined below).
+__device__ __forceinline__ float rlx_max_finite(unsigned int fmt);
 
 __device__ __forceinline__ float rlx_decode_lowp(unsigned int fmt, unsigned int code) {
-    if (fmt == 6u) { // FP4 E2M1 LUT
-        const float lut[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-                               -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
-        return lut[code & 0xFu];
-    }
     unsigned int e_bits, m_bits;
     int bias;
     unsigned int fnuz = 0u, has_inf = 0u, e4m3ocp = 0u;
-    switch (fmt) {
-        case 0u: e_bits = 4u; m_bits = 3u; bias = 7;  e4m3ocp = 1u; break;
-        case 1u: e_bits = 5u; m_bits = 2u; bias = 15; has_inf = 1u; break;
-        case 2u: e_bits = 4u; m_bits = 3u; bias = 8;  fnuz = 1u; break;
-        case 3u: e_bits = 5u; m_bits = 2u; bias = 16; fnuz = 1u; break;
-        case 4u: e_bits = 2u; m_bits = 3u; bias = 1;  break; // e2m3 (finite)
-        case 5u: e_bits = 3u; m_bits = 2u; bias = 3;  break; // e3m2 (finite)
-        default: return 0.0f;
+    if (fmt & RLX_LOWP_CUSTOM_BIT) {
+        // Parameterized fNeXmY: all-finite, fields packed in `fmt`.
+        e_bits = fmt & 0xFu;
+        m_bits = (fmt >> 4) & 0xFu;
+        bias   = (int)(signed char)((fmt >> 8) & 0xFFu);
+    } else {
+        if (fmt == 6u) { // FP4 E2M1 LUT
+            const float lut[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                                   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+            return lut[code & 0xFu];
+        }
+        switch (fmt) {
+            case 0u: e_bits = 4u; m_bits = 3u; bias = 7;  e4m3ocp = 1u; break;
+            case 1u: e_bits = 5u; m_bits = 2u; bias = 15; has_inf = 1u; break;
+            case 2u: e_bits = 4u; m_bits = 3u; bias = 8;  fnuz = 1u; break;
+            case 3u: e_bits = 5u; m_bits = 2u; bias = 16; fnuz = 1u; break;
+            case 4u: e_bits = 2u; m_bits = 3u; bias = 1;  break; // e2m3 (finite)
+            case 5u: e_bits = 3u; m_bits = 2u; bias = 3;  break; // e3m2 (finite)
+            default: return 0.0f;
+        }
     }
     unsigned int width = e_bits + m_bits;
     unsigned int sign_bit = (code >> width) & 1u;
@@ -65,7 +87,12 @@ __device__ __forceinline__ float rlx_decode_lowp(unsigned int fmt, unsigned int 
 // simple and exact, round-half-to-even, saturating, NaN→0 (matches the oracle).
 __device__ __forceinline__ unsigned char rlx_encode_lowp(unsigned int fmt, float x) {
     if (isnan(x)) return 0u;
-    unsigned int width = (fmt == 6u) ? 4u : ((fmt == 4u || fmt == 5u) ? 6u : 8u);
+    // ±inf saturates to ±max_finite (mirrors lowp_codec.rs — snapping to a
+    // generic huge value would be equidistant from every code in the search).
+    if (isinf(x)) { float mf = rlx_max_finite(fmt); x = (x > 0.0f ? mf : -mf); }
+    unsigned int width = (fmt & RLX_LOWP_CUSTOM_BIT)
+        ? (1u + (fmt & 0xFu) + ((fmt >> 4) & 0xFu))
+        : ((fmt == 6u) ? 4u : ((fmt == 4u || fmt == 5u) ? 6u : 8u));
     unsigned int n_codes = 1u << width;
     unsigned char best = 0u;
     double best_err = 1.0e300;
@@ -98,6 +125,17 @@ __device__ __forceinline__ unsigned char rlx_f32_to_e8m0(float s) {
 
 // Largest finite magnitude of a format (for amax→scale).
 __device__ __forceinline__ float rlx_max_finite(unsigned int fmt) {
+    if (fmt & RLX_LOWP_CUSTOM_BIT) {
+        // Scan the (≤256-code) space like the CPU oracle — matches exactly.
+        unsigned int width = 1u + (fmt & 0xFu) + ((fmt >> 4) & 0xFu);
+        unsigned int n = 1u << width;
+        float mx = 0.0f;
+        for (unsigned int c = 0u; c < n; ++c) {
+            float v = fabsf(rlx_decode_lowp(fmt, c));
+            if (isfinite(v)) mx = fmaxf(mx, v);
+        }
+        return mx;
+    }
     switch (fmt) {
         case 0u: return 448.0f;
         case 1u: return 57344.0f;
@@ -209,8 +247,15 @@ extern "C" __global__ void scaled_dequantize_general(
     arena[out_off_f32 + i] = rlx_decode_lowp(fmt, codes[i]) * s;
 }
 
-// Decode-and-accumulate GEMM (TN: lhs[m,k]·rhs[n,k]ᵀ → out[m,n]), one thread
-// per output element. The non-tensor-core fallback for formats cublasLt can't do.
+// Decode-and-accumulate GEMM (TN: lhs[m,k]·rhs[n,k]ᵀ → out[m,n]) — the
+// non-tensor-core fallback for formats cublasLt can't do. Shared-memory tiled:
+// each 16×16 output tile cooperatively stages a 16-wide strip of decoded,
+// scale-applied lhs / rhs into shared memory and reuses it, so each code is
+// decoded once per tile instead of once per output element (≈16× fewer decodes,
+// plus f32 reuse from shared mem). Launched with a fixed 16×16 block (see the
+// LaunchConfig in backend.rs). Accumulation is tile-blocked in f32, so it tracks
+// — but is not bit-identical to — the sequential CPU oracle.
+#define RLX_LOWP_TILE 16u
 extern "C" __global__ void scaled_matmul_decode(
     float* __restrict__ arena,
     unsigned int lhs_byte_off,
@@ -228,9 +273,8 @@ extern "C" __global__ void scaled_matmul_decode(
     unsigned int has_bias,
     unsigned int bias_off_f32)
 {
-    unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int i = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= m || j >= n) return;
+    __shared__ float As[RLX_LOWP_TILE][RLX_LOWP_TILE];
+    __shared__ float Bs[RLX_LOWP_TILE][RLX_LOWP_TILE];
     const unsigned char* lhs = reinterpret_cast<const unsigned char*>(arena) + lhs_byte_off;
     const unsigned char* rhs = reinterpret_cast<const unsigned char*>(arena) + rhs_byte_off;
     const unsigned char* lsb = reinterpret_cast<const unsigned char*>(arena) + lhs_scale_byte_off;
@@ -239,21 +283,50 @@ extern "C" __global__ void scaled_matmul_decode(
     float ls0 = arena[lhs_scale_byte_off / 4u];
     float rs0 = arena[rhs_scale_byte_off / 4u];
 
+    unsigned int tx = threadIdx.x, ty = threadIdx.y;
+    unsigned int i = blockIdx.y * RLX_LOWP_TILE + ty; // output row (m)
+    unsigned int j = blockIdx.x * RLX_LOWP_TILE + tx; // output col (n)
+
     float acc = 0.0f;
-    for (unsigned int p = 0u; p < k; ++p) {
-        float ls, rs;
-        if (scale_mode == 0u) {
-            ls = ls0;
-            rs = rs0;
+    unsigned int ntiles = (k + RLX_LOWP_TILE - 1u) / RLX_LOWP_TILE;
+    for (unsigned int t = 0u; t < ntiles; ++t) {
+        // Stage A[i, t*TILE+tx] (decoded × its scale) into shared As[ty][tx].
+        unsigned int pa = t * RLX_LOWP_TILE + tx;
+        if (i < m && pa < k) {
+            float ls;
+            if (scale_mode == 0u) {
+                ls = ls0;
+            } else {
+                unsigned int li = i * nblk + pa / block;
+                ls = (scale_mode == 1u) ? rlx_e8m0(lsb[li]) : rlx_decode_lowp(0u, lsb[li]);
+            }
+            As[ty][tx] = rlx_decode_lowp(lhs_fmt, lhs[i * k + pa]) * ls;
         } else {
-            unsigned int li = i * nblk + p / block, ri = j * nblk + p / block;
-            if (scale_mode == 1u) { ls = rlx_e8m0(lsb[li]); rs = rlx_e8m0(rsb[ri]); }
-            else { ls = rlx_decode_lowp(0u, lsb[li]); rs = rlx_decode_lowp(0u, rsb[ri]); }
+            As[ty][tx] = 0.0f;
         }
-        float a = rlx_decode_lowp(lhs_fmt, lhs[i * k + p]) * ls;
-        float b = rlx_decode_lowp(rhs_fmt, rhs[j * k + p]) * rs;
-        acc += a * b;
+        // Stage B[j, t*TILE+ty] into shared Bs[ty][tx] (Bs[p][tx] ↦ rhs[j, ·]).
+        unsigned int pb = t * RLX_LOWP_TILE + ty;
+        if (j < n && pb < k) {
+            float rs;
+            if (scale_mode == 0u) {
+                rs = rs0;
+            } else {
+                unsigned int ri = j * nblk + pb / block;
+                rs = (scale_mode == 1u) ? rlx_e8m0(rsb[ri]) : rlx_decode_lowp(0u, rsb[ri]);
+            }
+            Bs[ty][tx] = rlx_decode_lowp(rhs_fmt, rhs[j * k + pb]) * rs;
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int p = 0u; p < RLX_LOWP_TILE; ++p) {
+            acc += As[ty][p] * Bs[p][tx];
+        }
+        __syncthreads();
     }
-    if (has_bias) acc += arena[bias_off_f32 + j];
-    arena[out_off_f32 + i * n + j] = acc;
+    if (i < m && j < n) {
+        if (has_bias) acc += arena[bias_off_f32 + j];
+        arena[out_off_f32 + i * n + j] = acc;
+    }
 }

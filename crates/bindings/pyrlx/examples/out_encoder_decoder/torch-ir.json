@@ -1,0 +1,2627 @@
+{
+ "format": "rlx-torch-ir",
+ "version": 1,
+ "model_name": "encoder_decoder",
+ "producer": "pyrlx / torch 2.11.0",
+ "inputs": [
+  {
+   "id": "src",
+   "shape": [
+    1,
+    5,
+    32
+   ],
+   "dtype": "f32"
+  },
+  {
+   "id": "tgt",
+   "shape": [
+    1,
+    3,
+    32
+   ],
+   "dtype": "f32"
+  }
+ ],
+ "weights": [
+  {
+   "id": "p_enc_p_q_weight",
+   "key": "enc.p.q.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_enc_p_k_weight",
+   "key": "enc.p.k.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_enc_p_v_weight",
+   "key": "enc.p.v.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_enc_p_o_weight",
+   "key": "enc.p.o.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_dec_self_p_q_weight",
+   "key": "dec_self.p.q.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_dec_self_p_k_weight",
+   "key": "dec_self.p.k.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_dec_self_p_v_weight",
+   "key": "dec_self.p.v.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_dec_self_p_o_weight",
+   "key": "dec_self.p.o.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_dec_cross_p_q_weight",
+   "key": "dec_cross.p.q.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_dec_cross_p_k_weight",
+   "key": "dec_cross.p.k.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_dec_cross_p_v_weight",
+   "key": "dec_cross.p.v.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_dec_cross_p_o_weight",
+   "key": "dec_cross.p.o.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_n_0_weight",
+   "key": "n.0.weight",
+   "shape": [
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_n_0_bias",
+   "key": "n.0.bias",
+   "shape": [
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_n_1_weight",
+   "key": "n.1.weight",
+   "shape": [
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_n_1_bias",
+   "key": "n.1.bias",
+   "shape": [
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_n_2_weight",
+   "key": "n.2.weight",
+   "shape": [
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_n_2_bias",
+   "key": "n.2.bias",
+   "shape": [
+    32
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  }
+ ],
+ "nodes": [
+  {
+   "id": "layer_norm",
+   "op": "aten.layer_norm.default",
+   "args": [
+    {
+     "ref": "src"
+    },
+    {
+     "list": [
+      {
+       "int": 32
+      }
+     ]
+    },
+    {
+     "ref": "p_n_0_weight"
+    },
+    {
+     "ref": "p_n_0_bias"
+    },
+    {
+     "float": 1e-05
+    },
+    {
+     "bool": false
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "layer_norm_1",
+   "op": "aten.layer_norm.default",
+   "args": [
+    {
+     "ref": "src"
+    },
+    {
+     "list": [
+      {
+       "int": 32
+      }
+     ]
+    },
+    {
+     "ref": "p_n_0_weight"
+    },
+    {
+     "ref": "p_n_0_bias"
+    },
+    {
+     "float": 1e-05
+    },
+    {
+     "bool": false
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_enc_p_q_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "layer_norm"
+    },
+    {
+     "list": [
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view"
+    },
+    {
+     "ref": "permute"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_1",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_2",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_1"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 4
+      },
+      {
+       "int": 8
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_1",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "view_2"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     5,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_2",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_enc_p_k_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_3",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "layer_norm_1"
+    },
+    {
+     "list": [
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_1",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_3"
+    },
+    {
+     "ref": "permute_2"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_4",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_1"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_5",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_4"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 4
+      },
+      {
+       "int": 8
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_3",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "view_5"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     5,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_4",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_enc_p_v_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_6",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "layer_norm_1"
+    },
+    {
+     "list": [
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_2",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_6"
+    },
+    {
+     "ref": "permute_4"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_7",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_2"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_8",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_7"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 4
+      },
+      {
+       "int": 8
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_5",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "view_8"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     5,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "scaled_dot_product_attention",
+   "op": "aten.scaled_dot_product_attention.default",
+   "args": [
+    {
+     "ref": "permute_1"
+    },
+    {
+     "ref": "permute_3"
+    },
+    {
+     "ref": "permute_5"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     5,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_6",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "scaled_dot_product_attention"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_9",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "permute_6"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_7",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_enc_p_o_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_10",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_9"
+    },
+    {
+     "list": [
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_3",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_10"
+    },
+    {
+     "ref": "permute_7"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_11",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_3"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "add",
+   "op": "aten.add.Tensor",
+   "args": [
+    {
+     "ref": "src"
+    },
+    {
+     "ref": "view_11"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "layer_norm_2",
+   "op": "aten.layer_norm.default",
+   "args": [
+    {
+     "ref": "tgt"
+    },
+    {
+     "list": [
+      {
+       "int": 32
+      }
+     ]
+    },
+    {
+     "ref": "p_n_1_weight"
+    },
+    {
+     "ref": "p_n_1_bias"
+    },
+    {
+     "float": 1e-05
+    },
+    {
+     "bool": false
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "layer_norm_3",
+   "op": "aten.layer_norm.default",
+   "args": [
+    {
+     "ref": "tgt"
+    },
+    {
+     "list": [
+      {
+       "int": 32
+      }
+     ]
+    },
+    {
+     "ref": "p_n_1_weight"
+    },
+    {
+     "ref": "p_n_1_bias"
+    },
+    {
+     "float": 1e-05
+    },
+    {
+     "bool": false
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_8",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_dec_self_p_q_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_12",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "layer_norm_2"
+    },
+    {
+     "list": [
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_4",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_12"
+    },
+    {
+     "ref": "permute_8"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_13",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_4"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_14",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_13"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 4
+      },
+      {
+       "int": 8
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_9",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "view_14"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     3,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_10",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_dec_self_p_k_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_15",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "layer_norm_3"
+    },
+    {
+     "list": [
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_5",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_15"
+    },
+    {
+     "ref": "permute_10"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_16",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_5"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_17",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_16"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 4
+      },
+      {
+       "int": 8
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_11",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "view_17"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     3,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_12",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_dec_self_p_v_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_18",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "layer_norm_3"
+    },
+    {
+     "list": [
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_6",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_18"
+    },
+    {
+     "ref": "permute_12"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_19",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_6"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_20",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_19"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 4
+      },
+      {
+       "int": 8
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_13",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "view_20"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     3,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "scaled_dot_product_attention_1",
+   "op": "aten.scaled_dot_product_attention.default",
+   "args": [
+    {
+     "ref": "permute_9"
+    },
+    {
+     "ref": "permute_11"
+    },
+    {
+     "ref": "permute_13"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     3,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_14",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "scaled_dot_product_attention_1"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_21",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "permute_14"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_15",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_dec_self_p_o_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_22",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_21"
+    },
+    {
+     "list": [
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_7",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_22"
+    },
+    {
+     "ref": "permute_15"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_23",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_7"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "add_1",
+   "op": "aten.add.Tensor",
+   "args": [
+    {
+     "ref": "tgt"
+    },
+    {
+     "ref": "view_23"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "layer_norm_4",
+   "op": "aten.layer_norm.default",
+   "args": [
+    {
+     "ref": "add_1"
+    },
+    {
+     "list": [
+      {
+       "int": 32
+      }
+     ]
+    },
+    {
+     "ref": "p_n_2_weight"
+    },
+    {
+     "ref": "p_n_2_bias"
+    },
+    {
+     "float": 1e-05
+    },
+    {
+     "bool": false
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_16",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_dec_cross_p_q_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_24",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "layer_norm_4"
+    },
+    {
+     "list": [
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_8",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_24"
+    },
+    {
+     "ref": "permute_16"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_25",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_8"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_26",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_25"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 4
+      },
+      {
+       "int": 8
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_17",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "view_26"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     3,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_18",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_dec_cross_p_k_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_27",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "add"
+    },
+    {
+     "list": [
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_9",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_27"
+    },
+    {
+     "ref": "permute_18"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_28",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_9"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_29",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_28"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 4
+      },
+      {
+       "int": 8
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_19",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "view_29"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     5,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_20",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_dec_cross_p_v_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_30",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "add"
+    },
+    {
+     "list": [
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_10",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_30"
+    },
+    {
+     "ref": "permute_20"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_31",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_10"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_32",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_31"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 5
+      },
+      {
+       "int": 4
+      },
+      {
+       "int": 8
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     5,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_21",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "view_32"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     5,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "scaled_dot_product_attention_2",
+   "op": "aten.scaled_dot_product_attention.default",
+   "args": [
+    {
+     "ref": "permute_17"
+    },
+    {
+     "ref": "permute_19"
+    },
+    {
+     "ref": "permute_21"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     4,
+     3,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_22",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "scaled_dot_product_attention_2"
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 2
+      },
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     4,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_33",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "permute_22"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute_23",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_dec_cross_p_o_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     32,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_34",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "view_33"
+    },
+    {
+     "list": [
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mm_11",
+   "op": "aten.mm.default",
+   "args": [
+    {
+     "ref": "view_34"
+    },
+    {
+     "ref": "permute_23"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view_35",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mm_11"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 3
+      },
+      {
+       "int": 32
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "add_2",
+   "op": "aten.add.Tensor",
+   "args": [
+    {
+     "ref": "add_1"
+    },
+    {
+     "ref": "view_35"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     1,
+     3,
+     32
+    ],
+    "dtype": "f32"
+   }
+  }
+ ],
+ "outputs": [
+  {
+   "ref": "add_2",
+   "shape": [
+    1,
+    3,
+    32
+   ],
+   "dtype": "f32"
+  }
+ ],
+ "decomposition": "high"
+}

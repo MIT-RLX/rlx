@@ -17,17 +17,17 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use crate::hlo::{
+    Computation, ConvDimNumbers, DotDimNumbers, GatherDimNumbers, HloBuilder, Literal, LiteralData,
+    ProgramShape, ScatterDimNumbers, Shape, Window, WindowDim, prim, prim_of,
+};
 use rlx_ir::op::{
     Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp, RegionPrologue,
     TransformStep,
 };
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, NodeId, Op};
-use crate::hlo::{
-    Computation, ConvDimNumbers, DotDimNumbers, GatherDimNumbers, HloBuilder, Literal, LiteralData,
-    ProgramShape, ScatterDimNumbers, Shape, Window, WindowDim, prim, prim_of,
-};
+use std::collections::HashMap;
 
 use super::*;
 
@@ -491,7 +491,6 @@ impl<'a> LowerCtx<'a> {
 
     // ── Constants ──────────────────────────────────────────────
 
-
     pub(crate) fn lower_constant(&self, data: &[u8], shape: Shape, dt: DType) -> i64 {
         // Decode the bytes per dtype into the matching LiteralData
         // variant. Constants in rlx-ir are stored as native-endian
@@ -593,7 +592,6 @@ impl<'a> LowerCtx<'a> {
 
     // ── Activation ─────────────────────────────────────────────
 
-
     pub(crate) fn lower_activation(&self, act: Activation, x: i64, shape: Shape) -> i64 {
         let elt = shape.element_type;
         match act {
@@ -671,7 +669,6 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-
     pub(crate) fn lower_binary(
         &self,
         op: BinaryOp,
@@ -693,7 +690,6 @@ impl<'a> LowerCtx<'a> {
         let (a, b) = self.broadcast_pair_to(a, b, a_id, b_id, &out.dimensions);
         self.entry.binary(opcode, a, b, out)
     }
-
 
     pub(crate) fn lower_elementwise_region(
         &mut self,
@@ -796,8 +792,12 @@ impl<'a> LowerCtx<'a> {
         *step_results.last().unwrap_or(&0)
     }
 
-
-    pub(crate) fn lower_resize_nearest_2x_nchw(&mut self, x: i64, input_id: NodeId, out: Shape) -> i64 {
+    pub(crate) fn lower_resize_nearest_2x_nchw(
+        &mut self,
+        x: i64,
+        input_id: NodeId,
+        out: Shape,
+    ) -> i64 {
         let dims = self.ir_shape_dims(input_id);
         assert_eq!(dims.len(), 4);
         let dt = prim_of(self.dtype(input_id));
@@ -810,7 +810,6 @@ impl<'a> LowerCtx<'a> {
             .broadcast(r1, &bcast_dims, Shape::array(dt, &rank6_out));
         self.entry.reshape(r2, out)
     }
-
 
     pub(crate) fn lower_transform_region(
         &mut self,
@@ -847,7 +846,6 @@ impl<'a> LowerCtx<'a> {
         let _ = out_shape;
         cur
     }
-
 
     pub(crate) fn lower_batch_elementwise_region(
         &mut self,
@@ -890,7 +888,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     // ── MatMul ─────────────────────────────────────────────────
-
 
     pub(crate) fn lower_matmul(&mut self, a_id: NodeId, b_id: NodeId, out: Shape) -> i64 {
         let a = self.hlo(a_id);
@@ -945,7 +942,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     // ── LayerNorm ──────────────────────────────────────────────
-
 
     pub(crate) fn lower_layernorm(
         &mut self,
@@ -1037,7 +1033,6 @@ impl<'a> LowerCtx<'a> {
         self.entry.binary("add", scaled, b_b, out)
     }
 
-
     pub(crate) fn lower_rmsnorm(
         &mut self,
         x_id: NodeId,
@@ -1093,7 +1088,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     // ── FusedResidualLN ────────────────────────────────────────
-
 
     pub(crate) fn lower_fused_residual_ln(
         &mut self,
@@ -1181,7 +1175,6 @@ impl<'a> LowerCtx<'a> {
 
     // ── FusedMatMulBiasAct ─────────────────────────────────────
 
-
     pub(crate) fn lower_fused_matmul_bias_act(
         &mut self,
         inputs: &[NodeId],
@@ -1200,7 +1193,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     // ── Attention ──────────────────────────────────────────────
-
 
     pub(crate) fn lower_attention(
         &mut self,
@@ -1276,7 +1268,6 @@ impl<'a> LowerCtx<'a> {
         self.entry.dot_general(probs, v, av_dn, out)
     }
 
-
     pub(crate) fn lower_rope(
         &mut self,
         x_id: NodeId,
@@ -1330,7 +1321,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     // ── FFT ────────────────────────────────────────────────────
-
 
     pub(crate) fn lower_fft(
         &mut self,
@@ -1411,7 +1401,6 @@ impl<'a> LowerCtx<'a> {
 
     // ── Gather ─────────────────────────────────────────────────
 
-
     pub(crate) fn lower_gather(
         &mut self,
         table_id: NodeId,
@@ -1459,7 +1448,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     // ── Reduce ─────────────────────────────────────────────────
-
 
     pub(crate) fn lower_reduce(
         &mut self,
@@ -1512,12 +1500,10 @@ impl<'a> LowerCtx<'a> {
 
     // ── Softmax ────────────────────────────────────────────────
 
-
     pub(crate) fn lower_softmax(&mut self, x_id: NodeId, axis: i32, out: Shape) -> i64 {
         let x = self.hlo(x_id);
         self.lower_softmax_id(x, out, axis as i64)
     }
-
 
     pub(crate) fn lower_softmax_id(&mut self, x: i64, out: Shape, axis: i64) -> i64 {
         let dims = out.dimensions.clone();
@@ -1558,8 +1544,13 @@ impl<'a> LowerCtx<'a> {
 
     // ── Cumsum ─────────────────────────────────────────────────
 
-
-    pub(crate) fn lower_cumsum(&mut self, x_id: NodeId, axis: i32, exclusive: bool, out: Shape) -> i64 {
+    pub(crate) fn lower_cumsum(
+        &mut self,
+        x_id: NodeId,
+        axis: i32,
+        exclusive: bool,
+        out: Shape,
+    ) -> i64 {
         // HLO has no `cumsum` primitive — use `reduce-window` with a
         // window that spans the whole prefix along the chosen axis.
         let x = self.hlo(x_id);
@@ -1623,7 +1614,6 @@ impl<'a> LowerCtx<'a> {
 
     // ── Conv ───────────────────────────────────────────────────
 
-
     pub(crate) fn lower_conv(
         &mut self,
         x_id: NodeId,
@@ -1672,7 +1662,6 @@ impl<'a> LowerCtx<'a> {
     }
 
     // ── Pool ───────────────────────────────────────────────────
-
 
     pub(crate) fn lower_pool(
         &mut self,
@@ -1735,8 +1724,12 @@ impl<'a> LowerCtx<'a> {
 
     // ── ScatterAdd ─────────────────────────────────────────────
 
-
-    pub(crate) fn lower_scatter_add(&mut self, updates_id: NodeId, indices_id: NodeId, out: Shape) -> i64 {
+    pub(crate) fn lower_scatter_add(
+        &mut self,
+        updates_id: NodeId,
+        indices_id: NodeId,
+        out: Shape,
+    ) -> i64 {
         // Build a zero-initialized destination of shape `out`, then
         // scatter-add updates rows at indices.
         let updates = self.hlo(updates_id);
@@ -1776,7 +1769,6 @@ impl<'a> LowerCtx<'a> {
     // Sort (descending) along the last axis, paired with an iota of
     // indices, then slice the leading k. Indices come back as f32
     // because rlx-ir is f32 at the I/O boundary.
-
 
     pub(crate) fn lower_topk(&mut self, x_id: NodeId, k: usize, out: Shape) -> i64 {
         let x = self.hlo(x_id);
@@ -1832,7 +1824,6 @@ impl<'a> LowerCtx<'a> {
     // For each token `i`, output[i] = input[i] @ weight[expert_idx[i]].
     // Lowered as gather(weight, idx) to materialize per-token weights
     // [M,K,N], then a batched dot_general with batch axis = M.
-
 
     pub(crate) fn lower_grouped_matmul(
         &mut self,
@@ -1894,7 +1885,6 @@ impl<'a> LowerCtx<'a> {
     // GGUF kernels on TPU — weights must be available when the HLO module is built
     // (`Op::Constant`, or `Op::Param` with bytes in `LowerParamBytes`).
 
-
     pub(crate) fn lower_dequant_matmul_gguf(
         &mut self,
         x_id: NodeId,
@@ -1928,7 +1918,6 @@ impl<'a> LowerCtx<'a> {
         };
         self.entry.dot_general(x, w_hlo, dn, out)
     }
-
 
     pub(crate) fn lower_dequant_matmul(
         &mut self,
@@ -2020,7 +2009,6 @@ impl<'a> LowerCtx<'a> {
     // dot, add bias, scale by `mult` in F32, round, +out_zp, clamp
     // to [-128, 127], convert back to S8.
 
-
     pub(crate) fn lower_qmatmul(
         &mut self,
         x_id: NodeId,
@@ -2100,7 +2088,6 @@ impl<'a> LowerCtx<'a> {
     // Same arithmetic shape as QMatMul, but wrapped around a 2-D
     // convolution. Inputs are NCHW int8; bias is per-output-channel
     // s32 in accumulator scale.
-
 
     pub(crate) fn lower_qconv2d(
         &mut self,
@@ -2205,7 +2192,6 @@ impl<'a> LowerCtx<'a> {
     // PJRT/XLA semantics — not bit-identical to RLX Philox/Ort on CPU.
     // `RngBackend::Zero` fills with a broadcast scalar zero instead.
 
-
     pub(crate) fn lower_rng_uniform(&self, low: f32, high: f32, out: Shape) -> i64 {
         if self.rng.backend == rlx_ir::RngBackend::Zero {
             let zero = self.entry.constant_f32_scalar(0.0);
@@ -2215,7 +2201,6 @@ impl<'a> LowerCtx<'a> {
         let b = self.entry.constant_f32_scalar(high);
         self.entry.rng(a, b, /*RNG_UNIFORM=*/ 1, out)
     }
-
 
     pub(crate) fn lower_rng_normal(&self, mean: f32, scale: f32, out: Shape) -> i64 {
         if self.rng.backend == rlx_ir::RngBackend::Zero {
@@ -2245,7 +2230,6 @@ impl<'a> LowerCtx<'a> {
     // through `rng-bit-generator` in a portable way, so we
     // deliberately don't aim for bit parity here — only that the
     // distribution is correct.
-
 
     pub(crate) fn lower_sample(
         &mut self,
@@ -2479,7 +2463,6 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-
     /// argmax via topk-1 on `x` of shape `dims` (last axis is the
     /// reduction). Returns f32 indices reshaped to `out_shape`.
     pub(crate) fn lower_topk_inner(
@@ -2530,7 +2513,6 @@ impl<'a> LowerCtx<'a> {
         );
         self.entry.convert(sliced, out_shape)
     }
-
 
     pub(crate) fn lower_selective_scan(
         &mut self,

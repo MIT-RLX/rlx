@@ -1,0 +1,22 @@
+{
+  "model": "encdec",
+  "num_inputs": 2,
+  "num_params": 18,
+  "num_instrs": 83,
+  "bundle_dir": "out_encdec/bundle",
+  "crate_dir": "out_encdec/rlx-encdec",
+  "parity": {
+    "passed": true,
+    "outputs": [
+      {
+        "index": 0,
+        "cosine": 0.999999999999999,
+        "max_abs_err": 1.1920928955078125e-7,
+        "rel_err": 6.169665936651227e-8,
+        "numel": 96
+      }
+    ],
+    "cosine_threshold": 0.999,
+    "max_abs_threshold": 0.01
+  }
+}

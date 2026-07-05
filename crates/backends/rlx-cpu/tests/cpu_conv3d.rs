@@ -87,7 +87,13 @@ fn run(g: &Graph, inputs: &[(&str, Vec<f32>)]) -> (Vec<f32>, Vec<usize>) {
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "length mismatch {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "length mismatch {} vs {}",
+        a.len(),
+        b.len()
+    );
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
@@ -114,7 +120,8 @@ fn conv3d_ref(
     dil: [usize; 3],
     groups: usize,
 ) -> (Vec<f32>, [usize; 3]) {
-    let out_dim = |x: usize, k: usize, i: usize| (x + 2 * pad[i] - dil[i] * (k - 1) - 1) / stride[i] + 1;
+    let out_dim =
+        |x: usize, k: usize, i: usize| (x + 2 * pad[i] - dil[i] * (k - 1) - 1) / stride[i] + 1;
     let d_out = out_dim(d, kd, 0);
     let h_out = out_dim(h, kh, 1);
     let w_out = out_dim(w, kw, 2);
@@ -143,9 +150,10 @@ fn conv3d_ref(
                                         if di >= d || hi >= h || wi >= w {
                                             continue;
                                         }
-                                        let iv = inp[(((ni * c_in + ci) * d + di) * h + hi) * w + wi];
-                                        let wv =
-                                            wt[(((co * c_in_pg + cioff) * kd + a) * kh + b) * kw + c];
+                                        let iv =
+                                            inp[(((ni * c_in + ci) * d + di) * h + hi) * w + wi];
+                                        let wv = wt
+                                            [(((co * c_in_pg + cioff) * kd + a) * kh + b) * kw + c];
                                         acc += iv * wv;
                                     }
                                 }
@@ -205,7 +213,11 @@ fn conv3d_matches_reference_stride1() {
         + 11.0 * 6.0
         + 13.0 * 7.0
         + 14.0 * 8.0;
-    assert!((out[0] - hand).abs() < 1e-5, "conv3d[0]={} want {hand}", out[0]);
+    assert!(
+        (out[0] - hand).abs() < 1e-5,
+        "conv3d[0]={} want {hand}",
+        out[0]
+    );
 }
 
 #[test]
@@ -285,7 +297,10 @@ fn conv_transpose3d_stride2_upsample() {
         "conv_transpose3d mismatch: {out:?} vs {expect:?}"
     );
     // A couple of hand-checked scatter values.
-    assert!((out[0] - 1.0).abs() < 1e-5, "out[0,0,0] should be input[0]=1");
+    assert!(
+        (out[0] - 1.0).abs() < 1e-5,
+        "out[0,0,0] should be input[0]=1"
+    );
     // Corner voxel input[1,1,1]=8 lands in the far 2×2×2 block, e.g. [3,3,3].
     assert!(
         (out[(3 * 4 + 3) * 4 + 3] - 8.0).abs() < 1e-5,
@@ -309,8 +324,7 @@ fn interpolate3d_nearest_replicates_2x() {
     for oz in 0..4 {
         for oy in 0..4 {
             for ox in 0..4 {
-                expect[(oz * 4 + oy) * 4 + ox] =
-                    x_data[((oz / 2) * 2 + oy / 2) * 2 + ox / 2];
+                expect[(oz * 4 + oy) * 4 + ox] = x_data[((oz / 2) * 2 + oy / 2) * 2 + ox / 2];
             }
         }
     }

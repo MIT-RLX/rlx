@@ -24,16 +24,27 @@ fn const_f32(g: &mut Graph, xs: &[f32], dims: &[usize]) -> NodeId {
     for x in xs {
         b.extend_from_slice(&x.to_le_bytes());
     }
-    g.add_node(Op::Constant { data: b }, vec![], Shape::new(dims, DType::F32))
+    g.add_node(
+        Op::Constant { data: b },
+        vec![],
+        Shape::new(dims, DType::F32),
+    )
 }
 fn f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 fn run(dev: Device, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) -> Vec<Vec<f32>> {
     let mut g = Graph::new("t");
     let outs = build(&mut g);
     g.set_outputs(outs);
-    Session::new(dev).compile(g).run_typed(&[]).iter().map(|o| f32s(&o.0)).collect()
+    Session::new(dev)
+        .compile(g)
+        .run_typed(&[])
+        .iter()
+        .map(|o| f32s(&o.0))
+        .collect()
 }
 
 /// Well-separated codebook so nearest-code is unambiguous (no f32 tie-flips).
@@ -96,7 +107,8 @@ fn fused_cosine_selects_by_direction() {
     let out = run(Device::Cpu, &|g| {
         let xn = const_f32(g, &x, &[n, d]);
         let cbn = const_f32(g, &cb, &[k, d]);
-        let (idx, _q) = rlx_vq::vector_quantize(g, xn, cbn, rlx_vq::Metric::Cosine, rlx_vq::Target::Cpu);
+        let (idx, _q) =
+            rlx_vq::vector_quantize(g, xn, cbn, rlx_vq::Metric::Cosine, rlx_vq::Target::Cpu);
         vec![idx]
     });
     assert_eq!(out[0], vec![1.0, 3.0, 0.0]);
@@ -121,7 +133,8 @@ fn fused_residual_vq_matches_composition() {
     let build_fused: &dyn Fn(&mut Graph) -> Vec<NodeId> = &|g| {
         let xn = const_f32(g, &x, &[n, d]);
         let cbn: Vec<NodeId> = cbs.iter().map(|c| const_f32(g, c, &[k, d])).collect();
-        let (mut idxs, recon) = rlx_vq::residual_vq(g, xn, &cbn, rlx_vq::Metric::L2, rlx_vq::Target::Cpu);
+        let (mut idxs, recon) =
+            rlx_vq::residual_vq(g, xn, &cbn, rlx_vq::Metric::L2, rlx_vq::Target::Cpu);
         idxs.push(recon);
         idxs
     };
@@ -184,7 +197,10 @@ fn gpu_target_portable_across_backends() {
     let cpu = run(Device::Cpu, build);
     for dev in [Device::Metal, Device::Gpu, Device::Mlx] {
         let got = run(dev, build);
-        assert_eq!(got[0], cpu[0], "{dev:?}: Target::Gpu indices differ from CPU");
+        assert_eq!(
+            got[0], cpu[0],
+            "{dev:?}: Target::Gpu indices differ from CPU"
+        );
         assert_eq!(got[1], cpu[1], "{dev:?}: Target::Gpu codes differ from CPU");
     }
 }
@@ -203,20 +219,25 @@ fn metal_gpu_beats_cpu() {
     let cpu_build: &dyn Fn(&mut Graph) -> Vec<NodeId> = &|g| {
         let xn = const_f32(g, &x, &[n, d]);
         let cbn = const_f32(g, &cb, &[k, d]);
-        let (idx, _q) = rlx_vq::vector_quantize(g, xn, cbn, rlx_vq::Metric::L2, rlx_vq::Target::Cpu);
+        let (idx, _q) =
+            rlx_vq::vector_quantize(g, xn, cbn, rlx_vq::Metric::L2, rlx_vq::Target::Cpu);
         vec![idx]
     };
     let gpu_build: &dyn Fn(&mut Graph) -> Vec<NodeId> = &|g| {
         let xn = const_f32(g, &x, &[n, d]);
         let cbn = const_f32(g, &cb, &[k, d]);
-        let (idx, _q) = rlx_vq::vector_quantize(g, xn, cbn, rlx_vq::Metric::L2, rlx_vq::Target::Gpu);
+        let (idx, _q) =
+            rlx_vq::vector_quantize(g, xn, cbn, rlx_vq::Metric::L2, rlx_vq::Target::Gpu);
         vec![idx]
     };
 
     // Same result on separable data.
     let cpu_idx = run(Device::Cpu, cpu_build);
     let gpu_idx = run(Device::Metal, gpu_build);
-    assert_eq!(cpu_idx[0], gpu_idx[0], "GPU lowering must match CPU indices");
+    assert_eq!(
+        cpu_idx[0], gpu_idx[0],
+        "GPU lowering must match CPU indices"
+    );
 
     let time = |dev: Device, build: &dyn Fn(&mut Graph) -> Vec<NodeId>| -> u128 {
         let mut g = Graph::new("t");
@@ -236,7 +257,10 @@ fn metal_gpu_beats_cpu() {
         "N={n} K={k}: CPU(fused)={cpu_ns}ns  Metal(Target::Gpu)={gpu_ns}ns  speedup={:.2}x",
         cpu_ns as f64 / gpu_ns as f64
     );
-    assert!(gpu_ns < cpu_ns, "Metal must be faster than CPU (got {gpu_ns} vs {cpu_ns})");
+    assert!(
+        gpu_ns < cpu_ns,
+        "Metal must be faster than CPU (got {gpu_ns} vs {cpu_ns})"
+    );
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -259,7 +283,8 @@ fn metal_fused_vs_composition_timing() {
         let mut gf = Graph::new("f");
         let xn = const_f32(&mut gf, &x, &[n, d]);
         let cbn = const_f32(&mut gf, &cb, &[k, d]);
-        let (idx, _q) = rlx_vq::vector_quantize(&mut gf, xn, cbn, rlx_vq::Metric::L2, rlx_vq::Target::Cpu);
+        let (idx, _q) =
+            rlx_vq::vector_quantize(&mut gf, xn, cbn, rlx_vq::Metric::L2, rlx_vq::Target::Cpu);
         gf.set_outputs(vec![idx]);
         let mut cf = Session::new(Device::Metal).compile(gf);
 

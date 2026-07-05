@@ -17,12 +17,6 @@
 
 #![allow(unused_imports)]
 
-use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU64;
-use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::shape::DimBinding;
-use rlx_ir::{Graph, NodeId, Op};
 use crate::buffer::{
     Arena, ReadbackLayout, ReadbackStaging, TinyReadbackStaging, decode_mapped_readback_f32,
     decode_tiny_mapped_f32, encode_readback_copies, plan_f32_uniform, read_f32_many_pooled,
@@ -59,6 +53,12 @@ use crate::kernels::{
     transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
     welch_peaks_gpu_kernel, where_kernel,
 };
+use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::shape::DimBinding;
+use rlx_ir::{Graph, NodeId, Op};
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 
 use super::*;
 
@@ -119,7 +119,6 @@ impl WgpuExecutable {
         pass.dispatch_workgroups(gx, gy, gz);
     }
 
-
     #[allow(dead_code)]
     pub(crate) fn dispatch_arena_copy_between_nodes(
         &self,
@@ -131,5 +130,4 @@ impl WgpuExecutable {
         let nbytes = self.arena.len_of(src_id).min(self.arena.len_of(dst_id));
         self.dispatch_arena_copy_bytes(dev, enc, src_id, dst_id, nbytes);
     }
-
 }

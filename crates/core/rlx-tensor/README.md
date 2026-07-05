@@ -136,3 +136,7 @@ round-trips.
 `s!` / `shape!` macros, and the slice helpers into scope). It is one layer above
 [`rlx-ir`](../rlx-ir) and shares its `Op` set, so any graph it builds compiles
 through the same fusion / memory-planning / backend pipeline as the rest of RLX.
+
+## License
+
+GPL-3.0-only.

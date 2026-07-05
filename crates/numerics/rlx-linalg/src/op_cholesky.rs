@@ -16,8 +16,6 @@
 //! `cholesky` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::infer::GraphExt;
@@ -31,7 +29,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct CholeskyExt;
-
 
 impl OpExtension for CholeskyExt {
     fn name(&self) -> &str {
@@ -71,10 +68,8 @@ impl OpExtension for CholeskyExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct CholeskyCpu;
-
 
 #[cfg(feature = "cpu")]
 impl CpuKernel for CholeskyCpu {
@@ -100,4 +95,3 @@ impl CpuKernel for CholeskyCpu {
 }
 
 // ── Solve Triangular ─────────────────────────────────────────────
-

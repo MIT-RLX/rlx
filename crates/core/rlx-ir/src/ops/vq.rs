@@ -161,11 +161,19 @@ mod tests {
         for x in xs {
             bytes.extend_from_slice(&x.to_le_bytes());
         }
-        g.add_node(Op::Constant { data: bytes }, vec![], Shape::new(shape, DType::F32))
+        g.add_node(
+            Op::Constant { data: bytes },
+            vec![],
+            Shape::new(shape, DType::F32),
+        )
     }
 
     fn dims(g: &Graph, id: NodeId) -> Vec<usize> {
-        g.shape(id).dims().iter().map(|d| d.unwrap_static()).collect()
+        g.shape(id)
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .collect()
     }
 
     #[test]
@@ -192,7 +200,9 @@ mod tests {
     fn rvq_shapes() {
         let mut g = Graph::new("rvq");
         let x = const_f32(&mut g, &[0.0; 4 * 4], &[4, 4]);
-        let cbs: Vec<_> = (0..3).map(|_| const_f32(&mut g, &[0.0; 16 * 4], &[16, 4])).collect();
+        let cbs: Vec<_> = (0..3)
+            .map(|_| const_f32(&mut g, &[0.0; 16 * 4], &[16, 4]))
+            .collect();
         let (indices, recon) = g.residual_vq(x, &cbs, VqMetric::L2);
         assert_eq!(indices.len(), 3);
         assert_eq!(dims(&g, recon), vec![4, 4]);

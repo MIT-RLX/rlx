@@ -16,7 +16,6 @@
 //! `cg` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -43,9 +42,7 @@ pub(super) fn decode_cg_attrs(attrs: &[u8]) -> Result<(u32, f64), String> {
     Ok((max_iter, tol))
 }
 
-
 pub(crate) struct SparseCgExt;
-
 
 impl OpExtension for SparseCgExt {
     fn name(&self) -> &str {
@@ -91,10 +88,8 @@ impl OpExtension for SparseCgExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SparseCgCpu;
-
 
 #[cfg(feature = "cpu")]
 impl CpuKernel for SparseCgCpu {
@@ -119,4 +114,3 @@ impl CpuKernel for SparseCgCpu {
 }
 
 // ── Sparse Values Gradient (`dL/dvalues` building block) ─────────
-

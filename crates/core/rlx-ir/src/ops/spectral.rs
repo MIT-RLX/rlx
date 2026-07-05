@@ -174,7 +174,7 @@ impl Graph {
     ) -> NodeId {
         let bp = self.band_power(x, sample_rate, bands);
         // 2πe
-        let c = self.constant((2.0 * std::f64::consts::PI * std::f64::consts::E) as f64, DType::F32);
+        let c = self.constant(2.0 * std::f64::consts::PI * std::f64::consts::E, DType::F32);
         let scaled = self.mul(bp, c);
         let logv = self.log_eps(scaled, 1e-8);
         let half = self.constant(0.5, DType::F32);
@@ -195,7 +195,11 @@ mod tests {
     use crate::Shape;
 
     fn dims(g: &Graph, id: NodeId) -> Vec<usize> {
-        g.shape(id).dims().iter().map(|d| d.unwrap_static()).collect()
+        g.shape(id)
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .collect()
     }
     fn input(g: &mut Graph, shape: &[usize]) -> NodeId {
         g.input("x", Shape::new(shape, DType::F32))
@@ -214,7 +218,13 @@ mod tests {
     fn band_power_shape() {
         let mut g = Graph::new("bp");
         let x = input(&mut g, &[4, 512]); // [C, T]
-        let bands = [(0.5, 4.0), (4.0, 8.0), (8.0, 13.0), (13.0, 30.0), (30.0, 45.0)];
+        let bands = [
+            (0.5, 4.0),
+            (4.0, 8.0),
+            (8.0, 13.0),
+            (13.0, 30.0),
+            (30.0, 45.0),
+        ];
         let y = g.band_power(x, 128.0, &bands);
         assert_eq!(dims(&g, y), vec![4, 5]);
     }

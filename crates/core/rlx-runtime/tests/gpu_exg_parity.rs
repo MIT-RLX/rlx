@@ -38,7 +38,11 @@ fn const_f32(g: &mut Graph, xs: &[f32], dims: &[usize]) -> NodeId {
     for x in xs {
         bytes.extend_from_slice(&x.to_le_bytes());
     }
-    g.add_node(Op::Constant { data: bytes }, vec![], Shape::new(dims, DType::F32))
+    g.add_node(
+        Op::Constant { data: bytes },
+        vec![],
+        Shape::new(dims, DType::F32),
+    )
 }
 
 fn bytes_to_f32s(bytes: &[u8]) -> Vec<f32> {

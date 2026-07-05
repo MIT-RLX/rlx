@@ -26,12 +26,12 @@ webgpu = ["dep:rlx-wgpu"]
 webgl = ["dep:rlx-webgl"]
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
-rlx-autodiff = { path = "../../core/rlx-autodiff", version = "0.2.10" }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.10" } # default features → cpu backend
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
+rlx-autodiff = { path = "../../core/rlx-autodiff", version = "0.2.12" }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.12" } # default features → cpu backend
 wasm-bindgen = "0.2.118"
-rlx-wgpu = { path = "../../backends/rlx-wgpu", version = "0.2.10", optional = true }
-rlx-webgl = { path = "../../backends/rlx-webgl", version = "0.2.10", optional = true }
+rlx-wgpu = { path = "../../backends/rlx-wgpu", version = "0.2.12", optional = true }
+rlx-webgl = { path = "../../backends/rlx-webgl", version = "0.2.12", optional = true }
 
 # wasm-only plumbing: async export support + console logging for panics.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

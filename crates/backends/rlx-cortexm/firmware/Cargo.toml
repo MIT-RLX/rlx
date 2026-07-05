@@ -9,6 +9,8 @@ version = "0.2.8"
 edition = "2024"
 description = "MNIST-on-nRF52840 firmware demo for rlx-cortexm"
 license = "GPL-3.0-only"
+authors = ["Eugene Hauptmann", "Nataliya Kosmyna"]
+readme = "README.md"
 
 [dependencies]
 rlx-cortexm   = { path = "..", default-features = false }

@@ -17,11 +17,6 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::{Graph, NodeId, Op};
-use std::sync::Mutex;
 use crate::arena::{Arena, HalfDtype, plan_f32_uniform};
 use crate::device::{RocmContext, rocm_blas, rocm_blas_lt, rocm_context, rocm_dnn};
 use crate::hip::{HipBuffer, HipDeviceptr};
@@ -31,6 +26,11 @@ use crate::hipblas::{
 use crate::hipblaslt::HipblasLtContext;
 use crate::host_staging::F32HostSlot;
 use crate::miopen::MiopenContext;
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::{Graph, NodeId, Op};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use super::*;
 
@@ -38,7 +38,6 @@ impl RocmExecutable {
     pub fn output_slots(&self) -> &[(usize, usize)] {
         &self.output_slots
     }
-
 
     /// Declared graph-output dtypes, in `graph.outputs` order. Used by
     /// the runtime wrapper's `run_typed` to narrow f32 outputs back to
@@ -50,5 +49,4 @@ impl RocmExecutable {
             .map(|&id| self.graph.node(id).shape.dtype())
             .collect()
     }
-
 }

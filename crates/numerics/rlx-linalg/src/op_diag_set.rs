@@ -16,8 +16,6 @@
 //! `diag_set` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::{DType, Node, NodeId, OpExtension, Shape, VjpContext};
@@ -30,7 +28,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct DiagSetExt;
-
 
 impl OpExtension for DiagSetExt {
     fn name(&self) -> &str {
@@ -109,7 +106,6 @@ impl OpExtension for DiagSetExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct DiagSetCpu;
 
@@ -135,4 +131,3 @@ impl CpuKernel for DiagSetCpu {
 }
 
 // ── Expm ──────────────────────────────────────────────────────────
-

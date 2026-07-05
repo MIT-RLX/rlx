@@ -10,20 +10,25 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use super::helpers::simple_op_flex;
+use super::helpers::*;
+use crate::proto;
+use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use crate::proto;
-use crate::{CoremlError, Result};
-use super::helpers::simple_op_flex;
-use super::helpers::*;
+use std::collections::HashMap;
 
 use super::*;
 
 impl<'a> LowerCtx<'a> {
     /// LoRA: `out = x·W + scale·(x·A)·B`. Inputs `[x, W, A, B]`.
-    pub(crate) fn lower_lora_matmul(&mut self, id: NodeId, scale: f32, out_name: &str) -> Result<()> {
+    pub(crate) fn lower_lora_matmul(
+        &mut self,
+        id: NodeId,
+        scale: f32,
+        out_name: &str,
+    ) -> Result<()> {
         let node = self.graph.node(id);
         let shape = node.shape.clone();
         let m = dim_static(&shape, 0)?;
@@ -57,7 +62,6 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
-
 
     /// MoE grouped matmul. Inputs `[input(M,K), weight(E,K,N),
     /// expert_idx(M)]`: each row picks its expert's weight slab.
@@ -119,5 +123,4 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
-
 }

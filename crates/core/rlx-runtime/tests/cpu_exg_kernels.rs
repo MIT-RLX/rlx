@@ -31,7 +31,11 @@ fn const_f32(g: &mut Graph, xs: &[f32], dims: &[usize]) -> NodeId {
     for x in xs {
         bytes.extend_from_slice(&x.to_le_bytes());
     }
-    g.add_node(Op::Constant { data: bytes }, vec![], Shape::new(dims, DType::F32))
+    g.add_node(
+        Op::Constant { data: bytes },
+        vec![],
+        Shape::new(dims, DType::F32),
+    )
 }
 
 fn bytes_to_f32s(bytes: &[u8]) -> Vec<f32> {
@@ -212,7 +216,10 @@ fn scan_unroll_matches_native_biquad() {
     // Force the unroll (as a Scan-less backend's legalization would).
     let unrolled_graph = rlx_fusion::control_flow::unroll_scan(build());
     assert!(
-        !unrolled_graph.nodes().iter().any(|n| matches!(n.op, Op::Scan { .. })),
+        !unrolled_graph
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::Scan { .. })),
         "unroll must eliminate Op::Scan"
     );
     let unrolled = run(unrolled_graph);

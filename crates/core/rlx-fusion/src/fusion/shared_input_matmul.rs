@@ -45,7 +45,6 @@ use super::*;
 /// of twice). Critical for SwiGLU (fc11+fc12) and QKV fusion.
 pub struct FuseSharedInputMatMul;
 
-
 impl Pass for FuseSharedInputMatMul {
     fn name(&self) -> &str {
         "fuse_shared_input_matmul"
@@ -164,4 +163,3 @@ impl Pass for FuseSharedInputMatMul {
 }
 
 // ── Pass 4: Detect SwiGLU pattern → FusedSwiGLU ────────────────────────
-

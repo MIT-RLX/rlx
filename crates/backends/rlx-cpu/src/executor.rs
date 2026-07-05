@@ -292,8 +292,26 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                         output[dst..dst + trailing].copy_from_slice(&table[src..src + trailing]);
                     }
                 } else {
-                    // General gather — fallback
-                    output.fill(0.0);
+                    // General gather along `axis`: the index tensor is applied
+                    // uniformly across the leading (`outer`) dims and copies a
+                    // contiguous `inner` block per gathered element.
+                    let rank = table_shape.rank();
+                    let outer: usize = (0..*axis)
+                        .map(|i| table_shape.dim(i).unwrap_static())
+                        .product();
+                    let axis_size = table_shape.dim(*axis).unwrap_static();
+                    let inner: usize = (*axis + 1..rank)
+                        .map(|i| table_shape.dim(i).unwrap_static())
+                        .product();
+                    let n_idx = indices.len();
+                    for o in 0..outer {
+                        for (k, &idx_f32) in indices.iter().enumerate() {
+                            let idx = (idx_f32 as usize).min(axis_size.saturating_sub(1));
+                            let src = (o * axis_size + idx) * inner;
+                            let dst = (o * n_idx + k) * inner;
+                            output[dst..dst + inner].copy_from_slice(&table[src..src + inner]);
+                        }
+                    }
                 }
             }
 
@@ -390,10 +408,56 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
             }
 
             // ── Reshape (zero-copy: same data, different shape) ─────
-            Op::Reshape { .. } | Op::Expand { .. } => {
+            Op::Reshape { .. } => {
                 let input = get_data(arena, external, node.inputs[0]);
                 let output = get_output(arena, node_id);
                 output[..input.len()].copy_from_slice(input);
+            }
+            // Broadcast the input up to the output shape (size-1 / missing leading
+            // dims replicate). A plain copy would leave a stride-0 axis unfilled —
+            // e.g. `[3,1] → [3,3]` in a `torch.eye` (arange/eq) construction.
+            Op::Expand { .. } => {
+                let input = get_data(arena, external, node.inputs[0]);
+                let in_shape = &graph.node(node.inputs[0]).shape;
+                let out_shape = &node.shape;
+                let out_rank = out_shape.rank();
+                let pad = out_rank - in_shape.rank();
+                let out_dims: Vec<usize> = (0..out_rank)
+                    .map(|i| out_shape.dim(i).unwrap_static())
+                    .collect();
+                let in_dims: Vec<usize> = (0..out_rank)
+                    .map(|i| {
+                        if i < pad {
+                            1
+                        } else {
+                            in_shape.dim(i - pad).unwrap_static()
+                        }
+                    })
+                    .collect();
+                // Row-major input strides over the padded shape; 0 on broadcast axes.
+                let mut in_strides = vec![0usize; out_rank];
+                let mut acc = 1usize;
+                for i in (0..out_rank).rev() {
+                    in_strides[i] = if in_dims[i] == 1 { 0 } else { acc };
+                    acc *= in_dims[i];
+                }
+                let output = get_output(arena, node_id);
+                let total: usize = out_dims.iter().product();
+                let mut coords = vec![0usize; out_rank];
+                for out_idx in 0..total {
+                    let mut in_idx = 0usize;
+                    for i in 0..out_rank {
+                        in_idx += coords[i] * in_strides[i];
+                    }
+                    output[out_idx] = input[in_idx];
+                    for i in (0..out_rank).rev() {
+                        coords[i] += 1;
+                        if coords[i] < out_dims[i] {
+                            break;
+                        }
+                        coords[i] = 0;
+                    }
+                }
             }
 
             // ── LayerNorm (parallel NEON) ────────────────────────────

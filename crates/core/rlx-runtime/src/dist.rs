@@ -452,7 +452,8 @@ mod tests {
         let mut buf = (header.len() as u64).to_le_bytes().to_vec();
         buf.extend_from_slice(header.as_bytes());
         buf.extend_from_slice(&data);
-        let path = std::env::temp_dir().join(format!("rlx_dist_{}.safetensors", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("rlx_dist_{}.safetensors", std::process::id()));
         std::fs::write(&path, &buf).unwrap();
         let got = resolve_weight_uri(&format!("safetensors://{}#w", path.display())).unwrap();
         std::fs::remove_file(&path).ok();
@@ -465,7 +466,8 @@ mod tests {
         let vals = [1.0f32, 2.0, -3.5, 4.25];
         let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         let mut w = GgufWriter::new();
-        w.add_tensor_bytes("w", vec![4], GgmlType::F32, bytes).unwrap();
+        w.add_tensor_bytes("w", vec![4], GgmlType::F32, bytes)
+            .unwrap();
         let path = std::env::temp_dir().join(format!("rlx_dist_{}.gguf", std::process::id()));
         w.write_to_path(&path).unwrap();
         let got = resolve_weight_uri(&format!("gguf://{}#w", path.display())).unwrap();
@@ -479,10 +481,20 @@ mod tests {
         let a = [1.0f32, 2.0, 3.0, 4.0];
         let b = [10.0f32, 20.0];
         let mut w = GgufWriter::new();
-        w.add_tensor_bytes("a", vec![4], GgmlType::F32, a.iter().flat_map(|v| v.to_le_bytes()).collect())
-            .unwrap();
-        w.add_tensor_bytes("b", vec![2], GgmlType::F32, b.iter().flat_map(|v| v.to_le_bytes()).collect())
-            .unwrap();
+        w.add_tensor_bytes(
+            "a",
+            vec![4],
+            GgmlType::F32,
+            a.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )
+        .unwrap();
+        w.add_tensor_bytes(
+            "b",
+            vec![2],
+            GgmlType::F32,
+            b.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )
+        .unwrap();
         let path = std::env::temp_dir().join(format!("rlx_cache_{}.gguf", std::process::id()));
         w.write_to_path(&path).unwrap();
         let p = path.display();
@@ -517,8 +529,12 @@ mod tests {
         let mut g = Graph::new("dq");
         let xin = g.input("x", Shape::new(&[m, k], DType::F32));
         let wp = g.param("W", Shape::new(&[packed.len()], DType::U8));
-        let out =
-            g.dequant_matmul_packed(xin, wp, QuantScheme::GgufQ8_0, Shape::new(&[m, n], DType::F32));
+        let out = g.dequant_matmul_packed(
+            xin,
+            wp,
+            QuantScheme::GgufQ8_0,
+            Shape::new(&[m, n], DType::F32),
+        );
         g.set_outputs(vec![out]);
 
         let mut c = Session::new(Device::Cpu).compile(g);

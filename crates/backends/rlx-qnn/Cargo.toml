@@ -26,9 +26,9 @@ default = []
 runtime = []
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
 # For unrolling Op::Scan into primitives (no native recurrence in QNN codegen).
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12" }
 
 [build-dependencies]
 cc = "1"

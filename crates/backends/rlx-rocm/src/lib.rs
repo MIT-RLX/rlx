@@ -47,11 +47,11 @@ pub mod llada2_gate_host;
 pub mod log_mel_backward_host;
 pub mod log_mel_host;
 pub mod lstm_host;
-pub mod scan_host;
 pub mod miopen;
 pub mod ms_deform_attn_host;
 pub mod rng_host;
 pub mod roctx;
+pub mod scan_host;
 pub mod splat_host;
 #[cfg(feature = "native-splat")]
 pub mod splat_native;

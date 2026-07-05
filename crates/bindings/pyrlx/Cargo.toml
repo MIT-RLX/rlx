@@ -1,6 +1,6 @@
 [package]
 name = "pyrlx"
-version                = "0.2.10"
+version                = "0.2.12"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Python bindings for rlx — run RLX graphs and HF models on any RLX backend"
@@ -43,11 +43,11 @@ rocm            = ["rlx-runtime/rocm"]
 pyo3      = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 numpy     = "0.22"
 
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10" }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.10", default-features = false }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.10" }
-rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.10", default-features = false, features = ["safetensors"] }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12" }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.12", default-features = false }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
+rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.12", default-features = false, features = ["safetensors"] }
 anyhow = "1"
 bytemuck = "1"
 [lints]

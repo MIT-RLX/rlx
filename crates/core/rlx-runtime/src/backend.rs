@@ -713,6 +713,8 @@ pub mod cpu_backend {
             Conv,
             Im2Col,
             ConvTranspose2d,
+            Conv3d,
+            ConvTranspose3d,
             Pool,
             GroupedMatMul,
             DequantGroupedMatMul,

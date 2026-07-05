@@ -10,14 +10,14 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use super::helpers::simple_op_flex;
+use super::helpers::*;
+use crate::proto;
+use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use crate::proto;
-use crate::{CoremlError, Result};
-use super::helpers::simple_op_flex;
-use super::helpers::*;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -211,11 +211,15 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Reshape a rope cos/sin table to gain a singleton head axis just before
     /// its last dim, so it broadcasts over the per-head groups when rope runs
     /// on a fused `[.., G, head_dim]` view.
-    pub(crate) fn rope_insert_head_axis(&mut self, src: NodeId, val: &str, out: &str) -> Result<String> {
+    pub(crate) fn rope_insert_head_axis(
+        &mut self,
+        src: NodeId,
+        val: &str,
+        out: &str,
+    ) -> Result<String> {
         let mut d = self.graph.shape(src).dims().to_vec();
         let pos = d.len().saturating_sub(1);
         d.insert(pos, Dim::Static(1));
@@ -231,7 +235,6 @@ impl<'a> LowerCtx<'a> {
         )?;
         Ok(out.to_string())
     }
-
 
     /// 2D axial RoPE (SAM2-style), input `[B, seq, num_heads·head_dim]`.
     /// Interleaved-pair rotation: first half rotated by the x-position
@@ -340,5 +343,4 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
-
 }

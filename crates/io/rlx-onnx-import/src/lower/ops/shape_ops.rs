@@ -37,7 +37,11 @@ use crate::lower::options::{ImportOptions, ImportReport};
 
 use super::*;
 
-pub(super) fn lower_transpose(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_transpose(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let rank = m.shape(x).rank();
     let perm: Vec<usize> = node
@@ -64,8 +68,11 @@ pub(super) fn lower_transpose(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: 
     Ok(true)
 }
 
-
-pub(super) fn lower_reshape(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_reshape(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let in_s = m.shape(x).clone();
     let dim_i64 = |d: Dim| dim_usize(d, ctx.opts) as i64;
@@ -131,8 +138,11 @@ pub(super) fn lower_reshape(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &B
     Ok(true)
 }
 
-
-pub(super) fn lower_gather(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_gather(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let table = ctx.tensor(&node.inputs[0])?;
     let indices = ctx.tensor(&node.inputs[1])?;
     let table_rank = m.shape(table).rank();
@@ -150,8 +160,11 @@ pub(super) fn lower_gather(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bu
     Ok(true)
 }
 
-
-pub(super) fn lower_concat(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_concat(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let inputs: Result<Vec<_>> = node.inputs.iter().map(|n| ctx.tensor(n)).collect();
     let mut inputs = inputs?;
     let peer_ids = inputs.clone();
@@ -218,8 +231,11 @@ pub(super) fn lower_concat(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bu
     Ok(true)
 }
 
-
-pub(super) fn lower_expand(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_expand(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let in_s = m.shape(x).clone();
     let evaluated = node
@@ -304,8 +320,11 @@ pub(super) fn lower_expand(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bu
     Ok(true)
 }
 
-
-pub(super) fn lower_slice_stub(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_slice_stub(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let meta = node.output_meta.first().context("slice output meta")?;
     let shape = slice_meta_stub_shape(meta, ctx.opts).context("slice stub shape")?;
     let out_name = node.outputs.first().context("slice output")?;
@@ -317,8 +336,11 @@ pub(super) fn lower_slice_stub(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node:
     Ok(true)
 }
 
-
-pub(super) fn lower_slice(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_slice(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     // Static control-tensor slices — shape arithmetic and VITS `convert_pad_shape`,
     // which reverses a small pad-spec list with `l[::-1]` (a step=-1 Slice over a
     // reshaped `[-1, 2]` tensor) before feeding it to `Pad`. Fold these to an i64
@@ -361,8 +383,11 @@ pub(super) fn lower_slice(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bun
     slice_to_output_shape(m, ctx, node, ctx.tensor(&node.inputs[0])?)
 }
 
-
-pub(super) fn lower_shape_op(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_shape_op(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let out_s = output_shape(ctx, node, m, ctx.tensor(&node.inputs[0])?);
     // `Shape(input_ids)` feeds duration / expand paths; keep as a runtime param so
     // static graphs can vary width without recompile, and dynamic templates set it
@@ -393,4 +418,3 @@ pub(super) fn lower_shape_op(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-

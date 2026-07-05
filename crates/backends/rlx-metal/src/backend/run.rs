@@ -17,13 +17,13 @@
 
 #![allow(unused_imports)]
 
-use rlx_ir::{Graph, NodeId, Op};
-use rlx_opt::memory;
-use std::collections::HashMap;
 use crate::arena::Arena;
 use crate::device::metal_device;
 use crate::kernels::kernels;
 use crate::thunk::{Thunk, ThunkSchedule};
+use rlx_ir::{Graph, NodeId, Op};
+use rlx_opt::memory;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -51,7 +51,6 @@ impl MetalExecutable {
         }
         &self.output_slots
     }
-
 
     /// High-throughput batch inference with per-run output snapshots.
     ///
@@ -123,11 +122,9 @@ impl MetalExecutable {
             .collect()
     }
 
-
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         self.run_read_outputs(inputs, None)
     }
-
 
     /// Run and read back only selected graph outputs (e.g. logits-only decode).
     pub fn run_read_outputs(
@@ -176,7 +173,6 @@ impl MetalExecutable {
             .collect()
     }
 
-
     /// Run with typed host inputs (I64 token ids, F32 style/speed, etc.).
     pub fn run_typed(
         &mut self,
@@ -184,16 +180,23 @@ impl MetalExecutable {
     ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
         let mut f32_owned: Vec<(String, Vec<f32>)> = Vec::new();
         for (name, data, dt) in inputs {
+            // Integer/bool inputs are widened to f32 to match the arena: compile
+            // rewrites their consumer nodes to F32 (see
+            // `widen_integer_activations_to_f32`), so the input slots are f32 too.
+            // Writing raw i64/i32 bytes would be read back as f32 garbage (e.g. a
+            // gather index or the VITS `arange < lengths` sequence mask).
+            let widen = matches!(
+                *dt,
+                rlx_ir::DType::I32 | rlx_ir::DType::I64 | rlx_ir::DType::U32 | rlx_ir::DType::Bool
+            );
+            // F64 / U8 / I8 keep their native byte width (packed weights, quant).
             let direct = matches!(
                 *dt,
-                rlx_ir::DType::F64
-                    | rlx_ir::DType::I32
-                    | rlx_ir::DType::I64
-                    | rlx_ir::DType::U32
-                    | rlx_ir::DType::U8
-                    | rlx_ir::DType::I8
+                rlx_ir::DType::F64 | rlx_ir::DType::U8 | rlx_ir::DType::I8
             );
-            if direct {
+            if widen {
+                f32_owned.push((name.to_string(), widen_input_bytes_to_f32(data, *dt)));
+            } else if direct {
                 if let Some(&id) = self.input_ids.get(*name)
                     && self.arena.has_buffer(id)
                 {
@@ -225,7 +228,6 @@ impl MetalExecutable {
             .collect()
     }
 
-
     /// Sequential per-thunk GPU timing (`RLX_METAL_THUNK_PROFILE=1`).
     pub(crate) fn run_thunk_profile(&mut self) {
         use std::time::Instant;
@@ -243,7 +245,6 @@ impl MetalExecutable {
         crate::thunk_profile::print_summary();
     }
 
-
     /// Execute the graph via MPSGraph (set up by lowering at compile time).
     /// All inputs/params are bound to their respective arena offsets; outputs
     /// are written into the arena slots so downstream consumers (run_slots
@@ -255,7 +256,6 @@ impl MetalExecutable {
         self.dispatch_mps_plan(plan, None, None);
         crate::mps_profile::record("mps_graph:dispatch_full", t0.elapsed());
     }
-
 
     /// Interleaved MPS sub-graph + thunk dispatch for Qwen3.5 decode.
     pub(crate) fn run_via_mps_hybrid(&mut self) {
@@ -284,5 +284,4 @@ impl MetalExecutable {
             }
         }
     }
-
 }

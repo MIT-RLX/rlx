@@ -163,6 +163,11 @@ SKIPPED=(
 # which rlx-vulkan/rlx-oneapi depend on). rlx-webgl (rlx-ir/rlx-autodiff/
 # rlx-compile) also lands there. rlx-web pulls in rlx-runtime AND rlx-webgl,
 # so it has to follow runtime — it sits alongside rlx-tensor.
+#
+# rlx-torch-import's [dependencies] are rlx-ir plus optional rlx-cpu,
+# rlx-runtime (the `runtime` default feature) and rlx-onnx-import (the `onnx`
+# feature). Optional deps are still resolved by cargo publish, so it has to
+# follow rlx-onnx-import — it rides in the same tier, listed right after it.
 TIERS=(
     "rlx-ir rlx-gguf rlx-nemo rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim"
     "rlx-flow rlx-fusion rlx-driver"
@@ -172,8 +177,8 @@ TIERS=(
     "rlx-cpu rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-webgl"
     "rlx-metal"
     "rlx-collectives rlx-runtime"
-    "rlx-tensor rlx-onnx-import rlx-bbo rlx-web"
-    "rlx-sparse rlx-linalg rlx-umap rlx-text rlx-gguf-convert rlx-onnx-conformance"
+    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-web"
+    "rlx-sparse rlx-linalg rlx-umap rlx-vq rlx-text rlx-gguf-convert rlx-onnx-conformance"
     "rlx-onnx"
     "rlx-fdm rlx-bench"
     "rlx-rl"
@@ -313,19 +318,27 @@ for i, line in enumerate(tier_lines):
         crate_tier[c] = (i, j)
 
 def parse_rlx_deps(toml_path: Path) -> set[str]:
+    # Every rlx-* dep cargo publish resolves against crates.io: [dependencies]
+    # AND target-cfg dependencies (e.g. rlx-metal on Apple); optional deps too.
+    # [dev-dependencies] are excluded: cargo strips path-only dev-deps from the
+    # published manifest.
     text = toml_path.read_text()
     deps: set[str] = set()
-    sm = re.search(r"\[dependencies\](.*?)(?=\n\[|\Z)", text, re.S)
-    if not sm:
-        return deps
-    for line in sm.group(1).splitlines():
-        m2 = re.match(r"^(rlx-[a-z0-9-]+)\s*=", line.strip())
-        if m2:
-            deps.add(m2.group(1))
+    for hm in re.finditer(r"(?m)^\[(?:dependencies|target\.[^\]]+\.dependencies)\]", text):
+        start = hm.end()
+        nxt = re.search(r"(?m)^\[", text[start:])
+        body = text[start : start + (nxt.start() if nxt else len(text))]
+        for line in body.splitlines():
+            s = line.strip()
+            if s.startswith("#"):
+                continue
+            m2 = re.match(r"^(rlx-[a-z0-9-]+)\s*=", s)
+            if m2:
+                deps.add(m2.group(1))
     return deps
 
 violations: list[str] = []
-for toml in sorted(root.glob("crates/*/rlx-*/Cargo.toml")):
+for toml in sorted(root.glob("crates/*/rlx-*/Cargo.toml")) + [root / "crates/rlx/Cargo.toml"]:
     name = toml.parent.name
     if name.endswith("-trainer"):
         continue
@@ -441,10 +454,21 @@ root = Path(sys.argv[1])
 workspace_version = sys.argv[2]
 crates = sys.argv[3].split()
 
+def crate_toml(crate: str) -> Path:
+    # Umbrella `rlx` lives directly under crates/; every other crate lives
+    # under crates/<group>/<crate>/ after the crate regrouping. (Nested
+    # sub-crates like the cortexm trainer aren't in TIERS, so a one-level
+    # group search is enough.)
+    direct = root / "crates" / crate / "Cargo.toml"
+    if direct.is_file():
+        return direct
+    matches = sorted(root.glob(f"crates/*/{crate}/Cargo.toml"))
+    if matches:
+        return matches[0]
+    raise SystemExit(f"could not find Cargo.toml for {crate}")
+
 def effective_version(crate: str) -> str:
-    toml = root / "crates" / crate / "Cargo.toml"
-    if not toml.is_file():
-        raise SystemExit(f"could not find Cargo.toml for {crate}")
+    toml = crate_toml(crate)
     text = toml.read_text()
     if re.search(r"^version\.workspace\s*=\s*true", text, re.M):
         return workspace_version

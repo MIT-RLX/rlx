@@ -16,7 +16,6 @@
 //! `lsqr` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -41,9 +40,7 @@ pub(super) fn decode_lsqr_attrs(attrs: &[u8]) -> Result<(u32, f64, u32), String>
     Ok((max_iter, tol, n_cols))
 }
 
-
 pub(crate) struct SparseLsqrExt;
-
 
 impl OpExtension for SparseLsqrExt {
     fn name(&self) -> &str {
@@ -59,7 +56,6 @@ impl OpExtension for SparseLsqrExt {
     }
     // VJP deferred — see SPARSE_LSQR_SOLVE doc.
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct SparseLsqrCpu;
@@ -95,4 +91,3 @@ impl CpuKernel for SparseLsqrCpu {
 }
 
 // ── Pure-Rust SpGEMM (CSR × CSR → CSR) ────────────────────────────
-

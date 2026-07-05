@@ -16,8 +16,6 @@
 //! `cholesky_backward` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::infer::GraphExt;
@@ -32,7 +30,6 @@ use super::*;
 
 pub(crate) struct CholeskyBackwardExt;
 
-
 impl OpExtension for CholeskyBackwardExt {
     fn name(&self) -> &str {
         LINALG_CHOLESKY_BACKWARD
@@ -45,7 +42,6 @@ impl OpExtension for CholeskyBackwardExt {
     }
     // No second-order VJP (returns empty).
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct CholeskyBackwardCpu;
@@ -73,4 +69,3 @@ impl CpuKernel for CholeskyBackwardCpu {
         algos::cholesky_backward(l, dl_dl, n, lower, out)
     }
 }
-

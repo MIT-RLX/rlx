@@ -71,7 +71,6 @@ pub fn compose_cumsum_backward(
     }
 }
 
-
 /// `GatherBackward` via `ScatterAdd` (axis 0) or flattened scatter (other axes).
 pub fn compose_gather_backward(
     g: &mut Graph,
@@ -130,4 +129,3 @@ pub fn compose_gather_backward(
         .collect();
     g.reshape_(scattered, dims)
 }
-

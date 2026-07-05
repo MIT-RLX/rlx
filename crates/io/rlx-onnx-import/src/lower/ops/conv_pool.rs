@@ -163,7 +163,6 @@ pub(super) fn lower_conv_transpose_decomposed(
     lower_conv(m, ctx, &synth, false)
 }
 
-
 pub(super) fn lower_conv(
     m: &mut HirMut<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -440,7 +439,6 @@ pub(super) fn lower_conv(
     Ok(true)
 }
 
-
 pub(super) fn lower_pool(
     m: &mut HirMut<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -479,4 +477,3 @@ pub(super) fn lower_pool(
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-

@@ -19,9 +19,15 @@ fn run_case(nh: usize, nkv: usize, hd: usize, seq: usize) -> Option<f32> {
     let kv_dim = nkv * hd; // GQA: nkv < nh (E2B global layers: nh=8, nkv=1)
     // Gemma 4 regime: Q/K per-head RMS-normed (‖head‖≈√hd), score_scale=1.0, so
     // scores ≈ hd. Unit-rms Q/K reproduce that large-score softmax regime.
-    let q: Vec<f32> = (0..b * seq * q_dim).map(|i| ((i as f32) * 0.011).sin()).collect();
-    let k: Vec<f32> = (0..b * seq * kv_dim).map(|i| ((i as f32) * 0.013).cos()).collect();
-    let v: Vec<f32> = (0..b * seq * kv_dim).map(|i| ((i as f32) * 0.017).sin()).collect();
+    let q: Vec<f32> = (0..b * seq * q_dim)
+        .map(|i| ((i as f32) * 0.011).sin())
+        .collect();
+    let k: Vec<f32> = (0..b * seq * kv_dim)
+        .map(|i| ((i as f32) * 0.013).cos())
+        .collect();
+    let v: Vec<f32> = (0..b * seq * kv_dim)
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
 
     let mut g = Graph::new("attn_hd");
     let qi = g.input("q", Shape::new(&[b, seq, q_dim], DType::F32));

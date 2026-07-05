@@ -16,8 +16,6 @@
 //! `svd_jvp` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::{DType, OpExtension, Shape};
@@ -30,7 +28,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct SvdJvpExt;
-
 
 impl OpExtension for SvdJvpExt {
     fn name(&self) -> &str {
@@ -46,7 +43,6 @@ impl OpExtension for SvdJvpExt {
         Shape::new(&[u_len + s_len + vt_len], DType::F64)
     }
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct SvdJvpCpu;
@@ -75,4 +71,3 @@ impl CpuKernel for SvdJvpCpu {
 }
 
 // ── Pinv JVP ──────────────────────────────────────────────────────
-

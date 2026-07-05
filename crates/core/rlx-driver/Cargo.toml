@@ -13,16 +13,29 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.10" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.12" }
 half = "2"
 # Zero-config LAN discovery (Bonjour/Avahi-compatible mDNS-SD), opt-in: the
 # unicast rendezvous path needs no extra deps, so keep this off by default.
 mdns-sd = { version = "0.13", optional = true }
+# Optional pure-Rust MPI backend — the C-free `mpi-rs` crate (lib name `mpi`,
+# rsmpi-compatible API). Off by default so the native `NetTransport` stays the
+# zero-dep path. Published as `mpi-rs` (the bare `mpi` name is rsmpi's); code
+# refers to it as `mpi` via the dependency key. To hack on it locally, add an
+# uncommitted `[patch.crates-io] mpi-rs = { path = "../mpi-no-c" }`.
+mpi = { package = "mpi-rs", version = "0.1.0", optional = true }
 
 [features]
 default = []
 # mDNS-SD service discovery for `Node` (advertise/browse `_rlx-coord._udp`).
 mdns = ["dep:mdns-sd"]
+# Route RLX collectives over the pure-Rust MPI backend (`MpiTransport`), reusing
+# MPI process bootstrap (mpirun/mpiexec) instead of manually wiring TCP peers.
+mpi = ["dep:mpi"]
+
+[[example]]
+name = "mpi_all_reduce"
+required-features = ["mpi"]
 
 [lints]
 workspace = true

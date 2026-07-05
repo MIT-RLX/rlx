@@ -1,0 +1,22 @@
+{
+  "model": "cnn",
+  "num_inputs": 1,
+  "num_params": 16,
+  "num_instrs": 37,
+  "bundle_dir": "/Users/Shared/rlx/crates/bindings/pyrlx/examples/out_cnn/bundle",
+  "crate_dir": "/Users/Shared/rlx/crates/bindings/pyrlx/examples/out_cnn/rlx-cnn",
+  "parity": {
+    "passed": true,
+    "outputs": [
+      {
+        "index": 0,
+        "cosine": 0.9999999999999977,
+        "max_abs_err": 2.9802322387695312e-8,
+        "rel_err": 9.388219493191992e-8,
+        "numel": 20
+      }
+    ],
+    "cosine_threshold": 0.999,
+    "max_abs_threshold": 0.01
+  }
+}

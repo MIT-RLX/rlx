@@ -18,8 +18,8 @@
 #![allow(unused_imports)]
 
 use crate::arena::Arena;
-use rlx_ir::NodeId;
 use crate::op_registry::MetalKernel;
+use rlx_ir::NodeId;
 use rlx_ir::op::{Activation, BinaryOp, CmpOp};
 use rlx_ir::{DType, Graph, Op, Shape};
 use std::sync::Arc;
@@ -36,11 +36,9 @@ impl ThunkSchedule {
         )
     }
 
-
     pub fn compile_with_rng(graph: &Graph, arena: &Arena, rng: rlx_ir::RngOptions) -> Self {
         Self::compile_with_rng_fab(graph, arena, rng, &std::collections::HashMap::new())
     }
-
 
     /// Like [`Self::compile_with_rng`] but with the native-`FusedAttentionBlock`
     /// scratch map: each surviving FAB node → its `(qkv, attn)` BYTE offsets in
@@ -1062,25 +1060,74 @@ impl ThunkSchedule {
                         && w_shape.rank() == 4
                         && out_shape.rank() == 4
                     {
+                        let n = in_shape.dim(0).unwrap_static() as u32;
+                        let c_in = in_shape.dim(1).unwrap_static() as u32;
+                        let h = in_shape.dim(2).unwrap_static() as u32;
+                        let w = in_shape.dim(3).unwrap_static() as u32;
+                        let c_out = out_shape.dim(1).unwrap_static() as u32;
+                        let h_out = out_shape.dim(2).unwrap_static() as u32;
+                        let w_out = out_shape.dim(3).unwrap_static() as u32;
+                        // rlx lowers ONNX 1D convs as 2D NCHW with a unit H axis and the
+                        // length in W (`[N,C,1,L]`), keeping the length kernel/stride/pad/
+                        // dilation at index 0 (`kernel=[k,1]`). A literal 2D conv would run
+                        // the k-tap kernel over the singleton H axis and ignore the length.
+                        // `[N,C,1,L]` and `[N,C,L,1]` share row-major layout, so relabel
+                        // the length onto H (no copy) — matching rlx-cpu, the MLX 1D path,
+                        // and onnxruntime. (VITS/TinyTTS duration predictor & text encoder.)
+                        let one_d_w = h == 1
+                            && w > 1
+                            && kernel_size[0] > 1
+                            && kernel_size.get(1).copied().unwrap_or(1) == 1;
+                        let (h, w, h_out, w_out, kh, kw, sh, sw, ph, pw, dh, dw) = if one_d_w {
+                            (
+                                w,
+                                1,
+                                w_out,
+                                1,
+                                kernel_size[0] as u32,
+                                1,
+                                stride.first().copied().unwrap_or(1) as u32,
+                                1,
+                                padding.first().copied().unwrap_or(0) as u32,
+                                0,
+                                dilation.first().copied().unwrap_or(1) as u32,
+                                1,
+                            )
+                        } else {
+                            (
+                                h,
+                                w,
+                                h_out,
+                                w_out,
+                                kernel_size[0] as u32,
+                                kernel_size[1] as u32,
+                                stride.first().copied().unwrap_or(1) as u32,
+                                stride.get(1).copied().unwrap_or(1) as u32,
+                                padding.first().copied().unwrap_or(0) as u32,
+                                padding.get(1).copied().unwrap_or(0) as u32,
+                                dilation.first().copied().unwrap_or(1) as u32,
+                                dilation.get(1).copied().unwrap_or(1) as u32,
+                            )
+                        };
                         Thunk::Conv2D {
                             src: off(node.inputs[0]),
                             weight: off(node.inputs[1]),
                             dst: off(node.id),
-                            n: in_shape.dim(0).unwrap_static() as u32,
-                            c_in: in_shape.dim(1).unwrap_static() as u32,
-                            h: in_shape.dim(2).unwrap_static() as u32,
-                            w: in_shape.dim(3).unwrap_static() as u32,
-                            c_out: out_shape.dim(1).unwrap_static() as u32,
-                            h_out: out_shape.dim(2).unwrap_static() as u32,
-                            w_out: out_shape.dim(3).unwrap_static() as u32,
-                            kh: kernel_size[0] as u32,
-                            kw: kernel_size[1] as u32,
-                            sh: stride.first().copied().unwrap_or(1) as u32,
-                            sw: stride.get(1).copied().unwrap_or(1) as u32,
-                            ph: padding.first().copied().unwrap_or(0) as u32,
-                            pw: padding.get(1).copied().unwrap_or(0) as u32,
-                            dh: dilation.first().copied().unwrap_or(1) as u32,
-                            dw: dilation.get(1).copied().unwrap_or(1) as u32,
+                            n,
+                            c_in,
+                            h,
+                            w,
+                            c_out,
+                            h_out,
+                            w_out,
+                            kh,
+                            kw,
+                            sh,
+                            sw,
+                            ph,
+                            pw,
+                            dh,
+                            dw,
                             groups: *groups as u32,
                         }
                     } else {

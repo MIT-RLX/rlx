@@ -20,9 +20,7 @@
 //!
 //! See [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 
-use cudarc::driver::{
-    CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
-};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use rlx_ir::{Graph, Op};
 use std::sync::Arc;
 

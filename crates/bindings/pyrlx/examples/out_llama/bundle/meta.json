@@ -1,0 +1,15 @@
+{
+  "name": "llama",
+  "inputs": [
+    {
+      "name": "ids",
+      "shape": [
+        1,
+        8
+      ],
+      "dtype": "i64"
+    }
+  ],
+  "output_count": 1,
+  "zero_params": []
+}

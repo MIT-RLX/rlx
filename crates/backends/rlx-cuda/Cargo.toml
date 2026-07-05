@@ -13,12 +13,12 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.10" }
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", features = ["splat"] }
+rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.12" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.12", features = ["splat"] }
 # IQ-family grid LUTs staged into a device buffer by `iq_grid.rs`.
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.10" }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
 
 # `dynamic-loading` lets the crate compile and link on hosts without a
 # CUDA SDK installed — libcuda is dlopen()'d at runtime. That's what

@@ -318,6 +318,7 @@ fn gru_bench() {
         bidir: true,
     };
     let (x, wih, whh, bih, bhh) = inputs(&cfg);
+    #[allow(unused_mut)]
     let mut devices = vec![("cpu", Device::Cpu)];
     #[cfg(all(target_os = "macos", feature = "metal"))]
     devices.push(("metal", Device::Metal));

@@ -16,8 +16,6 @@
 //! `svd` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::{DType, Node, NodeId, OpExtension, Shape, VjpContext};
@@ -30,7 +28,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct SvdExt;
-
 
 impl OpExtension for SvdExt {
     fn name(&self) -> &str {
@@ -192,10 +189,8 @@ impl OpExtension for SvdExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SvdCpu;
-
 
 #[cfg(feature = "cpu")]
 impl CpuKernel for SvdCpu {
@@ -224,4 +219,3 @@ impl CpuKernel for SvdCpu {
 }
 
 // ── LogDet ────────────────────────────────────────────────────────
-

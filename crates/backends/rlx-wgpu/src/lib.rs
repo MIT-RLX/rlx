@@ -36,7 +36,6 @@ pub mod coop_f16_vk;
 pub mod device;
 pub mod fft_dispatch;
 pub mod fft_host;
-pub mod scan_host;
 pub mod gdn_host;
 pub mod gguf_gpu;
 pub mod gguf_host;
@@ -48,6 +47,7 @@ pub mod log_mel_host;
 pub mod lstm_host;
 pub mod ms_deform_attn;
 pub mod rng_host;
+pub mod scan_host;
 #[cfg(feature = "splat")]
 pub mod splat;
 #[cfg(feature = "native-splat")]

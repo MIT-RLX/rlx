@@ -10,8 +10,25 @@
 
 use crate::hir::{HirModule, HirNodeId};
 use crate::op::*;
+use crate::quant::{ScaleLayout, ScaledFormat};
 use crate::shape;
 use crate::{DType, Op, Shape};
+
+/// Interpolation mode for [`HirMut::grid_sample2d`] (PyTorch `grid_sample`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GridMode {
+    Nearest,
+    Bilinear,
+    Bicubic,
+}
+
+/// Out-of-bounds handling for [`HirMut::grid_sample2d`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GridPad {
+    Zeros,
+    Border,
+    Reflection,
+}
 
 /// Mutable HIR builder view — implements [`HirGraphExt`] without conflicting
 /// with [`HirModule`]'s block-level `rms_norm` / `rope` methods.
@@ -86,6 +103,576 @@ impl<'a> HirMut<'a> {
             shape,
         )
     }
+
+    /// Bilinear 2-D resize of NCHW `x` to `[N, C, out_h, out_w]` — see
+    /// [`Self::resize_separable`].
+    pub fn resize_bilinear2d(
+        &mut self,
+        x: HirNodeId,
+        out_h: usize,
+        out_w: usize,
+        align_corners: bool,
+    ) -> HirNodeId {
+        self.resize_separable(x, out_h, out_w, align_corners, false, false)
+    }
+
+    /// Bicubic 2-D resize of NCHW `x` to `[N, C, out_h, out_w]` — see
+    /// [`Self::resize_separable`] (PyTorch cubic-convolution kernel, `a = -0.75`).
+    pub fn resize_bicubic2d(
+        &mut self,
+        x: HirNodeId,
+        out_h: usize,
+        out_w: usize,
+        align_corners: bool,
+    ) -> HirNodeId {
+        self.resize_separable(x, out_h, out_w, align_corners, true, false)
+    }
+
+    /// Antialiased bilinear resize (`_upsample_bilinear2d_aa`): downsampling
+    /// widens the filter by the scale factor and renormalizes.
+    pub fn resize_bilinear2d_aa(
+        &mut self,
+        x: HirNodeId,
+        out_h: usize,
+        out_w: usize,
+        align_corners: bool,
+    ) -> HirNodeId {
+        self.resize_separable(x, out_h, out_w, align_corners, false, true)
+    }
+
+    /// Antialiased bicubic resize (`_upsample_bicubic2d_aa`).
+    pub fn resize_bicubic2d_aa(
+        &mut self,
+        x: HirNodeId,
+        out_h: usize,
+        out_w: usize,
+        align_corners: bool,
+    ) -> HirNodeId {
+        self.resize_separable(x, out_h, out_w, align_corners, true, true)
+    }
+
+    /// Separable 2-D resize (bilinear/bicubic, optionally antialiased) of NCHW `x`.
+    ///
+    /// Every one of these filters is separable, so a resize is exactly two 1-D
+    /// resamples (W then H), each a matmul by a constant `[in, out]`
+    /// interpolation matrix built per PyTorch's `align_corners` (and antialias)
+    /// convention. This lands `upsample_{bilinear,bicubic}2d(_aa)` on the
+    /// universal `MatMul`/`reshape`/`transpose` ops — bit-exact on every backend,
+    /// with no dedicated kernel.
+    fn resize_separable(
+        &mut self,
+        x: HirNodeId,
+        out_h: usize,
+        out_w: usize,
+        align_corners: bool,
+        cubic: bool,
+        antialias: bool,
+    ) -> HirNodeId {
+        let in_s = self.shape(x).clone();
+        let n = in_s.dim(0).unwrap_static();
+        let c = in_s.dim(1).unwrap_static();
+        let h_in = in_s.dim(2).unwrap_static();
+        let w_in = in_s.dim(3).unwrap_static();
+
+        // ── W (last) axis: [N·C·H_in, W_in] @ [W_in, out_w] ──
+        let wmat = {
+            let data = interp_matrix_bytes(w_in, out_w, align_corners, cubic, antialias);
+            self.0.mir(
+                Op::Constant { data },
+                vec![],
+                Shape::new(&[w_in, out_w], DType::F32),
+            )
+        };
+        let x2 = self.reshape_(x, vec![(n * c * h_in) as i64, w_in as i64]);
+        let xw = self.mm(x2, wmat);
+        let xw4 = self.reshape_(xw, vec![n as i64, c as i64, h_in as i64, out_w as i64]);
+
+        // ── H axis: move H last, matmul by [H_in, out_h], move back ──
+        let xt = self.transpose_(xw4, vec![0, 1, 3, 2]); // [N, C, out_w, H_in]
+        let xt2 = self.reshape_(xt, vec![(n * c * out_w) as i64, h_in as i64]);
+        let hmat = {
+            let data = interp_matrix_bytes(h_in, out_h, align_corners, cubic, antialias);
+            self.0.mir(
+                Op::Constant { data },
+                vec![],
+                Shape::new(&[h_in, out_h], DType::F32),
+            )
+        };
+        let xh = self.mm(xt2, hmat);
+        let xh4 = self.reshape_(xh, vec![n as i64, c as i64, out_w as i64, out_h as i64]);
+        self.transpose_(xh4, vec![0, 1, 3, 2]) // [N, C, out_h, out_w]
+    }
+
+    // ── grid_sample helpers (operate on [S,1] coordinate tensors) ────────────
+    fn gs_const(&mut self, v: f64) -> HirNodeId {
+        let data = (v as f32).to_le_bytes().to_vec();
+        self.0
+            .mir(Op::Constant { data }, vec![], Shape::new(&[1], DType::F32))
+    }
+    /// `a <op> b` for same-shape (or scalar-`b`) operands; shape = shape(a).
+    fn gs_bin(&mut self, op: BinaryOp, a: HirNodeId, b: HirNodeId) -> HirNodeId {
+        let s = self.shape(a).clone();
+        self.0.mir(Op::Binary(op), vec![a, b], s)
+    }
+    /// `a <op> scalar` — `a` stays the full-size lhs so CPU broadcast is valid.
+    fn gs_scalar(&mut self, op: BinaryOp, a: HirNodeId, v: f64) -> HirNodeId {
+        let k = self.gs_const(v);
+        self.gs_bin(op, a, k)
+    }
+    fn gs_round(&mut self, a: HirNodeId) -> HirNodeId {
+        let s = self.shape(a).clone();
+        self.0.mir(Op::Activation(Activation::Round), vec![a], s)
+    }
+    fn gs_abs(&mut self, a: HirNodeId) -> HirNodeId {
+        let s = self.shape(a).clone();
+        self.0.mir(Op::Activation(Activation::Abs), vec![a], s)
+    }
+    /// `Compare` yields a bool tensor; cast it to f32 {0,1} so it can be used in
+    /// arithmetic on the f32 arena (a raw bool operand under-sizes / mis-reads).
+    fn gs_cmp_f32(&mut self, op: CmpOp, a: HirNodeId, b: HirNodeId) -> HirNodeId {
+        let s = self.shape(a).clone();
+        let cmp = self.0.mir(Op::Compare(op), vec![a, b], s.clone());
+        self.0.mir(Op::Cast { to: DType::F32 }, vec![cmp], s)
+    }
+    /// `floor(a) = round(a) − (round(a) > a)` — exact for all finite `a`.
+    fn gs_floor(&mut self, a: HirNodeId) -> HirNodeId {
+        let r = self.gs_round(a);
+        let gt = self.gs_cmp_f32(CmpOp::Gt, r, a);
+        self.gs_bin(BinaryOp::Sub, r, gt)
+    }
+    fn gs_clamp(&mut self, a: HirNodeId, lo: f64, hi: f64) -> HirNodeId {
+        let a = self.gs_scalar(BinaryOp::Max, a, lo);
+        self.gs_scalar(BinaryOp::Min, a, hi)
+    }
+    fn gs_one_minus(&mut self, a: HirNodeId) -> HirNodeId {
+        let neg = self.gs_scalar(BinaryOp::Mul, a, -1.0);
+        self.gs_scalar(BinaryOp::Add, neg, 1.0)
+    }
+    fn gs_expand(&mut self, a: HirNodeId, s: usize, c: usize) -> HirNodeId {
+        self.0.mir(
+            Op::Expand {
+                target_shape: vec![s as i64, c as i64],
+            },
+            vec![a],
+            Shape::new(&[s, c], DType::F32),
+        )
+    }
+
+    /// Unnormalize a `[S,1]` normalized grid coord to pixel space, then apply
+    /// the padding transform to the *continuous* coordinate (PyTorch order).
+    fn gs_coord(&mut self, g: HirNodeId, size: usize, ac: bool, pad: GridPad) -> HirNodeId {
+        let coord = if ac {
+            let a = 0.5 * (size as f64 - 1.0);
+            let ga = self.gs_scalar(BinaryOp::Mul, g, a);
+            self.gs_scalar(BinaryOp::Add, ga, a)
+        } else {
+            let a = size as f64 * 0.5;
+            let ga = self.gs_scalar(BinaryOp::Mul, g, a);
+            self.gs_scalar(BinaryOp::Add, ga, a - 0.5)
+        };
+        match pad {
+            GridPad::Zeros => coord,
+            GridPad::Border => self.gs_clamp(coord, 0.0, size as f64 - 1.0),
+            GridPad::Reflection => {
+                let r = self.gs_reflect(coord, size, ac);
+                self.gs_clamp(r, 0.0, size as f64 - 1.0)
+            }
+        }
+    }
+
+    /// Reflect a continuous coordinate into `[0, size-1]` per PyTorch
+    /// `reflect_coordinates` (span/min depend on `align_corners`).
+    fn gs_reflect(&mut self, coord: HirNodeId, size: usize, ac: bool) -> HirNodeId {
+        let (min, span) = if ac {
+            (0.0, size as f64 - 1.0)
+        } else {
+            (-0.5, size as f64)
+        };
+        if span <= 0.0 {
+            return self.gs_scalar(BinaryOp::Mul, coord, 0.0); // size 1 → all → 0
+        }
+        let cm = self.gs_scalar(BinaryOp::Sub, coord, min);
+        let x = self.gs_abs(cm);
+        let q = self.gs_scalar(BinaryOp::Mul, x, 1.0 / span);
+        let fq = self.gs_floor(q);
+        let span_fq = self.gs_scalar(BinaryOp::Mul, fq, span);
+        let extra = self.gs_bin(BinaryOp::Sub, x, span_fq); // x mod span
+        // parity = fq − 2·floor(fq/2)  ∈ {0,1}
+        let half = self.gs_scalar(BinaryOp::Mul, fq, 0.5);
+        let fhalf = self.gs_floor(half);
+        let two_fhalf = self.gs_scalar(BinaryOp::Mul, fhalf, 2.0);
+        let parity = self.gs_bin(BinaryOp::Sub, fq, two_fhalf);
+        let even = self.gs_scalar(BinaryOp::Add, extra, min);
+        let neg_extra = self.gs_scalar(BinaryOp::Mul, extra, -1.0);
+        let odd = self.gs_scalar(BinaryOp::Add, neg_extra, min + span);
+        let inv_p = self.gs_one_minus(parity);
+        let e = self.gs_bin(BinaryOp::Mul, even, inv_p);
+        let o = self.gs_bin(BinaryOp::Mul, odd, parity);
+        self.gs_bin(BinaryOp::Add, e, o)
+    }
+
+    /// `1` if the integer index `idx ∈ [0, size-1]`, else `0` — computed with
+    /// `max`/`min` arithmetic (no `Compare`, so no bool-arena hazard):
+    /// `1 − min(1, relu(−idx) + relu(idx − (size−1)))`.
+    fn gs_inbounds(&mut self, idx: HirNodeId, size: usize) -> HirNodeId {
+        let neg = self.gs_scalar(BinaryOp::Mul, idx, -1.0);
+        let lo = self.gs_scalar(BinaryOp::Max, neg, 0.0);
+        let hi_shift = self.gs_scalar(BinaryOp::Add, idx, -(size as f64 - 1.0));
+        let hi = self.gs_scalar(BinaryOp::Max, hi_shift, 0.0);
+        let oob = self.gs_bin(BinaryOp::Add, lo, hi);
+        let oobc = self.gs_scalar(BinaryOp::Min, oob, 1.0);
+        let neg_oob = self.gs_scalar(BinaryOp::Mul, oobc, -1.0);
+        self.gs_scalar(BinaryOp::Add, neg_oob, 1.0)
+    }
+
+    /// Zeros-padding validity mask (`1` where integer sample `(xi,yi)` is in
+    /// bounds).
+    fn gs_validity(&mut self, xi: HirNodeId, yi: HirNodeId, w: usize, h: usize) -> HirNodeId {
+        let vx = self.gs_inbounds(xi, w);
+        let vy = self.gs_inbounds(yi, h);
+        self.gs_bin(BinaryOp::Mul, vx, vy)
+    }
+
+    /// Gather one integer sample `(xi,yi)` from `table [S_in,C]`, weighted by
+    /// `weight [S,1]` (× validity for zeros-padding). Returns `[S,C]`.
+    #[allow(clippy::too_many_arguments)]
+    fn gs_tap(
+        &mut self,
+        table: HirNodeId,
+        xi: HirNodeId,
+        yi: HirNodeId,
+        weight: HirNodeId,
+        w: usize,
+        h: usize,
+        s: usize,
+        c: usize,
+        pad: GridPad,
+    ) -> HirNodeId {
+        let cxi = self.gs_clamp(xi, 0.0, w as f64 - 1.0);
+        let cyi = self.gs_clamp(yi, 0.0, h as f64 - 1.0);
+        let row = self.gs_scalar(BinaryOp::Mul, cyi, w as f64);
+        let flat = self.gs_bin(BinaryOp::Add, row, cxi);
+        let flat1d = self.reshape_(flat, vec![s as i64]);
+        let gathered = self.gather_(table, flat1d, 0); // [S, C]
+        let w_full = if pad == GridPad::Zeros {
+            let v = self.gs_validity(xi, yi, w, h);
+            self.gs_bin(BinaryOp::Mul, weight, v)
+        } else {
+            weight
+        };
+        let w_exp = self.gs_expand(w_full, s, c);
+        self.gs_bin(BinaryOp::Mul, gathered, w_exp)
+    }
+
+    /// Keys cubic weight `cubic_filter(dist)` as a tensor, where `dist` is a
+    /// scalar-affine function `slope·t + bias` of `t [S,1]`, evaluated on the
+    /// branch (`inner` = |dist|<1) selected at build time by the tap position.
+    fn gs_cubic_w(&mut self, t: HirNodeId, slope: f64, bias: f64, inner: bool) -> HirNodeId {
+        const A: f64 = -0.75;
+        // dist = slope·t + bias (|dist| within one branch across t∈[0,1)).
+        let d = {
+            let st = self.gs_scalar(BinaryOp::Mul, t, slope);
+            self.gs_scalar(BinaryOp::Add, st, bias)
+        };
+        let ad = self.gs_abs(d);
+        let ad2 = self.gs_bin(BinaryOp::Mul, ad, ad);
+        if inner {
+            // (A+2)|x|³ − (A+3)|x|² + 1
+            let p = self.gs_scalar(BinaryOp::Mul, ad, A + 2.0);
+            let p = self.gs_scalar(BinaryOp::Add, p, -(A + 3.0));
+            let p = self.gs_bin(BinaryOp::Mul, p, ad2);
+            self.gs_scalar(BinaryOp::Add, p, 1.0)
+        } else {
+            // A|x|³ − 5A|x|² + 8A|x| − 4A
+            let p = self.gs_scalar(BinaryOp::Mul, ad, A);
+            let p = self.gs_scalar(BinaryOp::Add, p, -5.0 * A);
+            let p = self.gs_bin(BinaryOp::Mul, p, ad);
+            let p = self.gs_scalar(BinaryOp::Add, p, 8.0 * A);
+            let p = self.gs_bin(BinaryOp::Mul, p, ad);
+            self.gs_scalar(BinaryOp::Add, p, -4.0 * A)
+        }
+    }
+
+    /// `grid_sample(input[N,C,H,W], grid[N,H_out,W_out,2])` → `[N,C,H_out,W_out]`.
+    ///
+    /// Fully general (all `mode`/`padding`/`align_corners`), expressed only with
+    /// universal ops (gather + `Round`-based floor + arithmetic) — no kernel.
+    /// Batch is unrolled (shapes are static).
+    pub fn grid_sample2d(
+        &mut self,
+        input: HirNodeId,
+        grid: HirNodeId,
+        mode: GridMode,
+        pad: GridPad,
+        ac: bool,
+    ) -> HirNodeId {
+        let in_s = self.shape(input).clone();
+        let (n, c, h, w) = (
+            in_s.dim(0).unwrap_static(),
+            in_s.dim(1).unwrap_static(),
+            in_s.dim(2).unwrap_static(),
+            in_s.dim(3).unwrap_static(),
+        );
+        let g_s = self.shape(grid).clone();
+        let (ho, wo) = (g_s.dim(1).unwrap_static(), g_s.dim(2).unwrap_static());
+        let s = ho * wo;
+
+        let mut batch_outs = Vec::with_capacity(n);
+        for bn in 0..n {
+            let in_n = self.narrow_(input, 0, bn, 1);
+            let in_flat = self.reshape_(in_n, vec![c as i64, (h * w) as i64]);
+            let table = self.transpose_(in_flat, vec![1, 0]); // [S_in, C]
+
+            let g_n = self.narrow_(grid, 0, bn, 1);
+            let g_flat = self.reshape_(g_n, vec![s as i64, 2]);
+            let gx0 = self.narrow_(g_flat, 1, 0, 1);
+            let gx = self.reshape_(gx0, vec![s as i64, 1]);
+            let gy0 = self.narrow_(g_flat, 1, 1, 1);
+            let gy = self.reshape_(gy0, vec![s as i64, 1]);
+            let cx = self.gs_coord(gx, w, ac, pad);
+            let cy = self.gs_coord(gy, h, ac, pad);
+
+            let out_n = match mode {
+                GridMode::Nearest => {
+                    let ix = self.gs_round(cx);
+                    let iy = self.gs_round(cy);
+                    let ones = self.gs_scalar(BinaryOp::Mul, ix, 0.0); // [S,1] zeros
+                    let ones = self.gs_scalar(BinaryOp::Add, ones, 1.0); // → ones
+                    self.gs_tap(table, ix, iy, ones, w, h, s, c, pad)
+                }
+                GridMode::Bilinear => {
+                    let ix0 = self.gs_floor(cx);
+                    let iy0 = self.gs_floor(cy);
+                    let ix1 = self.gs_scalar(BinaryOp::Add, ix0, 1.0);
+                    let iy1 = self.gs_scalar(BinaryOp::Add, iy0, 1.0);
+                    let wx1 = self.gs_bin(BinaryOp::Sub, cx, ix0);
+                    let wy1 = self.gs_bin(BinaryOp::Sub, cy, iy0);
+                    let wx0 = self.gs_one_minus(wx1);
+                    let wy0 = self.gs_one_minus(wy1);
+                    let taps = [
+                        (ix0, iy0, wx0, wy0),
+                        (ix1, iy0, wx1, wy0),
+                        (ix0, iy1, wx0, wy1),
+                        (ix1, iy1, wx1, wy1),
+                    ];
+                    let mut acc: Option<HirNodeId> = None;
+                    for (xi, yi, wxk, wyk) in taps {
+                        let weight = self.gs_bin(BinaryOp::Mul, wxk, wyk);
+                        let contrib = self.gs_tap(table, xi, yi, weight, w, h, s, c, pad);
+                        acc = Some(match acc {
+                            None => contrib,
+                            Some(a) => self.gs_bin(BinaryOp::Add, a, contrib),
+                        });
+                    }
+                    acc.unwrap()
+                }
+                GridMode::Bicubic => {
+                    let bx = self.gs_floor(cx);
+                    let by = self.gs_floor(cy);
+                    let tx = self.gs_bin(BinaryOp::Sub, cx, bx);
+                    let ty = self.gs_bin(BinaryOp::Sub, cy, by);
+                    // 4 taps at base+{-1,0,1,2}; weights are cubic_filter(dist).
+                    let offs = [-1.0f64, 0.0, 1.0, 2.0];
+                    // dist(t) for tap k: |k_off − t|; branch inner = (k in {0,1} rel).
+                    let wx: Vec<HirNodeId> = (0..4)
+                        .map(|k| {
+                            let (slope, bias, inner) = cubic_dist_params(k);
+                            self.gs_cubic_w(tx, slope, bias, inner)
+                        })
+                        .collect();
+                    let wy: Vec<HirNodeId> = (0..4)
+                        .map(|k| {
+                            let (slope, bias, inner) = cubic_dist_params(k);
+                            self.gs_cubic_w(ty, slope, bias, inner)
+                        })
+                        .collect();
+                    let mut acc: Option<HirNodeId> = None;
+                    for (ky, oy) in offs.iter().enumerate() {
+                        let yi = self.gs_scalar(BinaryOp::Add, by, *oy);
+                        for (kx, ox) in offs.iter().enumerate() {
+                            let xi = self.gs_scalar(BinaryOp::Add, bx, *ox);
+                            let weight = self.gs_bin(BinaryOp::Mul, wx[kx], wy[ky]);
+                            let contrib = self.gs_tap(table, xi, yi, weight, w, h, s, c, pad);
+                            acc = Some(match acc {
+                                None => contrib,
+                                Some(a) => self.gs_bin(BinaryOp::Add, a, contrib),
+                            });
+                        }
+                    }
+                    acc.unwrap()
+                }
+            };
+
+            let out_t = self.transpose_(out_n, vec![1, 0]); // [C, S]
+            let out_r = self.reshape_(out_t, vec![1, c as i64, ho as i64, wo as i64]);
+            batch_outs.push(out_r);
+        }
+        if batch_outs.len() == 1 {
+            batch_outs.pop().unwrap()
+        } else {
+            self.concat_(batch_outs, 0)
+        }
+    }
+}
+
+/// For bicubic tap `k` (positions `base + {-1,0,1,2}`), the distance to the
+/// sample point `base+t` is `|off_k − t|`; return `(slope, bias, inner)` so the
+/// weight is `cubic_filter(slope·t + bias)` on the correct kernel branch.
+/// k=0 → dist 1+t (outer); k=1 → t (inner); k=2 → 1−t (inner); k=3 → 2−t (outer).
+fn cubic_dist_params(k: usize) -> (f64, f64, bool) {
+    match k {
+        0 => (1.0, 1.0, false),  // 1 + t,  |·| ∈ [1,2)
+        1 => (1.0, 0.0, true),   // t,       |·| ∈ [0,1)
+        2 => (-1.0, 1.0, true),  // 1 − t,   |·| ∈ (0,1]
+        _ => (-1.0, 2.0, false), // 2 − t,   |·| ∈ (1,2]
+    }
+}
+
+/// Source coordinate for output index `j`, matching PyTorch's
+/// `area_pixel_compute_source_index`. `cubic` keeps a negative source (bicubic),
+/// while linear clamps it to 0.
+fn resize_source_index(
+    j: usize,
+    l_in: usize,
+    l_out: usize,
+    align_corners: bool,
+    cubic: bool,
+) -> f64 {
+    if align_corners {
+        if l_out <= 1 {
+            0.0
+        } else {
+            j as f64 * (l_in as f64 - 1.0) / (l_out as f64 - 1.0)
+        }
+    } else {
+        let s = (j as f64 + 0.5) * (l_in as f64 / l_out as f64) - 0.5;
+        if cubic { s } else { s.max(0.0) }
+    }
+}
+
+/// PyTorch cubic-convolution kernel weights (Keys, `a = -0.75`) for fractional
+/// offset `t ∈ [0, 1)`, over the 4 taps at `floor(src) + {-1, 0, 1, 2}`.
+fn cubic_coeffs(t: f64) -> [f64; 4] {
+    [
+        cubic_filter(t + 1.0),
+        cubic_filter(t),
+        cubic_filter(1.0 - t),
+        cubic_filter(2.0 - t),
+    ]
+}
+
+/// Triangle (linear) reconstruction filter, support radius 1.
+fn linear_filter(x: f64) -> f64 {
+    let a = x.abs();
+    if a < 1.0 { 1.0 - a } else { 0.0 }
+}
+
+/// Keys cubic filter (`a = -0.75`), support radius 2.
+fn cubic_filter(x: f64) -> f64 {
+    const A: f64 = -0.75;
+    let a = x.abs();
+    if a < 1.0 {
+        ((A + 2.0) * a - (A + 3.0)) * a * a + 1.0
+    } else if a < 2.0 {
+        ((A * a - 5.0 * A) * a + 8.0 * A) * a - 4.0 * A
+    } else {
+        0.0
+    }
+}
+
+/// Row-major `[l_in, l_out]` interpolation matrix (`out[.., j] = Σ_i in·M[i,j]`).
+/// Non-antialiased path: linear (2 taps) or bicubic (4 taps), edge-clamped,
+/// matching PyTorch's `upsample_{bilinear,bicubic}2d`.
+fn interp_matrix_plain(l_in: usize, l_out: usize, align_corners: bool, cubic: bool) -> Vec<f32> {
+    let mut m = vec![0f32; l_in * l_out];
+    let clamp_idx = |i: i64| -> usize { i.clamp(0, l_in as i64 - 1) as usize };
+    for j in 0..l_out {
+        let src = resize_source_index(j, l_in, l_out, align_corners, cubic);
+        let base = src.floor();
+        let t = src - base;
+        if cubic {
+            let ix = base as i64;
+            for (k, &w) in cubic_coeffs(t).iter().enumerate() {
+                let idx = clamp_idx(ix - 1 + k as i64);
+                m[idx * l_out + j] += w as f32;
+            }
+        } else {
+            let i0 = clamp_idx(base as i64);
+            let i1 = clamp_idx(base as i64 + 1);
+            m[i0 * l_out + j] += (1.0 - t) as f32;
+            m[i1 * l_out + j] += t as f32;
+        }
+    }
+    m
+}
+
+/// Antialiased interpolation matrix, matching PyTorch's aa resize: for
+/// downsampling (`scale ≥ 1`) the filter is widened by `scale` and the per-output
+/// weights are renormalized to sum to 1; for upsampling it reduces to the plain
+/// filter. `interp_size·0.5` = 1 (linear) / 2 (cubic).
+fn interp_matrix_aa(l_in: usize, l_out: usize, align_corners: bool, cubic: bool) -> Vec<f32> {
+    let scale = if align_corners {
+        if l_out <= 1 {
+            0.0
+        } else {
+            (l_in as f64 - 1.0) / (l_out as f64 - 1.0)
+        }
+    } else {
+        l_in as f64 / l_out as f64
+    };
+    // Antialias only affects downsampling; PyTorch ignores it when upsampling.
+    if scale < 1.0 {
+        return interp_matrix_plain(l_in, l_out, align_corners, cubic);
+    }
+    let radius = if cubic { 2.0 } else { 1.0 };
+    let (support, invscale) = (radius * scale, 1.0 / scale);
+    let filt = |x: f64| {
+        if cubic {
+            cubic_filter(x)
+        } else {
+            linear_filter(x)
+        }
+    };
+    let mut m = vec![0f32; l_in * l_out];
+    for j in 0..l_out {
+        let center = scale * (j as f64 + 0.5);
+        // `as i64` truncates toward zero — matches C++ static_cast<int64_t>.
+        let xmin = (((center - support + 0.5) as i64).max(0)) as usize;
+        let xmax = (((center + support + 0.5) as i64).min(l_in as i64)) as usize;
+        let mut total = 0.0f64;
+        let mut ws = Vec::with_capacity(xmax.saturating_sub(xmin));
+        for i in xmin..xmax {
+            let w = filt((i as f64 + 0.5 - center) * invscale);
+            ws.push(w);
+            total += w;
+        }
+        if total != 0.0 {
+            for (k, w) in ws.iter().enumerate() {
+                m[(xmin + k) * l_out + j] = (w / total) as f32;
+            }
+        }
+    }
+    m
+}
+
+/// Row-major `[l_in, l_out]` f32 interpolation matrix as LE bytes.
+fn interp_matrix_bytes(
+    l_in: usize,
+    l_out: usize,
+    align_corners: bool,
+    cubic: bool,
+    antialias: bool,
+) -> Vec<u8> {
+    let m = if antialias {
+        interp_matrix_aa(l_in, l_out, align_corners, cubic)
+    } else {
+        interp_matrix_plain(l_in, l_out, align_corners, cubic)
+    };
+    let mut bytes = Vec::with_capacity(m.len() * 4);
+    for v in m {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
 }
 
 /// Ergonomic shape-inferred building on [`HirMut`].
@@ -95,6 +682,72 @@ pub trait HirGraphExt {
     fn add_node(&mut self, op: Op, inputs: Vec<HirNodeId>, shape: Shape) -> HirNodeId;
 
     fn mm(&mut self, lhs: HirNodeId, rhs: HirNodeId) -> HirNodeId;
+
+    /// Dynamically quantize `x` (logical `[rows, cols]`, blocks along the last
+    /// axis) to low-precision `fmt` codes + a scale tensor, per `layout`.
+    /// Returns `(codes, scale)`. Building block of [`scaled_matmul`](Self::scaled_matmul).
+    fn scaled_quantize(
+        &mut self,
+        x: HirNodeId,
+        fmt: ScaledFormat,
+        layout: ScaleLayout,
+    ) -> (HirNodeId, HirNodeId) {
+        let xs = self.shape(x).clone();
+        let cols = xs.dim(xs.rank() - 1).unwrap_static();
+        let rows = xs.num_elements().unwrap() / cols.max(1);
+        let scale_shape = match layout {
+            ScaleLayout::PerTensor => Shape::new(&[1], layout.scale_dtype()),
+            _ => Shape::new(
+                &[rows, cols.div_ceil(layout.block() as usize)],
+                layout.scale_dtype(),
+            ),
+        };
+        let scale = self.add_node(
+            Op::ScaledQuantScale {
+                format: fmt,
+                scale_layout: layout,
+            },
+            vec![x],
+            scale_shape,
+        );
+        let codes = self.add_node(
+            Op::ScaledQuantize {
+                format: fmt,
+                scale_layout: layout,
+            },
+            vec![x, scale],
+            xs.with_dtype(DType::U8),
+        );
+        (codes, scale)
+    }
+
+    /// Native low-precision GEMM (TN: `lhs [m,k] · rhs [n,k]ᵀ → [m,n]` f32).
+    /// Both operands are dynamically quantized to `fmt`/`layout`. `rhs` must be
+    /// K-last (`[n, k]`). `fmt` may be any [`ScaledFormat`], including a
+    /// parameterized `Custom` (e.g. `ScaledFormat::custom(3, 0)` for `f4e3m0`).
+    fn scaled_matmul(
+        &mut self,
+        lhs: HirNodeId,
+        rhs: HirNodeId,
+        fmt: ScaledFormat,
+        layout: ScaleLayout,
+    ) -> HirNodeId {
+        let m = self.shape(lhs).dim(0).unwrap_static();
+        let n = self.shape(rhs).dim(0).unwrap_static();
+        let (lq, ls) = self.scaled_quantize(lhs, fmt, layout);
+        let (rq, rs) = self.scaled_quantize(rhs, fmt, layout);
+        self.add_node(
+            Op::ScaledMatMul {
+                lhs_format: fmt,
+                rhs_format: fmt,
+                scale_layout: layout,
+                has_bias: false,
+            },
+            vec![lq, rq, ls, rs],
+            Shape::new(&[m, n], DType::F32),
+        )
+    }
+
     fn add(&mut self, lhs: HirNodeId, rhs: HirNodeId) -> HirNodeId;
     fn sub(&mut self, lhs: HirNodeId, rhs: HirNodeId) -> HirNodeId;
     fn mul(&mut self, lhs: HirNodeId, rhs: HirNodeId) -> HirNodeId;
@@ -643,5 +1296,101 @@ impl HirGraphExt for HirMut<'_> {
         shape: Shape,
     ) -> HirNodeId {
         HirModule::gated_delta_net_carry(self.0, q, k, v, g, beta, state, state_size, shape)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HirModule;
+
+    #[test]
+    fn resize_bilinear2d_shape() {
+        let mut hir = HirModule::new("bl".to_string());
+        let mut b = HirMut::new(&mut hir);
+        let x = b.input("x", Shape::new(&[1, 3, 8, 8], DType::F32));
+        let y = b.resize_bilinear2d(x, 16, 20, false);
+        let s = b.shape(y);
+        assert_eq!(s.dim(0).unwrap_static(), 1);
+        assert_eq!(s.dim(1).unwrap_static(), 3);
+        assert_eq!(s.dim(2).unwrap_static(), 16);
+        assert_eq!(s.dim(3).unwrap_static(), 20);
+    }
+
+    fn matrix(l_in: usize, l_out: usize, align_corners: bool, cubic: bool) -> Vec<f32> {
+        interp_matrix_plain(l_in, l_out, align_corners, cubic)
+    }
+
+    #[test]
+    fn interp_matrix_2x_align_false() {
+        // linear [in=2, out=4]: out = [in0, .75·in0+.25·in1, .25·in0+.75·in1, in1]
+        let m = matrix(2, 4, false, false);
+        let want = [1.0, 0.75, 0.25, 0.0, 0.0, 0.25, 0.75, 1.0];
+        for (g, w) in m.iter().zip(want) {
+            assert!((g - w).abs() < 1e-6, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn cubic_matrix_partition_of_unity() {
+        // Every output column's weights sum to 1 (constant-preserving), incl. edges.
+        for &(li, lo, ac) in &[(4usize, 8usize, false), (5, 3, true), (6, 13, false)] {
+            let m = matrix(li, lo, ac, true);
+            for j in 0..lo {
+                let col: f32 = (0..li).map(|i| m[i * lo + j]).sum();
+                assert!(
+                    (col - 1.0).abs() < 1e-5,
+                    "col {j} sum {col} ({li}->{lo} ac={ac})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cubic_matrix_interpolates_samples() {
+        // align_corners=True maps j=0→sample 0 and j=out-1→sample in-1 exactly,
+        // so those columns are one-hot (cubic passes through the samples).
+        let (li, lo) = (4usize, 7usize);
+        let m = matrix(li, lo, true, true);
+        assert!((m[0] - 1.0).abs() < 1e-6); // col 0 → sample 0
+        assert!((m[(li - 1) * lo + (lo - 1)] - 1.0).abs() < 1e-6); // last col → last sample
+    }
+
+    #[test]
+    fn aa_matrix_bilinear_downsample_4_to_2() {
+        // PyTorch antialias bilinear 4→2 (align_corners=False): widened triangle,
+        // renormalized. Columns: [3/7,3/7,1/7,0] and [0,1/7,3/7,3/7].
+        let m = interp_matrix_aa(4, 2, false, false);
+        let (a, b) = (3.0f32 / 7.0, 1.0f32 / 7.0);
+        let want = [a, 0.0, a, b, b, a, 0.0, a]; // row-major [4,2]
+        for (g, w) in m.iter().zip(want) {
+            assert!((g - w).abs() < 1e-4, "aa {m:?}");
+        }
+    }
+
+    #[test]
+    fn aa_matches_plain_on_upsample() {
+        // Antialias is a no-op when upsampling (scale ≤ 1): aa == plain.
+        for &cubic in &[false, true] {
+            let aa = interp_matrix_aa(3, 8, false, cubic);
+            let plain = interp_matrix_plain(3, 8, false, cubic);
+            for (g, w) in aa.iter().zip(&plain) {
+                assert!(
+                    (g - w).abs() < 1e-5,
+                    "cubic={cubic}: aa {aa:?} vs plain {plain:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aa_matrix_partition_of_unity() {
+        for &(li, lo, cubic) in &[(8usize, 3usize, false), (10, 4, true), (7, 2, false)] {
+            let m = interp_matrix_aa(li, lo, false, cubic);
+            for j in 0..lo {
+                let col: f32 = (0..li).map(|i| m[i * lo + j]).sum();
+                assert!((col - 1.0).abs() < 1e-5, "col {j} sum {col}");
+            }
+        }
     }
 }

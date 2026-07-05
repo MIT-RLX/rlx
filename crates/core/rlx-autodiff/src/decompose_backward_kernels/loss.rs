@@ -74,4 +74,3 @@ pub fn compose_softmax_cross_entropy_backward(
     let dl_b = broadcast_scalar(g, d_loss, out_shape);
     g.mul(diff, dl_b)
 }
-

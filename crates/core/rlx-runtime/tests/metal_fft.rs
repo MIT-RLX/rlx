@@ -192,7 +192,10 @@ fn fft_metal_native_large_n_matches_cpu() {
         for k in 0..cpu.len() {
             max_diff = max_diff.max((cpu[k] - mtl[k]).abs());
         }
-        assert!(max_diff < tol, "N={n}: max|Δ|={max_diff} tol={tol} rms={rms}");
+        assert!(
+            max_diff < tol,
+            "N={n}: max|Δ|={max_diff} tol={tol} rms={rms}"
+        );
     }
 }
 
@@ -232,7 +235,10 @@ fn fft_metal_large_batch_matches_cpu() {
     for k in 0..cpu.len() {
         max_diff = max_diff.max((cpu[k] - mtl[k]).abs());
     }
-    assert!(max_diff < tol, "n={n} batch={batch}: max|Δ|={max_diff} tol={tol}");
+    assert!(
+        max_diff < tol,
+        "n={n} batch={batch}: max|Δ|={max_diff} tol={tol}"
+    );
 }
 
 #[test]

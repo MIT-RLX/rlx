@@ -16,8 +16,6 @@
 //! `slog_det` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::infer::GraphExt;
@@ -31,7 +29,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct SlogDetExt;
-
 
 impl OpExtension for SlogDetExt {
     fn name(&self) -> &str {
@@ -93,7 +90,6 @@ impl OpExtension for SlogDetExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SlogDetCpu;
 
@@ -118,4 +114,3 @@ impl CpuKernel for SlogDetCpu {
         algos::slogdet(a, n, out)
     }
 }
-

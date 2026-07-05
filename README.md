@@ -6,15 +6,20 @@ backend-specific kernels for CPU, Apple Silicon (Metal / MLX), NVIDIA
 (CUDA), AMD (ROCm), Google TPU, cross-platform GPU (wgpu), and
 microcontrollers (Cortex-M).
 
-> Status: **0.2.10**, Apple-Silicon-first. The CPU and Apple GPU paths
+> Status: **0.2.12**, Apple-Silicon-first. The CPU and Apple GPU paths
 > are mature; CUDA / ROCm / TPU / WGPU work but have seen less mileage;
 > Cortex-M is a separate INT8 product. Multi-backend runtime helpers
 > (`GraphDevices`, `DeviceRouter`) — see [`docs/backend-selection.md`](docs/backend-selection.md).
+> **0.2.12** landed FIR / RIR / IIR digital filters + fused `Op::PartitionedConv`
+> (batched-GEMM convolution reverb), a native Vulkan FFT compute kernel (`Op::Fft`
+> on-device — fixes the discrete-GPU host-fallback crash), and parameterized
+> `fNeXmY` minifloats (`ScaledFormat::Custom`) — see [`CHANGELOG.md`](CHANGELOG.md).
+> **0.2.11** landed full GGUF IQ / TQ / MX backend parity, Metal fused IQ
+> GEMV, `FusedAttentionBlock` on every inference backend (with native CUDA /
+> Metal fused-attention kernels), and pyrlx GGUF load / save / convert — see
+> [`docs/gguf-backend-paths.md`](docs/gguf-backend-paths.md) and [`CHANGELOG.md`](CHANGELOG.md).
 > **0.2.10** added tensor-parallel collectives, native `Gru` / `Rnn` /
 > `Mamba2`, and dynamic-shape specialization — see [`docs/op-coverage.md`](docs/op-coverage.md).
-> Unreleased work includes full GGUF IQ / TQ / MX backend parity, Metal fused IQ
-> GEMV, pyrlx GGUF load / save / convert — see [`docs/gguf-backend-paths.md`](docs/gguf-backend-paths.md)
-> and [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Why another one
 
@@ -155,6 +160,55 @@ checks) via `bench_fft_matrix`. Python bindings: `pyrlx.Graph.fft`, `.rfft`,
 
 Or depend on each crate directly (`rlx-ir`, `rlx-opt`, `rlx-runtime`,
 …) for the smallest possible dep tree.
+
+## Import a PyTorch model
+
+Already have a model in PyTorch? Convert it straight to RLX — no ONNX in the
+loop. [`rlx-torch-import`](crates/io/rlx-torch-import/README.md) runs
+`torch.export`, maps each ATen op directly onto RLX ops, and emits a runnable
+**bundle** (serialized HIR graph + weights) and/or a **standalone RLX crate**,
+then verifies numeric parity against PyTorch (cosine + max abs err).
+
+**Python** — one call (`pip install pyrlx`):
+
+```python
+import pyrlx, torch
+from torchvision.models import resnet18
+
+model = resnet18(weights="DEFAULT").eval()
+example = (torch.randn(1, 3, 224, 224),)
+
+pyrlx.from_torch(model, example, out_dir="out/", verify=True)
+# → out/bundle/            runnable HIR graph + weights   (parity: cosine 1.000000)
+#   out/rlx-resnet18/      standalone RLX crate you can ship / edit
+```
+
+Options: `emit=("bundle","crate")`, `emit_style="graph"|"tensor"|"flow"` (the
+crate's authoring layer), `decomposition="aten"|"high"|"core"`, `verify=True`.
+
+**CLI** — a `model.py` exposing `model` + `example_inputs`:
+
+```bash
+rlx-torch-import model.py -o out/ --emit bundle,crate --verify --device cuda
+```
+
+**A second example** — a HuggingFace LLM exports the same way (weight names stay
+HF-canonical, so RLX's loaders consume them directly):
+
+```python
+from transformers import LlamaForCausalLM
+model = LlamaForCausalLM.from_pretrained("…").eval()
+pyrlx.from_torch(model, (torch.randint(0, 32000, (1, 16)),), out_dir="llama/", verify=True)
+```
+
+Verified end-to-end at **cosine 1.000000** on both **CPU and CUDA** (RTX 3080 Ti)
+across MLP, encoder-decoder, CNN, MNIST, LLaMA (rotary + GQA + causal mask), DINO
+/ ViT, and the FLUX diffusion transformer (MMDiT). Runnable, per-model, per-form
+examples live in
+[`crates/bindings/pyrlx/examples/`](crates/bindings/pyrlx/examples/README.md)
+(`python mlp.py`, `python llama.py`, …). Training is out of scope — `torch.export`
+captures the inference graph; import the *forward* and use RLX's own autodiff +
+[`rlx-optim`](crates/core/rlx-optim) for on-device training.
 
 ## Workspace layout
 

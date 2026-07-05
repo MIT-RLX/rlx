@@ -16,7 +16,6 @@
 //! `gmres` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -32,7 +31,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_k
 use super::*;
 
 pub(crate) struct SparseGmresExt;
-
 
 impl OpExtension for SparseGmresExt {
     fn name(&self) -> &str {
@@ -84,7 +82,6 @@ impl OpExtension for SparseGmresExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SparseGmresCpu;
 
@@ -110,4 +107,3 @@ impl CpuKernel for SparseGmresCpu {
 }
 
 // ── Sparse Transpose Values ───────────────────────────────────────
-

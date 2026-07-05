@@ -17,11 +17,6 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::{Graph, NodeId, Op};
-use std::sync::Mutex;
 use crate::arena::{Arena, HalfDtype, plan_f32_uniform};
 use crate::device::{RocmContext, rocm_blas, rocm_blas_lt, rocm_context, rocm_dnn};
 use crate::hip::{HipBuffer, HipDeviceptr};
@@ -31,6 +26,11 @@ use crate::hipblas::{
 use crate::hipblaslt::HipblasLtContext;
 use crate::host_staging::F32HostSlot;
 use crate::miopen::MiopenContext;
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::{Graph, NodeId, Op};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use super::*;
 
@@ -42,7 +42,6 @@ impl RocmExecutable {
     pub fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
         self.active_extent = extent;
     }
-
 
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
         if let Some(&id) = self.param_offsets.get(name)
@@ -57,7 +56,6 @@ impl RocmExecutable {
         }
     }
 
-
     pub fn set_param_bytes(&mut self, name: &str, data: &[u8]) {
         if let Some(&id) = self.param_offsets.get(name)
             && self.arena.has(id)
@@ -66,7 +64,6 @@ impl RocmExecutable {
             crate::gguf_host::upload_param_bytes(&self.ctx, &mut self.arena.buffer, byte_off, data);
         }
     }
-
 
     pub fn set_param_half(&mut self, name: &str, dtype: HalfDtype, bits: &[u16]) {
         let id = match self.param_offsets.get(name) {
@@ -86,10 +83,8 @@ impl RocmExecutable {
         }
     }
 
-
     pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
         self.gpu_handle_feeds
             .insert(handle_name.to_string(), output_index);
     }
-
 }

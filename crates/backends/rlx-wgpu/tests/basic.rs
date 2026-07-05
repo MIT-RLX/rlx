@@ -1736,6 +1736,74 @@ fn conv2d_general_matches_cpu_reference() {
 }
 
 #[test]
+fn conv1d_tiled_one_d_matches_cpu_reference() {
+    // Exercises the `conv1d_tiled` fast path: a 1D conv lowered as 2D NCHW
+    // `[1, C, 1, L]` with kernel `[k, 1]` and a long length (h_out ≥ the tiled
+    // routing threshold), with stride/padding/dilation. Verifies bit-close
+    // parity with a hand-computed 1D reference in the same accumulation order.
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    let (c_in, c_out, l, k, s, p, d) = (3usize, 5usize, 300usize, 3usize, 1usize, 1usize, 2usize);
+    let l_out = (l + 2 * p - d * (k - 1) - 1) / s + 1; // 298 ≥ 256 → tiled path
+    assert!(l_out >= 256);
+
+    let xs: Vec<f32> = (0..c_in * l)
+        .map(|i| ((i * 7 + 1) % 13) as f32 * 0.1 - 0.6)
+        .collect();
+    let ws: Vec<f32> = (0..c_out * c_in * k)
+        .map(|i| ((i * 5 + 3) % 11) as f32 * 0.1 - 0.5)
+        .collect();
+
+    // CPU reference — 1D conv over the length axis (ci outer, kr inner).
+    let mut expected = vec![0f32; c_out * l_out];
+    for co in 0..c_out {
+        for lo in 0..l_out {
+            let mut acc = 0f32;
+            for ci in 0..c_in {
+                for kr in 0..k {
+                    let pos = (lo * s + kr * d) as isize - p as isize;
+                    if pos < 0 || pos >= l as isize {
+                        continue;
+                    }
+                    acc += xs[ci * l + pos as usize] * ws[(co * c_in + ci) * k + kr];
+                }
+            }
+            expected[co * l_out + lo] = acc;
+        }
+    }
+
+    let mut g = Graph::new("conv1d_tiled");
+    let x = g.input("x", Shape::new(&[1, c_in, 1, l], DType::F32));
+    let wt = g.param("w", Shape::new(&[c_out, c_in, k, 1], DType::F32));
+    let y = g.add_node(
+        Op::Conv {
+            kernel_size: vec![k, 1],
+            stride: vec![s, 1],
+            padding: vec![p, 0],
+            dilation: vec![d, 1],
+            groups: 1,
+        },
+        vec![x, wt],
+        Shape::new(&[1, c_out, 1, l_out], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("w", &ws);
+    let r = exe.run(&[("x", &xs)]);
+    assert_eq!(r[0].len(), expected.len());
+    let max_abs = r[0]
+        .iter()
+        .zip(&expected)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_abs < 1e-5,
+        "wgpu conv1d_tiled vs CPU max|Δ| = {max_abs}"
+    );
+}
+
+#[test]
 fn pool1d_max_matches_reference() {
     if !rlx_wgpu::is_available() {
         return;

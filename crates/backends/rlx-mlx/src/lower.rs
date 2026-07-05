@@ -429,7 +429,7 @@ pub fn lower_subgraph(
         // but worth a debug-friendly note. For now silently allow.
     }
 
-    lower_with_env(sub, sub_env, parent_params, parent_params_typed, rng)
+    lower_with_env(sub, sub_env, parent_params, parent_params_typed, rng, false)
 }
 
 /// Walk `graph` with `env` already populated for every leaf node
@@ -443,17 +443,50 @@ pub fn lower_subgraph(
 /// recurse into sub-graphs (Op::If, Op::While) — sub-graph leaves
 /// look them up by name. Pass empty maps for trace contexts that
 /// don't see sub-graphs.
+/// Ops MLX fuses into a single Metal kernel — elementwise plus the "movement"
+/// ops (reshape/transpose/broadcast) it fuses across for free. A long chain of
+/// these shares one kernel whose arguments are the chain's leaves.
+pub fn is_fusable(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Binary(_)
+            | Op::Activation(_)
+            | Op::Compare(_)
+            | Op::Cast { .. }
+            | Op::Where
+            | Op::Expand { .. }
+            | Op::Fma
+            | Op::Reshape { .. }
+            | Op::Transpose { .. }
+    )
+}
+
 pub fn lower_with_env(
     graph: &Graph,
     mut env: HashMap<NodeId, Array>,
     params: &HashMap<String, Vec<f32>>,
     params_typed: &HashMap<String, (Vec<u8>, DType)>,
     rng: rlx_ir::RngOptions,
+    eval_barriers: bool,
 ) -> Result<Vec<Array>, MlxError> {
     let debug_eval = std::env::var("RLX_MLX_DEBUG_EVAL").is_ok();
     if debug_eval {
         eprintln!("rlx-mlx: lower_with_env {} nodes", graph.nodes().len());
     }
+    // Fusion-depth cap (lazy path only): MLX fuses a run of elementwise ops into
+    // one Metal kernel whose arguments are the run's leaves; a very deep run
+    // (e.g. the grid_sample decomposition) exhausts the argument-buffer limit.
+    // Materializing the array every `fuse_cap` consecutive fusable ops breaks the
+    // run into kernels that fit. Non-elementwise ops (matmul/gather/…) reset the
+    // counter, so ordinary models never trigger it. Illegal inside `mlx::compile`
+    // (the compile trace passes `eval_barriers = false`).
+    let fuse_cap: usize = std::env::var("RLX_MLX_FUSE_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    // Depth of the fusable-op chain rooted at each node (0 = materialized leaf /
+    // non-fusable). Tracks the real data-dependency subtree, not iteration order.
+    let mut fuse_depth: HashMap<NodeId, usize> = HashMap::new();
     for node in graph.nodes() {
         let id = node.id;
         if env.contains_key(&id) {
@@ -1387,12 +1420,26 @@ pub fn lower_with_env(
                         let co = wsh[0] as i32;
                         let cig = wsh[1] as i32;
                         let k = wsh[2].max(wsh[3]) as i32;
+                        // The kernel/stride/pad/dilation for the real (length) axis live
+                        // at the conv-param index of the non-trivial kernel dimension —
+                        // NOT the non-singleton *input* axis. rlx uses BOTH conventions:
+                        //   * ONNX-native 1D convs → `[N,C,1,L]` with kernel `[k,1]`,
+                        //     pad `[p,0]` at index 0 (VITS/TinyTTS text-enc & duration
+                        //     predictor: kernel-3 same-padded).
+                        //   * ONNX 2D-with-unit-H convs → `[N,C,1,L]` with kernel `[1,k]`,
+                        //     pad `[0,p]` at index 1 (EEGNet / U-Sleep / SeizureTransformer
+                        //     depthwise stages).
+                        // Keying off the input singleton (old `in_shape[2]==1 ? 1 : 0`)
+                        // read the wrong index for the first convention and silently
+                        // dropped the length padding (11→9), crashing the next reshape.
+                        let li = if wsh[2] >= wsh[3] { 0 } else { 1 };
                         let _ = co;
                         let x_ncl = ops::reshape(x, &[n, ci, length])?;
                         let w_ncl = ops::reshape(w, &[co, cig, k])?;
                         let x_nlc = ops::transpose(&x_ncl, &[0, 2, 1])?;
                         let w_mlx = ops::transpose(&w_ncl, &[0, 2, 1])?;
-                        let y_nlc = ops::conv1d(&x_nlc, &w_mlx, s(0), p(0), d(0), *groups as i32)?;
+                        let y_nlc =
+                            ops::conv1d(&x_nlc, &w_mlx, s(li), p(li), d(li), *groups as i32)?;
                         let y_ncl = ops::transpose(&y_nlc, &[0, 2, 1])?; // [N, Co, Lo]
                         // Reshape to the importer's declared 4D output shape (it places
                         // the length axis in W: `[N,Co,1,Lo]`) so downstream ops that
@@ -3981,6 +4028,25 @@ pub fn lower_with_env(
             if let Some(a) = env.get(&id) {
                 eval(&[a]).map_err(|e| MlxError(format!("eval at {label}: {e}")))?;
             }
+        } else if eval_barriers {
+            if is_fusable(&node.op) {
+                let d = 1 + node
+                    .inputs
+                    .iter()
+                    .map(|i| fuse_depth.get(i).copied().unwrap_or(0))
+                    .max()
+                    .unwrap_or(0);
+                if d >= fuse_cap {
+                    if let Some(a) = env.get(&id) {
+                        eval(&[a]).map_err(|e| MlxError(format!("fuse-cap eval: {e}")))?;
+                    }
+                    fuse_depth.insert(id, 0);
+                } else {
+                    fuse_depth.insert(id, d);
+                }
+            } else {
+                fuse_depth.insert(id, 0);
+            }
         }
     }
 
@@ -4150,7 +4216,7 @@ pub fn lower_and_run_typed_with_extent(
     // construction is pure (no eval), so we trigger it here against
     // outputs after lowering. For interleaved per-op eval we'd need
     // a separate walker variant — currently no caller asks for that.
-    let outs = lower_with_env(graph, env, params, params_typed, rng)?;
+    let outs = lower_with_env(graph, env, params, params_typed, rng, true)?;
 
     let refs: Vec<&Array> = outs.iter().collect();
     match mode {

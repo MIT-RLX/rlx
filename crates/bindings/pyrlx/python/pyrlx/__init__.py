@@ -107,7 +107,16 @@ from .dsl import (
     set_param,
 )
 
+# PyTorch → RLX converter. Pure-Python front-end that imports torch lazily
+# inside its functions, so importing pyrlx never requires torch to be installed.
+from .torch_import import (
+    export_torch_ir,
+    from_torch,
+)
+
 __all__ = [
+    "from_torch",
+    "export_torch_ir",
     "available_devices",
     "is_available",
     "parse_device",

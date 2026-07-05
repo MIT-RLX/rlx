@@ -17,13 +17,13 @@
 
 #![allow(unused_imports)]
 
-use rlx_ir::{Graph, NodeId, Op};
-use rlx_opt::memory;
-use std::collections::HashMap;
 use crate::arena::Arena;
 use crate::device::metal_device;
 use crate::kernels::kernels;
 use crate::thunk::{Thunk, ThunkSchedule};
+use rlx_ir::{Graph, NodeId, Op};
+use rlx_opt::memory;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -104,7 +104,6 @@ impl MetalExecutable {
         let _ = self.encode_commit(true, None, None);
         crate::mps_profile::record("encode_path:thunks_only", t0.elapsed());
     }
-
 
     /// Encode + commit. When `wait=true`, also waits for completion and
     /// returns None. When `wait=false`, returns the command buffer so the
@@ -5517,5 +5516,4 @@ impl MetalExecutable {
             Some(cmd_buf)
         }
     }
-
 }

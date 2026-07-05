@@ -49,13 +49,22 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
             })
             .collect();
         let new_id = match &node.op {
-            Op::FusedMatMulBiasAct { .. } => unfuse_fused_mat_mul_bias_act(node, new_inputs, &mut out),
+            Op::FusedMatMulBiasAct { .. } => {
+                unfuse_fused_mat_mul_bias_act(node, new_inputs, &mut out)
+            }
             Op::FusedResidualLN { .. } => unfuse_fused_residual_l_n(node, new_inputs, &mut out),
-            Op::FusedResidualRmsNorm { .. } => unfuse_fused_residual_rms_norm(node, new_inputs, &mut out),
-            Op::FusedAttentionBlock { .. } => unfuse_fused_attention_block(node, new_inputs, &mut out),
-            Op::FusedTransformerLayer { .. } => unfuse_fused_transformer_layer(node, new_inputs, &mut out),
+            Op::FusedResidualRmsNorm { .. } => {
+                unfuse_fused_residual_rms_norm(node, new_inputs, &mut out)
+            }
+            Op::FusedAttentionBlock { .. } => {
+                unfuse_fused_attention_block(node, new_inputs, &mut out)
+            }
+            Op::FusedTransformerLayer { .. } => {
+                unfuse_fused_transformer_layer(node, new_inputs, &mut out)
+            }
             Op::FusedSwiGLU { .. } => unfuse_fused_swi_g_l_u(node, new_inputs, &mut out),
             Op::LoraMatMul { .. } => unfuse_lora_mat_mul(node, new_inputs, &mut out),
+            Op::PartitionedConv { .. } => unfuse_partitioned_conv(node, new_inputs, &mut out),
             Op::GatedDeltaNet { .. } => unfuse_gated_delta_net(node, new_inputs, &mut out),
             Op::Lstm { .. } => unfuse_lstm(node, new_inputs, &mut out),
             Op::Gru { .. } => unfuse_gru(node, new_inputs, &mut out),
@@ -75,7 +84,6 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
     out.set_outputs(new_outputs);
     out
 }
-
 
 /// Decompose a single `Op::FusedAttentionBlock` into its primitive chain,
 /// appending the nodes to `out` and returning the NodeId of the
@@ -290,7 +298,6 @@ pub fn expand_attention_block(
     out_node
 }
 
-
 /// Decompose **only** `Op::FusedAttentionBlock` nodes into primitives,
 /// leaving every other op untouched (including other fused ops a backend
 /// may lower natively, e.g. `FusedMatMulBiasAct` / `FusedResidualLN`).
@@ -341,4 +348,3 @@ pub fn unfuse_attention_block(g: Graph) -> Graph {
     out.set_outputs(new_outputs);
     out
 }
-

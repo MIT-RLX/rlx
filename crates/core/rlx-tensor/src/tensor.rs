@@ -6,7 +6,7 @@
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::{DType, Dim, GraphExt, NodeId, Op, Shape};
+use rlx_ir::{DType, Dim, GraphExt, NodeId, Op, ScaleLayout, ScaledFormat, Shape};
 
 use crate::handle::GraphHandle;
 use crate::scalar::{Scalar, promote_scalar};
@@ -264,6 +264,18 @@ impl Tensor {
 
     pub fn matmul(&self, rhs: &Tensor) -> Self {
         self.map_binary(BinaryRhs::Tensor(rhs), |g, a, b| g.mm(a, b))
+    }
+
+    /// Native low-precision GEMM (TN: `self [m,k] · rhs [n,k]ᵀ → [m,n]`).
+    /// Both operands are dynamically quantized to the minifloat `fmt` +
+    /// `layout`; `rhs` must be K-last (`[n, k]`). `fmt` may be any
+    /// [`ScaledFormat`], including a parameterized `Custom` — e.g.
+    /// `t.scaled_matmul(&w, ScaledFormat::custom(3, 0), ScaleLayout::mx())` runs
+    /// the matmul in `f4e3m0`.
+    pub fn scaled_matmul(&self, rhs: &Tensor, fmt: ScaledFormat, layout: ScaleLayout) -> Self {
+        self.map_binary(BinaryRhs::Tensor(rhs), move |g, a, b| {
+            g.scaled_matmul(a, b, fmt, layout)
+        })
     }
 
     pub fn softmax(&self, axis: i32) -> Self {

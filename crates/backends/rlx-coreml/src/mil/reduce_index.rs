@@ -10,14 +10,14 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use super::helpers::simple_op_flex;
+use super::helpers::*;
+use crate::proto;
+use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use crate::proto;
-use crate::{CoremlError, Result};
-use super::helpers::simple_op_flex;
-use super::helpers::*;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -65,7 +65,6 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
-
 
     /// `ArgMax` / `ArgMin` along one axis; indices are f32-encoded at the IR boundary.
     pub(crate) fn lower_argreduce(
@@ -117,9 +116,13 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Batch-general flip along `axes` via per-axis `gather` with reversed indices.
-    pub(crate) fn lower_reverse(&mut self, id: NodeId, axes: &[usize], out_name: &str) -> Result<()> {
+    pub(crate) fn lower_reverse(
+        &mut self,
+        id: NodeId,
+        axes: &[usize],
+        out_name: &str,
+    ) -> Result<()> {
         let node = self.graph.node(id);
         let in_shape = self.graph.shape(node.inputs[0]).clone();
         if axes.is_empty() {
@@ -165,5 +168,4 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, cur);
         Ok(())
     }
-
 }

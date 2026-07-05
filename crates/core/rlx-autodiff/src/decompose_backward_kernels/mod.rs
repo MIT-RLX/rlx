@@ -45,7 +45,6 @@ const ATTN_MASK_NEG_INF: f32 = -1e9;
 
 const MASK_BINARY_THRESHOLD: f32 = 0.5;
 
-
 /// Max scan length for decomposed `ScanBackward` / `ScanBackwardXs` unrolls.
 pub const SCAN_DECOMPOSE_MAX_LENGTH: u32 = 256;
 
@@ -53,7 +52,6 @@ use crate::activation_deriv::scalar_const;
 use crate::autodiff::grad_with_loss;
 use crate::compose::{broadcast_scalar, merge_subgraph};
 use crate::prepare_ad::prepare_graph_for_ad;
-
 
 fn axis_pos(axis: i32, rank: usize) -> usize {
     if axis < 0 {
@@ -63,17 +61,14 @@ fn axis_pos(axis: i32, rank: usize) -> usize {
     }
 }
 
-
 fn broadcast_eps(g: &mut Graph, eps: f32, like: &Shape) -> NodeId {
     let eps_s = scalar_const(eps as f64, &Shape::scalar(like.dtype()), g);
     broadcast_scalar(g, eps_s, like)
 }
 
-
 fn batch_reduce_axes(rank: usize, feature_axis: usize) -> Vec<usize> {
     (0..rank).filter(|&i| i != feature_axis).collect()
 }
-
 
 fn static_dim4(shape: &Shape) -> Option<[usize; 4]> {
     if shape.rank() != 4 {
@@ -89,12 +84,10 @@ fn static_dim4(shape: &Shape) -> Option<[usize; 4]> {
     Some(out)
 }
 
-
 fn gather_flat_f32(g: &mut Graph, flat_x: NodeId, index: usize, dt: DType) -> NodeId {
     let idx = f32_tensor_const(vec![index as f32], Shape::new(&[1], dt), g);
     g.gather_(flat_x, idx, 0)
 }
-
 
 /// True when conv backward-input can decompose to forward `Op::Conv` with
 /// dynamic batch (spatial + channel dims static; weights static).
@@ -111,7 +104,6 @@ pub fn conv_di_decompose_eligible(dy: &Shape, w: &Shape, dx: &Shape) -> bool {
     (1..4).all(|axis| dy.dim(axis).is_static() && dx.dim(axis).is_static())
 }
 
-
 /// True when conv backward-weight can decompose via `Op::Im2Col` without
 /// binding batch (spatial + channel dims static; batch may be dynamic).
 pub fn conv_dw_im2col_eligible(x: &Shape, dy: &Shape, dw: &Shape) -> bool {
@@ -127,14 +119,12 @@ pub fn conv_dw_im2col_eligible(x: &Shape, dy: &Shape, dw: &Shape) -> bool {
     (1..4).all(|axis| x.dim(axis).is_static() && dy.dim(axis).is_static())
 }
 
-
 fn static_dim2(shape: &Shape) -> Option<[usize; 2]> {
     if shape.rank() != 2 {
         return None;
     }
     Some([shape.dim(0).unwrap_static(), shape.dim(1).unwrap_static()])
 }
-
 
 fn dim_product(shape: &Shape, start: usize, end: usize) -> usize {
     shape.dims()[start..end]
@@ -143,14 +133,12 @@ fn dim_product(shape: &Shape, start: usize, end: usize) -> usize {
         .product()
 }
 
-
 fn perm_move_axis_last(rank: usize, axis: usize) -> Vec<usize> {
     let mut perm: Vec<usize> = (0..rank).collect();
     perm.remove(axis);
     perm.push(axis);
     perm
 }
-
 
 fn invert_perm(perm: &[usize]) -> Vec<usize> {
     let mut inv = vec![0usize; perm.len()];
@@ -160,12 +148,10 @@ fn invert_perm(perm: &[usize]) -> Vec<usize> {
     inv
 }
 
-
 fn apply_perm_shape(shape: &Shape, perm: &[usize]) -> Shape {
     let dims: Vec<Dim> = perm.iter().map(|&i| shape.dim(i)).collect();
     Shape::from_dims(&dims, shape.dtype())
 }
-
 
 fn cumsum_backward_matrix(l: usize, exclusive: bool) -> Vec<f32> {
     let mut mat = vec![0f32; l * l];
@@ -180,7 +166,6 @@ fn cumsum_backward_matrix(l: usize, exclusive: bool) -> Vec<f32> {
     mat
 }
 
-
 fn q_max_for_bits(bits: u8) -> f32 {
     match bits {
         8 => 127.0,
@@ -190,11 +175,9 @@ fn q_max_for_bits(bits: u8) -> f32 {
     }
 }
 
-
 fn scan_vjp_input_names(body_vjp: &Graph) -> (String, Vec<String>) {
     scan_primal_input_names(body_vjp, "d_output")
 }
-
 
 fn scan_primal_input_names(body: &Graph, skip: &str) -> (String, Vec<String>) {
     let mut names: Vec<(NodeId, String)> = body
@@ -214,7 +197,6 @@ fn scan_primal_input_names(body: &Graph, skip: &str) -> (String, Vec<String>) {
     (carry, xs)
 }
 
-
 fn xs_step_shape(g: &Graph, xs_id: NodeId, dt: DType) -> Shape {
     let xs_shape = g.node(xs_id).shape.clone();
     let mut step_dims: Vec<usize> = xs_shape
@@ -229,7 +211,6 @@ fn xs_step_shape(g: &Graph, xs_id: NodeId, dt: DType) -> Shape {
     Shape::new(&step_dims, dt)
 }
 
-
 fn checkpoint_t_for_k(k: usize, k_total: usize, n_steps: usize) -> usize {
     if k_total == n_steps {
         k
@@ -240,7 +221,6 @@ fn checkpoint_t_for_k(k: usize, k_total: usize, n_steps: usize) -> usize {
             .min(n_steps - 1)
     }
 }
-
 
 fn carry_before_step(
     g: &mut Graph,
@@ -255,7 +235,6 @@ fn carry_before_step(
         narrow_step(g, trajectory, t - 1, step_shape)
     }
 }
-
 
 fn forward_step_carry(
     g: &mut Graph,
@@ -275,7 +254,6 @@ fn forward_step_carry(
     let id_map = merge_subgraph(g, forward_body, &bind);
     id_map[&forward_body.outputs[0]]
 }
-
 
 fn run_scan_backward_steps(
     g: &mut Graph,
@@ -378,7 +356,6 @@ fn run_scan_backward_steps(
     (dcarry, dx_steps)
 }
 
-
 fn finalize_scan_backward_carry(g: &mut Graph, dcarry: NodeId, out_shape: &Shape) -> NodeId {
     reconcile_node_shape(g, dcarry);
     if g.node(dcarry).shape.dims() != out_shape.dims() {
@@ -392,7 +369,6 @@ fn finalize_scan_backward_carry(g: &mut Graph, dcarry: NodeId, out_shape: &Shape
         dcarry
     }
 }
-
 
 fn narrow_step(g: &mut Graph, x: NodeId, t: usize, step_shape: &Shape) -> NodeId {
     let narrowed = g.narrow_(x, 0, t, 1);
@@ -409,7 +385,6 @@ fn narrow_step(g: &mut Graph, x: NodeId, t: usize, step_shape: &Shape) -> NodeId
     }
 }
 
-
 fn reconcile_node_shape(g: &mut Graph, id: NodeId) {
     let node = g.node(id).clone();
     if let Some(inferred) = rlx_ir::infer_shape::infer_output_shape(g, &node) {
@@ -418,7 +393,6 @@ fn reconcile_node_shape(g: &mut Graph, id: NodeId) {
         }
     }
 }
-
 
 /// Max im2col rows × patch cols per matmul tile (raise for larger static convs).
 // Im2col chunk-size guard for `compose_conv2d_backward_weight`. The original
@@ -431,7 +405,6 @@ fn reconcile_node_shape(g: &mut Graph, id: NodeId) {
 // cost of larger transient buffers. Tunable per call site if the buffer
 // blow-up ever becomes the bottleneck instead.
 const IM2COL_MAX_MKL: usize = 4_194_304;
-
 
 fn reshape_attn_rank4(
     g: &mut Graph,
@@ -479,7 +452,6 @@ fn reshape_attn_rank4(
         q_shape.rank()
     );
 }
-
 
 fn build_im2col_rows(
     g: &mut Graph,
@@ -537,30 +509,25 @@ fn build_im2col_rows(
     g.concat_(rows, 0)
 }
 
-
 fn compare_eq(g: &mut Graph, lhs: NodeId, rhs: NodeId) -> NodeId {
     let s = shape::compare_shape(&g.node(lhs).shape, &g.node(rhs).shape).expect("compare eq");
     g.add_node(Op::Compare(CmpOp::Eq), vec![lhs, rhs], s)
 }
-
 
 fn compare_ge(g: &mut Graph, lhs: NodeId, rhs: NodeId) -> NodeId {
     let s = shape::compare_shape(&g.node(lhs).shape, &g.node(rhs).shape).expect("compare ge");
     g.add_node(Op::Compare(CmpOp::Ge), vec![lhs, rhs], s)
 }
 
-
 fn compare_gt(g: &mut Graph, lhs: NodeId, rhs: NodeId) -> NodeId {
     let s = shape::compare_shape(&g.node(lhs).shape, &g.node(rhs).shape).expect("compare gt");
     g.add_node(Op::Compare(CmpOp::Gt), vec![lhs, rhs], s)
 }
 
-
 fn cast_f32(g: &mut Graph, x: NodeId) -> NodeId {
     let s = g.node(x).shape.clone().with_dtype(DType::F32);
     g.add_node(Op::Cast { to: DType::F32 }, vec![x], s)
 }
-
 
 fn argmax_window_flat(
     g: &mut Graph,
@@ -616,7 +583,6 @@ fn argmax_window_flat(
     best_i.expect("maxpool window has no in-bounds positions")
 }
 
-
 /// Nearest-neighbour upsample of an NCHW tensor by integer factors (kh, kw):
 /// each `[ho,wo]` element is repeated into a `kh×kw` block. Implemented with
 /// reshape → expand (broadcast) → reshape, so it lowers on every backend.
@@ -647,18 +613,15 @@ fn nn_upsample_nchw(
     )
 }
 
-
 fn f32_tensor_const(data: Vec<f32>, shape: Shape, g: &mut Graph) -> NodeId {
     let bytes: Vec<u8> = data.into_iter().flat_map(f32::to_le_bytes).collect();
     g.add_node(Op::Constant { data: bytes }, vec![], shape)
 }
 
-
 fn where_select(g: &mut Graph, cond: NodeId, on_true: NodeId, on_false: NodeId) -> NodeId {
     let s = shape::binary_shape(&g.node(on_true).shape, &g.node(on_false).shape).expect("where");
     g.add_node(Op::Where, vec![cond, on_true, on_false], s)
 }
-
 
 /// Additive 0 / `-inf` mask for [`MaskKind::Causal`] and [`MaskKind::SlidingWindow`],
 /// matching `apply_synthetic_mask` in `rlx-cpu`.
@@ -698,7 +661,6 @@ fn synthetic_additive_mask_data(
     }
     buf
 }
-
 
 fn broadcast_mask_to_scores(
     g: &mut Graph,
@@ -749,7 +711,6 @@ fn broadcast_mask_to_scores(
         _ => panic!("broadcast_mask_to_scores: Custom/Bias only"),
     }
 }
-
 
 fn apply_attn_score_mask(
     g: &mut Graph,
@@ -817,7 +778,6 @@ fn apply_attn_score_mask(
 
     scores
 }
-
 
 /// Rank-4 `[B, H, S, D]` SDPA via matmul + mask + softmax + matmul.
 /// Used before reverse-mode so higher-order AD never sees `Op::Attention`.
@@ -898,7 +858,6 @@ pub fn expand_attention_forward_primitives(
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,4 +885,3 @@ mod tests {
         assert_eq!(g.node(dx_k).shape, g.node(dx_c).shape);
     }
 }
-

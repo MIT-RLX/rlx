@@ -16,7 +16,6 @@
 //! `mat_vec` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -32,7 +31,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_k
 use super::*;
 
 pub(crate) struct SparseMatVecExt;
-
 
 impl OpExtension for SparseMatVecExt {
     fn name(&self) -> &str {
@@ -70,10 +68,8 @@ impl OpExtension for SparseMatVecExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SparseMatVecCpu;
-
 
 #[cfg(feature = "cpu")]
 impl CpuKernel for SparseMatVecCpu {
@@ -96,4 +92,3 @@ impl CpuKernel for SparseMatVecCpu {
 }
 
 // ── Conjugate Gradient ────────────────────────────────────────────
-

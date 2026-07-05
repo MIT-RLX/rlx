@@ -57,11 +57,9 @@ fn fusible_mm_bias_epilogue_activation(act: Activation) -> bool {
     matches!(act, Activation::Gelu | Activation::Silu)
 }
 
-
 fn leading_flatten_shape(in_shape: &Shape, new_shape: &[i64]) -> Option<Shape> {
     rlx_ir::shape::leading_flatten_shape(in_shape, new_shape)
 }
-
 
 fn sole_consumer(graph: &Graph, id: NodeId) -> Option<NodeId> {
     graph
@@ -71,7 +69,6 @@ fn sole_consumer(graph: &Graph, id: NodeId) -> Option<NodeId> {
         .map(|n| n.id)
 }
 
-
 /// Match a single producer node id that produces a tensor consumed by `narrow`.
 fn narrow_parent(node: &Node) -> Option<(NodeId, usize, usize, usize)> {
     match &node.op {
@@ -79,7 +76,6 @@ fn narrow_parent(node: &Node) -> Option<(NodeId, usize, usize, usize)> {
         _ => None,
     }
 }
-
 
 /// Match `FusedMatMulBiasAct{activation: None}` and return its (input, weight, bias) tuple.
 fn fused_mm_bias_none(node: &Node) -> Option<(NodeId, NodeId, NodeId)> {
@@ -90,7 +86,6 @@ fn fused_mm_bias_none(node: &Node) -> Option<(NodeId, NodeId, NodeId)> {
     }
     None
 }
-
 
 /// Match `FusedResidualLN { has_bias: false }` and return `(x, residual, gamma, beta, eps)`.
 fn fused_residual_ln_no_bias(node: &Node) -> Option<(NodeId, NodeId, NodeId, NodeId, f32)> {
@@ -111,7 +106,6 @@ fn fused_residual_ln_no_bias(node: &Node) -> Option<(NodeId, NodeId, NodeId, Nod
     None
 }
 
-
 /// Match `FusedMatMulBiasAct { activation: Some(a) }` and return `(input, weight, bias, activation)`.
 fn fused_mm_bias_act(node: &Node) -> Option<(NodeId, NodeId, NodeId, Activation)> {
     if let Op::FusedMatMulBiasAct {
@@ -123,7 +117,6 @@ fn fused_mm_bias_act(node: &Node) -> Option<(NodeId, NodeId, NodeId, Activation)
     }
     None
 }
-
 
 /// Match `FusedAttentionBlock { has_bias: true, has_rope: false }` BERT shape.
 fn fused_attn_block_bert(
@@ -151,7 +144,6 @@ fn fused_attn_block_bert(
     }
     None
 }
-
 
 /// Unfuse only `ElementwiseRegion` nodes that exceed [`crate::limits::FusionLimits`].
 ///
@@ -308,7 +300,6 @@ pub fn clip_elementwise_regions(graph: Graph, limits: crate::limits::FusionLimit
     }
     rw.finish(&graph.outputs)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1434,4 +1425,3 @@ mod tests {
         assert_eq!(fab_count, 0, "block-fusion must skip large batches");
     }
 }
-

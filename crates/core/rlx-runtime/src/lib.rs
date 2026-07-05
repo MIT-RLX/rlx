@@ -68,9 +68,9 @@ mod deferred;
 pub mod device_bench;
 pub mod device_ext;
 pub mod device_parse;
+pub mod device_policy;
 /// Ship-graph distributed execution (build the worker once, run any model).
 pub mod dist;
-pub mod device_policy;
 pub mod expert_pool;
 pub mod graph_io;
 pub mod jacfwd;
@@ -179,14 +179,16 @@ pub use memory_estimate::{
     DEFAULT_SOFT_MEMORY_FRACTION, MoeOffloadEstimate, available_unified_memory,
     estimate_moe_offload, llama_decode_bucket_compile_peak_bytes,
     llama_decode_bucket_resident_bytes, llama_decode_oneshot_compile_peak_bytes,
-    memory_headroom_bytes, process_rss_bytes,
-    soft_memory_budget_bytes, soft_memory_fraction, would_exceed_soft_budget,
+    memory_headroom_bytes, process_rss_bytes, soft_memory_budget_bytes, soft_memory_fraction,
+    would_exceed_soft_budget,
 };
 pub use model_pipeline::ModelCompilePipeline;
 pub use options::CompileOptions;
 pub use precision::Precision;
 pub use reflect::{ModelReflection, load_hir_template_with_extensions, specialize_entry};
 pub use registry::{BackendFactory, backend_for, register_backend, registered_devices};
+/// Native low-precision GEMM config for [`CompileOptions::scaled_quant`].
+pub use rlx_opt::rlx_compile::scaled_quant_insert::ScaledQuantConfig;
 
 /// Alias for [`COMPILE_OUTPUT_CAP_ENV`].
 pub const MLX_COMPILE_OUTPUT_CAP_ENV: &str = COMPILE_OUTPUT_CAP_ENV;
@@ -214,6 +216,13 @@ pub fn reset_mlx_compile_output_cap() {
 
 #[cfg(feature = "cpu")]
 pub use rlx_cpu::moe_residency::MoeResidencyStats;
+/// Stub for builds without the `cpu` backend feature (e.g. downstream crates that
+/// bring their own `rlx-cpu` and set `default-features = false`). The MoE-residency
+/// backend trait methods reference `crate::MoeResidencyStats` unconditionally but only
+/// ever return `None` off the CPU path, so an empty type keeps the API compiling.
+#[cfg(not(feature = "cpu"))]
+#[derive(Debug, Clone, Default)]
+pub struct MoeResidencyStats;
 #[cfg(feature = "cpu")]
 pub use rlx_cpu::moe_topk_capture::MoeTopkCapture;
 pub use rlx_driver::{

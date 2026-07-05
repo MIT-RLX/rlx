@@ -17,6 +17,8 @@
 //! GPU-backend trap. CPU is the reference (matches rten); every GPU backend must
 //! match it.
 
+#![allow(dead_code)]
+
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 

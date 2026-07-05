@@ -59,11 +59,11 @@ pub mod log_mel_backward_host;
 pub mod log_mel_host;
 pub mod lstm_host;
 pub mod ms_deform_attn_host;
-pub mod scan_host;
 #[cfg(feature = "native-cuda-fft")]
 pub mod native_fft_dispatch;
 pub mod rng_host;
 pub mod sam_ops_host;
+pub mod scan_host;
 pub mod splat_host;
 #[cfg(feature = "native-splat")]
 pub mod splat_native;

@@ -53,6 +53,7 @@ mod rms_norm;
 mod rope;
 mod self_attn;
 mod swiglu;
+mod transformer_encoder_layer;
 mod vision_layer;
 mod vit_attn;
 
@@ -62,7 +63,7 @@ pub use bind_decode::BindDecodeInputsStage;
 pub use cls_pool::ClsTokenPoolStage;
 pub use custom::CustomStage;
 pub use decode_rope_params::DecodeRopeParamsStage;
-pub use dinov2_layer::dinov2_layer_fused;
+pub use dinov2_layer::{dinov2_layer_fused, dinov2_layer_fused_exact};
 pub use embed::EmbedStage;
 pub use embed_scale::EmbedScaleStage;
 pub use gather_decode_rope::GatherDecodeRopeStage;
@@ -70,7 +71,7 @@ pub use gather_from_input::{GatherAddStage, GatherFromInputStage};
 pub use gather_last_token::GatherLastTokenStage;
 pub use gdn_scan::GdnScanStage;
 pub use geglu::GeGluStage;
-pub use gelu_ffn::GeluFfnStage;
+pub use gelu_ffn::{FfnActivation, GeluFfnStage};
 pub use gemma_decode_layer::{GemmaDecodeLayerSpec, GemmaDecodeLayerStage};
 pub use gemma_kv_tap::GemmaKvTapStage;
 pub use gemma_layer::{
@@ -106,6 +107,7 @@ pub use rms_norm::RmsNormStage;
 pub use rope::RopeTablesStage;
 pub use self_attn::{SelfAttnPrefillSpec, SelfAttnPrefillStage};
 pub use swiglu::SwiGluStage;
+pub use transformer_encoder_layer::transformer_encoder_layer;
 pub use vision_layer::{VisionSwiGluFfnStage, nomic_vision_layer_fused};
 pub use vit_attn::{VitSelfAttnSpec, VitSelfAttnStage};
 

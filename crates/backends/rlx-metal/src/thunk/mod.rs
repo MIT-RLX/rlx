@@ -15,7 +15,6 @@
 
 //! Pre-compiled command list — analog of rlx-cpu's Thunk.
 
-
 const ARENA_LARGE_OFF: usize = 1usize << 32;
 
 #[inline]
@@ -1549,10 +1548,7 @@ impl Thunk {
 
 mod compile;
 
-impl ThunkSchedule {
-
-}
-
+impl ThunkSchedule {}
 
 fn strides_dense_contiguous(rank: usize, dims: &[u32], strides: &[u32]) -> bool {
     if rank == 0 || dims.len() < rank || strides.len() < rank {
@@ -2211,7 +2207,7 @@ fn mlp_gate_up_row_bytes(k: u32, scheme: rlx_ir::quant::QuantScheme) -> usize {
     use rlx_ir::quant::QuantScheme;
     match scheme {
         QuantScheme::GgufQ4K => (k as usize / 256) * 144,
-        QuantScheme::GgufQ5_0 => ((k as usize + 31) / 32) * 22,
+        QuantScheme::GgufQ5_0 => (k as usize).div_ceil(32) * 22,
         QuantScheme::GgufQ6K => (k as usize / 256) * 210,
         _ => 0,
     }
@@ -3179,4 +3175,3 @@ mod region_rewrite_tests {
         }
     }
 }
-

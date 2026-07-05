@@ -140,9 +140,18 @@ impl VulkanDevice {
             inst_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
         }
 
+        // Opt-in Khronos validation layer for debugging (RLX_VULKAN_VALIDATION=1);
+        // VUID messages print to stderr. Off by default (no runtime cost).
+        let validation_layer = c"VK_LAYER_KHRONOS_validation";
+        let mut inst_layers: Vec<*const c_char> = Vec::new();
+        if std::env::var("RLX_VULKAN_VALIDATION").ok().as_deref() == Some("1") {
+            inst_layers.push(validation_layer.as_ptr());
+        }
+
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&inst_ext)
+            .enabled_layer_names(&inst_layers)
             .flags(inst_flags);
         let instance = unsafe { entry.create_instance(&create_info, None) }
             .map_err(|e| format!("vk instance: {e}"))?;

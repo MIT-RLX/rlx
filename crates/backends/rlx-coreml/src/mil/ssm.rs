@@ -10,14 +10,14 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use super::helpers::simple_op_flex;
+use super::helpers::*;
+use crate::proto;
+use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use crate::proto;
-use crate::{CoremlError, Result};
-use super::helpers::simple_op_flex;
-use super::helpers::*;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -25,7 +25,12 @@ impl<'a> LowerCtx<'a> {
     /// Mamba selective scan, unrolled over the sequence. Inputs
     /// `[x, delta, A, B, C]` with `x,delta:[b,s,h]`, `A:[h,n]`,
     /// `B,C:[b,s,n]`. Per step: `H ← exp(Δ·A)·H + (Δ·x)·B`, `y = Σₙ C·H`.
-    pub(crate) fn lower_selective_scan(&mut self, id: NodeId, n: usize, out_name: &str) -> Result<()> {
+    pub(crate) fn lower_selective_scan(
+        &mut self,
+        id: NodeId,
+        n: usize,
+        out_name: &str,
+    ) -> Result<()> {
         let node = self.graph.node(id);
         let out_shape = node.shape.clone();
         let b = dim_static(&out_shape, 0)?;
@@ -152,7 +157,6 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
-
 
     /// Qwen3.5 gated delta-net, unrolled over the sequence. Inputs
     /// `[q,k,v,g,beta(,state)]`, `q,k,v:[b,s,H,n]`, `g,beta:[b,s,H]`.
@@ -284,7 +288,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Slice token `t` of a `[b,s,H,n]` GDN tensor → `[b,H,1,n]`.
     pub(crate) fn gdn_vec(
         &mut self,
@@ -316,7 +319,6 @@ impl<'a> LowerCtx<'a> {
         Ok(out)
     }
 
-
     /// Slice token `t` of a `[b,s,H]` GDN scalar tensor → `[b,H,1,1]`.
     pub(crate) fn gdn_scalar(
         &mut self,
@@ -338,5 +340,4 @@ impl<'a> LowerCtx<'a> {
         )?;
         Ok(out)
     }
-
 }

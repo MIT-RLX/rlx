@@ -1,0 +1,677 @@
+{
+ "format": "rlx-torch-ir",
+ "version": 1,
+ "model_name": "cnn",
+ "producer": "pyrlx / torch 2.11.0",
+ "inputs": [
+  {
+   "id": "x",
+   "shape": [
+    2,
+    3,
+    16,
+    16
+   ],
+   "dtype": "f32"
+  }
+ ],
+ "weights": [
+  {
+   "id": "p_c1_weight",
+   "key": "c1.weight",
+   "shape": [
+    8,
+    3,
+    3,
+    3
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_c1_bias",
+   "key": "c1.bias",
+   "shape": [
+    8
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_b1_weight",
+   "key": "b1.weight",
+   "shape": [
+    8
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_b1_bias",
+   "key": "b1.bias",
+   "shape": [
+    8
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_c2_weight",
+   "key": "c2.weight",
+   "shape": [
+    16,
+    8,
+    3,
+    3
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_c2_bias",
+   "key": "c2.bias",
+   "shape": [
+    16
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_b2_weight",
+   "key": "b2.weight",
+   "shape": [
+    16
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_b2_bias",
+   "key": "b2.bias",
+   "shape": [
+    16
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_head_weight",
+   "key": "head.weight",
+   "shape": [
+    10,
+    16
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "p_head_bias",
+   "key": "head.bias",
+   "shape": [
+    10
+   ],
+   "dtype": "f32",
+   "kind": "param"
+  },
+  {
+   "id": "b_b1_running_mean",
+   "key": "b1.running_mean",
+   "shape": [
+    8
+   ],
+   "dtype": "f32",
+   "kind": "buffer"
+  },
+  {
+   "id": "b_b1_running_var",
+   "key": "b1.running_var",
+   "shape": [
+    8
+   ],
+   "dtype": "f32",
+   "kind": "buffer"
+  },
+  {
+   "id": "b_b1_num_batches_tracked",
+   "key": "b1.num_batches_tracked",
+   "shape": [],
+   "dtype": "i64",
+   "kind": "buffer"
+  },
+  {
+   "id": "b_b2_running_mean",
+   "key": "b2.running_mean",
+   "shape": [
+    16
+   ],
+   "dtype": "f32",
+   "kind": "buffer"
+  },
+  {
+   "id": "b_b2_running_var",
+   "key": "b2.running_var",
+   "shape": [
+    16
+   ],
+   "dtype": "f32",
+   "kind": "buffer"
+  },
+  {
+   "id": "b_b2_num_batches_tracked",
+   "key": "b2.num_batches_tracked",
+   "shape": [],
+   "dtype": "i64",
+   "kind": "buffer"
+  }
+ ],
+ "nodes": [
+  {
+   "id": "convolution",
+   "op": "aten.convolution.default",
+   "args": [
+    {
+     "ref": "x"
+    },
+    {
+     "ref": "p_c1_weight"
+    },
+    {
+     "ref": "p_c1_bias"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 1
+      }
+     ]
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 1
+      }
+     ]
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 1
+      }
+     ]
+    },
+    {
+     "bool": false
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 0
+      }
+     ]
+    },
+    {
+     "int": 1
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     2,
+     8,
+     16,
+     16
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "_native_batch_norm_legit_no_training",
+   "op": "aten._native_batch_norm_legit_no_training.default",
+   "args": [
+    {
+     "ref": "convolution"
+    },
+    {
+     "ref": "p_b1_weight"
+    },
+    {
+     "ref": "p_b1_bias"
+    },
+    {
+     "ref": "b_b1_running_mean"
+    },
+    {
+     "ref": "b_b1_running_var"
+    },
+    {
+     "float": 0.1
+    },
+    {
+     "float": 1e-05
+    }
+   ],
+   "kwargs": {},
+   "out": [
+    {
+     "shape": [
+      2,
+      8,
+      16,
+      16
+     ],
+     "dtype": "f32"
+    },
+    {
+     "shape": [
+      0
+     ],
+     "dtype": "f32"
+    },
+    {
+     "shape": [
+      0
+     ],
+     "dtype": "f32"
+    }
+   ]
+  },
+  {
+   "id": "getitem",
+   "op": "_getitem",
+   "args": [
+    {
+     "ref": "_native_batch_norm_legit_no_training"
+    },
+    {
+     "int": 0
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     2,
+     8,
+     16,
+     16
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "relu",
+   "op": "aten.relu.default",
+   "args": [
+    {
+     "ref": "getitem"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     2,
+     8,
+     16,
+     16
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "max_pool2d_with_indices",
+   "op": "aten.max_pool2d_with_indices.default",
+   "args": [
+    {
+     "ref": "relu"
+    },
+    {
+     "list": [
+      {
+       "int": 2
+      },
+      {
+       "int": 2
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": [
+    {
+     "shape": [
+      2,
+      8,
+      8,
+      8
+     ],
+     "dtype": "f32"
+    },
+    {
+     "shape": [
+      2,
+      8,
+      8,
+      8
+     ],
+     "dtype": "i64"
+    }
+   ]
+  },
+  {
+   "id": "getitem_3",
+   "op": "_getitem",
+   "args": [
+    {
+     "ref": "max_pool2d_with_indices"
+    },
+    {
+     "int": 0
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     2,
+     8,
+     8,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "convolution_1",
+   "op": "aten.convolution.default",
+   "args": [
+    {
+     "ref": "getitem_3"
+    },
+    {
+     "ref": "p_c2_weight"
+    },
+    {
+     "ref": "p_c2_bias"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 1
+      }
+     ]
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 1
+      }
+     ]
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 1
+      }
+     ]
+    },
+    {
+     "bool": false
+    },
+    {
+     "list": [
+      {
+       "int": 0
+      },
+      {
+       "int": 0
+      }
+     ]
+    },
+    {
+     "int": 1
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     2,
+     16,
+     8,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "_native_batch_norm_legit_no_training_1",
+   "op": "aten._native_batch_norm_legit_no_training.default",
+   "args": [
+    {
+     "ref": "convolution_1"
+    },
+    {
+     "ref": "p_b2_weight"
+    },
+    {
+     "ref": "p_b2_bias"
+    },
+    {
+     "ref": "b_b2_running_mean"
+    },
+    {
+     "ref": "b_b2_running_var"
+    },
+    {
+     "float": 0.1
+    },
+    {
+     "float": 1e-05
+    }
+   ],
+   "kwargs": {},
+   "out": [
+    {
+     "shape": [
+      2,
+      16,
+      8,
+      8
+     ],
+     "dtype": "f32"
+    },
+    {
+     "shape": [
+      0
+     ],
+     "dtype": "f32"
+    },
+    {
+     "shape": [
+      0
+     ],
+     "dtype": "f32"
+    }
+   ]
+  },
+  {
+   "id": "getitem_5",
+   "op": "_getitem",
+   "args": [
+    {
+     "ref": "_native_batch_norm_legit_no_training_1"
+    },
+    {
+     "int": 0
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     2,
+     16,
+     8,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "relu_1",
+   "op": "aten.relu.default",
+   "args": [
+    {
+     "ref": "getitem_5"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     2,
+     16,
+     8,
+     8
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "mean",
+   "op": "aten.mean.dim",
+   "args": [
+    {
+     "ref": "relu_1"
+    },
+    {
+     "list": [
+      {
+       "int": -1
+      },
+      {
+       "int": -2
+      }
+     ]
+    },
+    {
+     "bool": true
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     2,
+     16,
+     1,
+     1
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "view",
+   "op": "aten.view.default",
+   "args": [
+    {
+     "ref": "mean"
+    },
+    {
+     "list": [
+      {
+       "int": 2
+      },
+      {
+       "int": 16
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     2,
+     16
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "permute",
+   "op": "aten.permute.default",
+   "args": [
+    {
+     "ref": "p_head_weight"
+    },
+    {
+     "list": [
+      {
+       "int": 1
+      },
+      {
+       "int": 0
+      }
+     ]
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     16,
+     10
+    ],
+    "dtype": "f32"
+   }
+  },
+  {
+   "id": "addmm",
+   "op": "aten.addmm.default",
+   "args": [
+    {
+     "ref": "p_head_bias"
+    },
+    {
+     "ref": "view"
+    },
+    {
+     "ref": "permute"
+    }
+   ],
+   "kwargs": {},
+   "out": {
+    "shape": [
+     2,
+     10
+    ],
+    "dtype": "f32"
+   }
+  }
+ ],
+ "outputs": [
+  {
+   "ref": "addmm",
+   "shape": [
+    2,
+    10
+   ],
+   "dtype": "f32"
+  }
+ ],
+ "decomposition": "high"
+}

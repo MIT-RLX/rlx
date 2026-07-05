@@ -19,9 +19,9 @@ default = []
 validation = []
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.10" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.10", default-features = false, features = ["compile"] }
-rlx-compile = { path = "../../core/rlx-compile", version = "0.2.10" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12", default-features = false, features = ["compile"] }
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.12" }
 # CPU reference kernels for the host-fallback path (sequential / specialized
 # ops with no native SPIR-V kernel yet: RNN family, Mamba2, GatedDeltaNet,
 # ConvTranspose2d, FFT, GGUF dequant). The host-visible arena lets the CPU
@@ -31,7 +31,7 @@ rlx-compile = { path = "../../core/rlx-compile", version = "0.2.10" }
 # built alongside rlx-runtime (which enables `cpu`→`blas`), Cargo's additive
 # feature unification restores the platform BLAS, so host-fallback numerics
 # match the CPU reference exactly.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.10", default-features = false }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.12", default-features = false }
 
 # Raw Vulkan. `loaded` = libloading-based dynamic load of the system
 # Vulkan loader at runtime via `Entry::load()`; no link-time dependency on

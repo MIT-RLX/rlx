@@ -17,12 +17,6 @@
 
 #![allow(unused_imports)]
 
-use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU64;
-use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::shape::DimBinding;
-use rlx_ir::{Graph, NodeId, Op};
 use crate::buffer::{
     Arena, ReadbackLayout, ReadbackStaging, TinyReadbackStaging, decode_mapped_readback_f32,
     decode_tiny_mapped_f32, encode_readback_copies, plan_f32_uniform, read_f32_many_pooled,
@@ -59,6 +53,12 @@ use crate::kernels::{
     transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
     welch_peaks_gpu_kernel, where_kernel,
 };
+use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::shape::DimBinding;
+use rlx_ir::{Graph, NodeId, Op};
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 
 use super::*;
 
@@ -68,14 +68,12 @@ impl WgpuExecutable {
         *self.rng.write().expect("rng lock") = rng;
     }
 
-
     /// Hint the next `run` to process only the first `actual` rows
     /// along the bucket axis (out of `upper`, the compile extent).
     /// Honored when every Step is in the safe set. See PLAN L1.
     pub fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
         self.active_extent = extent;
     }
-
 
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
         const STASH_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -97,7 +95,6 @@ impl WgpuExecutable {
         }
     }
 
-
     /// Upload raw bytes for a Param. The bytes land tight-packed at
     /// the param's slot offset — no f32 round-trip. Used for quantized
     /// weights (int8 / int4) where the kernel reads the byte stream
@@ -117,10 +114,8 @@ impl WgpuExecutable {
         }
     }
 
-
     pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
         self.gpu_handle_feeds
             .insert(handle_name.to_string(), output_index);
     }
-
 }

@@ -36,7 +36,11 @@ pub fn run_scan(
     bcast_outer: &[(usize, usize)],
 ) {
     let cb = plan.carry_bytes;
-    let out_len = if save_trajectory { length as usize * cb } else { cb };
+    let out_len = if save_trajectory {
+        length as usize * cb
+    } else {
+        cb
+    };
 
     // Contiguous arena span covering every referenced region; run the CPU scan
     // against a host copy with offsets rebased to the span start.

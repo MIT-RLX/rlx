@@ -16,7 +16,6 @@
 //! `lu` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -32,7 +31,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_k
 use super::*;
 
 pub(crate) struct SparseLuExt;
-
 
 impl OpExtension for SparseLuExt {
     fn name(&self) -> &str {
@@ -95,10 +93,8 @@ impl OpExtension for SparseLuExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SparseLuCpu;
-
 
 #[cfg(feature = "cpu")]
 impl CpuKernel for SparseLuCpu {
@@ -122,4 +118,3 @@ impl CpuKernel for SparseLuCpu {
 }
 
 // ── Sparse Mat-Vec ────────────────────────────────────────────────
-

@@ -76,11 +76,14 @@ pub(super) fn lower_reduce(
     Ok(true)
 }
 
-
 /// ONNX `CumProd` — cumulative product along `axis` (input 1, baked into attrs
 /// when constant). Mirrors `CumSum`'s `exclusive`/`reverse` attributes, packed
 /// as `[axis_i32, exclusive_u8, reverse_u8]`.
-pub(super) fn lower_cumprod(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_cumprod(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let rank = m.shape(x).rank().max(1);
     let axis = node
@@ -119,8 +122,11 @@ pub(super) fn lower_cumprod(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &B
     Ok(true)
 }
 
-
-pub(super) fn lower_topk(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_topk(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let rank = m.shape(x).rank().max(1);
     let axis = normalize_axis(
@@ -156,8 +162,11 @@ pub(super) fn lower_topk(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bund
     Ok(true)
 }
 
-
-pub(super) fn lower_cumsum(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_cumsum(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let rank = m.shape(x).rank().max(1);
     let axis = node
@@ -194,4 +203,3 @@ pub(super) fn lower_cumsum(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bu
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-

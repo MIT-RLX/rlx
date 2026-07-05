@@ -57,7 +57,6 @@ use super::*;
 /// emit one monolithic kernel per layer.
 pub struct FuseTransformerLayer;
 
-
 impl FuseTransformerLayer {
     fn should_fuse(graph: &Graph) -> bool {
         // Same gate as FuseAttentionBlock — single-source of truth for
@@ -65,7 +64,6 @@ impl FuseTransformerLayer {
         FuseAttentionBlock::should_fuse(graph)
     }
 }
-
 
 impl Pass for FuseTransformerLayer {
     fn name(&self) -> &str {
@@ -293,4 +291,3 @@ impl Pass for FuseTransformerLayer {
 //
 // Fusion boundaries: chains do not extend across inputs whose producer
 // satisfies [`rlx_ir::Op::is_fusion_boundary`] (BLAS, Gaussian splat, …).
-

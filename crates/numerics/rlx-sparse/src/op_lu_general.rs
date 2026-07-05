@@ -16,7 +16,6 @@
 //! `lu_general` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;
@@ -32,7 +31,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_k
 use super::*;
 
 pub(crate) struct SparseLuGeneralExt;
-
 
 impl OpExtension for SparseLuGeneralExt {
     fn name(&self) -> &str {
@@ -88,7 +86,6 @@ impl OpExtension for SparseLuGeneralExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct SparseLuGeneralCpu;
 
@@ -120,4 +117,3 @@ impl CpuKernel for SparseLuGeneralCpu {
 // Iterative analog of CG for non-symmetric A. Same 7-input shape as
 // `sparse_lu_solve_general`. Attrs encode `(max_iter, tol)` exactly
 // like CG.
-

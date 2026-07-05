@@ -17,11 +17,6 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
-use rlx_ir::{Graph, NodeId, Op};
-use std::sync::Mutex;
 use crate::arena::{Arena, HalfDtype, plan_f32_uniform};
 use crate::device::{RocmContext, rocm_blas, rocm_blas_lt, rocm_context, rocm_dnn};
 use crate::hip::{HipBuffer, HipDeviceptr};
@@ -31,6 +26,11 @@ use crate::hipblas::{
 use crate::hipblaslt::HipblasLtContext;
 use crate::host_staging::F32HostSlot;
 use crate::miopen::MiopenContext;
+use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::{Graph, NodeId, Op};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use super::*;
 
@@ -51,7 +51,6 @@ impl RocmExecutable {
         }
     }
 
-
     pub(crate) fn fill_output_staging_all(&mut self) {
         unsafe {
             let _ = (self.ctx.runtime.hip_stream_sync)(self.ctx.default_stream);
@@ -66,5 +65,4 @@ impl RocmExecutable {
                 .expect("rlx-rocm: output download failed");
         }
     }
-
 }

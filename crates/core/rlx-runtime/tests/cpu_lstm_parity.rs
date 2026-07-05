@@ -16,6 +16,8 @@
 //! reference recurrence, and (2) the `unfuse` decomposition (the path
 //! MLX / CoreML / TPU and autodiff take) vs the native kernel.
 
+#![allow(dead_code)]
+
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 

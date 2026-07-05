@@ -109,3 +109,7 @@ rlx.mlp_grads_webgl(x, t, in, hid, out, w1, b1, w2, b2);
 `just check-wasm` compiles the CPU + WebGPU + WebGL stack for
 `wasm32-unknown-unknown` (all feature configs) and runs `rlx-webgl`'s native
 parity tests. It is part of `just ci`.
+
+## License
+
+GPL-3.0-only.

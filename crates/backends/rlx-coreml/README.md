@@ -110,3 +110,7 @@ internals (`Fused*`, `ElementwiseRegion`), `CustomFn`, `QMatMul` / `QConv2d` (in
 
 CoreML may pad rank-4 outputs for ANE alignment; the shim copies via
 stride-aware indexing, not flat `memcpy`.
+
+## License
+
+GPL-3.0-only.

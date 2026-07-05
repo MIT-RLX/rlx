@@ -37,7 +37,11 @@ use crate::lower::options::{ImportOptions, ImportReport};
 
 use super::*;
 
-pub(super) fn lower_scatter_nd(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_scatter_nd(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let data = ctx.tensor(&node.inputs[0])?;
     let indices = ctx.tensor(&node.inputs[1])?;
     let updates = ctx.tensor(&node.inputs[2])?;
@@ -54,7 +58,6 @@ pub(super) fn lower_scatter_nd(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node:
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-
 
 pub(super) fn lower_scatter_elements(
     m: &mut HirMut<'_>,
@@ -80,11 +83,14 @@ pub(super) fn lower_scatter_elements(
     Ok(true)
 }
 
-
 /// ONNX `GatherND` (opset 11+). Gathers slices from `data` indexed by the
 /// trailing axis of `indices`; lowered to a reference CPU kernel. The
 /// `batch_dims` attribute is forwarded in the op attrs (i32 LE).
-pub(super) fn lower_gather_nd(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_gather_nd(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let data = ctx.tensor(&node.inputs[0])?;
     let indices = ctx.tensor(&node.inputs[1])?;
     let batch_dims = node
@@ -107,11 +113,14 @@ pub(super) fn lower_gather_nd(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: 
     Ok(true)
 }
 
-
 /// ONNX `OneHot` (opset 9+). Inputs `[indices, depth, values]`; `values` is
 /// `[off_value, on_value]`. The `axis` attribute (default -1) selects where the
 /// new depth axis is inserted and is forwarded in the op attrs (i32 LE).
-pub(super) fn lower_one_hot(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_one_hot(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let indices = ctx.tensor(&node.inputs[0])?;
     let depth = ctx.tensor(&node.inputs[1])?;
     let values = ctx.tensor(&node.inputs[2])?;
@@ -155,12 +164,15 @@ pub(super) fn lower_one_hot(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &B
     Ok(true)
 }
 
-
 /// ONNX `NonZero` (opset 9+). Output is `[rank, nnz]` of I64 indices — `nnz` is
 /// data-dependent, so the static buffer is sized at the model-provided shape
 /// when available, else the `[rank, numel]` upper bound. The kernel zero-pads
 /// any unused tail.
-pub(super) fn lower_non_zero(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_non_zero(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let in_s = m.shape(x);
     let rank = in_s.rank().max(1);
@@ -181,4 +193,3 @@ pub(super) fn lower_non_zero(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-

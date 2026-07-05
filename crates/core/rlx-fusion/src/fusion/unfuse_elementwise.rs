@@ -36,7 +36,6 @@ pub struct UnfuseElementwiseRegions {
     pub unfuse_prologue: bool,
 }
 
-
 impl UnfuseElementwiseRegions {
     /// GPU / Metal / CUDA / wgpu: unfuse plain regions, keep resize prologue.
     pub const FOR_GPU: UnfuseElementwiseRegions = UnfuseElementwiseRegions {
@@ -47,7 +46,6 @@ impl UnfuseElementwiseRegions {
         unfuse_prologue: true,
     };
 }
-
 
 impl Pass for UnfuseElementwiseRegions {
     fn name(&self) -> &str {
@@ -262,4 +260,3 @@ impl Pass for UnfuseElementwiseRegions {
         rw.finish(&graph.outputs)
     }
 }
-

@@ -33,6 +33,7 @@
 use crate::Precision;
 use rlx_ir::OpKind;
 use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
+use rlx_opt::rlx_compile::scaled_quant_insert::ScaledQuantConfig;
 use rlx_opt::{FusionOptions, FusionTarget, PrecisionPolicy};
 use std::collections::HashMap;
 
@@ -44,6 +45,11 @@ pub struct CompileOptions {
     pub precision: Precision,
     /// Optional per-op precision policy (mixed precision rewrite).
     pub policy: Option<PrecisionPolicy>,
+    /// Opt-in native low-precision GEMM. When set, every 2-D `Op::MatMul` is
+    /// rewritten to a `ScaledMatMul` whose operands are dynamically quantized to
+    /// this element format + scale layout — any [`ScaledFormat`], including a
+    /// parameterized `Custom` (e.g. `f4e3m0`). Off by default; changes numerics.
+    pub scaled_quant: Option<ScaledQuantConfig>,
     /// RNG policy for in-graph [`Op::RngNormal`] / [`Op::RngUniform`] nodes.
     pub rng: rlx_ir::RngOptions,
     /// Run dead-code elimination as part of compile. Default: true.
@@ -79,6 +85,7 @@ impl Default for CompileOptions {
         Self {
             precision: Precision::F32,
             policy: None,
+            scaled_quant: None,
             rng: rlx_ir::RngOptions::default(),
             dce: true,
             constant_folding: true,
@@ -107,6 +114,14 @@ impl CompileOptions {
     }
     pub fn policy(mut self, p: PrecisionPolicy) -> Self {
         self.policy = Some(p);
+        self
+    }
+    /// Enable native low-precision GEMM for every 2-D matmul in the graph, in
+    /// the given element format + scale layout. Accepts any [`ScaledFormat`] via
+    /// [`ScaledQuantConfig`] — e.g. `ScaledQuantConfig::fp8_e4m3()`, or a
+    /// parameterized `ScaledFormat::custom(3, 0)` (`f4e3m0`).
+    pub fn scaled_quant(mut self, cfg: ScaledQuantConfig) -> Self {
+        self.scaled_quant = Some(cfg);
         self
     }
     pub fn rng(mut self, rng: rlx_ir::RngOptions) -> Self {

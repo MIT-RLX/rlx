@@ -309,10 +309,8 @@ fn fk_prologue_chain_matches_primitives_on_cuda() {
     }
     let target = FusionTarget::Cuda;
     let g = build_resize_chain_graph();
-    let x: Vec<f32> = (0..1 * 3 * 8 * 8)
-        .map(|i| (i as f32) * 0.01 - 0.5)
-        .collect();
-    let a: Vec<f32> = (0..1 * 3 * 16 * 16).map(|i| (i as f32) * 0.001).collect();
+    let x: Vec<f32> = (0..3 * 8 * 8).map(|i| (i as f32) * 0.01 - 0.5).collect();
+    let a: Vec<f32> = (0..3 * 16 * 16).map(|i| (i as f32) * 0.001).collect();
     let inputs = &[("x", x.as_slice()), ("a", a.as_slice())];
 
     let ref_out = run_on(Device::Cpu, g.clone(), &CompileOptions::new(), inputs);
@@ -329,10 +327,8 @@ fn fk_prologue_session_pipeline_keeps_region_cuda() {
         return;
     }
     let g = build_resize_chain_graph();
-    let x: Vec<f32> = (0..1 * 3 * 8 * 8)
-        .map(|i| (i as f32) * 0.01 - 0.5)
-        .collect();
-    let a: Vec<f32> = (0..1 * 3 * 16 * 16).map(|i| (i as f32) * 0.001).collect();
+    let x: Vec<f32> = (0..3 * 8 * 8).map(|i| (i as f32) * 0.01 - 0.5).collect();
+    let a: Vec<f32> = (0..3 * 16 * 16).map(|i| (i as f32) * 0.001).collect();
     let inputs = &[("x", x.as_slice()), ("a", a.as_slice())];
 
     let mut opts = CompileOptions::new().fusion_target(FusionTarget::Cuda);
@@ -915,10 +911,8 @@ fn fk_prologue_resize_on_input_one_matches_cpu_cuda() {
         return;
     }
     let g = build_resize_prologue_secondary_input_graph();
-    let x: Vec<f32> = (0..1 * 3 * 8 * 8)
-        .map(|i| (i as f32) * 0.01 - 0.5)
-        .collect();
-    let a: Vec<f32> = (0..1 * 3 * 16 * 16).map(|i| (i as f32) * 0.001).collect();
+    let x: Vec<f32> = (0..3 * 8 * 8).map(|i| (i as f32) * 0.01 - 0.5).collect();
+    let a: Vec<f32> = (0..3 * 16 * 16).map(|i| (i as f32) * 0.001).collect();
     let inputs = &[("x", x.as_slice()), ("a", a.as_slice())];
 
     let mut g_ref = Graph::new("fk_ref");
@@ -953,10 +947,8 @@ fn fk_prologue_resize_on_input_one_matches_cpu_mlx() {
         return;
     }
     let g = build_resize_prologue_secondary_input_graph();
-    let x: Vec<f32> = (0..1 * 3 * 8 * 8)
-        .map(|i| (i as f32) * 0.01 - 0.5)
-        .collect();
-    let a: Vec<f32> = (0..1 * 3 * 16 * 16).map(|i| (i as f32) * 0.001).collect();
+    let x: Vec<f32> = (0..3 * 8 * 8).map(|i| (i as f32) * 0.01 - 0.5).collect();
+    let a: Vec<f32> = (0..3 * 16 * 16).map(|i| (i as f32) * 0.001).collect();
     let inputs = &[("x", x.as_slice()), ("a", a.as_slice())];
 
     let mut g_ref = Graph::new("fk_ref");

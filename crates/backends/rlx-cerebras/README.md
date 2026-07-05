@@ -48,3 +48,7 @@ cargo run -p rlx-cerebras --bin rlx-cerebras-emit -- 32 64 32 ./cerebras-out
 # then, on a Linux host with the Cerebras SDK container:
 cd cerebras-out && bash commands_wse2.sh   # cslc + cs_python run.py → "SUCCESS!"
 ```
+
+## License
+
+GPL-3.0-only.

@@ -78,7 +78,6 @@ pub fn compose_layer_norm_backward_input(
     g.mul(inv_std_b, t3)
 }
 
-
 /// RMSNorm backward w.r.t. input (axis = -1), matching `training_bwd::rms_norm_backward_row`.
 pub fn compose_rms_norm_backward_input(
     g: &mut Graph,
@@ -132,7 +131,6 @@ pub fn compose_rms_norm_backward_input(
     g.mul(diff, inv_r_b)
 }
 
-
 /// LayerNorm backward w.r.t. gamma (axis = -1): `sum(dy * x_hat)` over batch axes.
 pub fn compose_layer_norm_backward_gamma(
     g: &mut Graph,
@@ -171,7 +169,6 @@ pub fn compose_layer_norm_backward_gamma(
     )
 }
 
-
 /// LayerNorm backward w.r.t. beta: `sum(dy)` over batch axes.
 pub fn compose_layer_norm_backward_beta(g: &mut Graph, dy: NodeId, beta_shape: &Shape) -> NodeId {
     let dy_shape = g.node(dy).shape.clone();
@@ -185,7 +182,6 @@ pub fn compose_layer_norm_backward_beta(g: &mut Graph, dy: NodeId, beta_shape: &
         beta_shape.clone(),
     )
 }
-
 
 /// RMSNorm backward w.r.t. gamma (axis = -1): `sum(dy * x * inv_r)`.
 pub fn compose_rms_norm_backward_gamma(
@@ -223,12 +219,10 @@ pub fn compose_rms_norm_backward_gamma(
     )
 }
 
-
 /// RMSNorm backward w.r.t. beta: `sum(dy)` over batch axes.
 pub fn compose_rms_norm_backward_beta(g: &mut Graph, dy: NodeId, beta_shape: &Shape) -> NodeId {
     compose_layer_norm_backward_beta(g, dy, beta_shape)
 }
-
 
 /// GroupNorm backward w.r.t. input (NCHW, static dims).
 pub fn compose_group_norm_backward_input(
@@ -296,7 +290,6 @@ pub fn compose_group_norm_backward_input(
     g.concat_(dx_groups, 1)
 }
 
-
 /// GroupNorm backward w.r.t. gamma (NCHW).
 pub fn compose_group_norm_backward_gamma(
     g: &mut Graph,
@@ -351,7 +344,6 @@ pub fn compose_group_norm_backward_gamma(
     g.concat_(dgamma, 0)
 }
 
-
 /// GroupNorm backward w.r.t. beta: `sum(dy)` over N,H,W.
 pub fn compose_group_norm_backward_beta(g: &mut Graph, dy: NodeId, beta_shape: &Shape) -> NodeId {
     let dy_shape = g.node(dy).shape.clone();
@@ -365,4 +357,3 @@ pub fn compose_group_norm_backward_beta(g: &mut Graph, dy: NodeId, beta_shape: &
         beta_shape.clone(),
     )
 }
-

@@ -26,6 +26,27 @@ pub fn dinov2_layer_fused(
     num_heads: usize,
     eps: f32,
 ) -> FlowStage {
+    dinov2_layer_fused_gelu(layer_idx, hidden_size, num_heads, eps, true)
+}
+
+/// Same as [`dinov2_layer_fused`] but with exact (erf) GELU — for parity with
+/// checkpoints trained against `torch.nn.GELU()`.
+pub fn dinov2_layer_fused_exact(
+    layer_idx: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    eps: f32,
+) -> FlowStage {
+    dinov2_layer_fused_gelu(layer_idx, hidden_size, num_heads, eps, false)
+}
+
+fn dinov2_layer_fused_gelu(
+    layer_idx: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    eps: f32,
+    approx_gelu: bool,
+) -> FlowStage {
     let lp = format!("blocks.{layer_idx}");
     FlowStage::Named {
         name: format!("layer{layer_idx}"),
@@ -52,7 +73,10 @@ pub fn dinov2_layer_fused(
                     format!("{lp}.norm2.bias"),
                     eps,
                 )
-                .stage(FlowStage::GeluFfn(GeluFfnStage::dinov2(&lp)))
+                .stage(FlowStage::GeluFfn(GeluFfnStage::dinov2_with(
+                    &lp,
+                    approx_gelu,
+                )))
                 .stage(FlowStage::LayerScale(LayerScaleStage::new(format!(
                     "{lp}.ls2.gamma"
                 ))))

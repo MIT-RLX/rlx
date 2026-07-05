@@ -17,13 +17,13 @@
 
 #![allow(unused_imports)]
 
-use rlx_ir::{Graph, NodeId, Op};
-use rlx_opt::memory;
-use std::collections::HashMap;
 use crate::arena::Arena;
 use crate::device::metal_device;
 use crate::kernels::kernels;
 use crate::thunk::{Thunk, ThunkSchedule};
+use rlx_ir::{Graph, NodeId, Op};
+use rlx_opt::memory;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -51,11 +51,9 @@ impl MetalExecutable {
         exe
     }
 
-
     pub fn compile(graph: Graph) -> Self {
         Self::compile_inner(graph, None, None, false, rlx_ir::RngOptions::default())
     }
-
 
     /// Compile with an optional `PrecisionPolicy`. The pass runs *after*
     /// fusion to avoid breaking pattern-match-based fusion via interleaved
@@ -69,7 +67,6 @@ impl MetalExecutable {
         Self::compile_inner(graph, policy, supported_ops, false, rng)
     }
 
-
     /// Compile a graph that already went through the fusion pipeline
     /// (e.g. from [`rlx_ir::LirModule`]). Skips re-fusion so backends
     /// invoked via `Backend::compile_lir` do not undo fused ops.
@@ -81,7 +78,6 @@ impl MetalExecutable {
     ) -> Self {
         Self::compile_inner(graph, policy, supported_ops, true, rng)
     }
-
 
     pub(crate) fn compile_inner(
         graph: Graph,
@@ -149,6 +145,20 @@ impl MetalExecutable {
         // so the f32 gate sees the final dtype. FAB-only — Metal's native
         // FusedMatMulBiasAct / FusedResidualLN / FusedSwiGLU survive.
         let fused = lower_fab_for_metal(fused);
+
+        // Metal is an f32-arena backend: every compute kernel (compare, cast,
+        // gather, transpose/expand, elementwise, matmul) reads and writes f32.
+        // Integer & bool tensors — VITS sequence masks (`arange(t) < lengths`),
+        // comparison results, gather indices, one-hot casts — must therefore be
+        // materialized as f32 in the arena, exactly like rlx-wgpu's f32-uniform
+        // arena. Without this, an i64 `arange` constant (8 B/elem) or a Bool
+        // compare result (1 B/elem) is read back through an f32 pointer as
+        // garbage → all-zero sequence mask → dead text encoder (TinyTTS). Weights
+        // stay untouched (Op::Param packed/quant blocks are read as raw bytes by
+        // DequantMatMul), and integer index/mask activations lose nothing: Metal's
+        // gather already truncates indices through f32, so values must already fit
+        // the f32 mantissa.
+        let fused = widen_integer_activations_to_f32(fused);
         // Per-node (qkv, attn) BYTE offsets for the surviving native FAB nodes,
         // relative to the FAB scratch base (resolved against the arena below).
         let (fab_scratch_bytes, fab_scratch_rel) = fab_scratch_layout(&fused);
@@ -524,5 +534,90 @@ impl MetalExecutable {
         me.bind_mps_executable_to_arena();
         me
     }
+}
 
+/// Dtypes materialized as f32 in the Metal arena. Metal's compute kernels are
+/// f32/f16-only, so integer & bool *activations/constants/indices* must live as
+/// f32 (their values already fit the mantissa — Metal's gather truncates indices
+/// through f32 regardless). Packed/quantized weights (`Op::Param`, e.g. GGUF
+/// U8/I8 blocks read raw by DequantMatMul) are handled elsewhere and must keep
+/// their true byte width, so U8/I8 are deliberately excluded here.
+#[inline]
+fn metal_widened_dtype(dt: rlx_ir::DType) -> bool {
+    matches!(
+        dt,
+        rlx_ir::DType::I64 | rlx_ir::DType::I32 | rlx_ir::DType::U32 | rlx_ir::DType::Bool
+    )
+}
+
+/// Reinterpret little-endian integer/bool bytes as f32 values (byte-encoded).
+fn int_bytes_to_f32_bytes(data: &[u8], dt: rlx_ir::DType) -> Vec<u8> {
+    use rlx_ir::DType;
+    match dt {
+        DType::I64 => data
+            .chunks_exact(8)
+            .flat_map(|c| (i64::from_le_bytes(c.try_into().unwrap()) as f32).to_le_bytes())
+            .collect(),
+        DType::I32 => data
+            .chunks_exact(4)
+            .flat_map(|c| (i32::from_le_bytes(c.try_into().unwrap()) as f32).to_le_bytes())
+            .collect(),
+        DType::U32 => data
+            .chunks_exact(4)
+            .flat_map(|c| (u32::from_le_bytes(c.try_into().unwrap()) as f32).to_le_bytes())
+            .collect(),
+        DType::Bool => data
+            .iter()
+            .flat_map(|&b| (b as f32).to_le_bytes())
+            .collect(),
+        _ => data.to_vec(),
+    }
+}
+
+/// Rewrite every non-param integer/bool tensor node to F32 (converting `Constant`
+/// payloads and `Cast` targets) so the whole graph runs through Metal's f32
+/// kernels + f32-sized arena slots. See the call site for the rationale. Mirrors
+/// rlx-wgpu's f32-uniform arena, which widens the same class of tensors on upload.
+fn widen_integer_activations_to_f32(mut graph: Graph) -> Graph {
+    use rlx_ir::DType;
+    // `Op::Custom` ops (Sparse-LU/mat_vec, FFT, …) run as host kernels against
+    // the unified-memory arena directly and read each input at its declared
+    // dtype (e.g. CSR `col_idx`/`row_ptr` as I32 via `expect_i32`). Widening
+    // those integer operands to f32 would corrupt them, so any tensor consumed
+    // by a Custom node keeps its true byte width — only the native f32 GPU
+    // kernels need the widened form. (A tensor feeding both a Custom host
+    // kernel and a native op would conflict, but no such graph exists today.)
+    let custom_operands: std::collections::HashSet<rlx_ir::NodeId> = graph
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.op, Op::Custom { .. }))
+        .flat_map(|n| n.inputs.iter().copied())
+        .collect();
+    for node in graph.nodes_mut() {
+        // Packed/quantized weight params live at their true byte width.
+        if matches!(node.op, Op::Param { .. }) {
+            continue;
+        }
+        // Host Custom-kernel operands must keep their declared dtype.
+        if custom_operands.contains(&node.id) {
+            continue;
+        }
+        let old = node.shape.dtype();
+        // Convert Constant literals up front (needs the pre-rewrite dtype).
+        if metal_widened_dtype(old)
+            && let Op::Constant { data } = &mut node.op
+        {
+            *data = int_bytes_to_f32_bytes(data, old);
+        }
+        // An integer/bool Cast target is now produced directly as f32.
+        if let Op::Cast { to } = &mut node.op
+            && metal_widened_dtype(*to)
+        {
+            *to = DType::F32;
+        }
+        if metal_widened_dtype(old) {
+            node.shape = node.shape.clone().with_dtype(DType::F32);
+        }
+    }
+    graph
 }

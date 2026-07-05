@@ -137,4 +137,3 @@ pub fn compose_fake_quantize_backward(
         }
     }
 }
-

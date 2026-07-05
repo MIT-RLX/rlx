@@ -37,7 +37,11 @@ use crate::lower::options::{ImportOptions, ImportReport};
 
 use super::*;
 
-pub(super) fn lower_qmatmul(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_qmatmul(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let act_q = ctx.tensor(&node.inputs[0])?;
     let act_scale = ctx.tensor(&node.inputs[1])?;
     let act_zp = ctx.tensor(&node.inputs[2])?;
@@ -60,8 +64,11 @@ pub(super) fn lower_qmatmul(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &B
     Ok(true)
 }
 
-
-pub(super) fn lower_matmul(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_matmul(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let a = ctx.tensor(&node.inputs[0])?;
     let w_name = node.inputs[1].as_str();
     let sa = m.shape(a).clone();
@@ -115,8 +122,11 @@ pub(super) fn lower_matmul(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bu
     Ok(true)
 }
 
-
-pub(super) fn lower_gemm(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+pub(super) fn lower_gemm(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
     let a = ctx.tensor(&node.inputs[0])?;
     let b = ctx.tensor(&node.inputs[1])?;
     let sa = m.shape(a).clone();
@@ -130,4 +140,3 @@ pub(super) fn lower_gemm(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &Bund
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }
-

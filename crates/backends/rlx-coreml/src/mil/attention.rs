@@ -10,14 +10,14 @@
 
 #![allow(unused_imports)]
 
-use std::collections::HashMap;
+use super::helpers::simple_op_flex;
+use super::helpers::*;
+use crate::proto;
+use crate::{CoremlError, Result};
 use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
-use crate::proto;
-use crate::{CoremlError, Result};
-use super::helpers::simple_op_flex;
-use super::helpers::*;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -200,7 +200,6 @@ impl<'a> LowerCtx<'a> {
         )))
     }
 
-
     /// Transpose a `[B,S,H,D]` operand to canonical `[B,H,S,D]` (perm `[0,2,1,3]`).
     pub(crate) fn bshd_to_bhsd(
         &mut self,
@@ -224,7 +223,6 @@ impl<'a> LowerCtx<'a> {
         )?;
         Ok(t)
     }
-
 
     /// Reshape+transpose a fused `[B,S,H·D]` operand to canonical `[B,H,S,D]`.
     pub(crate) fn fused_to_bhsd(
@@ -263,7 +261,6 @@ impl<'a> LowerCtx<'a> {
         Ok(t)
     }
 
-
     /// [`Self::fused_to_bhsd`] deriving head count + seq from the operand shape
     /// (key/value heads may be fewer than `num_heads` before `repeat_kv`).
     pub(crate) fn fused_to_bhsd_kv(
@@ -278,7 +275,6 @@ impl<'a> LowerCtx<'a> {
         let h = dim_static(&shape, 2)? / d;
         Ok((self.fused_to_bhsd(in_id, b, s, h, d, prefix)?, s))
     }
-
 
     /// Canonical scaled-dot-product attention on `[..,Sq,D]` q/k/v. MIL
     /// `matmul` batches leading dims and the masks broadcast, so one core
@@ -405,7 +401,6 @@ impl<'a> LowerCtx<'a> {
         Ok(cur)
     }
 
-
     pub(crate) fn attention_core(
         &mut self,
         q: &str,
@@ -505,7 +500,6 @@ impl<'a> LowerCtx<'a> {
         )?;
         Ok(())
     }
-
 
     /// Fused scaled-dot-product attention backward (`dQ`/`dK`/`dV`). Canonicalizes
     /// any of the three operand layouts the forward accepts — `[B,H,S,D]`,
@@ -649,7 +643,6 @@ impl<'a> LowerCtx<'a> {
             "attention backward: unsupported operand layout (rank {rank}, last {last})"
         )))
     }
-
 
     /// Canonical `[B,H,S,D]` attention backward, emitting the single `wrt` gradient
     /// to `result`. Recompute `P = softmax(scale·QKᵀ [+ mask])`, then:
@@ -810,5 +803,4 @@ impl<'a> LowerCtx<'a> {
         }
         Ok(())
     }
-
 }

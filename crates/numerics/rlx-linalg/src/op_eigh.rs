@@ -16,8 +16,6 @@
 //! `eigh` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::infer::GraphExt;
@@ -31,7 +29,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct EighExt;
-
 
 impl OpExtension for EighExt {
     fn name(&self) -> &str {
@@ -156,10 +153,8 @@ impl OpExtension for EighExt {
     }
 }
 
-
 #[cfg(feature = "cpu")]
 pub(crate) struct EighCpu;
-
 
 #[cfg(feature = "cpu")]
 impl CpuKernel for EighCpu {
@@ -184,4 +179,3 @@ impl CpuKernel for EighCpu {
 }
 
 // ── QR ───────────────────────────────────────────────────────────
-

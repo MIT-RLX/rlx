@@ -192,14 +192,12 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-
     pub(crate) fn val(&self, id: NodeId) -> String {
         self.names
             .get(&id.0)
             .cloned()
             .unwrap_or_else(|| format!("v{}", id.0))
     }
-
 
     /// Like [`Self::val`], but coerces a bool operand to fp32 first. CoreML's
     /// arithmetic ops (mul/add/…) reject bool tensors, but VITS multiplies
@@ -224,7 +222,6 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-
     /// Walk the graph in topo order, emitting one MIL op per node.
     pub(crate) fn run(&mut self) -> Result<()> {
         for id in self.graph.topo_order() {
@@ -232,7 +229,6 @@ impl<'a> LowerCtx<'a> {
         }
         Ok(())
     }
-
 
     pub(crate) fn lower_node(&mut self, id: NodeId) -> Result<()> {
         let node = self.graph.node(id);
@@ -944,7 +940,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     /// Emit a single-output op and push it (without registering a node).
     pub(crate) fn emit(
         &mut self,
@@ -958,7 +953,6 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-
     pub(crate) fn simple_op(
         &self,
         ty: &str,
@@ -968,7 +962,6 @@ impl<'a> LowerCtx<'a> {
     ) -> Result<proto::Operation> {
         simple_op_flex(ty, out_name, out_shape, inputs, self.opts.flexible_inputs)
     }
-
 
     /// Emit `dst = src[..., start..start+len]` along the last axis.
     pub(crate) fn slice_last(
@@ -982,7 +975,6 @@ impl<'a> LowerCtx<'a> {
     ) -> Result<()> {
         self.slice_axis(src, src_rank, src_rank - 1, start, len, out_shape, dst)
     }
-
 
     /// Emit `dst = src` sliced to `[start, start+len)` along `axis`.
     #[allow(clippy::too_many_arguments)]
@@ -1012,8 +1004,13 @@ impl<'a> LowerCtx<'a> {
         )
     }
 
-
-    pub(crate) fn reshape_to(&mut self, src: &str, dims: &[i64], out_shape: &Shape, dst: &str) -> Result<()> {
+    pub(crate) fn reshape_to(
+        &mut self,
+        src: &str,
+        dims: &[i64],
+        out_shape: &Shape,
+        dst: &str,
+    ) -> Result<()> {
         let s: Vec<i32> = dims.iter().map(|&v| v as i32).collect();
         self.emit(
             "reshape",
@@ -1022,7 +1019,6 @@ impl<'a> LowerCtx<'a> {
             vec![("x", bind_name(src)), ("shape", bind_value(vec_i32(&s)))],
         )
     }
-
 
     pub(crate) fn matmul(&mut self, dst: &str, x: &str, y: &str, out_shape: &Shape) -> Result<()> {
         self.emit(
@@ -1037,7 +1033,6 @@ impl<'a> LowerCtx<'a> {
             ],
         )
     }
-
 
     pub(crate) fn matmul_op(
         &mut self,
@@ -1061,12 +1056,10 @@ impl<'a> LowerCtx<'a> {
         )
     }
 
-
     pub(crate) fn push_named(&mut self, id: NodeId, name: String, op: proto::Operation) {
         self.operations.push(op);
         self.names.insert(id.0, name);
     }
-
 
     pub(crate) fn unique_feature_name(&mut self, raw: &str) -> String {
         let base = sanitize(raw);
@@ -1079,7 +1072,6 @@ impl<'a> LowerCtx<'a> {
         *n += 1;
         name
     }
-
 
     /// Verify every value referenced by an op (or by a block output)
     /// resolves to something produced (a function input or an op output).
@@ -1122,7 +1114,6 @@ impl<'a> LowerCtx<'a> {
         }
         Ok(())
     }
-
 
     pub(crate) fn finish(mut self) -> Result<LoweredProgram> {
         // `graph` is a shared reference (Copy); this rebinds it without moving
@@ -1231,8 +1222,6 @@ impl<'a> LowerCtx<'a> {
     }
 }
 
-
 // --------------------------------------------------------------------------
 // proto builders
 // --------------------------------------------------------------------------
-

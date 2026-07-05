@@ -41,7 +41,6 @@ use super::*;
 /// largest memory win on transformer FFN blocks.
 pub struct FuseSwiGLUDualMatmul;
 
-
 impl FuseSwiGLUDualMatmul {
     fn match_dual_swiglu(
         graph: &Graph,
@@ -75,7 +74,6 @@ impl FuseSwiGLUDualMatmul {
         Some((mul_node.id, gate_mm.id, up_mm.id, up_mm.inputs[0], silu_id))
     }
 }
-
 
 impl Pass for FuseSwiGLUDualMatmul {
     fn name(&self) -> &str {
@@ -155,4 +153,3 @@ impl Pass for FuseSwiGLUDualMatmul {
 }
 
 // ── Pass 3: Shared-input MatMul concat (QKV, SwiGLU fc11+fc12) ──────────
-

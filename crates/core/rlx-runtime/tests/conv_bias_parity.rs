@@ -3,6 +3,8 @@
 //! `conv2d_bias` sequence). conv and Expand pass standalone on Metal, but the
 //! detection diverges at full resolution — this tests the combination.
 
+#![allow(dead_code)]
+
 use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};

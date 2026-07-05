@@ -17,13 +17,13 @@
 
 #![allow(unused_imports)]
 
-use rlx_ir::{Graph, NodeId, Op};
-use rlx_opt::memory;
-use std::collections::HashMap;
 use crate::arena::Arena;
 use crate::device::metal_device;
 use crate::kernels::kernels;
 use crate::thunk::{Thunk, ThunkSchedule};
+use rlx_ir::{Graph, NodeId, Op};
+use rlx_opt::memory;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -57,7 +57,6 @@ impl MetalExecutable {
             .collect()
     }
 
-
     /// Declared graph-output dtypes, in `graph.outputs` order. Used by
     /// the runtime wrapper's `run_typed` to narrow the f32 outputs back
     /// to F16/BF16/etc. on the way out, mirroring what backends with
@@ -70,9 +69,7 @@ impl MetalExecutable {
             .collect()
     }
 
-
     pub fn output_slots(&self) -> &[(usize, usize)] {
         &self.output_slots
     }
-
 }

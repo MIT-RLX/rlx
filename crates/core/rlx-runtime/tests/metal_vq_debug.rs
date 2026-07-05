@@ -11,22 +11,37 @@ fn const_f32(g: &mut Graph, xs: &[f32], dims: &[usize]) -> NodeId {
     for x in xs {
         bytes.extend_from_slice(&x.to_le_bytes());
     }
-    g.add_node(Op::Constant { data: bytes }, vec![], Shape::new(dims, DType::F32))
+    g.add_node(
+        Op::Constant { data: bytes },
+        vec![],
+        Shape::new(dims, DType::F32),
+    )
 }
 fn f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 fn run(dev: Device, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) -> Vec<Vec<f32>> {
     let mut g = Graph::new("d");
     let o = build(&mut g);
     g.set_outputs(o);
-    Session::new(dev).compile(g).run_typed(&[]).iter().map(|o| f32s(&o.0)).collect()
+    Session::new(dev)
+        .compile(g)
+        .run_typed(&[])
+        .iter()
+        .map(|o| f32s(&o.0))
+        .collect()
 }
 
 #[test]
 fn argmin_isolated() {
     let build: &dyn Fn(&mut Graph) -> Vec<NodeId> = &|g| {
-        let d = const_f32(g, &[0.0, -80.0, 80.0, 5.0, 5.0, -1.0, 9.0, 2.0, 3.0], &[3, 3]);
+        let d = const_f32(
+            g,
+            &[0.0, -80.0, 80.0, 5.0, 5.0, -1.0, 9.0, 2.0, 3.0],
+            &[3, 3],
+        );
         let s = rlx_ir::shape::reduce_shape(g.shape(d), &[1], false).unwrap();
         let idx = g.argmin(d, 1, false, s);
         vec![idx]

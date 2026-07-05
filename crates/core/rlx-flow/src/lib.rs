@@ -40,9 +40,10 @@ pub mod prelude;
 
 pub use blocks::RopeTablesStage;
 pub use blocks::{
-    BertEncoderLayerSpec, BertEncoderLayerStage, BertQkvStyle, ClsTokenPoolStage,
-    NomicEncoderLayerSpec, NomicEncoderLayerStage, Qwen3DecodeLayerSpec, Qwen3DecoderSpec,
-    Qwen3DecoderStage, VitSelfAttnSpec, dinov2_layer_fused, nomic_vision_layer_fused,
+    BertEncoderLayerSpec, BertEncoderLayerStage, BertQkvStyle, ClsTokenPoolStage, FfnActivation,
+    GeluFfnStage, NomicEncoderLayerSpec, NomicEncoderLayerStage, Qwen3DecodeLayerSpec,
+    Qwen3DecoderSpec, Qwen3DecoderStage, VitSelfAttnSpec, dinov2_layer_fused,
+    nomic_vision_layer_fused, transformer_encoder_layer,
 };
 pub use composite::LayerComposition;
 pub use context::{DecodeBindings, FlowState, GdnInputSlots};

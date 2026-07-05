@@ -31,17 +31,29 @@ const SR: f32 = 128.0;
 const T: usize = 512;
 const C: usize = 4;
 // delta, theta, alpha, beta, gamma
-const BANDS: [(f32, f32); 5] = [(1.0, 4.0), (4.0, 8.0), (8.0, 13.0), (13.0, 30.0), (30.0, 45.0)];
+const BANDS: [(f32, f32); 5] = [
+    (1.0, 4.0),
+    (4.0, 8.0),
+    (8.0, 13.0),
+    (13.0, 30.0),
+    (30.0, 45.0),
+];
 
 fn const_f32(g: &mut Graph, xs: &[f32], dims: &[usize]) -> NodeId {
     let mut b = Vec::with_capacity(xs.len() * 4);
     for x in xs {
         b.extend_from_slice(&x.to_le_bytes());
     }
-    g.add_node(Op::Constant { data: b }, vec![], Shape::new(dims, DType::F32))
+    g.add_node(
+        Op::Constant { data: b },
+        vec![],
+        Shape::new(dims, DType::F32),
+    )
 }
 fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 /// RBJ notch biquad at `f0` (Hz), quality `q`, normalized by a0 downstream.
@@ -81,7 +93,12 @@ fn run(dev: Device) -> Vec<Vec<f32>> {
     let mut g = Graph::new("eeg");
     let outs = build(&mut g);
     g.set_outputs(outs);
-    Session::new(dev).compile(g).run_typed(&[]).iter().map(|o| bytes_to_f32s(&o.0)).collect()
+    Session::new(dev)
+        .compile(g)
+        .run_typed(&[])
+        .iter()
+        .map(|o| bytes_to_f32s(&o.0))
+        .collect()
 }
 
 #[test]

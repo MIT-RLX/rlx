@@ -50,7 +50,6 @@ use super::*;
 /// has exactly one consumer. The mul may have any number of consumers.
 pub struct FuseSwiGLU;
 
-
 impl Pass for FuseSwiGLU {
     fn name(&self) -> &str {
         "fuse_swiglu"
@@ -195,4 +194,3 @@ impl Pass for FuseSwiGLU {
 }
 
 // ── Pass 5: Fuse Attention Block (QKV → SDPA → OutProj) ────────────────
-

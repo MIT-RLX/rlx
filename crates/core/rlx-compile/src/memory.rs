@@ -653,17 +653,32 @@ pub fn plan_memory_backward(
 
 #[inline]
 fn node_slot_bytes(node: &rlx_ir::Node, f32_uniform: bool) -> usize {
-    // f32-uniform planning gives f32 activation slots a uniform 4-byte-per-elem
-    // width (so any slot can be bound as f32). But NON-f32 nodes — notably packed
-    // U8 GGUF weight params — must keep their true byte width: sizing them as f32
-    // 4x-bloats packed weights (a 2B model's ~1.7 GB of packed weights → ~6.5 GB,
-    // which exceeds wgpu's 4 GiB single-buffer cap and OOMs). They're read as raw
-    // bytes by DequantMatMul, so they never need f32 alignment.
-    if f32_uniform && node.shape.dtype() == rlx_ir::DType::F32 {
-        node.shape.num_elements().unwrap_or(0) * 4
-    } else {
-        node.shape.size_bytes().unwrap_or(0)
+    // f32-uniform planning gives activation slots a uniform 4-byte-per-elem
+    // width (so any slot can be bound as f32). The one exception is packed /
+    // quantized WEIGHTS — non-F32 `Param`s read as raw bytes by DequantMatMul.
+    // Sizing those as f32 4x-bloats packed weights (a 2B model's ~1.7 GB →
+    // ~6.5 GB, which exceeds wgpu's 4 GiB single-buffer cap and OOMs), so they
+    // keep their true (sub-4-byte) byte width.
+    //
+    // Every OTHER tensor — including bool masks and integer activations —
+    // occupies 4 bytes per logical element in this arena (F32 directly; bool /
+    // int tensors are widened to f32 on upload / at compute time). Sizing such
+    // a slot by its native byte width (bool = 1 B/elem) leaves it 4x too small,
+    // so the kernel's `num_elements * 4`-byte write overruns into the following
+    // slot and silently clobbers whatever lives there — e.g. the persistent
+    // params sitting after a VITS relative-position bool attention mask, which
+    // turned long-form wgpu TTS output into all-zero garbage. Take the max of
+    // the native width and the f32 width so integer tensors that are stored
+    // wider than 4 bytes on other f32-uniform backends are never shrunk.
+    let native = node.shape.size_bytes().unwrap_or(0);
+    if f32_uniform {
+        let packed_weight =
+            matches!(node.op, rlx_ir::Op::Param { .. }) && node.shape.dtype() != rlx_ir::DType::F32;
+        if !packed_weight {
+            return native.max(node.shape.num_elements().unwrap_or(0) * 4);
+        }
     }
+    native
 }
 
 fn plan_memory_aligned_inner(

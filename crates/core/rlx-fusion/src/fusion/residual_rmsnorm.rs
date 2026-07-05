@@ -33,7 +33,6 @@ use super::*;
 /// Fuses `add(x, residual) → rms_norm` into [`Op::FusedResidualRmsNorm`].
 pub struct FuseResidualRmsNorm;
 
-
 impl Pass for FuseResidualRmsNorm {
     fn name(&self) -> &str {
         "fuse_residual_rms_norm"
@@ -99,4 +98,3 @@ impl Pass for FuseResidualRmsNorm {
 }
 
 // ── Pass 2c: RmsNorm → Reshape(leading flatten) ─────────────────────────
-

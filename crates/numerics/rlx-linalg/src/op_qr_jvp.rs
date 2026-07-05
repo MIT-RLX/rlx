@@ -16,8 +16,6 @@
 //! `qr_jvp` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::infer::GraphExt;
@@ -31,7 +29,6 @@ use rlx_cpu::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef};
 use super::*;
 
 pub(crate) struct QrJvpExt;
-
 
 impl OpExtension for QrJvpExt {
     fn name(&self) -> &str {
@@ -47,7 +44,6 @@ impl OpExtension for QrJvpExt {
         Shape::new(&[q_len + r_len], DType::F64)
     }
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct QrJvpCpu;
@@ -80,4 +76,3 @@ impl CpuKernel for QrJvpCpu {
 }
 
 // ── SVD JVP ───────────────────────────────────────────────────────
-

@@ -16,8 +16,6 @@
 //! `pinv_backward` op registration — split from `lib.rs` (see `register()`).
 
 #![cfg_attr(not(feature = "cpu"), allow(dead_code))]
-
-
 #![allow(unused_imports)]
 
 use rlx_ir::{OpExtension, Shape};
@@ -31,7 +29,6 @@ use super::*;
 
 pub(crate) struct PinvBackwardExt;
 
-
 impl OpExtension for PinvBackwardExt {
     fn name(&self) -> &str {
         LINALG_PINV_BACKWARD
@@ -43,7 +40,6 @@ impl OpExtension for PinvBackwardExt {
         inputs[0].clone() // dL/dA shape == A shape
     }
 }
-
 
 #[cfg(feature = "cpu")]
 pub(crate) struct PinvBackwardCpu;
@@ -81,4 +77,3 @@ impl CpuKernel for PinvBackwardCpu {
 }
 
 // ── Lstsq ─────────────────────────────────────────────────────────
-
