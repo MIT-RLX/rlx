@@ -161,6 +161,9 @@ impl<'a> LowerCtx<'a> {
                     ("x", bind_name(&cur)),
                     ("indices", bind_name(&idx_i32)),
                     ("axis", bind_value(scalar_i32(ax as i32))),
+                    // Required by the iOS18 gather opset (the LUT path forces
+                    // spec-9); matches the other gather sites.
+                    ("validate_indices", bind_value(scalar_bool(false))),
                 ],
             )?;
             cur = next;

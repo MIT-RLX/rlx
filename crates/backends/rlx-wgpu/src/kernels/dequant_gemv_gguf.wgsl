@@ -106,6 +106,25 @@ fn dequant_gemv(@builtin(global_invocation_id) gid: vec3<u32>) {
                 is = is + 32u;
             }
         }
+    } else if (params.scheme_id == 24u) {
+        // Q1_0 (prism-ml Bonsai-27B): 18 bytes / 128 elems. f16 scale `d` +
+        // 16 sign bytes, LSB-first, bit1 -> +d, bit0 -> -d. Reads packed weight
+        // directly (no f32 scratch). k is a multiple of 128.
+        let nbk1 = params.k / 128u;
+        let blk1 = 18u;
+        for (var b: u32 = 0u; b < nbk1; b = b + 1u) {
+            let off = (j * nbk1 + b) * blk1;
+            let d = dq_read_f16(off);
+            let nd = -d;
+            let ko = b * 128u;
+            for (var byte: u32 = 0u; byte < 16u; byte = byte + 1u) {
+                let bits = read_w(off + 2u + byte);
+                for (var bit: u32 = 0u; bit < 8u; bit = bit + 1u) {
+                    let w = select(nd, d, ((bits >> bit) & 1u) != 0u);
+                    acc = acc + xarr[xb + ko + byte * 8u + bit] * w;
+                }
+            }
+        }
     } else if (params.scheme_id == 2u) {
         // Q6_K: 210 bytes / 256 elems.
         let ql_len = 256u / 2u;

@@ -138,6 +138,41 @@ fn wgpu_gguf_dequant_matmul_prefill_matches_cpu() {
             256,
             1e-2,
         ),
+        // Custom 1-bit Q1_0 (prism-ml Bonsai-27B): 128-elem blocks. k a
+        // multiple of 128; wgpu on-device dequant_gguf path vs CPU.
+        (
+            QuantScheme::GgufQ1_0,
+            rlx_gguf::GgmlType::Q1_0,
+            5,
+            512,
+            256,
+            1e-2,
+        ),
+        // Bonsai-ish prefill tiles (hidden=5120).
+        (
+            QuantScheme::GgufQ1_0,
+            rlx_gguf::GgmlType::Q1_0,
+            33,
+            512,
+            512,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ1_0,
+            rlx_gguf::GgmlType::Q1_0,
+            8,
+            5120,
+            5120,
+            2e-2,
+        ),
+        (
+            QuantScheme::GgufQ1_0,
+            rlx_gguf::GgmlType::Q1_0,
+            33,
+            5120,
+            5120,
+            2e-2,
+        ),
     ];
     for (scheme, ggml, m, k, n, tol) in cases {
         let Some(max_abs) = run_case(*scheme, *ggml, *m, *k, *n) else {

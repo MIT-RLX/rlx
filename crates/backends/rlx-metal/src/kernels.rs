@@ -50,6 +50,167 @@ kernel void sgemm(
     C[row * N + col] = sum;
 }
 
+// F32 activations × F16 weights → F32 (Zonos Metal Linear). Avoids casting
+// the full weight matrix to F32 on every decode step.
+kernel void sgemm_f16w(
+    device const float* A [[buffer(0)]],
+    device const half* B  [[buffer(1)]],
+    device float* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= M || col >= N) return;
+    float sum = 0.0;
+    for (uint k = 0; k < K; ++k) {
+        sum += A[row * K + k] * float(B[k * N + col]);
+    }
+    C[row * N + col] = sum;
+}
+
+// Small-M F16-weight GEMM (CFG decode: M=2). One thread per output column;
+// all M rows share each B load — padded simdgroup wastes 6/8 A rows when M=2.
+kernel void sgemm_f16w_small_m(
+    device const float* A [[buffer(0)]],
+    device const half* B  [[buffer(1)]],
+    device float* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint col = gid;
+    if (col >= N || M == 0u || M > 4u) return;
+
+    // Hot path: M==2 (Zonos CFG) — no per-k row branches.
+    if (M == 2u) {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        uint k = 0;
+        for (; k + 3u < K; k += 4u) {
+            float4 bv = float4(
+                float(B[(k + 0u) * N + col]),
+                float(B[(k + 1u) * N + col]),
+                float(B[(k + 2u) * N + col]),
+                float(B[(k + 3u) * N + col]));
+            float4 a0 = *(device const float4*)(A + k);
+            float4 a1 = *(device const float4*)(A + K + k);
+            acc0 += a0.x * bv.x + a0.y * bv.y + a0.z * bv.z + a0.w * bv.w;
+            acc1 += a1.x * bv.x + a1.y * bv.y + a1.z * bv.z + a1.w * bv.w;
+        }
+        for (; k < K; ++k) {
+            float b = float(B[k * N + col]);
+            acc0 += A[k] * b;
+            acc1 += A[K + k] * b;
+        }
+        C[col] = acc0;
+        C[N + col] = acc1;
+        return;
+    }
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    uint k = 0;
+    for (; k + 3u < K; k += 4u) {
+        float b0 = float(B[(k + 0u) * N + col]);
+        float b1 = float(B[(k + 1u) * N + col]);
+        float b2 = float(B[(k + 2u) * N + col]);
+        float b3 = float(B[(k + 3u) * N + col]);
+        float4 bv = float4(b0, b1, b2, b3);
+        {
+            float4 a = *(device const float4*)(A + k);
+            acc0 += a.x * bv.x + a.y * bv.y + a.z * bv.z + a.w * bv.w;
+        }
+        if (M > 1u) {
+            float4 a = *(device const float4*)(A + K + k);
+            acc1 += a.x * bv.x + a.y * bv.y + a.z * bv.z + a.w * bv.w;
+        }
+        if (M > 2u) {
+            float4 a = *(device const float4*)(A + 2u * K + k);
+            acc2 += a.x * bv.x + a.y * bv.y + a.z * bv.z + a.w * bv.w;
+        }
+        if (M > 3u) {
+            float4 a = *(device const float4*)(A + 3u * K + k);
+            acc3 += a.x * bv.x + a.y * bv.y + a.z * bv.z + a.w * bv.w;
+        }
+    }
+    for (; k < K; ++k) {
+        float b = float(B[k * N + col]);
+        acc0 += A[k] * b;
+        if (M > 1u) acc1 += A[K + k] * b;
+        if (M > 2u) acc2 += A[2u * K + k] * b;
+        if (M > 3u) acc3 += A[3u * K + k] * b;
+    }
+    C[col] = acc0;
+    if (M > 1u) C[N + col] = acc1;
+    if (M > 2u) C[2u * N + col] = acc2;
+    if (M > 3u) C[3u * N + col] = acc3;
+}
+
+// Padded simdgroup with F16 B (same staging as sgemm_simd_padded).
+kernel void sgemm_simd_padded_f16w(
+    device const float* A [[buffer(0)]],
+    device const half* B  [[buffer(1)]],
+    device float* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    uint row_base = tgid.y * 8;
+    uint col_base = tgid.x * 8;
+    threadgroup float A_pad[64];
+    threadgroup float B_pad[64];
+    simdgroup_float8x8 a, b, c;
+    c = simdgroup_float8x8(0.0f);
+    for (uint k = 0; k < K; k += 8) {
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 32 + slid;
+            uint ar = idx / 8;
+            uint ac = idx % 8;
+            uint src_row = row_base + ar;
+            uint src_col = k + ac;
+            float v = (src_row < M && src_col < K) ? A[src_row * K + src_col] : 0.0f;
+            A_pad[idx] = v;
+        }
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 32 + slid;
+            uint br = idx / 8;
+            uint bc = idx % 8;
+            uint src_row = k + br;
+            uint src_col = col_base + bc;
+            float v = (src_row < K && src_col < N) ? float(B[src_row * N + src_col]) : 0.0f;
+            B_pad[idx] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(a, A_pad, 8);
+        simdgroup_load(b, B_pad, 8);
+        simdgroup_multiply_accumulate(c, a, b, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Write back with bounds (same as sgemm_simd_padded).
+    threadgroup float C_pad[64];
+    simdgroup_store(c, C_pad, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < 2; ++i) {
+        uint idx = i * 32 + slid;
+        uint cr = idx / 8;
+        uint cc = idx % 8;
+        uint out_row = row_base + cr;
+        uint out_col = col_base + cc;
+        if (out_row < M && out_col < N) {
+            C[out_row * N + out_col] = C_pad[idx];
+        }
+    }
+}
+
 // ── Half-precision (f16) variants ──────────────────────────────────────
 // Apple Silicon supports simdgroup_half8x8 — same tensor unit pipeline
 // but 2× peak FLOPs and ½ memory bandwidth vs simdgroup_float8x8.
@@ -236,6 +397,101 @@ kernel void silu_inplace_h(
     data[gid] = half(x / (1.0f + exp(-x)));
 }
 
+kernel void relu_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    data[gid] = max(data[gid], half(0.0h));
+}
+
+kernel void sigmoid_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    float x = float(data[gid]);
+    data[gid] = half(1.0f / (1.0f + exp(-x)));
+}
+
+kernel void tanh_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    float x = float(data[gid]);
+    data[gid] = half(tanh(clamp(x, -15.0f, 15.0f)));
+}
+
+kernel void exp_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = half(exp(float(data[gid]))); }
+
+kernel void log_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = half(log(float(data[gid]))); }
+
+kernel void sqrt_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = half(sqrt(float(data[gid]))); }
+
+kernel void rsqrt_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = half(rsqrt(float(data[gid]))); }
+
+kernel void neg_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = -data[gid]; }
+
+kernel void abs_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = abs(data[gid]); }
+
+kernel void sin_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = half(sin(float(data[gid]))); }
+
+kernel void cos_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = half(cos(float(data[gid]))); }
+
+kernel void tan_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = half(tan(float(data[gid]))); }
+
+kernel void atan_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = half(atan(float(data[gid]))); }
+
+kernel void round_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = half(round(float(data[gid]))); }
+
 // f16 input, f32 reduction, f16 output (mixed precision LayerNorm)
 kernel void layer_norm_h(
     device const half* input [[buffer(0)]],
@@ -270,7 +526,7 @@ kernel void layer_norm_h(
     }
 
     float mean = partial_sum[0] / float(h);
-    float var = partial_sumsq[0] / float(h) - mean * mean;
+    float var = fmax(0.0f, partial_sumsq[0] / float(h) - mean * mean);
     float inv_std = rsqrt(var + eps);
 
     for (uint i = tid; i < h; i += tsize) {
@@ -313,7 +569,7 @@ kernel void fused_residual_ln_h(
     }
 
     float mean = partial_sum[0] / float(h);
-    float var = partial_sumsq[0] / float(h) - mean * mean;
+    float var = fmax(0.0f, partial_sumsq[0] / float(h) - mean * mean);
     float inv_std = rsqrt(var + eps);
 
     for (uint i = tid; i < h; i += tsize) {
@@ -323,17 +579,23 @@ kernel void fused_residual_ln_h(
 }
 
 kernel void fused_residual_rms_norm_h(
-    device const half* x      [[buffer(0)]],
-    device const half* res    [[buffer(1)]],
-    device const half* gamma  [[buffer(2)]],
-    device const half* beta   [[buffer(3)]],
-    device half* out          [[buffer(4)]],
-    constant uint& h          [[buffer(5)]],
-    constant float& eps       [[buffer(6)]],
+    device const char* arena  [[buffer(0)]],
+    constant ulong& x_off     [[buffer(1)]],
+    constant ulong& res_off   [[buffer(2)]],
+    constant ulong& g_off     [[buffer(3)]],
+    constant ulong& b_off     [[buffer(4)]],
+    constant ulong& out_off   [[buffer(5)]],
+    constant uint& h          [[buffer(6)]],
+    constant float& eps       [[buffer(7)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tsize [[threads_per_threadgroup]]
 ) {
+    device const half* x = (device const half*)(arena + x_off);
+    device const half* res = (device const half*)(arena + res_off);
+    device const half* gamma = (device const half*)(arena + g_off);
+    device const half* beta = (device const half*)(arena + b_off);
+    device half* out = (device half*)(arena + out_off);
     threadgroup float partial_sumsq[256];
     float local_sumsq = 0.0f;
     for (uint i = tid; i < h; i += tsize) {
@@ -375,6 +637,55 @@ kernel void elem_mul_h(
 ) {
     if (gid >= len) return;
     c[gid] = a[gid] * b[gid];
+}
+
+kernel void elem_sub_h(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* c       [[buffer(2)]],
+    constant uint& len   [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    c[gid] = a[gid] - b[gid];
+}
+
+kernel void elem_div_h(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* c       [[buffer(2)]],
+    constant uint& len   [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    c[gid] = a[gid] / b[gid];
+}
+
+kernel void elem_max_h(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* c       [[buffer(2)]],
+    constant uint& len   [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; c[gid] = max(a[gid], b[gid]); }
+
+kernel void elem_min_h(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* c       [[buffer(2)]],
+    constant uint& len   [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; c[gid] = min(a[gid], b[gid]); }
+
+kernel void elem_pow_h(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* c       [[buffer(2)]],
+    constant uint& len   [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    c[gid] = half(pow(float(a[gid]), float(b[gid])));
 }
 
 kernel void gather_axis0_h(
@@ -1273,6 +1584,26 @@ kernel void silu_inplace4(
     data[gid] = out;
 }
 
+// Out-of-place SiLU: dst = src * sigmoid(src) — skips a prior Copy.
+kernel void silu_out4(
+    device char* arena [[buffer(0)]],
+    constant ulong& src_byte_off [[buffer(1)]],
+    constant ulong& dst_byte_off [[buffer(2)]],
+    constant uint& len4 [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len4) return;
+    device const packed_float4* src = (device const packed_float4*)(arena + src_byte_off);
+    device packed_float4* dst = (device packed_float4*)(arena + dst_byte_off);
+    packed_float4 px = src[gid];
+    packed_float4 out;
+    for (uint c = 0; c < 4; ++c) {
+        float xv = px[c];
+        out[c] = xv / (1.0 + exp(-xv));
+    }
+    dst[gid] = out;
+}
+
 // rhs [cols] broadcast across rows: out[m, n] = lhs[m*cols+n] op rhs[n]
 kernel void binary_broadcast_rhs_col_f32(
     device const float* lhs [[buffer(0)]],
@@ -1547,7 +1878,7 @@ inline float fused_act(float x, uint act) {
         case 1: return x / (1.0 + exp(-x));
         case 2: return max(x, 0.0);
         case 3: return 1.0 / (1.0 + exp(-x));
-        case 4: return tanh(x);
+        case 4: return tanh(clamp(x, -15.0f, 15.0f)); // fast-math tanh NaNs on large |x|
         default: return x;
     }
 }
@@ -1918,6 +2249,29 @@ kernel void elem_compare(
     c[gid] = r ? 1.0f : 0.0f;
 }
 
+/// Compare with optional scalar broadcast (`flags`: bit0=lhs scalar, bit1=rhs).
+kernel void elem_compare_bcast(
+    device const float* a    [[buffer(0)]],
+    device const float* b    [[buffer(1)]],
+    device float* c          [[buffer(2)]],
+    constant uint& len       [[buffer(3)]],
+    constant uint& op_kind   [[buffer(4)]],
+    constant uint& flags     [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    float x = (flags & 1u) ? a[0] : a[gid];
+    float y = (flags & 2u) ? b[0] : b[gid];
+    bool r = false;
+    if      (op_kind == 0) r = (x == y);
+    else if (op_kind == 1) r = (x != y);
+    else if (op_kind == 2) r = (x <  y);
+    else if (op_kind == 3) r = (x <= y);
+    else if (op_kind == 4) r = (x >  y);
+    else                   r = (x >= y);
+    c[gid] = r ? 1.0f : 0.0f;
+}
+
 // 2D convolution (naive direct, NCHW input). One thread per output
 // element. Supports groups, dilation. Bias is a separate Op (matches the
 // IR's two-input Conv shape). Two u32-arrays of dims pack into one
@@ -1970,6 +2324,56 @@ kernel void conv2d(
         }
     }
     dst[((n * c_out) + co) * h_out * w_out + ho * w_out + wo] = acc;
+}
+
+// Depthwise causal 1-D conv on BSC layout `[B, W, C]` → `[B, out_seq, C]`.
+// Weight is NCHW-packed `[C, 1, 1, K]` (same as `Op::Conv` depthwise). Optional
+// fused SiLU. Replaces Transpose→Copy→Conv2D→Copy→Transpose(+Silu) for GDN.
+kernel void depthwise_conv1d_bsc(
+    device float* arena            [[buffer(0)]],
+    constant ulong& src_off        [[buffer(1)]],
+    constant ulong& wt_off         [[buffer(2)]],
+    constant ulong& dst_off        [[buffer(3)]],
+    constant uint4& dims           [[buffer(4)]], // batch, width, out_seq, channels
+    constant uint2& k_silu         [[buffer(5)]], // k, silu!=0
+    device const float* wt_buf     [[buffer(7)]],
+    uint gid                       [[thread_position_in_grid]]
+) {
+    const uint batch = dims.x;
+    const uint width = dims.y;
+    const uint out_seq = dims.z;
+    const uint channels = dims.w;
+    const uint k = k_silu.x;
+    const bool do_silu = k_silu.y != 0u;
+    const uint total = batch * out_seq * channels;
+    if (gid >= total || k == 0u) return;
+
+    const uint c = gid % channels;
+    const uint tmp = gid / channels;
+    const uint t = tmp % out_seq;
+    const uint b = tmp / out_seq;
+
+    device const float* src = (device const float*)((device char*)arena + src_off);
+    device float* dst = (device float*)((device char*)arena + dst_off);
+    device const float* wt = (device const float*)((device const char*)wt_buf + wt_off);
+
+    const uint src_base = b * width * channels + t * channels + c;
+    const uint wt_base = c * k;
+    float acc = 0.f;
+    if (k == 4u) {
+        acc += src[src_base + 0u * channels] * wt[wt_base + 0u];
+        acc += src[src_base + 1u * channels] * wt[wt_base + 1u];
+        acc += src[src_base + 2u * channels] * wt[wt_base + 2u];
+        acc += src[src_base + 3u * channels] * wt[wt_base + 3u];
+    } else {
+        for (uint ki = 0u; ki < k; ++ki) {
+            acc += src[src_base + ki * channels] * wt[wt_base + ki];
+        }
+    }
+    if (do_silu) {
+        acc = acc / (1.0f + exp(-acc));
+    }
+    dst[b * out_seq * channels + t * channels + c] = acc;
 }
 
 // 1-D conv (W_in = W_out = 1) — Voxtral codec layout `[N,C,T,1]`.
@@ -2167,7 +2571,7 @@ kernel void group_norm(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float mean = partial_sum[0] / float(count);
-    float var = partial_sumsq[0] / float(count) - mean * mean;
+    float var = fmax(0.0f, partial_sumsq[0] / float(count) - mean * mean);
     float inv = rsqrt(var + eps);
 
     for (uint i = tid; i < count; i += tsize) {
@@ -2839,6 +3243,24 @@ kernel void elem_where(
     out[gid] = cond[gid] != 0.0f ? a[gid] : b[gid];
 }
 
+/// Where with optional scalar broadcast on any operand.
+/// `flags`: bit0=cond scalar, bit1=a scalar, bit2=b scalar.
+kernel void elem_where_bcast(
+    device const float* cond [[buffer(0)]],
+    device const float* a    [[buffer(1)]],
+    device const float* b    [[buffer(2)]],
+    device float* out        [[buffer(3)]],
+    constant uint& len       [[buffer(4)]],
+    constant uint& flags     [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    float c = (flags & 1u) ? cond[0] : cond[gid];
+    float x = (flags & 2u) ? a[0] : a[gid];
+    float y = (flags & 4u) ? b[0] : b[gid];
+    out[gid] = c != 0.0f ? x : y;
+}
+
 // Single-rounded fused multiply-add: out = fma(a, b, c). MSL `fma` is a true
 // fused op (one rounding) — required for compensated / error-free-transform math.
 kernel void elem_fma(
@@ -2920,7 +3342,11 @@ kernel void tanh_inplace(
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= len) return;
-    data[gid] = tanh(data[gid]);
+    // Clamp to the tanh saturation range: Metal's fast-math `tanh` returns NaN for
+    // large |x| (it evaluates via exp, which overflows) — e.g. VITS posterior
+    // WaveNet pre-activations reach ~300. tanh(±15)≈±1 to f32 precision, matching
+    // CPU's stable tanh; clamp also folds ±inf to ±15.
+    data[gid] = tanh(clamp(data[gid], -15.0f, 15.0f));
 }
 
 // In-place exp / log / sqrt / rsqrt / neg / abs — one kernel each so the
@@ -3486,7 +3912,7 @@ kernel void fused_residual_ln(
     }
 
     float mean = partial_sum[0] / float(h);
-    float var = partial_sumsq[0] / float(h) - mean * mean;
+    float var = fmax(0.0f, partial_sumsq[0] / float(h) - mean * mean);
     float inv_std = rsqrt(var + eps);
 
     // Pass 2: write normalized output
@@ -3496,19 +3922,516 @@ kernel void fused_residual_ln(
     }
 }
 
-// Fused residual + RMSNorm: out = RmsNorm(x + residual, gamma, beta)
-kernel void fused_residual_rms_norm(
+// DiT adaLN-Zero: out = norm(x) * (1 + scale) + shift
+// scale/shift broadcast over leading dims (typically [B,1,D] over [B,S,D]).
+// `layer_norm != 0` → mean-subtract; else RMS only.
+// Packed lead dims: [lead_rank, x_lead[8], mod_lead[8]] as 17 uints.
+kernel void ada_layer_norm(
     device const float* x      [[buffer(0)]],
-    device const float* res    [[buffer(1)]],
-    device const float* gamma  [[buffer(2)]],
-    device const float* beta   [[buffer(3)]],
-    device float* out          [[buffer(4)]],
-    constant uint& h           [[buffer(5)]],
-    constant float& eps        [[buffer(6)]],
+    device const float* scale  [[buffer(1)]],
+    device const float* shift  [[buffer(2)]],
+    device float* out          [[buffer(3)]],
+    constant uint& h           [[buffer(4)]],
+    constant float& eps        [[buffer(5)]],
+    constant uint& layer_norm  [[buffer(6)]],
+    constant uint* lead_pack   [[buffer(7)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tsize [[threads_per_threadgroup]]
 ) {
+    uint lead_rank = lead_pack[0];
+    // Decode `row` into a multi-index over x_lead; fold into mod base offset.
+    uint rem = row;
+    uint mod_base = 0;
+    uint mod_stride = h;
+    for (int j = int(lead_rank) - 1; j >= 0; --j) {
+        uint xd = lead_pack[1 + j];
+        if (xd == 0u) { xd = 1u; }
+        uint xi = rem % xd;
+        rem /= xd;
+        uint md = lead_pack[9 + j];
+        if (md == 0u) { md = 1u; }
+        if (md != 1u) {
+            mod_base += xi * mod_stride;
+        }
+        mod_stride *= md;
+    }
+
+    threadgroup float partial_sum[256];
+    threadgroup float partial_sumsq[256];
+
+    float local_sum = 0.0;
+    float local_sumsq = 0.0;
+    for (uint i = tid; i < h; i += tsize) {
+        float v = x[row * h + i];
+        local_sum += v;
+        local_sumsq += v * v;
+    }
+    partial_sum[tid] = local_sum;
+    partial_sumsq[tid] = local_sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial_sum[tid] += partial_sum[tid + stride];
+            partial_sumsq[tid] += partial_sumsq[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float mean = 0.0;
+    float inv;
+    if (layer_norm != 0u) {
+        mean = partial_sum[0] / float(h);
+        float var = fmax(0.0f, partial_sumsq[0] / float(h) - mean * mean);
+        inv = rsqrt(var + eps);
+    } else {
+        float ms = partial_sumsq[0] / float(h);
+        inv = rsqrt(ms + eps);
+    }
+
+    for (uint i = tid; i < h; i += tsize) {
+        float n = (x[row * h + i] - mean) * inv;
+        out[row * h + i] = n * (1.0f + scale[mod_base + i]) + shift[mod_base + i];
+    }
+}
+
+// f16 DiT adaLN — accumulate in f32, store half.
+kernel void ada_layer_norm_h(
+    device const half* x      [[buffer(0)]],
+    device const half* scale  [[buffer(1)]],
+    device const half* shift  [[buffer(2)]],
+    device half* out          [[buffer(3)]],
+    constant uint& h           [[buffer(4)]],
+    constant float& eps        [[buffer(5)]],
+    constant uint& layer_norm  [[buffer(6)]],
+    constant uint* lead_pack   [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    uint lead_rank = lead_pack[0];
+    uint rem = row;
+    uint mod_base = 0;
+    uint mod_stride = h;
+    for (int j = int(lead_rank) - 1; j >= 0; --j) {
+        uint xd = lead_pack[1 + j];
+        if (xd == 0u) { xd = 1u; }
+        uint xi = rem % xd;
+        rem /= xd;
+        uint md = lead_pack[9 + j];
+        if (md == 0u) { md = 1u; }
+        if (md != 1u) {
+            mod_base += xi * mod_stride;
+        }
+        mod_stride *= md;
+    }
+
+    threadgroup float partial_sum[256];
+    threadgroup float partial_sumsq[256];
+
+    float local_sum = 0.0;
+    float local_sumsq = 0.0;
+    for (uint i = tid; i < h; i += tsize) {
+        float v = float(x[row * h + i]);
+        local_sum += v;
+        local_sumsq += v * v;
+    }
+    partial_sum[tid] = local_sum;
+    partial_sumsq[tid] = local_sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial_sum[tid] += partial_sum[tid + stride];
+            partial_sumsq[tid] += partial_sumsq[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float mean = 0.0;
+    float inv;
+    if (layer_norm != 0u) {
+        mean = partial_sum[0] / float(h);
+        float var = fmax(0.0f, partial_sumsq[0] / float(h) - mean * mean);
+        inv = rsqrt(var + eps);
+    } else {
+        float ms = partial_sumsq[0] / float(h);
+        inv = rsqrt(ms + eps);
+    }
+
+    for (uint i = tid; i < h; i += tsize) {
+        float n = (float(x[row * h + i]) - mean) * inv;
+        out[row * h + i] = half(n * (1.0f + float(scale[mod_base + i])) + float(shift[mod_base + i]));
+    }
+}
+
+// DiT gated residual: out = x + gate * y  (gate broadcasts like adaLN scale).
+// lead_pack: [lead_rank, x_lead[8], gate_lead[8]].
+kernel void gated_residual(
+    device const float* x      [[buffer(0)]],
+    device const float* y      [[buffer(1)]],
+    device const float* gate   [[buffer(2)]],
+    device float* out          [[buffer(3)]],
+    constant uint& h           [[buffer(4)]],
+    constant uint* lead_pack   [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint lead_rank = lead_pack[0];
+    uint row = gid / h;
+    uint col = gid % h;
+    uint rem = row;
+    uint gate_base = 0;
+    uint gate_stride = h;
+    for (int j = int(lead_rank) - 1; j >= 0; --j) {
+        uint xd = lead_pack[1 + j];
+        if (xd == 0u) { xd = 1u; }
+        uint xi = rem % xd;
+        rem /= xd;
+        uint gd = lead_pack[9 + j];
+        if (gd == 0u) { gd = 1u; }
+        if (gd != 1u) {
+            gate_base += xi * gate_stride;
+        }
+        gate_stride *= gd;
+    }
+    uint i = row * h + col;
+    out[i] = x[i] + gate[gate_base + col] * y[i];
+}
+
+kernel void gated_residual_h(
+    device const half* x      [[buffer(0)]],
+    device const half* y      [[buffer(1)]],
+    device const half* gate   [[buffer(2)]],
+    device half* out          [[buffer(3)]],
+    constant uint& h           [[buffer(4)]],
+    constant uint* lead_pack   [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint lead_rank = lead_pack[0];
+    uint row = gid / h;
+    uint col = gid % h;
+    uint rem = row;
+    uint gate_base = 0;
+    uint gate_stride = h;
+    for (int j = int(lead_rank) - 1; j >= 0; --j) {
+        uint xd = lead_pack[1 + j];
+        if (xd == 0u) { xd = 1u; }
+        uint xi = rem % xd;
+        rem /= xd;
+        uint gd = lead_pack[9 + j];
+        if (gd == 0u) { gd = 1u; }
+        if (gd != 1u) {
+            gate_base += xi * gate_stride;
+        }
+        gate_stride *= gd;
+    }
+    uint i = row * h + col;
+    out[i] = half(float(x[i]) + float(gate[gate_base + col]) * float(y[i]));
+}
+
+// Packed DiT gated residual backward: out = [dx ∥ dy ∥ dgate] (1-D).
+// Threadgroups = mod_rows (unique gate rows); each TG owns one gate slice
+// and loops `seq_per_mod` x-rows that share it (DiT [B,S,D] / [B,1,D]).
+kernel void gated_residual_backward(
+    device const float* y       [[buffer(0)]],
+    device const float* gate    [[buffer(1)]],
+    device const float* dy      [[buffer(2)]],
+    device float* packed        [[buffer(3)]],
+    constant uint& h            [[buffer(4)]],
+    constant uint& seq_per_mod  [[buffer(5)]],
+    constant uint& mod_rows     [[buffer(6)]],
+    uint m [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    if (m >= mod_rows) return;
+    uint nx = mod_rows * seq_per_mod * h;
+    uint gate_base = m * h;
+    device float* dx = packed;
+    device float* dy_out = packed + nx;
+    device float* dgate = packed + 2 * nx;
+
+    for (uint i = tid; i < h; i += tsize) {
+        float acc = 0.0f;
+        for (uint s = 0; s < seq_per_mod; s++) {
+            uint row = m * seq_per_mod + s;
+            uint idx = row * h + i;
+            float g = gate[gate_base + i];
+            float d = dy[idx];
+            dx[idx] = d;
+            dy_out[idx] = d * g;
+            acc += d * y[idx];
+        }
+        dgate[gate_base + i] = acc;
+    }
+}
+
+kernel void gated_residual_backward_h(
+    device const half* y       [[buffer(0)]],
+    device const half* gate    [[buffer(1)]],
+    device const half* dy      [[buffer(2)]],
+    device half* packed        [[buffer(3)]],
+    constant uint& h            [[buffer(4)]],
+    constant uint& seq_per_mod  [[buffer(5)]],
+    constant uint& mod_rows     [[buffer(6)]],
+    uint m [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    if (m >= mod_rows) return;
+    uint nx = mod_rows * seq_per_mod * h;
+    uint gate_base = m * h;
+    device half* dx = packed;
+    device half* dy_out = packed + nx;
+    device half* dgate = packed + 2 * nx;
+
+    for (uint i = tid; i < h; i += tsize) {
+        float acc = 0.0f;
+        for (uint s = 0; s < seq_per_mod; s++) {
+            uint row = m * seq_per_mod + s;
+            uint idx = row * h + i;
+            float g = float(gate[gate_base + i]);
+            float d = float(dy[idx]);
+            dx[idx] = half(d);
+            dy_out[idx] = half(d * g);
+            acc += d * float(y[idx]);
+        }
+        dgate[gate_base + i] = half(acc);
+    }
+}
+
+// Packed AdaLayerNorm backward: out = [dx ∥ dscale ∥ dshift] (1-D).
+// Same launch geometry as gated_residual_backward.
+kernel void ada_layer_norm_backward(
+    device const float* x       [[buffer(0)]],
+    device const float* scale   [[buffer(1)]],
+    device const float* dy      [[buffer(2)]],
+    device float* packed        [[buffer(3)]],
+    constant uint& h            [[buffer(4)]],
+    constant float& eps         [[buffer(5)]],
+    constant uint& layer_norm   [[buffer(6)]],
+    constant uint& seq_per_mod  [[buffer(7)]],
+    constant uint& mod_rows     [[buffer(8)]],
+    uint m [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    if (m >= mod_rows) return;
+    uint nx = mod_rows * seq_per_mod * h;
+    uint mod_len = mod_rows * h;
+    uint mod_base = m * h;
+    device float* dx = packed;
+    device float* dscale = packed + nx;
+    device float* dshift = packed + nx + mod_len;
+
+    threadgroup float partial_sum[256];
+    threadgroup float partial_sumsq[256];
+
+    // Zero modulation grads for this slice.
+    for (uint i = tid; i < h; i += tsize) {
+        dscale[mod_base + i] = 0.0f;
+        dshift[mod_base + i] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    float inv_h = 1.0f / float(h);
+    for (uint s = 0; s < seq_per_mod; s++) {
+        uint row = m * seq_per_mod + s;
+
+        float local_sum = 0.0f;
+        float local_sumsq = 0.0f;
+        for (uint i = tid; i < h; i += tsize) {
+            float v = x[row * h + i];
+            local_sum += v;
+            local_sumsq += v * v;
+        }
+        partial_sum[tid] = local_sum;
+        partial_sumsq[tid] = local_sumsq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+            if (tid < stride) {
+                partial_sum[tid] += partial_sum[tid + stride];
+                partial_sumsq[tid] += partial_sumsq[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float mean = 0.0f;
+        float inv;
+        if (layer_norm != 0u) {
+            mean = partial_sum[0] * inv_h;
+            float var = fmax(0.0f, partial_sumsq[0] * inv_h - mean * mean);
+            inv = rsqrt(var + eps);
+        } else {
+            inv = rsqrt(partial_sumsq[0] * inv_h + eps);
+        }
+
+        // First pass: accumulate dscale/dshift and reduction stats for dx.
+        float local_sy = 0.0f;
+        float local_sxh = 0.0f;
+        for (uint i = tid; i < h; i += tsize) {
+            float n = (x[row * h + i] - mean) * inv;
+            float d = dy[row * h + i];
+            float sc = scale[mod_base + i];
+            float sy = d * (1.0f + sc);
+            dscale[mod_base + i] += d * n;
+            dshift[mod_base + i] += d;
+            local_sy += sy;
+            local_sxh += sy * n;
+        }
+        partial_sum[tid] = local_sy;
+        partial_sumsq[tid] = local_sxh;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+            if (tid < stride) {
+                partial_sum[tid] += partial_sum[tid + stride];
+                partial_sumsq[tid] += partial_sumsq[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float m_sy = partial_sum[0] * inv_h;
+        float m_sxh = partial_sumsq[0] * inv_h;
+
+        for (uint i = tid; i < h; i += tsize) {
+            float n = (x[row * h + i] - mean) * inv;
+            float d = dy[row * h + i];
+            float sc = scale[mod_base + i];
+            float sy = d * (1.0f + sc);
+            if (layer_norm != 0u) {
+                dx[row * h + i] = inv * (sy - m_sy - n * m_sxh);
+            } else {
+                float n_rms = x[row * h + i] * inv;
+                dx[row * h + i] = inv * (sy - n_rms * m_sxh);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void ada_layer_norm_backward_h(
+    device const half* x       [[buffer(0)]],
+    device const half* scale   [[buffer(1)]],
+    device const half* dy      [[buffer(2)]],
+    device half* packed        [[buffer(3)]],
+    constant uint& h            [[buffer(4)]],
+    constant float& eps         [[buffer(5)]],
+    constant uint& layer_norm   [[buffer(6)]],
+    constant uint& seq_per_mod  [[buffer(7)]],
+    constant uint& mod_rows     [[buffer(8)]],
+    uint m [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    if (m >= mod_rows) return;
+    uint nx = mod_rows * seq_per_mod * h;
+    uint mod_len = mod_rows * h;
+    uint mod_base = m * h;
+    device half* dx = packed;
+    device half* dscale = packed + nx;
+    device half* dshift = packed + nx + mod_len;
+
+    threadgroup float partial_sum[256];
+    threadgroup float partial_sumsq[256];
+
+    for (uint i = tid; i < h; i += tsize) {
+        dscale[mod_base + i] = half(0.0h);
+        dshift[mod_base + i] = half(0.0h);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    float inv_h = 1.0f / float(h);
+    for (uint s = 0; s < seq_per_mod; s++) {
+        uint row = m * seq_per_mod + s;
+
+        float local_sum = 0.0f;
+        float local_sumsq = 0.0f;
+        for (uint i = tid; i < h; i += tsize) {
+            float v = float(x[row * h + i]);
+            local_sum += v;
+            local_sumsq += v * v;
+        }
+        partial_sum[tid] = local_sum;
+        partial_sumsq[tid] = local_sumsq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+            if (tid < stride) {
+                partial_sum[tid] += partial_sum[tid + stride];
+                partial_sumsq[tid] += partial_sumsq[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float mean = 0.0f;
+        float inv;
+        if (layer_norm != 0u) {
+            mean = partial_sum[0] * inv_h;
+            float var = fmax(0.0f, partial_sumsq[0] * inv_h - mean * mean);
+            inv = rsqrt(var + eps);
+        } else {
+            inv = rsqrt(partial_sumsq[0] * inv_h + eps);
+        }
+
+        float local_sy = 0.0f;
+        float local_sxh = 0.0f;
+        for (uint i = tid; i < h; i += tsize) {
+            float n = (float(x[row * h + i]) - mean) * inv;
+            float d = float(dy[row * h + i]);
+            float sc = float(scale[mod_base + i]);
+            float sy = d * (1.0f + sc);
+            dscale[mod_base + i] = half(float(dscale[mod_base + i]) + d * n);
+            dshift[mod_base + i] = half(float(dshift[mod_base + i]) + d);
+            local_sy += sy;
+            local_sxh += sy * n;
+        }
+        partial_sum[tid] = local_sy;
+        partial_sumsq[tid] = local_sxh;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+            if (tid < stride) {
+                partial_sum[tid] += partial_sum[tid + stride];
+                partial_sumsq[tid] += partial_sumsq[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float m_sy = partial_sum[0] * inv_h;
+        float m_sxh = partial_sumsq[0] * inv_h;
+
+        for (uint i = tid; i < h; i += tsize) {
+            float n = (float(x[row * h + i]) - mean) * inv;
+            float d = float(dy[row * h + i]);
+            float sc = float(scale[mod_base + i]);
+            float sy = d * (1.0f + sc);
+            if (layer_norm != 0u) {
+                dx[row * h + i] = half(inv * (sy - m_sy - n * m_sxh));
+            } else {
+                float n_rms = float(x[row * h + i]) * inv;
+                dx[row * h + i] = half(inv * (sy - n_rms * m_sxh));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// Fused residual + RMSNorm: out = RmsNorm(x + residual, gamma, beta).
+// Arena + byte offsets (task #50) — `set_buffer(..., large_offset)` silently
+// drops writes on M-series for big Qwen3.5 / Bonsai arenas.
+kernel void fused_residual_rms_norm(
+    device const char* arena   [[buffer(0)]],
+    constant ulong& x_off      [[buffer(1)]],
+    constant ulong& res_off    [[buffer(2)]],
+    constant ulong& g_off      [[buffer(3)]],
+    constant ulong& b_off      [[buffer(4)]],
+    constant ulong& out_off    [[buffer(5)]],
+    constant uint& h           [[buffer(6)]],
+    constant float& eps        [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    device const float* x = (device const float*)(arena + x_off);
+    device const float* res = (device const float*)(arena + res_off);
+    device const float* gamma = (device const float*)(arena + g_off);
+    device const float* beta = (device const float*)(arena + b_off);
+    device float* out = (device float*)(arena + out_off);
     threadgroup float partial_sumsq[256];
     float local_sumsq = 0.0;
     for (uint i = tid; i < h; i += tsize) {
@@ -3539,6 +4462,10 @@ struct SdpaOffsets {
     ulong v;
     ulong m;
     ulong o;
+    // GQA/MQA: K/V head count (equals `heads` for MHA). Packed here so we
+    // don't need a 7th set_bytes slot past the Metal arg-table quirk.
+    uint kv_heads;
+    uint _pad;
 };
 
 // Q/K/V offset helpers — BSNH [B, L, H*D] vs BHSD [B, H, L, D].
@@ -3554,13 +4481,17 @@ static inline uint qkv_q_offset(
 }
 static inline uint qkv_kv_offset(
     uint bi, uint hi, uint ki,
-    uint heads, uint seq_k, uint head_dim, uint k_stride, uint bhsd
+    uint heads, uint kv_heads, uint seq_k, uint head_dim, uint k_stride, uint bhsd
 ) {
+    // Map query head → shared KV head (GQA/MQA). MHA: kv_heads == heads.
+    uint nkv = (kv_heads == 0u) ? heads : kv_heads;
+    uint group = heads / nkv;
+    uint hi_kv = (group > 1u) ? (hi / group) : hi;
     if (bhsd != 0u) {
-        return bi * heads * seq_k * head_dim + hi * seq_k * head_dim + ki * head_dim;
+        return bi * nkv * seq_k * head_dim + hi_kv * seq_k * head_dim + ki * head_dim;
     }
-    uint hs = heads * head_dim;
-    return bi * k_stride * hs + ki * hs + hi * head_dim;
+    uint hs = nkv * head_dim;
+    return bi * k_stride * hs + ki * hs + hi_kv * head_dim;
 }
 
 // Multi-head SDPA: attention(Q, K, V, mask) → out
@@ -3639,7 +4570,7 @@ kernel void sdpa(
         uint ki = idx % seq_k;
         float dot = 0.0;
         uint q_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
-        uint k_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
         for (uint d = 0; d < head_dim; ++d) {
             dot += Q[q_base + d] * K[k_base + d];
         }
@@ -3698,7 +4629,7 @@ kernel void sdpa(
         uint d = idx % head_dim;
         float acc = 0.0;
         for (uint ki = 0; ki < seq_k; ++ki) {
-            uint v_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
+            uint v_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
             acc += scores[qi * seq_k + ki] * V[v_base + d];
         }
         uint o_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
@@ -3787,7 +4718,7 @@ kernel void sdpa_long(
 
     for (uint ki = 0; ki < seq_k; ++ki) {
         // Score: scale * (Q · K[ki]) + mask
-        uint k_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
         float dot = 0.0;
         for (uint d = 0; d < head_dim; ++d) dot += q_reg[d] * K[k_base + d];
         float s = dot * scale;
@@ -3811,7 +4742,7 @@ kernel void sdpa_long(
         float e_old = precise::exp(m_acc - m_new);
         float e_cur = precise::exp(s - m_new);
         l_acc = e_old * l_acc + e_cur;
-        uint v_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
+        uint v_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
         for (uint d = 0; d < head_dim; ++d) {
             o_acc[d] = e_old * o_acc[d] + e_cur * V[v_base + d];
         }
@@ -3826,8 +4757,11 @@ kernel void sdpa_long(
     }
 }
 
-// Decode-step SDPA fast path (Lq == 1, Lk arbitrary). Same numerics as
-// `sdpa_long` but qi is always 0 — one thread per (batch, head).
+// Decode-step SDPA fast path (Lq == 1, Lk arbitrary).
+//
+// One threadgroup per (batch, head); threads split the K axis and merge
+// online-softmax states. The old 1-thread-per-head launch left Apple GPUs
+// nearly idle on GQA decode (Zonos: batch=2 × 16 heads = 32 threads).
 kernel void sdpa_decode_m1(
     device const float* arena_q   [[buffer(0)]],
     device const float* arena_k   [[buffer(1)]],
@@ -3846,7 +4780,9 @@ kernel void sdpa_decode_m1(
     constant float& score_scale  [[buffer(14)]],
     constant float& attn_softcap [[buffer(15)]],
     constant SdpaOffsets& byte_offs [[buffer(16)]],
-    uint tid_x [[thread_position_in_grid]]
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tsize [[threads_per_threadgroup]]
 ) {
     device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
     device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
@@ -3854,70 +4790,134 @@ kernel void sdpa_decode_m1(
     device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
     device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
 
-    constexpr uint MAX_HEAD_DIM = 512u;
-    uint total = batch * heads;
-    if (tid_x >= total) return;
+    // TG=32 × dh≤128 → 16 KiB for partial O; fits Apple7/8 32 KiB tg limit.
+    constexpr uint MAX_DH = 128u;
+    constexpr uint TG = 32u;
+    threadgroup float tg_m[TG];
+    threadgroup float tg_l[TG];
+    threadgroup float tg_o[TG * MAX_DH];
 
-    uint hi = tid_x % heads;
-    uint bi = tid_x / heads;
+    uint bi = tgid / heads;
+    uint hi = tgid % heads;
+    if (bi >= batch) return;
 
     float scale = (score_scale > 0.0f) ? score_scale : 1.0f / precise::sqrt(float(head_dim));
     float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
-
-    float q_reg[MAX_HEAD_DIM];
-    uint q_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
-    for (uint d = 0; d < head_dim; ++d) q_reg[d] = Q[q_base + d];
-
     uint q_offset = seq_k - 1u;
+    uint q_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
 
-    float m_acc = -1e30;
-    float l_acc = 0.0;
-    float o_acc[MAX_HEAD_DIM];
-    for (uint d = 0; d < head_dim; ++d) o_acc[d] = 0.0;
+    // Large head_dim: one thread walks all of K (rare for LLM decode; Gemma-4).
+    if (head_dim > MAX_DH || tsize < 2u) {
+        if (tid != 0u) return;
+        float q_reg[512];
+        for (uint d = 0; d < head_dim; ++d) q_reg[d] = Q[q_base + d];
+        float m_acc = -1e30f;
+        float l_acc = 0.0f;
+        float o_acc[512];
+        for (uint d = 0; d < head_dim; ++d) o_acc[d] = 0.0f;
+        for (uint ki = 0; ki < seq_k; ++ki) {
+            uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; ++d) dot += q_reg[d] * K[k_base + d];
+            float s = dot * scale;
+            if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+            if (mask_kind == 1u) {
+                if (ki > q_offset) s = -1e9f;
+            } else if (mask_kind == 2u) {
+                if (M[bi * k_stride + ki] < 0.5f) s = -1e9f;
+            } else if (mask_kind == 4u) {
+                uint lo = q_offset > window ? q_offset - window : 0u;
+                if (ki < lo || ki > q_offset) s = -1e9f;
+            }
+            float m_new = max(m_acc, s);
+            float e_old = precise::exp(m_acc - m_new);
+            float e_cur = precise::exp(s - m_new);
+            l_acc = e_old * l_acc + e_cur;
+            uint v_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+            for (uint d = 0; d < head_dim; ++d) {
+                o_acc[d] = e_old * o_acc[d] + e_cur * V[v_base + d];
+            }
+            m_acc = m_new;
+        }
+        float inv_l = 1.0f / l_acc;
+        uint o_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
+        for (uint d = 0; d < head_dim; ++d) OUT[o_base + d] = o_acc[d] * inv_l;
+        return;
+    }
 
-    for (uint ki = 0; ki < seq_k; ++ki) {
-        uint k_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
-        float dot = 0.0;
+    float q_reg[MAX_DH];
+    for (uint d = tid; d < head_dim; d += tsize) tg_o[d] = Q[q_base + d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint d = 0; d < head_dim; ++d) q_reg[d] = tg_o[d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m_acc = -1e30f;
+    float l_acc = 0.0f;
+    float o_acc[MAX_DH];
+    for (uint d = 0; d < head_dim; ++d) o_acc[d] = 0.0f;
+
+    for (uint ki = tid; ki < seq_k; ki += tsize) {
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+        float dot = 0.0f;
         for (uint d = 0; d < head_dim; d += 4u) {
             if (d + 3u < head_dim) {
-                float4 qv = float4(q_reg[d], q_reg[d+1u], q_reg[d+2u], q_reg[d+3u]);
+                float4 qv = float4(q_reg[d], q_reg[d + 1u], q_reg[d + 2u], q_reg[d + 3u]);
                 float4 kv = *(device const float4*)(K + k_base + d);
                 dot += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
             } else {
-                for (uint dd = d; dd < head_dim; ++dd) {
-                    dot += q_reg[dd] * K[k_base + dd];
-                }
+                for (uint dd = d; dd < head_dim; ++dd) dot += q_reg[dd] * K[k_base + dd];
             }
         }
         float s = dot * scale;
-        if (softcap_inv > 0.0f) {
-            s = precise::tanh(s * softcap_inv) * attn_softcap;
-        }
+        if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
         if (mask_kind == 1u) {
-            if (ki > q_offset) s = -1e9;
+            if (ki > q_offset) s = -1e9f;
         } else if (mask_kind == 2u) {
-            if (M[bi * k_stride + ki] < 0.5) s = -1e9;
+            if (M[bi * k_stride + ki] < 0.5f) s = -1e9f;
         } else if (mask_kind == 4u) {
-            uint abs_q = q_offset;
-            uint lo = abs_q > window ? abs_q - window : 0u;
-            if (ki < lo || ki > abs_q) s = -1e9;
+            uint lo = q_offset > window ? q_offset - window : 0u;
+            if (ki < lo || ki > q_offset) s = -1e9f;
         }
-
         float m_new = max(m_acc, s);
         float e_old = precise::exp(m_acc - m_new);
         float e_cur = precise::exp(s - m_new);
         l_acc = e_old * l_acc + e_cur;
-        uint v_base = qkv_kv_offset(bi, hi, ki, heads, seq_k, head_dim, k_stride, bhsd);
+        uint v_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
         for (uint d = 0; d < head_dim; ++d) {
             o_acc[d] = e_old * o_acc[d] + e_cur * V[v_base + d];
         }
         m_acc = m_new;
     }
 
-    float inv_l = 1.0 / l_acc;
-    uint o_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
-    for (uint d = 0; d < head_dim; ++d) {
-        OUT[o_base + d] = o_acc[d] * inv_l;
+    // Idle lanes beyond TG keep identity merge state (already set if tid>=TG).
+    if (tid < TG) {
+        tg_m[tid] = m_acc;
+        tg_l[tid] = l_acc;
+        for (uint d = 0; d < head_dim; ++d) tg_o[tid * MAX_DH + d] = o_acc[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = TG / 2u; stride > 0u; stride /= 2u) {
+        if (tid < stride) {
+            float m1 = tg_m[tid];
+            float m2 = tg_m[tid + stride];
+            float m_new = max(m1, m2);
+            float e1 = precise::exp(m1 - m_new);
+            float e2 = precise::exp(m2 - m_new);
+            tg_l[tid] = e1 * tg_l[tid] + e2 * tg_l[tid + stride];
+            tg_m[tid] = m_new;
+            for (uint d = 0; d < head_dim; ++d) {
+                tg_o[tid * MAX_DH + d] =
+                    e1 * tg_o[tid * MAX_DH + d] + e2 * tg_o[(tid + stride) * MAX_DH + d];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        float inv_l = 1.0f / tg_l[0];
+        uint o_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
+        for (uint d = 0; d < head_dim; ++d) OUT[o_base + d] = tg_o[d] * inv_l;
     }
 }
 
@@ -4015,7 +5015,7 @@ kernel void sdpa_fa_f32(
             uint ki = i / head_dim;
             uint di = i % head_dim;
             uint pos = kt + ki;
-            uint kv_off = qkv_kv_offset(bi, hi, pos, heads, seq_k, head_dim, k_stride, bhsd);
+            uint kv_off = qkv_kv_offset(bi, hi, pos, heads, heads, seq_k, head_dim, k_stride, bhsd);
             bool in_range = pos < seq_k;
             K_tg[ki * MAX_DH + di] = in_range ? K[kv_off + di] : 0.0f;
             V_tg[ki * MAX_DH + di] = in_range ? V[kv_off + di] : 0.0f;
@@ -4814,7 +5814,7 @@ kernel void layer_norm(
     }
 
     float mean = partial_sum[0] / float(h);
-    float var = partial_sumsq[0] / float(h) - mean * mean;
+    float var = fmax(0.0f, partial_sumsq[0] / float(h) - mean * mean);
     float inv_std = rsqrt(var + eps);
 
     // Pass 2: normalize
@@ -4860,6 +5860,48 @@ kernel void rms_norm(
     float inv_rms = rsqrt(partial_sumsq[0] / float(h) + eps);
     for (uint i = tid; i < h; i += tsize) {
         output[row * h + i] = input[row * h + i] * inv_rms * gamma[i] + beta[i];
+    }
+}
+
+// GDN gated norm: out = rms_norm(x) * silu(z). Same dispatch as rms_norm.
+kernel void rms_norm_mul_silu(
+    device const char* arena [[buffer(0)]],
+    constant ulong& in_off [[buffer(1)]],
+    constant ulong& g_off [[buffer(2)]],
+    constant ulong& b_off [[buffer(3)]],
+    constant ulong& z_off [[buffer(4)]],
+    constant ulong& out_off [[buffer(5)]],
+    constant uint& h [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    device const float* input = (device const float*)(arena + in_off);
+    device const float* gamma = (device const float*)(arena + g_off);
+    device const float* beta = (device const float*)(arena + b_off);
+    device const float* z = (device const float*)(arena + z_off);
+    device float* output = (device float*)(arena + out_off);
+    threadgroup float partial_sumsq[256];
+    float local_sumsq = 0.0f;
+    for (uint i = tid; i < h; i += tsize) {
+        float v = input[row * h + i];
+        local_sumsq += v * v;
+    }
+    partial_sumsq[tid] = local_sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial_sumsq[tid] += partial_sumsq[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = rsqrt(partial_sumsq[0] / float(h) + eps);
+    for (uint i = tid; i < h; i += tsize) {
+        float zv = z[row * h + i];
+        float silu = zv / (1.0f + exp(-zv));
+        output[row * h + i] =
+            (input[row * h + i] * inv_rms * gamma[i] + beta[i]) * silu;
     }
 }
 
@@ -5112,12 +6154,12 @@ kernel void elementwise_region(
             if      (op_sub == 3u) result = max(lhs, 0.0f);                // Relu
             else if (op_sub == 0u || op_sub == 1u) {
                 float c = 0.7978845608f;
-                float inner = c * (lhs + 0.044715f * lhs * lhs * lhs);
+                float inner = clamp(c * (lhs + 0.044715f * lhs * lhs * lhs), -15.0f, 15.0f);
                 result = 0.5f * lhs * (1.0f + tanh(inner));                // Gelu
             }
             else if (op_sub == 2u) result = lhs / (1.0f + exp(-lhs));      // Silu
             else if (op_sub == 4u) result = 1.0f / (1.0f + exp(-lhs));     // Sigmoid
-            else if (op_sub == 5u) result = tanh(lhs);
+            else if (op_sub == 5u) result = tanh(clamp(lhs, -15.0f, 15.0f));
             else if (op_sub == 6u) result = exp(lhs);
             else if (op_sub == 7u) result = log(lhs);
             else if (op_sub == 8u) result = sqrt(lhs);
@@ -5246,12 +6288,12 @@ kernel void batch_elementwise_region(
             if      (op_sub == 3u) result = max(lhs, 0.0f);
             else if (op_sub == 0u || op_sub == 1u) {
                 float c = 0.7978845608f;
-                float inner = c * (lhs + 0.044715f * lhs * lhs * lhs);
+                float inner = clamp(c * (lhs + 0.044715f * lhs * lhs * lhs), -15.0f, 15.0f);
                 result = 0.5f * lhs * (1.0f + tanh(inner));
             }
             else if (op_sub == 2u) result = lhs / (1.0f + exp(-lhs));
             else if (op_sub == 4u) result = 1.0f / (1.0f + exp(-lhs));
-            else if (op_sub == 5u) result = tanh(lhs);
+            else if (op_sub == 5u) result = tanh(clamp(lhs, -15.0f, 15.0f));
             else if (op_sub == 6u) result = exp(lhs);
             else if (op_sub == 7u) result = log(lhs);
             else if (op_sub == 8u) result = sqrt(lhs);
@@ -5383,6 +6425,92 @@ kernel void gated_delta_net(
     }
 }
 
+// Simdgroup-cooperative GDN for n == 128 (Bonsai / Qwen3.5). llama.cpp-style:
+// one simdgroup owns one state column; 32 threads × 4 floats keep that column
+// in registers and use simd_sum — no threadgroup barriers inside the scan.
+// Grid: (n/NSG, heads, batch) threadgroups, threads (32, NSG, 1).
+constant uint GDN_SG_N = 128u;
+constant uint GDN_SG_NSG = 4u;
+
+kernel void gated_delta_net_sg(
+    device float* arena        [[buffer(0)]],
+    constant uint& q_off       [[buffer(1)]],
+    constant uint& k_off       [[buffer(2)]],
+    constant uint& v_off       [[buffer(3)]],
+    constant uint& g_off       [[buffer(4)]],
+    constant uint& beta_off    [[buffer(5)]],
+    constant uint& state_off   [[buffer(6)]],
+    constant uint& dst_off     [[buffer(7)]],
+    constant uint4& dims       [[buffer(8)]], // batch, seq, heads, n
+    constant uint& use_carry   [[buffer(9)]],
+    uint3 tgpig                [[threadgroup_position_in_grid]],
+    uint3 tpitg                [[thread_position_in_threadgroup]]
+) {
+    const uint b = dims.x, s = dims.y, h = dims.z, n = dims.w;
+    if (n != GDN_SG_N) return;
+
+    const uint tx = tpitg.x; // 0..31 within simdgroup
+    const uint ty = tpitg.y; // simdgroup index in threadgroup
+    const uint bi = tgpig.z;
+    const uint hi = tgpig.y;
+    const uint col = tgpig.x * GDN_SG_NSG + ty; // state column j
+    if (bi >= b || hi >= h || col >= n || tx >= 32u) return;
+
+    const float scale = rsqrt(float(n));
+    const uint s_base = state_off + (bi * h + hi) * n * n;
+    device float* s_mat = arena + s_base;
+
+    // Register tile of column `col`: S[is][col] for is = tx*4 .. tx*4+3.
+    float ls[GDN_SG_NSG];
+    #pragma unroll
+    for (uint j = 0u; j < GDN_SG_NSG; ++j) {
+        const uint is = tx * GDN_SG_NSG + j;
+        ls[j] = (use_carry != 0u) ? s_mat[is * n + col] : 0.0f;
+    }
+
+    const uint hs_n = h * n;
+    for (uint ti = 0u; ti < s; ++ti) {
+        const uint qkv_step = bi * s * hs_n + ti * hs_n + hi * n;
+        const uint gb_step  = bi * s * h + ti * h + hi;
+        device const float* q_ptr = arena + q_off + qkv_step;
+        device const float* k_ptr = arena + k_off + qkv_step;
+        device const float* v_ptr = arena + v_off + qkv_step;
+        const float g_exp = exp(arena[g_off + gb_step]);
+        const float beta_t = arena[beta_off + gb_step];
+
+        float s_k = 0.0f;
+        #pragma unroll
+        for (uint j = 0u; j < GDN_SG_NSG; ++j) {
+            const uint is = tx * GDN_SG_NSG + j;
+            ls[j] *= g_exp;
+            s_k += ls[j] * k_ptr[is];
+        }
+        s_k = simd_sum(s_k);
+
+        const float d = (v_ptr[col] - s_k) * beta_t;
+
+        float y = 0.0f;
+        #pragma unroll
+        for (uint j = 0u; j < GDN_SG_NSG; ++j) {
+            const uint is = tx * GDN_SG_NSG + j;
+            ls[j] += k_ptr[is] * d;
+            y += ls[j] * q_ptr[is];
+        }
+        y = simd_sum(y);
+
+        if (tx == 0u) {
+            arena[dst_off + qkv_step + col] = y * scale;
+        }
+    }
+
+    // Write column back (carry / next step).
+    #pragma unroll
+    for (uint j = 0u; j < GDN_SG_NSG; ++j) {
+        const uint is = tx * GDN_SG_NSG + j;
+        s_mat[is * n + col] = ls[j];
+    }
+}
+
 // ── Selective scan (Mamba SSM, f32) ─────────────────────────────────
 // One thread per (batch, channel); each thread owns a private state
 // vector of size n (n ≤ SSM_MAX_N) and scans sequentially over seq.
@@ -5477,7 +6605,7 @@ kernel void lstm(
         }
         float i_g = 1.0f / (1.0f + exp(-z[0]));
         float f_g = 1.0f / (1.0f + exp(-z[1]));
-        float g_g = tanh(z[2]);
+        float g_g = tanh(clamp(z[2], -15.0f, 15.0f));
         float o_g = 1.0f / (1.0f + exp(-z[3]));
         c_k = f_g * c_k + i_g * g_g;
         float h_k = o_g * tanh(c_k);
@@ -5535,7 +6663,7 @@ kernel void gru(
         }
         float rg = 1.0f / (1.0f + exp(-(xi[0] + hi[0])));
         float zg = 1.0f / (1.0f + exp(-(xi[1] + hi[1])));
-        float ng = tanh(xi[2] + rg * hi[2]);
+        float ng = tanh(clamp(xi[2] + rg * hi[2], -15.0f, 15.0f));
         float h_k = (1.0f - zg) * ng + zg * h_sh[k];
         // Finish reading h_prev across all threads before overwriting.
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6272,6 +7400,8 @@ fn msl_source() -> String {
 pub struct Kernels {
     pub library: Library,
     pub sgemm: ComputePipelineState,
+    pub sgemm_f16w: ComputePipelineState,
+    pub sgemm_f16w_small_m: ComputePipelineState,
     pub sgemm_simd: ComputePipelineState,
     pub sgemm_simd_bias: ComputePipelineState,
     pub sgemm_simd_4x4: ComputePipelineState,
@@ -6282,6 +7412,20 @@ pub struct Kernels {
     pub gelu_inplace_h: ComputePipelineState,
     pub gelu_approx_inplace_h: ComputePipelineState,
     pub silu_inplace_h: ComputePipelineState,
+    pub relu_inplace_h: ComputePipelineState,
+    pub sigmoid_inplace_h: ComputePipelineState,
+    pub tanh_inplace_h: ComputePipelineState,
+    pub exp_inplace_h: ComputePipelineState,
+    pub log_inplace_h: ComputePipelineState,
+    pub sqrt_inplace_h: ComputePipelineState,
+    pub rsqrt_inplace_h: ComputePipelineState,
+    pub neg_inplace_h: ComputePipelineState,
+    pub abs_inplace_h: ComputePipelineState,
+    pub sin_inplace_h: ComputePipelineState,
+    pub cos_inplace_h: ComputePipelineState,
+    pub tan_inplace_h: ComputePipelineState,
+    pub atan_inplace_h: ComputePipelineState,
+    pub round_inplace_h: ComputePipelineState,
     pub layer_norm_h: ComputePipelineState,
     pub fused_residual_ln_h: ComputePipelineState,
     pub fused_residual_rms_norm_h: ComputePipelineState,
@@ -6290,6 +7434,11 @@ pub struct Kernels {
     pub reduce_axes_h: ComputePipelineState,
     pub elem_add_h: ComputePipelineState,
     pub elem_mul_h: ComputePipelineState,
+    pub elem_sub_h: ComputePipelineState,
+    pub elem_div_h: ComputePipelineState,
+    pub elem_max_h: ComputePipelineState,
+    pub elem_min_h: ComputePipelineState,
+    pub elem_pow_h: ComputePipelineState,
     pub gather_axis0_h: ComputePipelineState,
     pub narrow_lastax_h: ComputePipelineState,
     pub sdpa_h: ComputePipelineState,
@@ -6301,6 +7450,7 @@ pub struct Kernels {
     pub copy_f32: ComputePipelineState,
     pub copy4: ComputePipelineState,
     pub sgemm_simd_padded: ComputePipelineState,
+    pub sgemm_simd_padded_f16w: ComputePipelineState,
     pub sgemm_simd_padded_bias: ComputePipelineState,
     pub sgemm_tiled: ComputePipelineState,
     pub bias_add: ComputePipelineState,
@@ -6311,6 +7461,7 @@ pub struct Kernels {
     pub gelu_approx_out4: ComputePipelineState,
     pub silu_inplace: ComputePipelineState,
     pub silu_inplace4: ComputePipelineState,
+    pub silu_out4: ComputePipelineState,
     pub binary_broadcast_rhs_col_f32: ComputePipelineState,
     pub binary_broadcast_rhs_col4: ComputePipelineState,
     pub binary_broadcast_rhs_row_f32: ComputePipelineState,
@@ -6325,6 +7476,7 @@ pub struct Kernels {
     pub fused_ternary_activation4: ComputePipelineState,
     pub layer_norm: ComputePipelineState,
     pub rms_norm: ComputePipelineState,
+    pub rms_norm_mul_silu: ComputePipelineState,
     pub elem_add: ComputePipelineState,
     pub elem_add4: ComputePipelineState,
     pub elem_sub4: ComputePipelineState,
@@ -6341,6 +7493,14 @@ pub struct Kernels {
     pub split_lastax4: ComputePipelineState,
     pub fused_residual_ln: ComputePipelineState,
     pub fused_residual_rms_norm: ComputePipelineState,
+    pub ada_layer_norm: ComputePipelineState,
+    pub ada_layer_norm_h: ComputePipelineState,
+    pub gated_residual: ComputePipelineState,
+    pub gated_residual_h: ComputePipelineState,
+    pub ada_layer_norm_backward: ComputePipelineState,
+    pub ada_layer_norm_backward_h: ComputePipelineState,
+    pub gated_residual_backward: ComputePipelineState,
+    pub gated_residual_backward_h: ComputePipelineState,
     pub sdpa: ComputePipelineState,
     pub sdpa_long: ComputePipelineState,
     pub sdpa_decode_m1: ComputePipelineState,
@@ -6380,7 +7540,9 @@ pub struct Kernels {
     pub elem_min: ComputePipelineState,
     pub elem_pow: ComputePipelineState,
     pub elem_compare: ComputePipelineState,
+    pub elem_compare_bcast: ComputePipelineState,
     pub elem_where: ComputePipelineState,
+    pub elem_where_bcast: ComputePipelineState,
     pub elem_fma: ComputePipelineState,
     pub reduce_axes: ComputePipelineState,
     pub topk_lastax: ComputePipelineState,
@@ -6402,6 +7564,7 @@ pub struct Kernels {
     pub conv2d_backward_weight_partial: ComputePipelineState,
     pub conv2d_backward_weight_reduce: ComputePipelineState,
     pub conv2d: ComputePipelineState,
+    pub depthwise_conv1d_bsc: ComputePipelineState,
     pub conv2d_w1: ComputePipelineState,
     pub layer_norm2d: ComputePipelineState,
     pub group_norm: ComputePipelineState,
@@ -6443,6 +7606,7 @@ pub struct Kernels {
     pub fft_outer_r4_f32: ComputePipelineState,
     pub fft_outer_r2_f32: ComputePipelineState,
     pub gated_delta_net: ComputePipelineState,
+    pub gated_delta_net_sg: ComputePipelineState,
     pub selective_scan: ComputePipelineState,
     pub lstm: ComputePipelineState,
     pub gru: ComputePipelineState,
@@ -6457,6 +7621,19 @@ pub struct Kernels {
     pub q4_0_mv_f32: ComputePipelineState,
     pub q4_1_mv_f32: ComputePipelineState,
     pub q8_0_mv_f32: ComputePipelineState,
+    /// Fused Q1_0 (Bonsai-27B 1-bit) GEMV (decode) + GEMM (prefill): read the
+    /// packed weight directly, skipping the dequant-to-f32 scratch + MPS sgemm
+    /// path (whose shared scratch raced and zeroed large-n Q1_0 projections).
+    pub q1_0_mv_f32: ComputePipelineState,
+    /// Simdgroup-cooperative Q1_0 GEMV: 32 threads → 8 outputs via `simd_sum`
+    /// (llama.cpp `kernel_mul_mv_q1_0_f32`). Used when `n_dim % 8 == 0`.
+    pub q1_0_mv_f32_sg: ComputePipelineState,
+    pub q1_0_dual_mv_f32_sg: ComputePipelineState,
+    pub q1_0_mm_f32: ComputePipelineState,
+    pub q2_0_mv_f32: ComputePipelineState,
+    pub q2_0_mv_f32_sg: ComputePipelineState,
+    pub q2_0_dual_mv_f32_sg: ComputePipelineState,
+    pub q2_0_mm_f32: ComputePipelineState,
     pub iq4_nl_mv_f32: ComputePipelineState,
     pub iq2_xxs_mv_f32: ComputePipelineState,
     pub iq2_xs_mv_f32: ComputePipelineState,
@@ -6484,6 +7661,15 @@ pub struct Kernels {
     pub q4k_mv_residual_f32: ComputePipelineState,
     pub q6k_mv_residual_f32: ComputePipelineState,
     pub q5_0_mv_residual_f32: ComputePipelineState,
+    /// Fused Q1_0 decode MLP (Bonsai): gate+up+SwiGLU and down+residual.
+    pub q1_0_swiglu_mv_f32: ComputePipelineState,
+    pub q1_0_swiglu_mv_f32_sg: ComputePipelineState,
+    pub q1_0_mv_residual_f32: ComputePipelineState,
+    pub q1_0_mv_residual_f32_sg: ComputePipelineState,
+    pub q2_0_swiglu_mv_f32: ComputePipelineState,
+    pub q2_0_swiglu_mv_f32_sg: ComputePipelineState,
+    pub q2_0_mv_residual_f32: ComputePipelineState,
+    pub q2_0_mv_residual_f32_sg: ComputePipelineState,
     /// Device buffer holding the concatenated IQ grid LUTs. Built once
     /// at Kernels init from `rlx_gguf::iq_grids::*`. Layout — see
     /// `dequant_gguf.msl` `IQ_GRID_OFF_*` constants.
@@ -6547,6 +7733,8 @@ impl Kernels {
         };
         Self {
             sgemm: pipeline("sgemm"),
+            sgemm_f16w: pipeline("sgemm_f16w"),
+            sgemm_f16w_small_m: pipeline("sgemm_f16w_small_m"),
             sgemm_simd: pipeline("sgemm_simd"),
             sgemm_simd_bias: pipeline("sgemm_simd_bias"),
             sgemm_simd_4x4: pipeline("sgemm_simd_4x4"),
@@ -6557,6 +7745,20 @@ impl Kernels {
             gelu_inplace_h: pipeline("gelu_inplace_h"),
             gelu_approx_inplace_h: pipeline("gelu_approx_inplace_h"),
             silu_inplace_h: pipeline("silu_inplace_h"),
+            relu_inplace_h: pipeline("relu_inplace_h"),
+            sigmoid_inplace_h: pipeline("sigmoid_inplace_h"),
+            tanh_inplace_h: pipeline("tanh_inplace_h"),
+            exp_inplace_h: pipeline("exp_inplace_h"),
+            log_inplace_h: pipeline("log_inplace_h"),
+            sqrt_inplace_h: pipeline("sqrt_inplace_h"),
+            rsqrt_inplace_h: pipeline("rsqrt_inplace_h"),
+            neg_inplace_h: pipeline("neg_inplace_h"),
+            abs_inplace_h: pipeline("abs_inplace_h"),
+            sin_inplace_h: pipeline("sin_inplace_h"),
+            cos_inplace_h: pipeline("cos_inplace_h"),
+            tan_inplace_h: pipeline("tan_inplace_h"),
+            atan_inplace_h: pipeline("atan_inplace_h"),
+            round_inplace_h: pipeline("round_inplace_h"),
             layer_norm_h: pipeline("layer_norm_h"),
             fused_residual_ln_h: pipeline("fused_residual_ln_h"),
             fused_residual_rms_norm_h: pipeline("fused_residual_rms_norm_h"),
@@ -6565,6 +7767,11 @@ impl Kernels {
             reduce_axes_h: pipeline("reduce_axes_h"),
             elem_add_h: pipeline("elem_add_h"),
             elem_mul_h: pipeline("elem_mul_h"),
+            elem_sub_h: pipeline("elem_sub_h"),
+            elem_div_h: pipeline("elem_div_h"),
+            elem_max_h: pipeline("elem_max_h"),
+            elem_min_h: pipeline("elem_min_h"),
+            elem_pow_h: pipeline("elem_pow_h"),
             gather_axis0_h: pipeline("gather_axis0_h"),
             narrow_lastax_h: pipeline("narrow_lastax_h"),
             sdpa_h: pipeline("sdpa_h"),
@@ -6575,6 +7782,7 @@ impl Kernels {
             copy_f32: pipeline("copy_f32"),
             copy4: pipeline("copy4"),
             sgemm_simd_padded: pipeline("sgemm_simd_padded"),
+            sgemm_simd_padded_f16w: pipeline("sgemm_simd_padded_f16w"),
             sgemm_simd_padded_bias: pipeline("sgemm_simd_padded_bias"),
             sgemm_tiled: pipeline("sgemm_tiled"),
             bias_add: pipeline("bias_add"),
@@ -6585,6 +7793,7 @@ impl Kernels {
             gelu_approx_out4: pipeline("gelu_approx_out4"),
             silu_inplace: pipeline("silu_inplace"),
             silu_inplace4: pipeline("silu_inplace4"),
+            silu_out4: pipeline("silu_out4"),
             binary_broadcast_rhs_col_f32: pipeline("binary_broadcast_rhs_col_f32"),
             binary_broadcast_rhs_col4: pipeline("binary_broadcast_rhs_col4"),
             binary_broadcast_rhs_row_f32: pipeline("binary_broadcast_rhs_row_f32"),
@@ -6599,6 +7808,7 @@ impl Kernels {
             fused_ternary_activation4: pipeline("fused_ternary_activation4"),
             layer_norm: pipeline("layer_norm"),
             rms_norm: pipeline("rms_norm"),
+            rms_norm_mul_silu: pipeline("rms_norm_mul_silu"),
             elem_add: pipeline("elem_add"),
             elem_add4: pipeline("elem_add4"),
             elem_sub4: pipeline("elem_sub4"),
@@ -6615,6 +7825,14 @@ impl Kernels {
             split_lastax4: pipeline("split_lastax4"),
             fused_residual_ln: pipeline("fused_residual_ln"),
             fused_residual_rms_norm: pipeline("fused_residual_rms_norm"),
+            ada_layer_norm: pipeline("ada_layer_norm"),
+            ada_layer_norm_h: pipeline("ada_layer_norm_h"),
+            gated_residual: pipeline("gated_residual"),
+            gated_residual_h: pipeline("gated_residual_h"),
+            ada_layer_norm_backward: pipeline("ada_layer_norm_backward"),
+            ada_layer_norm_backward_h: pipeline("ada_layer_norm_backward_h"),
+            gated_residual_backward: pipeline("gated_residual_backward"),
+            gated_residual_backward_h: pipeline("gated_residual_backward_h"),
             sdpa: pipeline("sdpa"),
             sdpa_long: pipeline("sdpa_long"),
             sdpa_decode_m1: pipeline("sdpa_decode_m1"),
@@ -6647,7 +7865,9 @@ impl Kernels {
             elem_min: pipeline("elem_min"),
             elem_pow: pipeline("elem_pow"),
             elem_compare: pipeline("elem_compare"),
+            elem_compare_bcast: pipeline("elem_compare_bcast"),
             elem_where: pipeline("elem_where"),
+            elem_where_bcast: pipeline("elem_where_bcast"),
             elem_fma: pipeline("elem_fma"),
             reduce_axes: pipeline("reduce_axes"),
             topk_lastax: pipeline("topk_lastax"),
@@ -6671,6 +7891,7 @@ impl Kernels {
             conv2d_backward_weight_partial: pipeline("conv2d_backward_weight_partial"),
             conv2d_backward_weight_reduce: pipeline("conv2d_backward_weight_reduce"),
             conv2d: pipeline("conv2d"),
+            depthwise_conv1d_bsc: pipeline("depthwise_conv1d_bsc"),
             conv2d_w1: pipeline("conv2d_w1"),
             layer_norm2d: pipeline("layer_norm2d"),
             group_norm: pipeline("group_norm"),
@@ -6708,6 +7929,7 @@ impl Kernels {
             fft_outer_r4_f32: pipeline("fft_outer_r4_f32"),
             fft_outer_r2_f32: pipeline("fft_outer_r2_f32"),
             gated_delta_net: pipeline("gated_delta_net"),
+            gated_delta_net_sg: pipeline("gated_delta_net_sg"),
             selective_scan: pipeline("selective_scan"),
             lstm: pipeline("lstm"),
             gru: pipeline("gru"),
@@ -6715,6 +7937,14 @@ impl Kernels {
             mamba2: pipeline("mamba2"),
             dequant_gguf: pipeline("dequant_gguf"),
             q4k_mv_f32: pipeline("q4k_mv_f32"),
+            q1_0_mv_f32: pipeline("q1_0_mv_f32"),
+            q1_0_mv_f32_sg: pipeline("q1_0_mv_f32_sg"),
+            q1_0_dual_mv_f32_sg: pipeline("q1_0_dual_mv_f32_sg"),
+            q1_0_mm_f32: pipeline("q1_0_mm_f32"),
+            q2_0_mv_f32: pipeline("q2_0_mv_f32"),
+            q2_0_mv_f32_sg: pipeline("q2_0_mv_f32_sg"),
+            q2_0_dual_mv_f32_sg: pipeline("q2_0_dual_mv_f32_sg"),
+            q2_0_mm_f32: pipeline("q2_0_mm_f32"),
             q4_0_mv_f32: pipeline("q4_0_mv_f32"),
             q4_1_mv_f32: pipeline("q4_1_mv_f32"),
             q8_0_mv_f32: pipeline("q8_0_mv_f32"),
@@ -6736,6 +7966,14 @@ impl Kernels {
             q4k_mv_residual_f32: pipeline("q4k_mv_residual_f32"),
             q6k_mv_residual_f32: pipeline("q6k_mv_residual_f32"),
             q5_0_mv_residual_f32: pipeline("q5_0_mv_residual_f32"),
+            q1_0_swiglu_mv_f32: pipeline("q1_0_swiglu_mv_f32"),
+            q1_0_swiglu_mv_f32_sg: pipeline("q1_0_swiglu_mv_f32_sg"),
+            q1_0_mv_residual_f32: pipeline("q1_0_mv_residual_f32"),
+            q1_0_mv_residual_f32_sg: pipeline("q1_0_mv_residual_f32_sg"),
+            q2_0_swiglu_mv_f32: pipeline("q2_0_swiglu_mv_f32"),
+            q2_0_swiglu_mv_f32_sg: pipeline("q2_0_swiglu_mv_f32_sg"),
+            q2_0_mv_residual_f32: pipeline("q2_0_mv_residual_f32"),
+            q2_0_mv_residual_f32_sg: pipeline("q2_0_mv_residual_f32_sg"),
             rms_norm_bwd: pipeline("rms_norm_bwd"),
             rms_norm_bwd_param: pipeline("rms_norm_bwd_param"),
             rms_norm_bwd_inv_r_f32: pipeline("rms_norm_bwd_inv_r_f32"),

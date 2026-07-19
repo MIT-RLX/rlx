@@ -10,7 +10,7 @@
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rlx_ir::DimBinding;
 use rlx_ir::Graph;
@@ -64,8 +64,12 @@ impl AotCache {
         Self { root: root.into() }
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn lir_path(&self, key: &str) -> PathBuf {
-        self.root.join(format!("{key}.lir.json"))
+        self.root.join(format!("{key}.lir.bin"))
     }
 
     fn meta_path(&self, key: &str) -> PathBuf {
@@ -76,9 +80,12 @@ impl AotCache {
     pub fn put_lir(&self, key: &str, lir: &LirModule) -> io::Result<LirFingerprint> {
         fs::create_dir_all(&self.root)?;
         let fp = LirFingerprint::of(lir);
-        let json = rlx_ir::lir_to_json(lir)
+        // Compact binary LIR — ~2.5× smaller than JSON and ~10× faster to load
+        // (baked constants are raw f32 bytes, not ASCII); this is the dominant
+        // per-process compile cost for constant-heavy graphs (STFT vocoders).
+        let bytes = rlx_ir::lir_to_bytes(lir)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        fs::write(self.lir_path(key), json)?;
+        fs::write(self.lir_path(key), bytes)?;
         fs::write(
             self.meta_path(key),
             format!("{{\"fingerprint\":{}}}\n", fp.0),
@@ -88,8 +95,8 @@ impl AotCache {
 
     /// Load a previously stored LIR module.
     pub fn get_lir(&self, key: &str) -> io::Result<LirModule> {
-        let json = fs::read_to_string(self.lir_path(key))?;
-        rlx_ir::lir_from_json(&json)
+        let bytes = fs::read(self.lir_path(key))?;
+        rlx_ir::lir_from_bytes(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
@@ -110,8 +117,14 @@ impl AotCache {
         options: &CompileOptions,
     ) -> Result<CompiledGraph, AotCacheError> {
         if self.contains(key) {
-            let lir = self.get_lir(key)?;
-            return Ok(self.compile_lir(device, lir, options));
+            match self.get_lir(key) {
+                Ok(lir) => return Ok(self.compile_lir(device, lir, options)),
+                Err(e) => {
+                    eprintln!("[aot] cache miss (reload failed for {key}): {e}");
+                    let _ = fs::remove_file(self.lir_path(key));
+                    let _ = fs::remove_file(self.meta_path(key));
+                }
+            }
         }
         let result = stages::compile_graph_stages(device, graph, options);
         stages::maybe_log_fusion(&result.fusion);
@@ -128,8 +141,15 @@ impl AotCache {
         options: &CompileOptions,
     ) -> Result<CompiledGraph, AotCacheError> {
         if self.contains(key) {
-            let lir = self.get_lir(key)?;
-            return Ok(self.compile_lir(device, lir, options));
+            match self.get_lir(key) {
+                Ok(lir) => return Ok(self.compile_lir(device, lir, options)),
+                Err(e) => {
+                    // Stale / schema-mismatched AOT blob — drop and recompile.
+                    eprintln!("[aot] cache miss (reload failed for {key}): {e}");
+                    let _ = fs::remove_file(self.lir_path(key));
+                    let _ = fs::remove_file(self.meta_path(key));
+                }
+            }
         }
         let result = stages::compile_hir_stages(device, hir, options)?;
         stages::maybe_log_fusion(&result.fusion);
@@ -148,8 +168,14 @@ impl AotCache {
     ) -> Result<CompiledGraph, AotCacheError> {
         let spec_key = format!("{base_key}__{}", binding_hash(binding));
         if self.contains(&spec_key) {
-            let lir = self.get_lir(&spec_key)?;
-            return Ok(self.compile_lir(device, lir, options));
+            match self.get_lir(&spec_key) {
+                Ok(lir) => return Ok(self.compile_lir(device, lir, options)),
+                Err(e) => {
+                    eprintln!("[aot] cache miss (reload failed for {spec_key}): {e}");
+                    let _ = fs::remove_file(self.lir_path(&spec_key));
+                    let _ = fs::remove_file(self.meta_path(&spec_key));
+                }
+            }
         }
         let pipe = stages::pipeline_for(device, options);
         let specialized = template.specialize(&pipe, binding);

@@ -4,7 +4,6 @@
 // One invocation per output element.
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint nn; uint cin; uint hh; uint ww;
@@ -29,7 +28,7 @@ void main() {
     uint group = co / cout_pg;
     uint ci_start = group * cin_pg;
 
-    float acc = (pc.has_bias != 0u) ? data[pc.b_off + co] : 0.0;
+    float acc = (pc.has_bias != 0u) ? arena_load(pc.b_off + co) : 0.0;
     for (uint cl = 0u; cl < cin_pg; cl++) {
         uint ci = ci_start + cl;
         for (uint i = 0u; i < pc.kh; i++) {
@@ -38,11 +37,11 @@ void main() {
             for (uint j = 0u; j < pc.kw; j++) {
                 int w = int(owi * pc.sw) - int(pc.pw) + int(j * pc.dw);
                 if (w < 0 || w >= int(pc.ww)) { continue; }
-                float xv = data[pc.x_off + ((n * pc.cin + ci) * pc.hh + uint(h)) * pc.ww + uint(w)];
-                float wv = data[pc.w_off + ((co * cin_pg + cl) * pc.kh + i) * pc.kw + j];
+                float xv = arena_load(pc.x_off + ((n * pc.cin + ci) * pc.hh + uint(h)) * pc.ww + uint(w));
+                float wv = arena_load(pc.w_off + ((co * cin_pg + cl) * pc.kh + i) * pc.kw + j);
                 acc += xv * wv;
             }
         }
     }
-    data[pc.out_off + gid] = acc;
+    arena_store(pc.out_off + gid, acc);
 }

@@ -131,14 +131,17 @@ impl VulkanDevice {
 
         // On Apple platforms the only ICD is MoltenVK, a portability driver:
         // it must be opted into via the portability-enumeration extension.
-        let mut inst_ext: Vec<*const c_char> = Vec::new();
-        let mut inst_flags = vk::InstanceCreateFlags::empty();
         #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
-        {
-            inst_ext.push(ash::khr::portability_enumeration::NAME.as_ptr());
-            inst_ext.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
-            inst_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-        }
+        let (inst_ext, inst_flags) = (
+            vec![
+                ash::khr::portability_enumeration::NAME.as_ptr(),
+                ash::khr::get_physical_device_properties2::NAME.as_ptr(),
+            ],
+            vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR,
+        );
+        #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
+        let (inst_ext, inst_flags): (Vec<*const c_char>, vk::InstanceCreateFlags) =
+            (Vec::new(), vk::InstanceCreateFlags::empty());
 
         // Opt-in Khronos validation layer for debugging (RLX_VULKAN_VALIDATION=1);
         // VUID messages print to stderr. Off by default (no runtime cost).
@@ -429,6 +432,34 @@ impl VulkanDevice {
             dev.wait_for_fences(&[fence], true, u64::MAX)
                 .expect("vk wait");
             dev.reset_fences(&[fence]).expect("vk reset fence");
+        }
+    }
+
+    /// Make GPU writes to a persistently-mapped HOST_VISIBLE arena visible to
+    /// the host. Required when the memory type is HOST_CACHED (or a driver
+    /// that does not honour HOST_COHERENT for device writes); safe no-op for
+    /// uncached coherent heaps.
+    pub fn invalidate_mapped(&self, memory: vk::DeviceMemory, offset: u64, size: u64) {
+        let range = vk::MappedMemoryRange::default()
+            .memory(memory)
+            .offset(offset)
+            .size(size);
+        unsafe {
+            self.device
+                .invalidate_mapped_memory_ranges(&[range])
+                .expect("vkInvalidateMappedMemoryRanges");
+        }
+    }
+
+    pub fn flush_mapped(&self, memory: vk::DeviceMemory, offset: u64, size: u64) {
+        let range = vk::MappedMemoryRange::default()
+            .memory(memory)
+            .offset(offset)
+            .size(size);
+        unsafe {
+            self.device
+                .flush_mapped_memory_ranges(&[range])
+                .expect("vkFlushMappedMemoryRanges");
         }
     }
 }

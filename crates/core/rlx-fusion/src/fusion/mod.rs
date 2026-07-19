@@ -28,7 +28,10 @@ use crate::graph_rewrite::Rewriter;
 
 // ── Pass 1: MatMul + Bias + Activation → FusedMatMulBiasAct ─────────────
 
+mod ada_layer_norm;
 mod attention_block;
+mod conv_bias_act;
+mod gated_residual;
 mod mark_elementwise;
 mod matmul_bias_act;
 mod residual_ln;
@@ -40,7 +43,10 @@ mod swiglu_dual;
 mod transformer_layer;
 mod unfuse_elementwise;
 
+pub use ada_layer_norm::*;
 pub use attention_block::*;
+pub use conv_bias_act::*;
+pub use gated_residual::*;
 pub use mark_elementwise::*;
 pub use matmul_bias_act::*;
 pub use residual_ln::*;
@@ -537,6 +543,45 @@ mod tests {
         ));
     }
 
+    /// Qwen/Bonsai post-attn: `h+=attn; n=rms(h); h+=ffn(n)` — add dst stays
+    /// live, so FuseResidualRmsNorm must refuse.
+    #[test]
+    fn fuse_residual_rms_norm_skips_live_reuse() {
+        let mut g = Graph::new("post_attn_reuse");
+        let h0 = g.input("h", f32_shape(&[1, 512]));
+        let attn = g.input("attn", f32_shape(&[1, 512]));
+        let ffn = g.input("ffn", f32_shape(&[1, 512]));
+        let gamma = g.param("gamma", f32_shape(&[512]));
+        let beta = g.param("beta", f32_shape(&[512]));
+        let h = g.binary(BinaryOp::Add, h0, attn, f32_shape(&[1, 512]));
+        let _n = g.add_node(
+            Op::RmsNorm {
+                axis: -1,
+                eps: 1e-6,
+            },
+            vec![h, gamma, beta],
+            f32_shape(&[1, 512]),
+        );
+        let out = g.binary(BinaryOp::Add, h, ffn, f32_shape(&[1, 512]));
+        g.set_outputs(vec![out]);
+
+        let fused = FuseResidualRmsNorm.run(g);
+        assert!(
+            fused
+                .nodes()
+                .iter()
+                .all(|n| !matches!(n.op, Op::FusedResidualRmsNorm { .. })),
+            "must not fuse when add result feeds both rms and a later residual"
+        );
+        assert!(
+            fused
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::RmsNorm { .. })),
+            "rms must remain unfused"
+        );
+    }
+
     #[test]
     fn fuse_rms_norm_reshape() {
         let mut g = Graph::new("test");
@@ -591,6 +636,38 @@ mod tests {
         // Both outputs should be Narrow ops
         for &out in &fused.outputs {
             assert!(matches!(fused.node(out).op, Op::Narrow { .. }));
+        }
+    }
+
+    /// F5 AdaLN packs dozens of linears on one time embed; leave them unfused
+    /// so backends never materialize a ~0.5 GiB Concat weight.
+    #[test]
+    fn fuse_shared_input_matmul_skips_oversized_groups() {
+        let mut g = Graph::new("adaln_pack");
+        let x = g.input("t", f32_shape(&[1, 64]));
+        let mut outs = Vec::new();
+        for i in 0..8 {
+            let w = g.param(format!("w{i}"), f32_shape(&[64, 128]));
+            outs.push(g.matmul(x, w, f32_shape(&[1, 128])));
+        }
+        g.set_outputs(outs);
+
+        let fused = FuseSharedInputMatMul.run(g);
+        let concat_count = fused
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Concat { .. }))
+            .count();
+        assert_eq!(
+            concat_count, 0,
+            "groups larger than MAX_SHARED_INPUT_MATMULS must stay unfused"
+        );
+        for &out in &fused.outputs {
+            assert!(
+                matches!(fused.node(out).op, Op::MatMul),
+                "expected unfused MatMul, got {:?}",
+                fused.node(out).op
+            );
         }
     }
 
@@ -1423,5 +1500,85 @@ mod tests {
             .filter(|n| matches!(n.op, Op::FusedAttentionBlock { .. }))
             .count();
         assert_eq!(fab_count, 0, "block-fusion must skip large batches");
+    }
+
+    #[test]
+    fn fuse_ada_layer_norm_one_plus_scale() {
+        use rlx_ir::infer::GraphExt;
+        let (b, s, d) = (2usize, 4usize, 8usize);
+        let eps = 1e-5f32;
+        let mut g = Graph::new("ada");
+        let x = g.input("x", f32_shape(&[b, s, d]));
+        let scale = g.input("scale", f32_shape(&[b, 1, d]));
+        let shift = g.input("shift", f32_shape(&[b, 1, d]));
+        let gamma = g.full(&[d], 1.0, DType::F32);
+        let beta = g.zeros(&[d], DType::F32);
+        let n = g.layer_norm(x, gamma, beta, -1, eps, f32_shape(&[b, s, d]));
+        let scale_e = g.add_node(
+            Op::Expand {
+                target_shape: vec![b as i64, s as i64, d as i64],
+            },
+            vec![scale],
+            f32_shape(&[b, s, d]),
+        );
+        let one = g.full(&[1], 1.0, DType::F32);
+        let one_plus = g.binary(BinaryOp::Add, one, scale_e, f32_shape(&[b, s, d]));
+        let scaled = g.binary(BinaryOp::Mul, n, one_plus, f32_shape(&[b, s, d]));
+        let shift_e = g.add_node(
+            Op::Expand {
+                target_shape: vec![b as i64, s as i64, d as i64],
+            },
+            vec![shift],
+            f32_shape(&[b, s, d]),
+        );
+        let out = g.binary(BinaryOp::Add, scaled, shift_e, f32_shape(&[b, s, d]));
+        g.set_outputs(vec![out]);
+
+        let fused = FuseAdaLayerNorm.run(g);
+        let out_node = fused.node(fused.outputs[0]);
+        assert!(
+            matches!(
+                out_node.op,
+                Op::AdaLayerNorm {
+                    norm: AdaNormKind::LayerNorm,
+                    ..
+                }
+            ),
+            "expected AdaLayerNorm, got {:?}",
+            out_node.op
+        );
+        assert_eq!(out_node.inputs.len(), 3);
+    }
+
+    #[test]
+    fn fuse_gated_residual_with_expand() {
+        let (b, s, d) = (2usize, 4usize, 8usize);
+        let mut g = Graph::new("gate");
+        let x = g.input("x", f32_shape(&[b, s, d]));
+        let y = g.input("y", f32_shape(&[b, s, d]));
+        let gate = g.input("gate", f32_shape(&[b, 1, d]));
+        let gate_e = g.add_node(
+            Op::Expand {
+                target_shape: vec![b as i64, s as i64, d as i64],
+            },
+            vec![gate],
+            f32_shape(&[b, s, d]),
+        );
+        let gy = g.binary(BinaryOp::Mul, gate_e, y, f32_shape(&[b, s, d]));
+        let out = g.binary(BinaryOp::Add, x, gy, f32_shape(&[b, s, d]));
+        g.set_outputs(vec![out]);
+
+        let fused = FuseGatedResidual.run(g);
+        let out_node = fused.node(fused.outputs[0]);
+        assert!(
+            matches!(out_node.op, Op::GatedResidual),
+            "expected GatedResidual, got {:?}",
+            out_node.op
+        );
+        assert_eq!(out_node.inputs.len(), 3);
+        // Prefer pre-Expand gate.
+        let gate_in = fused.node(out_node.inputs[2]);
+        assert!(matches!(gate_in.op, Op::Input { .. }));
+        assert_eq!(gate_in.shape.dims(), f32_shape(&[b, 1, d]).dims());
     }
 }

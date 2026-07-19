@@ -13,12 +13,16 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.12" }
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.12", features = ["splat"] }
+rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.13" }
+rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.13" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
+rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.13" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.13", features = ["splat"] }
 # IQ-family grid LUTs staged into a device buffer by `iq_grid.rs`.
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13" }
+# Runtime dlopen of a pip/conda-installed cuDNN (see `device.rs::preload_real_cudnn`).
+libloading = "0.8"
 
 # `dynamic-loading` lets the crate compile and link on hosts without a
 # CUDA SDK installed — libcuda is dlopen()'d at runtime. That's what
@@ -44,6 +48,10 @@ cudarc = { version = "0.19", default-features = false, features = [
     "cublas",
     "cublaslt",
     "cudnn",
+    # cuSOLVER for the native batched symmetric eigensolver (`SsyevjBatched`),
+    # the on-device forward path for `Op::Eigh` / `Op::EighBatch` (see
+    # `eigh_native.rs`). Dynamic-loaded like the rest — no SDK needed to build.
+    "cusolver",
     "cuda-12030",
     "dynamic-loading",
 ] }
@@ -86,6 +94,9 @@ hip-cpu-validate = ["dep:cc"]
 
 [build-dependencies]
 cc = { version = "1", optional = true }
+
+[dev-dependencies]
+rlx-runtime = { path = "../../core/rlx-runtime", features = ["cuda", "cpu"] }
 
 [lints]
 workspace = true

@@ -107,7 +107,15 @@ pub fn topo_sort_nodes(nodes: Vec<BundleNode>) -> Vec<BundleNode> {
     if order.len() != n {
         return nodes;
     }
-    order.into_iter().map(|i| nodes[i].clone()).collect()
+    // Permute the owned nodes into topo order by MOVING each out of its slot
+    // (`Option::take`) — a `nodes[i].clone()` here copied every BundleNode,
+    // including its `HashMap<String, serde_json::Value>` attrs (KBs/node), on
+    // every import. `order` is a permutation so each `take` fires exactly once.
+    let mut slots: Vec<Option<BundleNode>> = nodes.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| slots[i].take().expect("topo order is a permutation"))
+        .collect()
 }
 
 /// Optional ONNX RLX bundle directory for integration tests and tools.

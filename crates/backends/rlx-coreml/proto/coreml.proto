@@ -210,9 +210,22 @@ enum DataType {
   FLOAT16 = 10;
   FLOAT32 = 11;
   FLOAT64 = 12;
+  BFLOAT16 = 13;
   INT8 = 21;
   INT16 = 22;
   INT32 = 23;
   INT64 = 24;
+  // Sub-byte signed int (weight compression / palettization).
+  INT4 = 25;
   UINT8 = 31;
+  UINT16 = 32;
+  UINT32 = 33;
+  UINT64 = 34;
+  // Sub-byte unsigned ints — LUT palettization index widths. UINT1 is the
+  // 1-bit index type Q1_0 needs for `constexpr_lut_to_dense` (packed 8/byte).
+  UINT4 = 35;
+  UINT2 = 36;
+  UINT1 = 37;
+  UINT6 = 38;
+  UINT3 = 39;
 }

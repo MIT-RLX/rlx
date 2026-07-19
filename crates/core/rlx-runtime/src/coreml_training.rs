@@ -174,9 +174,9 @@ impl Optimizer {
 /// Learning rate + optimizer for a [`CoremlTrainingSession`].
 ///
 /// **Speed vs precision** is chosen by compute units (`RLX_COREML_UNITS`), not a
-/// field here: gradients default to fp32 CPU+GPU (accurate), and
-/// `RLX_COREML_UNITS=ane` runs them on the **Neural Engine** (`f16+f16` hardware)
-/// for faster training. See [`rlx_coreml::default_compute_units`].
+/// field here: gradients default to fp32 CPU+GPU (accurate / BNNS-safe), and
+/// `RLX_COREML_UNITS=ane` (or an f16 AFP graph) runs on the **Neural Engine**
+/// (`f16+f16` hardware) for faster training. See [`rlx_coreml::default_compute_units`].
 #[derive(Debug, Clone, Copy)]
 pub struct TrainConfig {
     pub lr: f32,

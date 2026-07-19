@@ -23,18 +23,23 @@ documentation.workspace = true
 default = []
 # In-process FFI execution on a QNN backend library (Device::Hexagon path).
 # Requires QNN_SDK_ROOT at build time; build.rs compiles runtime/rlx_qnn_shim.c.
-runtime = []
+# Pulls `rlx-gguf` for host-side DequantMatMul (GGUF → f32 MatMul).
+runtime = ["dep:rlx-gguf"]
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
 # For unrolling Op::Scan into primitives (no native recurrence in QNN codegen).
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13" }
+# Host GGUF dequant for DequantMatMul (runtime feature only).
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13", optional = true }
 
 [build-dependencies]
 cc = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Tests pack Q8_0 / Q4_0 weights even when building without `runtime`.
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13" }
 
 [lib]
 path = "src/lib.rs"

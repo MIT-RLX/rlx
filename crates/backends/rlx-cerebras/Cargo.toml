@@ -18,8 +18,8 @@ documentation.workspace = true
 # (which lives outside this crate, in a Singularity container on a Linux host).
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13" }
 
 [dev-dependencies]
 tempfile = "3"

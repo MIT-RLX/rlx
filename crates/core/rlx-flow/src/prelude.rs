@@ -28,3 +28,7 @@ pub use crate::{
     BuiltModel, CompileProfile, Emit, FlowStage, FlowValue, LayerStack, ModelFlow, ModelRecipe,
     SideOutputs, WeightSource,
 };
+// Downstream extension seam: implement `LayerStage` for a custom block and drop
+// it into any flow via `ModelFlow::layer` — no core `FlowStage` variant needed.
+// `FlowCtx` is the emission surface the block receives.
+pub use crate::{FlowCtx, LayerStage, StageArtifacts};

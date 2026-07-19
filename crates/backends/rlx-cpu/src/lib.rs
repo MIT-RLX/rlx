@@ -39,6 +39,7 @@ pub mod gguf_matmul;
 pub mod gguf_scheme;
 pub mod iir; // IIR biquad zero-phase Butterworth filtering (filter-bank front-end)
 pub mod spd; // SPD-manifold Riemannian kernels (logm/expm/sqrtm, AIRM distance, Karcher mean, batched eigh)
+pub mod spd_kernels; // CpuKernel impls for the core SPDNet ops (BiMap/ReEig/LogEig/SpdBatchNorm)
 pub use gguf_scheme::quant_scheme_for_ggml;
 pub mod im2col;
 pub mod intrinsics;
@@ -54,6 +55,8 @@ pub mod onnx_control_flow;
 pub mod onnx_indexing;
 pub mod onnx_ref;
 pub mod op_registry;
+pub mod supported_ops;
+pub use supported_ops::SUPPORTED_OPS;
 pub mod pool;
 pub mod splat;
 pub mod thunk;

@@ -36,6 +36,74 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::WelchPeaks { k, n_segments } => {
             crate::audio::welch_peaks_output_shape(in_shape(0), *k, *n_segments).ok()
         }
+
+        // ── Riemannian / SPD-manifold layers ────────────────────
+        Op::BiMap => {
+            // W [m,n] · X [n,n] · Wᵀ → [m,m]
+            let m = in_shape(0).dim(0).unwrap_static();
+            Some(Shape::new(&[m, m], in_shape(0).dtype()))
+        }
+        // ReEig/LogEig emit a packed [Y (n²), λ (n), U (n²)] buffer so the
+        // backward reuses the eigendecomposition; the builder narrows Y.
+        Op::ReEig { .. } | Op::LogEig { .. } => {
+            let n = in_shape(0).dim(0).unwrap_static();
+            Some(Shape::new(&[2 * n * n + n], in_shape(0).dtype()))
+        }
+        Op::SpdBatchNorm { .. } => Some(shape::unary_shape(in_shape(0))),
+        Op::SpdKarcherMean { .. } | Op::SpdKarcherMeanWeighted { .. } => {
+            // [batch, n, n] (+ optional weights [batch]) → [n, n]
+            let n = in_shape(0).dim(1).unwrap_static();
+            Some(Shape::new(&[n, n], in_shape(0).dtype()))
+        }
+        // Arbitrary-base AIRM maps / transport are all [n,n] → [n,n]; the
+        // result matches the tangent/point operand (last input).
+        Op::SpdLogMap | Op::SpdExpMap => Some(shape::unary_shape(in_shape(1))),
+        Op::SpdParallelTransport => Some(shape::unary_shape(in_shape(2))),
+        // Batched matrix function preserves the [batch, n, n] shape.
+        Op::SpdMatrixFnBatch { .. } => Some(shape::unary_shape(in_shape(0))),
+        // Backward reads (λ [n], U [n²], dY [n²]) → dX [n, n]; input 0 is λ.
+        Op::ReEigBackward { .. } | Op::LogEigBackward { .. } => {
+            let n = in_shape(0).dim(0).unwrap_static();
+            Some(Shape::new(&[n, n], in_shape(0).dtype()))
+        }
+        // dX = dY shape (input 2 of [mean, G, dY]).
+        Op::SpdBatchNormBackwardX { .. } => Some(shape::unary_shape(in_shape(2))),
+        // dG = G shape (input 2 of [X, mean, G, dY]).
+        Op::SpdBatchNormBackwardG { .. } => Some(shape::unary_shape(in_shape(2))),
+        // Packed per-input gradients: [k, n, n] where k = #differentiable
+        // inputs (base+arg = 2, from+to+v = 3). n from the base/from operand.
+        Op::SpdLogMapBackward | Op::SpdExpMapBackward => {
+            let n = in_shape(0).dim(0).unwrap_static();
+            Some(Shape::new(&[2, n, n], in_shape(0).dtype()))
+        }
+        Op::SpdParallelTransportBackward => {
+            let n = in_shape(0).dim(0).unwrap_static();
+            Some(Shape::new(&[3, n, n], in_shape(0).dtype()))
+        }
+        // dX = X shape ([B, n, n]).
+        Op::SpdMatrixFnBatchBackward { .. } => Some(shape::unary_shape(in_shape(0))),
+        // Eigh packs [λ (n) ∥ U (n²)] = [n²+n].
+        Op::Eigh => {
+            let n = in_shape(0).dim(0).unwrap_static();
+            Some(Shape::new(&[n * n + n], in_shape(0).dtype()))
+        }
+        Op::EighBatch => {
+            let b = in_shape(0).dim(0).unwrap_static();
+            let n = in_shape(0).dim(1).unwrap_static();
+            Some(Shape::new(&[b, n * n + n], in_shape(0).dtype()))
+        }
+        // Backward → Ā; recover n from the packed length L=n²+n ⇒ n=(√(1+4L)−1)/2.
+        Op::EighBackward => {
+            let len = in_shape(0).dim(0).unwrap_static();
+            let n = (((1 + 4 * len) as f64).sqrt().round() as usize - 1) / 2;
+            Some(Shape::new(&[n, n], in_shape(0).dtype()))
+        }
+        Op::EighBatchBackward => {
+            let b = in_shape(0).dim(0).unwrap_static();
+            let len = in_shape(0).dim(1).unwrap_static();
+            let n = (((1 + 4 * len) as f64).sqrt().round() as usize - 1) / 2;
+            Some(Shape::new(&[b, n, n], in_shape(0).dtype()))
+        }
         Op::Binary(_) => shape::binary_shape(in_shape(0), in_shape(1)).ok(),
         Op::Compare(_) => shape::compare_shape(in_shape(0), in_shape(1)).ok(),
         Op::Where => {
@@ -80,6 +148,12 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             shape::concat_shape(&inputs, *axis).ok()
         }
         Op::Gather { axis } => shape::gather_shape(in_shape(0), in_shape(1), *axis).ok(),
+        // ScatterND / ScatterElements output matches `data` (input 0).
+        Op::ScatterNd { .. } | Op::ScatterElements { .. } => Some(shape::unary_shape(in_shape(0))),
+        // GatherElements output matches `indices` (input 1).
+        Op::GatherElements { .. } => Some(in_shape(1).clone()),
+        // GatherND: indices[:-1] + data[batch+k:] — fall back to declared shape.
+        Op::GatherNd { .. } => Some(node.shape.clone()),
         // Reverse flips element order along axes; shape is unchanged.
         Op::Reverse { .. } => Some(shape::unary_shape(in_shape(0))),
         Op::Expand { target_shape } => shape::expand_shape(in_shape(0), target_shape).ok(),
@@ -135,9 +209,74 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         }
 
         Op::FusedMatMulBiasAct { .. } => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
+        // Like `Op::Conv`, the output shape is set explicitly by the fusion pass
+        // (from the pre-fusion conv/activation output); nothing to infer here.
+        Op::FusedConvBiasAct { .. } => None,
         Op::FusedSwiGLU { .. } => None,
         Op::FusedResidualLN { .. } | Op::FusedResidualRmsNorm { .. } => {
             Some(shape::unary_shape(in_shape(0)))
+        }
+
+        // DiT adaLN-Zero: out shape == x; scale/shift must broadcast to x
+        // (typically `[B,1,D]` over `[B,S,D]`) with matching last feature dim.
+        Op::AdaLayerNorm { .. } => {
+            let x = in_shape(0);
+            let scale = in_shape(1);
+            let shift = in_shape(2);
+            let b_scale = shape::broadcast(scale, x).ok()?;
+            let b_shift = shape::broadcast(shift, x).ok()?;
+            if b_scale.dims() != x.dims() || b_shift.dims() != x.dims() {
+                return None;
+            }
+            Some(shape::unary_shape(x))
+        }
+        // DiT gated residual: out == x; y same shape as x; gate broadcasts to x.
+        Op::GatedResidual => {
+            let x = in_shape(0);
+            let y = in_shape(1);
+            let gate = in_shape(2);
+            if y.dims() != x.dims() {
+                return None;
+            }
+            let b_gate = shape::broadcast(gate, x).ok()?;
+            if b_gate.dims() != x.dims() {
+                return None;
+            }
+            Some(shape::unary_shape(x))
+        }
+        // Packed DiT modulation backward: 1-D [nx + 2·ns] / [nx + ny + ng].
+        Op::AdaLayerNormBackward { .. } => {
+            let x = in_shape(0);
+            let scale = in_shape(1);
+            let shift = in_shape(2);
+            let dy = in_shape(3);
+            if dy.dims() != x.dims() || scale.dims() != shift.dims() {
+                return None;
+            }
+            let b_scale = shape::broadcast(scale, x).ok()?;
+            let b_shift = shape::broadcast(shift, x).ok()?;
+            if b_scale.dims() != x.dims() || b_shift.dims() != x.dims() {
+                return None;
+            }
+            let nx = x.num_elements()?;
+            let ns = scale.num_elements()?;
+            Some(Shape::new(&[nx + 2 * ns], x.dtype()))
+        }
+        Op::GatedResidualBackward => {
+            let x = in_shape(0);
+            let y = in_shape(1);
+            let gate = in_shape(2);
+            let dy = in_shape(3);
+            if y.dims() != x.dims() || dy.dims() != x.dims() {
+                return None;
+            }
+            let b_gate = shape::broadcast(gate, x).ok()?;
+            if b_gate.dims() != x.dims() {
+                return None;
+            }
+            let nx = x.num_elements()?;
+            let ng = gate.num_elements()?;
+            Some(Shape::new(&[nx + nx + ng], x.dtype()))
         }
 
         Op::DequantMatMul { .. } | Op::LoraMatMul { .. } | Op::QMatMul { .. } => {

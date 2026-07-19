@@ -30,7 +30,8 @@ use rlx_fusion::fk_fusion::{
     MarkTransformRegions,
 };
 use rlx_fusion::fusion::{
-    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
+    FuseAdaLayerNorm, FuseAttentionBlock, FuseConvAffineAct, FuseConvBiasAct, FuseGatedResidual,
+    FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
     FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul, FuseTransformerLayer,
     MarkElementwiseRegions, UnfuseElementwiseRegions,
 };
@@ -247,6 +248,17 @@ pub fn fusion_passes_for_supported(
     if supports_op(supported, OpKind::FusedMatMulBiasAct) {
         passes.push(&FuseMatMulBiasAct);
     }
+    // Conv + bias + activation → cuDNN's fused conv-bias-activation (CUDA only
+    // claims `FusedConvBiasAct`; every other backend keeps it decomposed).
+    // `RLX_DISABLE_CONV_BIAS_ACT_FUSION=1` skips it (ablation / A-B benchmarking
+    // vs the unfused conv+bias+act path). `FuseConvAffineAct` folds a
+    // host-pre-folded BatchNorm affine (`conv→Mul→Add→relu`) into the same op.
+    if supports_op(supported, OpKind::FusedConvBiasAct)
+        && !rlx_ir::env::flag("RLX_DISABLE_CONV_BIAS_ACT_FUSION")
+    {
+        passes.push(&FuseConvBiasAct);
+        passes.push(&FuseConvAffineAct);
+    }
     // Block-level fusion: `Op::FusedAttentionBlock`. All backends that claim
     // this op now produce parity-correct output (the MLX
     // `Op::FusedAttentionBlock` lowering at `rlx-mlx/src/lower.rs:1689`
@@ -265,6 +277,14 @@ pub fn fusion_passes_for_supported(
     }
     if supports_op(supported, OpKind::FusedResidualRmsNorm) {
         passes.push(&FuseResidualRmsNorm);
+    }
+    // DiT adaLN-Zero / gated residual — after residual-LN so we don't
+    // compete for Add→LN patterns; gated residual is independent.
+    if supports_op(supported, OpKind::AdaLayerNorm) {
+        passes.push(&FuseAdaLayerNorm);
+    }
+    if supports_op(supported, OpKind::GatedResidual) {
+        passes.push(&FuseGatedResidual);
     }
     passes.push(&FuseRmsNormReshape);
 
@@ -286,7 +306,8 @@ pub fn fusion_passes_for_supported(
     if supports_op(supported, OpKind::FusedSwiGLU) {
         passes.push(&FuseSwiGLUDualMatmul);
     }
-    if supports_op(supported, OpKind::MatMul) {
+    // Opt out: `RLX_NO_SHARED_INPUT_MATMUL=1` (debug / parity vs unfused AdaLN).
+    if supports_op(supported, OpKind::MatMul) && !rlx_ir::env::flag("RLX_NO_SHARED_INPUT_MATMUL") {
         passes.push(&FuseSharedInputMatMul);
     }
     if supports_op(supported, OpKind::FusedSwiGLU) {
@@ -451,6 +472,8 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
             FusedResidualLN,
             FusedResidualRmsNorm,
             FusedAttentionBlock,
+            AdaLayerNorm,
+            GatedResidual,
         ],
         FusionTarget::Metal => &[
             MatMul,
@@ -462,6 +485,8 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
             FusedMatMulBiasAct,
             FusedResidualLN,
             FusedResidualRmsNorm,
+            AdaLayerNorm,
+            GatedResidual,
         ],
         FusionTarget::Mlx => &[
             MatMul,
@@ -473,6 +498,8 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
             FusedMatMulBiasAct,
             FusedResidualLN,
             FusedResidualRmsNorm,
+            AdaLayerNorm,
+            GatedResidual,
         ],
         FusionTarget::Wgpu => &[
             MatMul,
@@ -483,10 +510,28 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
             FusedMatMulBiasAct,
             FusedResidualLN,
             FusedResidualRmsNorm,
+            AdaLayerNorm,
+            GatedResidual,
             FusedAttentionBlock,
             FusedTransformerLayer,
         ],
-        FusionTarget::Cuda | FusionTarget::Rocm => &[
+        // CUDA lowers `FusedConvBiasAct` to cuDNN's fused conv-bias-activation.
+        // ROCm/MIOpen has no fused-conv path yet, so it is NOT claimed there —
+        // its conv-bias-activation stays decomposed until a MIOpen lowering lands.
+        FusionTarget::Cuda => &[
+            MatMul,
+            DotGeneral,
+            ElementwiseRegion,
+            TransformRegion,
+            BatchElementwiseRegion,
+            FusedMatMulBiasAct,
+            FusedConvBiasAct,
+            FusedResidualLN,
+            FusedResidualRmsNorm,
+            AdaLayerNorm,
+            GatedResidual,
+        ],
+        FusionTarget::Rocm => &[
             MatMul,
             DotGeneral,
             ElementwiseRegion,
@@ -495,6 +540,8 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
             FusedMatMulBiasAct,
             FusedResidualLN,
             FusedResidualRmsNorm,
+            AdaLayerNorm,
+            GatedResidual,
         ],
         FusionTarget::Tpu => &[
             MatMul,
@@ -503,6 +550,8 @@ pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
             BatchElementwiseRegion,
             FusedMatMulBiasAct,
             FusedResidualLN,
+            AdaLayerNorm,
+            GatedResidual,
         ],
     }
 }
@@ -690,8 +739,8 @@ mod tests {
         let passes = fusion_passes(FusionTarget::Cpu, FusionOptions::default());
         assert_eq!(
             passes.len(),
-            17,
-            "CPU default supported_ops omit Fft/WelchPeaks and mark_elementwise (unfuse-only backends skip mark)"
+            19,
+            "CPU default supported_ops omit Fft/WelchPeaks and mark_elementwise (unfuse-only backends skip mark); includes FuseAdaLayerNorm + FuseGatedResidual"
         );
         assert_eq!(passes[2].name(), "fuse_matmul_bias_act");
         assert_eq!(passes[3].name(), "fuse_attention_block");

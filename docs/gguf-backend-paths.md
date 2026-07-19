@@ -3,7 +3,7 @@
 How `Op::DequantMatMul { scheme }` and grouped GGUF matmul reach each RLX
 backend (current tree). For the full op matrix see
 [op-coverage.md](op-coverage.md); for scheme definitions see
-[`crates/rlx-ir/src/quant.rs`](../crates/rlx-ir/src/quant.rs).
+[`crates/core/rlx-ir/src/quant.rs`](../crates/core/rlx-ir/src/quant.rs).
 
 ## IR contract
 
@@ -18,7 +18,9 @@ weight bytes — no separate scale/zp tensors.
 ## Shared GPU scheme ids
 
 Metal, CUDA, ROCm, and WGPU use the same integer ids in `dequant_gguf`
-kernels (`gguf_scheme_id` / `scheme_from_id` in each backend's `gguf_host`):
+kernels. Canonical helpers live in `rlx-gpu-host`
+(`gguf_scheme_id` / `scheme_from_id`); each backend's `gguf_host` (or Metal's
+`gguf_scheme_id` helper) re-exports them:
 
 | id | `QuantScheme` | Block (elements) | Block (bytes) |
 |----|---------------|------------------|---------------|
@@ -40,9 +42,16 @@ kernels (`gguf_scheme_id` / `scheme_from_id` in each backend's `gguf_host`):
 | 21 | `GgufQ4_1` | 32 | 20 |
 | 22 | `GgufQ5_0` | 32 | 22 |
 | 23 | `GgufQ5_1` | 32 | 24 |
+| 24 | `GgufQ1_0` | 128 | 18 |
 
-Map GGUF file dtypes to IR: [`rlx_cpu::quant_scheme_for_ggml`](../crates/rlx-cpu/src/gguf_scheme.rs)
+Map GGUF file dtypes to IR: [`rlx_cpu::quant_scheme_for_ggml`](../crates/backends/rlx-cpu/src/gguf_scheme.rs)
 (`GgmlType` → `QuantScheme` for loader / graph builders).
+
+GPU backends must **not** hand-roll this table: encode/decode via
+`QuantScheme::gpu_dequant_scheme_id` / `from_gpu_dequant_scheme_id`
+(defined once by `define_gguf_gpu_dequant_ids!` in `rlx-ir`).
+`rlx-gpu-host::{gguf_scheme_id,scheme_from_id}` (re-exported from each
+backend `gguf_host`) only delegates.
 
 IQ-family kernels take a ~33 KB grid LUT (see `rlx_gguf::iq_grids`); staged
 once per device context on Metal/CUDA/ROCm/WGPU.
@@ -57,7 +66,8 @@ once per device context on Metal/CUDA/ROCm/WGPU.
 | **WGPU** | `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | — | — | `gguf_host` when scratch exceeds limits |
 | **ANE (CoreML)** | hybrid host segments | — | MIL `mul` + optional `sub` | `RLX_COREML_HOST_DEQUANT=1` |
 | **TPU** | — | — | — | host dequant at HLO emit (`Constant`, `quant_param_bindings`, or runtime `set_param_typed` on deferred Param) |
-| **MLX** | host dequant + cache | — | — | primary Apple path when MLX enabled |
+| **MLX** | Q1_0 on-device (`dequant_q1_0.metal`); other GGUF host dequant + cache | — | — | `RLX_MLX_GGUF_HOST_FALLBACK=1` / `RLX_MLX_Q1_HOST=1` |
+| **QNN (Hexagon)** | — | — | — | host dequant → f32 MatMul (`rlx_qnn::dequant`, `set_param_typed` U8) |
 
 Non-GGUF FP8 / NVFP4 block matmul on Metal uses `dequant_matmul_fp8` /
 `dequant_matmul_nvfp4` MSL when no deferred host ops are pending.
@@ -70,14 +80,14 @@ Non-GGUF FP8 / NVFP4 block matmul on Metal uses `dequant_matmul_fp8` /
 | **P1** | WGPU GPU dequant path | `rlx-wgpu/src/kernels/dequant_gguf.wgsl`, `gguf_gpu.rs`, `backend.rs` |
 | **P2** | Metal FP8 / NVFP4 GPU dequant matmul | `rlx-metal/src/kernels.rs` (`dequant_matmul_fp8`, `dequant_matmul_nvfp4`) |
 | **P3** | `GgufQ4_1` IR scheme + kernel id 21 | `rlx-ir/src/quant.rs`, all `gguf_host.rs`, MSL/CUDA/WGSL |
-| **P4** | TPU compile-time GGUF → f32 HLO dot | `rlx-tpu/src/lower.rs` (`lower_dequant_matmul_gguf`) |
+| **P4** | TPU compile-time GGUF → f32 HLO dot | `rlx-tpu/src/lower/lower.rs` (`lower_dequant_matmul_gguf`) |
 | **P5** | Metal fused decode GEMV (Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2/3/1 family) | `rlx-metal/src/dequant_gguf.msl`, `backend.rs`, `tests/iq_mv_parity.rs` |
 
 ## Backlog follow-up — landed
 
 | Item | What | Primary files |
 |------|------|-----------------|
-| **B1** | MLX + `dequant_cache` Q4_1 / Q5_0 / Q5_1 | `rlx-mlx/src/lower.rs`, `rlx-cpu/src/dequant_cache.rs` |
+| **B1** | MLX + `dequant_cache` Q4_1 / Q5_0 / Q5_1 | `rlx-mlx/src/lower/` (`helpers` dequant cache), `rlx-cpu/src/dequant_cache.rs` |
 | **B2** | WGPU + Metal dequant parity; Metal fused GEMV tests | `rlx-wgpu/tests/gguf_dequant_parity.rs`, `rlx-metal/tests/iq4_dequant_parity.rs`, `iq_mv_parity.rs`, `q40_q80_mv_parity.rs` |
 | **B3** | CoreML MIL on-device IQ/TQ/MX + K-quants | `rlx-coreml/tests/mil_p15.rs`, `mil/helpers.rs` |
 | **B4** | WGPU grouped MoE GPU path | `rlx-wgpu/src/gguf_gpu.rs` |
@@ -110,7 +120,7 @@ Otherwise Q4_1+ fall through with wrong block stride.
 | IQ1_S | `k % 256 == 0` | `RLX_METAL_IQ1S_FUSED_DISABLE=1` |
 | IQ1_M | `k % 256 == 0` | `RLX_METAL_IQ1M_FUSED_DISABLE=1` |
 
-**Query coverage:** [`has_metal_dequant_kernel`](../crates/rlx-metal/src/backend.rs).
+**Query coverage:** [`has_metal_dequant_kernel`](../crates/backends/rlx-metal/src/backend/encode/ops.rs) (re-exported from `rlx_metal`).
 
 ## WGPU
 
@@ -147,6 +157,10 @@ IQ1_S / IQ1_M use MIL `sub` for the δ nudge (`offset = scale × δ`).
 
 Schemes without a MIL lowering host-dequant at bake time via hybrid segments
 or `RLX_COREML_HOST_DEQUANT=1`.
+
+**Compute units:** unset `RLX_COREML_UNITS` → fp32 graphs use CoreML **CPU+GPU**
+(avoids Neural-Engine `bnns::GraphCompile` SIGSEGVs on large programs); f16 /
+`RLX_COREML_UNITS=ane` target the ANE. See `rlx_coreml::default_compute_units`.
 
 ## TPU
 
@@ -185,24 +199,25 @@ Non-GGUF schemes still use the in-HLO `convert + scale/zp tile + dot` path.
 | `RLX_METAL_IQ1S_FUSED_DISABLE=1` | Metal | Disable IQ1_S fused GEMV |
 | `RLX_METAL_IQ1M_FUSED_DISABLE=1` | Metal | Disable IQ1_M fused GEMV |
 | `RLX_COREML_HOST_DEQUANT=1` | ANE | Bake full f32 weights at compile |
+| `RLX_COREML_UNITS` | ANE | `cpu`/`gpu`/`all`/`ane`; unset → fp32 CPU+GPU, f16 CPU+ANE |
 | (arena planning) | WGPU | Auto host fallback when scratch does not fit |
 
 ## Code map
 
 | Concern | Location |
 |---------|----------|
-| IR schemes | `crates/rlx-ir/src/quant.rs` |
-| CPU reference + MoE | `crates/rlx-cpu/src/gguf_matmul.rs` |
-| Parse / dequant | `crates/rlx-gguf/src/lib.rs` |
-| GgmlType → IR | `crates/rlx-cpu/src/gguf_scheme.rs` |
-| Dequant cache | `crates/rlx-cpu/src/dequant_cache.rs` |
-| Metal MSL + encode | `crates/rlx-metal/src/dequant_gguf.msl`, `backend.rs` |
-| CUDA / ROCm | `crates/rlx-gpu-kernels/kernels/dequant_gguf.cu`, `rlx-cuda/src/gguf_gpu.rs` |
-| WGPU | `crates/rlx-wgpu/src/kernels/dequant_gguf.wgsl`, `gguf_gpu.rs` |
-| ANE MIL | `crates/rlx-coreml/src/mil/helpers.rs`, `mod.rs` |
-| TPU HLO | `crates/rlx-tpu/src/lower.rs` |
-| Python bindings | `crates/pyrlx/src/gguf.rs`, `gguf_convert.rs` |
-| Convert CLI / lib | `crates/rlx-gguf-convert/` |
+| IR schemes | `crates/core/rlx-ir/src/quant.rs` |
+| CPU reference + MoE | `crates/backends/rlx-cpu/src/gguf_matmul.rs` |
+| Parse / dequant | `crates/io/rlx-gguf/src/lib.rs` |
+| GgmlType → IR | `crates/backends/rlx-cpu/src/gguf_scheme.rs` |
+| Dequant cache | `crates/backends/rlx-cpu/src/dequant_cache.rs` |
+| Metal MSL + encode | `crates/backends/rlx-metal/src/dequant_gguf.msl`, `backend.rs` |
+| CUDA / ROCm | `crates/backends/rlx-gpu-kernels/kernels/dequant_gguf.cu`, `rlx-cuda/src/gguf_gpu.rs` |
+| WGPU | `crates/backends/rlx-wgpu/src/kernels/dequant_gguf.wgsl`, `gguf_gpu.rs` |
+| ANE MIL | `crates/backends/rlx-coreml/src/mil/helpers.rs`, `mod.rs` |
+| TPU HLO | `crates/backends/rlx-tpu/src/lower/lower.rs` |
+| Python bindings | `crates/bindings/pyrlx/src/gguf.rs`, `gguf_convert.rs` |
+| Convert CLI / lib | `crates/io/rlx-gguf-convert/` |
 
 ## Maintenance
 
@@ -234,6 +249,6 @@ w = f.dequant_tensor("token_embd.weight")
 
 Build with `maturin develop --features cpu,gguf-convert` (default). Optional
 `gguf-onnx` / `gguf-pt` cargo features for ONNX / PyTorch checkpoints.
-Tests: `crates/pyrlx/tests/test_gguf_*.py`; `just test-pyrlx`.
+Tests: `crates/bindings/pyrlx/tests/test_gguf_*.py`; `just test-pyrlx`.
 7. Parity test (Metal / WGPU / runtime integration as appropriate).
 8. Refresh this doc and [op-coverage.md](op-coverage.md).

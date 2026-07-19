@@ -31,6 +31,7 @@ use crate::tensor_data::i64_tensor;
 use super::options::{ImportOptions, ImportReport};
 
 mod activation;
+mod attention;
 mod binary;
 mod cast_quant;
 mod control;
@@ -44,6 +45,7 @@ mod rnn;
 mod shape_ops;
 
 use activation::*;
+use attention::*;
 use binary::*;
 use cast_quant::*;
 use control::*;
@@ -59,12 +61,37 @@ use shape_ops::*;
 const MAX_STUB_ELEMENTS: usize = 8 * 1024 * 1024;
 
 fn is_typical_channel(c: usize) -> bool {
+    // Keep an *upper* bound: sequence lengths (LuxTTS/F5 T≫C) must not look like
+    // channels, or `[1, T, C]` is misread as NCL with C=T (breaks long CFM).
     matches!(
         c,
-        22 | 32 | 64 | 80 | 100 | 105 | 125 | 128 | 256 | 512 | 768 | 1024
+        16 | 22
+            | 24
+            | 32
+            | 48
+            | 64
+            | 80
+            | 96
+            | 100
+            | 105
+            | 125
+            | 128
+            | 160
+            | 192
+            | 256
+            | 272
+            | 320
+            | 384
+            | 512
+            | 640
+            | 768
+            | 1024
+            | 1152
+            | 1280
+            | 1536
+            | 2048
     )
 }
-
 fn normalize_axis(axis: i64, rank: usize) -> usize {
     if axis < 0 {
         (rank as i64 + axis) as usize
@@ -171,6 +198,40 @@ fn binary_infer_add(m: &mut HirMut<'_>, a: HirNodeId, b: HirNodeId, site: &str) 
     binary_infer(m, BinaryOp::Add, a, b, site)
 }
 
+/// All dims of `s` are statically known. Layout heuristics that call
+/// `unwrap_static` must return false for symbolic dims under `dynamic_sequence`.
+fn dims_all_static(s: &Shape) -> bool {
+    s.dims().iter().all(|d| matches!(d, Dim::Static(_)))
+}
+
+/// ONNX `com.microsoft` fused activations `BiasGelu(x, bias) = Gelu(x + bias)`
+/// and the tanh-approx `FastGelu` — decomposed to a broadcast bias-add + the
+/// native Gelu activation. (F5-TTS's ConvNeXt-v2 pointwise blocks emit BiasGelu;
+/// without this its output orphans and the whole GRN chain fails to import.)
+fn lower_bias_gelu(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+    approx: bool,
+) -> Result<bool> {
+    let x = ctx.tensor(&node.inputs[0])?;
+    let inp = if node.inputs.len() > 1 && !node.inputs[1].is_empty() {
+        let bias = ctx.tensor(&node.inputs[1])?;
+        binary_infer_add(m, x, bias, &node.name)
+    } else {
+        x
+    };
+    let act = if approx {
+        Activation::GeluApprox
+    } else {
+        Activation::Gelu
+    };
+    let s = m.shape(inp).clone();
+    let id = m.add_node(Op::Activation(act), vec![inp], s);
+    ctx.env.insert(node.outputs[0].clone(), id);
+    Ok(true)
+}
+
 /// `[N,L,C]` with `L > C` and typical channel width on the last axis.
 fn is_vocoder_blc(s: &Shape) -> bool {
     s.rank() == 3
@@ -192,6 +253,7 @@ fn is_ncl_rank3(s: &Shape) -> bool {
         && s.dim(1).unwrap_static() >= 64
         && s.dim(2).unwrap_static() > 1
         && s.dim(1).unwrap_static() > s.dim(2).unwrap_static()
+        && !is_typical_channel(s.dim(2).unwrap_static())
         && !is_blc_rank3(s)
 }
 
@@ -225,6 +287,7 @@ fn meta_layout_ncl(s: &Shape) -> bool {
         && s.dim(1).unwrap_static() >= 64
         && !is_blc_rank3(s)
         && s.dim(1).unwrap_static() > s.dim(2).unwrap_static()
+        && !is_typical_channel(s.dim(2).unwrap_static())
 }
 
 fn is_rank3_ncl_pair(a: &Shape, b: &Shape) -> bool {
@@ -282,6 +345,12 @@ fn repair_duplicate_length_rank3(
         || sa.dim(0).unwrap_static() != 1
         || peer.dim(0).unwrap_static() != 1
         || sa.dim(1).unwrap_static() != sa.dim(2).unwrap_static()
+        // A genuine duplicate-length block is `[1,L,L]` with L>1. A `[1,1,1]`
+        // (or `[1,d,d]` unit) is a scalar/broadcast operand — reshaping its single
+        // element to the peer's `[1,C,L]` reads far past the buffer → garbage/inf.
+        // (Seen as the supertonic CFM Euler step `dt=1/total_step` `[1,1,1]` × the
+        // `[1,144,100]` guidance field exploding to amax ~5.9e3 with inf.)
+        || sa.dim(1).unwrap_static() <= 1
     {
         return x;
     }
@@ -347,6 +416,59 @@ fn binary_infer(
     b: HirNodeId,
     site: &str,
 ) -> HirNodeId {
+    // Clean same-rank NumPy broadcast, checked BEFORE any layout heuristic. When
+    // the two operands already broadcast to one of their own shapes there is no
+    // NCL/BLC ambiguity to fix, so `collapse_duplicate_channel_4d` (which would
+    // reshape a RoPE cos `[1,seq,1,head_dim]` to `[1,head_dim,seq]`, mistaking it
+    // for a mis-promoted BLC and breaking `Q[1,seq,H,hd] × cos` → head broadcast)
+    // must not run. The collapse only exists to REPAIR shapes that DON'T broadcast.
+    {
+        let ra = m.shape(a).clone();
+        let rb = m.shape(b).clone();
+        if ra.rank() == rb.rank() && ra.rank() >= 2 {
+            if let Ok(out) = rlx_ir::shape::binary_shape(&ra, &rb) {
+                if out.dims() == ra.dims() || out.dims() == rb.dims() {
+                    return m.add_node(Op::Binary(op), vec![a, b], out);
+                }
+            }
+        }
+    }
+    // A scalar operand (numel 1) broadcasts UNAMBIGUOUSLY against any shape, so it
+    // must skip every NCL/BLC/channel heuristic below — those exist to repair
+    // conv-bias `[C]` and VITS-mask layout ambiguity, which a scalar never has.
+    {
+        let ra = m.shape(a).clone();
+        let rb = m.shape(b).clone();
+        let na = ra.num_elements().unwrap_or(0);
+        let nb = rb.num_elements().unwrap_or(0);
+        if (na == 1 || nb == 1) && dims_all_static(&ra) && dims_all_static(&rb) {
+            if let Ok(out) = rlx_ir::shape::binary_shape(&ra, &rb) {
+                return m.add_node(Op::Binary(op), vec![a, b], out);
+            }
+        }
+    }
+    // Dynamic-length operands (a `dynamic_sequence` import — e.g. the ChatterBox
+    // S3Gen decoder whose U-Net lengths change via lookahead/up/downsampling)
+    // carry symbolic dims that the static NCL/BLC layout heuristics below cannot
+    // inspect (`unwrap_static` panics). Symbolic broadcast is unambiguous, so
+    // route straight to the generic path; `Dim::Dynamic` operands unify at
+    // runtime specialization.
+    {
+        let ra = m.shape(a).clone();
+        let rb = m.shape(b).clone();
+        if !dims_all_static(&ra) || !dims_all_static(&rb) {
+            return match rlx_ir::shape::binary_shape(&ra, &rb) {
+                Ok(sh) => m.add_node(Op::Binary(op), vec![a, b], sh),
+                Err(_) => {
+                    // Symbolic dims that don't statically broadcast: keep the
+                    // higher-rank operand's shape (the extra axes broadcast; the
+                    // symbolic lengths resolve identically at runtime).
+                    let sh = if ra.rank() >= rb.rank() { ra } else { rb };
+                    m.add_node(Op::Binary(op), vec![a, b], sh)
+                }
+            };
+        }
+    }
     let mut a_in = collapse_duplicate_channel_4d(m, a);
     let mut b_in = collapse_duplicate_channel_4d(m, b);
     let sa0 = m.shape(a_in).clone();
@@ -355,9 +477,21 @@ fn binary_infer(
     b_in = repair_duplicate_length_rank3(m, b_in, &sb0, &sa0);
     let sa0 = m.shape(a_in).clone();
     let sb0 = m.shape(b_in).clone();
-    if sa0.rank() == 1 && sb0.rank() >= 2 {
+    // A rank-1 operand is channel-aligned (conv bias `[C]`→`[N,C,H,W]`). Skip that
+    // ONLY for the RoPE outer-product signature — a rank-≥3 peer whose LAST dim is
+    // 1 and whose SECOND-TO-LAST dim matches the param size: `inv_freq[32] ×
+    // positions[..,32,1]` must NumPy-broadcast to `[..,32,32]` (channel-aligning
+    // puts `32` on dim -2 and collapses the freq axis → `[..,32,1]` → wrong
+    // Cos/Sin). Everything else keeps the (proven) channel heuristic.
+    let is_rope_outer = |param: &Shape, peer: &Shape| -> bool {
+        let r = peer.rank();
+        r >= 3
+            && peer.dim(r - 1).unwrap_static() == 1
+            && peer.dim(r - 2).unwrap_static() == param.dim(0).unwrap_static()
+    };
+    if sa0.rank() == 1 && sb0.rank() >= 2 && !is_rope_outer(&sa0, &sb0) {
         a_in = broadcast_param_channels(m, a_in, b_in);
-    } else if sb0.rank() == 1 && sa0.rank() >= 2 {
+    } else if sb0.rank() == 1 && sa0.rank() >= 2 && !is_rope_outer(&sb0, &sa0) {
         b_in = broadcast_param_channels(m, b_in, a_in);
     }
     let sa = m.shape(a_in).clone();
@@ -851,16 +985,72 @@ fn binary_infer(
             return m.add_node(Op::Binary(op), vec![a_fix, b_fix], sh);
         }
     }
+    // BLC tensor × length-last mask: `[1, L, C] * [1, 1, L]` → reshape the mask to
+    // `[1, L, 1]` so it broadcasts over channels. VITS `enc_q`/`enc_p` apply
+    // `x * x_mask` where the importer holds `x` seq-first (BLC) while the mask
+    // stays `[b, 1, t]` (length last). Only fires when the mask's last dim equals
+    // the tensor's length dim and the channel dims genuinely differ (so the plain
+    // NumPy broadcast — already handled by the fast path — does not apply).
+    if sa.rank() == 3
+        && sb.rank() == 3
+        && sa.dim(0).unwrap_static() == sb.dim(0).unwrap_static()
+        && sb.dim(1).unwrap_static() == 1
+        && sb.dim(2).unwrap_static() == sa.dim(1).unwrap_static()
+        && sa.dim(2).unwrap_static() != sb.dim(2).unwrap_static()
+    {
+        let b_fix = m.reshape_(
+            b_in,
+            vec![
+                sa.dim(0).unwrap_static() as i64,
+                sa.dim(1).unwrap_static() as i64,
+                1,
+            ],
+        );
+        return m.add_node(Op::Binary(op), vec![a_in, b_fix], sa.clone());
+    }
+    if sa.rank() == 3
+        && sb.rank() == 3
+        && sa.dim(0).unwrap_static() == sb.dim(0).unwrap_static()
+        && sa.dim(1).unwrap_static() == 1
+        && sa.dim(2).unwrap_static() == sb.dim(1).unwrap_static()
+        && sb.dim(2).unwrap_static() != sa.dim(2).unwrap_static()
+    {
+        let a_fix = m.reshape_(
+            a_in,
+            vec![
+                sb.dim(0).unwrap_static() as i64,
+                sb.dim(1).unwrap_static() as i64,
+                1,
+            ],
+        );
+        return m.add_node(Op::Binary(op), vec![a_fix, b_in], sb.clone());
+    }
     if let Some(id) = try_vocoder_ncl_batch_binary(m, op, a_in, b_in, &sa, &sb, site) {
         return id;
     }
     match rlx_ir::shape::binary_shape(&sa, &sb) {
         Ok(sh) => m.add_node(Op::Binary(op), vec![a_in, b_in], sh),
-        Err(e) => panic!(
-            "binary_infer at {site}: unaligned {:?} vs {:?}: {e}",
-            sa.dims(),
-            sb.dims()
-        ),
+        Err(e) => {
+            if std::env::var("RLX_DBG_BINF").is_ok() {
+                eprintln!(
+                    "[binf] {site}: unaligned {:?} vs {:?}: {e}",
+                    sa.dims(),
+                    sb.dims()
+                );
+                // best-effort: use the higher-rank operand's shape so import continues
+                let sh = if sa.rank() >= sb.rank() {
+                    sa.clone()
+                } else {
+                    sb.clone()
+                };
+                return m.add_node(Op::Binary(op), vec![a_in, b_in], sh);
+            }
+            panic!(
+                "binary_infer at {site}: unaligned {:?} vs {:?}: {e}",
+                sa.dims(),
+                sb.dims()
+            )
+        }
     }
 }
 
@@ -874,6 +1064,13 @@ fn resolve_dim_ir(v: &serde_json::Value, opts: &ImportOptions) -> Result<Dim> {
             .as_u64()
             .map(|x| Dim::Static(x as usize))
             .ok_or_else(|| anyhow!("bad dim {n}")),
+        // Explicit per-name length override (`named_lengths`) ALWAYS wins — even
+        // for `unk__*`/`Cast*`/`sequence_length` names — so a caller that binds a
+        // graph-split boundary dim (e.g. Kokoro decoder `unk__368`=total_frames,
+        // `unk__357`=batch) is honored before any heuristic (or the `unk__` bail).
+        serde_json::Value::String(s) if opts.named_lengths.contains_key(s.as_str()) => {
+            Ok(Dim::Static(opts.named_lengths[s.as_str()]))
+        }
         serde_json::Value::String(s) => match s.as_str() {
             "num_samples" => Ok(Dim::Static(opts.max_waveform_samples)),
             s if is_sequence_dim_label(s) => {
@@ -897,7 +1094,35 @@ fn resolve_dim_ir(v: &serde_json::Value, opts: &ImportOptions) -> Result<Dim> {
                     bail!("unresolved ONNX symbolic dim {s} (run shape propagation first)")
                 }
             }
-            other => bail!("unknown symbolic dim {other}"),
+            // (Explicit `named_lengths` overrides are handled by the outer guard
+            // above — they win over every heuristic here, including the `unk__` bail.)
+            // Named dynamic dims models export (`batch_size`, `text_length`,
+            // `latent_length`, `source_audio_len`, `max_duration`, …). Batch-like
+            // → 1; length/time-like → the compile sequence length. Mirrors the
+            // same logic in `shape_propagate::resolve_dims` so graph INPUTS
+            // (resolved via this path) agree with propagated intermediate shapes.
+            other => {
+                let low = other.to_ascii_lowercase();
+                let is_batch = low == "n" || low == "b" || low.contains("batch");
+                let is_len = low.contains("length")
+                    || low.contains("_len")
+                    || low.ends_with("len")
+                    || low.contains("seq")
+                    || low.contains("duration")
+                    || low.contains("frame")
+                    || low.contains("audio");
+                let _ = is_len;
+                if is_batch {
+                    Ok(Dim::Static(1))
+                } else if opts.dynamic_sequence {
+                    // Length-like or otherwise-unknown named dim → the sequence
+                    // axis (matches the old `"?"` → seq_len behavior; only batch
+                    // dims are special-cased to 1).
+                    Ok(Dim::Dynamic(sym::SEQ))
+                } else {
+                    Ok(Dim::Static(opts.sequence_length))
+                }
+            }
         },
         _ => bail!("invalid dim {v:?}"),
     }
@@ -917,6 +1142,71 @@ fn dim_usize(d: Dim, opts: &ImportOptions) -> usize {
     }
 }
 
+/// ONNX `Trilu` (keep the upper/lower triangle of the last two dims, zero the
+/// rest) — the causal-mask generator in transformer decoders (`Trilu(ones, k=1,
+/// upper=1) * -inf`). rlx-ir has no triangular op, but the shape is static, so
+/// bake the `[rows, cols]` keep-mask (1 in the retained triangle) as a Constant
+/// and lower `Trilu(x)` to `x * mask` (mask broadcasts over x's leading dims).
+/// Works on every backend. `k` = diagonal offset (input 1, default 0); `upper`
+/// attribute defaults to 1. Without this, Trilu fell through to a stub that
+/// produced a garbage shape → downstream Transpose OOB crash (Parler decoder).
+fn lower_trilu(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+    let x = ctx.tensor(&node.inputs[0])?;
+    let x_shape = m.shape(x).clone();
+    let rank = x_shape.rank();
+    if rank < 2 {
+        return Ok(false);
+    }
+    let rows = dim_usize(x_shape.dim(rank - 2), ctx.opts);
+    let cols = dim_usize(x_shape.dim(rank - 1), ctx.opts);
+    if rows == 0 || cols == 0 {
+        return Ok(false);
+    }
+    let k = node
+        .inputs
+        .get(1)
+        .and_then(|n| eval_static_shape_vector(ctx, m, n, 0))
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0);
+    let upper = node
+        .attrs
+        .get("upper")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1)
+        != 0;
+    let dt = x_shape.dtype();
+    let mut keep = vec![0f32; rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            let retained = if upper {
+                (j as i64) >= (i as i64) + k
+            } else {
+                (j as i64) <= (i as i64) + k
+            };
+            if retained {
+                keep[i * cols + j] = 1.0;
+            }
+        }
+    }
+    let bytes: Vec<u8> = match dt {
+        DType::F32 => keep.iter().flat_map(|&v| v.to_le_bytes()).collect(),
+        DType::I64 => keep
+            .iter()
+            .flat_map(|&v| (v as i64).to_le_bytes())
+            .collect(),
+        DType::Bool | DType::U8 => keep.iter().map(|&v| v as u8).collect(),
+        _ => return Ok(false),
+    };
+    let mask_id = m.add_node(
+        Op::Constant { data: bytes },
+        vec![],
+        Shape::new(&[rows, cols], dt),
+    );
+    let out = m.add_node(Op::Binary(BinaryOp::Mul), vec![x, mask_id], x_shape);
+    ctx.env.insert(node.outputs[0].clone(), out);
+    Ok(true)
+}
+
 fn shape_dims_i64(shape: &Shape, opts: &ImportOptions) -> Vec<i64> {
     shape
         .dims()
@@ -931,7 +1221,12 @@ pub fn resolve_shape(meta: &serde_json::Value, opts: &ImportOptions) -> Result<S
     let dtype_s = obj.get("dtype").and_then(|d| d.as_str()).unwrap_or("f32");
     let dims: Vec<Dim> = match shape_v {
         serde_json::Value::Array(a) if a.is_empty() => {
-            bail!("empty shape meta (unknown rank)")
+            // An empty shape array is a rank-0 scalar (ONNX encodes scalars as a
+            // present `shape` with zero dims — e.g. `speed`, `t`, `guidance_scale`,
+            // `time_step` inputs of luxtts/f5). rlx has no rank-0 tensor, so
+            // represent it as `[1]`; broadcasting treats it as a scalar. Genuine
+            // unknown rank is encoded as `["?"]`, handled below — NOT an error.
+            vec![Dim::Static(1)]
         }
         serde_json::Value::Array(a) => a
             .iter()
@@ -1005,6 +1300,14 @@ struct LowerCtx<'a> {
     quant_weight_keys: HashSet<String>,
     i64_params: HashMap<String, Vec<i64>>,
     init_shapes: &'a HashMap<String, Vec<usize>>,
+    /// Tensors that were rank-0 scalars in ONNX (padded to `[1]` by `resolve_shape`,
+    /// since rlx has no rank-0). Tracked so `Gather` with a scalar index removes the
+    /// gathered axis (ONNX semantics) instead of leaving a spurious size-1 dim —
+    /// e.g. F5-TTS `Gather(time_embed, time_step_scalar, axis=1)`.
+    scalars: HashSet<String>,
+    /// `If`-node name → (then, else) branch subgraph nodes, so `lower_if` can inline
+    /// a branch whose output is COMPUTED (not a folded constant). See `onnx_file`.
+    if_branches: HashMap<String, (Vec<BundleNode>, Vec<BundleNode>)>,
     report: ImportReport,
 }
 
@@ -1245,10 +1548,20 @@ pub fn build_hir_from_parts(
         quant_weight_keys,
         i64_params,
         init_shapes: &init_shapes,
+        scalars: HashSet::new(),
+        if_branches: crate::onnx_file::take_if_branches(),
         report: ImportReport::default(),
     };
 
+    // Folded CONSTANT tensors that were rank-0 scalars — a scalar Gather index must
+    // drop its axis, same as a scalar input (see `onnx_file::take_scalar_consts`).
+    ctx.scalars.extend(crate::onnx_file::take_scalar_consts());
+
     for io in &manifest.inputs {
+        // A present-but-empty ONNX shape = rank-0 scalar (resolve_shape pads to [1]).
+        if io.meta.shape.is_empty() {
+            ctx.scalars.insert(io.name.clone());
+        }
         let shape = resolve_shape(
             &serde_json::json!({"shape": io.meta.shape, "dtype": io.meta.dtype}),
             &opts,
@@ -1270,6 +1583,7 @@ pub fn build_hir_from_parts(
             .insert(DURATION_CARRY.to_string(), (bytes, DType::I64));
     }
 
+    eval_caches_reset();
     let mut pending: Vec<&BundleNode> = nodes.iter().collect();
     let mut guard = 0usize;
     while !pending.is_empty() {
@@ -1297,6 +1611,39 @@ pub fn build_hir_from_parts(
                     !inp.is_empty() && !init_names.contains(*inp) && !ctx.env.contains_key(*inp)
                 })
                 .collect();
+            if std::env::var("RLX_IMP_DBG").is_ok() {
+                // A tensor is "missing" but is it produced by ANY pending node?
+                // If not, its producer was lowered yet inserted nothing (the true
+                // root); if yes, walk toward that pending producer. Dump the whole
+                // stuck frontier so the deepest root is visible, not just the first.
+                let pending_outs: std::collections::HashSet<&str> = pending
+                    .iter()
+                    .flat_map(|n| n.inputs.iter())
+                    .map(String::as_str)
+                    .collect();
+                let _ = pending_outs;
+                eprintln!("[imp-dbg] stuck frontier: {} pending nodes", pending.len());
+                for n in pending.iter().take(24) {
+                    let miss: Vec<&str> = n
+                        .inputs
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|i| {
+                            !i.is_empty() && !init_names.contains(*i) && !ctx.env.contains_key(*i)
+                        })
+                        .collect();
+                    // Is each missing input produced by some other pending node?
+                    let orphan: Vec<&str> = miss
+                        .iter()
+                        .copied()
+                        .filter(|mi| !pending.iter().any(|p| p.outputs.iter().any(|o| o == mi)))
+                        .collect();
+                    eprintln!(
+                        "[imp-dbg]   {} [{}] missing={:?} ORPHAN(no producer)={:?}",
+                        n.name, n.op, miss, orphan
+                    );
+                }
+            }
             bail!(
                 "HIR lowering cannot resolve inputs for {} (missing: {missing:?})",
                 stuck.name
@@ -1308,6 +1655,22 @@ pub fn build_hir_from_parts(
     let mut outs = Vec::new();
     for o in &manifest.outputs {
         outs.push(ctx.tensor(&o.name)?);
+    }
+    // Debug tap: append named intermediate tensors as extra graph outputs, so a
+    // compiled + run graph exposes them on ANY backend — used to bisect a native
+    // result against a reference runtime (onnxruntime) tensor-by-tensor. Set
+    // `RLX_ONNX_TAP=name1,name2` to the ONNX tensor names of interest. Tapped
+    // tensors are emitted after the real outputs, in the order listed; names that
+    // were not lowered (folded/stubbed) are skipped with a warning.
+    if let Ok(tap) = std::env::var("RLX_ONNX_TAP") {
+        for name in tap.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(&id) = ctx.env.get(name) {
+                eprintln!("[onnx-tap] + output {name} shape={:?}", m.shape(id).dims());
+                outs.push(id);
+            } else {
+                eprintln!("[onnx-tap] warn: tensor '{name}' not found (not lowered)");
+            }
+        }
     }
     m.0.set_outputs(outs);
 
@@ -1381,14 +1744,41 @@ fn lower_node(
             continue;
         }
         if let Some(i64_data) = ctx.i64_params.get(name.as_str()) {
-            let shape_dims = ctx
+            let mut shape_dims = ctx
                 .init_shapes
                 .get(name.as_str())
                 .cloned()
                 .unwrap_or_else(|| vec![i64_data.len()]);
+            // ONNX rank-0 scalars arrive as `dims=[]`; promote to `[1]` so
+            // broadcast/BiasAdd heuristics see a real trailing dim of size 1.
+            if shape_dims.is_empty() {
+                shape_dims.push(1);
+            }
             let bytes: Vec<u8> = i64_data.iter().flat_map(|d| d.to_le_bytes()).collect();
             let shape = Shape::new(&shape_dims, DType::I64);
             let id = m.add_node(Op::Constant { data: bytes }, vec![], shape);
+            ctx.env.insert(name.clone(), id);
+            continue;
+        }
+        // Folded f32 Constants (incl. inside `If` subgraphs) live in `ctx.params`
+        // even when the caller passes a narrow `inits` set — materialize them.
+        if ctx.params.contains_key(name.as_str()) || ctx.typed_params.contains_key(name.as_str()) {
+            if let Some((_, dtype)) = ctx.typed_params.get(name.as_str()) {
+                let shape_dims = ctx
+                    .init_shapes
+                    .get(name.as_str())
+                    .with_context(|| format!("typed weight shape for {name}"))?;
+                let shape = Shape::new(shape_dims, *dtype);
+                let id = m.param(name, shape);
+                ctx.env.insert(name.clone(), id);
+                continue;
+            }
+            let shape_dims = ctx
+                .init_shapes
+                .get(name.as_str())
+                .with_context(|| format!("weight shape for {name}"))?;
+            let shape = Shape::new(shape_dims, DType::F32);
+            let id = m.param(name, shape);
             ctx.env.insert(name.clone(), id);
             continue;
         }
@@ -1414,6 +1804,9 @@ fn lower_node(
         ctx.env.insert(name.clone(), id);
     }
 
+    // Remember where this ONNX node's HIR nodes start, so we can stamp all of
+    // them (not just the output) with the source op's name below.
+    let first_new = m.0.len();
     let op = node.op.as_str();
     let lowered = match op {
         "Add" | "Mul" | "Sub" | "Div" | "Max" | "Min" => lower_binary(m, ctx, node, op)?,
@@ -1425,9 +1818,26 @@ fn lower_node(
         "ActCopy" => lower_act_copy(m, ctx, node)?,
         "Gemm" => lower_gemm(m, ctx, node)?,
         "Relu" => lower_activation(m, ctx, node, Activation::Relu)?,
-        "Tanh" | "Sigmoid" | "Sqrt" | "Sin" | "Cos" | "Exp" | "Neg" | "Abs" | "Atan" | "Floor"
-        | "Round" | "Erf" => lower_activation_map(m, ctx, node, op)?,
+        "Tanh" | "Sigmoid" | "Sqrt" | "Sin" | "Cos" | "Exp" | "Log" | "Neg" | "Abs" | "Atan"
+        | "Round" => lower_activation_map(m, ctx, node, op)?,
+        "Sign" => lower_sign(m, ctx, node)?,
+        "Erf" => lower_erf(m, ctx, node)?,
+        // Standalone ONNX `Gelu` (opset 20) + Microsoft fused `BiasGelu`/`FastGelu`.
+        // `lower_bias_gelu` handles the no-bias (single-input) case too.
+        "Gelu" => {
+            let approx = node.attrs.get("approximate").and_then(|v| v.as_str()) == Some("tanh");
+            lower_bias_gelu(m, ctx, node, approx)?
+        }
+        "BiasGelu" => lower_bias_gelu(m, ctx, node, false)?,
+        "FastGelu" => lower_bias_gelu(m, ctx, node, true)?,
+        "Ceil" => lower_round_dir(m, ctx, node, true)?,
+        "Floor" => lower_round_dir(m, ctx, node, false)?,
         "LeakyRelu" => lower_leaky_relu(m, ctx, node)?,
+        "Elu" => lower_elu(m, ctx, node)?,
+        "PRelu" => lower_prelu(m, ctx, node)?,
+        "Reciprocal" => lower_reciprocal(m, ctx, node)?,
+        "Softplus" => lower_softplus(m, ctx, node)?,
+        "Tile" => lower_tile(m, ctx, node)?,
         "Cast" => lower_cast(m, ctx, node)?,
         "Transpose" => lower_transpose(m, ctx, node)?,
         "Reshape" | "Unsqueeze" | "Squeeze" | "Flatten" => lower_reshape(m, ctx, node)?,
@@ -1435,6 +1845,9 @@ fn lower_node(
         "Concat" => lower_concat(m, ctx, node)?,
         "Softmax" => lower_softmax(m, ctx, node)?,
         "LayerNormalization" => lower_layer_norm(m, ctx, node)?,
+        "SimplifiedLayerNormalization" => lower_simplified_layer_norm(m, ctx, node)?,
+        "SkipSimplifiedLayerNormalization" => lower_skip_simplified_layer_norm(m, ctx, node)?,
+        "GroupQueryAttention" => lower_group_query_attention(m, ctx, node)?,
         "InstanceNormalization" => lower_instance_norm(m, ctx, node)?,
         "BatchNormalization" => lower_batch_norm(m, ctx, node)?,
         "AveragePool" | "MaxPool" | "GlobalAveragePool" => lower_pool(m, ctx, node, op)?,
@@ -1443,10 +1856,10 @@ fn lower_node(
         "Clip" => lower_clip(m, ctx, node)?,
         "Where" => lower_where(m, ctx, node)?,
         "Expand" => lower_expand(m, ctx, node)?,
-        "Equal" | "Less" | "Greater" | "LessOrEqual" | "GreaterOrEqual" | "Not" | "And" | "Or" => {
-            lower_compare(m, ctx, node, op)?
-        }
-        "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" | "ReduceProd" => {
+        "Equal" | "Less" | "Greater" | "LessOrEqual" | "GreaterOrEqual" | "Not" | "And" | "Or"
+        | "Xor" => lower_compare(m, ctx, node, op)?,
+        "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" | "ReduceProd" | "ReduceL2"
+        | "ReduceL1" | "ReduceSumSquare" | "ReduceLogSum" | "ReduceLogSumExp" => {
             lower_reduce(m, ctx, node, op)?
         }
         "Conv" => lower_conv(m, ctx, node, false)?,
@@ -1454,20 +1867,28 @@ fn lower_node(
         "Slice" => lower_slice(m, ctx, node)?,
         "Shape" => lower_shape_op(m, ctx, node)?,
         "ConstantOfShape" => lower_constant_of_shape(m, ctx, node)?,
+        "Trilu" => lower_trilu(m, ctx, node)?,
         "Pad" => lower_pad_as_concat(m, ctx, node)?,
         "Range" => lower_range(m, ctx, node)?,
+        "STFT" => lower_stft(m, ctx, node)?,
+        "DFT" => lower_dft(m, ctx, node)?,
         "DynamicQuantizeLinear" => lower_dynamic_quant(m, ctx, node)?,
         "Resize" => lower_resize(m, ctx, node)?,
         "TopK" => lower_topk(m, ctx, node)?,
+        "ArgMax" => lower_arg_reduce(m, ctx, node, true)?,
+        "ArgMin" => lower_arg_reduce(m, ctx, node, false)?,
         "CumSum" => lower_cumsum(m, ctx, node)?,
         "ScatterND" => lower_scatter_nd(m, ctx, node)?,
         "ScatterElements" => lower_scatter_elements(m, ctx, node)?,
         "GatherND" => lower_gather_nd(m, ctx, node)?,
+        "GatherElements" => lower_gather_elements(m, ctx, node)?,
         "OneHot" => lower_one_hot(m, ctx, node)?,
         "NonZero" => lower_non_zero(m, ctx, node)?,
         "CumProd" => lower_cumprod(m, ctx, node)?,
         "Einsum" => lower_einsum(m, ctx, node)?,
         "LSTM" => lower_lstm(m, ctx, node)?,
+        "GRU" => lower_gru(m, ctx, node)?,
+        "Split" => lower_split(m, ctx, node)?,
         "DynamicQuantizeLSTM" => lower_dynamic_quantize_lstm(m, ctx, node)?,
         "RandomNormalLike" | "RandomUniformLike" => lower_random_like(m, ctx, node)?,
         "RandomNormal" | "RandomUniform" => lower_random(m, ctx, node)?,
@@ -1499,17 +1920,58 @@ fn lower_node(
     };
     if lowered {
         ctx.report.lowered += 1;
+        // Source-op provenance label: prefer the ONNX node name, falling back
+        // to its first output tensor name — `node.name` is frequently empty in
+        // real graphs, whereas output tensor names (`/…/Softmax_output_0`) are
+        // present and descriptive.
+        let label = if !node.name.is_empty() {
+            node.name.clone()
+        } else {
+            node.outputs
+                .iter()
+                .find(|o| !o.is_empty())
+                .cloned()
+                .unwrap_or_default()
+        };
+        // Stamp every HIR node this lowering produced so intermediates
+        // (Softmax → sub/exp/reduce/div, LayerNorm, attention, …) carry the
+        // source op's identity instead of a generic "mir" — a NaN in any of
+        // them then localizes back to this ONNX node.
+        m.0.label_nodes_since(first_new, &label);
         for out in &node.outputs {
             if let Some(&id) = ctx.env.get(out) {
                 // DynamicQuantizeLinear aliases its output to the f32 producer; keep the
-                // producer's ONNX name (e.g. LayerNormalization) for debugging.
-                if m.0.node(id).name.is_none() {
-                    m.0.node_mut(id).name = Some(node.name.clone());
+                // producer's own (already-stamped) name for debugging.
+                if m.0.node(id).name.is_none() && !label.is_empty() {
+                    m.0.node_mut(id).name = Some(label.clone());
                 }
             }
         }
     }
+    if std::env::var("RLX_DBG_SHAPES").is_ok() {
+        for out in &node.outputs {
+            if let Some(&id) = ctx.env.get(out) {
+                eprintln!("[shape] {} = {:?} ({})", out, m.shape(id).dims(), node.op);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Output shape for a strictly shape-PRESERVING (unary elementwise) op — Erf,
+/// Softplus, Reciprocal, LeakyRelu, Ceil/Floor, PRelu, Random*Like, … Their
+/// output shape IS the input shape, so the input is authoritative when fully
+/// static; the ONNX `output_meta` can carry a symbolic dim that
+/// shape-propagation defaulted to a wrong concrete length (the ChatterBox S3Gen
+/// decoder: a length-64 tensor whose declared meta resolved to 128, cascading
+/// the whole U-Net). Only consult `output_meta` when the input is under-inferred.
+fn unary_out_shape(ctx: &LowerCtx<'_>, node: &BundleNode, m: &HirMut<'_>, x: HirNodeId) -> Shape {
+    let in_s = m.shape(x).clone();
+    if in_s.is_static() {
+        in_s
+    } else {
+        output_shape(ctx, node, m, x)
+    }
 }
 
 fn output_shape(
@@ -1612,11 +2074,13 @@ fn broadcast_matmul_batch(
 }
 
 fn permuted_shape(in_s: &Shape, perm: &[usize]) -> Shape {
-    let dims: Vec<usize> = perm
+    // Preserve `Dim::Dynamic` — a transpose only reorders axes; unwrapping to
+    // usize would panic on a `dynamic_sequence` import's symbolic length.
+    let dims: Vec<Dim> = perm
         .iter()
-        .filter_map(|&p| in_s.dims().get(p).map(|d| d.unwrap_static()))
+        .filter_map(|&p| in_s.dims().get(p).copied())
         .collect();
-    Shape::new(&dims, in_s.dtype())
+    Shape::from_dims(&dims, in_s.dtype())
 }
 
 fn unsqueeze_axes(ctx: &LowerCtx<'_>, node: &BundleNode) -> Vec<i64> {
@@ -1633,13 +2097,65 @@ fn unsqueeze_axes(ctx: &LowerCtx<'_>, node: &BundleNode) -> Vec<i64> {
 }
 
 fn bundle_node_for_output<'a>(nodes: &'a [BundleNode], name: &str) -> Option<&'a BundleNode> {
-    nodes
-        .iter()
-        .find(|n| n.outputs.first().is_some_and(|o| o == name))
+    nodes.iter().find(|n| n.outputs.iter().any(|o| o == name))
+}
+
+/// Like [`bundle_node_for_output`], but also searches `If` then/else subgraphs.
+/// Needed so shape-arithmetic folds (`ConstantOfShape(Concat(…))`, etc.) work
+/// when the Zipformer `encoder_pos` else branch is inlined for `2T−1 > max_len`.
+fn bundle_node_for_output_ctx<'a>(ctx: &'a LowerCtx<'_>, name: &str) -> Option<&'a BundleNode> {
+    if let Some(n) = bundle_node_for_output(ctx.nodes, name) {
+        return Some(n);
+    }
+    for (then_n, else_n) in ctx.if_branches.values() {
+        if let Some(n) =
+            bundle_node_for_output(then_n, name).or_else(|| bundle_node_for_output(else_n, name))
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+// Per-compile memoization of the shape evaluators. Extending the ops these fold
+// (control-flow / dynamic-pad / downsample shape plumbing) made deep
+// Shape→Gather→arith→Concat→Reshape chains foldable — but the recursive
+// evaluators re-walk them once per dependent Reshape/Concat, which is O(N²) on a
+// big graph (the Zipformer fm_decoder). Cache SUCCESSFUL folds by tensor name:
+// within one compile the bindings are fixed, so a name's fold is deterministic.
+// `None` (unfoldable) is cheap and left uncached to avoid depth-limit poisoning.
+// `eval_caches_reset()` is called at the start of each `build_hir_from_parts`.
+thread_local! {
+    static EVAL_VEC_CACHE: std::cell::RefCell<HashMap<String, Vec<i64>>> =
+        std::cell::RefCell::new(HashMap::new());
+    static EVAL_I64_CACHE: std::cell::RefCell<HashMap<String, (Vec<i64>, Vec<usize>)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn eval_caches_reset() {
+    EVAL_VEC_CACHE.with(|c| c.borrow_mut().clear());
+    EVAL_I64_CACHE.with(|c| c.borrow_mut().clear());
 }
 
 /// Evaluate ONNX shape tensors (Shape→Gather→Concat chains) at import time.
+/// Memoizing wrapper — see [`eval_static_shape_vector_uncached`].
 fn eval_static_shape_vector(
+    ctx: &LowerCtx<'_>,
+    m: &HirMut<'_>,
+    name: &str,
+    depth: usize,
+) -> Option<Vec<i64>> {
+    if let Some(v) = EVAL_VEC_CACHE.with(|c| c.borrow().get(name).cloned()) {
+        return Some(v);
+    }
+    let r = eval_static_shape_vector_uncached(ctx, m, name, depth);
+    if let Some(ref v) = r {
+        EVAL_VEC_CACHE.with(|c| c.borrow_mut().insert(name.to_string(), v.clone()));
+    }
+    r
+}
+
+fn eval_static_shape_vector_uncached(
     ctx: &LowerCtx<'_>,
     m: &HirMut<'_>,
     name: &str,
@@ -1651,10 +2167,45 @@ fn eval_static_shape_vector(
     if let Some(v) = crate::tensor_data::i64_tensor(&ctx.i64_params, &ctx.params, name) {
         return Some(v);
     }
-    let node = bundle_node_for_output(ctx.nodes, name)?;
+    let node = bundle_node_for_output_ctx(ctx, name)?;
     match node.op.as_str() {
-        "Identity" | "Cast" | "Unsqueeze" | "Squeeze" if !node.inputs.is_empty() => {
+        // Identity for the flat value vector: rank-only ops don't change which
+        // integers a shape-arithmetic tensor carries, only their layout (which
+        // this evaluator ignores). `Reshape` here is the pad/downsample shape
+        // plumbing (`Reshape → … → Concat` reshape targets).
+        "Identity" | "Cast" | "Unsqueeze" | "Squeeze" | "Reshape" | "Flatten"
+            if !node.inputs.is_empty() =>
+        {
             eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)
+        }
+        "Expand" if !node.inputs.is_empty() => {
+            let data = eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)?;
+            // Expand to a target shape: broadcast a scalar to `prod(shape)`;
+            // otherwise keep the values (a same-size expand is a no-op here).
+            let tgt = node
+                .inputs
+                .get(1)
+                .filter(|s| !s.is_empty())
+                .and_then(|n| eval_static_shape_vector(ctx, m, n, depth + 1));
+            // Cap the fold size: shape-arithmetic vectors are tiny. A large expand
+            // is real data — return None so it stays a runtime op.
+            const MAX: usize = 4096;
+            match tgt {
+                Some(t) if data.len() == 1 => {
+                    let n: usize = t.iter().map(|&d| d.max(0) as usize).product();
+                    if n > MAX { None } else { Some(vec![data[0]; n.max(1)]) }
+                }
+                _ => Some(data),
+            }
+        }
+        "Tile" if node.inputs.len() >= 2 => {
+            let data = eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)?;
+            let reps = eval_static_shape_vector(ctx, m, &node.inputs[1], depth + 1)?;
+            let r = reps.first().copied().unwrap_or(1).max(1) as usize;
+            if data.len().saturating_mul(r) > 4096 {
+                return None;
+            }
+            Some(data.iter().cloned().cycle().take(data.len() * r).collect())
         }
         "Shape" if !node.inputs.is_empty() => {
             let in_name = &node.inputs[0];
@@ -1663,11 +2214,14 @@ fn eval_static_shape_vector(
             } else {
                 ctx.shape_for(m, in_name).ok()?
             };
+            // Resolve any residual dynamic dim to the compile sequence length rather
+            // than panicking (`unwrap_static`) — a graph input can still carry a
+            // symbolic seq dim here even when the compile length is fixed.
             Some(
                 shape
                     .dims()
                     .iter()
-                    .map(|d| d.unwrap_static() as i64)
+                    .map(|d| dim_usize(*d, ctx.opts) as i64)
                     .collect(),
             )
         }
@@ -1815,9 +2369,64 @@ fn eval_static_shape_vector(
                     .collect(),
             )
         }
+        // Reductions over a (tiny) shape-arithmetic vector. The S3Gen decoder's
+        // sequence mask builds its length as `Range(0, ReduceMax(Add(pad_offsets,
+        // lengths)), 1)`; without folding `ReduceMax` the Range limit can't
+        // resolve and the mask length falls back to a default, mismatching the
+        // token length. Layout/axis is ignored (these vectors are 1-D).
+        "ReduceMax" | "ReduceMin" | "ReduceSum" | "ReduceProd"
+            // Only fold a FULL reduce-to-scalar (no `axes` input/attr). An
+            // axis-specific reduce over a multi-element shape vector would need
+            // layout the flat evaluator discards — folding it produces a wrong
+            // scalar (observed: a spurious `264` deep in the S3Gen decoder).
+            if !node.inputs.is_empty()
+                && node.inputs.len() < 2
+                && !node.attrs.contains_key("axes") =>
+        {
+            let data = eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)?;
+            if data.is_empty() {
+                return None;
+            }
+            let v = match node.op.as_str() {
+                "ReduceMax" => data.iter().copied().max().unwrap_or(0),
+                "ReduceMin" => data.iter().copied().min().unwrap_or(0),
+                "ReduceSum" => data.iter().sum(),
+                _ => data.iter().product(),
+            };
+            Some(vec![v])
+        }
         "Relu" if !node.inputs.is_empty() => {
             eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)
                 .map(|v| v.into_iter().map(|x| x.max(0)).collect())
+        }
+        // `Ceil(a/b)` — the ChatterBox speech_encoder's resampler computes its
+        // output length as `Ceil(num_samples·2/3)` (feeding an audio Slice's
+        // `ends`). The flat i64 `Div` arm FLOORS, so a plain Ceil would keep the
+        // floored value (`ceil(32000/3)=10667` vs floor `10666`). When the input
+        // is a `Div`, recompute it as ceil-division `(a+b−1)/b`; otherwise pass
+        // the (already-integer) value through. `Floor` is the plain floor `Div`.
+        "Ceil" | "Floor" if !node.inputs.is_empty() => {
+            if node.op == "Ceil" {
+                if let Some(div) = bundle_node_for_output_ctx(ctx, &node.inputs[0])
+                    .filter(|n| n.op == "Div" && n.inputs.len() >= 2)
+                {
+                    let a = eval_static_shape_vector(ctx, m, &div.inputs[0], depth + 1)?;
+                    let b = eval_static_shape_vector(ctx, m, &div.inputs[1], depth + 1)?;
+                    if !a.is_empty() && !b.is_empty() {
+                        let n = a.len().max(b.len());
+                        let at = |v: &[i64], i: usize| if v.len() == 1 { v[0] } else { v[i] };
+                        return Some(
+                            (0..n)
+                                .map(|i| {
+                                    let (x, y) = (at(&a, i), at(&b, i));
+                                    if y != 0 { (x + y - 1).div_euclid(y) } else { 0 }
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+            }
+            eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)
         }
         "Clip" if !node.inputs.is_empty() => {
             let v = eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)?;
@@ -1867,6 +2476,231 @@ fn eval_static_shape_vector(
             }
             Some(v)
         }
+        // `Shape[a:b]` — a 1-D slice over a shape vector (e.g. supertonic vocoder's
+        // de-quant reshape target `Concat([batch, -1, 6, Shape[2:3]])`). Only axis-0,
+        // step-1 (the only meaningful case for a rank-1 shape vector).
+        "Slice" if node.inputs.len() >= 3 => {
+            let data = eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)?;
+            let ev = |i: usize| {
+                node.inputs
+                    .get(i)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|n| eval_static_shape_vector(ctx, m, n, depth + 1))
+            };
+            let starts = ev(1)?;
+            let ends = ev(2)?;
+            let ax = ev(3).and_then(|a| a.first().copied()).unwrap_or(0);
+            let step = ev(4).and_then(|s| s.first().copied()).unwrap_or(1);
+            if (ax != 0 && ax != -1) || step != 1 {
+                return None;
+            }
+            let len = data.len() as i64;
+            let clamp = |x: i64| (if x < 0 { len + x } else { x }).clamp(0, len) as usize;
+            let s = clamp(starts.first().copied().unwrap_or(0));
+            let e = clamp(ends.first().copied().unwrap_or(len));
+            Some(if s < e { data[s..e].to_vec() } else { Vec::new() })
+        }
+        // Shape-arithmetic control/broadcast ops emitted by dynamic padding (e.g.
+        // the Zipformer downsample's pad-to-multiple: `ConstantOfShape → Equal →
+        // Where`) and ceil-division (`Mod`). Folding these lets the dependent
+        // Reshape/Expand targets resolve statically at the compile length.
+        "ConstantOfShape" if !node.inputs.is_empty() => {
+            let dims = eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)?;
+            let val = node
+                .attrs
+                .get("value")
+                .and_then(|v| {
+                    v.get("tensor")
+                        .and_then(|t| t.get("scalar"))
+                        .and_then(|s| s.as_f64())
+                        .map(|x| x as i64)
+                        .or_else(|| v.as_array().and_then(|a| a.first()).and_then(|x| x.as_i64()))
+                        .or_else(|| v.as_i64())
+                })
+                .unwrap_or(0);
+            // Empty shape → scalar; product of empty = 1 in ONNX ConstantOfShape.
+            let n: usize = if dims.is_empty() {
+                1
+            } else {
+                dims.iter().map(|&d| d.max(0) as usize).product()
+            };
+            Some(vec![val; n])
+        }
+        "Where" if node.inputs.len() >= 3 => {
+            let c = eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)?;
+            let x = eval_static_shape_vector(ctx, m, &node.inputs[1], depth + 1)?;
+            let y = eval_static_shape_vector(ctx, m, &node.inputs[2], depth + 1)?;
+            let n = c.len().max(x.len()).max(y.len());
+            let at = |v: &[i64], i: usize| if v.len() == 1 { v[0] } else { *v.get(i).unwrap_or(&0) };
+            Some((0..n).map(|i| if at(&c, i) != 0 { at(&x, i) } else { at(&y, i) }).collect())
+        }
+        "Equal" | "Mod" if node.inputs.len() >= 2 => {
+            let a = eval_static_shape_vector(ctx, m, &node.inputs[0], depth + 1)?;
+            let b = eval_static_shape_vector(ctx, m, &node.inputs[1], depth + 1)?;
+            if a.is_empty() || b.is_empty() {
+                return None;
+            }
+            let n = a.len().max(b.len());
+            let at = |v: &[i64], i: usize| if v.len() == 1 { v[0] } else { *v.get(i).unwrap_or(&0) };
+            let is_eq = node.op == "Equal";
+            Some(
+                (0..n)
+                    .map(|i| {
+                        let (x, y) = (at(&a, i), at(&b, i));
+                        if is_eq {
+                            (x == y) as i64
+                        } else if y != 0 {
+                            x.rem_euclid(y)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate a FLOAT scalar shape-expression at import time. The ONNX length
+/// regulator computes frame counts in floating point
+/// (`num_frames = ceil(prompt_feat_len / prompt_len × (…) / speed)`), which the
+/// integer evaluators can't fold. Integer leaves (`Gather(Shape(x))`, bound dims)
+/// are lifted to f64. Returns None if any leaf is a genuine runtime value.
+fn eval_f64_scalar(ctx: &LowerCtx<'_>, m: &HirMut<'_>, name: &str, depth: usize) -> Option<f64> {
+    if depth > 40 {
+        return None;
+    }
+    // Folded params (Constant / initializer scalars).
+    if let Some(v) = ctx.params.get(name) {
+        return v.first().map(|&x| x as f64);
+    }
+    if let Some(v) = ctx.i64_params.get(name) {
+        return v.first().map(|&x| x as f64);
+    }
+    let node = bundle_node_for_output_ctx(ctx, name)?;
+    let arg = |i: usize| {
+        node.inputs
+            .get(i)
+            .and_then(|n| eval_f64_scalar(ctx, m, n, depth + 1))
+    };
+    match node.op.as_str() {
+        "Ceil" => arg(0).map(f64::ceil),
+        "Floor" => arg(0).map(f64::floor),
+        "Round" => arg(0).map(f64::round),
+        "Neg" => arg(0).map(|x| -x),
+        "Cast" | "Identity" => arg(0),
+        "Div" | "Mul" | "Add" | "Sub" | "Pow" if node.inputs.len() >= 2 => {
+            let (a, b) = (arg(0)?, arg(1)?);
+            Some(match node.op.as_str() {
+                "Div" => a / b,
+                "Mul" => a * b,
+                "Add" => a + b,
+                "Sub" => a - b,
+                _ => a.powf(b),
+            })
+        }
+        // Integer shape-arithmetic leaf (e.g. `Gather(Shape(x))`) — lift to f64.
+        _ => {
+            eval_i64_shaped(ctx, m, name, depth + 1).and_then(|(d, _)| d.first().map(|&x| x as f64))
+        }
+    }
+}
+
+/// Evaluate a 1-D COMPILE-TIME-CONSTANT numeric vector (values, as f64). Walks a
+/// constant initializer/param through element-wise `Mul/Add/Sub/Div`, a scalar
+/// `Greater/Less/…/Equal` threshold (→ 0/1 mask), an axis-0 step-1 `Slice`
+/// (unresolvable `ends` clamp to the data length — ONNX Slice semantics), and
+/// `Cast/Identity`. Enables folding e.g. the ISTFT window-sum `NonZero`
+/// normalization mask, whose values depend only on a fixed `window_sum`
+/// initializer (not the audio), even though the graph routes it past a
+/// data-dependent signal length. Returns `None` (no fold) if anything is
+/// non-constant. Capped to keep import cheap.
+fn eval_const_f64_vec(
+    ctx: &LowerCtx<'_>,
+    m: &HirMut<'_>,
+    name: &str,
+    depth: usize,
+) -> Option<Vec<f64>> {
+    const CAP: usize = 1 << 16;
+    if depth > 40 {
+        return None;
+    }
+    if let Some(v) = ctx.params.get(name) {
+        return (v.len() <= CAP).then(|| v.iter().map(|&x| x as f64).collect());
+    }
+    if let Some(v) = ctx.i64_params.get(name) {
+        return (v.len() <= CAP).then(|| v.iter().map(|&x| x as f64).collect());
+    }
+    let node = bundle_node_for_output_ctx(ctx, name)?;
+    let vec_arg = |i: usize| {
+        node.inputs
+            .get(i)
+            .filter(|s| !s.is_empty())
+            .and_then(|n| eval_const_f64_vec(ctx, m, n, depth + 1))
+    };
+    let scalar_arg = |i: usize| {
+        node.inputs
+            .get(i)
+            .filter(|s| !s.is_empty())
+            .and_then(|n| eval_f64_scalar(ctx, m, n, depth + 1))
+    };
+    match node.op.as_str() {
+        "Cast" | "Identity" => vec_arg(0),
+        "Greater" | "GreaterOrEqual" | "Less" | "LessOrEqual" | "Equal"
+            if node.inputs.len() >= 2 =>
+        {
+            let a = vec_arg(0)?;
+            let t = scalar_arg(1)?;
+            Some(
+                a.iter()
+                    .map(|&x| {
+                        let hit = match node.op.as_str() {
+                            "Greater" => x > t,
+                            "GreaterOrEqual" => x >= t,
+                            "Less" => x < t,
+                            "LessOrEqual" => x <= t,
+                            _ => x == t,
+                        };
+                        if hit { 1.0 } else { 0.0 }
+                    })
+                    .collect(),
+            )
+        }
+        "Mul" | "Add" | "Sub" | "Div" if node.inputs.len() >= 2 => {
+            let a = vec_arg(0)?;
+            let b = vec_arg(1).or_else(|| scalar_arg(1).map(|s| vec![s; a.len()]))?;
+            if b.len() != a.len() && b.len() != 1 {
+                return None;
+            }
+            Some(
+                a.iter()
+                    .enumerate()
+                    .map(|(i, &x)| {
+                        let y = if b.len() == 1 { b[0] } else { b[i] };
+                        match node.op.as_str() {
+                            "Mul" => x * y,
+                            "Add" => x + y,
+                            "Sub" => x - y,
+                            _ => x / y,
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        "Slice" if !node.inputs.is_empty() => {
+            let data = vec_arg(0)?;
+            let len = data.len() as i64;
+            let start = scalar_arg(1).map(|s| s as i64).unwrap_or(0);
+            let end = scalar_arg(2).map(|s| s as i64).unwrap_or(len);
+            let step = scalar_arg(4).map(|s| s as i64).unwrap_or(1);
+            if step != 1 {
+                return None;
+            }
+            let s = start.clamp(0, len) as usize;
+            let e = end.clamp(0, len) as usize;
+            (s <= e).then(|| data[s..e].to_vec())
+        }
         _ => None,
     }
 }
@@ -1874,8 +2708,24 @@ fn eval_static_shape_vector(
 /// Shaped int64 mini-interpreter for the small index/shape tensors torch emits
 /// for dynamic ops (notably `F.pad`'s pad-spec construction in VITS relative-
 /// position attention: `ConstantOfShape → Concat → Reshape → Transpose → Slice`).
-/// Returns `(data, shape)` row-major. Tensors are tiny → evaluated eagerly.
+/// Returns `(data, shape)` row-major. Memoizing wrapper (per-compile cache).
 fn eval_i64_shaped(
+    ctx: &LowerCtx<'_>,
+    m: &HirMut<'_>,
+    name: &str,
+    depth: usize,
+) -> Option<(Vec<i64>, Vec<usize>)> {
+    if let Some(v) = EVAL_I64_CACHE.with(|c| c.borrow().get(name).cloned()) {
+        return Some(v);
+    }
+    let r = eval_i64_shaped_uncached(ctx, m, name, depth);
+    if let Some(ref v) = r {
+        EVAL_I64_CACHE.with(|c| c.borrow_mut().insert(name.to_string(), v.clone()));
+    }
+    r
+}
+
+fn eval_i64_shaped_uncached(
     ctx: &LowerCtx<'_>,
     m: &HirMut<'_>,
     name: &str,
@@ -1884,19 +2734,76 @@ fn eval_i64_shaped(
     if depth > 32 {
         return None;
     }
-    if let Some(v) = crate::tensor_data::i64_tensor(&ctx.i64_params, &ctx.params, name) {
+    // Genuine i64 params are shape/index tensors — use directly.
+    if let Some(v) = ctx.i64_params.get(name) {
         let shape = ctx
             .init_shapes
             .get(name)
             .cloned()
             .unwrap_or_else(|| vec![v.len()]);
-        return Some((v, shape));
+        return Some((v.clone(), shape));
     }
-    let node = bundle_node_for_output(ctx.nodes, name)?;
+    // An f32 param is only shape/index data if it is SMALL and INTEGER-VALUED
+    // (some exporters store shapes as f32, e.g. Reshape targets `[1, 192, -1]`).
+    // A large or fractional f32 tensor is real data — e.g. OpenVoice's baked
+    // `[1,192,32768]` noise constant — and must NOT be reinterpreted as an i64
+    // shape (doing so folds a data Slice into integer garbage → NaN). Reject it
+    // so the Slice falls through to a proper Narrow.
+    if let Some(v) = ctx.params.get(name) {
+        const MAX_SHAPE_ELEMS: usize = 4096;
+        if v.len() <= MAX_SHAPE_ELEMS
+            && v.iter()
+                .all(|&x| x.is_finite() && (x - x.round()).abs() < 1e-3 && x.abs() < 9.0e18)
+        {
+            let iv: Vec<i64> = v.iter().map(|&x| x.round() as i64).collect();
+            let shape = ctx
+                .init_shapes
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| vec![iv.len()]);
+            return Some((iv, shape));
+        }
+    }
+    let node = bundle_node_for_output_ctx(ctx, name)?;
     let numel = |s: &[usize]| s.iter().product::<usize>().max(1);
     match node.op.as_str() {
-        "Identity" | "Cast" if !node.inputs.is_empty() => {
+        "Identity" if !node.inputs.is_empty() => {
             eval_i64_shaped(ctx, m, &node.inputs[0], depth + 1)
+        }
+        "Cast" if !node.inputs.is_empty() => {
+            // A `Cast` to an integer type of a FLOAT scalar expression must be
+            // evaluated in floating point — the ONNX length regulator computes
+            // `num_frames = Cast(Ceil(feat_len/plen * (…) / speed), int)`, and
+            // integer eval would truncate `40/15` to 2 instead of 2.667. ONNX
+            // `Cast` to int truncates toward zero.
+            let to = node.attrs.get("to").and_then(|v| v.as_i64()).unwrap_or(0);
+            let src_float = bundle_node_for_output_ctx(ctx, &node.inputs[0])
+                .map(|s| {
+                    matches!(s.op.as_str(), "Ceil" | "Floor" | "Round" | "Div")
+                        || s.output_meta
+                            .first()
+                            .and_then(|meta| meta.get("dtype"))
+                            .and_then(|d| d.as_str())
+                            .is_some_and(|d| d == "f32" || d == "f64")
+                })
+                .unwrap_or(false);
+            // The float-scalar path collapses its operand to a single value, so it
+            // is ONLY valid for a genuinely scalar length expression. A Cast of a
+            // multi-element vector (e.g. VITS `convert_pad_shape`'s
+            // `Cast(Concat([0,l-1,0,…]))`, 2*rank pad amounts) must preserve every
+            // element — route those through the integer vector eval instead.
+            let int_eval = eval_i64_shaped(ctx, m, &node.inputs[0], depth + 1);
+            if let Some((data, _)) = &int_eval {
+                if data.len() > 1 {
+                    return int_eval;
+                }
+            }
+            if matches!(to, 6 | 7 | 9) && src_float {
+                if let Some(v) = eval_f64_scalar(ctx, m, &node.inputs[0], depth + 1) {
+                    return Some((vec![v.trunc() as i64], vec![]));
+                }
+            }
+            int_eval
         }
         "Shape" if !node.inputs.is_empty() => {
             if let Some((_, shape)) = eval_i64_shaped(ctx, m, &node.inputs[0], depth + 1) {
@@ -1907,6 +2814,33 @@ fn eval_i64_shaped(
             let v = eval_static_shape_vector(ctx, m, name, depth + 1)?;
             let n = v.len();
             Some((v, vec![n]))
+        }
+        "Gather" if node.inputs.len() >= 2 => {
+            // Shape-arithmetic gather over a 1-D shape vector, axis 0 — e.g.
+            // `Gather(Shape(x), idx)` selecting dims. Output values = table[idx],
+            // output shape = idx shape (so a scalar index yields a scalar dim, not
+            // a vector). Only this case; real data gathers fall through to None.
+            let (table, tshape) = eval_i64_shaped(ctx, m, &node.inputs[0], depth + 1)?;
+            let (idx, ishape) = eval_i64_shaped(ctx, m, &node.inputs[1], depth + 1)?;
+            let axis = node
+                .attrs
+                .get("axis")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .rem_euclid(tshape.len().max(1) as i64) as usize;
+            if tshape.len() != 1 || axis != 0 || table.is_empty() {
+                return None;
+            }
+            let out: Vec<i64> = idx
+                .iter()
+                .map(|&i| table[i.rem_euclid(table.len() as i64) as usize])
+                .collect();
+            let out_shape = if ishape.is_empty() {
+                vec![out.len()]
+            } else {
+                ishape
+            };
+            Some((out, out_shape))
         }
         "ConstantOfShape" if !node.inputs.is_empty() => {
             let (shape_data, _) = eval_i64_shaped(ctx, m, &node.inputs[0], depth + 1)?;
@@ -2000,6 +2934,11 @@ fn eval_i64_shaped(
             for (k, &ax) in axes.iter().enumerate() {
                 let a = ax.rem_euclid(rank as i64) as usize;
                 let d = shape[a] as i64;
+                // Empty dim → empty selection (guards clamp(0, d-1) panic when d==0).
+                if d == 0 {
+                    idx[a] = Vec::new();
+                    continue;
+                }
                 let step = steps.get(k).copied().unwrap_or(1);
                 let mut s = starts[k];
                 let mut e = ends[k];
@@ -2101,6 +3040,18 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
 }
 
 fn resolve_reshape_dims(mut dims: Vec<i64>, in_s: &Shape) -> Option<Vec<i64>> {
+    // ONNX Reshape (default allowzero=0): a 0 in the target copies the corresponding
+    // input dimension. Treating 0 as a literal zero made `Reshape([0,32,-1])` on
+    // `[1,512,200]` fail (`known` product 0) and fall back to the input shape, so
+    // MioTTS InstanceNorm still saw `[1,512,200]` instead of `[1,32,3200]`.
+    for (i, d) in dims.iter_mut().enumerate() {
+        if *d == 0 {
+            if i >= in_s.rank() {
+                return None;
+            }
+            *d = in_s.dim(i).unwrap_static() as i64;
+        }
+    }
     let neg = dims.iter().filter(|&&d| d == -1).count();
     if neg > 1 {
         return None;
@@ -2212,6 +3163,34 @@ fn blc_to_ncl_for_channel_concat(m: &HirMut<'_>, id: HirNodeId, peers: &[HirNode
         if is_typical_channel(d1) && d1 > d2 && d2 == l {
             return false;
         }
+    }
+    // Symmetric channel-concat of identical NCL tensors — the VITS flow coupling
+    // `cat([x0, x1_transformed], dim=1)` where both operands are `[1, C, L]`.
+    // Concatenate channels directly; do NOT transpose. `is_vocoder_blc` misfires
+    // here because the length dim (e.g. 64) coincidentally matches a "typical
+    // channel" value while the true channel dim (e.g. 96) does not — flipping the
+    // operands to `[1, L, C]` yields `[1, 2L, C]` instead of `[1, 2C, L]`.
+    if is_ncl_rank3(s) && peers.iter().all(|&p| m.shape(p).dims() == s.dims()) {
+        return false;
+    }
+    // Sequence(middle)-axis concat: all operands share the same LAST dim but differ
+    // in the MIDDLE dim → the concat EXTENDS the middle axis with the channels
+    // preserved (F5-TTS mel-condition: `[ref_frames,100] ++ [pad_frames,100]` fills
+    // the duration canvas). A shared last dim ⇒ channels unchanged ⇒ this is a
+    // sequence concat, not a channel concat, so do NOT transpose to NCL. Without
+    // this, `is_vocoder_blc` decides purely on `dim1 > dim2`: at short references
+    // (frames < 100 mels) it guessed NCL and skipped, but at long references
+    // (frames > 100) it flipped to BLC and transposed → the mel-condition came out
+    // `[1, 2·mels, frames]` instead of `[1, md, mels]` and corrupted conditioning.
+    let same_last = peers.iter().all(|&p| {
+        let ps = m.shape(p);
+        ps.rank() == 3 && ps.dim(2).unwrap_static() == d2
+    });
+    let differs_mid = peers
+        .iter()
+        .any(|&p| m.shape(p).dim(1).unwrap_static() != d1);
+    if same_last && differs_mid {
+        return false;
     }
     is_vocoder_blc(s)
 }
@@ -2505,6 +3484,20 @@ fn slice_to_output_shape(
         ctx.passthrough_stub(m, node)?;
         return Ok(true);
     }
+    // This is the fallback for a Slice whose bounds/axes we couldn't fold (e.g. the
+    // T5 encoder's position-bias slice `bias[:, :, -q:, :]` with a dynamic `-q`
+    // start and an `axes` constant not in the param set). If the declared output
+    // meta disagrees with the input element count, a Reshape here would CORRUPT the
+    // data — the bias `[1,16,128,128]` (262144) got a stale meta of `[128]`, so it
+    // was flattened to 128 values (head-0/query-0 only) and broadcast to every
+    // query → garbled attention. At a fixed compile length these unresolvable
+    // slices are full-length identities, so pass the input through unchanged.
+    let in_numel = m.shape(x).num_elements();
+    let out_numel = out_s.num_elements();
+    if in_numel.is_some() && out_numel != in_numel {
+        ctx.env.insert(node.outputs[0].clone(), x);
+        return Ok(true);
+    }
     let new_shape: Vec<i64> = shape_dims_i64(&out_s, ctx.opts);
     let id = if ctx.opts.dynamic_sequence {
         m.add_node(Op::Reshape { new_shape }, vec![x], out_s)
@@ -2563,18 +3556,63 @@ fn try_lower_slice_narrow(
             .or_else(|| eval_static_shape_vector(ctx, m, n, 0))
     };
     let starts = eval_vec(ctx, m, &node.inputs[1]);
-    let ends = eval_vec(ctx, m, &node.inputs[2]);
-    let axes = node.inputs.get(3).and_then(|n| eval_vec(ctx, m, n));
+    let ends_opt = eval_vec(ctx, m, &node.inputs[2]);
+    // An `axes` input that is present but non-empty; `""` marks an omitted optional.
+    let axes_input = node.inputs.get(3).filter(|n| !n.is_empty());
+    let axes_eval = axes_input.and_then(|n| eval_vec(ctx, m, n));
     let steps = node.inputs.get(4).and_then(|n| eval_vec(ctx, m, n));
-    let (Some(starts), Some(ends)) = (starts, ends) else {
+    let Some(starts) = starts else {
         return Ok(false);
     };
     let axes: Vec<i64> = if force_time_axis {
         vec![2]
+    } else if let Some(ax) = axes_eval {
+        ax
+    } else if axes_input.is_some() {
+        // The Slice carries an explicit `axes` input we couldn't fold (e.g. the
+        // T5 encoder's padding-mask / relative-position-bias slices whose `ends`
+        // is a dynamic `2*len-1` and whose `axes` constant isn't in the param
+        // set). Defaulting to `[0..len(starts)]` would silently narrow axis 0 —
+        // for a `[1,1,1,128]` key mask that collapses the 128 keys onto the batch
+        // axis, so real queries attend to *padding* keys (cosine 0.47, garbled
+        // audio). Bail to `slice_to_output_shape` (a shape-correct Reshape) which
+        // is exact for the identity slices these turn out to be.
+        return Ok(false);
     } else {
-        axes.unwrap_or_else(|| (0..starts.len() as i64).collect())
+        (0..starts.len() as i64).collect()
     };
     let steps: Vec<i64> = steps.unwrap_or_else(|| vec![1; starts.len()]);
+    // When `ends` is a *dynamic* runtime length (e.g. a Slice `[:, :, 0:t]` whose
+    // end is `Shape(audio)`), the shape evaluator can't fold it. Rather than drop
+    // to the data-corrupting Reshape fallback, derive `ends` from the declared
+    // output shape at the compile length: `end[i] = start[i] + out_meta.dim(ax)`.
+    // This keeps it a real Narrow (crop) — critical for slices over baked-in data
+    // (e.g. OpenVoice's `[1,192,32768]` noise constant, cropped to `[1,192,t]`).
+    let ends: Vec<i64> = match ends_opt {
+        Some(e) => e,
+        None => {
+            if steps.iter().any(|&s| s != 1) {
+                return Ok(false);
+            }
+            let Some(out_s) = node
+                .output_meta
+                .first()
+                .and_then(|mm| resolve_shape(mm, ctx.opts).ok())
+            else {
+                return Ok(false);
+            };
+            let mut e = Vec::with_capacity(axes.len());
+            for (i, &ax) in axes.iter().enumerate() {
+                let axis = ax.rem_euclid(rank as i64) as usize;
+                if axis >= out_s.rank() {
+                    return Ok(false);
+                }
+                let len = dim_usize(out_s.dim(axis), ctx.opts) as i64;
+                e.push(starts.get(i).copied().unwrap_or(0) + len);
+            }
+            e
+        }
+    };
     // Negative-step (reverse) slicing. rlx-ir has no flip/reverse op; `Gather`
     // only supports axis 0 (and reads f32 indices), and a concat-of-unit-narrows
     // decomposition explodes the MLX compile time. So express the reversal as a
@@ -2650,6 +3688,80 @@ fn try_lower_slice_narrow(
         ctx.env.insert(node.outputs[0].clone(), id);
         return Ok(true);
     }
+    // Multi-axis positive-step slice — e.g. the VITS relative-position rel-shift
+    // final index `[:, :, :l, l-1:]` (axes `[2,3]`, starts `[0, l-1]`, ends
+    // `[l, 2l-1]`). The single-axis path below already resolves these dynamic
+    // bounds; the only gap was >1 axis. Apply an independent `Narrow` per axis.
+    // `output_meta` is unusable here because `Pad` propagates as a passthrough
+    // upstream, so it never reduces `[l+1, 2l-1]` back to `[l, l]`.
+    if axes.len() > 1 && steps.iter().all(|&s| s == 1) {
+        if starts.len() != axes.len() || ends.len() != axes.len() {
+            return Ok(false);
+        }
+        let mut cur = x;
+        for (i, &ax_raw) in axes.iter().enumerate() {
+            let axis = ax_raw.rem_euclid(rank as i64) as usize;
+            if axis >= rank {
+                return Ok(false);
+            }
+            let dim = dim_usize(m.shape(cur).dim(axis), ctx.opts);
+            let (start, len) = onnx_slice_axis_start_len(starts[i], ends[i], dim);
+            let len = len.max(1);
+            cur = if ctx.opts.dynamic_sequence {
+                let cur_s = m.shape(cur);
+                let mut out_dims: Vec<Dim> = (0..cur_s.rank()).map(|d| cur_s.dim(d)).collect();
+                out_dims[axis] = Dim::Static(len);
+                let out_s = Shape::from_dims(&out_dims, cur_s.dtype());
+                m.add_node(
+                    Op::Narrow {
+                        axis,
+                        start: start.min(dim),
+                        len,
+                    },
+                    vec![cur],
+                    out_s,
+                )
+            } else {
+                m.narrow_(cur, axis, start.min(dim), len)
+            };
+        }
+        ctx.env.insert(node.outputs[0].clone(), cur);
+        return Ok(true);
+    }
+    // Single-axis positive STRIDED slice (`step > 1`) — e.g. the RoPE interleaved
+    // even/odd head-dim split `x[..., 0::2]` / `x[..., 1::2]` (starts 0/1, step 2,
+    // halving 64→32). rlx-ir has no strided-narrow, so gather the strided indices
+    // along the axis. Every interleaved-RoPE LM (moss-nano / maya1 / chatterbox)
+    // needs this; the old blanket bail kept the FULL dim, doubling every downstream
+    // shape (the rope Mul then failed to broadcast).
+    if axes.len() == 1 && steps.len() == 1 && steps[0] > 1 {
+        let axis = axes[0].rem_euclid(rank as i64) as usize;
+        if axis < rank {
+            let dim = dim_usize(m.shape(x).dim(axis), ctx.opts);
+            let (start, clen) = onnx_slice_axis_start_len(starts[0], ends[0], dim);
+            let step = steps[0] as usize;
+            let idxs: Vec<i64> = (start..start + clen)
+                .step_by(step)
+                .map(|v| v as i64)
+                .collect();
+            if !idxs.is_empty() {
+                let n = idxs.len();
+                let bytes: Vec<u8> = idxs.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let idx_id = m.add_node(
+                    Op::Constant { data: bytes },
+                    vec![],
+                    Shape::new(&[n], DType::I64),
+                );
+                let base = m.shape(x).clone();
+                let mut out_dims: Vec<Dim> = (0..base.rank()).map(|d| base.dim(d)).collect();
+                out_dims[axis] = Dim::Static(n);
+                let out_s = Shape::from_dims(&out_dims, base.dtype());
+                let id = m.add_node(Op::Gather { axis }, vec![x, idx_id], out_s);
+                ctx.env.insert(node.outputs[0].clone(), id);
+                return Ok(true);
+            }
+        }
+    }
     if steps.iter().any(|&s| s != 1) || axes.len() != 1 {
         return Ok(false);
     }
@@ -2696,6 +3808,68 @@ fn try_lower_slice_narrow(
     Ok(true)
 }
 
+/// ONNX `Split` — divide `x` along `axis` into N contiguous chunks (one per
+/// output). Split sizes come from the `split` input tensor (opset 13+), the
+/// `split` attribute (opset <13), or an equal division. Lowered to one `Narrow`
+/// per non-empty output. VITS `enc_p` uses this to split `stats` into `m, logs`.
+fn lower_split(m: &mut HirMut<'_>, ctx: &mut LowerCtx<'_>, node: &BundleNode) -> Result<bool> {
+    let x = ctx.tensor(&node.inputs[0])?;
+    let rank = m.shape(x).rank();
+    if rank == 0 {
+        ctx.passthrough_stub(m, node)?;
+        return Ok(true);
+    }
+    let axis = normalize_axis(
+        node.attrs.get("axis").and_then(|v| v.as_i64()).unwrap_or(0),
+        rank,
+    );
+    let dim = dim_usize(m.shape(x).dim(axis), ctx.opts);
+    let n_out = node.outputs.len().max(1);
+    let sizes: Vec<usize> = node
+        .inputs
+        .get(1)
+        .filter(|s| !s.is_empty())
+        .and_then(|n| {
+            i64_tensor(&ctx.i64_params, &ctx.params, n)
+                .or_else(|| eval_static_shape_vector(ctx, m, n, 0))
+        })
+        .or_else(|| {
+            node.attrs
+                .get("split")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+        })
+        .map(|v: Vec<i64>| v.iter().map(|&s| s.max(0) as usize).collect())
+        .unwrap_or_else(|| {
+            let base = (dim / n_out).max(1);
+            let mut v = vec![base; n_out];
+            if let Some(last) = v.last_mut() {
+                *last = dim.saturating_sub(base * (n_out - 1)).max(1);
+            }
+            v
+        });
+    let mut offset = 0usize;
+    for (i, out_name) in node.outputs.iter().enumerate() {
+        let size_i = sizes.get(i).copied().unwrap_or(0);
+        if !out_name.is_empty() {
+            let start = offset.min(dim);
+            let len = size_i.min(dim.saturating_sub(start)).max(1);
+            let id = if ctx.opts.dynamic_sequence {
+                let s = m.shape(x);
+                let mut out_dims: Vec<Dim> = (0..s.rank()).map(|d| s.dim(d)).collect();
+                out_dims[axis] = Dim::Static(len);
+                let out_s = Shape::from_dims(&out_dims, s.dtype());
+                m.add_node(Op::Narrow { axis, start, len }, vec![x], out_s)
+            } else {
+                m.narrow_(x, axis, start, len)
+            };
+            ctx.env.insert(out_name.clone(), id);
+        }
+        offset += size_i;
+    }
+    Ok(true)
+}
+
 fn lstm_attrs_bytes(hidden_size: usize, bidirectional: bool) -> Vec<u8> {
     let mut v = vec![0u8; 8];
     v[0..4].copy_from_slice(&(hidden_size as u32).to_le_bytes());
@@ -2725,8 +3899,11 @@ fn resize_output_shape(
         .get(2)
         .filter(|s| !s.is_empty())
         .map(String::as_str);
+    // Err (not `Ok(in_s)`) when there are no readable scales, so the caller can
+    // fall back to the declared `output_meta` — an `Ok(in_s)` here masqueraded as
+    // a real result and pinned some resizes to their INPUT shape.
     let Some(name) = scales_name else {
-        return Ok(in_s.clone());
+        return Err(anyhow!("resize: no scales input"));
     };
     let scales = ctx.params.get(name).cloned().or_else(|| {
         ctx.i64_params
@@ -2734,7 +3911,7 @@ fn resize_output_shape(
             .map(|v| v.iter().map(|&x| x as f32).collect())
     });
     let Some(scales) = scales else {
-        return Ok(in_s.clone());
+        return Err(anyhow!("resize: scales not a readable constant"));
     };
     let rank = in_s.rank();
     let mut dims = Vec::with_capacity(rank);

@@ -25,7 +25,10 @@ use rlx_ir::{Graph, Op};
 use std::sync::Arc;
 
 use crate::gguf_host::scheme_from_id;
-use crate::kernels::{dequant_gguf_kernel, dequant_matmul_gguf_kernel, matmul_bt_kernel};
+use crate::kernels::{
+    dequant_gguf_kernel, dequant_matmul_gguf_kernel, dequant_matmul_gguf_q1_gemv_kernel,
+    matmul_bt_kernel,
+};
 
 fn slab_bytes_for(scheme: rlx_ir::quant::QuantScheme, k: usize, n: usize) -> usize {
     let block_elems = scheme.gguf_block_size() as usize;
@@ -33,8 +36,18 @@ fn slab_bytes_for(scheme: rlx_ir::quant::QuantScheme, k: usize, n: usize) -> usi
     (k * n) / block_elems * block_bytes
 }
 
+pub fn gguf_fused_m1_env_disabled() -> bool {
+    matches!(
+        rlx_ir::env::var("RLX_CUDA_GGUF_FUSED_M1")
+            .or_else(|| rlx_ir::env::var("ORPHEUS_CUDA_GGUF_FUSED_M1"))
+            .as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
 /// Max f32 scratch for dequantized weights `[n, k]` across all GGUF ops.
 pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
+    let fused_disabled = gguf_fused_m1_env_disabled();
     let mut max = 0usize;
     for node in graph.nodes() {
         if let Op::DequantMatMul { scheme } = &node.op
@@ -49,7 +62,10 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
             // f32 dequant slab. Skipping it avoids reserving the multi-GiB
             // tied-embed dequant scratch (Gemma 4 12B lm_head: 3840*262144*4 =
             // 4 GiB) that would push the arena past 16 GiB VRAM and OOM.
+            // When `RLX_CUDA_GGUF_FUSED_M1=0`, keep planning scratch so the
+            // dequant+matmul fallback stays on-device (or host if scratch is 0).
             if m == 1
+                && !fused_disabled
                 && gguf_fused_gemv_m1_supported(crate::gguf_host::gguf_scheme_id(*scheme), m, k)
             {
                 continue;
@@ -69,13 +85,23 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
     max
 }
 
-/// Fused on-device GEMV for decode (`m == 1`) on Q4_K / Q6_K — matches
-/// rlx-vulkan `dequant_matmul` and rlx-cpu `gguf_matmul_bt`.
+/// Fused on-device GEMV for decode (`m == 1`) on Q4_K / Q6_K / Q1_0 —
+/// matches rlx-vulkan `dequant_matmul` and rlx-cpu `gguf_matmul_bt`.
 pub fn gguf_fused_gemv_m1_supported(scheme_id: u32, m: usize, k: usize) -> bool {
-    m == 1 && k.is_multiple_of(256) && matches!(scheme_id, 0 | 2)
+    if m != 1 {
+        return false;
+    }
+    match scheme_id {
+        // Q4_K / Q6_K: 256-elem super-blocks
+        0 | 2 => k.is_multiple_of(256),
+        // Q1_0 (Bonsai): 128-elem blocks
+        24 => k.is_multiple_of(128),
+        _ => false,
+    }
 }
 
-/// Launch [`dequant_matmul_gguf`] — one thread per output column.
+/// Launch fused GGUF GEMV (`m == 1`) — one thread per output column for
+/// Q4_K/Q6_K; cooperative block-per-row for Q1_0.
 pub fn run_dequant_matmul_gguf_gemv_m1(
     ctx: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
@@ -88,6 +114,40 @@ pub fn run_dequant_matmul_gguf_gemv_m1(
     out_byte_off: usize,
 ) {
     debug_assert!(gguf_fused_gemv_m1_supported(scheme_id, 1, k));
+    let x_off = x_byte_off / 4;
+    let out_off = out_byte_off / 4;
+
+    // Q1_0: one CTA per output row — threads split the k/128 weight blocks.
+    // Cuts the serial-per-row decode that dominated Bonsai-27B tok/s.
+    if scheme_id == 24 {
+        let kernel = dequant_matmul_gguf_q1_gemv_kernel(ctx);
+        let block = 128u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_u = n as u64;
+        let k_u = k as u64;
+        let x_u = x_off as u64;
+        let w_u = w_byte_off as u64;
+        let out_u = out_off as u64;
+        let mut launcher = stream.launch_builder(&kernel.function);
+        launcher
+            .arg(&mut *buffer)
+            .arg(&n_u)
+            .arg(&k_u)
+            .arg(&x_u)
+            .arg(&w_u)
+            .arg(&out_u);
+        unsafe {
+            launcher
+                .launch(cfg)
+                .expect("rlx-cuda: dequant_matmul_gguf_q1_gemv launch failed");
+        }
+        return;
+    }
+
     let kernel = dequant_matmul_gguf_kernel(ctx);
     let (grid, block) = crate::kernels::dispatch_grid_1d(n as u32, 64);
     let cfg = LaunchConfig {
@@ -95,8 +155,8 @@ pub fn run_dequant_matmul_gguf_gemv_m1(
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };
-    let x_off = (x_byte_off / 4) as u32;
-    let out_off = (out_byte_off / 4) as u32;
+    let x_off_u = x_off as u32;
+    let out_off_u = out_off as u32;
     let w_off = w_byte_off as u32;
     let n_u = n as u32;
     let k_u = k as u32;
@@ -105,9 +165,9 @@ pub fn run_dequant_matmul_gguf_gemv_m1(
         .arg(&mut *buffer)
         .arg(&n_u)
         .arg(&k_u)
-        .arg(&x_off)
+        .arg(&x_off_u)
         .arg(&w_off)
-        .arg(&out_off)
+        .arg(&out_off_u)
         .arg(&scheme_id);
     unsafe {
         launcher
@@ -127,6 +187,7 @@ fn run_matmul_bt(
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
+    precise_default: bool,
 ) {
     let kernel = matmul_bt_kernel(ctx);
     let cfg = LaunchConfig {
@@ -137,9 +198,31 @@ fn run_matmul_bt(
     let m_u = m as u32;
     let k_u = k as u32;
     let n_u = n as u32;
-    let a_off = (x_byte_off / 4) as u32;
-    let b_off = (w_byte_off / 4) as u32;
-    let c_off = (out_byte_off / 4) as u32;
+    // 64-bit element offsets: the packed 27B arena is >4 GB, so a u32 offset
+    // truncates and the sgemm reads/writes the wrong rows (garbage logits).
+    // Kernel params are `unsigned long long` (see matmul_bt.cu).
+    let a_off = (x_byte_off / 4) as u64;
+    let b_off = (w_byte_off / 4) as u64;
+    let c_off = (out_byte_off / 4) as u64;
+    // Double-single (compensated) dot-product accumulation — see matmul_bt.cu.
+    // On by default for strict-parity runs; opt-in elsewhere via
+    // RLX_CUDA_MATMUL_PRECISE. Improves the k-reduction precision so a coarse
+    // 1-bit (Q1_0) model's near-tie argmaxes track the reference.
+    // Double-single (compensated) dot-product accumulation — see matmul_bt.cu.
+    // Always on for Q1_0 (`precise_default`) unless RLX_CUDA_MATMUL_PRECISE=0.
+    // Also via RLX_CUDA_PARITY / RLX_CUDA_NO_TF32. Improves near-tie argmaxes for 1-bit.
+    let precise_off = matches!(
+        rlx_ir::env::var("RLX_CUDA_MATMUL_PRECISE").as_deref(),
+        Some("0") | Some("false") | Some("off")
+    );
+    let precise: u32 = if precise_off {
+        0
+    } else {
+        (precise_default
+            || rlx_ir::env::flag("RLX_CUDA_PARITY")
+            || rlx_ir::env::flag("RLX_CUDA_NO_TF32")
+            || rlx_ir::env::flag("RLX_CUDA_MATMUL_PRECISE")) as u32
+    };
     let mut launcher = stream.launch_builder(&kernel.function);
     launcher
         .arg(&mut *buffer)
@@ -148,7 +231,8 @@ fn run_matmul_bt(
         .arg(&n_u)
         .arg(&a_off)
         .arg(&b_off)
-        .arg(&c_off);
+        .arg(&c_off)
+        .arg(&precise);
     unsafe {
         launcher
             .launch(cfg)
@@ -188,8 +272,10 @@ pub fn run_dequant_matmul_gguf_gpu(
         block_dim: (threads, 1, 1),
         shared_mem_bytes: 0,
     };
-    let dst_f32_off = (scratch_byte_off / 4) as u32;
-    let w_off_u32 = w_byte_off as u32;
+    // 64-bit arena offsets — see matmul_bt.cu / dequant_gguf.cu. The >4 GB
+    // packed-27B arena overflows u32 → wrong weight slot → garbage.
+    let dst_f32_off = (scratch_byte_off / 4) as u64;
+    let w_off_u64 = w_byte_off as u64;
     let nb_u32 = num_blocks as u32;
     // Materialise the IQ grid LUT on this context once (cached). Bound
     // as a kernel arg unconditionally — non-IQ schemes ignore the pointer.
@@ -199,7 +285,7 @@ pub fn run_dequant_matmul_gguf_gpu(
     let mut launcher = stream.launch_builder(&kernel.function);
     launcher
         .arg(&mut *buffer)
-        .arg(&w_off_u32)
+        .arg(&w_off_u64)
         .arg(&dst_f32_off)
         .arg(&scheme_id)
         .arg(&nb_u32)
@@ -210,6 +296,12 @@ pub fn run_dequant_matmul_gguf_gpu(
             .expect("rlx-cuda: dequant_gguf launch failed");
     }
 
+    // Scheme 24 = GgufQ1_0 — auto-enable compensated matmul by default.
+    let precise_default = scheme_id == 24;
+    let precise_off = matches!(
+        rlx_ir::env::var("RLX_CUDA_MATMUL_PRECISE").as_deref(),
+        Some("0") | Some("false") | Some("off")
+    );
     run_matmul_bt(
         ctx,
         stream,
@@ -220,6 +312,7 @@ pub fn run_dequant_matmul_gguf_gpu(
         x_byte_off,
         scratch_byte_off,
         out_byte_off,
+        precise_default && !precise_off,
     );
 }
 
@@ -286,7 +379,7 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };
-    let dst_f32_off = (dequant_off / 4) as u32;
+    let dst_f32_off = (dequant_off / 4) as u64; // 64-bit: >4 GB arena (see dequant_gguf.cu)
     let nb_u32 = num_blocks as u32;
 
     let lut = crate::iq_grid::cuda_iq_grid_buffer(ctx, stream);
@@ -298,11 +391,11 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
             continue;
         }
         let w_off = w_byte_off + e * slab_bytes;
-        let w_off_u32 = w_off as u32;
+        let w_off_u64 = w_off as u64; // 64-bit: >4 GB arena (see dequant_gguf.cu)
         let mut launcher = stream.launch_builder(&kernel.function);
         launcher
             .arg(&mut *buffer)
-            .arg(&w_off_u32)
+            .arg(&w_off_u64)
             .arg(&dst_f32_off)
             .arg(&scheme_id)
             .arg(&nb_u32)
@@ -324,6 +417,7 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
             pack_in_off + in_start * k * 4,
             dequant_off,
             pack_out_off + in_start * n * 4,
+            scheme_id == 24,
         );
     }
 

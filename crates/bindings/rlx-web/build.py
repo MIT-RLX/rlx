@@ -78,12 +78,56 @@ def target_dir() -> Path:
     return Path(json.loads(out.stdout)["target_directory"])
 
 
+BACKENDS = ("python", "npx", "miniserve", "basic-http-server")
+
+
+def serve_static(web_dir: Path, backend: str, port: int) -> None:
+    """Serve `web_dir` with the chosen static file server."""
+    if backend == "python":
+        import functools
+        import http.server
+        import socketserver
+
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(web_dir))
+        with socketserver.TCPServer(("", port), handler) as httpd:
+            httpd.serve_forever()
+        return
+
+    if backend == "npx":
+        if shutil.which("npx") is None:
+            raise SystemExit("npx not found — use --serve-with python")
+        subprocess.run(["npx", "--yes", "serve", str(web_dir), "-l", str(port)], check=True)
+        return
+
+    if backend == "miniserve":
+        exe = shutil.which("miniserve") or shutil.which("miniserve.exe")
+        if exe is None:
+            raise SystemExit("miniserve not found — cargo install miniserve")
+        subprocess.run([exe, "-p", str(port), str(web_dir)], check=True)
+        return
+
+    if backend == "basic-http-server":
+        exe = shutil.which("basic-http-server")
+        if exe is None:
+            raise SystemExit("basic-http-server not found — cargo install basic-http-server")
+        subprocess.run([exe, str(web_dir), "--addr", f"127.0.0.1:{port}"], check=True)
+        return
+
+    raise SystemExit(f"unknown serve backend {backend!r}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build the rlx-web wasm bundle.")
     ap.add_argument("--webgpu", action="store_true", help="enable the WebGPU compute path")
     ap.add_argument("--webgl", action="store_true", help="enable the WebGL2 GPGPU path")
     ap.add_argument("--all", action="store_true", help="enable every GPU backend")
     ap.add_argument("--serve", action="store_true", help="serve the demo after building")
+    ap.add_argument(
+        "--serve-with",
+        choices=BACKENDS,
+        default="python",
+        help="static server for --serve (default: python stdlib)",
+    )
     ap.add_argument("--debug", action="store_true", help="debug build (default: release)")
     ap.add_argument("--port", type=int, default=8000, help="port for --serve")
     args = ap.parse_args()
@@ -112,29 +156,25 @@ def main() -> None:
         raise SystemExit(f"expected wasm artifact not found: {wasm}")
 
     PKG_DIR.mkdir(parents=True, exist_ok=True)
-    run([bindgen, "--target", "web", "--out-dir", str(PKG_DIR),
+    run([bindgen, "--target", "web", "--typescript", "--out-dir", str(PKG_DIR),
          "--out-name", OUT_NAME, str(wasm)])
 
     print(f"\n✓ bundle ready: {PKG_DIR}")
     print(f"  backends: {', '.join(['cpu', *features]) if features else 'cpu'}")
 
     if args.serve:
-        import functools
-        import http.server
-        import socketserver
-
-        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(WEB_DIR))
-        url = f"http://localhost:{args.port}/"
-        print(f"\nServing {WEB_DIR} at {url}  (Ctrl-C to stop)")
+        url = f"http://127.0.0.1:{args.port}/vision-bench.html"
+        print(f"\nServing {WEB_DIR} via {args.serve_with} at {url}  (Ctrl-C to stop)")
+        print("  index.html — MLP demo")
+        print("  vision-bench.html — vision models")
         try:
             webbrowser.open(url)
         except Exception:
             pass
-        with socketserver.TCPServer(("", args.port), handler) as httpd:
-            try:
-                httpd.serve_forever()
-            except KeyboardInterrupt:
-                print("\nstopped.")
+        try:
+            serve_static(WEB_DIR, args.serve_with, args.port)
+        except KeyboardInterrupt:
+            print("\nstopped.")
 
 
 if __name__ == "__main__":

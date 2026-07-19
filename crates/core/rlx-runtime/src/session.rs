@@ -92,8 +92,36 @@ impl Session {
         if rlx_ir::dynamic::has_dynamic_dims(&graph) && !self.coreml_native_flex() {
             return self.compile_deferred(graph, self.default_options());
         }
+        let opts = self.default_options();
+        if opts.cache_param_invariant
+            && let Some(staged) = self.try_hoist_param_invariant(&graph, &opts)
+        {
+            return staged;
+        }
         self.compile_module(GraphModule::from_graph(graph))
             .expect("compile MIR graph through fusion pipeline")
+    }
+
+    /// If `graph` has a hoistable param-invariant closure, compile it as a
+    /// separate run-once `prepare` graph and attach it to the compiled main
+    /// graph. Returns `None` when there is nothing to hoist. Sub-compiles clear
+    /// the flag so this does not recurse.
+    fn try_hoist_param_invariant(
+        &self,
+        graph: &Graph,
+        options: &crate::CompileOptions,
+    ) -> Option<CompiledGraph> {
+        let split = rlx_compile::split_param_invariant(graph)?;
+        let mut sub = options.clone();
+        sub.cache_param_invariant = false;
+        let prepare = self.compile_with(split.prepare, &sub);
+        let main = self.compile_with(split.main, &sub);
+        Some(main.with_staging(
+            prepare,
+            split.boundary,
+            split.prepare_params,
+            split.main_params,
+        ))
     }
 
     /// Wrap a dynamic-shape graph so it specializes + recompiles per input shape.
@@ -130,6 +158,11 @@ impl Session {
         };
         if rlx_ir::dynamic::has_dynamic_dims(&graph) && !self.coreml_native_flex() {
             return self.compile_deferred(graph, options.clone());
+        }
+        if options.cache_param_invariant
+            && let Some(staged) = self.try_hoist_param_invariant(&graph, options)
+        {
+            return staged;
         }
         self.compile_module_with(GraphModule::from_graph(graph), options)
             .expect("compile MIR graph through fusion pipeline")

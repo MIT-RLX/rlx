@@ -52,7 +52,7 @@ extern "C" __global__ void layer_norm2d(
     var /= (float)c;
 
     float eps = __int_as_float((int)eps_bits);
-    float inv = rsqrtf(var + eps);
+    float inv = 1.0f / sqrtf(var + eps);
 
     for (unsigned int ch = 0; ch < c; ++ch) {
         unsigned int idx = ((bn * c + ch) * spatial) + pos;

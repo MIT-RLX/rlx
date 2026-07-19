@@ -21,6 +21,39 @@ use std::collections::HashMap;
 
 use super::*;
 
+/// How Q1_0 weights are lowered for on-device CoreML dequant. All non-F32 modes
+/// keep the weight COMPRESSED in weight.bin (no full f32 unfold).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Q1Mode {
+    /// Legacy: expand qs to f32 constants (multi-GiB; 64M-elem capped).
+    F32,
+    /// 1-bit LUT palettization via `constexpr_lut_to_dense` (iOS18 opset) —
+    /// packed UINT1 indices (~n·k/8 bytes, the true no-unfold size, ~3.4 GB for
+    /// Bonsai-27B) + per-128-block LUT {−d,+d}. Validated on-device against the
+    /// dequant reference (see `coreml_quant`). Preferred non-unfold path.
+    Lut,
+}
+
+fn q1_ondevice_mode() -> Q1Mode {
+    match std::env::var("RLX_COREML_Q1_MODE").as_deref() {
+        // Legacy multi-GiB F32 unfold (disk OOM on 27B). Opt in only when
+        // deliberately comparing against the old bake path.
+        Ok("f32") | Ok("F32") => Q1Mode::F32,
+        // Default + aliases: 1-bit LUT palettization (no F32 unfold).
+        // "int8"/"affine" used to select the deprecated ios16 int8 constexpr
+        // path; on iOS18 they map here (smaller, and affine no longer takes
+        // `quantized_data`).
+        Ok("lut") | Ok("int8") | Ok("affine") | Err(_) => Q1Mode::Lut,
+        Ok(other) => {
+            eprintln!(
+                "[rlx-coreml] unknown RLX_COREML_Q1_MODE={other:?}; using lut \
+                 (set f32 for the legacy unfold)"
+            );
+            Q1Mode::Lut
+        }
+    }
+}
+
 impl<'a> LowerCtx<'a> {
     /// Fetch the GGUF/quantized bytes for the `Param` weight at `w_id`.
     pub(crate) fn quant_bytes(&self, w_id: NodeId) -> Result<&[u8]> {
@@ -50,6 +83,30 @@ impl<'a> LowerCtx<'a> {
         n: usize,
         k: usize,
     ) -> Result<String> {
+        let elems = n.saturating_mul(k);
+        // Q1_0 defaults to Lut (1-bit palettization, no F32 unfold). Opt into
+        // the legacy multi-GiB F32 bake with RLX_COREML_Q1_MODE=f32 — that path
+        // alone keeps the 64M-elem guard (27B F32 qs fills the disk).
+        if matches!(scheme, QuantScheme::GgufQ1_0) {
+            let mode = self.opts.q1_mode.unwrap_or_else(q1_ondevice_mode);
+            match mode {
+                Q1Mode::Lut => return self.bake_q1_lut(prefix, bytes, n, k),
+                Q1Mode::F32 => {}
+            }
+        }
+        // qs is baked as F32 (±1 / nibbles / …). A single 27B Q1_0 projection
+        // is ~n·k f32 ≈ multi-GiB and writing it into weight.bin OOMs the disk
+        // (Bonsai-27B prefills produced ~94 GiB mlpackages). Refuse loudly.
+        const MAX_ONDEVICE_WEIGHT_ELEMS: usize = 64 * 1024 * 1024; // 64M → 256 MiB qs
+        if elems > MAX_ONDEVICE_WEIGHT_ELEMS {
+            return Err(CoremlError::Unsupported(format!(
+                "CoreML on-device dequant refuses {scheme:?} weight [{n}×{k}] \
+                 ({elems} elems ≈ {:.1} GiB as F32 qs). For Q1_0 use the default \
+                 Lut path (or RLX_COREML_Q1_MODE=lut); do not set MODE=f32 on \
+                 27B-class models. Other schemes need Metal/MLX/CUDA/CPU.",
+                (elems * 4) as f64 / (1u64 << 30) as f64
+            )));
+        }
         const QK: usize = 32;
         let nb = (k * n) / QK;
         if nb * QK != k * n {
@@ -112,6 +169,72 @@ impl<'a> LowerCtx<'a> {
         Ok(wc)
     }
 
+    /// Non-unfolding Q1_0 via 1-bit LUT palettization (`constexpr_lut_to_dense`)
+    /// — the true no-unfold path. The weight stays 1-bit packed in weight.bin
+    /// (~n·k/8 bytes) and CoreML dequants on ANE. Q1_0's own sign bytes ARE the
+    /// palette indices (bit1→+d bit0→−d, LSB-first), so the packed indices are
+    /// copied straight out of the block; the per-128-block scale `d` becomes a
+    /// per-group LUT `{−d, +d}`. Requires the UINT1 proto DataType (added to
+    /// coreml.proto). Weight `[n,k]` row-major, blocks 128-along-k.
+    fn bake_q1_lut(&mut self, prefix: &str, bytes: &[u8], n: usize, k: usize) -> Result<String> {
+        const BLK: usize = 18; // Q1_0 block: 2 (f16 d) + 16 sign bytes
+        const GS: usize = 128; // group / block size along k
+        if !k.is_multiple_of(GS) {
+            return Err(CoremlError::Runtime(format!(
+                "Q1_0 lut: k={k} not a multiple of {GS}"
+            )));
+        }
+        let kg = k / GS; // 128-blocks per row
+        let n_blocks = n * kg;
+        if bytes.len() < n_blocks * BLK {
+            return Err(CoremlError::Runtime(format!(
+                "Q1_0 lut: need {} bytes, got {}",
+                n_blocks * BLK,
+                bytes.len()
+            )));
+        }
+        // Extract packed 1-bit indices (= the sign bytes, already LSB-first) and
+        // a per-block LUT {−d, +d}, both in row-major (n, kg) block order.
+        let mut indices = Vec::with_capacity(n * k / 8);
+        let mut lut = Vec::with_capacity(n_blocks * 2);
+        for b in 0..n_blocks {
+            let base = b * BLK;
+            let d = read_f16_le(&bytes[base..base + 2]);
+            lut.push(-d);
+            lut.push(d);
+            indices.extend_from_slice(&bytes[base + 2..base + BLK]); // 16 sign bytes
+        }
+        let idx_name = format!("{prefix}_idx");
+        self.operations.push(make_const_u1_packed(
+            &mut self.blob,
+            &idx_name,
+            &[n, k],
+            &indices,
+        )?);
+        // LUT [n, kg, 2, 1] f16: grouped palettization (group_size 128 along k,
+        // 1 along n; 2 palette entries = 2^1; scalar vector).
+        let lut_name = format!("{prefix}_lut");
+        self.operations.push(make_const_float(
+            &mut self.blob,
+            &lut_name,
+            &Shape::new(&[n, kg, 2, 1], DType::F16),
+            &lut,
+            DType::F16,
+        )?);
+        // `constexpr_lut_to_dense` requires lut.dtype == output.dtype (f16 here).
+        let dq_name = format!("{prefix}_w");
+        self.emit(
+            "constexpr_lut_to_dense",
+            &dq_name,
+            &Shape::new(&[n, k], DType::F16),
+            vec![
+                ("indices", bind_name(&idx_name)),
+                ("lut", bind_name(&lut_name)),
+            ],
+        )?;
+        Ok(dq_name)
+    }
+
     /// On-device block dequant for supported GGUF schemes, then MIL matmul.
     pub(crate) fn lower_dequant_matmul_ondevice(
         &mut self,
@@ -161,6 +284,17 @@ impl<'a> LowerCtx<'a> {
         let n = dim_static(&out_shape, out_shape.rank() - 1)?;
         let m = out_shape.num_elements().unwrap_or(0) / n.max(1);
         let k = self.graph.shape(x_id).num_elements().unwrap_or(0) / m.max(1);
+
+        const MAX_HOST_BAKE_ELEMS: usize = 64 * 1024 * 1024;
+        let elems = n.saturating_mul(k);
+        if elems > MAX_HOST_BAKE_ELEMS {
+            return Err(CoremlError::Unsupported(format!(
+                "CoreML host-bake dequant refuses {scheme:?} weight [{n}×{k}] \
+                 ({elems} elems ≈ {:.1} GiB F32). Use Metal/MLX/CUDA/CPU for \
+                 packed 27B-class models.",
+                (elems * 4) as f64 / (1u64 << 30) as f64
+            )));
+        }
 
         let wf = dequant_scheme(scheme, self.quant_bytes(w_id)?, k * n)?;
         let x = self.val(x_id);

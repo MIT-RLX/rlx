@@ -57,6 +57,99 @@ pub(super) fn unfuse_fused_mat_mul_bias_act(
     }
 }
 
+pub(super) fn unfuse_fused_conv_bias_act(
+    node: &rlx_ir::Node,
+    new_inputs: Vec<NodeId>,
+    out: &mut Graph,
+) -> NodeId {
+    use rlx_ir::infer::GraphExt;
+    let Op::FusedConvBiasAct {
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        groups,
+        activation,
+        has_residual,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    {
+        // Inputs: [input, weight, bias] (+ residual when has_residual).
+        // Rebuilds the canonical conv-bias-activation graph:
+        //   y0 = Conv(input, weight)
+        //   b4 = Reshape(bias, [1, C, 1, 1])
+        //   be = Expand(b4, y0.shape)          # [N, C, H, W]
+        //   y1 = y0 + be
+        //   y2 = activation(y1)                # if Some(act)
+        //   y3 = y2 + residual                 # if has_residual
+        let in_x = new_inputs[0];
+        let in_w = new_inputs[1];
+        let in_b = new_inputs[2];
+        let y_shape = node.shape.clone(); // [N, C_out, H_out, W_out]
+        let dtype = y_shape.dtype();
+
+        let y0 = out.conv2d(
+            in_x,
+            in_w,
+            [kernel_size[0], kernel_size[1]],
+            [stride[0], stride[1]],
+            [padding[0], padding[1]],
+            [dilation[0], dilation[1]],
+            *groups,
+        );
+
+        // bias [C_out] → [1, C_out, 1, 1].
+        let c_out = match y_shape.dim(1) {
+            Dim::Static(n) => n,
+            _ => panic!("FusedConvBiasAct unfuse: dynamic channel dim"),
+        };
+        let b4_shape = IrShape::from_dims(
+            &[
+                Dim::Static(1),
+                Dim::Static(c_out),
+                Dim::Static(1),
+                Dim::Static(1),
+            ],
+            dtype,
+        );
+        let b4 = out.reshape(in_b, vec![1, c_out as i64, 1, 1], b4_shape);
+
+        let be = out.add_node(
+            Op::Expand {
+                target_shape: y_shape
+                    .dims()
+                    .iter()
+                    .map(|d| match d {
+                        Dim::Static(n) => *n as i64,
+                        _ => -1,
+                    })
+                    .collect(),
+            },
+            vec![b4],
+            y_shape.clone(),
+        );
+        let y1 = out.binary(BinaryOp::Add, y0, be, y_shape.clone());
+        // Residual (cuDNN `z`) is added BEFORE the activation:
+        // `act(conv + bias + residual)`, matching the fused-op semantics.
+        let y1r = if *has_residual {
+            let in_res = new_inputs
+                .get(3)
+                .copied()
+                .expect("FusedConvBiasAct has_residual but missing residual input");
+            out.binary(BinaryOp::Add, y1, in_res, y_shape.clone())
+        } else {
+            y1
+        };
+        if let Some(act) = activation {
+            out.activation(*act, y1r, y_shape)
+        } else {
+            y1r
+        }
+    }
+}
+
 pub(super) fn unfuse_fused_residual_l_n(
     node: &rlx_ir::Node,
     new_inputs: Vec<NodeId>,
@@ -574,4 +667,71 @@ pub(super) fn unfuse_partitioned_conv(
         unreachable!()
     };
     out.partitioned_conv1d_gemm(new_inputs[0], new_inputs[1], *block)
+}
+
+/// Decompose [`Op::AdaLayerNorm`] (`norm(x)·(1+scale)+shift`) into primitives.
+///
+/// Using the identity `n·(1+scale) = n + n·scale`, this needs no `1+scale`
+/// constant — only broadcast `Mul`/`Add`:
+///
+/// ```text
+///   n   = norm(x)                 (affine-free: gamma = 1, beta = 0, shape [D])
+///   out = n + n * scale + shift   # NumPy broadcast; no Expand
+/// ```
+///
+/// Preferring implicit Binary broadcast over `Op::Expand` avoids materializing
+/// `[B,S,D]` modulation on claim-then-unfuse backends (Vulkan / OneAPI /
+/// WebGL). Backends that only trailing-broadcast may re-legalize via
+/// `LegalizeBroadcast`.
+pub(super) fn unfuse_ada_layer_norm(
+    node: &rlx_ir::Node,
+    new_inputs: Vec<NodeId>,
+    out: &mut Graph,
+) -> NodeId {
+    use rlx_ir::infer::GraphExt;
+    let Op::AdaLayerNorm { norm, eps } = &node.op else {
+        unreachable!()
+    };
+    let in_x = new_inputs[0];
+    let in_scale = new_inputs[1];
+    let in_shift = new_inputs[2];
+    let y_shape = node.shape.clone();
+    let dtype = y_shape.dtype();
+    let rank = y_shape.rank();
+    let d = match y_shape.dim(rank - 1) {
+        Dim::Static(n) => n,
+        _ => panic!("AdaLayerNorm unfuse: dynamic last (feature) dim"),
+    };
+
+    // norm(x) with synthesized affine-free params of shape [D].
+    let gamma = out.full(&[d], 1.0, dtype);
+    let beta = out.zeros(&[d], dtype);
+    let n = match norm {
+        AdaNormKind::LayerNorm => out.layer_norm(in_x, gamma, beta, -1, *eps, y_shape.clone()),
+        AdaNormKind::RmsNorm => out.rms_norm(in_x, gamma, beta, *eps),
+    };
+
+    // n·(1+scale) + shift  ==  n + n·scale + shift (broadcast).
+    let n_scale = out.binary(BinaryOp::Mul, n, in_scale, y_shape.clone());
+    let m = out.binary(BinaryOp::Add, n, n_scale, y_shape.clone());
+    out.binary(BinaryOp::Add, m, in_shift, y_shape)
+}
+
+/// Decompose [`Op::GatedResidual`] (`x + gate·y`) into primitives:
+///
+/// ```text
+///   out = x + gate * y     # NumPy broadcast on gate; no Expand
+/// ```
+pub(super) fn unfuse_gated_residual(
+    node: &rlx_ir::Node,
+    new_inputs: Vec<NodeId>,
+    out: &mut Graph,
+) -> NodeId {
+    debug_assert!(matches!(node.op, Op::GatedResidual));
+    let in_x = new_inputs[0];
+    let in_y = new_inputs[1];
+    let in_gate = new_inputs[2];
+    let y_shape = node.shape.clone();
+    let gy = out.binary(BinaryOp::Mul, in_gate, in_y, y_shape.clone());
+    out.binary(BinaryOp::Add, in_x, gy, y_shape)
 }

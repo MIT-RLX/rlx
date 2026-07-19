@@ -78,6 +78,24 @@ pub struct CompileOptions {
     pub quant_param_bindings: Option<HashMap<String, Vec<u8>>>,
     /// Native vs common IR lowering ([`KernelDispatchConfig`], `RLX_KERNEL_DISPATCH=common`).
     pub kernel_dispatch: KernelDispatchConfig,
+    /// Prevent Metal from lowering the graph through MPSGraph.
+    ///
+    /// This keeps the regular Metal thunk schedule while retaining all other
+    /// compile options. Off by default.
+    pub disable_mpsgraph: bool,
+    /// On backends that list `OpKind::Scan` (host-fallback), Scans with
+    /// `length <= scan_unroll_max_length` are IR-unrolled into body replicas so
+    /// they run as ordinary device ops. Longer Scans keep `ScanHost`.
+    /// Default: **64**. `0` disables unroll on claiming backends; `u32::MAX`
+    /// prefers unroll for every eligible Scan.
+    pub scan_unroll_max_length: u32,
+    /// Hoist the param-invariant subgraph (compute that depends only on weights,
+    /// never on `Op::Input`) into a separate "prepare" graph run ONCE, feeding
+    /// its outputs into the main graph across forwards. Complements
+    /// `param_bindings` (which folds such compute away at compile when weight
+    /// VALUES are known); this handles run-time-only weights. Opt-in; default
+    /// off (also settable via `RLX_CACHE_PARAM_INVARIANT=1`).
+    pub cache_param_invariant: bool,
 }
 
 impl Default for CompileOptions {
@@ -99,6 +117,9 @@ impl Default for CompileOptions {
             param_bindings: None,
             quant_param_bindings: None,
             kernel_dispatch: KernelDispatchConfig::from_env(),
+            disable_mpsgraph: false,
+            scan_unroll_max_length: 64,
+            cache_param_invariant: rlx_ir::env::flag("RLX_CACHE_PARAM_INVARIANT"),
         }
     }
 }
@@ -192,6 +213,12 @@ impl CompileOptions {
 
     pub fn kernel_dispatch_config(mut self, config: KernelDispatchConfig) -> Self {
         self.kernel_dispatch = config;
+        self
+    }
+
+    /// Prefer IR-unrolling Scans with `length <= max` on Scan-claiming backends.
+    pub fn scan_unroll_max_length(mut self, max: u32) -> Self {
+        self.scan_unroll_max_length = max;
         self
     }
 

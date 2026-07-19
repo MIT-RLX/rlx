@@ -37,6 +37,7 @@ pub fn fusion_target_for(device: Device) -> FusionTarget {
         Device::Cuda => FusionTarget::Cuda,
         Device::Rocm => FusionTarget::Rocm,
         Device::Gpu | Device::Vulkan | Device::WebGpu | Device::OneApi => FusionTarget::Wgpu,
+        Device::OpenGl => FusionTarget::Cpu,
         Device::Tpu => FusionTarget::Tpu,
         // CoreML runs its own graph optimizer, so we want minimal RLX-side
         // fusion: the CPU fusion target only synthesizes Fused* ops the
@@ -56,7 +57,14 @@ pub fn pipeline_for(device: Device, options: &CompileOptions) -> CompilePipeline
         .unwrap_or_else(|| fusion_target_for(device));
     let mut opts = options.fusion_opts.merge_env();
     if !opts.keep_elementwise_regions {
-        if matches!(target, FusionTarget::Cpu) && !opts.unfuse_elementwise_regions {
+        if matches!(target, FusionTarget::Cpu | FusionTarget::Mlx)
+            && !opts.unfuse_elementwise_regions
+        {
+            // MLX ElementwiseRegion modulus tiling broadcasts `[1,C,1]` onto
+            // `[1,C,T]` as flat `gid % C` (varies across time) instead of
+            // channel-wise `bias[c]`. That corrupts AdaIN / Conv bias on
+            // Kokoro/StyleTTS2 and drops MLX↔CPU cosine to ~0.06. Unfuse like
+            // Metal/WGPU/CUDA so Binary+Expand use normal MLX broadcast.
             opts.unfuse_elementwise_regions = true;
         }
         if matches!(target, FusionTarget::Metal) {
@@ -85,6 +93,9 @@ pub fn pipeline_for(device: Device, options: &CompileOptions) -> CompilePipeline
     pipe.opts = pipe.opts.apply_native_fk_defaults(target);
     pipe.arena_alignment = options.arena_alignment;
     pipe.assert_fusion_clean = options.assert_fusion_clean;
+    // Device token for legalize errors — Vulkan / OneAPI share Wgpu fusion
+    // patterns but must not report themselves as `"wgpu"`.
+    pipe.backend_label = Some(device.as_arg());
     if let Some(ops) = options.supported_ops {
         pipe.supported_ops = Some(ops);
     } else if let Some(backend) = crate::registry::backend_for(device) {
@@ -147,8 +158,12 @@ pub fn compile_hir_stages(
     options: &CompileOptions,
 ) -> Result<CompileResult, rlx_ir::hir::LowerError> {
     let pipe = pipeline_for(device, options);
-    pipe.compile_hir(hir)
-        .map(|r| maybe_specialize(r, &pipe, options))
+    // Mirror backend `compile(Graph)`: bake `param_bindings` + DCE/fold
+    // *before* fusion so FuseAdaLayerNorm sees Constants (ONNX affine-free
+    // LN γ/β and scalar 1) instead of Params.
+    let mir = CompilePipeline::lower_hir(hir)?;
+    let graph = crate::precompile::precompile_cleanup(mir.into_graph(), options);
+    Ok(maybe_specialize(pipe.compile_graph(graph), &pipe, options))
 }
 
 /// Compile a [`GraphModule`] (HIR, MIR, or LIR stage) through the pipeline.
@@ -157,9 +172,19 @@ pub fn compile_module_stages(
     module: GraphModule,
     options: &CompileOptions,
 ) -> Result<CompileResult, rlx_ir::hir::LowerError> {
-    let pipe = pipeline_for(device, options);
-    pipe.compile_module(module)
-        .map(|r| maybe_specialize(r, &pipe, options))
+    match module.stage() {
+        rlx_ir::GraphStage::Hir => {
+            let hir = module
+                .into_hir()
+                .expect("GraphModule stage() / into_hir mismatch");
+            compile_hir_stages(device, hir, options)
+        }
+        _ => {
+            let pipe = pipeline_for(device, options);
+            pipe.compile_module(module)
+                .map(|r| maybe_specialize(r, &pipe, options))
+        }
+    }
 }
 
 /// Print fusion diagnostics when `RLX_FUSION_REPORT=1`.

@@ -93,6 +93,7 @@ fn ggml_type_name(ggml: GgmlType) -> &'static str {
         F64 => "F64",
         Q8_1 => "Q8_1",
         Q1_0 => "Q1_0",
+        Q2_0 => "Q2_0",
     }
 }
 
@@ -139,6 +140,8 @@ fn dequant_f32(ggml: GgmlType, bytes: &[u8], n: usize) -> PyResult<Vec<f32>> {
         IQ3S => rlx_gguf::iq_dequant::dequant_iq3_s(bytes, n),
         IQ1S => rlx_gguf::iq_dequant::dequant_iq1_s(bytes, n),
         IQ1M => rlx_gguf::iq_dequant::dequant_iq1_m(bytes, n),
+        Q1_0 => rlx_gguf::q1_dequant::dequant_q1_0(bytes, n),
+        Q2_0 => rlx_gguf::q2_dequant::dequant_q2_0(bytes, n),
         other => Err(anyhow::anyhow!("dequant for {other:?} not implemented")),
     };
     out.map_err(map_dequant_err(ggml, n))

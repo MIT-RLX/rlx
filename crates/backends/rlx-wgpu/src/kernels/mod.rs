@@ -103,15 +103,21 @@ pub const UMAP_KNN_WGSL: &str = include_str!("umap_knn.wgsl");
 pub const GROUPED_MATMUL_WGSL: &str = include_str!("grouped_matmul.wgsl");
 pub const SAMPLE_WGSL: &str = include_str!("sample.wgsl");
 pub const SELECTIVE_SCAN_WGSL: &str = include_str!("selective_scan.wgsl");
+pub const GATED_DELTA_NET_WGSL: &str = include_str!("gated_delta_net.wgsl");
 pub const MAMBA2_WGSL: &str = include_str!("mamba2.wgsl");
 pub const GRU_WGSL: &str = include_str!("gru.wgsl");
 pub const RNN_WGSL: &str = include_str!("rnn.wgsl");
 pub const DEQUANT_MATMUL_WGSL: &str = include_str!("dequant_matmul.wgsl");
 pub const DEQUANT_GGUF_WGSL: &str = include_str!("dequant_gguf.wgsl");
 pub const DEQUANT_GEMV_GGUF_WGSL: &str = include_str!("dequant_gemv_gguf.wgsl");
+pub const DEQUANT_GEMM_Q1_0_WGSL: &str = include_str!("dequant_gemm_q1_0.wgsl");
 pub const FUSED_RESIDUAL_LN_WGSL: &str = include_str!("fused_residual_ln.wgsl");
 pub const FUSED_RESIDUAL_LN_TEE_WGSL: &str = include_str!("fused_residual_ln_tee.wgsl");
 pub const FUSED_RESIDUAL_RMS_NORM_WGSL: &str = include_str!("fused_residual_rms_norm.wgsl");
+pub const ADA_LAYER_NORM_WGSL: &str = include_str!("ada_layer_norm.wgsl");
+pub const GATED_RESIDUAL_WGSL: &str = include_str!("gated_residual.wgsl");
+pub const ADA_LAYER_NORM_BACKWARD_WGSL: &str = include_str!("ada_layer_norm_backward.wgsl");
+pub const GATED_RESIDUAL_BACKWARD_WGSL: &str = include_str!("gated_residual_backward.wgsl");
 pub const MATMUL_QKV_WGSL: &str = include_str!("matmul_qkv.wgsl");
 pub const MATMUL_QKV_COOP_F32_WGSL: &str = include_str!("matmul_qkv_coop_f32.wgsl");
 
@@ -872,6 +878,20 @@ pub struct DequantGemvGgufParams {
     pub _p1: u32,
 }
 
+/// Layout for fused Q1_0 GEMM (`dequant_gemm_q1_0.wgsl`). 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct DequantGemmQ10Params {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    pub x_f32_off: u32,
+    pub w_byte_off: u32,
+    pub out_f32_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+}
+
 /// Layout for DequantMatMul. 48 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -933,6 +953,85 @@ pub struct MatmulQkvParams {
 
 /// Layout for FusedResidualRmsNorm (same bind layout as FusedResidualLN).
 pub type FusedResidualRmsNormParams = FusedResidualLnParams;
+
+/// Layout for AdaLayerNorm. 112 bytes (28 u32s).
+/// `lead_pack` is 20 u32s (5×vec4 in WGSL); first 17 from IR are used.
+/// Prefixed by 8 scalar u32s (32 bytes) so the vec4 array is naturally
+/// 16-byte aligned — no implicit WGSL padding.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct AdaLayerNormParams {
+    pub outer: u32,
+    pub inner: u32,
+    pub in_off: u32,
+    pub scale_off: u32,
+    pub shift_off: u32,
+    pub out_off: u32,
+    pub eps_bits: u32,
+    pub layer_norm: u32,
+    pub lead_pack: [u32; 20],
+}
+
+/// Layout for GatedResidual. 128 bytes (32 u32s).
+/// Six scalar fields (24 B) + 8 B explicit pad so `lead_pack` (vec4 array)
+/// starts at offset 32, matching WGSL uniform layout; trailing pad to 128.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GatedResidualParams {
+    pub outer: u32,
+    pub inner: u32,
+    pub x_off: u32,
+    pub y_off: u32,
+    pub gate_off: u32,
+    pub out_off: u32,
+    pub _pre0: u32,
+    pub _pre1: u32,
+    pub lead_pack: [u32; 20],
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+    pub _pad3: u32,
+}
+
+/// Expand the 17-u32 IR lead pack into the 20-u32 WGSL uniform slot.
+#[inline]
+pub fn lead_pack_uniform(src: [u32; 17]) -> [u32; 20] {
+    let mut out = [0u32; 20];
+    out[..17].copy_from_slice(&src);
+    out
+}
+
+/// Layout for AdaLayerNormBackward. 48 bytes (12 u32s).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct AdaLayerNormBackwardParams {
+    pub mod_rows: u32,
+    pub seq_per_mod: u32,
+    pub inner: u32,
+    pub x_off: u32,
+    pub scale_off: u32,
+    pub dy_off: u32,
+    pub out_off: u32,
+    pub eps_bits: u32,
+    pub layer_norm: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+}
+
+/// Layout for GatedResidualBackward. 32 bytes (8 u32s).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GatedResidualBackwardParams {
+    pub mod_rows: u32,
+    pub seq_per_mod: u32,
+    pub inner: u32,
+    pub y_off: u32,
+    pub gate_off: u32,
+    pub dy_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+}
 
 /// Layout for FusedResidualLN. 48 bytes.
 #[repr(C)]
@@ -1041,6 +1140,29 @@ pub struct SelectiveScanParams {
     pub _p3: u32,
     pub _p4: u32,
     pub _p5: u32,
+}
+
+/// Layout for GatedDeltaNet. 64 bytes (16 u32s).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GatedDeltaNetParams {
+    pub batch: u32,
+    pub seq: u32,
+    pub heads: u32,
+    pub state_size: u32,
+    pub q_off: u32,
+    pub k_off: u32,
+    pub v_off: u32,
+    pub g_off: u32,
+    pub beta_off: u32,
+    pub state_off: u32,
+    pub out_off: u32,
+    pub use_carry: u32,
+    /// PLAN L1 — full-extent seq stride for per-batch offset math.
+    pub seq_stride: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+    pub _p3: u32,
 }
 
 /// Layout for Sample. 48 bytes.
@@ -1732,16 +1854,22 @@ static UMAP_KNN: OnceLock<Kernel> = OnceLock::new();
 static GROUPED_MATMUL: OnceLock<Kernel> = OnceLock::new();
 static SAMPLE: OnceLock<Kernel> = OnceLock::new();
 static SELECTIVE_SCAN: OnceLock<Kernel> = OnceLock::new();
+static GATED_DELTA_NET: OnceLock<Kernel> = OnceLock::new();
 static MAMBA2: OnceLock<Kernel> = OnceLock::new();
 static GRU: OnceLock<Kernel> = OnceLock::new();
 static RNN: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_MATMUL: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GGUF: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMV_GGUF: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMM_Q1_0: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_BT: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN_TEE: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_RMS_NORM: OnceLock<Kernel> = OnceLock::new();
+static ADA_LAYER_NORM: OnceLock<Kernel> = OnceLock::new();
+static GATED_RESIDUAL: OnceLock<Kernel> = OnceLock::new();
+static ADA_LAYER_NORM_BACKWARD: OnceLock<Kernel> = OnceLock::new();
+static GATED_RESIDUAL_BACKWARD: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_QKV: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_QKV_COOP_F32: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_QKV_COOP_F16_VK: OnceLock<Kernel> = OnceLock::new();
@@ -2502,6 +2630,16 @@ pub fn selective_scan_kernel(device: &wgpu::Device) -> &'static Kernel {
         )
     })
 }
+pub fn gated_delta_net_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GATED_DELTA_NET.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu gated_delta_net",
+            GATED_DELTA_NET_WGSL,
+            "gated_delta_net",
+        )
+    })
+}
 pub fn mamba2_kernel(device: &wgpu::Device) -> &'static Kernel {
     MAMBA2.get_or_init(|| build_kernel(device, "rlx-wgpu mamba2", MAMBA2_WGSL, "mamba2"))
 }
@@ -2544,6 +2682,16 @@ pub fn dequant_gemv_gguf_kernel(device: &wgpu::Device) -> &'static Kernel {
         )
     })
 }
+pub fn dequant_gemm_q1_0_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMM_Q1_0.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemm_q1_0",
+            DEQUANT_GEMM_Q1_0_WGSL,
+            "dequant_gemm_q1_0",
+        )
+    })
+}
 pub fn fused_residual_ln_kernel(device: &wgpu::Device) -> &'static Kernel {
     FUSED_RESIDUAL_LN.get_or_init(|| {
         build_kernel(
@@ -2571,6 +2719,46 @@ pub fn fused_residual_rms_norm_kernel(device: &wgpu::Device) -> &'static Kernel 
             "rlx-wgpu fused_residual_rms_norm",
             FUSED_RESIDUAL_RMS_NORM_WGSL,
             "fused_residual_rms_norm",
+        )
+    })
+}
+pub fn ada_layer_norm_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ADA_LAYER_NORM.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu ada_layer_norm",
+            ADA_LAYER_NORM_WGSL,
+            "ada_layer_norm",
+        )
+    })
+}
+pub fn gated_residual_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GATED_RESIDUAL.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu gated_residual",
+            GATED_RESIDUAL_WGSL,
+            "gated_residual",
+        )
+    })
+}
+pub fn ada_layer_norm_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ADA_LAYER_NORM_BACKWARD.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu ada_layer_norm_backward",
+            ADA_LAYER_NORM_BACKWARD_WGSL,
+            "ada_layer_norm_backward",
+        )
+    })
+}
+pub fn gated_residual_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GATED_RESIDUAL_BACKWARD.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu gated_residual_backward",
+            GATED_RESIDUAL_BACKWARD_WGSL,
+            "gated_residual_backward",
         )
     })
 }

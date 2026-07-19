@@ -6,7 +6,10 @@ path for Intel Arc / Data Center Max (Ponte Vecchio) GPUs.
 It mirrors the native GPU backends (rlx-cuda / rlx-vulkan): the crate owns the
 Level Zero driver / device / context / compute-queue, a USM-shared f32 arena,
 and SPIR-V compute modules — the peak Intel path, distinct from the wgpu/Vulkan
-portability layers.
+portability layers. Packed DiT reverse (`AdaLayerNormBackward` /
+`GatedResidualBackward`) has dedicated OpenCL-C SPIR-V kernels
+(`kernels/ada_layer_norm_backward.cl` / `gated_residual_backward.cl`); when
+kernels are not embedded the same ops host-fallback through `rlx-cpu`.
 
 ```
 rlx-ir Graph
@@ -21,8 +24,12 @@ rlx-ir Graph
 `libze_loader` is opened at **runtime** with `libloading` — there is no
 link-time dependency on the oneAPI runtime, so the crate compiles and
 `cargo build`s on hosts with no Level Zero driver (this macOS dev box, CI).
-`rlx_oneapi::is_available()` returns `false` there and the runtime registry
-never registers `Device::OneApi`, exactly like rlx-cuda / rlx-rocm / rlx-vulkan.
+`rlx_oneapi::is_available()` is always `true` once the crate is linked: with a
+Level Zero GPU **and** embedded SPIR-V kernels the native USM path runs;
+otherwise every op uses the bit-exact `rlx-cpu` reference (`run_host`). Use
+`has_level_zero_device()` / `device_name()` / `has_native_kernels()` to probe
+hardware. `Device::OneApi` stays selectable via `RLX_DEVICE=oneapi` even when
+only `libze_loader` is present (no `ze_intel_gpu` plugin).
 
 ## Why OpenCL-C kernels (not GLSL/naga)
 
@@ -49,7 +56,7 @@ only in its Linux Docker image.)
 |---|---|
 | Level Zero FFI + driver/device/context/queue bring-up | implemented |
 | USM-shared arena, SPIR-V module/kernel cache, per-op dispatch | implemented |
-| OpenCL-C kernels: `binary`, `unary`, `matmul`, `softmax`, `rmsnorm` | written |
+| OpenCL-C kernels: `binary`, `unary`, `matmul`, `softmax`, `rmsnorm`, `ada_layer_norm_backward`, `gated_residual_backward` | written |
 | CPU-reference path (whole graph) | **validated** (tests green on macOS) |
 | Native dispatch on Intel hardware | **NOT yet validated** — no Intel GPU on the dev box |
 

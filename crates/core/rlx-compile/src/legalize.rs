@@ -78,16 +78,18 @@ pub fn format_legalize_error(backend_name: &str, errors: &[(NodeId, OpKind)]) ->
     // they know where to plug in.
     if errors.iter().any(|(_, k)| *k == OpKind::Custom) {
         s.push_str(
-            "\n  `Op::Custom` is registered by name; the IR-level \
-             extension (`rlx_ir::register_op`) routes shape inference \
-             and autodiff. Per-backend execution requires registering \
-             a kernel in that backend's `op_registry`:\n\
-             \x20  - CPU:   `rlx_cpu::op_registry::register_cpu_kernel`\n\
-             \x20  - Metal: `rlx_metal::op_registry::register_metal_kernel` \
-             (trait surface only — execution dispatch not wired yet)\n\
-             \x20  - MLX:   `rlx_mlx::op_registry::register_mlx_kernel` \
-             (trait surface only — execution dispatch not wired yet)\n\
-             \x20For now, pin custom-op graphs to `Device::Cpu`.",
+            "\n  `Op::Custom` is registered by name via `rlx_ir::register_op` \
+             (routes shape inference + autodiff). To make it runnable, do ONE \
+             of:\n\
+             \x20  - Provide an `OpExtension::lower` rule — it decomposes to \
+             primitives and runs on EVERY backend with no kernel (preferred; \
+             also keeps it visible to fusion).\n\
+             \x20  - Register a per-backend kernel: \
+             `rlx_cpu::op_registry::register_cpu_kernel` (CPU), \
+             `rlx_metal::op_registry::register_metal_kernel` (Metal), \
+             `rlx_mlx::op_registry::register_mlx_kernel` (MLX). A registered \
+             CPU kernel additionally runs on the GPU-host backends \
+             (CUDA/ROCm/wgpu/Vulkan) via host staging.",
         );
     }
     if errors

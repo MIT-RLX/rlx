@@ -818,82 +818,34 @@ fn jvp_rule(
             ))
         }
 
-        Op::LayerNorm { axis, eps } => {
-            let t_x = t_inputs[0]?;
-            let gamma = fwd_map[&node.inputs[1]];
-            let x = fwd_map[&node.inputs[0]];
-            let x_shape = node.shape.clone();
-            let rank = x_shape.rank();
-            let axis_pos = if *axis < 0 {
-                (rank as i32 + *axis) as usize
-            } else {
-                *axis as usize
-            };
-            let mut keep_dims: Vec<Dim> = x_shape.dims().to_vec();
-            keep_dims[axis_pos] = Dim::Static(1);
-            let keep_shape = Shape::from_dims(&keep_dims, x_shape.dtype());
-            let mean = bwd.add_node(
-                Op::Reduce {
-                    op: ReduceOp::Mean,
-                    axes: vec![axis_pos],
-                    keep_dim: true,
-                },
-                vec![x],
-                keep_shape.clone(),
-            );
-            let diff = bwd.binary(BinaryOp::Sub, x, mean, x_shape.clone());
-            let diff_sq = bwd.binary(BinaryOp::Mul, diff, diff, x_shape.clone());
-            let var = bwd.add_node(
-                Op::Reduce {
-                    op: ReduceOp::Mean,
-                    axes: vec![axis_pos],
-                    keep_dim: true,
-                },
-                vec![diff_sq],
-                keep_shape.clone(),
-            );
-            let eps_c = scalar_const(*eps as f64, &keep_shape, bwd);
-            let var_eps = bwd.binary(BinaryOp::Add, var, eps_c, keep_shape.clone());
-            let inv_std = bwd.activation(Activation::Rsqrt, var_eps, keep_shape.clone());
-            let inv_std_b = unbroadcast_inverse(inv_std, &x_shape, bwd);
-            let gamma_b = unbroadcast_inverse(gamma, &x_shape, bwd);
-            let inner = bwd.binary(BinaryOp::Mul, t_x, gamma_b, x_shape.clone());
-            Some(bwd.binary(BinaryOp::Mul, inner, inv_std_b, x_shape))
-        }
+        Op::LayerNorm { axis, eps } => jvp_layer_norm_exact(
+            fwd_map[&node.inputs[0]],
+            fwd_map[&node.inputs[1]],
+            t_inputs[0],
+            t_inputs.get(1).copied().flatten(),
+            t_inputs.get(2).copied().flatten(),
+            *axis,
+            *eps,
+            &node.shape,
+            bwd,
+        ),
 
-        Op::RmsNorm { axis, eps } => {
-            // Pushforward through RMSNorm matches STE on the norm divisor.
-            let t_x = t_inputs[0]?;
-            let gamma = fwd_map[&node.inputs[1]];
-            let x = fwd_map[&node.inputs[0]];
-            let x_shape = node.shape.clone();
-            let rank = x_shape.rank();
-            let axis_pos = if *axis < 0 {
-                (rank as i32 + *axis) as usize
-            } else {
-                *axis as usize
-            };
-            let mut keep_dims: Vec<Dim> = x_shape.dims().to_vec();
-            keep_dims[axis_pos] = Dim::Static(1);
-            let keep_shape = Shape::from_dims(&keep_dims, x_shape.dtype());
-            let xsq = bwd.binary(BinaryOp::Mul, x, x, x_shape.clone());
-            let r_sq = bwd.add_node(
-                Op::Reduce {
-                    op: ReduceOp::Mean,
-                    axes: vec![axis_pos],
-                    keep_dim: true,
-                },
-                vec![xsq],
-                keep_shape.clone(),
-            );
-            let eps_c = scalar_const(*eps as f64, &keep_shape, bwd);
-            let r_sq_eps = bwd.binary(BinaryOp::Add, r_sq, eps_c, keep_shape.clone());
-            let inv_r = bwd.activation(Activation::Rsqrt, r_sq_eps, keep_shape.clone());
-            let inv_r_b = unbroadcast_inverse(inv_r, &x_shape, bwd);
-            let gamma_b = unbroadcast_inverse(gamma, &x_shape, bwd);
-            let inner = bwd.binary(BinaryOp::Mul, t_x, gamma_b, x_shape.clone());
-            Some(bwd.binary(BinaryOp::Mul, inner, inv_r_b, x_shape))
+        Op::AdaLayerNorm { norm, eps } => {
+            jvp_ada_layer_norm(node, t_inputs, fwd_map, bwd, *norm, *eps)
         }
+        Op::GatedResidual => jvp_gated_residual(node, t_inputs, fwd_map, bwd),
+
+        Op::RmsNorm { axis, eps } => jvp_rms_norm_exact(
+            fwd_map[&node.inputs[0]],
+            fwd_map[&node.inputs[1]],
+            t_inputs[0],
+            t_inputs.get(1).copied().flatten(),
+            t_inputs.get(2).copied().flatten(),
+            *axis,
+            *eps,
+            &node.shape,
+            bwd,
+        ),
 
         Op::GroupNorm { num_groups, eps } => {
             // STE: freeze per-group mean/var; push t_x through scaled gamma.
@@ -984,6 +936,308 @@ fn jvp_rule(
 
         other => panic!("jvp: no rule for op {other:?}"),
     }
+}
+
+/// Exact LayerNorm pushforward (includes mean/var derivatives).
+fn jvp_layer_norm_exact(
+    x: NodeId,
+    gamma: NodeId,
+    t_x: Option<NodeId>,
+    t_gamma: Option<NodeId>,
+    t_beta: Option<NodeId>,
+    axis: i32,
+    eps: f32,
+    x_shape: &Shape,
+    bwd: &mut Graph,
+) -> Option<NodeId> {
+    if t_x.is_none() && t_gamma.is_none() && t_beta.is_none() {
+        return None;
+    }
+    let rank = x_shape.rank();
+    let axis_pos = if axis < 0 {
+        (rank as i32 + axis) as usize
+    } else {
+        axis as usize
+    };
+    let mut keep_dims: Vec<Dim> = x_shape.dims().to_vec();
+    keep_dims[axis_pos] = Dim::Static(1);
+    let keep_shape = Shape::from_dims(&keep_dims, x_shape.dtype());
+    let mean = bwd.add_node(
+        Op::Reduce {
+            op: ReduceOp::Mean,
+            axes: vec![axis_pos],
+            keep_dim: true,
+        },
+        vec![x],
+        keep_shape.clone(),
+    );
+    let mean_b = unbroadcast_inverse(mean, x_shape, bwd);
+    let centered = bwd.binary(BinaryOp::Sub, x, mean_b, x_shape.clone());
+    let centered_sq = bwd.binary(BinaryOp::Mul, centered, centered, x_shape.clone());
+    let var = bwd.add_node(
+        Op::Reduce {
+            op: ReduceOp::Mean,
+            axes: vec![axis_pos],
+            keep_dim: true,
+        },
+        vec![centered_sq],
+        keep_shape.clone(),
+    );
+    let eps_c = scalar_const(eps as f64, &keep_shape, bwd);
+    let var_eps = bwd.binary(BinaryOp::Add, var, eps_c, keep_shape.clone());
+    let inv = bwd.activation(Activation::Rsqrt, var_eps, keep_shape.clone());
+    let inv_b = unbroadcast_inverse(inv, x_shape, bwd);
+    let xhat = bwd.binary(BinaryOp::Mul, centered, inv_b, x_shape.clone());
+    let gamma_b = unbroadcast_inverse(gamma, x_shape, bwd);
+
+    let t_xhat = t_x.map(|tx| {
+        let t_mean = bwd.add_node(
+            Op::Reduce {
+                op: ReduceOp::Mean,
+                axes: vec![axis_pos],
+                keep_dim: true,
+            },
+            vec![tx],
+            keep_shape.clone(),
+        );
+        let t_mean_b = unbroadcast_inverse(t_mean, x_shape, bwd);
+        let t_centered = bwd.binary(BinaryOp::Sub, tx, t_mean_b, x_shape.clone());
+        let c_tc = bwd.binary(BinaryOp::Mul, centered, t_centered, x_shape.clone());
+        let mean_c_tc = bwd.add_node(
+            Op::Reduce {
+                op: ReduceOp::Mean,
+                axes: vec![axis_pos],
+                keep_dim: true,
+            },
+            vec![c_tc],
+            keep_shape.clone(),
+        );
+        let two = scalar_const(2.0, &keep_shape, bwd);
+        let t_var = bwd.binary(BinaryOp::Mul, two, mean_c_tc, keep_shape.clone());
+        // t_inv = -0.5 · inv³ · t_var
+        let inv2 = bwd.binary(BinaryOp::Mul, inv, inv, keep_shape.clone());
+        let inv3 = bwd.binary(BinaryOp::Mul, inv2, inv, keep_shape.clone());
+        let neg_half = scalar_const(-0.5, &keep_shape, bwd);
+        let t_inv = bwd.binary(BinaryOp::Mul, neg_half, inv3, keep_shape.clone());
+        let t_inv = bwd.binary(BinaryOp::Mul, t_inv, t_var, keep_shape.clone());
+        let t_inv_b = unbroadcast_inverse(t_inv, x_shape, bwd);
+        let term_a = bwd.binary(BinaryOp::Mul, t_centered, inv_b, x_shape.clone());
+        let term_b = bwd.binary(BinaryOp::Mul, centered, t_inv_b, x_shape.clone());
+        bwd.binary(BinaryOp::Add, term_a, term_b, x_shape.clone())
+    });
+
+    let term_x = t_xhat.map(|txh| bwd.binary(BinaryOp::Mul, gamma_b, txh, x_shape.clone()));
+    let term_g = t_gamma.map(|tg| {
+        let tg_b = unbroadcast_inverse(tg, x_shape, bwd);
+        bwd.binary(BinaryOp::Mul, tg_b, xhat, x_shape.clone())
+    });
+    let term_b = t_beta.map(|tb| unbroadcast_inverse(tb, x_shape, bwd));
+    sum_optional_terms(term_x, term_g, term_b, x_shape, bwd)
+}
+
+/// Exact RMSNorm pushforward (includes RMS divisor derivative).
+fn jvp_rms_norm_exact(
+    x: NodeId,
+    gamma: NodeId,
+    t_x: Option<NodeId>,
+    t_gamma: Option<NodeId>,
+    t_beta: Option<NodeId>,
+    axis: i32,
+    eps: f32,
+    x_shape: &Shape,
+    bwd: &mut Graph,
+) -> Option<NodeId> {
+    if t_x.is_none() && t_gamma.is_none() && t_beta.is_none() {
+        return None;
+    }
+    let rank = x_shape.rank();
+    let axis_pos = if axis < 0 {
+        (rank as i32 + axis) as usize
+    } else {
+        axis as usize
+    };
+    let mut keep_dims: Vec<Dim> = x_shape.dims().to_vec();
+    keep_dims[axis_pos] = Dim::Static(1);
+    let keep_shape = Shape::from_dims(&keep_dims, x_shape.dtype());
+    let xsq = bwd.binary(BinaryOp::Mul, x, x, x_shape.clone());
+    let r_sq = bwd.add_node(
+        Op::Reduce {
+            op: ReduceOp::Mean,
+            axes: vec![axis_pos],
+            keep_dim: true,
+        },
+        vec![xsq],
+        keep_shape.clone(),
+    );
+    let eps_c = scalar_const(eps as f64, &keep_shape, bwd);
+    let r_sq_eps = bwd.binary(BinaryOp::Add, r_sq, eps_c, keep_shape.clone());
+    let inv = bwd.activation(Activation::Rsqrt, r_sq_eps, keep_shape.clone());
+    let inv_b = unbroadcast_inverse(inv, x_shape, bwd);
+    let xhat = bwd.binary(BinaryOp::Mul, x, inv_b, x_shape.clone());
+    let gamma_b = unbroadcast_inverse(gamma, x_shape, bwd);
+
+    let t_xhat = t_x.map(|tx| {
+        let x_tx = bwd.binary(BinaryOp::Mul, x, tx, x_shape.clone());
+        let mean_x_tx = bwd.add_node(
+            Op::Reduce {
+                op: ReduceOp::Mean,
+                axes: vec![axis_pos],
+                keep_dim: true,
+            },
+            vec![x_tx],
+            keep_shape.clone(),
+        );
+        let two = scalar_const(2.0, &keep_shape, bwd);
+        let t_r2 = bwd.binary(BinaryOp::Mul, two, mean_x_tx, keep_shape.clone());
+        let inv2 = bwd.binary(BinaryOp::Mul, inv, inv, keep_shape.clone());
+        let inv3 = bwd.binary(BinaryOp::Mul, inv2, inv, keep_shape.clone());
+        let neg_half = scalar_const(-0.5, &keep_shape, bwd);
+        let t_inv = bwd.binary(BinaryOp::Mul, neg_half, inv3, keep_shape.clone());
+        let t_inv = bwd.binary(BinaryOp::Mul, t_inv, t_r2, keep_shape.clone());
+        let t_inv_b = unbroadcast_inverse(t_inv, x_shape, bwd);
+        let term_a = bwd.binary(BinaryOp::Mul, tx, inv_b, x_shape.clone());
+        let term_b = bwd.binary(BinaryOp::Mul, x, t_inv_b, x_shape.clone());
+        bwd.binary(BinaryOp::Add, term_a, term_b, x_shape.clone())
+    });
+
+    let term_x = t_xhat.map(|txh| bwd.binary(BinaryOp::Mul, gamma_b, txh, x_shape.clone()));
+    let term_g = t_gamma.map(|tg| {
+        let tg_b = unbroadcast_inverse(tg, x_shape, bwd);
+        bwd.binary(BinaryOp::Mul, tg_b, xhat, x_shape.clone())
+    });
+    let term_b = t_beta.map(|tb| unbroadcast_inverse(tb, x_shape, bwd));
+    sum_optional_terms(term_x, term_g, term_b, x_shape, bwd)
+}
+
+fn sum_optional_terms(
+    a: Option<NodeId>,
+    b: Option<NodeId>,
+    c: Option<NodeId>,
+    shape: &Shape,
+    bwd: &mut Graph,
+) -> Option<NodeId> {
+    match (a, b, c) {
+        (Some(a), Some(b), Some(c)) => {
+            let ab = bwd.binary(BinaryOp::Add, a, b, shape.clone());
+            Some(bwd.binary(BinaryOp::Add, ab, c, shape.clone()))
+        }
+        (Some(a), Some(b), None) | (Some(a), None, Some(b)) | (None, Some(a), Some(b)) => {
+            Some(bwd.binary(BinaryOp::Add, a, b, shape.clone()))
+        }
+        (Some(a), None, None) | (None, Some(a), None) | (None, None, Some(a)) => Some(a),
+        (None, None, None) => None,
+    }
+}
+
+/// JVP for `out = n · (1+scale) + shift` with `n = LN/RMS(x)`.
+fn jvp_ada_layer_norm(
+    node: &Node,
+    t_inputs: &[Option<NodeId>],
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+    norm: AdaNormKind,
+    eps: f32,
+) -> Option<NodeId> {
+    let (tx, ts, tt) = (t_inputs[0], t_inputs[1], t_inputs[2]);
+    if tx.is_none() && ts.is_none() && tt.is_none() {
+        return None;
+    }
+    let x = fwd_map[&node.inputs[0]];
+    let scale = fwd_map[&node.inputs[1]];
+    let x_shape = node.shape.clone();
+    let dtype = x_shape.dtype();
+    let d = match x_shape.dim(x_shape.rank() - 1) {
+        Dim::Static(n) => n,
+        _ => return None,
+    };
+    let gamma = bwd.full(&[d], 1.0, dtype);
+    let beta = bwd.zeros(&[d], dtype);
+    let n = match norm {
+        AdaNormKind::LayerNorm => bwd.layer_norm(x, gamma, beta, -1, eps, x_shape.clone()),
+        AdaNormKind::RmsNorm => bwd.rms_norm(x, gamma, beta, eps),
+    };
+    let tgt: Vec<i64> = x_shape
+        .dims()
+        .iter()
+        .map(|dim| match dim {
+            Dim::Static(v) => *v as i64,
+            _ => -1,
+        })
+        .collect();
+    let scale_e = bwd.add_node(
+        Op::Expand {
+            target_shape: tgt.clone(),
+        },
+        vec![scale],
+        x_shape.clone(),
+    );
+    let ones = {
+        let dims: Vec<usize> = x_shape.dims().iter().map(|d| d.unwrap_static()).collect();
+        bwd.full(&dims, 1.0, dtype)
+    };
+    let one_plus = bwd.binary(BinaryOp::Add, ones, scale_e, x_shape.clone());
+
+    let t_n = match norm {
+        AdaNormKind::LayerNorm => {
+            jvp_layer_norm_exact(x, gamma, tx, None, None, -1, eps, &x_shape, bwd)
+        }
+        AdaNormKind::RmsNorm => {
+            jvp_rms_norm_exact(x, gamma, tx, None, None, -1, eps, &x_shape, bwd)
+        }
+    };
+
+    let term1 = t_n.map(|tn| bwd.binary(BinaryOp::Mul, tn, one_plus, x_shape.clone()));
+    let term2 = ts.map(|ts| {
+        let ts_e = bwd.add_node(
+            Op::Expand {
+                target_shape: tgt.clone(),
+            },
+            vec![ts],
+            x_shape.clone(),
+        );
+        bwd.binary(BinaryOp::Mul, n, ts_e, x_shape.clone())
+    });
+    let term3 =
+        tt.map(|tt| bwd.add_node(Op::Expand { target_shape: tgt }, vec![tt], x_shape.clone()));
+    sum_optional_terms(term1, term2, term3, &x_shape, bwd)
+}
+
+/// JVP for `out = x + gate · y` with broadcast gate.
+fn jvp_gated_residual(
+    node: &Node,
+    t_inputs: &[Option<NodeId>],
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Option<NodeId> {
+    let (tx, ty, tg) = (t_inputs[0], t_inputs[1], t_inputs[2]);
+    if tx.is_none() && ty.is_none() && tg.is_none() {
+        return None;
+    }
+    let y = fwd_map[&node.inputs[1]];
+    let gate = fwd_map[&node.inputs[2]];
+    let x_shape = node.shape.clone();
+    let tgt: Vec<i64> = x_shape
+        .dims()
+        .iter()
+        .map(|d| match d {
+            Dim::Static(v) => *v as i64,
+            _ => -1,
+        })
+        .collect();
+    let gate_e = bwd.add_node(
+        Op::Expand {
+            target_shape: tgt.clone(),
+        },
+        vec![gate],
+        x_shape.clone(),
+    );
+    let term_x = tx;
+    let term_gy = ty.map(|ty| bwd.binary(BinaryOp::Mul, gate_e, ty, x_shape.clone()));
+    let term_tg = tg.map(|tg| {
+        let tg_e = bwd.add_node(Op::Expand { target_shape: tgt }, vec![tg], x_shape.clone());
+        bwd.binary(BinaryOp::Mul, tg_e, y, x_shape.clone())
+    });
+    sum_optional_terms(term_x, term_gy, term_tg, &x_shape, bwd)
 }
 
 /// Build a scalar constant matching `shape`'s dtype, broadcastable

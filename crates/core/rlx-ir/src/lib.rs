@@ -43,6 +43,7 @@ pub mod const_check;
 pub mod dtype;
 pub mod dynamic;
 pub mod env;
+pub mod env_catalog;
 pub mod fft;
 pub mod graph;
 pub mod hir;
@@ -56,6 +57,7 @@ pub mod lowp_codec;
 pub mod measure;
 pub mod mir;
 pub mod module;
+pub mod numeric_check;
 pub mod nvfp4;
 pub mod op;
 pub mod op_registry;
@@ -97,6 +99,7 @@ pub use dynamic::{
     sync_graph_shapes, sync_narrow_ops, sync_reshape_ops,
 };
 pub use env::{RlxEnv, RuntimeOverrides, flag, is_unset, parse_or, set, unset, var, var_os};
+pub use env_catalog::{CATALOG as ENV_CATALOG, EnvVarDoc, format_catalog as format_env_catalog};
 pub use fft::{FftGpuPlan, FftMeta, FftNorm, fft_meta, fftn_axes_all, normalize_fftn_axes};
 pub use graph::{Graph, Node, NodeId};
 pub use hir::{
@@ -119,12 +122,17 @@ pub use logical_kernel::{
 pub use measure::{CacheBuster, Tick, time_ns};
 pub use mir::{MirModule, MirNode, MirNodeId, MirOp};
 pub use module::{GraphModule, GraphStage};
-pub use op::{ChainOperand, ChainStep, Op, OpKind, RegionPrologue, RopeStyle, TransformStep};
+pub use numeric_check::{BadValue, DebugMode, DebugScanner, NanReport, check_node, first_bad};
+pub use op::{
+    AdaNormKind, ChainOperand, ChainStep, Op, OpKind, RegionPrologue, RopeStyle,
+    ScatterNdReduction, SpdMatFn, TransformStep,
+};
 pub use op_registry::{
-    JvpContext, OpExtension, OpRegistry, VjpContext, VmapContext, global_registry, lookup_op,
-    register_op,
+    CustomOpError, JvpContext, LowerContext, OpExtension, OpRegistry, VjpContext, VmapContext,
+    global_registry, is_op_registered, lookup_op, register_op, register_op_strict,
 };
 pub use ops::attention::attention_kind_op;
+pub use ops::backward::{unpack_ada_layer_norm_backward, unpack_gated_residual_backward};
 pub use ops::dsp::{FirMode, iir_impulse_response};
 pub use phase::{Phase, PhaseSchedule, derive_phases};
 pub use provenance::{NodeOrigin, node_label, stamp_pass_origins};
@@ -141,7 +149,10 @@ pub use rng::{
     ort_engine_seed,
 };
 #[cfg(feature = "serialize")]
-pub use serialize::{hir_from_json, hir_to_json, lir_from_json, lir_to_json};
+pub use serialize::{
+    LIR_BIN_VERSION, hir_from_json, hir_to_json, lir_from_bytes, lir_from_json, lir_to_bytes,
+    lir_to_json,
+};
 pub use verify::{VerifyError, verify, verify_all, verify_shapes};
 
 /// Lower a HIR module to MIR, then extract the legacy [`Graph`] API surface.
@@ -162,5 +173,5 @@ pub use rf::{
     complex_div, const_f32, cs_degen_z_in, find_param_node, find_param_nodes, mag2, s11_from_z,
     scalar_f32,
 };
-pub use shape::{Dim, DimBinding, Shape};
+pub use shape::{Dim, DimBinding, Shape, ada_modulation_launch, ada_modulation_lead_pack};
 pub use variant::{ModelPhase, ModelVariant};

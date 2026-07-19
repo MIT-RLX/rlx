@@ -267,6 +267,15 @@ impl ModelFlow {
         self
     }
 
+    /// Like [`Self::embed`] but gathers the embedding rows on the host and
+    /// feeds them as an `inputs_embeds` input, so a large-vocab F32 table
+    /// never becomes a resident device param. See [`EmbedStage::host_hidden`].
+    pub fn embed_host(mut self, weight_key: impl Into<String>, hidden: usize) -> Self {
+        self.stages
+            .push(FlowStage::Embed(EmbedStage::token_host(weight_key, hidden)));
+        self
+    }
+
     /// HuggingFace-style token embedding table.
     pub fn token_embed(self) -> Self {
         self.embed("model.embed_tokens.weight")

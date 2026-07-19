@@ -32,16 +32,16 @@ fn cast_f32_to_f64() {
 
 #[test]
 fn cast_f32_to_i32() {
-    // round-to-nearest on cast
+    // ONNX / NumPy Cast float→int truncates toward zero.
     let x = Tensor::from_vec(vec![1.4, 2.6, -3.2], [3]).cast(DType::I32);
     assert_eq!(x.dtype(), DType::I32);
-    assert_eq!(x.to_vec_i32(), vec![1, 3, -3]);
+    assert_eq!(x.to_vec_i32(), vec![1, 2, -3]);
 }
 
 #[test]
 fn cast_f32_to_i64() {
     let x = Tensor::from_vec(vec![1.4, 2.6, -3.2], [3]).cast(DType::I64);
-    assert_eq!(x.to_vec_i64(), vec![1, 3, -3]);
+    assert_eq!(x.to_vec_i64(), vec![1, 2, -3]);
 }
 
 #[test]

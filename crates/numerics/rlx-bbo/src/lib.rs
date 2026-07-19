@@ -133,6 +133,11 @@ pub struct PsoConfig {
     pub w: f64,
     pub c1: f64,
     pub c2: f64,
+    /// Optional early-stop: halt once the global best has not improved for this
+    /// many consecutive iterations. `None` (the default) always runs the full
+    /// `n_iters`. Useful when each evaluation is expensive (e.g. a full ADC
+    /// modulator + FFT per call) and the swarm has visibly plateaued.
+    pub patience: Option<usize>,
 }
 
 impl Default for PsoConfig {
@@ -143,6 +148,7 @@ impl Default for PsoConfig {
             w: 0.729,
             c1: 1.494,
             c2: 1.494,
+            patience: None,
         }
     }
 }
@@ -170,7 +176,9 @@ where
     let mut gbest_v = *gbest_v;
     let mut n_evals = cfg.n_particles;
     let mut trace = vec![gbest_v];
+    let mut stall = 0usize;
     for _ in 0..cfg.n_iters {
+        let gbest_before = gbest_v;
         for p_idx in 0..cfg.n_particles {
             for d in 0..n {
                 let r1: f64 = rng.gen_range(0.0..1.0);
@@ -193,6 +201,17 @@ where
             }
         }
         trace.push(gbest_v);
+        // Opt-in early stop once the swarm stops improving the global best.
+        if let Some(patience) = cfg.patience {
+            if gbest_v < gbest_before {
+                stall = 0;
+            } else {
+                stall += 1;
+                if stall >= patience {
+                    break;
+                }
+            }
+        }
     }
     BboSolution {
         x: gbest,
@@ -272,5 +291,184 @@ where
         value: best_v,
         trace,
         n_evals,
+    }
+}
+
+#[cfg(test)]
+mod core_optimizer_tests {
+    //! Convergence and invariant tests for the core black-box optimizers
+    //! (`random_search`, `pso`, `one_plus_one_es`) on standard benchmarks.
+    use super::*;
+
+    /// Sphere: convex, minimum 0 at the origin (inside the symmetric box).
+    fn sphere(x: &[f64]) -> f64 {
+        x.iter().map(|v| v * v).sum()
+    }
+
+    /// Rosenbrock (2-D): a curved, narrow valley — a harder test.
+    fn rosenbrock(x: &[f64]) -> f64 {
+        let (a, b) = (1.0, 100.0);
+        (a - x[0]).powi(2) + b * (x[1] - x[0] * x[0]).powi(2)
+    }
+
+    fn box3() -> Bbox {
+        Bbox::new(vec![(-5.0, 5.0); 3])
+    }
+
+    #[test]
+    fn all_optimizers_minimize_the_sphere() {
+        let rs = random_search(&box3(), 4000, 1, sphere);
+        let pso_sol = pso(&box3(), &PsoConfig::default(), 1, sphere);
+        let es = one_plus_one_es(&box3(), &EsConfig::default(), 1, sphere);
+        assert!(rs.value < 3.0, "random_search {}", rs.value);
+        assert!(pso_sol.value < 1e-2, "pso {}", pso_sol.value);
+        assert!(es.value < 1e-1, "es {}", es.value);
+        // The guided searches beat the blind one on a convex function.
+        assert!(pso_sol.value < rs.value && es.value < rs.value);
+    }
+
+    #[test]
+    fn solutions_stay_within_bounds() {
+        let bbox = box3();
+        for sol in [
+            random_search(&bbox, 500, 2, sphere),
+            pso(&bbox, &PsoConfig::default(), 2, sphere),
+            one_plus_one_es(&bbox, &EsConfig::default(), 2, sphere),
+        ] {
+            for (&xi, &(lo, hi)) in sol.x.iter().zip(&bbox.bounds) {
+                assert!(
+                    xi >= lo - 1e-9 && xi <= hi + 1e-9,
+                    "{xi} out of [{lo}, {hi}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trace_is_monotone_best_so_far() {
+        for sol in [
+            random_search(&box3(), 500, 3, sphere),
+            pso(&box3(), &PsoConfig::default(), 3, sphere),
+            one_plus_one_es(&box3(), &EsConfig::default(), 3, sphere),
+        ] {
+            assert!(!sol.trace.is_empty());
+            assert!(
+                sol.trace.windows(2).all(|w| w[1] <= w[0] + 1e-12),
+                "trace not monotone"
+            );
+            assert!((sol.trace.last().unwrap() - sol.value).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn reported_value_matches_the_objective_at_the_solution() {
+        for sol in [
+            random_search(&box3(), 500, 4, sphere),
+            pso(&box3(), &PsoConfig::default(), 4, sphere),
+            one_plus_one_es(&box3(), &EsConfig::default(), 4, sphere),
+        ] {
+            assert!((sphere(&sol.x) - sol.value).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn pso_solves_the_rosenbrock_valley() {
+        // Global minimum is (1, 1) with value 0; a decent optimizer gets close.
+        let bbox = Bbox::new(vec![(-2.0, 2.0); 2]);
+        let cfg = PsoConfig {
+            n_particles: 40,
+            n_iters: 300,
+            ..PsoConfig::default()
+        };
+        let sol = pso(&bbox, &cfg, 1, rosenbrock);
+        assert!(sol.value < 1e-2, "rosenbrock {}", sol.value);
+        assert!(
+            (sol.x[0] - 1.0).abs() < 0.1 && (sol.x[1] - 1.0).abs() < 0.1,
+            "x = {:?}",
+            sol.x
+        );
+    }
+
+    #[test]
+    fn more_evaluations_do_not_hurt() {
+        let short = pso(
+            &box3(),
+            &PsoConfig {
+                n_iters: 10,
+                ..PsoConfig::default()
+            },
+            5,
+            sphere,
+        );
+        let long = pso(
+            &box3(),
+            &PsoConfig {
+                n_iters: 150,
+                ..PsoConfig::default()
+            },
+            5,
+            sphere,
+        );
+        assert!(
+            long.value <= short.value + 1e-12,
+            "long {} vs short {}",
+            long.value,
+            short.value
+        );
+    }
+
+    #[test]
+    fn early_stop_cuts_evaluations_without_hurting_quality() {
+        // A tiny discrete objective plateaus fast: the swarm locks onto the
+        // bin minimum, then the global best stops changing bit-for-bit.
+        let step = |x: &[f64]| (x[0].round().powi(2) + x[1].round().powi(2)).max(0.0);
+        let bbox = Bbox::new(vec![(-4.0, 4.0); 2]);
+        let full = pso(
+            &bbox,
+            &PsoConfig {
+                n_iters: 200,
+                ..PsoConfig::default()
+            },
+            7,
+            step,
+        );
+        let stopped = pso(
+            &bbox,
+            &PsoConfig {
+                n_iters: 200,
+                patience: Some(8),
+                ..PsoConfig::default()
+            },
+            7,
+            step,
+        );
+        // Same optimum reached, but with a shorter run and fewer evaluations.
+        assert_eq!(stopped.value, full.value);
+        assert!(
+            stopped.trace.len() < full.trace.len(),
+            "did not stop early: {}",
+            stopped.trace.len()
+        );
+        assert!(stopped.n_evals < full.n_evals);
+        // The tail it skipped was flat anyway (no improvement was left on the table).
+        assert_eq!(*full.trace.last().unwrap(), *stopped.trace.last().unwrap());
+    }
+
+    #[test]
+    fn generous_patience_is_identical_to_no_early_stop() {
+        // Patience larger than n_iters can never trigger ⇒ bit-identical result.
+        let a = pso(&box3(), &PsoConfig::default(), 9, sphere);
+        let b = pso(
+            &box3(),
+            &PsoConfig {
+                patience: Some(10_000),
+                ..PsoConfig::default()
+            },
+            9,
+            sphere,
+        );
+        assert_eq!(a.value, b.value);
+        assert_eq!(a.trace.len(), b.trace.len());
+        assert_eq!(a.n_evals, b.n_evals);
     }
 }

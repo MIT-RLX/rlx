@@ -4,7 +4,6 @@
 // invocation per (n, h, w) position.
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint positions; // N * H * W
@@ -26,20 +25,19 @@ void main() {
 
     float mean = 0.0;
     for (uint ch = 0u; ch < pc.c; ch++) {
-        mean += data[pc.x_off + base + ch * pc.hw];
+        mean += arena_load(pc.x_off + base + ch * pc.hw);
     }
     mean /= float(pc.c);
     float var = 0.0;
     for (uint ch = 0u; ch < pc.c; ch++) {
-        float d = data[pc.x_off + base + ch * pc.hw] - mean;
+        float d = arena_load(pc.x_off + base + ch * pc.hw) - mean;
         var += d * d;
     }
     var /= float(pc.c);
     float inv = inversesqrt(var + pc.eps);
     for (uint ch = 0u; ch < pc.c; ch++) {
-        float g = data[pc.gamma_off + ch];
-        float b = data[pc.beta_off + ch];
-        data[pc.out_off + base + ch * pc.hw] =
-            (data[pc.x_off + base + ch * pc.hw] - mean) * inv * g + b;
+        float g = arena_load(pc.gamma_off + ch);
+        float b = arena_load(pc.beta_off + ch);
+        arena_store(pc.out_off + base + ch * pc.hw, (arena_load(pc.x_off + base + ch * pc.hw) - mean) * inv * g + b);
     }
 }

@@ -1588,4 +1588,73 @@ int rlx_mlx_dist_all_sum_array(rlx_mlx_array_t* in, rlx_mlx_array_t** out) {
     });
 }
 
+int rlx_mlx_dist_all_reduce_array(rlx_mlx_array_t* in, int kind, rlx_mlx_array_t** out) {
+    return guarded([&] {
+        // Device-resident all-reduce honoring the reduction kind (matches
+        // rlx-collectives' encode_kind: 0=Sum 1=Mean 2=Max 3=Min). All lazy —
+        // no host round-trip. Mean = all_sum / world_size.
+        auto g = dist_group();
+        mc::array x = unwrap(in);
+        mc::array y = [&]() -> mc::array {
+            switch (kind) {
+                case 2:
+                    return mcd::all_max(x, g);
+                case 3:
+                    return mcd::all_min(x, g);
+                case 1:
+                    return mc::divide(mcd::all_sum(x, g),
+                                      mc::array(static_cast<float>(g.size())));
+                default:
+                    return mcd::all_sum(x, g);
+            }
+        }();
+        *out = wrap(std::move(y));
+    });
+}
+
+int rlx_mlx_dist_all_gather_array(rlx_mlx_array_t* in, rlx_mlx_array_t** out) {
+    return guarded([&] {
+        // Lazy all_gather — concatenate each rank's shard along axis 0 on the
+        // device array. No eval, no host copy; the node joins the graph.
+        mc::array y = mcd::all_gather(unwrap(in), dist_group());
+        *out = wrap(std::move(y));
+    });
+}
+
+int rlx_mlx_dist_reduce_scatter_array(rlx_mlx_array_t* in, int kind, rlx_mlx_array_t** out) {
+    return guarded([&] {
+        // mlx-distributed has no native reduce-scatter, so compose it: a lazy
+        // all-reduce(kind) followed by an axis-0 slice of this rank's block.
+        // Stays device-resident and lazy — mirror of the CPU kernel. `kind`
+        // matches rlx-collectives (0=Sum 1=Mean 2=Max 3=Min).
+        auto g = dist_group();
+        mc::array x = unwrap(in);
+        mc::array summed = [&]() -> mc::array {
+            switch (kind) {
+                case 2:
+                    return mcd::all_max(x, g);
+                case 3:
+                    return mcd::all_min(x, g);
+                case 1:
+                    return mc::divide(mcd::all_sum(x, g),
+                                      mc::array(static_cast<float>(g.size())));
+                default:
+                    return mcd::all_sum(x, g);
+            }
+        }();
+        mc::Shape shape = summed.shape();
+        if (shape.empty()) {
+            throw std::runtime_error("reduce_scatter: input must be at least rank-1");
+        }
+        int size = g.size();
+        int rank = g.rank();
+        int chunk = (size > 0) ? (shape[0] / size) : shape[0];
+        mc::Shape s_start(shape.size(), 0);
+        mc::Shape s_stop = shape;
+        s_start[0] = rank * chunk;
+        s_stop[0] = (rank + 1) * chunk;
+        *out = wrap(mc::slice(summed, std::move(s_start), std::move(s_stop)));
+    });
+}
+
 } // extern "C"

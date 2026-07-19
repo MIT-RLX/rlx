@@ -41,10 +41,12 @@ pub fn is_ternary(layer: &Layer) -> bool {
         layer,
         Layer::Conv2d {
             weight_bits: 2,
+            weight_encoding: crate::model::WeightEncoding::SignedInt,
             w_zp: 0,
             ..
         } | Layer::Dense {
             weight_bits: 2,
+            weight_encoding: crate::model::WeightEncoding::SignedInt,
             w_zp: 0,
             ..
         }
@@ -68,6 +70,7 @@ mod tests {
             w_zp: 0,
             out_zp: 0,
             weight_bits: 2,
+            weight_encoding: crate::model::WeightEncoding::SignedInt,
             requant: vec![(m0, sh)],
             weights: vec![0x4D],
             bias: None,
@@ -86,6 +89,7 @@ mod tests {
             w_zp: 0,
             out_zp: 0,
             weight_bits: 8,
+            weight_encoding: crate::model::WeightEncoding::SignedInt,
             requant: vec![(m0, sh)],
             weights: vec![1; 4],
             bias: None,

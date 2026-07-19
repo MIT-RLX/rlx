@@ -15,7 +15,7 @@
 
 //! Verify that the runtime's `LowerControlFlow` pre-pass lets the CPU
 //! backend execute graphs containing `Op::If` and `Op::While` end-to-end
-//! — neither op is in `CPU_SUPPORTED_OPS`, so without the rewrite the
+//! — neither op is in `rlx_cpu::SUPPORTED_OPS`, so without the rewrite the
 //! legalize check would reject them.
 //!
 //! `Op::If` rewrites to `Where(predicate, then_inlined, else_inlined)`

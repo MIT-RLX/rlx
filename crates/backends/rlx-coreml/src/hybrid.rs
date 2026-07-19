@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rlx_ir::{Graph, NodeId, Op, Shape};
+use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
 use crate::host_exec::is_host_op;
 use crate::{CoremlError, Result};
@@ -15,6 +15,12 @@ use crate::{CoremlError, Result};
 pub struct MilSegment {
     pub graph: Graph,
     pub extra_inputs: Vec<(String, Shape)>,
+    /// Maps each MIL-local output node id → the ORIGINAL global node id. The MIL
+    /// subgraph renumbers nodes locally, so a global output `v80` may become a
+    /// local `v10`; without this map the runner would write the buffer to
+    /// `env[10]` instead of `env[80]`, losing the graph output (only the first
+    /// segment escapes this because its local ids coincide with the global ones).
+    pub out_local_to_global: HashMap<u32, u32>,
 }
 
 /// One execution step — host ops or a CoreML-compilable subgraph.
@@ -46,6 +52,19 @@ pub fn mil_body_is_trivial(graph: &Graph) -> bool {
 /// Classify `graph` for hybrid execution.
 pub fn plan_execution(graph: &Graph) -> Result<ExecutionPlan> {
     let segments = build_segments(graph)?;
+    if std::env::var("RLX_COREML_SEG_REPORT").as_deref() == Ok("1") {
+        let nh = segments
+            .iter()
+            .filter(|s| matches!(s, Segment::Host(_)))
+            .count();
+        let nm = segments
+            .iter()
+            .filter(|s| matches!(s, Segment::Mil(_)))
+            .count();
+        eprintln!(
+            "[coreml] hybrid segments: {nh} host + {nm} MIL ({nm} CoreML models to compile+load)"
+        );
+    }
     if segments.len() == 1 {
         if let Segment::Mil(ref m) = segments[0] {
             if mil_body_is_trivial(&m.graph) {
@@ -92,10 +111,11 @@ fn flush_mil(
     mil_nodes: &mut Vec<NodeId>,
 ) -> Result<()> {
     if mil_has_compute(graph, mil_nodes) {
-        let (g, extra) = build_mil_subgraph(graph, mil_nodes)?;
+        let (g, extra, out_map) = build_mil_subgraph(graph, mil_nodes)?;
         segments.push(Segment::Mil(MilSegment {
             graph: g,
             extra_inputs: extra,
+            out_local_to_global: out_map,
         }));
     }
     mil_nodes.clear();
@@ -114,7 +134,7 @@ fn mil_has_compute(graph: &Graph, mil_nodes: &[NodeId]) -> bool {
 fn build_mil_subgraph(
     graph: &Graph,
     mil_nodes: &[NodeId],
-) -> Result<(Graph, Vec<(String, Shape)>)> {
+) -> Result<(Graph, Vec<(String, Shape)>, HashMap<u32, u32>)> {
     let mil_set: HashSet<NodeId> = mil_nodes.iter().copied().collect();
     let mut g = Graph::new(format!("{}_coreml", graph.name));
     let mut map: HashMap<NodeId, NodeId> = HashMap::new();
@@ -143,22 +163,48 @@ fn build_mil_subgraph(
         let node = graph.node(id);
         let mut new_inputs = Vec::with_capacity(node.inputs.len());
         for &inp in &node.inputs {
+            let is_leaf = matches!(
+                graph.node(inp).op,
+                Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+            );
             if mil_set.contains(&inp) {
                 new_inputs.push(
                     *map.get(&inp)
                         .ok_or_else(|| CoremlError::Runtime(format!("mil map missing {inp:?}")))?,
                 );
-            } else if is_host_op(&graph.node(inp).op) {
+            } else if is_leaf {
+                new_inputs.push(clone_leaf(&mut g, &mut map, inp));
+            } else {
+                // Any external NON-leaf value — a host op's output OR a prior MIL
+                // segment's output — is fed into this MIL model as a boundary
+                // input, sourced from the global `env` (which every segment
+                // writes its outputs to) via the `host_v{id}` naming the runner
+                // resolves. Previously only `is_host_op` inputs took this path,
+                // so a later MIL segment consuming an earlier MIL segment's
+                // output hit `clone_leaf on non-leaf`.
                 let name = format!("host_v{}", inp.0);
                 if let std::collections::hash_map::Entry::Vacant(e) = map.entry(inp) {
                     let shape = graph.shape(inp).clone();
-                    let nid = g.input(&name, shape.clone());
-                    e.insert(nid);
-                    extra_inputs.push((name, shape));
+                    // The global `env` (and the runner) carry every value as f32,
+                    // and MIL feature I/O only accepts F32/F16/I32/F64 — never Bool
+                    // or I64. Declare the boundary input F32 and, when the true
+                    // dtype differs, cast it back inside the MIL graph so
+                    // downstream ops see the right type. (moss's cross-segment
+                    // masks are Bool; its indices small enough to be exact in f32.)
+                    if shape.dtype() == DType::F32 {
+                        let nid = g.input(&name, shape.clone());
+                        e.insert(nid);
+                        extra_inputs.push((name, shape));
+                    } else {
+                        let f32_shape = shape.clone().with_dtype(DType::F32);
+                        let in_nid = g.input(&name, f32_shape.clone());
+                        let cast_nid =
+                            g.add_node(Op::Cast { to: shape.dtype() }, vec![in_nid], shape);
+                        e.insert(cast_nid);
+                        extra_inputs.push((name, f32_shape));
+                    }
                 }
                 new_inputs.push(map[&inp]);
-            } else {
-                new_inputs.push(clone_leaf(&mut g, &mut map, inp));
             }
         }
         let new_id = g.append_node(node.op.clone(), new_inputs, node.shape.clone(), None);
@@ -169,9 +215,18 @@ fn build_mil_subgraph(
     let mapped: Vec<NodeId> = outs
         .iter()
         .map(|&oid| {
-            map.get(&oid)
-                .copied()
-                .ok_or_else(|| CoremlError::Runtime(format!("missing mil output map for {oid:?}")))
+            let local = map.get(&oid).copied().ok_or_else(|| {
+                CoremlError::Runtime(format!("missing mil output map for {oid:?}"))
+            })?;
+            // MIL feature outputs must be F32/F16/I32/F64, and the runner reads
+            // them back into the f32 `env` — so cast any Bool/I64 output to F32.
+            let d = graph.shape(oid).dtype();
+            if d == DType::F32 {
+                Ok(local)
+            } else {
+                let f32_shape = graph.shape(oid).clone().with_dtype(DType::F32);
+                Ok(g.add_node(Op::Cast { to: DType::F32 }, vec![local], f32_shape))
+            }
         })
         .collect::<Result<Vec<_>>>()?;
     if mapped.is_empty() {
@@ -179,20 +234,27 @@ fn build_mil_subgraph(
             "empty MIL segment (no outputs)".into(),
         ));
     }
+    // Reverse map: MIL-local output id → original global id, so the runner writes
+    // each output buffer back to the correct global `env` slot.
+    let out_local_to_global: HashMap<u32, u32> =
+        outs.iter().zip(&mapped).map(|(g, l)| (l.0, g.0)).collect();
     g.set_outputs(mapped);
-    Ok((g, extra_inputs))
+    Ok((g, extra_inputs, out_local_to_global))
 }
 
 fn mil_segment_outputs(graph: &Graph, mil_set: &HashSet<NodeId>) -> Vec<NodeId> {
+    // A MIL segment must export both the final graph outputs it owns AND any of
+    // its nodes consumed by a *later* segment (host or another MIL segment) — the
+    // latter become that segment's boundary inputs, resolved through the global
+    // `env`. (Previously an early return after collecting graph outputs dropped
+    // the cross-segment-consumed nodes, so a later segment's `host_v{id}` input
+    // had no producer in `env`.)
     let mut outs: Vec<NodeId> = graph
         .outputs
         .iter()
         .filter(|o| mil_set.contains(o))
         .copied()
         .collect();
-    if !outs.is_empty() {
-        return outs;
-    }
     for &id in mil_set {
         for user in graph.users(id) {
             if !mil_set.contains(&user) {

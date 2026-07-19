@@ -13,7 +13,6 @@
 // fallback; native drivers use the tiled fp32 / cooperative-matrix kernels.
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint m;
@@ -38,7 +37,7 @@ void main() {
     uint b_base = pc.b_off + bz * pc.b_bs + col;
     float acc = 0.0;
     for (uint kk = 0u; kk < pc.k; kk++) {
-        acc += data[a_base + kk] * data[b_base + kk * pc.n];
+        acc += arena_load(a_base + kk) * arena_load(b_base + kk * pc.n);
     }
-    data[pc.c_off + bz * pc.c_bs + row * pc.n + col] = acc;
+    arena_store(pc.c_off + bz * pc.c_bs + row * pc.n + col, acc);
 }

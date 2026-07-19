@@ -58,7 +58,7 @@ fn fnv1a64(s: &str) -> u64 {
     h
 }
 
-fn compile(ctx: &Arc<RocmContext>, src: &str, entry: &str) -> HipKernel {
+pub(crate) fn compile(ctx: &Arc<RocmContext>, src: &str, entry: &str) -> HipKernel {
     let cache_path =
         hsaco_cache_dir().map(|d| d.join(format!("{}-{:016x}.hsaco", entry, fnv1a64(src))));
 
@@ -207,6 +207,30 @@ kernel_cache!(
     fused_residual_ln_kernel,
     FUSED_RESIDUAL_LN_CU,
     "fused_residual_ln"
+);
+kernel_cache!(
+    ADA_LAYER_NORM,
+    ada_layer_norm_kernel,
+    ADA_LAYER_NORM_CU,
+    "ada_layer_norm"
+);
+kernel_cache!(
+    GATED_RESIDUAL,
+    gated_residual_kernel,
+    GATED_RESIDUAL_CU,
+    "gated_residual"
+);
+kernel_cache!(
+    ADA_LAYER_NORM_BACKWARD,
+    ada_layer_norm_backward_kernel,
+    ADA_LAYER_NORM_BACKWARD_CU,
+    "ada_layer_norm_backward"
+);
+kernel_cache!(
+    GATED_RESIDUAL_BACKWARD,
+    gated_residual_backward_kernel,
+    GATED_RESIDUAL_BACKWARD_CU,
+    "gated_residual_backward"
 );
 kernel_cache!(GATHER, gather_kernel, GATHER_CU, "gather");
 kernel_cache!(
@@ -386,6 +410,10 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = rope_backward_kernel(ctx);
     let _ = gather_backward_kernel(ctx);
     let _ = fused_residual_ln_kernel(ctx);
+    let _ = ada_layer_norm_kernel(ctx);
+    let _ = gated_residual_kernel(ctx);
+    let _ = ada_layer_norm_backward_kernel(ctx);
+    let _ = gated_residual_backward_kernel(ctx);
     let _ = gather_kernel(ctx);
     let _ = gather_axis_kernel(ctx);
     let _ = narrow_kernel(ctx);

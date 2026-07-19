@@ -1,0 +1,91 @@
+#version 450
+// Fused Q1_0 GEMM (prefill m>1) for Op::DequantMatMul.
+//
+// Mirrors Metal `q1_0_mm_f32` / wgpu `dequant_gemm_q1_0`: TM=8 output rows per
+// thread. **1-D dispatch** (MoltenVK ignored `gl_GlobalInvocationID.y` in the
+// earlier 2-D grid, leaving all but the first tile zero → Bonsai `!!!!`).
+// Linear id = col * n_row_tiles + row_tile.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+
+layout(push_constant) uniform PC {
+    uint m;         // active rows
+    uint k;         // contraction dim (multiple of 128)
+    uint n;         // output columns
+    uint x_word;    // f32-word offset of X[0,0]
+    uint w_word;    // f32-word offset of packed W (16-B aligned)
+    uint out_word;  // f32-word offset of Y[0,0]
+} pc;
+
+const uint TM = 8u;
+const uint BLK_BYTES = 18u;
+
+uint rd_byte(uint rel) {
+    uint w = arena_load_u(pc.w_word + (rel >> 2u));
+    return (w >> ((rel & 3u) * 8u)) & 0xFFu;
+}
+
+float rd_f16(uint rel) {
+    uint w = arena_load_u(pc.w_word + (rel >> 2u));
+    uint h = (w >> ((rel & 3u) * 8u)) & 0xFFFFu;
+    return unpackHalf2x16(h).x;
+}
+
+void main() {
+    uint n_row_tiles = (pc.m + TM - 1u) / TM;
+    uint total = pc.n * n_row_tiles;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) { return; }
+
+    uint col = idx / n_row_tiles;
+    uint row0 = (idx - col * n_row_tiles) * TM;
+    if (col >= pc.n || row0 >= pc.m) { return; }
+
+    uint nblocks = pc.k / 128u;
+    uint w_row = col * nblocks * BLK_BYTES;
+
+    float acc[TM];
+    for (uint r = 0u; r < TM; r++) { acc[r] = 0.0; }
+
+    uint p = 0u;
+    for (uint b = 0u; b < nblocks; b++) {
+        uint off = w_row + b * BLK_BYTES;
+        float d = rd_f16(off);
+        float nd = -d;
+        for (uint byte = 0u; byte < 16u; byte++) {
+            uint bits = rd_byte(off + 2u + byte);
+            float ww[8];
+            ww[0] = ((bits & 1u)   != 0u) ? d : nd;
+            ww[1] = ((bits & 2u)   != 0u) ? d : nd;
+            ww[2] = ((bits & 4u)   != 0u) ? d : nd;
+            ww[3] = ((bits & 8u)   != 0u) ? d : nd;
+            ww[4] = ((bits & 16u)  != 0u) ? d : nd;
+            ww[5] = ((bits & 32u)  != 0u) ? d : nd;
+            ww[6] = ((bits & 64u)  != 0u) ? d : nd;
+            ww[7] = ((bits & 128u) != 0u) ? d : nd;
+            for (uint r = 0u; r < TM; r++) {
+                uint rr = row0 + r;
+                uint rc = min(rr, pc.m - 1u);
+                uint xr = pc.x_word + rc * pc.k + p;
+                float s = uintBitsToFloat(arena_load_u(xr))       * ww[0]
+                        + uintBitsToFloat(arena_load_u(xr + 1u)) * ww[1]
+                        + uintBitsToFloat(arena_load_u(xr + 2u)) * ww[2]
+                        + uintBitsToFloat(arena_load_u(xr + 3u)) * ww[3]
+                        + uintBitsToFloat(arena_load_u(xr + 4u)) * ww[4]
+                        + uintBitsToFloat(arena_load_u(xr + 5u)) * ww[5]
+                        + uintBitsToFloat(arena_load_u(xr + 6u)) * ww[6]
+                        + uintBitsToFloat(arena_load_u(xr + 7u)) * ww[7];
+                if (rr < pc.m) { acc[r] += s; }
+            }
+            p += 8u;
+        }
+    }
+
+    for (uint r = 0u; r < TM; r++) {
+        uint rr = row0 + r;
+        if (rr < pc.m) {
+            arena_store_u(pc.out_word + rr * pc.n + col, floatBitsToUint(acc[r]));
+        }
+    }
+}

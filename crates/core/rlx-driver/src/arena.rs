@@ -65,10 +65,20 @@ pub trait DeviceArena {
 /// Used by every CPU-resident-arena backend. GPU backends can call this
 /// after staging into a host buffer, then upload.
 ///
-/// Currently supports F32 / F16 / BF16. Other dtypes fall through to F32.
+/// Currently supports F32 / F64 / F16 / BF16 / C64. Other dtypes fall
+/// through to F32.
 pub unsafe fn write_typed_from_f32(dst_ptr: *mut u8, dtype: DType, src: &[f32], max_elems: usize) {
     let n = src.len().min(max_elems);
     match dtype {
+        DType::F64 => unsafe {
+            // F64 slots are 8 B/elem; widen the f32 input. (Values carry
+            // f32 precision — this is the f32 entry path; `run_typed`'s
+            // `all_f64` branch is the full-precision route.)
+            let dst = dst_ptr as *mut f64;
+            for i in 0..n {
+                *dst.add(i) = src[i] as f64;
+            }
+        },
         DType::F16 => unsafe {
             let dst = dst_ptr as *mut half::f16;
             for i in 0..n {
@@ -97,6 +107,17 @@ pub unsafe fn write_typed_from_f32(dst_ptr: *mut u8, dtype: DType, src: &[f32], 
 /// Helper: read `n_elems` of `dtype` from `src_ptr`, returning `Vec<f32>`.
 pub unsafe fn read_typed_to_f32(src_ptr: *const u8, dtype: DType, n_elems: usize) -> Vec<f32> {
     match dtype {
+        DType::F64 => {
+            // F64 slots are 8 B/elem; narrow to f32 for the f32 read path.
+            let mut out = Vec::with_capacity(n_elems);
+            unsafe {
+                let src = src_ptr as *const f64;
+                for i in 0..n_elems {
+                    out.push(*src.add(i) as f32);
+                }
+            }
+            out
+        }
         DType::F16 => {
             let mut out = Vec::with_capacity(n_elems);
             unsafe {

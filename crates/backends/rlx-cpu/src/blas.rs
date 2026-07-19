@@ -78,6 +78,94 @@ unsafe extern "C" {
     fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, incx: i32);
 }
 
+/// Cap BLAS's own thread pool when Rayon owns outer parallelism.
+///
+/// Nested OpenBLAS/MKL × Rayon oversubscription (N² threads) is catastrophic
+/// for CNN training: wall time jumps from ~1–2 min/epoch to tens of minutes.
+/// Called once when the Rayon pool starts (and from `RLX_FAST_CONV`). Honours
+/// an explicit user override via `OPENBLAS_NUM_THREADS` / `OMP_NUM_THREADS` /
+/// `MKL_NUM_THREADS` / `VECLIB_MAXIMUM_THREADS`.
+pub fn limit_inner_threads() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let user_set = [
+            "OPENBLAS_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        ]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some());
+        if user_set {
+            return;
+        }
+        set_blas_num_threads(1);
+    });
+}
+
+/// Set the vendor BLAS thread pool size (OpenBLAS / MKL / Accelerate).
+///
+/// Prefer keeping this at 1 while Rayon owns outer loops; briefly raise it
+/// for a single huge GEMM on the main thread (see [`sgemm_auto`]).
+/// No-ops when the requested size already matches the last set value.
+pub fn set_blas_num_threads(n: i32) {
+    let n = n.max(1);
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static LAST: AtomicI32 = AtomicI32::new(1);
+    if LAST.swap(n, Ordering::SeqCst) == n {
+        return;
+    }
+    #[cfg(rlx_cpu_blas_accelerate)]
+    {
+        // SAFETY: env read by Accelerate at first use / next GEMM.
+        unsafe {
+            std::env::set_var("VECLIB_MAXIMUM_THREADS", n.to_string());
+        }
+    }
+    #[cfg(rlx_cpu_blas_openblas)]
+    {
+        unsafe extern "C" {
+            fn openblas_set_num_threads(n: i32);
+        }
+        unsafe {
+            openblas_set_num_threads(n);
+        }
+    }
+    #[cfg(rlx_cpu_blas_mkl)]
+    {
+        unsafe extern "C" {
+            fn MKL_Set_Num_Threads(n: i32);
+        }
+        unsafe {
+            MKL_Set_Num_Threads(n);
+        }
+    }
+    let _ = n; // no-op when no BLAS linked
+}
+
+/// Ensure BLAS is at `n` threads (idempotent). Used so consecutive huge
+/// GEMMs avoid OpenBLAS set/teardown thrash, while Rayon entry points pin
+/// back to 1.
+#[inline]
+pub fn ensure_blas_threads(n: i32) {
+    set_blas_num_threads(n);
+}
+
+/// Run `f` with a temporary BLAS thread count, then restore to 1.
+///
+/// Only safe off the Rayon pool (nested MT BLAS × Rayon oversubscribes).
+#[inline]
+pub fn with_blas_threads<R>(n: i32, f: impl FnOnce() -> R) -> R {
+    if n <= 1 || rayon::current_thread_index().is_some() {
+        return f();
+    }
+    set_blas_num_threads(n);
+    let out = f();
+    set_blas_num_threads(1);
+    out
+}
+
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 #[inline]
@@ -344,6 +432,47 @@ unsafe extern "C" {
         ldvt: *const i32,
         work: *mut f64,
         lwork: *const i32,
+        info_out: *mut i32,
+    );
+
+    /// dgesdd — SVD via divide-and-conquer (the driver NumPy's `linalg.pinv`
+    /// / `linalg.svd` use). Differs from `dgesvd` on ill-conditioned/degenerate
+    /// inputs, so matching NumPy bit-for-bit requires *this* routine.
+    #[link_name = "dgesdd_"]
+    fn lapack_dgesdd(
+        jobz: *const i8,
+        m: *const i32,
+        n: *const i32,
+        a: *mut f64,
+        lda: *const i32,
+        s: *mut f64,
+        u: *mut f64,
+        ldu: *const i32,
+        vt: *mut f64,
+        ldvt: *const i32,
+        work: *mut f64,
+        lwork: *const i32,
+        iwork: *mut i32,
+        info_out: *mut i32,
+    );
+
+    /// dgelsd — minimum-norm least-squares via SVD (the driver SciPy's
+    /// `linalg.lstsq` uses by default). Solves `min‖A·X − B‖`.
+    #[link_name = "dgelsd_"]
+    fn lapack_dgelsd(
+        m: *const i32,
+        n: *const i32,
+        nrhs: *const i32,
+        a: *mut f64,
+        lda: *const i32,
+        b: *mut f64,
+        ldb: *const i32,
+        s: *mut f64,
+        rcond: *const f64,
+        rank: *mut i32,
+        work: *mut f64,
+        lwork: *const i32,
+        iwork: *mut i32,
         info_out: *mut i32,
     );
 
@@ -844,6 +973,52 @@ unsafe fn lapack_dgesvd(
 }
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
+unsafe fn lapack_dgesdd(
+    _: *const i8,
+    _: *const i32,
+    _: *const i32,
+    _: *mut f64,
+    _: *const i32,
+    _: *mut f64,
+    _: *mut f64,
+    _: *const i32,
+    _: *mut f64,
+    _: *const i32,
+    _: *mut f64,
+    _: *const i32,
+    _: *mut i32,
+    info: *mut i32,
+) {
+    unsafe {
+        *info = -1;
+    }
+    panic!("rlx-cpu: dgesdd requires a linked LAPACK backend (unavailable on this target)");
+}
+#[cfg(not(rlx_cpu_blas))]
+#[allow(non_snake_case, clippy::too_many_arguments)]
+unsafe fn lapack_dgelsd(
+    _: *const i32,
+    _: *const i32,
+    _: *const i32,
+    _: *mut f64,
+    _: *const i32,
+    _: *mut f64,
+    _: *const i32,
+    _: *mut f64,
+    _: *const f64,
+    _: *mut i32,
+    _: *mut f64,
+    _: *const i32,
+    _: *mut i32,
+    info: *mut i32,
+) {
+    unsafe {
+        *info = -1;
+    }
+    panic!("rlx-cpu: dgelsd requires a linked LAPACK backend (unavailable on this target)");
+}
+#[cfg(not(rlx_cpu_blas))]
+#[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn cblas_dtrsm(
     _: i32,
     _: i32,
@@ -1089,6 +1264,184 @@ pub fn dgesvd_thin(
     0
 }
 
+/// Thin SVD via LAPACK **`dgesdd`** (divide-and-conquer) — the driver NumPy's
+/// `linalg.svd`/`linalg.pinv` use. Same I/O contract as [`dgesvd_thin`]; use
+/// this when bit-exact NumPy parity on ill-conditioned inputs is required.
+pub fn dgesdd_thin(
+    a: &mut [f64],
+    m: usize,
+    n: usize,
+    s: &mut [f64],
+    u: &mut [f64],
+    vt: &mut [f64],
+) -> i32 {
+    assert_eq!(a.len(), m * n);
+    let k = m.min(n);
+    assert_eq!(s.len(), k);
+    assert_eq!(u.len(), m * k);
+    assert_eq!(vt.len(), k * n);
+
+    let mut a_col = transpose_to_col(a, m, n);
+    let mut u_col = vec![0f64; m * k];
+    let mut vt_col = vec![0f64; k * n];
+    let jobz = b'S' as i8;
+    let mm = m as i32;
+    let nn = n as i32;
+    let ldu = m as i32;
+    let ldvt = k as i32;
+    let mut iwork = vec![0i32; 8 * k];
+    let mut info: i32 = 0;
+    // workspace query
+    let mut wq = [0f64; 1];
+    let m1: i32 = -1;
+    unsafe {
+        lapack_dgesdd(
+            &jobz,
+            &mm,
+            &nn,
+            a_col.as_mut_ptr(),
+            &mm,
+            s.as_mut_ptr(),
+            u_col.as_mut_ptr(),
+            &ldu,
+            vt_col.as_mut_ptr(),
+            &ldvt,
+            wq.as_mut_ptr(),
+            &m1,
+            iwork.as_mut_ptr(),
+            &mut info,
+        );
+    }
+    if info != 0 {
+        return info;
+    }
+    let lwork = wq[0] as i32;
+    let mut work = vec![0f64; lwork.max(1) as usize];
+    unsafe {
+        lapack_dgesdd(
+            &jobz,
+            &mm,
+            &nn,
+            a_col.as_mut_ptr(),
+            &mm,
+            s.as_mut_ptr(),
+            u_col.as_mut_ptr(),
+            &ldu,
+            vt_col.as_mut_ptr(),
+            &ldvt,
+            work.as_mut_ptr(),
+            &lwork,
+            iwork.as_mut_ptr(),
+            &mut info,
+        );
+    }
+    if info != 0 {
+        return info;
+    }
+    for i in 0..m {
+        for j in 0..k {
+            u[i * k + j] = u_col[j * m + i];
+        }
+    }
+    for i in 0..k {
+        for j in 0..n {
+            vt[i * n + j] = vt_col[j * k + i];
+        }
+    }
+    0
+}
+
+/// Minimum-norm least-squares `min‖A·X − B‖` via LAPACK **`dgelsd`** (the driver
+/// SciPy's `linalg.lstsq` uses). `a` is m×n row-major, `b` is m×nrhs row-major;
+/// the solution `X` (n×nrhs) is written row-major into `x`. `rcond < 0` uses
+/// machine precision (SciPy's default). Returns 0 on success.
+pub fn dgelsd_solve(
+    a: &[f64],
+    b: &[f64],
+    m: usize,
+    n: usize,
+    nrhs: usize,
+    rcond: f64,
+    x: &mut [f64],
+) -> i32 {
+    assert_eq!(a.len(), m * n);
+    assert_eq!(b.len(), m * nrhs);
+    assert_eq!(x.len(), n * nrhs);
+    let k = m.min(n);
+    let ldb = m.max(n);
+    let mut a_col = transpose_to_col(a, m, n);
+    // B column-major with leading dim ldb=max(m,n); first m rows filled.
+    let mut b_col = vec![0f64; ldb * nrhs];
+    for i in 0..m {
+        for j in 0..nrhs {
+            b_col[i + j * ldb] = b[i * nrhs + j];
+        }
+    }
+    let mm = m as i32;
+    let nn = n as i32;
+    let nrhs_i = nrhs as i32;
+    let ldb_i = ldb as i32;
+    let mut s = vec![0f64; k];
+    let rc = rcond;
+    let mut rank: i32 = 0;
+    let mut info: i32 = 0;
+    let nlvl = (k as f64).log2().floor() as usize + 1;
+    let mut iwork = vec![0i32; (3 * k * nlvl + 11 * k).max(1)];
+    let mut wq = [0f64; 1];
+    let m1: i32 = -1;
+    unsafe {
+        lapack_dgelsd(
+            &mm,
+            &nn,
+            &nrhs_i,
+            a_col.as_mut_ptr(),
+            &mm,
+            b_col.as_mut_ptr(),
+            &ldb_i,
+            s.as_mut_ptr(),
+            &rc,
+            &mut rank,
+            wq.as_mut_ptr(),
+            &m1,
+            iwork.as_mut_ptr(),
+            &mut info,
+        );
+    }
+    if info != 0 {
+        return info;
+    }
+    let lwork = wq[0] as i32;
+    let mut work = vec![0f64; lwork.max(1) as usize];
+    unsafe {
+        lapack_dgelsd(
+            &mm,
+            &nn,
+            &nrhs_i,
+            a_col.as_mut_ptr(),
+            &mm,
+            b_col.as_mut_ptr(),
+            &ldb_i,
+            s.as_mut_ptr(),
+            &rc,
+            &mut rank,
+            work.as_mut_ptr(),
+            &lwork,
+            iwork.as_mut_ptr(),
+            &mut info,
+        );
+    }
+    if info != 0 {
+        return info;
+    }
+    // Solution X is in the first n rows of b_col (col-major, ld=ldb) → row-major.
+    for i in 0..n {
+        for j in 0..nrhs {
+            x[i * nrhs + j] = b_col[i + j * ldb];
+        }
+    }
+    0
+}
+
 /// Solve `op(A) · X = B` (or `X · op(A) = B` for `right`) where A is
 /// triangular. Row-major callers throughout. Overwrites B with X.
 ///
@@ -1183,6 +1536,18 @@ pub fn sgemm_accumulate(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize,
             c.as_mut_ptr(),
             n as i32,
         );
+    }
+}
+
+/// Like [`sgemm_accumulate`] with the same Rayon-split dispatch as [`sgemm_auto`].
+#[inline]
+pub fn sgemm_accumulate_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    // Defined below with `par_sgemm`; call via the public name once both are
+    // in scope (same module — order-independent). Prefer parallel when large.
+    if prefer_par_sgemm(m, k, n) {
+        crate::blas::par_sgemm_accumulate(a, b, c, m, k, n);
+    } else {
+        sgemm_accumulate(a, b, c, m, k, n);
     }
 }
 
@@ -1398,8 +1763,10 @@ pub unsafe fn sgemm_general(
 #[inline]
 pub fn sgemm_bias(a: &[f32], b: &[f32], bias: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     // Cost model decides: NEON when BLAS overhead dominates the compute.
-    if crate::cost::hw_model().prefer_neon_sgemm(m, k, n) {
+    if m <= 8 && crate::cost::hw_model().prefer_neon_sgemm(m, k, n) {
         crate::kernels::neon_sgemm_bias_small(a, b, bias, c, m, k, n);
+    } else if prefer_par_sgemm(m, k, n) {
+        par_sgemm_bias(a, b, bias, c, m, k, n);
     } else {
         sgemm(a, b, c, m, k, n);
         bias_add(c, bias, m, n);
@@ -1463,7 +1830,11 @@ pub fn sgemm_bias_epilogue<E: Fn(f32) -> f32>(
     }
 }
 
-/// sgemm with auto-dispatch: NEON for tiny m, parallel BLAS for small-m, sequential BLAS otherwise.
+/// sgemm with auto-dispatch: NEON for tiny m, Rayon-split BLAS for
+/// medium/large shapes, sequential BLAS otherwise.
+///
+/// `limit_inner_threads()` pins OpenBLAS/MKL/Accelerate to 1 thread so
+/// Rayon owns outer parallelism. Large DiT/CNN GEMMs go through [`par_sgemm`].
 #[inline]
 pub fn sgemm_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     // `parity-gemm` feature swaps in the same Rust `gemm` crate that
@@ -1481,11 +1852,274 @@ pub fn sgemm_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: us
     #[cfg(not(feature = "parity-gemm"))]
     if m <= 8 && crate::cost::hw_model().prefer_neon_sgemm(m, k, n) {
         crate::kernels::neon_sgemm_small(a, b, c, m, k, n);
-    } else if m < 32 {
-        // Multi-core AMX split for small m where AMX internal threading doesn't engage
-        par_sgemm(a, b, c, m, k, n);
-    } else {
+        return;
+    }
+    #[cfg(not(feature = "parity-gemm"))]
+    {
+        let flops = (m as u64).saturating_mul(k as u64).saturating_mul(n as u64);
+        // Prefer Rayon-split single-thread BLAS. Vendor MT BLAS for these DiT
+        // shapes was slower on OpenBLAS (NFE=8 ~23s vs ~15s) and sticky MT
+        // oversubscribed Rayon elementwise (BinaryFull ~5×). Keep
+        // `with_blas_threads` for explicit callers.
+        let _ = flops;
+        if prefer_par_sgemm(m, k, n) {
+            par_sgemm(a, b, c, m, k, n);
+        } else {
+            sgemm(a, b, c, m, k, n);
+        }
+    }
+}
+
+/// Enough FLOPs + a wide enough split axis to pay for Rayon hand-off.
+#[inline]
+fn prefer_par_sgemm(m: usize, k: usize, n: usize) -> bool {
+    let workers = crate::pool::num_threads();
+    if workers <= 1 {
+        return false;
+    }
+    let flops = (m as u64).saturating_mul(k as u64).saturating_mul(n as u64);
+    if flops < 1_000_000 {
+        return false;
+    }
+    // Split the wider output axis; need ≥8 cols/rows per worker.
+    m.max(n) >= workers.saturating_mul(8)
+}
+
+/// Parallel sgemm: split across Rayon workers, each calling single-threaded
+/// CBLAS (see [`limit_inner_threads`]).
+///
+/// For large square-ish GEMMs (DiT FFN: m≈1k, n≈2–3k, k≈1k) a 2-D tile grid
+/// beats pure column/row splits — each worker only streams an A-panel and a
+/// B-panel instead of re-reading the full shared operand.
+pub fn par_sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    let workers = crate::pool::num_threads();
+    if !prefer_par_sgemm(m, k, n) {
         sgemm(a, b, c, m, k, n);
+        return;
+    }
+    let a_addr = a.as_ptr() as usize;
+    let b_addr = b.as_ptr() as usize;
+    let c_addr = c.as_mut_ptr() as usize;
+    let flops = (m as u64).saturating_mul(k as u64).saturating_mul(n as u64);
+
+    // 2-D tiling when both output axes are wide enough for a grid.
+    if m >= 256 && n >= 256 && flops >= 200_000_000 {
+        let tiles_m = ((workers as f64).sqrt().round() as usize).clamp(2, 8);
+        let tiles_n = (workers / tiles_m).max(2);
+        let n_tiles = tiles_m * tiles_n;
+        let m_chunk = m.div_ceil(tiles_m);
+        let n_chunk = n.div_ceil(tiles_n);
+        crate::pool::par_for(n_tiles, 1, &|off, cnt| {
+            for t in off..off + cnt {
+                let tm = t / tiles_n;
+                let tn = t % tiles_n;
+                let m0 = tm * m_chunk;
+                let n0 = tn * n_chunk;
+                if m0 >= m || n0 >= n {
+                    continue;
+                }
+                let local_m = (m0 + m_chunk).min(m) - m0;
+                let local_n = (n0 + n_chunk).min(n) - n0;
+                unsafe {
+                    cblas_sgemm(
+                        101,
+                        111,
+                        111,
+                        local_m as i32,
+                        local_n as i32,
+                        k as i32,
+                        1.0,
+                        (a_addr as *const f32).add(m0 * k),
+                        k as i32,
+                        (b_addr as *const f32).add(n0),
+                        n as i32,
+                        0.0,
+                        (c_addr as *mut f32).add(m0 * n + n0),
+                        n as i32,
+                    );
+                }
+            }
+        });
+        return;
+    }
+
+    if n >= m {
+        // Split columns of C / B.
+        let chunk = n.div_ceil(workers);
+        crate::pool::par_for(workers, 1, &|off, cnt| {
+            for w in off..off + cnt {
+                let n_start = w * chunk;
+                if n_start >= n {
+                    continue;
+                }
+                let n_end = (n_start + chunk).min(n);
+                let local_n = n_end - n_start;
+                unsafe {
+                    cblas_sgemm(
+                        101,
+                        111,
+                        111,
+                        m as i32,
+                        local_n as i32,
+                        k as i32,
+                        1.0,
+                        a_addr as *const f32,
+                        k as i32,
+                        (b_addr as *const f32).add(n_start),
+                        n as i32,
+                        0.0,
+                        (c_addr as *mut f32).add(n_start),
+                        n as i32,
+                    );
+                }
+            }
+        });
+    } else {
+        // Split rows of C / A.
+        let chunk = m.div_ceil(workers);
+        crate::pool::par_for(workers, 1, &|off, cnt| {
+            for w in off..off + cnt {
+                let m_start = w * chunk;
+                if m_start >= m {
+                    continue;
+                }
+                let m_end = (m_start + chunk).min(m);
+                let local_m = m_end - m_start;
+                unsafe {
+                    cblas_sgemm(
+                        101,
+                        111,
+                        111,
+                        local_m as i32,
+                        n as i32,
+                        k as i32,
+                        1.0,
+                        (a_addr as *const f32).add(m_start * k),
+                        k as i32,
+                        b_addr as *const f32,
+                        n as i32,
+                        0.0,
+                        (c_addr as *mut f32).add(m_start * n),
+                        n as i32,
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// Parallel accumulate GEMM: same split as [`par_sgemm`] but β = 1 (add into C).
+pub fn par_sgemm_accumulate(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    let workers = crate::pool::num_threads();
+    if !prefer_par_sgemm(m, k, n) {
+        sgemm_accumulate(a, b, c, m, k, n);
+        return;
+    }
+    let a_addr = a.as_ptr() as usize;
+    let b_addr = b.as_ptr() as usize;
+    let c_addr = c.as_mut_ptr() as usize;
+    let flops = (m as u64).saturating_mul(k as u64).saturating_mul(n as u64);
+
+    if m >= 256 && n >= 256 && flops >= 200_000_000 {
+        let tiles_m = ((workers as f64).sqrt().round() as usize).clamp(2, 8);
+        let tiles_n = (workers / tiles_m).max(2);
+        let n_tiles = tiles_m * tiles_n;
+        let m_chunk = m.div_ceil(tiles_m);
+        let n_chunk = n.div_ceil(tiles_n);
+        crate::pool::par_for(n_tiles, 1, &|off, cnt| {
+            for t in off..off + cnt {
+                let tm = t / tiles_n;
+                let tn = t % tiles_n;
+                let m0 = tm * m_chunk;
+                let n0 = tn * n_chunk;
+                if m0 >= m || n0 >= n {
+                    continue;
+                }
+                let local_m = (m0 + m_chunk).min(m) - m0;
+                let local_n = (n0 + n_chunk).min(n) - n0;
+                unsafe {
+                    cblas_sgemm(
+                        101,
+                        111,
+                        111,
+                        local_m as i32,
+                        local_n as i32,
+                        k as i32,
+                        1.0,
+                        (a_addr as *const f32).add(m0 * k),
+                        k as i32,
+                        (b_addr as *const f32).add(n0),
+                        n as i32,
+                        1.0,
+                        (c_addr as *mut f32).add(m0 * n + n0),
+                        n as i32,
+                    );
+                }
+            }
+        });
+        return;
+    }
+
+    if n >= m {
+        let chunk = n.div_ceil(workers);
+        crate::pool::par_for(workers, 1, &|off, cnt| {
+            for w in off..off + cnt {
+                let n_start = w * chunk;
+                if n_start >= n {
+                    continue;
+                }
+                let n_end = (n_start + chunk).min(n);
+                let local_n = n_end - n_start;
+                unsafe {
+                    cblas_sgemm(
+                        101,
+                        111,
+                        111,
+                        m as i32,
+                        local_n as i32,
+                        k as i32,
+                        1.0,
+                        a_addr as *const f32,
+                        k as i32,
+                        (b_addr as *const f32).add(n_start),
+                        n as i32,
+                        1.0,
+                        (c_addr as *mut f32).add(n_start),
+                        n as i32,
+                    );
+                }
+            }
+        });
+    } else {
+        let chunk = m.div_ceil(workers);
+        crate::pool::par_for(workers, 1, &|off, cnt| {
+            for w in off..off + cnt {
+                let m_start = w * chunk;
+                if m_start >= m {
+                    continue;
+                }
+                let m_end = (m_start + chunk).min(m);
+                let local_m = m_end - m_start;
+                unsafe {
+                    cblas_sgemm(
+                        101,
+                        111,
+                        111,
+                        local_m as i32,
+                        n as i32,
+                        k as i32,
+                        1.0,
+                        (a_addr as *const f32).add(m_start * k),
+                        k as i32,
+                        b_addr as *const f32,
+                        n as i32,
+                        1.0,
+                        (c_addr as *mut f32).add(m_start * n),
+                        n as i32,
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -1527,55 +2161,10 @@ fn sgemm_via_gemm_crate(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize,
     }
 }
 
-/// Parallel sgemm without bias (split across n dimension for multi-core AMX).
-pub fn par_sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    let cfg = crate::config::RuntimeConfig::global();
-    let workers = cfg.pool_workers + 1;
-    let total_flops = (m * k * n) as u64;
-    if m >= 32 || total_flops < 2_000_000 || n < workers * 32 {
-        sgemm(a, b, c, m, k, n);
-        return;
-    }
-    let chunk = n / workers;
-    let a_addr = a.as_ptr() as usize;
-    let b_addr = b.as_ptr() as usize;
-    let c_addr = c.as_mut_ptr() as usize;
-
-    crate::pool::par_for(workers, 1, &|off, cnt| {
-        for w in off..off + cnt {
-            let n_start = w * chunk;
-            let n_end = if w + 1 == workers { n } else { (w + 1) * chunk };
-            let local_n = n_end - n_start;
-            if local_n == 0 {
-                continue;
-            }
-            unsafe {
-                cblas_sgemm(
-                    101,
-                    111,
-                    111,
-                    m as i32,
-                    local_n as i32,
-                    k as i32,
-                    1.0,
-                    a_addr as *const f32,
-                    k as i32,
-                    (b_addr as *const f32).add(n_start),
-                    n as i32,
-                    0.0,
-                    (c_addr as *mut f32).add(n_start),
-                    n as i32,
-                );
-            }
-        }
-    });
-}
-
-/// Parallelized sgemm + bias: splits across the n dimension to use multiple
-/// cores' AMX coprocessors on Apple Silicon. Critical for small-m workloads
-/// where AMX internal threading doesn't engage.
+/// Parallelized sgemm + bias: splits across the wider of m/n via Rayon,
+/// each slice using single-threaded CBLAS ([`limit_inner_threads`]).
 ///
-/// For each worker thread: computes a column slice of C using its own AMX.
+/// For each worker thread: computes a row or column slice of C.
 pub fn par_sgemm_bias(
     a: &[f32],
     b: &[f32],
@@ -1585,83 +2174,99 @@ pub fn par_sgemm_bias(
     k: usize,
     n: usize,
 ) {
-    let cfg = crate::config::RuntimeConfig::global();
-    let workers = cfg.pool_workers + 1; // total threads (workers + main)
-    // Only split when AMX wastes capacity (m < 32 tile width).
-    // For m ≥ 32, AMX's internal threading handles parallelism better.
-    let total_flops = (m * k * n) as u64;
-    if m >= 32 || total_flops < 2_000_000 || n < workers * 32 {
+    let workers = crate::pool::num_threads();
+    if !prefer_par_sgemm(m, k, n) {
         sgemm_bias(a, b, bias, c, m, k, n);
         return;
     }
 
-    // Split n into approximately equal chunks
-    let chunk = n / workers;
     let a_addr = a.as_ptr() as usize;
     let b_addr = b.as_ptr() as usize;
     let bias_addr = bias.as_ptr() as usize;
     let c_addr = c.as_mut_ptr() as usize;
 
-    crate::pool::par_for(workers, 1, &|off, cnt| {
-        for w in off..off + cnt {
-            let n_start = w * chunk;
-            let n_end = if w + 1 == workers { n } else { (w + 1) * chunk };
-            let local_n = n_end - n_start;
-            if local_n == 0 {
-                continue;
-            }
-            unsafe {
-                // sgemm: A[m,k] @ B[:, n_start..n_end] → C[:, n_start..n_end]
-                // ldb = n (B's full row stride), ldc = n (C's full row stride)
-
-                cblas_sgemm(
-                    101,
-                    111,
-                    111, // ROW_MAJOR, NO_TRANS, NO_TRANS
-                    m as i32,
-                    local_n as i32,
-                    k as i32,
-                    1.0,
-                    a_addr as *const f32,
-                    k as i32,
-                    (b_addr as *const f32).add(n_start),
-                    n as i32,
-                    0.0,
-                    (c_addr as *mut f32).add(n_start),
-                    n as i32,
-                );
-                // bias_add for this column slice
-                let local_bias =
-                    std::slice::from_raw_parts((bias_addr as *const f32).add(n_start), local_n);
-                let local_c =
-                    std::slice::from_raw_parts_mut((c_addr as *mut f32).add(n_start), m * n);
-                #[cfg(target_arch = "aarch64")]
-                {
-                    use std::arch::aarch64::*;
-                    let chunks = local_n / 4;
+    if n >= m {
+        let chunk = n.div_ceil(workers);
+        crate::pool::par_for(workers, 1, &|off, cnt| {
+            for w in off..off + cnt {
+                let n_start = w * chunk;
+                if n_start >= n {
+                    continue;
+                }
+                let n_end = (n_start + chunk).min(n);
+                let local_n = n_end - n_start;
+                unsafe {
+                    cblas_sgemm(
+                        101,
+                        111,
+                        111,
+                        m as i32,
+                        local_n as i32,
+                        k as i32,
+                        1.0,
+                        a_addr as *const f32,
+                        k as i32,
+                        (b_addr as *const f32).add(n_start),
+                        n as i32,
+                        0.0,
+                        (c_addr as *mut f32).add(n_start),
+                        n as i32,
+                    );
+                    let local_bias =
+                        std::slice::from_raw_parts((bias_addr as *const f32).add(n_start), local_n);
+                    let local_c =
+                        std::slice::from_raw_parts_mut((c_addr as *mut f32).add(n_start), m * n);
                     for row in 0..m {
                         let base = row * n;
-                        for c in 0..chunks {
-                            let off = base + c * 4;
-                            let v = vld1q_f32(local_c.as_ptr().add(off));
-                            let bv = vld1q_f32(local_bias.as_ptr().add(c * 4));
-                            vst1q_f32(local_c.as_mut_ptr().add(off), vaddq_f32(v, bv));
-                        }
-                        for i in (chunks * 4)..local_n {
+                        for i in 0..local_n {
                             local_c[base + i] += local_bias[i];
                         }
                     }
                 }
-                #[cfg(not(target_arch = "aarch64"))]
-                for row in 0..m {
-                    let base = row * n;
-                    for i in 0..local_n {
-                        local_c[base + i] += local_bias[i];
+            }
+        });
+    } else {
+        let chunk = m.div_ceil(workers);
+        crate::pool::par_for(workers, 1, &|off, cnt| {
+            for w in off..off + cnt {
+                let m_start = w * chunk;
+                if m_start >= m {
+                    continue;
+                }
+                let m_end = (m_start + chunk).min(m);
+                let local_m = m_end - m_start;
+                unsafe {
+                    cblas_sgemm(
+                        101,
+                        111,
+                        111,
+                        local_m as i32,
+                        n as i32,
+                        k as i32,
+                        1.0,
+                        (a_addr as *const f32).add(m_start * k),
+                        k as i32,
+                        b_addr as *const f32,
+                        n as i32,
+                        0.0,
+                        (c_addr as *mut f32).add(m_start * n),
+                        n as i32,
+                    );
+                    let bias_sl = std::slice::from_raw_parts(bias_addr as *const f32, n);
+                    let local_c = std::slice::from_raw_parts_mut(
+                        (c_addr as *mut f32).add(m_start * n),
+                        local_m * n,
+                    );
+                    for row in 0..local_m {
+                        let base = row * n;
+                        for i in 0..n {
+                            local_c[base + i] += bias_sl[i];
+                        }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 }
 
 #[cfg(test)]

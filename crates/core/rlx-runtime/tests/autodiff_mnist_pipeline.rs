@@ -207,8 +207,12 @@ fn tinyconv_grad_matches_cortexm_trainer_builder() {
     let bwd_crate = grad_with_loss(&fwd.graph, &fwd.params);
     let r_crate = execute(&attach_train_graph(&fwd, bwd_crate), &x, &labels);
 
-    assert!((r_opt.loss - r_crate.loss).abs() < 1e-6);
-    assert_grads_close(&r_opt.grads, &r_crate.grads, 1e-6);
+    // The two entry points build equivalent backward graphs but accumulate
+    // gradient contributions in a hasher-dependent order, so f32 reductions
+    // differ by accumulation noise (~2e-6 rel). Use the same f32 bar as the
+    // sibling three-paths test rather than a 1e-6 bar that's tighter than f32.
+    assert!((r_opt.loss - r_crate.loss).abs() < 1e-4 * r_opt.loss.abs().max(1.0));
+    assert_grads_close(&r_opt.grads, &r_crate.grads, 1e-4);
 }
 
 // ── MNIST IDX loader (minimal copy of cortexm-trainer) ───────────

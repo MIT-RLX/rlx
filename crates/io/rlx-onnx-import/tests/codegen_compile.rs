@@ -40,7 +40,7 @@ fn node(
 }
 
 /// Build the six-op graph spec covering GatherND/OneHot/NonZero/CumProd/Einsum/
-/// ScatterND. Returns the spec's nodes plus the expected `custom_summary` rows.
+/// ScatterND. GatherND/ScatterND are first-class; the rest stay Custom.
 fn six_op_nodes() -> Vec<BundleNode> {
     vec![
         node(
@@ -203,12 +203,11 @@ fn emitted_codegen_compiles_and_runs() {
     // (op name, num_inputs, attrs_len, actual operand count) the compiled,
     // executed codegen must have produced.
     let expected = [
-        ("onnx.GatherND", 2u32, 4usize, 2usize), // batch_dims i32
-        ("onnx.OneHot", 3, 4, 3),                // axis i32
+        ("onnx.OneHot", 3u32, 4usize, 3usize), // axis i32
         ("onnx.NonZero", 1, 0, 1),
         ("onnx.CumProd", 2, 6, 2), // [axis_i32, exclusive, reverse]; data+axis
         ("onnx.Einsum", 2, 9, 2),  // "ij,jk->ik" == 9 bytes
-        ("onnx.ScatterND", 3, 0, 3),
+                                   // GatherND / ScatterND are first-class IR ops, not listed in CUSTOM summary.
     ];
     for (name, ni, al, ic) in expected {
         let actual = got
@@ -216,6 +215,10 @@ fn emitted_codegen_compiles_and_runs() {
             .unwrap_or_else(|| panic!("missing {name} in output:\n{stdout}"));
         assert_eq!(actual, &(ni, al, ic), "{name} mismatch (got {actual:?})");
     }
+    assert!(
+        !got.contains_key("onnx.ScatterND") && !got.contains_key("onnx.GatherND"),
+        "ScatterND/GatherND must not emit Custom; got {got:?}"
+    );
     assert_eq!(
         got.len(),
         expected.len(),

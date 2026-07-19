@@ -217,3 +217,220 @@ pub fn register_cpu_kernel(k: Arc<dyn CpuKernel>) {
 pub fn lookup_cpu_kernel(name: &str) -> Option<Arc<dyn CpuKernel>> {
     global_cpu_kernels().lookup(name)
 }
+
+/// Run a registered custom-op [`CpuKernel`] against **host byte buffers** — the
+/// generic host-fallback a GPU backend uses for a custom op it has no native
+/// kernel for. The `collective.*` ops are the motivating case: they are
+/// host/transport ops with no device kernel, so every backend runs them by
+/// staging the operands to host and calling the one registered CPU kernel here.
+///
+/// All operands are treated as `F32` (the dtype of the ops that take this path).
+/// Each `(&[u8], &Shape)` input is reinterpreted as an `f32` slice and handed to
+/// the kernel as a [`CpuTensorRef::F32`]; the output the same. Returns `Err` if
+/// no kernel is registered under `name`, if a buffer is not 4-byte aligned or a
+/// multiple of 4 bytes, or if the kernel itself errors.
+pub fn run_f32_custom_op_host(
+    name: &str,
+    inputs: &[(&[u8], &Shape)],
+    out: (&mut [u8], &Shape),
+    attrs: &[u8],
+) -> Result<(), String> {
+    let kernel = lookup_cpu_kernel(name)
+        .ok_or_else(|| format!("no CpuKernel registered for custom op '{name}'"))?;
+
+    fn as_f32<'a>(bytes: &'a [u8], role: &str) -> Result<&'a [f32], String> {
+        if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>())
+            || !bytes.len().is_multiple_of(4)
+        {
+            return Err(format!("{role}: host buffer not f32-aligned/sized"));
+        }
+        // SAFETY: alignment + length checked; every bit pattern is a valid f32.
+        Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) })
+    }
+
+    let refs: Vec<CpuTensorRef<'_>> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, &(b, sh))| {
+            as_f32(b, &format!("{name} input {i}"))
+                .map(|data| CpuTensorRef::F32 { data, shape: sh })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let (out_bytes, out_shape) = out;
+    if !(out_bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>())
+        || !out_bytes.len().is_multiple_of(4)
+    {
+        return Err(format!("{name} output: host buffer not f32-aligned/sized"));
+    }
+    let out_len = out_bytes.len() / 4;
+    // SAFETY: alignment + length checked above.
+    let out_data =
+        unsafe { std::slice::from_raw_parts_mut(out_bytes.as_mut_ptr() as *mut f32, out_len) };
+    let out_view = CpuTensorMut::F32 {
+        data: out_data,
+        shape: out_shape,
+    };
+
+    kernel.execute(&refs, out_view, attrs)
+}
+
+/// Reinterpret `bytes` as a `&[T]`, checking alignment + size. SAFETY caller:
+/// every bit pattern of the raw scalar types we use here (integers/floats/half)
+/// is a valid value, so the transmute is sound once alignment + length hold.
+fn as_typed<'a, T>(bytes: &'a [u8], role: &str) -> Result<&'a [T], String> {
+    let sz = std::mem::size_of::<T>();
+    if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<T>())
+        || !bytes.len().is_multiple_of(sz)
+    {
+        return Err(format!("{role}: host buffer not {sz}-byte aligned/sized"));
+    }
+    Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, bytes.len() / sz) })
+}
+
+fn as_typed_mut<'a, T>(bytes: &'a mut [u8], role: &str) -> Result<&'a mut [T], String> {
+    let sz = std::mem::size_of::<T>();
+    if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<T>())
+        || !bytes.len().is_multiple_of(sz)
+    {
+        return Err(format!("{role}: host buffer not {sz}-byte aligned/sized"));
+    }
+    let n = bytes.len() / sz;
+    Ok(unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut T, n) })
+}
+
+fn cpu_ref_from_bytes<'a>(
+    b: &'a [u8],
+    sh: &'a Shape,
+    role: &str,
+) -> Result<CpuTensorRef<'a>, String> {
+    Ok(match sh.dtype() {
+        DType::F32 => CpuTensorRef::F32 {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        DType::F64 => CpuTensorRef::F64 {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        DType::F16 => CpuTensorRef::F16 {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        DType::BF16 => CpuTensorRef::BF16 {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        DType::I8 => CpuTensorRef::I8 {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        DType::I16 => CpuTensorRef::I16 {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        DType::I32 => CpuTensorRef::I32 {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        DType::I64 => CpuTensorRef::I64 {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        DType::U8 => CpuTensorRef::U8 {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        DType::U32 => CpuTensorRef::U32 {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        DType::Bool => CpuTensorRef::Bool {
+            data: as_typed(b, role)?,
+            shape: sh,
+        },
+        other => {
+            return Err(format!(
+                "{role}: unsupported dtype {other:?} for host custom-op"
+            ));
+        }
+    })
+}
+
+fn cpu_mut_from_bytes<'a>(b: &'a mut [u8], sh: &'a Shape) -> Result<CpuTensorMut<'a>, String> {
+    Ok(match sh.dtype() {
+        DType::F32 => CpuTensorMut::F32 {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        DType::F64 => CpuTensorMut::F64 {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        DType::F16 => CpuTensorMut::F16 {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        DType::BF16 => CpuTensorMut::BF16 {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        DType::I8 => CpuTensorMut::I8 {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        DType::I16 => CpuTensorMut::I16 {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        DType::I32 => CpuTensorMut::I32 {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        DType::I64 => CpuTensorMut::I64 {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        DType::U8 => CpuTensorMut::U8 {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        DType::U32 => CpuTensorMut::U32 {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        DType::Bool => CpuTensorMut::Bool {
+            data: as_typed_mut(b, "output")?,
+            shape: sh,
+        },
+        other => {
+            return Err(format!(
+                "output: unsupported dtype {other:?} for host custom-op"
+            ));
+        }
+    })
+}
+
+/// Dtype-aware sibling of [`run_f32_custom_op_host`]: run a registered custom-op
+/// [`CpuKernel`] against **host byte buffers**, reinterpreting each operand per
+/// its `Shape`'s dtype (so integer ops like `onnx.Mod` on I64, or Bool masks,
+/// are handled correctly — not forced to F32). This is the generic host-delegate
+/// a GPU backend (Metal / MLX / wgpu) uses for any `onnx.*` custom op it has no
+/// native kernel for, staging operands to host over unified/mapped memory.
+pub fn run_custom_op_host(
+    name: &str,
+    inputs: &[(&[u8], &Shape)],
+    out: (&mut [u8], &Shape),
+    attrs: &[u8],
+) -> Result<(), String> {
+    let kernel = lookup_cpu_kernel(name)
+        .ok_or_else(|| format!("no CpuKernel registered for custom op '{name}'"))?;
+    let refs: Vec<CpuTensorRef<'_>> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, &(b, sh))| cpu_ref_from_bytes(b, sh, &format!("{name} input {i}")))
+        .collect::<Result<_, _>>()?;
+    let (out_bytes, out_shape) = out;
+    let out_view = cpu_mut_from_bytes(out_bytes, out_shape)?;
+    kernel.execute(&refs, out_view, attrs)
+}

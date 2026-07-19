@@ -122,19 +122,86 @@ pub(super) fn lower_matmul(
     Ok(true)
 }
 
+/// Transpose the last two axes of `x` (ONNX Gemm `transA`/`transB`).
+fn transpose_last2(m: &mut HirMut<'_>, x: HirNodeId) -> HirNodeId {
+    let s = m.shape(x).clone();
+    let r = s.rank();
+    if r < 2 {
+        return x;
+    }
+    let mut perm: Vec<usize> = (0..r).collect();
+    perm.swap(r - 2, r - 1);
+    let dims: Vec<usize> = perm.iter().map(|&i| s.dim(i).unwrap_static()).collect();
+    let out = Shape::new(&dims, s.dtype());
+    m.add_node(Op::Transpose { perm }, vec![x], out)
+}
+
+/// `x * factor` (scalar), for Gemm `alpha`/`beta`.
+fn scale_by(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    x: HirNodeId,
+    factor: f32,
+    key: String,
+) -> HirNodeId {
+    let sc = m.param(&key, Shape::new(&[1], DType::F32));
+    ctx.params.insert(key, vec![factor]);
+    let s = m.shape(x).clone();
+    m.add_node(Op::Binary(BinaryOp::Mul), vec![x, sc], s)
+}
+
 pub(super) fn lower_gemm(
     m: &mut HirMut<'_>,
     ctx: &mut LowerCtx<'_>,
     node: &BundleNode,
 ) -> Result<bool> {
-    let a = ctx.tensor(&node.inputs[0])?;
-    let b = ctx.tensor(&node.inputs[1])?;
+    let mut a = ctx.tensor(&node.inputs[0])?;
+    let mut b = ctx.tensor(&node.inputs[1])?;
+    // ONNX Gemm: Y = alpha·(op(A)·op(B)) + beta·C. A PyTorch `Linear` exports as
+    // `transB=1` with weight `[out, in]`, so op(B) transposes it to `[in, out]`;
+    // without this the matmul keeps the `in` feature dim (wrong output shape).
+    if node
+        .attrs
+        .get("transA")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        != 0
+    {
+        a = transpose_last2(m, a);
+    }
+    if node
+        .attrs
+        .get("transB")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        != 0
+    {
+        b = transpose_last2(m, b);
+    }
     let sa = m.shape(a).clone();
     let sb = m.shape(b).clone();
     let s = infer_matmul_output_shape(&sa, &sb, ctx.opts.sequence_length);
     let mut id = m.add_node(Op::MatMul, vec![a, b], s.clone());
+    let alpha = node
+        .attrs
+        .get("alpha")
+        .and_then(|v| v.as_f64())
+        .map(|x| x as f32)
+        .unwrap_or(1.0);
+    if alpha != 1.0 {
+        id = scale_by(m, ctx, id, alpha, format!("__gemm_alpha__/{}", node.name));
+    }
     if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
-        let c = ctx.tensor(&node.inputs[2])?;
+        let mut c = ctx.tensor(&node.inputs[2])?;
+        let beta = node
+            .attrs
+            .get("beta")
+            .and_then(|v| v.as_f64())
+            .map(|x| x as f32)
+            .unwrap_or(1.0);
+        if beta != 1.0 {
+            c = scale_by(m, ctx, c, beta, format!("__gemm_beta__/{}", node.name));
+        }
         id = binary_infer_add(m, id, c, &node.name);
     }
     ctx.env.insert(node.outputs[0].clone(), id);

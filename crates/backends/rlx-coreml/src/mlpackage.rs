@@ -41,6 +41,11 @@ pub struct BlobWriter {
 const BLOB_SENTINEL: u32 = 0xDEAD_BEEF;
 const BLOB_DTYPE_FLOAT16: u32 = 1;
 const BLOB_DTYPE_FLOAT32: u32 = 2;
+const BLOB_DTYPE_UINT8: u32 = 3;
+const BLOB_DTYPE_INT8: u32 = 4;
+/// CoreML MILBlob sub-byte dtype code for 1-bit packed data (palettization
+/// indices). Matches coremltools' BlobDataType ordering.
+const BLOB_DTYPE_UINT1: u32 = 11;
 
 impl BlobWriter {
     pub fn new() -> Self {
@@ -100,6 +105,42 @@ impl BlobWriter {
         }
         self.count += 1;
         meta_off
+    }
+
+    /// Append a raw uint8 tensor (packed quant indices / int weights); returns
+    /// its metadata record offset. `dtype` is the CoreML blob dtype code
+    /// (3 = uint8, 4 = int8). Used by the non-unfolding Q1_0 paths
+    /// (`constexpr_lut_to_dense` indices / `constexpr_affine_dequantize` data)
+    /// so quant weights never expand to f32 in the blob.
+    pub fn write_bytes_dtype(&mut self, data: &[u8], dtype: u32) -> u64 {
+        self.align64();
+        let meta_off = self.buf.len() as u64;
+        let data_off = meta_off + 64;
+        let size = data.len() as u64;
+        let mut meta = [0u8; 64];
+        meta[0..4].copy_from_slice(&BLOB_SENTINEL.to_le_bytes());
+        meta[4..8].copy_from_slice(&dtype.to_le_bytes());
+        meta[8..16].copy_from_slice(&size.to_le_bytes());
+        meta[16..24].copy_from_slice(&data_off.to_le_bytes());
+        self.buf.extend_from_slice(&meta);
+        self.buf.extend_from_slice(data);
+        self.count += 1;
+        meta_off
+    }
+    /// uint8 blob (CoreML blob dtype 3).
+    pub fn write_u8(&mut self, data: &[u8]) -> u64 {
+        self.write_bytes_dtype(data, BLOB_DTYPE_UINT8)
+    }
+    /// Packed 1-bit blob (CoreML blob dtype 11 = UInt1): 8 indices per byte,
+    /// LSB-first. For `constexpr_lut_to_dense` palettization indices. `data` is
+    /// the already-packed bytes (`num_elems / 8`).
+    pub fn write_u1_packed(&mut self, packed: &[u8]) -> u64 {
+        self.write_bytes_dtype(packed, BLOB_DTYPE_UINT1)
+    }
+    /// int8 blob (CoreML blob dtype 4).
+    pub fn write_i8(&mut self, data: &[i8]) -> u64 {
+        let bytes: Vec<u8> = data.iter().map(|&v| v as u8).collect();
+        self.write_bytes_dtype(&bytes, BLOB_DTYPE_INT8)
     }
 
     pub fn is_empty(&self) -> bool {

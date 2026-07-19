@@ -41,8 +41,11 @@ use rlx_ir::Graph;
 use rlx_runtime::{Device, Session};
 use wasm_bindgen::prelude::*;
 
+mod api;
+mod exec;
 mod mlp;
 mod transformer;
+mod vision;
 use mlp::MlpDims;
 use transformer::TfConfig;
 
@@ -275,8 +278,13 @@ fn set_params(
 #[cfg(all(feature = "webgpu", target_arch = "wasm32"))]
 #[wasm_bindgen]
 pub async fn init_webgpu() -> bool {
-    rlx_wgpu::device::init_wgpu_device().await
+    rlx_runtime::init_webgpu().await
 }
+
+pub use api::{
+    VisionBench, VisionModelInfo, list_vision_models, parse_backend, preferred_backend,
+    vision_model_info,
+};
 
 #[cfg(test)]
 mod tests {

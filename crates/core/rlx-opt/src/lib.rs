@@ -141,11 +141,13 @@ pub mod vmap {
 // ── Root re-exports (legacy `use rlx_opt::…`) ─────────────────────
 
 pub use rlx_fusion::{
-    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
-    FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul, FuseTransformerLayer, FusionReport,
-    LowerControlFlow, LowerDotGeneral, MarkElementwiseRegions, MissReason, MissedFusion, Pass,
-    UnfuseElementwiseRegions, inline_if, inline_subgraph_into, run_passes,
-    unfuse_fused_for_autodiff, unroll_while,
+    FuseAdaLayerNorm, FuseAttentionBlock, FuseGatedResidual, FuseMatMulBiasAct, FuseResidualLN,
+    FuseResidualRmsNorm, FuseRmsNormReshape, FuseSharedInputMatMul, FuseSwiGLU,
+    FuseSwiGLUDualMatmul, FuseTransformerLayer, FusionReport, LowerControlFlow, LowerDotGeneral,
+    LowerScan, LowerSpectral, MarkElementwiseRegions, MissReason, MissedFusion, Pass,
+    UnfuseElementwiseRegions, inline_if, inline_subgraph_into, maybe_unroll_scans,
+    maybe_unroll_scans_budget, register_ir_pass, registered_ir_passes, run_passes,
+    run_registered_ir_passes, unfuse_fused_for_autodiff, unroll_scan, unroll_while,
 };
 
 #[cfg(feature = "training")]
@@ -178,9 +180,9 @@ pub use rlx_compile::{
     fusion_limits_for_target, fusion_passes, fusion_passes_for_supported, inline_into, insert_q_dq,
     inspect_compiled, inspect_fusion, inspect_pipeline, is_pure_view, legalize_for_backend,
     legalize_or_rewrite_for_backend, legalize_or_rewrite_for_backend_with_config,
-    legalize_or_rewrite_for_backend_with_dispatch, maybe_dump_pipeline, maybe_log_dispatch_report,
-    plan_memory_backward, plan_memory_f32_uniform, plan_memory_with_options,
-    prepare_graph_for_backend_with_report, promote_params_to_inputs, rewrite_for_backend,
-    rewrite_for_backend_with_config, rewrite_for_backend_with_dispatch, specialize_params,
-    supported_for_target, supports_op,
+    legalize_or_rewrite_for_backend_with_dispatch, lower_custom_ops, maybe_dump_pipeline,
+    maybe_log_dispatch_report, plan_memory_backward, plan_memory_f32_uniform,
+    plan_memory_with_options, prepare_graph_for_backend_with_report, promote_params_to_inputs,
+    rewrite_for_backend, rewrite_for_backend_with_config, rewrite_for_backend_with_dispatch,
+    specialize_params, supported_for_target, supports_op,
 };

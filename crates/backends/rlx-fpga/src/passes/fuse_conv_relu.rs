@@ -114,6 +114,7 @@ mod tests {
                     w_zp: 0,
                     out_zp: 0,
                     weight_bits: 8,
+                    weight_encoding: crate::model::WeightEncoding::SignedInt,
                     requant: vec![(1 << 30, 0)],
                     weights: vec![1],
                     bias: None,
@@ -129,6 +130,7 @@ mod tests {
                     stride_w: 1,
                 },
             ],
+            extra_outputs: vec![],
         };
         let mut hints = vec![Hints::default(); 2];
         run(&m, &mut hints);

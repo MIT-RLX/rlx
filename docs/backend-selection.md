@@ -110,11 +110,20 @@ first request per device). Use `GraphDevices` when you want lazy compile-on-firs
 | `is_available(device)` | Driver + feature probe |
 | `available_devices()` | All compiled-in backends that pass `is_available` |
 | `devices_for(&graph)` | Graph-compatible backends |
-| `device_report(&graph, &policy)` | Blockers + recommended device |
+| `device_report(&graph, &policy)` | Blockers + recommended device; each row includes advisory `capabilities` (see below) |
 | `device_label(device)` | Stable string (`"metal"`, `"gpu"`, …) |
 | `parse_device(&str)` | String → `Device` (aliases: `nvidia`→cuda, `wgpu`→gpu) |
 | `BackendsManifest::current()` | Compile-time feature manifest |
 | `register_backends! { … }` | Register companion crates at startup (prelude macro) |
+| `advisory_capabilities(device)` | Static [`ExecutableCapabilities`](../crates/core/rlx-runtime/src/capabilities.rs) bits typical for that device |
+
+### `DeviceCandidate.capabilities`
+
+`device_report` fills `capabilities` with human-readable names from
+[`advisory_capabilities`](../crates/core/rlx-runtime/src/device_policy.rs)
+(`clone`, `moe`, `gpu_handles`, `kv_resident`, `typed_io`, `async_pipeline`,
+`active_extent`, …). These are **advisory** — confirm after compile with
+`ExecutableGraph::capabilities()`. Python: `device_report(g)[0].capabilities`.
 
 ## Environment variables
 
@@ -126,6 +135,7 @@ first request per device). Use `GraphDevices` when you want lazy compile-on-firs
 | `RLX_DEVICE` | Default hint for resolved runs |
 | `RLX_DEVICE_CHAIN` | Fallback order (`cuda,gpu,cpu`) |
 | `RLX_BENCHMARK_PICK` | If set to `N`, enable benchmark pick with `N` runs |
+| `RLX_COREML_UNITS` | CoreML silicon: `cpu` / `gpu` / `all` / `ane`. Unset → fp32 CPU+GPU, f16 CPU+ANE. See [rlx-coreml README](../crates/backends/rlx-coreml/README.md). |
 
 Prefix variants: `DevicePolicy::from_env_key("MYAPP")` reads `MYAPP_DEVICES`, etc.
 
@@ -141,6 +151,7 @@ print(json.loads(rlx.backends_manifest()))
 print(rlx.parse_device("metal"))
 print(rlx.fastest_device_for(g))
 print(rlx.device_report(g)[0].label)
+print(rlx.device_report(g)[0].capabilities)
 
 # Multi-backend runner
 policy = rlx.DevicePolicy.only(["cpu", "metal"]).with_benchmark_pick(20)
@@ -173,7 +184,7 @@ Build with the backends you need:
 maturin develop --features cpu,metal,mlx,gpu
 ```
 
-See also [`crates/pyrlx/docs/backends.md`](../crates/pyrlx/docs/backends.md).
+See also [`crates/bindings/pyrlx/docs/backends.md`](../crates/bindings/pyrlx/docs/backends.md).
 
 ## Custom backends
 

@@ -513,6 +513,80 @@ impl<'a> HirMut<'a> {
             self.concat_(batch_outs, 0)
         }
     }
+
+    // ── SPDNet / Riemannian manifold layers ─────────────────────────────────
+    // Mirror `crate::Graph::{bimap,reeig,logeig,spd_batch_norm_transport}`
+    // (see `ops/manifold.rs`) at the HIR level, emitting via `mir(...)`. These
+    // operate on symmetric-positive-definite matrices and are F64-first (the
+    // CPU kernels `expect_f64`); the caller must supply F64-typed inputs.
+
+    /// BiMap (bilinear mapping) SPDNet layer: `Y = W · X · Wᵀ`.
+    /// `w` is `[m, n]`, `x` is `[n, n]` symmetric SPD; output `Y` is `[m, m]`.
+    pub fn bimap(&mut self, w: HirNodeId, x: HirNodeId) -> HirNodeId {
+        let ws = self.shape(w).clone();
+        let m = ws.dim(0).unwrap_static();
+        let dtype = ws.dtype();
+        self.0
+            .mir(Op::BiMap, vec![w, x], Shape::new(&[m, m], dtype))
+    }
+
+    /// ReEig (eigenvalue rectification) SPDNet nonlinearity:
+    /// `Y = U · max(ε, Σ) · Uᵀ`. `x` is `[n, n]` symmetric SPD; output `Y` is
+    /// the same shape (the SPD analogue of ReLU). See [`Self::spectral_layer`].
+    pub fn reeig(&mut self, x: HirNodeId, eps: f32) -> HirNodeId {
+        self.spectral_layer(Op::ReEig { eps }, x)
+    }
+
+    /// LogEig SPDNet layer: `Y = logm(X) = U · log(Σ) · Uᵀ`. Maps the SPD
+    /// manifold to the tangent space at the identity. `x` is `[n, n]`; output
+    /// `Y` is the same shape. See [`Self::spectral_layer`].
+    pub fn logeig(&mut self, x: HirNodeId, eps: f32) -> HirNodeId {
+        self.spectral_layer(Op::LogEig { eps }, x)
+    }
+
+    /// Shared builder for the packed spectral layers (ReEig / LogEig): push the
+    /// op (output `[2n²+n]` = `Y ∥ λ ∥ U`, so the backward reuses the
+    /// eigendecomposition), then narrow + reshape the leading `Y` block to
+    /// `[n, n]`. Mirrors `Graph::spectral_layer` in `ops/manifold.rs`.
+    fn spectral_layer(&mut self, op: Op, x: HirNodeId) -> HirNodeId {
+        let xs = self.shape(x).clone();
+        let n = xs.dim(0).unwrap_static();
+        let dtype = xs.dtype();
+        let packed = self.0.mir(op, vec![x], Shape::new(&[2 * n * n + n], dtype));
+        let y_flat = self.0.mir(
+            Op::Narrow {
+                axis: 0,
+                start: 0,
+                len: n * n,
+            },
+            vec![packed],
+            Shape::new(&[n * n], dtype),
+        );
+        self.0.mir(
+            Op::Reshape {
+                new_shape: vec![n as i64, n as i64],
+            },
+            vec![y_flat],
+            Shape::new(&[n, n], dtype),
+        )
+    }
+
+    /// SPD batch-norm affine transport (eval / inference form):
+    /// `Y_i = G^{1/2} (M^{-1/2} X_i M^{-1/2}) G^{1/2}`.
+    /// `x` is `[batch, n, n]`, `mean` (frozen running Fréchet mean) and `g`
+    /// (learnable SPD bias) are `[n, n]`. Output matches `x`. Mirrors
+    /// `Graph::spd_batch_norm_transport`.
+    pub fn spd_batch_norm_transport(
+        &mut self,
+        x: HirNodeId,
+        mean: HirNodeId,
+        g: HirNodeId,
+        eps: f32,
+    ) -> HirNodeId {
+        let shape = self.shape(x).clone();
+        self.0
+            .mir(Op::SpdBatchNorm { eps }, vec![x, mean, g], shape)
+    }
 }
 
 /// For bicubic tap `k` (positions `base + {-1,0,1,2}`), the distance to the
@@ -803,6 +877,19 @@ pub trait HirGraphExt {
     ) -> HirNodeId;
     fn rms_norm(&mut self, x: HirNodeId, gamma: HirNodeId, beta: HirNodeId, eps: f32) -> HirNodeId;
 
+    /// DiT adaLN-Zero: `norm(x)·(1+scale)+shift`.
+    fn ada_layer_norm(
+        &mut self,
+        x: HirNodeId,
+        scale: HirNodeId,
+        shift: HirNodeId,
+        norm: AdaNormKind,
+        eps: f32,
+    ) -> HirNodeId;
+
+    /// DiT gated residual: `x + gate·y`.
+    fn gated_residual(&mut self, x: HirNodeId, y: HirNodeId, gate: HirNodeId) -> HirNodeId;
+
     fn sum(&mut self, x: HirNodeId, axes: Vec<usize>, keep_dim: bool) -> HirNodeId;
     fn mean(&mut self, x: HirNodeId, axes: Vec<usize>, keep_dim: bool) -> HirNodeId;
     fn sm(&mut self, x: HirNodeId, axis: i32) -> HirNodeId;
@@ -1081,6 +1168,24 @@ impl HirGraphExt for HirMut<'_> {
         let s = shape::unary_shape(self.shape(x));
         self.0
             .mir(Op::RmsNorm { axis: -1, eps }, vec![x, gamma, beta], s)
+    }
+
+    fn ada_layer_norm(
+        &mut self,
+        x: HirNodeId,
+        scale: HirNodeId,
+        shift: HirNodeId,
+        norm: AdaNormKind,
+        eps: f32,
+    ) -> HirNodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.0
+            .mir(Op::AdaLayerNorm { norm, eps }, vec![x, scale, shift], s)
+    }
+
+    fn gated_residual(&mut self, x: HirNodeId, y: HirNodeId, gate: HirNodeId) -> HirNodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.0.mir(Op::GatedResidual, vec![x, y, gate], s)
     }
 
     fn sum(&mut self, x: HirNodeId, axes: Vec<usize>, keep_dim: bool) -> HirNodeId {

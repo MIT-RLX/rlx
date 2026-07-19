@@ -573,6 +573,20 @@ unsafe extern "C" {
     pub fn rlx_mlx_dist_recv_f32(out: *mut c_float, nelems: usize, src: c_int) -> c_int;
     pub fn rlx_mlx_dist_barrier() -> c_int;
     pub fn rlx_mlx_dist_all_sum_array(inp: *mut mlx_array_t, out: *mut *mut mlx_array_t) -> c_int;
+    pub fn rlx_mlx_dist_all_reduce_array(
+        inp: *mut mlx_array_t,
+        kind: c_int,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+    pub fn rlx_mlx_dist_all_gather_array(
+        inp: *mut mlx_array_t,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+    pub fn rlx_mlx_dist_reduce_scatter_array(
+        inp: *mut mlx_array_t,
+        kind: c_int,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
 }
 
 #[repr(C)]

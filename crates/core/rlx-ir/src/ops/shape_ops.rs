@@ -17,6 +17,7 @@
 //! (plan #53). Other shape ops (narrow, transpose, expand) live
 //! on `GraphExt` in `infer.rs` since they need shape inference.
 
+use crate::op::ScatterNdReduction;
 use crate::{Graph, NodeId, Op, Shape};
 
 impl Graph {
@@ -28,6 +29,68 @@ impl Graph {
     /// Gather (embedding lookup).
     pub fn gather(&mut self, table: NodeId, indices: NodeId, axis: usize, shape: Shape) -> NodeId {
         self.push(Op::Gather { axis }, vec![table, indices], shape, None)
+    }
+
+    /// ONNX ScatterND: copy `data`, write `updates` at multi-index locations.
+    pub fn scatter_nd(
+        &mut self,
+        data: NodeId,
+        indices: NodeId,
+        updates: NodeId,
+        reduction: ScatterNdReduction,
+    ) -> NodeId {
+        let shape = self.node(data).shape.clone();
+        self.push(
+            Op::ScatterNd { reduction },
+            vec![data, indices, updates],
+            shape,
+            None,
+        )
+    }
+
+    /// ONNX ScatterElements along `axis`.
+    pub fn scatter_elements(
+        &mut self,
+        data: NodeId,
+        indices: NodeId,
+        updates: NodeId,
+        axis: i32,
+        reduction: ScatterNdReduction,
+    ) -> NodeId {
+        let shape = self.node(data).shape.clone();
+        self.push(
+            Op::ScatterElements { axis, reduction },
+            vec![data, indices, updates],
+            shape,
+            None,
+        )
+    }
+
+    /// ONNX GatherND.
+    pub fn gather_nd(
+        &mut self,
+        data: NodeId,
+        indices: NodeId,
+        batch_dims: i32,
+        out_shape: Shape,
+    ) -> NodeId {
+        self.push(
+            Op::GatherNd { batch_dims },
+            vec![data, indices],
+            out_shape,
+            None,
+        )
+    }
+
+    /// ONNX GatherElements / take_along_axis — output shape = indices shape.
+    pub fn gather_elements(&mut self, data: NodeId, indices: NodeId, axis: i32) -> NodeId {
+        let shape = self.node(indices).shape.clone();
+        self.push(
+            Op::GatherElements { axis },
+            vec![data, indices],
+            shape,
+            None,
+        )
     }
 
     /// Concatenate tensors along an axis.

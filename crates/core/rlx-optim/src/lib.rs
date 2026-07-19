@@ -49,6 +49,7 @@
 //! | [`Muon`]        | Muon (Newton–Schulz orth.)    |
 //! | [`Sophia`]      | Sophia-H                      |
 //! | [`Mars`]        | MARS (variance-reduced)       |
+//! | [`Stiefel`]     | Riemannian SGD on St(m,n)     |
 
 #![forbid(unsafe_code)]
 
@@ -68,6 +69,7 @@ mod radam;
 mod sgd;
 mod soap;
 mod sophia;
+mod stiefel;
 
 pub use adafactor::Adafactor;
 pub use adam::Adam;
@@ -76,13 +78,14 @@ pub use kron_psgd::KronPsgd;
 pub use lamb::Lamb;
 pub use lion::Lion;
 pub use mars::Mars;
-pub use muon::Muon;
+pub use muon::{Muon, newton_schulz_orth};
 pub use nadamw::NAdamW;
 pub use qhadamw::QHAdamW;
 pub use radam::RAdam;
 pub use sgd::Sgd;
 pub use soap::Soap;
 pub use sophia::Sophia;
+pub use stiefel::Stiefel;
 
 pub use common::{global_grad_clip_scale, l2_norm};
 

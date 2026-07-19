@@ -1513,6 +1513,75 @@ mod algos {
         Ok(())
     }
 
+    /// Moore–Penrose pseudo-inverse matching **NumPy's `np.linalg.pinv`**
+    /// bit-for-bit: SVD via LAPACK `dgesdd` (not `dgesvd`) and the NumPy cutoff
+    /// `s_i ≤ rcond·s_max → 0` (default `rcond=1e-15`). Use this — not [`pinv`],
+    /// which uses `dgesvd` + a `max(m,n)·eps` cutoff — whenever a computation is
+    /// ill-conditioned enough that the SVD *driver* changes the answer (e.g. a
+    /// rank-deficient Gram matrix). `A: m×n` → `Y: n×m`.
+    pub fn pinv_gesdd(
+        a_in: &[f64],
+        m: usize,
+        n: usize,
+        rcond: f64,
+        out: &mut [f64],
+    ) -> Result<(), String> {
+        if a_in.len() != m * n || out.len() != n * m {
+            return Err(format!("pinv_gesdd: shape mismatch (m={m}, n={n})"));
+        }
+        let k = m.min(n);
+        let mut a_work = a_in.to_vec();
+        let mut u = vec![0f64; m * k];
+        let mut s = vec![0f64; k];
+        let mut vt = vec![0f64; k * n];
+        let info = rlx_cpu::blas::dgesdd_thin(&mut a_work, m, n, &mut s, &mut u, &mut vt);
+        if info != 0 {
+            return Err(format!("pinv_gesdd: dgesdd info={info}"));
+        }
+        let s_max = s.iter().cloned().fold(0f64, f64::max);
+        let cutoff = rcond * s_max;
+        // Reconstruct `pinv = (Vᵀ·diag(1/s))·Uᵀ` in NumPy's exact evaluation
+        // order — `(vt·inv)·u`, summed over ascending l — so the result is
+        // bit-identical to `np.linalg.pinv` even on ill-conditioned inputs where
+        // the multiplication order changes the last ULPs. (`vt·(inv·u)` differs.)
+        for i in 0..n {
+            for j in 0..m {
+                let mut acc = 0f64;
+                for l in 0..k {
+                    let inv = if s[l] > cutoff { 1.0 / s[l] } else { 0.0 };
+                    acc += vt[l * n + i] * inv * u[j * k + l];
+                }
+                out[i * m + j] = acc;
+            }
+        }
+        Ok(())
+    }
+
+    /// Minimum-norm least-squares `min‖A·X − B‖` matching **SciPy's
+    /// `scipy.linalg.lstsq`** (LAPACK `dgelsd`). `A: m×n` row-major, `B: m×nrhs`
+    /// row-major, `X: n×nrhs` row-major. `rcond < 0` ⇒ machine precision (SciPy
+    /// default). Pairs with [`pinv_gesdd`] for NumPy/SciPy-exact linear algebra.
+    pub fn lstsq_gelsd(
+        a: &[f64],
+        b: &[f64],
+        m: usize,
+        n: usize,
+        nrhs: usize,
+        rcond: f64,
+        x: &mut [f64],
+    ) -> Result<(), String> {
+        if a.len() != m * n || b.len() != m * nrhs || x.len() != n * nrhs {
+            return Err(format!(
+                "lstsq_gelsd: shape mismatch (m={m}, n={n}, nrhs={nrhs})"
+            ));
+        }
+        let info = rlx_cpu::blas::dgelsd_solve(a, b, m, n, nrhs, rcond, x);
+        if info != 0 {
+            return Err(format!("lstsq_gelsd: dgelsd info={info}"));
+        }
+        Ok(())
+    }
+
     /// VJP for `pinv`. For full column-rank A (m ≥ n):
     ///   dL/dA = -Yᵀ·G·Yᵀ + (I_m - A·Y)·Gᵀ·Y·Yᵀ
     /// where Y = pinv(A), G = dL/dY (n×m). For square A, the second
@@ -2181,7 +2250,9 @@ pub fn svd(g: &mut Graph, a: NodeId) -> (NodeId, NodeId, NodeId) {
 /// Dense LAPACK wrappers for host-side crates (eda-doa, eda-fullwave, …).
 #[cfg(feature = "cpu")]
 pub mod host {
-    pub use super::algos::{cholesky, eigh, gesv, matmul, solve_triangular};
+    pub use super::algos::{
+        cholesky, eigh, gesv, lstsq_gelsd, matmul, pinv_gesdd, solve_triangular,
+    };
 }
 
 // ── Registration ─────────────────────────────────────────────────

@@ -44,6 +44,19 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
         // Block-level fast paths for the new schemes that share QK_K.
         QuantScheme::GgufTQ1_0 => rlx_gguf::tq_dequant::dequant_tq1_0_block(block, out),
         QuantScheme::GgufTQ2_0 => rlx_gguf::tq_dequant::dequant_tq2_0_block(block, out),
+        // 128-element 1-bit block (PrismML Bonsai-27B); caller slices `out`.
+        QuantScheme::GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0_block(
+            block,
+            (&mut out[..rlx_gguf::q1_dequant::QK1_0])
+                .try_into()
+                .unwrap(),
+        ),
+        QuantScheme::GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0_block(
+            block,
+            (&mut out[..rlx_gguf::q2_dequant::QK2_0])
+                .try_into()
+                .unwrap(),
+        ),
         // 32-element blocks: caller slices `out` to the correct length.
         QuantScheme::GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4_block(
             block,
@@ -352,6 +365,8 @@ pub fn dequant_moe_weights_to_grouped_f32(
             QuantScheme::GgufTQ2_0 => rlx_gguf::tq_dequant::dequant_tq2_0(slab, k * n),
             QuantScheme::GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4(slab, k * n),
             QuantScheme::GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(slab, k * n),
+            QuantScheme::GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0(slab, k * n),
+            QuantScheme::GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(slab, k * n),
             other => panic!("dequant_moe_weights: unsupported scheme {other:?}"),
         }
         .expect("dequant_moe_weights: slab dequant failed");
@@ -572,6 +587,65 @@ mod tests {
                 legacy[i],
                 dispatched[i]
             );
+        }
+    }
+
+    #[test]
+    fn fused_q1_0_matches_full_dequant() {
+        // Custom 1-bit Q1_0 (PrismML Bonsai-27B): 128-element blocks,
+        // f16 group scale + 128 sign bits. Exercises both the m=1 and
+        // the m>1 accumulation paths of gguf_matmul_bt.
+        use rlx_gguf::q1_dequant::QK1_0;
+        let k = 256usize; // 2 blocks per row
+        let n = 8usize;
+        let blocks_per_row = k / QK1_0;
+
+        let mut packed = Vec::new();
+        let mut w_ref = vec![0f32; n * k]; // row-major [n, k]
+        for row in 0..n {
+            for b in 0..blocks_per_row {
+                // f16-roundtrip the scale so w_ref == packed-dequant exactly.
+                let d =
+                    half::f16::from_f32(0.1 + 0.05 * (row * blocks_per_row + b) as f32).to_f32();
+                packed.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                let mut bits = [0u8; QK1_0 / 8];
+                for j in 0..QK1_0 {
+                    let elem = b * QK1_0 + j;
+                    let positive = !(row + elem).is_multiple_of(3);
+                    if positive {
+                        bits[j / 8] |= 1 << (j % 8);
+                    }
+                    w_ref[row * k + elem] = if positive { d } else { -d };
+                }
+                packed.extend_from_slice(&bits);
+            }
+        }
+        // Whole-tensor dequant agrees with the hand-built reference.
+        let deq = rlx_gguf::q1_dequant::dequant_q1_0(&packed, n * k).unwrap();
+        assert_eq!(deq, w_ref);
+
+        for m in [1usize, 3] {
+            let x: Vec<f32> = (0..m * k).map(|i| 0.01 * i as f32 - 0.3).collect();
+            let mut reference = vec![0f32; m * n];
+            for mi in 0..m {
+                for row in 0..n {
+                    let mut acc = 0f32;
+                    for p in 0..k {
+                        acc += x[mi * k + p] * w_ref[row * k + p];
+                    }
+                    reference[mi * n + row] = acc;
+                }
+            }
+            let mut fused = vec![0f32; m * n];
+            gguf_matmul_bt(&x, &packed, &mut fused, m, k, n, QuantScheme::GgufQ1_0);
+            for i in 0..reference.len() {
+                assert!(
+                    (reference[i] - fused[i]).abs() < 1e-3,
+                    "m={m} i={i}: ref={} fused={}",
+                    reference[i],
+                    fused[i]
+                );
+            }
         }
     }
 

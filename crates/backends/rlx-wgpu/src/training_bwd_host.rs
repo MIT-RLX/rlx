@@ -12,24 +12,25 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-//! Host-side training backward ops for wgpu arenas (readback → CPU → writeback).
+
+//! Host-side training backward ops for wgpu arenas.
+//!
+//! Thin adapters over [`rlx_gpu_host`] (whole-arena mirror).
 
 use crate::buffer::Arena;
+use crate::host_stage::WgpuArena;
 
-#[inline]
-fn run_on_arena(
-    arena: &Arena,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    f: impl FnOnce(*mut u8),
-) {
-    let mut host = arena.read_bytes_range(device, queue, 0, arena.size);
-    f(host.as_mut_ptr());
-    arena.write_bytes_range(queue, 0, &host);
+fn arena<'a>(arena: &'a Arena, device: &'a wgpu::Device, queue: &'a wgpu::Queue) -> WgpuArena<'a> {
+    WgpuArena {
+        arena,
+        device,
+        queue,
+        size_bytes: arena.size,
+    }
 }
 
 pub fn run_rms_norm_backward_input(
-    arena: &Arena,
+    arena_buf: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     x: usize,
@@ -41,15 +42,12 @@ pub fn run_rms_norm_backward_input(
     h: u32,
     eps: f32,
 ) {
-    run_on_arena(arena, device, queue, |base| unsafe {
-        rlx_cpu::thunk::execute_rms_norm_backward_input_f32(
-            x, gamma, beta, dy, dx, rows, h, eps, base,
-        );
-    });
+    let mut a = arena(arena_buf, device, queue);
+    rlx_gpu_host::run_rms_norm_backward_input(&mut a, x, gamma, beta, dy, dx, rows, h, eps);
 }
 
 pub fn run_rms_norm_backward_gamma(
-    arena: &Arena,
+    arena_buf: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     x: usize,
@@ -61,15 +59,12 @@ pub fn run_rms_norm_backward_gamma(
     h: u32,
     eps: f32,
 ) {
-    run_on_arena(arena, device, queue, |base| unsafe {
-        rlx_cpu::thunk::execute_rms_norm_backward_gamma_f32(
-            x, gamma, beta, dy, dgamma, rows, h, eps, base,
-        );
-    });
+    let mut a = arena(arena_buf, device, queue);
+    rlx_gpu_host::run_rms_norm_backward_gamma(&mut a, x, gamma, beta, dy, dgamma, rows, h, eps);
 }
 
 pub fn run_rms_norm_backward_beta(
-    arena: &Arena,
+    arena_buf: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     x: usize,
@@ -81,15 +76,12 @@ pub fn run_rms_norm_backward_beta(
     h: u32,
     eps: f32,
 ) {
-    run_on_arena(arena, device, queue, |base| unsafe {
-        rlx_cpu::thunk::execute_rms_norm_backward_beta_f32(
-            x, gamma, beta, dy, dbeta, rows, h, eps, base,
-        );
-    });
+    let mut a = arena(arena_buf, device, queue);
+    rlx_gpu_host::run_rms_norm_backward_beta(&mut a, x, gamma, beta, dy, dbeta, rows, h, eps);
 }
 
 pub fn run_rope_backward(
-    arena: &Arena,
+    arena_buf: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     dy: usize,
@@ -103,15 +95,14 @@ pub fn run_rope_backward(
     n_rot: u32,
     cos_len: u32,
 ) {
-    run_on_arena(arena, device, queue, |base| unsafe {
-        rlx_cpu::thunk::execute_rope_backward_f32(
-            dy, cos, sin, dx, batch, seq, hidden, head_dim, n_rot, cos_len, base,
-        );
-    });
+    let mut a = arena(arena_buf, device, queue);
+    rlx_gpu_host::run_rope_backward(
+        &mut a, dy, cos, sin, dx, batch, seq, hidden, head_dim, n_rot, cos_len,
+    );
 }
 
 pub fn run_cumsum_backward(
-    arena: &Arena,
+    arena_buf: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     dy: usize,
@@ -120,13 +111,12 @@ pub fn run_cumsum_backward(
     cols: u32,
     exclusive: bool,
 ) {
-    run_on_arena(arena, device, queue, |base| unsafe {
-        rlx_cpu::thunk::execute_cumsum_backward_f32(dy, dx, rows, cols, exclusive, base);
-    });
+    let mut a = arena(arena_buf, device, queue);
+    rlx_gpu_host::run_cumsum_backward(&mut a, dy, dx, rows, cols, exclusive);
 }
 
 pub fn run_gather_backward(
-    arena: &Arena,
+    arena_buf: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     dy: usize,
@@ -137,9 +127,6 @@ pub fn run_gather_backward(
     num_idx: u32,
     trailing: u32,
 ) {
-    run_on_arena(arena, device, queue, |base| unsafe {
-        rlx_cpu::thunk::execute_gather_backward_f32(
-            dy, indices, dst, outer, axis_dim, num_idx, trailing, base,
-        );
-    });
+    let mut a = arena(arena_buf, device, queue);
+    rlx_gpu_host::run_gather_backward(&mut a, dy, indices, dst, outer, axis_dim, num_idx, trailing);
 }

@@ -85,6 +85,8 @@ pub mod iq_grids;
 pub mod iq_quantize;
 pub mod mx_dequant;
 pub mod mx_quantize;
+pub mod q1_dequant;
+pub mod q2_dequant;
 pub mod quantize;
 pub mod tq_dequant;
 pub mod tq_quantize;
@@ -141,6 +143,7 @@ pub enum GgmlType {
     MXFP4 = 39,
     NVFP4 = 40,
     Q1_0 = 41,
+    Q2_0 = 42,
 }
 
 impl GgmlType {
@@ -180,6 +183,7 @@ impl GgmlType {
             39 => Self::MXFP4,
             40 => Self::NVFP4,
             41 => Self::Q1_0,
+            42 => Self::Q2_0,
             other => bail!("unknown ggml type {other}"),
         })
     }
@@ -264,15 +268,41 @@ impl GgufTensor {
     }
 }
 
+/// Tensor-data segment backing: either slurped into an owned `Vec`
+/// (default) or an `mmap` of the file (low-footprint path — the 3.8 GB
+/// of a 27B Q1_0 never becomes resident RSS; the OS pages it on demand).
+/// Both deref to the offset-relative data bytes so [`GgufFile`] callers
+/// are backing-agnostic.
+enum GgufData {
+    Owned(Vec<u8>),
+    /// `map` covers the whole file; `start` is the byte offset of the
+    /// data segment, so the deref yields the same offset-relative slice
+    /// as `Owned`.
+    Mmap {
+        map: memmap2::Mmap,
+        start: usize,
+    },
+}
+
+impl std::ops::Deref for GgufData {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            GgufData::Owned(v) => v.as_slice(),
+            GgufData::Mmap { map, start } => &map[*start..],
+        }
+    }
+}
+
 pub struct GgufFile {
     pub version: u32,
     pub alignment: u64,
     pub metadata: HashMap<String, MetaValue>,
     pub tensors: HashMap<String, GgufTensor>,
-    /// Raw tensor-data segment (`data_start` to EOF). Slurped into
-    /// memory — fine for embed-class models. Future mmap path slots
-    /// in here.
-    data: Vec<u8>,
+    /// Tensor-data segment (`data_start` to EOF), owned or mmap-backed.
+    data: GgufData,
+    /// Byte offset of the data segment within the file (for the mmap path).
+    data_offset: u64,
 }
 
 impl GgufFile {
@@ -295,16 +325,19 @@ impl GgufFile {
             .map(|p| Self::from_path(p.as_ref()))
             .collect::<Result<_>>()?;
         let mut merged = parts.remove(0);
+        // Splits merge into one owned buffer (the mmap path is single-file).
+        let mut merged_bytes: Vec<u8> = merged.data.to_vec();
         for part in parts {
-            let base = merged.data.len() as u64;
+            let base = merged_bytes.len() as u64;
             for (name, mut t) in part.tensors {
                 t.offset = t.offset.saturating_add(base);
                 if merged.tensors.insert(name, t).is_some() {
                     bail!("from_split_paths: duplicate tensor name in split merge");
                 }
             }
-            merged.data.extend_from_slice(&part.data);
+            merged_bytes.extend_from_slice(&part.data);
         }
+        merged.data = GgufData::Owned(merged_bytes);
         merged
             .metadata
             .insert("split.count".into(), MetaValue::U32(1));
@@ -313,6 +346,37 @@ impl GgufFile {
     }
 
     pub fn from_reader<R: Read + Seek>(r: &mut R) -> Result<Self> {
+        Self::from_reader_inner(r, true)
+    }
+
+    /// Parse only the header (metadata + tensor table) and skip the
+    /// tensor-data slurp. For cheap probes — arch detection, `inspect`
+    /// — on large files: reading a 3.8 GB `Q1_0` GGUF just to read
+    /// `general.architecture` would otherwise pull the whole file into
+    /// RAM. The returned file has an empty `data` segment, so
+    /// `dequant_f32` / `tensor_bytes` will error; metadata and tensor
+    /// shapes/dtypes are fully populated.
+    pub fn header_from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        Self::header_from_reader(&mut f)
+    }
+
+    /// Header-only parse from any [`Read`] + [`Seek`] (e.g. HTTP Range
+    /// buffer wrapped in [`std::io::Cursor`]). Does not read tensor data.
+    pub fn header_from_reader<R: Read + Seek>(r: &mut R) -> Result<Self> {
+        Self::from_reader_inner(r, false)
+    }
+
+    /// Header-only parse from an in-memory GGUF **prefix** (metadata +
+    /// tensor table). Returns an error if `bytes` ends mid-header — grow
+    /// the Range window and retry.
+    pub fn header_from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cur = std::io::Cursor::new(bytes);
+        Self::header_from_reader(&mut cur)
+    }
+
+    fn from_reader_inner<R: Read + Seek>(r: &mut R, read_data: bool) -> Result<Self> {
         let magic = read_u32(r)?;
         if magic != GGUF_MAGIC {
             bail!("not a GGUF file (magic {magic:#x})");
@@ -383,21 +447,56 @@ impl GgufFile {
             );
         }
 
-        // Data segment starts at the next `alignment` boundary.
+        // Data segment starts at the next `alignment` boundary. Compute
+        // its file offset unconditionally so the mmap path can reuse a
+        // header-only parse.
         let pos = r.stream_position()?;
         let pad = (alignment - (pos % alignment)) % alignment;
-        r.seek(SeekFrom::Current(pad as i64))?;
-
+        let data_offset = pos + pad;
         let mut data = Vec::new();
-        r.read_to_end(&mut data)?;
+        if read_data {
+            r.seek(SeekFrom::Current(pad as i64))?;
+            r.read_to_end(&mut data)?;
+        }
 
         Ok(Self {
             version,
             alignment,
             metadata,
             tensors,
-            data,
+            data: GgufData::Owned(data),
+            data_offset,
         })
+    }
+
+    /// Parse the header and `mmap` the file's data segment instead of
+    /// slurping it into RSS. Ideal for large models on constrained
+    /// machines — the OS pages tensor bytes on demand and the pages are
+    /// reclaimable. `tensor_bytes` / `dequant_f32` work unchanged.
+    pub fn from_path_mmap<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut gf = {
+            let mut r = &f;
+            Self::from_reader_inner(&mut r, false)?
+        };
+        // SAFETY: read-only mmap of a file we hold open; callers get
+        // immutable `&[u8]` slices. Concurrent external truncation is UB,
+        // same caveat as every mmap-based loader.
+        let map =
+            unsafe { memmap2::Mmap::map(&f).with_context(|| format!("mmap {}", path.display()))? };
+        if (gf.data_offset as usize) > map.len() {
+            bail!(
+                "GGUF data offset {} past mapped length {}",
+                gf.data_offset,
+                map.len()
+            );
+        }
+        gf.data = GgufData::Mmap {
+            map,
+            start: gf.data_offset as usize,
+        };
+        Ok(gf)
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &str> {
@@ -446,6 +545,8 @@ impl GgufFile {
             GgmlType::IQ3S => iq_dequant::dequant_iq3_s(bytes, n)?,
             GgmlType::IQ1S => iq_dequant::dequant_iq1_s(bytes, n)?,
             GgmlType::IQ1M => iq_dequant::dequant_iq1_m(bytes, n)?,
+            GgmlType::Q1_0 => q1_dequant::dequant_q1_0(bytes, n)?,
+            GgmlType::Q2_0 => q2_dequant::dequant_q2_0(bytes, n)?,
             other => bail!("dequant for {other:?} not implemented yet (tensor {name})"),
         };
         Ok((data, t.shape.clone()))
@@ -535,6 +636,9 @@ fn bytes_for(dtype: GgmlType, n: usize) -> Option<usize> {
         GgmlType::IQ3S => iq_dequant::iq3_s_bytes(n),
         GgmlType::IQ1S => iq_dequant::iq1_s_bytes(n),
         GgmlType::IQ1M => iq_dequant::iq1_m_bytes(n),
+        // Custom 1-bit format (PrismML Bonsai-27B): f16 scale + 128 sign bits.
+        GgmlType::Q1_0 => q1_dequant::q1_0_bytes(n),
+        GgmlType::Q2_0 => q2_dequant::q2_0_bytes(n),
         // Anything else: not yet supported. dequant_f32 will reject
         // these too; tensor_bytes returns None to stay consistent.
         _ => None,

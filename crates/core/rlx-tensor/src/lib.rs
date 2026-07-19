@@ -88,7 +88,7 @@ pub use rlx_ir::{DType, Dim, Graph, NodeId, ScaleLayout, ScaledFormat, Shape};
 /// Optimizers for [`Func::train_step`] (re-exported from `rlx_optim`).
 /// Available with the `optim` feature.
 #[cfg(feature = "optim")]
-pub use rlx_optim::{Adam, AdamW, Lion, Optimizer, Sgd};
+pub use rlx_optim::{Adam, AdamW, Lion, Muon, Optimizer, Sgd};
 #[cfg(feature = "optim")]
 pub use schedule::LrSchedule;
 pub use scope::{GraphScope, graph, graph_with};

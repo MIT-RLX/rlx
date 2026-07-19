@@ -200,12 +200,16 @@ impl MetalHwModel {
             // for sub-32 m until the kernel learns to mask the bottom rows.
             SgemmVariant::Simd4x4
         } else if m < 32 {
-            // Gemma 4 E2B prefill (bucket=16), decode steps, and other
-            // sub-32 row counts. simdgroup sgemm uses reduced internal
-            // accumulators and drifts ~0.1 L2 vs CPU/MLX by the final layer;
-            // scalar naive restores parity at small m where throughput cost
-            // is negligible.
-            SgemmVariant::Naive
+            // Decode / small-batch: Naive is correct but ~3× slower than
+            // simdgroup on Zonos CFG (m=2). Prefer SimdPadded for large
+            // projections; keep Naive for tiny dims or when
+            // RLX_METAL_SGEMM_PRECISE=1 (accumulator-parity debug).
+            let precise = rlx_ir::env::flag("RLX_METAL_SGEMM_PRECISE");
+            if !precise && k >= 256 && n >= 256 && k.is_multiple_of(8) {
+                SgemmVariant::SimdPadded
+            } else {
+                SgemmVariant::Naive
+            }
         } else if aligned_8 && m >= 8 && n >= 8 {
             SgemmVariant::Simd
         } else if k.is_multiple_of(8) && n >= 8 && m >= 1 {
@@ -351,11 +355,14 @@ mod tests {
         // overflow C past row m-1 — fall back to the padded simd kernel.
         assert_eq!(hw.pick_sgemm(750, 768, 2304), SgemmVariant::SimdPadded);
         assert_eq!(hw.pick_sgemm(8, 16, 16), SgemmVariant::Naive);
-        // m < 32 always routes to scalar naive (accumulator-parity fix), even
-        // when k,n are 32-aligned transformer-weight dims.
-        assert_eq!(hw.pick_sgemm(6, 768, 2304), SgemmVariant::Naive);
-        assert_eq!(hw.pick_sgemm(6, 768, 2300), SgemmVariant::Naive);
+        // Large k,n decode-style dims use SimdPadded (not Naive).
+        assert_eq!(hw.pick_sgemm(6, 768, 2304), SgemmVariant::SimdPadded);
+        assert_eq!(hw.pick_sgemm(2, 2048, 2048), SgemmVariant::SimdPadded);
+        // Tiny / unaligned stay Naive.
         assert_eq!(hw.pick_sgemm(6, 7, 7), SgemmVariant::Naive);
+        rlx_ir::env::set("RLX_METAL_SGEMM_PRECISE", "1");
+        assert_eq!(hw.pick_sgemm(6, 768, 2304), SgemmVariant::Naive);
+        rlx_ir::env::unset("RLX_METAL_SGEMM_PRECISE");
         rlx_ir::env::unset("RLX_DISABLE_MPS");
     }
 }

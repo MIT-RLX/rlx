@@ -23,6 +23,8 @@ pub mod io_output_gate;
 pub mod legalize;
 pub mod legalize_broadcast;
 pub mod memory;
+pub mod numeric_lint;
+pub mod param_hoist;
 pub mod param_specialize;
 pub mod precision;
 pub mod promote_params;
@@ -64,13 +66,15 @@ pub use memory::{
     MemoryPlanOptions, SharedWeightLayout, WeightSlot, is_pure_view, plan_memory_backward,
     plan_memory_f32_uniform, plan_memory_with_options,
 };
+pub use numeric_lint::{NumericLint, lint_numerics};
+pub use param_hoist::{HoistSplit, split_param_invariant};
 pub use param_specialize::{SpecializeParams, specialize_params};
 pub use precision::{AutoMixedPrecision, CastConfig, OpKind, Precision, PrecisionPolicy};
 pub use promote_params::promote_params_to_inputs;
 pub use quant_insert::{CalibrationEntry, CalibrationRecord, insert_q_dq};
 pub use rewrite::{
     legalize_or_rewrite_for_backend, legalize_or_rewrite_for_backend_with_config,
-    legalize_or_rewrite_for_backend_with_dispatch, rewrite_for_backend,
+    legalize_or_rewrite_for_backend_with_dispatch, lower_custom_ops, rewrite_for_backend,
     rewrite_for_backend_with_config, rewrite_for_backend_with_dispatch,
 };
 pub use rlx_fusion::FusionLimits;

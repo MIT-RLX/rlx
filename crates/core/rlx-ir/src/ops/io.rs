@@ -151,6 +151,41 @@ impl Graph {
         )
     }
 
+    /// Non-panicking [`custom_op`](Self::custom_op): returns a
+    /// [`CustomOpError`](crate::CustomOpError) instead of panicking when the op
+    /// isn't registered or the input arity mismatches. Prefer this in library
+    /// code that builds graphs from user/config input.
+    pub fn try_custom_op(
+        &mut self,
+        name: impl Into<String>,
+        attrs: Vec<u8>,
+        inputs: Vec<NodeId>,
+    ) -> Result<NodeId, crate::CustomOpError> {
+        let name: String = name.into();
+        let ext = crate::lookup_op(&name)
+            .ok_or_else(|| crate::CustomOpError::NotRegistered(name.clone()))?;
+        if ext.num_inputs() != inputs.len() {
+            return Err(crate::CustomOpError::ArityMismatch {
+                name,
+                expected: ext.num_inputs(),
+                got: inputs.len(),
+            });
+        }
+        let in_shapes: Vec<&Shape> = inputs.iter().map(|id| self.shape(*id)).collect();
+        let out_shape = ext.infer_shape(&in_shapes, &attrs);
+        let num_inputs = ext.num_inputs() as u32;
+        Ok(self.push(
+            Op::Custom {
+                name,
+                num_inputs,
+                attrs,
+            },
+            inputs,
+            out_shape,
+            None,
+        ))
+    }
+
     /// 1D FFT along the last axis.
     ///
     /// * **F32 / F64** — 2N real-block layout: last axis is `[re…, im…]`.

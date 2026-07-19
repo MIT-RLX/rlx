@@ -8,6 +8,8 @@ CUDA driver API.
 ## Stack
 
 - **Matmul** — hipBLAS / hipBLASLt (with `GemmEx` for mixed precision).
+- **Eigensolver** — hipSOLVER `SsyevjBatched` for `Op::Eigh` / `Op::EighBatch`
+  (`n ≤ 32`); larger `n` uses the CPU host path.
 - **Convolution / pooling** — MIOpen, including 4D and N-D primitives.
 - **Custom kernels** — hipRTC-compiled, cached on disk.
 - **hipGraph** — capture + replay.
@@ -27,8 +29,9 @@ rlx-rocm = "0.2"
 rlx-gpu-kernels = { version = "0.2", features = ["rocm"] }
 ```
 
-A working ROCm install (libhipruntime / libhipblas / libMIOpen) must be
-on the loader path at runtime.
+A working ROCm install (libhipruntime / libhipblas / libMIOpen / libhipsolver)
+must be on the loader path at runtime. hipSOLVER is optional for most ops but
+required for the native `Eigh` / `EighBatch` path (`n ≤ 32`).
 
 A host-side HIP-CPU shim is bundled for off-GPU validation; see
 `rlx-rocm/tests/hip_cpu_validate.rs`.
@@ -87,6 +90,9 @@ Feeds `RocmCostModel` in `rlx-runtime` for backend ranking.
   forward-find heuristic + workspace, with custom-kernel fallback.
 * **hipBLAS GemmEx mixed-precision** — half-arena consumer; same
   cast→GemmEx pattern as rlx-cuda.
+* **hipSOLVER SsyevjBatched** — `Op::Eigh` / `Op::EighBatch` with
+  `n ≤ 32` → `Step::EighNative` (on-device; see `eigh_native.rs`).
+  Missing `libhipsolver` or larger `n` keeps `Step::SpdHost`.
 * **hipGraph capture/replay** — ExecMode::Graph wired via
   `hipStreamBeginCapture` / `hipGraphLaunch`.
 * **Multi-stream + dependency-aware scheduling** —

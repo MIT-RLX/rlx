@@ -20,6 +20,15 @@
 //
 // Mask kinds (match forward `attention.cu`): 0=None 1=Causal 2=Custom
 // 3=SlidingWindow 4=Bias (additive [B,H,S_q,S_k] tensor at mask_off).
+//
+// PERF: dQ is thread-per-query, so each query's softmax row is built once —
+// O(S_q·S_k·D). The dK/dV outputs are indexed by key, so a naive thread-per-key
+// kernel rebuilds the WHOLE S_q×S_k softmax matrix once per key = O(S_q·S_k²·D),
+// i.e. ~S_k× slower (this dominated training: 91% of GPU time, 136ms vs 0.8ms
+// forward). When one block spans all keys of a (batch,head) — the common case,
+// seq_k ≤ blockDim.x — the key-threads instead build each query's softmax row
+// ONCE cooperatively in shared memory, restoring O(S_q·S_k·D). The original
+// per-key loops are kept as a correctness fallback for seq_k > blockDim.x.
 
 #define MAX_HEAD_DIM 128
 #define MAX_ATTN_SEQ 512
@@ -137,12 +146,91 @@ extern "C" __global__ void attention_bwd(
             }
             arena[o_base + d] = acc;
         }
-    } else if (wrt == 2u) {
-        unsigned int ki = blockIdx.y * blockDim.x + threadIdx.x;
-        if (ki >= seq_k) return;
+        return;
+    }
+
+    // wrt == 1 (dK) or wrt == 2 (dV).
+    if (seq_k <= blockDim.x) {
+        // ---- Fast path: one block spans all keys; softmax row built ONCE ----
+        __shared__ float sh_p[MAX_ATTN_SEQ];   // holds row scores, then P[qi,:]
+        __shared__ float sh_dp[MAX_ATTN_SEQ];  // dV-projection dp[qi,:] (dK only)
+        unsigned int ki = threadIdx.x;
+        bool active = (ki < seq_k);
         unsigned int k_base = k_base_g + ki * head_dim;
         unsigned int v_base = v_base_g + ki * head_dim;
         unsigned int o_base = out_off + (bh * seq_k + ki) * head_dim;
+
+        float acc[MAX_HEAD_DIM];
+        for (unsigned int d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+
+        for (unsigned int qi = 0; qi < seq_q; ++qi) {
+            unsigned int q_base = q_base_g + qi * head_dim;
+            unsigned int dy_base = dy_base_g + qi * head_dim;
+
+            // (1) each key-thread computes its own score s = scale·Q[qi]·K[ki].
+            float s = -3.4e38f;
+            if (active) {
+                float dot = 0.0f;
+                for (unsigned int d = 0; d < head_dim; ++d) {
+                    dot += arena[q_base + d] * arena[k_base + d];
+                }
+                dot *= scale;
+                s = mask_score(dot, qi, ki, bh, seq_q, seq_k, mask_kind, mask_off, window, arena);
+                sh_p[ki] = s;
+            }
+            __syncthreads();
+
+            // (2) each thread reduces the shared row to (max, sum) → P[qi,ki].
+            float m = -3.4e38f;
+            for (unsigned int kk = 0; kk < seq_k; ++kk) m = fmaxf(m, sh_p[kk]);
+            float Z = 0.0f;
+            for (unsigned int kk = 0; kk < seq_k; ++kk) {
+                Z += (sh_p[kk] <= -1e30f) ? 0.0f : expf(sh_p[kk] - m);
+            }
+            float invZ = (Z > 0.0f) ? 1.0f / Z : 0.0f;
+            float p = active ? (((s <= -1e30f) ? 0.0f : expf(s - m)) * invZ) : 0.0f;
+
+            if (wrt == 2u) {
+                // dV[ki,d] += P[qi,ki] · dY[qi,d]
+                if (active) {
+                    for (unsigned int d = 0; d < head_dim; ++d) {
+                        acc[d] += p * arena[dy_base + d];
+                    }
+                }
+                __syncthreads(); // sh_p reused by next qi
+            } else {
+                // dK: dp[qi,ki] = dY[qi]·V[ki]; delta = Σ_k P[qi,k]·dp[qi,k]
+                __syncthreads(); // all threads done reading s before overwrite
+                float dpk = 0.0f;
+                if (active) {
+                    for (unsigned int d = 0; d < head_dim; ++d) {
+                        dpk += arena[dy_base + d] * arena[v_base + d];
+                    }
+                    sh_dp[ki] = dpk;
+                    sh_p[ki] = p; // overwrite row scores with P for the delta reduction
+                }
+                __syncthreads();
+                float delta = 0.0f;
+                for (unsigned int kk = 0; kk < seq_k; ++kk) delta += sh_p[kk] * sh_dp[kk];
+                float dscore = active ? (p * (dpk - delta) * scale) : 0.0f;
+                if (active) {
+                    for (unsigned int d = 0; d < head_dim; ++d) {
+                        acc[d] += dscore * arena[q_base + d];
+                    }
+                }
+                __syncthreads(); // sh_p/sh_dp reused by next qi
+            }
+        }
+        if (active) {
+            for (unsigned int d = 0; d < head_dim; ++d) arena[o_base + d] = acc[d];
+        }
+    } else if (wrt == 2u) {
+        // ---- Fallback (seq_k > blockDim.x): original thread-per-key dV ----
+        unsigned int ki = blockIdx.y * blockDim.x + threadIdx.x;
+        if (ki >= seq_k) return;
+        unsigned int v_base = v_base_g + ki * head_dim;
+        unsigned int o_base = out_off + (bh * seq_k + ki) * head_dim;
+        (void)v_base;
 
         for (unsigned int d = 0; d < head_dim; ++d) {
             arena[o_base + d] = 0.0f;
@@ -165,7 +253,8 @@ extern "C" __global__ void attention_bwd(
                 arena[o_base + d] += scores[ki] * arena[dy_base + d];
             }
         }
-    } else if (wrt == 1u) {
+    } else {
+        // ---- Fallback (seq_k > blockDim.x): original thread-per-key dK ----
         unsigned int ki = blockIdx.y * blockDim.x + threadIdx.x;
         if (ki >= seq_k) return;
         unsigned int o_base = out_off + (bh * seq_k + ki) * head_dim;

@@ -69,6 +69,10 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Build on CPU and on `dev`, assert element-wise agreement.
 fn parity(name: &str, dev: Device, tol: f32, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) {
+    if !rlx_runtime::is_available(dev) {
+        eprintln!("skip {name}: {dev:?} unavailable");
+        return;
+    }
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let cpu = run_on(Device::Cpu, build);
     let gpu = run_on(dev, build);
@@ -251,10 +255,8 @@ mod wgpu {
     }
 }
 
-// CUDA/ROCm/Vulkan cover the FFT-composition filters (cuFFT/rocFFT native,
-// Vulkan host-fallback). `iirfilt` is omitted: it lowers via `Op::Scan`, whose
-// host-fallback is only wired for CPU/MLX/Metal/wgpu — matching how
-// `gpu_exg_parity` leaves `biquad` off these backends.
+// CUDA/ROCm/Vulkan cover the FFT-composition filters plus `iirfilt` via the
+// shared `Op::Scan` host-fallback (D2H → packed CPU body → H2D).
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
@@ -277,6 +279,10 @@ mod cuda {
     #[test]
     fn partitioned_conv_op() {
         check_partitioned_conv_op(Device::Cuda);
+    }
+    #[test]
+    fn iirfilt() {
+        check_iirfilt(Device::Cuda);
     }
 }
 
@@ -303,6 +309,10 @@ mod rocm {
     fn partitioned_conv_op() {
         check_partitioned_conv_op(Device::Rocm);
     }
+    #[test]
+    fn iirfilt() {
+        check_iirfilt(Device::Rocm);
+    }
 }
 
 #[cfg(feature = "vulkan")]
@@ -327,5 +337,18 @@ mod vulkan {
     #[test]
     fn partitioned_conv_op() {
         check_partitioned_conv_op(Device::Vulkan);
+    }
+    #[test]
+    fn iirfilt() {
+        check_iirfilt(Device::Vulkan);
+    }
+}
+
+#[cfg(feature = "oneapi")]
+mod oneapi {
+    use super::*;
+    #[test]
+    fn iirfilt() {
+        check_iirfilt(Device::OneApi);
     }
 }

@@ -3,7 +3,6 @@
 // expert e = round(expert_idx[m]). input [M,K], weight [E,K,N], idx [M] → [M,N].
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint m;
@@ -19,12 +18,12 @@ void main() {
     uint col = gl_GlobalInvocationID.x; // n
     uint row = gl_GlobalInvocationID.y; // m
     if (col >= pc.n || row >= pc.m) { return; }
-    uint e = uint(data[pc.idx_off + row] + 0.5);
+    uint e = uint(arena_load(pc.idx_off + row) + 0.5);
     uint wbase = e * pc.k * pc.n;
     uint abase = pc.in_off + row * pc.k;
     float acc = 0.0;
     for (uint kk = 0u; kk < pc.k; kk++) {
-        acc += data[abase + kk] * data[pc.w_off + wbase + kk * pc.n + col];
+        acc += arena_load(abase + kk) * arena_load(pc.w_off + wbase + kk * pc.n + col);
     }
-    data[pc.out_off + row * pc.n + col] = acc;
+    arena_store(pc.out_off + row * pc.n + col, acc);
 }

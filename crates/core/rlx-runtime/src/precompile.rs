@@ -21,7 +21,14 @@ use rlx_opt::pass::Pass as _;
 
 /// Param specialization, algebraic simplify, DCE, and constant folding.
 pub fn precompile_cleanup(graph: Graph, options: &CompileOptions) -> Graph {
-    let mut graph = graph;
+    // Decompose registered custom ops that opt into a `lower` rule into
+    // primitives BEFORE fusion / legalize / kernel dispatch. Every backend that
+    // whitelists `OpKind::Custom` (all of them) would otherwise pass legalize and
+    // then hard-fail at kernel-dispatch time for a custom op it has no kernel
+    // for; lowering here lets such an op run on any backend with no kernel. A
+    // no-op unless the graph carries a custom op, and idempotent with the same
+    // pass inside `rewrite_for_backend`.
+    let mut graph = rlx_opt::lower_custom_ops(graph);
     if options
         .param_bindings
         .as_ref()

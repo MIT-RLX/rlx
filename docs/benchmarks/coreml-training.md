@@ -155,6 +155,8 @@ training path, not bugs:
    `CoremlTrainingSession::with_precision_policy(AutoMixed)` lowers an fp16 graph
    that `default_compute_units` routes to `CpuAndNeuralEngine` — wiring that into
    the trainer would let RLX actually use the ANE on compute-bound models.
+   (Unset `RLX_COREML_UNITS` keeps **fp32** graphs on CPU+GPU — BNNS-safe for
+   large programs; only f16 / `RLX_COREML_UNITS=ane` target the Neural Engine.)
 
 See also: [op-coverage.md](../op-coverage.md) (per-backend op support, incl. ANE)
 and [backend-selection.md](../backend-selection.md) (`RLX_COREML_UNITS` and

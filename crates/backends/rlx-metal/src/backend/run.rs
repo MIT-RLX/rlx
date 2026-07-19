@@ -126,6 +126,55 @@ impl MetalExecutable {
         self.run_read_outputs(inputs, None)
     }
 
+    /// Per-node arena dump (mirror of `RLX_CPU_DUMP_NODES`) for cross-backend
+    /// divergence bisection. Diff against the CPU dump to find the first
+    /// node whose max|x| / nonzero count / NaN count diverges. Meaningful
+    /// only with `RLX_ARENA_NO_REUSE=1` so intermediate buffers aren't stomped.
+    fn dump_metal_nodes_if_requested(&self) {
+        if !rlx_ir::env::flag("RLX_METAL_DUMP_NODES") {
+            return;
+        }
+        let limit = rlx_ir::env::parse_or("RLX_METAL_DUMP_NODES_LIMIT", 4000usize);
+        eprintln!(
+            "[rlx-metal-dump] per-node max|x| (topo order, limit={limit}); set RLX_ARENA_NO_REUSE=1"
+        );
+        let mut shown = 0usize;
+        for (i, node) in self.graph.nodes().iter().enumerate() {
+            if !self.arena.has_buffer(node.id) {
+                continue;
+            }
+            if matches!(
+                node.op,
+                rlx_ir::Op::Input { .. }
+                    | rlx_ir::Op::Param { .. }
+                    | rlx_ir::Op::Constant { .. }
+                    | rlx_ir::Op::Reshape { .. }
+                    | rlx_ir::Op::Cast { .. }
+            ) {
+                continue;
+            }
+            if self.arena.dtype(node.id) != rlx_ir::DType::F32 {
+                continue;
+            }
+            let data = self.arena.read_as_f32(node.id);
+            if data.is_empty() {
+                continue;
+            }
+            let max = data.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let nz = data.iter().filter(|&&v| v != 0.0).count();
+            let nan = data.iter().filter(|&&v| v.is_nan()).count();
+            eprintln!(
+                "  [{i:>3}] {:?} max={max:.6} nz={nz}/{} nan={nan}",
+                node.op,
+                data.len()
+            );
+            shown += 1;
+            if shown >= limit {
+                break;
+            }
+        }
+    }
+
     /// Run and read back only selected graph outputs (e.g. logits-only decode).
     pub fn run_read_outputs(
         &mut self,
@@ -153,6 +202,7 @@ impl MetalExecutable {
             }
         }
         self.encode_and_run();
+        self.dump_metal_nodes_if_requested();
         if !self.gpu_handle_feeds.is_empty() {
             self.propagate_gpu_handle_feeds_in_arena();
             if read_indices.is_none() || rlx_ir::env::flag("RLX_GPU_HANDLE_HOST_MIRROR") {
@@ -167,10 +217,21 @@ impl MetalExecutable {
             None => (0..n_out).collect(),
             Some(ix) => ix.to_vec(),
         };
-        indices
+        let outs: Vec<Vec<f32>> = indices
             .iter()
             .map(|&i| self.read_graph_output_f32(i))
-            .collect()
+            .collect();
+        // NaN/Inf output-boundary scan (RLX_DEBUG_NANS). MPSGraph executes the
+        // graph opaquely, so we can't hook per-op here — scan the outputs and
+        // point provenance at the offending output node. For internal
+        // localization, replay the same graph on the CPU backend.
+        let scanner = rlx_ir::numeric_check::DebugScanner::from_env("metal");
+        if scanner.enabled() {
+            for (&i, buf) in indices.iter().zip(&outs) {
+                scanner.check(&self.graph, self.graph.outputs[i], buf, &[]);
+            }
+        }
+        outs
     }
 
     /// Run with typed host inputs (I64 token ids, F32 style/speed, etc.).

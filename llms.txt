@@ -1,0 +1,51 @@
+# RLX
+
+> RLX is a Rust workspace: a JAX-shaped tensor IR with fusion, bidirectional
+> autodiff, and vmap on top of feature-gated per-backend kernels (CPU, Apple
+> Metal / MLX / CoreML, NVIDIA CUDA, AMD ROCm, Google TPU, wgpu, native Vulkan,
+> Intel oneAPI, Qualcomm Hexagon / QNN, Cortex-M, FPGA). The user-facing API is
+> `rlx-runtime` (`Session` / `compile` / `execute`); the entry crate is `rlx`
+> (the prelude, default features `cpu` + `tensor`). Concrete model definitions
+> live downstream in the sibling `rlx-models` repo.
+
+## Start here
+
+- [README.md](README.md): overview, install, quickstart, status by area
+- [AGENTS.md](AGENTS.md): instructions for AI agents — conventions, forbidden vocabulary, op checklist
+- [docs/README.md](docs/README.md): documentation index
+- [PLAN.md](PLAN.md): roadmap; its `## Landed` section tracks in-tree work with bench deltas
+- [CHANGELOG.md](CHANGELOG.md): per-release feature history
+
+## Workspace (crates/ grouped by role)
+
+- **core**: `rlx-ir`, `rlx-flow`, `rlx-tensor`, `rlx-fusion`, `rlx-unfuse`, `rlx-autodiff`, `rlx-compile`, `rlx-opt`, `rlx-driver`, `rlx-runtime`, `rlx-optim`, `rlx-collectives`, `rlx-extend`, `rlx-macros`
+- **backends**: `rlx-cpu`, `rlx-metal`, `rlx-mlx`, `rlx-coreml`, `rlx-cuda`, `rlx-rocm`, `rlx-tpu`, `rlx-wgpu`, `rlx-vulkan`, `rlx-oneapi`, `rlx-webgl`, `rlx-qnn`, `rlx-cerebras`, `rlx-cortexm`, `rlx-fpga`, `rlx-gpu-host`, `rlx-gpu-kernels`
+- **io**: `rlx-gguf`, `rlx-gguf-convert`, `rlx-onnx` (+ `-import` / `-proto` / `-conformance`), `rlx-torch-import`, `rlx-text`, `rlx-nemo`
+- **numerics**: `rlx-linalg`, `rlx-sparse`, `rlx-umap`, `rlx-fdm`, `rlx-bbo`, `rlx-rl`, `rlx-vq`
+- **tooling**: `rlx-bench`, `rlx-check`, `rlx-hwprofile`
+- **bindings**: `pyrlx` (PyO3), `rlx-web` (wasm)
+- **umbrella**: `rlx` (prelude crate)
+
+Each crate has its own `README.md`. `rlx-mlx-sys/vendor/mlx` is a git submodule — avoid drive-by edits.
+
+## Key docs
+
+- [docs/op-coverage.md](docs/op-coverage.md): per-op × per-backend support matrix (single source of truth)
+- [docs/backend-selection.md](docs/backend-selection.md): runtime device switching (`GraphDevices`, `DeviceRouter`)
+- [docs/gguf-backend-paths.md](docs/gguf-backend-paths.md): GGUF quant schemes + per-backend dequant paths
+- [docs/extending.md](docs/extending.md): extend RLX from a downstream crate via the `rlx-extend` seams
+- [docs/distributed.md](docs/distributed.md) / [docs/iroh-transport.md](docs/iroh-transport.md): distributed training + NAT traversal
+- [docs/development.md](docs/development.md): contributor workflow
+
+## Commands
+
+- `just ci` — build + workspace tests + clippy + pyrlx pytest
+- `just test` / `just test-gpu` — cargo tests
+- `cargo rlx check` — static graph checker (shape / dispatch / fusion / NaN lint)
+- `RLX_DISPATCH_REPORT=1` — print native / common-ir / rewritten / missing per op after compile
+
+## Conventions
+
+- Per-backend peak performance is the north star; core stays application-agnostic; keep diffs minimal.
+- Adding an op touches `rlx-ir` + every backend's `SUPPORTED_OPS` + fusion + an autodiff VJP/JVP + a parity test.
+- Do not introduce the forbidden vocabulary listed in [AGENTS.md](AGENTS.md).

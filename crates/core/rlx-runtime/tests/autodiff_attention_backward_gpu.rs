@@ -177,7 +177,11 @@ fn metal_attention_backward_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_attention_backward_matches_cpu() {
-    use rlx_runtime::{CompileOptions, Device, Session};
+    use rlx_runtime::{CompileOptions, Device, Session, is_available};
+    if !is_available(Device::Cuda) {
+        eprintln!("skip cuda_attention_backward_matches_cpu (unavailable)");
+        return;
+    }
     let (q, k, v, dy) = synthetic_inputs();
     let bwd = build_bwd_kernel_graph();
     let (dq_cpu, dk_cpu, dv_cpu) = cpu_bwd_grads(bwd.clone(), &q, &k, &v, &dy);

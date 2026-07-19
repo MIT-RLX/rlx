@@ -13,35 +13,41 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// Softmax along the last axis. Block-per-row with shared-memory tree
-// reductions for max and sum_exp.
+// Softmax along an ARBITRARY axis. Block-per-vector with shared-memory tree
+// reductions for max and sum_exp. Each softmax vector has `axis_len` elements
+// with `stride` between consecutive elements (stride==1 → the fast contiguous
+// last-axis case). There are `num_rows` (= outer * stride) vectors:
+//   row r → outer index o = r / stride, inner index s = r % stride,
+//   base   = o * axis_len * stride + s,  element j at base + j*stride.
 //
-// Launch shape: grid=(outer,1,1), block=(256,1,1). Each block computes
-// row max (tree reduce), stashes exp(x - max) into output, then sums
-// (tree reduce) and normalizes.
+// Launch shape: grid=(num_rows,1,1), block=(256,1,1).
 
 #define SM_BLOCK 256
 
 extern "C" __global__ void softmax(
     float* arena,
-    unsigned int outer,
-    unsigned int inner,
+    unsigned int num_rows,
+    unsigned int axis_len,
+    unsigned int stride,
     unsigned int in_off,
     unsigned int out_off
 ) {
     unsigned int row = blockIdx.x;
-    if (row >= outer) return;
+    if (row >= num_rows) return;
     unsigned int tid = threadIdx.x;
     unsigned int bsz = blockDim.x;
-    unsigned int in_base  = in_off  + row * inner;
-    unsigned int out_base = out_off + row * inner;
+    unsigned int o = row / stride;
+    unsigned int sidx = row % stride;
+    unsigned int base = o * axis_len * stride + sidx;
+    unsigned int in_base  = in_off  + base;
+    unsigned int out_base = out_off + base;
 
     __shared__ float s[SM_BLOCK];
 
     // Phase 1: row max.
     float local_max = -3.4e38f;
-    for (unsigned int i = tid; i < inner; i += bsz) {
-        local_max = fmaxf(local_max, arena[in_base + i]);
+    for (unsigned int j = tid; j < axis_len; j += bsz) {
+        local_max = fmaxf(local_max, arena[in_base + j * stride]);
     }
     s[tid] = local_max;
     __syncthreads();
@@ -52,14 +58,16 @@ extern "C" __global__ void softmax(
     float row_max = s[0];
     __syncthreads();
 
-    // Phase 2: stash exp(x - max), accumulate sum.
-    float local_sum = 0.0f;
-    for (unsigned int i = tid; i < inner; i += bsz) {
-        float e = expf(arena[in_base + i] - row_max);
-        arena[out_base + i] = e;
-        local_sum += e;
+    // Phase 2: stash exp(x - max), accumulate sum in double for ODE-stable
+    // attention (F5 DiT has 22 Softmax ops; float sum drift compounds).
+    double local_sum = 0.0;
+    for (unsigned int j = tid; j < axis_len; j += bsz) {
+        float e = expf(arena[in_base + j * stride] - row_max);
+        arena[out_base + j * stride] = e;
+        local_sum += (double)e;
     }
-    s[tid] = local_sum;
+    // Tree-reduce via float shared mem (sum fits f32 for typical attn rows).
+    s[tid] = (float)local_sum;
     __syncthreads();
     for (unsigned int s_off = bsz / 2; s_off > 0; s_off >>= 1) {
         if (tid < s_off) s[tid] += s[tid + s_off];
@@ -69,7 +77,7 @@ extern "C" __global__ void softmax(
     __syncthreads();
 
     // Phase 3: normalize.
-    for (unsigned int i = tid; i < inner; i += bsz) {
-        arena[out_base + i] = arena[out_base + i] * inv_sum;
+    for (unsigned int j = tid; j < axis_len; j += bsz) {
+        arena[out_base + j * stride] = arena[out_base + j * stride] * inv_sum;
     }
 }

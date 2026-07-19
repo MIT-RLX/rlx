@@ -120,16 +120,51 @@ fn widen_constant_bytes(data: &[u8], from: DType) -> Vec<u8> {
     }
 }
 
+fn is_lowp_layout_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Concat { .. }
+            | Op::Narrow { .. }
+            | Op::Reshape { .. }
+            | Op::Transpose { .. }
+            | Op::Expand { .. }
+    )
+}
+
 /// Rewrite F16/BF16 node shapes (and constant payloads) to F32 for CPU exec.
+///
+/// Boundary tensors (`Param` / `Input`) keep their declared dtype so Metal (and
+/// other backends with native F16 weight paths) can store Linear weights at
+/// half width. Pure layout ops that only rearrange F16/BF16 tensors (e.g. the
+/// weight `Concat` from shared-input MatMul fusion) stay low-precision too —
+/// promoting those would materialize a full F32 copy of every packed weight.
 pub fn promote_to_f32(graph: Graph) -> Graph {
     if !needs_f32_exec(&graph) {
         return graph;
     }
     let mut out = Graph::new(format!("{}_f32_exec", graph.name));
     let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    // Node ids in the *source* graph whose dtype we intentionally kept low-p.
+    let mut kept_lowp: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
     for node in graph.nodes() {
         let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
-        let shape = promote_shape(&node.shape);
+        let is_boundary = matches!(&node.op, Op::Param { .. } | Op::Input { .. });
+        let is_layout_of_lowp = is_lowp_layout_op(&node.op)
+            && matches!(node.shape.dtype(), DType::F16 | DType::BF16)
+            && !node.inputs.is_empty()
+            && node.inputs.iter().all(|&i| {
+                kept_lowp.contains(&i)
+                    || matches!(graph.node(i).shape.dtype(), DType::F16 | DType::BF16)
+            });
+        let keep_dtype = is_boundary || is_layout_of_lowp;
+        let shape = if keep_dtype {
+            node.shape.clone()
+        } else {
+            promote_shape(&node.shape)
+        };
+        if keep_dtype && matches!(shape.dtype(), DType::F16 | DType::BF16) {
+            kept_lowp.insert(node.id);
+        }
         let op = match &node.op {
             Op::Constant { data } => Op::Constant {
                 data: widen_constant_bytes(data, node.shape.dtype()),

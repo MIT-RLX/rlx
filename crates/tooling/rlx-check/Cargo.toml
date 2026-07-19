@@ -1,0 +1,49 @@
+[package]
+name = "rlx-check"
+version.workspace       = true
+edition.workspace       = true
+rust-version.workspace  = true
+description = "Device-free static graph checker for RLX — backend dispatch, fusion, shape/dtype and numeric diagnostics (`cargo rlx check`)"
+authors.workspace       = true
+license.workspace       = true
+keywords.workspace      = true
+categories.workspace    = true
+readme                  = "README.md"
+repository.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+
+# `cargo rlx check` — Cargo runs the `cargo-rlx` binary and passes the
+# subcommand name (`rlx`) as the first argument, which the binary skips.
+[[bin]]
+name = "cargo-rlx"
+path = "src/bin/cargo-rlx.rs"
+
+[dependencies]
+# The checker itself lives in `rlx_runtime::check` (single source of truth,
+# reachable from the `#[rlx_model(check)]` hook). This crate is the CLI + demos.
+# rlx-runtime default = ["cpu"], portable everywhere; other backends' execution
+# legality is opt-in below and needs that backend's build deps.
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.13" }
+# serialize: serde derives on Graph/Op/Shape so the CLI can load a graph from JSON.
+rlx-ir      = { path = "../../core/rlx-ir", version = "0.2.13", features = ["serialize"] }
+serde_json  = "1"
+
+[dev-dependencies]
+# End-to-end test of the `#[rlx_model(check)]` self-check hook.
+rlx-macros = { path = "../../core/rlx-macros", version = "0.2.13" }
+
+[features]
+default = []
+# Enable a backend's real execution-legality check (native/common-ir/unsupported).
+# Without it, that backend still gets device-free *fusion* coverage.
+metal  = ["rlx-runtime/metal"]
+mlx    = ["rlx-runtime/mlx"]
+gpu    = ["rlx-runtime/gpu"]
+cuda   = ["rlx-runtime/cuda"]
+rocm   = ["rlx-runtime/rocm"]
+tpu    = ["rlx-runtime/tpu"]
+coreml = ["rlx-runtime/coreml"]
+
+[lints]
+workspace = true

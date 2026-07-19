@@ -50,6 +50,13 @@ pub enum DurationLoopLowering {
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
     pub sequence_length: usize,
+    /// Per-name override for symbolic length dims. Maps an ONNX `dim_param`
+    /// name (e.g. `"text_length"`, `"latent_length"`) to the concrete static
+    /// length to bake for this compile. Lets a single graph carry *two or more
+    /// distinct* dynamic lengths (cross-attention CFM/DiT decoders) instead of
+    /// collapsing every length axis to `sequence_length`. Empty by default →
+    /// identical behavior to the single-`sequence_length` path.
+    pub named_lengths: HashMap<String, usize>,
     pub max_waveform_samples: usize,
     /// When true, keep int8 weights and lower to `DequantMatMul` / `QConv2d` instead of
     /// expanding everything to F32 at import time.
@@ -84,6 +91,7 @@ impl Default for ImportOptions {
     fn default() -> Self {
         Self {
             sequence_length: 128,
+            named_lengths: HashMap::new(),
             max_waveform_samples: 48_000,
             use_quantized_kernels: true,
             dynamic_sequence: false,

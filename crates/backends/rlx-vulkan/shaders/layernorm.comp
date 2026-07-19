@@ -4,7 +4,6 @@
 // One invocation per row. has_beta=0 ⇒ beta term skipped.
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -22,18 +21,18 @@ void main() {
     if (row >= pc.rows) { return; }
     uint base = row * pc.n;
     float mean = 0.0;
-    for (uint i = 0u; i < pc.n; i++) { mean += data[pc.x_off + base + i]; }
+    for (uint i = 0u; i < pc.n; i++) { mean += arena_load(pc.x_off + base + i); }
     mean /= float(pc.n);
     float var = 0.0;
     for (uint i = 0u; i < pc.n; i++) {
-        float d = data[pc.x_off + base + i] - mean;
+        float d = arena_load(pc.x_off + base + i) - mean;
         var += d * d;
     }
     var /= float(pc.n);
     float inv = inversesqrt(var + pc.eps);
     for (uint i = 0u; i < pc.n; i++) {
-        float g = data[pc.gamma_off + i];
-        float b = (pc.has_beta != 0u) ? data[pc.beta_off + i] : 0.0;
-        data[pc.out_off + base + i] = (data[pc.x_off + base + i] - mean) * inv * g + b;
+        float g = arena_load(pc.gamma_off + i);
+        float b = (pc.has_beta != 0u) ? arena_load(pc.beta_off + i) : 0.0;
+        arena_store(pc.out_off + base + i, (arena_load(pc.x_off + base + i) - mean) * inv * g + b);
     }
 }

@@ -68,11 +68,26 @@ impl Model {
         // into inlined body replicas (primitives the codegen handles) first.
         let scan_unrolled;
         let g = if g.nodes().iter().any(|n| matches!(n.op, Op::Scan { .. })) {
-            scan_unrolled = rlx_opt::control_flow::unroll_scan(g.clone());
+            use rlx_opt::pass::Pass as _;
+            scan_unrolled = rlx_opt::LowerScan.run(g.clone());
             &scan_unrolled
         } else {
             g
         };
+        // Distributed collectives are host/transport ops (they need an OS network
+        // stack + threads to talk to other ranks). They cannot be expressed inside
+        // a single-device CSL fabric program — reject with a specific, actionable
+        // error rather than the generic "lowers only Op::MatMul" path below.
+        if let Some(name) = g.nodes().iter().find_map(|n| match &n.op {
+            Op::Custom { name, .. } if name.starts_with("collective.") => Some(name.clone()),
+            _ => None,
+        }) {
+            return Err(format!(
+                "rlx-cerebras: '{name}' is a distributed host/transport collective \
+                 — it cannot be expressed in a single-device CSL fabric program. \
+                 Run the distributed graph on a host-capable backend (CPU/CUDA/Metal/…)."
+            ));
+        }
         if g.outputs.len() != 1 {
             return Err(format!(
                 "rlx-cerebras milestone 1 lowers a single-output graph; got {} outputs",
@@ -161,5 +176,30 @@ mod tests {
         );
         g.set_outputs(vec![c]);
         assert!(Model::from_graph(&g).is_err());
+    }
+
+    #[test]
+    fn from_graph_rejects_collective_with_specific_message() {
+        // A distributed collective can't be lowered to a single-device CSL
+        // fabric program; the error must name the op and say so specifically,
+        // not fall through to the generic "lowers only Op::MatMul" path.
+        let mut g = Graph::new("ar");
+        let x = g.input("x", Shape::new(&[4], DType::F32));
+        let ar = g.add_node(
+            rlx_ir::Op::Custom {
+                name: "collective.all_reduce".to_string(),
+                num_inputs: 1,
+                attrs: vec![],
+            },
+            vec![x],
+            Shape::new(&[4], DType::F32),
+        );
+        g.set_outputs(vec![ar]);
+
+        let err = Model::from_graph(&g).expect_err("collective must be rejected");
+        assert!(
+            err.contains("collective.all_reduce") && err.contains("host/transport collective"),
+            "unexpected error: {err}"
+        );
     }
 }

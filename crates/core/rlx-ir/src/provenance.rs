@@ -85,9 +85,15 @@ impl fmt::Display for NodeOrigin {
     }
 }
 
-/// Best-effort label for diagnostics (origin label, node name, or id).
+/// Best-effort label for diagnostics (leaf name, origin label, node name, id).
 pub fn node_label(graph: &Graph, id: NodeId) -> String {
     let node = graph.node(id);
+    // A leaf's declared name is its most meaningful identity — a NaN in a
+    // weight or input should say "qkv.weight" / "input_ids", not "h0".
+    match &node.op {
+        crate::Op::Input { name } | crate::Op::Param { name } => return name.clone(),
+        _ => {}
+    }
     if let Some(ref o) = node.origin {
         if let Some(ref l) = o.label {
             return l.clone();

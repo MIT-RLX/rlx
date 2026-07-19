@@ -31,7 +31,10 @@
 //! Falls back to `Instant` on non-AArch64 / non-Apple targets so the API
 //! stays portable.
 
-#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+#[cfg(all(
+    not(all(target_arch = "aarch64", target_vendor = "apple")),
+    not(target_arch = "wasm32")
+))]
 use std::time::Instant;
 
 /// Opaque tick reading. Subtract two of these to get a `Duration`.
@@ -39,7 +42,12 @@ use std::time::Instant;
 pub struct Tick {
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     cycles: u64,
-    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+    #[cfg(target_arch = "wasm32")]
+    millis: f64,
+    #[cfg(all(
+        not(all(target_arch = "aarch64", target_vendor = "apple")),
+        not(target_arch = "wasm32")
+    ))]
     instant: Instant,
 }
 
@@ -53,7 +61,15 @@ impl Tick {
                 cycles: read_cntvct(),
             }
         }
-        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+        #[cfg(target_arch = "wasm32")]
+        {
+            // `std::time::Instant` panics on wasm32-unknown-unknown.
+            Tick { millis: 0.0 }
+        }
+        #[cfg(all(
+            not(all(target_arch = "aarch64", target_vendor = "apple")),
+            not(target_arch = "wasm32")
+        ))]
         {
             Tick {
                 instant: Instant::now(),
@@ -73,7 +89,15 @@ impl Tick {
             let freq = cntfrq_hz();
             ((dt as u128) * 1_000_000_000u128 / freq as u128) as u64
         }
-        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = start;
+            0
+        }
+        #[cfg(all(
+            not(all(target_arch = "aarch64", target_vendor = "apple")),
+            not(target_arch = "wasm32")
+        ))]
         {
             self.instant.duration_since(start.instant).as_nanos() as u64
         }

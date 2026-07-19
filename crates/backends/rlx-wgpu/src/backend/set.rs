@@ -24,25 +24,26 @@ use crate::buffer::{
 };
 use crate::device::wgpu_device;
 use crate::kernels::{
-    ArgmaxParams, AttentionBwdParams, AttentionParams, BatchElementwiseRegionParams, BinaryParams,
-    Conv1dParams, Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams,
-    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
-    FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNormBwdParams, LayerNormParams,
-    Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
-    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
-    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams, argmax_kernel,
-    attention_bwd_kernel, attention_kernel, batch_elementwise_region_kernel, binary_kernel,
-    cast_f32_to_f16_kernel, compare_kernel, concat_kernel, conv1d_kernel, conv2d_kernel,
-    conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel, fma_kernel,
-    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
-    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
-    gather_split_kernel, grouped_matmul_kernel, gru_kernel,
-    layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
-    layer_norm_backward_input_kernel, layernorm_kernel, mamba2_kernel,
-    matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
+    AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams, AttentionBwdParams,
+    AttentionParams, BatchElementwiseRegionParams, BinaryParams, Conv1dParams, Conv2dParams,
+    Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
+    ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
+    FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatedResidualBackwardParams,
+    GatedResidualParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupedMatmulParams,
+    GruParams, Kernel, LayerNormBwdParams, LayerNormParams, Mamba2Params, MatmulParams,
+    MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams,
+    RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams, ScatterAddParams,
+    SceParams, SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams,
+    UnaryParams, WelchPeaksGpuParams, WhereParams, argmax_kernel, attention_bwd_kernel,
+    attention_kernel, batch_elementwise_region_kernel, binary_kernel, cast_f32_to_f16_kernel,
+    compare_kernel, concat_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel,
+    elementwise_region_spatial_kernel, expand_kernel, fma_kernel, fused_residual_ln_kernel,
+    fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel, gather_axis_kernel,
+    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
+    grouped_matmul_kernel, gru_kernel, layer_norm_backward_gamma_partial_kernel,
+    layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layernorm_kernel,
+    mamba2_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
@@ -109,13 +110,26 @@ impl WgpuExecutable {
         if let Some(&id) = self.param_offsets.get(name)
             && self.arena.has(id)
         {
-            dev.queue
-                .write_buffer(&self.arena.buffer, self.arena.offset(id) as u64, data);
+            // Chunked + shard-safe (weight buffer or arena). Large F5 tiles
+            // truncated on a single `queue.write_buffer` under Metal/wgpu.
+            self.arena
+                .write_bytes_range(&dev.queue, self.arena.offset(id), data);
         }
     }
 
     pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
         self.gpu_handle_feeds
             .insert(handle_name.to_string(), output_index);
+    }
+
+    /// Mark an already-staged graph input as device-resident so subsequent
+    /// `run` calls skip host re-upload (ORT-style I/O binding for constants).
+    pub fn prepare_resident_gpu_handle(&mut self, name: &str) -> bool {
+        if !self.input_offsets.contains_key(name) {
+            return false;
+        }
+        self.gpu_handle_resident.insert(name.to_string());
+        self.gpu_handles.entry(name.to_string()).or_default();
+        true
     }
 }

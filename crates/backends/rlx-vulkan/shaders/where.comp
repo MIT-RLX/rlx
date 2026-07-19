@@ -2,7 +2,6 @@
 // Ternary select: cond != 0 ? a : b. Operands broadcast by trailing modulus.
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint n;
@@ -21,6 +20,6 @@ void main() {
     uint ci = (pc.cond_mod == 0u) ? i : (i % pc.cond_mod);
     uint ai = (pc.a_mod == 0u) ? i : (i % pc.a_mod);
     uint bi = (pc.b_mod == 0u) ? i : (i % pc.b_mod);
-    float c = data[pc.cond_off + ci];
-    data[pc.out_off + i] = (c != 0.0) ? data[pc.a_off + ai] : data[pc.b_off + bi];
+    float c = arena_load(pc.cond_off + ci);
+    arena_store(pc.out_off + i, (c != 0.0) ? arena_load(pc.a_off + ai) : arena_load(pc.b_off + bi));
 }

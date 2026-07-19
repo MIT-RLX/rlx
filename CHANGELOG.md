@@ -7,6 +7,347 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-07-18
+
+### Added
+
+- **CUDA: fused conv + bias + activation (+ residual) via cuDNN.**
+  `Op::FusedConvBiasAct` folds a convolution's bias + `relu` — and an
+  optional ResNet residual (cuDNN `z` operand) — into one
+  `cudnnConvolutionBiasActivationForward`. `FuseConvBiasAct` matches
+  `conv→bias→relu`; `FuseConvAffineAct` folds a host-pre-folded BatchNorm
+  block `conv→Mul(scale)→Add(shift)→[Add(residual)]→relu` (per-channel scale
+  folds into the weights). Fires only for cuDNN-friendly shapes
+  (`groups==1, k>1`) + identity/relu — **1.6–2.2×** vs unfused at batch 1 on an
+  NVIDIA GPU. cuDNN stays optional: falls back to the direct-conv kernel +
+  `conv_bias_act_epilogue.cu` (bit-exact) when libcudnn is absent. Diagnostics:
+  `RLX_CUDA_LOG_CONV_PATH`, `RLX_CUDA_LOG_FALLBACK`,
+  `RLX_DISABLE_CONV_BIAS_ACT_FUSION`. See
+  [`crates/backends/rlx-cuda/README.md`](crates/backends/rlx-cuda/README.md).
+
+- **Compute weight-derived tensors once, not every forward** — two mechanisms.
+  Compile-time: `CompileOptions::param_bindings` bakes weights to constants and
+  `ConstantFolding` (now with NumPy **broadcasting**) folds per-channel weight
+  math away. Run time: `CompileOptions::cache_param_invariant` /
+  `RLX_CACHE_PARAM_INVARIANT=1` splits the param-invariant closure into a
+  *prepare* graph run once (`rlx_compile::split_param_invariant`), injected into
+  the main graph via persistent `bind_handle` (CPU) or a feed fallback (CUDA).
+  Complementary + transparent; validated CPU + CUDA. See
+  [`docs/weight-compute-caching.md`](docs/weight-compute-caching.md).
+
+- **QNN / Hexagon: x86 HTP functional simulator recipes** (`just qnn-htp-sim`).
+  Points `RLX_QNN_BACKEND_LIB` at `libQnnHtp.so` (no Snapdragon silicon).
+  Re-runs quantized MatMul probes plus LinearStatic `run_qnn.sh` /
+  `run_qnn_context.sh`. Emitted run scripts honor `RLX_QNN_BACKEND_LIB`
+  (default still `libQnnCpu.so`). I8×I8 MatMul IR lowers as Dequantize both →
+  f32 MatMul (portable across CPU / HTP sim).
+
+- **QNN / Hexagon: offline context-binary path** (`run_qnn_context.sh`).
+  Emit → `qnn-model-lib-generator` → `qnn-context-binary-generator` →
+  `qnn-net-run --retrieve_context model.bin`. Complements the FFI
+  `export_context_binary` / `reload_from_context_binary` path.
+
+- **QNN / Hexagon: `from_graph` → `LinearStatic` with Constant weights.**
+  When `Add(MatMul(Input, Constant), Constant)` is recognized, weight/bias
+  f32 payloads are baked into the emitted `qnn_model.cpp` (not seed-0).
+
+- **QNN / Hexagon: codegen `LinearStatic`** (STATIC weight/bias packing).
+  Activation-only `APP_WRITE`; `W`/`b` baked into `qnn_model.cpp`. CLI
+  `--linear-static` / `just qnn-emit-linear-static`.
+
+- **QNN / Hexagon: codegen `Mlp2`** (two-layer `LinearRelu → Linear`).
+  Offline `qnn-net-run` path; CLI `--mlp2 M K H N` / `just qnn-emit-mlp2`.
+
+- **QNN / Hexagon: per-channel int8 MatMul weights** (`AXIS_SCALE_OFFSET`).
+  `Dequantize` with `axis=Some` + `scales.len() > 1` stages STATIC
+  `SFIXED_POINT_8` with QNN `AXIS_SCALE_OFFSET` (e.g. Linear `[K,N]` axis=1).
+
+- **QNN / Hexagon: codegen `MatMulSoftmax`** (`softmax(in0·in1, axis=1)`).
+  Offline `qnn-net-run` path; CLI `--matmul-softmax` / `just qnn-emit-matmul-softmax`.
+
+- **QNN / Hexagon: bidirectional `QMatMul` ↔ QNN bridges.**
+  Host INT8 accumulate mixes with QNN in either direction:
+  `QMatMul → Dequantize → Relu`, and
+  `Quantize → QMatMul → Dequantize → Relu` (pre-session → host → post-session).
+
+- **QNN / Hexagon: on-device int4 weights** (BW_SCALE_OFFSET bitwidth=4).
+  IR may store tightly packed nibbles (`(K·N+1)/2` bytes); the runtime unpacks
+  to 1 byte/elem because `libQnnCpu` rejects native `SFIXED_POINT_4`
+  (`UNSUPPORTED_TENSOR_PARAM`). Dequantize → f32 MatMul on device.
+
+- **QNN / Hexagon: on-device `MatMul(I8, I8)` lower.**
+  `Quantize(x)` × STATIC I8 weight without Dequantize in IR. Runtime inserts
+  Dequantize on both operands → f32 MatMul (libQnnCpu rejects direct
+  sfixed8×sfixed8 with `0xc26`; HTP prepare accepts but execute fails on
+  MatMul_bias). Host `Op::QMatMul` remains the fully-quantized path.
+
+- **QNN / Hexagon: `Op::QMatMul` (fully quantized INT8, no f32 weight bake).**
+  Integer accumulate + requantize on the host (same kernel as `rlx-cpu`);
+  weights stay I8. Plus multi-op codegen `Linear` / `LinearRelu` for the
+  offline `qnn-net-run` path.
+
+- **QNN / Hexagon: persistent session + context-binary save/load (M3).**
+  Shim `rlx_qnn_session_*` finalizes once and reuses across `run`s. Export via
+  `contextGetBinary` / reload via `createFromBinary` + `libQnnSystem` metadata.
+  `QnnExecutable::{export_context_binary,reload_from_context_binary}`.
+
+- **QNN / Hexagon: on-device int8 MatMul weights** (`MatMul(x, Dequantize(I8_w))`).
+  I8 `Param`/`Constant` weights stay STATIC `SFIXED_POINT_8`; QNN runs
+  Dequantize → f32 MatMul (mixed f32×int8 MatMul is rejected by the CPU
+  backend). Shim `clientBuf.dataSize` uses 1 byte/elem for sfixed8.
+  `set_param_typed(I8)` fills deferred weights. FFI + Session parity vs CPU.
+
+- **QNN / Hexagon: host-dequant `DequantMatMul` (GGUF → f32 MatMul).**
+  Packed GGUF weights (`Q8_0`/`Q4_0`/K/IQ/…) decode on the host (same posture
+  as CoreML's off-device path), transpose `[N,K]→[K,N]`, and run a plain QNN
+  MatMul. `set_param_typed(U8)` fills deferred weights. Plus earlier FAB /
+  Expand / Silu / Custom Attention work; `just qnn-ffi` validates on Linux.
+
+- **QNN / Hexagon: `FusedAttentionBlock`, Expand, Silu, Custom rank-4 Attention.**
+  `QnnBackend` now claims `SUPPORTED_OPS` (legalize) and runs
+  `unfuse_attention_block` before FFI lower. New lowers: `Expand` (Reshape+Tile),
+  `Silu` (Sigmoid·x), rank-4 `Attention` with additive `MaskKind::Custom` (FAB
+  shape), and NeoX RoPE broadcast from compact `[S,D/2]` tables. Parity via
+  `fused_attention_block_parity` (`Device::Hexagon`) and `just qnn-ffi`
+  (native Linux, no Docker). Shim includes `<stdlib.h>` for newer gcc.
+
+- **Static graph checker (`rlx_runtime::check`) + `cargo rlx check` + `#[rlx_model(check)]`.**
+  Folds the analyses rlx already computes — shape/dtype verification (`verify_all`),
+  backend dispatch (native / common-IR / unsupported via each backend's real op
+  claim), missed fusions (`FusionReport.missed` with fix hints), and the
+  provable-NaN/Inf lint (`lint_numerics`) — into one structured `CheckReport`
+  (human or `--json`). Fusion/shape/numeric run with no GPU or driver; CPU
+  execution legality is always available, other backends' legality is opt-in
+  behind per-backend features (op claim read driver-free from the registry —
+  factories build unit structs, `supported_ops()` is a const).
+  - The checker lives in `rlx_runtime::check::check_graph` (single source of
+    truth, no new deps for consumers).
+  - **`#[rlx_model(check)]`** injects a `model_self_check(&graph)` call right
+    after tracing, so building a model surfaces findings on stderr — tuned by
+    `RLX_CHECK` (`off` / `all` / `strict`). The generated code already routes
+    through `::rlx_runtime`, so no extra dependency is needed.
+  - **`cargo rlx check`** (`crates/tooling/rlx-check`): a `cargo-rlx` subcommand
+    over the same `check_graph`, with built-in `--demo` graphs, `--json`, backend
+    filtering, and `just check-graph` / `just install-check`. Non-zero exit on any
+    error-level finding for CI/pre-commit gating.
+
+- **Vulkan / OneAPI packed DiT reverse SPIR-V.** Dedicated
+  `ada_layer_norm_backward` / `gated_residual_backward` compute kernels
+  (Vulkan GLSL via naga; OneAPI OpenCL-C via `ocloc` when
+  `RLX_ONEAPI_BUILD_KERNELS=1`). `compile_rng` no longer decomposes these
+  ops; OneAPI host-fallbacks through `rlx-cpu` when kernels are not embedded.
+
+- **CoreML ANE native MIL for DiT modulation forward (`AdaLayerNorm` /
+  `GatedResidual`).** Composed lowering (implicit broadcast, no `Expand`) in
+  `rlx_coreml::mil`; `compile_with_options` no longer calls
+  `unfuse_dit_modulation`. Host-portable `mil_lower` tests; op-coverage ANE ✅.
+
+- **DiT modulation ops on all backends (`Op::AdaLayerNorm` /
+  `Op::GatedResidual`).** Claimed in every `*_SUPPORTED_OPS` set and fused via
+  `FuseAdaLayerNorm` / `FuseGatedResidual` on all fusion targets. Native
+  kernels: CPU, Metal (MSL), CUDA/ROCm (shared `.cu` in `rlx-gpu-kernels`),
+  wgpu (WGSL). Composed: MLX (`ops::layer_norm` / `rms_norm` + broadcast),
+  TPU (HLO). Claim-then-`unfuse_dit_modulation` (broadcast Mul/Add, no Expand):
+  Vulkan, OneAPI, WebGL (CoreML ANE uses native composed MIL for forward +
+  packed reverse). Shared `rlx_ir::ada_modulation_lead_pack` for `[B,1,D]`
+  broadcast metadata. Parity: CPU Session + Metal vs CPU.
+
+- **DiT modulation autodiff (fused + unfuse).** Default AD keeps
+  `AdaLayerNorm` / `GatedResidual` fused and emits packed
+  `AdaLayerNormBackward` / `GatedResidualBackward` (`[dx ∥ dscale ∥ dshift]` /
+  `[dx ∥ dy ∥ dgate]`), avoiding Expand of `[B,1,D]` modulation in the
+  backward graph. Native reverse kernels on CPU, Metal, CUDA/ROCm (shared
+  `.cu`), and wgpu; CoreML ANE uses native composed MIL for packed reverse
+  (`COREML_NATIVE_BACKWARD_OPS`); MLX and TPU use native composed lowering in
+  `lower.rs`; Vulkan / OneAPI ship dedicated SPIR-V kernels
+  (`ada_layer_norm_backward` / `gated_residual_backward`).
+  Import-shaped LN+Expand+Mul/Add graphs fuse
+  via `FuseAdaLayerNorm` / `FuseGatedResidual` under Session (FLUX adaLN-Zero +
+  F5 identity/RMS fixtures in `dit_import_fuse`). Exact JVP for
+  LayerNorm / RmsNorm / Ada (full mean/var / RMS pushforward). Microbench:
+  `rlx-bench` `bench_dit_modulation`. Flow: `dit_ada_gated_linear` train step.
+  The unfuse-for-AD path remains available through
+  `rlx_fusion::unfuse_dit_modulation` before `grad_with_loss` (primitive
+  VJPs). JVP rules for both forward ops; `vmap` auto-unfuses then lifts
+  primitives. FD coverage for fused/unfused reverse, decompose_backward, JVP,
+  and vmap; Metal/CUDA/wgpu/ROCm/MLX↔CPU grad parity; tiny DiT-block train
+  step on CPU.
+
+- **DiT ONNX adaLN fixture + multi-block train.** Real ONNX `dit_adaln.onnx`
+  (affine-free `LayerNormalization` + `Expand` modulation) imports strictly and
+  fuses to `AdaLayerNorm` after param specialization; 3-block FLUX-style train
+  graph asserts six `AdaLayerNormBackward` / six `GatedResidualBackward` ops.
+  `bench_dit_modulation` median numbers recorded in `docs/op-coverage.md`.
+
+- **Differentiable symmetric eigendecomposition (`Op::Eigh` / `Op::EighBatch`).**
+  First-class `eigh` as a graph op — `A [n,n] → (λ [n] ascending, U [n,n]`
+  columns = eigenvectors, `A = U diag(λ) Uᵀ)`, packed `[λ ∥ U]` internally —
+  plus the batched `[B,n,n]` form. Full reverse mode via `Op::EighBackward` /
+  `Op::EighBatchBackward` (the standard symmetric-eigendecomposition adjoint
+  `Ā = sym(U (diag(λ̄) + F∘(Uᵀ Ū)) Uᵀ)`, `F_ij = 1/(λ_j−λ_i)`, degeneracy-
+  guarded). Builders `Graph::eigh` / `Graph::eigh_batch`; VJP wired in autodiff.
+  Runs on **all backends**: CPU-native (LAPACK `dsyevd`, f64) and F64 CPU
+  host-fallback on Metal / CUDA / ROCm / wgpu / Vulkan / oneAPI (`is_spd_host`
+  + every `*_SUPPORTED_OPS` list). This is the differentiable primitive the SPD
+  spectral functions build on, and the seam a native batched eigensolver
+  (cuSOLVER `syevjBatched` &c.) plugs into. Verified: forward `A = U diag(λ) Uᵀ`
+  reconstruction, VJP finite-difference checked (incl. the eigenvector gradient,
+  sign-aligned), the exact `Σλ = trace ⇒ ∂/∂A = I` end-to-end gradient through
+  `Session`, and gradient parity on real CUDA hardware (bit-exact vs CPU).
+- **Native CUDA batched eigensolver (`Step::EighNative`, cuSOLVER
+  `SsyevjBatched`).** `Op::Eigh` / `Op::EighBatch` with `n ≤ 32` now run
+  **on-device** on the CUDA backend via cuSOLVER's batched Jacobi eigensolver —
+  no D2H→CPU→H2D round-trip. An `eigh_assemble` NVRTC kernel transposes
+  cuSOLVER's column-major eigenvectors into the packed `[λ ∥ U]` layout and
+  interleaves the eigenvalues; `n > 32` falls back to the CPU host path. f32
+  (matches the widened SPD arena; f32 Jacobi ≈ f64 LAPACK to cos≈1.0 on these
+  small SPD blocks). Measured on an NVIDIA GPU: ~0.5 µs/matrix at n=32,
+  batch≥4096 (a single kernel launch for the whole batch) vs ~7.6 µs on the
+  rayon CPU path. Requires cudarc's `cusolver` feature (bumped to 0.19.8 for the
+  CUDA-13 cuSOLVER symbol set). Verified on CUDA hardware: native forward
+  reconstruction (single + batched) and gradient parity vs CPU; full rlx-cuda
+  suite green.
+- **Native ROCm batched eigensolver (`Step::EighNative`, hipSOLVER
+  `SsyevjBatched`).** Same on-device path for AMD: `Op::Eigh` / `Op::EighBatch`
+  with `n ≤ 32` when `libhipsolver` is loadable. Hand-rolled libloading shim
+  (`hipsolver.rs`) + hipRTC `eigh_assemble` kernel mirroring the CUDA layout.
+  Missing hipSOLVER or `n > 32` keeps the existing CPU host-fallback.
+
+- **SPD-manifold Riemannian primitives — host helpers + first-class ops on
+  every backend.** `rlx_cpu::spd` gains `karcher_mean_weighted` (the true AIRM
+  barycentre `argmin_M Σ wᵢ δ²(M, Cᵢ)` — what a barycentric-OT projection /
+  soft-clustering / weighted-MDM needs, replacing the log-Euclidean
+  `expm(Σ w̄ᵢ logm Cᵢ)` shortcut), the arbitrary-base `log_map` / `exp_map` and
+  `parallel_transport` (AIRM `Log_P`/`Exp_P` and the isometric transport of
+  Yair et al. 2019 — `geodesic_interp(A,B,t)` is now just
+  `exp_map(A, t·log_map(A,B))`), and rayon-batched `logm_batch` / `expm_batch` /
+  `sqrtm_batch` / `invsqrtm_batch`. These are also promoted to graph ops
+  `Op::SpdKarcherMeanWeighted` / `SpdLogMap` / `SpdExpMap` /
+  `SpdParallelTransport` / `SpdMatrixFnBatch { kind }` (builders
+  `Graph::spd_karcher_mean_weighted` / `spd_log_map` / `spd_exp_map` /
+  `spd_parallel_transport` / `spd_{logm,expm,sqrtm,invsqrtm}_batch`), so they run
+  on **all backends**: CPU-native (F64), and F64 CPU host-fallback on Metal /
+  CUDA / ROCm / wgpu / Vulkan / oneAPI (the same eigendecomposition-free
+  host-delegation path as the existing SPDNet ops — claimed in every
+  `*_SUPPORTED_OPS` list + `is_spd_host`). **Fully differentiable**: the maps
+  carry analytic Riemannian VJPs (`SpdLogMapBackward` / `SpdExpMapBackward` /
+  `SpdParallelTransportBackward` / `SpdMatrixFnBatchBackward`, packed per-input
+  gradients) — the base point is differentiated too, so a learned base trains
+  correctly, not just the moving argument (`SpdKarcherMean{,Weighted}` stay
+  detached statistics). Verified: weighted-barycentre stationarity, `exp∘log`
+  round-trip, transport isometry, batch-vs-scalar parity, and every VJP
+  finite-difference checked (rlx-cpu unit tests); end-to-end gradients through
+  `Session` on CPU; forward parity on Metal / wgpu / Vulkan / oneAPI /
+  CUDA(hardware) / ROCm; and a gradient parity check on the GPU host path (wgpu).
+- **First-class `ScatterElements` / `GatherNd` / `GatherElements`.** ONNX
+  import emits `Op::ScatterElements { axis, reduction }`,
+  `Op::GatherNd { batch_dims }`, and `Op::GatherElements { axis }` (no longer
+  Custom / flatten decompositions). CPU thunks are the reference; Metal /
+  wgpu / CUDA / ROCm / Vulkan / MLX host-delegate; CoreML hybrid host; TPU
+  XLA gather/scatter. Autodiff VJP for all three (plus existing ScatterNd);
+  finite-diff checked.
+- **First-class `Op::ScatterNd`.** ONNX ScatterND lowers to
+  `Op::ScatterNd { reduction }` (none/add/mul/max/min) instead of
+  `Op::Custom("onnx.ScatterND")`. CPU thunk is the reference; Metal /
+  wgpu / CUDA / ROCm / Vulkan / MLX host-delegate via `HostOpDesc`;
+  CoreML MIL `scatter_nd`; TPU XLA scatter. Claimed in every runtime
+  `*_SUPPORTED_OPS` list. Autodiff VJP covers all five reductions
+  (finite-diff checked).
+- **FPGA export legalizer + DX.** `ExportQuantMode::{Int8,Int4,Fp4}`,
+  `prepare_model` / `LegalizeOptions`, split requant side tables
+  (`*_requant_m0` / `*_requant_shift`), `board_top.sv` shells, bias-free
+  Dense / logits-only output, `ExportSession`, and `pyrlx.export_fpga`
+  (feature `fpga`). Soft scalar **sidebands** (`SidebandSpec`,
+  `bind_sideband_inputs`, CLI `--sideband`). See
+  [`docs/fpga-export.md`](docs/fpga-export.md).
+- **First-class FPGA / SystemVerilog export.** `Model::from_graph`,
+  `FpgaExportConfig` + `HwTarget` (default **target-agnostic** soft-port RTL;
+  optional ECP5 / iCE40 / Xilinx7 synth scripts), `rlx_fpga::export_graph`,
+  and `rlx_runtime::export` (`ExportTarget::Fpga`, feature `fpga`).
+  Docs: [`docs/fpga-export.md`](docs/fpga-export.md). Recipes: `just fpga-emit`,
+  `just test-fpga`. `rlx` feature `edge` now includes `fpga`.
+- **Unified `Op::Scan` host contract across GPU backends.** Long scans that survive
+  legalize run through shared `rlx-cpu` macros (`rlx_scan_host_desc!`,
+  `rlx_execute_scan_on_bytes!`, `rlx_scan_stage_d2h!`, `rlx_maybe_unroll_scans!`)
+  and `ScanHostDesc` / `run_scan_packed_f32` — Metal / CUDA / ROCm / wgpu /
+  Vulkan / OneAPI / CoreML / MLX. Short scans prefer on-device IR via
+  `CompileOptions::scan_unroll_max_length` (default **64**) plus
+  `maybe_unroll_scans_budget(4096)` (`length × body_nodes`).
+- **`Op::ScanBackward` / `ScanBackwardXs` GPU host path** via shared
+  `HostOpDesc` (byte offsets) + macros (`rlx_host_op_desc!`,
+  `rlx_execute_host_op_on_bytes!`, `rlx_host_op_stage_d2h!`) and value-map
+  helpers `run_scan_node_f32` / `run_host_op_node_f32` — Metal / CUDA / ROCm /
+  wgpu / Vulkan / CoreML / MLX / OneAPI. Discrete GPUs also share
+  `rlx_arena_stage_d2h!` for Scan / HostOp / Spd; wgpu uses `HostOpSpan`.
+  Parity: `scan_backward_parity`.
+- **MLX `RLX_MLX_PROFILE`:** per-op-kind wall-time dump on executable drop
+  (restored after lower.rs host-path work).
+- **TPU `QuantScheme::GgufQ1_0`** host dequant at HLO emit
+  (`rlx_gguf::q1_dequant::dequant_q1_0`).
+
+### Changed
+
+- **De-duplicated GPU-backend infrastructure into two shared crates.** Three
+  copy-pasted-across-backends surfaces now live once:
+  - **`rlx-gpu-host`** — host-fallback staging (`D2H → CPU → H2D`) for ops with
+    no native kernel (RNN/SSM, im2col, deformable attention, UMAP kNN, log-mel,
+    welch-peaks, splat, rms/rope/cumsum/gather backward, Scan/HostOp/indexing,
+    RNG fill, SPD manifold eval, GGUF dequant-matmul CPU fallback, maxpool/conv
+    training compact-scratch, …). Ops that were duplicated across GPU backends
+    are now single-source generic fns over a `DeviceArena` staging trait; each
+    backend keeps a ~15-line adapter (`CudaArena`/`RocmArena`/`WgpuArena`) and
+    thin per-op wrappers, so call sites are unchanged. SPD `eval` /
+    `is_spd_host` are re-exported from Metal/Vulkan/oneAPI/CUDA/ROCm/wgpu.
+    Vision/RNN/collective host paths and compact conv/pool training also live
+    here. `device_report` rows include advisory `capabilities`; `just new-op`
+    prints the AGENTS checklist. ONNX custom-op f32-slot dtype bridging and
+    SAM debug hosts also share `rlx-gpu-host`. Verified: CUDA
+    `gated_delta_net` / `welch_peaks` parity on an NVIDIA GPU + CPU
+    equivalence guard tests.
+  - **`rlx-unfuse`** — the IR-level unfuse/decompose pass (`FusedAttentionBlock`,
+    `FusedTransformerLayer`, `FusedSwiGLU`, `LoraMatMul`, `DotGeneral`, rank-3
+    `Attention`, control flow) shared by `rlx-cuda`/`rlx-rocm`/`rlx-wgpu` behind
+    a per-backend `DecomposePolicy` (capability flags). The ~80%-identical logic
+    lives once; the CUDA-native-FAB gate, attention-backward promotion, and
+    wgpu's fused-op/rank-3 variants are policy flags. Behavior-preserving
+    (safety-critical gates confirmed byte-identical; wgpu decompose parity green
+    on Metal, CUDA attention parity green on the NVIDIA GPU).
+- **Split `rlx-cuda` `backend.rs` (12.5k lines) into a `backend/` module dir**
+  (`mod`/`run`/`compile`/`set`/`fill`/`output`), mirroring `rlx-rocm`. Pure code
+  move — all methods preserved, public API unchanged.
+- **Peel mega backend / lower files into navigable modules** (pure moves; public
+  APIs unchanged):
+  - **Metal** — `backend/encode/{mod,ops}.rs` (`encode_and_run` + `encode_*`
+    helpers); `backend/mod.rs` keeps `MetalExecutable`.
+  - **CUDA / ROCm** — `backend/{step,helpers}.rs` (+ CUDA `bwd_launch.rs`);
+    `Step` / op-id / schedule helpers off `mod.rs`.
+  - **wgpu** — `backend/{step,helpers}.rs`; `compile/{mod,lower}.rs` (match body
+    in `lower.rs`).
+  - **MLX** — `lower/{mod,env,subgraph,helpers}.rs` (`lower_with_env` match in
+    `env.rs`).
+- **CPU `RLX_FAST_CONV` defaults on.** Forward Conv2D uses im2col+BLAS (and
+  rayon fans for pool / elementwise / bwd) unless `RLX_FAST_CONV=0`. Fixes
+  orders-of-magnitude-slow MNIST CNN training that previously fell through to
+  the scalar nested-loop kernel. When the fast path is on, OpenBLAS/MKL/
+  Accelerate inner threads are capped to 1 (unless the user already set
+  `OPENBLAS_NUM_THREADS` / `OMP_NUM_THREADS` / …) so Rayon outer parallelism
+  does not nest into an N² thread storm. Cortex-M trainer labels stay correct
+  (`rlx-fused` by default; set `=0` for the unfused `rlx` bar).
+- **Vulkan / oneAPI claim `OpKind::Custom`.** In-graph collectives
+  (`collective.all_reduce`, …) used by `rlx-vision-bench` data-parallel graphs
+  no longer fail Session legalize on Vulkan; any Custom routes to the existing
+  host-fallback. `rlx_oneapi::is_available()` is now always true (CPU reference
+  when no Level Zero GPU / kernels) so `RLX_DEVICE=oneapi` works without
+  `ze_intel_gpu`. OneAPI `host::eval` now returns dtype-aware `HostOut`
+  (Bool/`U8`/`I8` as bytes) so SoftmaxCE→`Compare`→`Where` no longer panics
+  reading a 1-byte mask as f32. `CompilePipeline::backend_label` keeps Vulkan /
+  OneAPI legalize errors from mislabeling as `"wgpu"`.
+- Clippy cleanup: drop unused `CnnGeom::final_hw` / `ident_mat`; split Vulkan
+  instance-ext cfg so non-Apple builds don't trip `unused_mut`.
+- Codegen backends (QNN / Cerebras) and TPU rewrite route nested Scan through
+  `LowerScan` / `LowerControlFlow` so arbitrary-body Scan does not need a
+  device body-ISA interpreter.
+
 ## [0.2.12] — 2026-07-06
 
 ### Added
@@ -37,7 +378,7 @@ bump may carry breaking changes per `0.x`-semver convention.
     elementwise multiply-accumulates.
   - Validated: CPU numeric (vs direct-convolution / DF2T references) and
     CPU-parity on **Metal, MLX, wgpu, CUDA, and Vulkan** — the last two on a
-    discrete RTX 3080 Ti (incl. `Op::PartitionedConv`); CoreML compile-checked.
+    discrete NVIDIA GPU (incl. `Op::PartitionedConv`); CoreML compile-checked.
     (Vulkan required the native-FFT kernel below; before it, the FFT filters
     segfaulted on discrete GPUs via host-fallback.)
   - Fixed a latent **batched `irfft`** bug uncovered by the framed convolution:
@@ -53,7 +394,7 @@ bump may carry breaking changes per `0.x`-semver convention.
   on-device for power-of-two `n ≤ 1024` (larger `n` / non-f32 still fall back to
   host); dispatch mirrors the wgpu native-FFT guard. This fixes the discrete-GPU
   crash and lets the FIR/RIR/IIR filters run on discrete Vulkan (validated on an
-  RTX 3080 Ti). Like `matmul_tiled`/`matmul_coop`, it is **precompiled offline
+  NVIDIA GPU). Like `matmul_tiled`/`matmul_coop`, it is **precompiled offline
   with glslang** to `shaders/precompiled/fft.spv` — naga's GLSL frontend has no
   `memoryBarrierShared`/`groupMemoryBarrier` and its bare `barrier()` doesn't
   enforce cross-subgroup shared visibility on NVIDIA, so the shared-memory
@@ -80,7 +421,7 @@ bump may carry breaking changes per `0.x`-semver convention.
     named ids (`0..=6`) keep the existing `switch`, so the hardware FP8 path is
     byte-for-byte unchanged. No hardware tensor core exists for these research
     formats — they always take the decode fallback.
-    - **Hardware-validated on CUDA** (RTX 3080 Ti, NVRTC,
+    - **Hardware-validated on CUDA** (NVIDIA GPU, NVRTC,
       `crates/backends/rlx-cuda/tests/cuda_scaled_custom.rs`): `f4e3m0` grid GEMM
       **bit-exact vs f32** (`max_abs = 0`), mx-block cosine 0.998, multi-tile
       (37×80×45) cosine 0.998; and a **12-format sweep** (6 custom splits + native
@@ -88,7 +429,7 @@ bump may carry breaking changes per `0.x`-semver convention.
       the CPU oracle** for every format.
     - The decode GEMM (`scaled_matmul_decode`) is now **shared-memory tiled**
       (16×16 — each code decoded once per tile instead of once per output
-      element): **~5.4× faster** on the 3080 Ti at 1024³ (74.9 → 405 GFLOP/s),
+      element): **~5.4× faster** on the NVIDIA GPU at 1024³ (74.9 → 405 GFLOP/s),
       same launch config, correctness unchanged.
     - **ROCm/HIP**: the shared kernels compile cleanly under `hipcc` for a real
       AMD target (gfx90a / CDNA2); on-device run pending AMD hardware (none
@@ -106,7 +447,7 @@ bump may carry breaking changes per `0.x`-semver convention.
     host-visible arena — added to `SUPPORTED_OPS` + `is_host_fallback`, and the
     generic host path now writes **U8 outputs** (quant codes / block scales) as
     raw bytes instead of reinterpreting them as f32. **Validated on a native
-    NVIDIA Vulkan driver** (RTX 3080 Ti): `f4e3m0` grid GEMM bit-exact vs f32,
+    NVIDIA Vulkan driver** (NVIDIA GPU): `f4e3m0` grid GEMM bit-exact vs f32,
     mx-block cosine 0.998 (`tests/vulkan_scaled_custom.rs`). (First native-driver
     Vulkan validation of any scaled path.)
 
@@ -261,8 +602,9 @@ bump may carry breaking changes per `0.x`-semver convention.
   their own crate `unfuse`, Metal/Vulkan/oneAPI/CoreML through an explicit pre-lowering
   pass (FAB-only, so each backend's native `FusedMatMulBiasAct` / `FusedResidualLN` /
   `LoraMatMul` survive). Cross-backend parity test
-  `crates/rlx-runtime/tests/fused_attention_block_parity.rs`. WebGL and QNN stay
-  excluded — neither can lower the resulting `Op::Attention`.
+  `crates/rlx-runtime/tests/fused_attention_block_parity.rs`. WebGL stays
+  excluded — it cannot lower the resulting `Op::Attention`. QNN claims FAB and
+  decomposes via `unfuse_attention_block` before the FFI lower.
 - **Native CUDA + Metal fused-attention kernels.** A `fused_attn_block` kernel
   (CUDA `fused_attn.cu`; Metal MSL in `kernels.rs`) fuses inline NeoX RoPE + softmax
   SDPA over the packed QKV projection — one block/threadgroup per batch·head, score
@@ -271,7 +613,7 @@ bump may carry breaking changes per `0.x`-semver convention.
   stay as GEMMs into appended arena scratch. Each backend keeps the block native when
   the `[seq,seq]` scores fit (`seq ≤ 96` CUDA / `≤ 64` Metal; Metal additionally gates
   to f32 + no-bias) and otherwise falls back to the primitive decomposition. Validated
-  vs the CPU reference: CUDA on an RTX 3080 Ti (identity / bias / rope), Metal on Apple
+  vs the CPU reference: CUDA on an NVIDIA GPU (identity / bias / rope), Metal on Apple
   Silicon (identity / rope native; bias decomposes).
 
 ### Performance
@@ -1112,7 +1454,8 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 Initial release. Tracked at [git history root].
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.12...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.13...HEAD
+[0.2.13]: https://github.com/MIT-RLX/rlx/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.12
 [0.2.11]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.11
 [0.2.10]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.10

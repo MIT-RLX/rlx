@@ -32,8 +32,10 @@
 
 use std::collections::BTreeMap;
 
+use super::io_ports::{self, primary_out_len, sanitize_port};
 use super::{Artifact, LayerHandle};
 use crate::codegen::relu::bits_for;
+use crate::export_config::IoConfig;
 use crate::model::{Layer, Model};
 use crate::tune::Tune;
 use crate::verilog::V;
@@ -43,11 +45,12 @@ pub fn emit(
     layers: &[LayerHandle],
     tune: &Tune,
     arena_bank: &BTreeMap<u8, u8>,
+    io: &IoConfig,
 ) -> Artifact {
     if tune.arena_plan && layers.iter().all(|l| l.hints.bram_slot_in.is_some()) {
-        emit_arena(model, layers, tune, arena_bank)
+        emit_arena(model, layers, tune, arena_bank, io)
     } else {
-        emit_per_stage(model, layers, tune)
+        emit_per_stage(model, layers, tune, io)
     }
 }
 
@@ -58,10 +61,10 @@ fn emit_arena(
     layers: &[LayerHandle],
     tune: &Tune,
     arena_bank: &BTreeMap<u8, u8>,
+    io: &IoConfig,
 ) -> Artifact {
     let scratch_len = arena_size(model, layers);
     let scratch_abits = bits_for(scratch_len);
-    let in_addr_bits = bits_for(model.input_len.max(1));
     let n_slots = layers
         .iter()
         .flat_map(|l| [l.hints.bram_slot_in, l.hints.bram_slot_out])
@@ -102,20 +105,14 @@ fn emit_arena(
     }
     v.blank();
 
-    let ports: Vec<String> = vec![
-        "input  logic                       clk".into(),
-        "input  logic                       rst".into(),
-        "input  logic                       start".into(),
-        "output logic                       done".into(),
-        format!("input  logic [{}:0]              in_addr", in_addr_bits - 1),
-        "input  logic                       in_we".into(),
-        "input  logic signed [7:0]          in_din".into(),
-        "output logic signed [7:0]          pred".into(),
-    ];
+    let n = &io.names;
+    let ports = io_ports::top_ports(model, io);
 
     v.module("top", &[], &ports, |v| {
         v.line(&format!("localparam int SCRATCH_LEN = {scratch_len};"));
         v.line(&format!("localparam int SCRATCH_AB  = {scratch_abits};"));
+        v.line(&format!("localparam int INPUT_LEN   = {};", model.input_len));
+        v.line(&format!("localparam int OUT_LEN     = {};", primary_out_len(model)));
         v.blank();
 
         // ── arena BRAMs ──
@@ -134,7 +131,7 @@ fn emit_arena(
                 v.line(&format!("logic signed [7:0]     ar{s}_dout;"));
                 v.line(&format!("block_ram #(.WIDTH(8), .DEPTH(SCRATCH_LEN)) u_ar{s} ("));
                 v.block(|v| {
-                    v.line(&format!(".clk(clk), .we(ar{s}_we), .addr(ar{s}_addr),"));
+                    v.line(&format!(".clk({}), .we(ar{s}_we), .addr(ar{s}_addr),", n.clk));
                     v.line(&format!(".din(ar{s}_din), .dout(ar{s}_dout)"));
                 });
                 v.line(");");
@@ -152,7 +149,8 @@ fn emit_arena(
                     ));
                     v.block(|v| {
                         v.line(&format!(
-                            ".clk(clk), .we(ar{s}_we[{b}]), .addr(ar{s}_word_addr),"
+                            ".clk({}), .we(ar{s}_we[{b}]), .addr(ar{s}_word_addr),",
+                            n.clk
                         ));
                         v.line(&format!(
                             ".din(ar{s}_din[{b}]), .dout(ar{s}_dout[{b}])"
@@ -183,7 +181,7 @@ fn emit_arena(
             }
             v.line(&format!("{} {} (", l.module_name, l.instance_name));
             v.block(|v| {
-                v.line(".clk(clk), .rst(rst),");
+                v.line(&format!(".clk({}), .rst({}),", n.clk, n.rst));
                 v.line(&format!(".start(l{i}_start), .done(l{i}_done),"));
                 v.line(&format!(".x_addr(l{i}_x_addr), .x_dout(l{i}_x_dout),"));
                 v.line(&format!(".y_addr(l{i}_y_addr), .y_we(l{i}_y_we), .y_din(l{i}_y_din)"));
@@ -208,11 +206,13 @@ fn emit_arena(
                 let bank = slot_bank[l.hints.bram_slot_in.unwrap() as usize];
                 let lsb_bits = bits_for(bank as usize);
                 v.line(&format!("logic [{}:0] l{i}_x_lsb_d1;", lsb_bits - 1));
-                v.line(&format!("always_ff @(posedge clk) l{i}_x_lsb_d1 <= l{i}_x_addr[{}:0];",
-                                lsb_bits - 1));
+                v.line(&format!("always_ff @(posedge {}) l{i}_x_lsb_d1 <= l{i}_x_addr[{}:0];",
+                                n.clk, lsb_bits - 1));
             }
             v.blank();
         }
+
+        emit_controller(v, layers.len(), n);
 
         // ── arena port routing (per-stage mux) ──
         v.comment("─── arena port routing — when stage == i, layer i drives slots ───");
@@ -232,27 +232,84 @@ fn emit_arena(
                     }
                 }
             }
-            // External input load into slot 0 when not running.
-            v.line("if (!start && cstate == C_IDLE) begin");
+            // Host load (IDLE) or host readout (DONE) into/from arena slots.
+            v.line(&format!(
+                "if (cstate == C_DONE && {}) begin",
+                if io.output.wants_memory() {
+                    n.out_re.as_str()
+                } else {
+                    "1'b0"
+                }
+            ));
+            v.block(|v| {
+                if io.output.wants_memory() {
+                    let last_out = layers.last().and_then(|l| l.hints.bram_slot_out).unwrap_or(0);
+                    let last_bank = slot_bank[last_out as usize];
+                    if last_bank == 1 {
+                        v.line(&format!(
+                            "ar{last_out}_addr = SCRATCH_AB'({});",
+                            n.out_addr
+                        ));
+                    } else {
+                        let bs = (last_bank as usize).trailing_zeros() as usize;
+                        v.line(&format!(
+                            "ar{last_out}_word_addr = {} >> {bs};",
+                            n.out_addr
+                        ));
+                    }
+                }
+            });
+            v.line(&format!(
+                "end else if (!{} && cstate == C_IDLE) begin",
+                n.start
+            ));
             v.block(|v| {
                 let bank0 = slot_bank[0];
-                if bank0 == 1 {
-                    v.line("ar0_addr = SCRATCH_AB'(in_addr);");
-                    v.line("ar0_we   = in_we;");
-                    v.line("ar0_din  = in_din;");
-                } else {
-                    let bank_shift = (bank0 as usize).trailing_zeros() as usize;
-                    let bank_mask = bank0 as usize - 1;
-                    v.comment(&format!("input goes to bank (in_addr & {bank_mask}) at index in_addr >> {bank_shift}"));
-                    v.line(&format!("ar0_word_addr = in_addr >> {bank_shift};"));
-                    for b in 0..bank0 {
-                        v.line(&format!("if ((in_addr & {bank_mask}) == {b}'d{bv}) begin",
-                                        b = bits_for(bank0 as usize), bv = b));
+                if io.input.wants_memory() {
+                    if bank0 == 1 {
+                        v.line(&format!("ar0_addr = SCRATCH_AB'({});", n.in_addr));
+                        v.line(&format!("ar0_we   = {};", n.in_we));
+                        v.line(&format!("ar0_din  = {};", n.in_din));
+                    } else {
+                        let bank_shift = (bank0 as usize).trailing_zeros() as usize;
+                        let bank_mask = bank0 as usize - 1;
+                        v.comment(&format!(
+                            "input goes to bank ({} & {bank_mask}) at index {} >> {bank_shift}",
+                            n.in_addr, n.in_addr
+                        ));
+                        v.line(&format!("ar0_word_addr = {} >> {bank_shift};", n.in_addr));
+                        for b in 0..bank0 {
+                            v.line(&format!(
+                                "if (({} & {bank_mask}) == {bw}'d{bv}) begin",
+                                n.in_addr,
+                                bw = bits_for(bank0 as usize),
+                                bv = b
+                            ));
+                            v.block(|v| {
+                                v.line(&format!("ar0_we[{b}]  = {};", n.in_we));
+                                v.line(&format!("ar0_din[{b}] = {};", n.in_din));
+                            });
+                            v.line("end");
+                        }
+                    }
+                }
+                if io.input.wants_stream() {
+                    v.comment("stream input beats land at in_wr_ptr (see always_ff below)");
+                    let beat = io.input.beat_elems() as usize;
+                    if bank0 == 1 {
+                        v.line("if (stream_in_fire) begin");
                         v.block(|v| {
-                            v.line(&format!("ar0_we[{b}]  = in_we;"));
-                            v.line(&format!("ar0_din[{b}] = in_din;"));
+                            v.line("ar0_addr = SCRATCH_AB'(in_wr_ptr);");
+                            v.line("ar0_we   = 1'b1;");
+                            v.line(&format!("ar0_din  = {}[7:0];", n.in_data));
                         });
                         v.line("end");
+                        if beat > 1 {
+                            v.comment(&format!(
+                                "beat_elems={beat}: only byte0 written combinationally; \
+                                 multi-byte stream expand is sequential in always_ff"
+                            ));
+                        }
                     }
                 }
             });
@@ -334,16 +391,45 @@ fn emit_arena(
         // Output prediction — read the last non-elided layer's output slot.
         let last_out = layers.last().and_then(|l| l.hints.bram_slot_out).unwrap_or(0);
         let last_bank = slot_bank[last_out as usize];
-        v.comment(&format!("Expose slot {last_out} as `pred` (last layer's output)."));
-        if last_bank == 1 {
-            v.line(&format!("assign pred = ar{last_out}_dout;"));
-        } else {
-            v.line(&format!("assign pred = ar{last_out}_dout[0];"));
+        if io.output.wants_pred_port() {
+            v.comment(&format!(
+                "Expose slot {last_out} as `{}` (last layer's output).",
+                n.pred
+            ));
+            if last_bank == 1 {
+                v.line(&format!("assign {} = ar{last_out}_dout;", n.pred));
+            } else {
+                v.line(&format!("assign {} = ar{last_out}_dout[0];", n.pred));
+            }
+        }
+        if io.output.wants_memory() {
+            v.comment(&format!(
+                "Memory readout of last slot via {} (1-cycle BRAM latency after {}/{})",
+                n.out_dout, n.out_addr, n.out_re
+            ));
+            if last_bank == 1 {
+                v.line(&format!("assign {} = ar{last_out}_dout;", n.out_dout));
+            } else {
+                v.line(&format!("assign {} = ar{last_out}_dout[0];", n.out_dout));
+            }
+        }
+        for extra in &model.extra_outputs {
+            let stem = sanitize_port(&extra.name);
+            let slot = layers
+                .get(extra.after_layer)
+                .and_then(|l| l.hints.bram_slot_out)
+                .unwrap_or(last_out);
+            v.comment(&format!(
+                "Extra readout `{stem}` → slot {slot} (layer {})",
+                extra.after_layer
+            ));
+            v.line(&format!("assign {stem}_dout = ar{slot}_dout;"));
         }
         v.blank();
 
-        // Controller FSM
-        emit_controller(v, layers.len());
+        // Stream input / output sidebands
+        emit_stream_sidebands(v, io, model, n);
+        emit_scalar_sidebands(v, io, n);
     });
 
     Artifact {
@@ -378,11 +464,11 @@ fn layer_kind(l: &Layer) -> &'static str {
     }
 }
 
-fn emit_controller(v: &mut V, n: usize) {
+fn emit_controller(v: &mut V, n_layers: usize, names: &crate::export_config::PortNames) {
     v.banner("controller — assert each layer's `start`, wait for `done`");
     v.line(&format!(
         "logic [{}:0] stage;",
-        bits_for((n + 2).max(2)) - 1
+        bits_for((n_layers + 2).max(2)) - 1
     ));
     v.line("typedef enum logic [1:0] {");
     v.block(|v| v.line("C_IDLE, C_RUN, C_STEP, C_DONE"));
@@ -390,16 +476,16 @@ fn emit_controller(v: &mut V, n: usize) {
     v.line("ctrl_t cstate, cnext;");
     v.blank();
     v.always_comb(|v| {
-        for i in 0..n {
+        for i in 0..n_layers {
             v.line(&format!(
                 "l{i}_start = (cstate == C_RUN) && (stage == {i});"
             ));
         }
-        v.line("done = (cstate == C_DONE);");
+        v.line(&format!("{} = (cstate == C_DONE);", names.done));
     });
     v.blank();
-    v.always_ff(|v| {
-        v.line("if (rst) begin");
+    v.always_ff_on(&names.clk, |v| {
+        v.line(&format!("if ({}) begin", names.rst));
         v.block(|v| {
             v.line("cstate <= C_IDLE;");
             v.line("stage  <= '0;");
@@ -407,7 +493,10 @@ fn emit_controller(v: &mut V, n: usize) {
         v.line("end else begin");
         v.block(|v| {
             v.line("cstate <= cnext;");
-            v.line("if (cstate == C_IDLE && start) stage <= '0;");
+            v.line(&format!(
+                "if (cstate == C_IDLE && {}) stage <= '0;",
+                names.start
+            ));
             v.line("if (cstate == C_STEP) stage <= stage + 1;");
         });
         v.line("end");
@@ -417,11 +506,11 @@ fn emit_controller(v: &mut V, n: usize) {
         v.line("cnext = cstate;");
         v.line("unique case (cstate)");
         v.block(|v| {
-            v.line("C_IDLE : if (start) cnext = C_RUN;");
+            v.line(&format!("C_IDLE : if ({}) cnext = C_RUN;", names.start));
             v.line("C_RUN  : begin");
             v.block(|v| {
                 let mut first = true;
-                for i in 0..n {
+                for i in 0..n_layers {
                     let kw = if first { "if   " } else { "else if" };
                     first = false;
                     v.line(&format!("{kw} (stage == {i} && l{i}_done) cnext = C_STEP;"));
@@ -430,17 +519,119 @@ fn emit_controller(v: &mut V, n: usize) {
             v.line("end");
             v.line(&format!(
                 "C_STEP : cnext = (stage == {}) ? C_DONE : C_RUN;",
-                n.saturating_sub(1)
+                n_layers.saturating_sub(1)
             ));
-            v.line("C_DONE : if (!start) cnext = C_IDLE;");
+            v.line(&format!("C_DONE : if (!{}) cnext = C_IDLE;", names.start));
         });
         v.line("endcase");
     });
 }
 
+fn emit_stream_sidebands(
+    v: &mut V,
+    io: &IoConfig,
+    model: &Model,
+    names: &crate::export_config::PortNames,
+) {
+    let n = names;
+    if io.input.wants_stream() {
+        let beat = io.input.beat_elems() as usize;
+        let ab = bits_for(model.input_len.max(1));
+        v.comment(&format!(
+            "Stream input: {}/{}/{} (beat_elems={beat})",
+            n.in_valid, n.in_ready, n.in_data
+        ));
+        v.line(&format!("logic [{}:0] in_wr_ptr;", ab - 1));
+        v.line("logic stream_in_fire;");
+        v.line(&format!(
+            "assign stream_in_fire = {} && {} && (cstate == C_IDLE);",
+            n.in_valid, n.in_ready
+        ));
+        v.line(&format!(
+            "assign {} = (cstate == C_IDLE) && (in_wr_ptr < INPUT_LEN);",
+            n.in_ready
+        ));
+        v.always_ff_on(&n.clk, |v| {
+            v.line(&format!("if ({}) in_wr_ptr <= '0;", n.rst));
+            v.line(&format!(
+                "else if (cstate == C_IDLE && {}) in_wr_ptr <= '0;",
+                n.start
+            ));
+            v.line(&format!(
+                "else if (stream_in_fire) in_wr_ptr <= in_wr_ptr + {beat};"
+            ));
+        });
+        v.blank();
+    }
+    if io.output.wants_stream() {
+        let beat = io.output.beat_elems() as usize;
+        let ab = bits_for(primary_out_len(model).max(1));
+        let data_w = 8 * beat;
+        v.comment(&format!(
+            "Stream output: {}/{}/{} (beat_elems={beat}); data peeks last-buffer byte0 via pred path",
+            n.out_valid, n.out_ready, n.out_data
+        ));
+        v.line(&format!("logic [{}:0] out_rd_ptr;", ab - 1));
+        v.line(&format!(
+            "assign {} = (cstate == C_DONE) && (out_rd_ptr < OUT_LEN);",
+            n.out_valid
+        ));
+        if io.output.wants_pred_port() {
+            if beat == 1 {
+                v.line(&format!("assign {} = {};", n.out_data, n.pred));
+            } else {
+                v.line(&format!(
+                    "assign {} = {{{{{}{{8'b0}}}}, {}}};",
+                    n.out_data,
+                    beat - 1,
+                    n.pred
+                ));
+            }
+        } else {
+            v.line(&format!("assign {} = {data_w}'d0;", n.out_data));
+        }
+        v.always_ff_on(&n.clk, |v| {
+            v.line(&format!("if ({}) out_rd_ptr <= '0;", n.rst));
+            v.line("else if (cstate != C_DONE) out_rd_ptr <= '0;");
+            v.line(&format!(
+                "else if ({} && {}) out_rd_ptr <= out_rd_ptr + {beat};",
+                n.out_valid, n.out_ready
+            ));
+        });
+        v.blank();
+    }
+}
+
+fn emit_scalar_sidebands(v: &mut V, io: &IoConfig, names: &crate::export_config::PortNames) {
+    if io.sidebands.is_empty() {
+        return;
+    }
+    v.comment(
+        "Scalar sidebands — sampled when start asserts; optional {name}_q echo \
+         (not part of the activation BRAM datapath).",
+    );
+    for sb in &io.sidebands {
+        let name = sanitize_port(&sb.name);
+        let w = sb.bits.max(1) as usize;
+        let signed = if sb.signed { "signed " } else { "" };
+        v.line(&format!("logic {signed}[{}:0] {name}_r;", w - 1));
+        v.always_ff_on(&names.clk, |v| {
+            v.line(&format!("if ({}) {name}_r <= '0;", names.rst));
+            v.line(&format!(
+                "else if (cstate == C_IDLE && {}) {name}_r <= {name};",
+                names.start
+            ));
+        });
+        if sb.echo {
+            v.line(&format!("assign {name}_q = {name}_r;"));
+        }
+    }
+    v.blank();
+}
+
 // ── Per-stage (legacy) layout ───────────────────────────────────────
 
-fn emit_per_stage(model: &Model, layers: &[LayerHandle], tune: &Tune) -> Artifact {
+fn emit_per_stage(model: &Model, layers: &[LayerHandle], tune: &Tune, io: &IoConfig) -> Artifact {
     let mut v = V::new();
     v.banner(&format!(
         "top — {} (per-stage BRAMs, legacy layout)",
@@ -457,25 +648,22 @@ fn emit_per_stage(model: &Model, layers: &[LayerHandle], tune: &Tune) -> Artifac
     }
     v.blank();
 
-    let in_addr_bits = bits_for(model.input_len);
+    let n = &io.names;
     let mut bram_lens: Vec<usize> = Vec::with_capacity(layers.len() + 1);
     bram_lens.push(model.input_len);
     for l in layers {
         bram_lens.push(l.out_len);
     }
-
-    let ports: Vec<String> = vec![
-        "input  logic                       clk".into(),
-        "input  logic                       rst".into(),
-        "input  logic                       start".into(),
-        "output logic                       done".into(),
-        format!("input  logic [{}:0]              in_addr", in_addr_bits - 1),
-        "input  logic                       in_we".into(),
-        "input  logic signed [7:0]          in_din".into(),
-        "output logic signed [7:0]          pred".into(),
-    ];
+    let ports = io_ports::top_ports(model, io);
+    let last_i = bram_lens.len() - 1;
 
     v.module("top", &[], &ports, |v| {
+        v.line(&format!("localparam int INPUT_LEN = {};", model.input_len));
+        v.line(&format!(
+            "localparam int OUT_LEN   = {};",
+            primary_out_len(model)
+        ));
+        v.blank();
         v.comment("─── activation BRAMs ───");
         for (i, len) in bram_lens.iter().enumerate() {
             let abits = bits_for(*len).max(1);
@@ -485,7 +673,7 @@ fn emit_per_stage(model: &Model, layers: &[LayerHandle], tune: &Tune) -> Artifac
             v.line(&format!("logic signed [7:0] a{i}_dout;"));
             v.line(&format!("block_ram #(.WIDTH(8), .DEPTH({len})) u_a{i} ("));
             v.block(|v| {
-                v.line(&format!(".clk(clk), .we(a{i}_we), .addr(a{i}_addr),"));
+                v.line(&format!(".clk({}), .we(a{i}_we), .addr(a{i}_addr),", n.clk));
                 v.line(&format!(".din(a{i}_din), .dout(a{i}_dout)"));
             });
             v.line(");");
@@ -505,7 +693,7 @@ fn emit_per_stage(model: &Model, layers: &[LayerHandle], tune: &Tune) -> Artifac
             v.line(&format!("logic signed [7:0] l{i}_y_din;"));
             v.line(&format!("{} {} (", l.module_name, l.instance_name));
             v.block(|v| {
-                v.line(".clk(clk), .rst(rst),");
+                v.line(&format!(".clk({}), .rst({}),", n.clk, n.rst));
                 v.line(&format!(".start(l{i}_start), .done(l{i}_done),"));
                 v.line(&format!(".x_addr(l{i}_x_addr), .x_dout(a{in_idx}_dout),"));
                 v.line(&format!(
@@ -516,9 +704,11 @@ fn emit_per_stage(model: &Model, layers: &[LayerHandle], tune: &Tune) -> Artifac
             v.blank();
         }
 
+        emit_controller(v, layers.len(), n);
+
         v.comment("─── BRAM port routing ───");
         v.always_comb(|v| {
-            v.line("if (start) begin");
+            v.line(&format!("if ({}) begin", n.start));
             v.block(|v| {
                 v.line("a0_addr = l0_x_addr;");
                 v.line("a0_we   = 1'b0;");
@@ -526,9 +716,15 @@ fn emit_per_stage(model: &Model, layers: &[LayerHandle], tune: &Tune) -> Artifac
             });
             v.line("end else begin");
             v.block(|v| {
-                v.line("a0_addr = in_addr;");
-                v.line("a0_we   = in_we;");
-                v.line("a0_din  = in_din;");
+                if io.input.wants_memory() {
+                    v.line(&format!("a0_addr = {};", n.in_addr));
+                    v.line(&format!("a0_we   = {};", n.in_we));
+                    v.line(&format!("a0_din  = {};", n.in_din));
+                } else {
+                    v.line("a0_addr = '0;");
+                    v.line("a0_we   = 1'b0;");
+                    v.line("a0_din  = 8'sd0;");
+                }
             });
             v.line("end");
         });
@@ -545,6 +741,15 @@ fn emit_per_stage(model: &Model, layers: &[LayerHandle], tune: &Tune) -> Artifac
                         "a{i}_addr = l{writer}_y_we ? l{writer}_y_addr : l{i}_x_addr;"
                     ));
                 });
+            } else if io.output.wants_memory() {
+                v.always_comb(|v| {
+                    v.line(&format!("a{i}_we   = l{writer}_y_we;"));
+                    v.line(&format!("a{i}_din  = l{writer}_y_din;"));
+                    v.line(&format!(
+                        "a{i}_addr = (cstate == C_DONE && {}) ? {} : l{writer}_y_addr;",
+                        n.out_re, n.out_addr
+                    ));
+                });
             } else {
                 v.always_comb(|v| {
                     v.line(&format!("a{i}_we   = l{writer}_y_we;"));
@@ -555,11 +760,17 @@ fn emit_per_stage(model: &Model, layers: &[LayerHandle], tune: &Tune) -> Artifac
             v.blank();
         }
 
-        v.comment("Expose the final BRAM at addr 0 as `pred`.");
-        v.line(&format!("assign pred = a{}_dout;", bram_lens.len() - 1));
+        if io.output.wants_pred_port() {
+            v.comment(&format!("Expose the final BRAM as `{}`.", n.pred));
+            v.line(&format!("assign {} = a{last_i}_dout;", n.pred));
+        }
+        if io.output.wants_memory() {
+            v.line(&format!("assign {} = a{last_i}_dout;", n.out_dout));
+        }
         v.blank();
 
-        emit_controller(v, layers.len());
+        emit_stream_sidebands(v, io, model, n);
+        emit_scalar_sidebands(v, io, n);
     });
 
     Artifact {
@@ -568,55 +779,114 @@ fn emit_per_stage(model: &Model, layers: &[LayerHandle], tune: &Tune) -> Artifac
     }
 }
 
-/// Emit a tiny Verilator-style testbench. Unchanged from before — loads
-/// `tb_image.mem` into the input port and prints `pred`.
-pub fn emit_tb(model: &Model) -> String {
+/// Emit a Verilator-style testbench matching the soft I/O configuration.
+pub fn emit_tb(model: &Model, io: &IoConfig) -> String {
     let in_len = model.input_len;
-    let in_bits = bits_for(in_len);
+    let in_bits = bits_for(in_len.max(1));
+    let n = &io.names;
+    let out_bits = bits_for(primary_out_len(model).max(1));
 
     let mut v = V::new();
-    v.banner("tb — TinyConv-MNIST testbench (image-driven, Verilator)");
+    v.banner("tb — image-driven testbench (Verilator)");
     v.line("`timescale 1ns/1ps");
     v.blank();
     v.module("tb", &[], &[], |v| {
-        v.line("logic clk = 0;");
-        v.line("always #5 clk = ~clk;");
-        v.line("logic rst = 1;");
-        v.line("logic start = 0;");
-        v.line("logic done;");
-        v.line(&format!("logic [{}:0] in_addr = '0;", in_bits - 1));
-        v.line("logic in_we = 0;");
-        v.line("logic signed [7:0] in_din = '0;");
-        v.line("logic signed [7:0] pred;");
+        v.line(&format!("logic {} = 0;", n.clk));
+        v.line(&format!("always #5 {0} = ~{0};", n.clk));
+        v.line(&format!("logic {} = 1;", n.rst));
+        v.line(&format!("logic {} = 0;", n.start));
+        v.line(&format!("logic {};", n.done));
+        if io.input.wants_memory() {
+            v.line(&format!("logic [{}:0] {} = '0;", in_bits - 1, n.in_addr));
+            v.line(&format!("logic {} = 0;", n.in_we));
+            v.line(&format!("logic signed [7:0] {} = '0;", n.in_din));
+        }
+        if io.output.wants_pred_port() {
+            v.line(&format!("logic signed [7:0] {};", n.pred));
+        }
+        if io.output.wants_memory() {
+            v.line(&format!("logic [{}:0] {} = '0;", out_bits - 1, n.out_addr));
+            v.line(&format!("logic {} = 0;", n.out_re));
+            v.line(&format!("logic signed [7:0] {};", n.out_dout));
+        }
+        for sb in &io.sidebands {
+            let name = sanitize_port(&sb.name);
+            let w = sb.bits.max(1) as usize;
+            let signed = if sb.signed { "signed " } else { "" };
+            v.line(&format!("logic {signed}[{}:0] {name} = '0;", w - 1));
+            if sb.echo {
+                v.line(&format!("logic {signed}[{}:0] {name}_q;", w - 1));
+            }
+        }
         v.blank();
 
         v.line("top u_top (");
         v.block(|v| {
-            v.line(".clk(clk), .rst(rst), .start(start), .done(done),");
-            v.line(".in_addr(in_addr), .in_we(in_we), .in_din(in_din),");
-            v.line(".pred(pred)");
+            let mut conns = vec![
+                format!(".{}({})", n.clk, n.clk),
+                format!(".{}({})", n.rst, n.rst),
+                format!(".{}({})", n.start, n.start),
+                format!(".{}({})", n.done, n.done),
+            ];
+            if io.input.wants_memory() {
+                conns.push(format!(".{}({})", n.in_addr, n.in_addr));
+                conns.push(format!(".{}({})", n.in_we, n.in_we));
+                conns.push(format!(".{}({})", n.in_din, n.in_din));
+            }
+            for sb in &io.sidebands {
+                let name = sanitize_port(&sb.name);
+                conns.push(format!(".{name}({name})"));
+                if sb.echo {
+                    conns.push(format!(".{name}_q({name}_q)"));
+                }
+            }
+            if io.output.wants_pred_port() {
+                conns.push(format!(".{}({})", n.pred, n.pred));
+            }
+            if io.output.wants_memory() {
+                conns.push(format!(".{}({})", n.out_addr, n.out_addr));
+                conns.push(format!(".{}({})", n.out_re, n.out_re));
+                conns.push(format!(".{}({})", n.out_dout, n.out_dout));
+            }
+            for (i, c) in conns.iter().enumerate() {
+                let comma = if i + 1 < conns.len() { "," } else { "" };
+                v.line(&format!("{c}{comma}"));
+            }
         });
         v.line(");");
         v.blank();
 
-        v.line(&format!("logic signed [7:0] image_mem [0:{}];", in_len - 1));
+        v.line(&format!(
+            "logic signed [7:0] image_mem [0:{}];",
+            in_len.max(1) - 1
+        ));
         v.line("initial begin");
         v.block(|v| {
             v.line("$readmemh(\"tb_image.mem\", image_mem);");
-            v.line("rst = 1; #20; rst = 0;");
-            v.line(&format!("for (int i = 0; i < {in_len}; i++) begin"));
-            v.block(|v| {
-                v.line("@(posedge clk);");
-                v.line("in_addr <= i[31:0];");
-                v.line("in_we   <= 1'b1;");
-                v.line("in_din  <= image_mem[i];");
-            });
-            v.line("end");
-            v.line("@(posedge clk); in_we <= 1'b0;");
-            v.line("@(posedge clk); start <= 1'b1;");
-            v.line("wait (done);");
-            v.line("@(posedge clk); start <= 1'b0;");
-            v.line("$display(\"pred = %0d\", $signed(pred));");
+            v.line(&format!("{} = 1; #20; {} = 0;", n.rst, n.rst));
+            if io.input.wants_memory() {
+                v.line(&format!("for (int i = 0; i < {in_len}; i++) begin"));
+                v.block(|v| {
+                    v.line(&format!("@(posedge {});", n.clk));
+                    v.line(&format!("{} <= i[31:0];", n.in_addr));
+                    v.line(&format!("{}   <= 1'b1;", n.in_we));
+                    v.line(&format!("{}  <= image_mem[i];", n.in_din));
+                });
+                v.line("end");
+                v.line(&format!("@(posedge {}); {} <= 1'b0;", n.clk, n.in_we));
+            }
+            v.line(&format!("@(posedge {}); {} <= 1'b1;", n.clk, n.start));
+            v.line(&format!("wait ({});", n.done));
+            v.line(&format!("@(posedge {}); {} <= 1'b0;", n.clk, n.start));
+            if io.output.wants_pred_port() {
+                v.line(&format!("$display(\"pred = %0d\", $signed({}));", n.pred));
+            }
+            for sb in &io.sidebands {
+                if sb.echo {
+                    let name = sanitize_port(&sb.name);
+                    v.line(&format!("$display(\"{name}_q = %0d\", {name}_q);"));
+                }
+            }
             v.line("$finish;");
         });
         v.line("end");

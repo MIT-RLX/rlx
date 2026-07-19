@@ -454,6 +454,7 @@ fn dequant_gguf_bytes(scheme: QuantScheme, bytes: &[u8], n: usize) -> Result<Vec
     use QuantScheme::*;
     let r = match scheme {
         GgufQ8_0 => rlx_gguf::dequant_q8_0(bytes, n),
+        GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0(bytes, n),
         GgufQ4_0 => rlx_gguf::dequant_q4_0(bytes, n),
         GgufQ4_1 => rlx_gguf::dequant_q4_1(bytes, n),
         GgufQ5_0 => rlx_gguf::dequant_q5_0(bytes, n),
@@ -477,6 +478,7 @@ fn dequant_gguf_bytes(scheme: QuantScheme, bytes: &[u8], n: usize) -> Result<Vec
         GgufTQ2_0 => rlx_gguf::tq_dequant::dequant_tq2_0(bytes, n),
         GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4(bytes, n),
         GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(bytes, n),
+        GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(bytes, n),
         other => return Err(format!("unsupported GGUF scheme {other:?}")),
     };
     r.map_err(|e| e.to_string())

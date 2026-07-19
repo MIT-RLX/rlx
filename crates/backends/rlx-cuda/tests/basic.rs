@@ -197,6 +197,83 @@ fn gated_delta_net_matches_cpu_reference() {
 }
 
 #[test]
+fn gated_delta_net_carry_exports_final_state() {
+    if !rlx_cuda::is_available() {
+        return;
+    }
+    use rlx_ir::Op;
+
+    let (b, s, h, n) = (1, 4, 2, 3);
+    let mut g = Graph::new("gdn_carry_export");
+    let bshn = Shape::new(&[b, s, h, n], DType::F32);
+    let bsh = Shape::new(&[b, s, h], DType::F32);
+    let state_shape = Shape::new(&[b, h, n, n], DType::F32);
+    let q = g.input("q", bshn.clone());
+    let k = g.input("k", bshn.clone());
+    let v = g.input("v", bshn.clone());
+    let g_in = g.input("g", bsh.clone());
+    let beta = g.input("beta", bsh);
+    let state = g.input("state", state_shape.clone());
+    let y = g.add_node(
+        Op::GatedDeltaNet {
+            state_size: n,
+            carry_state: true,
+        },
+        vec![q, k, v, g_in, beta, state],
+        bshn,
+    );
+    // Same materialize pattern as qwen35 prefill-cache export.
+    let scan_sum = g.sum(y, vec![0, 1, 2, 3], false);
+    let one = g.add_node(
+        Op::Constant {
+            data: 1.0f32.to_le_bytes().to_vec(),
+        },
+        vec![],
+        Shape::new(&[1], DType::F32),
+    );
+    let zero = g.add_node(
+        Op::Constant {
+            data: 0.0f32.to_le_bytes().to_vec(),
+        },
+        vec![],
+        Shape::new(&[1], DType::F32),
+    );
+    let zero_dep = g.mul(scan_sum, zero);
+    let scale = g.add(one, zero_dep);
+    let state_out = g.mul(state, scale);
+    g.set_outputs(vec![y, state_out]);
+    let mut exe = CudaExecutable::compile(g);
+
+    let nqkv = b * s * h * n;
+    let ngb = b * s * h;
+    let nstate = b * h * n * n;
+    let q_data: Vec<f32> = (0..nqkv).map(|i| 0.05 + 0.03 * (i as f32)).collect();
+    let k_data: Vec<f32> = (0..nqkv).map(|i| 0.10 + 0.02 * (i as f32)).collect();
+    let v_data: Vec<f32> = (0..nqkv).map(|i| 0.30 + 0.05 * (i as f32)).collect();
+    let g_data: Vec<f32> = (0..ngb).map(|i| -0.20 - 0.01 * (i as f32)).collect();
+    let beta_data: Vec<f32> = (0..ngb).map(|i| 0.40 + 0.02 * (i as f32)).collect();
+    let state0 = vec![0f32; nstate];
+
+    let r = exe.run(&[
+        ("q", &q_data),
+        ("k", &k_data),
+        ("v", &v_data),
+        ("g", &g_data),
+        ("beta", &beta_data),
+        ("state", &state0),
+    ]);
+    let nnz = r[1].iter().filter(|&&x| x != 0.0).count();
+    eprintln!(
+        "gdn carry export: state nnz={nnz}/{nstate} max={}",
+        r[1].iter().cloned().fold(0.0f32, f32::max)
+    );
+    assert!(
+        nnz > 0,
+        "GatedDeltaNet carry must leave non-zero final state; got all zeros"
+    );
+}
+
+#[test]
 fn dequant_matmul_gguf_q8k_matches_reference() {
     if !rlx_cuda::is_available() {
         return;

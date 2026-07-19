@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use crate::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_kernel};
+use rlx_ir::DType;
 
 const MOD: &str = "onnx.Mod";
 const IS_NAN: &str = "onnx.IsNaN";
@@ -198,16 +199,55 @@ impl CpuKernel for ModKernel {
         output: CpuTensorMut<'_>,
         attrs: &[u8],
     ) -> Result<(), String> {
-        let a = inputs
-            .first()
-            .ok_or("onnx.Mod: missing a")?
-            .expect_f32("a")?;
-        let b = inputs
-            .get(1)
-            .ok_or("onnx.Mod: missing b")?
-            .expect_f32("b")?;
-        let out = output.expect_f32_mut("out")?;
+        let a_in = inputs.first().ok_or("onnx.Mod: missing a")?;
+        let b_in = inputs.get(1).ok_or("onnx.Mod: missing b")?;
         let fmod = attrs.first().copied().unwrap_or(0) != 0;
+        // Integer Mod (MOSS codec's RVQ index arithmetic feeds i64 codes) — the
+        // f32 path would lose precision above 2^24 and here the kernel is handed
+        // i64 tensors outright. Dispatch on dtype; `%` on i64 is ONNX's integer
+        // remainder (sign follows the dividend, matching `fmod=0`).
+        if a_in.dtype() == DType::I64 {
+            let a = a_in.expect_i64("a")?;
+            let b = b_in.expect_i64("b")?;
+            let n = a.len().min(b.len());
+            let rem = |i: usize| -> i64 { if b[i] == 0 { 0 } else { a[i] % b[i] } };
+            // The output slot's dtype is whatever the arena allocated for this
+            // node (the ONNX importer sometimes types Mod's output as F32 even
+            // for integer operands; GPU backends preserve that slot). Write the
+            // integer remainder into whichever dtype the output view is, casting
+            // value-preservingly — this keeps the kernel correct on every
+            // backend regardless of the declared output dtype.
+            let od = output.dtype();
+            match output {
+                CpuTensorMut::I64 { data, .. } => {
+                    let n = n.min(data.len());
+                    for i in 0..n {
+                        data[i] = rem(i);
+                    }
+                }
+                CpuTensorMut::I32 { data, .. } => {
+                    let n = n.min(data.len());
+                    for i in 0..n {
+                        data[i] = rem(i) as i32;
+                    }
+                }
+                CpuTensorMut::F32 { data, .. } => {
+                    let n = n.min(data.len());
+                    for i in 0..n {
+                        data[i] = rem(i) as f32;
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "onnx.Mod: unsupported output dtype {od:?} for i64 inputs"
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        let a = a_in.expect_f32("a")?;
+        let b = b_in.expect_f32("b")?;
+        let out = output.expect_f32_mut("out")?;
         let n = a.len().min(b.len()).min(out.len());
         for i in 0..n {
             out[i] = if fmod {

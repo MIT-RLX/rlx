@@ -17,9 +17,23 @@ extern "C" __global__ void matmul_bt(
     unsigned int m,
     unsigned int k,
     unsigned int n,
-    unsigned int a_off,
-    unsigned int b_off,
-    unsigned int c_off
+    // 64-bit f32 arena offsets — see dequant_gguf.cu. A >4 G-element (16 GB)
+    // arena would overflow u32; the packed 27B arena is >4 GB, so the base
+    // slots already exceed what a u32 element offset can reach reliably once
+    // combined with row/col strides.
+    unsigned long long a_off,
+    unsigned long long b_off,
+    unsigned long long c_off,
+    // `precise != 0`: accumulate the dot product in **double-single** (a value
+    // represented as a hi f32 + a lo f32 error term — "an FX as two FX/2").
+    // Each product `a*b` is split exactly via `fma(a,b,-p)` (two-product) and
+    // summed with a compensated (Neumaier) running error, so the k-reduction is
+    // ~2× the working precision of a plain f32 FMA sum. Plain f32 tiling rounds
+    // differently than the CPU's sequential sum, which on a coarse 1-bit (Q1_0)
+    // model can flip a near-tie argmax; the compensated sum converges to the
+    // true dot product both paths approximate. `precise == 0` keeps the fast
+    // single-f32 path untouched.
+    unsigned int precise
 ) {
     __shared__ float tile_a[TILE_M][TILE_K];
     __shared__ float tile_b[TILE_K][TILE_N];
@@ -33,11 +47,13 @@ extern "C" __global__ void matmul_bt(
     unsigned int col_base = wid_x * TILE_N + lc * RN;
 
     float acc[RM][RN];
+    float comp[RM][RN]; // lo halves — the accumulated rounding error (double-single)
 #pragma unroll
     for (int i = 0; i < RM; ++i) {
 #pragma unroll
         for (int j = 0; j < RN; ++j) {
             acc[i][j] = 0.0f;
+            comp[i][j] = 0.0f;
         }
     }
 
@@ -89,11 +105,30 @@ extern "C" __global__ void matmul_bt(
             for (unsigned int j = 0; j < RN; ++j) {
                 b_reg[j] = tile_b[kk][lc * RN + j];
             }
+            if (precise) {
 #pragma unroll
-            for (unsigned int i = 0; i < RM; ++i) {
+                for (unsigned int i = 0; i < RM; ++i) {
 #pragma unroll
-                for (unsigned int j = 0; j < RN; ++j) {
-                    acc[i][j] += a_reg[i] * b_reg[j];
+                    for (unsigned int j = 0; j < RN; ++j) {
+                        // two-product: p + e == a*b exactly (e = fma rounding error)
+                        float p = a_reg[i] * b_reg[j];
+                        float e = __fmaf_rn(a_reg[i], b_reg[j], -p);
+                        // Neumaier two-sum of p into acc, folding lost bits + e into comp
+                        float s = acc[i][j] + p;
+                        float err = (fabsf(acc[i][j]) >= fabsf(p))
+                                        ? ((acc[i][j] - s) + p)
+                                        : ((p - s) + acc[i][j]);
+                        acc[i][j] = s;
+                        comp[i][j] += err + e;
+                    }
+                }
+            } else {
+#pragma unroll
+                for (unsigned int i = 0; i < RM; ++i) {
+#pragma unroll
+                    for (unsigned int j = 0; j < RN; ++j) {
+                        acc[i][j] += a_reg[i] * b_reg[j];
+                    }
                 }
             }
         }
@@ -113,7 +148,8 @@ extern "C" __global__ void matmul_bt(
             if (global_col >= n) {
                 continue;
             }
-            arena[c_off + global_row * n + global_col] = acc[i][j];
+            arena[c_off + global_row * n + global_col] =
+                precise ? (acc[i][j] + comp[i][j]) : acc[i][j];
         }
     }
 }

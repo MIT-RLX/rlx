@@ -41,21 +41,21 @@ vision models:
 
 | Group | Ops |
 | --- | --- |
-| Linear / element-wise | `MatMul`, `Binary` (Add/Sub/Mul/Div), `Neg` |
-| Activations | `Relu`, `Gelu`, `Sigmoid`, `Tanh` |
-| Shape | `Reshape`, `Transpose`, `Narrow` (→ StridedSlice), `Concat` |
+| Linear / element-wise | `MatMul`, `Binary` (Add/Sub/Mul/Div), `Neg`, `Expand`, `Silu` |
+| Activations | `Relu`, `Gelu`, `Sigmoid`, `Tanh`, `Silu` |
+| Shape | `Reshape`, `Transpose`, `Narrow` (→ StridedSlice), `Concat`, `Expand` |
 | Indexing | `Gather` (embedding lookup, int32 indices) |
 | Normalization | `LayerNorm`, `RmsNorm` |
-| Attention | `Softmax`, `RoPE` (NeoX), `Attention` — MHA/GQA, causal / sliding-window / none, optional logit softcap |
+| Attention | `Softmax`, `RoPE` (NeoX, compact table broadcast), `Attention` (MHA/GQA; causal / sliding-window / none / custom rank-4), `FusedAttentionBlock` (claimed → unfuse) |
 | Reduction | `Reduce` (Mean/Sum/Max — e.g. mean-pool for BERT/nomic) |
 | Vision | `Conv2d` (NCHW↔NHWC, stride/pad/dilation/group) |
-| Quantization | `Quantize` / `Dequantize` (int8 `SFIXED_POINT_8`, scale/offset) |
+| Quantization | `Quantize` / `Dequantize` (int8 `SFIXED_POINT_8`); int8/int4 MatMul weights via STATIC sfixed8/4 + Dequantize → f32 MatMul (per-tensor `SCALE_OFFSET` or per-channel `AXIS_SCALE_OFFSET`); `QMatMul` (host INT8 accumulate, mixable with QNN ops via APP_WRITE bridge); `DequantMatMul` (GGUF host-dequant → f32 MatMul) |
 
-Ops that map to several QNN nodes — `RmsNorm`, `RoPE` (7 nodes), `Attention`
-(~13 nodes), `Conv2d`, GQA — are decomposed into the underlying QNN primitives
-with intermediate `NATIVE` tensors. Static weights (`Param` / `Constant`) are
-staged as `QNN_TENSOR_TYPE_STATIC`. **17/17 FFI ops validated bit-exact** against
-`libQnnCpu.so` in Docker.
+Ops that map to several QNN nodes — `RmsNorm`, `RoPE`, `Attention`,
+`Conv2d`, GQA, `Expand`, `Silu` — are decomposed into the underlying QNN
+primitives with intermediate `NATIVE` tensors. Static weights (`Param` /
+`Constant`) are staged as `QNN_TENSOR_TYPE_STATIC`. FFI ops validated
+bit-exact against `libQnnCpu.so` (see `just qnn-ffi`).
 
 Layout: a thin C shim (`runtime/rlx_qnn_shim.{c,h}`), compiled by `build.rs`
 against the real SDK headers, `dlopen`s the backend lib and drives the
@@ -65,9 +65,11 @@ runtime, nothing linked — so `cargo build -p rlx-qnn --features runtime`
 compiles on any host with no SDK present. Design + milestones:
 [`docs/ffi-runtime-backend.md`](docs/ffi-runtime-backend.md).
 
-Remaining: quantized *matmul* deployment (per-channel/block scales, int4) and
-HTP/on-device + the context-binary perf path (`libQnnHtp.so`, needs Snapdragon
-silicon — where the perf, the north star, lives).
+x86 HTP **functional simulator**: `just qnn-htp-sim` (or
+`RLX_QNN_HTP_LIB=…/libQnnHtp.so`) — no Snapdragon silicon; covers
+sfixed8 MatMul (via Dequantize), int4/int8 probes, LinearStatic offline.
+Remaining: real HTP silicon soak (latency/power), native packed
+`SFIXED_POINT_4`, HTP per-channel Dequantize, deeper multi-layer codegen.
 
 ## Codegen / export tool
 
@@ -97,22 +99,42 @@ rlx-ir Graph
   → qnn-model-lib-generator + qnn-net-run   (QNN SDK, Linux host)
 ```
 
-### Status — milestone 1
+### Status — MatMul + Linear / LinearRelu / MatMulSoftmax / Mlp2 / LinearStatic
 
-A single rank-2 `MatMul`: one node, two runtime activation inputs (`in0[M,K]`,
-`in1[K,N]`), one output (`out[M,N]`), f32. Validated end-to-end —
-`qnn-model-lib-generator` compiles the emitted `qnn_model.cpp` against the real
-QNN headers and `qnn-net-run` executes it on `libQnnCpu.so` with numpy parity
-(atol/rtol 1e-3), reproducible in Docker. It is also the graph-construction
-reference and numerical oracle the FFI runtime reuses; multi-op codegen lands
-with the context-binary perf path.
+Rank-2 `MatMul`, multi-op `Linear` / `LinearRelu` / `MatMulSoftmax`,
+two-layer `Mlp2`, and `LinearStatic` (STATIC weight/bias from seed-0 or
+`from_graph` f32 Constants, activation-only input): f32. Validated
+end-to-end — `qnn-model-lib-generator` compiles the emitted
+`qnn_model.cpp` against the real QNN headers and `qnn-net-run` executes
+it on `libQnnCpu.so` with numpy parity (atol/rtol 1e-3). Offline
+context-binary path: `bash run_qnn_context.sh`.
+
+On-device int8/int4: `MatMul(x, Dequantize(I8))` — int8 when Constant len
+equals `K·N`; int4 when len is `(K·N+1)/2` (packed in IR, unpacked to
+`SFIXED_POINT_8` + `BW_SCALE_OFFSET` bitwidth=4 on CPU — native
+`SFIXED_POINT_4` is unsupported on `libQnnCpu`).
+`MatMul(Quantize(x), I8)` lowers as Dequantize both → f32 MatMul (portable;
+direct sfixed8×sfixed8 is rejected by `libQnnCpu` / broken on HTP sim
+execute). Validated on x86 `libQnnHtp.so` via `just qnn-htp-sim`. Fully
+quantized `Op::QMatMul` runs on the host INT8 kernel and mixes with QNN ops
+in either direction (`Quantize → QMatMul → Dequantize → Relu`).
+Per-channel `AXIS_SCALE_OFFSET` Dequantize works on CPU; HTP soft-skips.
 
 ### Emit
 
 ```sh
 cargo run -p rlx-qnn --bin rlx-qnn-emit -- 32 64 32 ./qnn-out
+cargo run -p rlx-qnn --bin rlx-qnn-emit -- --linear 8 16 4 ./qnn-linear
+cargo run -p rlx-qnn --bin rlx-qnn-emit -- --linear-relu 8 16 4 ./qnn-linrelu
+cargo run -p rlx-qnn --bin rlx-qnn-emit -- --matmul-softmax 8 16 4 ./qnn-mmsm
+cargo run -p rlx-qnn --bin rlx-qnn-emit -- --mlp2 8 16 32 4 ./qnn-mlp2
+cargo run -p rlx-qnn --bin rlx-qnn-emit -- --linear-static 8 16 4 ./qnn-linstatic
 # then, on a Linux host with the QNN SDK (QNN_SDK_ROOT set):
-cd qnn-out && bash run_qnn.sh   # build + qnn-net-run → "SUCCESS!"
+cd qnn-out && bash run_qnn.sh           # model.so path → "SUCCESS!"
+cd qnn-out && bash run_qnn_context.sh   # .bin --retrieve_context → "SUCCESS!"
+# HTP x86 functional sim (no silicon):
+#   export RLX_QNN_BACKEND_LIB=$QNN_SDK_ROOT/lib/x86_64-linux-clang/libQnnHtp.so
+#   just qnn-htp-sim
 ```
 
 ## Validation (Docker)

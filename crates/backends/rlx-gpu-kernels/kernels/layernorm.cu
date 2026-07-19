@@ -78,7 +78,8 @@ extern "C" __global__ void rlx_norm(
         float sum_x2 = ln_block_sum(local_sum_sq, s, tid, bsz);
         float mean = sum_x * n_inv;
         float var = fmaxf(sum_x2 * n_inv - mean * mean, 0.0f);
-        float inv_std = rsqrtf(var + eps);
+        // Precise 1/sqrt — matches CPU `1.0/(var+eps).sqrt()` (not fast rsqrtf).
+        float inv_std = 1.0f / sqrtf(var + eps);
 
         for (unsigned int i = tid; i < inner; i += bsz) {
             float g = arena[gamma_off + i];
@@ -93,7 +94,7 @@ extern "C" __global__ void rlx_norm(
             local_ss += v * v;
         }
         float ss = ln_block_sum(local_ss, s, tid, bsz);
-        float inv_rms = rsqrtf(ss * n_inv + eps);
+        float inv_rms = 1.0f / sqrtf(ss * n_inv + eps);
 
         for (unsigned int i = tid; i < inner; i += bsz) {
             float g = arena[gamma_off + i];

@@ -13,9 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// RLX — versatile ML compiler + runtime.
+//! Host-side `Op::Im2Col` for wgpu arenas.
 
 use crate::buffer::Arena;
+use crate::host_stage::WgpuArena;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_im2col(
@@ -39,40 +40,29 @@ pub fn run_im2col(
     dh: u32,
     dw_dil: u32,
 ) {
-    let per_batch = (c_in as usize) * (h as usize) * (w as usize);
-    let n_eff = if n == 0 { 0 } else { n as usize };
-    let m = n_eff * h_out as usize * w_out as usize;
-    let k = (c_in as usize) * (kh as usize) * (kw as usize);
-    let x_len = if n == 0 {
-        per_batch.max(1)
-    } else {
-        n_eff * per_batch
+    let mut a = WgpuArena {
+        arena,
+        device,
+        queue,
+        size_bytes: 0,
     };
-    let col_len = if n == 0 { k.max(1) } else { m * k };
-    let span_start = x_byte_off.min(col_byte_off);
-    let span_end = (x_byte_off + x_len * 4).max(col_byte_off + col_len * 4);
-    let span_len = span_end.saturating_sub(span_start);
-    let mut host = arena.read_bytes_range(device, queue, span_start, span_len);
-    unsafe {
-        rlx_cpu::im2col::execute_im2col_rows_layout(
-            x_byte_off - span_start,
-            col_byte_off - span_start,
-            n,
-            c_in,
-            h,
-            w,
-            h_out,
-            w_out,
-            kh,
-            kw,
-            sh,
-            sw,
-            ph,
-            pw,
-            dh,
-            dw_dil,
-            host.as_mut_ptr(),
-        );
-    }
-    arena.write_bytes_range(queue, span_start, &host);
+    rlx_gpu_host::run_im2col(
+        &mut a,
+        x_byte_off,
+        col_byte_off,
+        n,
+        c_in,
+        h,
+        w,
+        h_out,
+        w_out,
+        kh,
+        kw,
+        sh,
+        sw,
+        ph,
+        pw,
+        dh,
+        dw_dil,
+    );
 }

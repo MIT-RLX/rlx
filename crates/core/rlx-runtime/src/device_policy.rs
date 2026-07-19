@@ -177,6 +177,93 @@ pub struct DeviceCandidate {
     pub supports_graph: bool,
     pub recommended: bool,
     pub blocker: Option<String>,
+    /// Advisory feature names this device's executables typically expose
+    /// (see [`crate::ExecutableCapabilities`]). Confirmed after compile via
+    /// [`crate::ExecutableGraph::capabilities`].
+    pub capabilities: Vec<&'static str>,
+}
+
+/// Advisory capability bits matching what each backend's
+/// [`crate::ExecutableGraph::capabilities`] override usually reports.
+pub fn advisory_capabilities(device: Device) -> crate::ExecutableCapabilities {
+    use crate::ExecutableCapabilities as C;
+    match device {
+        Device::Cpu => C {
+            clone: true,
+            moe: true,
+            typed_io: true,
+            active_extent: true,
+            ..C::NONE
+        },
+        Device::Metal => C {
+            clone: true,
+            gpu_handles: true,
+            kv_resident: true,
+            typed_io: true,
+            async_pipeline: true,
+            active_extent: true,
+            ..C::NONE
+        },
+        Device::Mlx => C {
+            clone: true,
+            moe: true,
+            persistent_handles: true,
+            gpu_handles: true,
+            kv_resident: true,
+            typed_io: true,
+            active_extent: true,
+            ..C::NONE
+        },
+        Device::Ane => C {
+            clone: true,
+            typed_io: true,
+            ..C::NONE
+        },
+        Device::Cuda => C {
+            clone: true,
+            gpu_handles: true,
+            kv_resident: true,
+            typed_io: true,
+            active_extent: true,
+            ..C::NONE
+        },
+        Device::Rocm => C {
+            clone: true,
+            moe: true,
+            gpu_handles: true,
+            kv_resident: true,
+            ..C::NONE
+        },
+        Device::Gpu | Device::WebGpu => C {
+            clone: true,
+            gpu_handles: true,
+            typed_io: true,
+            active_extent: true,
+            ..C::NONE
+        },
+        Device::Vulkan => C {
+            clone: true,
+            gpu_handles: true,
+            kv_resident: true,
+            typed_io: true,
+            ..C::NONE
+        },
+        Device::OneApi => C {
+            clone: true,
+            typed_io: true,
+            ..C::NONE
+        },
+        Device::Tpu => C {
+            clone: true,
+            typed_io: true,
+            ..C::NONE
+        },
+        Device::OpenGl | Device::DirectX => C {
+            typed_io: true,
+            ..C::NONE
+        },
+        Device::Hexagon => C::NONE,
+    }
 }
 
 /// Explain which backends are viable for `graph` under `policy`.
@@ -213,6 +300,7 @@ pub fn device_report(graph: &Graph, policy: &DevicePolicy) -> Vec<DeviceCandidat
                 supports_graph: supports,
                 recommended: device == recommended,
                 blocker,
+                capabilities: advisory_capabilities(device).enabled_names(),
             }
         })
         .collect()
@@ -399,5 +487,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].recommended);
         assert!(rows[0].supports_graph);
+        assert!(
+            rows[0].capabilities.contains(&"clone"),
+            "cpu advisory caps: {:?}",
+            rows[0].capabilities
+        );
     }
 }

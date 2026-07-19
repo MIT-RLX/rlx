@@ -24,23 +24,30 @@
 //! `hw/<model>/` tree containing `top.sv`, `tb.sv` (a Verilator-style
 //! testbench), one .sv per layer, the BRAM/requant primitives, and a
 //! `weights/` directory of `.mem` files for `$readmemh`.
+//!
+//! Prefer [`emit_with_config`] when you need a hardware target
+//! ([`crate::export_config::HwTarget::Generic`] by default) or synth scripts.
 
 use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::export_config::FpgaExportConfig;
 use crate::model::Model;
 use crate::passes::{OptimizedModel, optimize, optimize_default};
 use crate::tune::Tune;
 
 pub mod argmax;
+pub mod board_shell;
 pub mod bram;
 pub mod conv2d;
 pub mod conv2d_parallel;
 pub mod dense;
+pub mod io_ports;
 pub mod maxpool;
 pub mod relu;
 pub mod requant;
+pub mod synth;
 pub mod top;
 pub mod weight_unpack;
 
@@ -68,14 +75,22 @@ pub struct LayerArtifacts {
 
 /// Emit a complete hardware tree for `model` under `out_dir`, using
 /// the default `Tune` (the `Precision` preset). For full control, see
-/// [`emit_model_tuned`] and [`emit_optimized`].
+/// [`emit_model_tuned`], [`emit_with_config`], and [`emit_optimized`].
 pub fn emit_model(model: &Model, out_dir: &Path) -> io::Result<()> {
-    emit_optimized(&optimize_default(model), out_dir)
+    emit_with_config(model, &FpgaExportConfig::default(), out_dir)
 }
 
 /// Emit `model` tuned for `tune` (e.g. `Tune::for_target(OptTarget::Energy)`).
 pub fn emit_model_tuned(model: &Model, tune: &Tune, out_dir: &Path) -> io::Result<()> {
-    emit_optimized(&optimize(model, tune), out_dir)
+    let cfg = FpgaExportConfig::default().with_tune(*tune);
+    emit_with_config(model, &cfg, out_dir)
+}
+
+/// Emit RTL + optional synth/constraint sidecars from a full
+/// [`FpgaExportConfig`] (tune + [`crate::export_config::HwTarget`]).
+pub fn emit_with_config(model: &Model, cfg: &FpgaExportConfig, out_dir: &Path) -> io::Result<()> {
+    let opt = optimize(model, &cfg.tune);
+    emit_optimized_with_config(&opt, cfg, out_dir)
 }
 
 /// Emit a previously-optimized model. The tree layout produced is:
@@ -96,17 +111,42 @@ pub fn emit_model_tuned(model: &Model, tune: &Tune, out_dir: &Path) -> io::Resul
 ///     tb.sv                  — image-driven testbench (Verilator)
 /// ```
 pub fn emit_optimized(opt: &OptimizedModel, out_dir: &Path) -> io::Result<()> {
+    emit_optimized_with_config(opt, &FpgaExportConfig::default(), out_dir)
+}
+
+/// Like [`emit_optimized`], but also writes synth scripts / constraints
+/// according to `cfg`.
+pub fn emit_optimized_with_config(
+    opt: &OptimizedModel,
+    cfg: &FpgaExportConfig,
+    out_dir: &Path,
+) -> io::Result<()> {
     fs::create_dir_all(out_dir.join("primitives"))?;
     fs::create_dir_all(out_dir.join("layers"))?;
     fs::create_dir_all(out_dir.join("weights"))?;
 
-    let arts = collect_artifacts_opt(opt);
+    let mut arts = collect_artifacts_io(opt, &cfg.io);
+    arts.extend(synth::collect_synth_artifacts(&opt.model, cfg));
+    if cfg.emit_board_shell {
+        if let Some(a) = board_shell::collect_board_shell(&opt.model, &cfg.hw_target, &cfg.io) {
+            arts.push(a);
+        }
+    }
     for a in &arts {
         let path = out_dir.join(&a.rel_path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, &a.content)?;
+        fs::write(&path, &a.content)?;
+        if a.rel_path == "synth.sh" {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&path)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&path, perms)?;
+            }
+        }
     }
     Ok(())
 }
@@ -114,11 +154,22 @@ pub fn emit_optimized(opt: &OptimizedModel, out_dir: &Path) -> io::Result<()> {
 /// Build every artifact for `model` in memory using the default `Tune`.
 /// Convenience wrapper around [`collect_artifacts_opt`].
 pub fn collect_artifacts(model: &Model) -> Vec<Artifact> {
-    collect_artifacts_opt(&optimize_default(model))
+    collect_artifacts_io(
+        &optimize_default(model),
+        &crate::export_config::IoConfig::default(),
+    )
 }
 
-/// Build every artifact for an optimized model in memory.
+/// Build every artifact for an optimized model in memory (default soft I/O).
 pub fn collect_artifacts_opt(opt: &OptimizedModel) -> Vec<Artifact> {
+    collect_artifacts_io(opt, &crate::export_config::IoConfig::default())
+}
+
+/// Build every artifact with a custom soft I/O configuration.
+pub fn collect_artifacts_io(
+    opt: &OptimizedModel,
+    io: &crate::export_config::IoConfig,
+) -> Vec<Artifact> {
     // Shared primitives. Both requant flavors are always emitted —
     // they're small, and emitting both means a layer can pick either.
     let mut out: Vec<Artifact> = vec![
@@ -181,10 +232,16 @@ pub fn collect_artifacts_opt(opt: &OptimizedModel) -> Vec<Artifact> {
 
     // Top-level glue. The Tune-banner makes it obvious from the top of
     // top.sv which configuration produced this tree.
-    out.push(top::emit(&opt.model, &layers, &opt.tune, &opt.arena_bank));
+    out.push(top::emit(
+        &opt.model,
+        &layers,
+        &opt.tune,
+        &opt.arena_bank,
+        io,
+    ));
     out.push(Artifact {
         rel_path: "tb.sv".into(),
-        content: top::emit_tb(&opt.model),
+        content: top::emit_tb(&opt.model, io),
     });
 
     out

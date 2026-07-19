@@ -55,6 +55,19 @@ use std::collections::{HashMap, HashSet};
 /// # Panics
 /// Panics on any op without a vmap rule. Add rules incrementally.
 pub fn vmap(forward: &Graph, batched_input_names: &[&str], batch_size: usize) -> Graph {
+    // DiT modulation fused ops have no batch rule; expand to LN/Mul/Add first.
+    let forward_owned;
+    let forward = if forward
+        .nodes()
+        .iter()
+        .any(|n| matches!(n.op, Op::AdaLayerNorm { .. } | Op::GatedResidual))
+    {
+        forward_owned = rlx_fusion::unfuse_dit_modulation(forward.clone());
+        &forward_owned
+    } else {
+        forward
+    };
+
     let batched_set: HashSet<&str> = batched_input_names.iter().copied().collect();
     let mut out = Graph::new(format!("{}_vmap", forward.name));
     let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
@@ -456,6 +469,68 @@ fn vmap_op(
             batched.insert(updates);
             batched.insert(indices);
             out.add_node(Op::ScatterAdd, vec![updates, indices], batched_shape())
+        }
+
+        Op::ScatterNd { reduction } => {
+            let data = lift_to_batched(out, new_inputs[0], batched, batch_size);
+            let indices = lift_to_batched(out, new_inputs[1], batched, batch_size);
+            let updates = lift_to_batched(out, new_inputs[2], batched, batch_size);
+            batched.insert(data);
+            batched.insert(indices);
+            batched.insert(updates);
+            out.add_node(
+                Op::ScatterNd {
+                    reduction: *reduction,
+                },
+                vec![data, indices, updates],
+                batched_shape(),
+            )
+        }
+
+        Op::ScatterElements { axis, reduction } => {
+            let data = lift_to_batched(out, new_inputs[0], batched, batch_size);
+            let indices = lift_to_batched(out, new_inputs[1], batched, batch_size);
+            let updates = lift_to_batched(out, new_inputs[2], batched, batch_size);
+            batched.insert(data);
+            batched.insert(indices);
+            batched.insert(updates);
+            // Axis shifts by +1 when a leading batch dim is inserted.
+            let axis = if *axis >= 0 { *axis + 1 } else { *axis };
+            out.add_node(
+                Op::ScatterElements {
+                    axis,
+                    reduction: *reduction,
+                },
+                vec![data, indices, updates],
+                batched_shape(),
+            )
+        }
+
+        Op::GatherNd { batch_dims } => {
+            let data = lift_to_batched(out, new_inputs[0], batched, batch_size);
+            let indices = lift_to_batched(out, new_inputs[1], batched, batch_size);
+            batched.insert(data);
+            batched.insert(indices);
+            out.add_node(
+                Op::GatherNd {
+                    batch_dims: batch_dims.saturating_add(1),
+                },
+                vec![data, indices],
+                batched_shape(),
+            )
+        }
+
+        Op::GatherElements { axis } => {
+            let data = lift_to_batched(out, new_inputs[0], batched, batch_size);
+            let indices = lift_to_batched(out, new_inputs[1], batched, batch_size);
+            batched.insert(data);
+            batched.insert(indices);
+            let axis = if *axis >= 0 { *axis + 1 } else { *axis };
+            out.add_node(
+                Op::GatherElements { axis },
+                vec![data, indices],
+                batched_shape(),
+            )
         }
 
         // ── ElementwiseRegion: same policy as plain elementwise ──
@@ -1342,6 +1417,15 @@ fn vmap_op(
              `rlx_fusion::UnfuseElementwiseRegions` (or \
              `rlx_fusion::unfuse_fused_for_autodiff`) so the simpler \
              ops get vmap'd individually.",
+                node.op,
+            )
+        }
+
+        // AdaLayerNorm / GatedResidual are unfused at the start of `vmap`.
+        Op::AdaLayerNorm { .. } | Op::GatedResidual => {
+            panic!(
+                "vmap: {:?} should have been expanded by \
+             `rlx_fusion::unfuse_dit_modulation` before per-op lifting.",
                 node.op,
             )
         }

@@ -167,11 +167,55 @@ impl Optimizer for Muon {
     }
 }
 
+/// Map `f(row_index, &mut row)` over the `n_rows × cols` row-major matrix
+/// `out`, parallelized across output rows. With the `parallel` feature this uses
+/// rayon's **persistent global pool** (no per-call thread spawn — the dominant
+/// overhead when the Newton–Schulz iteration fires this many small matmuls per
+/// step); without it, dependency-free scoped threads. Serial below 64 rows.
+/// `f` reads only shared (immutable) state and writes its own disjoint row.
+fn par_rows<F: Fn(usize, &mut [f32]) + Sync>(out: &mut [f32], cols: usize, f: F) {
+    let n = out.len() / cols;
+    if n < 64 {
+        for (i, row) in out.chunks_mut(cols).enumerate() {
+            f(i, row);
+        }
+        return;
+    }
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        out.par_chunks_mut(cols)
+            .enumerate()
+            .for_each(|(i, row)| f(i, row));
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let threads = std::thread::available_parallelism()
+            .map(|x| x.get())
+            .unwrap_or(1)
+            .min(n);
+        let per = n.div_ceil(threads);
+        std::thread::scope(|s| {
+            for (t, chunk) in out.chunks_mut(per * cols).enumerate() {
+                let f = &f;
+                s.spawn(move || {
+                    let base = t * per;
+                    for (ii, row) in chunk.chunks_mut(cols).enumerate() {
+                        f(base + ii, row);
+                    }
+                });
+            }
+        });
+    }
+}
+
 /// Newton–Schulz semi-orthogonalization. Operates on a row-major
 /// `rows × cols` matrix and returns its closest semi-orthogonal matrix
 /// (up to the polynomial truncation). The input is first scaled by its
 /// Frobenius norm to stay inside the polynomial's region of convergence.
-fn newton_schulz_orth(
+/// The per-iteration `X·Xᵀ`, `A²` and `X`-update products are parallelized
+/// over rows, so it stays cheap even for the largest transformer matrices.
+pub fn newton_schulz_orth(
     g: &[f32],
     rows: usize,
     cols: usize,
@@ -188,11 +232,13 @@ fn newton_schulz_orth(
     for xi in &mut x {
         *xi /= fro;
     }
-    // The cubic iteration is more efficient on the "thin" side; we
-    // transpose internally if rows < cols so that the inner products
-    // are over the longer axis.
-    let (mut x_mat, r, k, transposed) = if rows < cols {
-        // transpose
+    // Operate with the SMALLER dimension as rows, so the `XXᵀ` Gram (`r×r`) is
+    // `min×min` — the cubic NS iteration's cost is dominated by that `r×r`
+    // matrix, and `U·Vᵀ` is identical in either orientation. (Transposing to
+    // `min×max`, as the canonical Muon reference does, is up to (max/min)²
+    // cheaper on the `A²` product than working on the `max×max` Gram.)
+    let (mut x_mat, r, k, transposed) = if rows > cols {
+        // transpose rows×cols → cols×rows so r = cols = min
         let mut t = vec![0.0f32; rows * cols];
         for i in 0..rows {
             for j in 0..cols {
@@ -208,37 +254,48 @@ fn newton_schulz_orth(
     let mut a_mat = vec![0.0f32; r * r];
     let mut a2 = vec![0.0f32; r * r];
     for _ in 0..steps {
-        // A = X · Xᵀ  (r × r)
-        for i in 0..r {
-            for j in 0..r {
+        // A = X · Xᵀ  (r × r) — dot products of contiguous rows (cache-friendly).
+        par_rows(&mut a_mat, r, |i, arow| {
+            let xi = &x_mat[i * k..i * k + k];
+            for (j, aij) in arow.iter_mut().enumerate() {
+                let xj = &x_mat[j * k..j * k + k];
                 let mut s = 0.0f32;
                 for p in 0..k {
-                    s += x_mat[i * k + p] * x_mat[j * k + p];
+                    s += xi[p] * xj[p];
                 }
-                a_mat[i * r + j] = s;
+                *aij = s;
             }
-        }
-        // A² = A · A
-        for i in 0..r {
-            for j in 0..r {
-                let mut s = 0.0f32;
-                for p in 0..r {
-                    s += a_mat[i * r + p] * a_mat[p * r + j];
+        });
+        // A² = A · A, in cache-friendly `ikj` order: accumulate whole rows so
+        // both operands are read contiguously (the `ijk` form strides down a
+        // column of A each inner step and thrashes cache for large matrices).
+        par_rows(&mut a2, r, |i, a2row| {
+            a2row.fill(0.0);
+            let ai = &a_mat[i * r..i * r + r];
+            for p in 0..r {
+                let aip = ai[p];
+                let ap = &a_mat[p * r..p * r + r];
+                for j in 0..r {
+                    a2row[j] += aip * ap[j];
                 }
-                a2[i * r + j] = s;
             }
-        }
-        // X ← a·X + b·A·X + cc·A²·X
-        for i in 0..r {
+        });
+        // X ← a·X + b·A·X + cc·A²·X  (also `ikj`: contiguous row updates).
+        par_rows(&mut tmp, k, |i, trow| {
+            let xi = &x_mat[i * k..i * k + k];
             for j in 0..k {
-                let mut s = a * x_mat[i * k + j];
-                for p in 0..r {
-                    s += b * a_mat[i * r + p] * x_mat[p * k + j];
-                    s += cc * a2[i * r + p] * x_mat[p * k + j];
-                }
-                tmp[i * k + j] = s;
+                trow[j] = a * xi[j];
             }
-        }
+            let ai = &a_mat[i * r..i * r + r];
+            let a2i = &a2[i * r..i * r + r];
+            for p in 0..r {
+                let coef = b * ai[p] + cc * a2i[p];
+                let xp = &x_mat[p * k..p * k + k];
+                for j in 0..k {
+                    trow[j] += coef * xp[j];
+                }
+            }
+        });
         std::mem::swap(&mut x_mat, &mut tmp);
     }
     if transposed {

@@ -1,0 +1,17 @@
+# Pure-Rust ONNX protobuf types. This is a vendored, protoc-free replacement for
+# the crates.io `onnx` crate, whose build.rs shelled out to the external `protoc`
+# binary to code-generate `src/onnx.rs` on every build. Here `src/onnx.rs` is the
+# checked-in rust-protobuf output; the only runtime dependency is the pure-Rust
+# `protobuf` crate. `src/onnx.rs` was post-processed to add `dyn` before its `Any`
+# trait objects so it builds on a modern edition. Regenerate only if the ONNX
+# schema changes: rust-protobuf 1.x output, then `sed` the bare `::std::any::Any`
+# refs to `dyn ::std::any::Any`.
+[package]
+name = "rlx-onnx-proto"
+version = "0.2.13"
+edition = "2021"
+license = "MIT"
+description = "Vendored pure-Rust ONNX protobuf types (protoc-free)"
+
+[dependencies]
+protobuf = "1.7"

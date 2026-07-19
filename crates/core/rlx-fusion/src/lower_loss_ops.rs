@@ -169,7 +169,19 @@ fn lower_softmax_cross_entropy_backward(
     };
     let one_hot = one_hot_2d(g, labels_flat, n, c, dt);
     let diff = g.sub(sm, one_hot);
-    let dl_b = broadcast_scalar(g, d_loss, &out_shape);
+    // `d_loss` is the per-example upstream gradient `[N]`; it scales each ROW
+    // (example) of `dlogits`, matching the CPU kernel `(p − one_hot)·d_loss[n]`.
+    // Reshape to `[N,1]` before expanding to `[N,C]` so it broadcasts across the
+    // CLASS axis — a bare `[N]→[N,C]` expand mis-aligns `N` with `C` under
+    // trailing-dim broadcasting (wrong, and out-of-bounds, whenever N≠C).
+    let dl_2d = g.reshape_(d_loss, vec![n as i64, 1]);
+    let dl_b = g.add_node(
+        Op::Expand {
+            target_shape: vec![n as i64, c as i64],
+        },
+        vec![dl_2d],
+        out_shape.clone(),
+    );
     g.mul(diff, dl_b)
 }
 

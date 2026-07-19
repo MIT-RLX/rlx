@@ -45,6 +45,8 @@ mod autodiff;
 mod device;
 mod device_router;
 mod dtype;
+#[cfg(feature = "fpga")]
+mod export_fpga;
 mod flexible_session;
 mod fusion_options;
 mod gguf;
@@ -69,6 +71,9 @@ fn _pyrlx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(autodiff::nth_order_grad, m)?)?;
     m.add_function(wrap_pyfunction!(autodiff::directional_nth_grad, m)?)?;
     m.add_function(wrap_pyfunction!(autodiff::vmap_py, m)?)?;
+
+    #[cfg(feature = "fpga")]
+    m.add_function(wrap_pyfunction!(export_fpga::export_fpga, m)?)?;
 
     m.add_class::<graph::PyGraph>()?;
     m.add_class::<session::PySession>()?;

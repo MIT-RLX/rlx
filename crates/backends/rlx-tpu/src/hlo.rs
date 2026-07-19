@@ -997,6 +997,22 @@ impl HloBuilder {
         c
     }
 
+    /// Scatter update-computation that returns the update (`y`), ignoring
+    /// the existing value (`x`) — ONNX ScatterND `reduction=none`.
+    pub fn make_scatter_replace(&mut self, name: &str, prim_ty: i32) -> Computation {
+        let c = self.computation(name);
+        let s = Shape::scalar(prim_ty);
+        let _p0 = c.parameter(0, "x", s.clone());
+        let p1 = c.parameter(1, "y", s.clone());
+        c.set_root(p1);
+        c.set_program_shape(ProgramShape {
+            parameters: vec![s.clone(), s.clone()],
+            parameter_names: vec!["x".into(), "y".into()],
+            result: s,
+        });
+        c
+    }
+
     pub fn finish(self) -> Vec<u8> {
         // The entry computation is the FIRST one we hand out via
         // `computation()`, so its index in `self.computations` is 0.

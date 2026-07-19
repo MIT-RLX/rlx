@@ -794,14 +794,45 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
         "RandomNormal" | "RandomUniform" => emit_random(node, out_ident, &meta0),
         "GatherND" if node.inputs.len() >= 2 => {
             let batch_dims = attr_i64(node, "batch_dims", 0) as i32;
-            emit_custom_onnx(
-                node,
+            let (pre, ids) = prefetch_inputs(out_ident, &[&node.inputs[0], &node.inputs[1]]);
+            let mut lines = pre;
+            lines.push(format!(
+                "let {out_ident} = {{ let mut m = HirMut::new(&mut b.hir); m.add_node(rlx_ir::Op::GatherNd {{ batch_dims: {batch_dims} }}, vec![{ids}], shape_from_meta({meta0}, opts)) }};",
+            ));
+            lines
+        }
+        "ScatterElements" if node.inputs.len() >= 3 => {
+            let axis = attr_i64(node, "axis", 0) as i32;
+            let reduction = match node
+                .attrs
+                .get("reduction")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none")
+            {
+                "add" => "rlx_ir::ScatterNdReduction::Add",
+                "mul" => "rlx_ir::ScatterNdReduction::Mul",
+                "max" => "rlx_ir::ScatterNdReduction::Max",
+                "min" => "rlx_ir::ScatterNdReduction::Min",
+                _ => "rlx_ir::ScatterNdReduction::None",
+            };
+            let (pre, ids) = prefetch_inputs(
                 out_ident,
-                &meta0,
-                "onnx.GatherND",
-                &[&node.inputs[0], &node.inputs[1]],
-                &format!("({batch_dims}i32).to_le_bytes().to_vec()"),
-            )
+                &[&node.inputs[0], &node.inputs[1], &node.inputs[2]],
+            );
+            let mut lines = pre;
+            lines.push(format!(
+                "let {out_ident} = {{ let mut m = HirMut::new(&mut b.hir); m.add_node(rlx_ir::Op::ScatterElements {{ axis: {axis}, reduction: {reduction} }}, vec![{ids}], shape_from_meta({meta0}, opts)) }};",
+            ));
+            lines
+        }
+        "GatherElements" if node.inputs.len() >= 2 => {
+            let axis = attr_i64(node, "axis", 0) as i32;
+            let (pre, ids) = prefetch_inputs(out_ident, &[&node.inputs[0], &node.inputs[1]]);
+            let mut lines = pre;
+            lines.push(format!(
+                "let {out_ident} = {{ let mut m = HirMut::new(&mut b.hir); m.add_node(rlx_ir::Op::GatherElements {{ axis: {axis} }}, vec![{ids}], shape_from_meta({meta0}, opts)) }};",
+            ));
+            lines
         }
         "OneHot" if node.inputs.len() >= 3 => {
             let axis = attr_i64(node, "axis", -1) as i32;
@@ -858,16 +889,31 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
             let attrs = format!("{}.as_bytes().to_vec()", rust_str_lit(equation));
             emit_custom_onnx(node, out_ident, &meta0, "onnx.Einsum", &inputs, &attrs)
         }
-        "ScatterND" if node.inputs.len() >= 3 => emit_custom_onnx(
-            node,
-            out_ident,
-            &meta0,
-            "onnx.ScatterND",
-            &[&node.inputs[0], &node.inputs[1], &node.inputs[2]],
-            "Vec::<u8>::new()",
-        ),
-        "ScatterElements" | "CumSum" | "SplitToSequence" | "ConcatFromSequence"
-        | "SequenceEmpty" | "Loop" | "If" | "Range" | "ConstantOfShape" | "Shape" | "Pad" => {
+        "ScatterND" if node.inputs.len() >= 3 => {
+            let reduction = match node
+                .attrs
+                .get("reduction")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none")
+            {
+                "add" => "rlx_ir::ScatterNdReduction::Add",
+                "mul" => "rlx_ir::ScatterNdReduction::Mul",
+                "max" => "rlx_ir::ScatterNdReduction::Max",
+                "min" => "rlx_ir::ScatterNdReduction::Min",
+                _ => "rlx_ir::ScatterNdReduction::None",
+            };
+            let (pre, ids) = prefetch_inputs(
+                out_ident,
+                &[&node.inputs[0], &node.inputs[1], &node.inputs[2]],
+            );
+            let mut lines = pre;
+            lines.push(format!(
+                "let {out_ident} = {{ let mut m = HirMut::new(&mut b.hir); m.add_node(rlx_ir::Op::ScatterNd {{ reduction: {reduction} }}, vec![{ids}], shape_from_meta({meta0}, opts)) }};",
+            ));
+            lines
+        }
+        "CumSum" | "SplitToSequence" | "ConcatFromSequence" | "SequenceEmpty" | "Loop" | "If"
+        | "Range" | "ConstantOfShape" | "Shape" | "Pad" => {
             let mut lines = vec![format!("// passthrough / delegated: {}", node.op)];
             lines.extend(stub_node(out_ident, &meta0, out_name));
             lines
@@ -1004,19 +1050,10 @@ mod tests {
         }
     }
 
-    /// The indexing/contraction ops must emit real `Op::Custom` nodes, not the
-    /// zero-filled `__stub__` placeholder.
+    /// Indexing/contraction ops emit real IR nodes (Custom or first-class), not stubs.
     #[test]
     fn indexing_ops_emit_custom_not_stub() {
         let cases = [
-            (
-                node(
-                    "GatherND",
-                    &["data", "indices"],
-                    &[("batch_dims", serde_json::json!(0))],
-                ),
-                "onnx.GatherND",
-            ),
             (
                 node(
                     "OneHot",
@@ -1035,10 +1072,6 @@ mod tests {
                 ),
                 "onnx.Einsum",
             ),
-            (
-                node("ScatterND", &["data", "indices", "updates"], &[]),
-                "onnx.ScatterND",
-            ),
         ];
         for (n, expect) in cases {
             let code = emit_node_body(&n, "__y").join("\n");
@@ -1050,6 +1083,36 @@ mod tests {
             assert!(
                 !code.contains("__stub__"),
                 "{} must not fall back to a stub; got:\n{code}",
+                n.op
+            );
+        }
+        // First-class IR indexing ops (not Op::Custom).
+        for (n, expect) in [
+            (
+                node(
+                    "GatherND",
+                    &["data", "indices"],
+                    &[("batch_dims", serde_json::json!(0))],
+                ),
+                "Op::GatherNd",
+            ),
+            (
+                node("ScatterND", &["data", "indices", "updates"], &[]),
+                "Op::ScatterNd",
+            ),
+            (
+                node("ScatterElements", &["data", "indices", "updates"], &[]),
+                "Op::ScatterElements",
+            ),
+            (
+                node("GatherElements", &["data", "indices"], &[]),
+                "Op::GatherElements",
+            ),
+        ] {
+            let code = emit_node_body(&n, "__y").join("\n");
+            assert!(
+                code.contains(expect) && !code.contains("Op::Custom"),
+                "{} should emit {expect}; got:\n{code}",
                 n.op
             );
         }

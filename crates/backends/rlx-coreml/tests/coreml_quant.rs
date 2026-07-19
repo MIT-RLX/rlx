@@ -80,6 +80,119 @@ fn dequant_matmul_q8_0() {
 }
 
 #[test]
+fn dequant_matmul_q1_0_nonunfolding_variations() {
+    // Bonsai-27B Q1_0 (1-bit ±d, 128-elem blocks). Validate NON-UNFOLDING CoreML
+    // paths ON-DEVICE: F32 (legacy unfold) and Lut (1-bit `constexpr_lut_to_dense`,
+    // iOS18 opset — packed UINT1 indices + per-block LUT). Both encode the SAME
+    // quantized weight, so both must match `x @ dequant_q1_0(packed)` — proving
+    // the 1-bit blob format + LSB-first packing + grouped LUT are correct on real
+    // coremlc, not just structurally. The Lut blob is ~n·k/8 (≈3.4 GB for 27B).
+    use rlx_coreml::mil::{LowerOptions, Q1Mode};
+    let (m, k, n) = (2usize, 128usize, 3usize); // k multiple of 128
+    let w_nk: Vec<f32> = (0..n * k)
+        .map(|i| ((i as f32) * 0.017).sin() * 0.4)
+        .collect();
+    let packed = rlx_gguf::quantize(&w_nk, rlx_gguf::GgmlType::Q1_0).expect("quantize");
+    let w_deq = rlx_gguf::q1_dequant::dequant_q1_0(&packed, n * k).expect("deq"); // [n,k] ±d
+    let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.02).cos()).collect();
+    // reference: out[i,j] = sum_k x[i,k] * w_deq[j,k]
+    let mut want = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut a = 0.0f32;
+            for kk in 0..k {
+                a += x[i * k + kk] * w_deq[j * k + kk];
+            }
+            want[i * n + j] = a;
+        }
+    }
+    for mode in [Q1Mode::F32, Q1Mode::Lut] {
+        let mut g = Graph::new("dq1");
+        let xi = g.input("x", Shape::new(&[m, k], DType::F32));
+        let w = g.param("W", Shape::new(&[n, k], DType::F32));
+        let y = g.append_node(
+            Op::DequantMatMul {
+                scheme: QuantScheme::GgufQ1_0,
+            },
+            vec![xi, w],
+            Shape::new(&[m, n], DType::F32),
+            None,
+        );
+        g.set_outputs(vec![y]);
+        let opts = LowerOptions {
+            ondevice_dequant: true,
+            q1_mode: Some(mode),
+            ..Default::default()
+        };
+        let mut e = CoremlExecutable::compile_with_lower_opts(g, opts);
+        e.set_param_typed("W", &packed, DType::U8);
+        let out = e
+            .run(&[("x", &x)])
+            .unwrap_or_else(|e| panic!("Q1_0 mode {mode:?} run failed: {e:?}"))
+            .remove(0);
+        // Same ±d weight in every mode; f16 scale precision only.
+        approx(&out, &want, 2e-2);
+    }
+}
+
+/// Timing: Bonsai decode-shaped Q1_0 matmul (m=1, k=5120, n=6144) on-device.
+/// Run with `--nocapture`. Measures compile (coremlc) + warm run latency for the
+/// 1-bit LUT path vs the F32 unfold, to answer "how fast is the no-unfold path".
+#[test]
+fn bench_q1_0_lut_vs_unfold_decode_shape() {
+    use rlx_coreml::mil::{LowerOptions, Q1Mode};
+    use std::time::Instant;
+    let (m, k, n) = (1usize, 5120usize, 6144usize); // Bonsai GDN-proj decode shape
+    let w_nk: Vec<f32> = (0..n * k)
+        .map(|i| ((i as f32) * 0.0007).sin() * 0.3)
+        .collect();
+    let packed = rlx_gguf::quantize(&w_nk, rlx_gguf::GgmlType::Q1_0).expect("quantize");
+    let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.003).cos()).collect();
+    let bench = |mode: Option<Q1Mode>| {
+        let mut g = Graph::new("dq1b");
+        let xi = g.input("x", Shape::new(&[m, k], DType::F32));
+        let w = g.param("W", Shape::new(&[n, k], DType::F32));
+        let y = g.append_node(
+            Op::DequantMatMul {
+                scheme: QuantScheme::GgufQ1_0,
+            },
+            vec![xi, w],
+            Shape::new(&[m, n], DType::F32),
+            None,
+        );
+        g.set_outputs(vec![y]);
+        let opts = LowerOptions {
+            ondevice_dequant: true,
+            q1_mode: mode,
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        let mut e = CoremlExecutable::compile_with_lower_opts(g, opts);
+        e.set_param_typed("W", &packed, DType::U8);
+        let _ = e.run(&[("x", &x)]).expect("warm"); // compile + first run (warm)
+        let compile_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let iters = 30;
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            let _ = e.run(&[("x", &x)]).expect("run");
+        }
+        let run_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        (compile_ms, run_ms)
+    };
+    let (c_lut, r_lut) = bench(Some(Q1Mode::Lut));
+    let (c_f32, r_f32) = bench(Some(Q1Mode::F32));
+    let packed_mb = packed.len() as f64 / 1e6;
+    let unfold_mb = (n * k * 4) as f64 / 1e6;
+    eprintln!(
+        "\n[bench Q1_0 m={m} k={k} n={n}] blob: LUT~{:.1}MB (indices n·k/8) vs unfold {:.1}MB\n\
+         LUT : compile+warm {c_lut:.0}ms, steady {r_lut:.2}ms/run\n\
+         F32 : compile+warm {c_f32:.0}ms, steady {r_f32:.2}ms/run",
+        packed.len() as f64 / 8.0 / 1e6 + packed_mb * 0.0, // indices ~ n*k/8
+        unfold_mb
+    );
+}
+
+#[test]
 fn dequant_matmul_q4_0() {
     // Q4_0 block = 32 → K multiple of 32. Exercises a second scheme.
     let (m, k, n) = (1usize, 64usize, 2usize);

@@ -168,16 +168,21 @@ SKIPPED=(
 # rlx-runtime (the `runtime` default feature) and rlx-onnx-import (the `onnx`
 # feature). Optional deps are still resolved by cargo publish, so it has to
 # follow rlx-onnx-import — it rides in the same tier, listed right after it.
+# rlx-unfuse (rlx-ir) rides tier 1; rlx-extend (rlx-ir/rlx-flow) tier 2.
+# rlx-hwprofile / rlx-onnx-proto are dep-free leaves (tier 0). rlx-gpu-host
+# (rlx-cpu/rlx-ir/rlx-compile) is consumed by the GPU backends, so it sits in
+# the backend tier right after rlx-cpu and before rlx-cuda/rlx-rocm/rlx-wgpu.
+# rlx-check (rlx-runtime) follows runtime.
 TIERS=(
-    "rlx-ir rlx-gguf rlx-nemo rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim"
-    "rlx-flow rlx-fusion rlx-driver"
-    "rlx-autodiff"
+    "rlx-ir rlx-gguf rlx-nemo rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto"
+    "rlx-unfuse rlx-flow rlx-fusion rlx-driver"
+    "rlx-autodiff rlx-extend"
     "rlx-compile"
     "rlx-opt"
-    "rlx-cpu rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-webgl"
+    "rlx-cpu rlx-gpu-host rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-webgl"
     "rlx-metal"
     "rlx-collectives rlx-runtime"
-    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-web"
+    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-web rlx-check"
     "rlx-sparse rlx-linalg rlx-umap rlx-vq rlx-text rlx-gguf-convert rlx-onnx-conformance"
     "rlx-onnx"
     "rlx-fdm rlx-bench"

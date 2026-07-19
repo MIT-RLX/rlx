@@ -272,7 +272,11 @@ fn wgpu_rms_norm_backward_input_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_rms_norm_backward_input_matches_cpu() {
-    use rlx_runtime::{CompileOptions, Device, Session};
+    use rlx_runtime::{CompileOptions, Device, Session, is_available};
+    if !is_available(Device::Cuda) {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
     let (x, gamma, beta, dy) = rms_norm_inputs();
     let bwd = build_rms_norm_bwd_input_graph();
     let want = cpu_run(
@@ -388,7 +392,11 @@ fn wgpu_rope_backward_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_rope_backward_matches_cpu() {
-    use rlx_runtime::{CompileOptions, Device, Session};
+    use rlx_runtime::{CompileOptions, Device, Session, is_available};
+    if !is_available(Device::Cuda) {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
     let (dy, cos, sin) = rope_inputs();
     let bwd = build_rope_bwd_graph();
     let want = cpu_run(bwd.clone(), &[("dy", &dy), ("cos", &cos), ("sin", &sin)]);
@@ -482,7 +490,11 @@ fn wgpu_cumsum_backward_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_cumsum_backward_matches_cpu() {
-    use rlx_runtime::{CompileOptions, Device, Session};
+    use rlx_runtime::{CompileOptions, Device, Session, is_available};
+    if !is_available(Device::Cuda) {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
     let dy = cumsum_inputs();
     let bwd = build_cumsum_bwd_graph();
     let want = cpu_run(bwd.clone(), &[("dy", &dy)]);
@@ -571,7 +583,11 @@ fn wgpu_gather_backward_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_gather_backward_matches_cpu() {
-    use rlx_runtime::{CompileOptions, Device, Session};
+    use rlx_runtime::{CompileOptions, Device, Session, is_available};
+    if !is_available(Device::Cuda) {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
     let (dy, indices) = gather_inputs();
     let bwd = build_gather_bwd_graph();
     let want = cpu_run(bwd.clone(), &[("dy", &dy), ("indices", &indices)]);

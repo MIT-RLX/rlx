@@ -85,6 +85,10 @@ pub struct CompilePipeline {
     /// are gated on these kinds and the optimized graph is legalized
     /// afterward. When `None`, [`supported_for_target`] is used.
     pub supported_ops: Option<&'static [OpKind]>,
+    /// Override the legalize-error backend label (e.g. `"vulkan"` /
+    /// `"oneapi"` when [`FusionTarget`] is still [`FusionTarget::Wgpu`]
+    /// for shared fusion patterns). When `None`, derived from `target`.
+    pub backend_label: Option<&'static str>,
     /// Native vs common IR lowering for logical kernels (see `rlx_ir::logical_kernel`).
     pub kernel_dispatch: KernelDispatchConfig,
 }
@@ -97,6 +101,7 @@ impl Default for CompilePipeline {
             arena_alignment: 64,
             assert_fusion_clean: false,
             supported_ops: None,
+            backend_label: None,
             kernel_dispatch: KernelDispatchConfig::from_env(),
         }
     }
@@ -232,6 +237,11 @@ impl CompilePipeline {
         self
     }
 
+    pub fn with_backend_label(mut self, label: &'static str) -> Self {
+        self.backend_label = Some(label);
+        self
+    }
+
     pub fn with_kernel_dispatch(
         mut self,
         policy: rlx_ir::logical_kernel::KernelDispatchPolicy,
@@ -251,6 +261,9 @@ impl CompilePipeline {
     }
 
     fn backend_name(&self) -> &'static str {
+        if let Some(label) = self.backend_label {
+            return label;
+        }
         match self.target {
             FusionTarget::Cpu => "cpu",
             FusionTarget::Metal => "metal",
@@ -274,12 +287,23 @@ impl CompilePipeline {
         });
         let graph = clip_elementwise_regions(graph, limits);
         debug_assert_graph!(&graph, "fusion");
+        // Downstream-registered fusion / rewrite passes (empty by default). Run
+        // after the built-in fusion pipeline so core invariants hold, but before
+        // legalize so their output is still lowered/legalized for the backend.
+        let graph = rlx_fusion::pass::run_registered_ir_passes(graph);
         let mut graph = self.legalize_after_fusion(graph);
         rlx_ir::dynamic::sync_graph_shapes(&mut graph);
         fix_import_sequence_axis(&mut graph);
         fix_lstm_output_shapes(&mut graph);
         debug_assert_graph!(&graph, "legalize");
         let mir = MirModule::from_graph(graph);
+        // Static NaN-source lint (opt-in): report provable compile-time
+        // non-finite values with provenance before the graph ever runs.
+        if rlx_ir::env::flag("RLX_LINT_NUMERICS") {
+            for lint in crate::numeric_lint::lint_numerics(mir.as_graph()) {
+                eprintln!("rlx numeric-lint: {lint}");
+            }
+        }
         let fusion = if let Some(ref before) = before {
             rlx_fusion::FusionReport::analyze(before, mir.as_graph())
         } else {
@@ -370,9 +394,41 @@ impl CompilePipeline {
             let dump = crate::inspect::inspect_pipeline(self, hir.clone())?;
             crate::inspect::maybe_dump_pipeline(&dump, &name);
         }
+        let dbg = rlx_ir::env::var("RLX_PHASE_TIMING").is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let t = if dbg {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mir = Self::lower_hir(hir)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(t) = t {
+            eprintln!("[phase]   lower_hir = {}ms", t.elapsed().as_millis());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let t = if dbg {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let (mir, fusion) = self.optimize_with_report(mir);
-        Ok(self.finish(mir, fusion))
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(t) = t {
+            eprintln!("[phase]   optimize = {}ms", t.elapsed().as_millis());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let t = if dbg {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let r = self.finish(mir, fusion);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(t) = t {
+            eprintln!("[phase]   finish(plan+lir) = {}ms", t.elapsed().as_millis());
+        }
+        Ok(r)
     }
 
     /// Legacy MIR entry: optimize + plan with fusion report.
@@ -597,6 +653,37 @@ mod tests {
         assert_eq!(result.lir.buffers.io.inputs.len(), 1);
         assert_eq!(result.lir.fingerprint(), result.lir.fingerprint());
         assert_eq!(result.lir.buffers.alignment, 64);
+    }
+
+    #[test]
+    fn numeric_lint_catches_const_div_by_zero_through_pipeline() {
+        // A constant `1.0 / 0.0` must be reported by the static lint whether
+        // const-folding bakes it into an inf Constant or leaves the Div in
+        // place — both are provable NaN sources with provenance.
+        let mut g = Graph::new("bad");
+        let one = g.add_node(
+            Op::Constant {
+                data: 1.0f32.to_le_bytes().to_vec(),
+            },
+            vec![],
+            f32_shape(&[1]),
+        );
+        let zero = g.add_node(
+            Op::Constant {
+                data: 0.0f32.to_le_bytes().to_vec(),
+            },
+            vec![],
+            f32_shape(&[1]),
+        );
+        let d = g.binary(rlx_ir::op::BinaryOp::Div, one, zero, f32_shape(&[1]));
+        g.set_outputs(vec![d]);
+
+        let result = CompilePipeline::new(FusionTarget::Cpu).compile_graph(g);
+        let lints = crate::numeric_lint::lint_numerics(result.lir.mir.as_graph());
+        assert!(
+            !lints.is_empty(),
+            "compiled graph should surface the div-by-zero as a numeric lint"
+        );
     }
 
     #[test]

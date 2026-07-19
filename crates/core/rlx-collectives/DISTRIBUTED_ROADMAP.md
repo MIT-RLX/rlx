@@ -1,6 +1,6 @@
 # Distributed RLX — integration seams (Tiers 2–5)
 
-**Implemented and validated** (Mac↔msi rig + emulated aarch64 under QEMU):
+**Implemented and validated** (Mac↔Linux CUDA rig + emulated aarch64 under QEMU):
 
 - **Tier 1** — bandwidth-optimal ring all-reduce, coalesced wire, grad-accum +
   non-blocking overlap (ring + coalesce ≈ 2× effective link throughput,
@@ -61,8 +61,8 @@ registers a device-resident `collective.all_reduce` kernel. Mirror it.
 5. `rlx-rocm` is the same source against RCCL (the crates already share
    `rlx-gpu-kernels`).
 
-**Cannot validate here:** NCCL is NVIDIA-only, so a Mac(Metal)↔msi(CUDA)
-all-reduce is fundamentally impossible; and msi has a single GPU, so even
+**Cannot validate here:** NCCL is NVIDIA-only, so a Mac(Metal)↔Linux(CUDA)
+all-reduce is fundamentally impossible; and the Linux rig has a single GPU, so even
 intra-node NCCL has nothing to talk to. Needs ≥2 NVIDIA GPUs or ≥2 NVIDIA
 nodes on a real fabric.
 
@@ -105,13 +105,13 @@ benchmarked if the machines are bridged (offered separately).
 | Item | Status |
 |------|--------|
 | Topology-aware planner (`src/planner.rs`) | ✅ implemented + 5 unit tests |
-| Pipeline-parallel demo (`MODE=pipeline`) | ✅ validated Mac/Metal→msi/CUDA |
+| Pipeline-parallel demo (`MODE=pipeline`) | ✅ validated Mac/Metal→Linux/CUDA |
 | UDP auto-discovery (`DISCOVER=1`) | ✅ validated cross-machine |
 | Comm profiler (`MODE=bench` → α/β/crossover) | ✅ implemented + feeds planner |
 | Ring/tree as `ProcessGroup` default | ✅ ring shipped (T1) |
 | Typed collectives — f16/bf16 (SIMD) + int8/u8 | ✅ `all_reduce_typed`, validated incl. under QEMU aarch64 |
 | Bounded-staleness federated averaging | ✅ `federated_average` (drops late workers), `MODE=federated` |
-| Dial-out star transport (NAT-friendly workers) | ✅ `coordinator_listen`/`worker_dial`, validated Mac↔msi + `DIAL_OUT=1` |
+| Dial-out star transport (NAT-friendly workers) | ✅ `coordinator_listen`/`worker_dial`, validated Mac↔Linux rig + `DIAL_OUT=1` |
 | Coordinator/worker ship-graph (serialized IR + weight URIs) | ✅ `MODE=coordinator`/`worker`; `seed://`/`file://`/`safetensors://`/`gguf://` sources, parse-once cache |
 | Quantized-on-device stage (`WEIGHTS_FMT=q8`) | ✅ Q8_0-packed GGUF → `U8` param → `DequantMatMul` across the mesh (Metal + CPU), matches dequant reference |
 | aarch64 / Raspberry Pi (cross-compile + QEMU) | ✅ BLAS-optional `rlx-cpu`; `./rig.sh cross-pi` / `test-pi` |

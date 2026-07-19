@@ -232,7 +232,7 @@ Worked examples for every model class + every option live in
 
 **Device:** `--device {cpu,cuda,metal,…}` runs the parity check on that backend
 (`--features cuda` for GPU). **All six showcase models (MLP, encoder-decoder,
-CNN, MNIST, Llama, DINO) verify at cosine 1.000000 on an RTX 3080 Ti** (CUDA
+CNN, MNIST, Llama, DINO) verify at cosine 1.000000 on an NVIDIA GPU** (CUDA
 13.1). Integer token inputs / params are fed as **f32 + a cast** so they cross
 the f32-arena GPU host surface. Bringing Llama up on CUDA surfaced and fixed four
 rlx-cuda bugs: the `unary.cu` activation kernel was missing sin/cos/tan/atan/round

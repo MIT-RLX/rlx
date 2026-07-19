@@ -43,7 +43,18 @@ use super::*;
 ///
 /// This saves one full input read (the shared input is read once instead
 /// of twice). Critical for SwiGLU (fc11+fc12) and QKV fusion.
+///
+/// Groups larger than [`MAX_SHARED_INPUT_MATMULS`] (or whose concatenated
+/// weights exceed [`MAX_SHARED_INPUT_WEIGHT_ELEMS`]) are left unfused.
+/// F5 DiT otherwise packs ~23 AdaLN linears on the same time embed into one
+/// ~0.5 GiB Concat weight; sharded wgpu cannot bind/stage that B correctly
+/// (MatMul term collapses; AdaLN Gemm matches bias alone).
 pub struct FuseSharedInputMatMul;
+
+/// SwiGLU (2), QKV (3), and MoE shared-expert tails (4) stay fused.
+const MAX_SHARED_INPUT_MATMULS: usize = 4;
+/// Soft cap (~128 MiB f32) — keeps moderate packs; skips F5-scale AdaLN packs.
+const MAX_SHARED_INPUT_WEIGHT_ELEMS: usize = 32 * 1024 * 1024;
 
 impl Pass for FuseSharedInputMatMul {
     fn name(&self) -> &str {
@@ -68,7 +79,7 @@ impl Pass for FuseSharedInputMatMul {
 
         let mut groups: Vec<FuseGroup> = Vec::new();
         for (input_id, matmul_ids) in input_to_matmuls {
-            if matmul_ids.len() < 2 {
+            if matmul_ids.len() < 2 || matmul_ids.len() > MAX_SHARED_INPUT_MATMULS {
                 continue;
             }
             let first = graph.node(matmul_ids[0]);
@@ -82,12 +93,25 @@ impl Pass for FuseSharedInputMatMul {
                     && graph.shape(m.inputs[1]).rank() == 2
                     && graph.shape(m.inputs[1]).dim(0) == w0.dim(0)
             });
-            if compatible {
-                groups.push(FuseGroup {
-                    input_id,
-                    matmul_ids,
-                });
+            if !compatible {
+                continue;
             }
+            let weight_elems: usize = matmul_ids
+                .iter()
+                .map(|&id| {
+                    graph
+                        .shape(graph.node(id).inputs[1])
+                        .num_elements()
+                        .unwrap_or(usize::MAX)
+                })
+                .fold(0usize, |acc, n| acc.saturating_add(n));
+            if weight_elems > MAX_SHARED_INPUT_WEIGHT_ELEMS {
+                continue;
+            }
+            groups.push(FuseGroup {
+                input_id,
+                matmul_ids,
+            });
         }
 
         if groups.is_empty() {

@@ -13,9 +13,12 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// RLX — versatile ML compiler + runtime.
+//! Host-side `Op::Fft` for wgpu arenas.
+//!
+//! Thin adapter over [`rlx_gpu_host::run_fft1d`].
 
 use crate::buffer::Arena;
+use crate::host_stage::WgpuArena;
 use rlx_ir::DType;
 
 pub fn run_fft1d(
@@ -30,30 +33,20 @@ pub fn run_fft1d(
     norm_tag: u32,
     dtype: DType,
 ) {
-    let meta = rlx_ir::fft::FftMeta {
+    let mut a = WgpuArena {
+        arena,
+        device,
+        queue,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_fft1d(
+        &mut a,
+        src_byte_off,
+        dst_byte_off,
         outer,
         n_complex,
-        axis_extent: match dtype {
-            DType::C64 => n_complex,
-            DType::F32 | DType::F64 => n_complex * 2,
-            other => panic!("fft_host: unsupported dtype {other:?}"),
-        },
-    };
-    let row_bytes = meta.row_bytes(dtype);
-    let (span_off, span_len) =
-        rlx_ir::fft::fft_arena_byte_span(src_byte_off, dst_byte_off, row_bytes, outer);
-    let mut host = arena.read_bytes_range(device, queue, span_off, span_len);
-    unsafe {
-        rlx_cpu::thunk::execute_fft1d(
-            src_byte_off - span_off,
-            dst_byte_off - span_off,
-            outer,
-            n_complex,
-            inverse,
-            norm_tag,
-            dtype,
-            host.as_mut_ptr(),
-        );
-    }
-    arena.write_bytes_range(queue, span_off, &host);
+        inverse,
+        norm_tag,
+        dtype,
+    );
 }

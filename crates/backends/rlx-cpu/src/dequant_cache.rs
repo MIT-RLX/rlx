@@ -65,6 +65,8 @@ fn scheme_tag(scheme: QuantScheme) -> u8 {
         QuantScheme::GgufQ4_1 => 22,
         QuantScheme::GgufQ5_0 => 23,
         QuantScheme::GgufQ5_1 => 24,
+        QuantScheme::GgufQ1_0 => 25,
+        QuantScheme::GgufQ2_0 => 26,
         _ => 255,
     }
 }
@@ -96,6 +98,8 @@ fn dequant_gguf(w_bytes: &[u8], k: usize, n: usize, scheme: QuantScheme) -> Vec<
         QuantScheme::GgufTQ2_0 => rlx_gguf::tq_dequant::dequant_tq2_0(w_bytes, n_elems),
         QuantScheme::GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4(w_bytes, n_elems),
         QuantScheme::GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(w_bytes, n_elems),
+        QuantScheme::GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0(w_bytes, n_elems),
+        QuantScheme::GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(w_bytes, n_elems),
         other => panic!("dequant_cache: unsupported GGUF scheme {other:?}"),
     }
     .expect("GGUF dequant failed")

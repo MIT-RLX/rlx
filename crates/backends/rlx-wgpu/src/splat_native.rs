@@ -288,6 +288,7 @@ pub fn run_gaussian_splat_render_native(
         max_list_entries,
     );
 
-    dispatch_prepared(device, queue, &arena.buffer, dst_byte_off as u64, &prep);
+    let (dst_buf, dst_local) = arena.resolve_act(dst_byte_off);
+    dispatch_prepared(device, queue, dst_buf, dst_local as u64, &prep);
     assert_eq!(dst_len, (width * height * 4) as usize);
 }

@@ -14,12 +14,14 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.12", features = ["serialize"] }
+rlx-ir = { path = "../rlx-ir", version = "0.2.13", features = ["serialize"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 [dev-dependencies]
+rlx-opt = { path = "../rlx-opt", version = "0.2.13" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.13", features = ["cpu", "training"] }
 
 [lints]
 workspace = true

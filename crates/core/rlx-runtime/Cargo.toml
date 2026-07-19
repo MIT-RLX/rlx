@@ -19,6 +19,11 @@ default = ["cpu"]
 # Base CPU with SIMD kernels (NEON/AVX) + persistent thread pool
 cpu = ["dep:rlx-cpu", "rlx-cpu/splat"]
 
+# VRAM-aware device selection: fold host GPU/VRAM detection
+# (rlx-hwprofile) into `fastest_device_with_vram`. Off by default — only
+# callers that want memory-floored device picks pay the probe/detection dep.
+hwprofile = ["dep:rlx-hwprofile"]
+
 # Compile-time gated kernel tracing (plan #7).
 # Off by default — production builds pay zero overhead; turn on for
 # debugging op dispatch / shapes / per-kernel timing.
@@ -45,9 +50,9 @@ mock-requests = []
 mmap-kv = ["dep:memmap2"]
 
 # BLAS acceleration (pick ONE per platform)
-blas-accelerate = ["cpu"]          # macOS: Apple Accelerate (AMX, fastest on Apple Silicon)
-blas-mkl = ["cpu"]                 # Intel/AMD: Intel MKL
-blas-openblas = ["cpu"]            # Cross-platform: OpenBLAS
+blas-accelerate = ["cpu"]                          # macOS: Apple Accelerate (via rlx-cpu build.rs)
+blas-mkl = ["cpu", "rlx-cpu/blas-mkl"]              # Intel/AMD: MKL instead of OpenBLAS
+blas-openblas = ["cpu"]                            # Linux/Windows: OpenBLAS (rlx-cpu default)
 
 # Future: direct hardware access. Declared (empty) so device_ext.rs's
 # `cfg!(feature = "...")` checks compile cleanly; flip to real deps
@@ -112,9 +117,13 @@ tpu = ["cpu", "dep:rlx-tpu"]
 # device / queue and embedded SPIR-V kernels, NOT the wgpu Vulkan adapter
 # (that remains `Device::Gpu`). Dynamic-loaded, so it compiles with no driver.
 vulkan = ["cpu", "dep:rlx-vulkan"]
-opengl = []                        # OpenGL compute shaders (legacy)
+# WebGL2 render-to-texture backend (browser fallback; native uses exec_cpu).
+opengl = ["cpu", "dep:rlx-webgl"]
 directx = []                       # DirectX 12 compute (Windows)
-webgpu = []                        # WebGPU (WASM target)
+# Browser WebGPU: enables `Device::WebGpu` registry entry (implies `gpu`).
+webgpu = ["gpu"]
+# Browser bundle: WebGPU primary + WebGL fallback.
+browser = ["webgpu", "opengl"]
 
 # ── Intel GPU ───────────────────────────────────────────────
 # Intel Arc / Data Center Max via oneAPI Level Zero (`Device::OneApi`). Owns its
@@ -128,33 +137,43 @@ oneapi = ["cpu", "dep:rlx-oneapi"]
 # a QNN backend library; needs QNN_SDK_ROOT at build time for the SDK headers.
 qnn = ["cpu", "dep:rlx-qnn"]
 
+# FPGA / SystemVerilog export (`rlx_runtime::export`). Offline artifact emit —
+# does not register a runtime Device / Backend.
+fpga = ["dep:rlx-fpga"]
+
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.12", features = ["serialize"] }
-rlx-opt = { path = "../rlx-opt", version = "0.2.12" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.13", features = ["serialize"] }
+rlx-opt = { path = "../rlx-opt", version = "0.2.13" }
 # Host-side training-step optimizers (Adam/AdamW/Lion/Muon/Sophia/…) for the
 # CoreML training session. Only pulled under `training`.
-rlx-optim = { path = "../rlx-optim", version = "0.2.12", optional = true }
-rlx-driver = { path = "../rlx-driver", version = "0.2.12" }
-rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.12", optional = true }
-rlx-mlx = { path = "../../backends/rlx-mlx", version = "0.2.12", optional = true }
-rlx-coreml = { path = "../../backends/rlx-coreml", version = "0.2.12", optional = true }
-rlx-wgpu = { path = "../../backends/rlx-wgpu", version = "0.2.12", optional = true }
-rlx-vulkan = { path = "../../backends/rlx-vulkan", version = "0.2.12", optional = true }
-rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.12", optional = true }
-rlx-rocm = { path = "../../backends/rlx-rocm", version = "0.2.12", optional = true }
-rlx-oneapi = { path = "../../backends/rlx-oneapi", version = "0.2.12", optional = true }
-rlx-tpu = { path = "../../backends/rlx-tpu", version = "0.2.12", optional = true }
-rlx-qnn = { path = "../../backends/rlx-qnn", version = "0.2.12", optional = true, features = ["runtime"] }
-rlx-macros = { path = "../rlx-macros", version = "0.2.12" }
+rlx-optim = { path = "../rlx-optim", version = "0.2.13", optional = true }
+rlx-driver = { path = "../rlx-driver", version = "0.2.13" }
+rlx-hwprofile = { path = "../../tooling/rlx-hwprofile", version = "0.2.13", optional = true }
+rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.13", optional = true }
+rlx-mlx = { path = "../../backends/rlx-mlx", version = "0.2.13", optional = true }
+rlx-wgpu = { path = "../../backends/rlx-wgpu", version = "0.2.13", optional = true }
+rlx-webgl = { path = "../../backends/rlx-webgl", version = "0.2.13", optional = true }
+rlx-vulkan = { path = "../../backends/rlx-vulkan", version = "0.2.13", optional = true }
+rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.13", optional = true }
+rlx-rocm = { path = "../../backends/rlx-rocm", version = "0.2.13", optional = true }
+rlx-oneapi = { path = "../../backends/rlx-oneapi", version = "0.2.13", optional = true }
+rlx-tpu = { path = "../../backends/rlx-tpu", version = "0.2.13", optional = true }
+rlx-qnn = { path = "../../backends/rlx-qnn", version = "0.2.13", optional = true, features = ["runtime"] }
+rlx-fpga = { path = "../../backends/rlx-fpga", version = "0.2.13", optional = true }
+rlx-macros = { path = "../rlx-macros", version = "0.2.13" }
+# rlx-compile: used unconditionally by src/check.rs, so it belongs in
+# [dependencies], not only [dev-dependencies].  The dev-dep entry
+# below is preserved for tests that need the `training` feature.
+rlx-compile = { path = "../rlx-compile", version = "0.2.13" }
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 inventory = "0.3"
 memmap2 = { version = "0.9", optional = true }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
-# rlx-gpu = { path = "../rlx-gpu", version = "0.2.12", optional = true }
-# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.12", optional = true }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13" }
+# rlx-gpu = { path = "../rlx-gpu", version = "0.2.13", optional = true }
+# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.13", optional = true }
 
 # rlx-metal is Apple-only (Metal is an Apple API). Make it a dependency solely on
 # Apple targets — excluding watchOS, which has no Metal compute — so the `metal`
@@ -162,18 +181,26 @@ rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
 # Matches the source gating + rlx-metal's `rlx_metal_host`:
 # `all(target_vendor = "apple", not(target_os = "watchos"))`.
 [target.'cfg(all(target_vendor = "apple", not(target_os = "watchos")))'.dependencies]
-rlx-metal = { path = "../../backends/rlx-metal", version = "0.2.12", optional = true }
+rlx-metal = { path = "../../backends/rlx-metal", version = "0.2.13", optional = true }
+# CoreML / ANE is an Apple-only framework (rlx-coreml's `rlx-cpu` bridge is
+# itself Apple-gated), so — like rlx-metal — it must only be a dependency on
+# Apple targets. Previously in the general `[dependencies]`, which made any
+# transitive `coreml` feature (pulled by the TTS crates on Linux) try to
+# compile rlx-coreml on Linux → `cannot find crate rlx_cpu`. The `coreml`
+# feature's `dep:rlx-coreml` is a no-op on non-Apple targets (same as
+# `metal`/`dep:rlx-metal`).
+rlx-coreml = { path = "../../backends/rlx-coreml", version = "0.2.13", optional = true }
 
 [build-dependencies]
 serde_json = "1"
 
 [dev-dependencies]
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.12" }
-rlx-fusion = { path = "../rlx-fusion", version = "0.2.12" }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.13" }
+rlx-fusion = { path = "../rlx-fusion", version = "0.2.13" }
 rayon = "1"
-rlx-compile = { path = "../rlx-compile", version = "0.2.12", features = ["training"] }
+rlx-compile = { path = "../rlx-compile", version = "0.2.13", features = ["training"] }
 # rlx-splat moved out of tree; splat examples/tests below are disabled until it returns.
-# rlx-splat = { path = "../rlx-splat", version = "0.2.12", default-features = false, features = ["test-support", "io"] }
+# rlx-splat = { path = "../rlx-splat", version = "0.2.13", default-features = false, features = ["test-support", "io"] }
 # Downstream demonstration packages used in integration tests.
 # `metal`/`mlx` are enabled ONLY on macOS (see the target-specific
 # dev-dependencies below) — those backends exist solely on Apple, and on a
@@ -198,6 +225,9 @@ tempfile = "3"
 # the cpu-only base above → on macOS rlx-sparse gets cpu + metal + mlx.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 rlx-sparse = { path = "../../numerics/rlx-sparse", default-features = false, features = ["metal", "mlx"] }
+# For the raw-GPU custom-kernel test (metal_gpu_custom_op.rs): construct MTLSize
+# / call the compute encoder directly, exactly as a downstream MetalGpuKernel would.
+metal = "0.30"
 
 [lints]
 workspace = true

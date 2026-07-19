@@ -228,6 +228,105 @@ pub fn metal_sgemm(
     metal_sgemm_bufs(enc, arena, a_off, arena, b_off, arena, c_off, m, k, n);
 }
 
+/// C = A_f32 @ B_f16 → C_f32. Loads half weights in-kernel (no full-matrix cast).
+pub fn metal_sgemm_f16w_bufs(
+    enc: &ComputeCommandEncoderRef,
+    a: &Buffer,
+    a_off: usize,
+    b: &Buffer,
+    b_off: usize,
+    c: &Buffer,
+    c_off: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    let kk = kernels();
+    let m_u = m as u32;
+    let k_u = k as u32;
+    let n_u = n as u32;
+    enc.set_buffer(0, Some(a), a_off as u64);
+    enc.set_buffer(1, Some(b), b_off as u64);
+    enc.set_buffer(2, Some(c), c_off as u64);
+    enc.set_bytes(3, 4, &m_u as *const _ as *const _);
+    enc.set_bytes(4, 4, &k_u as *const _ as *const _);
+    enc.set_bytes(5, 4, &n_u as *const _ as *const _);
+
+    // Prefer small-M column kernel for CFG decode (M=2): shares B loads across
+    // rows. Padded simdgroup zeros 6/8 A rows and is slower for skinny M.
+    if m <= 4 && n >= 64 {
+        enc.set_compute_pipeline_state(&kk.sgemm_f16w_small_m);
+        let grid = MTLSize {
+            width: n as u64,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 64u64.min(n as u64).max(1),
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threads(grid, tg);
+        return;
+    }
+    // Prefer padded simd for large decode Linears; naive for tiny dims.
+    let use_padded = matches!(
+        hw_model().pick_sgemm(m, k, n),
+        SgemmVariant::SimdPadded
+            | SgemmVariant::Simd
+            | SgemmVariant::Simd4x4
+            | SgemmVariant::Mps
+            | SgemmVariant::Tiled
+    ) && k >= 256
+        && n >= 256;
+    if use_padded {
+        enc.set_compute_pipeline_state(&kk.sgemm_simd_padded_f16w);
+        let tg_count = MTLSize {
+            width: n.div_ceil(8) as u64,
+            height: m.div_ceil(8) as u64,
+            depth: 1,
+        };
+        enc.dispatch_thread_groups(
+            tg_count,
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    } else {
+        enc.set_compute_pipeline_state(&kk.sgemm_f16w);
+        let grid = MTLSize {
+            width: n as u64,
+            height: m as u64,
+            depth: 1,
+        };
+        let tg_w = 16u64.min(n as u64);
+        let tg_h = 16u64.min(m as u64);
+        enc.dispatch_threads(
+            grid,
+            MTLSize {
+                width: tg_w,
+                height: tg_h,
+                depth: 1,
+            },
+        );
+    }
+}
+
+pub fn metal_sgemm_f16w(
+    enc: &ComputeCommandEncoderRef,
+    arena: &Buffer,
+    a_off: usize,
+    b_off: usize,
+    c_off: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    metal_sgemm_f16w_bufs(enc, arena, a_off, arena, b_off, arena, c_off, m, k, n);
+}
+
 /// Activation kind passed to fused matmul kernels.
 #[repr(u32)]
 #[derive(Copy, Clone)]
@@ -395,13 +494,28 @@ pub fn metal_hgemm(
     k: usize,
     n: usize,
 ) {
+    metal_hgemm_bufs(enc, arena, a_off, arena, b_off, arena, c_off, m, k, n);
+}
+
+pub fn metal_hgemm_bufs(
+    enc: &ComputeCommandEncoderRef,
+    a: &Buffer,
+    a_off: usize,
+    b: &Buffer,
+    b_off: usize,
+    c: &Buffer,
+    c_off: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
     let kk = kernels();
     let m_u = m as u32;
     let k_u = k as u32;
     let n_u = n as u32;
-    enc.set_buffer(0, Some(arena), a_off as u64);
-    enc.set_buffer(1, Some(arena), b_off as u64);
-    enc.set_buffer(2, Some(arena), c_off as u64);
+    enc.set_buffer(0, Some(a), a_off as u64);
+    enc.set_buffer(1, Some(b), b_off as u64);
+    enc.set_buffer(2, Some(c), c_off as u64);
     enc.set_bytes(3, 4, &m_u as *const _ as *const _);
     enc.set_bytes(4, 4, &k_u as *const _ as *const _);
     enc.set_bytes(5, 4, &n_u as *const _ as *const _);

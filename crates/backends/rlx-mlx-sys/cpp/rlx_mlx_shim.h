@@ -619,6 +619,17 @@ int rlx_mlx_dist_barrier(void);
 // the caller evals it as part of the surrounding graph.
 int rlx_mlx_dist_all_sum_array(rlx_mlx_array_t* in, rlx_mlx_array_t** out);
 
+// Device-resident all-reduce honoring the reduction kind (0=Sum 1=Mean 2=Max
+// 3=Min, matching rlx-collectives). Lazy; no host round-trip.
+int rlx_mlx_dist_all_reduce_array(rlx_mlx_array_t* in, int kind, rlx_mlx_array_t** out);
+
+// Device-resident AllGather / ReduceScatter on array handles, mirroring
+// all_sum_array. all_gather concatenates each rank's shard along axis 0;
+// reduce_scatter is a fused all_sum + this rank's axis-0 slice (mlx has no
+// native reduce-scatter). Both are lazy with no host round-trip.
+int rlx_mlx_dist_all_gather_array(rlx_mlx_array_t* in, rlx_mlx_array_t** out);
+int rlx_mlx_dist_reduce_scatter_array(rlx_mlx_array_t* in, int kind, rlx_mlx_array_t** out);
+
 #ifdef __cplusplus
 }
 #endif

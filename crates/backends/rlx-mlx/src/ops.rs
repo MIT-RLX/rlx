@@ -26,6 +26,7 @@ use crate::ffi::{self, MlxMask, MlxReduce, MlxUnary, mlx_array_t};
 macro_rules! binary {
     ($name:ident, $shim:ident) => {
         pub fn $name(a: &Array, b: &Array) -> Result<Array, MlxError> {
+            let _guard = crate::sync::runtime_guard();
             let mut out: *mut mlx_array_t = ptr::null_mut();
             let rc = unsafe { ffi::$shim(a.ptr, b.ptr, &mut out) };
             check(rc)?;
@@ -52,6 +53,7 @@ binary!(gt, rlx_mlx_op_gt);
 binary!(ge, rlx_mlx_op_ge);
 
 pub fn select(cond: &Array, x: &Array, y: &Array) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_where(cond.ptr, x.ptr, y.ptr, &mut out) };
     check(rc)?;
@@ -59,6 +61,7 @@ pub fn select(cond: &Array, x: &Array, y: &Array) -> Result<Array, MlxError> {
 }
 
 pub fn unary(a: &Array, kind: MlxUnary) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_unary(a.ptr, kind, &mut out) };
     check(rc)?;
@@ -66,6 +69,7 @@ pub fn unary(a: &Array, kind: MlxUnary) -> Result<Array, MlxError> {
 }
 
 pub fn reshape(a: &Array, new_shape: &[i32]) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc =
         unsafe { ffi::rlx_mlx_op_reshape(a.ptr, new_shape.as_ptr(), new_shape.len(), &mut out) };
@@ -74,6 +78,7 @@ pub fn reshape(a: &Array, new_shape: &[i32]) -> Result<Array, MlxError> {
 }
 
 pub fn transpose(a: &Array, perm: &[i32]) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_transpose(a.ptr, perm.as_ptr(), perm.len(), &mut out) };
     check(rc)?;
@@ -81,6 +86,7 @@ pub fn transpose(a: &Array, perm: &[i32]) -> Result<Array, MlxError> {
 }
 
 pub fn slice(a: &Array, start: &[i32], stop: &[i32]) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     if start.len() != stop.len() {
         return Err(MlxError("slice: start/stop length mismatch".into()));
     }
@@ -108,6 +114,7 @@ pub fn slice(a: &Array, start: &[i32], stop: &[i32]) -> Result<Array, MlxError> 
 }
 
 pub fn concat(arrays: &[&Array], axis: i32) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let handles: Vec<*mut mlx_array_t> = arrays.iter().map(|a| a.ptr).collect();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_concat(handles.as_ptr(), handles.len(), axis, &mut out) };
@@ -116,6 +123,7 @@ pub fn concat(arrays: &[&Array], axis: i32) -> Result<Array, MlxError> {
 }
 
 pub fn broadcast_to(a: &Array, shape: &[i32]) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_broadcast_to(a.ptr, shape.as_ptr(), shape.len(), &mut out) };
     check(rc)?;
@@ -140,6 +148,7 @@ pub fn resize_nearest_2x_nchw(x: &Array) -> Result<Array, MlxError> {
 }
 
 pub fn take(a: &Array, indices: &Array, axis: i32) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_take(a.ptr, indices.ptr, axis, &mut out) };
     check(rc)?;
@@ -147,6 +156,7 @@ pub fn take(a: &Array, indices: &Array, axis: i32) -> Result<Array, MlxError> {
 }
 
 pub fn reduce(a: &Array, kind: MlxReduce, axes: &[i32], keep_dim: bool) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe {
         ffi::rlx_mlx_op_reduce(
@@ -163,6 +173,7 @@ pub fn reduce(a: &Array, kind: MlxReduce, axes: &[i32], keep_dim: bool) -> Resul
 }
 
 pub fn cumsum(a: &Array, axis: i32, exclusive: bool) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc =
         unsafe { ffi::rlx_mlx_op_cumsum(a.ptr, axis, if exclusive { 1 } else { 0 }, &mut out) };
@@ -171,6 +182,7 @@ pub fn cumsum(a: &Array, axis: i32, exclusive: bool) -> Result<Array, MlxError> 
 }
 
 pub fn fft(a: &Array, inverse: bool, norm_tag: u32) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe {
         ffi::rlx_mlx_op_fft(
@@ -185,6 +197,7 @@ pub fn fft(a: &Array, inverse: bool, norm_tag: u32) -> Result<Array, MlxError> {
 }
 
 pub fn rms_norm(x: &Array, gamma: &Array, eps: f32) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_rmsnorm(x.ptr, gamma.ptr, eps, &mut out) };
     check(rc)?;
@@ -199,6 +212,7 @@ pub fn attention(
     mask_kind: MlxMask,
     mask: Option<&Array>,
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let mask_ptr = mask.map(|m| m.ptr).unwrap_or(ptr::null_mut());
     let rc = unsafe {
@@ -216,6 +230,7 @@ pub fn conv2d(
     dilation: (i32, i32),
     groups: i32,
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe {
         ffi::rlx_mlx_op_conv2d(
@@ -235,6 +250,7 @@ pub fn conv1d(
     dilation: i32,
     groups: i32,
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe {
         ffi::rlx_mlx_op_conv1d(
@@ -253,6 +269,7 @@ pub fn conv3d(
     dilation: (i32, i32, i32),
     groups: i32,
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe {
         ffi::rlx_mlx_op_conv3d(
@@ -275,6 +292,7 @@ pub fn conv_general(
     groups: i32,
     flip: bool,
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe {
         ffi::rlx_mlx_op_conv_general(
@@ -300,6 +318,7 @@ pub fn conv_general(
 }
 
 pub fn argpartition(a: &Array, kth: i32, axis: i32) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_argpartition(a.ptr, kth, axis, &mut out) };
     check(rc)?;
@@ -310,6 +329,7 @@ pub fn argpartition(a: &Array, kth: i32, axis: i32) -> Result<Array, MlxError> {
 /// `mc::contiguous`. Use after a transpose whose strided view would
 /// otherwise be elided by `mc::compile`'s optimizer.
 pub fn contiguous(a: &Array) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_contiguous(a.ptr, &mut out) };
     check(rc)?;
@@ -333,6 +353,7 @@ pub fn maxpool2d_backward_metal(
     ph: i32,
     pw: i32,
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe {
         ffi::rlx_mlx_op_maxpool2d_backward_metal(
@@ -344,6 +365,7 @@ pub fn maxpool2d_backward_metal(
 }
 
 pub fn take_along_axis(a: &Array, indices: &Array, axis: i32) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_take_along_axis(a.ptr, indices.ptr, axis, &mut out) };
     check(rc)?;
@@ -356,6 +378,7 @@ pub fn scatter_add_axis(
     updates: &Array,
     axis: i32,
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe {
         ffi::rlx_mlx_op_scatter_add_axis(a.ptr, indices.ptr, updates.ptr, axis, &mut out)
@@ -370,6 +393,7 @@ pub fn scatter_add(
     updates: &Array,
     axis: i32,
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc =
         unsafe { ffi::rlx_mlx_op_scatter_add(a.ptr, indices.ptr, updates.ptr, axis, &mut out) };
@@ -378,6 +402,7 @@ pub fn scatter_add(
 }
 
 pub fn gather_mm(a: &Array, b: &Array, idx: &Array) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_gather_mm(a.ptr, b.ptr, idx.ptr, &mut out) };
     check(rc)?;
@@ -393,6 +418,7 @@ pub fn quantized_matmul(
     group_size: i32,
     bits: i32,
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let bias_ptr = biases.map(|b| b.ptr).unwrap_or(ptr::null_mut());
     let rc = unsafe {
@@ -412,6 +438,7 @@ pub fn quantized_matmul(
 }
 
 pub fn categorical(logits: &Array, axis: i32, seed: u64) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_categorical(logits.ptr, axis, seed, &mut out) };
     check(rc)?;
@@ -419,6 +446,7 @@ pub fn categorical(logits: &Array, axis: i32, seed: u64) -> Result<Array, MlxErr
 }
 
 pub fn argmax(a: &Array, axis: i32, keep_dim: bool) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_argmax(a.ptr, axis, if keep_dim { 1 } else { 0 }, &mut out) };
     check(rc)?;
@@ -431,6 +459,7 @@ pub fn slice_strided(
     stop: &[i32],
     strides: &[i32],
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     if start.len() != stop.len() || start.len() != strides.len() {
         return Err(MlxError(
             "slice_strided: start/stop/strides length mismatch".into(),
@@ -452,6 +481,7 @@ pub fn slice_strided(
 }
 
 pub fn pad(a: &Array, low: &[i32], high: &[i32], pad_value: f32) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     if low.len() != high.len() {
         return Err(MlxError("pad: low/high length mismatch".into()));
     }
@@ -472,6 +502,7 @@ pub fn pad(a: &Array, low: &[i32], high: &[i32], pad_value: f32) -> Result<Array
 
 /// Top-k values along an axis (sorted descending).
 pub fn topk_values(a: &Array, k: i32, axis: i32) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_topk_values(a.ptr, k, axis, &mut out) };
     check(rc)?;
@@ -480,6 +511,7 @@ pub fn topk_values(a: &Array, k: i32, axis: i32) -> Result<Array, MlxError> {
 
 /// Sort along an axis (ascending). Pair with negate to get descending.
 pub fn sort(a: &Array, axis: i32) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_sort(a.ptr, axis, &mut out) };
     check(rc)?;
@@ -487,6 +519,7 @@ pub fn sort(a: &Array, axis: i32) -> Result<Array, MlxError> {
 }
 
 pub fn softmax(a: &Array, axis: i32) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_softmax(a.ptr, axis, &mut out) };
     check(rc)?;
@@ -494,6 +527,7 @@ pub fn softmax(a: &Array, axis: i32) -> Result<Array, MlxError> {
 }
 
 pub fn gelu(a: &Array) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_gelu(a.ptr, &mut out) };
     check(rc)?;
@@ -540,6 +574,7 @@ pub fn attention_reference_bhsd(
 }
 
 pub fn silu(a: &Array) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_silu(a.ptr, &mut out) };
     check(rc)?;
@@ -547,6 +582,7 @@ pub fn silu(a: &Array) -> Result<Array, MlxError> {
 }
 
 pub fn cast(a: &Array, dtype: DType) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc = unsafe { ffi::rlx_mlx_op_cast(a.ptr, map_dtype(dtype), &mut out) };
     check(rc)?;
@@ -559,6 +595,7 @@ pub fn layer_norm(
     beta: Option<&Array>,
     eps: f32,
 ) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let beta_ptr = beta.map(|b| b.ptr).unwrap_or(ptr::null_mut());
     let rc = unsafe { ffi::rlx_mlx_op_layernorm(x.ptr, gamma.ptr, beta_ptr, eps, &mut out) };

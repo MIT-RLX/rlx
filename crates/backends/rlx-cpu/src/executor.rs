@@ -40,6 +40,10 @@ pub struct ExternalBuffers<'a> {
 /// Returns the output node IDs (data is in the arena).
 pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
     let schedule: Vec<NodeId> = arena.schedule().to_vec();
+    // NaN/Inf localization epilogue. Off unless `RLX_DEBUG_NANS` is set;
+    // `RLX_DEBUG_NANS=abort` additionally fails fast. The env is read once here
+    // so the hot loop pays only a bool test.
+    let scanner = rlx_ir::numeric_check::DebugScanner::from_env("cpu");
     for &node_id in &schedule {
         let node = graph.node(node_id);
 
@@ -1090,7 +1094,45 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 }
             }
         }
+
+        // ── NaN/Inf debug epilogue ───────────────────────────────
+        // Runs in schedule (topological) order, so the FIRST node that
+        // trips is the origin — not the downstream ops that inherit it.
+        if scanner.enabled() {
+            scan_node_for_nans(&scanner, graph, node_id, arena, external);
+        }
     }
+}
+
+/// Localize a NaN/Inf on a single computed node using the same buffer
+/// accessors as the executor, applying the [`DebugScanner`] policy (print /
+/// abort). Returns the report on a hit for tests. No-op when the node has no
+/// scannable `f32` buffer. Split out from [`execute`] so the gather logic is
+/// unit-testable without toggling process env.
+///
+/// F32 buffers only — the executor also stores raw f64 for DenseSolve, which
+/// we skip.
+pub(crate) fn scan_node_for_nans(
+    scanner: &rlx_ir::numeric_check::DebugScanner,
+    graph: &Graph,
+    node_id: NodeId,
+    arena: &Arena,
+    external: &ExternalBuffers,
+) -> Option<rlx_ir::numeric_check::NanReport> {
+    let node = graph.node(node_id);
+    if node.shape.dtype() != rlx_ir::DType::F32 || !arena.has_buffer(node_id) {
+        return None;
+    }
+    let out = get_data(arena, external, node_id);
+    let mut inbufs: Vec<(NodeId, &[f32])> = Vec::with_capacity(node.inputs.len());
+    for &inp in &node.inputs {
+        if graph.node(inp).shape.dtype() == rlx_ir::DType::F32
+            && (external.buffers.contains_key(&inp) || arena.has_buffer(inp))
+        {
+            inbufs.push((inp, get_data(arena, external, inp)));
+        }
+    }
+    scanner.check(graph, node_id, out, &inbufs)
 }
 
 /// Get read-only data for a node — from external or arena via raw pointer.
@@ -1406,6 +1448,50 @@ mod tests {
         assert!((result[5] - 1.0).abs() < 1e-5, "pos1[1]={}", result[5]);
         assert!((result[6] - 1.0).abs() < 1e-5, "pos1[2]={}", result[6]);
         assert!((result[7] - 0.0).abs() < 1e-5, "pos1[3]={}", result[7]);
+    }
+
+    /// NaN localization epilogue: sqrt(-1) → NaN should be pinned to the
+    /// Sqrt node as the *culprit* (finite input, non-finite output), with a
+    /// fix hint. Exercises the exact gather/accessor path `execute` uses.
+    #[test]
+    fn epilogue_localizes_sqrt_of_negative() {
+        use rlx_ir::op::Activation;
+        let mut g = Graph::new("nan_localize");
+        let x = g.input("x", Shape::new(&[2], DType::F32));
+        let s = g.activation(Activation::Sqrt, x, Shape::new(&[2], DType::F32));
+        g.set_outputs(vec![s]);
+
+        let plan = memory::plan_memory(&g);
+        let mut arena = Arena::from_plan(plan);
+        let data = vec![-1.0f32, 4.0]; // sqrt(-1) = NaN, sqrt(4) = 2
+        let mut ext = ExternalBuffers {
+            buffers: HashMap::new(),
+        };
+        for node in g.nodes() {
+            if let Op::Input { .. } = &node.op {
+                ext.buffers.insert(node.id, &data);
+            }
+        }
+
+        execute(&g, &mut arena, &ext);
+
+        // Output is now [NaN, 2.0]; the epilogue helper localizes it.
+        let scanner = rlx_ir::numeric_check::DebugScanner::with_mode(
+            rlx_ir::numeric_check::DebugMode::Warn,
+            "cpu",
+        );
+        let report = super::scan_node_for_nans(&scanner, &g, g.outputs[0], &arena, &ext)
+            .expect("sqrt(-1) must be localized as a NaN");
+        assert_eq!(report.node, s);
+        assert!(report.op.contains("Sqrt"), "op tag was {}", report.op);
+        assert!(
+            report.source_input.is_none(),
+            "finite input → Sqrt is the culprit, not a propagator"
+        );
+        assert!(report.fix.is_some(), "culprit should carry a fix hint");
+
+        // Sanity: a clean node (the input) reports nothing.
+        assert!(super::scan_node_for_nans(&scanner, &g, x, &arena, &ext).is_none());
     }
 
     /// Test LayerNorm standalone.

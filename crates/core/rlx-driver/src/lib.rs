@@ -43,6 +43,8 @@ pub mod buffer;
 pub mod collective;
 pub mod device;
 pub mod handle;
+#[cfg(feature = "iroh")]
+pub mod iroh_transport;
 #[cfg(feature = "mpi")]
 pub mod mpi_transport;
 pub mod net;
@@ -58,6 +60,10 @@ pub use device::{
     BackendSupport, Device, DeviceFromStrError, STANDARD_DEVICES, StandardBackends, validate_device,
 };
 pub use handle::BufferHandle;
+#[cfg(feature = "iroh")]
+pub use iroh_transport::{
+    IrohPeer, IrohTransport, RLX_PIPELINE_ALPN, RelayMap, RelayMode, process_group_from_env,
+};
 #[cfg(feature = "mpi")]
 pub use mpi_transport::MpiTransport;
 pub use net::{DEFAULT_HEAP_BYTES, NetTransport, TcpTransport, ThunderboltTransport};
@@ -68,4 +74,4 @@ pub use stream::{CommandStream, SyncStream};
 pub use symmetric::{
     CollectiveError, LocalTransport, Rank, SymmetricBuffer, SymmetricHeap, SymmetricTransport,
 };
-pub use transport::{ProcessGroup, Transport, default_barrier};
+pub use transport::{ProcessGroup, ReduceMode, Transport, default_barrier, env_reduce_mode};

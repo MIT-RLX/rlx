@@ -29,16 +29,22 @@
 //! - `backend`  — Backend trait impl + per-op dispatch
 
 pub mod backend;
+pub mod supported_ops;
+pub use supported_ops::SUPPORTED_OPS;
 pub mod buffer;
 pub mod calibrate;
+pub mod collective_host;
+pub mod conv_bwd_host;
 pub mod conv_transpose2d_host;
 pub mod coop_f16_vk;
+pub mod custom_host;
 pub mod device;
 pub mod fft_dispatch;
 pub mod fft_host;
 pub mod gdn_host;
 pub mod gguf_gpu;
 pub mod gguf_host;
+pub mod host_stage;
 pub mod im2col_host;
 pub mod iq_grid;
 pub mod kernels;
@@ -48,6 +54,7 @@ pub mod lstm_host;
 pub mod ms_deform_attn;
 pub mod rng_host;
 pub mod scan_host;
+pub mod spd_host;
 #[cfg(feature = "splat")]
 pub mod splat;
 #[cfg(feature = "native-splat")]
@@ -58,6 +65,7 @@ pub mod unfuse;
 pub mod vision_host;
 pub mod welch_peaks_dispatch;
 pub mod welch_peaks_host;
+pub mod wgpu_gpu_custom;
 
 /// True if a wgpu adapter is reachable on this system. Always
 /// available at the crate level; the runtime registry only registers
@@ -67,4 +75,6 @@ pub fn is_available() -> bool {
     device::wgpu_device().is_some()
 }
 
-pub use device::{is_vulkan_available, select_vulkan_backend};
+#[cfg(target_arch = "wasm32")]
+pub use device::init_wgpu_device;
+pub use device::{is_vulkan_available, select_vulkan_backend, wgpu_device};

@@ -23,7 +23,7 @@
 //! ## Status: end-to-end dispatch wired
 //!
 //! All three pieces are in place:
-//!   - ✅ `Custom` is whitelisted in `METAL_SUPPORTED_OPS`.
+//!   - ✅ `Custom` is whitelisted in `SUPPORTED_OPS`.
 //!   - ✅ `Thunk::CustomOp` variant + lowering arm in
 //!     `rlx-metal/src/thunk.rs::ThunkSchedule::compile`.
 //!   - ✅ Executor arm in `backend.rs::encode_commit` flushes the
@@ -157,14 +157,158 @@ fn ensure_builtins_registered() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
         crate::ms_deform_attn::register();
+        // Host-delegate collective ops (all_reduce / all_gather / reduce_scatter
+        // + Megatron f/g). Pure host/transport ops with no device kernel; they
+        // stage to host and delegate to the registered rlx-collectives CPU
+        // kernel. See `crate::collective`.
+        crate::collective::register();
+        // Register rlx-cpu's ONNX reference kernels (ScatterND / NonZero /
+        // GatherND / Einsum / Mod / …) so the generic host-delegate below can
+        // find them even in a Metal-only run (the CPU thunk-compile path that
+        // normally registers them never executes). Idempotent.
+        rlx_cpu::onnx_ref::register_onnx_reference_kernels();
         // NB: `llada2_gate` is registered by its consumer (rlx-llada2); do not
         // auto-register it here or it double-registers.
     });
 }
 
+/// Generic host-delegate for any `onnx.*` (or other) custom op that has a
+/// registered rlx-cpu reference kernel but no native Metal kernel. Stages the
+/// operands to host (zero-copy on Apple's unified memory) and runs the CPU
+/// reference, dtype-aware. This lets every ONNX-imported graph run on Metal —
+/// the heavy compute lowers to MSL, the handful of reference-only indexing ops
+/// (Einsum, Mod, ScatterND, …) fall back to the host.
+#[derive(Debug)]
+struct OnnxHostDelegate {
+    name: String,
+}
+
+impl MetalKernel for OnnxHostDelegate {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn execute(
+        &self,
+        inputs: &[(&[u8], &Shape)],
+        output: (&mut [u8], &Shape),
+        attrs: &[u8],
+    ) -> Result<(), String> {
+        if std::env::var("RLX_DBG_CUSTOM").is_ok() {
+            eprintln!(
+                "[custom] {} in={:?} out={:?}",
+                self.name,
+                inputs
+                    .iter()
+                    .map(|(_, s)| (s.dtype(), s.dims().to_vec()))
+                    .collect::<Vec<_>>(),
+                (output.1.dtype(), output.1.dims().to_vec()),
+            );
+        }
+        rlx_cpu::op_registry::run_custom_op_host(&self.name, inputs, output, attrs)
+    }
+}
+
 pub fn lookup_metal_kernel(name: &str) -> Option<Arc<dyn MetalKernel>> {
     ensure_builtins_registered();
-    global_metal_kernels().lookup(name)
+    if let Some(k) = global_metal_kernels().lookup(name) {
+        return Some(k);
+    }
+    // No native Metal kernel — fall back to the rlx-cpu reference over unified
+    // memory if one is registered under this name.
+    if rlx_cpu::op_registry::lookup_cpu_kernel(name).is_some() {
+        return Some(Arc::new(OnnxHostDelegate {
+            name: name.to_string(),
+        }));
+    }
+    None
+}
+
+// ── Raw-GPU custom kernels (v2: no host roundtrip) ──────────────────────────
+
+/// Dispatch context handed to a [`MetalGpuKernel`]: the live serial compute
+/// encoder on the current command buffer, the unified-memory arena buffer, and
+/// per-operand byte offsets + shapes + attribute bytes.
+///
+/// Bind an operand's sub-buffer with
+/// `d.encoder.set_buffer(index, Some(d.arena), off as u64)` (the `off` values
+/// are byte offsets into `d.arena`, matching metal-rs's `set_buffer` offset arg).
+pub struct MetalGpuDispatch<'a> {
+    /// Live compute encoder — encode your dispatch here. Do **not** end it,
+    /// commit, or wait; the executor owns command-buffer lifetime.
+    pub encoder: &'a metal::ComputeCommandEncoderRef,
+    /// The `StorageModeShared` arena buffer holding every operand.
+    pub arena: &'a metal::BufferRef,
+    /// Per-input `(byte offset into arena, element count, shape)`.
+    pub inputs: &'a [(usize, u32, Shape)],
+    /// Output `(byte offset, element count, shape)`.
+    pub output: &'a (usize, u32, Shape),
+    /// Per-instance attribute bytes from `Op::Custom.attrs`.
+    pub attrs: &'a [u8],
+}
+
+/// A raw-GPU Metal custom kernel: dispatches a real MSL kernel onto the active
+/// compute encoder with **no host roundtrip and no queue sync** — contrast
+/// [`MetalKernel`], which copies operands to host, runs CPU-style, and forces a
+/// commit + `wait_until_completed`. Use this for fine-grained ops where the host
+/// roundtrip would dominate; for coarse ops (Sparse-LU, FFT) the host-delegate
+/// [`MetalKernel`] is fine, and for ops expressible as primitives prefer
+/// `OpExtension::lower`.
+///
+/// Register under the same `name` used in `Op::Custom` / `OpExtension::name`; a
+/// registered GPU kernel takes **precedence** over a host-delegate `MetalKernel`
+/// of the same name. Compile a `ComputePipelineState` once (e.g. behind a
+/// `OnceLock`) via [`crate::metal_device`] +
+/// [`crate::pipeline_cache::load_or_compile_library`], then bind + dispatch in
+/// `encode`.
+pub trait MetalGpuKernel: Send + Sync + std::fmt::Debug {
+    fn name(&self) -> &str;
+
+    /// Encode this op's dispatch into `d.encoder`. Return `Err` to abort the run.
+    fn encode(&self, d: &MetalGpuDispatch) -> Result<(), String>;
+}
+
+struct MetalGpuKernelRegistry {
+    kernels: RwLock<HashMap<String, Arc<dyn MetalGpuKernel>>>,
+}
+
+impl MetalGpuKernelRegistry {
+    fn new() -> Self {
+        Self {
+            kernels: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn register(&self, k: Arc<dyn MetalGpuKernel>) {
+        let name = k.name().to_string();
+        let mut g = self.kernels.write().unwrap();
+        if g.contains_key(&name) {
+            eprintln!(
+                "rlx-metal: MetalGpuKernel '{name}' was already registered — \
+                 replacing the previous entry"
+            );
+        }
+        g.insert(name, k);
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn MetalGpuKernel>> {
+        self.kernels.read().unwrap().get(name).cloned()
+    }
+}
+
+fn global_metal_gpu_kernels() -> &'static MetalGpuKernelRegistry {
+    static R: OnceLock<MetalGpuKernelRegistry> = OnceLock::new();
+    R.get_or_init(MetalGpuKernelRegistry::new)
+}
+
+/// Register a raw-GPU Metal custom kernel. Takes precedence over a host-delegate
+/// [`MetalKernel`] registered under the same name.
+pub fn register_metal_gpu_kernel(k: Arc<dyn MetalGpuKernel>) {
+    global_metal_gpu_kernels().register(k);
+}
+
+/// Look up a registered raw-GPU Metal custom kernel by name.
+pub fn lookup_metal_gpu_kernel(name: &str) -> Option<Arc<dyn MetalGpuKernel>> {
+    global_metal_gpu_kernels().lookup(name)
 }
 
 #[cfg(test)]

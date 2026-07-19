@@ -140,42 +140,14 @@ as the codegen path does.
 - **M2 — single matmul, style 1. ✅ done.** Graph build via the QNN C API + the
   `ExecutableGraph` wrapper + `Device::Hexagon` registration; Session-level
   parity in Docker. rlx-models can target `Device::Hexagon` for a matmul today.
-- **M3 — context binary (perf).** Emit `.bin` via the codegen→lib→generator
-  chain; `createFromBinary` + execute. HTP-ready artifact.
-- **M-breadth — op surface. ✅ in progress.** General rlx-ir→QNN graph lowering
-  shipped: MatMul, element-wise binary (Add/Sub/Mul/Div), activations
-  (Relu/Gelu/Sigmoid/Tanh), Reshape, Softmax (scalar axis param), Transpose
-  (perm *tensor* param), LayerNorm (float `epsilon` scalar + `axes` tensor +
-  gamma/beta statics), with `Param`/`Constant` static weights — validated via
-  `relu(x·W + b)`, `softmax(reshape(x))`, `xᵀ`, `layernorm(x)`, and a
-  Session-level `x·W + c` on `libQnnCpu.so`. LayerNorm + **RmsNorm** (the latter
-  lowered `RmsNorm(x,γ) → Add(β)` — the first **multi-node decomposition**, one
-  rlx-ir op → N QNN nodes + intermediate tensors). The shim's param machinery
-  covers **bool/uint32/float scalars + uint32 tensor** params, plus a **QNN
-  error logger** (surfaces backend op-config rejections). Also: `Concat`
-  (variadic + axis), `ElementWiseNeg`, `Narrow` → `StridedSlice` (rank-2 int32
-  `ranges` tensor param), and **NeoX RoPE** (a 7-node decomposition
-  `Narrow×2 → Neg → Concat → Mul(cos) + Mul(sin) → Add`, bit-exact), and
-  **Attention** (causal/none MHA SDPA → a ~13-node decomposition: head-split
-  reshape/transpose, scaled q·kᵀ, baked causal mask, softmax, ·v, merge —
-  validated at `7e-9`), incl. **GQA** (KV heads via `Reshape → Tile → Reshape`),
-  **sliding-window** masks, and **logit softcap** (`cap·tanh`) — covering
-  Llama/Qwen/Mistral/Gemma attention. **A complete modern-LLM transformer block
-  now runs on QNN** (15/15 FFI tests bit-exact). Also `Reduce` (Mean/Sum/Max →
-  mean-pool for BERT/nomic **embedding models**) and `Conv2d` (NCHW↔NHWC layout
-  transposes + HWIO weight reorder + stride/pad/dilation tensor params →
-  **vision models**, SAM/ViT). Coverage now spans LLM + embedding + vision —
-  the rlx-models families (qwen3/bert/sam/nomic). Plus **`Gather`** (embedding
-  lookup, int32 indices — the first op of a decoder LLM), which added the
-  **non-f32 (int32) tensor support**: a *complete decoder LLM forward pass*
-  (embedding → blocks → norm → lm_head) is now expressible on QNN. Plus
-  **`Quantize`/`Dequantize`** (int8 `SFIXED_POINT_8` + scale/offset
-  `quantizeParams`) — the quantized-tensor foundation. 17/17 FFI tests
-  bit-exact. Remaining: quantized *matmul* deployment (per-channel/block scales,
-  int4, static quantized weights — builds on this foundation); then
-  HTP/on-device.
-- **M4 — HTP / on-device.** `libQnnHtp.so` on Snapdragon silicon (the only step
-  Docker can't cover) + the context-binary perf path (M3).
+- **M3 — context binary (perf). ✅ done (CPU-validated).** Persistent session
+  (`rlx_qnn_session_*`: finalize once, execute many). Save via
+  `contextGetBinary` / load via `createFromBinary` + `libQnnSystem` metadata +
+  `graphRetrieve`. Round-trip bit-exact on `libQnnCpu.so`. HTP still needs
+  silicon (M4).
+- **M-breadth — op surface. ✅ done** (see earlier notes; 39 FFI tests).
+- **M4 — HTP / on-device.** `libQnnHtp.so` on Snapdragon silicon (Docker can't
+  cover). Same session + context-binary path.
 
 ## Risks / open questions
 

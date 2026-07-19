@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use rlx_ir::{DType, Graph, NodeId};
+use rlx_ir::{DType, Graph, NodeId, Op};
 
 use crate::array::{Array, MlxError, synchronize};
 use crate::compiled::CompiledFn;
@@ -38,6 +38,11 @@ pub struct MlxExecutable {
     handles: HashMap<String, Vec<f32>>,
     /// GPU-resident inputs — reused across `run()` without host upload.
     gpu_handles: HashMap<String, Array>,
+    /// Device-resident param arrays, materialized once and reused across
+    /// `run()` (compiled path) so multi-GB weights aren't rebuilt from the host
+    /// `params` map on every call. Invalidated per-name on
+    /// `set_param`/`set_param_typed`/`copy_params_from`.
+    gpu_params: HashMap<String, Array>,
     /// After each `run`, copy `outputs[idx]` into the named GPU handle.
     gpu_handle_feeds: HashMap<String, usize>,
     /// Row feeds for resident KV: [`feed_kv_row`] copies one output row into the handle.
@@ -93,6 +98,19 @@ pub struct MlxExecutable {
     compile_disabled: Option<String>,
     /// Runtime-mutable RNG policy for in-graph random ops.
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+}
+
+// RLX_MLX_PROFILE: when set, dump the per-op-kind wall-time breakdown once,
+// when the (typically sole) executable is dropped at the end of the run.
+impl Drop for MlxExecutable {
+    fn drop(&mut self) {
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var_os("RLX_MLX_PROFILE").is_some()
+            && !REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            crate::lower::mlx_profile_report();
+        }
+    }
 }
 
 impl MlxExecutable {
@@ -170,6 +188,7 @@ impl MlxExecutable {
             params: HashMap::new(),
             handles: HashMap::new(),
             gpu_handles: HashMap::new(),
+            gpu_params: HashMap::new(),
             gpu_handle_feeds: HashMap::new(),
             kv_row_feeds: HashMap::new(),
             last_outputs: Vec::new(),
@@ -202,6 +221,7 @@ impl MlxExecutable {
     /// No-op for non-Compiled modes.
     pub fn warm_compile(&mut self) -> Result<(), MlxError> {
         let _guard = crate::sync::runtime_guard();
+        self.maybe_disable_compile_for_graph_size();
         if self.mode != MlxMode::Compiled
             || self.compiled.is_some()
             || self.compile_disabled.is_some()
@@ -217,6 +237,25 @@ impl MlxExecutable {
                 self.note_compile_disabled(e.to_string());
                 Ok(())
             }
+        }
+    }
+
+    /// Skip `mlx::compile` for oversized graphs. First `invoke` runs
+    /// `compile_simplify`, which can hang unboundedly on large TTS/vocoder
+    /// IR (Kokoro decoder ~2400 nodes). Lazy finishes in seconds.
+    fn maybe_disable_compile_for_graph_size(&mut self) {
+        if self.mode != MlxMode::Compiled || self.compile_disabled.is_some() {
+            return;
+        }
+        let Some(limit) = compile_max_nodes_from_env() else {
+            return;
+        };
+        let n = self.graph.nodes().len();
+        if n > limit {
+            self.note_compile_disabled(format!(
+                "graph has {n} nodes (limit {limit}); mlx::compile_simplify is unbounded on \
+                 large TTS/vocoder graphs — set RLX_MLX_COMPILE_MAX_NODES=0 to force Compiled"
+            ));
         }
     }
 
@@ -284,6 +323,8 @@ impl MlxExecutable {
         }
         // Drop any typed override so subsequent runs see the f32 data.
         self.params_typed.remove(name);
+        // Invalidate the device-resident cache so the new data is re-materialized.
+        self.gpu_params.remove(name);
     }
 
     /// Bind a parameter from raw bytes in the given dtype. No f32
@@ -294,6 +335,7 @@ impl MlxExecutable {
             .insert(name.to_string(), (data.to_vec(), dtype));
         // Drop any f32 override so subsequent runs see the typed data.
         self.params.remove(name);
+        self.gpu_params.remove(name);
     }
 
     /// Copy named params from another executable (decode bucket weight sharing).
@@ -321,6 +363,8 @@ impl MlxExecutable {
             }
             dst.copy_from_slice(data);
         }
+        // Mutated in place → drop any device-resident cache for these params.
+        self.gpu_params.clear();
         true
     }
 
@@ -356,25 +400,43 @@ impl MlxExecutable {
         inputs: &[(&str, &[f32])],
         read_indices: Option<&[usize]>,
     ) -> Result<Vec<Vec<f32>>, MlxError> {
+        // Hold across `to_f32` as well: `run_arrays`' guard would otherwise
+        // drop before the shim's eval-on-read, racing parallel test threads /
+        // cargo-test binaries (SIGTRAP / SIGSEGV). Reentrant with the nested
+        // guard inside `run_arrays`.
+        let _guard = crate::sync::runtime_guard();
         let outs = self.run_arrays(inputs)?;
         let indices: Vec<usize> = match read_indices {
             None => (0..outs.len()).collect(),
             Some(ix) => ix.to_vec(),
         };
-        indices
+        let f32_outs: Vec<Vec<f32>> = indices
             .iter()
             .map(|&i| {
                 outs.get(i)
                     .ok_or_else(|| MlxError(format!("output index {i} missing")))?
                     .to_f32()
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        // NaN/Inf output-boundary scan (RLX_DEBUG_NANS). MLX execution is
+        // delegated to its C++ runtime with no per-op host boundary, so we scan
+        // the outputs; for internal localization replay on the CPU backend.
+        let scanner = rlx_ir::numeric_check::DebugScanner::from_env("mlx");
+        if scanner.enabled() {
+            for (&i, buf) in indices.iter().zip(&f32_outs) {
+                if let Some(&id) = self.graph.outputs.get(i) {
+                    scanner.check(&self.graph, id, buf, &[]);
+                }
+            }
+        }
+        Ok(f32_outs)
     }
 
     /// Execute and return MLX output arrays (after GPU handle refresh).
     fn run_arrays(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Array>, MlxError> {
         let _guard = crate::sync::runtime_guard();
         self.sync_pending_inner();
+        self.maybe_disable_compile_for_graph_size();
         let mut input_map: HashMap<String, Vec<f32>> = self.handles.clone();
         for &(name, data) in inputs {
             input_map.insert(name.to_string(), data.to_vec());
@@ -411,14 +473,60 @@ impl MlxExecutable {
     pub fn run_typed(&mut self, inputs: &[(&str, &[u8], DType)]) -> Vec<(Vec<u8>, DType)> {
         let _guard = crate::sync::runtime_guard();
         self.sync_pending_inner();
+        self.maybe_disable_compile_for_graph_size();
 
         // Stash typed inputs so run_compiled / lower_and_run_typed
         // can read them. Cleared at the end so the executable doesn't
         // hold onto user buffers longer than needed.
+        //
+        // F5 (and other ONNX-f16 models) often feed F16 host bytes while
+        // `prepare_f32_exec_graph` rewrote Input shapes to F32. Widen at
+        // the boundary instead of requiring callers to match exactly.
         self.inputs_typed.clear();
         for (name, data, dt) in inputs {
+            let graph_dt = self
+                .graph
+                .nodes()
+                .iter()
+                .find(|n| matches!(&n.op, Op::Input { name: nme } if nme == name))
+                .map(|n| n.shape.dtype())
+                .unwrap_or(*dt);
+            let (bytes, stored_dt) = match (*dt, graph_dt) {
+                (DType::F16, DType::F32) => {
+                    let f: Vec<f32> = data
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect();
+                    (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
+                }
+                (DType::BF16, DType::F32) => {
+                    let f: Vec<f32> = data
+                        .chunks_exact(2)
+                        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect();
+                    (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
+                }
+                // Metal/CPU widen I64 activations to F32; MLX graphs after
+                // prepare_f32 may still declare I64 inputs while some leaves
+                // were rewritten — also accept I64/I32 host bytes for F32 slots.
+                (DType::I64, DType::F32) => {
+                    let f: Vec<f32> = data
+                        .chunks_exact(8)
+                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+                        .collect();
+                    (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
+                }
+                (DType::I32, DType::F32) => {
+                    let f: Vec<f32> = data
+                        .chunks_exact(4)
+                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+                        .collect();
+                    (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
+                }
+                _ => (data.to_vec(), *dt),
+            };
             self.inputs_typed
-                .insert(name.to_string(), (data.to_vec(), *dt));
+                .insert(name.to_string(), (bytes, stored_dt));
         }
 
         let outs = if self.use_compiled() {
@@ -503,13 +611,37 @@ impl MlxExecutable {
                 }
             }
         }
-        let compiled = self.compiled.as_ref().unwrap();
-        let order = compiled.leaf_order();
+        // Clone the leaf order so the immutable borrow of `compiled` ends before
+        // we mutate `self.gpu_params` below.
+        let order: Vec<(NodeId, LeafKey)> = self.compiled.as_ref().unwrap().leaf_order().to_vec();
 
-        // Build leaves in the exact order the compiled fn expects.
+        // Build leaves in the exact order the compiled fn expects. Params are
+        // materialized on device once and cached, so multi-GB weights aren't
+        // rebuilt from the host `params` map on every run (that copy was the
+        // dominant cost for weight-heavy models).
         let mut leaves: Vec<Array> = Vec::with_capacity(order.len());
-        for (id, key) in order {
+        for (id, key) in &order {
             let leaf = match key {
+                LeafKey::Param(name)
+                    if !self.params_typed.contains_key(name) && self.params.contains_key(name) =>
+                {
+                    if let Some(cached) = self.gpu_params.get(name) {
+                        cached.clone_handle()?
+                    } else {
+                        let a = lower::build_leaf_for(
+                            &self.graph,
+                            *id,
+                            &self.params,
+                            input_map,
+                            &self.params_typed,
+                            &self.inputs_typed,
+                            Some(&self.gpu_handles),
+                        )?;
+                        crate::array::eval(&[&a])?; // force device materialization
+                        self.gpu_params.insert(name.clone(), a.clone_handle()?);
+                        a
+                    }
+                }
                 LeafKey::Input(_) | LeafKey::Param(_) | LeafKey::Constant => lower::build_leaf_for(
                     &self.graph,
                     *id,
@@ -526,6 +658,7 @@ impl MlxExecutable {
         // A compiled kernel can still fail at *invoke* time — e.g. a very deep
         // fused elementwise region (grid_sample decomposition) exhausts Metal's
         // argument buffers. Lazy lowering caps fusion depth, so fall back to it.
+        let compiled = self.compiled.as_ref().unwrap();
         match compiled.invoke(&leaves) {
             Ok(o) => Ok(o),
             Err(e) => {
@@ -558,6 +691,7 @@ impl MlxExecutable {
     pub fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
         let _guard = crate::sync::runtime_guard();
         self.sync_pending_inner();
+        self.maybe_disable_compile_for_graph_size();
 
         // Build a name→data map by zipping positional inputs against
         // the captured input_names. Anything beyond what was supplied
@@ -818,6 +952,59 @@ impl MlxExecutable {
         Ok(())
     }
 
+    /// Batch-major past `[B, seq_cap, row_elems]` ← new `[B, 1, row_elems]`.
+    pub fn feed_kv_batch_major(
+        &mut self,
+        dst_row: usize,
+        batch: usize,
+        seq_cap: usize,
+        row_elems: usize,
+    ) -> Result<(), MlxError> {
+        if batch <= 1 {
+            return self.feed_kv_row(0, dst_row, row_elems);
+        }
+        if self.kv_row_feeds.is_empty() || self.last_outputs.is_empty() {
+            return Ok(());
+        }
+        let feeds: Vec<(String, usize)> = self
+            .kv_row_feeds
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for (name, out_idx) in feeds {
+            let out_arr = self
+                .last_outputs
+                .get(out_idx)
+                .ok_or_else(|| MlxError(format!("kv row feed output {out_idx} missing")))?;
+            let mut handle = self
+                .gpu_handles
+                .get(&name)
+                .ok_or_else(|| MlxError(format!("no gpu handle '{name}'")))?
+                .clone_handle()?;
+            let handle_shape = handle.shape()?;
+            let out_data = out_arr.to_f32()?;
+            let mut handle_data = handle.to_f32()?;
+            for b in 0..batch {
+                let src_start = b * row_elems;
+                let dst_start = b * seq_cap * row_elems + dst_row * row_elems;
+                let src_end = src_start + row_elems;
+                let dst_end = dst_start + row_elems;
+                if src_end > out_data.len() || dst_end > handle_data.len() {
+                    return Err(MlxError(format!(
+                        "feed_kv_batch_major {name}: b={b} dst_row={dst_row} batch={batch} \
+                         seq_cap={seq_cap} row_elems={row_elems} out_len={} handle_len={}",
+                        out_data.len(),
+                        handle_data.len()
+                    )));
+                }
+                handle_data[dst_start..dst_end].copy_from_slice(&out_data[src_start..src_end]);
+            }
+            handle = Array::from_f32_slice(&handle_data, &handle_shape, DType::F32)?;
+            self.gpu_handles.insert(name, handle);
+        }
+        Ok(())
+    }
+
     fn run_internal(
         &mut self,
         inputs: &[(&str, &[f32])],
@@ -880,11 +1067,29 @@ impl MlxExecutable {
 /// Compiled-mode graphs that contain host-eval ops (e.g. GGUF
 /// DequantMatMul) auto-fall back to Lazy on first run with a
 /// warning — see `MlxExecutable::compile_disabled_reason`.
+/// Oversized graphs also fall back via [`compile_max_nodes_from_env`].
 fn mode_from_env() -> MlxMode {
     match rlx_ir::env::var("RLX_MLX_MODE").as_deref() {
         Some(s) if s.eq_ignore_ascii_case("eager") => MlxMode::Eager,
         Some(s) if s.eq_ignore_ascii_case("lazy") => MlxMode::Lazy,
         Some(s) if s.eq_ignore_ascii_case("compiled") => MlxMode::Compiled,
         _ => MlxMode::Compiled,
+    }
+}
+
+/// Default IR node count above which Compiled is skipped for Lazy.
+/// Kokoro/StyleTTS2 decoder graphs are ~2400 nodes; LLM decode steps stay under.
+const DEFAULT_COMPILE_MAX_NODES: usize = 1536;
+
+/// `RLX_MLX_COMPILE_MAX_NODES`: max nodes for Compiled (default 1536).
+/// `0` disables the limit (force Compiled even on huge graphs).
+fn compile_max_nodes_from_env() -> Option<usize> {
+    match rlx_ir::env::var("RLX_MLX_COMPILE_MAX_NODES") {
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT_COMPILE_MAX_NODES),
+        },
+        None => Some(DEFAULT_COMPILE_MAX_NODES),
     }
 }

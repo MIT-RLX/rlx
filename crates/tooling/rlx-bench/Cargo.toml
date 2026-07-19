@@ -13,14 +13,14 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12" }
-rlx-fusion = { path = "../../core/rlx-fusion", version = "0.2.12" }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.12", features = ["cpu"] }
-rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.12" }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
-rlx-driver = { path = "../../core/rlx-driver", version = "0.2.12" }
-rlx-mlx = { path = "../../backends/rlx-mlx", version = "0.2.12", optional = true }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13" }
+rlx-fusion = { path = "../../core/rlx-fusion", version = "0.2.13" }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.13", features = ["cpu"] }
+rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.13" }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13" }
+rlx-driver = { path = "../../core/rlx-driver", version = "0.2.13" }
+rlx-mlx = { path = "../../backends/rlx-mlx", version = "0.2.13", optional = true }
 
 [features]
 default = []

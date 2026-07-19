@@ -255,7 +255,7 @@ Kept as a general capability for compute-bound training.
 
 ## CUDA / ROCm runbook (the rig)
 
-All runners are device-aware; on an NVIDIA box (the docs' WSL/RTX-4090 rig) run:
+All runners are device-aware; on an NVIDIA box (the docs' WSL CUDA rig) run:
 
 ```bash
 # PyTorch (eager + compiled), JAX, Keras, ORT

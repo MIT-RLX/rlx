@@ -62,32 +62,29 @@ fn fused_residual_ln(
     let eps = bitcast<f32>(params.eps_bits);
     let with_bias = params.has_bias != 0u;
 
-    // Pass 1 (fused mean + variance): fold residual + bias into the
-    // OUTPUT slot, and accumulate BOTH sum_x and sum_x² in the same
-    // loop. variance = E[x²] − (E[x])². This collapses what used to
-    // be two sequential read passes over `inner` into one — eliminates
-    // ~33 % of the LayerNorm wall time at BERT inner=384/768 dims.
-    //
-    // The "subtract mean then square" form is more stable when var is
-    // very small, but f32 accumulation here gives plenty of headroom
-    // for BERT-class activations (~1.0 magnitudes). PyTorch's
-    // `nn.LayerNorm` uses the same identity for the same reason.
-    var sum_x:   f32 = 0.0;
-    var sum_x2:  f32 = 0.0;
+    // Pass 1: fold residual + bias into the OUTPUT slot and accumulate
+    // the mean. (The summed value x+residual+bias is materialized in
+    // out_base, so the variance pass reads it back cheaply.)
+    var sum_x: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         var v = arena[in_base + i] + arena[res_base + i];
         if (with_bias) { v = v + arena[params.bias_off + i]; }
         arena[out_base + i] = v;
-        sum_x  = sum_x  + v;
-        sum_x2 = sum_x2 + v * v;
+        sum_x = sum_x + v;
     }
     let mean = sum_x * n_inv;
-    // E[x²] − E[x]² can come out slightly negative under f32
-    // catastrophic cancellation (near-uniform rows). WGSL leaves
-    // `inverseSqrt(x ≤ 0)` undefined: Apple/Metal returns finite,
-    // NVIDIA's `rcpsqrt.approx.f32` returns NaN. Clamp to 0 so the
-    // result matches the CPU LN path on every backend.
-    let var_ = max(sum_x2 * n_inv - mean * mean, 0.0);
+    // Pass 1b: STABLE TWO-PASS variance = mean((x − mean)²). The one-pass
+    // identity E[x²] − (E[x])² catastrophically cancels in f32 when the
+    // row carries a large DC offset (pre-norm transformer activations),
+    // collapsing the variance to near-zero and corrupting the norm on
+    // wgpu only. Two-pass matches CPU/Metal/MLX/CoreML; the extra read
+    // over `inner` is worth correctness.
+    var sum_sq: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+        let d = arena[out_base + i] - mean;
+        sum_sq = sum_sq + d * d;
+    }
+    let var_ = sum_sq * n_inv;
     let inv_std = inverseSqrt(var_ + eps);
 
     // Pass 2: normalize, scale, shift in place. (Was Pass 3.)

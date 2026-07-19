@@ -122,6 +122,8 @@ pub(super) fn dequant_scheme(scheme: QuantScheme, bytes: &[u8], n: usize) -> Res
         GgufTQ2_0 => rlx_gguf::tq_dequant::dequant_tq2_0(bytes, n),
         GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4(bytes, n),
         GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(bytes, n),
+        GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0(bytes, n),
+        GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(bytes, n),
         other => {
             return Err(CoremlError::Unsupported(format!(
                 "GGUF dequant scheme {other:?}"
@@ -467,6 +469,72 @@ pub(super) fn make_const(
     })
 }
 
+/// TensorType with an explicit proto DataType — for sub-byte types (UInt1/…)
+/// that `rlx_ir::DType` can't name. All-static dims.
+fn tensor_type_dt(dims: &[usize], dt: proto::DataType) -> proto::TensorType {
+    proto::TensorType {
+        data_type: dt as i32,
+        rank: dims.len() as i64,
+        dimensions: dims
+            .iter()
+            .map(|&n| proto::Dimension {
+                dimension: Some(proto::dimension::Dimension::Constant(
+                    proto::dimension::ConstantDimension { size: n as u64 },
+                )),
+            })
+            .collect(),
+        attributes: HashMap::new(),
+    }
+}
+
+/// Build a UINT1-typed const backed by a packed 1-bit blob (8 elems/byte,
+/// LSB-first). `dims` is the LOGICAL (unpacked) shape; `packed` is
+/// `ceil(num_elems / 8)` bytes. Feeds `constexpr_lut_to_dense` palettization
+/// indices — the Q1_0 no-unfold path (keeps 1-bit storage, ~n·k/8 bytes).
+pub(super) fn make_const_u1_packed(
+    blob: &mut crate::mlpackage::BlobWriter,
+    out_name: &str,
+    dims: &[usize],
+    packed: &[u8],
+) -> Result<proto::Operation> {
+    let n_elems: usize = dims.iter().product();
+    let need = n_elems.div_ceil(8);
+    if packed.len() != need {
+        return Err(CoremlError::Runtime(format!(
+            "const '{out_name}': u1 wants {need} packed bytes for {n_elems} elems, got {}",
+            packed.len()
+        )));
+    }
+    let offset = blob.write_u1_packed(packed);
+    let tt = tensor_type_dt(dims, proto::DataType::Uint1);
+    let vt = proto::ValueType {
+        r#type: Some(proto::value_type::Type::TensorType(tt)),
+    };
+    let val = proto::Value {
+        doc_string: String::new(),
+        r#type: Some(vt.clone()),
+        value: Some(proto::value::Value::BlobFileValue(
+            proto::value::BlobFileValue {
+                file_name: "@model_path/weights/weight.bin".to_string(),
+                offset,
+            },
+        )),
+    };
+    let mut attributes = HashMap::new();
+    attributes.insert("name".to_string(), scalar_str(out_name));
+    attributes.insert("val".to_string(), val);
+    Ok(proto::Operation {
+        r#type: "const".to_string(),
+        inputs: HashMap::new(),
+        outputs: vec![proto::NamedValueType {
+            name: out_name.to_string(),
+            r#type: Some(vt),
+        }],
+        blocks: vec![],
+        attributes,
+    })
+}
+
 /// Build a float `const` op (f32 or f16 blob / inline).
 pub(super) fn make_const_float(
     blob: &mut crate::mlpackage::BlobWriter,
@@ -558,6 +626,7 @@ pub(super) fn scheme_supports_ondevice_block_dequant(scheme: QuantScheme) -> boo
             | QuantScheme::GgufQ2K
             | QuantScheme::GgufQ3K
             | QuantScheme::GgufQ6K
+            | QuantScheme::GgufQ1_0
     )
 }
 
@@ -604,7 +673,7 @@ fn grid_u32_to_i8x4(entry: u32) -> [i8; 4] {
     ]
 }
 
-fn read_f16_le(b: &[u8]) -> f32 {
+pub(super) fn read_f16_le(b: &[u8]) -> f32 {
     half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()
 }
 
@@ -657,10 +726,43 @@ pub(super) fn split_gguf_ondevice(
         QuantScheme::GgufIQ3S => split_iq3_s_ondevice(bytes, nb),
         QuantScheme::GgufIQ1S => split_iq1_s_ondevice(bytes, nb),
         QuantScheme::GgufIQ1M => split_iq1_m_ondevice(bytes, nb),
+        QuantScheme::GgufQ1_0 => split_q1_0_ondevice(bytes, nb),
         other => Err(CoremlError::Unsupported(format!(
             "split_gguf_ondevice: {other:?}"
         ))),
     }
+}
+
+/// Q1_0 (prism-ml Bonsai): `{f16 d; u8 qs[16]}` per 128 elems — bit=1 → +d,
+/// bit=0 → −d. Expressed as the affine form the on-device MIL dequant expects
+/// (`value = qs·scale + offset`, QK=32 granularity): qs ∈ {−1,+1} (the sign),
+/// scale = the block's `d` (shared across its four 32-elem chunks), offset = 0.
+fn split_q1_0_ondevice(bytes: &[u8], nb: usize) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    const BLOCK: usize = 18; // 2 (f16 d) + 16 (128 sign bits)
+    const CHUNKS_PER_BLOCK: usize = 128 / QK; // 4
+    let n_blocks = nb / CHUNKS_PER_BLOCK;
+    if !nb.is_multiple_of(CHUNKS_PER_BLOCK) || bytes.len() < n_blocks * BLOCK {
+        return Err(CoremlError::Runtime(format!(
+            "Q1_0 ondevice: {nb} chunks / {} bytes inconsistent",
+            bytes.len()
+        )));
+    }
+    let mut qs = vec![0f32; nb * QK];
+    let mut scales = vec![0f32; nb];
+    let offsets = vec![0f32; nb];
+    for c in 0..nb {
+        let block = c / CHUNKS_PER_BLOCK;
+        let chunk_in_block = c % CHUNKS_PER_BLOCK;
+        let base = block * BLOCK;
+        let d = read_f16_le(&bytes[base..base + 2]);
+        scales[c] = d;
+        for i in 0..QK {
+            let elem = chunk_in_block * QK + i; // 0..127 within the 128-block
+            let bit = (bytes[base + 2 + elem / 8] >> (elem % 8)) & 1;
+            qs[c * QK + i] = if bit == 1 { 1.0 } else { -1.0 };
+        }
+    }
+    Ok((qs, scales, offsets))
 }
 
 fn split_q4_1_ondevice(bytes: &[u8], nb: usize) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
@@ -2028,8 +2130,22 @@ pub(crate) fn bytes_to_f32(data: &[u8], shape: &Shape) -> Result<Vec<f32>> {
             .collect()),
         DType::Bool | DType::U8 => Ok(data.iter().map(|&b| b as f32).collect()),
         DType::I8 => Ok(data.iter().map(|&b| (b as i8) as f32).collect()),
+        // F16 activations mode (RLX_COREML_F16): small synthesized consts arrive
+        // as f16 bytes; decode to f32 for inline/blob baking (make_const re-casts
+        // to f16 when the const's shape dtype is F16).
+        DType::F16 => {
+            if !data.len().is_multiple_of(2) {
+                return Err(CoremlError::Runtime(
+                    "constant byte len not f16-aligned".into(),
+                ));
+            }
+            Ok(data
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect())
+        }
         other => Err(CoremlError::Unsupported(format!(
-            "constant dtype {other:?} (only F32/int/bool baked inline)"
+            "constant dtype {other:?} (only F32/f16/int/bool baked inline)"
         ))),
     }
 }

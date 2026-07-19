@@ -21,7 +21,7 @@
 //!   validation on Arc / Data Center Max.
 
 use crate::device::oneapi_device;
-use crate::host::{self, HostBuf};
+use crate::host::{self, HostBuf, HostOut};
 use crate::kernels::kernels;
 use rlx_compile::memory::{BufferSlot, MemoryPlan};
 use rlx_ir::op::Activation;
@@ -56,6 +56,14 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // Claimed first-class; `compile_rng` runs `unfuse_attention_block`
         // to lower it to the primitive chain above before legalization.
         FusedAttentionBlock,
+        // DiT modulation — claimed for fusion; `unfuse_dit_modulation`
+        // expands forward Ada/Gated before host / SPIR-V lowering.
+        AdaLayerNorm,
+        GatedResidual,
+        // Packed DiT reverse — native OpenCL-C SPIR-V when kernels are
+        // embedded (`RLX_ONEAPI_BUILD_KERNELS=1`); else CPU host-fallback.
+        AdaLayerNormBackward,
+        GatedResidualBackward,
         Transpose,
         Narrow,
         Concat,
@@ -72,6 +80,10 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         SelectiveScan, // SSM / Mamba
         Im2Col,
         ScatterAdd,
+        ScatterNd,
+        ScatterElements,
+        GatherNd,
+        GatherElements,
         TopK, // vision / indexing / generation
         Lstm,
         Gru,
@@ -81,6 +93,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // General Op::Scan (arbitrary-body recurrence, e.g. IIR biquad):
         // no native kernel → routed to the rlx-cpu host fallback (USM-shared arena).
         Scan,
+        ScanBackward,
+        ScanBackwardXs,
         ConvTranspose2d,
         Fft,
         DequantMatMul,
@@ -89,6 +103,35 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         RngNormal,
         RngUniform,
         Sample, // RNG / generation
+        // Core Riemannian / SPD-manifold ops (F64): no native kernel → routed
+        // to the F64-aware CPU host fallback (`crate::spd`), on both the
+        // value-map (`run_host`) and USM-arena (`run_l0`) paths.
+        BiMap,
+        ReEig,
+        LogEig,
+        SpdBatchNorm,
+        SpdKarcherMean,
+        SpdKarcherMeanWeighted,
+        SpdLogMap,
+        SpdExpMap,
+        SpdParallelTransport,
+        SpdMatrixFnBatch,
+        ReEigBackward,
+        LogEigBackward,
+        SpdBatchNormBackwardX,
+        SpdBatchNormBackwardG,
+        SpdLogMapBackward,
+        SpdExpMapBackward,
+        SpdParallelTransportBackward,
+        SpdMatrixFnBatchBackward,
+        Eigh,
+        EighBackward,
+        EighBatch,
+        EighBatchBackward,
+        // In-graph collectives (`collective.*`) — claimed so the Session/stages
+        // legalize pass lets them through; `run_host` / L0 host-fallback eval
+        // via rlx-cpu (same as rlx-vulkan).
+        Custom,
     ]
 };
 
@@ -102,6 +145,8 @@ fn native_kernel(op: &Op) -> Option<&'static str> {
         Op::MatMul => Some("matmul"),
         Op::Softmax { .. } => Some("softmax"),
         Op::RmsNorm { .. } => Some("rmsnorm"),
+        Op::AdaLayerNormBackward { .. } => Some("ada_layer_norm_backward"),
+        Op::GatedResidualBackward => Some("gated_residual_backward"),
         _ => None,
     }
 }
@@ -131,6 +176,14 @@ impl OneApiExecutable {
 
     /// Legalize the graph to the native primitive set, then capture I/O maps.
     pub fn compile_rng(graph: Graph, rng: RngOptions) -> Self {
+        Self::compile_rng_with_options(graph, rng, 64)
+    }
+
+    pub fn compile_rng_with_options(
+        graph: Graph,
+        rng: RngOptions,
+        scan_unroll_max_length: u32,
+    ) -> Self {
         use rlx_opt::pass::Pass as _;
 
         let graph = rlx_opt::LowerControlFlow.run(graph);
@@ -138,8 +191,11 @@ impl OneApiExecutable {
         // kernel) to primitives before legalization. FAB-only; no-op when
         // absent.
         let graph = rlx_opt::unfuse::unfuse_attention_block(graph);
+        let graph = rlx_opt::unfuse::unfuse_dit_modulation(graph);
         let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, SUPPORTED_OPS)
             .unwrap_or_else(|errs| panic!("{}", rlx_opt::format_legalize_error("oneapi", &errs)));
+        let graph = rlx_cpu::rlx_maybe_unroll_scans!(graph, scan_unroll_max_length);
+        let graph = rlx_opt::maybe_unroll_scans_budget(graph, 4096);
         let graph = rlx_opt::LegalizeBroadcast.run(graph);
 
         let output_ids = graph.outputs.clone();
@@ -237,6 +293,30 @@ impl OneApiExecutable {
                         f32v.insert(node.id, widen_const_to_f32(data, node.shape.dtype()));
                     }
                 }
+                // Core Riemannian / SPD-manifold ops (F64) go through the
+                // F64-aware `spd::eval` (widens f32→f64, runs the CPU thunk,
+                // narrows back), not the f32-only `host::eval` — same split as
+                // rlx-vulkan. Delegating with each node's REAL declared
+                // dtype/shape handles the packed `[2n²+n]` ReEig/LogEig forward
+                // output + precomputed backward layout for free.
+                op if crate::spd::is_spd_host(op) => {
+                    let in_specs: Vec<(Shape, Vec<f32>)> = node
+                        .inputs
+                        .iter()
+                        .map(|&id| {
+                            let sh = self.graph.node(id).shape.clone();
+                            (sh, f32v.get(&id).cloned().unwrap_or_default())
+                        })
+                        .collect();
+                    let out = crate::spd::eval(&node.op, &node.shape, &in_specs);
+                    f32v.insert(node.id, out);
+                }
+                Op::Scan { .. } => {
+                    let out = rlx_cpu::thunk::run_scan_node_f32(node, |id| {
+                        f32v.get(&id).cloned().unwrap_or_default()
+                    });
+                    f32v.insert(node.id, out);
+                }
                 _ => {
                     let in_specs: Vec<(Shape, HostBuf)> = node
                         .inputs
@@ -251,8 +331,14 @@ impl OneApiExecutable {
                             (sh, buf)
                         })
                         .collect();
-                    let out = host::eval(&node.op, &node.shape, &in_specs);
-                    f32v.insert(node.id, out);
+                    match host::eval(&node.op, &node.shape, &in_specs) {
+                        HostOut::F32(out) => {
+                            f32v.insert(node.id, out);
+                        }
+                        HostOut::Bytes(b) => {
+                            bytev.insert(node.id, b);
+                        }
+                    }
                 }
             }
         }
@@ -324,7 +410,33 @@ impl OneApiExecutable {
             ) {
                 continue;
             }
-            match native_kernel(&node.op) {
+            // SPD-manifold ops (F64, no native kernel) read the USM arena, run
+            // the F64-aware `spd::eval` (widen f32→f64 → CPU thunk → narrow),
+            // and write back — exactly rlx-vulkan's host-fallback split from
+            // the f32-only `host::eval`.
+            if crate::spd::is_spd_host(&node.op) {
+                let in_specs: Vec<(Shape, Vec<f32>)> = node
+                    .inputs
+                    .iter()
+                    .map(|&id| {
+                        let sh = self.graph.node(id).shape.clone();
+                        let nn = sh.num_elements().unwrap_or(0);
+                        (sh, arena.read_f32(id, nn))
+                    })
+                    .collect();
+                let out = crate::spd::eval(&node.op, &node.shape, &in_specs);
+                arena.write_f32(node.id, &out);
+                continue;
+            }
+            if matches!(node.op, Op::Scan { .. }) {
+                let out = rlx_cpu::thunk::run_scan_node_f32(node, |id| {
+                    let nn = self.graph.node(id).shape.num_elements().unwrap_or(0);
+                    arena.read_f32(id, nn)
+                });
+                arena.write_f32(node.id, &out);
+                continue;
+            }
+            match native_kernel(&node.op).filter(|name| kerns.get(name).is_some()) {
                 Some(name) => self.dispatch(dev, kerns, list, name, node, &arena),
                 None => {
                     // Read inputs out of the arena, eval on CPU, write back.
@@ -334,7 +446,7 @@ impl OneApiExecutable {
                         .map(|&id| {
                             let sh = self.graph.node(id).shape.clone();
                             let nn = sh.num_elements().unwrap_or(0);
-                            let buf = if matches!(sh.dtype(), DType::U8 | DType::I8) {
+                            let buf = if matches!(sh.dtype(), DType::U8 | DType::I8 | DType::Bool) {
                                 HostBuf::Bytes(arena.read_bytes(id, nn))
                             } else {
                                 HostBuf::F32(arena.read_f32(id, nn))
@@ -342,8 +454,10 @@ impl OneApiExecutable {
                             (sh, buf)
                         })
                         .collect();
-                    let out = host::eval(&node.op, &node.shape, &in_specs);
-                    arena.write_f32(node.id, &out);
+                    match host::eval(&node.op, &node.shape, &in_specs) {
+                        HostOut::F32(out) => arena.write_f32(node.id, &out),
+                        HostOut::Bytes(b) => arena.write_bytes(node.id, &b),
+                    }
                 }
             }
         }
@@ -474,6 +588,50 @@ impl OneApiExecutable {
                     KArg::F32(*eps),
                 ]);
                 (rows, 64)
+            }
+            Op::AdaLayerNormBackward { norm, eps } => {
+                use rlx_ir::ada_modulation_launch;
+                use rlx_ir::op::AdaNormKind;
+                let x = node.inputs[0];
+                let scale = node.inputs[1];
+                let dy = node.inputs[3];
+                let x_dims = dims(&self.graph, x);
+                let mod_dims = dims(&self.graph, scale);
+                let inner = *x_dims.last().unwrap_or(&1) as u32;
+                let (mod_rows, seq_per_mod) = ada_modulation_launch(&x_dims, &mod_dims);
+                let layer_norm = matches!(norm, AdaNormKind::LayerNorm) as u32;
+                args.extend([
+                    KArg::U32(mod_rows),
+                    KArg::U32(seq_per_mod),
+                    KArg::U32(inner),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(scale)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                    KArg::U32(layer_norm),
+                    KArg::F32(*eps),
+                ]);
+                (mod_rows as usize, 64)
+            }
+            Op::GatedResidualBackward => {
+                use rlx_ir::ada_modulation_launch;
+                let y = node.inputs[1];
+                let gate = node.inputs[2];
+                let dy = node.inputs[3];
+                let x_dims = dims(&self.graph, dy);
+                let gate_dims = dims(&self.graph, gate);
+                let inner = *x_dims.last().unwrap_or(&1) as u32;
+                let (mod_rows, seq_per_mod) = ada_modulation_launch(&x_dims, &gate_dims);
+                args.extend([
+                    KArg::U32(mod_rows),
+                    KArg::U32(seq_per_mod),
+                    KArg::U32(inner),
+                    KArg::U32(off(y)),
+                    KArg::U32(off(gate)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                ]);
+                (mod_rows as usize, 64)
             }
             _ => return,
         };

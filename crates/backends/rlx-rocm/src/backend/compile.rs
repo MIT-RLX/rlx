@@ -602,6 +602,142 @@ impl RocmExecutable {
                         has_bias: if *has_bias { 1 } else { 0 },
                     });
                 }
+                Op::AdaLayerNorm { norm, eps } => {
+                    let x_id = node.inputs[0];
+                    let scale_id = node.inputs[1];
+                    let shift_id = node.inputs[2];
+                    let in_dims = node.shape.dims();
+                    let inner = in_dims.last().unwrap().unwrap_static() as u32;
+                    let total: u32 = in_dims.iter().map(|d| d.unwrap_static() as u32).product();
+                    let outer = total / inner.max(1);
+                    let x_dims: Vec<usize> = graph
+                        .node(x_id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
+                    let mod_dims: Vec<usize> = graph
+                        .node(scale_id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
+                    let lead_pack = rlx_ir::ada_modulation_lead_pack(&x_dims, &mod_dims);
+                    let meta = upload_meta(&ctx, &lead_pack);
+                    let meta_idx = meta_buffers.len();
+                    meta_buffers.push(meta);
+                    schedule.push(Step::AdaLayerNorm {
+                        outer,
+                        inner,
+                        in_off: (arena.offset(x_id) / 4) as u32,
+                        scale_off: (arena.offset(scale_id) / 4) as u32,
+                        shift_off: (arena.offset(shift_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        eps_bits: eps.to_bits(),
+                        layer_norm: u32::from(matches!(norm, rlx_ir::op::AdaNormKind::LayerNorm)),
+                        meta_idx,
+                    });
+                }
+                Op::GatedResidual => {
+                    let x_id = node.inputs[0];
+                    let y_id = node.inputs[1];
+                    let gate_id = node.inputs[2];
+                    let in_dims = node.shape.dims();
+                    let inner = in_dims.last().unwrap().unwrap_static() as u32;
+                    let total: u32 = in_dims.iter().map(|d| d.unwrap_static() as u32).product();
+                    let x_dims: Vec<usize> = graph
+                        .node(x_id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
+                    let gate_dims: Vec<usize> = graph
+                        .node(gate_id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
+                    let lead_pack = rlx_ir::ada_modulation_lead_pack(&x_dims, &gate_dims);
+                    let meta = upload_meta(&ctx, &lead_pack);
+                    let meta_idx = meta_buffers.len();
+                    meta_buffers.push(meta);
+                    schedule.push(Step::GatedResidual {
+                        total,
+                        inner,
+                        x_off: (arena.offset(x_id) / 4) as u32,
+                        y_off: (arena.offset(y_id) / 4) as u32,
+                        gate_off: (arena.offset(gate_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        meta_idx,
+                    });
+                }
+                Op::AdaLayerNormBackward { norm, eps } => {
+                    let x_id = node.inputs[0];
+                    let scale_id = node.inputs[1];
+                    let shift_id = node.inputs[2];
+                    let dy_id = node.inputs[3];
+                    let _ = shift_id;
+                    let in_dims = graph.node(x_id).shape.dims();
+                    let inner = in_dims.last().unwrap().unwrap_static() as u32;
+                    let x_dims: Vec<usize> = in_dims.iter().map(|d| d.unwrap_static()).collect();
+                    let mod_dims: Vec<usize> = graph
+                        .node(scale_id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
+                    let (mod_rows, seq_per_mod) = rlx_ir::ada_modulation_launch(&x_dims, &mod_dims);
+                    schedule.push(Step::AdaLayerNormBackward {
+                        mod_rows,
+                        seq_per_mod,
+                        inner,
+                        x_off: (arena.offset(x_id) / 4) as u32,
+                        scale_off: (arena.offset(scale_id) / 4) as u32,
+                        dy_off: (arena.offset(dy_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        eps_bits: eps.to_bits(),
+                        layer_norm: u32::from(matches!(norm, rlx_ir::op::AdaNormKind::LayerNorm)),
+                    });
+                }
+                Op::GatedResidualBackward => {
+                    let x_id = node.inputs[0];
+                    let y_id = node.inputs[1];
+                    let gate_id = node.inputs[2];
+                    let dy_id = node.inputs[3];
+                    let _ = x_id;
+                    let in_dims = graph.node(y_id).shape.dims();
+                    let inner = in_dims.last().unwrap().unwrap_static() as u32;
+                    let x_dims: Vec<usize> = graph
+                        .node(x_id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
+                    let gate_dims: Vec<usize> = graph
+                        .node(gate_id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
+                    let (mod_rows, seq_per_mod) =
+                        rlx_ir::ada_modulation_launch(&x_dims, &gate_dims);
+                    schedule.push(Step::GatedResidualBackward {
+                        mod_rows,
+                        seq_per_mod,
+                        inner,
+                        y_off: (arena.offset(y_id) / 4) as u32,
+                        gate_off: (arena.offset(gate_id) / 4) as u32,
+                        dy_off: (arena.offset(dy_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                    });
+                }
                 Op::Gather { axis } => {
                     let table_id = node.inputs[0];
                     let idx_id = node.inputs[1];
@@ -1432,38 +1568,25 @@ impl RocmExecutable {
                         carry: *carry,
                     });
                 }
-                Op::Scan {
-                    body,
-                    length,
-                    save_trajectory,
-                    num_bcast,
-                    num_xs,
-                    ..
-                } => {
-                    let nb = *num_bcast as usize;
-                    let nx = *num_xs as usize;
-                    let plan = rlx_cpu::thunk::compile_scan_body(body, nb, nx);
-                    let bcast_outer: Vec<(usize, usize)> = (0..nb)
-                        .map(|i| {
-                            let id = node.inputs[1 + i];
-                            (arena.offset(id), graph.node(id).shape.size_bytes().unwrap())
-                        })
-                        .collect();
-                    let xs_outer: Vec<(usize, usize)> = (0..nx)
-                        .map(|i| {
-                            let id = node.inputs[1 + nb + i];
-                            let total = graph.node(id).shape.size_bytes().unwrap();
-                            (arena.offset(id), total / *length as usize)
-                        })
-                        .collect();
+                Op::Scan { .. } => {
                     schedule.push(Step::ScanHost {
-                        plan: std::sync::Arc::new(plan),
-                        outer_init_off: arena.offset(node.inputs[0]),
-                        outer_final_off: arena.offset(node.id),
-                        length: *length,
-                        save_trajectory: *save_trajectory,
-                        xs_outer,
-                        bcast_outer,
+                        desc: rlx_cpu::rlx_scan_host_desc!(graph, node, |id| arena.offset(id)),
+                    });
+                }
+                Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => {
+                    schedule.push(Step::HostOp {
+                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+                    });
+                }
+                Op::ScatterNd { .. }
+                | Op::ScatterElements { .. }
+                | Op::GatherNd { .. }
+                | Op::GatherElements { .. } => {
+                    // f32-uniform arena: I64 indices live as f32 slots (same as
+                    // CUDA/wgpu). Force the f32→i64 reader for ScatterNd/Gather*.
+                    schedule.push(Step::CpuIndexing {
+                        thunk: rlx_cpu::rlx_indexing_thunk!(graph, node, |id| arena.offset(id))
+                            .force_indices_f32(),
                     });
                 }
                 Op::Custom { name, attrs, .. } => match name.as_str() {
@@ -1508,6 +1631,47 @@ impl RocmExecutable {
                             out_off: (arena.offset(node.id) / 4) as u32,
                             out_len,
                             attrs: attrs.clone(),
+                        });
+                    }
+                    n if crate::collective_host::COLLECTIVE_OPS.contains(&n) => {
+                        // Host-delegate collective (all_reduce / all_gather /
+                        // reduce_scatter / f / g): stage off-GPU and run the
+                        // registered rlx-cpu collective kernel. Offsets/lengths
+                        // are f32 elements (arena convention).
+                        let in_id = node.inputs[0];
+                        let in_len = graph.node(in_id).shape.num_elements().unwrap() as u32;
+                        let out_len = node.shape.num_elements().unwrap() as u32;
+                        schedule.push(Step::CollectiveHost {
+                            name: n.to_string(),
+                            in_off: (arena.offset(in_id) / 4) as u32,
+                            in_len,
+                            out_off: (arena.offset(node.id) / 4) as u32,
+                            out_len,
+                            attrs: attrs.clone(),
+                        });
+                    }
+                    other
+                        if crate::rocm_gpu_kernels::has_gpu_kernel(other)
+                            && node.inputs.len() <= crate::rocm_gpu_kernels::MAX_INPUTS =>
+                    {
+                        // Raw-GPU custom op: hipRTC kernel launched against the
+                        // arena (no host roundtrip). Offsets baked as f32-element
+                        // offsets; guarded to ≤ MAX_INPUTS.
+                        let in_offs: Vec<(u32, u32)> = node
+                            .inputs
+                            .iter()
+                            .map(|&id| {
+                                (
+                                    (arena.offset(id) / 4) as u32,
+                                    graph.node(id).shape.num_elements().unwrap_or(0) as u32,
+                                )
+                            })
+                            .collect();
+                        schedule.push(Step::RocmGpuKernel {
+                            name: other.to_string(),
+                            out_off: (arena.offset(node.id) / 4) as u32,
+                            out_len: node.shape.num_elements().unwrap_or(0) as u32,
+                            in_offs,
                         });
                     }
                     other => panic!("rlx-rocm: unsupported Op::Custom('{other}')"),
@@ -2093,6 +2257,54 @@ impl RocmExecutable {
                         axis_dim: axis_dim as u32,
                         num_idx: num_idx as u32,
                         trailing: trailing as u32,
+                    });
+                }
+                // Native batched symmetric eigendecomposition: `Op::Eigh` /
+                // `Op::EighBatch` (n ≤ 32) run on-device via hipSOLVER
+                // `SsyevjBatched` when libhipsolver is loadable. Larger `n` or
+                // missing hipSOLVER falls through to the CPU host-fallback
+                // below. Input `[n,n]` (Eigh, batch=1) or `[B,n,n]` (EighBatch);
+                // output packed `[.. , n²+n]`.
+                op @ (Op::Eigh | Op::EighBatch)
+                    if {
+                        let s = &graph.node(node.inputs[0]).shape;
+                        let n = s.dim(s.rank().saturating_sub(1)).unwrap_static();
+                        n <= crate::eigh_native::MAX_N && crate::eigh_native::is_available()
+                    } =>
+                {
+                    let in_shape = graph.node(node.inputs[0]).shape.clone();
+                    let n = in_shape
+                        .dim(in_shape.rank().saturating_sub(1))
+                        .unwrap_static();
+                    let batch = if matches!(op, Op::EighBatch) {
+                        in_shape.dim(0).unwrap_static()
+                    } else {
+                        1
+                    };
+                    schedule.push(Step::EighNative {
+                        in_off: arena.offset(node.inputs[0]) / 4,
+                        out_off: arena.offset(node.id) / 4,
+                        n,
+                        batch,
+                    });
+                }
+                // Core Riemannian / SPD-manifold ops (F64, no ROCm kernel) run
+                // on the CPU reference between GPU segments (D2H → CPU → H2D),
+                // like `Op::Scan` / `Op::Fft`. Delegating through the CPU thunk
+                // with each node's REAL declared dtype/shape handles the packed
+                // `[2n²+n]` ReEig/LogEig forward output and the precomputed
+                // backward layout for free — no shapes are hardcoded here.
+                op if crate::spd::is_spd_host(op) => {
+                    let inputs: Vec<(usize, rlx_ir::Shape)> = node
+                        .inputs
+                        .iter()
+                        .map(|&id| (arena.offset(id) / 4, graph.node(id).shape.clone()))
+                        .collect();
+                    schedule.push(Step::SpdHost {
+                        op: op.clone(),
+                        out_off: arena.offset(node.id) / 4,
+                        out_shape: node.shape.clone(),
+                        inputs,
                     });
                 }
                 other => panic!(

@@ -1,0 +1,183 @@
+<!doctype html>
+<!--
+  RLX vision benchmark in the browser — MNIST CNN/MLP, CIFAR CNN, ResNet-style.
+  Serve with `just serve-web --all` / `serve.py` (needs http:// for ES modules + wasm).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RLX vision bench — browser</title>
+    <style>
+      :root {
+        --ink: #1a1a1a;
+        --muted: #5a5a5a;
+        --line: #e2e2e2;
+        --panel: #f7f7f5;
+        --cpu: #2563eb;
+        --webgpu: #059669;
+        --webgl: #d97706;
+        --sps: #7c3aed;
+      }
+      body { font: 15px/1.5 "IBM Plex Sans", "Segoe UI", system-ui, sans-serif; color: var(--ink); max-width: 64rem; margin: 2rem auto; padding: 0 1rem; }
+      h1 { font-size: 1.45rem; letter-spacing: -0.02em; }
+      h2 { font-size: 1.05rem; margin-top: 1.5rem; }
+      label { display: inline-block; margin: 0.4rem 0.9rem 0.4rem 0; }
+      select, button, input[type="number"] { font: inherit; padding: 0.35rem 0.6rem; }
+      button:disabled { opacity: 0.55; cursor: not-allowed; }
+      table { border-collapse: collapse; width: 100%; margin-top: 0.8rem; }
+      th, td { border: 1px solid var(--line); padding: 0.45rem 0.6rem; text-align: left; }
+      th { background: var(--panel); }
+      .ok { color: #0a7; } .warn { color: #c70; } .err { color: #c33; }
+      pre { background: var(--panel); padding: 0.7rem; border-radius: 6px; white-space: pre-wrap; max-height: 14rem; overflow-y: auto; font-size: 0.85rem; }
+      nav a { margin-right: 1rem; color: var(--muted); text-decoration: none; }
+      nav a b { color: var(--ink); }
+      #progress-panel {
+        margin: 1rem 0;
+        padding: 0.95rem 1rem 1.1rem;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      #progress-panel[hidden] { display: none; }
+      .phase { font-weight: 650; margin-bottom: 0.35rem; }
+      .bar {
+        height: 10px;
+        background: #e8e8e4;
+        border-radius: 5px;
+        overflow: hidden;
+        margin: 0.4rem 0 0.55rem;
+      }
+      .bar > i {
+        display: block;
+        height: 100%;
+        width: 0%;
+        background: var(--cpu);
+        border-radius: 5px;
+        transition: width 0.12s ease-out;
+      }
+      .meta { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 0.86rem; color: var(--muted); }
+      .charts {
+        display: grid;
+        grid-template-columns: 1.4fr 1fr;
+        gap: 0.85rem;
+        margin-top: 0.9rem;
+      }
+      @media (max-width: 720px) {
+        .charts { grid-template-columns: 1fr; }
+      }
+      .chart-card {
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 0.55rem 0.65rem 0.35rem;
+      }
+      .chart-card h3 {
+        margin: 0 0 0.35rem;
+        font-size: 0.78rem;
+        font-weight: 650;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+      }
+      canvas { width: 100%; height: 180px; display: block; }
+      .legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        margin-top: 0.35rem;
+        font-size: 0.8rem;
+        color: var(--muted);
+      }
+      .legend span::before {
+        content: "";
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+        margin-right: 0.35rem;
+        vertical-align: -1px;
+      }
+      .legend .cpu::before { background: var(--cpu); }
+      .legend .webgpu::before { background: var(--webgpu); }
+      .legend .webgl::before { background: var(--webgl); }
+      .legend .sps::before { background: var(--sps); }
+      .controls { display: flex; flex-wrap: wrap; align-items: end; gap: 0.35rem 0.75rem; }
+    </style>
+  </head>
+  <body>
+    <nav>
+      <a href="./index.html">MLP demo</a>
+      <a href="./vision-bench.html"><b>Vision bench</b></a>
+    </nav>
+    <h1>RLX vision benchmark (browser)</h1>
+    <p>Classification models on CPU, WebGPU, and WebGL2. Live charts track loss and
+       throughput while training. WebGL trains only the MLP (conv backward not
+       available yet).</p>
+
+    <div id="status">loading…</div>
+    <p>Preferred backend: <code id="pref">—</code> · GPU features: <code id="gpu-feat">—</code></p>
+
+    <div class="controls">
+      <label>
+        Model
+        <select id="model"></select>
+      </label>
+      <label>
+        Steps
+        <input id="steps" type="number" value="40" min="1" max="500" />
+      </label>
+      <label>
+        Train backends
+        <select id="train-backends">
+          <option value="all">CPU + WebGPU + WebGL</option>
+          <option value="cpu-gpu">CPU + WebGPU</option>
+          <option value="cpu">CPU only</option>
+        </select>
+      </label>
+      <button id="run">Run benchmark</button>
+    </div>
+
+    <div id="progress-panel" hidden>
+      <div class="phase" id="phase">—</div>
+      <div class="bar"><i id="bar"></i></div>
+      <div class="meta" id="progress-meta">—</div>
+      <div class="charts">
+        <div class="chart-card">
+          <h3>Training loss</h3>
+          <canvas id="loss-chart" width="640" height="180"></canvas>
+          <div class="legend">
+            <span class="cpu">CPU</span>
+            <span class="webgpu">WebGPU</span>
+            <span class="webgl">WebGL</span>
+          </div>
+        </div>
+        <div class="chart-card">
+          <h3>Throughput (steps/s)</h3>
+          <canvas id="sps-chart" width="420" height="180"></canvas>
+          <div class="legend">
+            <span class="sps">instantaneous</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <h2>Results</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Backend</th>
+          <th>Forward (max |Δ| vs CPU)</th>
+          <th>Train step loss</th>
+          <th>Bench (loss₀ → loss₁, steps/s)</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+
+    <h2>Log</h2>
+    <pre id="log">—</pre>
+
+    <script type="module" src="./vision-bench.js"></script>
+  </body>
+</html>

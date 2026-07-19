@@ -55,7 +55,7 @@ extern "C" __global__ void fused_residual_rms_norm(
         local_ss += v * v;
     }
     float ss = frrn_block_sum(local_ss, s, tid, bsz);
-    float inv_rms = rsqrtf(ss * n_inv + eps);
+    float inv_rms = 1.0f / sqrtf(ss * n_inv + eps);
 
     for (unsigned int i = tid; i < inner; i += bsz) {
         float g = arena[gamma_off + i];

@@ -121,9 +121,9 @@ Metal / CUDA / ROCm / wgpu session compile enables native FKL regions on GPU-cla
 To tune performance:
 
 1. **Metal**  `rlx-metal/src/kernels.rs` (`elementwise_region`), `mps_graph_lower.rs` (MPSGraph path), env `RLX_MPSGRAPH_TRACE` to see fallback to MSL thunks.
-2. **CUDA / ROCm**  `rlx-gpu-kernels/kernels/elementwise_region.cu` and optional `batch_elementwise_region.cu` (set `RLX_FK_BATCH_SINGLE_KERNEL=1`), dispatch in `rlx-cuda` / `rlx-rocm` `backend.rs`.
+2. **CUDA / ROCm**  `rlx-gpu-kernels/kernels/elementwise_region.cu` and optional `batch_elementwise_region.cu` (set `RLX_FK_BATCH_SINGLE_KERNEL=1`), dispatch in `rlx-cuda` / `rlx-rocm` `backend/`.
 3. **wgpu**  `rlx-wgpu/src/kernels/elementwise_region.wgsl` (`elementwise_region` vs `elementwise_region_spatial`).
-4. **MLX**  `rlx-mlx/src/lower.rs` (`ElementwiseRegion` + `ops::resize_nearest_2x_nchw`).
+4. **MLX**  `rlx-mlx/src/lower/` (`ElementwiseRegion` in `env.rs` + `ops::resize_nearest_2x_nchw`).
 5. **TPU**  `rlx-tpu/src/lower.rs` (inline HLO chain; `ir_passes::prepare_graph_for_hlo` runs FKL before lowering). Direct `TpuExecutable::compile` and orchestrated HLO segments share the same path.
 
 ### Fusion pass tuning (`rlx-fusion`)
@@ -148,7 +148,7 @@ Variants include `session_default_pipeline` (production `CompileOptions`),
 `session_native_batch` (`native_fk_regions` on the same primitive graph), and pre-fused IR
 (`skip_fusion` in bench opts). Set `FK_BENCH_OPS=1` to print post-pipeline op counts without timing.
 
-Python timing demo: `crates/pyrlx/examples/fk_fusion_bench.py` (`--batch` for narrow+relu+concat).
+Python timing demo: `crates/bindings/pyrlx/examples/fk_fusion_bench.py` (`--batch` for narrow+relu+concat).
 
 ### Session API (native batch)
 

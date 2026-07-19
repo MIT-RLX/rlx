@@ -5,12 +5,9 @@
 
 //! Per-kernel compute-pipeline cache.
 //!
-//! Every kernel shares one descriptor-set layout (a single storage buffer =
-//! the arena, at binding 0) and one pipeline layout (that DSL + a 128-byte
-//! push-constant range, the Vulkan-guaranteed minimum). Per-op parameters
-//! (offsets, dims, selectors) travel entirely through push constants, so a
-//! single descriptor set bound to the arena serves every dispatch. Compute
-//! pipelines are compiled lazily from the embedded SPIR-V and cached.
+//! Every kernel shares one descriptor-set layout: binding 0 = activations,
+//! binding 1 = weights (a tiny dummy buffer when unsplit). A 128-byte push-
+//! constant range carries per-op offsets (weight slots tagged with bit 31).
 
 use crate::device::{VulkanDevice, vulkan_device};
 use crate::shaders;
@@ -43,11 +40,18 @@ pub fn kernels() -> Option<&'static Kernels> {
 
 impl Kernels {
     fn new(dev: &'static VulkanDevice) -> Self {
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
         let dsl = unsafe {
             dev.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),

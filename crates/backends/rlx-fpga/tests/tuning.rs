@@ -50,10 +50,12 @@ fn ternary_dense_model() -> Model {
             w_zp: 0,
             out_zp: 0,
             weight_bits: 2,
+            weight_encoding: rlx_fpga::WeightEncoding::SignedInt,
             requant: vec![(m0, sh)],
             weights: packed,
             bias: None,
         }],
+        extra_outputs: vec![],
     }
 }
 

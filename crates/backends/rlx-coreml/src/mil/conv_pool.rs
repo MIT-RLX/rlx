@@ -167,6 +167,14 @@ impl<'a> LowerCtx<'a> {
         let shape = node.shape.clone();
         let in_shape = self.graph.shape(node.inputs[0]).clone();
         let w_shape = self.graph.shape(node.inputs[1]).clone();
+        if std::env::var("RLX_DBG_CONV").is_ok() {
+            eprintln!(
+                "[mil-conv] transpose={transpose} groups={groups} in={:?} w={:?} out={:?}",
+                in_shape.dims(),
+                w_shape.dims(),
+                shape.dims()
+            );
+        }
         // rlx lowers ONNX 1D convs as 2D NCHW with a unit H axis and the length in W
         // (`[N,C,1,L]`, weight `[Co,Ci,k,1]`). CoreML's 2D conv would run the k-tap
         // kernel over the singleton H axis, so collapse to a real rank-3 1D conv over
@@ -245,7 +253,42 @@ impl<'a> LowerCtx<'a> {
             return Ok(());
         }
         let x = self.val(node.inputs[0]);
-        let w = self.val(node.inputs[1]);
+        let mut w = self.val(node.inputs[1]);
+        // MIL's `conv_transpose` requires the weight as `[C_in, C_out/groups, *k]`.
+        // The importer boxes a grouped/depthwise transposed-conv weight oddly (a
+        // depthwise ConvTranspose1d arrives as `[1, C, 1, k]` — C_in in dim 1),
+        // which MIL rejects (`KernelChannels(1) != InputChannels(512)`). The flat
+        // data is already C_in-major, so reshape it into MIL's layout. (For
+        // groups=1 this is a no-op reshape.)
+        if transpose {
+            let cin = in_shape.dim(1).unwrap_static() as i32;
+            let cout = shape.dim(1).unwrap_static() as i32;
+            let g = groups.max(1) as i32;
+            let (kh, kw) = (
+                w_shape.dim(2).unwrap_static() as i32,
+                w_shape.dim(3).unwrap_static() as i32,
+            );
+            let tgt = [cin, cout / g, kh, kw];
+            if w_shape
+                .dims()
+                .iter()
+                .map(|d| d.unwrap_static() as i32)
+                .collect::<Vec<_>>()
+                != tgt
+            {
+                let wr = format!("{out_name}_wt");
+                self.emit(
+                    "reshape",
+                    &wr,
+                    &Shape::new(
+                        &[cin as usize, (cout / g) as usize, kh as usize, kw as usize],
+                        DType::F32,
+                    ),
+                    vec![("x", bind_name(&w)), ("shape", bind_value(vec_i32(&tgt)))],
+                )?;
+                w = wr;
+            }
+        }
         let strides = vec_usize_i32(stride);
         let dilations = vec_usize_i32(dilation);
         let pad = pad_begin_end(padding);

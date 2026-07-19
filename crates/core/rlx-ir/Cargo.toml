@@ -16,9 +16,10 @@ documentation.workspace = true
 smallvec = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+bincode = { version = "1", optional = true }
 
 [features]
-serialize = ["dep:serde", "dep:serde_json"]
+serialize = ["dep:serde", "dep:serde_json", "dep:bincode"]
 
 [dev-dependencies]
 [lints]

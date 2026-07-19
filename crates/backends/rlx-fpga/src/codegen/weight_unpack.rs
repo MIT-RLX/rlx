@@ -15,26 +15,31 @@
 
 //! Combinational weight unpack: byte + lane → 32-bit signed value.
 //!
-//! Mirrors `rlx_cortexm::quant::read_weight` for `BITS ∈ {2, 4, 8}`. For
-//! ternary (`BITS = 2`), the trainer emits values in `{-1, 0, 1}`; the
-//! unpack still sign-extends the unused `-2` codepoint correctly so
-//! malformed weight files don't silently produce wrong arithmetic.
+//! * `ENCODING=0` (default): two's-complement INT2/4/8 (cortexm layout).
+//! * `ENCODING=1` + `BITS=4`: OCP FP4 E2M1 nibble → fixed-point via LUT
+//!   (`round(decode(code) * 2)` so 0.5→1); fold the ×2 into requant scales.
+
+use rlx_ir::ScaledFormat;
 
 use crate::verilog::V;
 
 pub fn emit() -> String {
     let mut v = V::new();
     v.banner("weight_unpack — extract one logical weight from a packed byte");
-    v.comment("BITS ∈ {2, 4, 8}.  `lane` selects the sub-byte slot:");
+    v.comment("BITS ∈ {2, 4, 8}.  ENCODING: 0=signed-int, 1=FP4-E2M1 (BITS=4).");
     v.comment("  BITS=2  →  lane ∈ {0,1,2,3}  (4 crumbs per byte, LSB first)");
     v.comment("  BITS=4  →  lane ∈ {0,1}      (low nibble, then high nibble)");
     v.comment("  BITS=8  →  lane is ignored");
-    v.comment("Output is sign-extended to 32 bits to feed the i32 MAC path.");
     v.blank();
+
+    let fp4_lut = fp4_e2m1_lut_lines();
 
     v.module(
         "weight_unpack",
-        &["parameter int BITS = 8".into()],
+        &[
+            "parameter int BITS = 8".into(),
+            "parameter int ENCODING = 0".into(),
+        ],
         &[
             "input  logic        [7:0]  byte_in".into(),
             "input  logic        [1:0]  lane".into(),
@@ -43,7 +48,26 @@ pub fn emit() -> String {
         |v| {
             v.line("generate");
             v.block(|v| {
-                v.line("if (BITS == 8) begin : g_b8");
+                v.line("if (ENCODING == 1 && BITS == 4) begin : g_fp4");
+                v.block(|v| {
+                    v.line("logic [3:0] nib;");
+                    v.always_comb(|v| {
+                        v.line("if (lane[0]) nib = byte_in[7:4];");
+                        v.line("else         nib = byte_in[3:0];");
+                    });
+                    v.comment("F4E2M1 decode × 2 → signed int for the MAC");
+                    v.always_comb(|v| {
+                        v.line("unique case (nib)");
+                        v.block(|v| {
+                            for line in &fp4_lut {
+                                v.line(line);
+                            }
+                            v.line("default: w_out = 32'sd0;");
+                        });
+                        v.line("endcase");
+                    });
+                });
+                v.line("end else if (BITS == 8) begin : g_b8");
                 v.block(|v| v.line("assign w_out = $signed({{24{byte_in[7]}}, byte_in});"));
                 v.line("end else if (BITS == 4) begin : g_b4");
                 v.block(|v| {
@@ -70,11 +94,6 @@ pub fn emit() -> String {
                     v.line("assign w_out = $signed({{30{crumb[1]}}, crumb});");
                 });
                 v.line("end else begin : g_bad");
-                v.block(|v| {
-                    v.line(
-                        "// $error must be inside an initial; for now compile-time fallback to 0",
-                    )
-                });
                 v.block(|v| v.line("assign w_out = 32'sd0;"));
                 v.line("end");
             });
@@ -82,4 +101,19 @@ pub fn emit() -> String {
         },
     );
     v.into_string()
+}
+
+fn fp4_e2m1_lut_lines() -> Vec<String> {
+    let fmt = ScaledFormat::F4E2M1;
+    (0u8..16)
+        .map(|code| {
+            let f = fmt.decode(code);
+            let q = if f.is_finite() {
+                (f * 2.0).round() as i32
+            } else {
+                0
+            };
+            format!("4'h{code:X}: w_out = 32'sd{q};")
+        })
+        .collect()
 }

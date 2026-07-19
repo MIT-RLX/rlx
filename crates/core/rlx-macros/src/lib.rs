@@ -73,8 +73,21 @@ pub fn pipeline_schedule(item: TokenStream) -> TokenStream {
 ///
 /// The original function becomes the "graph builder". A new `_compiled` function
 /// is generated that manages the cache and execution.
+///
+/// # Opt-in self-check
+/// `#[rlx_model(check)]` injects a call to
+/// [`rlx_runtime::check::model_self_check`] right after the graph is traced, so
+/// building the model surfaces shape/dtype, backend-dispatch, missed-fusion and
+/// numeric findings on stderr. It runs on the CPU reference backend by default;
+/// tune with `RLX_CHECK` (`off` / `all` / `strict`). No extra dependency — the
+/// generated code already routes through `::rlx_runtime`.
 #[proc_macro_attribute]
-pub fn rlx_model(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn rlx_model(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // `#[rlx_model(check)]` opts this model into the post-trace self-check.
+    let want_check = attr
+        .to_string()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|w| w == "check");
     let input_fn = parse_macro_input!(item as ItemFn);
     let fn_name = &input_fn.sig.ident;
     let fn_vis = &input_fn.vis;
@@ -87,6 +100,13 @@ pub fn rlx_model(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // The graph builder function name (original, kept for debugging)
     let builder_name = syn::Ident::new(&format!("{fn_name}_build_graph"), fn_name.span());
+
+    // Optional post-trace self-check (see `#[rlx_model(check)]`).
+    let check_hook = if want_check {
+        quote! { ::rlx_runtime::check::model_self_check(stringify!(#fn_name), &graph); }
+    } else {
+        quote! {}
+    };
 
     let expanded = quote! {
         /// Graph builder (the original function — builds IR graph via tracing).
@@ -108,6 +128,9 @@ pub fn rlx_model(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let graph = ::rlx_runtime::trace::trace(stringify!(#fn_name), |t| {
                     #builder_name(t)
                 });
+
+                // Opt-in `#[rlx_model(check)]` self-check (no-op otherwise).
+                #check_hook
 
                 // Compile: fuse → memory plan → thunks
                 let session = ::rlx_runtime::Session::new(::rlx_runtime::Device::Cpu);

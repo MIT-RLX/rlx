@@ -63,6 +63,7 @@ impl CompiledFn {
     /// Compile `graph` once and return a handle that replays the
     /// optimized trace on subsequent calls.
     pub fn compile(graph: Graph) -> Result<Self, MlxError> {
+        let _guard = crate::sync::runtime_guard();
         if let Some(op) = lower::first_host_eval_op(&graph) {
             return Err(MlxError(format!(
                 "rlx-mlx: graph contains `{op}` whose lowering evaluates a tensor on the host; \
@@ -106,6 +107,7 @@ impl CompiledFn {
     /// Invoke the compiled function. `inputs` must match `leaf_order`
     /// in length and order. Returns owned output arrays.
     pub fn invoke(&self, inputs: &[Array]) -> Result<Vec<Array>, MlxError> {
+        let _guard = crate::sync::runtime_guard();
         if inputs.len() != self.leaf_order.len() {
             return Err(MlxError(format!(
                 "CompiledFn: expected {} leaves, got {}",
@@ -136,6 +138,7 @@ impl CompiledFn {
 impl Drop for CompiledFn {
     fn drop(&mut self) {
         if !self.handle.is_null() {
+            let _guard = crate::sync::runtime_guard();
             unsafe {
                 ffi::rlx_mlx_compiled_free(self.handle);
             }

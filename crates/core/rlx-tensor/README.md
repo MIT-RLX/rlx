@@ -111,7 +111,7 @@ let mut opt = AdamW::new(3e-4);
 let (loss, _) = f.train_step(&mut opt, &[("x", &xs)]);
 ```
 
-`Adam`, `AdamW`, `Lion`, `Sgd`, `Optimizer`, and `LrSchedule` are re-exported.
+`Adam`, `Muon`, `AdamW`, `Lion`, `Sgd`, `Optimizer`, and `LrSchedule` are re-exported.
 
 ## Features
 

@@ -94,6 +94,17 @@ fn register_builtin(r: &Registry) {
         Box::new(crate::backend::wgpu_backend::WgpuBackend) as Box<dyn Backend>
     });
 
+    // Browser-facing WebGPU label — same wgpu backend as `Device::Gpu`.
+    #[cfg(feature = "webgpu")]
+    map.insert(Device::WebGpu, || {
+        Box::new(crate::backend::wgpu_backend::WgpuBackend) as Box<dyn Backend>
+    });
+
+    #[cfg(feature = "opengl")]
+    map.insert(Device::OpenGl, || {
+        Box::new(crate::backend::webgl_backend::WebglBackend) as Box<dyn Backend>
+    });
+
     #[cfg(feature = "vulkan")]
     map.insert(Device::Vulkan, || {
         Box::new(crate::backend::vulkan_backend::VulkanBackend) as Box<dyn Backend>

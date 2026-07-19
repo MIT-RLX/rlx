@@ -58,5 +58,5 @@ cd out_mlp/rlx-mlp && cargo run --example verify   # runs the crate vs the golde
 ```
 
 All six models verify at **cosine 1.000000** vs PyTorch on both **CPU and CUDA**
-(RTX 3080 Ti). Integer token ids / params are fed as f32 + a cast, so the same
+(NVIDIA GPU). Integer token ids / params are fed as f32 + a cast, so the same
 artifacts run on the GPU.

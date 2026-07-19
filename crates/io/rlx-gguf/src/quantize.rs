@@ -755,6 +755,8 @@ pub fn quantize(src: &[f32], dtype: GgmlType) -> Result<Vec<u8>> {
             Ok(out)
         }
         GgmlType::Q8_0 => quantize_q8_0(src),
+        GgmlType::Q1_0 => crate::q1_dequant::quantize_q1_0(src),
+        GgmlType::Q2_0 => crate::q2_dequant::quantize_q2_0(src),
         GgmlType::Q4_0 => quantize_q4_0(src),
         GgmlType::Q4_1 => quantize_q4_1(src),
         GgmlType::Q5_0 => quantize_q5_0(src),

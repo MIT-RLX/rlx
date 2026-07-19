@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use rlx_coreml::mil::lower_graph;
 use rlx_coreml::proto;
 use rlx_ir::op::{Activation, BinaryOp};
-use rlx_ir::{DType, Graph, Shape};
+use rlx_ir::{DType, Graph, GraphExt, Op, Shape};
 
 fn main_block(model: &proto::Model) -> &proto::Block {
     let proto::model::Type::MlProgram(program) = model.r#type.as_ref().unwrap();
@@ -54,6 +54,88 @@ fn lowers_matmul_relu_chain() {
     assert!(lowered.model.specification_version >= 6);
 }
 
+/// Native DiT adaLN forward lowers to composed MIL (rsqrt + implicit broadcast),
+/// not the unfuse Expand-heavy primitive chain.
+#[test]
+fn ada_layer_norm_forward_lowers_to_native_kernel() {
+    use rlx_ir::op::AdaNormKind;
+    let (b, s, d) = (2usize, 3usize, 4usize);
+    let mut g = Graph::new("ada_fwd");
+    let x = g.input("x", Shape::new(&[b, s, d], DType::F32));
+    let scale = g.input("scale", Shape::new(&[b, 1, d], DType::F32));
+    let shift = g.input("shift", Shape::new(&[b, 1, d], DType::F32));
+    let out = g.ada_layer_norm(x, scale, shift, AdaNormKind::LayerNorm, 1e-5);
+    g.set_outputs(vec![out]);
+
+    let lowered = lower_graph(&g, &HashMap::new(), &Default::default()).expect("lower ada fwd");
+    let types = op_types(main_block(&lowered.model));
+    assert!(
+        types.iter().any(|t| t == "rsqrt"),
+        "expected LN inv_std rsqrt: {types:?}"
+    );
+    assert!(
+        types.iter().filter(|t| *t == "mul").count() >= 2,
+        "norm*scale + (1+scale): {types:?}"
+    );
+    assert!(
+        !types.contains(&"expand".to_string()),
+        "native kernel should not expand: {types:?}"
+    );
+    assert_eq!(lowered.outputs[0].dims, vec![b as i64, s as i64, d as i64]);
+}
+
+/// Native DiT adaLN (RMS) forward lowers without expand.
+#[test]
+fn ada_layer_norm_rms_forward_lowers_to_native_kernel() {
+    use rlx_ir::op::AdaNormKind;
+    let (b, s, d) = (2usize, 3usize, 4usize);
+    let mut g = Graph::new("ada_rms_fwd");
+    let x = g.input("x", Shape::new(&[b, s, d], DType::F32));
+    let scale = g.input("scale", Shape::new(&[b, 1, d], DType::F32));
+    let shift = g.input("shift", Shape::new(&[b, 1, d], DType::F32));
+    let out = g.ada_layer_norm(x, scale, shift, AdaNormKind::RmsNorm, 1e-5);
+    g.set_outputs(vec![out]);
+
+    let lowered = lower_graph(&g, &HashMap::new(), &Default::default()).expect("lower ada rms fwd");
+    let types = op_types(main_block(&lowered.model));
+    assert!(
+        types.iter().any(|t| t == "rsqrt"),
+        "expected RMS inv rsqrt: {types:?}"
+    );
+    assert!(
+        !types.contains(&"expand".to_string()),
+        "native kernel should not expand: {types:?}"
+    );
+}
+
+/// Native DiT gated residual forward lowers to mul + add, not expand.
+#[test]
+fn gated_residual_forward_lowers_to_native_kernel() {
+    let (b, s, d) = (2usize, 3usize, 4usize);
+    let mut g = Graph::new("gate_fwd");
+    let x = g.input("x", Shape::new(&[b, s, d], DType::F32));
+    let y = g.input("y", Shape::new(&[b, s, d], DType::F32));
+    let gate = g.input("gate", Shape::new(&[b, 1, d], DType::F32));
+    let out = g.gated_residual(x, y, gate);
+    g.set_outputs(vec![out]);
+
+    let lowered = lower_graph(&g, &HashMap::new(), &Default::default()).expect("lower gate fwd");
+    let types = op_types(main_block(&lowered.model));
+    assert!(
+        types.iter().any(|t| t == "mul"),
+        "expected gate*y mul: {types:?}"
+    );
+    assert!(
+        types.iter().any(|t| t == "add"),
+        "expected x+gate*y add: {types:?}"
+    );
+    assert!(
+        !types.contains(&"expand".to_string()),
+        "native kernel should not expand: {types:?}"
+    );
+    assert_eq!(lowered.outputs[0].dims, vec![b as i64, s as i64, d as i64]);
+}
+
 /// The native RMSNorm input-gradient kernel (training) lowers to a tight,
 /// broadcast-driven MIL graph — `rsqrt` + two `reduce_mean`s, no decomposition
 /// `expand`s — directly, without going through the autodiff decomposer.
@@ -94,6 +176,72 @@ fn rms_norm_backward_input_lowers_to_native_kernel() {
         "native kernel should not expand: {types:?}"
     );
     assert_eq!(lowered.outputs[0].dims, vec![rows as i64, h as i64]);
+}
+
+/// Native packed DiT adaLN reverse lowers to composed MIL (rsqrt + concat pack),
+/// not the autodiff Expand-heavy decomposition.
+#[cfg(feature = "training")]
+#[test]
+fn ada_layer_norm_backward_lowers_to_native_kernel() {
+    use rlx_ir::op::AdaNormKind;
+    let (b, s, d) = (2usize, 3usize, 4usize);
+    let mut g = Graph::new("ada_bwd");
+    let x = g.input("x", Shape::new(&[b, s, d], DType::F32));
+    let scale = g.input("scale", Shape::new(&[b, 1, d], DType::F32));
+    let shift = g.input("shift", Shape::new(&[b, 1, d], DType::F32));
+    let dy = g.input("dy", Shape::new(&[b, s, d], DType::F32));
+    let packed = g.ada_layer_norm_backward(x, scale, shift, dy, AdaNormKind::LayerNorm, 1e-5);
+    g.set_outputs(vec![packed]);
+
+    let lowered = lower_graph(&g, &HashMap::new(), &Default::default()).expect("lower ada bwd");
+    let types = op_types(main_block(&lowered.model));
+    assert!(
+        types.iter().any(|t| t == "rsqrt"),
+        "expected LN inv_std rsqrt: {types:?}"
+    );
+    assert!(
+        types.iter().any(|t| t == "concat"),
+        "expected packed concat: {types:?}"
+    );
+    assert!(
+        !types.contains(&"expand".to_string()),
+        "native kernel should not expand: {types:?}"
+    );
+    let nx = b * s * d;
+    let ns = b * d;
+    assert_eq!(lowered.outputs[0].dims, vec![(nx + 2 * ns) as i64]);
+}
+
+/// Native packed gated residual reverse lowers to mul + reduce_sum + concat.
+#[cfg(feature = "training")]
+#[test]
+fn gated_residual_backward_lowers_to_native_kernel() {
+    let (b, s, d) = (2usize, 3usize, 4usize);
+    let mut g = Graph::new("gate_bwd");
+    let x = g.input("x", Shape::new(&[b, s, d], DType::F32));
+    let y = g.input("y", Shape::new(&[b, s, d], DType::F32));
+    let gate = g.input("gate", Shape::new(&[b, 1, d], DType::F32));
+    let dy = g.input("dy", Shape::new(&[b, s, d], DType::F32));
+    let packed = g.gated_residual_backward(x, y, gate, dy);
+    g.set_outputs(vec![packed]);
+
+    let lowered = lower_graph(&g, &HashMap::new(), &Default::default()).expect("lower gate bwd");
+    let types = op_types(main_block(&lowered.model));
+    assert!(
+        types.iter().filter(|t| *t == "mul").count() >= 2,
+        "dy*gate + dy*y: {types:?}"
+    );
+    assert!(
+        types.iter().any(|t| t == "concat"),
+        "expected packed concat: {types:?}"
+    );
+    assert!(
+        !types.contains(&"expand".to_string()),
+        "native kernel should not expand: {types:?}"
+    );
+    let nx = b * s * d;
+    let ng = b * d;
+    assert_eq!(lowered.outputs[0].dims, vec![(nx + nx + ng) as i64]);
 }
 
 /// The native MaxPool2d-backward kernel lowers at real CNN scale — where the
@@ -478,6 +626,35 @@ fn oversize_model_is_an_explicit_error() {
         }
         other => panic!("expected TooLarge, got {other:?}"),
     }
+}
+
+#[test]
+fn lowers_onnx_scatter_nd() {
+    // data [2,3], indices [2,1] pointing at rows 0 and 1, updates [2,3].
+    let mut g = Graph::new("snd");
+    let data = g.input("data", Shape::new(&[2, 3], DType::F32));
+    let indices = g.input("indices", Shape::new(&[2, 1], DType::F32));
+    let updates = g.input("updates", Shape::new(&[2, 3], DType::F32));
+    let y = g.append_node(
+        Op::ScatterNd {
+            reduction: rlx_ir::ScatterNdReduction::None,
+        },
+        vec![data, indices, updates],
+        Shape::new(&[2, 3], DType::F32),
+        None,
+    );
+    g.set_outputs(vec![y]);
+
+    let lowered = lower_graph(&g, &HashMap::new(), &Default::default()).expect("lower");
+    let types = op_types(main_block(&lowered.model));
+    assert!(
+        types.iter().any(|t| t == "scatter_nd"),
+        "expected scatter_nd in {types:?}"
+    );
+    assert!(
+        types.iter().any(|t| t == "cast"),
+        "indices must cast to int32: {types:?}"
+    );
 }
 
 #[test]

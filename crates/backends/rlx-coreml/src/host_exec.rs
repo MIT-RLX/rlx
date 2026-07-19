@@ -13,23 +13,53 @@ use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use crate::op_registry::lookup_coreml_kernel;
 use crate::{CoremlError, Result};
 
+/// Custom ops that have a native MIL lowering (not host-segmented).
+fn mil_lowerable_custom(name: &str) -> bool {
+    matches!(name, "onnx.ScatterND")
+}
+
 /// Ops executed on the host between CoreML segments (not lowered to MIL).
 pub fn is_host_op(op: &Op) -> bool {
-    matches!(
-        op,
+    match op {
         Op::Fft { .. }
-            | Op::LogMel
-            | Op::Sample { .. }
-            | Op::RngNormal { .. }
-            | Op::RngUniform { .. }
-            | Op::WelchPeaks { .. }
-            | Op::Lstm { .. }
-            | Op::Gru { .. }
-            | Op::Rnn { .. }
-            | Op::Mamba2 { .. }
-            | Op::Scan { .. }
-            | Op::Custom { .. }
-    )
+        | Op::LogMel
+        | Op::Sample { .. }
+        | Op::RngNormal { .. }
+        | Op::RngUniform { .. }
+        | Op::WelchPeaks { .. }
+        // `carry = false` LSTM/GRU/RNN lower natively to MIL (`mil::rnn`);
+        // only the stateful decode-carry form stays on the host.
+        | Op::Lstm { carry: true, .. }
+        | Op::Gru { carry: true, .. }
+        | Op::Rnn { carry: true, .. }
+        | Op::Mamba2 { .. }
+        | Op::ScanBackward { .. }
+        | Op::ScanBackwardXs { .. }
+        | Op::ScatterElements { .. }
+        | Op::GatherNd { .. }
+        | Op::GatherElements { .. } => true,
+        // Native MIL `while_loop` lowering (default) keeps the scan ON-DEVICE —
+        // no host split, so the whole graph stays one CoreML model instead of
+        // `length`+1 separately-compiled segments (the SPD-eigensolver cost:
+        // tensorcspnet/coreml 88s→68s, spdnet 64s→0.2s). Native ONLY for the
+        // final-carry form whose body is itself fully MIL-lowerable (no nested
+        // host ops); the trajectory form, a host-op body, or
+        // `RLX_COREML_NATIVE_SCAN=0` all host-fall-back.
+        Op::Scan {
+            save_trajectory,
+            body,
+            ..
+        } => {
+            *save_trajectory
+                || std::env::var("RLX_COREML_NATIVE_SCAN").as_deref() == Ok("0")
+                || body.nodes().iter().any(|n| is_host_op(&n.op))
+        }
+        // Most `Op::Custom` stay host (ONNX reference kernels). ScatterND has a
+        // MIL `scatter_nd` path so F5-TTS Transformer does not hybridize into
+        // ~88 host segments (which breaks CoreML input declaration).
+        Op::Custom { name, .. } => !mil_lowerable_custom(name),
+        _ => false,
+    }
 }
 
 /// Run one host op; `env` maps producer `NodeId` → f32 tensor (row-major).
@@ -201,7 +231,45 @@ pub fn run_host_node(
             state_size,
         } => run_mamba2_f32(graph, node, env, *head_dim, *state_size),
         Op::Custom { name, attrs, .. } => run_custom_f32(graph, node, env, name, attrs),
-        Op::Scan { .. } => run_scan_f32(graph, node, env),
+        Op::Scan { .. } => {
+            for nid in &node.inputs {
+                if !env.contains_key(&nid.0) {
+                    return Err(CoremlError::Runtime(format!(
+                        "scan: missing value for v{}",
+                        nid.0
+                    )));
+                }
+            }
+            Ok(rlx_cpu::thunk::run_scan_node_f32(node, |nid| {
+                env.get(&nid.0).cloned().unwrap_or_default()
+            }))
+        }
+        Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => {
+            for nid in &node.inputs {
+                if !env.contains_key(&nid.0) {
+                    return Err(CoremlError::Runtime(format!(
+                        "ScanBackward: missing value for v{}",
+                        nid.0
+                    )));
+                }
+            }
+            Ok(rlx_cpu::thunk::run_host_op_node_f32(graph, node, |nid| {
+                env.get(&nid.0).cloned().unwrap_or_default()
+            }))
+        }
+        Op::ScatterElements { .. } | Op::GatherNd { .. } | Op::GatherElements { .. } => {
+            for nid in &node.inputs {
+                if !env.contains_key(&nid.0) {
+                    return Err(CoremlError::Runtime(format!(
+                        "indexing host op: missing value for v{}",
+                        nid.0
+                    )));
+                }
+            }
+            Ok(rlx_cpu::thunk::run_host_op_node_f32(graph, node, |nid| {
+                env.get(&nid.0).cloned().unwrap_or_default()
+            }))
+        }
         other => Err(CoremlError::Unsupported(format!(
             "host_exec: not a host op {:?}",
             other
@@ -399,79 +467,56 @@ fn multinomial(probs: &[f32], rng: &mut rlx_ir::Philox4x32) -> usize {
     probs.len().saturating_sub(1)
 }
 
-/// General `Op::Scan` on the host: compile the body once, lay the outer inputs
-/// out in a local byte arena, and run rlx-cpu's `execute_scan_host` (same
-/// reference kernels as the CPU backend). Enables IIR (`biquad`) between MIL
-/// segments.
-fn run_scan_f32(
-    _graph: &Graph,
-    node: &rlx_ir::Node,
-    env: &HashMap<u32, Vec<f32>>,
-) -> Result<Vec<f32>> {
-    let (body, length, save_trajectory, num_bcast, num_xs) = match &node.op {
-        Op::Scan {
-            body,
-            length,
-            save_trajectory,
-            num_bcast,
-            num_xs,
-            ..
-        } => (
-            body,
-            *length,
-            *save_trajectory,
-            *num_bcast as usize,
-            *num_xs as usize,
-        ),
-        _ => unreachable!("run_scan_f32 called on non-Scan op"),
-    };
-    let load = |nid: NodeId| -> Result<Vec<f32>> {
-        env.get(&nid.0)
-            .cloned()
-            .ok_or_else(|| CoremlError::Runtime(format!("scan: missing value for v{}", nid.0)))
-    };
-    let plan = rlx_cpu::thunk::compile_scan_body(body, num_bcast, num_xs);
-
-    let mut arena: Vec<u8> = Vec::new();
-    let init = load(node.inputs[0])?;
-    let init_off = arena.len();
-    arena.extend(init.iter().flat_map(|f| f.to_le_bytes()));
-
-    let mut bcast_outer: Vec<(usize, usize)> = Vec::with_capacity(num_bcast);
-    for i in 0..num_bcast {
-        let v = load(node.inputs[1 + i])?;
-        let off = arena.len();
-        arena.extend(v.iter().flat_map(|f| f.to_le_bytes()));
-        bcast_outer.push((off, v.len() * 4));
+/// Re-encode `n` f32 host values into the little-endian bytes of `dtype`.
+fn f32_to_dtype_bytes(f: &[f32], dtype: DType) -> Vec<u8> {
+    match dtype {
+        DType::F32 => f.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        DType::F64 => f.iter().flat_map(|&x| (x as f64).to_le_bytes()).collect(),
+        DType::I64 => f.iter().flat_map(|&x| (x as i64).to_le_bytes()).collect(),
+        DType::I32 => f.iter().flat_map(|&x| (x as i32).to_le_bytes()).collect(),
+        DType::I16 => f.iter().flat_map(|&x| (x as i16).to_le_bytes()).collect(),
+        DType::I8 => f.iter().map(|&x| x as i8 as u8).collect(),
+        DType::U32 => f.iter().flat_map(|&x| (x as u32).to_le_bytes()).collect(),
+        DType::U8 => f.iter().map(|&x| x as u8).collect(),
+        DType::Bool => f.iter().map(|&x| u8::from(x != 0.0)).collect(),
+        _ => f.iter().flat_map(|x| x.to_le_bytes()).collect(),
     }
-    let mut xs_outer: Vec<(usize, usize)> = Vec::with_capacity(num_xs);
-    for i in 0..num_xs {
-        let v = load(node.inputs[1 + num_bcast + i])?;
-        let total = v.len() * 4;
-        let off = arena.len();
-        arena.extend(v.iter().flat_map(|f| f.to_le_bytes()));
-        xs_outer.push((off, total / length as usize));
-    }
+}
 
-    let out_len = node.shape.num_elements().unwrap_or(0);
-    let final_off = arena.len();
-    arena.resize(final_off + out_len * 4, 0);
-    unsafe {
-        rlx_cpu::thunk::execute_scan_host(
-            arena.as_mut_ptr(),
-            &plan,
-            init_off,
-            final_off,
-            length,
-            save_trajectory,
-            &xs_outer,
-            &bcast_outer,
-        );
+/// Decode `dtype` little-endian bytes back to f32 host values.
+fn dtype_bytes_to_f32(b: &[u8], dtype: DType) -> Vec<f32> {
+    match dtype {
+        DType::F32 => b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
+        DType::F64 => b
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        DType::I64 => b
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        DType::I32 => b
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        DType::I16 => b
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        DType::I8 => b.iter().map(|&x| x as i8 as f32).collect(),
+        DType::U32 => b
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        DType::U8 | DType::Bool => b.iter().map(|&x| x as f32).collect(),
+        _ => b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
     }
-    Ok(arena[final_off..final_off + out_len * 4]
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect())
 }
 
 fn run_custom_f32(
@@ -481,37 +526,82 @@ fn run_custom_f32(
     name: &str,
     attrs: &[u8],
 ) -> Result<Vec<f32>> {
-    let kernel = lookup_coreml_kernel(name).ok_or_else(|| {
-        CoremlError::Runtime(format!(
-            "host_exec: no CoremlKernel registered for Op::Custom('{name}')"
-        ))
-    })?;
-
-    let mut in_bufs: Vec<(Vec<u8>, Shape)> = Vec::with_capacity(node.inputs.len());
+    // Gather each operand from the f32 `env`.
+    let mut in_f32: Vec<(Vec<f32>, Shape)> = Vec::with_capacity(node.inputs.len());
     for &inp in &node.inputs {
         let shape = graph.shape(inp).clone();
         let f32s = env
             .get(&inp.0)
             .ok_or_else(|| CoremlError::Runtime(format!("host_exec: missing input v{}", inp.0)))?;
-        let bytes: Vec<u8> = f32s.iter().flat_map(|f| f.to_le_bytes()).collect();
-        in_bufs.push((bytes, shape));
+        in_f32.push((f32s.clone(), shape));
     }
-    let in_refs: Vec<(&[u8], &Shape)> = in_bufs.iter().map(|(b, s)| (b.as_slice(), s)).collect();
     let out_shape = node.shape.clone();
-    let out_len = out_shape.num_elements().unwrap_or(0) * DType::F32.size_bytes();
-    let mut out_bytes = vec![0u8; out_len];
-    kernel
-        .execute(&in_refs, (&mut out_bytes, &out_shape), attrs)
-        .map_err(|e| CoremlError::Runtime(format!("Op::Custom('{name}'): {e}")))?;
-    if !out_bytes.len().is_multiple_of(4) {
+
+    // Prefer a registered CoreML-side kernel (f32 bytes in/out).
+    if let Some(kernel) = lookup_coreml_kernel(name) {
+        let in_bufs: Vec<(Vec<u8>, Shape)> = in_f32
+            .iter()
+            .map(|(f, s)| (f.iter().flat_map(|x| x.to_le_bytes()).collect(), s.clone()))
+            .collect();
+        let in_refs: Vec<(&[u8], &Shape)> =
+            in_bufs.iter().map(|(b, s)| (b.as_slice(), s)).collect();
+        let out_len = out_shape.num_elements().unwrap_or(0) * DType::F32.size_bytes();
+        let mut out_bytes = vec![0u8; out_len];
+        kernel
+            .execute(&in_refs, (&mut out_bytes, &out_shape), attrs)
+            .map_err(|e| CoremlError::Runtime(format!("Op::Custom('{name}'): {e}")))?;
+        return Ok(out_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect());
+    }
+
+    // Fall back to the rlx-cpu ONNX reference kernel (dtype-aware) — the same
+    // generic host-delegate the Metal/MLX/wgpu backends use. `env` is f32, so
+    // re-encode each operand to its declared dtype, run the kernel, cast back.
+    rlx_cpu::onnx_ref::register_onnx_reference_kernels();
+    if rlx_cpu::op_registry::lookup_cpu_kernel(name).is_none() {
         return Err(CoremlError::Runtime(format!(
-            "Op::Custom('{name}'): output not f32-aligned"
+            "host_exec: no CoremlKernel or rlx-cpu reference kernel for Op::Custom('{name}')"
         )));
     }
-    Ok(out_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    // The index operand of Gather/Scatter/OneHot must be I64 (the reference
+    // kernel `expect_i64`s it), but CoreML's `promote_int_to_f32` demoted it to
+    // F32 in the arena. Force those positions back to I64 (re-rounding the f32
+    // index values) so the host-delegate kernel sees the dtype it needs.
+    let idx_pos: Option<usize> = match name {
+        "onnx.GatherND" | "onnx.ScatterND" | "onnx.ScatterElements" | "onnx.GatherElements" => {
+            Some(1)
+        }
+        "onnx.OneHot" => Some(0),
+        _ => None,
+    };
+    let in_shapes: Vec<Shape> = in_f32
+        .iter()
+        .enumerate()
+        .map(|(i, (_, s))| {
+            if Some(i) == idx_pos {
+                s.clone().with_dtype(DType::I64)
+            } else {
+                s.clone()
+            }
+        })
+        .collect();
+    let in_bytes: Vec<Vec<u8>> = in_f32
+        .iter()
+        .zip(in_shapes.iter())
+        .map(|((f, _), s)| f32_to_dtype_bytes(f, s.dtype()))
+        .collect();
+    let in_pairs: Vec<(&[u8], &Shape)> = in_bytes
+        .iter()
+        .zip(in_shapes.iter())
+        .map(|(b, s)| (b.as_slice(), s))
+        .collect();
+    let out_n = out_shape.num_elements().unwrap_or(0);
+    let mut out = vec![0u8; out_n * out_shape.dtype().size_bytes()];
+    rlx_cpu::op_registry::run_custom_op_host(name, &in_pairs, (&mut out, &out_shape), attrs)
+        .map_err(|e| CoremlError::Runtime(format!("Op::Custom('{name}'): {e}")))?;
+    Ok(dtype_bytes_to_f32(&out, out_shape.dtype()))
 }
 
 #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
@@ -544,8 +634,26 @@ fn run_lstm_f32(
     let batch = in_shape.dim(rank - 3).unwrap_static();
     let seq = in_shape.dim(rank - 2).unwrap_static();
     let input_size = in_shape.dim(rank - 1).unwrap_static();
-    let _dirs = if bidirectional { 2 } else { 1 };
     let out_len = node.shape.num_elements().unwrap_or(0);
+    let ex = rlx_cpu::thunk::rnn_expected_lens(
+        4,
+        batch,
+        seq,
+        input_size,
+        hidden,
+        num_layers,
+        bidirectional,
+    );
+    rlx_cpu::thunk::check_rnn_lens(
+        "lstm",
+        &[
+            ("x", x.len(), ex.x),
+            ("w_ih", w_ih.len(), ex.w_ih),
+            ("w_hh", w_hh.len(), ex.w_hh),
+            ("bias", bias.len(), ex.bias),
+        ],
+    )
+    .map_err(CoremlError::Runtime)?;
     let mut arena: Vec<u8> = Vec::new();
     let mut push_f32 = |v: &[f32]| -> usize {
         let off = arena.len();
@@ -633,6 +741,26 @@ fn run_gru_f32(
     let seq = in_shape.dim(rank - 2).unwrap_static();
     let input_size = in_shape.dim(rank - 1).unwrap_static();
     let out_len = node.shape.num_elements().unwrap_or(0);
+    let ex = rlx_cpu::thunk::rnn_expected_lens(
+        3,
+        batch,
+        seq,
+        input_size,
+        hidden,
+        num_layers,
+        bidirectional,
+    );
+    rlx_cpu::thunk::check_rnn_lens(
+        "gru",
+        &[
+            ("x", x.len(), ex.x),
+            ("w_ih", w_ih.len(), ex.w_ih),
+            ("w_hh", w_hh.len(), ex.w_hh),
+            ("b_ih", b_ih.len(), ex.bias),
+            ("b_hh", b_hh.len(), ex.bias),
+        ],
+    )
+    .map_err(CoremlError::Runtime)?;
     let mut arena: Vec<u8> = Vec::new();
     let mut push_f32 = |v: &[f32]| -> usize {
         let off = arena.len();
@@ -720,6 +848,25 @@ fn run_rnn_f32(
     let seq = in_shape.dim(rank - 2).unwrap_static();
     let input_size = in_shape.dim(rank - 1).unwrap_static();
     let out_len = node.shape.num_elements().unwrap_or(0);
+    let ex = rlx_cpu::thunk::rnn_expected_lens(
+        1,
+        batch,
+        seq,
+        input_size,
+        hidden,
+        num_layers,
+        bidirectional,
+    );
+    rlx_cpu::thunk::check_rnn_lens(
+        "rnn",
+        &[
+            ("x", x.len(), ex.x),
+            ("w_ih", w_ih.len(), ex.w_ih),
+            ("w_hh", w_hh.len(), ex.w_hh),
+            ("bias", bias.len(), ex.bias),
+        ],
+    )
+    .map_err(CoremlError::Runtime)?;
     let mut arena: Vec<u8> = Vec::new();
     let mut push_f32 = |v: &[f32]| -> usize {
         let off = arena.len();

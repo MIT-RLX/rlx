@@ -77,7 +77,7 @@ extern "C" __global__ void fused_residual_ln(
     float sum_x2 = frl_block_sum(local_sum_sq, s, tid, bsz);
     float mean = sum_x * n_inv;
     float var = fmaxf(sum_x2 * n_inv - mean * mean, 0.0f);
-    float inv_std = rsqrtf(var + eps);
+    float inv_std = 1.0f / sqrtf(var + eps);
 
     // Phase 3: normalize, scale, shift.
     for (unsigned int i = tid; i < inner; i += bsz) {

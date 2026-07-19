@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use RLX in academic work, please cite it as below."
+title: "RLX: a small ML compiler and runtime for transformer inference and training"
+abstract: >-
+  RLX is an ML compiler and runtime with a JAX-shaped IR, autodiff (reverse and
+  forward mode), vmap, and per-backend peak kernels for CPU, Apple Silicon
+  (Metal / MLX / CoreML), NVIDIA (CUDA), AMD (ROCm), Google TPU, cross-platform
+  GPU (wgpu / Vulkan / oneAPI), Qualcomm Hexagon (QNN), microcontrollers
+  (Cortex-M), and FPGAs.
+type: software
+authors:
+  - family-names: Hauptmann
+    given-names: Eugene
+    affiliation: MIT
+  - family-names: Kosmyna
+    given-names: Nataliya
+    affiliation: MIT
+repository-code: "https://github.com/MIT-RLX/rlx"
+url: "https://github.com/MIT-RLX/rlx"
+license: GPL-3.0-only
+version: "0.2.13"
+date-released: "2026-07-18"
+keywords:
+  - machine learning
+  - compiler
+  - autodiff
+  - transformer inference
+  - quantization
+  - heterogeneous computing

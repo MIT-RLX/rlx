@@ -22,16 +22,16 @@ default = []
 training = []
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13" }
 # Host-side GGUF dequant fallback for the off-path quant schemes.
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13" }
 prost = "0.13"
 half = "2"
 bytemuck = { version = "1", features = ["derive"] }
 
 [target.'cfg(all(target_vendor = "apple", not(target_os = "watchos")))'.dependencies]
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.12", default-features = false }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.13", default-features = false }
 
 [build-dependencies]
 prost-build = "0.13"

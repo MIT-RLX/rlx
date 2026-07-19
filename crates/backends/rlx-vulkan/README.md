@@ -76,8 +76,12 @@ straight from the arena), `DequantGroupedMatMul`/`DequantMoEWeights`, and
 segments and flushes around each host op. These are correctness-complete and
 parity-validated; promoting the hot ones to native SPIR-V is a perf follow-up.
 
-Out of scope for a forward-inference backend: backward/training ops, int8-I/O
-`QMatMul`/`QConv2d`, and domain custom ops (Gaussian splat).
+Out of scope for a forward-inference kernel set: int8-I/O `QMatMul`/`QConv2d`,
+and domain custom ops (Gaussian splat). Packed DiT reverse
+(`AdaLayerNormBackward` / `GatedResidualBackward`) has dedicated SPIR-V shaders
+(`ada_layer_norm_backward.comp` / `gated_residual_backward.comp`); forward
+`AdaLayerNorm` / `GatedResidual` still claim-then-`unfuse_dit_modulation`. Host
+`Scan*` / SPD / Eigh backward stay as arena CPU fallbacks.
 
 ## Status
 
@@ -98,7 +102,7 @@ This validation caught two real bugs (push-constant array layout in the
 strided-copy kernel; a missing RMSNorm `beta` term), both fixed.
 
 **Not yet validated on a native Vulkan driver / real GPU** — that's the pending
-step on the RTX 4090 box. Kernels are also still naive (correctness first):
+step on the Linux CUDA rig. Kernels are also still naive (correctness first):
 shared-memory tiling, a device-local arena + staging, grid-stride dispatch, and
 promoting hot host-fallback ops (esp. `DequantMatMul`) to native SPIR-V are the
 perf follow-ups, best done there.

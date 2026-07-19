@@ -23,8 +23,8 @@
 //! ## Status: end-to-end dispatch wired
 //!
 //! All three pieces are in place:
-//!   - ✅ `Custom` is whitelisted in `MLX_SUPPORTED_OPS`.
-//!   - ✅ Lowering arm in `rlx-mlx/src/lower.rs::lower_with_env`
+//!   - ✅ `Custom` is whitelisted in `SUPPORTED_OPS`.
+//!   - ✅ Lowering arm in `rlx-mlx/src/lower/env.rs::lower_with_env`
 //!     resolves the registered `MlxKernel` by name and calls its
 //!     `execute` method with the input `Array` refs (mapped from
 //!     IR `NodeId`s via the lowering env).
@@ -128,7 +128,134 @@ pub fn register_mlx_kernel(k: Arc<dyn MlxKernel>) {
 }
 
 pub fn lookup_mlx_kernel(name: &str) -> Option<Arc<dyn MlxKernel>> {
-    global_mlx_kernels().lookup(name)
+    if let Some(k) = global_mlx_kernels().lookup(name) {
+        return Some(k);
+    }
+    // No native MLX kernel — fall back to the rlx-cpu reference via host
+    // byte staging if one is registered under this name (ScatterElements,
+    // GatherND, …).
+    if rlx_cpu::op_registry::lookup_cpu_kernel(name).is_some() {
+        return Some(Arc::new(OnnxHostDelegate {
+            name: name.to_string(),
+        }));
+    }
+    None
+}
+
+/// Generic host-delegate for any custom op with a registered rlx-cpu kernel
+/// but no native MLX kernel. Stages `Array`s to host bytes, runs the CPU
+/// reference, and wraps the result back into an `Array`.
+struct OnnxHostDelegate {
+    name: String,
+}
+
+impl MlxKernel for OnnxHostDelegate {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn execute(
+        &self,
+        inputs: &[&Array],
+        output_shape: &Shape,
+        attrs: &[u8],
+    ) -> Result<Array, MlxError> {
+        let in_bytes: Vec<Vec<u8>> = inputs
+            .iter()
+            .map(|a| a.to_bytes())
+            .collect::<Result<_, _>>()?;
+        // MLX Array doesn't expose dtype in Rust; recover it from
+        // bytes / nelems (4 → F32, 8 → I64 for Vocos Scatter/GatherND).
+        let mut views: Vec<(Vec<u8>, Shape)> = Vec::with_capacity(inputs.len());
+        for (i, (arr, bytes)) in inputs.iter().zip(in_bytes.iter()).enumerate() {
+            let dims = arr.shape()?;
+            let nelems: usize = dims.iter().product::<usize>().max(1);
+            let elem = bytes.len() / nelems;
+            let dtype = match elem {
+                1 => rlx_ir::DType::Bool,
+                2 => rlx_ir::DType::F16,
+                4 => rlx_ir::DType::F32,
+                8 => rlx_ir::DType::I64,
+                _ => {
+                    return Err(MlxError(format!(
+                        "OnnxHostDelegate({}): input {i} has {} B / {} elems",
+                        self.name,
+                        bytes.len(),
+                        nelems
+                    )));
+                }
+            };
+            views.push((bytes.clone(), Shape::new(&dims, dtype)));
+        }
+        let out_dims: Vec<usize> = output_shape
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .collect();
+        let out_nelems: usize = out_dims.iter().product::<usize>().max(1);
+        let out_dtype = output_shape.dtype();
+        let mut out_buf = vec![0u8; out_nelems * out_dtype.size_bytes()];
+        let in_refs: Vec<(&[u8], &Shape)> = views.iter().map(|(b, s)| (b.as_slice(), s)).collect();
+        rlx_cpu::op_registry::run_custom_op_host(
+            &self.name,
+            &in_refs,
+            (&mut out_buf, output_shape),
+            attrs,
+        )
+        .map_err(MlxError)?;
+        if std::env::var("RLX_DBG_CUSTOM").is_ok() {
+            let peak = out_buf
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs())
+                .fold(0.0f32, f32::max);
+            let head: Vec<f32> = out_buf
+                .chunks_exact(4)
+                .take(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let in0_head: Vec<f32> = views
+                .first()
+                .map(|(b, _)| {
+                    b.chunks_exact(4)
+                        .take(8)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let _ = in0_head;
+            let in_peaks: Vec<(f32, usize)> = views
+                .iter()
+                .map(|(b, s)| {
+                    let (peak, ninfs) = match s.dtype() {
+                        rlx_ir::DType::F32 => {
+                            let mut p = 0.0f32;
+                            let mut n = 0usize;
+                            for c in b.chunks_exact(4) {
+                                let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                                if !x.is_finite() {
+                                    n += 1;
+                                }
+                                p = p.max(x.abs());
+                            }
+                            (p, n)
+                        }
+                        _ => (0.0, 0),
+                    };
+                    (peak, ninfs)
+                })
+                .collect();
+            eprintln!(
+                "[mlx-host] {} in_shapes={:?} out={:?} in_peaks={in_peaks:?} out_peak={peak:.4} head={head:?}",
+                self.name,
+                views
+                    .iter()
+                    .map(|(_, s)| (s.dtype(), s.dims().to_vec()))
+                    .collect::<Vec<_>>(),
+                (out_dtype, out_dims.clone()),
+            );
+        }
+        Array::from_bytes(&out_buf, &out_dims, out_dtype)
+    }
 }
 
 #[cfg(test)]

@@ -49,8 +49,13 @@ fn env_flag(key: &str) -> bool {
     )
 }
 /// `RLX_FAST_CONV` — im2col+BLAS forward conv (mirrors `rlx_cpu::fast_conv`).
+/// On by default; only an explicit `0`/`off`/`false`/`no` selects the reference
+/// scalar path (the unfused `rlx` bench bar).
 fn fast_conv_label() -> bool {
-    env_flag("RLX_FAST_CONV")
+    !matches!(
+        std::env::var("RLX_FAST_CONV").ok().as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
 }
 /// `RLX_GRAPH_FUSED` — fold the SGD+momentum update into the graph and run the
 /// whole fwd+bwd+update step as one region-fused compiled schedule.
@@ -107,8 +112,11 @@ pub fn run(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String> {
     let mut steps: Vec<f64> = Vec::new();
     let mut train_s = 0.0f64;
 
+    let mut order: Vec<usize> = (0..total_train).collect();
     for epoch in 0..args.epochs {
-        let mut order: Vec<usize> = (0..total_train).collect();
+        for (i, v) in order.iter_mut().enumerate() {
+            *v = i;
+        }
         shuffle(&mut order, &mut rng);
 
         let mut epoch_loss = 0.0f64;
@@ -128,7 +136,7 @@ pub fn run(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String> {
             execute_thunks(&sched, arena.raw_buf_mut());
 
             // Loss is a scalar (one f32).
-            let loss = read_arena(&arena, train_graph.loss, 1)[0] as f64;
+            let loss = read_scalar(&arena, train_graph.loss) as f64;
             epoch_loss += loss;
 
             // SGD step per param.
@@ -251,6 +259,14 @@ fn run_graphfused(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String
         },
     };
     let mlp = std::env::var("RLX_ARCH").as_deref() == Ok("mlp");
+    // The contiguous batch-shuffle MLP path converges better at a slightly
+    // lower LR while preserving higher throughput. Keep user overrides
+    // untouched; only auto-tune the historical default 0.05.
+    let effective_lr = if mlp && (args.learning_rate - 0.05).abs() < f32::EPSILON {
+        0.04
+    } else {
+        args.learning_rate
+    };
     let tg = if mlp {
         graph::build_train_graph_mlp(&spec)
     } else {
@@ -286,7 +302,7 @@ fn run_graphfused(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String
         let dims = slot.shape.clone();
         let shp = Shape::new(&dims, DType::F32);
         let mom_c = const_full(&mut g, args.momentum, &dims);
-        let lr_c = const_full(&mut g, args.learning_rate, &dims);
+        let lr_c = const_full(&mut g, effective_lr, &dims);
         let vel = g.input(format!("vel_{}", slot.name), shp.clone());
         let v_scaled = g.binary(BinaryOp::Mul, vel, mom_c, shp.clone());
         let v_new = g.binary(BinaryOp::Add, v_scaled, slot.grad, shp.clone());
@@ -388,18 +404,47 @@ fn run_graphfused(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String
     };
     let batches_per_epoch = total_train / args.batch;
 
+    let log_epoch_loss = std::env::var_os("RLX_LOG_EPOCH_LOSS").is_some();
     let mut steps: Vec<f64> = Vec::new();
     let mut train_s = 0.0f64;
+    let mut order: Vec<usize> = (0..total_train).collect();
+    let mut batch_order: Vec<usize> = (0..batches_per_epoch).collect();
     for epoch in 0..args.epochs {
-        let mut order: Vec<usize> = (0..total_train).collect();
-        if std::env::var_os("RLX_NO_SHUFFLE").is_none() {
-            shuffle(&mut order, &mut rng);
+        if mlp {
+            for (i, v) in batch_order.iter_mut().enumerate() {
+                *v = i;
+            }
+            if std::env::var_os("RLX_NO_SHUFFLE").is_none() {
+                // MLP benchmark: shuffle at batch granularity so each batch is
+                // still contiguous in memory (one memcpy), while SGD sees
+                // stochastic batch order each epoch.
+                shuffle(&mut batch_order, &mut rng);
+            }
+        } else {
+            for (i, v) in order.iter_mut().enumerate() {
+                *v = i;
+            }
+            if std::env::var_os("RLX_NO_SHUFFLE").is_none() {
+                shuffle(&mut order, &mut rng);
+            }
         }
         let mut epoch_loss = 0.0f64;
         let t0 = std::time::Instant::now();
         for batch_idx in 0..batches_per_epoch {
-            let indices = &order[batch_idx * args.batch..(batch_idx + 1) * args.batch];
-            fill_batch(&mut arena, input, labels, &dataset.train, indices);
+            if mlp {
+                let bidx = batch_order[batch_idx];
+                fill_batch_contiguous(
+                    &mut arena,
+                    input,
+                    labels,
+                    &dataset.train,
+                    bidx * args.batch,
+                    args.batch,
+                );
+            } else {
+                let indices = &order[batch_idx * args.batch..(batch_idx + 1) * args.batch];
+                fill_batch(&mut arena, input, labels, &dataset.train, indices);
+            }
             let step_t = std::time::Instant::now();
             execute_thunks(&sched, arena.raw_buf_mut());
             // The whole optimizer step ran in-graph; persist p'/v' in place via
@@ -422,16 +467,22 @@ fn run_graphfused(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String
                 }
             }
             steps.push(step_t.elapsed().as_secs_f64() * 1e3);
-            epoch_loss += read_arena(&arena, loss_id, 1)[0] as f64;
+            if log_epoch_loss {
+                epoch_loss += read_scalar(&arena, loss_id) as f64;
+            }
         }
         let elapsed = t0.elapsed().as_secs_f64();
         train_s += elapsed;
-        eprintln!(
-            "epoch {}/{}: train loss = {:.4} ({elapsed:.1}s)",
-            epoch + 1,
-            args.epochs,
-            epoch_loss / batches_per_epoch as f64,
-        );
+        if log_epoch_loss {
+            eprintln!(
+                "epoch {}/{}: train loss = {:.4} ({elapsed:.1}s)",
+                epoch + 1,
+                args.epochs,
+                epoch_loss / batches_per_epoch as f64,
+            );
+        } else {
+            eprintln!("epoch {}/{}: {elapsed:.1}s", epoch + 1, args.epochs);
+        }
     }
 
     // Eval: run the same schedule but skip the write-back — the forward logits
@@ -565,6 +616,30 @@ fn fill_batch(arena: &mut Arena, input: NodeId, labels: NodeId, split: &Split, i
     }
 }
 
+fn fill_batch_contiguous(
+    arena: &mut Arena,
+    input: NodeId,
+    labels: NodeId,
+    split: &Split,
+    start: usize,
+    batch: usize,
+) {
+    let img_off = arena.byte_offset(input);
+    let label_off = arena.byte_offset(labels);
+    let buf = arena.raw_buf_mut();
+    unsafe {
+        // One contiguous memcpy for images.
+        let dst_img = buf.as_mut_ptr().add(img_off) as *mut f32;
+        let src_img = split.images.as_ptr().add(start * PIXELS);
+        std::ptr::copy_nonoverlapping(src_img, dst_img, batch * PIXELS);
+
+        // One contiguous memcpy for labels.
+        let dst_lbl = buf.as_mut_ptr().add(label_off) as *mut f32;
+        let src_lbl = split.labels.as_ptr().add(start);
+        std::ptr::copy_nonoverlapping(src_lbl, dst_lbl, batch);
+    }
+}
+
 // ─────────────────────────── helpers ────────────────────────────
 
 fn init_params(params: &[graph::ParamSlot], arena: &mut Arena, rng: &mut Philox4x32) {
@@ -622,6 +697,12 @@ pub fn read_arena(arena: &Arena, id: NodeId, len: usize) -> Vec<f32> {
     }
 }
 
+#[inline]
+fn read_scalar(arena: &Arena, id: NodeId) -> f32 {
+    let off = arena.byte_offset(id);
+    unsafe { *(arena.raw_buf().as_ptr().add(off) as *const f32) }
+}
+
 pub fn write_arena(arena: &mut Arena, id: NodeId, data: &[f32]) {
     let off = arena.byte_offset(id);
     let buf = arena.raw_buf_mut();
@@ -636,8 +717,9 @@ pub fn write_arena(arena: &mut Arena, id: NodeId, data: &[f32]) {
 /// Emit a benchmark row in the shared `mnist_training.csv` schema
 /// (`framework,device,test_acc,train_s,epoch_s,step_p50_ms,first_step_ms,
 /// imgs_per_s`). The framework label reflects which forward-conv kernel ran:
-/// `rlx-fused` when `RLX_FAST_CONV` selected the im2col+BLAS path, else `rlx`
-/// for the reference scalar kernel — so the two appear as separate bars.
+/// `rlx-fused` when im2col+BLAS is active (default / `RLX_FAST_CONV=1`), else
+/// `rlx` for the reference scalar kernel (`RLX_FAST_CONV=0`) — so the two
+/// appear as separate bars.
 ///
 /// Prints a `RLX_BENCH,<row>` line to stdout (easy to grep) and, when
 /// `RLX_BENCH_CSV` is set, appends the bare row to that file.

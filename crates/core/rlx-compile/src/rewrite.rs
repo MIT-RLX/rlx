@@ -18,7 +18,7 @@
 //! When [`legalize_for_backend`] fails, this module applies structural lowers
 //! and fused-op unfuse passes until the graph legalizes or no progress is made.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rlx_fusion::control_flow::{LowerControlFlow, LowerScan};
 use rlx_fusion::fusion::UnfuseElementwiseRegions;
@@ -28,11 +28,12 @@ use rlx_fusion::lower_fma::LowerFma;
 use rlx_fusion::lower_logical_kernels;
 use rlx_fusion::lower_loss_ops::LowerSoftmaxCrossEntropy;
 use rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
+use rlx_fusion::lower_spectral::LowerSpectral;
 use rlx_fusion::lower_vae_ops::{LowerBatchNormInference, LowerGroupNorm, LowerResizeNearest2x};
 use rlx_fusion::pass::Pass;
 use rlx_fusion::unfuse::unfuse_fused_for_autodiff;
 use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
-use rlx_ir::{Graph, Op, OpKind};
+use rlx_ir::{Graph, LowerContext, Node, NodeId, Op, OpKind, lookup_op};
 
 use crate::legalize::legalize_for_backend;
 
@@ -42,6 +43,7 @@ use crate::legalize::legalize_for_backend;
 // backend that lacks a native kernel (the op would hard-fail at legalization).
 const FUSED_KINDS: &[OpKind] = &[
     OpKind::FusedMatMulBiasAct,
+    OpKind::FusedConvBiasAct,
     OpKind::FusedSwiGLU,
     OpKind::FusedResidualLN,
     OpKind::FusedResidualRmsNorm,
@@ -55,6 +57,8 @@ const FUSED_KINDS: &[OpKind] = &[
     OpKind::SelectiveScan,
     OpKind::LoraMatMul,
     OpKind::PartitionedConv,
+    OpKind::AdaLayerNorm,
+    OpKind::GatedResidual,
 ];
 
 fn unsupported_kinds(graph: &Graph, supported: &[OpKind]) -> HashSet<OpKind> {
@@ -102,8 +106,72 @@ fn needs_backward_decompose(bad: &HashSet<OpKind>) -> bool {
                 | SoftmaxCrossEntropyBackward
                 | ReluBackward
                 | ActivationBackward
+                | ScanBackward
+                | ScanBackwardXs
+                | AdaLayerNormBackward
+                | GatedResidualBackward
         )
     })
+}
+
+/// Copy a node into `out`, preserving its debug `name` and `origin`.
+fn copy_node(out: &mut Graph, node: &Node, inputs: Vec<NodeId>) -> NodeId {
+    let id = out.add_node(node.op.clone(), inputs, node.shape.clone());
+    let n = out.node_mut(id);
+    n.name = node.name.clone();
+    n.origin = node.origin.clone();
+    id
+}
+
+/// Decompose registered custom ops that provide an
+/// [`OpExtension::lower`](rlx_ir::OpExtension::lower) rule into primitive
+/// subgraphs.
+///
+/// This is the middle extensibility tier for [`Op::Custom`]: an op with **no**
+/// `lower` override stays opaque and is executed by its per-backend kernel (see
+/// `rlx-cpu/src/op_registry.rs`); an op **with** a `lower` override becomes
+/// primitives here, so it fuses and runs on **every** backend with no kernel and
+/// no edit to the closed core `Op` enum. Registering `lower` is opt-in — an op
+/// that ships a hand-tuned native kernel simply doesn't implement it.
+///
+/// Rebuilds the graph node-by-node (the standard `HashMap<NodeId, NodeId>`
+/// remap); a no-op when the graph contains no custom ops. Runs early in the
+/// backend rewrite so the decomposition is visible to fusion.
+pub fn lower_custom_ops(graph: Graph) -> Graph {
+    if !graph
+        .nodes()
+        .iter()
+        .any(|n| matches!(n.op, Op::Custom { .. }))
+    {
+        return graph;
+    }
+    let mut out = Graph::new(&graph.name);
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in graph.nodes() {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_id = match &node.op {
+            Op::Custom { name, .. } => {
+                // `lower` emits the decomposition directly into `out` against the
+                // already-remapped inputs and returns its output node. `None`
+                // (the trait default, or a decline) keeps the op opaque.
+                let lowered = lookup_op(name).and_then(|ext| {
+                    let mut ctx = LowerContext {
+                        inputs: &new_inputs,
+                        out: &mut out,
+                    };
+                    ext.lower(node, &mut ctx)
+                });
+                match lowered {
+                    Some(id) => id,
+                    None => copy_node(&mut out, node, new_inputs),
+                }
+            }
+            _ => copy_node(&mut out, node, new_inputs),
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(graph.outputs.iter().map(|o| id_map[o]).collect());
+    out
 }
 
 /// Rewrite `graph` toward `supported` op kinds. Idempotent when already legal.
@@ -127,6 +195,20 @@ pub fn rewrite_for_backend_with_config(
     config: KernelDispatchConfig,
 ) -> Graph {
     graph = lower_logical_kernels(graph, supported, config);
+
+    // Lower f32 SPD spectral ops (ReEig/LogEig) to the graph-primitive Jacobi
+    // eigensolver on EVERY backend — a no-op unless an f32 spectral op is
+    // present. f64 nodes are left for the native LAPACK / host-fallback path, so
+    // this never regresses CPU or the f64 GPU host-fallback (see LowerSpectral).
+    // Runs before the `supported.is_empty()` early-out because an f32 SPD op has
+    // no native kernel anywhere and must always be decomposed.
+    graph = LowerSpectral.run(graph);
+
+    // Decompose registered custom ops that opt into a `lower` rule, on EVERY
+    // backend (including empty-supported codegen targets below) — a no-op unless
+    // the graph carries such an op. Runs before the `supported.is_empty()`
+    // early-out so decomposition reaches the standalone/codegen paths too.
+    graph = lower_custom_ops(graph);
 
     if supported.is_empty() {
         return graph;
@@ -167,6 +249,13 @@ pub fn rewrite_for_backend_with_config(
         }
         if bad.contains(&OpKind::If) || bad.contains(&OpKind::While) {
             graph = LowerControlFlow.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::ReEig) || bad.contains(&OpKind::LogEig) {
+            // A backend that doesn't even claim the f64 host-fallback for ReEig/
+            // LogEig: lower f32 nodes to the Jacobi eigensolver (f64 nodes remain
+            // and will surface as a clear legalize error — f64 SPD needs CPU).
+            graph = LowerSpectral.run(graph);
             changed = true;
         }
         if bad.contains(&OpKind::Scan) {
@@ -263,6 +352,67 @@ mod tests {
     use super::*;
     use rlx_ir::infer::GraphExt;
     use rlx_ir::*;
+
+    #[test]
+    fn lower_custom_op_decomposes_to_primitives_for_restricted_backend() {
+        use rlx_ir::op::BinaryOp;
+        use rlx_ir::{LowerContext, Node, NodeId, OpExtension, register_op};
+        use std::sync::Arc;
+
+        // A downstream-style custom op that opts into decomposition: `y = x + x`.
+        struct DoubleOp;
+        impl OpExtension for DoubleOp {
+            fn name(&self) -> &str {
+                "test_double_lower"
+            }
+            fn num_inputs(&self) -> usize {
+                1
+            }
+            fn infer_shape(&self, inputs: &[&Shape], _: &[u8]) -> Shape {
+                inputs[0].clone()
+            }
+            fn lower(&self, _node: &Node, ctx: &mut LowerContext) -> Option<NodeId> {
+                let x = ctx.inputs[0];
+                let shape = ctx.out.node(x).shape.clone();
+                Some(
+                    ctx.out
+                        .add_node(Op::Binary(BinaryOp::Add), vec![x, x], shape),
+                )
+            }
+        }
+        register_op(Arc::new(DoubleOp));
+
+        let f = DType::F32;
+        let mut g = Graph::new("cust");
+        let x = g.input("x", Shape::new(&[4], f));
+        let y = g.custom_op("test_double_lower", vec![], vec![x]);
+        g.set_outputs(vec![y]);
+
+        // A restricted backend that does NOT claim `Custom` — before lowering the
+        // graph is illegal for it; after, it decomposes to Input + Binary.
+        let prims = &[OpKind::Input, OpKind::Binary];
+        assert!(legalize_for_backend(&g, prims).is_err());
+
+        let lowered = rewrite_for_backend(g, prims);
+        assert!(
+            legalize_for_backend(&lowered, prims).is_ok(),
+            "custom op should legalize after lowering"
+        );
+        assert!(
+            !lowered
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Custom { .. })),
+            "the Op::Custom node must be gone"
+        );
+        assert!(
+            lowered
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Binary(BinaryOp::Add))),
+            "expected the decomposed Add primitive"
+        );
+    }
 
     #[test]
     fn rewrite_lowers_sce_for_cuda_primitives() {

@@ -5,11 +5,12 @@
 
 //! Cross-backend parity for `Op::FusedAttentionBlock`.
 //!
-//! Every backend now *claims* `OpKind::FusedAttentionBlock` (so the
-//! `FuseAttentionBlock` pass is a first-class op everywhere) and lowers it:
-//! CPU/MLX natively, everyone else by decomposing to the primitive chain
-//! (matmul → narrow → reshape/transpose → \[rope\] → attention → matmul).
-//! This test pins all paths to the same numbers.
+//! Every backend that claims `OpKind::FusedAttentionBlock` (so the
+//! `FuseAttentionBlock` pass is first-class) and lowers it: CPU/MLX natively,
+//! everyone else by decomposing to the primitive chain (matmul → narrow →
+//! reshape/transpose → \[rope\] → attention → matmul). This test pins all
+//! paths to the same numbers. QNN (`Device::Hexagon`) is included — it claims
+//! FAB and runs `unfuse_attention_block` before the FFI lower.
 //!
 //! ## Mask convention
 //!
@@ -289,7 +290,7 @@ fn fab_rocm_parity() {
 }
 
 #[test]
-#[cfg(feature = "tpu")]
-fn fab_tpu_parity() {
-    fab_suite(Device::Tpu, 1e-2, "tpu");
+#[cfg(feature = "qnn")]
+fn fab_qnn_parity() {
+    fab_suite(Device::Hexagon, 1e-2, "qnn");
 }

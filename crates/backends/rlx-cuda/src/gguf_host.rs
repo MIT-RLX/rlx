@@ -12,123 +12,18 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 //! Host-side GGUF K-quant `Op::DequantMatMul` for CUDA device arenas.
 //!
-//! CUDA's f32 arena stores packed U8 weights inline (first `N` bytes of
-//! each param slot). This module D2H → `rlx_cpu::gguf_matmul` → H2D when
-//! the GPU `dequant_gguf` path is unavailable.
-//!
-//! Scheme ids for the GPU kernel are shared with Metal/ROCm/WGPU — see
-//! [`gguf_scheme_id`] and [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
+//! Thin adapter over [`rlx_gpu_host`]. Scheme ids for the GPU kernel are shared
+//! with Metal/ROCm/WGPU — see [`gguf_scheme_id`] and
+//! [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 
+use crate::host_stage::CudaArena;
 use cudarc::driver::{CudaSlice, CudaStream};
-use rlx_ir::quant::QuantScheme;
 use std::sync::Arc;
 
-/// Maps [`QuantScheme`] to the shared GPU `dequant_gguf` kernel scheme id (0–23).
-///
-/// Legacy tail: Q4_0 = 19, Q8_0 = 20, Q4_1 = 21. Table:
-/// [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
-pub fn gguf_scheme_id(scheme: QuantScheme) -> u32 {
-    match scheme {
-        QuantScheme::GgufQ4K => 0,
-        QuantScheme::GgufQ5K => 1,
-        QuantScheme::GgufQ6K => 2,
-        QuantScheme::GgufQ8K => 3,
-        QuantScheme::GgufQ2K => 4,
-        QuantScheme::GgufQ3K => 5,
-        QuantScheme::GgufIQ4NL => 6,
-        QuantScheme::GgufIQ4XS => 7,
-        QuantScheme::GgufTQ1_0 => 8,
-        QuantScheme::GgufTQ2_0 => 9,
-        QuantScheme::GgufMXFP4 => 10,
-        QuantScheme::GgufNVFP4 => 11,
-        QuantScheme::GgufIQ2XXS => 12,
-        QuantScheme::GgufIQ2XS => 13,
-        QuantScheme::GgufIQ2S => 14,
-        QuantScheme::GgufIQ3XXS => 15,
-        QuantScheme::GgufIQ3S => 16,
-        QuantScheme::GgufIQ1S => 17,
-        QuantScheme::GgufIQ1M => 18,
-        QuantScheme::GgufQ4_0 => 19,
-        QuantScheme::GgufQ8_0 => 20,
-        QuantScheme::GgufQ4_1 => 21,
-        QuantScheme::GgufQ5_0 => 22,
-        QuantScheme::GgufQ5_1 => 23,
-        other => panic!("rlx-cuda gguf_host: unsupported scheme {other:?}"),
-    }
-}
-
-pub fn scheme_from_id(scheme_id: u32) -> QuantScheme {
-    match scheme_id {
-        0 => QuantScheme::GgufQ4K,
-        1 => QuantScheme::GgufQ5K,
-        2 => QuantScheme::GgufQ6K,
-        3 => QuantScheme::GgufQ8K,
-        4 => QuantScheme::GgufQ2K,
-        5 => QuantScheme::GgufQ3K,
-        6 => QuantScheme::GgufIQ4NL,
-        7 => QuantScheme::GgufIQ4XS,
-        8 => QuantScheme::GgufTQ1_0,
-        9 => QuantScheme::GgufTQ2_0,
-        10 => QuantScheme::GgufMXFP4,
-        11 => QuantScheme::GgufNVFP4,
-        12 => QuantScheme::GgufIQ2XXS,
-        13 => QuantScheme::GgufIQ2XS,
-        14 => QuantScheme::GgufIQ2S,
-        15 => QuantScheme::GgufIQ3XXS,
-        16 => QuantScheme::GgufIQ3S,
-        17 => QuantScheme::GgufIQ1S,
-        18 => QuantScheme::GgufIQ1M,
-        19 => QuantScheme::GgufQ4_0,
-        20 => QuantScheme::GgufQ8_0,
-        21 => QuantScheme::GgufQ4_1,
-        22 => QuantScheme::GgufQ5_0,
-        23 => QuantScheme::GgufQ5_1,
-        _ => panic!("rlx-cuda gguf_host: bad scheme_id {scheme_id}"),
-    }
-}
-
-fn dtoh_bytes(
-    stream: &Arc<CudaStream>,
-    buffer: &CudaSlice<f32>,
-    byte_off: usize,
-    len: usize,
-) -> Vec<u8> {
-    let start_f32 = byte_off / 4;
-    let end_byte = byte_off + len;
-    let end_f32 = end_byte.div_ceil(4);
-    let mut words = vec![0f32; end_f32 - start_f32];
-    stream
-        .memcpy_dtoh(&buffer.slice(start_f32..end_f32), &mut words)
-        .expect("rlx-cuda: gguf dtoh failed");
-    let mut raw = vec![0u8; words.len() * 4];
-    for (i, w) in words.iter().enumerate() {
-        raw[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
-    }
-    raw[byte_off % 4..byte_off % 4 + len].to_vec()
-}
-
-fn htod_bytes(stream: &Arc<CudaStream>, buffer: &mut CudaSlice<f32>, byte_off: usize, data: &[u8]) {
-    let start_f32 = byte_off / 4;
-    let end_byte = byte_off + data.len();
-    let end_f32 = end_byte.div_ceil(4);
-    let mut words = vec![0f32; end_f32 - start_f32];
-    stream
-        .memcpy_dtoh(&buffer.slice(start_f32..end_f32), &mut words)
-        .expect("rlx-cuda: gguf htod staging dtoh failed");
-    let mut raw = vec![0u8; words.len() * 4];
-    for (i, w) in words.iter().enumerate() {
-        raw[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
-    }
-    raw[byte_off % 4..byte_off % 4 + data.len()].copy_from_slice(data);
-    for (i, chunk) in raw.chunks_exact(4).enumerate() {
-        words[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-    }
-    stream
-        .memcpy_htod(&words, &mut buffer.slice_mut(start_f32..end_f32))
-        .expect("rlx-cuda: gguf htod failed");
-}
+pub use rlx_gpu_host::{gguf_scheme_id, scheme_from_id};
 
 /// Fused GGUF dequant matmul on the host; syncs the stream around D2H/H2D.
 pub fn run_dequant_matmul_gguf(
@@ -142,33 +37,21 @@ pub fn run_dequant_matmul_gguf(
     w_byte_off: usize,
     out_byte_off: usize,
 ) {
-    let scheme = scheme_from_id(scheme_id);
-    let block_bytes = scheme.gguf_block_bytes() as usize;
-    let block_elems = scheme.gguf_block_size() as usize;
-    let total_bytes = (k * n) / block_elems * block_bytes;
-
-    stream
-        .synchronize()
-        .expect("rlx-cuda: gguf pre-sync failed");
-
-    let x_f32_off = x_byte_off / 4;
-    let mut x_host = vec![0f32; m * k];
-    stream
-        .memcpy_dtoh(&buffer.slice(x_f32_off..x_f32_off + m * k), &mut x_host)
-        .expect("rlx-cuda: gguf x dtoh failed");
-
-    let w_host = dtoh_bytes(stream, buffer, w_byte_off, total_bytes);
-
-    let mut out_host = vec![0f32; m * n];
-    rlx_cpu::gguf_matmul::gguf_matmul_bt(&x_host, &w_host, &mut out_host, m, k, n, scheme);
-
-    let out_f32_off = out_byte_off / 4;
-    stream
-        .memcpy_htod(
-            &out_host,
-            &mut buffer.slice_mut(out_f32_off..out_f32_off + m * n),
-        )
-        .expect("rlx-cuda: gguf out htod failed");
+    let mut arena = CudaArena {
+        stream,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_dequant_matmul_gguf(
+        &mut arena,
+        m,
+        k,
+        n,
+        scheme_id,
+        x_byte_off,
+        w_byte_off,
+        out_byte_off,
+    );
 }
 
 /// Fused GGUF dequant grouped matmul on the host (MoE expert stacks).
@@ -185,50 +68,23 @@ pub fn run_dequant_grouped_matmul_gguf(
     idx_byte_off: usize,
     out_byte_off: usize,
 ) {
-    let scheme = scheme_from_id(scheme_id);
-    let block_bytes = scheme.gguf_block_bytes() as usize;
-    let block_elems = scheme.gguf_block_size() as usize;
-    let slab_bytes = (k * n) / block_elems * block_bytes;
-    let total_bytes = num_experts * slab_bytes;
-
-    stream
-        .synchronize()
-        .expect("rlx-cuda: grouped gguf pre-sync failed");
-
-    let x_f32_off = x_byte_off / 4;
-    let mut x_host = vec![0f32; m * k];
-    stream
-        .memcpy_dtoh(&buffer.slice(x_f32_off..x_f32_off + m * k), &mut x_host)
-        .expect("rlx-cuda: grouped gguf x dtoh failed");
-
-    let w_host = dtoh_bytes(stream, buffer, w_byte_off, total_bytes);
-
-    let idx_f32_off = idx_byte_off / 4;
-    let mut idx_host = vec![0f32; m];
-    stream
-        .memcpy_dtoh(&buffer.slice(idx_f32_off..idx_f32_off + m), &mut idx_host)
-        .expect("rlx-cuda: grouped gguf idx dtoh failed");
-
-    let mut out_host = vec![0f32; m * n];
-    rlx_cpu::gguf_matmul::gguf_grouped_matmul_bt(
-        &x_host,
-        &w_host,
-        &idx_host,
-        &mut out_host,
+    let mut arena = CudaArena {
+        stream,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_dequant_grouped_matmul_gguf(
+        &mut arena,
         m,
         k,
         n,
         num_experts,
-        scheme,
+        scheme_id,
+        x_byte_off,
+        w_byte_off,
+        idx_byte_off,
+        out_byte_off,
     );
-
-    let out_f32_off = out_byte_off / 4;
-    stream
-        .memcpy_htod(
-            &out_host,
-            &mut buffer.slice_mut(out_f32_off..out_f32_off + m * n),
-        )
-        .expect("rlx-cuda: grouped gguf out htod failed");
 }
 
 /// Upload raw U8 param bytes into the f32 arena slot at `byte_off`.
@@ -238,5 +94,10 @@ pub fn upload_param_bytes(
     byte_off: usize,
     data: &[u8],
 ) {
-    htod_bytes(stream, buffer, byte_off, data);
+    let mut arena = CudaArena {
+        stream,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::upload_param_bytes(&mut arena, byte_off, data);
 }

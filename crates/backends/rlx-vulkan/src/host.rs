@@ -12,12 +12,15 @@
 //! Because the Vulkan arena is HOST_VISIBLE + mapped, the executor reads the
 //! op's inputs straight out of the arena and writes the result straight back —
 //! no device↔host staging. The cost is one queue flush around the op.
+//!
+//! The Vulkan arena is **f32-uniform**: integer / bool tensors are stored as
+//! `f32`-encoded values (one f32 word per element). The CPU arena uses native
+//! dtype widths, so this module converts at the boundary.
 
 use rlx_ir::{DType, Graph, Op, Shape};
 
-/// One host-fallback input: f32 activations, or raw bytes for a packed quant
-/// weight (U8/I8 operands such as the GGUF weight of `Op::DequantMatMul` or the
-/// packed codes / block scales of `Op::ScaledMatMul`).
+/// One host-fallback input: f32 activations (including f32-encoded ints from
+/// the Vulkan arena), or raw bytes for a packed quant weight (U8/I8).
 pub enum HostBuf {
     F32(Vec<f32>),
     Bytes(Vec<u8>),
@@ -31,8 +34,188 @@ pub enum HostOut {
     Bytes(Vec<u8>),
 }
 
-/// Run a single op on the CPU reference and return its output in its native
-/// dtype. `inputs[i]` is `(declared_shape, buffer)` read from the arena.
+/// Pack f32-encoded arena values into the CPU arena's native dtype bytes.
+fn write_f32_encoded_as_native(raw: &mut [u8], off: usize, dtype: DType, vals: &[f32]) {
+    match dtype {
+        DType::F32 | DType::C64 => {
+            for (i, &v) in vals.iter().enumerate() {
+                let b = v.to_le_bytes();
+                let dst = off + i * 4;
+                if dst + 4 <= raw.len() {
+                    raw[dst..dst + 4].copy_from_slice(&b);
+                }
+            }
+        }
+        DType::F64 => {
+            for (i, &v) in vals.iter().enumerate() {
+                let b = (v as f64).to_le_bytes();
+                let dst = off + i * 8;
+                if dst + 8 <= raw.len() {
+                    raw[dst..dst + 8].copy_from_slice(&b);
+                }
+            }
+        }
+        DType::I64 => {
+            for (i, &v) in vals.iter().enumerate() {
+                let b = (v as i64).to_le_bytes();
+                let dst = off + i * 8;
+                if dst + 8 <= raw.len() {
+                    raw[dst..dst + 8].copy_from_slice(&b);
+                }
+            }
+        }
+        DType::I32 | DType::U32 => {
+            for (i, &v) in vals.iter().enumerate() {
+                let b = (v as i32).to_le_bytes();
+                let dst = off + i * 4;
+                if dst + 4 <= raw.len() {
+                    raw[dst..dst + 4].copy_from_slice(&b);
+                }
+            }
+        }
+        DType::I16 => {
+            for (i, &v) in vals.iter().enumerate() {
+                let b = (v as i16).to_le_bytes();
+                let dst = off + i * 2;
+                if dst + 2 <= raw.len() {
+                    raw[dst..dst + 2].copy_from_slice(&b);
+                }
+            }
+        }
+        DType::I8 => {
+            for (i, &v) in vals.iter().enumerate() {
+                let dst = off + i;
+                if dst < raw.len() {
+                    raw[dst] = v as i8 as u8;
+                }
+            }
+        }
+        DType::U8 | DType::Bool => {
+            for (i, &v) in vals.iter().enumerate() {
+                let dst = off + i;
+                if dst < raw.len() {
+                    raw[dst] = v as u8;
+                }
+            }
+        }
+        DType::F16 => {
+            for (i, &v) in vals.iter().enumerate() {
+                let b = half::f16::from_f32(v).to_le_bytes();
+                let dst = off + i * 2;
+                if dst + 2 <= raw.len() {
+                    raw[dst..dst + 2].copy_from_slice(&b);
+                }
+            }
+        }
+        DType::BF16 => {
+            for (i, &v) in vals.iter().enumerate() {
+                let b = half::bf16::from_f32(v).to_le_bytes();
+                let dst = off + i * 2;
+                if dst + 2 <= raw.len() {
+                    raw[dst..dst + 2].copy_from_slice(&b);
+                }
+            }
+        }
+    }
+}
+
+/// Unpack CPU-native bytes into f32-encoded values for the Vulkan arena.
+fn read_native_as_f32_encoded(raw: &[u8], off: usize, dtype: DType, n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    match dtype {
+        DType::F32 | DType::C64 => {
+            for i in 0..n {
+                let s = off + i * 4;
+                if s + 4 > raw.len() {
+                    break;
+                }
+                out.push(f32::from_le_bytes([
+                    raw[s],
+                    raw[s + 1],
+                    raw[s + 2],
+                    raw[s + 3],
+                ]));
+            }
+        }
+        DType::F64 => {
+            for i in 0..n {
+                let s = off + i * 8;
+                if s + 8 > raw.len() {
+                    break;
+                }
+                let v = f64::from_le_bytes(raw[s..s + 8].try_into().unwrap());
+                out.push(v as f32);
+            }
+        }
+        DType::I64 => {
+            for i in 0..n {
+                let s = off + i * 8;
+                if s + 8 > raw.len() {
+                    break;
+                }
+                let v = i64::from_le_bytes(raw[s..s + 8].try_into().unwrap());
+                out.push(v as f32);
+            }
+        }
+        DType::I32 | DType::U32 => {
+            for i in 0..n {
+                let s = off + i * 4;
+                if s + 4 > raw.len() {
+                    break;
+                }
+                let v = i32::from_le_bytes([raw[s], raw[s + 1], raw[s + 2], raw[s + 3]]);
+                out.push(v as f32);
+            }
+        }
+        DType::I16 => {
+            for i in 0..n {
+                let s = off + i * 2;
+                if s + 2 > raw.len() {
+                    break;
+                }
+                out.push(i16::from_le_bytes([raw[s], raw[s + 1]]) as f32);
+            }
+        }
+        DType::I8 => {
+            for i in 0..n {
+                if off + i >= raw.len() {
+                    break;
+                }
+                out.push(raw[off + i] as i8 as f32);
+            }
+        }
+        DType::U8 | DType::Bool => {
+            for i in 0..n {
+                if off + i >= raw.len() {
+                    break;
+                }
+                out.push(raw[off + i] as f32);
+            }
+        }
+        DType::F16 => {
+            for i in 0..n {
+                let s = off + i * 2;
+                if s + 2 > raw.len() {
+                    break;
+                }
+                out.push(half::f16::from_le_bytes([raw[s], raw[s + 1]]).to_f32());
+            }
+        }
+        DType::BF16 => {
+            for i in 0..n {
+                let s = off + i * 2;
+                if s + 2 > raw.len() {
+                    break;
+                }
+                out.push(half::bf16::from_le_bytes([raw[s], raw[s + 1]]).to_f32());
+            }
+        }
+    }
+    out
+}
+
+/// Run a single op on the CPU reference and return its output as f32-encoded
+/// values (or raw bytes for U8/I8 packed outputs) for the Vulkan arena.
 pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut {
     let mut g = Graph::new("vk_host_fallback");
     let ids: Vec<rlx_ir::NodeId> = inputs
@@ -55,12 +238,11 @@ pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut 
     let plan = rlx_compile::memory::plan_memory_aligned(&g, 16);
     let mut arena = rlx_cpu::arena::Arena::from_plan(plan);
 
-    for (i, (_, buf)) in inputs.iter().enumerate() {
+    for (i, (sh, buf)) in inputs.iter().enumerate() {
         match buf {
             HostBuf::F32(vals) => {
-                let slot = arena.slice_mut(ids[i]);
-                let n = slot.len().min(vals.len());
-                slot[..n].copy_from_slice(&vals[..n]);
+                let off = arena.byte_offset(ids[i]);
+                write_f32_encoded_as_native(arena.raw_buf_mut(), off, sh.dtype(), vals);
             }
             HostBuf::Bytes(bytes) => {
                 let off = arena.byte_offset(ids[i]);
@@ -81,8 +263,13 @@ pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut 
         DType::U8 | DType::I8 => {
             let nbytes = n * out_shape.dtype().size_bytes();
             let off = arena.byte_offset(out);
+            let avail = arena.raw_buf().len().saturating_sub(off);
+            let nbytes = nbytes.min(avail);
             HostOut::Bytes(arena.raw_buf()[off..off + nbytes].to_vec())
         }
-        _ => HostOut::F32(arena.slice_mut(out)[..n].to_vec()),
+        dt => {
+            let off = arena.byte_offset(out);
+            HostOut::F32(read_native_as_f32_encoded(arena.raw_buf(), off, dt, n))
+        }
     }
 }

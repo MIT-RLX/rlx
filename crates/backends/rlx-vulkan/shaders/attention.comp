@@ -7,7 +7,6 @@
 //            4 bias (additive per b,h,q,k). q_offset = k_s - q_s (KV-cache).
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 const uint MAX_DH = 256u;
 
@@ -70,10 +69,10 @@ void main() {
             uint lo = (abs_q > pc.window) ? (abs_q - pc.window) : 0u;
             masked = (ki < lo) || (ki > abs_q);
         } else if (pc.mask_kind == 3u) {          // custom (per b,k)
-            masked = data[pc.mask_off + bi * pc.k_s + ki] < pc.thr;
+            masked = arena_load(pc.mask_off + bi * pc.k_s + ki) < pc.thr;
         } else if (pc.mask_kind == 4u) {          // additive bias (per b,h,q,k)
             uint per_bh = pc.q_s * pc.k_s;
-            bias = data[pc.mask_off + (bi * pc.nh + hi) * per_bh + qi * pc.k_s + ki];
+            bias = arena_load(pc.mask_off + (bi * pc.nh + hi) * per_bh + qi * pc.k_s + ki);
         }
 
         uint k_base;
@@ -92,7 +91,7 @@ void main() {
         } else {
             float dot = 0.0;
             for (uint d = 0u; d < pc.dh; d++) {
-                dot += data[q_base + d] * data[k_base + d];
+                dot += arena_load(q_base + d) * arena_load(k_base + d);
             }
             score = dot * pc.scale + bias;
         }
@@ -103,13 +102,13 @@ void main() {
         float p = exp(score - m_new);
         l = l * corr + p;
         for (uint d = 0u; d < pc.dh; d++) {
-            acc[d] = acc[d] * corr + p * data[v_base + d];
+            acc[d] = acc[d] * corr + p * arena_load(v_base + d);
         }
         m = m_new;
     }
 
     float inv = (l > 0.0) ? (1.0 / l) : 0.0;
     for (uint d = 0u; d < pc.dh; d++) {
-        data[o_base + d] = acc[d] * inv;
+        arena_store(o_base + d, acc[d] * inv);
     }
 }

@@ -32,6 +32,10 @@
 //! - `lower`   — rlx-ir Graph → MLX op chain
 //! - `backend` — `MlxExecutable` (set_param / run / handles)
 
+/// Legalization op claim — always available (no MLX host required).
+pub mod supported_ops;
+pub use supported_ops::SUPPORTED_OPS;
+
 #[cfg(rlx_mlx_host)]
 pub(crate) mod ffi {
     pub use rlx_mlx_sys::ffi::*;
@@ -72,6 +76,9 @@ pub mod splat;
 
 #[cfg(rlx_mlx_host)]
 pub mod batched_lu_kernel;
+
+#[cfg(rlx_mlx_host)]
+pub mod dequant_q1_0;
 
 #[cfg(rlx_mlx_host)]
 pub mod llada2_gate;

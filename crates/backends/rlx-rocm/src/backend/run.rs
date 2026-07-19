@@ -56,6 +56,16 @@ impl RocmExecutable {
         self.pending_read_indices = read_indices.map(|s| s.to_vec());
         let outs = self.run_inner(inputs);
         self.pending_read_indices = None;
+        // NaN/Inf output-boundary scan (RLX_DEBUG_NANS). ROCm runs op-by-op on
+        // the device; per-op D2H would perturb timing, so we scan the outputs
+        // here (when reading all of them, where they align with graph.outputs).
+        // For internal localization replay the same graph on the CPU backend.
+        let scanner = rlx_ir::numeric_check::DebugScanner::from_env("rocm");
+        if scanner.enabled() && read_indices.is_none() {
+            for (buf, &id) in outs.iter().zip(self.graph.outputs.iter()) {
+                scanner.check(&self.graph, id, buf, &[]);
+            }
+        }
         outs
     }
 
@@ -218,6 +228,49 @@ impl RocmExecutable {
                         (grid, 1, 1),
                         (block, 1, 1),
                         [&mut arena_ptr, &n_s, a_off, b_off, c_off, op]
+                    );
+                }
+                Step::RocmGpuKernel {
+                    name,
+                    out_off,
+                    out_len,
+                    in_offs,
+                } => {
+                    // Raw-GPU custom op: hipRTC-compile (cached) + launch against
+                    // the whole arena. Offsets are scalar args (copied into the
+                    // launch params at enqueue, so no async lifetime hazard).
+                    let gk = crate::rocm_gpu_kernels::lookup(name)
+                        .expect("RocmGpuKernel vanished from the registry between compile and run");
+                    let gpu_kernel = crate::rocm_gpu_kernels::get_or_build(&self.ctx, &*gk);
+                    let bs = gk.block_size();
+                    let (grid, block) = dispatch_grid_1d(*out_len, bs);
+                    // Pad (off,len) to MAX_INPUTS with (0,0); `n_inputs` says how
+                    // many are real. Matches the fixed 12-arg kernel signature.
+                    let n_inputs = in_offs.len() as u32;
+                    let mut io = [0u32; crate::rocm_gpu_kernels::MAX_INPUTS * 2];
+                    for (i, (o, l)) in in_offs.iter().enumerate() {
+                        io[i * 2] = *o;
+                        io[i * 2 + 1] = *l;
+                    }
+                    crate::launch_kernel!(
+                        gpu_kernel.as_ref(),
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            out_off,
+                            out_len,
+                            &n_inputs,
+                            &io[0],
+                            &io[1],
+                            &io[2],
+                            &io[3],
+                            &io[4],
+                            &io[5],
+                            &io[6],
+                            &io[7]
+                        ]
                     );
                 }
                 Step::Compare {
@@ -493,6 +546,141 @@ impl RocmExecutable {
                             out_off,
                             eps_bits,
                             has_bias
+                        ]
+                    );
+                }
+                Step::AdaLayerNorm {
+                    outer,
+                    inner,
+                    in_off,
+                    scale_off,
+                    shift_off,
+                    out_off,
+                    eps_bits,
+                    layer_norm,
+                    meta_idx,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = ada_layer_norm_kernel(&self.ctx);
+                    let mut meta_ptr = self.meta_buffers[*meta_idx].ptr;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (outer_s, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &outer_s,
+                            inner,
+                            in_off,
+                            scale_off,
+                            shift_off,
+                            out_off,
+                            eps_bits,
+                            layer_norm,
+                            &mut meta_ptr
+                        ]
+                    );
+                }
+                Step::GatedResidual {
+                    total,
+                    inner,
+                    x_off,
+                    y_off,
+                    gate_off,
+                    out_off,
+                    meta_idx,
+                } => {
+                    let total_s = scale(*total);
+                    if total_s == 0 {
+                        continue;
+                    }
+                    let kernel = gated_residual_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(total_s, 256);
+                    let mut meta_ptr = self.meta_buffers[*meta_idx].ptr;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &total_s,
+                            inner,
+                            x_off,
+                            y_off,
+                            gate_off,
+                            out_off,
+                            &mut meta_ptr
+                        ]
+                    );
+                }
+                Step::AdaLayerNormBackward {
+                    mod_rows,
+                    seq_per_mod,
+                    inner,
+                    x_off,
+                    scale_off,
+                    dy_off,
+                    out_off,
+                    eps_bits,
+                    layer_norm,
+                } => {
+                    let mod_rows_s = scale(*mod_rows);
+                    if mod_rows_s == 0 {
+                        continue;
+                    }
+                    let kernel = ada_layer_norm_backward_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (mod_rows_s, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &mod_rows_s,
+                            seq_per_mod,
+                            inner,
+                            x_off,
+                            scale_off,
+                            dy_off,
+                            out_off,
+                            eps_bits,
+                            layer_norm
+                        ]
+                    );
+                }
+                Step::GatedResidualBackward {
+                    mod_rows,
+                    seq_per_mod,
+                    inner,
+                    y_off,
+                    gate_off,
+                    dy_off,
+                    out_off,
+                } => {
+                    let mod_rows_s = scale(*mod_rows);
+                    if mod_rows_s == 0 {
+                        continue;
+                    }
+                    let kernel = gated_residual_backward_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (mod_rows_s, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &mod_rows_s,
+                            seq_per_mod,
+                            inner,
+                            y_off,
+                            gate_off,
+                            dy_off,
+                            out_off
                         ]
                     );
                 }
@@ -2068,26 +2256,60 @@ impl RocmExecutable {
                         *carry,
                     );
                 }
-                Step::ScanHost {
-                    plan,
-                    outer_init_off,
-                    outer_final_off,
-                    length,
-                    save_trajectory,
-                    xs_outer,
-                    bcast_outer,
-                } => {
+                Step::ScanHost { desc } => {
                     crate::scan_host::run_scan(
                         &self.ctx,
                         &self.arena.buffer,
                         self.arena.size,
-                        plan,
-                        *outer_init_off,
-                        *outer_final_off,
-                        *length,
-                        *save_trajectory,
-                        xs_outer,
-                        bcast_outer,
+                        desc,
+                    );
+                }
+                Step::HostOp { desc } => {
+                    crate::scan_host::run_host_op(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        desc,
+                    );
+                }
+                Step::CpuIndexing { thunk } => {
+                    crate::scan_host::run_indexing(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        thunk,
+                    );
+                }
+                Step::SpdHost {
+                    op,
+                    out_off,
+                    out_shape,
+                    inputs,
+                } => {
+                    crate::spd_host::run_spd(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        op,
+                        *out_off,
+                        out_shape,
+                        inputs,
+                    );
+                }
+                Step::EighNative {
+                    in_off,
+                    out_off,
+                    n,
+                    batch,
+                } => {
+                    crate::eigh_native::run(
+                        &self.ctx,
+                        stream,
+                        &self.arena.buffer,
+                        *in_off,
+                        *out_off,
+                        *n,
+                        *batch,
                     );
                 }
                 Step::Llada2GroupLimitedGate {
@@ -2119,6 +2341,26 @@ impl RocmExecutable {
                         &self.arena.buffer,
                         self.arena.size,
                         in_offs,
+                        *out_off as usize,
+                        *out_len as usize,
+                        attrs,
+                    );
+                }
+                Step::CollectiveHost {
+                    name,
+                    in_off,
+                    in_len,
+                    out_off,
+                    out_len,
+                    attrs,
+                } => {
+                    crate::collective_host::run_collective(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        name,
+                        *in_off as usize,
+                        *in_len as usize,
                         *out_off as usize,
                         *out_len as usize,
                         attrs,

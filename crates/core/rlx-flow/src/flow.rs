@@ -82,6 +82,21 @@ impl ModelFlow {
         self
     }
 
+    /// Append a downstream-defined [`LayerStage`](crate::LayerStage) block.
+    ///
+    /// The **extension front door**: a model crate outside `rlx-flow` implements
+    /// `LayerStage` for its own architecture block and drops it straight into a
+    /// flow — no [`FlowStage`] enum variant, no core edit. The block composes
+    /// primitives through [`FlowCtx`](crate::FlowCtx)'s emission surface, so it
+    /// fuses and hits the fast path on every backend.
+    ///
+    /// (Distinct from [`layer`](Self::layer), which builds a named
+    /// [`LayerStack`](crate::LayerStack) from a closure of built-in blocks.)
+    pub fn layer_stage(mut self, stage: impl crate::LayerStage + 'static) -> Self {
+        self.stages.push(FlowStage::dynamic(stage));
+        self
+    }
+
     pub fn output(mut self, name: impl Into<String>) -> Self {
         self.output_names = vec![name.into()];
         self
@@ -131,6 +146,16 @@ impl ModelFlow {
         let primary = value.ok_or_else(|| anyhow::anyhow!("ModelFlow produced no output"))?;
         let mut outputs = vec![primary.id];
         outputs.extend(self.extra_outputs);
+        // Auxiliary outputs published by stages via `ctx.publish_side_output`
+        // (KV taps, aux heads) — appended after the primary + explicit extras so
+        // existing output indices are preserved.
+        let side_names: Vec<String> = ctx
+            .state
+            .side_outputs
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        outputs.extend(ctx.state.side_outputs.iter().map(|(_, id)| *id));
 
         ctx.module.set_outputs(outputs);
         module = ctx.module;
@@ -138,12 +163,15 @@ impl ModelFlow {
             self.extension_plan.apply(hir);
         }
 
+        let mut output_names = self.output_names;
+        output_names.extend(side_names);
+
         Ok(BuiltModel {
             module,
             params,
             typed_params: Vec::new(),
             profile: self.profile,
-            output_names: self.output_names,
+            output_names,
             primary_shape: primary.shape,
         })
     }
@@ -272,8 +300,12 @@ impl BuiltModel {
     }
 
     /// Split into HIR module + param map (common compile path).
-    pub fn into_parts(self) -> Result<(HirModule, HashMap<String, Vec<f32>>)> {
-        let params = self.params.clone();
+    pub fn into_parts(mut self) -> Result<(HirModule, HashMap<String, Vec<f32>>)> {
+        // Move the param map out instead of cloning it — `into_hir` consumes
+        // `self` but only reads `self.module`, so the original would just be
+        // dropped. For a multi-GB weight map this avoids a full duplicate on
+        // every compile.
+        let params = std::mem::take(&mut self.params);
         let hir = self
             .into_hir()
             .ok_or_else(|| anyhow::anyhow!("expected HIR stage"))?;
@@ -332,6 +364,99 @@ mod tests {
 
         let built = flow.build(&mut w).unwrap();
         assert!(built.into_hir().unwrap().len() >= 4);
+    }
+
+    #[test]
+    fn spdnet_stack_composes_and_lowers() {
+        use rlx_ir::Op;
+        use rlx_ir::hir::HirOp;
+
+        // BiMap weight + SPD batch-norm params are F64 and uploaded out of band
+        // (declare_param_f64), so MapWeights need not carry them.
+        let mut w = MapWeights::default();
+
+        let stage = LayerStack::named("spd_block")
+            .bimap("bimap.w", 3)
+            .reeig(1e-5)
+            .logeig(1e-5)
+            .build();
+
+        // SPD input `[4, 4]` → BiMap → `[3, 3]` → ReEig/LogEig (shape-preserving).
+        let flow = ModelFlow::new("spdnet")
+            .input("x", Shape::new(&[4, 4], DType::F64))
+            .raw_stage(stage);
+
+        let built = flow.build(&mut w).unwrap();
+        // Output is the LogEig `[3, 3]` block, F64.
+        let ps = built.primary_shape();
+        assert_eq!(ps.rank(), 2);
+        assert_eq!(ps.dim(0).unwrap_static(), 3);
+        assert_eq!(ps.dim(1).unwrap_static(), 3);
+        assert_eq!(ps.dtype(), DType::F64);
+
+        let hir = built.into_hir().unwrap();
+        let has = |want: &Op| {
+            hir.nodes().iter().any(|n| match &n.op {
+                HirOp::Mir(op) => std::mem::discriminant(op) == std::mem::discriminant(want),
+                _ => false,
+            })
+        };
+        assert!(has(&Op::BiMap), "expected a BiMap node");
+        assert!(has(&Op::ReEig { eps: 0.0 }), "expected a ReEig node");
+        assert!(has(&Op::LogEig { eps: 0.0 }), "expected a LogEig node");
+        // spectral_layer packs then narrows + reshapes the `Y` block.
+        assert!(
+            has(&Op::Narrow {
+                axis: 0,
+                start: 0,
+                len: 0
+            }),
+            "expected a Narrow node from spectral_layer"
+        );
+        // Every F64 SPD op node must stay F64 (CPU kernels expect_f64).
+        for n in hir.nodes() {
+            if let HirOp::Mir(Op::BiMap | Op::ReEig { .. } | Op::LogEig { .. }) = &n.op {
+                assert_eq!(n.shape.dtype(), DType::F64);
+            }
+        }
+    }
+
+    #[test]
+    fn spd_batch_norm_stage_declares_f64_params_and_lowers() {
+        use rlx_ir::Op;
+        use rlx_ir::hir::HirOp;
+
+        let mut w = MapWeights::default();
+        let stage = LayerStack::named("spd_bn")
+            .spd_batch_norm("bn.g", "bn.running_mean", 1e-5)
+            .build();
+
+        // `[batch, n, n]` = `[2, 3, 3]`; output matches the input.
+        let flow = ModelFlow::new("spdbn")
+            .input("x", Shape::new(&[2, 3, 3], DType::F64))
+            .raw_stage(stage);
+
+        let built = flow.build(&mut w).unwrap();
+        let ps = built.primary_shape();
+        assert_eq!(ps.rank(), 3);
+        assert_eq!(ps.dim(0).unwrap_static(), 2);
+        assert_eq!(ps.dim(2).unwrap_static(), 3);
+        assert_eq!(ps.dtype(), DType::F64);
+
+        let hir = built.into_hir().unwrap();
+        // Two F64 Param nodes (G + running mean) shaped `[3, 3]`.
+        let f64_params = hir
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, HirOp::Param { .. }) && n.shape.dtype() == DType::F64)
+            .count();
+        assert_eq!(f64_params, 2, "expected G + running-mean F64 params");
+        assert!(
+            hir.nodes()
+                .iter()
+                .any(|n| matches!(&n.op, HirOp::Mir(Op::SpdBatchNorm { .. }))),
+            "expected a SpdBatchNorm node"
+        );
     }
 
     #[test]

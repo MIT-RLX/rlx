@@ -14,6 +14,8 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     println!("cargo:rerun-if-changed=shaders");
+    println!("cargo:rerun-if-changed=shaders/arena_f32.inc");
+    println!("cargo:rerun-if-changed=shaders/arena_u32.inc");
     println!("cargo:rerun-if-changed=build.rs");
 
     let mut entries: Vec<String> = Vec::new(); // shader names (sorted)
@@ -32,7 +34,7 @@ fn main() {
         let src = fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("rlx-vulkan: read {}: {e}", path.display()));
 
-        let words = compile_glsl_to_spirv(&name, &src);
+        let words = compile_glsl_to_spirv(&name, &src, &shader_dir);
 
         // Write SPIR-V words as little-endian bytes.
         let mut bytes = Vec::with_capacity(words.len() * 4);
@@ -93,15 +95,25 @@ fn main() {
     fs::write(&gen_path, out_src).unwrap();
 }
 
-fn compile_glsl_to_spirv(name: &str, src: &str) -> Vec<u32> {
+fn compile_glsl_to_spirv(name: &str, src: &str, shader_dir: &Path) -> Vec<u32> {
     use naga::ShaderStage;
     use naga::back::spv;
     use naga::front::glsl::{Frontend, Options};
     use naga::valid::{Capabilities, ValidationFlags, Validator};
 
+    let u32_arena = name.starts_with("dequant");
+    let inc_name = if u32_arena {
+        "arena_u32.inc"
+    } else {
+        "arena_f32.inc"
+    };
+    let inc = fs::read_to_string(shader_dir.join(inc_name))
+        .unwrap_or_else(|e| panic!("rlx-vulkan: read {inc_name}: {e}"));
+    let src = inject_arena_include(src, &inc);
+
     let options = Options::from(ShaderStage::Compute);
     let module = Frontend::default()
-        .parse(&options, src)
+        .parse(&options, &src)
         .unwrap_or_else(|e| panic!("rlx-vulkan: GLSL parse error in {name}.comp: {e:?}"));
 
     let info = Validator::new(ValidationFlags::all(), Capabilities::all())
@@ -115,4 +127,14 @@ fn compile_glsl_to_spirv(name: &str, src: &str) -> Vec<u32> {
     };
     spv::write_vec(&module, &info, &spv_opts, Some(&pipe_opts))
         .unwrap_or_else(|e| panic!("rlx-vulkan: SPIR-V emit error in {name}.comp: {e:?}"))
+}
+
+/// Insert dual-buffer arena helpers immediately after `#version 450`.
+fn inject_arena_include(src: &str, inc: &str) -> String {
+    const VER: &str = "#version 450";
+    if let Some(rest) = src.strip_prefix(VER) {
+        format!("{VER}\n{inc}{rest}")
+    } else {
+        format!("{VER}\n{inc}\n{src}")
+    }
 }

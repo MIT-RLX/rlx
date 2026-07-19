@@ -14,9 +14,10 @@ use rlx_ir::{Graph, NodeId, Op, Shape};
 use crate::activation_deriv::activation_deriv_wrt_x;
 use crate::compose::broadcast_scalar;
 use crate::decompose_backward_kernels::{
-    SCAN_DECOMPOSE_MAX_LENGTH, compose_conv2d_backward_input, compose_conv2d_backward_weight,
-    compose_conv2d_backward_weight_im2col, compose_cumsum_backward, compose_fake_quantize_backward,
-    compose_gather_backward, compose_group_norm_backward_beta, compose_group_norm_backward_gamma,
+    SCAN_DECOMPOSE_MAX_LENGTH, compose_ada_layer_norm_backward, compose_conv2d_backward_input,
+    compose_conv2d_backward_weight, compose_conv2d_backward_weight_im2col, compose_cumsum_backward,
+    compose_fake_quantize_backward, compose_gated_residual_backward, compose_gather_backward,
+    compose_group_norm_backward_beta, compose_group_norm_backward_gamma,
     compose_group_norm_backward_input, compose_layer_norm_backward_gamma,
     compose_layer_norm_backward_input, compose_max_pool2d_backward, compose_rms_norm_backward_beta,
     compose_rms_norm_backward_gamma, compose_rms_norm_backward_input, compose_rope_backward,
@@ -73,6 +74,8 @@ fn contains_training_backward_except(g: &Graph, preserved: &[OpKind]) -> bool {
                 | Op::FakeQuantizeBackward { .. }
                 | Op::ScanBackward { .. }
                 | Op::ScanBackwardXs { .. }
+                | Op::AdaLayerNormBackward { .. }
+                | Op::GatedResidualBackward
         )
     })
 }
@@ -300,6 +303,27 @@ fn decompose_backward_ops_once_except(g: Graph, preserved: &[OpKind]) -> Graph {
                     d_loss,
                     &node.shape,
                 )
+            }
+            Op::AdaLayerNormBackward { norm, eps } => {
+                let [x, scale, shift, dy] = new_inputs[..] else {
+                    panic!("AdaLayerNormBackward expects [x, scale, shift, dy]");
+                };
+                compose_ada_layer_norm_backward(
+                    &mut out,
+                    x,
+                    scale,
+                    shift,
+                    dy,
+                    *norm,
+                    *eps,
+                    &node.shape,
+                )
+            }
+            Op::GatedResidualBackward => {
+                let [x, y, gate, dy] = new_inputs[..] else {
+                    panic!("GatedResidualBackward expects [x, y, gate, dy]");
+                };
+                compose_gated_residual_backward(&mut out, x, y, gate, dy, &node.shape)
             }
             Op::FakeQuantizeBackward { bits, axis, ste } => {
                 let [x, dy] = new_inputs[..] else {

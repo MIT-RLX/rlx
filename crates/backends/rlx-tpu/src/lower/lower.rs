@@ -22,8 +22,8 @@ use crate::hlo::{
     ProgramShape, ScatterDimNumbers, Shape, Window, WindowDim, prim, prim_of,
 };
 use rlx_ir::op::{
-    Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp, RegionPrologue,
-    TransformStep,
+    Activation, AdaNormKind, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp,
+    RegionPrologue, TransformStep,
 };
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, NodeId, Op};
@@ -236,6 +236,18 @@ impl<'a> LowerCtx<'a> {
                 self.lower_fused_residual_ln(&n.inputs, *has_bias, *eps, out_shape)
             }
 
+            Op::AdaLayerNorm { norm, eps } => {
+                self.lower_ada_layer_norm(&n.inputs, *norm, *eps, out_shape)
+            }
+
+            Op::GatedResidual => self.lower_gated_residual(&n.inputs, out_shape),
+
+            Op::AdaLayerNormBackward { norm, eps } => {
+                self.lower_ada_layer_norm_backward(&n.inputs, *norm, *eps, out_shape)
+            }
+
+            Op::GatedResidualBackward => self.lower_gated_residual_backward(&n.inputs, out_shape),
+
             Op::FusedMatMulBiasAct { activation } => {
                 self.lower_fused_matmul_bias_act(&n.inputs, *activation, out_shape)
             }
@@ -324,6 +336,27 @@ impl<'a> LowerCtx<'a> {
             } => self.lower_pool(n.inputs[0], *kind, kernel_size, stride, padding, out_shape),
 
             Op::ScatterAdd => self.lower_scatter_add(n.inputs[0], n.inputs[1], out_shape),
+
+            Op::ScatterNd { reduction } => {
+                self.lower_scatter_nd(n.inputs[0], n.inputs[1], n.inputs[2], *reduction, out_shape)
+            }
+
+            Op::GatherNd { batch_dims } => {
+                self.lower_gather_nd(n.inputs[0], n.inputs[1], *batch_dims, out_shape)
+            }
+
+            Op::ScatterElements { axis, reduction } => self.lower_scatter_elements(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                *axis,
+                *reduction,
+                out_shape,
+            ),
+
+            Op::GatherElements { axis } => {
+                self.lower_gather_elements(n.inputs[0], n.inputs[1], *axis, out_shape)
+            }
 
             Op::TopK { k } => self.lower_topk(n.inputs[0], *k, out_shape),
 
@@ -456,6 +489,22 @@ impl<'a> LowerCtx<'a> {
             // would need to be a separately-loaded XLA plugin. Reject
             // explicitly so the failure names the op rather than
             // bottoming out as an obscure HLO error.
+            //
+            // `collective.*` custom ops are the exception: they run as
+            // host segments (see `crate::segment` / `crate::collective_host`),
+            // so a graph containing them compiles via segmented
+            // orchestration and never reaches whole-graph HLO lowering.
+            // Reaching here with a collective op therefore means the
+            // orchestration predicate (`segment::needs_orchestration`)
+            // missed it — a bug — so name the op either way.
+            Op::Custom { name, .. } if crate::segment::COLLECTIVE_OPS.contains(&name.as_str()) => {
+                panic!(
+                    "rlx-tpu: collective op '{name}' reached whole-graph HLO \
+                     lowering — it must run as a host segment via segmented \
+                     orchestration. This is a bug in \
+                     `segment::needs_orchestration`.",
+                )
+            }
             Op::Custom { name, .. } => panic!(
                 "rlx-tpu: Op::Custom('{name}') has no TPU lowering. \
                  Custom ops are CPU-only today; either move this op \
@@ -469,15 +518,18 @@ impl<'a> LowerCtx<'a> {
                  use Device::Cpu for graphs containing dense solves.",
             ),
 
-            // Scan was added recently and isn't lowered to HLO yet.
-            // Decompose via unfuse before reaching this point.
-            Op::Scan { .. }
-            | Op::ScanBackward { .. }
-            | Op::ScanBackwardXs { .. }
-            | Op::BatchedDenseSolve
-            | Op::CustomFn { .. } => panic!(
-                "rlx-tpu: Op::Scan / Scan-backward / BatchedDenseSolve / \
-                 CustomFn have no TPU lowering yet — use Device::Cpu.",
+            // Op::Scan / ScanBackward* should be rewritten by legalize
+            // (`LowerScan` + backward decompose) before HLO. If any escape,
+            // pin the graph to Device::Cpu rather than silently mislowering.
+            Op::Scan { .. } | Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => panic!(
+                "rlx-tpu: Op::Scan / ScanBackward escaped legalize — \
+                 expected LowerScan / backward decompose. Pin this graph \
+                 to Device::Cpu, or ensure legalize_or_rewrite_for_backend runs."
+            ),
+
+            Op::BatchedDenseSolve | Op::CustomFn { .. } => panic!(
+                "rlx-tpu: BatchedDenseSolve / CustomFn have no TPU lowering yet — \
+                 use Device::Cpu.",
             ),
 
             Op::GaussianSplatRender { .. } | Op::GaussianSplatRenderBackward { .. } => panic!(
@@ -1173,6 +1225,431 @@ impl<'a> LowerCtx<'a> {
         self.entry.binary("add", scaled, b_b, out)
     }
 
+    // ── AdaLayerNorm / GatedResidual ───────────────────────────
+
+    pub(crate) fn lower_ada_layer_norm(
+        &mut self,
+        inputs: &[NodeId],
+        norm: AdaNormKind,
+        eps: f32,
+        out: Shape,
+    ) -> i64 {
+        let x_id = inputs[0];
+        let scale_id = inputs[1];
+        let shift_id = inputs[2];
+        let x = self.hlo(x_id);
+        let x_dims = out.dimensions.clone();
+        let x_dt = self.graph.node(x_id).shape.dtype();
+        let prim_ty = prim_of(x_dt);
+        let rank = x_dims.len();
+        let ax = (rank - 1) as i64;
+        let mut reduced = x_dims.clone();
+        reduced[ax as usize] = 1;
+        let summed_dims: Vec<i64> = x_dims
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &d)| if i == ax as usize { None } else { Some(d) })
+            .collect();
+        let kept_shape = Shape::array(prim_ty, &reduced);
+        let summed_shape = Shape::array(prim_ty, &summed_dims);
+        let n_elems = x_dims[ax as usize] as f32;
+        let n_c = self.const_in_dtype(prim_ty, n_elems);
+        let n_b = self.entry.broadcast(n_c, &[], summed_shape.clone());
+
+        let n = match norm {
+            AdaNormKind::LayerNorm => {
+                let pre_sum = self.reduce_one(x, ax, "add", 0.0, x_dt, summed_dims.clone());
+                let mean = self
+                    .entry
+                    .binary("divide", pre_sum, n_b, summed_shape.clone());
+                let mean_kept = self.entry.reshape(mean, kept_shape.clone());
+                let mean_b = self.broadcast_align(mean_kept, &reduced, out.clone());
+                let centered = self.entry.binary("subtract", x, mean_b, out.clone());
+                let sq = self
+                    .entry
+                    .binary("multiply", centered, centered, out.clone());
+                let sq_sum = self.reduce_one(sq, ax, "add", 0.0, x_dt, summed_dims);
+                let var = self
+                    .entry
+                    .binary("divide", sq_sum, n_b, summed_shape.clone());
+                let var_kept = self.entry.reshape(var, kept_shape);
+                let eps_c = self.const_in_dtype(prim_ty, eps);
+                let eps_b = self
+                    .entry
+                    .broadcast(eps_c, &[], Shape::array(prim_ty, &reduced));
+                let var_eps =
+                    self.entry
+                        .binary("add", var_kept, eps_b, Shape::array(prim_ty, &reduced));
+                let inv_std = self
+                    .entry
+                    .unary("rsqrt", var_eps, Shape::array(prim_ty, &reduced));
+                let inv_std_b = self.broadcast_align(inv_std, &reduced, out.clone());
+                self.entry
+                    .binary("multiply", centered, inv_std_b, out.clone())
+            }
+            AdaNormKind::RmsNorm => {
+                let sq = self.entry.binary("multiply", x, x, out.clone());
+                let sq_sum = self.reduce_one(sq, ax, "add", 0.0, x_dt, summed_dims);
+                let sq_mean = self
+                    .entry
+                    .binary("divide", sq_sum, n_b, summed_shape.clone());
+                let eps_c = self.const_in_dtype(prim_ty, eps);
+                let eps_b = self.entry.broadcast(eps_c, &[], summed_shape.clone());
+                let var_eps = self
+                    .entry
+                    .binary("add", sq_mean, eps_b, summed_shape.clone());
+                let inv = self.entry.unary("rsqrt", var_eps, summed_shape);
+                let inv_kept = self.entry.reshape(inv, kept_shape);
+                let inv_b = self.broadcast_align(inv_kept, &reduced, out.clone());
+                self.entry.binary("multiply", x, inv_b, out.clone())
+            }
+        };
+
+        let scale = self.hlo(scale_id);
+        let shift = self.hlo(shift_id);
+        let scale_dims = self.ir_shape_dims(scale_id);
+        let shift_dims = self.ir_shape_dims(shift_id);
+        let scale_b = self.broadcast_to_target(scale, &scale_dims, out.clone());
+        let shift_b = self.broadcast_to_target(shift, &shift_dims, out.clone());
+        let n_scale = self.entry.binary("multiply", n, scale_b, out.clone());
+        let m = self.entry.binary("add", n, n_scale, out.clone());
+        self.entry.binary("add", m, shift_b, out)
+    }
+
+    pub(crate) fn lower_gated_residual(&mut self, inputs: &[NodeId], out: Shape) -> i64 {
+        let x = self.hlo(inputs[0]);
+        let y = self.hlo(inputs[1]);
+        let gate = self.hlo(inputs[2]);
+        let gate_dims = self.ir_shape_dims(inputs[2]);
+        let gate_b = self.broadcast_to_target(gate, &gate_dims, out.clone());
+        let gy = self.entry.binary("multiply", gate_b, y, out.clone());
+        self.entry.binary("add", x, gy, out)
+    }
+
+    /// Sum broadcast axes of `grad` (shape `full_dims`) down to `target_dims`.
+    pub(crate) fn sum_unbroadcast_hlo(
+        &mut self,
+        grad: i64,
+        full_dims: &[i64],
+        target_dims: &[i64],
+        dt: DType,
+    ) -> i64 {
+        if full_dims == target_dims {
+            return grad;
+        }
+        let prim_ty = prim_of(dt);
+        let g_rank = full_dims.len();
+        let t_rank = target_dims.len();
+        let extra = g_rank.saturating_sub(t_rank);
+        let mut axes: Vec<usize> = (0..extra).collect();
+        for i in 0..t_rank {
+            if target_dims[i] == 1 && full_dims[extra + i] > 1 {
+                axes.push(extra + i);
+            }
+        }
+        let mut current = grad;
+        let mut running_dims = full_dims.to_vec();
+        for &ax in &axes {
+            running_dims[ax] = 1;
+            let kept_shape = Shape::array(prim_ty, &running_dims);
+            let collapsed_dims: Vec<i64> = running_dims
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &d)| if i == ax { None } else { Some(d) })
+                .collect();
+            let collapsed_shape = Shape::array(prim_ty, &collapsed_dims);
+            let red = self.reducer("add", prim_ty);
+            let init = self.const_in_dtype(prim_ty, 0.0);
+            let reduced = self
+                .entry
+                .reduce(current, init, &red, &[ax as i64], collapsed_shape);
+            current = self.entry.reshape(reduced, kept_shape);
+        }
+        self.entry
+            .reshape(current, Shape::array(prim_ty, target_dims))
+    }
+
+    /// Flatten each grad to 1-D and concat on axis 0 (packed DiT reverse layout).
+    pub(crate) fn pack_flat_grads_hlo(&mut self, grads: &[(i64, &[i64])], out: Shape) -> i64 {
+        let prim_ty = out.element_type;
+        let mut flats = Vec::with_capacity(grads.len());
+        for (hlo, dims) in grads {
+            let n: i64 = dims.iter().product();
+            let flat_shape = Shape::array(prim_ty, &[n]);
+            flats.push(self.entry.reshape(*hlo, flat_shape));
+        }
+        self.entry.concat(&flats, 0, out)
+    }
+
+    /// LayerNorm input reverse with γ=1 (`sy = dn` HLO).
+    pub(crate) fn lower_layernorm_dx_gamma1_hlo(
+        &mut self,
+        x: i64,
+        dn: i64,
+        eps: f32,
+        out: Shape,
+        x_dt: DType,
+    ) -> i64 {
+        let x_dims = out.dimensions.clone();
+        let prim_ty = prim_of(x_dt);
+        let rank = x_dims.len();
+        let ax = (rank - 1) as i64;
+        let mut reduced = x_dims.clone();
+        reduced[ax as usize] = 1;
+        let kept_shape = Shape::array(prim_ty, &reduced);
+        let summed_dims: Vec<i64> = x_dims
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &d)| if i == ax as usize { None } else { Some(d) })
+            .collect();
+        let summed_shape = Shape::array(prim_ty, &summed_dims);
+        let n_elems = x_dims[ax as usize] as f32;
+        let n_c = self.const_in_dtype(prim_ty, n_elems);
+        let n_b = self.entry.broadcast(n_c, &[], summed_shape.clone());
+
+        let pre_sum = self.reduce_one(x, ax, "add", 0.0, x_dt, summed_dims.clone());
+        let mean = self
+            .entry
+            .binary("divide", pre_sum, n_b, summed_shape.clone());
+        let mean_kept = self.entry.reshape(mean, kept_shape.clone());
+        let mean_b = self.broadcast_align(mean_kept, &reduced, out.clone());
+        let centered = self.entry.binary("subtract", x, mean_b, out.clone());
+        let sq = self
+            .entry
+            .binary("multiply", centered, centered, out.clone());
+        let sq_sum = self.reduce_one(sq, ax, "add", 0.0, x_dt, summed_dims.clone());
+        let var = self
+            .entry
+            .binary("divide", sq_sum, n_b, summed_shape.clone());
+        let var_kept = self.entry.reshape(var, kept_shape.clone());
+        let eps_c = self.const_in_dtype(prim_ty, eps);
+        let eps_b = self
+            .entry
+            .broadcast(eps_c, &[], Shape::array(prim_ty, &reduced));
+        let var_eps = self
+            .entry
+            .binary("add", var_kept, eps_b, Shape::array(prim_ty, &reduced));
+        let inv_std = self
+            .entry
+            .unary("rsqrt", var_eps, Shape::array(prim_ty, &reduced));
+        let inv_std_b = self.broadcast_align(inv_std, &reduced, out.clone());
+        let xhat = self
+            .entry
+            .binary("multiply", centered, inv_std_b, out.clone());
+
+        let m_sy = self.reduce_one(dn, ax, "add", 0.0, x_dt, summed_dims.clone());
+        let m_sy_div = self.entry.binary("divide", m_sy, n_b, summed_shape.clone());
+        let m_sy_kept = self.entry.reshape(m_sy_div, kept_shape.clone());
+        let m_sy_b = self.broadcast_align(m_sy_kept, &reduced, out.clone());
+        let sy_xh = self.entry.binary("multiply", dn, xhat, out.clone());
+        let m_sxh = self.reduce_one(sy_xh, ax, "add", 0.0, x_dt, summed_dims);
+        let m_sxh_div = self.entry.binary("divide", m_sxh, n_b, summed_shape);
+        let m_sxh_kept = self.entry.reshape(m_sxh_div, kept_shape);
+        let m_sxh_b = self.broadcast_align(m_sxh_kept, &reduced, out.clone());
+        let term1 = self.entry.binary("subtract", dn, m_sy_b, out.clone());
+        let term2 = self.entry.binary("multiply", xhat, m_sxh_b, out.clone());
+        let inner = self.entry.binary("subtract", term1, term2, out.clone());
+        self.entry.binary("multiply", inv_std_b, inner, out)
+    }
+
+    /// RMSNorm input reverse with γ=1 (`sy = dn` HLO).
+    pub(crate) fn lower_rms_norm_dx_gamma1_hlo(
+        &mut self,
+        x: i64,
+        dn: i64,
+        eps: f32,
+        out: Shape,
+        x_dt: DType,
+    ) -> i64 {
+        let x_dims = out.dimensions.clone();
+        let prim_ty = prim_of(x_dt);
+        let rank = x_dims.len();
+        let ax = (rank - 1) as i64;
+        let mut reduced = x_dims.clone();
+        reduced[ax as usize] = 1;
+        let kept_shape = Shape::array(prim_ty, &reduced);
+        let summed_dims: Vec<i64> = x_dims
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &d)| if i == ax as usize { None } else { Some(d) })
+            .collect();
+        let summed_shape = Shape::array(prim_ty, &summed_dims);
+        let n_elems = x_dims[ax as usize] as f32;
+        let n_c = self.const_in_dtype(prim_ty, n_elems);
+        let n_b = self.entry.broadcast(n_c, &[], summed_shape.clone());
+
+        let sq = self.entry.binary("multiply", x, x, out.clone());
+        let sq_sum = self.reduce_one(sq, ax, "add", 0.0, x_dt, summed_dims.clone());
+        let sq_mean = self
+            .entry
+            .binary("divide", sq_sum, n_b, summed_shape.clone());
+        let eps_c = self.const_in_dtype(prim_ty, eps);
+        let eps_b = self.entry.broadcast(eps_c, &[], summed_shape.clone());
+        let var_eps = self
+            .entry
+            .binary("add", sq_mean, eps_b, summed_shape.clone());
+        let inv_r = self.entry.unary("rsqrt", var_eps, summed_shape.clone());
+        let inv_r_kept = self.entry.reshape(inv_r, kept_shape.clone());
+        let inv_r_b = self.broadcast_align(inv_r_kept, &reduced, out.clone());
+        let inv_r2 = self.entry.binary("multiply", inv_r_b, inv_r_b, out.clone());
+        let dy_gx = self.entry.binary("multiply", dn, x, out.clone());
+        let dot = self.reduce_one(dy_gx, ax, "add", 0.0, x_dt, summed_dims);
+        let dot_div = self.entry.binary("divide", dot, n_b, summed_shape);
+        let dot_kept = self.entry.reshape(dot_div, kept_shape);
+        let dot_b = self.broadcast_align(dot_kept, &reduced, out.clone());
+        let x_dot = self.entry.binary("multiply", x, dot_b, out.clone());
+        let x_dot_scaled = self.entry.binary("multiply", x_dot, inv_r2, out.clone());
+        let term = self.entry.binary("subtract", dn, x_dot_scaled, out.clone());
+        self.entry.binary("multiply", inv_r_b, term, out)
+    }
+
+    /// Affine-free ada norm value `n` (γ=1, β=0) for backward.
+    fn lower_ada_norm_value(
+        &mut self,
+        x_id: NodeId,
+        norm: AdaNormKind,
+        eps: f32,
+        out: Shape,
+    ) -> i64 {
+        let x = self.hlo(x_id);
+        let x_dims = out.dimensions.clone();
+        let x_dt = self.dtype(x_id);
+        let prim_ty = prim_of(x_dt);
+        let rank = x_dims.len();
+        let ax = (rank - 1) as i64;
+        let mut reduced = x_dims.clone();
+        reduced[ax as usize] = 1;
+        let kept_shape = Shape::array(prim_ty, &reduced);
+        let summed_dims: Vec<i64> = x_dims
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &d)| if i == ax as usize { None } else { Some(d) })
+            .collect();
+        let summed_shape = Shape::array(prim_ty, &summed_dims);
+        let n_elems = x_dims[ax as usize] as f32;
+        let n_c = self.const_in_dtype(prim_ty, n_elems);
+        let n_b = self.entry.broadcast(n_c, &[], summed_shape.clone());
+
+        match norm {
+            AdaNormKind::LayerNorm => {
+                let pre_sum = self.reduce_one(x, ax, "add", 0.0, x_dt, summed_dims.clone());
+                let mean = self
+                    .entry
+                    .binary("divide", pre_sum, n_b, summed_shape.clone());
+                let mean_kept = self.entry.reshape(mean, kept_shape.clone());
+                let mean_b = self.broadcast_align(mean_kept, &reduced, out.clone());
+                let centered = self.entry.binary("subtract", x, mean_b, out.clone());
+                let sq = self
+                    .entry
+                    .binary("multiply", centered, centered, out.clone());
+                let sq_sum = self.reduce_one(sq, ax, "add", 0.0, x_dt, summed_dims);
+                let var = self
+                    .entry
+                    .binary("divide", sq_sum, n_b, summed_shape.clone());
+                let var_kept = self.entry.reshape(var, kept_shape);
+                let eps_c = self.const_in_dtype(prim_ty, eps);
+                let eps_b = self
+                    .entry
+                    .broadcast(eps_c, &[], Shape::array(prim_ty, &reduced));
+                let var_eps =
+                    self.entry
+                        .binary("add", var_kept, eps_b, Shape::array(prim_ty, &reduced));
+                let inv_std = self
+                    .entry
+                    .unary("rsqrt", var_eps, Shape::array(prim_ty, &reduced));
+                let inv_std_b = self.broadcast_align(inv_std, &reduced, out.clone());
+                self.entry
+                    .binary("multiply", centered, inv_std_b, out.clone())
+            }
+            AdaNormKind::RmsNorm => {
+                let sq = self.entry.binary("multiply", x, x, out.clone());
+                let sq_sum = self.reduce_one(sq, ax, "add", 0.0, x_dt, summed_dims);
+                let sq_mean = self
+                    .entry
+                    .binary("divide", sq_sum, n_b, summed_shape.clone());
+                let eps_c = self.const_in_dtype(prim_ty, eps);
+                let eps_b = self.entry.broadcast(eps_c, &[], summed_shape.clone());
+                let var_eps = self
+                    .entry
+                    .binary("add", sq_mean, eps_b, summed_shape.clone());
+                let inv = self.entry.unary("rsqrt", var_eps, summed_shape);
+                let inv_kept = self.entry.reshape(inv, kept_shape);
+                let inv_b = self.broadcast_align(inv_kept, &reduced, out.clone());
+                self.entry.binary("multiply", x, inv_b, out.clone())
+            }
+        }
+    }
+
+    /// Packed DiT adaLN reverse — mirrors `compose_ada_layer_norm_backward`.
+    pub(crate) fn lower_ada_layer_norm_backward(
+        &mut self,
+        inputs: &[NodeId],
+        norm: AdaNormKind,
+        eps: f32,
+        out: Shape,
+    ) -> i64 {
+        let x_id = inputs[0];
+        let scale_id = inputs[1];
+        let dy_id = inputs[3];
+        let x = self.hlo(x_id);
+        let dy = self.hlo(dy_id);
+        let scale = self.hlo(scale_id);
+        let x_dims = self.ir_shape_dims(x_id);
+        let scale_dims = self.ir_shape_dims(scale_id);
+        let x_dt = self.dtype(x_id);
+        let prim_ty = prim_of(x_dt);
+        let x_shape = Shape::array(prim_ty, &x_dims);
+
+        let n = self.lower_ada_norm_value(x_id, norm, eps, x_shape.clone());
+        let one_c = self.const_in_dtype(prim_ty, 1.0);
+        let ones_b = self.entry.broadcast(one_c, &[], x_shape.clone());
+        let scale_b = self.broadcast_to_target(scale, &scale_dims, x_shape.clone());
+        let one_plus = self.entry.binary("add", ones_b, scale_b, x_shape.clone());
+        let dn = self.entry.binary("multiply", dy, one_plus, x_shape.clone());
+
+        let dx = match norm {
+            AdaNormKind::LayerNorm => {
+                self.lower_layernorm_dx_gamma1_hlo(x, dn, eps, x_shape.clone(), x_dt)
+            }
+            AdaNormKind::RmsNorm => {
+                self.lower_rms_norm_dx_gamma1_hlo(x, dn, eps, x_shape.clone(), x_dt)
+            }
+        };
+
+        let dsf = self.entry.binary("multiply", dy, n, x_shape.clone());
+        let dscale = self.sum_unbroadcast_hlo(dsf, &x_dims, &scale_dims, x_dt);
+        let dshift = self.sum_unbroadcast_hlo(dy, &x_dims, &scale_dims, x_dt);
+        self.pack_flat_grads_hlo(
+            &[(dx, &x_dims), (dscale, &scale_dims), (dshift, &scale_dims)],
+            out,
+        )
+    }
+
+    /// Packed DiT gated residual reverse — mirrors `compose_gated_residual_backward`.
+    pub(crate) fn lower_gated_residual_backward(&mut self, inputs: &[NodeId], out: Shape) -> i64 {
+        let y_id = inputs[1];
+        let gate_id = inputs[2];
+        let dy_id = inputs[3];
+        let dy = self.hlo(dy_id);
+        let y = self.hlo(y_id);
+        let gate = self.hlo(gate_id);
+        let x_dims = self.ir_shape_dims(inputs[0]);
+        let gate_dims = self.ir_shape_dims(gate_id);
+        let x_dt = self.dtype(dy_id);
+        let prim_ty = prim_of(x_dt);
+        let x_shape = Shape::array(prim_ty, &x_dims);
+
+        let dx = dy;
+        let gate_b = self.broadcast_to_target(gate, &gate_dims, x_shape.clone());
+        let dy_out = self.entry.binary("multiply", dy, gate_b, x_shape.clone());
+        let dgate_full = self.entry.binary("multiply", dy, y, x_shape);
+        let dgate = self.sum_unbroadcast_hlo(dgate_full, &x_dims, &gate_dims, x_dt);
+        self.pack_flat_grads_hlo(
+            &[(dx, &x_dims), (dy_out, &x_dims), (dgate, &gate_dims)],
+            out,
+        )
+    }
+
     // ── FusedMatMulBiasAct ─────────────────────────────────────
 
     pub(crate) fn lower_fused_matmul_bias_act(
@@ -1764,6 +2241,208 @@ impl<'a> LowerCtx<'a> {
             .scatter(dest, idx_s32, updates, &combiner, dn, out)
     }
 
+    // ── ScatterNd (ONNX ScatterND) ─────────────────────────────
+
+    pub(crate) fn lower_scatter_nd(
+        &mut self,
+        data_id: NodeId,
+        indices_id: NodeId,
+        updates_id: NodeId,
+        reduction: rlx_ir::ScatterNdReduction,
+        out: Shape,
+    ) -> i64 {
+        let data = self.hlo(data_id);
+        let updates = self.hlo(updates_id);
+        let idx = self.hlo(indices_id);
+        let idx_dt = self.dtype(indices_id);
+        let idx_s32 = if matches!(idx_dt, DType::I32 | DType::I64 | DType::U32) {
+            idx
+        } else {
+            let id_dims = self.ir_shape_dims(indices_id);
+            self.entry.convert(idx, Shape::array(prim::S32, &id_dims))
+        };
+
+        let data_dims = self.ir_shape_dims(data_id);
+        let idx_dims = self.ir_shape_dims(indices_id);
+        let upd_dims = self.ir_shape_dims(updates_id);
+        let k = *idx_dims.last().unwrap_or(&1);
+        let indices_rank = idx_dims.len() as i64;
+        let updates_rank = upd_dims.len() as i64;
+        // ONNX: updates trailing window = data[k:]; those axes are update_window_dims.
+        let update_window_dims: Vec<i64> = ((indices_rank - 1)..updates_rank).collect();
+        let inserted_window_dims: Vec<i64> = (0..k).collect();
+        let scatter_dims_to_operand_dims: Vec<i64> = (0..k).collect();
+        let dn = ScatterDimNumbers {
+            update_window_dims,
+            inserted_window_dims,
+            scatter_dims_to_operand_dims,
+            index_vector_dim: indices_rank - 1,
+        };
+        let prim_ty = out.element_type;
+        let combiner = match reduction {
+            rlx_ir::ScatterNdReduction::None => self
+                .builder
+                .make_scatter_replace(&format!("scatter_nd_replace_{prim_ty}"), prim_ty),
+            rlx_ir::ScatterNdReduction::Add => self.reducer("add", prim_ty),
+            rlx_ir::ScatterNdReduction::Mul => self.reducer("multiply", prim_ty),
+            rlx_ir::ScatterNdReduction::Max => self.reducer("maximum", prim_ty),
+            rlx_ir::ScatterNdReduction::Min => self.reducer("minimum", prim_ty),
+        };
+        let _ = data_dims;
+        self.entry
+            .scatter(data, idx_s32, updates, &combiner, dn, out)
+    }
+
+    // ── GatherNd (ONNX GatherND) ───────────────────────────────
+
+    pub(crate) fn lower_gather_nd(
+        &mut self,
+        data_id: NodeId,
+        indices_id: NodeId,
+        batch_dims: i32,
+        out: Shape,
+    ) -> i64 {
+        assert_eq!(
+            batch_dims, 0,
+            "rlx-tpu: GatherNd batch_dims={batch_dims} not supported (need 0)"
+        );
+        let data = self.hlo(data_id);
+        let idx = self.hlo(indices_id);
+        let idx_dt = self.dtype(indices_id);
+        let idx_s32 = if matches!(idx_dt, DType::I32 | DType::I64 | DType::U32) {
+            idx
+        } else {
+            let id_dims = self.ir_shape_dims(indices_id);
+            self.entry.convert(idx, Shape::array(prim::S32, &id_dims))
+        };
+        let data_dims = self.ir_shape_dims(data_id);
+        let idx_dims = self.ir_shape_dims(indices_id);
+        let k = *idx_dims.last().unwrap_or(&1);
+        let indices_rank = idx_dims.len() as i64;
+        let mut slice_sizes = data_dims.clone();
+        for d in slice_sizes.iter_mut().take(k as usize) {
+            *d = 1;
+        }
+        let n_offset = (data_dims.len() as i64) - k;
+        let offset_dims: Vec<i64> = ((indices_rank - 1)..(indices_rank - 1 + n_offset)).collect();
+        let dn = GatherDimNumbers {
+            offset_dims,
+            collapsed_slice_dims: (0..k).collect(),
+            start_index_map: (0..k).collect(),
+            index_vector_dim: indices_rank - 1,
+        };
+        self.entry.gather(data, idx_s32, dn, slice_sizes, out)
+    }
+
+    // Expand take_along / scatter_elements indices into full ND indices
+    // of shape `[*indices_shape, rank]` for GatherNd / ScatterNd.
+    fn expand_elements_indices_nd(
+        &mut self,
+        data_id: NodeId,
+        indices_id: NodeId,
+        axis: i32,
+    ) -> (i64, Vec<i64>) {
+        let data_dims = self.ir_shape_dims(data_id);
+        let idx_dims = self.ir_shape_dims(indices_id);
+        let rank = data_dims.len() as i64;
+        let axis = if axis < 0 { axis + rank as i32 } else { axis } as i64;
+        let idx = self.hlo(indices_id);
+        let idx_dt = self.dtype(indices_id);
+        let idx_s32 = if matches!(idx_dt, DType::I32 | DType::I64 | DType::U32) {
+            idx
+        } else {
+            self.entry.convert(idx, Shape::array(prim::S32, &idx_dims))
+        };
+        // Stack per-axis coordinates: iota for non-axis dims, indices for axis.
+        let mut comps: Vec<i64> = Vec::with_capacity(rank as usize);
+        for d in 0..rank {
+            let comp = if d == axis {
+                idx_s32
+            } else {
+                let iota_shape = Shape::array(prim::S32, &idx_dims);
+                self.entry.iota(d, iota_shape)
+            };
+            // [..., 1]
+            let mut unsqueeze_dims = idx_dims.clone();
+            unsqueeze_dims.push(1);
+            comps.push(
+                self.entry
+                    .reshape(comp, Shape::array(prim::S32, &unsqueeze_dims)),
+            );
+        }
+        let mut nd_dims = idx_dims.clone();
+        nd_dims.push(rank);
+        let stacked = self
+            .entry
+            .concat(&comps, rank, Shape::array(prim::S32, &nd_dims));
+        (stacked, nd_dims)
+    }
+
+    pub(crate) fn lower_gather_elements(
+        &mut self,
+        data_id: NodeId,
+        indices_id: NodeId,
+        axis: i32,
+        out: Shape,
+    ) -> i64 {
+        let (nd_idx, _nd_dims) = self.expand_elements_indices_nd(data_id, indices_id, axis);
+        let data = self.hlo(data_id);
+        let data_dims = self.ir_shape_dims(data_id);
+        let idx_dims = self.ir_shape_dims(indices_id);
+        let k = data_dims.len() as i64;
+        let indices_rank = (idx_dims.len() as i64) + 1; // after expand
+        let slice_sizes = vec![1i64; k as usize];
+        let offset_dims: Vec<i64> = vec![];
+        let dn = GatherDimNumbers {
+            offset_dims,
+            collapsed_slice_dims: (0..k).collect(),
+            start_index_map: (0..k).collect(),
+            index_vector_dim: indices_rank - 1,
+        };
+        self.entry.gather(data, nd_idx, dn, slice_sizes, out)
+    }
+
+    pub(crate) fn lower_scatter_elements(
+        &mut self,
+        data_id: NodeId,
+        indices_id: NodeId,
+        updates_id: NodeId,
+        axis: i32,
+        reduction: rlx_ir::ScatterNdReduction,
+        out: Shape,
+    ) -> i64 {
+        let (nd_idx, _nd_dims) = self.expand_elements_indices_nd(data_id, indices_id, axis);
+        let data = self.hlo(data_id);
+        let updates = self.hlo(updates_id);
+        let data_dims = self.ir_shape_dims(data_id);
+        let idx_dims = self.ir_shape_dims(indices_id);
+        let k = data_dims.len() as i64;
+        let indices_rank = (idx_dims.len() as i64) + 1;
+        let updates_rank = self.ir_shape_dims(updates_id).len() as i64;
+        // Full multi-index → no update window dims.
+        let update_window_dims: Vec<i64> = ((indices_rank - 1)..updates_rank).collect();
+        let inserted_window_dims: Vec<i64> = (0..k).collect();
+        let scatter_dims_to_operand_dims: Vec<i64> = (0..k).collect();
+        let dn = ScatterDimNumbers {
+            update_window_dims,
+            inserted_window_dims,
+            scatter_dims_to_operand_dims,
+            index_vector_dim: indices_rank - 1,
+        };
+        let prim_ty = out.element_type;
+        let combiner = match reduction {
+            rlx_ir::ScatterNdReduction::None => self
+                .builder
+                .make_scatter_replace(&format!("scatter_el_replace_{prim_ty}"), prim_ty),
+            rlx_ir::ScatterNdReduction::Add => self.reducer("add", prim_ty),
+            rlx_ir::ScatterNdReduction::Mul => self.reducer("multiply", prim_ty),
+            rlx_ir::ScatterNdReduction::Max => self.reducer("maximum", prim_ty),
+            rlx_ir::ScatterNdReduction::Min => self.reducer("minimum", prim_ty),
+        };
+        self.entry
+            .scatter(data, nd_idx, updates, &combiner, dn, out)
+    }
+
     // ── TopK ──────────────────────────────────────────────────────
     //
     // Sort (descending) along the last axis, paired with an iota of
@@ -1945,7 +2624,9 @@ impl<'a> LowerCtx<'a> {
             | QuantScheme::GgufQ8_0
             | QuantScheme::GgufQ4_1
             | QuantScheme::GgufQ5_0
-            | QuantScheme::GgufQ5_1 => panic!(
+            | QuantScheme::GgufQ5_1
+            | QuantScheme::GgufQ1_0
+            | QuantScheme::GgufQ2_0 => panic!(
                 "rlx-tpu: GGUF / NVFP4 quant schemes have no HLO lowering — dequantize on CPU first."
             ),
             QuantScheme::GgufQ4K

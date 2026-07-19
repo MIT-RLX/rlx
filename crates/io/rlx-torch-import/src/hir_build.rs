@@ -48,6 +48,9 @@ pub fn build_hir(lo: &Lowered) -> Result<HirModule> {
     }
 
     for ins in &lo.instrs {
+        // Remember where this instruction's HIR nodes start, so every node it
+        // expands into is stamped with the torch source name below.
+        let first_new = b.0.len();
         let get = |vm: &HashMap<String, HirNodeId>, name: &str| -> Result<HirNodeId> {
             vm.get(name)
                 .copied()
@@ -284,6 +287,10 @@ pub fn build_hir(lo: &Lowered) -> Result<HirModule> {
                 continue;
             }
         };
+        // Stamp the HIR nodes this instruction produced with its torch result
+        // name, so intermediates (a lowered attention, layernorm, …) localize
+        // back to the source op instead of a generic "mir".
+        b.0.label_nodes_since(first_new, &ins.result);
         vm.insert(ins.result.clone(), out);
     }
 

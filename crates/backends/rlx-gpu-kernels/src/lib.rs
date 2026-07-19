@@ -45,6 +45,10 @@ pub const ROPE_BWD_CU: &str = include_str!("../kernels/rope_backward.cu");
 pub const GATHER_BWD_CU: &str = include_str!("../kernels/gather_backward.cu");
 pub const FUSED_RESIDUAL_LN_CU: &str = include_str!("../kernels/fused_residual_ln.cu");
 pub const FUSED_RESIDUAL_RMS_NORM_CU: &str = include_str!("../kernels/fused_residual_rms_norm.cu");
+pub const ADA_LAYER_NORM_CU: &str = include_str!("../kernels/ada_layer_norm.cu");
+pub const GATED_RESIDUAL_CU: &str = include_str!("../kernels/gated_residual.cu");
+pub const ADA_LAYER_NORM_BACKWARD_CU: &str = include_str!("../kernels/ada_layer_norm_backward.cu");
+pub const GATED_RESIDUAL_BACKWARD_CU: &str = include_str!("../kernels/gated_residual_backward.cu");
 pub const GATHER_CU: &str = include_str!("../kernels/gather.cu");
 pub const GATHER_AXIS_CU: &str = include_str!("../kernels/gather_axis.cu");
 pub const NARROW_CU: &str = include_str!("../kernels/narrow.cu");
@@ -66,11 +70,14 @@ pub const DEQUANT_GGUF_CU: &str = include_str!("../kernels/dequant_gguf.cu");
 pub const DEQUANT_MATMUL_GGUF_CU: &str = include_str!("../kernels/dequant_matmul_gguf.cu");
 pub const SAMPLE_CU: &str = include_str!("../kernels/sample.cu");
 pub const SELECTIVE_SCAN_CU: &str = include_str!("../kernels/selective_scan.cu");
+pub const GATED_DELTA_NET_CU: &str = include_str!("../kernels/gated_delta_net.cu");
 pub const POOL1D_CU: &str = include_str!("../kernels/pool1d.cu");
 pub const POOL2D_CU: &str = include_str!("../kernels/pool2d.cu");
 pub const POOL3D_CU: &str = include_str!("../kernels/pool3d.cu");
 pub const CONV1D_CU: &str = include_str!("../kernels/conv1d.cu");
 pub const CONV2D_CU: &str = include_str!("../kernels/conv2d.cu");
+pub const CONV2D_BACKWARD_INPUT_CU: &str = include_str!("../kernels/conv2d_backward_input.cu");
+pub const CONV2D_BACKWARD_WEIGHT_CU: &str = include_str!("../kernels/conv2d_backward_weight.cu");
 pub const IM2COL_CU: &str = include_str!("../kernels/im2col.cu");
 pub const CONV3D_CU: &str = include_str!("../kernels/conv3d.cu");
 pub const LAYER_NORM2D_CU: &str = include_str!("../kernels/layer_norm2d.cu");
@@ -107,6 +114,10 @@ cuda_src_with_gelu!(matmul_cuda_src, include_str!("../kernels/matmul.cu"));
 cuda_src_with_gelu!(
     matmul_epilogue_cuda_src,
     include_str!("../kernels/matmul_epilogue.cu")
+);
+cuda_src_with_gelu!(
+    conv_bias_act_epilogue_cuda_src,
+    include_str!("../kernels/conv_bias_act_epilogue.cu")
 );
 cuda_src_with_gelu!(
     elementwise_region_cuda_src,
