@@ -30,7 +30,8 @@
 
 #[cfg(rlx_cpu_blas)]
 unsafe extern "C" {
-    fn cblas_sgemm(
+    #[link_name = "cblas_sgemm"]
+    fn cblas_sgemm_raw(
         order: i32,
         transa: i32,
         transb: i32,
@@ -76,6 +77,56 @@ unsafe extern "C" {
     );
 
     fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, incx: i32);
+}
+
+/// Empty-dim-guarded wrapper over vendor `cblas_sgemm`. Vendor BLAS rejects a
+/// zero contraction (`lda=0` when `K=0`) with "Parameter 9 had an invalid
+/// value", but an empty matmul is well-defined: `K=0` ⇒ the `A·B` term is a sum
+/// over nothing (0), so `C = beta·C`; `M==0`/`N==0` ⇒ `C` is empty (nothing to
+/// write). Handle those here without calling BLAS. This is reachable now that
+/// the importer emits genuinely empty tensors (0-length dims) instead of
+/// promoting them to `[1]` — e.g. supertonic's ConstantOfShape-derived operand
+/// hit `cblas_sgemm K=0` and crashed the whole CPU run. The scalar fallback
+/// (`cfg(not(rlx_cpu_blas))`) already degenerates correctly for `K=0`, so this
+/// wrapper only guards the vendor path. Signature matches the old extern, so
+/// every `cblas_sgemm(...)` call site is covered unchanged.
+#[cfg(rlx_cpu_blas)]
+#[allow(non_snake_case, clippy::too_many_arguments)]
+#[inline]
+unsafe fn cblas_sgemm(
+    order: i32,
+    transa: i32,
+    transb: i32,
+    m: i32,
+    n: i32,
+    k: i32,
+    alpha: f32,
+    a: *const f32,
+    lda: i32,
+    b: *const f32,
+    ldb: i32,
+    beta: f32,
+    c: *mut f32,
+    ldc: i32,
+) {
+    if m <= 0 || n <= 0 {
+        return;
+    }
+    if k <= 0 {
+        let (mm, nn, ldc) = (m as usize, n as usize, ldc as usize);
+        for i in 0..mm {
+            for j in 0..nn {
+                let cp = unsafe { c.add(i * ldc + j) };
+                unsafe { *cp *= beta };
+            }
+        }
+        return;
+    }
+    unsafe {
+        cblas_sgemm_raw(
+            order, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+        );
+    }
 }
 
 /// Cap BLAS's own thread pool when Rayon owns outer parallelism.

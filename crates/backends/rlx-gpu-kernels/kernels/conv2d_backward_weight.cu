@@ -47,7 +47,12 @@ extern "C" __global__ void conv2d_backward_weight(
     unsigned int g = co / c_out_per_g;
     unsigned int ci = g * c_in_per_g + ci_off;
 
-    float acc = 0.0f;
+    // DOUBLE-SINGLE (f32+f32) accumulation: dw sums dy*x over N*H_out*W_out
+    // (thousands of terms); a plain f32 running sum drifts ~1-2 ULPs on large-
+    // magnitude weight grads. Carry the partial sum as an unevaluated (hi, lo)
+    // pair (~48 mantissa bits) via FMA TwoProduct + TwoSum → f64-grade precision
+    // at ~f32 throughput (native f64 is 1/64-rate here).
+    float hi = 0.0f, lo = 0.0f;
     for (unsigned int nn = 0; nn < n; ++nn) {
         for (unsigned int ho = 0; ho < h_out; ++ho) {
             int ih = (int)(ho * sh + ki * dh) - (int)ph;
@@ -57,9 +62,17 @@ extern "C" __global__ void conv2d_backward_weight(
                 if (iw < 0 || iw >= (int)w) continue;
                 float dyv = arena[dy_off + ((nn * c_out + co) * h_out + ho) * w_out + wo];
                 float xv = arena[x_off + ((nn * c_in + ci) * h + ih) * w + iw];
-                acc += dyv * xv;
+                float p = dyv * xv;
+                float ep = __fmaf_rn(dyv, xv, -p);
+                float s = hi + p;
+                float bb = s - hi;
+                float es = (hi - (s - bb)) + (p - bb);
+                lo += ep + es;
+                float t = s + lo;
+                lo -= t - s;
+                hi = t;
             }
         }
     }
-    arena[dw_off + i] = acc;
+    arena[dw_off + i] = hi;
 }

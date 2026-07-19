@@ -28,8 +28,7 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 
 mod ops;
-pub use ops::has_metal_dequant_kernel;
-pub(crate) use ops::*;
+pub use ops::*;
 
 /// Check a just-completed command buffer for a GPU-side failure instead of
 /// silently proceeding to read the arena.

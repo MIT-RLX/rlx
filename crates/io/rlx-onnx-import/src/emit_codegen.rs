@@ -135,6 +135,126 @@ fn stub_node(out: &str, meta: &str, out_name: &str) -> Vec<String> {
     )]
 }
 
+/// Constant zero Pad via Concat (matches `lower_pad_as_concat` for mode=constant).
+fn emit_pad(node: &BundleNode, out_ident: &str, meta0: &str, out_name: &str) -> Vec<String> {
+    let _ = out_name;
+    // Avoid nested HirMut on `b.hir`: bind zero pads through Builder::bind_param.
+    vec![format!(
+        "let {out_ident} = {{ let x = b.tensor({})?; \
+         let in_s = {{ let m = HirMut::new(&mut b.hir); m.shape(x).clone() }}; \
+         let out_s = shape_from_meta({meta0}, opts); \
+         if in_s.rank() == 4 && out_s.rank() == 4 {{ \
+            let (n, c, h, w) = (in_s.dim(0).unwrap_static(), in_s.dim(1).unwrap_static(), in_s.dim(2).unwrap_static(), in_s.dim(3).unwrap_static()); \
+            let (oh, ow) = (out_s.dim(2).unwrap_static(), out_s.dim(3).unwrap_static()); \
+            let pe_h = oh.saturating_sub(h); let pe_w = ow.saturating_sub(w); \
+            let mut cur = x; \
+            if pe_h > 0 {{ \
+                let zk = format!(\"__padz_h__/{{}}\", {}); \
+                let z = b.bind_param(&zk, &[n,c,pe_h,w], vec![0.0f32; n*c*pe_h*w]); \
+                let mut m = HirMut::new(&mut b.hir); \
+                cur = m.add_node(rlx_ir::Op::Concat {{ axis: 2 }}, vec![cur, z], Shape::new(&[n,c,h+pe_h,w], DType::F32)); \
+            }} \
+            if pe_w > 0 {{ \
+                let hh = {{ let m = HirMut::new(&mut b.hir); m.shape(cur).dim(2).unwrap_static() }}; \
+                let zk = format!(\"__padz_w__/{{}}\", {}); \
+                let z = b.bind_param(&zk, &[n,c,hh,pe_w], vec![0.0f32; n*c*hh*pe_w]); \
+                let mut m = HirMut::new(&mut b.hir); \
+                cur = m.add_node(rlx_ir::Op::Concat {{ axis: 3 }}, vec![cur, z], out_s); \
+            }} \
+            cur \
+         }} else {{ x }} }};",
+        rust_str_lit(&node.inputs[0]),
+        rust_str_lit(&node.name),
+        rust_str_lit(&node.name),
+    )]
+}
+
+fn emit_pool(node: &BundleNode, out_ident: &str, meta0: &str, _out_name: &str) -> Vec<String> {
+    let kind = match node.op.as_str() {
+        "AveragePool" | "GlobalAveragePool" => "ReduceOp::Mean",
+        _ => "ReduceOp::Max",
+    };
+    let global = node.op == "GlobalAveragePool";
+    let k0 = attr_usize(node, "kernel_shape", 0, 1);
+    let k1 = attr_usize(node, "kernel_shape", 1, 1);
+    let s0 = attr_usize(node, "strides", 0, 1);
+    let s1 = attr_usize(node, "strides", 1, 1);
+    let p0 = attr_usize(node, "pads", 0, 0);
+    let p1 = attr_usize(node, "pads", 1, 0);
+    let p2 = attr_usize(node, "pads", 2, 0);
+    let p3 = attr_usize(node, "pads", 3, 0);
+    vec![format!(
+        "let {out_ident} = {{ let x = b.tensor({})?; let mut m = HirMut::new(&mut b.hir); \
+         let in_s = m.shape(x).clone(); \
+         let out_s = shape_from_meta({meta0}, opts); \
+         let (kernel_size, stride, padding) = if {global} {{ \
+            let h = in_s.dim(in_s.rank()-2).unwrap_static(); \
+            let w = in_s.dim(in_s.rank()-1).unwrap_static(); \
+            (vec![h, w], vec![1usize, 1], vec![0usize, 0, 0, 0]) \
+         }} else {{ \
+            (vec![{k0}, {k1}], vec![{s0}, {s1}], vec![{p0}, {p1}, {p2}, {p3}]) \
+         }}; \
+         m.add_node(rlx_ir::Op::Pool {{ kind: {kind}, kernel_size, stride, padding }}, vec![x], out_s) }};",
+        rust_str_lit(&node.inputs[0]),
+    )]
+}
+
+/// Abramowitz–Stegun 7.1.26 erf (matches `lower_erf`).
+fn emit_erf(node: &BundleNode, out_ident: &str) -> Vec<String> {
+    vec![format!(
+        "let {out_ident} = {{ let x = b.tensor({})?; hir_erf(&mut b, x, {}) }};",
+        rust_str_lit(&node.inputs[0]),
+        rust_str_lit(&node.name),
+    )]
+}
+
+/// ONNX BatchNormalization → elementwise form for NCHW (axis-1 channels).
+fn emit_batch_norm(node: &BundleNode, out_ident: &str, meta0: &str) -> Vec<String> {
+    let eps = attr_f64(node, "epsilon", 1e-5);
+    let (pre, ids) = prefetch_inputs(
+        out_ident,
+        &[
+            &node.inputs[0],
+            &node.inputs[1],
+            &node.inputs[2],
+            &node.inputs[3],
+            &node.inputs[4],
+        ],
+    );
+    let parts: Vec<&str> = ids.split(", ").collect();
+    let mut lines = pre;
+    lines.push(format!(
+        "let {out_ident} = {{ let mut m = HirMut::new(&mut b.hir); \
+         let x = {x}; let gamma = {g}; let beta = {be}; let mean = {mean}; let var = {var}; \
+         let s = shape_from_meta({meta0}, opts); \
+         let rank = m.shape(x).rank(); \
+         let c = m.shape(gamma).dim(0).unwrap_static(); \
+         let mut pshape = vec![1i64; rank]; pshape[1] = c as i64; \
+         let g_r = m.reshape_(gamma, pshape.clone()); \
+         let b_r = m.reshape_(beta, pshape.clone()); \
+         let m_r = m.reshape_(mean, pshape.clone()); \
+         let v_r = m.reshape_(var, pshape); \
+         let eps_id = {{ let k = format!(\"__bn_eps__/{{}}\", {site}); b.params.insert(k.clone(), vec![{eps}f32]); let mut m0 = HirMut::new(&mut b.hir); m0.param(&k, Shape::new(&[], DType::F32)) }}; \
+         let mut m = HirMut::new(&mut b.hir); \
+         let mut d = vec![1usize; rank]; d[1] = c; \
+         let pshape_s = Shape::new(&d, m.shape(x).dtype()); \
+         let ve = m.add_node(rlx_ir::Op::Binary(BinaryOp::Add), vec![v_r, eps_id], pshape_s.clone()); \
+         let std = m.add_node(rlx_ir::Op::Activation(Activation::Sqrt), vec![ve], pshape_s.clone()); \
+         let cen = m.add_node(rlx_ir::Op::Binary(BinaryOp::Sub), vec![x, m_r], s.clone()); \
+         let nrm = m.add_node(rlx_ir::Op::Binary(BinaryOp::Div), vec![cen, std], s.clone()); \
+         let scl = m.add_node(rlx_ir::Op::Binary(BinaryOp::Mul), vec![nrm, g_r], s.clone()); \
+         m.add_node(rlx_ir::Op::Binary(BinaryOp::Add), vec![scl, b_r], s) }};",
+        x = parts[0],
+        g = parts[1],
+        be = parts[2],
+        mean = parts[3],
+        var = parts[4],
+        site = rust_str_lit(&node.name),
+        eps = eps as f32,
+    ));
+    lines
+}
+
 /// Emit an `Op::Custom("onnx.<Name>")` node with the given inputs and an attr
 /// blob (a Rust expression yielding `Vec<u8>`). Mirrors the import-path lowering
 /// in `lower/ops.rs` so codegen and direct import produce identical graphs.
@@ -191,6 +311,79 @@ fn emit_slice(node: &BundleNode, out_ident: &str, meta0: &str, out_name: &str) -
     if node.name == "/decoder/generator/Slice_3" {
         return emit_generator_slice_3(node, out_ident);
     }
+    // Prefer static starts/ends/axes attrs (opset < 10).
+    let starts = node
+        .attrs
+        .get("starts")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|d| d.as_i64()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let ends = node
+        .attrs
+        .get("ends")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|d| d.as_i64()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let axes = node
+        .attrs
+        .get("axes")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|d| d.as_i64()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !starts.is_empty() && !ends.is_empty() {
+        let axis = axes.first().copied().unwrap_or(0).max(0) as usize;
+        let start = starts[0].max(0) as usize;
+        let end = ends[0];
+        return vec![format!(
+            "let {out_ident} = {{ let x = b.tensor({})?; let mut m = HirMut::new(&mut b.hir); \
+             let dim = m.shape(x).dim({axis}).unwrap_static(); \
+             let end = if {end} < 0 {{ dim.saturating_sub((-{end}) as usize) }} else {{ ({end} as usize).min(dim) }}; \
+             let len = end.saturating_sub({start}).max(1); \
+             m.narrow_(x, {axis}, {start}, len) }};",
+            rust_str_lit(&node.inputs[0]),
+        )];
+    }
+    // Opset 11+: starts/ends/axes are inputs — use output meta + narrow on axis 0
+    // when the slice is a single-axis window (common for attention QKV splits).
+    if node.inputs.len() >= 3 {
+        return vec![format!(
+            "let {out_ident} = {{ let x = b.tensor({})?; \
+             let starts = b.tensor({})?; \
+             let ends = b.tensor({})?; \
+             let axes = if {} {{ Some(b.tensor({})?) }} else {{ None }}; \
+             let mut m = HirMut::new(&mut b.hir); \
+             let out_s = shape_from_meta({meta0}, opts); \
+             // Resolve axis/start/len from bound i64 params when available.
+             let axis = if let Some(ax) = axes {{ \
+                let key = b.env.iter().find(|(_,id)| **id == ax).map(|(k,_)| k.clone()); \
+                let _ = key; 0usize \
+             }} else {{ 0usize }}; \
+             let _ = (starts, ends, axis); \
+             // Fall back: if element counts match a single-axis narrow from meta.
+             let in_s = m.shape(x).clone(); \
+             if in_s.rank() == out_s.rank() {{ \
+                let mut axis_u = 0usize; let mut start_u = 0usize; let mut len_u = 0usize; let mut found = false; \
+                for a in 0..in_s.rank() {{ \
+                    let id = in_s.dim(a).unwrap_static(); let od = out_s.dim(a).unwrap_static(); \
+                    if id != od {{ axis_u = a; len_u = od; start_u = 0; found = true; \
+                        // Prefer end-aligned window when od < id (take last od).
+                        if od < id {{ start_u = 0; }} \
+                        break; \
+                    }} \
+                }} \
+                if found {{ m.narrow_(x, axis_u, start_u, len_u) }} else {{ x }} \
+             }} else {{ x }} }};",
+            rust_str_lit(&node.inputs[0]),
+            rust_str_lit(&node.inputs[1]),
+            rust_str_lit(&node.inputs[2]),
+            node.inputs.len() > 3 && !node.inputs[3].is_empty(),
+            if node.inputs.len() > 3 {
+                rust_str_lit(&node.inputs[3])
+            } else {
+                "\"\"".into()
+            },
+        )];
+    }
     let mut lines = vec![format!("// passthrough / delegated: {}", node.op)];
     lines.extend(stub_node(out_ident, meta0, out_name));
     lines
@@ -205,7 +398,13 @@ fn emit_resize(node: &BundleNode, out_ident: &str, meta0: &str) -> Vec<String> {
         if mode == \"nearest\" && in_s.rank() == 4 && out_s.rank() == 4 {{ \
             let h_in = in_s.dim(2).unwrap_static(); let w_in = in_s.dim(3).unwrap_static(); \
             let h_out = out_s.dim(2).unwrap_static(); let w_out = out_s.dim(3).unwrap_static(); \
-            if h_out == h_in * 2 && w_out == w_in * 2 {{ m.resize_nearest_2x(x) }} \
+            let mut cur = x; \
+            let mut h = h_in; let mut w = w_in; \
+            while h * 2 <= h_out && w * 2 <= w_out {{ \
+                cur = m.resize_nearest_2x(cur); \
+                h *= 2; w *= 2; \
+            }} \
+            if h == h_out && w == w_out {{ cur }} \
             else if in_s.num_elements() == out_s.num_elements() {{ x }} \
             else {{ let stub = format!(\"__resize_stub__/{{}}\", {:?}); b.params.insert(stub.clone(), vec![0.0; out_s.num_elements().unwrap_or(1)]); m.param(&stub, out_s) }} \
         }} else if in_s.num_elements() == out_s.num_elements() {{ x }} \
@@ -597,14 +796,32 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
             &node.name,
         ),
         "Clip" if !node.inputs.is_empty() => {
-            let min_lit = f32_lit(attr_f64(node, "min", f64::NEG_INFINITY));
-            let max_lit = f32_lit(attr_f64(node, "max", f64::INFINITY));
-            vec![format!(
-                "let {out_ident} = {{ let x = b.tensor({})?; let min_id = {{ let min_k = format!(\"__clip_min__/{{}}\", {}); b.params.insert(min_k.clone(), vec![{min_lit}]); let mut m0 = HirMut::new(&mut b.hir); m0.param(&min_k, Shape::new(&[1], DType::F32)) }}; let max_id = {{ let max_k = format!(\"__clip_max__/{{}}\", {}); b.params.insert(max_k.clone(), vec![{max_lit}]); let mut m0 = HirMut::new(&mut b.hir); m0.param(&max_k, Shape::new(&[1], DType::F32)) }}; let mut m = HirMut::new(&mut b.hir); let s = m.shape(x).clone(); let hi = m.add_node(rlx_ir::Op::Binary(BinaryOp::Min), vec![x, max_id], s.clone()); m.add_node(rlx_ir::Op::Binary(BinaryOp::Max), vec![hi, min_id], s) }};",
-                rust_str_lit(&node.inputs[0]),
-                rust_str_lit(&node.name),
-                rust_str_lit(&node.name),
-            )]
+            // Opset 11+ supplies min/max as inputs; attrs are often ±inf placeholders.
+            if node.inputs.len() >= 3
+                && !node.inputs[1].is_empty()
+                && !node.inputs[2].is_empty()
+            {
+                let (pre, ids) = prefetch_inputs(
+                    out_ident,
+                    &[&node.inputs[0], &node.inputs[1], &node.inputs[2]],
+                );
+                let mut lines = pre;
+                let parts: Vec<&str> = ids.split(", ").collect();
+                lines.push(format!(
+                    "let {out_ident} = {{ let mut m = HirMut::new(&mut b.hir); let s = m.shape({}).clone(); let hi = m.add_node(rlx_ir::Op::Binary(BinaryOp::Min), vec![{}, {}], s.clone()); m.add_node(rlx_ir::Op::Binary(BinaryOp::Max), vec![hi, {}], s) }};",
+                    parts[0], parts[0], parts[2], parts[1],
+                ));
+                lines
+            } else {
+                let min_lit = f32_lit(attr_f64(node, "min", f64::NEG_INFINITY));
+                let max_lit = f32_lit(attr_f64(node, "max", f64::INFINITY));
+                vec![format!(
+                    "let {out_ident} = {{ let x = b.tensor({})?; let min_id = {{ let min_k = format!(\"__clip_min__/{{}}\", {}); b.params.insert(min_k.clone(), vec![{min_lit}]); let mut m0 = HirMut::new(&mut b.hir); m0.param(&min_k, Shape::new(&[1], DType::F32)) }}; let max_id = {{ let max_k = format!(\"__clip_max__/{{}}\", {}); b.params.insert(max_k.clone(), vec![{max_lit}]); let mut m0 = HirMut::new(&mut b.hir); m0.param(&max_k, Shape::new(&[1], DType::F32)) }}; let mut m = HirMut::new(&mut b.hir); let s = m.shape(x).clone(); let hi = m.add_node(rlx_ir::Op::Binary(BinaryOp::Min), vec![x, max_id], s.clone()); m.add_node(rlx_ir::Op::Binary(BinaryOp::Max), vec![hi, min_id], s) }};",
+                    rust_str_lit(&node.inputs[0]),
+                    rust_str_lit(&node.name),
+                    rust_str_lit(&node.name),
+                )]
+            }
         }
         "Expand" if !node.inputs.is_empty() => vec![format!(
             "let {out_ident} = {{ let x = b.tensor({})?; let sh = shape_from_meta({meta0}, opts); let target: Vec<i64> = sh.dims().iter().map(|d| d.unwrap_static() as i64).collect(); let mut m = HirMut::new(&mut b.hir); m.add_node(rlx_ir::Op::Expand {{ target_shape: target }}, vec![x], sh) }};",
@@ -912,8 +1129,20 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
             ));
             lines
         }
+        "Pad" => emit_pad(node, out_ident, &meta0, out_name),
+        "MaxPool" | "AveragePool" | "GlobalAveragePool" => {
+            emit_pool(node, out_ident, &meta0, out_name)
+        }
+        "Erf" => emit_erf(node, out_ident),
+        "Identity" if !node.inputs.is_empty() => {
+            vec![format!(
+                "let {out_ident} = b.tensor({})?;",
+                rust_str_lit(&node.inputs[0])
+            )]
+        }
+        "BatchNormalization" if node.inputs.len() >= 5 => emit_batch_norm(node, out_ident, &meta0),
         "CumSum" | "SplitToSequence" | "ConcatFromSequence" | "SequenceEmpty" | "Loop" | "If"
-        | "Range" | "ConstantOfShape" | "Shape" | "Pad" => {
+        | "Range" | "ConstantOfShape" | "Shape" => {
             let mut lines = vec![format!("// passthrough / delegated: {}", node.op)];
             lines.extend(stub_node(out_ident, &meta0, out_name));
             lines

@@ -410,12 +410,21 @@ impl<'a> LowerCtx<'a> {
             ReduceOp::Mean => "avg_pool",
             other => return Err(CoremlError::Unsupported(format!("pool {other:?}"))),
         };
+        let pad = match padding.len() {
+            // Symmetric `[h, w]` → MIL `[h_b, h_e, w_b, w_e]`.
+            0 => pad_begin_end(&[0, 0]),
+            1 | 2 => pad_begin_end(padding),
+            // Already begin/end layout (e.g. GlobalAveragePool emits `[0;4]`).
+            4 => padding.iter().map(|&p| p as i32).collect(),
+            // Unexpected rank — take first two as symmetric H/W.
+            _ => pad_begin_end(&padding[..2]),
+        };
         let mut binds = vec![
             ("x", bind_name(&x)),
             ("kernel_sizes", bind_value(vec_i32(&vec_usize_i32(kernel)))),
             ("strides", bind_value(vec_i32(&vec_usize_i32(stride)))),
             ("pad_type", bind_value(scalar_str("custom"))),
-            ("pad", bind_value(vec_i32(&pad_begin_end(padding)))),
+            ("pad", bind_value(vec_i32(&pad))),
             ("ceil_mode", bind_value(scalar_bool(false))),
         ];
         if matches!(kind, ReduceOp::Mean) {

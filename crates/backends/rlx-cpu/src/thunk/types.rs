@@ -257,6 +257,15 @@ pub enum Thunk {
         dst: usize,
         len: u32,
     },
+    /// Narrowing f64 → f32 (`x as f32`, round-to-nearest). Without this the
+    /// generic Copy fallback byte-copies `len` f32-width elements out of the
+    /// 8-byte-per-element f64 buffer, so it reads each f64's two 4-byte halves
+    /// as two garbage f32s (round-trip F32→F64→F32 returned garbage).
+    CastF64ToF32 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
     /// Truncating f32 → i32 (ONNX Cast; toward zero).
     CastF32ToI32 {
         src: usize,

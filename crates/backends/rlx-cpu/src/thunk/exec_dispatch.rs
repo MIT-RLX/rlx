@@ -183,6 +183,7 @@ pub(crate) fn thunk_kind_name(t: &Thunk) -> &'static str {
         Thunk::CopyF64 { .. } => "CopyF64",
         Thunk::CopyI64 { .. } => "CopyI64",
         Thunk::CastF32ToI64 { .. } => "CastF32ToI64",
+        Thunk::CastF64ToF32 { .. } => "CastF64ToF32",
         Thunk::CastI64ToF32 { .. } => "CastI64ToF32",
         Thunk::CastBoolToI32 { .. } => "CastBoolToI32",
         Thunk::CastBoolToF32 { .. } => "CastBoolToF32",
@@ -695,6 +696,21 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let out = sl_mut_f64(*dst, base, len);
                     for i in 0..len {
                         out[i] = inp[i] as f64;
+                    }
+                }
+            }
+
+            Thunk::CastF64ToF32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_f64(*src, base, len);
+                    let out = sl_mut(*dst, base, len);
+                    // f64 → f32 narrowing (round-to-nearest), not a bitcast.
+                    for i in 0..len {
+                        out[i] = inp[i] as f32;
                     }
                 }
             }

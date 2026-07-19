@@ -3692,8 +3692,8 @@ impl CudaExecutable {
                     // Match the backward-filter routing: only grouped/degenerate
                     // shapes go to the host path; normal 2-D convs keep fast cuDNN.
                     let cudnn_ok_shape = *groups == 1 && *kh > 1 && *kw > 1;
-                    let allow_cudnn =
-                        cudnn_ok_shape || rlx_ir::env::flag("RLX_CUDA_CONV_BWD_CUDNN");
+                    let allow_cudnn = !rlx_ir::env::flag("RLX_CUDA_CONV_FORCE_GATHER")
+                        && (cudnn_ok_shape || rlx_ir::env::flag("RLX_CUDA_CONV_BWD_CUDNN"));
                     let used_cudnn = if allow_cudnn
                         && let (Some(handle), Some(workspace)) =
                             (self.dnn, self.dnn_workspace.as_ref())
@@ -3735,6 +3735,19 @@ impl CudaExecutable {
                     } else {
                         false
                     };
+                    if rlx_ir::env::flag("RLX_CUDA_CONV_TRACE") {
+                        let path = if used_cudnn {
+                            "cuDNN"
+                        } else if rlx_ir::env::flag("RLX_CUDA_CONV_BWD_HOST") {
+                            "HOST"
+                        } else {
+                            "gather-kernel"
+                        };
+                        eprintln!(
+                            "[CONV-TRACE] Conv2dBackwardInput n={} c_in={} c_out={} {}x{} k={}x{} g={} | cudnn_ok_shape={} dnn_loaded={} -> {path}",
+                            *n, *c_in, *c_out, *h, *w_in, *kh, *kw, *groups, cudnn_ok_shape, self.dnn.is_some()
+                        );
+                    }
                     if !used_cudnn {
                         // No cuDNN: default to the direct device gather kernel
                         // (one thread per dx element, no atomics) instead of the
@@ -3841,8 +3854,8 @@ impl CudaExecutable {
                     // cuDNN for all backward shapes; forward mirrors this routing
                     // unless `RLX_CUDA_CONV_FWD_CUDNN=1` opts it back in.
                     let cudnn_ok_shape = *groups == 1 && *kh > 1 && *kw > 1;
-                    let allow_cudnn =
-                        cudnn_ok_shape || rlx_ir::env::flag("RLX_CUDA_CONV_BWD_CUDNN");
+                    let allow_cudnn = !rlx_ir::env::flag("RLX_CUDA_CONV_FORCE_GATHER")
+                        && (cudnn_ok_shape || rlx_ir::env::flag("RLX_CUDA_CONV_BWD_CUDNN"));
                     let used_cudnn = if allow_cudnn
                         && let (Some(handle), Some(workspace)) =
                             (self.dnn, self.dnn_workspace.as_ref())
@@ -3884,6 +3897,19 @@ impl CudaExecutable {
                     } else {
                         false
                     };
+                    if rlx_ir::env::flag("RLX_CUDA_CONV_TRACE") {
+                        let path = if used_cudnn {
+                            "cuDNN"
+                        } else if rlx_ir::env::flag("RLX_CUDA_CONV_BWD_HOST") {
+                            "HOST"
+                        } else {
+                            "gather-kernel"
+                        };
+                        eprintln!(
+                            "[CONV-TRACE] Conv2dBackwardWeight n={} c_in={} c_out={} {}x{} k={}x{} g={} | cudnn_ok_shape={} dnn_loaded={} -> {path}",
+                            *n, *c_in, *c_out, *h, *w, *kh, *kw, *groups, cudnn_ok_shape, self.dnn.is_some()
+                        );
+                    }
                     if !used_cudnn {
                         // No cuDNN: direct device gather kernel (one thread per dw
                         // element) instead of the host D2H→CPU→H2D path.

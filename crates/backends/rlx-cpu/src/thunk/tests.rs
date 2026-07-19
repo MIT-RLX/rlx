@@ -911,6 +911,45 @@ fn run_graph(g: &Graph, inputs: &[(NodeId, &[f32])], out_id: NodeId, out_len: us
     }
 }
 
+/// f32 → f64 → f32 round-trip must be a value-preserving numeric narrowing.
+/// Before the `CastF64ToF32` thunk existed, the f64 → f32 leg fell through to
+/// the generic byte-Copy, which read `len` f32-width lanes out of the 8-byte
+/// f64 buffer — returning e.g. `[0.0, 1.875, 0.0, 2.0, 0.0, 2.125]` for the
+/// input `[1,2,3,4,5,6]`. These integers are exactly representable in both
+/// f32 and f64, so the round-trip must reproduce the input exactly.
+#[test]
+fn cast_f64_to_f32_roundtrip_preserves_values() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let len = x.len();
+
+    let mut g = Graph::new("cast_rt");
+    let xn = g.input("x", Shape::new(&[len], f));
+    let widened = g.cast(xn, DType::F64);
+    let narrowed = g.cast(widened, DType::F32);
+    g.set_outputs(vec![narrowed]);
+
+    let actual = run_graph(&g, &[(xn, &x)], narrowed, len);
+    assert_eq!(
+        actual, x,
+        "f32→f64→f32 round-trip corrupted values (missing CastF64ToF32)"
+    );
+
+    // Genuinely narrowing values (not f32-exact in f64) must round to nearest,
+    // not bit-truncate.
+    let y: Vec<f32> = vec![0.1, -2.5, 3.14159_26, 1.0e7, -1.0e-7, 123.456];
+    let mut g2 = Graph::new("cast_rt2");
+    let yn = g2.input("y", Shape::new(&[y.len()], f));
+    let yw = g2.cast(yn, DType::F64);
+    let yb = g2.cast(yw, DType::F32);
+    g2.set_outputs(vec![yb]);
+    let actual2 = run_graph(&g2, &[(yn, &y)], yb, y.len());
+    for (a, e) in actual2.iter().zip(&y) {
+        // Widening then narrowing an f32 is lossless: expect exact equality.
+        assert_eq!(*a, *e, "f32→f64→f32 narrowing mismatch: {a} vs {e}");
+    }
+}
+
 #[test]
 fn relu_backward_matches_mask() {
     let f = DType::F32;

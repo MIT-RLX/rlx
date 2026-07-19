@@ -147,6 +147,15 @@ pub(crate) fn compile_cast(
                 dst,
                 len: len as u32,
             }
+        } else if in_dtype == rlx_ir::DType::F64 && out_dtype == rlx_ir::DType::F32 {
+            // f64 → f32 narrowing. Input is 8 bytes/element; the generic Copy
+            // below would misread the f64 buffer as 4-byte f32 lanes (two
+            // garbage f32s per f64).
+            Thunk::CastF64ToF32 {
+                src,
+                dst,
+                len: len as u32,
+            }
         } else if in_dtype == rlx_ir::DType::F32 && out_dtype == rlx_ir::DType::I32 {
             Thunk::CastF32ToI32 {
                 src,

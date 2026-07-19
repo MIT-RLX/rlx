@@ -50,7 +50,8 @@ extern "C" __global__ void conv2d_backward_input(
     unsigned int ci_off = ci - g * c_in_per_g;
     unsigned int co_start = g * c_out_per_g;
 
-    float acc = 0.0f;
+    // DOUBLE-SINGLE (f32+f32) accumulation — see conv2d_backward_weight.cu.
+    float hi = 0.0f, lo = 0.0f;
     for (unsigned int ki = 0; ki < kh; ++ki) {
         int num_h = (int)(ih + ph) - (int)(ki * dh);
         if (num_h < 0 || (unsigned int)num_h % sh != 0) continue;
@@ -65,9 +66,17 @@ extern "C" __global__ void conv2d_backward_input(
                 unsigned int co = co_start + co_off;
                 float dyv = arena[dy_off + ((nn * c_out + co) * h_out + ho) * w_out + wo];
                 float wv = arena[w_off + (((co * c_in_per_g + ci_off) * kh + ki) * kw + kj)];
-                acc += dyv * wv;
+                float p = dyv * wv;
+                float ep = __fmaf_rn(dyv, wv, -p);
+                float s = hi + p;
+                float bb = s - hi;
+                float es = (hi - (s - bb)) + (p - bb);
+                lo += ep + es;
+                float t = s + lo;
+                lo -= t - s;
+                hi = t;
             }
         }
     }
-    arena[dx_off + i] = acc;
+    arena[dx_off + i] = hi;
 }
