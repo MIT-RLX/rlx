@@ -557,50 +557,6 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     }
     arena_size = orphan_off.max(arena_size);
 
-    if rlx_ir::env::flag("RLX_ARENA_DIAG") {
-        // Owner-owner slots must be disjoint (esp. under NO_REUSE). Scan + report
-        // ConvBwdInput ownership/offset to explain bug-#4 nested writes.
-        let owners: std::collections::HashSet<NodeId> = nodes
-            .iter()
-            .filter(|n| root(n.id) == n.id && !is_arena_view(&n.op))
-            .map(|n| n.id)
-            .collect();
-        let mut own: Vec<(usize, usize, NodeId)> = assignments
-            .iter()
-            .filter(|(id, _)| owners.contains(id))
-            .map(|(id, s)| (s.offset, s.offset + s.size, *id))
-            .collect();
-        own.sort_by_key(|&(o, _, _)| o);
-        let mut overlaps = 0usize;
-        for w in own.windows(2) {
-            if w[1].0 < w[0].1 {
-                overlaps += 1;
-                if overlaps <= 10 {
-                    eprintln!(
-                        "[ARENA-DIAG] OWNER OVERLAP: {:?} [{}..{}] & {:?} [{}..{}]",
-                        w[0].2, w[0].0, w[0].1, w[1].2, w[1].0, w[1].1
-                    );
-                }
-            }
-        }
-        eprintln!("[ARENA-DIAG] arena_size_bytes={arena_size} (u32::MAX={}) overlaps={overlaps} owners={} no_reuse={no_reuse}", u32::MAX, own.len());
-        let mut trunc = 0usize;
-        for node in nodes {
-            if matches!(node.op, Op::Conv2dBackwardInput { .. } | Op::Conv2dBackwardWeight { .. }) {
-                let a = assignments.get(&node.id).unwrap();
-                let truncates = a.offset > u32::MAX as usize;
-                if truncates {
-                    trunc += 1;
-                }
-                eprintln!(
-                    "[ARENA-DIAG] {:?} byte_off={} TRUNCATES_u32={truncates} (as_u32/4={})",
-                    node.op, a.offset, (a.offset as u32) / 4
-                );
-            }
-        }
-        eprintln!("[ARENA-DIAG] conv-backward nodes whose byte offset TRUNCATES u32: {trunc}");
-    }
-
     MemoryPlan {
         arena_size,
         assignments,

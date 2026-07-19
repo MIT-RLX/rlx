@@ -2898,6 +2898,28 @@ impl CudaExecutable {
                         inputs,
                     });
                 }
+                // Region-marking wraps bare `Op::ResizeNearest2x` into a
+                // single-step TransformRegion (same as Metal). Unwrap to the
+                // native 2× nearest upsample step.
+                Op::TransformRegion { steps, .. }
+                    if steps.len() == 1
+                        && matches!(
+                            steps[0],
+                            rlx_ir::op::TransformStep::ResizeNearest2x(
+                                rlx_ir::op::ChainOperand::Input(0)
+                            )
+                        ) =>
+                {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::ResizeNearest2x {
+                        src_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                    });
+                }
                 other => panic!(
                     "rlx-cuda: op {other:?} not yet lowered. \
                      Open a follow-up PR if you hit this — every other op \
