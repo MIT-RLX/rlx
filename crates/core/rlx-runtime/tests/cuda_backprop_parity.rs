@@ -92,10 +92,15 @@ fn parity(
     let cpu = run(bwd, Device::Cpu, params, inputs);
     let cuda = run(bwd, target(), params, inputs);
     let mut bad = false;
+    let l2 = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
     for (i, (c, g)) in cpu.iter().zip(&cuda).enumerate() {
         let e = max_err(c, g);
+        let (nc, ng) = (l2(c), l2(g));
+        // relative: is the CUDA output ~zero while CPU is not? (the zero-dW bug)
+        let zero = ng < 1e-4 * nc.max(1e-9);
         eprintln!(
-            "  {name}[{i}] max_err={e:.6} {}",
+            "  {name}[{i}] max_err={e:.6} |cpu|={nc:.5} |cuda|={ng:.5}{} {}",
+            if zero { " CUDA≈0!" } else { "" },
             if e < tol { "ok" } else { "MISMATCH" }
         );
         bad |= e >= tol;
@@ -1007,4 +1012,228 @@ fn cudnn_stable_conv_bwd_finite_matches_cpu() {
         !bad,
         "cuDNN stable conv bwd: disagrees with CPU (see above)"
     );
+}
+
+/// Reproduce the codec's zero-dW bug in isolation: the residual-branch convs
+/// (res.a2, res.s1, res.s2) get ~ZERO weight-gradient on CUDA while CPU/MLX
+/// compute it correctly (measured via per-tensor param-update cosine). The
+/// INPUT gradient flows (so upstream layers still train) but Conv2dBackwardWeight
+/// yields ≈0. These exercise the exact failing shapes vs known-good controls.
+#[test]
+fn codec_conv_shapes_dw() {
+    if !is_available(target()) {
+        eprintln!("codec_conv_shapes: {:?} unavailable — skipping", target());
+        return;
+    }
+    // (label, b, cin, cout, k, stride, pad, h, w) — grad_w is output index 2.
+    let cases: &[(&str, usize, usize, usize, usize, usize, usize, usize, usize)] = &[
+        ("res_a1_ctl", 2, 1, 64, 5, 2, 2, 256, 256), // control — trains OK in codec
+        ("base_a2_ctl", 2, 64, 12, 3, 1, 1, 64, 64), // control — trains OK
+        ("res_a2_BAD", 2, 64, 12, 5, 2, 2, 128, 128), // codec res.a2 — ZERO dW on CUDA
+        ("res_s1_BAD", 2, 12, 256, 3, 1, 1, 64, 64),  // codec res.s1 (up2 conv) — ZERO
+    ];
+    let mut bad = Vec::new();
+    for &(lbl, b, cin, cout, k, s, p, h, w) in cases {
+        let mut g = Graph::new(lbl);
+        let x = g.param("x", Shape::new(&[b, cin, h, w], F));
+        let wt = g.param("wt", Shape::new(&[cout, cin, k, k], F));
+        let y = g.conv2d(x, wt, [k, k], [s, s], [p, p], [1, 1], 1);
+        let rank = g.node(y).shape.rank();
+        let sq = g.mul(y, y);
+        let loss = reduce(&mut g, ReduceOp::Sum, sq, (0..rank).collect(), Shape::from_dims(&[], F));
+        g.set_outputs(vec![loss]);
+        let bwd = rlx_autodiff::grad_with_loss(&g, &[x, wt]);
+        let p_in = vec![("x", seeded(b * cin * h * w, 1)), ("wt", seeded(cout * cin * k * k, 2))];
+        // outputs: [loss, grad_x, grad_wt]; index 2 = dW is the one under suspicion.
+        if parity(lbl, &bwd, &p_in, &[("d_output", &[1.0])], 2e-3) {
+            bad.push(lbl);
+        }
+    }
+    eprintln!("codec_conv_shapes_dw MISMATCHES: {bad:?}");
+    assert!(bad.is_empty(), "conv dW disagrees CPU vs CUDA: {bad:?}");
+}
+
+/// Reproduce the codec's zero-dW in CONTEXT (single convs alone don't). Two
+/// patterns from the residual branch: (A) conv -> pixel-shuffle (up2) -> loss,
+/// and (B) conv -> gelu -> conv -> loss. Checks the conv WEIGHT gradients (dW)
+/// CPU vs CUDA — the codec zeroes these on CUDA while dx stays correct.
+#[test]
+fn codec_context_dw() {
+    if !is_available(target()) { eprintln!("codec_context_dw: skip"); return; }
+    let mut bad = Vec::new();
+    // (A) conv -> pixel-shuffle (res.s1 pattern): cin=12, cout*4=256, then shuffle to 2h,2w.
+    {
+        let (b,cin,cout,h,w)=(2usize,12usize,64usize,64usize,64usize);
+        let mut g=Graph::new("convPS");
+        let x=g.param("x",Shape::new(&[b,cin,h,w],F));
+        let wt=g.param("wt",Shape::new(&[cout*4,cin,3,3],F));
+        let y=g.conv2d(x,wt,[3,3],[1,1],[1,1],[1,1],1);
+        let r=g.reshape_(y,vec![b as i64,cout as i64,2,2,h as i64,w as i64]);
+        let t=g.transpose_(r,vec![0,1,4,2,5,3]);
+        let o=g.reshape_(t,vec![b as i64,cout as i64,(2*h) as i64,(2*w) as i64]);
+        let sq=g.mul(o,o);
+        let loss=reduce(&mut g,ReduceOp::Sum,sq,vec![0,1,2,3],Shape::from_dims(&[],F));
+        g.set_outputs(vec![loss]);
+        let bwd=rlx_autodiff::grad_with_loss(&g,&[x,wt]);
+        if parity("convPS_dW",&bwd,&[("x",seeded(b*cin*h*w,1)),("wt",seeded(cout*4*cin*9,2))],&[("d_output",&[1.0])],5e-3){bad.push("convPS");}
+    }
+    // (B) conv -> gelu -> conv (res.a1->gelu->res.a2 pattern): check BOTH dW.
+    {
+        let (b,h,w)=(2usize,128usize,128usize);
+        let mut g=Graph::new("convGeluConv");
+        let x=g.param("x",Shape::new(&[b,1,256,256],F));
+        let w1=g.param("w1",Shape::new(&[64,1,5,5],F));    // res.a1
+        let a=g.conv2d(x,w1,[5,5],[2,2],[2,2],[1,1],1);    // ->[b,64,128,128]
+        let ga=g.gelu_approx(a);
+        let w2=g.param("w2",Shape::new(&[12,64,5,5],F));   // res.a2
+        let y=g.conv2d(ga,w2,[5,5],[2,2],[2,2],[1,1],1);   // ->[b,12,64,64]
+        let sq=g.mul(y,y);
+        let loss=reduce(&mut g,ReduceOp::Sum,sq,vec![0,1,2,3],Shape::from_dims(&[],F));
+        g.set_outputs(vec![loss]);
+        let _=(h,w);
+        let bwd=rlx_autodiff::grad_with_loss(&g,&[x,w1,w2]);
+        if parity("convGeluConv_dW",&bwd,&[("x",seeded(b*1*256*256,3)),("w1",seeded(64*25,4)),("w2",seeded(12*64*25,5))],&[("d_output",&[1.0])],1e-2){bad.push("convGeluConv");}
+    }
+    eprintln!("codec_context_dw MISMATCHES: {bad:?}");
+    assert!(bad.is_empty(),"context dW disagrees: {bad:?}");
+}
+
+/// Reproduce the codec's residual-synthesis `+inf` in the backward. up2 chain:
+/// yq[b,12,64,64] -> conv+pixelshuffle -> [b,64,128,128] -> gelu -> conv+shuffle
+/// -> [b,1,256,256] -> loss. The codec NaNs with a +inf at a backward Reshape
+/// here (large-spatial up2 backward). Check CUDA gradients stay finite.
+#[test]
+fn codec_up2_chain_finite() {
+    if !is_available(target()) { eprintln!("up2_chain: skip"); return; }
+    let (b,lat,c)=(2usize,12usize,64usize);
+    let mut g=Graph::new("up2chain");
+    let x=g.param("x",Shape::new(&[b,lat,64,64],F));
+    let w1=g.param("w1",Shape::new(&[c*4,lat,3,3],F));
+    let y1=g.conv2d(x,w1,[3,3],[1,1],[1,1],[1,1],1);
+    let r1=g.reshape_(y1,vec![b as i64,c as i64,2,2,64,64]);
+    let t1=g.transpose_(r1,vec![0,1,4,2,5,3]);
+    let s1=g.reshape_(t1,vec![b as i64,c as i64,128,128]);
+    let gs1=g.gelu_approx(s1);
+    let w2=g.param("w2",Shape::new(&[4,c,3,3],F));
+    let y2=g.conv2d(gs1,w2,[3,3],[1,1],[1,1],[1,1],1);
+    let r2=g.reshape_(y2,vec![b as i64,1,2,2,128,128]);
+    let t2=g.transpose_(r2,vec![0,1,4,2,5,3]);
+    let o=g.reshape_(t2,vec![b as i64,1,256,256]);
+    let sq=g.mul(o,o);
+    let loss=reduce(&mut g,ReduceOp::Sum,sq,vec![0,1,2,3],Shape::from_dims(&[],F));
+    g.set_outputs(vec![loss]);
+    let bwd=rlx_autodiff::grad_with_loss(&g,&[x,w1,w2]);
+    let outs=run(&bwd,target(),&[("x",seeded(b*lat*64*64,1)),("w1",seeded(c*4*lat*9,2)),("w2",seeded(4*c*9,3))],&[("d_output",&[1.0])]);
+    let mut any_bad=false;
+    for (i,o) in outs.iter().enumerate(){
+        let nfin=o.iter().filter(|v| !v.is_finite()).count();
+        if nfin>0 { eprintln!("  up2chain out[{i}]: {nfin} non-finite of {}",o.len()); any_bad=true; }
+    }
+    eprintln!("up2_chain reproduces +inf: {any_bad}");
+    assert!(!any_bad,"CUDA up2-chain backward produced non-finite gradients (repro of codec +inf)");
+}
+
+/// The codec's residual bias-gradient hits ~874670 on CUDA (vs CPU max node 8.5)
+/// and grows to +inf. bias-grad = reduce_sum(dy) over batch×spatial (65536
+/// elems). This checks the large-spatial bias-broadcast backward (the reduce)
+/// at the exact codec shape [16,256,64,64] — is CUDA's d_bias correct?
+#[test]
+fn codec_bias_reduce_large() {
+    if !is_available(target()) { eprintln!("bias_reduce: skip"); return; }
+    let (b,c,h,w)=(16usize,256usize,64usize,64usize);
+    let mut g=Graph::new("biasred");
+    let x=g.param("x",Shape::new(&[b,c,h,w],F));
+    let bias=g.param("bias",Shape::new(&[1,c,1,1],F));
+    let y=g.add(x,bias);           // broadcast add
+    let sq=g.mul(y,y);
+    let loss=reduce(&mut g,ReduceOp::Sum,sq,vec![0,1,2,3],Shape::from_dims(&[],F));
+    g.set_outputs(vec![loss]);
+    let bwd=rlx_autodiff::grad_with_loss(&g,&[x,bias]);
+    // small inputs so d_bias is modestly-sized; a wrong reduce shows as huge/mismatch.
+    let xv:Vec<f32>=seeded(b*c*h*w,1).iter().map(|v|v*0.1).collect();
+    let bv:Vec<f32>=seeded(c,2).iter().map(|v|v*0.1).collect();
+    let cpu=run(&bwd,Device::Cpu,&[("x",xv.clone()),("bias",bv.clone())],&[("d_output",&[1.0])]);
+    let cud=run(&bwd,target(),&[("x",xv),("bias",bv)],&[("d_output",&[1.0])]);
+    let l2=|v:&[f32]|v.iter().map(|x|x*x).sum::<f32>().sqrt();
+    // outputs: [loss, d_x, d_bias]; index 2 = d_bias
+    for (i,(cp,cd)) in cpu.iter().zip(&cud).enumerate(){
+        let me=max_err(cp,cd);
+        eprintln!("  biasred[{i}] |cpu|={:.4} |cuda|={:.4} max_err={me:.4}",l2(cp),l2(cd));
+    }
+    let me=max_err(&cpu[2],&cud[2]);
+    let rel=me/(l2(&cpu[2]).max(1e-9));
+    assert!(rel<1e-2,"d_bias (large-spatial reduce) disagrees CPU vs CUDA: rel={rel}");
+}
+
+/// Faithful residual-synthesis repro with MEAN loss + conv BIASES (the codec's
+/// up2 uses conv()+bias). yq[b,12,64,64] -> up2(conv12->256 +bias)+shuffle ->
+/// [b,64,128,128] -> gelu -> up2(conv64->4 +bias)+shuffle -> [b,1,256,256] ->
+/// MEAN((.)²). Codec's residual bias-grad is ~874670 on CUDA but should be ~1e6×
+/// smaller under a mean loss. Compare ALL grads CPU vs CUDA (esp. biases).
+#[test]
+fn codec_residual_synth_meanloss() {
+    if !is_available(target()) { eprintln!("resid_synth: skip"); return; }
+    let (b,lat,c)=(4usize,12usize,64usize);
+    let mut g=Graph::new("residsynth");
+    let x=g.param("x",Shape::new(&[b,lat,64,64],F));
+    // up2 #1: conv lat->c*4 + bias, pixelshuffle to 128
+    let w1=g.param("w1",Shape::new(&[c*4,lat,3,3],F));
+    let b1=g.param("b1",Shape::new(&[1,(c*4) as i64 as usize,1,1],F));
+    let y1=g.conv2d(x,w1,[3,3],[1,1],[1,1],[1,1],1);
+    let y1=g.add(y1,b1);
+    let r1=g.reshape_(y1,vec![b as i64,c as i64,2,2,64,64]);
+    let t1=g.transpose_(r1,vec![0,1,4,2,5,3]);
+    let s1=g.reshape_(t1,vec![b as i64,c as i64,128,128]);
+    let gs1=g.gelu_approx(s1);
+    // up2 #2: conv c->1*4 + bias, pixelshuffle to 256
+    let w2=g.param("w2",Shape::new(&[4,c,3,3],F));
+    let b2=g.param("b2",Shape::new(&[1,4,1,1],F));
+    let y2=g.conv2d(gs1,w2,[3,3],[1,1],[1,1],[1,1],1);
+    let y2=g.add(y2,b2);
+    let r2=g.reshape_(y2,vec![b as i64,1,2,2,128,128]);
+    let t2=g.transpose_(r2,vec![0,1,4,2,5,3]);
+    let o=g.reshape_(t2,vec![b as i64,1,256,256]);
+    let sq=g.mul(o,o);
+    let loss=g.add_node(Op::Reduce{op:ReduceOp::Mean,axes:vec![0,1,2,3],keep_dim:false},vec![sq],Shape::from_dims(&[],F));
+    g.set_outputs(vec![loss]);
+    let bwd=rlx_autodiff::grad_with_loss(&g,&[x,w1,b1,w2,b2]);
+    let sm=|n,s|->Vec<f32>{seeded(n,s).iter().map(|v|v*0.2).collect()};
+    let ins=[("x",sm(b*lat*64*64,1)),("w1",sm(c*4*lat*9,2)),("b1",sm(c*4,3)),("w2",sm(4*c*9,4)),("b2",sm(4,5))];
+    let cpu=run(&bwd,Device::Cpu,&ins,&[("d_output",&[1.0])]);
+    let cud=run(&bwd,target(),&ins,&[("d_output",&[1.0])]);
+    let l2=|v:&[f32]|v.iter().map(|x|x*x).sum::<f32>().sqrt();
+    let lbl=["loss","d_x","d_w1","d_b1","d_w2","d_b2"];
+    let mut bad=false;
+    for (i,(cp,cd)) in cpu.iter().zip(&cud).enumerate(){
+        let (nc,nd)=(l2(cp),l2(cd)); let rel=(nc-nd).abs()/nc.max(1e-9);
+        eprintln!("  {} |cpu|={:.6} |cuda|={:.6} rel={:.4}{}",lbl.get(i).unwrap_or(&"?"),nc,nd,rel,if rel>0.05{"  MISMATCH"}else{""});
+        if rel>0.05 {bad=true;}
+    }
+    assert!(!bad,"residual synth grads disagree CPU vs CUDA");
+}
+
+/// Minimal test of the all-axis MEAN backward at the codec's exact size. The
+/// codec's dist = mean(sq) over [16,1,256,256]=1M; on CUDA its gradients come
+/// out ~1e6× too large (≈ N), i.e. the 1/N is lost in the full graph. Does the
+/// all-axis mean backward apply 1/N at 1M elements? grad(mean(x²)) = 2x/N.
+#[test]
+fn mean_backward_large_1m() {
+    if !is_available(target()) { eprintln!("mean_1m: skip"); return; }
+    for &(bb,cc,hh,ww) in &[(16usize,1usize,256usize,256usize),(4,1,256,256),(16,64,64,64)] {
+        let n=(bb*cc*hh*ww) as f32;
+        let mut g=Graph::new("mean1m");
+        let x=g.param("x",Shape::new(&[bb,cc,hh,ww],F));
+        let sq=g.mul(x,x);
+        let loss=g.add_node(Op::Reduce{op:ReduceOp::Mean,axes:vec![0,1,2,3],keep_dim:false},vec![sq],Shape::from_dims(&[],F));
+        g.set_outputs(vec![loss]);
+        let bwd=rlx_autodiff::grad_with_loss(&g,&[x]);
+        let xv=seeded(bb*cc*hh*ww,7);
+        let cpu=run(&bwd,Device::Cpu,&[("x",xv.clone())],&[("d_output",&[1.0])]);
+        let cud=run(&bwd,target(),&[("x",xv)],&[("d_output",&[1.0])]);
+        let l2=|v:&[f32]|v.iter().map(|z|z*z).sum::<f32>().sqrt();
+        // grad_x = 2x/N ; index 1
+        let rel=max_err(&cpu[1],&cud[1])/l2(&cpu[1]).max(1e-12);
+        eprintln!("  mean1m [{bb},{cc},{hh},{ww}] N={n:.0}: |cpu_grad|={:.6} |cuda_grad|={:.6} rel_err={rel:.4}",l2(&cpu[1]),l2(&cud[1]));
+        assert!(rel<1e-2,"mean backward wrong 1/N at N={n}");
+    }
 }

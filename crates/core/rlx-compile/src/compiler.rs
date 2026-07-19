@@ -288,8 +288,32 @@ impl CompilePipeline {
     pub fn optimize_with_report(&self, mir: MirModule) -> (MirModule, FusionReport) {
         let need_fusion_diff = self.assert_fusion_clean || self.fusion_report;
         let before = need_fusion_diff.then(|| mir.as_graph().clone());
-        let passes =
-            fusion_passes_for_supported(self.effective_supported(), self.opts, self.target);
+        // CUDA fuses conv+bias into `FusedConvBiasAct` (and folds convs into FK
+        // regions) as a FORWARD optimization, but the fused backward cannot
+        // recover the intermediate that `Conv2dBackwardWeight` needs — so the
+        // fused conv's WEIGHT gradient comes out ~0, silently freezing those
+        // weights during training (measured: ~half a conv codec's params never
+        // updated on CUDA while CPU/MLX were correct — a hard-to-see training
+        // bug, not a crash). Gate conv/FK fusion off when the graph is a
+        // TRAINING graph (contains conv-weight-backward), keeping it for
+        // inference. Cheap scan; only fires on CUDA training compiles.
+        let opts = {
+            let mut o = self.opts;
+            if matches!(self.target, FusionTarget::Cuda)
+                && mir.as_graph().nodes().iter().any(|nd| {
+                    matches!(
+                        nd.op,
+                        rlx_ir::Op::Conv2dBackwardWeight { .. }
+                            | rlx_ir::Op::Conv2dBackwardInput { .. }
+                    )
+                })
+            {
+                o.disable_conv_bias_act_fusion = true;
+                o.fk_fusion = false;
+            }
+            o
+        };
+        let passes = fusion_passes_for_supported(self.effective_supported(), opts, self.target);
         let limits = self.opts.fusion_limits;
         let graph = with_fusion_context(self.target, self.opts, || {
             with_fusion_limits(limits, || run_passes(mir.into_graph(), &passes, false))

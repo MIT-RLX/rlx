@@ -92,7 +92,12 @@ pub fn activation_deriv_wrt_x(
             let ax = g.activation(Activation::Abs, x, shape.clone());
             g.binary(BinaryOp::Div, x, ax, shape.clone())
         }
-        Activation::Gelu => {
+        // `GeluApprox` (tanh-approx GELU, the PyTorch/ViT default) shares this
+        // derivative EXACTLY; `Gelu` (erf form) uses it as a ~1e-3 approximation.
+        // NB `GeluApprox` was previously (wrongly) grouped with `Silu` below and
+        // got SILU's derivative — same class of silent-wrong-gradient bug as the
+        // old `Gelu`, caught by `tests/activation_backward_fd.rs`.
+        Activation::Gelu | Activation::GeluApprox => {
             // Tanh-approximation of the GELU derivative (matches the exact erf
             // form to ~1e-3 — the same approximation `GeluApprox` uses):
             //   g(x)  = 0.5·x·(1 + tanh(u)),  u = c·(x + a·x³), c = √(2/π), a = 0.044715
@@ -130,7 +135,7 @@ pub fn activation_deriv_wrt_x(
             let term2 = g.binary(BinaryOp::Mul, hx_sech2, u_prime, shape.clone());
             g.binary(BinaryOp::Add, term1, term2, shape.clone())
         }
-        Activation::GeluApprox | Activation::Silu => {
+        Activation::Silu => {
             let sig = g.activation(Activation::Sigmoid, x, shape.clone());
             let one = scalar_const(1.0, shape, g);
             let one_minus = g.binary(BinaryOp::Sub, one, sig, shape.clone());
