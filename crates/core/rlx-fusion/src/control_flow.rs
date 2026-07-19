@@ -77,6 +77,216 @@ impl Pass for LowerScan {
     }
 }
 
+/// Selectively unroll short `Op::Scan` nodes so GPU backends can run the body
+/// as ordinary device ops. A Scan is unrolled when:
+/// - `length <= max_length` (and `max_length > 0`), and
+/// - `num_checkpoints == 0` or `num_checkpoints == length` (full trajectory;
+///   partial checkpointing needs the host `ScanHost` / native Scan loop).
+///
+/// Longer or checkpointed Scans are left intact for host-fallback. `max_length
+/// == 0` is a no-op; `max_length == u32::MAX` unrolls every eligible Scan
+/// (same as [`unroll_scan`] for non-checkpointed nodes).
+pub fn maybe_unroll_scans(g: Graph, max_length: u32) -> Graph {
+    if max_length == 0 {
+        return g;
+    }
+    let needs = g.nodes().iter().any(|n| match &n.op {
+        Op::Scan {
+            length,
+            num_checkpoints,
+            ..
+        } => *length <= max_length && (*num_checkpoints == 0 || *num_checkpoints == *length),
+        _ => false,
+    });
+    if !needs {
+        return g;
+    }
+    maybe_unroll_scans_inner(g, max_length)
+}
+
+/// Unroll Scans whose expanded node budget (`length * body_nodes`) fits under
+/// `max_body_replicas`. Prefers on-device IR over host `ScanHost` when the
+/// body is small enough that unrolling stays tractable (SPD Jacobi, short IIR).
+pub fn maybe_unroll_scans_budget(g: Graph, max_body_replicas: usize) -> Graph {
+    if max_body_replicas == 0 {
+        return g;
+    }
+    let needs = g.nodes().iter().any(|n| match &n.op {
+        Op::Scan {
+            body,
+            length,
+            num_checkpoints,
+            ..
+        } => {
+            (*num_checkpoints == 0 || *num_checkpoints == *length)
+                && (*length as usize).saturating_mul(body.nodes().len()) <= max_body_replicas
+        }
+        _ => false,
+    });
+    if !needs {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: std::collections::HashMap<NodeId, NodeId> = std::collections::HashMap::new();
+    let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
+    for node in &nodes {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_id = match &node.op {
+            Op::Scan {
+                body,
+                length,
+                save_trajectory,
+                num_bcast,
+                num_xs,
+                num_checkpoints,
+            } if (*num_checkpoints == 0 || *num_checkpoints == *length)
+                && (*length as usize).saturating_mul(body.nodes().len()) <= max_body_replicas =>
+            {
+                unroll_one_scan(
+                    &mut out,
+                    body,
+                    *length as usize,
+                    *save_trajectory,
+                    *num_bcast as usize,
+                    *num_xs as usize,
+                    &new_inputs,
+                    &node.shape,
+                )
+            }
+            _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
+        };
+        id_map.insert(node.id, new_id);
+    }
+    let new_outputs: Vec<NodeId> = g.outputs.iter().map(|i| id_map[i]).collect();
+    out.set_outputs(new_outputs);
+    out
+}
+
+fn maybe_unroll_scans_inner(g: Graph, max_length: u32) -> Graph {
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
+
+    for node in &nodes {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_id = match &node.op {
+            Op::Scan {
+                body,
+                length,
+                save_trajectory,
+                num_bcast,
+                num_xs,
+                num_checkpoints,
+            } if *length <= max_length
+                && (*num_checkpoints == 0 || *num_checkpoints == *length) =>
+            {
+                unroll_one_scan(
+                    &mut out,
+                    body,
+                    *length as usize,
+                    *save_trajectory,
+                    *num_bcast as usize,
+                    *num_xs as usize,
+                    &new_inputs,
+                    &node.shape,
+                )
+            }
+            _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
+        };
+        id_map.insert(node.id, new_id);
+    }
+    let new_outputs: Vec<NodeId> = g.outputs.iter().map(|i| id_map[i]).collect();
+    out.set_outputs(new_outputs);
+    out
+}
+
+/// Expand a single Scan into inlined body replicas (shared by [`unroll_scan`]
+/// and [`maybe_unroll_scans`]).
+#[allow(clippy::too_many_arguments)]
+fn unroll_one_scan(
+    out: &mut Graph,
+    body: &Graph,
+    length: usize,
+    save_trajectory: bool,
+    nb: usize,
+    nx: usize,
+    new_inputs: &[NodeId],
+    out_shape: &Shape,
+) -> NodeId {
+    debug_assert!(length >= 1, "unroll_scan: length must be ≥1");
+    let init = new_inputs[0];
+    let bcasts: Vec<NodeId> = new_inputs[1..1 + nb].to_vec();
+    let xs: Vec<NodeId> = new_inputs[1 + nb..1 + nb + nx].to_vec();
+    let carry_shape = out.node(init).shape.clone();
+
+    let mut carry = init;
+    let mut rows: Vec<NodeId> = Vec::with_capacity(length);
+    for t in 0..length {
+        let mut xs_t: Vec<NodeId> = Vec::with_capacity(nx);
+        for &x in &xs {
+            let xsh = out.node(x).shape.clone();
+            let ps_usize: Vec<usize> = xsh
+                .dims()
+                .iter()
+                .skip(1)
+                .map(|d| d.unwrap_static())
+                .collect();
+            let ps_i64: Vec<i64> = ps_usize.iter().map(|&d| d as i64).collect();
+            let mut nar_dims = vec![1usize];
+            nar_dims.extend(ps_usize.iter().copied());
+            let narrowed = out.add_node(
+                Op::Narrow {
+                    axis: 0,
+                    start: t,
+                    len: 1,
+                },
+                vec![x],
+                Shape::new(&nar_dims, xsh.dtype()),
+            );
+            let reshaped = out.add_node(
+                Op::Reshape { new_shape: ps_i64 },
+                vec![narrowed],
+                Shape::new(&ps_usize, xsh.dtype()),
+            );
+            xs_t.push(reshaped);
+        }
+        let mut captures = vec![carry];
+        captures.extend(bcasts.iter().copied());
+        captures.extend(xs_t);
+        let outs = inline_subgraph_into_outputs(body, &captures, out);
+        carry = outs[0];
+        if save_trajectory {
+            rows.push(carry);
+        }
+    }
+
+    if save_trajectory {
+        let cdims: Vec<usize> = carry_shape
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .collect();
+        let mut rdims = vec![1usize];
+        rdims.extend(cdims.iter().copied());
+        let ri64: Vec<i64> = rdims.iter().map(|&d| d as i64).collect();
+        let reshaped_rows: Vec<NodeId> = rows
+            .iter()
+            .map(|&r| {
+                out.add_node(
+                    Op::Reshape {
+                        new_shape: ri64.clone(),
+                    },
+                    vec![r],
+                    Shape::new(&rdims, carry_shape.dtype()),
+                )
+            })
+            .collect();
+        out.add_node(Op::Concat { axis: 0 }, reshaped_rows, out_shape.clone())
+    } else {
+        carry
+    }
+}
+
 /// Bounded-unroll `Op::Scan` into `length` inlined body copies. Each step
 /// inlines the body with `[carry, bcast.., xs[t]]` (slicing `xs` at row `t`);
 /// the produced carry feeds the next step. With `save_trajectory`, the per-step
@@ -99,84 +309,16 @@ pub fn unroll_scan(g: Graph) -> Graph {
                 num_bcast,
                 num_xs,
                 ..
-            } => {
-                let nb = *num_bcast as usize;
-                let nx = *num_xs as usize;
-                let length = *length as usize;
-                debug_assert!(length >= 1, "unroll_scan: length must be ≥1");
-                let init = new_inputs[0];
-                let bcasts: Vec<NodeId> = new_inputs[1..1 + nb].to_vec();
-                let xs: Vec<NodeId> = new_inputs[1 + nb..1 + nb + nx].to_vec();
-                let carry_shape = out.node(init).shape.clone();
-
-                let mut carry = init;
-                let mut rows: Vec<NodeId> = Vec::with_capacity(length);
-                for t in 0..length {
-                    // Slice each xs at step t: [length, *ps] → Narrow → [1, *ps] → Reshape → [*ps].
-                    let mut xs_t: Vec<NodeId> = Vec::with_capacity(nx);
-                    for &x in &xs {
-                        let xsh = out.node(x).shape.clone();
-                        let ps_usize: Vec<usize> = xsh
-                            .dims()
-                            .iter()
-                            .skip(1)
-                            .map(|d| d.unwrap_static())
-                            .collect();
-                        let ps_i64: Vec<i64> = ps_usize.iter().map(|&d| d as i64).collect();
-                        let mut nar_dims = vec![1usize];
-                        nar_dims.extend(ps_usize.iter().copied());
-                        let narrowed = out.add_node(
-                            Op::Narrow {
-                                axis: 0,
-                                start: t,
-                                len: 1,
-                            },
-                            vec![x],
-                            Shape::new(&nar_dims, xsh.dtype()),
-                        );
-                        let reshaped = out.add_node(
-                            Op::Reshape { new_shape: ps_i64 },
-                            vec![narrowed],
-                            Shape::new(&ps_usize, xsh.dtype()),
-                        );
-                        xs_t.push(reshaped);
-                    }
-                    let mut captures = vec![carry];
-                    captures.extend(bcasts.iter().copied());
-                    captures.extend(xs_t);
-                    let outs = inline_subgraph_into_outputs(body, &captures, &mut out);
-                    carry = outs[0];
-                    if *save_trajectory {
-                        rows.push(carry);
-                    }
-                }
-
-                if *save_trajectory {
-                    let cdims: Vec<usize> = carry_shape
-                        .dims()
-                        .iter()
-                        .map(|d| d.unwrap_static())
-                        .collect();
-                    let mut rdims = vec![1usize];
-                    rdims.extend(cdims.iter().copied());
-                    let ri64: Vec<i64> = rdims.iter().map(|&d| d as i64).collect();
-                    let reshaped_rows: Vec<NodeId> = rows
-                        .iter()
-                        .map(|&r| {
-                            out.add_node(
-                                Op::Reshape {
-                                    new_shape: ri64.clone(),
-                                },
-                                vec![r],
-                                Shape::new(&rdims, carry_shape.dtype()),
-                            )
-                        })
-                        .collect();
-                    out.add_node(Op::Concat { axis: 0 }, reshaped_rows, node.shape.clone())
-                } else {
-                    carry
-                }
-            }
+            } => unroll_one_scan(
+                &mut out,
+                body,
+                *length as usize,
+                *save_trajectory,
+                *num_bcast as usize,
+                *num_xs as usize,
+                &new_inputs,
+                &node.shape,
+            ),
             _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
         };
         id_map.insert(node.id, new_id);
@@ -513,6 +655,61 @@ mod tests {
         assert_eq!(
             n_mul, 4,
             "expected 2 body Mul + 2 active*cond_f Mul from While (N=2)"
+        );
+    }
+
+    #[test]
+    fn maybe_unroll_scans_short_only() {
+        let s = Shape::new(&[2], DType::F32);
+        let mut body = Graph::new("body");
+        let bc = body.input("c", s.clone());
+        let bx = body.input("x", s.clone());
+        let by = body.binary(BinaryOp::Add, bc, bx, s.clone());
+        body.set_outputs(vec![by]);
+
+        let mut g = Graph::new("two_scans");
+        let init = g.input("init", s.clone());
+        let xs_short = g.input("xs_s", Shape::new(&[4, 2], DType::F32));
+        let xs_long = g.input("xs_l", Shape::new(&[128, 2], DType::F32));
+        let short = g.add_node(
+            Op::Scan {
+                body: Box::new(body.clone()),
+                length: 4,
+                save_trajectory: false,
+                num_bcast: 0,
+                num_xs: 1,
+                num_checkpoints: 0,
+            },
+            vec![init, xs_short],
+            s.clone(),
+        );
+        let long = g.add_node(
+            Op::Scan {
+                body: Box::new(body),
+                length: 128,
+                save_trajectory: false,
+                num_bcast: 0,
+                num_xs: 1,
+                num_checkpoints: 0,
+            },
+            vec![short, xs_long],
+            s.clone(),
+        );
+        g.set_outputs(vec![long]);
+
+        let out = maybe_unroll_scans(g, 64);
+        let scans: Vec<_> = out
+            .nodes()
+            .iter()
+            .filter_map(|n| match &n.op {
+                Op::Scan { length, .. } => Some(*length),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            scans,
+            vec![128],
+            "only the short Scan (len=4) should unroll; long Scan remains"
         );
     }
 

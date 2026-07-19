@@ -113,14 +113,20 @@ impl HwInfo {
         info
     }
 
-    /// Optimal worker count: P-cores/2 (avoids E-cores + AMX cache thrashing).
+    /// Optimal worker count.
+    ///
+    /// Apple Silicon: half of P-cores (avoid E-cores + AMX cache thrashing).
+    /// Elsewhere: ~¾ of logical CPUs — DiT/CNN CPU paths want more outer
+    /// Rayon width once BLAS is pinned to 1 thread.
     fn optimal_workers(&self) -> usize {
         let base = if self.perf_cores > 0 {
-            self.perf_cores / 2 // Use half of P-cores
+            self.perf_cores / 2
+        } else if cfg!(all(target_arch = "aarch64", target_vendor = "apple")) {
+            self.total_cpus / 2
         } else {
-            self.total_cpus / 2 // Fallback: half of all CPUs
+            self.total_cpus.saturating_mul(3) / 4
         };
-        base.clamp(1, 15)
+        base.clamp(1, 32)
     }
 
     /// Cache line: prefer runtime-detected, fall back to compile-time.
@@ -233,7 +239,7 @@ impl RuntimeConfig {
         if let Some(v) = rlx_ir::env::var("RLX_WORKERS")
             && let Ok(n) = v.parse::<usize>()
         {
-            cfg.pool_workers = if n == 0 { cfg.pool_workers } else { n.min(15) };
+            cfg.pool_workers = if n == 0 { cfg.pool_workers } else { n.min(32) };
         }
         if let Some(v) = rlx_ir::env::var("RLX_PAR_THRESHOLD")
             && let Ok(n) = v.parse()
@@ -300,7 +306,7 @@ mod tests {
     fn auto_detect_sane_defaults() {
         let cfg = RuntimeConfig::auto_detect();
         assert!(cfg.pool_workers >= 1);
-        assert!(cfg.pool_workers <= 15);
+        assert!(cfg.pool_workers <= 32);
         // Platform-appropriate cache line
         assert!(cfg.arena_alignment >= 64);
         assert!(cfg.verbose == 0);

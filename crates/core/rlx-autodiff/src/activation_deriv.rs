@@ -93,19 +93,42 @@ pub fn activation_deriv_wrt_x(
             g.binary(BinaryOp::Div, x, ax, shape.clone())
         }
         Activation::Gelu => {
-            let c = scalar_const(0.7978845608 * 0.5, shape, g);
+            // Tanh-approximation of the GELU derivative (matches the exact erf
+            // form to ~1e-3 — the same approximation `GeluApprox` uses):
+            //   g(x)  = 0.5·x·(1 + tanh(u)),  u = c·(x + a·x³), c = √(2/π), a = 0.044715
+            //   g'(x) = 0.5·(1 + tanh(u)) + 0.5·x·(1 − tanh²(u))·u',  u' = c·(1 + 3a·x²)
+            // The previous formula was WRONG: it computed `(1−tanh²(u))·(c+1.5x²)`
+            // ≈ d/dx tanh(u), dropping BOTH the `0.5·(1+tanh(u))` term and the
+            // `0.5·x` factor — silently corrupting gelu gradients on every backend
+            // that DECOMPOSES `ActivationBackward` (e.g. CUDA, which lacks a native
+            // kernel) while CPU/MLX (native kernel) were correct. That mismatch made
+            // conv models diverge on CUDA at LRs where CPU/MLX trained fine.
+            let c = scalar_const(0.7978845608, shape, g); // √(2/π)
+            let a = scalar_const(0.044715, shape, g);
+            let half = scalar_const(0.5, shape, g);
             let x2 = g.binary(BinaryOp::Mul, x, x, shape.clone());
             let x3 = g.binary(BinaryOp::Mul, x, x2, shape.clone());
-            let c_x3 = g.binary(BinaryOp::Mul, c, x3, shape.clone());
-            let inner = g.binary(BinaryOp::Add, x, c_x3, shape.clone());
-            let t = g.activation(Activation::Tanh, inner, shape.clone());
-            let one = scalar_const(1.0, shape, g);
+            let a_x3 = g.binary(BinaryOp::Mul, a, x3, shape.clone());
+            let inner_arg = g.binary(BinaryOp::Add, x, a_x3, shape.clone());
+            let u = g.binary(BinaryOp::Mul, c, inner_arg, shape.clone());
+            let t = g.activation(Activation::Tanh, u, shape.clone());
+            // term1 = 0.5·(1 + tanh(u))
+            let one_a = scalar_const(1.0, shape, g);
+            let one_plus_t = g.binary(BinaryOp::Add, one_a, t, shape.clone());
+            let term1 = g.binary(BinaryOp::Mul, half, one_plus_t, shape.clone());
+            // term2 = 0.5·x·(1 − tanh²(u))·u',  u' = c·(1 + 3a·x²)
             let t2 = g.binary(BinaryOp::Mul, t, t, shape.clone());
-            let sech2 = g.binary(BinaryOp::Sub, one, t2, shape.clone());
-            let one_half = scalar_const(1.5, shape, g);
-            let one_half_x2 = g.binary(BinaryOp::Mul, one_half, x2, shape.clone());
-            let inner_deriv = g.binary(BinaryOp::Add, c, one_half_x2, shape.clone());
-            g.binary(BinaryOp::Mul, sech2, inner_deriv, shape.clone())
+            let one_b = scalar_const(1.0, shape, g);
+            let sech2 = g.binary(BinaryOp::Sub, one_b, t2, shape.clone());
+            let three_a = scalar_const(3.0 * 0.044715, shape, g); // 0.134145
+            let three_a_x2 = g.binary(BinaryOp::Mul, three_a, x2, shape.clone());
+            let one_c = scalar_const(1.0, shape, g);
+            let u_arg = g.binary(BinaryOp::Add, one_c, three_a_x2, shape.clone());
+            let u_prime = g.binary(BinaryOp::Mul, c, u_arg, shape.clone());
+            let half_x = g.binary(BinaryOp::Mul, half, x, shape.clone());
+            let hx_sech2 = g.binary(BinaryOp::Mul, half_x, sech2, shape.clone());
+            let term2 = g.binary(BinaryOp::Mul, hx_sech2, u_prime, shape.clone());
+            g.binary(BinaryOp::Add, term1, term2, shape.clone())
         }
         Activation::GeluApprox | Activation::Silu => {
             let sig = g.activation(Activation::Sigmoid, x, shape.clone());

@@ -13,51 +13,58 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Host-side `Op::Scan` for ROCm device arenas (D2H → CPU → H2D). Mirrors the
-//! CUDA path: the body is compiled once (`ScanBodyPlan`), then each run reads
-//! the arena back, loops the body on the CPU via
-//! `rlx_cpu::thunk::execute_scan_host`, and writes it back.
+//! Host-side `Op::Scan` / HostOp / indexing for ROCm arenas.
+//!
+//! Thin adapters over [`rlx_gpu_host`] (`run_scan` / `run_host_op` / `run_indexing`).
 
 use crate::device::RocmContext;
 use crate::hip::HipBuffer;
-use rlx_cpu::thunk::ScanBodyPlan;
+use crate::host_stage::RocmArena;
+use rlx_cpu::thunk::{HostOpDesc, INDEXING_CONTIGUOUS_SPAN_CAP, IndexingThunk, ScanHostDesc};
 
-#[allow(clippy::too_many_arguments)]
 pub fn run_scan(
     ctx: &RocmContext,
     buffer: &HipBuffer<f32>,
     arena_size_bytes: usize,
-    plan: &ScanBodyPlan,
-    outer_init_off: usize,
-    outer_final_off: usize,
-    length: u32,
-    save_trajectory: bool,
-    xs_outer: &[(usize, usize)],
-    bcast_outer: &[(usize, usize)],
+    desc: &ScanHostDesc,
 ) {
-    let rt = &ctx.runtime;
-    let n_f32 = arena_size_bytes / 4;
-    let mut host = vec![0f32; n_f32];
+    let mut arena = RocmArena {
+        ctx,
+        buffer,
+        size_bytes: arena_size_bytes,
+    };
+    rlx_gpu_host::run_scan(&mut arena, desc);
+}
 
-    unsafe {
-        let _ = (rt.hip_stream_sync)(ctx.default_stream);
-        let _ = (rt.hip_memcpy_dtoh)(host.as_mut_ptr() as *mut _, buffer.ptr, n_f32 * 4);
-    }
+pub fn run_host_op(
+    ctx: &RocmContext,
+    buffer: &HipBuffer<f32>,
+    arena_size_bytes: usize,
+    desc: &HostOpDesc,
+) {
+    let mut arena = RocmArena {
+        ctx,
+        buffer,
+        size_bytes: arena_size_bytes,
+    };
+    rlx_gpu_host::run_host_op(&mut arena, desc);
+}
 
-    unsafe {
-        rlx_cpu::thunk::execute_scan_host(
-            host.as_mut_ptr() as *mut u8,
-            plan,
-            outer_init_off,
-            outer_final_off,
-            length,
-            save_trajectory,
-            xs_outer,
-            bcast_outer,
-        );
-    }
-
-    unsafe {
-        let _ = (rt.hip_memcpy_htod)(buffer.ptr, host.as_ptr() as *const _, n_f32 * 4);
-    }
+pub fn run_indexing(
+    ctx: &RocmContext,
+    buffer: &HipBuffer<f32>,
+    arena_size_bytes: usize,
+    thunk: &IndexingThunk,
+) {
+    let mut arena = RocmArena {
+        ctx,
+        buffer,
+        size_bytes: arena_size_bytes,
+    };
+    rlx_gpu_host::run_indexing(
+        &mut arena,
+        arena_size_bytes,
+        thunk,
+        INDEXING_CONTIGUOUS_SPAN_CAP,
+    );
 }

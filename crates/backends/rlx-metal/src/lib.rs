@@ -69,10 +69,22 @@ pub mod kernels;
 #[cfg(rlx_metal_host)]
 pub mod fft_dispatch;
 
+/// CPU host-fallback for the core Riemannian / SPD-manifold ops (BiMap /
+/// ReEig / LogEig / SpdBatchNorm / SpdKarcherMean + backwards). No MSL
+/// eigen kernel; they run `rlx_cpu::spd` (F64) against the unified-memory
+/// arena between GPU segments, like `Op::Fft`. See `crate::spd`.
+#[cfg(rlx_metal_host)]
+pub mod spd;
+
 #[cfg(rlx_metal_host)]
 pub mod llada2_gate;
 #[cfg(rlx_metal_host)]
 pub mod ms_deform_attn;
+
+#[cfg(rlx_metal_host)]
+pub mod config;
+#[cfg(rlx_metal_host)]
+pub use config::{MetalRuntimeConfig, install_runtime_config, reload_runtime_config, runtime_config};
 
 #[cfg(rlx_metal_host)]
 pub mod cost;
@@ -115,6 +127,13 @@ pub mod async_copy;
 
 #[cfg(rlx_metal_host)]
 pub mod op_registry;
+
+#[cfg(rlx_metal_host)]
+pub mod collective;
+
+/// Legalization op claim — always available (no Metal device required).
+pub mod supported_ops;
+pub use supported_ops::SUPPORTED_OPS;
 
 /// PLAN: Schedule splitting for the Metal MPSGraph path. Splits the
 /// schedule at attention boundaries so the broken slice-of-computed

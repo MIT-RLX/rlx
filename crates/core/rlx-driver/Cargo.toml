@@ -13,7 +13,7 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.12" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.13" }
 half = "2"
 # Zero-config LAN discovery (Bonjour/Avahi-compatible mDNS-SD), opt-in: the
 # unicast rendezvous path needs no extra deps, so keep this off by default.
@@ -24,6 +24,12 @@ mdns-sd = { version = "0.13", optional = true }
 # refers to it as `mpi` via the dependency key. To hack on it locally, add an
 # uncommitted `[patch.crates-io] mpi-rs = { path = "../mpi-no-c" }`.
 mpi = { package = "mpi-rs", version = "0.1.0", optional = true }
+# Optional iroh QUIC + relay transport — NAT-traversing peer transport for
+# pipeline/collective traffic across machines on different networks. Off by
+# default so the zero-dep native `NetTransport` stays the base path. Pinned to
+# the inspected 1.0 release-candidate; bump to the 1.0 stable line as needed.
+iroh = { version = "=1.0.0-rc.1", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"], optional = true }
 
 [features]
 default = []
@@ -32,6 +38,9 @@ mdns = ["dep:mdns-sd"]
 # Route RLX collectives over the pure-Rust MPI backend (`MpiTransport`), reusing
 # MPI process bootstrap (mpirun/mpiexec) instead of manually wiring TCP peers.
 mpi = ["dep:mpi"]
+# iroh QUIC + relay transport (`IrohTransport`) — NAT traversal for
+# cross-network `rlx-distributed` / `rlx-collectives` runs.
+iroh = ["dep:iroh", "dep:tokio"]
 
 [[example]]
 name = "mpi_all_reduce"

@@ -94,6 +94,7 @@ pub fn emit(layer: &Layer, hints: &Hints) -> LayerArtifacts {
             w_zp,
             out_zp,
             weight_bits,
+            weight_encoding: _,
             requant,
             weights,
             bias,
@@ -330,7 +331,7 @@ pub fn emit(layer: &Layer, hints: &Hints) -> LayerArtifacts {
                 v.line("genvar gi;");
                 v.line("generate for (gi = 0; gi < P; gi = gi + 1) begin : g_unpack");
                 v.block(|v| {
-                    v.line("weight_unpack #(.BITS(W_BITS)) u_w_unpack (");
+                    v.line("weight_unpack #(.BITS(W_BITS), .ENCODING(0)) u_w_unpack (");
                     v.block(|v| {
                         v.line(".byte_in(w_byte[gi]),");
                         v.line(".lane(w_lane_q),");

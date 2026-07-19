@@ -140,6 +140,8 @@ impl PyFusionOptions {
             fuse_batch_preprocess: self.fuse_batch_preprocess,
             native_fk_regions: self.native_fk_regions,
             fusion_limits: rlx_opt::FusionLimits::default(),
+            disable_conv_bias_act_fusion: false,
+            no_io_peaks_output: false,
         }
     }
 }

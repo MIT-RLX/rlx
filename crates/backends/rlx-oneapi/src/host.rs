@@ -13,18 +13,24 @@
 //! - On Intel hardware, ops with no native SPIR-V kernel yet route here (read
 //!   from the USM arena, eval, write back) — exactly rlx-vulkan's host-fallback.
 
-use rlx_ir::{Graph, Op, Shape};
+use rlx_ir::{DType, Graph, Op, Shape};
 
-/// One host-eval input: f32 activations, or raw bytes for a packed quant weight
-/// (U8/I8 operands such as the GGUF weight of `Op::DequantMatMul`).
+/// One host-eval input: f32 activations, or raw bytes for a packed / mask
+/// buffer (`U8`/`I8`/`Bool`, e.g. `Compare` predicates feeding `Where`).
 pub enum HostBuf {
     F32(Vec<f32>),
     Bytes(Vec<u8>),
 }
 
-/// Run a single op on the CPU reference and return its f32 output.
-/// `inputs[i]` is `(declared_shape, buffer)`.
-pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> Vec<f32> {
+/// A host-eval op's output in its native dtype.
+pub enum HostOut {
+    F32(Vec<f32>),
+    Bytes(Vec<u8>),
+}
+
+/// Run a single op on the CPU reference and return its output in its native
+/// dtype. `inputs[i]` is `(declared_shape, buffer)`.
+pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut {
     let mut g = Graph::new("oneapi_host_eval");
     let ids: Vec<rlx_ir::NodeId> = inputs
         .iter()
@@ -66,5 +72,18 @@ pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> Vec<f32>
     rlx_cpu::thunk::execute_thunks(&schedule, arena.raw_buf_mut());
 
     let n = out_shape.num_elements().unwrap_or(0);
-    arena.slice_mut(out)[..n].to_vec()
+    match out_shape.dtype() {
+        // Packed / mask outputs must not be reinterpreted as f32 — Compare→Bool
+        // allocates 1 byte/elem, so `slice_mut` would be 4× too short.
+        DType::U8 | DType::I8 | DType::Bool => {
+            let nbytes = n * out_shape.dtype().size_bytes().max(1);
+            let off = arena.byte_offset(out);
+            HostOut::Bytes(arena.raw_buf()[off..off + nbytes].to_vec())
+        }
+        _ => {
+            let slot = arena.slice_mut(out);
+            let take = n.min(slot.len());
+            HostOut::F32(slot[..take].to_vec())
+        }
+    }
 }

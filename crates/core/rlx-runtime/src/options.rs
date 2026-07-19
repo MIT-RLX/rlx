@@ -78,10 +78,43 @@ pub struct CompileOptions {
     pub quant_param_bindings: Option<HashMap<String, Vec<u8>>>,
     /// Native vs common IR lowering ([`KernelDispatchConfig`], `RLX_KERNEL_DISPATCH=common`).
     pub kernel_dispatch: KernelDispatchConfig,
+    /// Prevent Metal from lowering the graph through MPSGraph.
+    ///
+    /// This keeps the regular Metal thunk schedule while retaining all other
+    /// compile options. Off by default.
+    pub disable_mpsgraph: bool,
+    /// On backends that list `OpKind::Scan` (host-fallback), Scans with
+    /// `length <= scan_unroll_max_length` are IR-unrolled into body replicas so
+    /// they run as ordinary device ops. Longer Scans keep `ScanHost`.
+    /// Default: **64**. `0` disables unroll on claiming backends; `u32::MAX`
+    /// prefers unroll for every eligible Scan.
+    pub scan_unroll_max_length: u32,
+    /// Hoist the param-invariant subgraph (compute that depends only on weights,
+    /// never on `Op::Input`) into a separate "prepare" graph run ONCE, feeding
+    /// its outputs into the main graph across forwards. Complements
+    /// `param_bindings` (which folds such compute away at compile when weight
+    /// VALUES are known); this handles run-time-only weights. Opt-in; default
+    /// off (also settable via `RLX_CACHE_PARAM_INVARIANT=1`).
+    pub cache_param_invariant: bool,
+    /// Static provable NaN/Inf lint during compile (`RLX_LINT_NUMERICS`).
+    pub lint_numerics: bool,
+    /// Print fusion before/after report (`RLX_FUSION_REPORT`).
+    pub fusion_report: bool,
+    /// Skip Conv+Bias+Act fusion (`RLX_DISABLE_CONV_BIAS_ACT_FUSION`).
+    pub disable_conv_bias_act_fusion: bool,
+    /// Disable IO-gated peaks-only fusion (`RLX_NO_IO_PEAKS_OUTPUT`).
+    pub no_io_peaks_output: bool,
 }
 
 impl Default for CompileOptions {
     fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl CompileOptions {
+    /// Defaults with **no** process-env overlay (tests / explicit builders).
+    pub fn baseline() -> Self {
         Self {
             precision: Precision::F32,
             policy: None,
@@ -98,14 +131,54 @@ impl Default for CompileOptions {
             dim_binding: None,
             param_bindings: None,
             quant_param_bindings: None,
-            kernel_dispatch: KernelDispatchConfig::from_env(),
+            kernel_dispatch: KernelDispatchConfig::default(),
+            disable_mpsgraph: false,
+            scan_unroll_max_length: 64,
+            cache_param_invariant: false,
+            lint_numerics: false,
+            fusion_report: false,
+            disable_conv_bias_act_fusion: false,
+            no_io_peaks_output: false,
         }
     }
-}
 
-impl CompileOptions {
+    /// [`baseline`] plus Public/compile-layer `RLX_*` overlays from the registry.
+    pub fn from_env() -> Self {
+        let mut opts = Self::baseline();
+        opts.apply_env();
+        opts
+    }
+
+    /// Overlay compile-layer env keys (idempotent). Uses [`rlx_ir::env_registry`]
+    /// so aliases resolve.
+    pub fn apply_env(&mut self) {
+        use rlx_ir::env_registry;
+        if env_registry::flag("RLX_VERBOSE") {
+            self.verbose = true;
+        }
+        if env_registry::flag("RLX_CACHE_PARAM_INVARIANT") {
+            self.cache_param_invariant = true;
+        }
+        if env_registry::flag("RLX_DISABLE_MPSGRAPH") {
+            self.disable_mpsgraph = true;
+        }
+        self.kernel_dispatch = KernelDispatchConfig::from_env();
+        if env_registry::flag("RLX_LINT_NUMERICS") {
+            self.lint_numerics = true;
+        }
+        if env_registry::flag("RLX_FUSION_REPORT") {
+            self.fusion_report = true;
+        }
+        if env_registry::flag("RLX_DISABLE_CONV_BIAS_ACT_FUSION") {
+            self.disable_conv_bias_act_fusion = true;
+        }
+        if env_registry::flag("RLX_NO_IO_PEAKS_OUTPUT") {
+            self.no_io_peaks_output = true;
+        }
+    }
+
     pub fn new() -> Self {
-        Self::default()
+        Self::from_env()
     }
 
     pub fn precision(mut self, p: Precision) -> Self {
@@ -195,6 +268,12 @@ impl CompileOptions {
         self
     }
 
+    /// Prefer IR-unrolling Scans with `length <= max` on Scan-claiming backends.
+    pub fn scan_unroll_max_length(mut self, max: u32) -> Self {
+        self.scan_unroll_max_length = max;
+        self
+    }
+
     /// Force listed logical kernels to use common IR even when native is in `supported_ops`.
     pub fn force_common_kinds(mut self, kinds: &'static [OpKind]) -> Self {
         self.kernel_dispatch.force_common_kinds = kinds;
@@ -204,6 +283,36 @@ impl CompileOptions {
     /// Keep listed logical kernels native even under `ForceCommon` / missing from `supported_ops`.
     pub fn force_native_kinds(mut self, kinds: &'static [OpKind]) -> Self {
         self.kernel_dispatch.force_native_kinds = kinds;
+        self
+    }
+
+    pub fn with_lint_numerics(mut self, on: bool) -> Self {
+        self.lint_numerics = on;
+        self
+    }
+
+    pub fn with_fusion_report(mut self, on: bool) -> Self {
+        self.fusion_report = on;
+        self
+    }
+
+    pub fn with_disable_mpsgraph(mut self, on: bool) -> Self {
+        self.disable_mpsgraph = on;
+        self
+    }
+
+    pub fn with_cache_param_invariant(mut self, on: bool) -> Self {
+        self.cache_param_invariant = on;
+        self
+    }
+
+    pub fn with_no_io_peaks_output(mut self, on: bool) -> Self {
+        self.no_io_peaks_output = on;
+        self
+    }
+
+    pub fn with_disable_conv_bias_act_fusion(mut self, on: bool) -> Self {
+        self.disable_conv_bias_act_fusion = on;
         self
     }
 }

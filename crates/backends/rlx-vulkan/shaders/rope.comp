@@ -7,7 +7,6 @@
 // per (token, head). x rows walk with src_row_stride; output is dense `hidden`.
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint batch;
@@ -41,8 +40,8 @@ void main() {
     uint rot_half = pc.n_rot / 2u;
 
     for (uint i = 0u; i < rot_half; i++) {
-        float cv = data[pc.cos_off + tab_off + i];
-        float sv = data[pc.sin_off + tab_off + i];
+        float cv = arena_load(pc.cos_off + tab_off + i);
+        float sv = arena_load(pc.sin_off + tab_off + i);
         uint a;
         uint b;
         if (pc.style == 0u) {        // NeoX rotate-half
@@ -52,12 +51,12 @@ void main() {
             a = 2u * i;
             b = 2u * i + 1u;
         }
-        float x1 = data[pc.x_off + src_base + a];
-        float x2 = data[pc.x_off + src_base + b];
-        data[pc.out_off + dst_base + a] = x1 * cv - x2 * sv;
-        data[pc.out_off + dst_base + b] = x2 * cv + x1 * sv;
+        float x1 = arena_load(pc.x_off + src_base + a);
+        float x2 = arena_load(pc.x_off + src_base + b);
+        arena_store(pc.out_off + dst_base + a, x1 * cv - x2 * sv);
+        arena_store(pc.out_off + dst_base + b, x2 * cv + x1 * sv);
     }
     for (uint j = pc.n_rot; j < pc.head_dim; j++) {
-        data[pc.out_off + dst_base + j] = data[pc.x_off + src_base + j];
+        arena_store(pc.out_off + dst_base + j, arena_load(pc.x_off + src_base + j));
     }
 }

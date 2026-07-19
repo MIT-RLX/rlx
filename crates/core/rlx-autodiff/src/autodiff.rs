@@ -56,7 +56,8 @@
 //! via negated sin), `SoftmaxCrossEntropyWithLogits`.
 //!
 //! Shape: `Reshape`, `Transpose`, `Expand`, `Concat`, `Narrow`,
-//! `Gather` (axis=0), `ScatterAdd`.
+//! `Gather` (axis=0), `ScatterAdd`, `ScatterNd`, `ScatterElements`,
+//! `GatherNd`, `GatherElements`.
 //!
 //! Attention: `Op::Attention` → three [`Op::AttentionBackward`]
 //! nodes (`dQ` / `dK` / `dV`) for all mask kinds. Causal /
@@ -77,9 +78,13 @@
 //! It unfuses elementwise regions and tier-2 fused ops
 //! (`FusedMatMulBiasAct`, `FusedResidualLN`, `FusedResidualRmsNorm`,
 //! `FusedSwiGLU`, `FusedAttentionBlock`, `FusedTransformerLayer`,
-//! `GatedDeltaNet`, `SelectiveScan`, …), lowers `DotGeneral`, inlines
+//! `GatedDeltaNet`, `SelectiveScan`, …),
+//! lowers `DotGeneral`, inlines
 //! `If` / unrolls `While`, inlines `CustomFn` without `vjp_body`, and
-//! rewrites scans for trajectory AD.
+//! rewrites scans for trajectory AD. DiT modulation (`AdaLayerNorm` /
+//! `GatedResidual`) stays fused — VJPs emit packed
+//! `AdaLayerNormBackward` / `GatedResidualBackward` (unfuse via
+//! `rlx_fusion::unfuse_dit_modulation` for the primitive-VJP path).
 //!
 //! For HIR builders, [`rlx_ir::hir::FusionPolicy::for_autodiff`] lowers
 //! to primitive MIR; [`grad_with_loss_module`] accepts HIR or MIR
@@ -105,7 +110,9 @@
 //! as IR nodes instead of MLX arrays.
 //! FusedTransformerLayer / FusedAttentionBlock / FusedSwiGLU /
 //! LoraMatMul / FusedMatMulBiasAct / FusedResidualLN are all
-//! decomposed by `rlx_fusion::unfuse_fused_for_autodiff` likewise. Op::If
+//! decomposed by `rlx_fusion::unfuse_fused_for_autodiff` likewise.
+//! `AdaLayerNorm` / `GatedResidual` use dedicated packed backward ops.
+//! Op::If
 //! is rewritten to `Where(predicate, then, else)` with both
 //! branches inlined; Op::While is bounded-unrolled up to
 //! `max_iterations`.
@@ -184,13 +191,28 @@ pub fn grad_with_loss_opts(forward: &Graph, wrt: &[NodeId], opts: GradWithLossOp
     //   2. `rlx_fusion::unfuse_fused_for_autodiff` (below) — handles the
     //      tier-2 fused ops with closed-form decompositions:
     //      FusedMatMulBiasAct, FusedResidualLN, LoraMatMul.
+    //      (AdaLayerNorm / GatedResidual keep fused form — see their VJPs.)
     //
     // FusedSwiGLU / FusedAttentionBlock / FusedTransformerLayer
     // are all decomposed by `rlx_fusion::unfuse_fused_for_autodiff` (each is
     // a multi-stage sub-graph; mirrors what `rlx-tpu/src/unfuse.rs`
     // does for HLO emission).
+    // `wrt` NodeIds were captured against the caller's ORIGINAL graph. Prepare
+    // renumbers nodes whenever it expands an op (multi-axis Reduce legalization,
+    // fused-op unfusing), so a param/input built AFTER an expansion point gets a
+    // stale id here → wrong gradient (or, if the stale id lands on a node with
+    // no gradient, the "no gradient flowed" panic below). Keep a handle to the
+    // original graph and re-resolve every wrt leaf by its stable name.
+    let orig_forward = forward;
     let forward_owned = crate::prepare_ad::prepare_graph_for_ad(forward.clone());
     let forward = &forward_owned;
+    let wrt_prepared: Vec<NodeId> = wrt
+        .iter()
+        .map(|&id| match &orig_forward.node(id).op {
+            Op::Param { name } | Op::Input { name } => forward.node_id_by_name(name).unwrap_or(id),
+            _ => id,
+        })
+        .collect();
 
     let mut bwd = Graph::new(format!("{}_grad", forward.name));
 
@@ -244,7 +266,7 @@ pub fn grad_with_loss_opts(forward: &Graph, wrt: &[NodeId], opts: GradWithLossOp
     for &aux in &forward.outputs[1..] {
         outputs.push(fwd_to_bwd[&aux]);
     }
-    for &id in wrt {
+    for &id in &wrt_prepared {
         let g = match grads.get(&fwd_to_bwd[&id]).copied() {
             Some(g) => g,
             None if opts.zero_missing_wrt => {
@@ -299,7 +321,7 @@ pub fn quantized_weight_bits(forward: &Graph, node_id: NodeId) -> Option<u8> {
     }
 }
 
-fn unbroadcast(grad: NodeId, target_shape: &Shape, bwd: &mut Graph) -> NodeId {
+pub(crate) fn unbroadcast(grad: NodeId, target_shape: &Shape, bwd: &mut Graph) -> NodeId {
     let grad_shape = bwd.node(grad).shape.clone();
     if grad_shape == *target_shape {
         return grad;
@@ -497,6 +519,9 @@ fn vjp(
             dilation,
             groups,
         } => vjp_conv(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ConvTranspose2d { .. } => {
+            vjp_conv_transpose2d(node, upstream, upstream_shape, fwd_map, bwd)
+        }
         Op::Pool {
             kind: ReduceOp::Max,
             kernel_size,
@@ -550,6 +575,10 @@ fn vjp(
             vjp_batch_norm_inference(node, upstream, upstream_shape, fwd_map, bwd)
         }
         Op::LayerNorm { axis, eps } => vjp_layer_norm(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::AdaLayerNorm { norm, eps } => {
+            vjp_ada_layer_norm(node, upstream, upstream_shape, fwd_map, bwd)
+        }
+        Op::GatedResidual => vjp_gated_residual(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Softmax { axis } => vjp_softmax(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Transpose { perm } => vjp_transpose(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Concat { axis } => vjp_concat(node, upstream, upstream_shape, fwd_map, bwd),
@@ -690,6 +719,14 @@ fn vjp(
             vjp_dequant_mat_mul(node, upstream, upstream_shape, fwd_map, bwd)
         }
         Op::ScatterAdd => vjp_scatter_add(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ScatterNd { reduction } => vjp_scatter_nd(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ScatterElements { .. } => {
+            vjp_scatter_elements(node, upstream, upstream_shape, fwd_map, bwd)
+        }
+        Op::GatherNd { .. } => vjp_gather_nd(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::GatherElements { .. } => {
+            vjp_gather_elements(node, upstream, upstream_shape, fwd_map, bwd)
+        }
         Op::Cumsum { axis, exclusive } => vjp_cumsum(node, upstream, upstream_shape, fwd_map, bwd),
         Op::GroupedMatMul => vjp_grouped_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
         Op::DequantGroupedMatMul { scheme } => {
@@ -767,6 +804,28 @@ fn vjp(
         } => vjp_conv2d_backward_weight(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Fft { inverse, norm } => vjp_fft(node, upstream, upstream_shape, fwd_map, bwd),
         Op::LogMel => vjp_log_mel(node, upstream, upstream_shape, fwd_map, bwd),
+        // ── Riemannian / SPD-manifold layers ─────────────────────
+        Op::BiMap => vjp_bimap(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ReEig { .. } => vjp_reeig(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::LogEig { .. } => vjp_logeig(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::SpdBatchNorm { .. } => vjp_spd_batch_norm(node, upstream, upstream_shape, fwd_map, bwd),
+        // The batch Fréchet mean is a detached statistic (mirroring
+        // Euclidean batch-norm's running stats) — no gradient to X. The
+        // weighted barycentre is likewise a detached prototype (weighted-MDM /
+        // soft-clustering), so it contributes no gradient either.
+        Op::SpdKarcherMean { .. } | Op::SpdKarcherMeanWeighted { .. } => vec![],
+        // Arbitrary-base AIRM maps / transport: full Riemannian VJPs (base
+        // points included) via the dedicated packed-gradient backward ops.
+        Op::SpdLogMap => vjp_spd_map(Op::SpdLogMapBackward, node, upstream, fwd_map, bwd),
+        Op::SpdExpMap => vjp_spd_map(Op::SpdExpMapBackward, node, upstream, fwd_map, bwd),
+        Op::SpdParallelTransport => vjp_spd_transport(node, upstream, fwd_map, bwd),
+        Op::SpdMatrixFnBatch { kind } => {
+            vjp_spd_matrix_fn_batch(*kind, node, upstream, fwd_map, bwd)
+        }
+        // Symmetric eigendecomposition: standard adjoint via the packed backward
+        // op. `upstream` is the accumulated cotangent on the `[λ ∥ U]` output.
+        Op::Eigh => vjp_eigh(node, upstream, fwd_map, bwd),
+        Op::EighBatch => vjp_eigh_batch(node, upstream, fwd_map, bwd),
         // The catch-all below remains as a safety net: if a
         // future op is added without a VJP rule, this panic
         // names it for the implementer.
@@ -956,6 +1015,333 @@ fn vjp_mat_mul(
 
         vec![(0, g_a), (1, g_b)]
     }
+}
+
+// ── Riemannian / SPD-manifold layer VJPs ─────────────────────────
+
+/// BiMap `Y = W·X·Wᵀ`: `dW = (Ḡ+Ḡᵀ)·W·X`, `dX = Wᵀ·Ḡ·W`. Built as a
+/// subgraph of core matmul / transpose / add so it reuses the tested
+/// GEMM VJP machinery (no dedicated BiMap-backward kernel).
+#[allow(unused_variables)]
+fn vjp_bimap(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::BiMap = &node.op else { unreachable!() };
+    let w_bwd = fwd_map[&node.inputs[0]];
+    let x_bwd = fwd_map[&node.inputs[1]];
+    let w_shape = bwd.node(w_bwd).shape.clone();
+    let dtype = upstream_shape.dtype();
+    let m = w_shape.dim(0);
+    let n = w_shape.dim(1);
+
+    let transpose2 = |bwd: &mut Graph, id: NodeId| -> NodeId {
+        let s = bwd.node(id).shape.clone();
+        let d0 = s.dim(0);
+        let d1 = s.dim(1);
+        let ns = Shape::from_dims(&[d1, d0], s.dtype());
+        bwd.add_node(Op::Transpose { perm: vec![1, 0] }, vec![id], ns)
+    };
+
+    // dW = (Ḡ + Ḡᵀ) · W · X   [m,n]
+    let gt = transpose2(bwd, upstream);
+    let g_sym = bwd.add_node(
+        Op::Binary(BinaryOp::Add),
+        vec![upstream, gt],
+        upstream_shape.clone(),
+    );
+    let wx = bwd.matmul(w_bwd, x_bwd, Shape::from_dims(&[m, n], dtype));
+    let dw = bwd.matmul(g_sym, wx, Shape::from_dims(&[m, n], dtype));
+
+    // dX = Wᵀ · Ḡ · W   [n,n]
+    let wt = transpose2(bwd, w_bwd);
+    let wt_g = bwd.matmul(wt, upstream, Shape::from_dims(&[n, m], dtype));
+    let dx_raw = bwd.matmul(wt_g, w_bwd, Shape::from_dims(&[n, n], dtype));
+    // X is SPD ⇒ project the cotangent onto Sym(n): ½(dX + dXᵀ), so
+    // BiMap's input gradient is symmetric like ReEig/LogEig/SPD-BN's.
+    let nn = Shape::from_dims(&[n, n], dtype);
+    let dx_t = transpose2(bwd, dx_raw);
+    let dx_sum = bwd.add_node(Op::Binary(BinaryOp::Add), vec![dx_raw, dx_t], nn.clone());
+    let half = bwd.add_node(
+        Op::Constant {
+            data: 0.5f64.to_le_bytes().to_vec(),
+        },
+        vec![],
+        Shape::new(&[1], dtype),
+    );
+    let dx = bwd.add_node(Op::Binary(BinaryOp::Mul), vec![dx_sum, half], nn);
+
+    vec![(0, dw), (1, dx)]
+}
+
+/// ReEig VJP → emits [`Op::ReEigBackward`] (Daleckii–Krein adjoint),
+/// reusing the eigendecomposition packed into the forward output.
+#[allow(unused_variables)]
+fn vjp_reeig(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::ReEig { eps } = &node.op else {
+        unreachable!()
+    };
+    vjp_spectral_layer(
+        Op::ReEigBackward { eps: *eps },
+        node,
+        upstream,
+        fwd_map,
+        bwd,
+    )
+}
+
+/// LogEig VJP → emits [`Op::LogEigBackward`] (Daleckii–Krein adjoint).
+#[allow(unused_variables)]
+fn vjp_logeig(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::LogEig { eps } = &node.op else {
+        unreachable!()
+    };
+    vjp_spectral_layer(
+        Op::LogEigBackward { eps: *eps },
+        node,
+        upstream,
+        fwd_map,
+        bwd,
+    )
+}
+
+/// Shared VJP for the packed spectral layers. The forward output is
+/// `[Y (n²), λ (n), U (n²)]`; the upstream cotangent (w.r.t. that packed
+/// buffer) carries `dY` in its first `n²` entries. Unpack `λ`, `U` from
+/// the mirrored forward and `dY` from the upstream, then emit the
+/// backward op `(λ, U, dY) → dX`.
+fn vjp_spectral_layer(
+    backward_op: Op,
+    node: &Node,
+    upstream: NodeId,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let n = match x_shape.dim(0) {
+        Dim::Static(v) => v,
+        _ => return Vec::new(),
+    };
+    let dtype = x_shape.dtype();
+    let packed_fwd = fwd_map[&node.id];
+    let lam = bwd.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: n * n,
+            len: n,
+        },
+        vec![packed_fwd],
+        Shape::new(&[n], dtype),
+    );
+    let u = bwd.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: n * n + n,
+            len: n * n,
+        },
+        vec![packed_fwd],
+        Shape::new(&[n * n], dtype),
+    );
+    let dy = bwd.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: 0,
+            len: n * n,
+        },
+        vec![upstream],
+        Shape::new(&[n * n], dtype),
+    );
+    let dx = bwd.add_node(backward_op, vec![lam, u, dy], Shape::new(&[n, n], dtype));
+    vec![(0, dx)]
+}
+
+/// SPD batch-norm VJP: `dX` and `dG` via their backward ops. The mean
+/// (input 1) is a detached statistic and receives no gradient.
+#[allow(unused_variables)]
+fn vjp_spd_batch_norm(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::SpdBatchNorm { eps } = &node.op else {
+        unreachable!()
+    };
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let mean_bwd = fwd_map[&node.inputs[1]];
+    let g_bwd = fwd_map[&node.inputs[2]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let g_shape = bwd.node(g_bwd).shape.clone();
+    // dX = f(mean, G, dY)
+    let dx = bwd.add_node(
+        Op::SpdBatchNormBackwardX { eps: *eps },
+        vec![mean_bwd, g_bwd, upstream],
+        x_shape,
+    );
+    // dG = f(X, mean, G, dY)
+    let dg = bwd.add_node(
+        Op::SpdBatchNormBackwardG { eps: *eps },
+        vec![x_bwd, mean_bwd, g_bwd, upstream],
+        g_shape,
+    );
+    vec![(0, dx), (2, dg)]
+}
+
+/// Narrow slice `idx` out of a packed `[k, n, n]` gradient buffer and reshape
+/// to `[n, n]` (the per-input gradient the SPD map backward ops emit).
+fn unpack_grad_slice(
+    bwd: &mut Graph,
+    packed: NodeId,
+    idx: usize,
+    n: usize,
+    dtype: DType,
+) -> NodeId {
+    let slice = bwd.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: idx,
+            len: 1,
+        },
+        vec![packed],
+        Shape::new(&[1, n, n], dtype),
+    );
+    bwd.add_node(
+        Op::Reshape {
+            new_shape: vec![n as i64, n as i64],
+        },
+        vec![slice],
+        Shape::new(&[n, n], dtype),
+    )
+}
+
+/// VJP for [`Op::SpdLogMap`] / [`Op::SpdExpMap`] (both take `[base, arg]`).
+/// Emits the packed-gradient backward op `[d_base ∥ d_arg]` and narrows the two
+/// `[n, n]` gradients out. Full AIRM adjoint — the base point is differentiated.
+fn vjp_spd_map(
+    backward_op: Op,
+    node: &Node,
+    upstream: NodeId,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let base = fwd_map[&node.inputs[0]];
+    let arg = fwd_map[&node.inputs[1]];
+    let base_shape = bwd.node(base).shape.clone();
+    let n = match base_shape.dim(0) {
+        Dim::Static(v) => v,
+        _ => return Vec::new(),
+    };
+    let dtype = base_shape.dtype();
+    let packed = bwd.add_node(
+        backward_op,
+        vec![base, arg, upstream],
+        Shape::new(&[2, n, n], dtype),
+    );
+    let d_base = unpack_grad_slice(bwd, packed, 0, n, dtype);
+    let d_arg = unpack_grad_slice(bwd, packed, 1, n, dtype);
+    vec![(0, d_base), (1, d_arg)]
+}
+
+/// VJP for [`Op::SpdParallelTransport`] (`[from, to, v]`). Emits the packed
+/// `[d_from ∥ d_to ∥ d_v]` backward op and narrows the three gradients out.
+fn vjp_spd_transport(
+    node: &Node,
+    upstream: NodeId,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let from = fwd_map[&node.inputs[0]];
+    let to = fwd_map[&node.inputs[1]];
+    let v = fwd_map[&node.inputs[2]];
+    let from_shape = bwd.node(from).shape.clone();
+    let n = match from_shape.dim(0) {
+        Dim::Static(val) => val,
+        _ => return Vec::new(),
+    };
+    let dtype = from_shape.dtype();
+    let packed = bwd.add_node(
+        Op::SpdParallelTransportBackward,
+        vec![from, to, v, upstream],
+        Shape::new(&[3, n, n], dtype),
+    );
+    let d_from = unpack_grad_slice(bwd, packed, 0, n, dtype);
+    let d_to = unpack_grad_slice(bwd, packed, 1, n, dtype);
+    let d_v = unpack_grad_slice(bwd, packed, 2, n, dtype);
+    vec![(0, d_from), (1, d_to), (2, d_v)]
+}
+
+/// VJP for [`Op::SpdMatrixFnBatch`] — per-slice Daleckii–Krein adjoint via the
+/// batched backward op. `dX = SpdMatrixFnBatchBackward{kind}(X, dY)`.
+fn vjp_spd_matrix_fn_batch(
+    kind: SpdMatFn,
+    node: &Node,
+    upstream: NodeId,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let x = fwd_map[&node.inputs[0]];
+    let x_shape = bwd.node(x).shape.clone();
+    let dx = bwd.add_node(
+        Op::SpdMatrixFnBatchBackward { kind },
+        vec![x, upstream],
+        x_shape,
+    );
+    vec![(0, dx)]
+}
+
+/// VJP for [`Op::Eigh`]. The forward output is packed `[λ ∥ U]`; `upstream`
+/// carries `[λ̄ ∥ Ū]` (accumulated from the λ/U narrows). Emits the standard
+/// symmetric-eigendecomposition adjoint `Op::EighBackward(fwd, upstream) → Ā`.
+fn vjp_eigh(
+    node: &Node,
+    upstream: NodeId,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let x = fwd_map[&node.inputs[0]];
+    let packed_fwd = fwd_map[&node.id];
+    let x_shape = bwd.node(x).shape.clone();
+    let n = match x_shape.dim(0) {
+        Dim::Static(v) => v,
+        _ => return Vec::new(),
+    };
+    let abar = bwd.add_node(
+        Op::EighBackward,
+        vec![packed_fwd, upstream],
+        Shape::new(&[n, n], x_shape.dtype()),
+    );
+    vec![(0, abar)]
+}
+
+/// VJP for [`Op::EighBatch`] — per-slice eigendecomposition adjoint.
+fn vjp_eigh_batch(
+    node: &Node,
+    upstream: NodeId,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let x = fwd_map[&node.inputs[0]];
+    let packed_fwd = fwd_map[&node.id];
+    let x_shape = bwd.node(x).shape.clone(); // [B, n, n]
+    let abar = bwd.add_node(Op::EighBatchBackward, vec![packed_fwd, upstream], x_shape);
+    vec![(0, abar)]
 }
 
 #[allow(unused_variables)]
@@ -1290,6 +1676,72 @@ fn vjp_conv(
         );
         vec![(0, dx), (1, dw)]
     }
+}
+
+// ── ConvTranspose2d ─────────────────────────────────────
+//
+// `conv_transpose2d(x, w)` is the *adjoint* of `conv2d`: it equals
+// `conv2d_backward_input(x, w, y_shape, …)` with the SAME weight layout
+// (`w: [C_in, C_out/groups, kH, kW]` = the conv2d weight `[out=C_in, in=C_out,…]`).
+// So its VJP reuses the tested conv2d ops:
+//   dx = conv2d(upstream, w, stride, padding, dilation, groups)   (upstream: y-space → x-space)
+//   dw = conv2d_backward_weight(input=upstream, grad_output=x, w_shape, …)
+// `output_padding` only enlarges the forward output; a nonzero value breaks the
+// clean conv2d size relationship, so guard it (the common — and pixel-shuffle-
+// replacing — case is `output_padding == 0`). Verified by finite differences in
+// `tests/conv_transpose2d_vjp.rs`.
+fn vjp_conv_transpose2d(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::ConvTranspose2d {
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        output_padding,
+        groups,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    assert!(
+        output_padding.iter().all(|&p| p == 0),
+        "ConvTranspose2d VJP: output_padding != 0 not supported yet \
+         (breaks the conv2d adjoint size relationship)"
+    );
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let w_bwd = fwd_map[&node.inputs[1]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let w_shape = bwd.node(w_bwd).shape.clone();
+    // dx: forward conv2d over the upstream gradient with the same weight.
+    let dx = bwd.add_node(
+        Op::Conv {
+            kernel_size: kernel_size.clone(),
+            stride: stride.clone(),
+            padding: padding.clone(),
+            dilation: dilation.clone(),
+            groups: *groups,
+        },
+        vec![upstream, w_bwd],
+        x_shape,
+    );
+    // dw: the correlation of the upstream (playing the conv2d input role) with x
+    // (the conv2d grad-output role) — swapped vs the plain conv2d weight grad.
+    let dw = bwd.conv2d_backward_weight(
+        upstream,
+        x_bwd,
+        w_shape,
+        kernel_size.clone(),
+        stride.clone(),
+        padding.clone(),
+        dilation.clone(),
+        *groups,
+    );
+    vec![(0, dx), (1, dw)]
 }
 
 #[allow(unused_variables)]
@@ -1701,6 +2153,46 @@ fn vjp_layer_norm(
         let dbeta = unbroadcast(upstream, &gamma_shape, bwd);
         vec![(0, dx), (1, dgamma), (2, dbeta)]
     }
+}
+
+fn vjp_ada_layer_norm(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::AdaLayerNorm { norm, eps } = &node.op else {
+        unreachable!()
+    };
+    let x = fwd_map[&node.inputs[0]];
+    let scale = fwd_map[&node.inputs[1]];
+    let shift = fwd_map[&node.inputs[2]];
+    let scale_shape = bwd.node(scale).shape.clone();
+    let x_shape = bwd.node(x).shape.clone();
+    let packed = bwd.ada_layer_norm_backward(x, scale, shift, upstream, *norm, *eps);
+    let (dx, dscale, dshift) =
+        rlx_ir::unpack_ada_layer_norm_backward(bwd, packed, &x_shape, &scale_shape);
+    vec![(0, dx), (1, dscale), (2, dshift)]
+}
+
+fn vjp_gated_residual(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    debug_assert!(matches!(node.op, Op::GatedResidual));
+    let x = fwd_map[&node.inputs[0]];
+    let y = fwd_map[&node.inputs[1]];
+    let gate = fwd_map[&node.inputs[2]];
+    let x_shape = bwd.node(x).shape.clone();
+    let gate_shape = bwd.node(gate).shape.clone();
+    let packed = bwd.gated_residual_backward(x, y, gate, upstream);
+    let (dx, dy, dgate) =
+        rlx_ir::unpack_gated_residual_backward(bwd, packed, &x_shape, &gate_shape);
+    vec![(0, dx), (1, dy), (2, dgate)]
 }
 
 #[allow(unused_variables)]
@@ -2564,6 +3056,275 @@ fn vjp_scatter_add(
         );
         vec![(0, dupdates)]
     }
+}
+
+// ── ScatterNd / ScatterElements ─────────────────────────
+//
+// Forward: out = copy(data); then at each index location, apply `updates`
+// with `reduction` (none/add/mul/max/min). Indices are non-differentiable.
+//
+//   None: d_updates = Gather*(upstream, indices)
+//         d_data    = Scatter*(upstream, indices, 0, none)  // zero written sites
+//   Add:  d_updates = Gather*(upstream, indices); d_data = upstream
+//   Mul:  d_updates = Gather*(upstream)*Gather*(data)
+//         d_data    = Scatter*(upstream, indices, Gather*(upstream)*updates, none)
+//   Max/Min: soft argmax/argmin — ties prefer `data` (Binary Max/Min).
+enum ScatterVjpKind {
+    Nd,
+    Elements { axis: i32 },
+}
+
+#[allow(unused_variables)]
+fn vjp_scatter_family(
+    kind: ScatterVjpKind,
+    reduction: rlx_ir::ScatterNdReduction,
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    use rlx_ir::ScatterNdReduction;
+    use rlx_ir::op::{BinaryOp, CmpOp};
+
+    let data_bwd = fwd_map[&node.inputs[0]];
+    let indices_bwd = fwd_map[&node.inputs[1]];
+    let updates_bwd = fwd_map[&node.inputs[2]];
+    let data_shape = bwd.node(data_bwd).shape.clone();
+    let updates_shape = bwd.node(updates_bwd).shape.clone();
+    let dtype = upstream_shape.dtype();
+
+    let gather_at = |bwd: &mut Graph, src: NodeId, out_shape: Shape| -> NodeId {
+        match kind {
+            ScatterVjpKind::Nd => bwd.add_node(
+                Op::GatherNd { batch_dims: 0 },
+                vec![src, indices_bwd],
+                out_shape,
+            ),
+            ScatterVjpKind::Elements { axis } => bwd.add_node(
+                Op::GatherElements { axis },
+                vec![src, indices_bwd],
+                out_shape,
+            ),
+        }
+    };
+    let scatter_none = |bwd: &mut Graph, base: NodeId, updates: NodeId, out: Shape| -> NodeId {
+        match kind {
+            ScatterVjpKind::Nd => bwd.add_node(
+                Op::ScatterNd {
+                    reduction: ScatterNdReduction::None,
+                },
+                vec![base, indices_bwd, updates],
+                out,
+            ),
+            ScatterVjpKind::Elements { axis } => bwd.add_node(
+                Op::ScatterElements {
+                    axis,
+                    reduction: ScatterNdReduction::None,
+                },
+                vec![base, indices_bwd, updates],
+                out,
+            ),
+        }
+    };
+    let zeros_like = |bwd: &mut Graph, shape: &Shape| -> NodeId {
+        let n = shape.num_elements().expect("scatter VJP: dynamic shape");
+        let bytes = vec![0u8; n * shape.dtype().size_bytes()];
+        bwd.add_node(Op::Constant { data: bytes }, vec![], shape.clone())
+    };
+
+    let gathered_up = gather_at(bwd, upstream, updates_shape.clone());
+
+    let (d_data, d_updates) = match reduction {
+        ScatterNdReduction::None => {
+            let zeros = zeros_like(bwd, &updates_shape);
+            let d_data = scatter_none(bwd, upstream, zeros, data_shape);
+            (d_data, gathered_up)
+        }
+        ScatterNdReduction::Add => (upstream, gathered_up),
+        ScatterNdReduction::Mul => {
+            let gathered_data = gather_at(bwd, data_bwd, updates_shape.clone());
+            let d_updates = bwd.binary(
+                BinaryOp::Mul,
+                gathered_up,
+                gathered_data,
+                updates_shape.clone(),
+            );
+            let d_data_at = bwd.binary(
+                BinaryOp::Mul,
+                gathered_up,
+                updates_bwd,
+                updates_shape.clone(),
+            );
+            let d_data = scatter_none(bwd, upstream, d_data_at, data_shape);
+            (d_data, d_updates)
+        }
+        ScatterNdReduction::Max | ScatterNdReduction::Min => {
+            let gathered_data = gather_at(bwd, data_bwd, updates_shape.clone());
+            let y_fwd = fwd_map[&node.id];
+            let gathered_y = gather_at(bwd, y_fwd, updates_shape.clone());
+            let bool_shape = Shape::from_dims(updates_shape.dims(), DType::Bool);
+            let zero = zeros_like(bwd, &updates_shape);
+
+            let data_eq = bwd.add_node(
+                Op::Compare(CmpOp::Eq),
+                vec![gathered_data, gathered_y],
+                bool_shape.clone(),
+            );
+            let data_mask =
+                bwd.add_node(Op::Cast { to: dtype }, vec![data_eq], updates_shape.clone());
+            let d_data_at = bwd.add_node(
+                Op::Where,
+                vec![data_mask, gathered_up, zero],
+                updates_shape.clone(),
+            );
+            let d_data = scatter_none(bwd, upstream, d_data_at, data_shape);
+
+            let upd_eq = bwd.add_node(
+                Op::Compare(CmpOp::Eq),
+                vec![updates_bwd, gathered_y],
+                bool_shape,
+            );
+            let upd_eq_f =
+                bwd.add_node(Op::Cast { to: dtype }, vec![upd_eq], updates_shape.clone());
+            let upd_grad_raw = bwd.add_node(
+                Op::Where,
+                vec![upd_eq_f, gathered_up, zero],
+                updates_shape.clone(),
+            );
+            let d_updates = bwd.add_node(
+                Op::Where,
+                vec![data_mask, zero, upd_grad_raw],
+                updates_shape,
+            );
+            (d_data, d_updates)
+        }
+    };
+
+    vec![(0, d_data), (2, d_updates)]
+}
+
+fn vjp_scatter_nd(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::ScatterNd { reduction } = &node.op else {
+        unreachable!()
+    };
+    vjp_scatter_family(
+        ScatterVjpKind::Nd,
+        *reduction,
+        node,
+        upstream,
+        upstream_shape,
+        fwd_map,
+        bwd,
+    )
+}
+
+fn vjp_scatter_elements(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::ScatterElements { axis, reduction } = &node.op else {
+        unreachable!()
+    };
+    vjp_scatter_family(
+        ScatterVjpKind::Elements { axis: *axis },
+        *reduction,
+        node,
+        upstream,
+        upstream_shape,
+        fwd_map,
+        bwd,
+    )
+}
+
+// ── GatherNd ────────────────────────────────────────────
+//
+// Forward: gather slices at multi-indices. VJP scatters upstream
+// gradients back into a zero tensor of `data` shape (Add for duplicates).
+#[allow(unused_variables)]
+fn vjp_gather_nd(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::GatherNd { batch_dims } = &node.op else {
+        unreachable!()
+    };
+    use rlx_ir::ScatterNdReduction;
+
+    let data_bwd = fwd_map[&node.inputs[0]];
+    let indices_bwd = fwd_map[&node.inputs[1]];
+    let data_shape = bwd.node(data_bwd).shape.clone();
+    let n = data_shape
+        .num_elements()
+        .expect("GatherNd VJP: dynamic shape");
+    let zeros = bwd.add_node(
+        Op::Constant {
+            data: vec![0u8; n * data_shape.dtype().size_bytes()],
+        },
+        vec![],
+        data_shape.clone(),
+    );
+    let _ = batch_dims; // ScatterNd covers the batch_dims=0 path used by VJP graphs.
+    let d_data = bwd.add_node(
+        Op::ScatterNd {
+            reduction: ScatterNdReduction::Add,
+        },
+        vec![zeros, indices_bwd, upstream],
+        data_shape,
+    );
+    vec![(0, d_data)]
+}
+
+// ── GatherElements ──────────────────────────────────────
+//
+// Forward: take_along_axis. VJP: ScatterElements(..., Add) into zeros.
+#[allow(unused_variables)]
+fn vjp_gather_elements(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::GatherElements { axis } = &node.op else {
+        unreachable!()
+    };
+    use rlx_ir::ScatterNdReduction;
+
+    let data_bwd = fwd_map[&node.inputs[0]];
+    let indices_bwd = fwd_map[&node.inputs[1]];
+    let data_shape = bwd.node(data_bwd).shape.clone();
+    let n = data_shape
+        .num_elements()
+        .expect("GatherElements VJP: dynamic shape");
+    let zeros = bwd.add_node(
+        Op::Constant {
+            data: vec![0u8; n * data_shape.dtype().size_bytes()],
+        },
+        vec![],
+        data_shape.clone(),
+    );
+    let d_data = bwd.add_node(
+        Op::ScatterElements {
+            axis: *axis,
+            reduction: ScatterNdReduction::Add,
+        },
+        vec![zeros, indices_bwd, upstream],
+        data_shape,
+    );
+    vec![(0, d_data)]
 }
 
 // ── Cumsum ──────────────────────────────────────────────
@@ -3756,6 +4517,8 @@ mod tests {
         let bwd = grad_with_loss(&g, &[x, y]);
         // [loss, dz/dx, dz/dy] — three outputs.
         assert_eq!(bwd.outputs.len(), 3);
+        // (Numeric regression for wrt-remap after a multi-axis reduce lives in
+        // tests/multi_axis_reduce_wrt_grad.rs.)
     }
 
     #[test]

@@ -59,10 +59,28 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
 
     for node in hir.nodes {
         let hir_id = node.id;
+        // Fast-path `Constant`: MOVE its byte buffer into the MIR graph instead
+        // of cloning it. `hir` is consumed here, so the source is dropped anyway;
+        // for large folded constants (RoPE cos/sin caches, embedding tables) this
+        // avoids a full duplicate during lowering. `tag_hir_subgraph` is a no-op
+        // for constants (its Input/Param/Constant arm), so nothing is skipped.
+        if matches!(node.op, HirOp::Constant { .. }) {
+            let data = match node.op {
+                HirOp::Constant { data } => data,
+                _ => unreachable!(),
+            };
+            let mir_id = g.add_node(Op::Constant { data }, vec![], node.shape);
+            map.insert(hir_id, mir_id);
+            continue;
+        }
         let label = node_label_for_hir(&node);
         let inputs: Vec<NodeId> = node.inputs.iter().map(|&id| map[&id]).collect();
 
         let op = &node.op;
+        // Capture MIR length before lowering so provenance tags only the
+        // nodes this HIR op produces — the old prior-map HashSet scan was
+        // O(N²) on large packed graphs (Qwen35 Bonsai ~90k nodes).
+        let first_new = g.len();
         let mir_id = match op {
             HirOp::Input { name } => g.input(name.clone(), node.shape),
             HirOp::Param { name } => g.param(name.clone(), node.shape),
@@ -394,7 +412,7 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
             HirOp::Mir(op) => g.add_node(op.clone(), inputs, node.shape),
         };
 
-        tag_hir_subgraph(&mut g, mir_id, hir_id, &label, &map, op);
+        tag_hir_subgraph(&mut g, first_new, hir_id, &label);
         map.insert(hir_id, mir_id);
     }
 
@@ -411,36 +429,17 @@ fn node_label_for_hir(node: &crate::hir::HirNode) -> Option<String> {
 }
 
 /// Tag every MIR node produced from one HIR block with shared provenance.
-fn tag_hir_subgraph(
-    g: &mut Graph,
-    root: NodeId,
-    hir_id: HirNodeId,
-    label: &Option<String>,
-    prior: &HashMap<HirNodeId, NodeId>,
-    op: &HirOp,
-) {
-    let prior_ids: std::collections::HashSet<NodeId> = prior.values().copied().collect();
+fn tag_hir_subgraph(g: &mut Graph, first_new: usize, hir_id: HirNodeId, label: &Option<String>) {
     let origin = NodeOrigin::from_hir(hir_id, label.clone());
-    let start = match op {
-        HirOp::Input { .. } | HirOp::Param { .. } | HirOp::Constant { .. } => root.0,
-        _ => prior_ids
-            .iter()
-            .map(|id| id.0)
-            .min()
-            .map(|i| i + 1)
-            .unwrap_or(0),
-    };
-    for i in start..=root.0 {
-        let id = NodeId(i);
-        if !prior_ids.contains(&id) {
-            let node = g.node_mut(id);
-            if node.origin.is_none() {
-                node.origin = Some(origin.clone());
-            }
-            if node.name.is_none() {
-                if let Some(l) = label {
-                    node.name = Some(l.clone());
-                }
+    for i in first_new..g.len() {
+        let id = NodeId(i as u32);
+        let node = g.node_mut(id);
+        if node.origin.is_none() {
+            node.origin = Some(origin.clone());
+        }
+        if node.name.is_none() {
+            if let Some(l) = label {
+                node.name = Some(l.clone());
             }
         }
     }

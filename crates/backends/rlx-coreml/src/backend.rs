@@ -119,18 +119,31 @@ fn demote_float_to_f16(graph: &mut Graph) {
 }
 
 pub fn default_lower_options(graph: &Graph) -> LowerOptions {
+    // RLX_COREML_F16=1 stores activations (and the dequant output) in f16, ~half
+    // the RAM + half the BNNS-compile working set. Needed for 27B-class models
+    // where the f32 decode-graph IR overruns disk during coremlc/BNNS compile.
+    let float_dtype = if std::env::var("RLX_COREML_F16").ok().as_deref() == Some("1") {
+        DType::F16
+    } else {
+        DType::F32
+    };
     LowerOptions {
-        float_dtype: DType::F32,
+        float_dtype,
         flexible_inputs: rlx_ir::dynamic::has_dynamic_dims(graph)
             || std::env::var("RLX_COREML_FLEXIBLE_INPUTS").ok().as_deref() == Some("1"),
         ondevice_dequant: std::env::var("RLX_COREML_HOST_DEQUANT").ok().as_deref() != Some("1"),
+        q1_mode: None, // None → RLX_COREML_Q1_MODE env (default Lut)
     }
 }
 
 /// Whether `graph` computes gradients — it carries a loss-cotangent seed input
 /// (`grad_with_loss` names it `d_output`) or still contains a native `*Backward`
-/// op (RMSNorm / MaxPool2d, which CoreML lowers directly). Used to pick a
-/// precision-preserving compute policy for training.
+/// op (RMSNorm / MaxPool2d, which CoreML lowers directly).
+///
+/// Kept for callers / tests that want to classify training graphs; compute-unit
+/// policy no longer branches on it because **all** fp32 graphs use CPU+GPU
+/// (see [`default_compute_units`]).
+#[allow(dead_code)]
 fn is_backward_graph(graph: &Graph) -> bool {
     graph.nodes().iter().any(|n| {
         if let Op::Input { name } = &n.op {
@@ -166,11 +179,13 @@ fn is_backward_graph(graph: &Graph) -> bool {
 ///   ANE (training included);
 /// - **an fp32 backward/training graph → `CpuAndGpu`** for gradient precision (the
 ///   ANE would silently downcast fp32 gradients to f16);
-/// - inference keeps the Neural Engine.
+/// - **fp32 inference → `CpuAndGpu`** — Apple's on-device BNNS AOT path
+///   (`bnns::GraphCompile`) SIGSEGVs on many large imported graphs (TTS CFM /
+///   VITS / DiT, multi-k-node ONNX). CoreML GPU units compile the same MIL
+///   cleanly. Opt into ANE with `RLX_COREML_UNITS=ane` (or ship an f16 graph).
 ///
-/// So precision↔speed is the user's choice: default fp32 (CPU+GPU, accurate) or an
-/// AFP f16 policy (ANE, fast). `RLX_COREML_UNITS=ane` also forces the ANE on an
-/// fp32 model (it downcasts internally).
+/// Precision↔speed is the user's choice: default fp32 (CPU+GPU, accurate /
+/// BNNS-safe) or an AFP f16 policy / `RLX_COREML_UNITS=ane` (ANE, fast).
 pub fn default_compute_units(graph: &Graph) -> ComputeUnits {
     match std::env::var("RLX_COREML_UNITS").as_deref() {
         Ok("cpu") => ComputeUnits::CpuOnly,
@@ -178,9 +193,34 @@ pub fn default_compute_units(graph: &Graph) -> ComputeUnits {
         Ok("all") => ComputeUnits::All,
         Ok("ane") => ComputeUnits::CpuAndNeuralEngine,
         _ if graph_has_f16(graph) => ComputeUnits::CpuAndNeuralEngine,
-        _ if is_backward_graph(graph) => ComputeUnits::CpuAndGpu,
-        _ => ComputeUnits::CpuAndNeuralEngine,
+        // Host-split graphs (Op::Scan-family: SPD eigensolvers, IIR/SSM
+        // recurrences) alternate host and MIL segments; EACH MIL segment
+        // compiles its own CoreML model, and the GPU/Metal compile cost per
+        // segment (~20s even for a tiny segment) dwarfs any GPU speedup — the
+        // GPU can't touch the host-scan portion at all. CPU-only compute units
+        // skip the Metal-path compile entirely: spdnet/coreml 64s → 1s with no
+        // runtime loss. (A size-based CpuAndGpu carve-out for large-batch nets
+        // was tried but gave no stable win — the GPU-compile-vs-matmul tradeoff
+        // is noise-dominated for these graphs.) `RLX_COREML_UNITS` overrides.
+        _ if graph_has_host_split(graph) => ComputeUnits::CpuOnly,
+        // fp32 inference + training: CPU+GPU. Avoids Neural-Engine BNNS crashes
+        // on large ML Programs; matches the precision path documented above.
+        _ => ComputeUnits::CpuAndGpu,
     }
+}
+
+/// True if the graph contains a recurrence/scan — either host-split ops
+/// (`Op::Scan`-family that run on the host between MIL segments) OR an `Op::Scan`
+/// now lowered natively to an on-device `while_loop`. Both cases run faster
+/// CPU-only on CoreML: the host-split form pays a ~20s Metal compile per segment,
+/// and the native `while_loop` pays a GPU compile + per-iteration dispatch that
+/// the CPU avoids (tensorcspnet 97s CpuAndGpu → 68s CpuOnly). See the host-split
+/// arm in [`default_compute_units`].
+fn graph_has_host_split(graph: &Graph) -> bool {
+    graph
+        .nodes()
+        .iter()
+        .any(|n| crate::host_exec::is_host_op(&n.op) || matches!(n.op, Op::Scan { .. }))
 }
 
 /// True if any node carries an f16 tensor — the signature of an
@@ -190,17 +230,9 @@ fn graph_has_f16(graph: &Graph) -> bool {
 }
 
 impl CoremlExecutable {
-    /// Stage a graph for CoreML execution under the default ([`All`])
-    /// compute-unit policy.
-    ///
-    /// [`All`]: ComputeUnits::All
+    /// Stage a graph for CoreML execution under [`default_compute_units`].
     pub fn compile(graph: Graph) -> Self {
-        let units = match std::env::var("RLX_COREML_UNITS").as_deref() {
-            Ok("cpu") => ComputeUnits::CpuOnly,
-            Ok("gpu") => ComputeUnits::CpuAndGpu,
-            Ok("all") => ComputeUnits::All,
-            _ => ComputeUnits::CpuAndNeuralEngine,
-        };
+        let units = default_compute_units(&graph);
         Self::compile_with_units(graph, units)
     }
 
@@ -363,13 +395,24 @@ impl CoremlExecutable {
     /// Run a prediction. `inputs` are `(ir_input_name, f32_data)`. Outputs
     /// are returned in graph-output order.
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> {
-        match self.plan.clone() {
+        let outs = match self.plan.clone() {
             ExecutionPlan::MilOnly => {
                 self.finalize()?;
-                Ok(self.run_coreml_slot(0, inputs, &HashMap::new())?)
+                self.run_coreml_slot(0, inputs, &HashMap::new())?
             }
-            ExecutionPlan::Segmented(segments) => self.run_segmented(inputs, &segments),
+            ExecutionPlan::Segmented(segments) => self.run_segmented(inputs, &segments)?,
+        };
+        // NaN/Inf output-boundary scan (RLX_DEBUG_NANS). MIL segments run
+        // opaquely on the Neural Engine, so per-op localization is only
+        // possible for host segments (done in `run_segmented`); here we scan
+        // the final outputs. For internal localization replay on CPU.
+        let scanner = rlx_ir::numeric_check::DebugScanner::from_env("coreml");
+        if scanner.enabled() {
+            for (buf, &oid) in outs.iter().zip(self.graph.outputs.iter()) {
+                scanner.check(&self.graph, oid, buf, &[]);
+            }
         }
+        Ok(outs)
     }
 
     fn run_segmented(
@@ -379,16 +422,28 @@ impl CoremlExecutable {
     ) -> Result<Vec<Vec<f32>>> {
         let mut env: HashMap<u32, Vec<f32>> = HashMap::new();
         seed_leaf_env(&self.graph, inputs, &self.params, &mut env)?;
+        // Host segments run op-by-op on the CPU, so we can localize a NaN to the
+        // exact host op (culprit vs propagator) — MIL segments stay opaque.
+        let scanner = rlx_ir::numeric_check::DebugScanner::from_env("coreml");
         let mut mil_idx = 0usize;
         for seg in segments {
             match seg {
                 Segment::Host(ids) => {
                     for &id in ids {
                         let v = run_host_node(&self.graph, id, &env, &self.params)?;
+                        if scanner.enabled() {
+                            let mut inbufs: Vec<(rlx_ir::NodeId, &[f32])> = Vec::new();
+                            for &inp in &self.graph.node(id).inputs {
+                                if let Some(buf) = env.get(&inp.0) {
+                                    inbufs.push((inp, buf));
+                                }
+                            }
+                            scanner.check(&self.graph, id, &v, &inbufs);
+                        }
                         env.insert(id.0, v);
                     }
                 }
-                Segment::Mil(MilSegment { graph, .. }) => {
+                Segment::Mil(seg @ MilSegment { graph, .. }) => {
                     if hybrid::mil_body_is_trivial(graph) {
                         mil_idx += 1;
                         continue;
@@ -399,8 +454,18 @@ impl CoremlExecutable {
                         self.mil_slots.get(mil_idx).and_then(|s| s.lowered.as_ref())
                     {
                         for (io, buf) in lowered.outputs.iter().zip(outs) {
-                            if let Some(id) = parse_vname(&io.ir_name) {
-                                env.insert(id, buf);
+                            // The MIL subgraph uses LOCAL node ids; translate each
+                            // output back to its original GLOBAL id so `env` (and
+                            // hence the graph's declared outputs) sees it. Falls
+                            // back to the raw id for the first segment where
+                            // local == global.
+                            if let Some(local) = parse_vname(&io.ir_name) {
+                                let global = seg
+                                    .out_local_to_global
+                                    .get(&local)
+                                    .copied()
+                                    .unwrap_or(local);
+                                env.insert(global, buf);
                             } else if let Some(id) = io
                                 .ir_name
                                 .strip_prefix("host_v")
@@ -609,7 +674,14 @@ fn sanitize(raw: &str) -> String {
 }
 
 fn parse_vname(name: &str) -> Option<u32> {
-    name.strip_prefix('v').and_then(|s| s.parse().ok())
+    // Names are `v{id}`, but the MIL lowering may tag an output that is *also*
+    // consumed by a later segment as `v{id}_g{n}` (disambiguating it from the
+    // `host_v{id}` boundary-input name). Take the leading digits after `v` so
+    // `v3_g1` → 3 — otherwise that output is silently dropped from `env` and a
+    // downstream host op (e.g. a host-eval LSTM) fails with "missing value".
+    let s = name.strip_prefix('v')?;
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 fn seed_leaf_env(
@@ -643,4 +715,71 @@ fn seed_leaf_env(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlx_ir::op::Activation;
+    use rlx_ir::{DType, Graph, Shape};
+    use std::sync::Mutex;
+
+    // Env mutation must be single-threaded across these cases.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn tiny_fp32() -> Graph {
+        let mut g = Graph::new("fp32_units");
+        let x = g.input("x", Shape::new(&[2, 2], DType::F32));
+        let y = g.activation(Activation::Relu, x, Shape::new(&[2, 2], DType::F32));
+        g.set_outputs(vec![y]);
+        g
+    }
+
+    fn tiny_f16() -> Graph {
+        let mut g = Graph::new("f16_units");
+        let x = g.input("x", Shape::new(&[2, 2], DType::F16));
+        let y = g.activation(Activation::Relu, x, Shape::new(&[2, 2], DType::F16));
+        g.set_outputs(vec![y]);
+        g
+    }
+
+    fn with_units_env(val: Option<&str>, f: impl FnOnce()) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("RLX_COREML_UNITS");
+        match val {
+            Some(v) => unsafe { std::env::set_var("RLX_COREML_UNITS", v) },
+            None => unsafe { std::env::remove_var("RLX_COREML_UNITS") },
+        }
+        f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("RLX_COREML_UNITS", v) },
+            None => unsafe { std::env::remove_var("RLX_COREML_UNITS") },
+        }
+    }
+
+    #[test]
+    fn default_compute_units_policy() {
+        with_units_env(None, || {
+            assert_eq!(default_compute_units(&tiny_fp32()), ComputeUnits::CpuAndGpu);
+            assert_eq!(
+                default_compute_units(&tiny_f16()),
+                ComputeUnits::CpuAndNeuralEngine
+            );
+        });
+        with_units_env(Some("ane"), || {
+            assert_eq!(
+                default_compute_units(&tiny_fp32()),
+                ComputeUnits::CpuAndNeuralEngine
+            );
+        });
+        with_units_env(Some("gpu"), || {
+            assert_eq!(default_compute_units(&tiny_f16()), ComputeUnits::CpuAndGpu);
+        });
+        with_units_env(Some("cpu"), || {
+            assert_eq!(default_compute_units(&tiny_fp32()), ComputeUnits::CpuOnly);
+        });
+        with_units_env(Some("all"), || {
+            assert_eq!(default_compute_units(&tiny_fp32()), ComputeUnits::All);
+        });
+    }
 }

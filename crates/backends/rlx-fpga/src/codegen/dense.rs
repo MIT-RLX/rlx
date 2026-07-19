@@ -30,7 +30,19 @@ use crate::tune::RequantPrecision;
 use crate::verilog::{V, mem_hex_bytes, mem_hex_words_i32};
 
 pub fn emit(layer: &Layer, hints: &Hints) -> LayerArtifacts {
-    let (name, in_f, out_f, x_zp, w_zp, out_zp, weight_bits, requant, weights, bias) = match layer {
+    let (
+        name,
+        in_f,
+        out_f,
+        x_zp,
+        w_zp,
+        out_zp,
+        weight_bits,
+        weight_encoding,
+        requant,
+        weights,
+        bias,
+    ) = match layer {
         Layer::Dense {
             name,
             in_features,
@@ -39,6 +51,7 @@ pub fn emit(layer: &Layer, hints: &Hints) -> LayerArtifacts {
             w_zp,
             out_zp,
             weight_bits,
+            weight_encoding,
             requant,
             weights,
             bias,
@@ -50,12 +63,14 @@ pub fn emit(layer: &Layer, hints: &Hints) -> LayerArtifacts {
             *w_zp,
             *out_zp,
             *weight_bits,
+            *weight_encoding,
             requant.clone(),
             weights.clone(),
             bias.clone(),
         ),
         _ => unreachable!("dense::emit called with non-Dense layer"),
     };
+    let _ = weight_encoding; // FP4 unpack wired via weight_unpack ENCODING param below.
     assert!(
         matches!(weight_bits, 2 | 4 | 8),
         "dense: weight_bits must be 2, 4 or 8 (got {weight_bits})"
@@ -153,6 +168,11 @@ pub fn emit(layer: &Layer, hints: &Hints) -> LayerArtifacts {
             v.line(&format!("localparam int IN_F={in_f}, OUT_F={out_f};"));
             v.line(&format!("localparam int X_ZP={x_zp}, W_ZP={w_zp}, OUT_ZP={out_zp};"));
             v.line(&format!("localparam int W_BITS={weight_bits};"));
+            let w_enc = match weight_encoding {
+                crate::model::WeightEncoding::SignedInt => 0,
+                crate::model::WeightEncoding::Fp4E2M1 => 1,
+            };
+            v.line(&format!("localparam int W_ENC={w_enc};"));
             v.line(&format!("localparam int W_LOG_LEN={w_logical_len};"));
             v.line(&format!("localparam int W_BYTE_LEN={w_byte_len};"));
             v.blank();
@@ -181,7 +201,7 @@ pub fn emit(layer: &Layer, hints: &Hints) -> LayerArtifacts {
             } else {
                 v.comment("Combinational weight unpack");
                 v.line("logic signed [31:0] w_val;");
-                v.line("weight_unpack #(.BITS(W_BITS)) u_w_unpack (");
+                v.line("weight_unpack #(.BITS(W_BITS), .ENCODING(W_ENC)) u_w_unpack (");
                 v.block(|v| {
                     v.line(".byte_in(w_byte),");
                     v.line(".lane(w_lane_q),");

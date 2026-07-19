@@ -291,6 +291,30 @@ fn transpose_2x3_to_3x2_matches_reference() {
     assert_eq!(r[0], vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 }
 
+/// AdaLN / Gemm(transB): `Transpose(Param)` must write the act slot, not only
+/// a scratch copy inside a weight-anchored bind window (no writeback).
+#[test]
+fn transpose_param_then_matmul_matches_reference() {
+    if !rlx_wgpu::is_available() {
+        return;
+    }
+    let mut g = Graph::new("tr_param_mm");
+    let x = g.input("x", Shape::new(&[1, 2], DType::F32));
+    let w = g.param("w", Shape::new(&[3, 2], DType::F32)); // ONNX Gemm transB layout
+    let wt = g.add_node(
+        Op::Transpose { perm: vec![1, 0] },
+        vec![w],
+        Shape::new(&[2, 3], DType::F32),
+    );
+    let y = g.matmul(x, wt, Shape::new(&[1, 3], DType::F32));
+    g.set_outputs(vec![y]);
+    let mut exe = WgpuExecutable::compile(g);
+    // w rows = out cols after transpose: [[1,2],[3,4],[5,6]] → [[1,3,5],[2,4,6]]
+    exe.set_param("w", &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let r = exe.run(&[("x", &[1.0, 1.0])]);
+    assert_eq!(r[0], vec![3.0, 7.0, 11.0]);
+}
+
 #[test]
 fn transpose_bhsd_layout_swap_matches_reference() {
     if !rlx_wgpu::is_available() {

@@ -67,7 +67,16 @@ pub fn register_coreml_kernel(k: Arc<dyn CoremlKernel>) {
     global_coreml_kernels().register(k);
 }
 
+/// Register rlx-coreml's built-in host-delegate kernels exactly once, before
+/// any lookup — currently the `collective.*` ops (host/transport delegates over
+/// the registered rlx-cpu kernel). See [`crate::collective`].
+fn ensure_builtins_registered() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(crate::collective::register);
+}
+
 pub fn lookup_coreml_kernel(name: &str) -> Option<Arc<dyn CoremlKernel>> {
+    ensure_builtins_registered();
     global_coreml_kernels().lookup(name)
 }
 

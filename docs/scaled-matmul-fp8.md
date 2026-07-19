@@ -142,10 +142,10 @@ y = g.scaled_matmul(lhs, rhs, format="f4e3m0", layout="mx")   # parses fNeXmY; V
 | Backend | Native compute? | What runs | Validated |
 |---------|-----------------|-----------|-----------|
 | **CPU** (`rlx-cpu`) | No (no FP8 matrix ISA) | **Reference oracle**: decode→scale→sgemm for every named + `Custom` format × every scale layout | ✅ on this host (bit-exact grid, cosine vs f32) |
-| **CUDA** (`rlx-cuda`) | **Yes** for per-tensor FP8 — cuBLASLt, sm_89+ (Ada/Hopper) | per-tensor `F8E4M3`/`F8E5M2` native GEMM; **all other formats (custom, block-MX, FP4, FP6) run the on-device decode-accumulate kernel** `scaled_matmul_decode` | ✅ **on RTX 3080 Ti** (12-format sweep bit-exact vs oracle; `f4e3m0` grid GEMM bit-exact vs f32; native fp8 *quantize* kernels validated). Tensor-core fp8 GEMM itself still needs sm_89+ |
+| **CUDA** (`rlx-cuda`) | **Yes** for per-tensor FP8 — cuBLASLt, sm_89+ (Ada/Hopper) | per-tensor `F8E4M3`/`F8E5M2` native GEMM; **all other formats (custom, block-MX, FP4, FP6) run the on-device decode-accumulate kernel** `scaled_matmul_decode` | ✅ **on NVIDIA GPU** (12-format sweep bit-exact vs oracle; `f4e3m0` grid GEMM bit-exact vs f32; native fp8 *quantize* kernels validated). Tensor-core fp8 GEMM itself still needs sm_89+ |
 | **ROCm** (`rlx-rocm`) | **Yes** for per-tensor FP8 — hipBLASLt FNUZ, CDNA3 (MI300) | per-tensor FNUZ fp8 native; other formats via the same decode-accumulate kernel | ⏳ kernels **compile under `hipcc` for gfx90a/CDNA2**; on-device run pending AMD hardware |
 | **Metal** (`rlx-metal`) | **No** — Apple GPUs have no FP8/FP4 matrix units | **all** formats/layouts run as a host decode-and-accumulate fallback over unified memory, reusing the *same* rlx-cpu oracle | ✅ **on Apple GPU** (Metal == CPU bit-for-bit, incl. `f4e3m0`, MXFP8, NVFP4) |
-| **Vulkan** (`rlx-vulkan`) | **No** — SPIR-V compute path has no FP8/FP4 matrix units | **all** formats run as a CPU host-fallback against the mapped host-visible arena (same rlx-cpu oracle); the four scaled ops are in `SUPPORTED_OPS` + `is_host_fallback`, and the host path writes U8 code/scale outputs as raw bytes | ✅ **on a native NVIDIA Vulkan driver** (RTX 3080 Ti): `f4e3m0` grid GEMM bit-exact vs f32 |
+| **Vulkan** (`rlx-vulkan`) | **No** — SPIR-V compute path has no FP8/FP4 matrix units | **all** formats run as a CPU host-fallback against the mapped host-visible arena (same rlx-cpu oracle); the four scaled ops are in `SUPPORTED_OPS` + `is_host_fallback`, and the host path writes U8 code/scale outputs as raw bytes | ✅ **on a native NVIDIA Vulkan driver** (NVIDIA GPU): `f4e3m0` grid GEMM bit-exact vs f32 |
 
 Every backend runs **every** format × scale layout; the only difference is
 whether the GEMM hits tensor cores (per-tensor FP8 on CUDA/ROCm with the right
@@ -170,7 +170,7 @@ under the runtime compilers). Weights quantize once and const-fold.
 The **decode-accumulate kernel** (`scaled_lowp_general.cu`, the non-tensor-core
 fallback for every custom / block / FP4 / FP6 format) is **16×16 shared-memory
 tiled** — each code is decoded once per tile instead of once per output element:
-**~5.4× faster** on the RTX 3080 Ti at 1024³ (74.9 → 405 GFLOP/s). Its generic
+**~5.4× faster** on the NVIDIA GPU at 1024³ (74.9 → 405 GFLOP/s). Its generic
 path unpacks `(exp, mant, bias)` from a packed `kernel_id()` descriptor (top-bit
 sentinel), so a new `fNeXmY` needs **no kernel edit**; the seven named ids
 (`0..=6`) keep the existing `switch`, leaving the hardware path byte-identical.
@@ -213,15 +213,15 @@ cargo build -p rlx-cuda -p rlx-rocm -p rlx-vulkan      # compile-check the GPU k
 ```
 
 On hardware (validated):
-- **CUDA — RTX 3080 Ti** (`rlx-cuda/tests/cuda_scaled_custom.rs`): `f4e3m0` grid
+- **CUDA — NVIDIA GPU** (`rlx-cuda/tests/cuda_scaled_custom.rs`): `f4e3m0` grid
   GEMM bit-exact vs f32; 12-format quantize→dequantize sweep bit-for-bit == the
   CPU oracle; tiled decode GEMM 405 GFLOP/s (5.4× the naive kernel). The
-  tensor-core fp8 *GEMM* still needs sm_89+ (Ada/Hopper); the 3080 Ti (Ampere)
+  tensor-core fp8 *GEMM* still needs sm_89+ (Ada/Hopper); the NVIDIA GPU (Ampere)
   validates the quantize kernels + decode path only.
 - **Metal — Apple GPU** (`rlx-metal/tests/metal_scaled_matmul_parity.rs`): Metal
   == CPU bit-for-bit for `f4e3m0` and the named formats.
 - **Vulkan — native NVIDIA** (`rlx-vulkan/tests/vulkan_scaled_custom.rs`):
-  `f4e3m0` grid GEMM bit-exact vs f32 on the RTX 3080 Ti driver.
+  `f4e3m0` grid GEMM bit-exact vs f32 on the NVIDIA GPU driver.
 - **ROCm — MI300 (CDNA3)**: pending AMD hardware. The shared kernels compile
   under `hipcc` for gfx90a; **verify the fp8 datatype / scale-pointer / transpose
   constants in `rlx-rocm/src/hipblaslt.rs` against the installed headers** before

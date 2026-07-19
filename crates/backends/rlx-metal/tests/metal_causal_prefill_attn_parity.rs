@@ -15,10 +15,9 @@
 
 //! Prefill CAUSAL `Op::Attention` (Lq = Lk = S > 1) on Metal vs CPU.
 //!
-//! The existing Metal attention parity tests cover `MaskKind::None` (encoder)
-//! and decode causal (`Lq = 1`). The LLM *prefill* path uses `MaskKind::Causal`
-//! with `Lq = S > 1` — this guards that untested case (suspected Voxtral Metal
-//! garbage-logits bug).
+//! Covers `[B,H,S,D]` MaskKind::Causal — historically the Metal 4-D MPSGraph
+//! path discarded the causal mask (all-zero). Also covers CFG-style B=2 and
+//! Custom bucket masks in `[B,S,H,D]` (Zonos decode).
 
 #![cfg(target_os = "macos")]
 
@@ -47,6 +46,16 @@ fn build_causal_prefill_attn(b: usize, h: usize, s: usize, d: usize) -> Graph {
     g
 }
 
+fn assert_metal_cpu_close(label: &str, metal: &[f32], cpu: &[f32], tol: f32) {
+    let max_abs = cpu
+        .iter()
+        .zip(metal.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("{label}: max_abs={max_abs:.6}");
+    assert!(max_abs < tol, "{label} max_abs={max_abs}");
+}
+
 #[test]
 fn metal_causal_prefill_attention_matches_cpu() {
     if !rlx_runtime::is_available(Device::Metal) {
@@ -67,16 +76,78 @@ fn metal_causal_prefill_attention_matches_cpu() {
 
     let mut c = Session::new(Device::Cpu).compile(g);
     let cpu = c.run(&[("q", &q), ("k", &k), ("v", &v)]).remove(0);
+    assert_metal_cpu_close("causal prefill B=1", &metal, &cpu, 1e-4);
+}
 
-    let max_abs = cpu
-        .iter()
-        .zip(metal.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    let cpu_sum: f64 = cpu.iter().map(|&x| x as f64).sum();
-    let metal_sum: f64 = metal.iter().map(|&x| x as f64).sum();
-    eprintln!(
-        "causal prefill attn: max_abs={max_abs:.6} cpu_sum={cpu_sum:.4} metal_sum={metal_sum:.4}"
+#[test]
+fn metal_causal_prefill_attention_batch2_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Metal) {
+        eprintln!("skip: Metal unavailable");
+        return;
+    }
+    let (b, h, s, d) = (2, 4, 32, 32);
+    let n = b * h * s * d;
+    let q: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.02).sin()).collect();
+    let k: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.04).cos()).collect();
+    let v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.015).sin()).collect();
+
+    let g = build_causal_prefill_attn(b, h, s, d);
+    let mut m = Session::new(Device::Metal).compile(g.clone());
+    let metal = m.run(&[("q", &q), ("k", &k), ("v", &v)]).remove(0);
+    let mut c = Session::new(Device::Cpu).compile(g);
+    let cpu = c.run(&[("q", &q), ("k", &k), ("v", &v)]).remove(0);
+    assert_metal_cpu_close("causal prefill B=2", &metal, &cpu, 1e-4);
+}
+
+#[test]
+fn metal_custom_bucket_mask_bshd_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Metal) {
+        eprintln!("skip: Metal unavailable");
+        return;
+    }
+    // Decode-shaped: Lq=1, Lk=upper+1, Custom keep-mask (Zonos CFG layout).
+    let (b, h, lq, lk, d) = (2, 4, 1usize, 17usize, 32usize);
+    let f = DType::F32;
+    let mut g = Graph::new("custom_bucket_attn");
+    let q = g.input("q", Shape::new(&[b, lq, h, d], f));
+    let k = g.input("k", Shape::new(&[b, lk, h, d], f));
+    let v = g.input("v", Shape::new(&[b, lk, h, d], f));
+    let mask = g.input("mask", Shape::new(&[b, lk], f));
+    let y = g.add_node(
+        rlx_ir::Op::Attention {
+            num_heads: h,
+            head_dim: d,
+            mask_kind: MaskKind::Custom,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v, mask],
+        Shape::new(&[b, lq, h, d], f),
     );
-    assert!(max_abs < 1e-4, "causal prefill attention max_abs={max_abs}");
+    g.set_outputs(vec![y]);
+
+    let nq = b * lq * h * d;
+    let nk = b * lk * h * d;
+    let qv: Vec<f32> = (0..nq).map(|i| ((i as f32) * 0.03).sin()).collect();
+    let kv: Vec<f32> = (0..nk).map(|i| ((i as f32) * 0.05).cos()).collect();
+    let vv: Vec<f32> = (0..nk).map(|i| ((i as f32) * 0.01).sin()).collect();
+    // Keep first 8 keys + last (decode "current") — pad the middle.
+    let past = 8usize;
+    let mut mv = vec![0.0f32; b * lk];
+    for bi in 0..b {
+        for i in 0..lk {
+            let keep = i < past || i + 1 == lk;
+            mv[bi * lk + i] = if keep { 1.0 } else { 0.0 };
+        }
+    }
+
+    let mut m = Session::new(Device::Metal).compile(g.clone());
+    let metal = m
+        .run(&[("q", &qv), ("k", &kv), ("v", &vv), ("mask", &mv)])
+        .remove(0);
+    let mut c = Session::new(Device::Cpu).compile(g);
+    let cpu = c
+        .run(&[("q", &qv), ("k", &kv), ("v", &vv), ("mask", &mv)])
+        .remove(0);
+    assert_metal_cpu_close("custom bucket B=2 BSHD", &metal, &cpu, 1e-4);
 }

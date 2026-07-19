@@ -69,10 +69,12 @@ fn synthetic_ternary_conv() -> Model {
             w_zp: 0,
             out_zp: 0,
             weight_bits: 2,
+            weight_encoding: rlx_fpga::WeightEncoding::SignedInt,
             requant,
             weights: packed,
             bias: None,
         }],
+        extra_outputs: vec![],
     }
 }
 

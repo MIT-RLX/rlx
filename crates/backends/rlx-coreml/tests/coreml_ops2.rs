@@ -145,6 +145,34 @@ fn scatter_add() {
 }
 
 #[test]
+fn scatter_nd_update() {
+    // data = [[1,1,1],[2,2,2]], replace row0 with [9,9,9] via indices [[0]].
+    let mut g = Graph::new("scatter_nd");
+    let data = g.input("data", Shape::new(&[2, 3], DType::F32));
+    let indices = g.input("indices", Shape::new(&[1, 1], DType::F32));
+    let updates = g.input("updates", Shape::new(&[1, 3], DType::F32));
+    let y = node(
+        &mut g,
+        Op::ScatterNd {
+            reduction: rlx_ir::ScatterNdReduction::None,
+        },
+        vec![data, indices, updates],
+        Shape::new(&[2, 3], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let mut e = CoremlExecutable::compile(g);
+    let out = e
+        .run(&[
+            ("data", &[1.0f32, 1.0, 1.0, 2.0, 2.0, 2.0]),
+            ("indices", &[0.0f32]),
+            ("updates", &[9.0f32, 9.0, 9.0]),
+        ])
+        .unwrap()
+        .remove(0);
+    approx(&out, &[9.0, 9.0, 9.0, 2.0, 2.0, 2.0], 1e-5);
+}
+
+#[test]
 fn batch_norm_inference() {
     let mut g = Graph::new("bn");
     let x = g.input("x", Shape::new(&[2, 3], DType::F32));

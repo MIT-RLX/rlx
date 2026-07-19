@@ -55,6 +55,9 @@ const TAG_BARRIER: u32 = TAG_RESERVED_BASE;
 const TAG_ALL_REDUCE: u32 = TAG_RESERVED_BASE + 1;
 const TAG_ALL_GATHER: u32 = TAG_RESERVED_BASE + 2;
 const TAG_BROADCAST: u32 = TAG_RESERVED_BASE + 3;
+const TAG_ALL_TO_ALL: u32 = TAG_RESERVED_BASE + 4;
+const TAG_REDUCE: u32 = TAG_RESERVED_BASE + 5;
+const TAG_PPERMUTE: u32 = TAG_RESERVED_BASE + 6;
 
 /// Two-sided, tagged, byte-oriented point-to-point transport between
 /// `world_size` ranks.
@@ -165,6 +168,80 @@ fn finalize(op: ReduceKind, acc: f32, n: u32) -> f32 {
         ReduceKind::Mean => acc / (n as f32),
         _ => acc,
     }
+}
+
+/// f64 mean-finalize for the deterministic reducer (divide once, in f64).
+fn finalize64(op: ReduceKind, acc: f64, n: u32) -> f64 {
+    match op {
+        ReduceKind::Mean => acc / (n as f64),
+        _ => acc,
+    }
+}
+
+/// `[start, end)` of chunk `i` in a near-equal `n`-way split of `len` — the
+/// first `len % n` chunks get one extra element. The single source of truth for
+/// every ring collective's chunk boundaries (both [`ProcessGroup::all_reduce`]
+/// rings partition the vector this way, and rank `me` ends up owning chunk
+/// `(me + 1) % n`).
+fn ring_chunk(len: usize, n: usize, i: usize) -> (usize, usize) {
+    let base = len / n;
+    let rem = len % n;
+    let bound = |j: usize| j * base + j.min(rem);
+    (bound(i), bound(i + 1))
+}
+
+/// Guard that a received frame is the length the ring expects for this step.
+fn expect_len(got: usize, want: usize) -> Result<(), CollectiveError> {
+    if got != want {
+        return Err(CollectiveError::LengthMismatch {
+            expected: want,
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// Reduction algorithm + precision for [`ProcessGroup::all_reduce`]. Selected
+/// per call, or globally via env (see [`env_reduce_mode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceMode {
+    /// Bandwidth-optimal ring, **f32** accumulation. Fastest; f32 precision, and
+    /// the last-ulp result depends on world size. Reproducible run-to-run. Default.
+    Ring,
+    /// **Deterministic + precise, at ring speed.** The same bandwidth-optimal ring,
+    /// but its reduce-scatter **accumulates in f64** (the all-gather stays f32 —
+    /// those values are already reduced, so there is no precision left to lose).
+    /// The fold order is fixed by the algorithm, so the result is bitwise
+    /// reproducible run-to-run; f64 accumulation makes each element the
+    /// correctly-rounded exact cross-rank sum, so it neither loses precision nor
+    /// biases the gradient and is effectively independent of world size. Only the
+    /// reduce-scatter carries an f64 payload (≈1.5× the f32 ring's bytes) — NOT a
+    /// gather-to-root's `O(n·len)`, so speed is preserved. The mode to pick when
+    /// you want reproducible, precise data-parallel training.
+    Deterministic,
+}
+
+/// Global reduction mode from the environment (read once), so a whole cluster
+/// opts into deterministic + precise reductions with no code change:
+///   `RLX_DETERMINISTIC_REDUCE=1` → [`ReduceMode::Deterministic`]
+///   (unset)                      → [`ReduceMode::Ring`]
+/// **Every rank must agree** (mismatched modes mix incompatible message sizes and
+/// would desync), so set it on all nodes — the same discipline as any other
+/// cluster-wide `RLX_*` flag.
+pub fn env_reduce_mode() -> ReduceMode {
+    static MODE: std::sync::OnceLock<ReduceMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let on = |k: &str| {
+            std::env::var(k)
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        };
+        if on("RLX_DETERMINISTIC_REDUCE") {
+            ReduceMode::Deterministic
+        } else {
+            ReduceMode::Ring
+        }
+    })
 }
 
 /// f64 reduction step — collectives accumulate in f64 regardless of the
@@ -516,6 +593,17 @@ impl ProcessGroup {
     /// because each rank's background reader thread always drains its
     /// socket, so a `send` never blocks on a peer that is itself sending.
     pub fn all_reduce(&self, data: &mut [f32], op: ReduceKind) -> Result<(), CollectiveError> {
+        self.all_reduce_mode(data, op, env_reduce_mode())
+    }
+
+    /// [`Self::all_reduce`] with an explicit [`ReduceMode`] (bypasses the env
+    /// default). Every rank must pass the same mode + length.
+    pub fn all_reduce_mode(
+        &self,
+        data: &mut [f32],
+        op: ReduceKind,
+        mode: ReduceMode,
+    ) -> Result<(), CollectiveError> {
         let n = self.world_size();
         if n <= 1 {
             for v in data.iter_mut() {
@@ -523,59 +611,113 @@ impl ProcessGroup {
             }
             return Ok(());
         }
-        let n = n as usize;
+        match mode {
+            ReduceMode::Ring => self.all_reduce_ring_f32(data, op),
+            ReduceMode::Deterministic => self.all_reduce_deterministic(data, op),
+        }
+    }
+
+    /// Bandwidth-optimal f32 ring (reduce-scatter → all-gather). The default path.
+    fn all_reduce_ring_f32(&self, data: &mut [f32], op: ReduceKind) -> Result<(), CollectiveError> {
+        let n = self.world_size() as usize;
         let me = self.rank() as usize;
         let next = ((me + 1) % n) as u32;
         let prev = ((me + n - 1) % n) as u32;
-
-        // Near-equal contiguous chunks; the first `rem` get one extra elem.
         let len = data.len();
-        let base = len / n;
-        let rem = len % n;
-        let bound = |i: usize| i * base + i.min(rem);
-        let chunk = |i: usize| (bound(i), bound(i + 1));
 
-        // Single tag is safe: the inbox is FIFO per source, and `prev`
-        // sends its 2(n-1) frames in exactly the order this rank consumes
-        // them.
-        let expect = |incoming: &[f32], want: usize| -> Result<(), CollectiveError> {
-            if incoming.len() != want {
-                return Err(CollectiveError::LengthMismatch {
-                    expected: want,
-                    got: incoming.len(),
-                });
-            }
-            Ok(())
-        };
-
-        // reduce-scatter: rank `me` ends owning the fully-reduced chunk (me+1)%n.
+        // reduce-scatter (f32, in place): rank `me` ends owning the fully-reduced
+        // chunk (me+1)%n. Single tag is safe — `prev` sends its 2(n-1) frames in
+        // exactly the FIFO order this rank consumes them.
         for step in 0..n - 1 {
-            let (ss, se) = chunk((me + n - step) % n);
-            let (rs, re) = chunk((me + n - step - 1) % n);
+            let (ss, se) = ring_chunk(len, n, (me + n - step) % n);
+            let (rs, re) = ring_chunk(len, n, (me + n - step - 1) % n);
             self.send_f32_tagged(next, TAG_ALL_REDUCE, &data[ss..se])?;
             let incoming = self.recv_f32_tagged(prev, TAG_ALL_REDUCE)?;
-            expect(&incoming, re - rs)?;
+            expect_len(incoming.len(), re - rs)?;
             for (d, v) in data[rs..re].iter_mut().zip(incoming) {
                 *d = combine(op, *d, v);
             }
         }
-        // all-gather: walk each reduced chunk around the ring.
+        // Finalize the owned chunk once (Mean → ÷n), then all-gather the reduced
+        // chunks around the ring. Dividing per-owner before the gather matches the
+        // deterministic ring and each element is still scaled exactly once.
+        let (os, oe) = ring_chunk(len, n, (me + 1) % n);
+        for v in data[os..oe].iter_mut() {
+            *v = finalize(op, *v, n as u32);
+        }
+        self.ring_all_gather(data, n, me)
+    }
+
+    /// The all-gather half shared by both rings: once each rank owns its finalized
+    /// chunk `(me+1)%n`, walk the chunks around the ring so every rank ends with
+    /// the whole vector. f32 payload — the values are already reduced.
+    fn ring_all_gather(
+        &self,
+        data: &mut [f32],
+        n: usize,
+        me: usize,
+    ) -> Result<(), CollectiveError> {
+        let next = ((me + 1) % n) as u32;
+        let prev = ((me + n - 1) % n) as u32;
+        let len = data.len();
         for step in 0..n - 1 {
-            let (ss, se) = chunk((me + n - step + 1) % n);
-            let (rs, re) = chunk((me + n - step) % n);
+            let (ss, se) = ring_chunk(len, n, (me + n - step + 1) % n);
+            let (rs, re) = ring_chunk(len, n, (me + n - step) % n);
             self.send_f32_tagged(next, TAG_ALL_REDUCE, &data[ss..se])?;
             let incoming = self.recv_f32_tagged(prev, TAG_ALL_REDUCE)?;
-            expect(&incoming, re - rs)?;
+            expect_len(incoming.len(), re - rs)?;
             data[rs..re].copy_from_slice(&incoming);
         }
-        // Mean is sum-reduced above, divided here once over the whole vector.
-        if matches!(op, ReduceKind::Mean) {
-            let inv = 1.0 / n as f32;
-            for v in data.iter_mut() {
-                *v *= inv;
+        Ok(())
+    }
+
+    /// [`ReduceMode::Deterministic`]: the same bandwidth-optimal ring as
+    /// [`Self::all_reduce_ring_f32`], but the **reduce-scatter accumulates in f64**
+    /// so no f32 precision is lost, and the all-gather propagates the already-
+    /// reduced values in f32 (nothing left to lose). The fold order is fixed by the
+    /// algorithm (not by message timing), so the result is bitwise reproducible;
+    /// f64 accumulation makes each element the correctly-rounded exact sum, so it
+    /// is effectively independent of world size. Only the reduce-scatter legs carry
+    /// f64 (≈1.5× the f32 ring's bytes) — the ring's `O((n-1)/n · len)` per rank is
+    /// preserved, unlike a gather-to-root's `O(n·len)`.
+    fn all_reduce_deterministic(
+        &self,
+        data: &mut [f32],
+        op: ReduceKind,
+    ) -> Result<(), CollectiveError> {
+        let n = self.world_size() as usize;
+        let me = self.rank() as usize;
+        let next = ((me + 1) % n) as u32;
+        let prev = ((me + n - 1) % n) as u32;
+        let len = data.len();
+
+        // f64 accumulator seeded with this rank's contribution.
+        let mut acc: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+        // Reused across steps — largest chunk is ⌈len/n⌉ f64 (8 bytes each).
+        let mut send = Vec::with_capacity((len / n + 1) * 8);
+
+        // reduce-scatter in f64: rank `me` ends owning the fully-summed chunk
+        // (me+1)%n. Partials travel as f64 so each add is lossless.
+        for step in 0..n - 1 {
+            let (ss, se) = ring_chunk(len, n, (me + n - step) % n);
+            let (rs, re) = ring_chunk(len, n, (me + n - step - 1) % n);
+            send.clear();
+            send.extend(acc[ss..se].iter().flat_map(|v| v.to_le_bytes()));
+            self.transport.send_bytes(next, TAG_ALL_REDUCE, &send)?;
+            let incoming = self.transport.recv_bytes(prev, TAG_ALL_REDUCE)?;
+            expect_len(incoming.len(), (re - rs) * 8)?;
+            for (a, c) in acc[rs..re].iter_mut().zip(incoming.chunks_exact(8)) {
+                *a = combine64(op, *a, f64::from_le_bytes(c.try_into().unwrap()));
             }
         }
-        Ok(())
+
+        // Finalize the owned chunk (Mean divides once, in f64), narrow to f32,
+        // then reuse the shared f32 all-gather to spread the reduced chunks.
+        let (os, oe) = ring_chunk(len, n, (me + 1) % n);
+        for i in os..oe {
+            data[i] = finalize64(op, acc[i], n as u32) as f32;
+        }
+        self.ring_all_gather(data, n, me)
     }
 
     /// In-place all-reduce over **any float dtype** (`F16`/`BF16`/`F32`/`F64`),
@@ -739,6 +881,108 @@ impl ProcessGroup {
         Ok(())
     }
 
+    /// All-to-all: rank `r` splits `data` into `world_size` equal chunks and
+    /// sends chunk `j` to rank `j`; output chunk `j` is what rank `j` sent to
+    /// `r`. Both `data` and the result are `world_size * chunk` f32. This is the
+    /// per-rank chunk-grid transpose — the primitive for MoE expert
+    /// dispatch/combine.
+    pub fn all_to_all(&self, data: &[f32]) -> Result<Vec<f32>, CollectiveError> {
+        let n = self.world_size() as usize;
+        if n <= 1 {
+            return Ok(data.to_vec());
+        }
+        if !data.len().is_multiple_of(n) {
+            return Err(CollectiveError::LengthMismatch {
+                expected: n,
+                got: data.len(),
+            });
+        }
+        let chunk = data.len() / n;
+        let rank = self.rank() as usize;
+        let mut out = vec![0f32; data.len()];
+        out[rank * chunk..(rank + 1) * chunk]
+            .copy_from_slice(&data[rank * chunk..(rank + 1) * chunk]);
+        for p in 0..n {
+            if p == rank {
+                continue;
+            }
+            let send = &data[p * chunk..(p + 1) * chunk];
+            // Deadlock-free pairwise exchange: the lower rank sends first.
+            if rank < p {
+                self.send_f32_tagged(p as u32, TAG_ALL_TO_ALL, send)?;
+                let r = self.recv_f32_tagged(p as u32, TAG_ALL_TO_ALL)?;
+                out[p * chunk..(p + 1) * chunk].copy_from_slice(&r);
+            } else {
+                let r = self.recv_f32_tagged(p as u32, TAG_ALL_TO_ALL)?;
+                out[p * chunk..(p + 1) * chunk].copy_from_slice(&r);
+                self.send_f32_tagged(p as u32, TAG_ALL_TO_ALL, send)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reduce to `root`: every rank contributes `data`; afterward only `root`'s
+    /// buffer holds the reduction (non-root buffers are left unchanged). The
+    /// transpose of [`broadcast`].
+    pub fn reduce(
+        &self,
+        root: u32,
+        data: &mut [f32],
+        op: ReduceKind,
+    ) -> Result<(), CollectiveError> {
+        let n = self.world_size();
+        if n <= 1 {
+            return Ok(());
+        }
+        if self.rank() == root {
+            let mut acc = data.to_vec();
+            for r in 0..n {
+                if r == root {
+                    continue;
+                }
+                let other = self.recv_f32_tagged(r, TAG_REDUCE)?;
+                if other.len() != acc.len() {
+                    return Err(CollectiveError::LengthMismatch {
+                        expected: acc.len(),
+                        got: other.len(),
+                    });
+                }
+                for i in 0..acc.len() {
+                    acc[i] = op.fold(acc[i], other[i]);
+                }
+            }
+            for v in acc.iter_mut() {
+                *v = op.finalize(*v, n as usize);
+            }
+            data.copy_from_slice(&acc);
+        } else {
+            self.send_f32_tagged(root, TAG_REDUCE, data)?;
+        }
+        Ok(())
+    }
+
+    /// Collective permute: `perm` is a list of `(src, dst)` pairs — rank `src`'s
+    /// `data` is delivered to rank `dst`'s output. A rank not named as a `dst`
+    /// receives zeros. Generalizes ring shifts / rotations (JAX's `ppermute`).
+    pub fn ppermute(&self, data: &[f32], perm: &[(u32, u32)]) -> Result<Vec<f32>, CollectiveError> {
+        let rank = self.rank();
+        let my_dst = perm.iter().find(|&&(s, _)| s == rank).map(|&(_, d)| d);
+        let my_src = perm.iter().find(|&&(_, d)| d == rank).map(|&(s, _)| s);
+        // Send our data to its destination (a self-permute needs no network).
+        if let Some(dst) = my_dst {
+            if dst != rank {
+                self.send_f32_tagged(dst, TAG_PPERMUTE, data)?;
+            }
+        }
+        // Our output is whatever our source sent (zeros if we're not a dst).
+        let out = match my_src {
+            Some(src) if src == rank => data.to_vec(),
+            Some(src) => self.recv_f32_tagged(src, TAG_PPERMUTE)?,
+            None => vec![0f32; data.len()],
+        };
+        Ok(out)
+    }
+
     /// Bounded-staleness federated averaging. Rank 0 collects each rank's
     /// vector but **skips any that miss `deadline`**, averages the arrivals
     /// (always including its own), and broadcasts the result. Returns the
@@ -879,6 +1123,74 @@ mod tests {
             g.all_reduce(&mut data, ReduceKind::Sum).unwrap();
             assert_eq!(data, vec![10.0; 3], "rank {}", g.rank());
         });
+    }
+
+    #[test]
+    fn all_reduce_modes_agree_on_the_sum() {
+        // Ring (f32) and Deterministic (f64 ring) must agree on a clean sum.
+        for mode in [ReduceMode::Ring, ReduceMode::Deterministic] {
+            run_ranks(4, move |g| {
+                let r = g.rank() as f32 + 1.0; // 1,2,3,4
+                let mut data = vec![r, r * 2.0, r * 3.0];
+                g.all_reduce_mode(&mut data, ReduceKind::Sum, mode).unwrap();
+                assert_eq!(
+                    data,
+                    vec![10.0, 20.0, 30.0],
+                    "mode {mode:?} rank {}",
+                    g.rank()
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn deterministic_reduce_mean_divides() {
+        run_ranks(4, |g| {
+            let mut data = vec![g.rank() as f32 + 1.0; 2]; // 1,2,3,4
+            g.all_reduce_mode(&mut data, ReduceKind::Mean, ReduceMode::Deterministic)
+                .unwrap();
+            assert_eq!(data, vec![2.5, 2.5], "rank {}", g.rank());
+        });
+    }
+
+    #[test]
+    fn deterministic_is_exact_where_the_f32_ring_would_lose_precision() {
+        // rank0=+1e8, rank1=-1e8, ranks2,3=+4 → true sum 8. f32's ulp at 1e8 is 8,
+        // so a naïve f32 fold of the small terms into 1e8 drops them; the f64
+        // reduce-scatter keeps full precision and lands exactly on 8 — at ring
+        // bandwidth (no precision loss for the determinism).
+        run_ranks(4, |g| {
+            let v = match g.rank() {
+                0 => 1e8f32,
+                1 => -1e8f32,
+                _ => 4.0f32,
+            };
+            let mut data = vec![v, v]; // >1 element so chunking is non-trivial
+            g.all_reduce_mode(&mut data, ReduceKind::Sum, ReduceMode::Deterministic)
+                .unwrap();
+            assert_eq!(data, vec![8.0, 8.0], "rank {}", g.rank());
+        });
+    }
+
+    #[test]
+    fn deterministic_is_world_size_independent_for_replicated_input() {
+        // Every rank contributes the same vector `v`; the reduced Mean must be `v`
+        // exactly, for ANY world size (2, 3, 5, 7) — the property the f32 ring
+        // lacks (its last ulp shifts with n). Node-count reproducibility.
+        for &n in &[2u32, 3, 5, 7] {
+            run_ranks(n, |g| {
+                let mut data = vec![0.1f32, 0.2, 0.3, 0.7];
+                g.all_reduce_mode(&mut data, ReduceKind::Mean, ReduceMode::Deterministic)
+                    .unwrap();
+                assert_eq!(
+                    data,
+                    vec![0.1, 0.2, 0.3, 0.7],
+                    "n={} rank {}",
+                    g.world_size(),
+                    g.rank()
+                );
+            });
+        }
     }
 
     #[test]

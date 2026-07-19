@@ -37,6 +37,9 @@ fn ensure_pool() {
             .num_threads(n)
             .thread_name(|i| format!("rlx-rayon-{i}"))
             .build_global();
+        // Pin OpenBLAS/MKL/Accelerate to 1 thread — Rayon owns outer
+        // parallelism (par_sgemm splits). Nested N² threads are catastrophic.
+        crate::blas::limit_inner_threads();
     });
 }
 
@@ -124,6 +127,9 @@ pub fn par_for<F: Fn(usize, usize) + Sync>(total: usize, min_per_thread: usize, 
             f(0, total);
             return;
         }
+        // Pin BLAS to 1 before Rayon fan-out so a preceding huge MT GEMM
+        // cannot oversubscribe with worker-local sgemm / elementwise work.
+        crate::blas::ensure_blas_threads(1);
         let chunk = total.div_ceil(n_threads);
         (0..n_threads).into_par_iter().for_each(|t| {
             let off = t * chunk;

@@ -8,6 +8,7 @@ use rlx_metal::kernels::kernels;
 fn scheme_block_elems(scheme_id: u32) -> usize {
     match scheme_id {
         19..=23 => 32,
+        24 => 128, // Q1_0
         _ => 256,
     }
 }
@@ -71,6 +72,7 @@ fn parity(scheme_id: u32, packed: &[u8], elems: usize, tol: f32, name: &str) {
         21 => rlx_gguf::dequant_q4_1(packed, elems).unwrap(),
         22 => rlx_gguf::dequant_q5_0(packed, elems).unwrap(),
         23 => rlx_gguf::dequant_q5_1(packed, elems).unwrap(),
+        24 => rlx_gguf::q1_dequant::dequant_q1_0(packed, elems).unwrap(),
         _ => panic!("bad scheme_id {scheme_id}"),
     };
     assert_eq!(metal_out.len(), elems);
@@ -140,6 +142,25 @@ fn q5_1_msl_matches_cpu_reference() {
     let w: Vec<f32> = (0..512).map(|i| (i as f32 * 0.019).sin()).collect();
     let packed = rlx_gguf::quantize::quantize_q5_1(&w).unwrap();
     parity(23, &packed, 512, 1e-4, "Q5_1");
+}
+
+#[test]
+fn q1_0_msl_matches_cpu_reference() {
+    // Q1_0 (prism-ml Bonsai-27B): f16 d + 16 sign bytes = 18 bytes / 128 elems.
+    let mut packed = Vec::new();
+    for b in 0..16u8 {
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&half::f16::from_f32(0.1 + 0.05 * b as f32).to_le_bytes());
+        for j in 0..128usize {
+            // Deterministic sign pattern; exercises LSB-first bit ordering
+            // across all 16 sign bytes.
+            if !(j + b as usize).is_multiple_of(3) {
+                block[2 + j / 8] |= 1 << (j % 8);
+            }
+        }
+        packed.extend_from_slice(&block);
+    }
+    parity(24, &packed, 16 * 128, 1e-4, "Q1_0");
 }
 
 #[test]

@@ -25,7 +25,9 @@
 //!   RANK=1 dist_job rlx-dist.toml
 //! ```
 
-use rlx_driver::{Node, ProcessGroup, ReduceKind, Topology};
+// One import for the whole distributed transport surface (process group, node
+// discovery, reduce kinds, transports) — see `rlx_collectives::prelude`.
+use rlx_collectives::prelude::*;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session, device_label, fastest_device, is_available, parse_device};
 use serde::Deserialize;

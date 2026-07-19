@@ -139,6 +139,17 @@ pub fn fastest_device_for_with_policy(
     graph: &Graph,
     policy: &crate::device_policy::DevicePolicy,
 ) -> Device {
+    // Hard override: `RLX_FORCE_DEVICE` pins the backend regardless of the cost
+    // model or policy. Without this, a small graph whose GPU dispatch cost
+    // exceeds CPU is silently placed on CPU even when the caller asked for a
+    // GPU backend — so a `--features gpu` run can be a CPU run in disguise,
+    // masking real GPU failures. Honored at the top of the single chokepoint
+    // so EVERY `fastest_device_for*` caller respects it.
+    if let Ok(s) = std::env::var("RLX_FORCE_DEVICE") {
+        if let Ok(dev) = crate::parse_device(&s) {
+            return dev;
+        }
+    }
     let candidates = crate::device_policy::devices_for_with_policy(graph, policy);
     if candidates.is_empty() {
         return crate::device_ext::fastest_among(&policy.apply(crate::available_devices()));

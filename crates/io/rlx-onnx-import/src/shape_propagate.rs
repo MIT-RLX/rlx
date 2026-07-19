@@ -27,6 +27,29 @@ use crate::lower::ImportOptions;
 type Dims = Vec<serde_json::Value>;
 type TensorMeta = (Dims, String);
 
+thread_local! {
+    /// Folded i64 CONSTANT values (axes/shape tensors) visible to shape inference.
+    /// Opset-13+ ops (Unsqueeze/Squeeze/Reduce/…) pass axes as an INPUT tensor, not
+    /// an attribute, so the meta pass needs the value to place the new/removed dim
+    /// correctly. Populated by the caller (`set_shape_i64_consts`) from the same
+    /// `i64_params` the lowerer uses. Empty for callers that don't set it (they keep
+    /// the old attribute-only behavior).
+    static SHAPE_I64_CONSTS: std::cell::RefCell<HashMap<String, Vec<i64>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Seed the folded i64 constants used by shape inference for input-form axes.
+/// Call immediately before [`propagate_shapes`]; cleared automatically at the start
+/// of each `propagate_shapes` is NOT done — callers own the lifetime, so re-set per
+/// graph. Passing an empty map restores attribute-only behavior.
+pub fn set_shape_i64_consts(consts: HashMap<String, Vec<i64>>) {
+    SHAPE_I64_CONSTS.with(|c| *c.borrow_mut() = consts);
+}
+
+fn shape_i64_const(name: &str) -> Option<Vec<i64>> {
+    SHAPE_I64_CONSTS.with(|c| c.borrow().get(name).cloned())
+}
+
 fn meta_is_empty(meta: &serde_json::Value) -> bool {
     meta.get("shape")
         .and_then(|s| s.as_array())
@@ -105,6 +128,17 @@ fn resolve_dims(
             // dims need the heuristics to decide batch-vs-length.
             if d.as_u64().is_some() {
                 return d.clone();
+            }
+            // Explicit per-name length override (`named_lengths`) wins over every
+            // heuristic below — lets one graph carry two+ distinct dynamic lengths
+            // (e.g. CFM cross-attention `text_length` vs `latent_length`) instead of
+            // collapsing every length axis to `sequence_length`. Mirrors the same
+            // lookup in `lower::resolve_dim_ir` so INPUT dims (resolved there) and
+            // propagated intermediate dims (resolved here) agree. No-op when empty.
+            if let Some(name) = d.as_str() {
+                if let Some(&v) = opts.named_lengths.get(name) {
+                    return serde_json::json!(v);
+                }
             }
             // `duration_proj` MatMul: `[batch_unk, seq_unk, 50]`.
             if dims.len() == 3 && dims[2].as_u64() == Some(50) {
@@ -193,6 +227,33 @@ fn resolve_dims(
                 sym_env.insert(s.to_string(), v);
                 return serde_json::json!(v);
             }
+            // Recognize common named dynamic dims that models export instead of
+            // the generic `sequence_length`/`unk__` (e.g. `batch_size`,
+            // `text_length`, `latent_length`, `source_audio_len`, `max_duration`).
+            // Batch-like names → 1; length/time-like names → the compile sequence
+            // length. Only reached for names NOT already handled above, so this
+            // cannot change the working `sequence_length`/`unk__` graphs.
+            {
+                let low = s.to_ascii_lowercase();
+                let is_batch = low == "n" || low == "b" || low.contains("batch");
+                let is_len = low.contains("length")
+                    || low.contains("_len")
+                    || low.ends_with("len")
+                    || low.contains("seq")
+                    || low.contains("duration")
+                    || low.contains("frame")
+                    || low.contains("audio");
+                if is_batch {
+                    return serde_json::json!(1);
+                }
+                if is_len {
+                    return if opts.dynamic_sequence {
+                        serde_json::json!("sequence_length")
+                    } else {
+                        serde_json::json!(opts.sequence_length)
+                    };
+                }
+            }
             if let Ok(v) = crate::lower::resolve_dim(d, opts) {
                 return serde_json::json!(v);
             }
@@ -226,7 +287,13 @@ fn broadcast_dims(a: &Dims, b: &Dims) -> Option<Dims> {
     }
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     let pad = long.len() - short.len();
-    let mut out = vec![serde_json::json!(1); pad];
+    // Numpy broadcasting: the shorter operand is right-aligned and its missing
+    // LEADING dims are implicitly 1, so the result's leading `pad` dims come
+    // entirely from the longer operand — NOT filled with 1. Filling with 1 here
+    // collapsed a `bias[C] + act[1, L, C]` add to `[1, 1, C]`, wiping the length
+    // axis (any downstream op that trusts the propagated meta, e.g. a Conv, then
+    // inherited the collapse — MiraTTS/BiCodec detokenizer 249→1).
+    let mut out: Dims = long[..pad].to_vec();
     for (i, d) in short.iter().enumerate() {
         let li = &long[pad + i];
         match (d, li) {
@@ -314,6 +381,25 @@ fn conv_output_dims(
             1,
             0,
         )
+    } else if stride > 1 {
+        // STRIDED forward conv length: (li + 2·pad − dilation·(k−1) − 1)/stride + 1.
+        // Needed for an STFT-as-conv audio front-end (kernel 1024, stride 256,
+        // F5-TTS): the length must shrink (13024 → 47), not pass through. Gated on
+        // stride > 1 to preserve the long-standing `lo = li` behavior for STRIDE-1
+        // convs — the ConvNeXt / VITS pattern is `explicit Pad → VALID conv` whose
+        // net length is unchanged, but the Pad's added width is not always tracked
+        // in the meta; there `lo = li` is the right net answer and the real formula
+        // would (wrongly) shrink it and break a downstream residual add.
+        let k = ws.last().copied().unwrap_or(1);
+        let dil = node
+            .attrs
+            .get("dilations")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize;
+        let eff = dil * k.saturating_sub(1);
+        (li + 2 * pad).saturating_sub(eff).saturating_sub(1) / stride + 1
     } else {
         li
     };
@@ -528,9 +614,12 @@ fn infer_output(
                         .collect()
                 })
                 .unwrap_or_else(|| (0..inp0.0.len()).collect());
-            let mut out = vec![serde_json::json!(1); inp0.0.len()];
+            // A Transpose's output rank equals its perm length; size `out` by the
+            // perm (not the input rank) so a perm longer than the currently-inferred
+            // input rank can't index out of bounds (guard both indices).
+            let mut out = vec![serde_json::json!(1); perm.len().max(inp0.0.len())];
             for (i, &p) in perm.iter().enumerate() {
-                if p < inp0.0.len() {
+                if i < out.len() && p < inp0.0.len() {
                     out[i] = inp0.0[p].clone();
                 }
             }
@@ -572,27 +661,74 @@ fn infer_output(
         }
         "Unsqueeze" => {
             let mut dims = inp0.0.clone();
+            // Axes: prefer the folded CONSTANT value of the axes-input tensor
+            // (opset-13+ form) so a non-1 axis places the new dim correctly. The old
+            // code hardcoded `[1]` whenever the axes input had a known shape, which
+            // silently mis-placed e.g. `Unsqueeze(mask, [-1])` → `[1,1,seq]` instead
+            // of `[1,seq,1]`, transposing attention masks (MOSS-TTS GPT-2). Fall back
+            // to the `axes` attribute, then `[0]`.
             let axes: Vec<i64> = node
                 .inputs
                 .get(1)
-                .and_then(|n| init_shapes.get(n))
-                .map(|_| vec![1i64])
+                .filter(|n| !n.is_empty())
+                .and_then(|n| shape_i64_const(n))
                 .or_else(|| {
                     node.attrs
                         .get("axes")
                         .and_then(|v| v.as_array())
                         .map(|a| a.iter().filter_map(|d| d.as_i64()).collect())
                 })
+                // axes input present but value unknown → single unsqueeze at 1 (legacy)
+                .or_else(|| {
+                    node.inputs
+                        .get(1)
+                        .filter(|n| !n.is_empty() && init_shapes.contains_key(*n))
+                        .map(|_| vec![1i64])
+                })
                 .unwrap_or_else(|| vec![0]);
-            for ax in axes {
-                let pos = ax.rem_euclid(dims.len() as i64 + 1) as usize;
+            // Insert low→high on the OUTPUT rank so multi-axis unsqueeze is stable.
+            let out_rank = dims.len() as i64 + axes.len() as i64;
+            let mut positions: Vec<usize> = axes
+                .iter()
+                .map(|&a| a.rem_euclid(out_rank) as usize)
+                .collect();
+            positions.sort_unstable();
+            for pos in positions {
                 dims.insert(pos.min(dims.len()), serde_json::json!(1));
             }
             Some((dims, dtype))
         }
         "Squeeze" => {
             let mut dims = inp0.0.clone();
-            dims.retain(|d| d.as_u64() != Some(1));
+            // Explicit axes (attr or folded input) squeeze only those positions;
+            // otherwise drop all size-1 dims (ONNX default).
+            let axes: Option<Vec<i64>> = node
+                .inputs
+                .get(1)
+                .filter(|n| !n.is_empty())
+                .and_then(|n| shape_i64_const(n))
+                .or_else(|| {
+                    node.attrs
+                        .get("axes")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|d| d.as_i64()).collect())
+                });
+            match axes {
+                Some(ax) if !ax.is_empty() => {
+                    let rank = dims.len() as i64;
+                    let mut drop: Vec<usize> = ax
+                        .iter()
+                        .map(|&a| a.rem_euclid(rank.max(1)) as usize)
+                        .collect();
+                    drop.sort_unstable_by(|a, b| b.cmp(a));
+                    for pos in drop {
+                        if pos < dims.len() && dims[pos].as_u64() == Some(1) {
+                            dims.remove(pos);
+                        }
+                    }
+                }
+                _ => dims.retain(|d| d.as_u64() != Some(1)),
+            }
             Some((dims, dtype))
         }
         "Slice" => Some(inp0),

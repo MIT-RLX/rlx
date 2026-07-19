@@ -103,7 +103,8 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
     // ── 256-elem block schemes (K-quants, IQ4_XS, IQ2/3/1, TQ) ─────
     if (params.scheme_id != 6u && params.scheme_id != 10u && params.scheme_id != 11u
         && params.scheme_id != 19u && params.scheme_id != 20u
-        && params.scheme_id != 21u && params.scheme_id != 22u && params.scheme_id != 23u) {
+        && params.scheme_id != 21u && params.scheme_id != 22u && params.scheme_id != 23u
+        && params.scheme_id != 24u) {
         let dst_base = params.dst_f32_off + gid * 256u;
 
         if (params.scheme_id == 3u) {
@@ -668,6 +669,21 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         let dst_base = params.dst_f32_off + gid * 32u;
         for (var j: u32 = 0u; j < 32u; j = j + 1u) {
             arena[dst_base + j] = d * f32(read_w_i8(qs_rel + j));
+        }
+        return;
+    }
+
+    if (params.scheme_id == 24u) {
+        // Q1_0 (prism-ml Bonsai-27B): f16 d | 16 sign bytes (18 bytes / 128 elems).
+        // Bit LSB-first within each byte; 1 -> +d, 0 -> -d.
+        let off = gid * 18u;
+        let d = dq_read_f16(off);
+        let neg_d = -d;
+        let qs_rel = off + 2u;
+        let dst_base = params.dst_f32_off + gid * 128u;
+        for (var j: u32 = 0u; j < 128u; j = j + 1u) {
+            let bit = (read_w(qs_rel + (j >> 3u)) >> (j & 7u)) & 1u;
+            arena[dst_base + j] = select(neg_d, d, bit != 0u);
         }
         return;
     }

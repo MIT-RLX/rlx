@@ -36,12 +36,12 @@ parity-gemm = ["dep:gemm"]
 splat = []
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13" }
 # GGUF K-quant block decoders — used by Op::DequantMatMul's GGUF
 # schemes so packed weight bytes can stay in the arena until matmul
 # time instead of round-tripping through f32 at load.
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.12" }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13" }
 # F16/BF16 conversion for the CastDtype thunk (and any future
 # half-precision kernel work). Already in the workspace via
 # rlx-runtime / rlx-metal.

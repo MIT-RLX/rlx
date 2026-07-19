@@ -3,7 +3,6 @@
 // input index is the same coordinate with flagged axes mirrored. rank ≤ 6.
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint n;
@@ -36,5 +35,5 @@ void main() {
         in_idx += c * stride;
         stride *= shape[ax];
     }
-    data[pc.out_off + i] = data[pc.in_off + in_idx];
+    arena_store(pc.out_off + i, arena_load(pc.in_off + in_idx));
 }

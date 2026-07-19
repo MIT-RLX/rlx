@@ -18,8 +18,9 @@
 use std::sync::Arc;
 
 use crate::blocks::{
-    GatherAddStage, LayerNormStage, LinearStage, ResidualAddStage, ResidualSaveStage, RmsNormStage,
-    SelfAttnPrefillSpec, SelfAttnPrefillStage, SwiGluStage,
+    BiMapStage, GatherAddStage, LayerNormStage, LinearStage, LogEigStage, ReEigStage,
+    ResidualAddStage, ResidualSaveStage, RmsNormStage, SelfAttnPrefillSpec, SelfAttnPrefillStage,
+    SpdBatchNormStage, SwiGluStage,
 };
 use crate::stage::FlowStage;
 
@@ -111,8 +112,59 @@ impl LayerStack {
         self
     }
 
+    /// SPDNet BiMap bilinear layer: `Y = W · X · Wᵀ` with `W [out_dim, n]`
+    /// (F64, semi-orthogonal). `n` is inferred from the current SPD input at
+    /// build time; `out_dim` sizes the output `[out_dim, out_dim]` and the F64
+    /// weight param, so it must be supplied here (the flow declares the param
+    /// node's shape eagerly).
+    pub fn bimap(mut self, w_key: impl Into<String>, out_dim: usize) -> Self {
+        self.stages
+            .push(FlowStage::BiMap(BiMapStage::new(w_key, out_dim)));
+        self
+    }
+
+    /// SPDNet ReEig nonlinearity (`Y = U·max(ε,Σ)·Uᵀ`). No weights.
+    pub fn reeig(mut self, eps: f32) -> Self {
+        self.stages.push(FlowStage::ReEig(ReEigStage::new(eps)));
+        self
+    }
+
+    /// SPDNet LogEig layer (`Y = logm(X)`; SPD manifold → tangent space). No
+    /// weights.
+    pub fn logeig(mut self, eps: f32) -> Self {
+        self.stages.push(FlowStage::LogEig(LogEigStage::new(eps)));
+        self
+    }
+
+    /// SPD batch-norm — **eval mode**. Loads the learnable SPD bias `G [n, n]`
+    /// and the frozen running Fréchet mean `[n, n]` (both F64), then applies
+    /// the affine transport. Training-time batch-mean + running-mean update is
+    /// the trainer's job — see [`crate::blocks::SpdBatchNormStage`].
+    pub fn spd_batch_norm(
+        mut self,
+        g_key: impl Into<String>,
+        running_mean_key: impl Into<String>,
+        eps: f32,
+    ) -> Self {
+        self.stages
+            .push(FlowStage::SpdBatchNorm(SpdBatchNormStage::new(
+                g_key,
+                running_mean_key,
+                eps,
+            )));
+        self
+    }
+
     pub fn stage(mut self, stage: FlowStage) -> Self {
         self.stages.push(stage);
+        self
+    }
+
+    /// Stack a downstream-defined [`LayerStage`](crate::LayerStage) block
+    /// (extension seam — see
+    /// [`ModelFlow::layer_stage`](crate::ModelFlow::layer_stage)).
+    pub fn layer_stage(mut self, stage: impl crate::LayerStage + 'static) -> Self {
+        self.stages.push(FlowStage::dynamic(stage));
         self
     }
 

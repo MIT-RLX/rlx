@@ -76,6 +76,24 @@ pub trait GraphExt {
     ) -> NodeId;
     fn rms_norm(&mut self, x: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId;
 
+    /// DiT adaLN-Zero modulation: `norm(x)·(1+scale)+shift`. `norm` normalizes
+    /// over the last axis with no learnable affine; `scale`/`shift` broadcast
+    /// over every axis except the last (the `[B,1,D]` modulation). See
+    /// [`Op::AdaLayerNorm`].
+    fn ada_layer_norm(
+        &mut self,
+        x: NodeId,
+        scale: NodeId,
+        shift: NodeId,
+        norm: crate::op::AdaNormKind,
+        eps: f32,
+    ) -> NodeId;
+
+    /// DiT gated residual: `x + gate·y`. `gate` broadcasts over every axis
+    /// except the last (the `[B,1,D]` modulation gate). See
+    /// [`Op::GatedResidual`].
+    fn gated_residual(&mut self, x: NodeId, y: NodeId, gate: NodeId) -> NodeId;
+
     // ── Convolution (NCHW) ───────────────────────────────────
     fn conv2d(
         &mut self,
@@ -171,12 +189,67 @@ pub trait GraphExt {
     /// `F32` plus `cast`).
     fn try_constant(&mut self, value: f64, dtype: DType) -> Result<NodeId, String>;
 
+    /// A constant **zeros tensor** of `dims` (an `Op::Constant`, so autodiff
+    /// gives it no gradient). Use this for zero-padding via `concat_` — e.g.
+    /// causal / "same" padding — instead of declaring a trainable zero `param`,
+    /// which pollutes the trained weights and (being batch-sized) mismatches the
+    /// node shape at a different inference batch. The shape is concrete, so the
+    /// tensor is rebuilt at the right size whenever the graph is rebuilt.
+    fn zeros(&mut self, dims: &[usize], dtype: DType) -> NodeId;
+
+    /// A constant tensor of `dims` filled with `value` (like [`GraphExt::zeros`]
+    /// but any scalar). An `Op::Constant`, so no gradient.
+    fn full(&mut self, dims: &[usize], value: f32, dtype: DType) -> NodeId;
+
+    /// Trainable BatchNorm with **batch statistics** (the training-mode BN that
+    /// rlx otherwise lacks — only `BatchNormInference` with frozen stats exists).
+    /// `x` is `[N, C, H, W]`; `gamma`/`beta` are `[C]`. The batch-coupled backward
+    /// is the tricky part autodiff can't compose — here it's obtained for FREE by
+    /// composing existing ops: transpose C↔N so `GroupNorm(num_groups=1)` (which
+    /// has a hand-written, batch-safe backward) normalises each channel over
+    /// `(N, H, W)` with an identity affine, then transpose back and apply the real
+    /// per-channel `gamma`/`beta` (a plain affine autodiff handles). Numerically
+    /// equals PyTorch `nn.BatchNorm2d` in `train()` mode (batch mean/var, `eps`).
+    fn batch_norm_training(&mut self, x: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId;
+
     // ── Stop gradient ───────────────────────────────────────
     /// Identity forward, zero backward. The reverse-mode autodiff rule
     /// for `Op::StopGradient` returns no gradient contribution to the
     /// input. Equivalent to PyTorch's `tensor.detach()` /
     /// `jax.lax.stop_gradient` / TF's `tf.stop_gradient`.
     fn stop_gradient(&mut self, x: NodeId) -> NodeId;
+}
+
+/// Reduce over `axes`, decomposing a NON-CONTIGUOUS multi-axis reduce into
+/// sequential single-axis reduces. The CPU `Reduce` thunk only supports a
+/// contiguous axis range; a reduce like `mean(x, [0,2,3])` (keeps axis 1)
+/// silently returns all zeros. Since sum is associative and mean composes
+/// (÷W · ÷H · ÷N = ÷NHW), reducing one axis at a time — descending, with
+/// keep_dim=true so the remaining axis indices stay valid — is numerically
+/// identical and correct on every backend. Contiguous / single-axis reduces
+/// keep the direct fast path.
+fn reduce_axes(g: &mut Graph, x: NodeId, op: ReduceOp, axes: Vec<usize>, keep_dim: bool) -> NodeId {
+    let mut sorted = axes.clone();
+    sorted.sort_unstable();
+    let contiguous = sorted.windows(2).all(|w| w[1] == w[0] + 1);
+    if axes.len() <= 1 || contiguous {
+        let s = shape::reduce_shape(g.shape(x), &axes, keep_dim).expect("reduce shape inference");
+        return g.reduce(x, op, axes, keep_dim, s);
+    }
+    // Non-contiguous: fold one axis at a time, highest first, keeping dims so
+    // the lower axis indices don't shift underneath us.
+    let mut cur = x;
+    for &ax in sorted.iter().rev() {
+        let s = shape::reduce_shape(g.shape(cur), &[ax], true).expect("reduce shape inference");
+        cur = g.reduce(cur, op, vec![ax], true, s);
+    }
+    if keep_dim {
+        cur
+    } else {
+        let s = shape::reduce_shape(g.shape(x), &axes, false).expect("reduce shape inference");
+        let dims: Vec<i64> = s.dims().iter().map(|d| d.unwrap_static() as i64).collect();
+        g.reshape(cur, dims, s)
+    }
 }
 
 impl GraphExt for Graph {
@@ -317,16 +390,29 @@ impl GraphExt for Graph {
         self.add_node(Op::RmsNorm { axis: -1, eps }, vec![x, gamma, beta], s)
     }
 
+    fn ada_layer_norm(
+        &mut self,
+        x: NodeId,
+        scale: NodeId,
+        shift: NodeId,
+        norm: crate::op::AdaNormKind,
+        eps: f32,
+    ) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.add_node(Op::AdaLayerNorm { norm, eps }, vec![x, scale, shift], s)
+    }
+
+    fn gated_residual(&mut self, x: NodeId, y: NodeId, gate: NodeId) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.add_node(Op::GatedResidual, vec![x, y, gate], s)
+    }
+
     fn sum(&mut self, x: NodeId, axes: Vec<usize>, keep_dim: bool) -> NodeId {
-        let s =
-            shape::reduce_shape(self.shape(x), &axes, keep_dim).expect("reduce shape inference");
-        self.reduce(x, ReduceOp::Sum, axes, keep_dim, s)
+        reduce_axes(self, x, ReduceOp::Sum, axes, keep_dim)
     }
 
     fn mean(&mut self, x: NodeId, axes: Vec<usize>, keep_dim: bool) -> NodeId {
-        let s =
-            shape::reduce_shape(self.shape(x), &axes, keep_dim).expect("reduce shape inference");
-        self.reduce(x, ReduceOp::Mean, axes, keep_dim, s)
+        reduce_axes(self, x, ReduceOp::Mean, axes, keep_dim)
     }
 
     fn sm(&mut self, x: NodeId, axis: i32) -> NodeId {
@@ -450,6 +536,50 @@ impl GraphExt for Graph {
         let data = scalar_constant_bytes(value, dtype)?;
         Ok(self.add_node(Op::Constant { data }, vec![], Shape::scalar(dtype)))
     }
+    fn zeros(&mut self, dims: &[usize], dtype: DType) -> NodeId {
+        let numel: usize = dims.iter().product();
+        let data = vec![0u8; numel * dtype.size_bytes()];
+        self.add_node(Op::Constant { data }, vec![], Shape::new(dims, dtype))
+    }
+    fn full(&mut self, dims: &[usize], value: f32, dtype: DType) -> NodeId {
+        let numel: usize = dims.iter().product();
+        let elem = scalar_constant_bytes(value as f64, dtype).expect("full: encode value");
+        let data: Vec<u8> = elem
+            .iter()
+            .cloned()
+            .cycle()
+            .take(numel * elem.len())
+            .collect();
+        self.add_node(Op::Constant { data }, vec![], Shape::new(dims, dtype))
+    }
+    fn batch_norm_training(&mut self, x: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId {
+        let dims: Vec<usize> = self
+            .shape(x)
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .collect();
+        assert_eq!(dims.len(), 4, "batch_norm_training expects [N,C,H,W]");
+        let c = dims[1];
+        let dt = self.shape(x).dtype();
+        // Fast primitive form: per-channel statistics over (N,H,W) directly, no
+        // transpose / GroupNorm detour. The mean over [0,2,3] is non-contiguous
+        // (keeps axis 1) and is decomposed into sequential single-axis reduces by
+        // `reduce_axes`, so it is correct on every backend. Standard batch-BN:
+        //   x̂ = (x − μ_c) / √(σ²_c + eps),  y = γ_c·x̂ + β_c.
+        let mu = self.mean(x, vec![0, 2, 3], true);
+        let xc = self.sub(x, mu);
+        let sq = self.mul(xc, xc);
+        let var = self.mean(sq, vec![0, 2, 3], true);
+        let eps_c = self.constant(eps as f64, dt);
+        let var_eps = self.add(var, eps_c);
+        let std = self.sqrt(var_eps);
+        let xhat = self.div(xc, std);
+        let gr = self.reshape_(gamma, vec![1, c as i64, 1, 1]);
+        let br = self.reshape_(beta, vec![1, c as i64, 1, 1]);
+        let scaled = self.mul(xhat, gr);
+        self.add(scaled, br)
+    }
 
     fn constant(&mut self, value: f64, dtype: DType) -> NodeId {
         self.try_constant(value, dtype)
@@ -478,6 +608,30 @@ mod tests {
         let wt = g.param("wt", Shape::new(&[4, 8, 2, 2], f));
         let z = g.conv_transpose2d(x, wt, [2, 2], [2, 2], [0, 0], [1, 1], [0, 0], 1);
         assert_eq!(g.shape(z), &Shape::new(&[1, 8, 16, 16], f));
+    }
+
+    #[test]
+    fn batch_norm_training_and_full_shapes() {
+        let mut g = Graph::new("bn");
+        let f = DType::F32;
+        let x = g.input("x", Shape::new(&[2, 3, 4, 5], f));
+        let gamma = g.param("g", Shape::new(&[3], f));
+        let beta = g.param("b", Shape::new(&[3], f));
+        let y = g.batch_norm_training(x, gamma, beta, 1e-5); // composes transpose+GroupNorm+affine
+        assert_eq!(g.shape(y), &Shape::new(&[2, 3, 4, 5], f)); // shape preserved
+        let ones = g.full(&[3], 1.0, f);
+        assert_eq!(g.shape(ones), &Shape::new(&[3], f));
+        assert!(matches!(g.node(ones).op, Op::Constant { .. }));
+    }
+
+    #[test]
+    fn zeros_tensor_shape_and_no_params() {
+        let mut g = Graph::new("zeros");
+        let f = DType::F32;
+        let z = g.zeros(&[2, 3, 1, 4], f);
+        assert_eq!(g.shape(z), &Shape::new(&[2, 3, 1, 4], f));
+        // It's a constant (no trainable param), so concat-padding never trains it.
+        assert!(matches!(g.node(z).op, Op::Constant { .. }));
     }
 
     #[test]

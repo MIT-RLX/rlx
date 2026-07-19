@@ -106,10 +106,11 @@ Off by default; turn on per workload:
 | `sparse`   | sparse linear algebra (custom-op scaffold) → `rlx::sparse`        |
 | `linalg`   | dense linalg via LAPACK (custom-op scaffold) → `rlx::linalg`      |
 | `cortexm`  | INT8 ARMv7E-M kernels → `rlx::cortexm` (no `Backend` impl)        |
-| `fpga`     | IR → SystemVerilog datapath synthesis → `rlx::fpga` (no `Backend`)|
+| `fpga`     | IR → SystemVerilog export → `rlx::fpga` + `rlx_runtime::export`   |
 
-`cortexm` and `fpga` don't go through the `Session` / `Backend`
-pipeline — they're specialty targets exposed for direct use.
+`cortexm` kernels and `fpga` export don't go through `Session` / `Backend`
+execution — they're specialty / offline targets. FPGA RTL is **target-agnostic**
+by default (`HwTarget::Generic`); see [`docs/fpga-export.md`](../../docs/fpga-export.md).
 
 ### Convenience aggregates
 
@@ -117,7 +118,7 @@ pipeline — they're specialty targets exposed for direct use.
 |-------------------|-----------------------------------------|
 | `apple-silicon`   | `cpu` + `metal` + `blas-accelerate`     |
 | `nvidia`          | `cpu` + `cuda`                          |
-| `edge`            | `cpu` + `cortexm`                       |
+| `edge`            | `cpu` + `cortexm` + `fpga`              |
 | `all-cpu`         | `cpu` + `gguf` + `linalg`               |
 
 `mlx` and `rocm` aren't in any aggregate (vendor-bundled). To opt

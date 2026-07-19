@@ -1,0 +1,21 @@
+[package]
+name = "rlx-unfuse"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Shared IR-level unfusion/decompose pass for the GPU-family backends (CUDA/ROCm/wgpu), parameterized by a per-backend DecomposePolicy."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.13" }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

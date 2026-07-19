@@ -196,6 +196,10 @@ fn gpu_target_portable_across_backends() {
     };
     let cpu = run(Device::Cpu, build);
     for dev in [Device::Metal, Device::Gpu, Device::Mlx] {
+        if !rlx_runtime::is_available(dev) {
+            eprintln!("skip {dev:?}: unavailable");
+            continue;
+        }
         let got = run(dev, build);
         assert_eq!(
             got[0], cpu[0],

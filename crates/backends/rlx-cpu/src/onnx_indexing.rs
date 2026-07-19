@@ -21,12 +21,14 @@
 
 use std::sync::Arc;
 
-use rlx_ir::DType;
+use rlx_ir::{DType, ScatterNdReduction};
 
 use crate::op_registry::{CpuKernel, CpuTensorMut, CpuTensorRef, register_cpu_kernel};
 
 const GATHER_ND: &str = "onnx.GatherND";
 const SCATTER_ND: &str = "onnx.ScatterND";
+pub const SCATTER_ELEMENTS: &str = "onnx.ScatterElements";
+const GATHER_ELEMENTS: &str = "onnx.GatherElements";
 const ONE_HOT: &str = "onnx.OneHot";
 const NON_ZERO: &str = "onnx.NonZero";
 const CUM_PROD: &str = "onnx.CumProd";
@@ -65,7 +67,7 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
 /// `data_shape`/`indices_shape` are the full operand shapes, `indices` the flat
 /// I64 index buffer, `batch_dims` the leading shared-batch rank. Each returned
 /// offset is the start of a contiguous `slice_size`-element run in `data`.
-fn gather_nd_src_offsets(
+pub fn gather_nd_src_offsets(
     data_shape: &[usize],
     indices: &[i64],
     indices_shape: &[usize],
@@ -133,7 +135,25 @@ impl CpuKernel for GatherNdKernel {
         };
         let data_shape = dims_usize(&inputs[0]);
         let indices_shape = dims_usize(&inputs[1]);
-        let indices = inputs[1].expect_i64("indices")?;
+        let indices_owned;
+        let indices: &[i64] = match inputs[1].dtype() {
+            DType::I64 => inputs[1].expect_i64("indices")?,
+            DType::F32 => {
+                let f = inputs[1].expect_f32("indices")?;
+                indices_owned = f.iter().map(|&x| x as i64).collect::<Vec<_>>();
+                indices_owned.as_slice()
+            }
+            DType::I32 => {
+                let i = inputs[1].expect_i32("indices")?;
+                indices_owned = i.iter().map(|&x| x as i64).collect::<Vec<_>>();
+                indices_owned.as_slice()
+            }
+            other => {
+                return Err(format!(
+                    "onnx.GatherND: unsupported indices dtype {other:?}"
+                ));
+            }
+        };
         let (offsets, slice) =
             gather_nd_src_offsets(&data_shape, indices, &indices_shape, batch_dims);
         match inputs[0].dtype() {
@@ -168,7 +188,7 @@ fn copy_slices<T: Copy>(src: &[T], dst: &mut [T], src_offsets: &[usize], slice: 
 // ---------------------------------------------------------------------------
 
 /// Destination element offsets, in updates order, for an ONNX ScatterND.
-fn scatter_nd_dst_offsets(
+pub fn scatter_nd_dst_offsets(
     data_shape: &[usize],
     indices: &[i64],
     indices_shape: &[usize],
@@ -197,6 +217,97 @@ fn scatter_nd_dst_offsets(
     (offsets, slice_size)
 }
 
+/// Decode ONNX / IR reduction from attrs (i32 LE).
+pub fn scatter_nd_reduction_from_attrs(attrs: &[u8]) -> ScatterNdReduction {
+    if attrs.len() >= 4 {
+        match i32::from_le_bytes(attrs[0..4].try_into().unwrap_or([0; 4])) {
+            1 => ScatterNdReduction::Add,
+            2 => ScatterNdReduction::Mul,
+            3 => ScatterNdReduction::Max,
+            4 => ScatterNdReduction::Min,
+            _ => ScatterNdReduction::None,
+        }
+    } else {
+        ScatterNdReduction::None
+    }
+}
+
+pub fn scatter_nd_reduction_to_attrs(r: ScatterNdReduction) -> [u8; 4] {
+    let v = match r {
+        ScatterNdReduction::None => 0i32,
+        ScatterNdReduction::Add => 1,
+        ScatterNdReduction::Mul => 2,
+        ScatterNdReduction::Max => 3,
+        ScatterNdReduction::Min => 4,
+    };
+    v.to_le_bytes()
+}
+
+fn apply_f32(dst: &mut f32, src: f32, reduction: ScatterNdReduction) {
+    match reduction {
+        ScatterNdReduction::None => *dst = src,
+        ScatterNdReduction::Add => *dst += src,
+        ScatterNdReduction::Mul => *dst *= src,
+        ScatterNdReduction::Max => *dst = dst.max(src),
+        ScatterNdReduction::Min => *dst = dst.min(src),
+    }
+}
+
+fn apply_i64(dst: &mut i64, src: i64, reduction: ScatterNdReduction) {
+    match reduction {
+        ScatterNdReduction::None => *dst = src,
+        ScatterNdReduction::Add => *dst += src,
+        ScatterNdReduction::Mul => *dst *= src,
+        ScatterNdReduction::Max => *dst = (*dst).max(src),
+        ScatterNdReduction::Min => *dst = (*dst).min(src),
+    }
+}
+
+/// ScatterND into `out` (starts as a copy of `data` when not aliased).
+pub fn scatter_nd_into_f32(
+    data: &[f32],
+    updates: &[f32],
+    out: &mut [f32],
+    dst_offsets: &[usize],
+    slice: usize,
+    reduction: ScatterNdReduction,
+) {
+    if !std::ptr::eq(data.as_ptr(), out.as_ptr()) {
+        let n = data.len().min(out.len());
+        out[..n].copy_from_slice(&data[..n]);
+    }
+    for (u, &off) in dst_offsets.iter().enumerate() {
+        let u0 = u * slice;
+        for j in 0..slice {
+            if let (Some(&s), Some(d)) = (updates.get(u0 + j), out.get_mut(off + j)) {
+                apply_f32(d, s, reduction);
+            }
+        }
+    }
+}
+
+pub fn scatter_nd_into_i64(
+    data: &[i64],
+    updates: &[i64],
+    out: &mut [i64],
+    dst_offsets: &[usize],
+    slice: usize,
+    reduction: ScatterNdReduction,
+) {
+    if !std::ptr::eq(data.as_ptr(), out.as_ptr()) {
+        let n = data.len().min(out.len());
+        out[..n].copy_from_slice(&data[..n]);
+    }
+    for (u, &off) in dst_offsets.iter().enumerate() {
+        let u0 = u * slice;
+        for j in 0..slice {
+            if let (Some(&s), Some(d)) = (updates.get(u0 + j), out.get_mut(off + j)) {
+                apply_i64(d, s, reduction);
+            }
+        }
+    }
+}
+
 struct ScatterNdKernel;
 
 impl CpuKernel for ScatterNdKernel {
@@ -208,7 +319,7 @@ impl CpuKernel for ScatterNdKernel {
         &self,
         inputs: &[CpuTensorRef<'_>],
         output: CpuTensorMut<'_>,
-        _attrs: &[u8],
+        attrs: &[u8],
     ) -> Result<(), String> {
         if inputs.len() < 3 {
             return Err(format!(
@@ -216,47 +327,315 @@ impl CpuKernel for ScatterNdKernel {
                 inputs.len()
             ));
         }
+        let reduction = scatter_nd_reduction_from_attrs(attrs);
         let data_shape = dims_usize(&inputs[0]);
         let indices_shape = dims_usize(&inputs[1]);
-        let indices = inputs[1].expect_i64("indices")?;
+        let indices_owned;
+        let indices: &[i64] = match inputs[1].dtype() {
+            DType::I64 => inputs[1].expect_i64("indices")?,
+            // Metal/wgpu f32-uniform arenas widen I64 indices to F32; accept
+            // them the same way GatherND does (ChatterBox HiFT / S3Gen ISTFT).
+            DType::F32 => {
+                let f = inputs[1].expect_f32("indices")?;
+                indices_owned = f.iter().map(|&x| x as i64).collect::<Vec<_>>();
+                indices_owned.as_slice()
+            }
+            DType::I32 => {
+                let i = inputs[1].expect_i32("indices")?;
+                indices_owned = i.iter().map(|&x| x as i64).collect::<Vec<_>>();
+                indices_owned.as_slice()
+            }
+            other => {
+                return Err(format!(
+                    "onnx.ScatterND: indices: expected I64/I32/F32, got {other:?}"
+                ));
+            }
+        };
         let (offsets, slice) = scatter_nd_dst_offsets(&data_shape, indices, &indices_shape);
         match inputs[0].dtype() {
             DType::I64 => {
                 let data = inputs[0].expect_i64("data")?;
                 let updates = inputs[2].expect_i64("updates")?;
                 let out = output.expect_i64_mut("out")?;
-                scatter_into(data, updates, out, &offsets, slice);
+                scatter_nd_into_i64(data, updates, out, &offsets, slice, reduction);
             }
             _ => {
                 let data = inputs[0].expect_f32("data")?;
                 let updates = inputs[2].expect_f32("updates")?;
                 let out = output.expect_f32_mut("out")?;
-                scatter_into(data, updates, out, &offsets, slice);
+                scatter_nd_into_f32(data, updates, out, &offsets, slice, reduction);
             }
         }
         Ok(())
     }
 }
 
-fn scatter_into<T: Copy>(
-    data: &[T],
-    updates: &[T],
-    out: &mut [T],
-    dst_offsets: &[usize],
-    slice: usize,
+// ---------------------------------------------------------------------------
+// ScatterElements
+// ---------------------------------------------------------------------------
+
+fn normalize_axis(axis: i32, rank: usize) -> usize {
+    let a = if axis < 0 { axis + rank as i32 } else { axis };
+    (a.max(0) as usize).min(rank.saturating_sub(1))
+}
+
+/// ONNX ScatterElements into `out` (starts as a copy of `data` when not aliased).
+pub fn scatter_elements_f32(
+    data: &[f32],
+    updates: &[f32],
+    indices: &[i64],
+    out: &mut [f32],
+    data_shape: &[usize],
+    axis: i32,
+    reduction: ScatterNdReduction,
 ) {
-    // Start from a copy of `data` (skip when aliased in place).
     if !std::ptr::eq(data.as_ptr(), out.as_ptr()) {
         let n = data.len().min(out.len());
         out[..n].copy_from_slice(&data[..n]);
     }
-    for (u, &off) in dst_offsets.iter().enumerate() {
-        let u0 = u * slice;
-        for j in 0..slice {
-            if let (Some(s), Some(d)) = (updates.get(u0 + j), out.get_mut(off + j)) {
-                *d = *s;
+    for x in out.iter_mut() {
+        if !x.is_finite() {
+            *x = 0.0;
+        }
+    }
+    if out.is_empty() || data_shape.is_empty() {
+        return;
+    }
+    let rank = data_shape.len();
+    let axis = normalize_axis(axis, rank);
+    if rank == 1 {
+        let n = indices.len().min(updates.len());
+        for i in 0..n {
+            let j = indices[i].max(0) as usize;
+            if j < out.len() {
+                apply_f32(&mut out[j], updates[i], reduction);
             }
         }
+        return;
+    }
+    let outer: usize = data_shape[..axis].iter().product::<usize>().max(1);
+    let inner: usize = data_shape[axis + 1..].iter().product::<usize>().max(1);
+    let axis_dim = data_shape[axis].max(1);
+    let n = indices.len().min(updates.len());
+    // Dense case: indices/updates match data layout except along `axis`.
+    let dense = n == outer * axis_dim * inner || n == outer * inner;
+    for flat_i in 0..n {
+        let row = indices[flat_i].max(0) as usize;
+        let dst = if outer == 1 && inner == 1 {
+            row.min(out.len().saturating_sub(1))
+        } else if dense && n == outer * inner {
+            // indices shape equals data with axis squeezed to size of updates along axis...
+            // ISTFT-style: one index per (outer, inner) position.
+            let o = flat_i / inner;
+            let i = flat_i % inner;
+            o.min(outer.saturating_sub(1)) * axis_dim * inner
+                + row.min(axis_dim.saturating_sub(1)) * inner
+                + i
+        } else {
+            let o = flat_i / (axis_dim * inner);
+            let rem = flat_i % (axis_dim * inner);
+            let i = rem % inner;
+            o.min(outer.saturating_sub(1)) * axis_dim * inner
+                + row.min(axis_dim.saturating_sub(1)) * inner
+                + i
+        };
+        if dst < out.len() {
+            apply_f32(&mut out[dst], updates[flat_i], reduction);
+        }
+    }
+}
+
+struct ScatterElementsKernel;
+
+impl CpuKernel for ScatterElementsKernel {
+    fn name(&self) -> &str {
+        SCATTER_ELEMENTS
+    }
+
+    fn execute(
+        &self,
+        inputs: &[CpuTensorRef<'_>],
+        output: CpuTensorMut<'_>,
+        attrs: &[u8],
+    ) -> Result<(), String> {
+        if inputs.len() < 3 {
+            return Err(format!(
+                "onnx.ScatterElements: expected 3 inputs, got {}",
+                inputs.len()
+            ));
+        }
+        let axis = if attrs.len() >= 4 {
+            i32::from_le_bytes(attrs[0..4].try_into().unwrap())
+        } else {
+            0
+        };
+        let reduction = if attrs.len() >= 8 {
+            scatter_nd_reduction_from_attrs(&attrs[4..8])
+        } else {
+            ScatterNdReduction::None
+        };
+        let data_shape = dims_usize(&inputs[0]);
+        let indices_owned;
+        let indices: &[i64] = match inputs[1].dtype() {
+            DType::I64 => inputs[1].expect_i64("indices")?,
+            DType::F32 => {
+                let f = inputs[1].expect_f32("indices")?;
+                indices_owned = f.iter().map(|&x| x as i64).collect::<Vec<_>>();
+                indices_owned.as_slice()
+            }
+            DType::I32 => {
+                let i = inputs[1].expect_i32("indices")?;
+                indices_owned = i.iter().map(|&x| x as i64).collect::<Vec<_>>();
+                indices_owned.as_slice()
+            }
+            other => {
+                return Err(format!(
+                    "onnx.ScatterElements: indices: expected I64/I32/F32, got {other:?}"
+                ));
+            }
+        };
+        // Integer data path (rare; some ONNX exports keep i64 for index-like buffers).
+        if inputs[0].dtype() == DType::I64 {
+            let updates = inputs[2].expect_i64("updates")?;
+            let mut res: Vec<i64> = inputs[0].as_i64().map(|d| d.to_vec()).unwrap_or_default();
+            let n = indices.len().min(updates.len());
+            for i in 0..n {
+                let j = indices[i].max(0) as usize;
+                if j < res.len() {
+                    apply_i64(&mut res[j], updates[i], reduction);
+                }
+            }
+            match output {
+                CpuTensorMut::I64 { data: out, .. } => {
+                    let n = res.len().min(out.len());
+                    out[..n].copy_from_slice(&res[..n]);
+                }
+                CpuTensorMut::F32 { data: out, .. } => {
+                    let n = res.len().min(out.len());
+                    for (d, &s) in out.iter_mut().zip(res.iter()).take(n) {
+                        *d = s as f32;
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "onnx.ScatterElements: unsupported output dtype {:?} for i64 data",
+                        other.dtype()
+                    ));
+                }
+            }
+            let _ = (axis, data_shape);
+            return Ok(());
+        }
+        let data = inputs[0].expect_f32("data")?;
+        let updates = inputs[2].expect_f32("updates")?;
+        let out = output.expect_f32_mut("out")?;
+        scatter_elements_f32(data, updates, indices, out, &data_shape, axis, reduction);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GatherElements
+// ---------------------------------------------------------------------------
+
+/// ONNX GatherElements / take_along_axis into `out` (shape = indices shape).
+pub fn gather_elements_f32(
+    data: &[f32],
+    indices: &[i64],
+    out: &mut [f32],
+    data_shape: &[usize],
+    indices_shape: &[usize],
+    axis: i32,
+) {
+    if data_shape.is_empty() || indices_shape.is_empty() {
+        return;
+    }
+    let rank = data_shape.len();
+    let axis = normalize_axis(axis, rank);
+    let mut dstride = vec![1usize; rank];
+    for k in (0..rank.saturating_sub(1)).rev() {
+        dstride[k] = dstride[k + 1] * data_shape[k + 1].max(1);
+    }
+    let mut ostride = vec![1usize; rank];
+    for k in (0..rank.saturating_sub(1)).rev() {
+        ostride[k] = ostride[k + 1] * indices_shape[k + 1].max(1);
+    }
+    let total: usize = indices_shape
+        .iter()
+        .product::<usize>()
+        .max(1)
+        .min(out.len());
+    let axis_dim = data_shape[axis].max(1) as i64;
+    for lin in 0..total {
+        let mut off = 0usize;
+        for k in 0..rank {
+            let coord = (lin / ostride[k]) % indices_shape[k].max(1);
+            if k == axis {
+                let mut idx = indices.get(lin).copied().unwrap_or(0);
+                if idx < 0 {
+                    idx += axis_dim;
+                }
+                let idx = idx.clamp(0, axis_dim.saturating_sub(1).max(0)) as usize;
+                off += idx * dstride[k];
+            } else {
+                off += coord.min(data_shape[k].saturating_sub(1)) * dstride[k];
+            }
+        }
+        if let (Some(&s), Some(d)) = (data.get(off), out.get_mut(lin)) {
+            *d = s;
+        }
+    }
+}
+
+struct GatherElementsKernel;
+
+impl CpuKernel for GatherElementsKernel {
+    fn name(&self) -> &str {
+        GATHER_ELEMENTS
+    }
+
+    fn execute(
+        &self,
+        inputs: &[CpuTensorRef<'_>],
+        output: CpuTensorMut<'_>,
+        attrs: &[u8],
+    ) -> Result<(), String> {
+        if inputs.len() < 2 {
+            return Err(format!(
+                "onnx.GatherElements: expected 2 inputs, got {}",
+                inputs.len()
+            ));
+        }
+        let axis = if attrs.len() >= 4 {
+            i32::from_le_bytes(attrs[0..4].try_into().unwrap())
+        } else {
+            0
+        };
+        let data_shape = dims_usize(&inputs[0]);
+        let indices_shape = dims_usize(&inputs[1]);
+        let indices_owned;
+        let indices: &[i64] = match inputs[1].dtype() {
+            DType::I64 => inputs[1].expect_i64("indices")?,
+            DType::F32 => {
+                let f = inputs[1].expect_f32("indices")?;
+                indices_owned = f.iter().map(|&x| x as i64).collect::<Vec<_>>();
+                indices_owned.as_slice()
+            }
+            DType::I32 => {
+                let i = inputs[1].expect_i32("indices")?;
+                indices_owned = i.iter().map(|&x| x as i64).collect::<Vec<_>>();
+                indices_owned.as_slice()
+            }
+            other => {
+                return Err(format!(
+                    "onnx.GatherElements: indices: expected I64/I32/F32, got {other:?}"
+                ));
+            }
+        };
+        let data = inputs[0].expect_f32("data")?;
+        let out = output.expect_f32_mut("out")?;
+        gather_elements_f32(data, indices, out, &data_shape, &indices_shape, axis);
+        Ok(())
     }
 }
 
@@ -721,6 +1100,8 @@ impl EinsumPlan {
 pub fn register_onnx_indexing_kernels() {
     register_cpu_kernel(Arc::new(GatherNdKernel));
     register_cpu_kernel(Arc::new(ScatterNdKernel));
+    register_cpu_kernel(Arc::new(ScatterElementsKernel));
+    register_cpu_kernel(Arc::new(GatherElementsKernel));
     register_cpu_kernel(Arc::new(OneHotKernel));
     register_cpu_kernel(Arc::new(NonZeroKernel));
     register_cpu_kernel(Arc::new(CumProdKernel));
@@ -784,6 +1165,36 @@ mod tests {
     }
 
     #[test]
+    fn scatter_elements_axis1() {
+        let data = [1.0f32; 8];
+        let idx = [0i64, 2, 0, 2, 1, 3, 1, 3];
+        let updates = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        let mut out = [0.0f32; 8];
+        scatter_elements_f32(
+            &data,
+            &updates,
+            &idx,
+            &mut out,
+            &[2, 4],
+            1,
+            ScatterNdReduction::None,
+        );
+        assert_eq!(out[0], 30.0);
+        assert_eq!(out[2], 40.0);
+        assert_eq!(out[5], 70.0);
+        assert_eq!(out[7], 80.0);
+    }
+
+    #[test]
+    fn gather_elements_axis1() {
+        let data: Vec<f32> = (0..8).map(|i| (i as f32) + 1.0).collect();
+        let idx = [0i64, 2, 1, 3, 1, 0, 3, 2];
+        let mut out = [0.0f32; 8];
+        gather_elements_f32(&data, &idx, &mut out, &[2, 4], &[2, 4], 1);
+        assert_eq!(out, [1.0, 3.0, 2.0, 4.0, 6.0, 5.0, 8.0, 7.0]);
+    }
+
+    #[test]
     fn scatter_nd_basic() {
         // data [4,4] of ones, scatter rows 0 and 2 with zeros/twos.
         let ds = Shape::new(&[4, 4], DType::F32);
@@ -810,6 +1221,93 @@ mod tests {
         assert_eq!(&out[0..4], &[0.0, 0.0, 0.0, 0.0]); // row 0
         assert_eq!(&out[4..8], &[1.0, 1.0, 1.0, 1.0]); // row 1 untouched
         assert_eq!(&out[8..12], &[2.0, 2.0, 2.0, 2.0]); // row 2
+    }
+
+    #[test]
+    fn scatter_nd_add_duplicate_indices() {
+        // data [2] = [1,1], indices [[0],[0]], updates [3,4], reduction=add → [8,1]
+        let ds = Shape::new(&[2], DType::F32);
+        let data = [1.0f32, 1.0];
+        let is = Shape::new(&[2, 1], DType::I64);
+        let idx = [0i64, 0];
+        let us = Shape::new(&[2], DType::F32);
+        let updates = [3.0f32, 4.0];
+        let mut out = [0.0f32; 2];
+        ScatterNdKernel
+            .execute(
+                &[
+                    f32_ref(&data, &ds),
+                    i64_ref(&idx, &is),
+                    f32_ref(&updates, &us),
+                ],
+                CpuTensorMut::F32 {
+                    data: &mut out,
+                    shape: &ds,
+                },
+                &scatter_nd_reduction_to_attrs(ScatterNdReduction::Add),
+            )
+            .unwrap();
+        assert_eq!(out, [8.0, 1.0]);
+    }
+
+    #[test]
+    fn scatter_nd_mul_max_min() {
+        let ds = Shape::new(&[2], DType::F32);
+        let data = [2.0f32, 5.0];
+        let is = Shape::new(&[1, 1], DType::I64);
+        let idx = [0i64];
+        let us = Shape::new(&[1], DType::F32);
+        let updates = [3.0f32];
+        let mut out = [0.0f32; 2];
+        ScatterNdKernel
+            .execute(
+                &[
+                    f32_ref(&data, &ds),
+                    i64_ref(&idx, &is),
+                    f32_ref(&updates, &us),
+                ],
+                CpuTensorMut::F32 {
+                    data: &mut out,
+                    shape: &ds,
+                },
+                &scatter_nd_reduction_to_attrs(ScatterNdReduction::Mul),
+            )
+            .unwrap();
+        assert_eq!(out, [6.0, 5.0]);
+
+        out = [0.0; 2];
+        ScatterNdKernel
+            .execute(
+                &[
+                    f32_ref(&data, &ds),
+                    i64_ref(&idx, &is),
+                    f32_ref(&updates, &us),
+                ],
+                CpuTensorMut::F32 {
+                    data: &mut out,
+                    shape: &ds,
+                },
+                &scatter_nd_reduction_to_attrs(ScatterNdReduction::Max),
+            )
+            .unwrap();
+        assert_eq!(out, [3.0, 5.0]);
+
+        out = [0.0; 2];
+        ScatterNdKernel
+            .execute(
+                &[
+                    f32_ref(&data, &ds),
+                    i64_ref(&idx, &is),
+                    f32_ref(&updates, &us),
+                ],
+                CpuTensorMut::F32 {
+                    data: &mut out,
+                    shape: &ds,
+                },
+                &scatter_nd_reduction_to_attrs(ScatterNdReduction::Min),
+            )
+            .unwrap();
+        assert_eq!(out, [2.0, 5.0]);
     }
 
     #[test]

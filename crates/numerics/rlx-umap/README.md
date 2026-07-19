@@ -153,7 +153,7 @@ cargo run -p rlx-umap --release --example bench_batch -- \
 
 **Not full UMAP** — cosine pairwise matrix + k-NN per row (same subgraph fast-umap uses for global k-NN, not the neural `fit()` loop).
 
-Timing vs `n` (powers of 2, `d=64`, `k=15`, release, warmup=1, runs=5). macOS (Apple Silicon), Windows + WSL Ubuntu on RTX 4090 via [`rig.sh`](../rig.sh).
+Timing vs `n` (powers of 2, `d=64`, `k=15`, release, warmup=1, runs=5). macOS (Apple Silicon), Windows + WSL Ubuntu on NVIDIA GPU via [`rig.sh`](../rig.sh).
 
 ![bench_batch: pairwise + k-NN (not full UMAP fit)](docs/bench_batch_e2e.svg)
 

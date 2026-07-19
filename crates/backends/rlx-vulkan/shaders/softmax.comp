@@ -2,9 +2,11 @@
 // Softmax over `axis_len` along a strided axis. The tensor is viewed as
 // [outer, axis_len, inner]: element (o, k, j) lives at
 // base + o*axis_len*inner + k*inner + j. One invocation per (o, j).
+//
+// Kahan compensated exp-sum (mirrors rlx-wgpu): chained Softmax in TTS DiT /
+// attention drifts with a plain f32 accumulator.
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint outer;
@@ -17,22 +19,27 @@ layout(push_constant) uniform PC {
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint total = pc.outer * pc.inner;
-    if (gid >= total) { return; }
+    if (gid >= total || pc.axis_len == 0u || pc.inner == 0u) { return; }
     uint o = gid / pc.inner;
     uint j = gid % pc.inner;
     uint base = o * pc.axis_len * pc.inner + j;
 
-    float m = -3.402823466e38;
-    for (uint k = 0u; k < pc.axis_len; k++) {
-        m = max(m, data[pc.in_off + base + k * pc.inner]);
+    float m = arena_load(pc.in_off + base);
+    for (uint k = 1u; k < pc.axis_len; k++) {
+        m = max(m, arena_load(pc.in_off + base + k * pc.inner));
     }
     float sum = 0.0;
+    float c = 0.0;
     for (uint k = 0u; k < pc.axis_len; k++) {
-        sum += exp(data[pc.in_off + base + k * pc.inner] - m);
+        float e = exp(arena_load(pc.in_off + base + k * pc.inner) - m);
+        float y = e - c;
+        float t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
     }
     float inv = (sum > 0.0) ? (1.0 / sum) : 0.0;
     for (uint k = 0u; k < pc.axis_len; k++) {
         uint idx = base + k * pc.inner;
-        data[pc.out_off + idx] = exp(data[pc.in_off + idx] - m) * inv;
+        arena_store(pc.out_off + idx, exp(arena_load(pc.in_off + idx) - m) * inv);
     }
 }

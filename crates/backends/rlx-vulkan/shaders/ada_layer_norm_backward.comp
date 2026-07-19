@@ -1,0 +1,89 @@
+#version 450
+// Packed AdaLayerNorm backward: out = [dx ∥ dscale ∥ dshift] (1-D floats).
+// One work-item per unique modulation row; that item loops `seq_per_mod`
+// feature-rows that share the same scale/shift slice (DiT [B,S,D]/[B,1,D]).
+// Serial over `inner` so naga can compile without shared-memory barriers.
+layout(local_size_x = 64) in;
+
+
+layout(push_constant) uniform PC {
+    uint mod_rows;
+    uint seq_per_mod;
+    uint inner;
+    uint x_off;
+    uint scale_off;
+    uint dy_off;
+    uint out_off;
+    uint layer_norm; // 1 = LayerNorm, 0 = RmsNorm
+    float eps;
+} pc;
+
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    if (m >= pc.mod_rows || pc.inner == 0u) { return; }
+
+    uint nx = pc.mod_rows * pc.seq_per_mod * pc.inner;
+    uint mod_len = pc.mod_rows * pc.inner;
+    uint mod_base = m * pc.inner;
+    uint dscale_base = pc.out_off + nx + mod_base;
+    uint dshift_base = pc.out_off + nx + mod_len + mod_base;
+    float n_inv = 1.0 / float(pc.inner);
+
+    for (uint i = 0u; i < pc.inner; i++) {
+        arena_store(dscale_base + i, 0.0);
+        arena_store(dshift_base + i, 0.0);
+    }
+
+    for (uint seq = 0u; seq < pc.seq_per_mod; seq++) {
+        uint row = m * pc.seq_per_mod + seq;
+        uint x_base = pc.x_off + row * pc.inner;
+        uint dy_base = pc.dy_off + row * pc.inner;
+        uint dx_base = pc.out_off + row * pc.inner;
+
+        float sum_x = 0.0;
+        float sum_x2 = 0.0;
+        for (uint i = 0u; i < pc.inner; i++) {
+            float v = arena_load(x_base + i);
+            sum_x += v;
+            sum_x2 += v * v;
+        }
+
+        float mean = 0.0;
+        float inv;
+        if (pc.layer_norm != 0u) {
+            mean = sum_x * n_inv;
+            float var_ = max(sum_x2 * n_inv - mean * mean, 0.0);
+            inv = inversesqrt(var_ + pc.eps);
+        } else {
+            inv = inversesqrt(sum_x2 * n_inv + pc.eps);
+        }
+
+        float sum_sy = 0.0;
+        float sum_sxh = 0.0;
+        for (uint i = 0u; i < pc.inner; i++) {
+            float n = (arena_load(x_base + i) - mean) * inv;
+            float d = arena_load(dy_base + i);
+            float sc = arena_load(pc.scale_off + mod_base + i);
+            float sy = d * (1.0 + sc);
+            arena_store(dscale_base + i, arena_load(dscale_base + i) + d * n);
+            arena_store(dshift_base + i, arena_load(dshift_base + i) + d);
+            sum_sy += sy;
+            sum_sxh += sy * n;
+        }
+        float m_sy = sum_sy * n_inv;
+        float m_sxh = sum_sxh * n_inv;
+
+        for (uint i = 0u; i < pc.inner; i++) {
+            float d = arena_load(dy_base + i);
+            float sc = arena_load(pc.scale_off + mod_base + i);
+            float sy = d * (1.0 + sc);
+            if (pc.layer_norm != 0u) {
+                float n = (arena_load(x_base + i) - mean) * inv;
+                arena_store(dx_base + i, inv * (sy - m_sy - n * m_sxh));
+            } else {
+                float n_rms = arena_load(x_base + i) * inv;
+                arena_store(dx_base + i, inv * (sy - n_rms * m_sxh));
+            }
+        }
+    }
+}

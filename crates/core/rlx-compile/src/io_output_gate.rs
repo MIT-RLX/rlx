@@ -24,7 +24,10 @@ impl Pass for SelectPeaksOnlyOutputs {
     }
 
     fn run(&self, mut graph: Graph) -> Graph {
-        if rlx_ir::env::flag("RLX_NO_IO_PEAKS_OUTPUT") {
+        if crate::fusion_target::active_fusion_options()
+            .map(|o| o.no_io_peaks_output)
+            .unwrap_or_else(|| rlx_ir::env_registry::flag("RLX_NO_IO_PEAKS_OUTPUT"))
+        {
             return graph;
         }
         let Some(target) = active_fusion_target() else {

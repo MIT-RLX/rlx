@@ -323,10 +323,84 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
                 }
                 vals[*out] = o;
             }
+            Step::Custom {
+                out,
+                input,
+                name,
+                attrs,
+            } => {
+                let o = run_custom_collective(name, &vals[*input], plan.slot_len[*out], attrs)?;
+                vals[*out] = o;
+            }
         }
     }
 
     Ok(plan.outputs.iter().map(|&s| vals[s].clone()).collect())
+}
+
+/// Run a host/transport `collective.*` op by delegating to the single
+/// registered CPU kernel via `rlx_cpu::op_registry::run_f32_custom_op_host`.
+///
+/// The collective kernels work off element counts + `attrs` (not the logical
+/// tensor rank), so a 1-D f32 `Shape` built from the element count is faithful —
+/// this mirrors how every other GPU backend (wgpu / metal / cuda / rocm / coreml)
+/// stages the operand to host and calls the one shared helper.
+///
+/// **Native only.** The collective transport (`rlx-driver` `ProcessGroup` /
+/// `NetTransport`) is built on `std::net` TCP sockets, which do not exist on
+/// wasm32/browser — so on wasm this returns a clear error instead of pretending
+/// to run a collective. See the module docs.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_custom_collective(
+    name: &str,
+    input: &[f32],
+    out_len: usize,
+    attrs: &[u8],
+) -> Result<Vec<f32>> {
+    use rlx_ir::{DType, Shape};
+    let mut out = vec![0f32; out_len];
+    let in_shape = Shape::new(&[input.len()], DType::F32);
+    let out_shape = Shape::new(&[out.len()], DType::F32);
+    rlx_cpu::op_registry::run_f32_custom_op_host(
+        name,
+        &[(bytemuck_cast(input), &in_shape)],
+        (bytemuck_cast_mut(&mut out), &out_shape),
+        attrs,
+    )
+    .map_err(|e| WebglError(format!("collective '{name}': {e}")))?;
+    Ok(out)
+}
+
+/// On wasm there is no TCP transport for the process group, so collectives
+/// cannot run. Report that plainly rather than fabricating a result.
+#[cfg(target_arch = "wasm32")]
+fn run_custom_collective(
+    name: &str,
+    _input: &[f32],
+    _out_len: usize,
+    _attrs: &[u8],
+) -> Result<Vec<f32>> {
+    Err(WebglError(format!(
+        "collective '{name}' unavailable in browser: no TCP transport on wasm32 \
+         (rlx-driver ProcessGroup uses std::net sockets). Run the collective graph \
+         on the native CPU executor."
+    )))
+}
+
+/// Reinterpret an `f32` slice as bytes (little-endian, native layout). The host
+/// helper reads it back through the same `f32`-alignment contract.
+#[cfg(not(target_arch = "wasm32"))]
+fn bytemuck_cast(s: &[f32]) -> &[u8] {
+    // SAFETY: `f32` has no invalid bit patterns; `[f32]` → `[u8]` is a valid
+    // reinterpret and the resulting slice covers exactly `len * 4` bytes.
+    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn bytemuck_cast_mut(s: &mut [f32]) -> &mut [u8] {
+    let len = std::mem::size_of_val(s);
+    // SAFETY: as above; mutable reinterpret of `[f32]` → `[u8]`.
+    unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut u8, len) }
 }
 
 #[cfg(test)]
@@ -400,5 +474,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out[0], vec![10.0, -2.0, 30.0]);
+    }
+
+    // A `collective.*` custom op lowers to `Step::Custom` and the NATIVE CPU
+    // executor host-delegates it to the single registered rlx-cpu kernel via
+    // `run_f32_custom_op_host`. `copy_to_parallel` is an identity copy whose
+    // kernel needs no process group, so this exercises the full wiring
+    // (build_plan → Step::Custom → host delegate → registered kernel) without a
+    // network. This path is native-only: on wasm there is no TCP transport.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn collective_copy_to_parallel_host_delegate() {
+        use crate::build_plan;
+        use rlx_ir::{DType, Graph, Shape};
+
+        // Register the collective op extensions + CPU kernels.
+        rlx_collectives::register();
+
+        let mut g = Graph::new("coll");
+        let x = g.input("x", Shape::new(&[2, 3], DType::F32));
+        // Megatron `f` operator == forward identity copy (group 0 unused here).
+        let y = rlx_collectives::copy_to_model_parallel(&mut g, x, 0);
+        g.set_outputs(vec![y]);
+
+        let plan = build_plan(&g).expect("build_plan lowers collective.copy_to_parallel");
+        // Sanity: the collective must survive legalization as a `Step::Custom`.
+        assert!(
+            plan.steps.iter().any(|s| matches!(
+                s,
+                Step::Custom { name, .. } if name == "collective.copy_to_parallel"
+            )),
+            "collective op should lower to Step::Custom"
+        );
+
+        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let out = run_cpu(&plan, &[("x", &data)]).expect("run_cpu host-delegates collective");
+        assert_eq!(out[0], data.to_vec());
     }
 }

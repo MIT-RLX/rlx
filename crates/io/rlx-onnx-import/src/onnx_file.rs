@@ -15,14 +15,14 @@
 
 //! Load a `.onnx` file directly into the bundle IR consumed by [`crate::lower`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use onnx::onnx::{
+use protobuf::Message;
+use rlx_onnx_proto::onnx::{
     AttributeProto_AttributeType, ModelProto, TensorProto, TensorProto_DataType, TypeProto_Tensor,
 };
-use protobuf::Message;
 use serde_json::json;
 
 use crate::bundle::{BundleManifest, BundleNode, IoMeta, TensorMeta};
@@ -50,6 +50,12 @@ fn shape_from_tensor_type(tt: &TypeProto_Tensor) -> Vec<serde_json::Value> {
             if d.has_dim_value() {
                 let v = d.get_dim_value();
                 if v > 0 { json!(v) } else { json!("?") }
+            } else if d.has_dim_param() && !d.get_dim_param().is_empty() {
+                // Preserve the symbolic NAME (e.g. `batch_size`, `text_length`) so
+                // the resolver can tell a batch dim (→1) from a length dim (→seq).
+                // Dropping it to "?" made every dynamic dim resolve to seq_len,
+                // mangling batch (see resolve_dim_ir named-dim handling).
+                json!(d.get_dim_param())
             } else {
                 json!("?")
             }
@@ -69,6 +75,9 @@ fn f32_from_raw(raw: &[u8], n: usize) -> Option<Vec<f32>> {
 }
 
 fn tensor_to_f32(name: &str, t: &TensorProto) -> Result<Vec<f32>> {
+    if t.get_dims().contains(&0) {
+        return Ok(Vec::new());
+    }
     let n = t.get_dims().iter().product::<i64>().max(1) as usize;
     if !t.get_float_data().is_empty() {
         return Ok(t.get_float_data().to_vec());
@@ -135,6 +144,11 @@ fn tensor_to_f32(name: &str, t: &TensorProto) -> Result<Vec<f32>> {
 }
 
 fn tensor_to_i64(name: &str, t: &TensorProto) -> Result<Vec<i64>> {
+    // A genuinely empty tensor (a dim of 0, e.g. a `Reshape`-to-scalar target `[]`)
+    // has no data — return the empty vector rather than bailing on the byte check.
+    if t.get_dims().contains(&0) {
+        return Ok(Vec::new());
+    }
     let n = t.get_dims().iter().product::<i64>().max(1) as usize;
     if !t.get_int64_data().is_empty() {
         return Ok(t.get_int64_data().to_vec());
@@ -164,7 +178,7 @@ fn tensor_to_i64(name: &str, t: &TensorProto) -> Result<Vec<i64>> {
     anyhow::bail!("initializer {name}: unsupported i64 dtype for native import")
 }
 
-fn parse_attribute(a: &onnx::onnx::AttributeProto) -> Option<serde_json::Value> {
+fn parse_attribute(a: &rlx_onnx_proto::onnx::AttributeProto) -> Option<serde_json::Value> {
     use AttributeProto_AttributeType::*;
     let name = a.get_name();
     match a.get_field_type() {
@@ -185,10 +199,23 @@ fn parse_attribute(a: &onnx::onnx::AttributeProto) -> Option<serde_json::Value> 
         TENSOR => {
             let t = a.get_t();
             let dims: Vec<i64> = t.get_dims().to_vec();
+            // Also capture the scalar value for small tensors. The metadata-only
+            // form dropped the data, so `ConstantOfShape(value=1)` (all-ones mask
+            // prefix) silently became 0. Cheap and additive — larger tensor attrs
+            // still carry only shape/dtype.
+            let scalar: Option<f64> = tensor_to_f32(name, t)
+                .ok()
+                .and_then(|v| v.first().map(|&x| x as f64))
+                .or_else(|| {
+                    tensor_to_i64(name, t)
+                        .ok()
+                        .and_then(|v| v.first().map(|&x| x as f64))
+                });
             Some(json!({
                 "tensor": {
                     "dims": dims,
                     "dtype": tensor_dtype(t.get_data_type()),
+                    "scalar": scalar,
                 }
             }))
         }
@@ -197,7 +224,129 @@ fn parse_attribute(a: &onnx::onnx::AttributeProto) -> Option<serde_json::Value> 
     }
 }
 
-fn output_meta_from_value_info(v: &onnx::onnx::ValueInfoProto) -> serde_json::Value {
+// Fold a `Constant` op node's tensor into the param maps (mirrors an
+// initializer), recording its shape + name. No-op for non-`Constant` nodes.
+// Shared by the top-level graph and `If`-branch subgraphs (see `lower_if`).
+thread_local! {
+    /// Names of folded CONSTANT tensors that are rank-0 SCALARS. A scalar Gather
+    /// index removes its axis (`Gather(x[1,10,17], scalar, axis=2) → [1,10]`), while
+    /// a rank-1 `[1]` index keeps it (`→ [1,10,1]`). `fold_constant_node` records the
+    /// original rank here so the lowerer's scalar-index squeeze fires for folded
+    /// scalar constants (not just scalar graph INPUTS) — MOSS-TTS's embedding-mask
+    /// `Gather(input_ids, 16)` was otherwise kept as `[1,10,1]`, injecting a spurious
+    /// axis through the whole GPT-2 stack. Cleared per import in `prepare_onnx_file`.
+    static SCALAR_CONSTS: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+fn scalar_consts_clear() {
+    SCALAR_CONSTS.with(|c| c.borrow_mut().clear());
+}
+
+/// Drain the folded-scalar-constant names collected during the current import.
+pub fn take_scalar_consts() -> HashSet<String> {
+    SCALAR_CONSTS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+thread_local! {
+    /// `If`-node name → (then-branch nodes, else-branch nodes). Lets `lower_if`
+    /// INLINE a branch that COMPUTES its output (`Squeeze`/`Identity`/… of an
+    /// outer-scope tensor) rather than only handling branches whose outputs are
+    /// folded constants — the MOSS codec's final `If(shape[1]==1, squeeze(wave),
+    /// wave)` reshaping otherwise fell to the zero stub and collapsed the audio.
+    /// Cleared per import in `prepare_onnx_file`.
+    static IF_BRANCHES: std::cell::RefCell<HashMap<String, (Vec<BundleNode>, Vec<BundleNode>)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn if_branches_clear() {
+    IF_BRANCHES.with(|c| c.borrow_mut().clear());
+}
+
+/// Drain the `If`-branch subgraph nodes collected during the current import.
+pub fn take_if_branches() -> HashMap<String, (Vec<BundleNode>, Vec<BundleNode>)> {
+    IF_BRANCHES.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+fn fold_constant_node(
+    n: &rlx_onnx_proto::onnx::NodeProto,
+    params: &mut HashMap<String, Vec<f32>>,
+    i64_params: &mut HashMap<String, Vec<i64>>,
+    const_shapes: &mut HashMap<String, Vec<usize>>,
+    folded_constants: &mut HashSet<String>,
+) {
+    if n.get_op_type() != "Constant" || n.get_output().is_empty() {
+        return;
+    }
+    let out = n.get_output()[0].to_string();
+    let mut shape: Option<Vec<usize>> = None;
+    for a in n.get_attribute() {
+        // `value_int`/`value_float` are always rank-0 scalars.
+        if matches!(a.get_name(), "value_int" | "value_float") {
+            SCALAR_CONSTS.with(|c| {
+                c.borrow_mut().insert(out.clone());
+            });
+        }
+        match a.get_name() {
+            "value" => {
+                let t = a.get_t();
+                let dims: Vec<usize> = t.get_dims().iter().map(|&d| d.max(1) as usize).collect();
+                if t.get_dims().is_empty() {
+                    SCALAR_CONSTS.with(|c| {
+                        c.borrow_mut().insert(out.clone());
+                    });
+                }
+                // Fold non-fatally: a Constant we cannot convert (external data,
+                // exotic dtype) is left in the graph for `lower_constant` rather
+                // than failing the whole import — folding is an optimization.
+                let folded = match t.get_data_type() as i32 {
+                    6 | 7 | 9 => match tensor_to_i64(&out, t) {
+                        Ok(v) => {
+                            i64_params.insert(out.clone(), v);
+                            true
+                        }
+                        Err(_) => false,
+                    },
+                    _ => match tensor_to_f32(&out, t) {
+                        Ok(v) => {
+                            params.insert(out.clone(), v);
+                            true
+                        }
+                        Err(_) => false,
+                    },
+                };
+                if folded {
+                    shape = Some(if dims.is_empty() { vec![1] } else { dims });
+                }
+            }
+            "value_float" => {
+                params.insert(out.clone(), vec![a.get_f()]);
+                shape = Some(vec![1]);
+            }
+            "value_int" => {
+                i64_params.insert(out.clone(), vec![a.get_i()]);
+                shape = Some(vec![1]);
+            }
+            "value_floats" => {
+                let v = a.get_floats().to_vec();
+                shape = Some(vec![v.len().max(1)]);
+                params.insert(out.clone(), v);
+            }
+            "value_ints" => {
+                let v = a.get_ints().to_vec();
+                shape = Some(vec![v.len().max(1)]);
+                i64_params.insert(out.clone(), v);
+            }
+            _ => {}
+        }
+    }
+    if let Some(sh) = shape {
+        const_shapes.insert(out.clone(), sh);
+        folded_constants.insert(out);
+    }
+}
+
+fn output_meta_from_value_info(v: &rlx_onnx_proto::onnx::ValueInfoProto) -> serde_json::Value {
     if v.has_field_type() {
         let tp = v.get_field_type();
         if tp.has_tensor_type() {
@@ -211,7 +360,9 @@ fn output_meta_from_value_info(v: &onnx::onnx::ValueInfoProto) -> serde_json::Va
     json!({"shape": ["?"], "dtype": "f32"})
 }
 
-fn build_value_info_map(graph: &onnx::onnx::GraphProto) -> HashMap<String, serde_json::Value> {
+fn build_value_info_map(
+    graph: &rlx_onnx_proto::onnx::GraphProto,
+) -> HashMap<String, serde_json::Value> {
     let mut map = HashMap::new();
     for v in graph.get_input() {
         map.insert(v.get_name().to_string(), output_meta_from_value_info(v));
@@ -233,7 +384,7 @@ fn build_value_info_map(graph: &onnx::onnx::GraphProto) -> HashMap<String, serde
     map
 }
 
-fn io_meta_from_value_info(v: &onnx::onnx::ValueInfoProto) -> IoMeta {
+fn io_meta_from_value_info(v: &rlx_onnx_proto::onnx::ValueInfoProto) -> IoMeta {
     let meta = output_meta_from_value_info(v);
     let shape = meta
         .get("shape")
@@ -252,6 +403,76 @@ fn io_meta_from_value_info(v: &onnx::onnx::ValueInfoProto) -> IoMeta {
 }
 
 /// Parse ONNX and return manifest + graph pieces (no HIR lowering).
+/// Inline ONNX external-data tensors. `external_data` (proto field 13, repeated
+/// `StringStringEntryProto` with keys `location`/`offset`/`length`) and
+/// `data_location` (field 14, `EXTERNAL == 1`) are unknown to the pinned proto
+/// crate, so they arrive in each tensor's `unknown_fields`. For every initializer
+/// that carries them we read `<onnx_dir>/<location>[offset .. offset+length]` and
+/// set it as `raw_data`, so the tensor becomes indistinguishable from an inline one.
+fn resolve_external_initializers(model: &mut ModelProto, onnx_path: &Path) -> Result<()> {
+    use rlx_onnx_proto::onnx::StringStringEntryProto;
+    const EXTERNAL_DATA_FIELD: u32 = 13;
+    const DATA_LOCATION_FIELD: u32 = 14;
+    let dir = onnx_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let mut cache: HashMap<String, Vec<u8>> = HashMap::new();
+    for init in model.mut_graph().mut_initializer().iter_mut() {
+        if !init.get_raw_data().is_empty() {
+            continue; // already inline
+        }
+        let uf = init.get_unknown_fields();
+        let entries: Vec<Vec<u8>> = uf
+            .get(EXTERNAL_DATA_FIELD)
+            .map(|v| v.length_delimited.clone())
+            .unwrap_or_default();
+        let is_external = uf
+            .get(DATA_LOCATION_FIELD)
+            .and_then(|v| v.varint.first().copied())
+            == Some(1)
+            || !entries.is_empty();
+        if !is_external {
+            continue;
+        }
+        let (mut location, mut offset, mut length) = (String::new(), 0usize, None::<usize>);
+        for e in &entries {
+            if let Ok(entry) = protobuf::parse_from_bytes::<StringStringEntryProto>(e) {
+                match entry.get_key() {
+                    "location" => location = entry.get_value().to_string(),
+                    "offset" => offset = entry.get_value().trim().parse().unwrap_or(0),
+                    "length" => length = entry.get_value().trim().parse().ok(),
+                    _ => {}
+                }
+            }
+        }
+        if location.is_empty() {
+            continue;
+        }
+        if !cache.contains_key(&location) {
+            let data = std::fs::read(dir.join(&location))
+                .with_context(|| format!("read external data file {location}"))?;
+            cache.insert(location.clone(), data);
+        }
+        let data = &cache[&location];
+        let end = length
+            .map(|l| offset.saturating_add(l))
+            .unwrap_or(data.len());
+        let slice = data
+            .get(offset..end.min(data.len()))
+            .unwrap_or(&[])
+            .to_vec();
+        anyhow::ensure!(
+            !slice.is_empty(),
+            "external initializer {} resolved to empty ({location}[{offset}..{:?}])",
+            init.get_name(),
+            length
+        );
+        init.set_raw_data(slice);
+    }
+    Ok(())
+}
+
 pub fn prepare_onnx_file(
     path: &Path,
 ) -> Result<(
@@ -261,23 +482,84 @@ pub fn prepare_onnx_file(
     HashMap<String, Vec<i64>>,
     HashMap<String, Vec<usize>>,
 )> {
+    scalar_consts_clear();
+    if_branches_clear();
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let mut model = ModelProto::new();
     model
         .merge_from_bytes(&bytes)
         .context("parse ONNX protobuf")?;
+    // Resolve ONNX EXTERNAL-data initializers (weights stored in a sibling `.data`
+    // file at per-tensor offsets — the >2 GB LM/DiT export convention). The pinned
+    // `onnx` proto crate predates external data, so `external_data` (field 13) and
+    // `data_location` (field 14) land in `unknown_fields`; read them there, slice the
+    // referenced file, and inline the bytes as `raw_data` so the normal initializer
+    // path sees ordinary tensors. Without this every external weight imports empty →
+    // "unsupported dtype". Needed by MOSS-TTS-Nano / ChatterBox / any big split-weight
+    // export.
+    resolve_external_initializers(&mut model, path)
+        .with_context(|| format!("resolve external data for {}", path.display()))?;
     let graph = model.get_graph();
 
     let mut params = HashMap::new();
     let mut i64_params = HashMap::new();
     for init in graph.get_initializer() {
         let name = init.get_name().to_string();
+        // Rank-0 scalar initializers (empty `dims`) must be tracked like folded
+        // Constant scalars so Gather can drop the gathered axis. ChatterBox
+        // speech_encoder's `/Gather_2(audio, /Constant_1=0)` is the canonical case:
+        // without the squeeze, Shape sees `[1, L]` and n_frames becomes
+        // `(1-400)/160+1 = -1`, collapsing the STFT framing mask.
+        if init.get_dims().is_empty() {
+            SCALAR_CONSTS.with(|c| {
+                c.borrow_mut().insert(name.clone());
+            });
+        }
         match init.get_data_type() as i32 {
             6 | 7 | 9 => {
                 i64_params.insert(name.clone(), tensor_to_i64(&name, init)?);
             }
             _ => {
                 params.insert(name.clone(), tensor_to_f32(&name, init)?);
+            }
+        }
+    }
+
+    // Constant folding: `Constant` op nodes carry their tensor in a `value`
+    // (or `value_float`/`value_int`/`value_floats`/`value_ints`) attribute.
+    // PyTorch exports emit these for scalars and small tensors, so materialize
+    // them into params/i64_params exactly like initializers, then drop the node.
+    let mut const_shapes: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut folded_constants: HashSet<String> = HashSet::new();
+    for n in graph.get_node() {
+        fold_constant_node(
+            n,
+            &mut params,
+            &mut i64_params,
+            &mut const_shapes,
+            &mut folded_constants,
+        );
+    }
+    // Also fold `Constant`s inside `If`-branch subgraphs. `lower_if` resolves the
+    // condition at compile time and emits the taken branch's output; when that
+    // output is a cached constant table (e.g. the Zipformer relative-position
+    // embedding, a `then`-branch `Constant`), its data must be a param. Subgraph
+    // tensor names are globally unique, so they share the top-level param maps.
+    for n in graph.get_node() {
+        if n.get_op_type() != "If" {
+            continue;
+        }
+        for a in n.get_attribute() {
+            if matches!(a.get_field_type(), AttributeProto_AttributeType::GRAPH) {
+                for sn in a.get_g().get_node() {
+                    fold_constant_node(
+                        sn,
+                        &mut params,
+                        &mut i64_params,
+                        &mut const_shapes,
+                        &mut folded_constants,
+                    );
+                }
             }
         }
     }
@@ -297,46 +579,107 @@ pub fn prepare_onnx_file(
 
     let value_info = build_value_info_map(graph);
 
+    let is_folded = |n: &rlx_onnx_proto::onnx::NodeProto| -> bool {
+        n.get_op_type() == "Constant"
+            && !n.get_output().is_empty()
+            && folded_constants.contains(n.get_output()[0].as_str())
+    };
+    // Build one `BundleNode` from an ONNX node — reused for the top-level graph AND
+    // for `If`-branch subgraph nodes (so `lower_if` can inline a computed branch).
+    let build_node = |n: &rlx_onnx_proto::onnx::NodeProto| -> BundleNode {
+        let mut attrs = HashMap::new();
+        for a in n.get_attribute() {
+            if let Some(v) = parse_attribute(a) {
+                attrs.insert(a.get_name().to_string(), v);
+            }
+        }
+        // For `If`, record each branch's output tensor names so `lower_if` can map
+        // the taken branch's outputs to the `If`'s outputs.
+        if n.get_op_type() == "If" {
+            for a in n.get_attribute() {
+                let key = match a.get_name() {
+                    "then_branch" => "_then_outputs",
+                    "else_branch" => "_else_outputs",
+                    _ => continue,
+                };
+                if matches!(a.get_field_type(), AttributeProto_AttributeType::GRAPH) {
+                    let outs: Vec<String> = a
+                        .get_g()
+                        .get_output()
+                        .iter()
+                        .map(|o| o.get_name().to_string())
+                        .collect();
+                    attrs.insert(key.to_string(), json!(outs));
+                }
+            }
+        }
+        let name = if n.get_name().is_empty() {
+            n.get_op_type().to_string()
+        } else {
+            n.get_name().to_string()
+        };
+        let output_meta: Vec<serde_json::Value> = n
+            .get_output()
+            .iter()
+            .map(|out| {
+                value_info
+                    .get(out)
+                    .cloned()
+                    .unwrap_or_else(|| json!({"shape": ["?"], "dtype": "f32"}))
+            })
+            .collect();
+        let output_meta = if output_meta.is_empty() {
+            vec![json!({"shape": ["?"], "dtype": "f32"})]
+        } else {
+            output_meta
+        };
+        BundleNode {
+            name,
+            op: n.get_op_type().to_string(),
+            inputs: n.get_input().to_vec(),
+            outputs: n.get_output().to_vec(),
+            attrs,
+            output_meta,
+        }
+    };
+
     let mut nodes: Vec<BundleNode> = graph
         .get_node()
         .iter()
-        .map(|n| {
-            let mut attrs = HashMap::new();
-            for a in n.get_attribute() {
-                if let Some(v) = parse_attribute(a) {
-                    attrs.insert(a.get_name().to_string(), v);
+        .filter(|n| !is_folded(n))
+        .map(&build_node)
+        .collect();
+
+    // Capture each `If`'s branch subgraph nodes (minus already-folded Constants) so
+    // `lower_if` can INLINE the taken branch when its output is computed, not a
+    // folded constant (MOSS codec's `If(shape[1]==1, squeeze(wave), wave)`).
+    for n in graph.get_node() {
+        if n.get_op_type() != "If" {
+            continue;
+        }
+        let mut then_nodes = Vec::new();
+        let mut else_nodes = Vec::new();
+        for a in n.get_attribute() {
+            let target = match a.get_name() {
+                "then_branch" => &mut then_nodes,
+                "else_branch" => &mut else_nodes,
+                _ => continue,
+            };
+            if matches!(a.get_field_type(), AttributeProto_AttributeType::GRAPH) {
+                for sn in a.get_g().get_node() {
+                    if !is_folded(sn) {
+                        target.push(build_node(sn));
+                    }
                 }
             }
-            let name = if n.get_name().is_empty() {
-                n.get_op_type().to_string()
-            } else {
-                n.get_name().to_string()
-            };
-            let output_meta: Vec<serde_json::Value> = n
-                .get_output()
-                .iter()
-                .map(|out| {
-                    value_info
-                        .get(out)
-                        .cloned()
-                        .unwrap_or_else(|| json!({"shape": ["?"], "dtype": "f32"}))
-                })
-                .collect();
-            let output_meta = if output_meta.is_empty() {
-                vec![json!({"shape": ["?"], "dtype": "f32"})]
-            } else {
-                output_meta
-            };
-            BundleNode {
-                name,
-                op: n.get_op_type().to_string(),
-                inputs: n.get_input().to_vec(),
-                outputs: n.get_output().to_vec(),
-                attrs,
-                output_meta,
-            }
-        })
-        .collect();
+        }
+        let if_name = if n.get_name().is_empty() {
+            "If".to_string()
+        } else {
+            n.get_name().to_string()
+        };
+        IF_BRANCHES.with(|c| c.borrow_mut().insert(if_name, (then_nodes, else_nodes)));
+    }
 
     let manifest = BundleManifest {
         source_onnx: path.display().to_string(),
@@ -357,6 +700,7 @@ pub fn prepare_onnx_file(
             init.get_dims().iter().map(|&d| d.max(1) as usize).collect(),
         );
     }
+    init_shapes.extend(const_shapes);
 
     let opts = ImportOptions::default();
     propagate_shapes(&mut nodes, &manifest, &init_shapes, &opts);
@@ -390,6 +734,7 @@ pub fn build_hir_from_onnx_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn onnx_test_model() -> Option<std::path::PathBuf> {
         std::env::var("RLX_ONNX_TEST_MODEL")
@@ -465,6 +810,40 @@ mod tests {
         assert!(!params.is_empty());
         assert!(!i64_params.is_empty(), "expected i64 constant initializers");
         assert!(init_shapes.len() >= params.len() + i64_params.len());
+    }
+
+    #[test]
+    fn scalar_initializer_registered_for_gather_squeeze() {
+        // ChatterBox speech_encoder (and similar Whisper-style frontends) use a
+        // rank-0 i64 initializer as a Gather index. Those must land in
+        // `take_scalar_consts` so lowering drops the gathered axis — otherwise
+        // STFT framing collapses (`binary_infer at /Sub_2`).
+        let candidates = [
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../../rlx-models/weights/tts/chatterbox/onnx/speech_encoder.onnx"),
+            PathBuf::from(
+                "/Users/Shared/rlx-models/weights/tts/chatterbox/onnx/speech_encoder.onnx",
+            ),
+        ];
+        let Some(path) = candidates.into_iter().find(|p| p.is_file()) else {
+            eprintln!("skip: chatterbox speech_encoder.onnx not present");
+            return;
+        };
+        let mut named = std::collections::HashMap::new();
+        named.insert("batch_size".into(), 1usize);
+        named.insert("num_samples".into(), 48_000);
+        let opts = ImportOptions {
+            sequence_length: 100,
+            named_lengths: named,
+            max_waveform_samples: 48_000,
+            strict: false,
+            ..Default::default()
+        };
+        let (hir, _params, report, manifest) =
+            build_hir_from_onnx_file(&path, opts).expect("import speech_encoder");
+        assert_eq!(report.stubbed, 0, "stubbed={}", report.stubbed);
+        assert!(!hir.nodes().is_empty());
+        assert_eq!(manifest.outputs.len(), 4);
     }
 
     #[test]

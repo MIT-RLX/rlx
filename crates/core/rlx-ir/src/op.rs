@@ -151,6 +151,22 @@ pub enum CmpOp {
     Ge,
 }
 
+/// Reduction applied when ONNX-style [`Op::ScatterNd`] writes updates.
+///
+/// Matches the ONNX ScatterND `reduction` attribute (opset 16+): `none`
+/// overwrites; `add`/`mul`/`max`/`min` combine with the existing value
+/// (required for duplicate indices).
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ScatterNdReduction {
+    #[default]
+    None,
+    Add,
+    Mul,
+    Max,
+    Min,
+}
+
 /// What kind of attention mask the kernel should apply.
 ///
 /// Borrowed from MAX's `nn/attention/mha_mask.mojo` pattern (#20 in
@@ -302,6 +318,10 @@ pub enum OpKind {
     DequantGroupedMatMul,
     DequantMoEWeights,
     ScatterAdd,
+    ScatterNd,
+    ScatterElements,
+    GatherNd,
+    GatherElements,
     LoraMatMul,
     PartitionedConv,
     DequantMatMul,
@@ -319,6 +339,7 @@ pub enum OpKind {
     Mamba2,
     FusedSwiGLU,
     FusedMatMulBiasAct,
+    FusedConvBiasAct,
     FusedResidualLN,
     FusedResidualRmsNorm,
     FusedAttentionBlock,
@@ -354,6 +375,64 @@ pub enum OpKind {
     LogMelBackward,
     /// Welch PSD top-K spikes from block-layout FFT spectra — see [`Op::WelchPeaks`].
     WelchPeaks,
+
+    // ── Riemannian / SPD-manifold layers ────────────────────────
+    /// SPDNet bilinear mapping — see [`Op::BiMap`].
+    BiMap,
+    /// SPDNet eigenvalue rectification — see [`Op::ReEig`].
+    ReEig,
+    /// SPDNet matrix-log layer — see [`Op::LogEig`].
+    LogEig,
+    /// SPD batch-norm affine transport — see [`Op::SpdBatchNorm`].
+    SpdBatchNorm,
+    /// Batch Fréchet/Karcher mean of SPD matrices — see [`Op::SpdKarcherMean`].
+    SpdKarcherMean,
+    /// Backward of [`Op::ReEig`].
+    ReEigBackward,
+    /// Backward of [`Op::LogEig`].
+    LogEigBackward,
+    /// Backward of [`Op::SpdBatchNorm`] w.r.t. inputs.
+    SpdBatchNormBackwardX,
+    /// Backward of [`Op::SpdBatchNorm`] w.r.t. bias G.
+    SpdBatchNormBackwardG,
+    /// Weighted batch Fréchet/Karcher mean — see [`Op::SpdKarcherMeanWeighted`].
+    SpdKarcherMeanWeighted,
+    /// AIRM logarithm map at an arbitrary base — see [`Op::SpdLogMap`].
+    SpdLogMap,
+    /// AIRM exponential map at an arbitrary base — see [`Op::SpdExpMap`].
+    SpdExpMap,
+    /// AIRM parallel transport of a tangent vector — see [`Op::SpdParallelTransport`].
+    SpdParallelTransport,
+    /// Batched SPD spectral matrix function — see [`Op::SpdMatrixFnBatch`].
+    SpdMatrixFnBatch,
+    /// Backward of [`Op::SpdLogMap`].
+    SpdLogMapBackward,
+    /// Backward of [`Op::SpdExpMap`].
+    SpdExpMapBackward,
+    /// Backward of [`Op::SpdParallelTransport`].
+    SpdParallelTransportBackward,
+    /// Backward of [`Op::SpdMatrixFnBatch`].
+    SpdMatrixFnBatchBackward,
+    /// Symmetric eigendecomposition — see [`Op::Eigh`].
+    Eigh,
+    /// Backward of [`Op::Eigh`].
+    EighBackward,
+    /// Batched symmetric eigendecomposition — see [`Op::EighBatch`].
+    EighBatch,
+    /// Backward of [`Op::EighBatch`].
+    EighBatchBackward,
+
+    // ── Diffusion Transformer (DiT) modulation ──────────────────
+    /// Fused adaptive-norm modulation `norm(x)·(1+scale)+shift` — see
+    /// [`Op::AdaLayerNorm`].
+    AdaLayerNorm,
+    /// Backward of [`Op::AdaLayerNorm`] — packed `[dx ∥ dscale ∥ dshift]`.
+    AdaLayerNormBackward,
+    /// Gated residual `x + gate·y` with broadcast gate — see
+    /// [`Op::GatedResidual`].
+    GatedResidual,
+    /// Backward of [`Op::GatedResidual`] — packed `[dx ∥ dy ∥ dgate]`.
+    GatedResidualBackward,
 }
 
 /// An operand inside a fused [`ChainStep`] — either a graph-level input
@@ -416,6 +495,38 @@ pub enum RopeStyle {
     #[default]
     NeoX,
     GptJ,
+}
+
+/// Pre-modulation normalization flavor for [`Op::AdaLayerNorm`] (DiT adaLN-Zero).
+/// Both normalize over the last axis with **no learnable affine** — the affine
+/// comes from the per-conditioning `scale`/`shift` inputs instead.
+///
+/// - [`AdaNormKind::LayerNorm`]: mean-subtract + variance-normalize (DiT / PixArt
+///   / SD3 / FLUX adaLN blocks — `LayerNorm(elementwise_affine=False)`).
+/// - [`AdaNormKind::RmsNorm`]: root-mean-square normalize only (adaLN variants
+///   that pre-norm with RMSNorm).
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AdaNormKind {
+    #[default]
+    LayerNorm,
+    RmsNorm,
+}
+
+/// Which spectral matrix function [`Op::SpdMatrixFnBatch`] applies to each SPD
+/// matrix of a batch — the batched counterparts of `rlx_cpu::spd`'s
+/// `logm` / `expm` / `sqrtm` / `invsqrtm` (spectral: `V·diag(f(λ))·Vᵀ`).
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpdMatFn {
+    /// Matrix logarithm of an SPD matrix.
+    Logm,
+    /// Matrix exponential of a symmetric matrix.
+    Expm,
+    /// Matrix square root of an SPD matrix.
+    Sqrtm,
+    /// Inverse matrix square root of an SPD matrix (`A^{-1/2}`).
+    Invsqrtm,
 }
 
 /// An operation in the RLX IR graph.
@@ -1225,6 +1336,40 @@ pub enum Op {
     /// accumulate (sequentially on CPU; with atomic-add on Metal).
     ScatterAdd,
 
+    /// ONNX ScatterND: copy `data`, then write `updates` at multi-index
+    /// locations from `indices`.
+    /// Inputs: `[data, indices, updates]`
+    ///   data    : rank `r` tensor (output shape matches)
+    ///   indices : rank `q`, trailing dim `k` indexes the first `k` axes of data
+    ///   updates : shape `indices.shape[:-1] + data.shape[k:]`
+    /// `reduction` selects overwrite vs accumulate (see [`ScatterNdReduction`]).
+    ScatterNd {
+        reduction: ScatterNdReduction,
+    },
+
+    /// ONNX ScatterElements: per-element scatter along `axis`.
+    /// Inputs: `[data, indices, updates]` — output shape matches `data`.
+    /// `indices` and `updates` share rank with `data`; along `axis` they
+    /// select which coordinate to write.
+    ScatterElements {
+        axis: i32,
+        reduction: ScatterNdReduction,
+    },
+
+    /// ONNX GatherND: gather slices from `data` indexed by the trailing
+    /// axis of `indices`. Inputs: `[data, indices]`.
+    /// `batch_dims` (default 0) skips leading shared batch axes.
+    GatherNd {
+        batch_dims: i32,
+    },
+
+    /// ONNX GatherElements / `take_along_axis`: output shape = `indices`
+    /// shape; each output element is `data` with the `axis` coordinate
+    /// replaced by the corresponding index. Inputs: `[data, indices]`.
+    GatherElements {
+        axis: i32,
+    },
+
     // ── Convolution ─────────────────────────────────────────────
     /// 2D convolution on NCHW tensors. Also exposed as [`OpKind::Conv`] / `conv2d`.
     /// Weight layout: `[C_out, C_in / groups, kH, kW]`.
@@ -1532,6 +1677,35 @@ pub enum Op {
     /// Fused matmul + bias + activation. Created from MatMul → Add → Activation.
     FusedMatMulBiasAct {
         activation: Option<Activation>,
+    },
+
+    /// Fused convolution + bias + activation. Created from
+    /// `Conv → Reshape(bias→[1,C,1,1]) → Expand → Add → [Activation]`.
+    ///
+    /// Inputs: `[input, weight, bias]` — bias is rank-1 `[C_out]`, mirroring
+    /// [`Op::QConv2d`]'s bundled-bias convention (not a separate broadcast Add).
+    /// Fields mirror [`Op::Conv`] plus the epilogue activation.
+    ///
+    /// Only backends that can apply the whole epilogue in one dispatch claim
+    /// this op — today CUDA. Every other backend decomposes it back to
+    /// primitives in `unfuse`, so the fusion is always safe to emit. On CUDA it
+    /// lowers to cuDNN's fused `cudnnConvolutionBiasActivationForward`. The
+    /// fusion pass only emits it for cuDNN-friendly shapes with an
+    /// identity/ReLU epilogue (the combination that benchmarks faster than
+    /// unfused); the `conv_bias_act_epilogue` kernel exists only as a
+    /// correctness fallback when libcudnn is absent at runtime.
+    ///
+    /// `has_residual`: when true a 4th input `residual` (full `[N,C,H,W]` tensor)
+    /// is added before the activation — `act(conv + bias + residual)` — mapping
+    /// to cuDNN's `z` operand. Used for ResNet `conv→bias→add(residual)→relu`.
+    FusedConvBiasAct {
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+        dilation: Vec<usize>,
+        groups: usize,
+        activation: Option<Activation>,
+        has_residual: bool,
     },
 
     /// Fused residual + optional bias + layer norm.
@@ -1962,6 +2136,234 @@ pub enum Op {
         jvp_body: Option<Box<crate::Graph>>,
         num_inputs: u32,
     },
+
+    // ── Riemannian / SPD-manifold layers ────────────────────────
+    //
+    // Building blocks of SPDNet (Huang & Van Gool, AAAI 2017) and
+    // Riemannian batch-norm (Brooks et al., NeurIPS 2019). They operate
+    // on symmetric-positive-definite matrices (covariance descriptors:
+    // EEG/BCI, diffusion tensors, second-order pooling). F64; compute
+    // bodies live in `rlx_cpu::spd`. Executed natively on CPU and via CPU
+    // host-fallback on Metal / Vulkan / wgpu / CUDA / ROCm / oneAPI (each
+    // delegates to `rlx_cpu::spd` through the thunk path — widening its
+    // f32 arena to f64 and back). Backends that compile to a closed f32
+    // program (MLX / CoreML / TPU / WebGL / QNN) can't run F64
+    // eigendecomposition and reject these ops cleanly at legalize
+    // (→ pin such graphs to `Device::Cpu`, like `Fft`/`DenseSolve`).
+    /// BiMap (bilinear mapping) SPDNet layer: `Y = W · X · Wᵀ`.
+    ///
+    /// Inputs: `[W [m,n], X [n,n]]` (X symmetric SPD). Output: `Y [m,m]`
+    /// (SPD when W has full row rank). Reduces the manifold dimension.
+    /// The Stiefel / semi-orthogonality constraint on `W` is the
+    /// optimizer's responsibility, not this op's. VJP decomposes to
+    /// matmuls: `dW = (Ḡ+Ḡᵀ)·W·X`, `dX = Wᵀ·Ḡ·W`.
+    BiMap,
+
+    /// ReEig (eigenvalue rectification) SPDNet nonlinearity:
+    /// `Y = U · max(ε, Σ) · Uᵀ` where `X = U Σ Uᵀ`. Input `[X [n,n]]`
+    /// symmetric → `Y [n,n]` SPD. The SPD analogue of ReLU: floors the
+    /// spectrum at `eps` to keep the output well-conditioned.
+    ReEig {
+        eps: f32,
+    },
+
+    /// LogEig SPDNet layer: `Y = U · log(Σ) · Uᵀ = logm(X)`. Maps the
+    /// SPD manifold to the tangent space at the identity (symmetric
+    /// matrices) so a plain Euclidean head can classify. Input
+    /// `[X [n,n]]` → `Y [n,n]`. `eps` floors the spectrum before `log`.
+    LogEig {
+        eps: f32,
+    },
+
+    /// SPD batch-norm affine transport (Brooks et al. 2019):
+    /// `Y_i = G^{1/2} · (M^{-1/2} X_i M^{-1/2}) · G^{1/2}`.
+    ///
+    /// Inputs: `[X [B,n,n], M [n,n], G [n,n]]` — a batch of SPD matrices,
+    /// the (detached) Fréchet mean `M`, and the learnable SPD bias `G`.
+    /// Output: `Y [B,n,n]`. Centers the batch to the identity then biases
+    /// toward `G`. `M` receives no gradient (detached statistic, like
+    /// Euclidean batch-norm's running mean); grads flow to `X` and `G`.
+    SpdBatchNorm {
+        eps: f32,
+    },
+
+    /// Fréchet / Karcher mean of a batch of SPD matrices under the AIRM
+    /// metric (iterative tangent averaging). Input `[X [B,n,n]]` →
+    /// `M [n,n]`. Non-differentiable (a detached batch statistic — its
+    /// VJP contributes no gradient), mirroring how batch-norm's running
+    /// statistics live outside the autodiff graph.
+    SpdKarcherMean {
+        iters: u32,
+        tol: f32,
+    },
+
+    /// Weighted Fréchet / Karcher mean of a batch of SPD matrices under the
+    /// AIRM metric — the barycentre `argmin_M Σᵢ wᵢ · δ²(M, Cᵢ)`. Inputs
+    /// `[X [B,n,n], w [B]]` → `M [n,n]`. The weighted counterpart of
+    /// [`Op::SpdKarcherMean`]: the true AIRM barycentre a barycentric-OT
+    /// projection / soft-clustering / weighted-MDM needs (not the
+    /// log-Euclidean shortcut `expm(Σ w̄ᵢ logm Cᵢ)`). Non-differentiable — a
+    /// detached statistic, exactly like [`Op::SpdKarcherMean`].
+    SpdKarcherMeanWeighted {
+        iters: u32,
+        tol: f32,
+    },
+
+    /// AIRM Riemannian **logarithm** at an arbitrary base point:
+    /// `Log_P(X) = P^{1/2} · logm(P^{-1/2} X P^{-1/2}) · P^{1/2}`. Inputs
+    /// `[base [n,n], x [n,n]]` → tangent vector `[n,n]`. Generalises
+    /// [`Op::LogEig`] (which is `Log_I`) to any base point — the Riemannian
+    /// OT / domain-adaptation primitive (Yair et al. 2019).
+    SpdLogMap,
+
+    /// AIRM Riemannian **exponential** at an arbitrary base point:
+    /// `Exp_P(V) = P^{1/2} · expm(P^{-1/2} V P^{-1/2}) · P^{1/2}`. Inputs
+    /// `[base [n,n], v [n,n]]` → SPD point `[n,n]`. Inverse of
+    /// [`Op::SpdLogMap`].
+    SpdExpMap,
+
+    /// AIRM **parallel transport** of a tangent vector between base points:
+    /// `Γ_{P→Q}(V) = E · V · Eᵀ`, `E = (Q P^{-1})^{1/2}`. Inputs
+    /// `[from [n,n], to [n,n], v [n,n]]` → transported tangent vector `[n,n]`.
+    /// The AIRM isometry that moves tangent vectors between base points for
+    /// Riemannian OT / domain adaptation (Yair et al. 2019).
+    SpdParallelTransport,
+
+    /// Batched SPD spectral matrix function — applies `kind` (logm / expm /
+    /// sqrtm / invsqrtm) to each matrix of a batch. Input `[X [B,n,n]]` →
+    /// `[B,n,n]`. The graph-level, any-backend counterpart of
+    /// `rlx_cpu::spd::{logm,expm,sqrtm,invsqrtm}_batch`.
+    SpdMatrixFnBatch {
+        kind: SpdMatFn,
+    },
+
+    /// Backward of [`Op::ReEig`]: `(X [n,n], dY [n,n]) → dX [n,n]` via
+    /// the Daleckii–Krein (Loewner) adjoint with `f(λ)=max(λ,ε)`.
+    ReEigBackward {
+        eps: f32,
+    },
+
+    /// Backward of [`Op::LogEig`]: `(X, dY) → dX` via the Loewner adjoint
+    /// with `f=log`, `f′=1/λ`.
+    LogEigBackward {
+        eps: f32,
+    },
+
+    /// Backward of [`Op::SpdBatchNorm`] w.r.t. the inputs `X` (mean
+    /// detached): `(M [n,n], G [n,n], dY [B,n,n]) → dX [B,n,n]`.
+    SpdBatchNormBackwardX {
+        eps: f32,
+    },
+
+    /// Backward of [`Op::SpdBatchNorm`] w.r.t. the learnable bias `G`
+    /// (mean detached): `(X [B,n,n], M [n,n], G [n,n], dY [B,n,n]) →
+    /// dG [n,n]`.
+    SpdBatchNormBackwardG {
+        eps: f32,
+    },
+
+    /// Backward of [`Op::SpdLogMap`]. Inputs `[base [n,n], x [n,n], dY [n,n]]` →
+    /// packed `[d_base ∥ d_x]` of shape `[2, n, n]` (the builder narrows the two
+    /// gradients out). Full AIRM adjoint — the base point receives a gradient.
+    SpdLogMapBackward,
+
+    /// Backward of [`Op::SpdExpMap`]. Inputs `[base [n,n], v [n,n], dY [n,n]]` →
+    /// packed `[d_base ∥ d_v]` of shape `[2, n, n]`.
+    SpdExpMapBackward,
+
+    /// Backward of [`Op::SpdParallelTransport`].
+    /// Inputs `[from [n,n], to [n,n], v [n,n], dY [n,n]]` → packed
+    /// `[d_from ∥ d_to ∥ d_v]` of shape `[3, n, n]`.
+    SpdParallelTransportBackward,
+
+    /// Backward of [`Op::SpdMatrixFnBatch`]: per-slice Daleckii–Krein adjoint of
+    /// `kind`. Inputs `[X [B,n,n], dY [B,n,n]]` → `dX [B,n,n]`.
+    SpdMatrixFnBatchBackward {
+        kind: SpdMatFn,
+    },
+
+    /// Symmetric **eigendecomposition** of an `[n,n]` matrix. Output is packed
+    /// `[λ (n) ∥ U (n²)]` — ascending eigenvalues then the row-major eigenvector
+    /// matrix (column `j` = eigenvector `j`, so `A = U diag(λ) Uᵀ`). The builder
+    /// [`Graph::eigh`] narrows the two views out. Differentiable (see
+    /// [`Op::EighBackward`]). The seam a native batched eigensolver (cuSOLVER
+    /// `syevjBatched` &c.) plugs into.
+    Eigh,
+
+    /// Backward of [`Op::Eigh`]. Inputs `[fwd [n²+n], bar [n²+n]]` — the packed
+    /// forward `[λ ∥ U]` and the upstream cotangent `[λ̄ ∥ Ū]` — → `Ā [n,n]`
+    /// (the standard symmetric-eigendecomposition adjoint).
+    EighBackward,
+
+    /// Batched [`Op::Eigh`]: `[B,n,n] → [B, n²+n]` packed per slice.
+    EighBatch,
+
+    /// Backward of [`Op::EighBatch`]. Inputs `[fwd [B,n²+n], bar [B,n²+n]]` →
+    /// `Ā [B,n,n]`.
+    EighBatchBackward,
+
+    // ── Diffusion Transformer (DiT) modulation ──────────────────
+    /// Fused adaptive-norm modulation — the signature DiT / adaLN-Zero op.
+    ///
+    /// ```text
+    /// out = norm(x) * (1 + scale) + shift
+    /// ```
+    ///
+    /// `norm` normalizes over the **last axis** with no learnable affine
+    /// ([`AdaNormKind`]); the affine is supplied per-conditioning by `scale`
+    /// and `shift`, which broadcast over every axis except the last (the DiT
+    /// `[B, 1, D]` modulation over `[B, S, D]`). Folding the broadcast into the
+    /// op avoids the `Op::Expand` materialization the decomposed form needs
+    /// (`[B,1,D]→[B,S,D]` can't ride an `ElementwiseRegion`'s trailing-modulo
+    /// broadcast) and keeps the pre-norm activation off the heap — mirroring
+    /// [`Op::FusedResidualLN`].
+    ///
+    /// Inputs: `[x, scale, shift]`
+    ///   - `x`:     `[..., D]`
+    ///   - `scale`: broadcast-compatible with `x`, last dim `D` (e.g. `[B, 1, D]`)
+    ///   - `shift`: same shape as `scale`
+    ///
+    /// Output shape == `x`. Backends without a native kernel decompose via
+    /// `unfuse` into `norm → mul(1+scale) → add(shift)`.
+    AdaLayerNorm {
+        norm: AdaNormKind,
+        eps: f32,
+    },
+
+    /// Gated residual `out = x + gate * y` (the DiT post-sublayer combine).
+    ///
+    /// `gate` broadcasts over every axis except the last (the `[B, 1, D]`
+    /// modulation gate over `[B, S, D]`), so — like [`Op::AdaLayerNorm`] — the
+    /// built-in broadcast avoids an `Op::Expand` of the gate. Used for both the
+    /// attention (`gate_msa`) and MLP (`gate_mlp`) residual joins.
+    ///
+    /// Inputs: `[x, y, gate]`
+    ///   - `x`:    residual stream `[..., D]`
+    ///   - `y`:    sublayer output, same shape as `x`
+    ///   - `gate`: broadcast-compatible with `x`, last dim `D` (e.g. `[B, 1, D]`)
+    ///
+    /// Output shape == `x`. Backends without a native kernel decompose via
+    /// `unfuse` into `mul(gate, y) → add(x)`.
+    GatedResidual,
+
+    /// Packed reverse of [`Op::AdaLayerNorm`].
+    ///
+    /// Inputs: `[x, scale, shift, dy]` (same shapes as the forward).
+    /// Output: 1-D `[nx + 2·ns]` packing `dx` (numel `nx`), `dscale` (`ns`),
+    /// `dshift` (`ns`) in that order — avoids materializing `Expand` of
+    /// `[B,1,D]` modulation in the backward graph. Unpack with
+    /// [`crate::ops::backward::unpack_ada_layer_norm_backward`].
+    AdaLayerNormBackward {
+        norm: AdaNormKind,
+        eps: f32,
+    },
+
+    /// Packed reverse of [`Op::GatedResidual`].
+    ///
+    /// Inputs: `[x, y, gate, dy]`. Output: 1-D `[nx + ny + ng]` packing
+    /// `dx`, `dy`, `dgate` (row-major). Unpack with
+    /// [`crate::ops::backward::unpack_gated_residual_backward`].
+    GatedResidualBackward,
 }
 
 impl Op {
@@ -2055,6 +2457,10 @@ impl Op {
             Op::DequantGroupedMatMul { .. } => OpKind::DequantGroupedMatMul,
             Op::DequantMoEWeights { .. } => OpKind::DequantMoEWeights,
             Op::ScatterAdd => OpKind::ScatterAdd,
+            Op::ScatterNd { .. } => OpKind::ScatterNd,
+            Op::ScatterElements { .. } => OpKind::ScatterElements,
+            Op::GatherNd { .. } => OpKind::GatherNd,
+            Op::GatherElements { .. } => OpKind::GatherElements,
             Op::LoraMatMul { .. } => OpKind::LoraMatMul,
             Op::PartitionedConv { .. } => OpKind::PartitionedConv,
             Op::DequantMatMul { .. } => OpKind::DequantMatMul,
@@ -2072,6 +2478,7 @@ impl Op {
             Op::Mamba2 { .. } => OpKind::Mamba2,
             Op::FusedSwiGLU { .. } => OpKind::FusedSwiGLU,
             Op::FusedMatMulBiasAct { .. } => OpKind::FusedMatMulBiasAct,
+            Op::FusedConvBiasAct { .. } => OpKind::FusedConvBiasAct,
             Op::FusedResidualLN { .. } => OpKind::FusedResidualLN,
             Op::FusedResidualRmsNorm { .. } => OpKind::FusedResidualRmsNorm,
             Op::FusedAttentionBlock { .. } => OpKind::FusedAttentionBlock,
@@ -2092,6 +2499,32 @@ impl Op {
             Op::LogMel => OpKind::LogMel,
             Op::LogMelBackward => OpKind::LogMelBackward,
             Op::WelchPeaks { .. } => OpKind::WelchPeaks,
+            Op::BiMap => OpKind::BiMap,
+            Op::ReEig { .. } => OpKind::ReEig,
+            Op::LogEig { .. } => OpKind::LogEig,
+            Op::SpdBatchNorm { .. } => OpKind::SpdBatchNorm,
+            Op::SpdKarcherMean { .. } => OpKind::SpdKarcherMean,
+            Op::SpdKarcherMeanWeighted { .. } => OpKind::SpdKarcherMeanWeighted,
+            Op::SpdLogMap => OpKind::SpdLogMap,
+            Op::SpdExpMap => OpKind::SpdExpMap,
+            Op::SpdParallelTransport => OpKind::SpdParallelTransport,
+            Op::SpdMatrixFnBatch { .. } => OpKind::SpdMatrixFnBatch,
+            Op::ReEigBackward { .. } => OpKind::ReEigBackward,
+            Op::LogEigBackward { .. } => OpKind::LogEigBackward,
+            Op::SpdBatchNormBackwardX { .. } => OpKind::SpdBatchNormBackwardX,
+            Op::SpdBatchNormBackwardG { .. } => OpKind::SpdBatchNormBackwardG,
+            Op::SpdLogMapBackward => OpKind::SpdLogMapBackward,
+            Op::SpdExpMapBackward => OpKind::SpdExpMapBackward,
+            Op::SpdParallelTransportBackward => OpKind::SpdParallelTransportBackward,
+            Op::SpdMatrixFnBatchBackward { .. } => OpKind::SpdMatrixFnBatchBackward,
+            Op::Eigh => OpKind::Eigh,
+            Op::EighBackward => OpKind::EighBackward,
+            Op::EighBatch => OpKind::EighBatch,
+            Op::EighBatchBackward => OpKind::EighBatchBackward,
+            Op::AdaLayerNorm { .. } => OpKind::AdaLayerNorm,
+            Op::AdaLayerNormBackward { .. } => OpKind::AdaLayerNormBackward,
+            Op::GatedResidual => OpKind::GatedResidual,
+            Op::GatedResidualBackward => OpKind::GatedResidualBackward,
         }
     }
 
@@ -2131,6 +2564,7 @@ impl Op {
                 | Op::Conv3d { .. }
                 | Op::ConvTranspose3d { .. }
                 | Op::FusedMatMulBiasAct { .. }
+                | Op::FusedConvBiasAct { .. }
                 | Op::GroupedMatMul
                 | Op::DequantGroupedMatMul { .. }
                 | Op::DequantMoEWeights { .. }
@@ -2195,11 +2629,13 @@ impl Op {
             Op::FakeQuantizeLSQ { .. } => 2, // x, scale (learned param)
             Op::FakeQuantizeLSQBackwardX { .. } | Op::FakeQuantizeLSQBackwardScale { .. } => 3, // x, scale, dy
             Op::Binary(_) | Op::Compare(_) | Op::Gather { .. } | Op::MatMul | Op::ScatterAdd => 2,
-            Op::GroupedMatMul => 3,               // input, weight, expert_idx
-            Op::DequantGroupedMatMul { .. } => 3, // input, packed_w, expert_idx
-            Op::DequantMoEWeights { .. } => 1,    // packed_w
-            Op::LoraMatMul { .. } => 4,           // x, w, a, b
-            Op::PartitionedConv { .. } => 2,      // x, ir
+            Op::GatherNd { .. } | Op::GatherElements { .. } => 2,
+            Op::ScatterNd { .. } | Op::ScatterElements { .. } => 3, // data, indices, updates
+            Op::GroupedMatMul => 3,                                 // input, weight, expert_idx
+            Op::DequantGroupedMatMul { .. } => 3,                   // input, packed_w, expert_idx
+            Op::DequantMoEWeights { .. } => 1,                      // packed_w
+            Op::LoraMatMul { .. } => 4,                             // x, w, a, b
+            Op::PartitionedConv { .. } => 2,                        // x, ir
             // x, w_q, scale, zp — or x, packed_w_bytes for GGUF
             // schemes (their scales/mins live inside the packed bytes,
             // see `QuantScheme::is_gguf`).
@@ -2248,6 +2684,10 @@ impl Op {
             | Op::RmsNorm { .. } => 3, // input, gamma, beta
             Op::BatchNormInference { .. } => 5, // x, gamma, beta, mean, var
             Op::FusedMatMulBiasAct { .. } => 3, // input, weight, bias
+            Op::FusedConvBiasAct {
+                has_residual: true, ..
+            } => 4, // + residual (z)
+            Op::FusedConvBiasAct { .. } => 3,   // input, weight, bias
             Op::FusedResidualLN { has_bias: true, .. } => 5, // x, residual, bias, gamma, beta
             Op::FusedResidualLN {
                 has_bias: false, ..
@@ -2321,6 +2761,33 @@ impl Op {
             Op::LogMel => 2,
             Op::LogMelBackward => 3,
             Op::WelchPeaks { .. } => 1,
+            // ── Riemannian / SPD-manifold layers ─────────────────
+            Op::BiMap => 2,                           // W, X
+            Op::ReEig { .. } => 1,                    // X
+            Op::LogEig { .. } => 1,                   // X
+            Op::SpdBatchNorm { .. } => 3,             // X, mean, G
+            Op::SpdKarcherMean { .. } => 1,           // X
+            Op::SpdKarcherMeanWeighted { .. } => 2,   // X, weights
+            Op::SpdLogMap => 2,                       // base, X
+            Op::SpdExpMap => 2,                       // base, V
+            Op::SpdParallelTransport => 3,            // from, to, V
+            Op::SpdMatrixFnBatch { .. } => 1,         // X
+            Op::ReEigBackward { .. } => 3,            // λ, U, dY  (reuses fwd eigendecomp)
+            Op::LogEigBackward { .. } => 3,           // λ, U, dY
+            Op::SpdBatchNormBackwardX { .. } => 3,    // mean, G, dY
+            Op::SpdBatchNormBackwardG { .. } => 4,    // X, mean, G, dY
+            Op::SpdLogMapBackward => 3,               // base, x, dY
+            Op::SpdExpMapBackward => 3,               // base, v, dY
+            Op::SpdParallelTransportBackward => 4,    // from, to, v, dY
+            Op::SpdMatrixFnBatchBackward { .. } => 2, // X, dY
+            Op::Eigh => 1,                            // A
+            Op::EighBackward => 2,                    // fwd_packed, bar
+            Op::EighBatch => 1,                       // A
+            Op::EighBatchBackward => 2,               // fwd_packed, bar
+            Op::AdaLayerNorm { .. } => 3,             // x, scale, shift
+            Op::AdaLayerNormBackward { .. } => 4,     // x, scale, shift, dy
+            Op::GatedResidual => 3,                   // x, y, gate
+            Op::GatedResidualBackward => 4,           // x, y, gate, dy
         }
     }
 }
@@ -2568,6 +3035,12 @@ impl std::fmt::Display for Op {
                 state_size,
             } => write!(f, "mamba2(p={head_dim},n={state_size})"),
             Op::ScatterAdd => write!(f, "scatter_add"),
+            Op::ScatterNd { reduction } => write!(f, "scatter_nd({reduction:?})"),
+            Op::ScatterElements { axis, reduction } => {
+                write!(f, "scatter_elements(axis={axis},{reduction:?})")
+            }
+            Op::GatherNd { batch_dims } => write!(f, "gather_nd(batch_dims={batch_dims})"),
+            Op::GatherElements { axis } => write!(f, "gather_elements(axis={axis})"),
             Op::Conv { kernel_size, .. } => write!(f, "conv2d({kernel_size:?})"),
             Op::Im2Col { kernel_size, .. } => write!(f, "im2col({kernel_size:?})"),
             Op::ConvTranspose2d { kernel_size, .. } => {
@@ -2621,6 +3094,20 @@ impl std::fmt::Display for Op {
             },
             Op::FusedMatMulBiasAct { activation } => {
                 write!(f, "fused_mm_bias")?;
+                if let Some(a) = activation {
+                    write!(f, "_{a:?}")?;
+                }
+                Ok(())
+            }
+            Op::FusedConvBiasAct {
+                activation,
+                has_residual,
+                ..
+            } => {
+                write!(f, "fused_conv_bias")?;
+                if *has_residual {
+                    write!(f, "_res")?;
+                }
                 if let Some(a) = activation {
                     write!(f, "_{a:?}")?;
                 }
@@ -2879,6 +3366,44 @@ impl std::fmt::Display for Op {
             Op::WelchPeaks { k, n_segments } => {
                 write!(f, "welch_peaks(k={k}, n_segments={n_segments})")
             }
+            Op::BiMap => write!(f, "bimap()"),
+            Op::ReEig { eps } => write!(f, "reeig(eps={eps})"),
+            Op::LogEig { eps } => write!(f, "logeig(eps={eps})"),
+            Op::SpdBatchNorm { eps } => write!(f, "spd_batch_norm(eps={eps})"),
+            Op::SpdKarcherMean { iters, tol } => {
+                write!(f, "spd_karcher_mean(iters={iters}, tol={tol})")
+            }
+            Op::SpdKarcherMeanWeighted { iters, tol } => {
+                write!(f, "spd_karcher_mean_weighted(iters={iters}, tol={tol})")
+            }
+            Op::SpdLogMap => write!(f, "spd_log_map()"),
+            Op::SpdExpMap => write!(f, "spd_exp_map()"),
+            Op::SpdParallelTransport => write!(f, "spd_parallel_transport()"),
+            Op::SpdMatrixFnBatch { kind } => write!(f, "spd_matrix_fn_batch(kind={kind:?})"),
+            Op::ReEigBackward { eps } => write!(f, "reeig_backward(eps={eps})"),
+            Op::LogEigBackward { eps } => write!(f, "logeig_backward(eps={eps})"),
+            Op::SpdBatchNormBackwardX { eps } => {
+                write!(f, "spd_batch_norm_backward_x(eps={eps})")
+            }
+            Op::SpdBatchNormBackwardG { eps } => {
+                write!(f, "spd_batch_norm_backward_g(eps={eps})")
+            }
+            Op::SpdLogMapBackward => write!(f, "spd_log_map_backward()"),
+            Op::SpdExpMapBackward => write!(f, "spd_exp_map_backward()"),
+            Op::SpdParallelTransportBackward => write!(f, "spd_parallel_transport_backward()"),
+            Op::SpdMatrixFnBatchBackward { kind } => {
+                write!(f, "spd_matrix_fn_batch_backward(kind={kind:?})")
+            }
+            Op::Eigh => write!(f, "eigh()"),
+            Op::EighBackward => write!(f, "eigh_backward()"),
+            Op::EighBatch => write!(f, "eigh_batch()"),
+            Op::EighBatchBackward => write!(f, "eigh_batch_backward()"),
+            Op::AdaLayerNorm { norm, eps } => write!(f, "ada_layer_norm({norm:?},eps={eps})"),
+            Op::AdaLayerNormBackward { norm, eps } => {
+                write!(f, "ada_layer_norm_backward({norm:?},eps={eps})")
+            }
+            Op::GatedResidual => write!(f, "gated_residual"),
+            Op::GatedResidualBackward => write!(f, "gated_residual_backward"),
         }
     }
 }

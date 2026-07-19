@@ -8,7 +8,7 @@
 #![cfg(all(feature = "cpu", feature = "cuda"))]
 
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
-use rlx_runtime::{Device, Session};
+use rlx_runtime::{Device, Session, is_available};
 
 fn const_f32(g: &mut Graph, xs: &[f32]) -> NodeId {
     let mut bytes = Vec::with_capacity(xs.len() * 4);
@@ -30,6 +30,10 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 
 #[test]
 fn fft_cuda_native_matches_cpu_pow2() {
+    if !is_available(Device::Cuda) {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
     for &n in &[2usize, 4, 8, 16, 64, 256, 1024, 2048, 4096] {
         let mut re: Vec<f32> = Vec::with_capacity(n);
         let mut im: Vec<f32> = Vec::with_capacity(n);
@@ -66,6 +70,10 @@ fn fft_cuda_native_matches_cpu_pow2() {
 
 #[test]
 fn fft_cuda_round_trip_f32_pow2() {
+    if !is_available(Device::Cuda) {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
     let n: usize = 32;
     let re: Vec<f32> = (0..n).map(|i| (i as f32 * 0.3).sin()).collect();
     let im: Vec<f32> = (0..n).map(|i| (i as f32 * 0.7).cos()).collect();

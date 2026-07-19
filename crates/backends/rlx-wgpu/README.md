@@ -15,10 +15,14 @@ no FFI, no submodules.
   Metal (+ MoltenVK) on macOS. Override with `WGPU_BACKEND`. Sync wrapper
   via `pollster::block_on` so the rest of the backend matches the
   rlx-cpu / rlx-metal / rlx-mlx synchronous shape.
-- **`buffer.rs` / `Arena`** — single contiguous storage buffer; per-
-  node offsets from `rlx-opt::memory::plan_memory_aligned`. f32 host
-  I/O via `queue.write_buffer` / pooled MAP_READ staging readback
-  (`ReadbackStaging`, `read_f32_many_pooled`).
+- **`buffer.rs` / `Arena`** — logical activation arena with per-node offsets
+  from `rlx-opt::memory::plan_memory_aligned`. When the plan exceeds wgpu
+  `max_buffer_size` (~4 GiB), the arena is **striped** across multiple ≤4 GiB
+  buffers (`extra_shards`); each stripe keeps a 64 MiB stage reserve so
+  cross-shard operand copies do not clobber live activations. f32 host I/O
+  via `queue.write_buffer` / pooled MAP_READ staging readback
+  (`ReadbackStaging`, `read_f32_many_pooled`). Env: `RLX_WGPU_SHARD_LOG=1`.
+  Packed quant weights may live in a separate `weight_buffer` (`from_plan_split`).
 - **`kernels/matmul.wgsl`** — fp32 matmul, one workgroup per 8×8 output
   tile. Functional, not optimized.
 - **`kernels/mod.rs`** — `OnceLock`-cached pipeline + bind-group layout.
@@ -28,18 +32,19 @@ no FFI, no submodules.
   `dispatch` submodules (each a sibling `impl WgpuExecutable`; see `mod.rs`).
   Unsupported ops panic at compile time with a clear "fall back to
   CPU/Metal/MLX" diagnostic.
-- **GGUF dequant** — `kernels/dequant_gguf.wgsl` + `gguf_gpu.rs`: GPU
-  dequant into arena scratch, then `matmul_bt`. Falls back to `gguf_host`
-  when scratch exceeds device limits or for grouped MoE GGUF matmul.
-  Scheme ids 0–23 match Metal/CUDA. Grouped MoE uses GPU path when scratch
-  fits. Details:
+- **GGUF dequant** — `kernels/dequant_gguf.wgsl` + `gguf_gpu.rs`: fused
+  windowed GEMV for Q4_K/Q6_K/Q1_0 (scratch-free, shard-safe). Other schemes
+  dequant into scratch then `matmul_bt` when the arena is a single buffer;
+  sharded / split-weight arenas fall back to `gguf_host`. Grouped MoE GGUF
+  uses the GPU path when scratch fits and the arena is unsharded. Scheme ids
+  match Metal/CUDA. Details:
   [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
 - **FFT** — `fft_gpu.wgsl` multi-kernel pow-2 dispatch, all stages in one
   compute pass with a **per-stage uniform pool** (each stage binds its own
   slot; a *shared* uniform would alias across stages because `write_buffer`
   lands before the pass runs). Batch (`outer`) spills across the y/z grid dims
-  past wgpu's 65535 per-dimension cap. Non-pow2 uses `fft_host.rs` (host sync);
-  f64 / C64 are rejected — the wgpu arena is f32-only.
+  past wgpu's 65535 per-dimension cap. Non-pow2 / **sharded arenas** use
+  `fft_host.rs` (host sync); f64 / C64 are rejected — the wgpu arena is f32-only.
   `RLX_BENCH_DISPATCH_ONLY=1` skips output readback for micro-benchmarks.
   `RLX_DISPATCH_REPORT=1` logs `fft_gpu` vs `fft_host` step counts.
 

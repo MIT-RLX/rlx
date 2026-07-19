@@ -292,3 +292,36 @@ fn rnn_relu_multi_layer_bidirectional() {
         true,
     );
 }
+
+/// Regression guard for the class of bug that once masqueraded as a "CoreML GRU
+/// bug": a mis-sized recurrent weight must fail LOUDLY at compile time (the
+/// f32 kernels read `w_hh` through raw pointers, so an under-sized buffer would
+/// otherwise read out of bounds and return silent garbage). Here `w_hh` is
+/// under-sized by the `×hidden` factor — compiling must panic with a clear
+/// message naming `w_hh`.
+#[test]
+#[should_panic(expected = "w_hh")]
+fn undersized_w_hh_panics_loudly() {
+    let f = DType::F32;
+    let (b, s, inp, h) = (1usize, 3usize, 4usize, 4usize);
+    let mut g = Graph::new("bad_gru");
+    let x = g.input("x", Shape::new(&[b, s, inp], f));
+    let wih = g.input("w_ih", Shape::new(&[3 * h * inp], f));
+    // BUG: w_hh should be [3h·h]; supply [3h] (missing the ×h factor).
+    let whh = g.input("w_hh", Shape::new(&[3 * h], f));
+    let bih = g.input("b_ih", Shape::new(&[3 * h], f));
+    let bhh = g.input("b_hh", Shape::new(&[3 * h], f));
+    let y = g.add_node(
+        Op::Gru {
+            hidden_size: h,
+            num_layers: 1,
+            bidirectional: false,
+            carry: false,
+        },
+        vec![x, wih, whh, bih, bhh],
+        Shape::new(&[b, s, h], f),
+    );
+    g.set_outputs(vec![y]);
+    // Panics inside compile_gru's `check_rnn_lens`.
+    let _ = Session::new(Device::Cpu).compile(g);
+}

@@ -5,7 +5,6 @@
 // write-collision — avoids the need for float atomics.
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint out_dim;
@@ -24,10 +23,10 @@ void main() {
     uint t = gid % pc.trailing;
     float acc = 0.0;
     for (uint i = 0u; i < pc.num_updates; i++) {
-        uint ix = uint(data[pc.idx_off + i] + 0.5);
+        uint ix = uint(arena_load(pc.idx_off + i) + 0.5);
         if (ix == j) {
-            acc += data[pc.upd_off + i * pc.trailing + t];
+            acc += arena_load(pc.upd_off + i * pc.trailing + t);
         }
     }
-    data[pc.out_off + gid] = acc;
+    arena_store(pc.out_off + gid, acc);
 }

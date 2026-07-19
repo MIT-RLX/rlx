@@ -20,21 +20,28 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::blocks::{
-    AttnMaskStage, BertEncoderLayerStage, BindDecodeInputsStage, BlockStage, ClsTokenPoolStage,
-    CustomStage, DecodeRopeParamsStage, EmbedScaleStage, EmbedStage, GatherAddStage,
-    GatherDecodeRopeStage, GatherFromInputStage, GatherLastTokenStage, GdnScanStage, GeGluStage,
-    GeluFfnStage, GemmaDecodeLayerStage, GemmaKvTapStage, GemmaRmsNormStage, LayerNormStage,
-    LayerScaleStage, LinearStage, LlamaDecodeLayerStage, LlamaDecoderStage, LlamaKvTapStage,
-    LmHeadStage, LogitSoftcapStage, NomicEncoderLayerStage, Qwen3DecodeLayerStage,
-    Qwen3DecoderStage, RepeatStage, ResidualAddStage, ResidualSaveStage, RmsNormStage,
-    RopeTablesStage, SelfAttnPrefillStage, SwiGluStage, VisionSwiGluFfnStage, VitSelfAttnStage,
+    AdaLayerNormStage, AttnMaskStage, BertEncoderLayerStage, BiMapStage, BindDecodeInputsStage,
+    BlockStage, ClsTokenPoolStage, CustomStage, DecodeRopeParamsStage, EmbedScaleStage, EmbedStage,
+    GatedResidualStage, GatherAddStage, GatherDecodeRopeStage, GatherFromInputStage,
+    GatherLastTokenStage, GdnScanStage, GeGluStage, GeluFfnStage, GemmaDecodeLayerStage,
+    GemmaKvTapStage, GemmaRmsNormStage, LayerNormStage, LayerScaleStage, LinearStage,
+    LlamaDecodeLayerStage, LlamaDecoderStage, LlamaKvTapStage, LmHeadStage, LogEigStage,
+    LogitSoftcapStage, NomicEncoderLayerStage, Qwen3DecodeLayerStage, Qwen3DecoderStage,
+    ReEigStage, RepeatStage, ResidualAddStage, ResidualSaveStage, RmsNormStage, RopeTablesStage,
+    SelfAttnPrefillStage, SpdBatchNormStage, SwiGluStage, VisionSwiGluFfnStage, VitSelfAttnStage,
 };
 use crate::context::FlowCtx;
+use crate::stage_contract::{DynStage, LayerStage};
 use crate::stream::{DualStreamStage, LoadStreamStage, StoreStreamStage};
 use crate::value::FlowValue;
 /// One stage in a model flow. Model authors compose these — not HIR ops.
 #[derive(Debug, Clone)]
 pub enum FlowStage {
+    /// Downstream-defined [`LayerStage`] (extension seam — no core edit needed).
+    ///
+    /// Lets a crate outside `rlx-flow` inject its own composable block into a
+    /// flow via [`ModelFlow::layer`](crate::ModelFlow::layer). See [`LayerStage`].
+    Dynamic(DynStage),
     /// Token embedding lookup.
     Embed(EmbedStage),
     /// Precomputed RoPE sin/cos tables as params.
@@ -69,6 +76,10 @@ pub enum FlowStage {
     ResidualSave(ResidualSaveStage),
     /// Add saved skip connection.
     ResidualAdd(ResidualAddStage),
+    /// DiT adaLN-Zero modulation (scale/shift from bound inputs).
+    AdaLayerNorm(AdaLayerNormStage),
+    /// DiT gated residual (`x + gate·y`) using saved skip + gate input.
+    GatedResidual(GatedResidualStage),
     /// SwiGLU feed-forward (gate/up/down).
     SwiGlu(SwiGluStage),
     /// Prefill self-attention (QKV + RoPE + GQA + causal mask).
@@ -123,15 +134,42 @@ pub enum FlowStage {
     GemmaKvTap(GemmaKvTapStage),
     /// Gemma GeGLU FFN.
     GeGlu(GeGluStage),
+    /// SPDNet BiMap bilinear mapping (`Y = W·X·Wᵀ`).
+    BiMap(BiMapStage),
+    /// SPDNet ReEig eigenvalue-rectification nonlinearity.
+    ReEig(ReEigStage),
+    /// SPDNet LogEig matrix-log (SPD manifold → tangent space).
+    LogEig(LogEigStage),
+    /// SPD batch-norm affine transport (eval-mode; frozen running mean).
+    SpdBatchNorm(SpdBatchNormStage),
 }
 
 impl FlowStage {
+    /// Wrap a downstream [`LayerStage`] as a flow stage (extension seam).
+    ///
+    /// Prefer the `.layer(..)` builder methods on
+    /// [`ModelFlow`](crate::ModelFlow) / [`LayerStack`](crate::LayerStack); this
+    /// is the underlying constructor for callers that build `FlowStage` values
+    /// directly (e.g. inside a [`RepeatStage`] closure).
+    pub fn dynamic(stage: impl LayerStage + 'static) -> Self {
+        FlowStage::Dynamic(DynStage::new(stage))
+    }
+
     pub(crate) fn emit(
         &self,
         ctx: &mut FlowCtx<'_>,
         input: Option<FlowValue>,
     ) -> Result<Option<FlowValue>> {
         match self {
+            FlowStage::Dynamic(s) => {
+                let input =
+                    input.ok_or_else(|| anyhow::anyhow!("dynamic layer stage requires input"))?;
+                // Side-output shapes in `StageArtifacts` are a declared contract;
+                // the stage itself registers any side node ids through `ctx`
+                // (state / `SideOutputs`), mirroring the built-in KV-tap stages.
+                let (value, _artifacts) = s.0.emit_layer(ctx, input)?;
+                Ok(Some(value))
+            }
             FlowStage::Embed(s) => {
                 let input = input.ok_or_else(|| anyhow::anyhow!("Embed requires input"))?;
                 s.emit(ctx, input)
@@ -208,6 +246,14 @@ impl FlowStage {
             }
             FlowStage::ResidualAdd(s) => {
                 let input = input.ok_or_else(|| anyhow::anyhow!("ResidualAdd requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::AdaLayerNorm(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("AdaLayerNorm requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::GatedResidual(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("GatedResidual requires input"))?;
                 s.emit(ctx, input)
             }
             FlowStage::SwiGlu(s) => {
@@ -311,6 +357,22 @@ impl FlowStage {
             }
             FlowStage::GeGlu(s) => {
                 let input = input.ok_or_else(|| anyhow::anyhow!("GeGlu requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::BiMap(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("BiMap requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::ReEig(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("ReEig requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::LogEig(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("LogEig requires input"))?;
+                s.emit(ctx, input)
+            }
+            FlowStage::SpdBatchNorm(s) => {
+                let input = input.ok_or_else(|| anyhow::anyhow!("SpdBatchNorm requires input"))?;
                 s.emit(ctx, input)
             }
         }

@@ -132,7 +132,12 @@ impl V {
 
     /// `always_ff @(posedge clk) begin ... end`.
     pub fn always_ff(&mut self, body: impl FnOnce(&mut Self)) {
-        self.line("always_ff @(posedge clk) begin");
+        self.always_ff_on("clk", body);
+    }
+
+    /// `always_ff @(posedge <clk_port>) begin ... end`.
+    pub fn always_ff_on(&mut self, clk: &str, body: impl FnOnce(&mut Self)) {
+        self.line(&format!("always_ff @(posedge {clk}) begin"));
         self.block(body);
         self.line("end");
     }

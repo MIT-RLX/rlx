@@ -26,6 +26,16 @@
 
 use crate::quant::quantize_multiplier;
 
+/// How packed weight nibbles/bytes are interpreted in the MAC path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WeightEncoding {
+    /// Two's-complement signed INT2/4/8 (cortexm / TFLite-Micro layout).
+    #[default]
+    SignedInt,
+    /// OCP FP4 E2M1 codes in 4-bit nibbles; unpack via FP4→fixed LUT.
+    Fp4E2M1,
+}
+
 /// One layer in the forward pass. Shapes are NHWC (matches cortexm).
 #[derive(Debug, Clone)]
 pub enum Layer {
@@ -45,6 +55,7 @@ pub enum Layer {
         w_zp: i32,
         out_zp: i32,
         weight_bits: u8,
+        weight_encoding: WeightEncoding,
         /// `[c_out]` Q0.31 (M0, shift) pairs.
         requant: Vec<(i32, i32)>,
         /// Packed weight bytes (i8 view) — same layout cortexm uses.
@@ -75,6 +86,7 @@ pub enum Layer {
         w_zp: i32,
         out_zp: i32,
         weight_bits: u8,
+        weight_encoding: WeightEncoding,
         requant: Vec<(i32, i32)>,
         weights: Vec<i8>,
         bias: Option<Vec<i32>>,
@@ -138,12 +150,23 @@ impl Layer {
     }
 }
 
+/// Extra named readout tap (multi-output bind) — buffer after `after_layer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraOutput {
+    pub name: String,
+    pub len: usize,
+    /// Index into [`Model::layers`] whose output buffer holds this tensor.
+    pub after_layer: usize,
+}
+
 /// A complete model: the input length and an ordered list of layers.
 #[derive(Debug, Clone)]
 pub struct Model {
     pub name: String,
     pub input_len: usize,
     pub layers: Vec<Layer>,
+    /// Additional memory-readout banks from [`crate::export_config::GraphIoBind`].
+    pub extra_outputs: Vec<ExtraOutput>,
 }
 
 impl Model {
@@ -165,6 +188,7 @@ impl Model {
 ///          → conv2[11×11×16] → relu → pool2[5×5×16]
 ///          → fc\[10\] → argmax.
 pub fn tinyconv_mnist_from_cortexm() -> Model {
+    use WeightEncoding::SignedInt;
     use rlx_cortexm::model_weights as w;
 
     fn requant_table(mults: &[f32]) -> Vec<(i32, i32)> {
@@ -187,6 +211,7 @@ pub fn tinyconv_mnist_from_cortexm() -> Model {
         w_zp: 0,
         out_zp: 0,
         weight_bits: w::WEIGHT_BITS,
+        weight_encoding: SignedInt,
         requant: requant_table(w::CONV1_MULT),
         weights: w::CONV1_W.to_vec(),
         bias: Some(w::CONV1_B.to_vec()),
@@ -222,6 +247,7 @@ pub fn tinyconv_mnist_from_cortexm() -> Model {
         w_zp: 0,
         out_zp: 0,
         weight_bits: w::WEIGHT_BITS,
+        weight_encoding: SignedInt,
         requant: requant_table(w::CONV2_MULT),
         weights: w::CONV2_W.to_vec(),
         bias: Some(w::CONV2_B.to_vec()),
@@ -249,6 +275,7 @@ pub fn tinyconv_mnist_from_cortexm() -> Model {
         w_zp: 0,
         out_zp: 0,
         weight_bits: w::WEIGHT_BITS,
+        weight_encoding: SignedInt,
         requant: requant_table(w::FC_MULT),
         weights: w::FC_W.to_vec(),
         bias: Some(w::FC_B.to_vec()),
@@ -262,6 +289,7 @@ pub fn tinyconv_mnist_from_cortexm() -> Model {
         name: "tinyconv_mnist".to_string(),
         input_len: 28 * 28,
         layers: vec![conv1, relu1, pool1, conv2, relu2, pool2, fc, argmax],
+        extra_outputs: vec![],
     }
 }
 

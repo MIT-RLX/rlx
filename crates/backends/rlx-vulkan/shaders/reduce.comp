@@ -4,7 +4,6 @@
 // op: 0 sum 1 mean 2 max 3 min 4 prod.
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint outer;  // number of output rows
@@ -24,7 +23,7 @@ void main() {
     else if (pc.op == 4u) { acc = 1.0; }               // prod
     else { acc = 0.0; }                                // sum/mean
     for (uint i = 0u; i < pc.r; i++) {
-        float x = data[base + i];
+        float x = arena_load(base + i);
         switch (pc.op) {
             case 0u: acc += x; break;
             case 1u: acc += x; break;
@@ -34,5 +33,5 @@ void main() {
         }
     }
     if (pc.op == 1u && pc.r > 0u) { acc /= float(pc.r); }
-    data[pc.out_off + o] = acc;
+    arena_store(pc.out_off + o, acc);
 }

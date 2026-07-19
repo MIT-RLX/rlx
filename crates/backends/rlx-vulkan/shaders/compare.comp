@@ -3,7 +3,6 @@
 // op: 0 eq 1 ne 2 lt 3 le 4 gt 5 ge.
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint n;
@@ -20,8 +19,8 @@ void main() {
     if (i >= pc.n) { return; }
     uint ai = (pc.a_mod == 0u) ? i : (i % pc.a_mod);
     uint bi = (pc.b_mod == 0u) ? i : (i % pc.b_mod);
-    float a = data[pc.a_off + ai];
-    float b = data[pc.b_off + bi];
+    float a = arena_load(pc.a_off + ai);
+    float b = arena_load(pc.b_off + bi);
     bool r = false;
     switch (pc.op) {
         case 0u: r = (a == b); break;
@@ -32,5 +31,5 @@ void main() {
         case 5u: r = (a >= b); break;
         default: r = false; break;
     }
-    data[pc.c_off + i] = r ? 1.0 : 0.0;
+    arena_store(pc.c_off + i, r ? 1.0 : 0.0);
 }

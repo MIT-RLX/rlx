@@ -32,6 +32,10 @@
 //! - `lower`   — rlx-ir Graph → MLX op chain
 //! - `backend` — `MlxExecutable` (set_param / run / handles)
 
+/// Legalization op claim — always available (no MLX host required).
+pub mod supported_ops;
+pub use supported_ops::SUPPORTED_OPS;
+
 #[cfg(rlx_mlx_host)]
 pub(crate) mod ffi {
     pub use rlx_mlx_sys::ffi::*;
@@ -74,6 +78,9 @@ pub mod splat;
 pub mod batched_lu_kernel;
 
 #[cfg(rlx_mlx_host)]
+pub mod dequant_q1_0;
+
+#[cfg(rlx_mlx_host)]
 pub mod llada2_gate;
 // Host-only: depends on `op_registry` (itself `rlx_mlx_host`-gated). Without
 // this gate the module leaks onto non-host targets (e.g. iOS) and fails to
@@ -92,8 +99,9 @@ pub use backend::MlxExecutable;
 pub use compiled::CompiledFn;
 #[cfg(rlx_mlx_host)]
 pub use config::{
-    COMPILE_OUTPUT_CAP_ENV, DEFAULT_COMPILE_OUTPUT_CAP, compile_output_cap,
-    reset_compile_output_cap, set_compile_output_cap,
+    COMPILE_OUTPUT_CAP_ENV, DEFAULT_COMPILE_OUTPUT_CAP, MlxRuntimeConfig, compile_output_cap,
+    install_runtime_config, reload_runtime_config, reset_compile_output_cap, runtime_config,
+    set_compile_output_cap,
 };
 #[cfg(rlx_mlx_host)]
 pub use distributed::MlxTransport;

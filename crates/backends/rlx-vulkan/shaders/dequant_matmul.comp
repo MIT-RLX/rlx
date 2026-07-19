@@ -1,56 +1,40 @@
 #version 450
-// Fused GGUF K-quant dequant + GEMV (decode, m == 1) for Op::DequantMatMul.
+// Fused GGUF K-quant / Q1_0 dequant + GEMV (decode, m == 1) for Op::DequantMatMul.
 //
 // Computes out[1, n] = x[1, k] @ Wᵀ where W is [n, k] row-major in packed
 // GGUF block layout (the same orientation as rlx-cpu `gguf_matmul_bt`). One
-// invocation owns one output column `j`: it walks the k/256 super-blocks that
-// make up row `j`, dequantizes each 256-element block into a private array
-// (mirroring the verified rlx-gguf `dequant_q4_k_block` / `dequant_q6_k_block`
-// reference math), and accumulates `Σ x[p] · w[j,p]`.
+// invocation owns one output column `j`.
 //
-// The f32-uniform arena is viewed here as raw 32-bit words so we can pull the
-// packed weight bytes (and f16 scales) out of the same buffer the f32
-// activations live in. Scheme: 0 = Q4_K (144 B / 256 elems), 1 = Q6_K (210 B).
+// Scheme: 0 = Q4_K (144 B / 256 elems), 1 = Q6_K (210 B / 256),
+//         2 = Q1_0 (18 B / 128 elems, prism-ml Bonsai).
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) buffer Arena { uint data[]; };
 
 layout(push_constant) uniform PC {
     uint n;         // output columns (rows of W)
-    uint k;         // contraction dim (multiple of 256)
+    uint k;         // contraction dim
     uint x_word;    // f32-word offset of x activations
     uint w_word;    // f32-word offset of the packed weight bytes (16-B aligned)
     uint out_word;  // f32-word offset of the output
-    uint scheme;    // 0 = Q4_K, 1 = Q6_K
+    uint scheme;    // 0 = Q4_K, 1 = Q6_K, 2 = Q1_0
 } pc;
 
-// Read one byte at offset `rel` (in bytes) RELATIVE to the weight's word base
-// (`pc.w_word`). We index `data[w_word + rel/4]` and extract byte `rel & 3`
-// rather than forming an absolute byte address `w_word*4 + rel`: the latter
-// overflows u32 once the arena exceeds 4 GiB, so weights past the 4 GiB mark
-// would read garbage (→ NaN logits). Word-relative addressing never forms a
-// value larger than `w_word + rel/4` words (< 4 Gi words even for a ~16 GiB
-// arena). Valid because slots are ≥4-byte aligned, so `w_word*4` is the exact
-// 4-aligned byte base and `(w_word*4 + rel) & 3 == rel & 3`.
+// Read one byte at offset `rel` (in bytes) RELATIVE to the weight's word base.
 uint rd_byte(uint rel) {
-    uint w = data[pc.w_word + (rel >> 2u)];
+    uint w = arena_load_u(pc.w_word + (rel >> 2u));
     return (w >> ((rel & 3u) * 8u)) & 0xFFu;
 }
 
-// Read one little-endian f16 at weight-relative byte offset `rel` (2-byte aligned).
 float rd_f16(uint rel) {
-    uint w = data[pc.w_word + (rel >> 2u)];
+    uint w = arena_load_u(pc.w_word + (rel >> 2u));
     uint h = (w >> ((rel & 3u) * 8u)) & 0xFFFFu;
     return unpackHalf2x16(h).x;
 }
 
-// Sign-extend an 8-bit value to a signed int (i8 cast).
 int sx8(uint b) {
     return int(b) - 256 * int((b >> 7u) & 1u);
 }
 
-// Q4_K 6-bit (scale, min) bit-interleave — mirrors get_scale_min_k4.
-// `sc_base` is the absolute byte address of the 12-byte scales region.
 void scale_min_k4(uint j, uint sc_base, out uint sc, out uint mn) {
     if (j < 4u) {
         sc = rd_byte(sc_base + j) & 63u;
@@ -66,18 +50,37 @@ void main() {
     uint j = gl_GlobalInvocationID.x;
     if (j >= pc.n) { return; }
 
-    uint blocks_per_row = pc.k / 256u;
-    uint block_bytes = (pc.scheme == 0u) ? 144u : 210u;
-
-    float blk[256];
     float acc = 0.0;
 
+    if (pc.scheme == 2u) {
+        // ── Q1_0: 18 B / 128 elems (f16 d | 16 sign bytes, LSB-first) ──────
+        uint blocks_per_row = pc.k / 128u;
+        for (uint r = 0u; r < blocks_per_row; r++) {
+            uint gbi = j * blocks_per_row + r;
+            uint base = gbi * 18u;
+            float d = rd_f16(base);
+            float neg_d = -d;
+            uint qs_base = base + 2u;
+            uint xb = pc.x_word + r * 128u;
+            for (uint t = 0u; t < 128u; t++) {
+                uint bit = (rd_byte(qs_base + (t >> 3u)) >> (t & 7u)) & 1u;
+                float w = (bit != 0u) ? d : neg_d;
+                acc += uintBitsToFloat(arena_load_u(xb + t)) * w;
+            }
+        }
+        arena_store_u(pc.out_word + j, floatBitsToUint(acc));
+        return;
+    }
+
+    uint blocks_per_row = pc.k / 256u;
+    uint block_bytes = (pc.scheme == 0u) ? 144u : 210u;
+    float blk[256];
+
     for (uint r = 0u; r < blocks_per_row; r++) {
-        uint gbi = j * blocks_per_row + r;        // global super-block index
-        uint base = gbi * block_bytes;            // weight-relative byte of block
+        uint gbi = j * blocks_per_row + r;
+        uint base = gbi * block_bytes;
 
         if (pc.scheme == 0u) {
-            // ── Q4_K: d(f16), dmin(f16), scales[12], qs[128] ──────────────
             float d = rd_f16(base);
             float dmin = rd_f16(base + 2u);
             uint sc_base = base + 4u;
@@ -105,7 +108,6 @@ void main() {
                 is += 32u;
             }
         } else {
-            // ── Q6_K: ql[128], qh[64], sc[16] (i8), d(f16) ────────────────
             uint ql_base = base;
             uint qh_base = base + 128u;
             uint sc_base = base + 192u;
@@ -134,9 +136,9 @@ void main() {
 
         uint xb = pc.x_word + r * 256u;
         for (uint t = 0u; t < 256u; t++) {
-            acc += uintBitsToFloat(data[xb + t]) * blk[t];
+            acc += uintBitsToFloat(arena_load_u(xb + t)) * blk[t];
         }
     }
 
-    data[pc.out_word + j] = floatBitsToUint(acc);
+    arena_store_u(pc.out_word + j, floatBitsToUint(acc));
 }

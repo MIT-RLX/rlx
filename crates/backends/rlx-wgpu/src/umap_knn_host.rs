@@ -16,6 +16,7 @@
 //! Host-side `Op::Custom("umap.knn")` for wgpu arenas (small `n` only).
 
 use crate::buffer::Arena;
+use crate::host_stage::WgpuArena;
 
 /// Prefer the in-GPU `umap_knn.wgsl` kernel at or above this point count.
 pub const UMAP_KNN_GPU_MIN_N: usize = 256;
@@ -29,10 +30,13 @@ pub fn run_umap_knn(
     n: usize,
     k: usize,
 ) {
-    let pw_bytes = n * n * 4;
-    let pw_host = arena.read_bytes_range(device, queue, pairwise_byte_off, pw_bytes);
-    let pairwise: Vec<f32> = bytemuck::cast_slice(&pw_host).to_vec();
-    let mut packed = vec![0f32; n * 2 * k];
-    rlx_cpu::umap_knn::knn_forward_packed(&pairwise, n, k, &mut packed);
-    arena.write_bytes_range(queue, out_byte_off, bytemuck::cast_slice(&packed));
+    debug_assert_eq!(pairwise_byte_off % 4, 0);
+    debug_assert_eq!(out_byte_off % 4, 0);
+    let mut a = WgpuArena {
+        arena,
+        device,
+        queue,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_umap_knn(&mut a, pairwise_byte_off / 4, out_byte_off / 4, n, k);
 }

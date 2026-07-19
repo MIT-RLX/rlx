@@ -302,6 +302,8 @@ pub(crate) struct PyDeviceCandidate {
     recommended: bool,
     #[pyo3(get)]
     blocker: Option<String>,
+    #[pyo3(get)]
+    capabilities: Vec<String>,
 }
 
 impl From<DeviceCandidate> for PyDeviceCandidate {
@@ -313,6 +315,7 @@ impl From<DeviceCandidate> for PyDeviceCandidate {
             supports_graph: row.supports_graph,
             recommended: row.recommended,
             blocker: row.blocker,
+            capabilities: row.capabilities.iter().map(|s| (*s).to_string()).collect(),
         }
     }
 }

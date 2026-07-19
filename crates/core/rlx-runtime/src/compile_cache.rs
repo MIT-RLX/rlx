@@ -241,11 +241,64 @@ pub struct BucketedCompileCache {
     device: Device,
     policy: Option<rlx_opt::PrecisionPolicy>,
     buckets: Vec<Bucket>,
+    /// Upper bound of the bucket whose uploaded weight buffer serves as the
+    /// canonical donor for [`Self::try_share_params_from_donor`]. The first
+    /// bucket to receive a real weight upload records itself here; later buckets
+    /// with a byte-identical layout retain its buffer instead of duplicating it.
+    weight_donor_upper: Option<u64>,
+    /// Monotonic access counter driving LRU eviction of large buckets.
+    clock: u64,
 }
 
 struct Bucket {
     range: Range<u64>,
     compiled: Option<CompiledGraph>,
+    /// Weight bytes uploaded into this bucket's arena (0 until compiled with
+    /// params). Used only to classify a bucket as "large" for eviction.
+    resident_bytes: usize,
+    /// `clock` value at last access; smallest = least-recently-used.
+    last_used: u64,
+}
+
+/// A bucket whose baked-in weights reach this size is "large" and eligible for
+/// LRU eviction (always on discrete VRAM; on unified memory only when the user
+/// opts in via `RLX_KV_CACHE_MAX_RESIDENT`). Below it, buckets are never evicted
+/// — small models keep the full power-of-two ladder resident (no behavior
+/// change). Off-switch everywhere: `RLX_KV_CACHE_NO_EVICT`.
+const LARGE_BUCKET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Max number of *large* buckets kept resident at once. Non-packed f32 decode
+/// bakes the full weight set (multi-GB) into every bucket's arena, so an
+/// N-rung ladder would pin N copies on the GPU and OOM. Monotonic decode only
+/// ever needs the current rung, so a cap of 1 is effectively free within a
+/// generation (a smaller rung is never revisited before it would be evicted)
+/// and keeps the transient compile peak to `prefill + one arena + its upload
+/// staging buffer` instead of also pinning a spare multi-GB copy — the latter
+/// pushes a 3 GB×N ladder past a 16 GB card. Override with
+/// `RLX_KV_CACHE_MAX_RESIDENT` (min 1) to trade VRAM for cross-bucket reuse.
+fn max_resident_large_buckets() -> usize {
+    std::env::var("RLX_KV_CACHE_MAX_RESIDENT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
+}
+
+/// Discrete-VRAM backends always cap large decode buckets (limited VRAM would
+/// OOM). Unified-memory devices (CPU / Metal / MLX / ANE) keep the full ladder
+/// resident by DEFAULT — warm for servers doing many short generations — and
+/// opt into capping via `RLX_KV_CACHE_MAX_RESIDENT` (see [`evict_for_incoming`]).
+fn device_has_discrete_vram(dev: Device) -> bool {
+    matches!(
+        dev,
+        Device::Gpu
+            | Device::Cuda
+            | Device::Vulkan
+            | Device::Rocm
+            | Device::OneApi
+            | Device::DirectX
+            | Device::WebGpu
+    )
 }
 
 impl BucketedCompileCache {
@@ -321,12 +374,90 @@ impl BucketedCompileCache {
             .map(|range| Bucket {
                 range,
                 compiled: None,
+                resident_bytes: 0,
+                last_used: 0,
             })
             .collect();
         Self {
             device,
             policy,
             buckets,
+            weight_donor_upper: None,
+            clock: 0,
+        }
+    }
+
+    /// Mark bucket `idx` as most-recently-used.
+    fn touch(&mut self, idx: usize) {
+        self.clock += 1;
+        self.buckets[idx].last_used = self.clock;
+    }
+
+    /// Before compiling a new bucket `idx` that will bake in `incoming_bytes`
+    /// of weights, free least-recently-used *large* buckets so that (existing
+    /// large + this one) stays within [`max_resident_large_buckets`]. Only
+    /// large incoming weights trigger this — small models are untouched, and
+    /// the current bucket is never a victim. Runs *before* the new arena is
+    /// allocated so the transient peak is `cap` copies, not `cap + 1`.
+    fn evict_for_incoming(&mut self, incoming_idx: usize, incoming_bytes: usize) {
+        if std::env::var("RLX_KV_CACHE_NO_EVICT").is_ok() {
+            return;
+        }
+        // Discrete VRAM always caps large buckets. Unified memory keeps the full
+        // ladder by default (no cross-generation recompiles) and opts in via
+        // RLX_KV_CACHE_MAX_RESIDENT — for a big model (e.g. Bonsai-27B, ~3.6 GB
+        // baked into every decode bucket) whose inline duplication would grow
+        // across a long generation. Monotonic host-fed-KV decode never revisits a
+        // climbed-past bucket, so capping is safe and ~free within a generation.
+        let unified_opt_in = std::env::var("RLX_KV_CACHE_MAX_RESIDENT").is_ok();
+        if !device_has_discrete_vram(self.device) && !unified_opt_in {
+            return;
+        }
+        if std::env::var("RLX_KV_CACHE_DBG").is_ok() {
+            let (n_large, resident): (usize, usize) = self
+                .buckets
+                .iter()
+                .filter(|b| b.compiled.is_some())
+                .fold((0, 0), |(n, r), b| {
+                    let is_large = b.resident_bytes >= LARGE_BUCKET_BYTES;
+                    (n + is_large as usize, r + b.resident_bytes)
+                });
+            eprintln!(
+                "[KVCACHE] compiling bucket idx={incoming_idx} incoming={:.2}GB \
+                 resident_large={n_large} resident_total={:.2}GB cap={}",
+                incoming_bytes as f64 / 1e9,
+                resident as f64 / 1e9,
+                max_resident_large_buckets(),
+            );
+        }
+        if incoming_bytes < LARGE_BUCKET_BYTES {
+            return;
+        }
+        let cap = max_resident_large_buckets();
+        loop {
+            let large: Vec<usize> = (0..self.buckets.len())
+                .filter(|&j| {
+                    j != incoming_idx
+                        && self.buckets[j].compiled.is_some()
+                        && self.buckets[j].resident_bytes >= LARGE_BUCKET_BYTES
+                })
+                .collect();
+            // `+ 1` reserves a slot for the bucket about to be compiled.
+            if large.len() < cap {
+                break;
+            }
+            let Some(&victim) = large.iter().min_by_key(|&&j| self.buckets[j].last_used) else {
+                break;
+            };
+            if let Some(c) = &mut self.buckets[victim].compiled {
+                c.sync_pending();
+            }
+            let victim_upper = self.buckets[victim].range.end.saturating_sub(1);
+            self.buckets[victim].compiled = None;
+            self.buckets[victim].resident_bytes = 0;
+            if self.weight_donor_upper == Some(victim_upper) {
+                self.weight_donor_upper = None;
+            }
         }
     }
 
@@ -465,6 +596,86 @@ impl BucketedCompileCache {
             return false;
         };
         dst_c.copy_params_from(src_c)
+    }
+
+    /// The bucket currently designated as the shared weight donor, if any.
+    pub fn weight_donor(&self) -> Option<&CompiledGraph> {
+        self.compiled_for_upper(self.weight_donor_upper?)
+    }
+
+    /// Record the bucket at `upper` as the canonical shared weight donor.
+    /// The first bucket to receive a real weight upload calls this; later
+    /// buckets share its buffer via [`Self::try_share_params_from_donor`].
+    pub fn set_weight_donor(&mut self, upper: u64) {
+        if self.weight_donor_upper.is_none() {
+            self.weight_donor_upper = Some(upper);
+        }
+    }
+
+    /// Retain the donor bucket's weight buffer for the bucket at `dst_upper`
+    /// (one GPU copy for both) when their layout matches exactly. Returns false
+    /// — caller must upload — when there is no donor or the layout differs.
+    ///
+    /// If the recorded donor was evicted, tries any other live compiled bucket
+    /// as a share source (needed when `RLX_KV_CACHE_MAX_RESIDENT=1` climbs).
+    pub fn try_share_params_from_donor(&mut self, dst_upper: u64) -> bool {
+        if std::env::var("RLX_METAL_NO_SHARE").is_ok() {
+            return false;
+        }
+        let mut candidates: Vec<u64> = Vec::new();
+        if let Some(src) = self.weight_donor_upper {
+            candidates.push(src);
+        }
+        for b in &self.buckets {
+            if b.compiled.is_none() {
+                continue;
+            }
+            let u = b.range.end.saturating_sub(1);
+            if u != dst_upper && !candidates.contains(&u) {
+                candidates.push(u);
+            }
+        }
+        for src_upper in candidates {
+            if self.try_share_params_between_uppers(dst_upper, src_upper) {
+                self.weight_donor_upper = Some(src_upper);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn try_share_params_between_uppers(&mut self, dst_upper: u64, src_upper: u64) -> bool {
+        if dst_upper == src_upper {
+            return true;
+        }
+        let dst_idx = self
+            .buckets
+            .iter()
+            .position(|b| b.range.end.saturating_sub(1) == dst_upper);
+        let src_idx = self
+            .buckets
+            .iter()
+            .position(|b| b.range.end.saturating_sub(1) == src_upper);
+        let (Some(dst_idx), Some(src_idx)) = (dst_idx, src_idx) else {
+            return false;
+        };
+        if dst_idx == src_idx {
+            return true;
+        }
+        let (dst, src) = if dst_idx < src_idx {
+            let (left, right) = self.buckets.split_at_mut(src_idx);
+            (&mut left[dst_idx], &right[0])
+        } else {
+            let (left, right) = self.buckets.split_at_mut(dst_idx);
+            (&mut right[0], &left[src_idx])
+        };
+        let Some(dst_c) = dst.compiled.as_mut() else {
+            return false;
+        };
+        let Some(src_c) = src.compiled.as_ref() else {
+            return false;
+        };
+        dst_c.share_params_from(src_c)
     }
 
     /// D2D seed resident KV from `src_key`'s bucket into `dst_key`'s bucket.
@@ -721,6 +932,8 @@ impl BucketedCompileCache {
         let upper = self.buckets[idx].range.end - 1;
         if self.buckets[idx].compiled.is_none() {
             let (graph, params) = build(upper);
+            let bytes: usize = params.values().map(|v| v.len() * 4).sum();
+            self.evict_for_incoming(idx, bytes);
             let mut session = Session::new(self.device);
             if let Some(p) = &self.policy {
                 session = session.with_policy(p.clone());
@@ -730,7 +943,9 @@ impl BucketedCompileCache {
                 compiled.set_param(&name, &data);
             }
             self.buckets[idx].compiled = Some(compiled);
+            self.buckets[idx].resident_bytes = bytes;
         }
+        self.touch(idx);
         Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
     }
 
@@ -748,6 +963,11 @@ impl BucketedCompileCache {
         let upper = self.buckets[idx].range.end - 1;
         if self.buckets[idx].compiled.is_none() {
             let (hir, params) = build(upper);
+            let bytes: usize = params.values().map(|v| v.len() * 4).sum();
+            // Defer `evict_for_incoming` until after the caller shares/uploads
+            // packed weights (`note_resident_bytes`). Compiling first keeps the
+            // previous rung alive long enough to `try_share_params_from_donor`
+            // under `RLX_KV_CACHE_MAX_RESIDENT=1` (no multi-GB re-upload).
             let mut session = Session::new(self.device);
             if let Some(p) = &self.policy {
                 session = session.with_policy(p.clone());
@@ -759,8 +979,32 @@ impl BucketedCompileCache {
                 compiled.set_param(&name, &data);
             }
             self.buckets[idx].compiled = Some(compiled);
+            self.buckets[idx].resident_bytes = bytes;
         }
+        self.touch(idx);
         Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
+    }
+
+    /// Record additional resident weight bytes after a packed GGUF upload.
+    ///
+    /// F32 `params` alone under-count packed Q1_0 / Q4_K arenas (~3–4 GiB), so
+    /// without this call discrete-VRAM eviction never classifies buckets as
+    /// "large" and keeps every rung resident → OOM on 16 GB cards.
+    pub fn note_resident_bytes(&mut self, key: u64, extra_bytes: usize) {
+        if extra_bytes == 0 {
+            return;
+        }
+        let Some(idx) = self.bucket_for(key) else {
+            return;
+        };
+        let before = self.buckets[idx].resident_bytes;
+        let after = before.saturating_add(extra_bytes);
+        // Evict *other* large buckets if this update crosses the threshold.
+        if after >= LARGE_BUCKET_BYTES {
+            self.evict_for_incoming(idx, after);
+        }
+        self.buckets[idx].resident_bytes = after;
+        self.touch(idx);
     }
 
     /// [`Self::run_padded`] with per-input optional row padding (`CacheRunInput`).

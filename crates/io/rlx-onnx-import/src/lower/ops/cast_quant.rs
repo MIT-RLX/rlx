@@ -53,7 +53,14 @@ pub(super) fn lower_cast(
     };
     let in_s = m.shape(x).clone();
     let in_dims = in_s.dims().to_vec();
-    let mut out_s = output_shape(ctx, node, m, x).with_dtype(dtype);
+    // A Cast is elementwise — its output shape ALWAYS equals its input shape. The
+    // ONNX `output_meta` can carry a rank-collapsed symbolic shape (the T5 encoder's
+    // extended attention mask `[1,1,1,128]` resolves to `[128]`, same element count
+    // so the old numel guard missed it); trusting it inserts a spurious Reshape that
+    // flattens the mask and re-lands it on the QUERY axis → real queries attend to
+    // padding keys (encoder cosine 0.47, garbled audio). Only the `waveform`/
+    // `duration` sink outputs intentionally re-cap the element count.
+    let mut out_s = in_s.clone().with_dtype(dtype);
     if node.outputs.iter().any(|o| o == "waveform") {
         let cap = ctx.opts.max_waveform_samples;
         let n = in_s.num_elements().unwrap_or(1).min(cap);
@@ -61,13 +68,6 @@ pub(super) fn lower_cast(
     } else if node.outputs.iter().any(|o| o == "duration") {
         let n = in_s.num_elements().unwrap_or(1);
         out_s = Shape::new(&[n.max(1)], dtype);
-    } else if !node
-        .outputs
-        .iter()
-        .any(|o| o == "waveform" || o == "duration")
-        && out_s.num_elements() != in_s.num_elements()
-    {
-        out_s = in_s.clone().with_dtype(dtype);
     }
     let needs_reshape = out_s.dims() != in_dims.as_slice()
         && !node

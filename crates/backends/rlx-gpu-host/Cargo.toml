@@ -1,0 +1,26 @@
+[package]
+name = "rlx-gpu-host"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Backend-agnostic host-fallback kernels (D2H → CPU → H2D) shared by RLX GPU backends (rlx-cuda / rlx-rocm)."
+authors.workspace      = true
+license.workspace      = true
+keywords = ["gpu", "cpu", "fallback", "rlx", "kernels"]
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[dependencies]
+# The actual host compute lives in rlx-cpu; this crate only owns the
+# stage-to-host / run / stage-back plumbing that every GPU backend shared.
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.13", features = ["splat"] }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
+# SPD host-fallback builds a one-op CPU graph and plans its arena.
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.13" }
+bytemuck = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

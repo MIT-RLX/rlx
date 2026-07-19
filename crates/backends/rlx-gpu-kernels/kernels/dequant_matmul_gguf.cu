@@ -3,15 +3,28 @@
 //
 // GPL-3.0-only. Fused GGUF K-quant dequant + GEMV (decode, m == 1).
 // Mirrors rlx-vulkan/shaders/dequant_matmul.comp and rlx-cpu gguf_matmul_bt.
+//
+// Schemes: 0 = Q4_K (256 elems / 144 B), 2 = Q6_K (256 / 210 B),
+// 24 = Q1_0 (128 elems / 18 B) — Bonsai-27B decode path.
 
-__device__ __forceinline__ unsigned int rd_byte(const float* arena, unsigned int w_word, unsigned int rel) {
-    unsigned int w = __float_as_uint(arena[w_word + (rel >> 2u)]);
-    return (w >> ((rel & 3u) * 8u)) & 0xFFu;
+// 64-bit weight-base index: packed 27B arenas exceed 4 GiB, so a u32
+// `w_word + (rel>>2)` truncates and the GEMV reads the wrong bytes.
+__device__ __forceinline__ unsigned int rd_byte(
+    const float* arena,
+    unsigned long long w_word,
+    unsigned long long rel
+) {
+    unsigned int w = __float_as_uint(arena[w_word + (rel >> 2ull)]);
+    return (w >> ((rel & 3ull) * 8ull)) & 0xFFu;
 }
 
-__device__ __forceinline__ float rd_f16(const float* arena, unsigned int w_word, unsigned int rel) {
-    unsigned int w = __float_as_uint(arena[w_word + (rel >> 2u)]);
-    unsigned int h = (w >> ((rel & 3u) * 8u)) & 0xFFFFu;
+__device__ __forceinline__ float rd_f16(
+    const float* arena,
+    unsigned long long w_word,
+    unsigned long long rel
+) {
+    unsigned int w = __float_as_uint(arena[w_word + (rel >> 2ull)]);
+    unsigned int h = (w >> ((unsigned int)(rel & 3ull) * 8u)) & 0xFFFFu;
     unsigned int sign = (h >> 15u) & 1u;
     unsigned int exp = (h >> 10u) & 0x1Fu;
     unsigned int mant = (unsigned int)h & 0x3FFu;
@@ -26,13 +39,23 @@ __device__ __forceinline__ float rd_f16(const float* arena, unsigned int w_word,
     return (sign != 0u) ? -v : v;
 }
 
+// Neumaier compensated sum — same scheme as matmul_bt.cu `precise`.
+// Plain f32 reduction on Q1_0 (coarse ±d weights) can flip near-tie argmaxes
+// vs dequant+matmul / Metal / CPU.
+__device__ __forceinline__ void neumaier_add(float& acc, float& comp, float x) {
+    float s = acc + x;
+    float err = (fabsf(acc) >= fabsf(x)) ? ((acc - s) + x) : ((x - s) + acc);
+    acc = s;
+    comp += err;
+}
+
 __device__ __forceinline__ int sx8(unsigned int b) {
     return (int)b - 256 * (int)((b >> 7u) & 1u);
 }
 
 __device__ __forceinline__ void scale_min_k4(
     const float* arena,
-    unsigned int w_word,
+    unsigned long long w_word,
     unsigned int j,
     unsigned int sc_base,
     unsigned int& sc,
@@ -60,12 +83,40 @@ extern "C" __global__ void dequant_matmul_gguf(
     unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
 
-    unsigned int w_word = w_byte_off / 4u;
+    unsigned long long w_word = (unsigned long long)(w_byte_off / 4u);
+    float acc = 0.0f;
+    float comp = 0.0f;
+
+    // Q1_0: 128 elems / 18 bytes — fuse dequant into the dot (no local slab).
+    if (scheme_id == 24u) {
+        unsigned int blocks_per_row = k / 128u;
+        for (unsigned int r = 0u; r < blocks_per_row; r++) {
+            unsigned long long base =
+                ((unsigned long long)j * (unsigned long long)blocks_per_row + (unsigned long long)r)
+                * 18ull;
+            float d = rd_f16(arena, w_word, base);
+            float neg_d = -d;
+            unsigned int xb = x_off + r * 128u;
+            #pragma unroll 4
+            for (unsigned int byte = 0u; byte < 16u; byte++) {
+                unsigned int qs = rd_byte(arena, w_word, base + 2ull + (unsigned long long)byte);
+                #pragma unroll
+                for (unsigned int bit = 0u; bit < 8u; bit++) {
+                    float w = ((qs >> bit) & 1u) ? d : neg_d;
+                    float p = arena[xb + byte * 8u + bit] * w;
+                    float e = __fmaf_rn(arena[xb + byte * 8u + bit], w, -p);
+                    neumaier_add(acc, comp, p);
+                    comp += e;
+                }
+            }
+        }
+        arena[out_off + j] = acc + comp;
+        return;
+    }
+
     unsigned int blocks_per_row = k / 256u;
     unsigned int block_bytes = (scheme_id == 0u) ? 144u : 210u;
-
     float blk[256];
-    float acc = 0.0f;
 
     for (unsigned int r = 0u; r < blocks_per_row; r++) {
         unsigned int gbi = j * blocks_per_row + r;
@@ -134,4 +185,70 @@ extern "C" __global__ void dequant_matmul_gguf(
     }
 
     arena[out_off + j] = acc;
+}
+
+
+// Cooperative Q1_0 GEMV: one block per output row, threads split weight blocks.
+// Uses 64-bit offsets so packed arenas >4 GiB address correctly.
+// Compensated (Neumaier) accumulation matches matmul_bt precise / Metal
+// dequant+matmul so decode argmaxes stay on the Metal token path.
+extern "C" __global__ void dequant_matmul_gguf_q1_gemv(
+    float* arena,
+    unsigned long long n,
+    unsigned long long k,
+    unsigned long long x_off,
+    unsigned long long w_byte_off,
+    unsigned long long out_off
+) {
+    unsigned long long j = blockIdx.x;
+    if (j >= n) return;
+
+    unsigned long long w_word = w_byte_off / 4ull;
+    unsigned long long blocks_per_row = k / 128ull;
+    float acc = 0.0f;
+    float comp = 0.0f;
+
+    for (unsigned long long r = threadIdx.x; r < blocks_per_row; r += blockDim.x) {
+        unsigned long long base = (j * blocks_per_row + r) * 18ull;
+        float d = rd_f16(arena, w_word, base);
+        float neg_d = -d;
+        unsigned long long xb = x_off + r * 128ull;
+        #pragma unroll 4
+        for (unsigned int byte = 0u; byte < 16u; byte++) {
+            unsigned int qs = rd_byte(arena, w_word, base + 2ull + (unsigned long long)byte);
+            #pragma unroll
+            for (unsigned int bit = 0u; bit < 8u; bit++) {
+                float w = ((qs >> bit) & 1u) ? d : neg_d;
+                float xv = arena[xb + (unsigned long long)(byte * 8u + bit)];
+                float p = xv * w;
+                float e = __fmaf_rn(xv, w, -p);
+                neumaier_add(acc, comp, p);
+                comp += e;
+            }
+        }
+    }
+
+    // Tree-reduce (acc, comp) pairs — fold compensation after each add.
+    __shared__ float smem_acc[256];
+    __shared__ float smem_comp[256];
+    unsigned int tid = threadIdx.x;
+    smem_acc[tid] = acc;
+    smem_comp[tid] = comp;
+    __syncthreads();
+    for (unsigned int s = blockDim.x >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            float a = smem_acc[tid];
+            float c = smem_comp[tid];
+            float a2 = smem_acc[tid + s];
+            float c2 = smem_comp[tid + s];
+            float ssum = a + a2;
+            float err = (fabsf(a) >= fabsf(a2)) ? ((a - ssum) + a2) : ((a2 - ssum) + a);
+            smem_acc[tid] = ssum;
+            smem_comp[tid] = c + c2 + err;
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        arena[out_off + j] = smem_acc[0] + smem_comp[0];
+    }
 }

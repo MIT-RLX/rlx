@@ -12,11 +12,14 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-//! Split MPSGraph lowering at GatedDeltaNet / DequantMatMul boundaries.
+//! Split MPSGraph lowering at GatedDeltaNet / Attention / DequantMatMul boundaries.
 //!
-//! Qwen3.5 decode graphs mix MPSGraph-eligible matmul/norm/attn ops with
-//! host-only GDN scans. Whole-graph `try_lower` bails on the first GDN;
-//! this module builds alternating MPS sub-graph plans + thunk ranges.
+//! Qwen3.5 decode graphs mix MPSGraph-eligible matmul/norm ops with host-only
+//! GDN scans. Transformer AR graphs (Zonos, …) mix matmul/norm with attention
+//! whose Q/K/V are slice-views of computed RoPE/GQA tensors — whole-graph
+//! MPSGraph SDPA returns wrong values for that pattern. Whole-graph
+//! `try_lower` bails on unsafe attention; this module builds alternating MPS
+//! sub-graph plans + thunk ranges (attention / GDN run as thunks).
 
 use rlx_ir::{Graph, NodeId, Op};
 use std::collections::{HashMap, HashSet};
@@ -134,60 +137,70 @@ fn can_lower_dequant_in_mps(
 }
 
 /// Build a hybrid plan when whole-graph lowering fails (typical Qwen3.5 decode).
+///
+/// Thunk ranges MUST index `ThunkSchedule.thunks`, which is one entry per
+/// `graph.nodes()` in order (Input/Param/Constant → `Thunk::Nop`). Counting
+/// only compute nodes (the old approach) desyncs Attention thunks from the
+/// schedule and produces garbage on large transformer graphs (Zonos).
 pub fn build_hybrid_plan(
     graph: &Graph,
     params_as_constants: Option<&HashMap<String, Vec<u8>>>,
 ) -> Option<Vec<HybridStep>> {
-    let schedulable: Vec<NodeId> = graph
-        .nodes()
-        .iter()
-        .filter(|n| {
-            !matches!(
-                n.op,
-                Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
-            )
-        })
-        .map(|n| n.id)
-        .collect();
-
     let mut steps: Vec<HybridStep> = Vec::new();
     let mut pending: Vec<NodeId> = Vec::new();
-    let mut thunk_idx = 0usize;
+    let mut pending_idxs: Vec<usize> = Vec::new();
 
-    let flush_mps = |pending: &mut Vec<NodeId>,
-                     steps: &mut Vec<HybridStep>,
-                     thunk_idx: usize|
-     -> Option<usize> {
-        if pending.is_empty() {
-            return Some(thunk_idx);
+    let flush_mps =
+        |pending: &mut Vec<NodeId>, pending_idxs: &mut Vec<usize>, steps: &mut Vec<HybridStep>| {
+            if pending.is_empty() {
+                return;
+            }
+            let start = *pending_idxs.iter().min().expect("pending idx");
+            let end = *pending_idxs.iter().max().expect("pending idx") + 1;
+            let extracted = extract_subgraph(graph, pending);
+            match try_lower_with_constants(&extracted.graph, params_as_constants) {
+                Some(plan) => {
+                    steps.push(HybridStep::SubGraph {
+                        plan,
+                        boundary_parent_ids: extracted.boundaries,
+                        output_parent_ids: extracted.output_parent_ids,
+                        thunk_skip: start..end,
+                    });
+                }
+                None => {
+                    // Segment has an unsupported op — run it as thunks and keep
+                    // trying MPSGraph on later segments (don't abort the hybrid).
+                    steps.push(HybridStep::Thunks(start..end));
+                }
+            }
+            pending.clear();
+            pending_idxs.clear();
+        };
+
+    for (thunk_idx, node) in graph.nodes().iter().enumerate() {
+        let id = node.id;
+        let op = &node.op;
+        if matches!(
+            op,
+            Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+        ) {
+            // Schedule slot is Nop — not part of MPS pending / attention splits.
+            continue;
         }
-        let n_thunks = pending.len();
-        let extracted = extract_subgraph(graph, pending);
-        let plan = try_lower_with_constants(&extracted.graph, params_as_constants)?;
-        steps.push(HybridStep::SubGraph {
-            plan,
-            boundary_parent_ids: extracted.boundaries,
-            output_parent_ids: extracted.output_parent_ids,
-            thunk_skip: thunk_idx..thunk_idx + n_thunks,
-        });
-        pending.clear();
-        Some(thunk_idx + n_thunks)
-    };
-
-    for &id in &schedulable {
-        let op = &graph.node(id).op;
-        if matches!(op, Op::GatedDeltaNet { .. } | Op::Lstm { .. })
-            || (matches!(op, Op::DequantMatMul { .. })
-                && !can_lower_dequant_in_mps(graph, id, params_as_constants))
+        if matches!(
+            op,
+            Op::GatedDeltaNet { .. } | Op::Lstm { .. } | Op::Attention { .. }
+        ) || (matches!(op, Op::DequantMatMul { .. })
+            && !can_lower_dequant_in_mps(graph, id, params_as_constants))
         {
-            thunk_idx = flush_mps(&mut pending, &mut steps, thunk_idx)?;
+            flush_mps(&mut pending, &mut pending_idxs, &mut steps);
             steps.push(HybridStep::Thunks(thunk_idx..thunk_idx + 1));
-            thunk_idx += 1;
         } else {
             pending.push(id);
+            pending_idxs.push(thunk_idx);
         }
     }
-    let _ = flush_mps(&mut pending, &mut steps, thunk_idx)?;
+    flush_mps(&mut pending, &mut pending_idxs, &mut steps);
 
     if steps.iter().all(|s| matches!(s, HybridStep::Thunks(_))) {
         return None;

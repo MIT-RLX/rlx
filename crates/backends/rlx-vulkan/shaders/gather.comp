@@ -1,10 +1,9 @@
 #version 450
 // Gather along `axis`: data viewed as [out_outer, axis_dim, out_inner], index
 // tensor flattened to n_idx elements (f32-encoded). Output [out_outer, n_idx,
-// out_inner]:  out[o, t, i] = data[o, idx[t], i].
+// out_inner]:  out[o, t, i] = arena_load(o, idx[t), i].
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint out_outer;
@@ -24,10 +23,10 @@ void main() {
     uint t = (gid / pc.out_inner) % pc.n_idx;
     uint o = gid / (pc.n_idx * pc.out_inner);
 
-    float fidx = data[pc.idx_off + t];
+    float fidx = arena_load(pc.idx_off + t);
     int ix = int(floor(fidx + 0.5));
     if (ix < 0) { ix = 0; }
     if (uint(ix) >= pc.axis_dim) { ix = int(pc.axis_dim) - 1; }
     uint src = (o * pc.axis_dim + uint(ix)) * pc.out_inner + i;
-    data[pc.out_off + gid] = data[pc.data_off + src];
+    arena_store(pc.out_off + gid, arena_load(pc.data_off + src));
 }

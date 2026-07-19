@@ -19,7 +19,7 @@
 //! # Apple:
 //! cargo run -p rlx-bench --release --example bench_fft_matrix \
 //!     --features metal,gpu,mlx,coreml,native-gpu-fft
-//! # msi (CUDA + Vulkan-wgpu):
+//! # Linux CUDA + Vulkan-wgpu rig:
 //! cargo run -p rlx-bench --release --example bench_fft_matrix \
 //!     --features cuda,gpu,native-gpu-fft
 //! ```

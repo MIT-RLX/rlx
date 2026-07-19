@@ -83,7 +83,41 @@ here and validated by serving the demo, which cross-checks GPU results against
 the CPU reference. The WebGL backend's planner + numerics are additionally
 verified natively (see `rlx-webgl`).
 
-## JS API
+## Vision benchmark (browser)
+
+Four classification models run in the browser via [`VisionBench`](src/api.rs):
+
+| Slug | Architecture |
+|------|----------------|
+| `mnist-cnn` | TinyConv MNIST (matches rlx-cortexm trainer) |
+| `mnist-mlp` | Flattened 784→128→10 MLP |
+| `cifar-cnn` | 3-block CNN for 32×32 RGB |
+| `resnet` | CIFAR-sized ResNet-style (two residual blocks) |
+
+Open <http://localhost:8000/vision-bench.html> after `just serve-web --all`.
+
+### TypeScript / JavaScript SDK
+
+The [`web/rlx.js`](web/rlx.js) wrapper (types in [`web/rlx.d.ts`](web/rlx.d.ts),
+source in [`web/rlx.ts`](web/rlx.ts)) provides a developer-friendly API over the
+raw wasm-bindgen exports:
+
+```js
+import Rlx from "./rlx.js";
+
+const rlx = await Rlx.init({ webgpu: true });
+const model = rlx.vision("mnist-cnn");
+const params = model.initParams(42);
+const { x, label } = model.syntheticBatch(1);
+const logits = model.forwardCpu(x, params);
+const { loss, params: next } = model.trainStepCpu(x, label, params, 0.01);
+const bench = model.benchCpu(50, 42, 0.01);
+```
+
+Low-level wasm exports remain available as `rlx.wasm` / `./pkg/rlx_web.js`.
+`just build-web` emits `./pkg/rlx_web.d.ts` via wasm-bindgen `--typescript`.
+
+## JS API (low-level)
 
 ```js
 import init, * as rlx from "./pkg/rlx_web.js";

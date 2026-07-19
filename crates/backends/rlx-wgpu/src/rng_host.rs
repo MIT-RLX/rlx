@@ -14,11 +14,16 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Host-side RNG fill for wgpu arenas (fill on host → H2D).
+//!
+//! Thin adapter over [`rlx_gpu_host::run_rng_normal`] /
+//! [`rlx_gpu_host::run_rng_uniform`].
 
 use crate::buffer::Arena;
+use crate::host_stage::WgpuArena;
 
 pub fn run_rng_normal(
     arena: &Arena,
+    device: &wgpu::Device,
     queue: &wgpu::Queue,
     dst_byte_off: usize,
     len: usize,
@@ -28,21 +33,18 @@ pub fn run_rng_normal(
     op_seed: Option<f32>,
     opts: rlx_ir::RngOptions,
 ) {
-    if len == 0 {
-        return;
-    }
-    assert_eq!(
-        dst_byte_off % 4,
-        0,
-        "rng_host: dst_byte_off must be f32-aligned"
-    );
-    let mut host = vec![0f32; len];
-    rlx_ir::fill_normal_like(&mut host, mean, scale, opts, key, op_seed);
-    arena.write_bytes_range(queue, dst_byte_off, bytemuck::cast_slice(&host));
+    let mut a = WgpuArena {
+        arena,
+        device,
+        queue,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_rng_normal(&mut a, dst_byte_off, len, mean, scale, key, op_seed, opts);
 }
 
 pub fn run_rng_uniform(
     arena: &Arena,
+    device: &wgpu::Device,
     queue: &wgpu::Queue,
     dst_byte_off: usize,
     len: usize,
@@ -52,15 +54,11 @@ pub fn run_rng_uniform(
     op_seed: Option<f32>,
     opts: rlx_ir::RngOptions,
 ) {
-    if len == 0 {
-        return;
-    }
-    assert_eq!(
-        dst_byte_off % 4,
-        0,
-        "rng_host: dst_byte_off must be f32-aligned"
-    );
-    let mut host = vec![0f32; len];
-    rlx_ir::fill_uniform_like(&mut host, low, high, opts, key, op_seed);
-    arena.write_bytes_range(queue, dst_byte_off, bytemuck::cast_slice(&host));
+    let mut a = WgpuArena {
+        arena,
+        device,
+        queue,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_rng_uniform(&mut a, dst_byte_off, len, low, high, key, op_seed, opts);
 }

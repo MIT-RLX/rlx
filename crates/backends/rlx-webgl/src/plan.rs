@@ -175,9 +175,22 @@ pub enum Step {
         base: Vec<u32>,
         axis_stride: u32,
     },
+    /// Host/transport custom op (`collective.*`): the single f32 `input` is
+    /// staged to a registered CPU kernel via
+    /// `rlx_cpu::op_registry::run_f32_custom_op_host`. There is no GPU/GLSL
+    /// mirror — a fragment shader can't drive a process group — so this step
+    /// only runs on the *native* CPU executor. On wasm (no TCP transport) it
+    /// errors. See [`crate::exec_cpu`].
+    Custom {
+        out: usize,
+        input: usize,
+        name: String,
+        attrs: Vec<u8>,
+    },
 }
 
 /// A lowered graph ready for either executor.
+#[derive(Clone)]
 pub struct Plan {
     pub steps: Vec<Step>,
     /// `(rows, cols)` per slot — the WebGL texture dimensions.
@@ -214,6 +227,10 @@ pub fn supported_ops() -> &'static [OpKind] {
         OpKind::Softmax,
         OpKind::LayerNorm,
         OpKind::RmsNorm,
+        // DiT modulation — claimed for fusion; expanded by
+        // `unfuse_dit_modulation` before `lower`.
+        OpKind::AdaLayerNorm,
+        OpKind::GatedResidual,
         OpKind::StopGradient,
         OpKind::Cumsum,
         OpKind::Concat,
@@ -224,8 +241,26 @@ pub fn supported_ops() -> &'static [OpKind] {
         OpKind::ArgMin,
         OpKind::Gather,
         OpKind::Rope,
+        // Host/transport custom ops (`collective.*`). Kept in the supported set
+        // so legalization preserves the node; `lower` restricts to the
+        // collective names and the CPU executor host-delegates them (native
+        // only — see `exec_cpu`).
+        OpKind::Custom,
     ]
 }
+
+/// `collective.*` op names this backend host-delegates (mirrors
+/// `rlx_collectives::{ALL_REDUCE, ALL_GATHER, REDUCE_SCATTER, COPY_TO_PARALLEL,
+/// REDUCE_FROM_PARALLEL}`, which rlx-webgl cannot depend on — later publish
+/// tier — so keep them in sync). Every other `Op::Custom` name is rejected
+/// (rlx-webgl is f32-only and has no other host kernels wired).
+pub(crate) const COLLECTIVE_OPS: &[&str] = &[
+    "collective.all_reduce",
+    "collective.all_gather",
+    "collective.reduce_scatter",
+    "collective.copy_to_parallel",
+    "collective.reduce_from_parallel",
+];
 
 /// Per-output groups for ArgMax/ArgMin: `groups[o*axsz + p]` = src linear index
 /// of axis position `p` for output element `o` (axis-ordered, so the winning `p`
@@ -417,6 +452,7 @@ const NATIVE_BACKWARD: &[OpKind] = &[OpKind::ReluBackward, OpKind::ActivationBac
 pub fn build_plan(graph: &Graph) -> Result<Plan> {
     let g = graph.clone();
     let g = rlx_autodiff::decompose_backward_ops_except(g, NATIVE_BACKWARD);
+    let g = rlx_fusion::unfuse_dit_modulation(g);
     let g = rlx_compile::rewrite_for_backend(g, supported_ops());
     lower(&g)
 }
@@ -1214,6 +1250,31 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     cond: mask_c,
                     a: rotated,
                     b: x,
+                });
+            }
+            Op::Custom {
+                name,
+                num_inputs,
+                attrs,
+            } => {
+                // Only the host/transport `collective.*` ops are wired (single
+                // f32 input, host-delegated). Any other custom op name is
+                // rejected — rlx-webgl has no other host kernels and is f32-only.
+                if !COLLECTIVE_OPS.contains(&name.as_str()) {
+                    return Err(WebglError(format!(
+                        "custom op {name:?} not supported on WebGL (only collective.* ops)"
+                    )));
+                }
+                if *num_inputs != 1 {
+                    return Err(WebglError(format!(
+                        "collective op {name:?} expects 1 input, graph has {num_inputs}"
+                    )));
+                }
+                b.emit(Step::Custom {
+                    out,
+                    input: input_slot(0)?,
+                    name: name.clone(),
+                    attrs: attrs.clone(),
                 });
             }
             other => {

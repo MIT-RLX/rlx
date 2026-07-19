@@ -3,7 +3,6 @@
 // exclusive=1 ⇒ out[j] = sum_{i<j} in[i]; else inclusive.
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -20,11 +19,11 @@ void main() {
     float acc = 0.0;
     for (uint j = 0u; j < pc.cols; j++) {
         if (pc.exclusive != 0u) {
-            data[pc.out_off + base + j] = acc;
-            acc += data[pc.in_off + base + j];
+            arena_store(pc.out_off + base + j, acc);
+            acc += arena_load(pc.in_off + base + j);
         } else {
-            acc += data[pc.in_off + base + j];
-            data[pc.out_off + base + j] = acc;
+            acc += arena_load(pc.in_off + base + j);
+            arena_store(pc.out_off + base + j, acc);
         }
     }
 }

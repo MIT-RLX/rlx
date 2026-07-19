@@ -11,7 +11,7 @@
 // accuracy + throughput (images/s).
 //
 // Run (Apple silicon):
-//   RLX_FAST_CONV=1 target/release/train-mnist --epochs 2 \
+//   target/release/train-mnist --epochs 2 \
 //       --out /tmp/tc.rs --val-set 0          # produces weights via RLX_F32_DUMP
 //   cargo run -p rlx-coreml --release --example ane_mnist
 //
@@ -19,7 +19,8 @@
 //   RLX_F32_DUMP  weights file (default /tmp/tinyconv_f32.bin)
 //   MNIST_RAW     IDX dir (default ~/.cache/torchvision-mnist/MNIST/raw)
 //   ANE_BATCH     batch size (default 100)
-//   RLX_COREML_UNITS  ane(default)/cpu/gpu/all
+//   RLX_COREML_UNITS  gpu(default for fp32)/ane/cpu/all
+
 #![cfg(any(target_os = "macos", target_os = "ios"))]
 
 use rlx_coreml::{ComputeUnits, CoremlExecutable, ane_available, chip_info};

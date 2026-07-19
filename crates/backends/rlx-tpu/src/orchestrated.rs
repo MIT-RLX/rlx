@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use rlx_ir::{DType, Graph, NodeId, Op};
 
 use crate::backend::{compile_pjrt_executable, destroy_buffer, download_buffer, upload_buffer};
+use crate::collective_host::run_collective;
 use crate::device::tpu_context;
 use crate::lower::{HloModule, LowerParamBytes, lower_graph_with_rng_and_params};
 use crate::segment::{Segment, plan};
@@ -45,6 +46,9 @@ enum CompiledSegment {
         node: NodeId,
     },
     SplatBackward {
+        node: NodeId,
+    },
+    Collective {
         node: NodeId,
     },
 }
@@ -91,6 +95,9 @@ impl OrchestratedExecutable {
                 }
                 Segment::SplatBackward { node } => {
                     compiled.push(CompiledSegment::SplatBackward { node });
+                }
+                Segment::Collective { node } => {
+                    compiled.push(CompiledSegment::Collective { node });
                 }
             }
         }
@@ -191,6 +198,9 @@ impl OrchestratedExecutable {
                 }
                 CompiledSegment::SplatBackward { node } => {
                     run_splat_backward(&self.graph, *node, &mut env);
+                }
+                CompiledSegment::Collective { node } => {
+                    run_collective(&self.graph, *node, &mut env);
                 }
             }
         }

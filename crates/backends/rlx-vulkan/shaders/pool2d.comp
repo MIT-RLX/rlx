@@ -3,7 +3,6 @@
 // invocation per output element. Avg divides by the valid (in-bounds) count.
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint nn; uint cc; uint hh; uint ww;   // input N,C,H,W
@@ -33,11 +32,11 @@ void main() {
             int w = w0 + int(j);
             if (w < 0 || w >= int(pc.ww)) { continue; }
             uint idx = ((n * pc.cc + c) * pc.hh + uint(h)) * pc.ww + uint(w);
-            float v = data[pc.x_off + idx];
+            float v = arena_load(pc.x_off + idx);
             if (pc.kind == 2u) { acc = max(acc, v); } else { acc += v; }
             cnt++;
         }
     }
     if (pc.kind == 1u) { acc = (cnt > 0u) ? acc / float(cnt) : 0.0; }
-    data[pc.out_off + gid] = acc;
+    arena_store(pc.out_off + gid, acc);
 }

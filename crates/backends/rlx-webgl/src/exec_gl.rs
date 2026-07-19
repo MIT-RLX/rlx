@@ -716,6 +716,16 @@ impl GlBackend {
                     self.draw();
                     tex[*out] = Some(t);
                 }
+                Step::Custom { name, .. } => {
+                    // Host/transport `collective.*` ops cannot run in-browser:
+                    // a fragment shader can't drive a process group, and the
+                    // rlx-driver transport uses std::net TCP sockets, which
+                    // don't exist on wasm32. Report that plainly.
+                    return Err(WebglError(format!(
+                        "collective '{name}' unavailable in browser: no TCP transport on wasm32. \
+                         Run the collective graph on the native CPU executor (exec_cpu)."
+                    )));
+                }
             }
         }
 

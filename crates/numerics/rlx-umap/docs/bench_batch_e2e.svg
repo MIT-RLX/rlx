@@ -2,7 +2,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 520" width="920" height="520">
   <rect width="100%" height="100%" fill="#ffffff"/>
   <text x="460" y="28" text-anchor="middle" font-size="16" font-weight="600" fill="#111827">bench_batch — pairwise + k-NN (ms, not full UMAP fit)</text>
-  <text x="460" y="44" text-anchor="middle" font-size="11" fill="#6b7280">d=64, k=15, release, warmup=1, runs=5 · building blocks only · RTX 4090 / Apple Silicon</text>
+  <text x="460" y="44" text-anchor="middle" font-size="11" fill="#6b7280">d=64, k=15, release, warmup=1, runs=5 · building blocks only · NVIDIA GPU / Apple Silicon</text>
   <text x="396" y="510" text-anchor="middle" font-size="12" fill="#374151">n (points)</text>
   <text transform="translate(18 252) rotate(-90)" text-anchor="middle" font-size="12" fill="#374151">time (ms, log)</text>
   <line x1="72" y1="48" x2="72" y2="456" stroke="#374151" stroke-width="1.5"/>

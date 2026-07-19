@@ -50,6 +50,7 @@ impl Array {
     /// every dependent MLX evaluation completes. The caller must also
     /// avoid mutating the buffer while MLX may still read from it.
     pub unsafe fn from_f32_slice_view(data: &[f32], shape: &[usize]) -> Result<Self, MlxError> {
+        let _guard = crate::sync::runtime_guard();
         let shape_i: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
         let mut out: *mut mlx_array_t = ptr::null_mut();
         let nbytes = std::mem::size_of_val(data);
@@ -72,6 +73,7 @@ impl Array {
 
     /// Construct an MLX leaf from host f32 data, casting to `dtype`.
     pub fn from_f32_slice(data: &[f32], shape: &[usize], dtype: DType) -> Result<Self, MlxError> {
+        let _guard = crate::sync::runtime_guard();
         let shape_i: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
         let mut out: *mut mlx_array_t = ptr::null_mut();
         let rc = unsafe {
@@ -90,6 +92,7 @@ impl Array {
 
     /// Read the array's contents back as f32, evaluating if needed.
     pub fn to_f32(&self) -> Result<Vec<f32>, MlxError> {
+        let _guard = crate::sync::runtime_guard();
         let nelems = self.num_elements()?;
         let mut buf = vec![0f32; nelems];
         let rc = unsafe { ffi::rlx_mlx_array_to_f32(self.ptr, buf.as_mut_ptr(), nelems) };
@@ -101,6 +104,7 @@ impl Array {
     /// dtype — no f32 widen/narrow round-trip. Useful when callers
     /// already hold half-precision (F16/BF16) buffers.
     pub fn from_bytes(data: &[u8], shape: &[usize], dtype: DType) -> Result<Self, MlxError> {
+        let _guard = crate::sync::runtime_guard();
         let shape_i: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
         let mut out: *mut mlx_array_t = std::ptr::null_mut();
         let rc = unsafe {
@@ -121,6 +125,7 @@ impl Array {
     /// No automatic conversion to f32 — pair with `from_bytes` for
     /// round-trip-free F16/BF16 I/O.
     pub fn to_bytes(&self) -> Result<Vec<u8>, MlxError> {
+        let _guard = crate::sync::runtime_guard();
         let nelems = self.num_elements()?;
         // Worst-case dtype width is f64 / i64 (8 B/elem). We don't
         // expose the array's actual dtype to Rust today, so the
@@ -144,7 +149,11 @@ impl Array {
     }
 
     pub fn shape(&self) -> Result<Vec<usize>, MlxError> {
-        let mut tmp = [0i32; 8];
+        let _guard = crate::sync::runtime_guard();
+        // 16 dims: high-rank intermediates (e.g. neurostorm's 4D-Swin window
+        // partition/reverse produces rank-9/10 tensors) overflow an 8-dim buffer
+        // → the shim's "shape buffer too small". MLX supports these ranks fine.
+        let mut tmp = [0i32; 16];
         let mut ndim = 0usize;
         let rc =
             unsafe { ffi::rlx_mlx_array_shape(self.ptr, tmp.as_mut_ptr(), tmp.len(), &mut ndim) };

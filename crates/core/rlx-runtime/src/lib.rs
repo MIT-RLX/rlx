@@ -56,6 +56,10 @@ pub mod aot_cache;
 pub mod attn_mask;
 pub mod backend;
 pub mod backends_manifest;
+pub mod browser;
+pub mod browser_support;
+pub mod capabilities;
+pub mod check;
 pub mod compile_cache;
 pub mod compile_config;
 pub mod compiled;
@@ -72,7 +76,10 @@ pub mod device_policy;
 /// Ship-graph distributed execution (build the worker once, run any model).
 pub mod dist;
 pub mod expert_pool;
+pub mod export;
 pub mod graph_io;
+#[cfg(feature = "hwprofile")]
+pub mod hwprofile_select;
 pub mod jacfwd;
 pub mod kernel_trace;
 pub mod kv_cache;
@@ -109,6 +116,7 @@ pub mod custom_ops;
 pub mod device_router;
 pub mod flexible_session;
 pub mod graph_devices;
+pub mod hetero;
 pub mod hwinfo;
 pub mod lm;
 pub mod logit_verify;
@@ -132,6 +140,14 @@ pub use rlx_driver::{
 pub use aot_cache::{AotCache, AotCacheError};
 pub use backend::{Backend, ExecutableGraph, compile_hir, compile_module};
 pub use backends_manifest::BackendsManifest;
+pub use browser::{
+    BrowserCompiledGraph, BrowserError, BrowserSession, browser_block_reason, init_webgpu,
+    supports_browser_graph,
+};
+pub use browser_support::{
+    collective_block_reason, passes_browser_preflight, select_browser_device_for_graph,
+};
+pub use capabilities::ExecutableCapabilities;
 pub use compile_cache::{
     BucketedCompileCache, CacheRunInput, CompileCache, DynamicDimCompileCache, pad_rows, slice_rows,
 };
@@ -150,25 +166,33 @@ pub use device_bench::{DeviceBenchResult, benchmark_devices, warm_all};
 #[cfg(feature = "apple")]
 pub use device_ext::available_apple_devices;
 pub use device_ext::{
-    available_devices, devices_for, dispatch_report_for_device,
-    dispatch_report_for_device_with_options, fastest_device, first_unsupported_op,
-    first_unsupported_op_with_options, full_name, is_available, legalize_graph_for_device,
-    legalize_graph_for_device_with_options, legalize_graph_for_device_with_report, supports,
-    supports_graph, supports_graph_with_options, supports_run_slots, trim_accelerator_arena_pool,
+    BROWSER_DEVICE_PRIORITY, available_browser_devices, available_devices, devices_for,
+    dispatch_report_for_device, dispatch_report_for_device_with_options, fastest_device,
+    first_unsupported_op, first_unsupported_op_with_options, full_name, is_available,
+    legalize_graph_for_device, legalize_graph_for_device_with_options,
+    legalize_graph_for_device_with_report, preferred_browser_device, supports, supports_graph,
+    supports_graph_with_options, supports_run_slots, trim_accelerator_arena_pool,
 };
 pub use device_parse::{ParseDeviceError, device_label, parse_device, parse_device_list};
 pub use device_policy::{
-    DeviceCandidate, DeviceFallbackError, DevicePickStrategy, DevicePolicy, device_chain_from_env,
-    device_chain_from_env_key, device_from_env, device_from_env_key, device_report,
-    devices_for_with_policy, resolve_device, resolve_device_chain, run_with_fallback,
+    DeviceCandidate, DeviceFallbackError, DevicePickStrategy, DevicePolicy, advisory_capabilities,
+    device_chain_from_env, device_chain_from_env_key, device_from_env, device_from_env_key,
+    device_report, devices_for_with_policy, resolve_device, resolve_device_chain,
+    run_with_fallback,
 };
 pub use device_router::DeviceRouter;
 pub use expert_pool::{
     ExpertPool, ExpertPoolConfig, ExpertPoolStats, ExpertRefreshPolicy, ExpertRefreshResult,
     MoEExecMode, gpu_expert_budget_from_vram,
 };
+pub use export::{ExportOptions, ExportTarget, ExportedArtifacts, export_graph};
+#[cfg(feature = "fpga")]
+pub use export::{ExportSession, export_tinyconv_mnist};
 pub use flexible_session::FlexibleSession;
 pub use graph_devices::{GraphDevices, graph_param_names};
+pub use hetero::{DeviceMap, HeteroExecutable};
+#[cfg(feature = "hwprofile")]
+pub use hwprofile_select::{device_vram_bytes, fastest_device_with_vram};
 pub use kv_cache::LayerKvCache;
 pub use lm::{
     ConfigSource, LmRunner, LmRunnerBuilder, MirostatMode, ModelRegistration,
@@ -228,8 +252,11 @@ pub use rlx_cpu::moe_topk_capture::MoeTopkCapture;
 pub use rlx_driver::{
     DEFAULT_HEAP_BYTES, NetTransport, ProcessGroup, TcpTransport, ThunderboltTransport, Transport,
 };
-pub use rlx_driver::{ReduceKind, all_gather, all_reduce, reduce_scatter};
+pub use rlx_driver::{
+    ReduceKind, ReduceMode, all_gather, all_reduce, env_reduce_mode, reduce_scatter,
+};
 pub use rlx_ir::env::{self, RlxEnv, RuntimeOverrides};
+pub use rlx_ir::{EnvVarDoc, format_env_catalog, public_catalog_docs as ENV_CATALOG};
 pub use session::Session;
 pub use stages::{
     compile_graph_stages, compile_graph_stages_for_backend, compile_hir_stages,

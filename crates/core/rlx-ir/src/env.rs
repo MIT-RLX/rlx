@@ -101,6 +101,15 @@ pub fn flag(key: &str) -> bool {
     }
 }
 
+/// Like [`flag`], but returns `default` when the key is unset. Use for
+/// failsafe defaults that must stay on unless explicitly disabled (`=0`).
+pub fn flag_or(key: &str, default: bool) -> bool {
+    match var(key) {
+        Some(v) => truthy(&v),
+        None => default,
+    }
+}
+
 /// True when neither a code override nor process env provides the key.
 pub fn is_unset(key: &str) -> bool {
     var(key).is_none()

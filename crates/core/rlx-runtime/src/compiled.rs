@@ -17,6 +17,29 @@
 
 use crate::backend::ExecutableGraph;
 use rlx_driver::Device;
+use std::collections::HashSet;
+
+/// Param-invariant "prepare" stage attached to a compiled graph.
+///
+/// Holds a separately-compiled weight-only graph (`prepare`) whose outputs are
+/// the boundary tensors of the main graph. Run once (lazily, on the first
+/// forward / `finalize_params`), its outputs are bound into the main graph via
+/// [`CompiledGraph::bind_handle`] so weight-derived compute happens once instead
+/// of every forward. See [`rlx_compile::split_param_invariant`].
+struct Staging {
+    prepare: Box<CompiledGraph>,
+    prepared: bool,
+    /// Boundary input names on the main graph, in `prepare`-output order.
+    boundary: Vec<String>,
+    prepare_params: HashSet<String>,
+    main_params: HashSet<String>,
+    /// True once the prepared outputs were injected via persistent `bind_handle`
+    /// (CPU). When false (backends without persistent handles, e.g. CUDA), the
+    /// prepared values are fed as ordinary inputs each forward from `values`.
+    bound: bool,
+    /// Prepared boundary values, kept only for the feed-each-forward fallback.
+    values: Vec<Vec<f32>>,
+}
 
 /// A compiled graph ready for execution.
 ///
@@ -27,6 +50,8 @@ use rlx_driver::Device;
 pub struct CompiledGraph {
     inner: Box<dyn ExecutableGraph>,
     device: Device,
+    /// Optional param-invariant prepare stage (None = ordinary graph).
+    staging: Option<Box<Staging>>,
 }
 
 impl Clone for CompiledGraph {
@@ -36,13 +61,73 @@ impl Clone for CompiledGraph {
         Self {
             inner: self.inner.clone_box(),
             device: self.device,
+            staging: self.staging.as_ref().map(|s| {
+                Box::new(Staging {
+                    prepare: s.prepare.clone(),
+                    prepared: s.prepared,
+                    boundary: s.boundary.clone(),
+                    prepare_params: s.prepare_params.clone(),
+                    main_params: s.main_params.clone(),
+                    bound: s.bound,
+                    values: s.values.clone(),
+                })
+            }),
         }
     }
 }
 
 impl CompiledGraph {
     pub(crate) fn new(inner: Box<dyn ExecutableGraph>, device: Device) -> Self {
-        Self { inner, device }
+        Self {
+            inner,
+            device,
+            staging: None,
+        }
+    }
+
+    /// Attach a param-invariant `prepare` stage to a compiled MAIN graph.
+    /// `prepare` and `boundary` come from [`rlx_compile::split_param_invariant`].
+    pub(crate) fn with_staging(
+        mut self,
+        prepare: CompiledGraph,
+        boundary: Vec<String>,
+        prepare_params: HashSet<String>,
+        main_params: HashSet<String>,
+    ) -> Self {
+        self.staging = Some(Box::new(Staging {
+            prepare: Box::new(prepare),
+            prepared: false,
+            boundary,
+            prepare_params,
+            main_params,
+            bound: false,
+            values: Vec::new(),
+        }));
+        self
+    }
+
+    /// Run the `prepare` stage once (lazily) and make its outputs available to
+    /// the main graph — via persistent `bind_handle` when supported (CPU), else
+    /// kept for feed-each-forward (CUDA). No-op after the first call.
+    fn ensure_prepared(&mut self) {
+        let Some(st) = self.staging.as_mut() else {
+            return;
+        };
+        if st.prepared {
+            return;
+        }
+        st.prepare.finalize_params();
+        let outs = st.prepare.run(&[]);
+        // Try persistent binding; it succeeds only when every boundary binds.
+        let mut all_bound = !outs.is_empty();
+        for (name, out) in st.boundary.iter().zip(outs.iter()) {
+            if !self.inner.bind_handle(name, out) {
+                all_bound = false;
+            }
+        }
+        st.bound = all_bound;
+        st.values = if all_bound { Vec::new() } else { outs };
+        st.prepared = true;
     }
 
     /// Which device this graph runs on.
@@ -53,13 +138,45 @@ impl CompiledGraph {
     /// Set a named parameter (model weight).
     /// Call once per parameter after compilation.
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
-        self.inner.set_param(name, data);
+        if let Some(st) = self.staging.as_mut() {
+            if st.prepare_params.contains(name) {
+                st.prepare.set_param(name, data);
+                st.prepared = false; // weight changed → re-run prepare next forward
+            }
+            if st.main_params.contains(name) {
+                self.inner.set_param(name, data);
+            }
+        } else {
+            self.inner.set_param(name, data);
+        }
     }
 
     /// Execute the graph with named inputs.
     /// Returns one `Vec<f32>` per graph output (copies from arena).
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
-        self.inner.run(inputs)
+        self.ensure_prepared();
+        match self.staging.as_ref() {
+            Some(st) if !st.bound => {
+                let mut merged: Vec<(&str, &[f32])> =
+                    Vec::with_capacity(inputs.len() + st.boundary.len());
+                merged.extend_from_slice(inputs);
+                for (name, vals) in st.boundary.iter().zip(st.values.iter()) {
+                    merged.push((name.as_str(), vals.as_slice()));
+                }
+                self.inner.run(&merged)
+            }
+            _ => self.inner.run(inputs),
+        }
+    }
+
+    /// Async WebGPU execution on wasm (non-blocking GPU→CPU readback).
+    /// WebGL and CPU backends fall back to synchronous [`Self::run`].
+    #[cfg(target_arch = "wasm32")]
+    pub async fn run_async(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>, String> {
+        match self.device {
+            Device::WebGpu | Device::Gpu => self.inner.wgpu_run_async(inputs).await,
+            _ => Ok(self.run(inputs)),
+        }
     }
 
     /// Run and read back only selected outputs (logits-only decode on MLX).
@@ -68,7 +185,19 @@ impl CompiledGraph {
         inputs: &[(&str, &[f32])],
         read_indices: Option<&[usize]>,
     ) -> Vec<Vec<f32>> {
-        self.inner.run_read_outputs(inputs, read_indices)
+        self.ensure_prepared();
+        match self.staging.as_ref() {
+            Some(st) if !st.bound => {
+                let mut merged: Vec<(&str, &[f32])> =
+                    Vec::with_capacity(inputs.len() + st.boundary.len());
+                merged.extend_from_slice(inputs);
+                for (name, vals) in st.boundary.iter().zip(st.values.iter()) {
+                    merged.push((name.as_str(), vals.as_slice()));
+                }
+                self.inner.run_read_outputs(&merged, read_indices)
+            }
+            _ => self.inner.run_read_outputs(inputs, read_indices),
+        }
     }
 
     /// Read one row from a row-major output tensor after a forward pass.
@@ -88,6 +217,7 @@ impl CompiledGraph {
     /// The returned pointers point into the arena. Do not use after
     /// the next call to run/run_raw (arena data will be overwritten).
     pub fn run_raw(&mut self, inputs: &[(&str, &[f32])]) -> Vec<(*const f32, usize)> {
+        self.ensure_prepared();
         self.inner.run_raw(inputs)
     }
 
@@ -95,6 +225,7 @@ impl CompiledGraph {
     /// Returns output (offset, len) pairs. Read data via `arena_ptr().add(offset)`.
     /// Zero HashMap lookup, zero Vec allocation, zero name matching.
     pub fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
+        self.ensure_prepared();
         self.inner.run_slots(inputs)
     }
 
@@ -155,6 +286,18 @@ impl CompiledGraph {
     /// in-place on device. Returns false when unsupported.
     pub fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
         self.inner.feed_kv_row(src_row, dst_row, row_elems)
+    }
+
+    /// Batch-major resident KV feed (`past[b, dst_row]` ← `new[b, 0]`).
+    pub fn feed_kv_batch_major(
+        &mut self,
+        dst_row: usize,
+        batch: usize,
+        seq_cap: usize,
+        row_elems: usize,
+    ) -> bool {
+        self.inner
+            .feed_kv_batch_major(dst_row, batch, seq_cap, row_elems)
     }
 
     /// Mark a graph input as device-resident without host staging.
@@ -218,6 +361,16 @@ impl CompiledGraph {
             return false;
         }
         self.inner.copy_params_from(src.inner.as_ref())
+    }
+
+    /// Share `src`'s packed weight buffer (retain, not copy) instead of uploading
+    /// our own, when the weight layout matches EXACTLY — one GPU copy backs both.
+    /// Returns false (caller must upload) on device mismatch or differing layout.
+    pub fn share_params_from(&mut self, src: &CompiledGraph) -> bool {
+        if self.device != src.device {
+            return false;
+        }
+        self.inner.share_params_from(src.inner.as_ref())
     }
 
     /// Run, refresh GPU handle from output, return that output vector.
@@ -300,11 +453,22 @@ impl CompiledGraph {
     /// natively) on the way in. Lets callers feed F16/BF16 weights
     /// without a host-side cast.
     pub fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
-        self.inner.set_param_typed(name, data, dtype);
+        if let Some(st) = self.staging.as_mut() {
+            if st.prepare_params.contains(name) {
+                st.prepare.set_param_typed(name, data, dtype);
+                st.prepared = false;
+            }
+            if st.main_params.contains(name) {
+                self.inner.set_param_typed(name, data, dtype);
+            }
+        } else {
+            self.inner.set_param_typed(name, data, dtype);
+        }
     }
 
     /// Finish param upload — warms backend caches when supported.
     pub fn finalize_params(&mut self) {
+        self.ensure_prepared();
         self.inner.finalize_params();
     }
 
@@ -316,6 +480,7 @@ impl CompiledGraph {
         &mut self,
         inputs: &[(&str, &[u8], rlx_ir::DType)],
     ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
+        self.ensure_prepared();
         self.inner.run_typed(inputs)
     }
 

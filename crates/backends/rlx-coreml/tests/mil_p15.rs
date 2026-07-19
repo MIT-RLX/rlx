@@ -77,6 +77,10 @@ fn lower_q8_0_ondevice_uses_block_mul() {
     typed.insert("W".to_string(), (packed, DType::U8));
     let opts = LowerOptions {
         ondevice_dequant: true,
+        // Q1_0's on-device default is the LUT path (constexpr_lut_to_dense);
+        // these helpers assert the block-`mul` dequant, so opt Q1_0 into the
+        // F32/mul path here (a no-op for other schemes, which ignore q1_mode).
+        q1_mode: Some(rlx_coreml::mil::Q1Mode::F32),
         ..Default::default()
     };
     let lowered = lower_graph_with_options(&g, &HashMap::new(), &typed, &opts).expect("lower");
@@ -107,6 +111,10 @@ fn assert_ondevice_mul_with_packed(scheme: QuantScheme, packed: Vec<u8>, k: usiz
     typed.insert("W".to_string(), (packed, DType::U8));
     let opts = LowerOptions {
         ondevice_dequant: true,
+        // Q1_0's on-device default is the LUT path (constexpr_lut_to_dense);
+        // these helpers assert the block-`mul` dequant, so opt Q1_0 into the
+        // F32/mul path here (a no-op for other schemes, which ignore q1_mode).
+        q1_mode: Some(rlx_coreml::mil::Q1Mode::F32),
         ..Default::default()
     };
     let lowered = lower_graph_with_options(&g, &HashMap::new(), &typed, &opts).expect("lower");
@@ -152,6 +160,10 @@ fn assert_ondevice_kquant_mul(scheme: QuantScheme, ggml: rlx_gguf::GgmlType) {
     typed.insert("W".to_string(), (packed, DType::U8));
     let opts = LowerOptions {
         ondevice_dequant: true,
+        // Q1_0's on-device default is the LUT path (constexpr_lut_to_dense);
+        // these helpers assert the block-`mul` dequant, so opt Q1_0 into the
+        // F32/mul path here (a no-op for other schemes, which ignore q1_mode).
+        q1_mode: Some(rlx_coreml::mil::Q1Mode::F32),
         ..Default::default()
     };
     let lowered = lower_graph_with_options(&g, &HashMap::new(), &typed, &opts).expect("lower");
@@ -214,6 +226,74 @@ fn lower_tq2_0_ondevice_uses_block_mul() {
 #[test]
 fn lower_tq1_0_ondevice_uses_block_mul() {
     assert_ondevice_mul_zeros(QuantScheme::GgufTQ1_0, 256, 2);
+}
+
+#[test]
+fn lower_q1_0_ondevice_uses_block_mul() {
+    // PrismML Bonsai Q1_0: 128-elem blocks, qs ∈ {±1} × per-block scale.
+    assert_ondevice_mul_zeros(QuantScheme::GgufQ1_0, 128, 2);
+}
+
+#[test]
+fn lower_q1_0_ondevice_roundtrips_quantize() {
+    assert_ondevice_kquant_mul(QuantScheme::GgufQ1_0, rlx_gguf::GgmlType::Q1_0);
+}
+
+/// The non-unfolding Q1_0 variations keep qs as int8 in weight.bin (no F32
+/// blow-up): `int8` uses cast+mul, `affine` uses `constexpr_affine_dequantize`.
+/// Both blobs must be far smaller than the legacy F32 unfold, and both must
+/// emit their expected op.
+#[test]
+fn lower_q1_0_ondevice_int8_variations_compress_blob() {
+    use rlx_coreml::mil::Q1Mode;
+    let (m, k, n) = (1usize, 256usize, 8usize);
+    let w_nk: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.031).sin()).collect();
+    let packed = rlx_gguf::quantize(&w_nk, rlx_gguf::GgmlType::Q1_0).expect("quantize");
+    let build = |mode: Option<Q1Mode>| {
+        let mut g = Graph::new("dq");
+        let xi = g.input("x", Shape::new(&[m, k], DType::F32));
+        let w = g.param("W", Shape::new(&[n, k], DType::F32));
+        let y = g.append_node(
+            Op::DequantMatMul {
+                scheme: QuantScheme::GgufQ1_0,
+            },
+            vec![xi, w],
+            Shape::new(&[m, n], DType::F32),
+            None,
+        );
+        g.set_outputs(vec![y]);
+        let mut typed = rlx_coreml::mil::TypedParams::new();
+        typed.insert("W".to_string(), (packed.clone(), DType::U8));
+        let opts = LowerOptions {
+            ondevice_dequant: true,
+            q1_mode: mode,
+            ..Default::default()
+        };
+        lower_graph_with_options(&g, &HashMap::new(), &typed, &opts).expect("lower")
+    };
+    let ops = |l: &rlx_coreml::mil::LoweredProgram| {
+        main_block(&l.model)
+            .operations
+            .iter()
+            .map(|o| o.r#type.clone())
+            .collect::<Vec<_>>()
+    };
+    let f32_low = build(Some(Q1Mode::F32)); // legacy F32 unfold
+    let lut_low = build(Some(Q1Mode::Lut)); // 1-bit palettization (also the env default)
+
+    let lut_ops = ops(&lut_low);
+    assert!(
+        lut_ops.iter().any(|t| t == "constexpr_lut_to_dense"),
+        "lut mode expected constexpr_lut_to_dense, got {lut_ops:?}"
+    );
+    // LUT keeps 1-bit packing — indices ~n·k/8 bytes vs the F32 unfold's n·k·4,
+    // so the blob is a tiny fraction of the unfold (>10× smaller here).
+    assert!(
+        lut_low.blob.len() * 8 < f32_low.blob.len(),
+        "lut blob {} not << f32 blob {}",
+        lut_low.blob.len(),
+        f32_low.blob.len()
+    );
 }
 
 #[test]

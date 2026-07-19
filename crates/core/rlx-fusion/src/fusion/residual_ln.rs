@@ -36,6 +36,22 @@ use super::*;
 /// bias variant (used in BERT's output projection).
 pub struct FuseResidualLN;
 
+/// `FusedResidualLN` computes `LayerNorm(x + residual)` as one elementwise
+/// pass and infers its output shape from operand 0 (`unary_shape(in_shape(0))`).
+/// That only holds when both `Add` operands already carry the full output shape.
+/// A conditioning-add — e.g. a `[1,1,512]` global bias broadcast over a
+/// `[1,83,512]` stream (ChatterBox S3Gen) — has a broadcast operand, so folding
+/// it would infer a `[1,1,512]` output and fail the IR verifier. Only fuse when
+/// both operands match the `Add` output shape (a true same-shape residual).
+fn add_operands_match_output(graph: &Graph, add: &rlx_ir::Node) -> bool {
+    if add.inputs.len() != 2 {
+        return false;
+    }
+    let out = &add.shape;
+    graph.node(add.inputs[0]).shape.dims() == out.dims()
+        && graph.node(add.inputs[1]).shape.dims() == out.dims()
+}
+
 impl Pass for FuseResidualLN {
     fn name(&self) -> &str {
         "fuse_residual_ln"
@@ -62,6 +78,7 @@ impl Pass for FuseResidualLN {
                 if matches!(ln_input.op, Op::Binary(BinaryOp::Add))
                     && graph.use_count(ln_input_id) == 1
                     && !is_output.contains_key(&ln_input_id)
+                    && add_operands_match_output(&graph, ln_input)
                 {
                     fused_away.insert(ln_input_id, ());
                 }

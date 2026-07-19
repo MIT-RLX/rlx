@@ -20,6 +20,9 @@ fn main() {
     // keeps `#[cfg(rlx_cpu_blas)]` free of unexpected-cfg warnings even on the
     // targets where we deliberately don't set it (aarch64 Linux, wasm).
     println!("cargo:rustc-check-cfg=cfg(rlx_cpu_blas)");
+    println!("cargo:rustc-check-cfg=cfg(rlx_cpu_blas_accelerate)");
+    println!("cargo:rustc-check-cfg=cfg(rlx_cpu_blas_openblas)");
+    println!("cargo:rustc-check-cfg=cfg(rlx_cpu_blas_mkl)");
 
     // The `blas` feature is the top-level switch; `--no-default-features`
     // (or a target with no BLAS) falls back to the portable gemm.
@@ -44,6 +47,7 @@ fn main() {
     if target_vendor == "apple" {
         println!("cargo:rustc-link-lib=framework=Accelerate");
         println!("cargo:rustc-cfg=rlx_cpu_blas");
+        println!("cargo:rustc-cfg=rlx_cpu_blas_accelerate");
         return;
     }
 
@@ -61,6 +65,7 @@ fn main() {
         }
         println!("cargo:rustc-link-lib=mkl_rt");
         println!("cargo:rustc-cfg=rlx_cpu_blas");
+        println!("cargo:rustc-cfg=rlx_cpu_blas_mkl");
         return;
     }
 
@@ -89,4 +94,5 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=openblas");
     println!("cargo:rustc-cfg=rlx_cpu_blas");
+    println!("cargo:rustc-cfg=rlx_cpu_blas_openblas");
 }

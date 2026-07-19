@@ -41,7 +41,9 @@
 //!   WORLD  number of ranks                            (default 1)
 //!   PEERS  comma-separated host:port, one per rank    (default loopback pair)
 //!   MODE   infer | train | both | bench | pipeline | topology | placement |
-//!          multidev | federated | coordinator | worker   (default both)
+//!          multidev | parity | federated | coordinator | worker   (default both)
+//!          parity = cross-backend divergence diagnostic on this node (CPU oracle
+//!                   vs every local backend) — flags round-off vs kernel-bug drift
 //!          federated = bounded-staleness federated averaging (LATE_MS makes
 //!                      this rank a straggler; FED_DEADLINE_MS = patience);
 //!                      DTYPE=i8 exercises the int8/edge collective in bench
@@ -73,8 +75,13 @@
 //! PEERS addresses stay on loopback at both ends.
 
 use rlx_collectives::planner::{self, Link};
-use rlx_collectives::{all_reduce as graph_all_reduce, register, register_group, unregister_group};
-use rlx_driver::{Node, ProcessGroup, ReduceKind};
+// One import for the in-graph collective ops, the group registry, mesh/planner,
+// and the re-exported transport types (`Node`, `ProcessGroup`, `ReduceKind`) —
+// see `rlx_collectives::prelude`.
+use rlx_collectives::prelude::*;
+// `all_reduce` aliased to distinguish the in-graph op builder from the host
+// `ProcessGroup::all_reduce` method used elsewhere in this file.
+use rlx_collectives::all_reduce as graph_all_reduce;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::dist; // reusable ship-graph worker/coordinator API
 use rlx_runtime::{
@@ -182,6 +189,16 @@ fn main() {
         group.barrier().expect("post-multidev barrier");
     }
 
+    if mode == "parity" {
+        // Cross-backend divergence diagnostic: on THIS node, run a representative
+        // graph on the CPU oracle + every other local backend and report whether
+        // the gap is bounded round-off (explainable cluster drift) or a candidate
+        // kernel bug. Run it on each node to localize where distributed numbers
+        // drift. `ok` folds in the verdict so a suspect backend fails the run.
+        ok &= !run_parity(&label);
+        group.barrier().expect("post-parity barrier");
+    }
+
     if mode == "federated" {
         ok &= run_federated(&group, &label);
         group.barrier().expect("post-federated barrier");
@@ -197,6 +214,15 @@ fn main() {
     if mode == "worker" {
         ok &= run_worker(&group, &label);
         group.barrier().expect("post-worker barrier");
+    }
+
+    // Generic TRAINING worker: receive a `TrainSpec` the master ships and run
+    // its data-parallel training loop on THIS node's hardware — with no model
+    // code. The counterpart master lives wherever the model does (e.g.
+    // rlx-models' MNIST coordinator); this binary trains it blind.
+    if mode == "trainserve" {
+        ok &= run_train_worker(&group, &label);
+        group.barrier().expect("post-trainserve barrier");
     }
 
     // Distributed FFT: rank 0 scatters signal slices to the workers, each runs
@@ -538,6 +564,80 @@ fn run_worker(group: &Arc<ProcessGroup>, label: &str) -> bool {
     true
 }
 
+/// Cross-worker gradient average, host-side, over the group registered under
+/// `gid`. This is the ONE collective the generic training worker needs; passing
+/// it as a closure keeps `rlx-runtime::dist` free of any collective dependency.
+fn train_all_reduce(gid: u64, flat: &[f32]) -> Vec<f32> {
+    rlx_collectives::start_all_reduce(gid, flat.to_vec(), ReduceKind::Mean)
+        .expect("gradient group registered")
+        .wait()
+}
+
+/// Generic TRAINING worker: receive a [`dist::TrainSpec`] the master ships,
+/// resolve its params + data node-locally, and run the data-parallel training
+/// loop on this node's chosen device — **with no model code baked in**. The
+/// worker binary is model-agnostic; the master (which owns the model) drives it.
+fn run_train_worker(group: &Arc<ProcessGroup>, label: &str) -> bool {
+    let mut spec = match dist::recv_train(group) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[{label}] TRAIN-WORKER: {e}");
+            return false;
+        }
+    };
+    eprintln!(
+        "[{label}] TRAIN-WORKER: got a job I have no code for — {} params, {} data inputs, \
+         {} epochs, batch {}, device='{}'{}. Training blind…",
+        spec.params.len(),
+        spec.data.len(),
+        spec.lr_per_epoch.len(),
+        spec.batch,
+        spec.device,
+        if spec.push_data {
+            ", data pushed over the wire"
+        } else {
+            ""
+        },
+    );
+    // No shared filesystem? Pull our data shard from the master and rewrite the
+    // spec to the received local files.
+    if spec.push_data {
+        if let Err(e) = dist::pull_shards(group, &mut spec, &std::env::temp_dir()) {
+            eprintln!("[{label}] TRAIN-WORKER pull_shards: {e}");
+            return false;
+        }
+    }
+    // The master's grad-reduce group; register this rank's transport under it.
+    let gid = spec.grad_group;
+    register_group(gid, group.clone());
+    let out = dist::run_train(
+        &spec,
+        group.world_size(),
+        dist::uri_resolver,
+        |flat| train_all_reduce(gid, flat),
+        true,
+    );
+    if gid != GID {
+        unregister_group(gid);
+    }
+    match out {
+        Ok((m, _final_params)) => {
+            let inv: Vec<&str> = m.inventory.iter().map(|d| device_label(*d)).collect();
+            let used: Vec<&str> = m.lanes.iter().map(|d| device_label(*d)).collect();
+            eprintln!(
+                "[{label}] TRAIN-WORKER done — {} samples, compute {:.2}s / comm {:.2}s, \
+                 loss {:.4}→{:.4}  | trained across {used:?} of node inventory {inv:?}",
+                m.samples, m.compute_s, m.comm_s, m.first_loss, m.last_loss,
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("[{label}] TRAIN-WORKER run_train: {e}");
+            false
+        }
+    }
+}
+
 // ── Distributed FFT ─────────────────────────────────────────────────────────
 
 /// FFT stage graph: input/output `[rows, 2*nfft]` — re plane then im plane, the
@@ -750,6 +850,51 @@ fn run_pipeline(group: &Arc<ProcessGroup>, label: &str, device: Device) -> bool 
         }
     );
     pass
+}
+
+/// `MODE=parity`: cross-backend divergence diagnostic for THIS node. Builds a
+/// representative forward graph (matmul → relu → matmul → softmax — the ops most
+/// likely to hide a kernel bug) and, via `rlx_runtime::dist`, runs it on the CPU
+/// oracle + every other local backend, reporting whether each backend's gap from
+/// CPU is bounded round-off (explainable) or too large for rounding (a candidate
+/// kernel bug). Returns `true` if any backend is suspect. Run on each cluster
+/// node to localize where "one machine vs the cluster" numbers actually drift.
+fn run_parity(label: &str) -> bool {
+    let (b, d, h) = (4usize, 16usize, 8usize);
+    let mut g = Graph::new("parity");
+    let x = g.input("x", Shape::new(&[b, d], DType::F32));
+    let w1 = g.param("w1", Shape::new(&[d, h], DType::F32));
+    let w2 = g.param("w2", Shape::new(&[h, d], DType::F32));
+    let l1 = g.matmul(x, w1, Shape::new(&[b, h], DType::F32));
+    let a1 = g.activation(
+        rlx_ir::op::Activation::Relu,
+        l1,
+        Shape::new(&[b, h], DType::F32),
+    );
+    let l2 = g.matmul(a1, w2, Shape::new(&[b, d], DType::F32));
+    let sm = g.softmax(l2, 1, Shape::new(&[b, d], DType::F32));
+    g.set_outputs(vec![sm]);
+
+    let seed =
+        |n: usize, p: f32| -> Vec<f32> { (0..n).map(|i| (i as f32 * p).sin() * 0.3).collect() };
+    let xv = seed(b * d, 0.11);
+    let w1v = seed(d * h, 0.07);
+    let w2v = seed(h * d, 0.05);
+    // f32 forward tolerance: a couple of thousandths relative is round-off; more
+    // is a kernel bug worth chasing with the per-primitive parity tests.
+    let suspect = dist::report_backend_divergence(
+        label,
+        &g,
+        &[("w1", &w1v), ("w2", &w2v)],
+        &[("x", xv.as_slice())],
+        2e-3,
+    );
+    if suspect {
+        eprintln!("[{label}] PARITY: a backend diverged beyond round-off ✗ (investigate)");
+    } else {
+        eprintln!("[{label}] PARITY: all local backends within round-off of CPU ✓");
+    }
+    suspect
 }
 
 /// Tensor-parallel matmul, **GPU-friendly split**: each rank runs its

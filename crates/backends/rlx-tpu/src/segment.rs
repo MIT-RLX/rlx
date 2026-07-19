@@ -18,6 +18,25 @@ use std::collections::{HashMap, HashSet};
 
 use rlx_ir::{Graph, NodeId, Op};
 
+/// Collective op names that run as host segments. These are host/transport ops
+/// (`collective.all_reduce` / `all_gather` / `reduce_scatter` and the Megatron
+/// `f`/`g` operators) with no XLA/HLO lowering today — the TPU can't drive the
+/// process group. Mirrors `rlx_collectives::{ALL_REDUCE, ALL_GATHER,
+/// REDUCE_SCATTER, COPY_TO_PARALLEL, REDUCE_FROM_PARALLEL}`, which rlx-tpu
+/// cannot depend on (later publish tier); keep them in sync.
+pub const COLLECTIVE_OPS: &[&str] = &[
+    "collective.all_reduce",
+    "collective.all_gather",
+    "collective.reduce_scatter",
+    "collective.copy_to_parallel",
+    "collective.reduce_from_parallel",
+];
+
+/// True when `op` is a `collective.*` custom op that runs as a host segment.
+pub fn is_collective_op(op: &Op) -> bool {
+    matches!(op, Op::Custom { name, .. } if COLLECTIVE_OPS.contains(&name.as_str()))
+}
+
 /// One compile/run segment for the TPU orchestrator.
 pub enum Segment {
     /// Lowered to HLO + PJRT; `output_orig` lists original graph node ids
@@ -32,15 +51,20 @@ pub enum Segment {
     SplatBackward {
         node: NodeId,
     },
+    /// A `collective.*` custom op run on the host between HLO segments.
+    Collective {
+        node: NodeId,
+    },
 }
 
-/// True when the graph contains any splat op (needs orchestration).
+/// True when the graph contains any op that must run as a host segment
+/// (Gaussian splat or a `collective.*` custom op) — i.e. needs orchestration.
 pub fn needs_orchestration(graph: &Graph) -> bool {
     graph.nodes().iter().any(|n| {
         matches!(
             n.op,
             Op::GaussianSplatRender { .. } | Op::GaussianSplatRenderBackward { .. }
-        )
+        ) || is_collective_op(&n.op)
     })
 }
 
@@ -58,6 +82,10 @@ pub fn plan(graph: &Graph) -> Vec<Segment> {
             Op::GaussianSplatRenderBackward { .. } => {
                 flush_hlo(graph, &mut hlo_batch, &mut segments);
                 segments.push(Segment::SplatBackward { node: nid });
+            }
+            op if is_collective_op(op) => {
+                flush_hlo(graph, &mut hlo_batch, &mut segments);
+                segments.push(Segment::Collective { node: nid });
             }
             Op::Input { .. } | Op::Param { .. } => {}
             _ => hlo_batch.push(nid),
@@ -198,6 +226,52 @@ mod tests {
         assert!(matches!(segs[0], Segment::Hlo { .. }));
         assert!(matches!(segs[1], Segment::SplatRender { .. }));
         assert!(matches!(segs[2], Segment::Hlo { .. }));
+    }
+
+    /// A `collective.*` custom op must split into its own host `Collective`
+    /// segment, sandwiched between the HLO segments that feed and consume it.
+    #[test]
+    fn plan_splits_collective_from_matmul() {
+        let mut g = Graph::new("collective_plan_test");
+        let shape = Shape::new(&[4], DType::F32);
+        let a = g.input("a", shape.clone());
+        let b = g.input("b", shape.clone());
+        let c = g.binary(BinaryOp::Add, a, b, shape.clone());
+        // Build the collective node directly (bypassing the registry-checked
+        // `custom_op` builder so this test doesn't depend on rlx-collectives).
+        let ar = g.append_node(
+            Op::Custom {
+                name: "collective.all_reduce".to_string(),
+                num_inputs: 1,
+                attrs: 0u64.to_le_bytes().to_vec(),
+            },
+            vec![c],
+            shape.clone(),
+            None,
+        );
+        let d = g.binary(BinaryOp::Add, ar, b, shape);
+        g.set_outputs(vec![d]);
+
+        assert!(needs_orchestration(&g));
+        let segs = plan(&g);
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(segs[0], Segment::Hlo { .. }));
+        assert!(matches!(segs[1], Segment::Collective { .. }));
+        assert!(matches!(segs[2], Segment::Hlo { .. }));
+    }
+
+    #[test]
+    fn is_collective_op_matches_names() {
+        assert!(is_collective_op(&Op::Custom {
+            name: "collective.reduce_scatter".to_string(),
+            num_inputs: 1,
+            attrs: vec![],
+        }));
+        assert!(!is_collective_op(&Op::Custom {
+            name: "sparse_lu".to_string(),
+            num_inputs: 2,
+            attrs: vec![],
+        }));
     }
 
     #[test]

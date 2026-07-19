@@ -258,6 +258,32 @@ impl MpsGraph {
             }
         }
     }
+    /// Element-wise `sin(x)`.
+    pub fn sin(&self, x: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                sinWithTensor: x.obj
+                name: ns_string("sin")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
+    /// Element-wise `cos(x)`.
+    pub fn cos(&self, x: &MpsTensor) -> MpsTensor {
+        unsafe {
+            let t: *mut Object = msg_send![self.obj,
+                cosWithTensor: x.obj
+                name: ns_string("cos")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+
     /// Element-wise natural log `log(x)`.
     pub fn log(&self, x: &MpsTensor) -> MpsTensor {
         unsafe {
@@ -380,6 +406,20 @@ impl MpsGraph {
                 reductionMinimumWithTensor: x.obj
                 axes: nsaxes
                 name: ns_string("redmin")];
+            MpsTensor {
+                obj: t,
+                shape: None,
+            }
+        }
+    }
+    /// Reduce-product over the given axes (always keep dims).
+    pub fn reduce_product(&self, x: &MpsTensor, axes: &[i32]) -> MpsTensor {
+        unsafe {
+            let nsaxes = ns_array_of_i32(axes);
+            let t: *mut Object = msg_send![self.obj,
+                reductionProductWithTensor: x.obj
+                axes: nsaxes
+                name: ns_string("redprod")];
             MpsTensor {
                 obj: t,
                 shape: None,
@@ -1880,6 +1920,21 @@ impl MpsTensor {
         self
     }
 
+    /// Rank of the underlying MPSGraph tensor as MPSGraph itself inferred it.
+    /// Returns `None` when MPSGraph has no static shape (dynamic). MPSGraph
+    /// left-pads lower-rank RLX tensors with leading batch dims (IR `[12,34]`
+    /// → MPS `[1,12,34]`), so axis-based ops must rebase against this rank.
+    pub(crate) fn mps_rank(&self) -> Option<usize> {
+        unsafe {
+            let shape: *mut Object = msg_send![self.obj, shape];
+            if shape.is_null() {
+                return None;
+            }
+            let count: usize = msg_send![shape, count];
+            Some(count)
+        }
+    }
+
     /// Sequence length for `[B, S, NH·DH]` attention inputs. Prefer `fallback`
     /// when element count matches logical seq; otherwise use padded axis (KV cache).
     fn infer_attn_seq(
@@ -2009,6 +2064,15 @@ unsafe fn mps_tensor_data_from_buffer(
                      ptr_page_aligned={} len_page_aligned={}",
                     (raw_ptr as usize).is_multiple_of(16384),
                     bytes.is_multiple_of(16384),
+                );
+            }
+            if std::env::var_os("RLX_MPS_ALIGN_DEBUG").is_some() {
+                eprintln!(
+                    "[mps-align] offset={offset} bytes={bytes} ptr_align16k={} off_align16k={} over4g={} null={}",
+                    (raw_ptr as usize).is_multiple_of(16384),
+                    offset.is_multiple_of(16384),
+                    offset >= (1usize << 32),
+                    view.is_null(),
                 );
             }
             msg_send![alloc,

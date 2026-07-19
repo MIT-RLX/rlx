@@ -257,7 +257,7 @@ fn best_of(cands: [(Strategy, f64); 3]) -> (Strategy, f64) {
 mod tests {
     use super::*;
 
-    // ~RTX 3080 Ti class, fp32 sustained.
+    // ~NVIDIA GPU class, fp32 sustained.
     fn gpu() -> Device {
         Device {
             flops_per_s: 15e12,

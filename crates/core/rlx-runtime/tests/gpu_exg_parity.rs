@@ -66,6 +66,10 @@ fn run_on(dev: Device, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) -> Vec<Vec<f32
 
 /// Build on CPU and on `dev`, assert element-wise agreement.
 fn parity(name: &str, dev: Device, tol: f32, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) {
+    if !rlx_runtime::is_available(dev) {
+        eprintln!("skip {name}: {dev:?} unavailable");
+        return;
+    }
     let cpu = run_on(Device::Cpu, build);
     let gpu = run_on(dev, build);
     assert_eq!(cpu.len(), gpu.len(), "{name}: output count mismatch");

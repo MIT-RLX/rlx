@@ -188,6 +188,12 @@ kernel_cache!(
     "matmul_epilogue"
 );
 kernel_cache!(
+    CONV_BIAS_ACT_EPILOGUE,
+    conv_bias_act_epilogue_kernel,
+    rlx_gpu_kernels::conv_bias_act_epilogue_cuda_src(),
+    "conv_bias_act_epilogue"
+);
+kernel_cache!(
     MATMUL_WMMA,
     matmul_wmma_kernel,
     MATMUL_WMMA_CU,
@@ -234,6 +240,30 @@ kernel_cache!(
     fused_residual_rms_norm_kernel,
     FUSED_RESIDUAL_RMS_NORM_CU,
     "fused_residual_rms_norm"
+);
+kernel_cache!(
+    ADA_LAYER_NORM,
+    ada_layer_norm_kernel,
+    ADA_LAYER_NORM_CU,
+    "ada_layer_norm"
+);
+kernel_cache!(
+    GATED_RESIDUAL,
+    gated_residual_kernel,
+    GATED_RESIDUAL_CU,
+    "gated_residual"
+);
+kernel_cache!(
+    ADA_LAYER_NORM_BACKWARD,
+    ada_layer_norm_backward_kernel,
+    ADA_LAYER_NORM_BACKWARD_CU,
+    "ada_layer_norm_backward"
+);
+kernel_cache!(
+    GATED_RESIDUAL_BACKWARD,
+    gated_residual_backward_kernel,
+    GATED_RESIDUAL_BACKWARD_CU,
+    "gated_residual_backward"
 );
 kernel_cache!(GATHER, gather_kernel, GATHER_CU, "gather");
 kernel_cache!(
@@ -305,12 +335,24 @@ kernel_cache!(
     DEQUANT_MATMUL_GGUF_CU,
     "dequant_matmul_gguf"
 );
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_Q1_GEMV,
+    dequant_matmul_gguf_q1_gemv_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_q1_gemv"
+);
 kernel_cache!(SAMPLE, sample_kernel, SAMPLE_CU, "sample");
 kernel_cache!(
     SELECTIVE_SCAN,
     selective_scan_kernel,
     SELECTIVE_SCAN_CU,
     "selective_scan"
+);
+kernel_cache!(
+    GATED_DELTA_NET,
+    gated_delta_net_kernel,
+    GATED_DELTA_NET_CU,
+    "gated_delta_net"
 );
 kernel_cache!(POOL1D, pool1d_kernel, POOL1D_CU, "pool1d");
 kernel_cache!(POOL2D, pool2d_kernel, POOL2D_CU, "pool2d");
@@ -372,6 +414,18 @@ kernel_cache!(
 kernel_cache!(POOL3D, pool3d_kernel, POOL3D_CU, "pool3d");
 kernel_cache!(CONV1D, conv1d_kernel, CONV1D_CU, "conv1d");
 kernel_cache!(CONV2D, conv2d_kernel, CONV2D_CU, "conv2d");
+kernel_cache!(
+    CONV2D_BACKWARD_INPUT,
+    conv2d_backward_input_kernel,
+    CONV2D_BACKWARD_INPUT_CU,
+    "conv2d_backward_input"
+);
+kernel_cache!(
+    CONV2D_BACKWARD_WEIGHT,
+    conv2d_backward_weight_kernel,
+    CONV2D_BACKWARD_WEIGHT_CU,
+    "conv2d_backward_weight"
+);
 kernel_cache!(IM2COL, im2col_kernel, IM2COL_CU, "im2col");
 kernel_cache!(CONV3D, conv3d_kernel, CONV3D_CU, "conv3d");
 kernel_cache!(
@@ -481,7 +535,17 @@ kernel_cache!(
 /// Dispatch grid for a 1-D workload of `n` threads with workgroup
 /// size `block_x`. CUDA's per-grid-dim limit is 2^31-1 on the X axis,
 /// so the 2-D fallback wgpu requires isn't needed here.
+///
+/// `n == 0` would yield `grid_dim.x == 0`, which CUDA rejects
+/// (`CUDA_ERROR_INVALID_VALUE`). Empty tensors still get an arena slot
+/// (see `arena_slot_bytes`); skip the launch at the call site, or use
+/// this helper which returns a no-op `(1, block)` grid — kernels must
+/// guard `idx < n`.
 pub fn dispatch_grid_1d(n: u32, block_x: u32) -> (u32, u32) {
+    let block_x = block_x.max(1);
+    if n == 0 {
+        return (1, block_x);
+    }
     (n.div_ceil(block_x), block_x)
 }
 

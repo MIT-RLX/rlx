@@ -39,7 +39,13 @@ pub mod mil;
 pub use mil::{LowerOptions, lower_graph, lower_graph_with_options};
 pub mod mlpackage;
 pub mod op_registry;
+pub mod supported_ops;
 pub use op_registry::{CoremlKernel, lookup_coreml_kernel, register_coreml_kernel};
+#[cfg(feature = "training")]
+pub use supported_ops::SUPPORTED_OPS_TRAINING;
+pub use supported_ops::{BACKWARD_OPS, NATIVE_BACKWARD_OPS, SUPPORTED_OPS};
+
+pub mod collective;
 
 /// prost-generated CoreML protobuf types (`package coreml`).
 pub mod proto {
@@ -58,10 +64,11 @@ pub mod backend;
 #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 pub use backend::{CoremlExecutable, default_compute_units, default_lower_options};
 
-/// Which CoreML compute units the model may use. Mirrors
-/// `MLComputeUnits`. The default ([`ComputeUnits::All`]) lets CoreML's
-/// planner pick per op — typically routing to the Neural Engine when the
-/// op shape makes that the fastest path.
+/// Which CoreML compute units the model may use. Mirrors `MLComputeUnits`.
+///
+/// Runtime selection for a compiled graph goes through
+/// [`default_compute_units`] (env + dtype), **not** this enum's `Default`
+/// impl — that only provides a serde/placeholder default of [`All`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ComputeUnits {
     /// CPU + GPU + Neural Engine, planner's choice (`MLComputeUnitsAll`).
@@ -69,9 +76,9 @@ pub enum ComputeUnits {
     All,
     /// CPU only.
     CpuOnly,
-    /// CPU + GPU.
+    /// CPU + GPU (default for **fp32** graphs — BNNS-safe on large ML Programs).
     CpuAndGpu,
-    /// CPU + Neural Engine.
+    /// CPU + Neural Engine (default for **f16** graphs / `RLX_COREML_UNITS=ane`).
     CpuAndNeuralEngine,
 }
 

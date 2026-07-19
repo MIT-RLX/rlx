@@ -30,19 +30,17 @@ fn run1(g: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
 
 #[test]
 fn device_discovery_is_graceful() {
-    // Must never panic regardless of host. Driverless → false + no name;
-    // with a Level Zero GPU → true + a device name.
-    let avail = rlx_oneapi::is_available();
-    if avail {
-        assert!(rlx_oneapi::device_name().is_some());
-        eprintln!(
-            "[rlx-oneapi] Level Zero device: {:?} (native kernels: {})",
-            rlx_oneapi::device_name(),
+    // Backend is always selectable (CPU-ref without L0). Must never panic.
+    assert!(rlx_oneapi::is_available());
+    match rlx_oneapi::device_name() {
+        Some(name) => eprintln!(
+            "[rlx-oneapi] Level Zero device: {name:?} (native kernels: {})",
             rlx_oneapi::has_native_kernels()
-        );
-    } else {
-        assert!(rlx_oneapi::device_name().is_none());
-        eprintln!("[rlx-oneapi] no Level Zero device — compute runs via CPU reference");
+        ),
+        None => {
+            assert!(!rlx_oneapi::has_level_zero_device());
+            eprintln!("[rlx-oneapi] no Level Zero device — compute runs via CPU reference");
+        }
     }
 }
 
@@ -106,4 +104,33 @@ fn param_upload_and_mul() {
     exe.set_param("w", &[2.0, 3.0, 4.0]);
     let r = exe.run(&[("x", &[1.0, 1.0, 1.0])]);
     assert_eq!(r[0], vec![2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn dit_packed_gated_residual_backward_runs() {
+    let (b, seq, d) = (2usize, 3usize, 4usize);
+    let mut g = Graph::new("gate_bwd");
+    let x = g.input("x", s(&[b, seq, d]));
+    let y = g.input("y", s(&[b, seq, d]));
+    let gate = g.input("gate", s(&[b, 1, d]));
+    let dy = g.input("dy", s(&[b, seq, d]));
+    let o = g.gated_residual_backward(x, y, gate, dy);
+    g.set_outputs(vec![o]);
+    let nx = b * seq * d;
+    let ng = b * d;
+    let r = run1(
+        g,
+        &[
+            ("x", &vec![0.1f32; nx]),
+            ("y", &vec![0.2f32; nx]),
+            ("gate", &vec![0.5f32; ng]),
+            ("dy", &vec![1.0f32; nx]),
+        ],
+    );
+    assert_eq!(r.len(), nx + nx + ng);
+    assert!(r.iter().all(|v| v.is_finite()));
+    // dx = dy = 1; dy_out = gate*dy = 0.5; dgate = sum_s y*dy = 3*0.2
+    assert!((r[0] - 1.0).abs() < 1e-5);
+    assert!((r[nx] - 0.5).abs() < 1e-5);
+    assert!((r[2 * nx] - 0.6).abs() < 1e-5);
 }

@@ -252,6 +252,32 @@ impl HirModule {
         id
     }
 
+    /// Stamp a source-op provenance `name` onto every node created at or
+    /// after index `from` whose label is only the generic op default (or
+    /// unset). Importers call this after lowering one source op (an ONNX
+    /// node, a torch aten call) so all the HIR nodes it expanded into share
+    /// that op's identity — the label then flows to every derived MIR node
+    /// via `tag_hir_subgraph`, so a NaN in any of them localizes back to the
+    /// user's original op instead of a generic `"mir"`.
+    ///
+    /// Explicitly-meaningful names are preserved: `Input`/`Param` nodes have
+    /// no default label, so their weight names (which differ from `None`) are
+    /// left untouched even if they fall inside the range.
+    pub fn label_nodes_since(&mut self, from: usize, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        for i in from..self.nodes.len() {
+            let is_generic = {
+                let n = &self.nodes[i];
+                n.name.is_none() || n.name.as_deref() == default_hir_block_label(&n.op).as_deref()
+            };
+            if is_generic {
+                self.nodes[i].name = Some(name.to_string());
+            }
+        }
+    }
+
     fn push_block(
         &mut self,
         op: HirOp,
@@ -952,6 +978,55 @@ mod tests {
         let g = mir.into_graph();
         assert!(g.nodes().iter().any(|n| matches!(n.op, Op::MatMul)));
         assert_eq!(g.len(), 9);
+    }
+
+    #[test]
+    fn label_nodes_since_flows_source_name_to_all_mir_nodes() {
+        // Mirrors the importer path: build a few raw `mir` ops (which default
+        // to the generic "mir" label), stamp them with the source-op name,
+        // then lower and confirm EVERY derived MIR node localizes back to that
+        // name instead of "mir" — this is exactly what the NaN localizer reads.
+        use crate::hir::HirMut;
+        use crate::op::Activation;
+        use crate::{Op, node_label};
+
+        let mut hir = HirModule::new("m");
+        {
+            let mut b = HirMut::new(&mut hir);
+            let x = b.input("x", f32_shape(&[4]));
+            let from = b.0.len(); // stamp everything created after the input
+            let e = b.activation(Activation::Exp, x, f32_shape(&[4]));
+            let two = b.add(e, e);
+            let out = b.div(two, e);
+            b.0.label_nodes_since(from, "Softmax_7");
+            b.set_outputs(vec![out]);
+        }
+        let g = hir.lower_to_mir().expect("lower").into_graph();
+
+        let mut compute = 0;
+        for node in g.nodes() {
+            match node.op {
+                Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => {}
+                _ => {
+                    compute += 1;
+                    assert_eq!(
+                        node_label(&g, node.id),
+                        "Softmax_7",
+                        "node {} {:?} lost source provenance",
+                        node.id,
+                        node.op
+                    );
+                }
+            }
+        }
+        assert!(
+            compute >= 3,
+            "expected exp/add/div compute nodes, got {compute}"
+        );
+
+        // The input keeps its own identity, not the source-op label.
+        let x_mir = g.input_id("x").expect("input x present");
+        assert_eq!(node_label(&g, x_mir), "x");
     }
 
     #[test]

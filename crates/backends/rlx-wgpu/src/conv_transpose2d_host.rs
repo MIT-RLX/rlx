@@ -12,11 +12,13 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-//! Host-side `Op::ConvTranspose2d` for wgpu arenas (readback → CPU → writeback).
-//! wgpu has no native transposed-conv kernel; the decoder upsample in vision
-//! U-Nets is a handful of ops, so the CPU reference round-trip is acceptable.
+
+//! Host-side `Op::ConvTranspose2d` for wgpu arenas.
+//!
+//! Thin adapter over [`rlx_gpu_host::run_conv_transpose2d_nchw`].
 
 use crate::buffer::Arena;
+use crate::host_stage::WgpuArena;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_conv_transpose2d(
@@ -43,30 +45,14 @@ pub fn run_conv_transpose2d(
     dw: usize,
     groups: usize,
 ) {
-    let mut host = arena.read_bytes_range(device, queue, 0, arena.size);
-    unsafe {
-        rlx_cpu::thunk::execute_conv_transpose2d_nchw_f32(
-            src,
-            weight,
-            dst,
-            n,
-            c_in,
-            h,
-            w_in,
-            c_out,
-            h_out,
-            w_out,
-            kh,
-            kw,
-            sh,
-            sw,
-            ph,
-            pw,
-            dh,
-            dw,
-            groups,
-            host.as_mut_ptr(),
-        );
-    }
-    arena.write_bytes_range(queue, 0, &host);
+    let mut a = WgpuArena {
+        arena,
+        device,
+        queue,
+        size_bytes: arena.size,
+    };
+    rlx_gpu_host::run_conv_transpose2d_nchw(
+        &mut a, src, weight, dst, n, c_in, h, w_in, c_out, h_out, w_out, kh, kw, sh, sw, ph, pw,
+        dh, dw, groups,
+    );
 }

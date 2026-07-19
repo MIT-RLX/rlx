@@ -193,6 +193,60 @@ impl Shape {
     }
 }
 
+/// Pack leading-dim broadcast metadata for DiT modulation kernels
+/// ([`Op::AdaLayerNorm`](crate::op::Op::AdaLayerNorm) /
+/// [`Op::GatedResidual`](crate::op::Op::GatedResidual)).
+///
+/// Layout: `[lead_rank, x_lead[0..8], mod_lead[0..8]]` — right-aligns
+/// `mod_dims` to `x_dims` with size-1 padding (NumPy broadcast). Last axis
+/// of both shapes is the feature dim and is omitted from the pack.
+pub fn ada_modulation_lead_pack(x_dims: &[usize], mod_dims_in: &[usize]) -> [u32; 17] {
+    let rank = x_dims.len();
+    assert!(rank >= 1, "AdaLayerNorm/GatedResidual: rank ≥ 1");
+    let lead = rank - 1;
+    assert!(
+        lead <= 8,
+        "AdaLayerNorm/GatedResidual: at most 8 leading dims"
+    );
+    let pad = rank
+        .checked_sub(mod_dims_in.len())
+        .expect("modulation rank exceeds x");
+    let mut mod_dims = vec![1usize; rank];
+    mod_dims[pad..].copy_from_slice(mod_dims_in);
+    let mut pack = [0u32; 17];
+    pack[0] = lead as u32;
+    for j in 0..lead {
+        pack[1 + j] = x_dims[j] as u32;
+        pack[9 + j] = mod_dims[j] as u32;
+    }
+    pack
+}
+
+/// Launch geometry for DiT modulation backward kernels: one block/threadgroup
+/// per unique modulation row; that unit loops `seq_per_mod` feature-rows that
+/// share it (typical DiT `[B,S,D]` / `[B,1,D]` → `(B, S)`).
+pub fn ada_modulation_launch(x_dims: &[usize], mod_dims: &[usize]) -> (u32, u32) {
+    assert!(!x_dims.is_empty() && !mod_dims.is_empty());
+    let xr = x_dims.len() - 1;
+    let mr = mod_dims.len() - 1;
+    let mut seq = 1u32;
+    let mut mods = 1u32;
+    for i in 0..xr {
+        let xd = x_dims[i] as u32;
+        let md = if i + mr >= xr {
+            mod_dims[i - (xr - mr)] as u32
+        } else {
+            1
+        };
+        if md == 1 && xd > 1 {
+            seq = seq.saturating_mul(xd);
+        } else {
+            mods = mods.saturating_mul(xd.max(1));
+        }
+    }
+    (mods.max(1), seq.max(1))
+}
+
 // ── Shape inference functions ────────────────────────────────────────────
 
 /// Numpy-style broadcast of two shapes. Returns the broadcast result.
@@ -406,7 +460,13 @@ pub fn gather_shape(table: &Shape, indices: &Shape, axis: usize) -> Result<Shape
     if axis >= table.rank() {
         return Err(format!("gather: axis {axis} >= rank {}", table.rank()));
     }
-    let mut dims: SmallVec<[Dim; 4]> = indices.dims.clone();
+    // ONNX Gather output = table[:axis] ++ indices.shape ++ table[axis+1:].
+    // The leading `table[:axis]` dims were previously DROPPED — correct only for
+    // axis 0 (empty prefix); an axis!=0 gather like `[4,3]` on axis 1 wrongly
+    // collapsed to `[6]` instead of `[4,6]` (StyleTTS2 nearest-resize / any
+    // batched/channel gather).
+    let mut dims: SmallVec<[Dim; 4]> = table.dims[..axis].iter().copied().collect();
+    dims.extend(indices.dims.iter().copied());
     for i in (axis + 1)..table.rank() {
         dims.push(table.dims[i]);
     }
@@ -424,14 +484,20 @@ pub fn reshape_shape(input: &Shape, new_shape: &[i64]) -> Result<Shape, String> 
     }
 
     if input.is_static() {
-        let total = input
-            .num_elements()
-            .ok_or_else(|| "reshape: input has dynamic dims".to_string())?;
+        // Only the `-1` case needs the input's element count. Computing `total`
+        // eagerly made a reshape to a FULLY-CONCRETE target fail whenever the
+        // input's product couldn't be formed (a stray over-large/garbage static
+        // dim from an upstream mis-resolved dynamic axis → `num_elements()` = None
+        // via checked_mul), aborting the whole import ("input has dynamic dims").
+        // A fully-specified target shape is well-defined regardless of the input.
         let known_product: i64 = new_shape.iter().filter(|&&d| d != -1).product();
         let mut dims = SmallVec::new();
         for &d in new_shape {
             if d == -1 {
-                let inferred = total as i64 / known_product;
+                let total = input
+                    .num_elements()
+                    .ok_or_else(|| "reshape: input has dynamic dims".to_string())?;
+                let inferred = total as i64 / known_product.max(1);
                 dims.push(Dim::Static(inferred as usize));
             } else if d < 0 {
                 return Err(format!("reshape: invalid dim {d}"));
@@ -900,6 +966,22 @@ mod tests {
                 DType::F32
             )
         );
+    }
+
+    #[test]
+    fn gather_nonzero_axis_keeps_prefix() {
+        // ONNX Gather output = table[:axis] ++ indices.shape ++ table[axis+1:].
+        // Regression: axis!=0 must NOT drop the leading dims (a nearest-upsample
+        // gather `[4,3]` on axis 1 with a `[6]` index → `[4,6]`, not `[6]`).
+        let table = Shape::new(&[4, 3], DType::F32);
+        let indices = Shape::new(&[6], DType::I64);
+        let r = gather_shape(&table, &indices, 1).unwrap();
+        assert_eq!(r, Shape::new(&[4, 6], DType::F32));
+        // axis 1 of a rank-3 table, 2-D index.
+        let table = Shape::new(&[2, 5, 7], DType::F32);
+        let indices = Shape::new(&[3, 4], DType::I64);
+        let r = gather_shape(&table, &indices, 1).unwrap();
+        assert_eq!(r, Shape::new(&[2, 3, 4, 7], DType::F32));
     }
 
     #[test]

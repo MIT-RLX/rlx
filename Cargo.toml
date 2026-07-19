@@ -6,10 +6,12 @@ members = [
     "crates/core/rlx-tensor",      # Symbolic tensor DSL (operator-overloaded graph building)
     "crates/core/rlx-flow",        # Block assembly-line API for model builders
     "crates/core/rlx-fusion",      # MIR fusion passes + fused-op unfuse
+    "crates/core/rlx-unfuse",      # Shared IR unfuse/decompose pass for CUDA/ROCm/wgpu (policy-parameterized)
     "crates/core/rlx-autodiff",    # Reverse/forward-mode AD on MIR
     "crates/core/rlx-compile",     # HIR → MIR → LIR pipeline
     "crates/core/rlx-opt",         # Facade: re-exports fusion + autodiff + compile
     "crates/core/rlx-optim",       # Training-step optimizers (Adam, AdamW, Lion, SOAP, Muon, …)
+    "crates/core/rlx-extend",      # Facade: stable extension surface (custom ops + LayerStage + DSL) for downstream
 
     # Driver layer (devices, arenas, buffers, streams)
     "crates/core/rlx-driver",
@@ -57,6 +59,7 @@ members = [
     "crates/io/rlx-gguf-convert", # safetensors / ONNX → GGUF conversion with per-tensor quant
     "crates/io/rlx-nemo",        # NVIDIA NeMo `.nemo` loader (tar + torch.save ckpt + YAML)
     "crates/backends/rlx-gpu-kernels", # Shared CUDA/HIP .cu sources for rlx-cuda + rlx-rocm
+    "crates/backends/rlx-gpu-host",    # Shared host-fallback (D2H→CPU→H2D) staging for rlx-cuda + rlx-rocm
     "crates/backends/rlx-mlx-sys",     # Vendored MLX C++ + rlx_mlx_shim C ABI
 
     # Proc macros
@@ -80,7 +83,10 @@ members = [
 
     # Benchmark framework (PLAN L5)
     "crates/tooling/rlx-bench",       # BenchmarkPattern + per-backend timing harness
+    "crates/tooling/rlx-hwprofile",   # Host GPU/VRAM detection for device selection + topology planning
+    "crates/tooling/rlx-check",       # `cargo rlx check` — device-free static graph diagnostics
     "crates/io/rlx-onnx",        # ONNX Runtime inference for .onnx files (PLAN B7)
+    "crates/io/rlx-onnx-proto",  # Vendored pure-Rust ONNX protobuf types (protoc-free)
     "crates/io/rlx-onnx-import", # ONNX → RLX HIR import + op lowering
     "crates/io/rlx-onnx-conformance", # ONNX op-level ORT parity harness
     "crates/io/rlx-torch-import", # PyTorch (torch.export) → RLX HIR import + bundle/crate emit
@@ -134,7 +140,7 @@ incremental = false
 # Add them as crates reach individual readiness.
 
 [workspace.package]
-version       = "0.2.12"
+version       = "0.2.13"
 edition       = "2024"
 rust-version  = "1.87"  # edition=2024 needs ≥1.85; we use `is_multiple_of` (stable in 1.87)
 license       = "GPL-3.0-only"

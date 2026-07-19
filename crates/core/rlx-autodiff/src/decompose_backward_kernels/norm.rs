@@ -357,3 +357,108 @@ pub fn compose_group_norm_backward_beta(g: &mut Graph, dy: NodeId, beta_shape: &
         beta_shape.clone(),
     )
 }
+
+/// Packed reverse of [`Op::AdaLayerNorm`] as primitives + Concat.
+pub fn compose_ada_layer_norm_backward(
+    g: &mut Graph,
+    x: NodeId,
+    scale: NodeId,
+    _shift: NodeId,
+    dy: NodeId,
+    norm: rlx_ir::op::AdaNormKind,
+    eps: f32,
+    out_shape: &Shape,
+) -> NodeId {
+    let x_shape = g.node(x).shape.clone();
+    let scale_shape = g.node(scale).shape.clone();
+    let dtype = x_shape.dtype();
+    let d = match x_shape.dim(x_shape.rank() - 1) {
+        Dim::Static(n) => n,
+        _ => panic!("compose_ada_layer_norm_backward: dynamic feature dim"),
+    };
+    let gamma = g.full(&[d], 1.0, dtype);
+    let beta = g.zeros(&[d], dtype);
+    let n = match norm {
+        rlx_ir::op::AdaNormKind::LayerNorm => {
+            g.layer_norm(x, gamma, beta, -1, eps, x_shape.clone())
+        }
+        rlx_ir::op::AdaNormKind::RmsNorm => g.rms_norm(x, gamma, beta, eps),
+    };
+    let tgt: Vec<i64> = x_shape
+        .dims()
+        .iter()
+        .map(|d| match d {
+            Dim::Static(v) => *v as i64,
+            _ => -1,
+        })
+        .collect();
+    let scale_e = g.add_node(
+        Op::Expand { target_shape: tgt },
+        vec![scale],
+        x_shape.clone(),
+    );
+    let ones = broadcast_eps(g, 1.0, &x_shape);
+    let one_plus = g.add(ones, scale_e);
+    let dn = g.mul(dy, one_plus);
+    let dx = match norm {
+        rlx_ir::op::AdaNormKind::LayerNorm => {
+            compose_layer_norm_backward_input(g, x, gamma, dn, -1, eps, &x_shape)
+        }
+        rlx_ir::op::AdaNormKind::RmsNorm => {
+            compose_rms_norm_backward_input(g, x, gamma, beta, dn, -1, eps, &x_shape)
+        }
+    };
+    let dscale_full = g.mul(dy, n);
+    let dscale = crate::autodiff::unbroadcast(dscale_full, &scale_shape, g);
+    let dshift = crate::autodiff::unbroadcast(dy, &scale_shape, g);
+    pack_flat_grads(g, &[dx, dscale, dshift], out_shape)
+}
+
+/// Packed reverse of [`Op::GatedResidual`] as primitives + Concat.
+pub fn compose_gated_residual_backward(
+    g: &mut Graph,
+    _x: NodeId,
+    y: NodeId,
+    gate: NodeId,
+    dy: NodeId,
+    out_shape: &Shape,
+) -> NodeId {
+    let x_shape = g.node(dy).shape.clone();
+    let gate_shape = g.node(gate).shape.clone();
+    let tgt: Vec<i64> = x_shape
+        .dims()
+        .iter()
+        .map(|d| match d {
+            Dim::Static(v) => *v as i64,
+            _ => -1,
+        })
+        .collect();
+    let gate_e = g.add_node(
+        Op::Expand { target_shape: tgt },
+        vec![gate],
+        x_shape.clone(),
+    );
+    let dx = dy;
+    let dy_out = g.mul(dy, gate_e);
+    let dgate_full = g.mul(dy, y);
+    let dgate = crate::autodiff::unbroadcast(dgate_full, &gate_shape, g);
+    pack_flat_grads(g, &[dx, dy_out, dgate], out_shape)
+}
+
+fn pack_flat_grads(g: &mut Graph, grads: &[NodeId], out_shape: &Shape) -> NodeId {
+    let dtype = out_shape.dtype();
+    let mut flats = Vec::with_capacity(grads.len());
+    for &id in grads {
+        let n = g.node(id).shape.num_elements().expect("static grad numel");
+        let flat = g.reshape_(id, vec![n as i64]);
+        flats.push(flat);
+    }
+    let mut cat = flats[0];
+    for &f in &flats[1..] {
+        cat = g.concat_(vec![cat, f], 0);
+    }
+    let got = g.node(cat).shape.num_elements();
+    debug_assert_eq!(got, out_shape.num_elements());
+    let _ = dtype;
+    cat
+}

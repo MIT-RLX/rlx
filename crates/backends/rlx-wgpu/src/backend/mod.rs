@@ -23,24 +23,13 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 
 use rlx_ir::dynamic::{bind_graph, infer_bindings_from_f32_inputs, same_binding};
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, ReduceOp};
+use rlx_ir::op::Activation;
 use rlx_ir::shape::DimBinding;
 use rlx_ir::{Graph, NodeId, Op};
 
 use crate::buffer::{Arena, ReadbackStaging, TinyReadbackStaging};
 use crate::device::wgpu_device;
-use crate::kernels::{
-    ArgmaxParams, AttentionBwdParams, AttentionParams, BatchElementwiseRegionParams, BinaryParams,
-    Conv1dParams, Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams,
-    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
-    FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupedMatmulParams, GruParams, Im2Col2dParams, Kernel, LayerNormBwdParams,
-    LayerNormParams, Mamba2Params, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
-    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
-    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
-    gather_split_kernel, matmul_coop_f16_vulkan_kernel,
-};
+use crate::kernels::{GatherParams, Kernel, gather_split_kernel, matmul_coop_f16_vulkan_kernel};
 /// Compute the maximum tail-scratch bytes any single op needs across
 /// the graph. Currently only `Op::LayerNormBackwardGamma` uses scratch
 /// — it stores `num_workgroups * H` f32 partial sums.
@@ -95,30 +84,45 @@ fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
     max_bytes.max(64 * 1024 * 1024)
 }
 
-/// Default routing thresholds for the im2col+GEMM conv path. im2col only wins
-/// when the GEMM amortizes the `col` materialization: the compute/col-write
-/// ratio is `c_out`, so a large output-channel count (`min_cout`) is the key
-/// gate, plus a real reduction depth (`min_k = c_in*kh*kw`) and a wide enough
-/// spatial extent (`min_spatial`). Small skinny 1D convs (few channels) are
-/// left on the direct `conv2d.wgsl` kernel, which is faster there. All three
-/// are overridable via env for tuning (`RLX_WGPU_IM2COL_MIN_{COUT,K,SPATIAL}`).
-const CONV_IM2COL_MIN_SPATIAL: u64 = 2048;
-const CONV_IM2COL_MIN_K: u64 = 256;
-const CONV_IM2COL_MIN_COUT: u64 = 64;
+/// Shared ephemeral state for `Op::GatedDeltaNet` with `carry_state=false`
+/// (one slab reused across layers — same sizing as Metal/CUDA).
+fn gdn_ephemeral_state_bytes(graph: &rlx_ir::Graph) -> usize {
+    let mut max = 0usize;
+    for node in graph.nodes() {
+        if let Op::GatedDeltaNet {
+            carry_state,
+            state_size,
+            ..
+        } = &node.op
+            && !*carry_state
+        {
+            let q_shape = &graph.node(node.inputs[0]).shape;
+            let elems = q_shape.dim(0).unwrap_static()
+                * q_shape.dim(2).unwrap_static()
+                * state_size
+                * state_size;
+            max = max.max(elems * std::mem::size_of::<f32>());
+        }
+    }
+    max
+}
 
 /// Hard cap on the col scratch matrix (bytes). Convs whose col would exceed
 /// this fall back to the direct conv kernel (keeps the arena well under the
 /// 4 GiB storage-binding limit).
 const CONV_IM2COL_MAX_COL_BYTES: u64 = 1024 * 1024 * 1024;
 
+// Defaults live in [`crate::config::WgpuRuntimeConfig::from_env`].
+const _CONV_IM2COL_DEFAULTS: (u64, u64, u64) = (2048, 256, 64);
+
 fn im2col_min_spatial() -> u64 {
-    rlx_ir::env::parse_or("RLX_WGPU_IM2COL_MIN_SPATIAL", CONV_IM2COL_MIN_SPATIAL)
+    crate::runtime_config().im2col_min_spatial as u64
 }
 fn im2col_min_k() -> u64 {
-    rlx_ir::env::parse_or("RLX_WGPU_IM2COL_MIN_K", CONV_IM2COL_MIN_K)
+    crate::runtime_config().im2col_min_k as u64
 }
 fn im2col_min_cout() -> u64 {
-    rlx_ir::env::parse_or("RLX_WGPU_IM2COL_MIN_COUT", CONV_IM2COL_MIN_COUT)
+    crate::runtime_config().im2col_min_cout as u64
 }
 
 /// Minimum output length for routing a `one_d` conv through the register-blocked
@@ -261,695 +265,13 @@ fn hash_f32_input(data: &[f32]) -> u64 {
 ///            both SHADER_F16 + EXPERIMENTAL_COOPERATIVE_MATRIX.
 ///            Caller must ensure A is mirrored to arena_f16 first
 ///            (the lowering inserts a `Step::CastF32ToF16` pre-pass).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MatmulCompute {
-    F32,
-    F16,
-    Coop16,
-    /// Cooperative-matrix on Apple's `simdgroup_float8x8` — same hardware
-    /// GEMM unit as Coop16 but with f32 operands and f32 accumulator.
-    /// No precision loss vs F32 baseline; no f16 overflow risk in deep
-    /// FFN sums. Used when alignment + features allow but the IR is f32.
-    CoopF32,
-    /// Vulkan/NVIDIA 16×16 f16 tensor-core matmul with K-slab f32
-    /// reduction (avoids Naga mixed f16/f32 coop_mat bugs).
-    CoopF16Vk,
-}
-
-/// Split-write QKV matmul kernel selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MatmulQkvKind {
-    F32,
-    CoopF32,
-    CoopF16Vk,
-}
-
-/// f32 → f16 element-wise cast, mirroring an arena region into the
-/// f16 shadow buffer. Used as a pre-pass before `matmul_coop16` so
-/// the matmul's A operand (a runtime activation, not a Param) is
-/// readable as f16.
-///
-/// Currently unused — the matmul_coop16 kernel stages A through
-/// workgroup-shared memory directly from the f32 arena. Kept for
-/// future paths that may want a one-shot cast (e.g. before a chain
-/// of f16-only kernels operating on a fixed activation region).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-struct CastF32ToF16Params {
-    pub src_off: u32, // f32-element offset into arena (also f16-element offset)
-    pub len: u32,
-    pub _p0: u32,
-    pub _p1: u32,
-}
-unsafe impl bytemuck::Pod for CastF32ToF16Params {}
-unsafe impl bytemuck::Zeroable for CastF32ToF16Params {}
-
-/// One dispatch step in the compiled schedule.
-///
-/// `dead_code` is allowed at the enum level: several variants carry
-/// fields (mask_buf, meta_idx, compute_precision discriminants) that
-/// are only consulted at compile time during bind-group construction,
-/// or are kept to extend buffer lifetimes (mask_buf). A few variants
-/// (CastF32ToF16, Copy, the unreachable F16 compute_precision) are
-/// retained for future paths.
-#[allow(dead_code)]
-enum Step {
-    CastF32ToF16 {
-        params: CastF32ToF16Params,
-    },
-    Matmul {
-        m: u32,
-        k: u32,
-        n: u32,
-        a_off_f32: u32,
-        b_off_f32: u32,
-        c_off_f32: u32,
-        batch: u32,
-        a_batch_stride: u32,
-        b_batch_stride: u32,
-        c_batch_stride: u32,
-        has_bias: u32,
-        bias_off_f32: u32,
-        act_id: u32, // 0xFFFF = no activation
-        // True iff input B is a Param node — i.e. a model weight that
-        // doesn't change between `run()` calls. Read from the f16
-        // shadow buffer (half memory bandwidth) when set + the device
-        // exposes SHADER_F16. Set at compile time; consulted only by
-        // the dispatch arm.
-        b_is_param: bool,
-        // Compute precision for the inner FMA. F32 = full precision
-        // (the historical / default path). F16 = mixed-precision
-        // (operands cast to f16, multiply in f16 for 2× ALU on Apple,
-        // accumulator in f32). Set at compile time from the IR's
-        // dtype after AutoMixedPrecision policy.
-        compute_precision: MatmulCompute,
-    },
-    Binary {
-        params: BinaryParams,
-    },
-    Compare {
-        params: BinaryParams,
-    },
-    Unary {
-        params: UnaryParams,
-        f16_mirror: bool,
-    },
-    Where {
-        params: WhereParams,
-    },
-    Fma {
-        params: FmaParams,
-    },
-    Reduce {
-        params: ReduceParams,
-    },
-    Softmax {
-        params: SoftmaxParams,
-    },
-    SoftmaxCrossEntropy {
-        params: SceParams,
-    },
-    LayerNorm {
-        params: LayerNormParams,
-    },
-    Cumsum {
-        params: CumsumParams,
-    },
-    /// Native multi-kernel f32 FFT (gpu-fft dispatch strategy).
-    FftGpu {
-        src_off: u32,
-        dst_off: u32,
-        outer: u32,
-        n: u32,
-        inverse: u32,
-        norm_scale: f32,
-    },
-    /// Explicit host FFT (D2H → rlx-cpu → H2D). Used when the native
-    /// WGSL kernel cannot handle dtype / size / non-pow-2 constraints.
-    FftHost {
-        src_byte_off: u32,
-        dst_byte_off: u32,
-        outer: u32,
-        n_complex: u32,
-        inverse: bool,
-        norm_tag: u32,
-        dtype_tag: u32,
-    },
-    /// General `Op::Scan` recurrence — D2H the input span → run the compiled
-    /// body loop on the CPU → H2D. Enables IIR (`biquad`/`sosfilt`) on wgpu.
-    ScanHost {
-        plan: std::sync::Arc<rlx_cpu::thunk::ScanBodyPlan>,
-        outer_init_off: usize,
-        outer_final_off: usize,
-        length: u32,
-        save_trajectory: bool,
-        xs_outer: Vec<(usize, usize)>,
-        bcast_outer: Vec<(usize, usize)>,
-    },
-    /// Welch PSD top-K — D2H → rlx-cpu → H2D.
-    WelchPeaksHost {
-        spec_byte_off: u32,
-        dst_byte_off: u32,
-        welch_batch: u32,
-        n_fft: u32,
-        n_segments: u32,
-        k: u32,
-    },
-    LogMelHost {
-        spec_byte_off: u32,
-        filt_byte_off: u32,
-        dst_byte_off: u32,
-        outer: u32,
-        n_fft: u32,
-        n_bins: u32,
-        n_mels: u32,
-    },
-    LogMelBackwardHost {
-        spec_byte_off: u32,
-        filt_byte_off: u32,
-        dy_byte_off: u32,
-        dst_byte_off: u32,
-        outer: u32,
-        n_fft: u32,
-        n_bins: u32,
-        n_mels: u32,
-    },
-    /// NCHW im2col host path (D2H → rlx-cpu → H2D).
-    Im2ColHost {
-        x_byte_off: u32,
-        col_byte_off: u32,
-        n: u32,
-        c_in: u32,
-        h: u32,
-        w: u32,
-        h_out: u32,
-        w_out: u32,
-        kh: u32,
-        kw: u32,
-        sh: u32,
-        sw: u32,
-        ph: u32,
-        pw: u32,
-        dh: u32,
-        dw_dil: u32,
-    },
-    /// Host fill for [`Op::RngNormal`] (fill → H2D).
-    RngNormalHost {
-        dst_byte_off: u32,
-        len: u32,
-        mean: f32,
-        scale: f32,
-        key: u64,
-        op_seed: Option<f32>,
-    },
-    /// Host fill for [`Op::RngUniform`] (fill → H2D).
-    RngUniformHost {
-        dst_byte_off: u32,
-        len: u32,
-        low: f32,
-        high: f32,
-        key: u64,
-        op_seed: Option<f32>,
-    },
-    /// Host-side buffer copy (recorded into a command encoder) used to
-    /// stage small param tensors into the tail scratch region so kernels
-    /// can bind a ≤4GiB window of the arena.
-    BufferCopy {
-        // u64: staging copies for >4 GiB GGUF decode arenas address tensors past
-        // the 4 GiB mark; a u32 byte offset truncates and stages garbage.
-        src_byte_off: u64,
-        dst_byte_off: u64,
-        bytes: u32,
-    },
-    Copy {
-        params: CopyParams,
-    },
-    /// PLAN L2 — fused N-ary element-wise region. Lowered from
-    /// `Op::ElementwiseRegion` by `MarkElementwiseRegions`. Kernel
-    /// interprets the chain encoding per-element (saves N kernel
-    /// dispatches + N global-memory round-trips vs the decomposed
-    /// atomic ops).
-    ElementwiseRegion {
-        params: ElementwiseRegionParams,
-    },
-    BatchElementwiseRegion {
-        params: BatchElementwiseRegionParams,
-    },
-    Transpose {
-        params: TransposeParams,
-        meta_idx: usize,
-    },
-    Narrow {
-        params: NarrowConcatParams,
-    },
-    Concat {
-        params: NarrowConcatParams,
-    }, // one Step per input
-    Gather {
-        params: GatherParams,
-    },
-    GatherAxis {
-        params: GatherAxisParams,
-    },
-    Attention {
-        params: AttentionParams,
-        mask_buf: Option<wgpu::Buffer>,
-    },
-    AttentionBackward {
-        params: AttentionBwdParams,
-        mask_buf: Option<wgpu::Buffer>,
-    },
-    Rope {
-        params: RopeParams,
-    },
-    Expand {
-        params: ExpandParams,
-        meta_idx: usize,
-    },
-    Argmax {
-        params: ArgmaxParams,
-    },
-    Pool2d {
-        params: Pool2dParams,
-    },
-    Conv2d {
-        params: Conv2dParams,
-    },
-    /// GPU im2col: gather a conv's receptive fields into a `col` matrix in the
-    /// arena scratch tail. Always immediately followed by a `Step::Matmul`
-    /// (weight @ col → NCHW output) that reuses the tiled f32 GEMM kernels.
-    Im2ColGpu {
-        params: Im2Col2dParams,
-    },
-    /// 2D register-blocked 1D conv (`conv1d_tiled.wgsl`) — same `Conv2dParams`
-    /// as `Conv2d` but a `TCO×TL` output tile per thread that reuses the input
-    /// across output channels. Used for the `one_d` (kw==1) vocoder convs.
-    Conv2dTiled {
-        params: Conv2dParams,
-    },
-    Pool1d {
-        params: Pool1dParams,
-    },
-    Pool3d {
-        params: Pool3dParams,
-    },
-    Conv1d {
-        params: Conv1dParams,
-    },
-    Conv3d {
-        params: Conv3dParams,
-    },
-    ScatterAdd {
-        params: ScatterAddParams,
-    },
-    TopK {
-        params: TopKParams,
-    },
-    WelchPeaksGpu {
-        params: WelchPeaksGpuParams,
-    },
-    GroupedMatmul {
-        params: GroupedMatmulParams,
-    },
-    Sample {
-        params: SampleParams,
-    },
-    SelectiveScan {
-        params: SelectiveScanParams,
-    },
-    /// Native WGSL Mamba-2 SSD scan (state_size ≤ 256).
-    Mamba2 {
-        params: Mamba2Params,
-    },
-    /// Native WGSL GRU (single-layer/unidir/no-carry, hidden ≤ 256).
-    Gru {
-        params: GruParams,
-    },
-    /// Native WGSL Elman RNN (single-layer/unidir/no-carry, hidden ≤ 256).
-    Rnn {
-        params: RnnParams,
-    },
-    /// Host-staged GRU fallback (multi-layer / bidir / carry / hidden > 256).
-    GruHost {
-        x: u32,
-        w_ih: u32,
-        w_hh: u32,
-        b_ih: u32,
-        b_hh: u32,
-        h0: u32,
-        dst: u32,
-        batch: u32,
-        seq: u32,
-        input_size: u32,
-        hidden: u32,
-        num_layers: u32,
-        bidirectional: bool,
-        carry: bool,
-    },
-    /// Host-staged Elman RNN fallback.
-    RnnHost {
-        x: u32,
-        w_ih: u32,
-        w_hh: u32,
-        bias: u32,
-        h0: u32,
-        dst: u32,
-        batch: u32,
-        seq: u32,
-        input_size: u32,
-        hidden: u32,
-        num_layers: u32,
-        bidirectional: bool,
-        carry: bool,
-        relu: bool,
-    },
-    DequantMatmul {
-        params: DequantMatmulParams,
-    },
-    /// Split-binding embedding gather for >4 GiB arenas. The table and the
-    /// idx/output slots are more than one ≤4 GiB binding window apart, so the
-    /// single-arena-binding `Step::Gather` cannot reach the output. Runs as a
-    /// host segment (its own submission + copy-back), like `DequantMatmulGguf`.
-    /// BYTE offsets are u64 (arena exceeds 4 GiB).
-    GatherSplit {
-        n_out: u32,
-        n_idx: u32,
-        dim: u32,
-        vocab: u32,
-        table_byte_off: u64,
-        idx_byte_off: u64,
-        out_byte_off: u64,
-    },
-    /// GGUF K-quant — host fused dequant+matmul between GPU segments.
-    DequantMatmulGguf {
-        m: u32,
-        k: u32,
-        n: u32,
-        scheme_id: u32,
-        // Arena BYTE offsets must be u64: GGUF decode arenas exceed 4 GiB
-        // (Orpheus-3B Q4_K_M is ~10 GiB), so a u32 byte offset truncates for
-        // any tensor past the 4 GiB mark and the host dequant reads garbage.
-        x_byte_off: u64,
-        w_byte_off: u64,
-        out_byte_off: u64,
-    },
-    /// GGUF K-quant — host fused dequant+grouped matmul between GPU segments.
-    DequantGroupedMatmulGguf {
-        m: u32,
-        k: u32,
-        n: u32,
-        num_experts: u32,
-        scheme_id: u32,
-        x_byte_off: u64,
-        w_byte_off: u64,
-        idx_byte_off: u64,
-        out_byte_off: u64,
-    },
-    /// Gated-DeltaNet — host scan between GPU segments (qwen35 linear layers).
-    GatedDeltaNet {
-        q_byte_off: u32,
-        k_byte_off: u32,
-        v_byte_off: u32,
-        g_byte_off: u32,
-        beta_byte_off: u32,
-        state_byte_off: u32,
-        dst_byte_off: u32,
-        batch: u32,
-        seq: u32,
-        heads: u32,
-        state_size: u32,
-        use_carry: bool,
-    },
-    Lstm {
-        x_byte_off: u32,
-        w_ih_byte_off: u32,
-        w_hh_byte_off: u32,
-        bias_byte_off: u32,
-        h0_byte_off: u32,
-        c0_byte_off: u32,
-        dst_byte_off: u32,
-        batch: u32,
-        seq: u32,
-        input_size: u32,
-        hidden: u32,
-        num_layers: u32,
-        bidirectional: bool,
-        carry: bool,
-    },
-    ConvTranspose2d {
-        src_byte_off: u32,
-        weight_byte_off: u32,
-        dst_byte_off: u32,
-        n: u32,
-        c_in: u32,
-        h: u32,
-        w_in: u32,
-        c_out: u32,
-        h_out: u32,
-        w_out: u32,
-        kh: u32,
-        kw: u32,
-        sh: u32,
-        sw: u32,
-        ph: u32,
-        pw: u32,
-        dh: u32,
-        dw: u32,
-        groups: u32,
-    },
-    /// Host-staged NCHW GroupNorm (readback → CPU → writeback).
-    GroupNormHost {
-        src_byte_off: u32,
-        gamma_byte_off: u32,
-        beta_byte_off: u32,
-        dst_byte_off: u32,
-        n: u32,
-        c: u32,
-        h: u32,
-        w: u32,
-        num_groups: u32,
-        eps: f32,
-    },
-    /// Host-staged NCHW LayerNorm2d (readback → CPU → writeback).
-    LayerNorm2dHost {
-        src_byte_off: u32,
-        gamma_byte_off: u32,
-        beta_byte_off: u32,
-        dst_byte_off: u32,
-        n: u32,
-        c: u32,
-        h: u32,
-        w: u32,
-        eps: f32,
-    },
-    /// Host-staged nearest 2× upsample on NCHW (readback → CPU → writeback).
-    ResizeNearest2xHost {
-        src_byte_off: u32,
-        dst_byte_off: u32,
-        n: u32,
-        c: u32,
-        h: u32,
-        w: u32,
-    },
-    /// Host-staged batch-general reverse/flip (readback → CPU → writeback).
-    ReverseHost {
-        src_byte_off: u32,
-        dst_byte_off: u32,
-        dims: Vec<u32>,
-        rev_mask: Vec<bool>,
-        elem_bytes: u32,
-    },
-    /// Host-staged ArgMax/ArgMin (readback → CPU → writeback).
-    ArgReduceHost {
-        src_byte_off: u32,
-        dst_byte_off: u32,
-        outer: u32,
-        reduced: u32,
-        inner: u32,
-        is_max: bool,
-    },
-    Llada2GroupLimitedGate {
-        sig_byte_off: u32,
-        route_byte_off: u32,
-        out_byte_off: u32,
-        n_elems: u32,
-        attrs: [u8; 20],
-    },
-    UmapKnn {
-        params: UmapKnnParams,
-    },
-    /// Small-`n` host k-NN (partial arena read/write; avoids GPU launch overhead).
-    UmapKnnHost {
-        pairwise_byte_off: u32,
-        out_byte_off: u32,
-        n: u32,
-        k: u32,
-    },
-    /// Fused multi-scale deformable attention (host compute over arena buffers).
-    MsDeformAttnHost {
-        in_offs: Vec<(u32, u32)>, // (byte_off, byte_len) per input
-        out_byte_off: u32,
-        out_bytes: u32,
-        attrs: Vec<u8>,
-    },
-    /// 3D Gaussian splat forward (CPU reference between segments).
-    #[cfg(feature = "splat")]
-    GaussianSplatRender {
-        positions_byte_off: u32,
-        positions_len: u32,
-        scales_byte_off: u32,
-        scales_len: u32,
-        rotations_byte_off: u32,
-        rotations_len: u32,
-        opacities_byte_off: u32,
-        opacities_len: u32,
-        colors_byte_off: u32,
-        colors_len: u32,
-        sh_coeffs_byte_off: u32,
-        sh_coeffs_len: u32,
-        meta_byte_off: u32,
-        dst_byte_off: u32,
-        dst_len: u32,
-        width: u32,
-        height: u32,
-        tile_size: u32,
-        radius_scale: f32,
-        alpha_cutoff: f32,
-        max_splat_steps: u32,
-        transmittance_threshold: f32,
-        max_list_entries: u32,
-    },
-    /// Backward splat — host round-trip via rlx-cpu/splat.
-    #[cfg(feature = "splat")]
-    GaussianSplatRenderBackward {
-        positions_byte_off: u32,
-        positions_len: u32,
-        scales_byte_off: u32,
-        scales_len: u32,
-        rotations_byte_off: u32,
-        rotations_len: u32,
-        opacities_byte_off: u32,
-        opacities_len: u32,
-        colors_byte_off: u32,
-        colors_len: u32,
-        sh_coeffs_byte_off: u32,
-        sh_coeffs_len: u32,
-        meta_byte_off: u32,
-        d_loss_byte_off: u32,
-        d_loss_len: u32,
-        packed_byte_off: u32,
-        packed_len: u32,
-        width: u32,
-        height: u32,
-        tile_size: u32,
-        radius_scale: f32,
-        alpha_cutoff: f32,
-        max_splat_steps: u32,
-        transmittance_threshold: f32,
-        max_list_entries: u32,
-        loss_grad_clip: f32,
-        sh_band: u32,
-        max_anisotropy: f32,
-    },
-    #[cfg(feature = "splat")]
-    GaussianSplatPrepare {
-        positions_byte_off: u32,
-        positions_len: u32,
-        scales_byte_off: u32,
-        scales_len: u32,
-        rotations_byte_off: u32,
-        rotations_len: u32,
-        opacities_byte_off: u32,
-        opacities_len: u32,
-        colors_byte_off: u32,
-        colors_len: u32,
-        sh_coeffs_byte_off: u32,
-        sh_coeffs_len: u32,
-        meta_byte_off: u32,
-        meta_len: u32,
-        prep_byte_off: u32,
-        prep_len: u32,
-        width: u32,
-        height: u32,
-        tile_size: u32,
-        radius_scale: f32,
-        alpha_cutoff: f32,
-        max_splat_steps: u32,
-        transmittance_threshold: f32,
-        max_list_entries: u32,
-    },
-    #[cfg(feature = "splat")]
-    GaussianSplatRasterize {
-        prep_byte_off: u32,
-        prep_len: u32,
-        meta_byte_off: u32,
-        meta_len: u32,
-        dst_byte_off: u32,
-        dst_len: u32,
-        count: u32,
-        width: u32,
-        height: u32,
-        tile_size: u32,
-        alpha_cutoff: f32,
-        max_splat_steps: u32,
-        transmittance_threshold: f32,
-        max_list_entries: u32,
-    },
-    RmsNormBackwardInput {
-        params: RmsNormBwdParams,
-    },
-    RmsNormBackwardGamma {
-        params: RmsNormBwdParams,
-    },
-    RmsNormBackwardBeta {
-        params: RmsNormBwdParams,
-    },
-    LayerNormBackwardInput {
-        params: LayerNormBwdParams,
-    },
-    LayerNormBackwardGammaPartial {
-        params: LayerNormBwdParams,
-        num_workgroups: u32,
-    },
-    LayerNormBackwardGammaReduce {
-        params: LayerNormBwdParams,
-    },
-    RopeBackward {
-        params: RopeBwdParams,
-    },
-    CumsumBackward {
-        params: CumsumBwdParams,
-    },
-    GatherBackward {
-        params: GatherBwdParams,
-    },
-    FusedResidualLn {
-        params: FusedResidualLnParams,
-    },
-    /// Split-write QKV matmul. Replaces a (FusedMatMulBiasAct → Narrow×3)
-    /// pattern with one dispatch that writes Q, K, V into separate
-    /// contiguous buffers from a single matmul pass. See
-    /// `kernels/matmul_qkv.wgsl`.
-    MatmulQkv {
-        params: MatmulQkvParams,
-        kind: MatmulQkvKind,
-    },
-    /// `fused_residual_ln_tee` — does (Add → LN) but writes the sum to
-    /// a separate arena slot (the eliminated Add's old slot). Fires
-    /// when the Add has multi-consumer downstream (vision pre-norm).
-    FusedResidualLnTee {
-        params: FusedResidualLnTeeParams,
-    },
-    FusedResidualRmsNorm {
-        params: FusedResidualRmsNormParams,
-    },
-}
-
 pub struct WgpuExecutable {
     graph: Graph,
     arena: Arena,
     /// Byte offset of GGUF dequant scratch slab (0 when host fallback).
     dequant_scratch_off: usize,
+    /// Byte offset of ephemeral GatedDeltaNet state (`carry_state=false`).
+    gdn_scratch_off: usize,
     schedule: Vec<Step>,
     input_offsets: HashMap<String, NodeId>,
     param_offsets: HashMap<String, NodeId>,
@@ -1022,372 +344,25 @@ pub struct WgpuExecutable {
     pending_read_indices: Option<Vec<usize>>,
     /// Runtime-mutable RNG policy for [`Step::RngNormalHost`] / [`Step::RngUniformHost`].
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
-}
-
-impl Step {
-    /// True when this Step variant honors active-extent dispatch (PLAN L1).
-    /// Coverage: simple element-wise + reductions + matmul + linalg
-    /// + reductions/argmax/topk/sample + gather + conv + pool +
-    /// scatter (zero output + scale num_updates) + macros gated to
-    /// batch=1 (Attention, SelectiveScan).
-    pub fn safe_for_active_extent(&self) -> bool {
-        match self {
-            Step::Binary { .. }
-            | Step::Compare { .. }
-            | Step::Unary { .. }
-            | Step::Where { .. }
-            | Step::Fma { .. }
-            | Step::Reduce { .. }
-            | Step::Softmax { .. }
-            | Step::SoftmaxCrossEntropy { .. }
-            | Step::LayerNorm { .. }
-            | Step::FusedResidualLn { .. }
-            | Step::FusedResidualLnTee { .. }
-            | Step::FusedResidualRmsNorm { .. }
-            | Step::Cumsum { .. }
-            | Step::Copy { .. }
-            | Step::ElementwiseRegion { .. }
-            | Step::BatchElementwiseRegion { .. }
-            | Step::Argmax { .. }
-            | Step::TopK { .. }
-            | Step::WelchPeaksGpu { .. }
-            | Step::Sample { .. }
-            | Step::Gather { .. }
-            | Step::GatherAxis { .. }
-            | Step::GatherSplit { .. }
-            | Step::GroupedMatmul { .. }
-            | Step::DequantMatmul { .. }
-            | Step::DequantMatmulGguf { .. }
-            | Step::DequantGroupedMatmulGguf { .. }
-            | Step::GatedDeltaNet { .. }
-            | Step::Lstm { .. }
-            | Step::ConvTranspose2d { .. }
-            | Step::GroupNormHost { .. }
-            | Step::LayerNorm2dHost { .. }
-            | Step::ResizeNearest2xHost { .. }
-            | Step::ReverseHost { .. }
-            | Step::ArgReduceHost { .. }
-            | Step::GruHost { .. }
-            | Step::RnnHost { .. }
-            | Step::Llada2GroupLimitedGate { .. }
-            | Step::UmapKnn { .. }
-            | Step::UmapKnnHost { .. }
-            | Step::MsDeformAttnHost { .. }
-            | Step::Conv1d { .. }
-            | Step::Conv2d { .. }
-            | Step::Conv2dTiled { .. }
-            | Step::Conv3d { .. }
-            | Step::Pool1d { .. }
-            | Step::Pool2d { .. }
-            | Step::Pool3d { .. }
-            | Step::ScatterAdd { .. }
-            | Step::BufferCopy { .. } => true,
-            // FFT: full-extent transform per row, no active-extent
-            // scaling. Marking true so a graph that mixes FFT with
-            // active-extent-safe ops still gets the optimization for
-            // the rest of the schedule.
-            Step::FftGpu { .. } | Step::FftHost { .. } | Step::ScanHost { .. } => true,
-            Step::Im2ColHost { .. }
-            | Step::RngNormalHost { .. }
-            | Step::RngUniformHost { .. }
-            | Step::WelchPeaksHost { .. }
-            | Step::LogMelHost { .. }
-            | Step::LogMelBackwardHost { .. } => true,
-            // Matmul: c_batch_stride is set at compile time at full m,
-            // independent of params.m. With scaled m, threads with
-            // global_row >= m early-return; per-batch output offsets
-            // stay correct. Safe at any batch.
-            Step::Matmul { .. } => true,
-            // im2col params (offsets + spatial extents) are baked at compile
-            // time for a fixed conv shape; they cannot be active-extent
-            // scaled. Returning false disables the fast path for any graph
-            // that contains an im2col conv (conv-heavy models don't use it).
-            Step::Im2ColGpu { .. } => false,
-            // Same active-extent reasoning as Matmul: per-batch output
-            // strides are baked at compile time, scaling m only adjusts
-            // the per-thread bound check.
-            Step::MatmulQkv { .. } => true,
-            Step::CastF32ToF16 { .. } => true,
-            // Attention: WGSL kernel uses `seq_q_stride`/`seq_k_stride`
-            // (full extent, set at compile time) for per-(batch, head)
-            // offset math, and `params.seq_q`/`params.seq_k` for loop
-            // bounds only. Scaling seq_q/seq_k shrinks the iteration
-            // without corrupting per-head strides. Safe at any batch.
-            Step::Attention { .. } => true,
-            Step::AttentionBackward { .. } => true,
-            // SelectiveScan: WGSL kernel uses `params.seq_stride`
-            // (full extent, set at compile time) for per-batch stride
-            // math; `params.seq` is the loop bound only. Safe at any
-            // batch under active-extent scaling of seq.
-            Step::SelectiveScan { .. } => true,
-            // Mamba2: same seq_stride discipline as SelectiveScan.
-            Step::Mamba2 { .. } => true,
-            // GRU/RNN: per-batch workgroups; seq_stride is full-extent, seq is
-            // the loop bound only. Safe under active-extent scaling.
-            Step::Gru { .. } => true,
-            Step::Rnn { .. } => true,
-            // Narrow + Concat: kernel iterates `params.total` in
-            // row-major order with outer as the leading dim. Scaling
-            // total by actual/upper effectively scales outer by the
-            // same factor (since total = outer * axis_size * inner).
-            // Output positions past scaled_total stay untouched.
-            // **Conservative assumption**: bucket axis is outer.
-            // Cases where the bucket axis is the narrow/concat axis
-            // itself are unsafe — fall back to full extent there.
-            Step::Narrow { .. } => true,
-            Step::Concat { .. } => true,
-            // Rope: WGSL kernel uses `seq_stride` (full extent, set
-            // at compile time) for per-batch buffer offset math and
-            // explicit `batch` for index decomposition. `params.seq`
-            // and `params.n_total` are runtime-scaled iteration
-            // bounds. Safe at any batch.
-            Step::Rope { .. } => true,
-            // Transpose: precomputed `bucket_outermost` flag in
-            // params (set to 1 at compile time iff `perm[0] == 0`).
-            // Active path scales `out_total` by `actual / upper`
-            // proportional to `out_dim_0`. Other transposes (where
-            // bucket axis moves) fall back to full extent.
-            Step::Transpose { params, .. } => params.bucket_outermost == 1,
-            // Expand: same shape as Transpose. `bucket_outermost` is
-            // 1 iff `in_dims[0] == out_dims[0]` (no broadcast at the
-            // bucket axis).
-            Step::Expand { params, .. } => params.bucket_outermost == 1,
-            // Training backward ops: not used in inference; disable
-            // active-extent fast path until individually audited.
-            Step::RmsNormBackwardInput { .. }
-            | Step::RmsNormBackwardGamma { .. }
-            | Step::RmsNormBackwardBeta { .. }
-            | Step::LayerNormBackwardInput { .. }
-            | Step::LayerNormBackwardGammaPartial { .. }
-            | Step::LayerNormBackwardGammaReduce { .. }
-            | Step::RopeBackward { .. }
-            | Step::CumsumBackward { .. }
-            | Step::GatherBackward { .. } => false,
-            #[cfg(feature = "splat")]
-            Step::GaussianSplatRender { .. }
-            | Step::GaussianSplatRenderBackward { .. }
-            | Step::GaussianSplatPrepare { .. }
-            | Step::GaussianSplatRasterize { .. } => false,
-        }
-    }
-}
-
-/// Static-string label for each Step variant — used by the Perfetto
-/// trace layer (PLAN L3) to mark per-step events without allocating.
-fn fft_dtype_tag(dtype: rlx_ir::DType) -> u32 {
-    match dtype {
-        rlx_ir::DType::F32 => 0,
-        rlx_ir::DType::F64 => 1,
-        rlx_ir::DType::C64 => 2,
-        other => panic!("rlx-wgpu Op::Fft: unsupported dtype {other:?}"),
-    }
-}
-
-fn fft_dtype_from_tag(tag: u32) -> rlx_ir::DType {
-    match tag {
-        0 => rlx_ir::DType::F32,
-        1 => rlx_ir::DType::F64,
-        2 => rlx_ir::DType::C64,
-        other => panic!("rlx-wgpu Op::Fft: bad dtype tag {other}"),
-    }
-}
-
-fn step_name(step: &Step) -> &'static str {
-    match step {
-        Step::CastF32ToF16 { .. } => "cast_f32_to_f16",
-        Step::Matmul { .. } => "matmul",
-        Step::Binary { .. } => "binary",
-        Step::Compare { .. } => "compare",
-        Step::Unary { .. } => "unary",
-        Step::Where { .. } => "where",
-        Step::Fma { .. } => "fma",
-        Step::Reduce { .. } => "reduce",
-        Step::Softmax { .. } => "softmax",
-        Step::SoftmaxCrossEntropy { .. } => "softmax_cross_entropy",
-        Step::LayerNorm { .. } => "layer_norm",
-        Step::Cumsum { .. } => "cumsum",
-        Step::FftGpu { .. } => "fft_gpu",
-        Step::FftHost { .. } => "fft_host",
-        Step::WelchPeaksHost { .. } => "welch_peaks_host",
-        Step::LogMelHost { .. } => "log_mel_host",
-        Step::LogMelBackwardHost { .. } => "log_mel_backward_host",
-        Step::Im2ColHost { .. } => "im2col_host",
-        Step::RngNormalHost { .. } => "rng_normal_host",
-        Step::RngUniformHost { .. } => "rng_uniform_host",
-        Step::BufferCopy { .. } => "buffer_copy",
-        Step::Copy { .. } => "copy",
-        Step::Transpose { .. } => "transpose",
-        Step::Narrow { .. } => "narrow",
-        Step::Concat { .. } => "concat",
-        Step::Gather { .. } => "gather",
-        Step::GatherAxis { .. } => "gather_axis",
-        Step::Attention { .. } => "attention",
-        Step::AttentionBackward { .. } => "attention_bwd",
-        Step::Rope { .. } => "rope",
-        Step::Expand { .. } => "expand",
-        Step::Argmax { .. } => "argmax",
-        Step::Pool2d { .. } => "pool2d",
-        Step::Conv2d { .. } => "conv2d",
-        Step::Conv2dTiled { .. } => "conv2d_tiled",
-        Step::Im2ColGpu { .. } => "im2col_gpu",
-        Step::Pool1d { .. } => "pool1d",
-        Step::Pool3d { .. } => "pool3d",
-        Step::Conv1d { .. } => "conv1d",
-        Step::Conv3d { .. } => "conv3d",
-        Step::ScatterAdd { .. } => "scatter_add",
-        Step::TopK { .. } => "topk",
-        Step::WelchPeaksGpu { .. } => "welch_peaks_gpu",
-        Step::GroupedMatmul { .. } => "grouped_matmul",
-        Step::Sample { .. } => "sample",
-        Step::SelectiveScan { .. } => "selective_scan",
-        Step::Mamba2 { .. } => "mamba2",
-        Step::Gru { .. } => "gru",
-        Step::Rnn { .. } => "rnn",
-        Step::GruHost { .. } => "gru_host",
-        Step::RnnHost { .. } => "rnn_host",
-        Step::DequantMatmul { .. } => "dequant_matmul",
-        Step::GatherSplit { .. } => "gather_split",
-        Step::DequantMatmulGguf { .. } => "dequant_matmul_gguf",
-        Step::DequantGroupedMatmulGguf { .. } => "dequant_grouped_matmul_gguf",
-        Step::GatedDeltaNet { .. } => "gated_delta_net",
-        Step::Lstm { .. } => "lstm",
-        Step::ConvTranspose2d { .. } => "conv_transpose2d",
-        Step::GroupNormHost { .. } => "group_norm_host",
-        Step::LayerNorm2dHost { .. } => "layer_norm2d_host",
-        Step::ResizeNearest2xHost { .. } => "resize_nearest2x_host",
-        Step::ReverseHost { .. } => "reverse_host",
-        Step::ArgReduceHost { .. } => "argreduce_host",
-        Step::Llada2GroupLimitedGate { .. } => "llada2_group_limited_gate",
-        Step::UmapKnn { .. } => "umap_knn",
-        Step::UmapKnnHost { .. } => "umap_knn_host",
-        Step::MsDeformAttnHost { .. } => "ms_deform_attn_host",
-        Step::ScanHost { .. } => "scan_host",
-        #[cfg(feature = "splat")]
-        Step::GaussianSplatRender { .. } => "gaussian_splat_render",
-        #[cfg(feature = "splat")]
-        Step::GaussianSplatRenderBackward { .. } => "gaussian_splat_render_backward",
-        #[cfg(feature = "splat")]
-        Step::GaussianSplatPrepare { .. } => "gaussian_splat_prepare",
-        #[cfg(feature = "splat")]
-        Step::GaussianSplatRasterize { .. } => "gaussian_splat_rasterize",
-        Step::RmsNormBackwardInput { .. } => "rms_norm_backward_input",
-        Step::RmsNormBackwardGamma { .. } => "rms_norm_backward_gamma",
-        Step::RmsNormBackwardBeta { .. } => "rms_norm_backward_beta",
-        Step::LayerNormBackwardInput { .. } => "layer_norm_backward_input",
-        Step::LayerNormBackwardGammaPartial { .. } => "layer_norm_backward_gamma_partial",
-        Step::LayerNormBackwardGammaReduce { .. } => "layer_norm_backward_gamma_reduce",
-        Step::RopeBackward { .. } => "rope_backward",
-        Step::CumsumBackward { .. } => "cumsum_backward",
-        Step::GatherBackward { .. } => "gather_backward",
-        Step::FusedResidualLn { .. } => "fused_residual_ln",
-        Step::FusedResidualLnTee { .. } => "fused_residual_ln_tee",
-        Step::FusedResidualRmsNorm { .. } => "fused_residual_rms_norm",
-        Step::MatmulQkv { .. } => "matmul_qkv",
-        Step::ElementwiseRegion { .. } => "elementwise_region",
-        Step::BatchElementwiseRegion { .. } => "batch_elementwise_region",
-    }
-}
-
-fn step_is_tail_host(step: &Step) -> bool {
-    matches!(
-        step,
-        Step::WelchPeaksHost { .. } | Step::LogMelHost { .. } | Step::LogMelBackwardHost { .. }
-    )
-}
-
-fn step_runs_on_host(step: &Step) -> bool {
-    match step {
-        Step::GatherSplit { .. }
-        | Step::DequantMatmulGguf { .. }
-        | Step::DequantGroupedMatmulGguf { .. }
-        | Step::GatedDeltaNet { .. }
-        | Step::Lstm { .. }
-        | Step::ConvTranspose2d { .. }
-        | Step::GroupNormHost { .. }
-        | Step::LayerNorm2dHost { .. }
-        | Step::ResizeNearest2xHost { .. }
-        | Step::ReverseHost { .. }
-        | Step::ArgReduceHost { .. }
-        | Step::GruHost { .. }
-        | Step::RnnHost { .. }
-        | Step::Llada2GroupLimitedGate { .. }
-        | Step::UmapKnnHost { .. }
-        | Step::MsDeformAttnHost { .. }
-        | Step::FftHost { .. }
-        | Step::ScanHost { .. }
-        | Step::Im2ColHost { .. }
-        | Step::RngNormalHost { .. }
-        | Step::RngUniformHost { .. }
-        | Step::BufferCopy { .. } => true,
-        #[cfg(feature = "splat")]
-        Step::GaussianSplatRender { .. }
-        | Step::GaussianSplatRenderBackward { .. }
-        | Step::GaussianSplatPrepare { .. }
-        | Step::GaussianSplatRasterize { .. } => true,
-        _ => false,
-    }
-}
-
-fn binary_op_id(op: BinaryOp) -> u32 {
-    match op {
-        BinaryOp::Add => 0,
-        BinaryOp::Sub => 1,
-        BinaryOp::Mul => 2,
-        BinaryOp::Div => 3,
-        BinaryOp::Max => 4,
-        BinaryOp::Min => 5,
-        BinaryOp::Pow => 6,
-    }
-}
-
-fn compare_op_id(op: CmpOp) -> u32 {
-    match op {
-        CmpOp::Eq => 0,
-        CmpOp::Ne => 1,
-        CmpOp::Lt => 2,
-        CmpOp::Le => 3,
-        CmpOp::Gt => 4,
-        CmpOp::Ge => 5,
-    }
-}
-
-fn reduce_op_id(op: ReduceOp) -> u32 {
-    match op {
-        ReduceOp::Sum => 0,
-        ReduceOp::Mean => 1,
-        ReduceOp::Max => 2,
-        ReduceOp::Min => 3,
-        ReduceOp::Prod => 4,
-    }
-}
-
-fn activation_op_id(act: Activation) -> u32 {
-    match act {
-        Activation::Relu => 0,
-        Activation::Sigmoid => 1,
-        Activation::Tanh => 2,
-        Activation::Exp => 3,
-        Activation::Log => 4,
-        Activation::Sqrt => 5,
-        Activation::Rsqrt => 6,
-        Activation::Neg => 7,
-        Activation::Abs => 8,
-        Activation::Gelu => 9,
-        Activation::Silu => 10,
-        Activation::GeluApprox => 11,
-        Activation::Round => 12,
-        Activation::Sin => 13,
-        Activation::Cos => 14,
-        Activation::Tan => 15,
-        Activation::Atan => 16,
-    }
+    /// Schedule indices that only pack Param/Constant subgraphs (F5 weight
+    /// Concat, static Expand, …). Executed on the first `run()`, then skipped
+    /// so the NFE loop stays device-resident like ORT I/O binding.
+    static_once_steps: HashSet<usize>,
+    static_once_done: bool,
 }
 
 mod compile;
 mod dispatch;
+mod helpers;
 mod run;
 mod set;
+/// Static-string label for each Step variant — used by the Perfetto
+/// trace layer (PLAN L3) to mark per-step events without allocating.
+mod step;
 mod test;
+
+pub(crate) use helpers::*;
+pub(crate) use step::*;
 
 impl WgpuExecutable {
     /// Resolve the deferred graph against bindings inferred from
@@ -1421,6 +396,7 @@ impl WgpuExecutable {
         self.graph = fresh.graph;
         self.arena = fresh.arena;
         self.dequant_scratch_off = fresh.dequant_scratch_off;
+        self.gdn_scratch_off = fresh.gdn_scratch_off;
         self.schedule = fresh.schedule;
         self.input_offsets = fresh.input_offsets;
         self.param_offsets = fresh.param_offsets;
@@ -1472,17 +448,22 @@ impl WgpuExecutable {
         });
         let arena = Arena {
             buffer: placeholder,
+            extra_shards: Vec::new(),
+            shard_size: 0,
             f16_buffer: None,
             offsets: HashMap::new(),
             lens: HashMap::new(),
             size: 0,
             scratch_off: 0,
             scratch_bytes: 0,
+            weight_buffer: None,
+            weight_offsets: HashMap::new(),
         };
         Self {
             graph: graph.clone(),
             arena,
             dequant_scratch_off: 0,
+            gdn_scratch_off: 0,
             schedule: Vec::new(),
             input_offsets: HashMap::new(),
             param_offsets: HashMap::new(),
@@ -1511,6 +492,8 @@ impl WgpuExecutable {
             gpu_handle_resident: HashSet::new(),
             pending_read_indices: None,
             rng,
+            static_once_steps: HashSet::new(),
+            static_once_done: false,
         }
     }
 
@@ -1576,29 +559,38 @@ impl WgpuExecutable {
         }
         let flat_probe = rlx_ir::env::parse_or::<usize>("RLX_WGPU_DUMP_FLAT", usize::MAX);
         let limit = rlx_ir::env::parse_or("RLX_WGPU_DUMP_NODES_LIMIT", 40usize);
-        eprintln!(
-            "[rlx-wgpu-dump] per-node max |x| (topo order, limit={limit}{})",
-            if flat_probe != usize::MAX {
-                format!(", flat[{flat_probe}]")
-            } else {
-                String::new()
-            }
-        );
-        let mut shown = 0usize;
-        for (i, node) in self.graph.nodes().iter().enumerate() {
-            if !self.arena.has(node.id) {
-                continue;
-            }
-            if matches!(
-                node.op,
-                rlx_ir::Op::Input { .. }
-                    | rlx_ir::Op::Param { .. }
-                    | rlx_ir::Op::Constant { .. }
-                    | rlx_ir::Op::Reshape { .. }
-                    | rlx_ir::Op::Cast { .. }
-            ) {
-                continue;
-            }
+        let from_end = rlx_ir::env::flag("RLX_WGPU_DUMP_TAIL");
+        eprintln!("[rlx-wgpu-dump] per-node max |x| (limit={limit}, from_end={from_end})");
+        let mut candidates: Vec<(usize, &rlx_ir::Node)> = self
+            .graph
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                if !self.arena.has(node.id) {
+                    return false;
+                }
+                if let Ok(spec) = std::env::var("RLX_WGPU_DUMP_IDS") {
+                    let want: std::collections::HashSet<u32> = spec
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    return want.contains(&node.id.0);
+                }
+                !matches!(
+                    node.op,
+                    rlx_ir::Op::Input { .. }
+                        | rlx_ir::Op::Param { .. }
+                        | rlx_ir::Op::Constant { .. }
+                        | rlx_ir::Op::Cast { .. }
+                )
+            })
+            .collect();
+        if from_end {
+            candidates.reverse();
+        }
+        for (shown, (i, node)) in candidates.into_iter().take(limit).enumerate() {
+            let _ = shown;
             let data = self.arena.read_f32(&dev.device, &dev.queue, node.id);
             let max = data.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
             let nz = data.iter().filter(|&&v| v != 0.0).count();
@@ -1608,14 +600,27 @@ impl WgpuExecutable {
                 String::new()
             };
             eprintln!(
-                "  [{i:>3}] {:?} max={max:.6} nonzero={}/{}{flat_s}",
+                "  [{i:>3}] {:?} id={:?} off={} max={max:.6} nonzero={}/{}{flat_s}",
                 node.op,
+                node.id,
+                self.arena.offset(node.id),
                 nz,
                 data.len()
             );
-            shown += 1;
-            if shown >= limit {
-                break;
+            if rlx_ir::env::flag("RLX_WGPU_DUMP_INPUTS") {
+                for (j, &inp) in node.inputs.iter().enumerate() {
+                    if self.arena.has(inp) {
+                        let d = self.arena.read_f32(&dev.device, &dev.queue, inp);
+                        let mx = d.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                        eprintln!(
+                            "       in[{j}] {:?} op={:?} off={} max={mx:.6} n={}",
+                            inp,
+                            self.graph.node(inp).op,
+                            self.arena.offset(inp),
+                            d.len()
+                        );
+                    }
+                }
             }
         }
     }
@@ -1810,7 +815,7 @@ fn dispatch_dims(threads_total: u32, workgroup_size: u32) -> (u32, u32, u32) {
 ///
 /// **Default OFF.** The Vulkan/DX12 cooperative-matrix matmul path
 /// silently produces wrong output on BERT-family attention chains on at
-/// least RTX 4090 (verified empirically against Bio_ClinicalBERT:
+/// least NVIDIA GPU (verified empirically against Bio_ClinicalBERT:
 /// encoder cosine collapses from ≈1.0 on the wide-F32 fallback to ≈0.09
 /// when the coop path runs, regardless of whether the kernel uses
 /// F16-acc or F32-acc accumulators). The root cause is upstream — likely
@@ -1846,27 +851,6 @@ fn coop_f16_vk_eligible(dev: &wgpu::Device, m: u32, k: u32, n: u32) -> bool {
         && crate::device::coop_f16_16x16_supported()
 }
 
-fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
-    match step {
-        Step::CastF32ToF16 { .. } => matches!(
-            prev,
-            Step::Unary {
-                f16_mirror: false,
-                ..
-            }
-        ),
-        Step::Matmul {
-            compute_precision: MatmulCompute::CoopF16Vk,
-            ..
-        }
-        | Step::MatmulQkv {
-            kind: MatmulQkvKind::CoopF16Vk,
-            ..
-        } => matches!(prev, Step::Unary { .. } | Step::CastF32ToF16 { .. }),
-        _ => false,
-    }
-}
-
 fn dispatch_wide_f32_matmul(
     pass: &mut wgpu::ComputePass<'_>,
     mm_w_active: &Kernel,
@@ -1882,7 +866,7 @@ fn dispatch_wide_f32_matmul(
     // zeros that the kernel still computes and writes back — pure
     // wasted work on small-M shapes like BERT-base prefill (m=32). The
     // regular 32×32-tile kernel sidesteps the M-axis padding and is
-    // ~8% faster end-to-end on RTX 4090 (verified on Bio_ClinicalBERT:
+    // ~8% faster end-to-end on NVIDIA GPU (verified on Bio_ClinicalBERT:
     // encoder forward 58.9 ms → 54.1 ms at cosine 0.9999995 vs HF).
     //
     // **Metal / other** (`matmul_wide`, 64×64 tile): the wider tile
@@ -1934,6 +918,9 @@ fn require_equal_shapes(graph: &Graph, ids: &[NodeId], op_name: &str) {
 
 /// Bind the entire arena in one storage buffer range when it fits the device limit.
 fn arena_whole_arena_bind(arena: &Arena, max_binding: u64) -> Option<(u64, u64)> {
+    if arena.is_sharded() {
+        return None;
+    }
     let need = arena.size as u64;
     if need > max_binding {
         return None;
@@ -1944,7 +931,115 @@ fn arena_whole_arena_bind(arena: &Arena, max_binding: u64) -> Option<(u64, u64)>
     Some((0, size))
 }
 
+/// Clamp `[base, base+size)` so it never runs past the physical buffer.
+/// `aligned_bind_size` already truncates silently — without this, lower.rs
+/// keeps computing locals against the *requested* size and the shader sees
+/// zeros past the real bind (F5 DiT on a single >4 GiB Metal buffer).
+fn arena_clamp_bind_window(arena: &Arena, base: &mut u64, size: &mut u64) {
+    let buf = if arena.is_sharded() {
+        arena_bind_buf(arena, *base).0.size()
+    } else {
+        arena.buffer.size()
+    };
+    let local_base = if arena.is_sharded() {
+        arena_bind_buf(arena, *base).1
+    } else {
+        *base
+    };
+    let cap = buf.saturating_sub(local_base).max(256);
+    if *size > cap {
+        *size = cap;
+    }
+}
+
+/// Map a logical rebase (window start in arena address space) to the physical
+/// buffer + local bind offset.
+fn arena_bind_buf(arena: &Arena, rebase: u64) -> (&wgpu::Buffer, u64) {
+    if arena.is_sharded() {
+        let (buf, local) = arena.resolve_act(rebase as usize);
+        (buf, local as u64)
+    } else {
+        (&arena.buffer, rebase)
+    }
+}
+
+/// Bind arena storage at a logical rebase window (shard-aware).
+fn bind_arena_window(
+    device: &wgpu::Device,
+    kernel: &Kernel,
+    arena: &Arena,
+    mut rebase: u64,
+    mut size: u64,
+    params: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    arena_clamp_bind_window(arena, &mut rebase, &mut size);
+    let (buf, local) = arena_bind_buf(arena, rebase);
+    bind_two_buf0_window(device, kernel, buf, local, size, params)
+}
+
+/// True when activation nodes do not all lie in one shard stripe.
+fn arena_span_crosses_shard(arena: &Arena, ids: &[NodeId]) -> bool {
+    if !arena.is_sharded() {
+        return false;
+    }
+    let s = arena.shard_size as u64;
+    let mut shard: Option<u64> = None;
+    for &id in ids {
+        let off = arena.offset(id);
+        if crate::buffer::is_weight_off(off) {
+            continue;
+        }
+        let o = off as u64;
+        let end = o.saturating_add(arena.len_of(id) as u64).saturating_sub(1);
+        let s0 = o / s;
+        let s1 = end / s;
+        if s0 != s1 {
+            return true;
+        }
+        match shard {
+            None => shard = Some(s0),
+            Some(prev) if prev != s0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Pick a single-shard subset for windowing when `ids` span multiple shards.
+/// Prefers the shard of the **first** activation id (callers put the op output
+/// first) so GPU writes land in the real output slot; inputs are staged in.
+fn arena_ids_for_shard_window(arena: &Arena, ids: &[NodeId]) -> Vec<NodeId> {
+    if !arena_span_crosses_shard(arena, ids) {
+        let acts: Vec<NodeId> = ids
+            .iter()
+            .copied()
+            .filter(|&id| !crate::buffer::is_weight_off(arena.offset(id)))
+            .collect();
+        return acts;
+    }
+    let s = arena.shard_size as u64;
+    let prefer_shard = ids
+        .iter()
+        .find(|&&id| !crate::buffer::is_weight_off(arena.offset(id)))
+        .map(|&id| (arena.offset(id) as u64) / s);
+    let Some(want) = prefer_shard else {
+        return Vec::new();
+    };
+    ids.iter()
+        .copied()
+        .filter(|&id| {
+            let off = arena.offset(id);
+            !crate::buffer::is_weight_off(off) && (off as u64) / s == want
+        })
+        .collect()
+}
+
 fn arena_window_for_nodes(dev: &wgpu::Device, arena: &Arena, ids: &[NodeId]) -> (u64, u64) {
+    if arena.is_sharded() {
+        let local_ids = arena_ids_for_shard_window(arena, ids);
+        let spec = arena.bind_spec_for_nodes(dev, &local_ids);
+        return (spec.rebase, spec.size);
+    }
     // wgpu requires storage buffer binding offsets aligned to 256 bytes.
     const ALIGN: u64 = 256;
     let max_binding = dev.limits().max_storage_buffer_binding_size;
@@ -1954,10 +1049,14 @@ fn arena_window_for_nodes(dev: &wgpu::Device, arena: &Arena, ids: &[NodeId]) -> 
     let mut lo: u64 = u64::MAX;
     let mut hi: u64 = 0;
     for &id in ids {
-        let off = arena.offset(id) as u64;
+        let off = arena.offset(id);
+        if crate::buffer::is_weight_off(off) {
+            continue;
+        }
+        let o = off as u64;
         let len = arena.len_of(id) as u64;
-        lo = lo.min(off);
-        hi = hi.max(off.saturating_add(len));
+        lo = lo.min(o);
+        hi = hi.max(o.saturating_add(len));
     }
     if lo == u64::MAX {
         return (0, max_binding.max(256));
@@ -1993,6 +1092,7 @@ fn arena_window_for_nodes(dev: &wgpu::Device, arena: &Arena, ids: &[NodeId]) -> 
             base = (base / ALIGN) * ALIGN;
         }
     }
+    arena_clamp_bind_window(arena, &mut base, &mut size);
     (base, size)
 }
 
@@ -2022,20 +1122,24 @@ fn run_gather_split(
     out_byte_off: usize,
 ) {
     const ALIGN: u64 = 256;
-    let arena_size = arena.size as u64;
     let max_bind = device.limits().max_storage_buffer_binding_size;
 
-    // Table window: cover [table_byte_off, + vocab*dim*4).
-    let t0 = table_byte_off as u64;
+    // Table / idx may live in the weight buffer (tagged offsets) or the act
+    // arena — always `resolve_w` so bit-62 tags are stripped correctly.
     let t_bytes = (vocab as u64) * (dim as u64) * 4;
-    let t_base = (t0 / ALIGN) * ALIGN;
-    let t_size = ((t0 + t_bytes - t_base).div_ceil(16) * 16).min(arena_size - t_base);
+    let (t_buf, t_raw) = arena.resolve_w(table_byte_off);
+    let t_base = (t_raw as u64 / ALIGN) * ALIGN;
+    let t_local = t_base;
+    let t_size = ((t_raw as u64 + t_bytes - t_base).div_ceil(16) * 16)
+        .min(t_buf.size().saturating_sub(t_local));
 
     // Index window: cover [idx_byte_off, + n_idx*4).
-    let i0 = idx_byte_off as u64;
     let i_bytes = ((n_idx as u64) * 4).max(4);
-    let i_base = (i0 / ALIGN) * ALIGN;
-    let i_size = ((i0 + i_bytes - i_base).div_ceil(16) * 16).min(arena_size - i_base);
+    let (i_buf, i_raw) = arena.resolve_w(idx_byte_off);
+    let i_base = (i_raw as u64 / ALIGN) * ALIGN;
+    let i_local = i_base;
+    let i_size = ((i_raw as u64 + i_bytes - i_base).div_ceil(16) * 16)
+        .min(i_buf.size().saturating_sub(i_local));
 
     assert!(
         t_size <= max_bind && i_size <= max_bind,
@@ -2056,8 +1160,8 @@ fn run_gather_split(
         n_idx,
         dim,
         vocab,
-        in_off: ((t0 - t_base) / 4) as u32,
-        idx_off: ((i0 - i_base) / 4) as u32,
+        in_off: ((t_raw as u64 - t_base) / 4) as u32,
+        idx_off: ((i_raw as u64 - i_base) / 4) as u32,
         out_off: 0,
         _p0: 0,
     };
@@ -2077,8 +1181,8 @@ fn run_gather_split(
             wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &arena.buffer,
-                    offset: t_base,
+                    buffer: t_buf,
+                    offset: t_local,
                     size: wgpu::BufferSize::new(t_size),
                 }),
             },
@@ -2089,8 +1193,8 @@ fn run_gather_split(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &arena.buffer,
-                    offset: i_base,
+                    buffer: i_buf,
+                    offset: i_local,
                     size: wgpu::BufferSize::new(i_size),
                 }),
             },
@@ -2115,7 +1219,8 @@ fn run_gather_split(
         pass.dispatch_workgroups(gx, gy, gz);
     }
     // Copy the embedding back into the arena (distinct buffers → legal).
-    enc.copy_buffer_to_buffer(&out_buf, 0, &arena.buffer, out_byte_off as u64, out_bytes);
+    let (dst, dst_off) = arena.resolve_w(out_byte_off);
+    enc.copy_buffer_to_buffer(&out_buf, 0, dst, dst_off as u64, out_bytes);
     queue.submit(std::iter::once(enc.finish()));
 }
 
@@ -2138,17 +1243,6 @@ fn arena_tensors_overlap(arena: &Arena, a: NodeId, b: NodeId) -> bool {
     let a1 = a0.saturating_add(al);
     let b1 = b0.saturating_add(bl);
     a0 < b1 && b0 < a1
-}
-
-/// True when a matmul reads its weight `B` from the separate f16 shadow buffer
-/// (so `B` is NOT bound through the arena binding). For these precisions the
-/// arena window must cover only the activation + output, never the weight.
-fn matmul_b_from_f16(precision: MatmulCompute, b_is_param: bool) -> bool {
-    b_is_param
-        && matches!(
-            precision,
-            MatmulCompute::F16 | MatmulCompute::Coop16 | MatmulCompute::CoopF16Vk
-        )
 }
 
 /// Arena bind window for matmul: when the weight alone fits the bind limit but
@@ -2178,20 +1272,38 @@ fn arena_matmul_bind_window(
         return (base, size, false);
     }
     let ids = [out_id, a_id, b_id];
-    let all_fits = arena_span_bytes(arena, &ids) <= max_binding;
+    let all_fits =
+        arena_span_bytes(arena, &ids) <= max_binding && !arena_span_crosses_shard(arena, &ids);
     let b_bytes = arena.len_of(b_id) as u64;
     let b_is_param = tensor_is_graph_param(graph, param_offsets, b_id);
-    let param_anchor =
-        b_is_param && b_bytes <= max_binding && (!all_fits || b_bytes > ARENA_STAGE_CAP);
+    // Param-anchor is unsafe on sharded arenas: the weight stripe rarely holds
+    // the matmul output, so C writes land at bogus local offsets.
+    let param_anchor = !arena.is_sharded()
+        && b_is_param
+        && b_bytes <= max_binding
+        && (!all_fits || b_bytes > ARENA_STAGE_CAP);
     let (mut base, mut size) = if param_anchor {
         arena_window_for_nodes(device, arena, &[b_id])
     } else if all_fits {
         arena_window_for_nodes(device, arena, &ids)
+    } else if arena_span_bytes(arena, &[out_id, b_id]) <= max_binding
+        && !arena_span_crosses_shard(arena, &[out_id, b_id])
+    {
+        // Prefer covering activation+weight over staging a huge B (F5 packs a
+        // 0.5 GiB Concat weight at off=0; staging it into a far output window
+        // exceeds ARENA_STAGE_CAP).
+        arena_window_for_nodes(device, arena, &[out_id, b_id])
+    } else if arena_span_bytes(arena, &[out_id, a_id]) <= max_binding
+        && !arena_span_crosses_shard(arena, &[out_id, a_id])
+    {
+        arena_window_for_nodes(device, arena, &[out_id, a_id])
     } else {
+        // Prefer the matmul output stripe on sharded arenas.
         arena_window_for_nodes(device, arena, &[out_id])
     };
     let param_anchor = param_anchor
-        || (b_is_param
+        || (!arena.is_sharded()
+            && b_is_param
             && b_bytes <= max_binding
             && !arena_tensor_in_window(arena, b_id, base, size));
     if param_anchor && !arena_tensor_in_window(arena, b_id, base, size) {
@@ -2213,13 +1325,30 @@ fn arena_expand_bind_window(
     let mut lo = *base;
     let mut hi = base.saturating_add(*size);
     for &id in ids {
-        let off = arena.offset(id) as u64;
+        let off = arena.offset(id);
+        if crate::buffer::is_weight_off(off) {
+            continue;
+        }
+        let o = off as u64;
         let len = arena.len_of(id) as u64;
-        lo = lo.min(off);
-        hi = hi.max(off.saturating_add(len));
+        lo = lo.min(o);
+        hi = hi.max(o.saturating_add(len));
     }
     let span = hi.saturating_sub(lo).max(1);
     if span > max_binding {
+        return;
+    }
+    if arena.is_sharded() {
+        let s = arena.shard_size as u64;
+        if lo / s != (hi.saturating_sub(1)) / s {
+            return; // would cross shard — keep existing window
+        }
+        // Keep the whole stripe bound so the per-shard stage reserve stays
+        // addressable. Tight sub-windows forced huge BufferCopies / panics and
+        // left staged bytes outside the bind range.
+        let shard_base = (lo / s) * s;
+        *base = shard_base;
+        *size = s.min(max_binding).max(256);
         return;
     }
     *base = (lo / ALIGN) * ALIGN;
@@ -2292,7 +1421,12 @@ fn arena_multi_op_window(
         *scratch = arena.scratch_off as u64;
         return (base, size, false);
     }
-    let param_anchor = if arena_span_bytes(arena, ids) > max_binding {
+    let param_anchor = if arena.is_sharded() {
+        // On striped arenas, never anchor on a far param — that leaves the
+        // op output outside the bound shard and `arena_local_off_f32` writes
+        // corrupt the wrong stripe. Stage params into the output shard instead.
+        None
+    } else if arena_span_bytes(arena, ids) > max_binding || arena_span_crosses_shard(arena, ids) {
         ids.iter()
             .find(|&&id| {
                 let nbytes = arena.len_of(id) as u64;
@@ -2303,19 +1437,28 @@ fn arena_multi_op_window(
         None
     };
     let mut param_anchored = param_anchor.is_some();
-    let (mut base, mut size) = if arena_span_bytes(arena, ids) <= max_binding {
-        arena_window_for_nodes(dev, arena, ids)
-    } else if let Some(id) = param_anchor {
-        arena_window_for_nodes(dev, arena, &[id])
-    } else {
-        arena_window_for_nodes(dev, arena, &[ids[0]])
-    };
+    let (mut base, mut size) =
+        if arena_span_bytes(arena, ids) <= max_binding && !arena_span_crosses_shard(arena, ids) {
+            arena_window_for_nodes(dev, arena, ids)
+        } else if let Some(id) = param_anchor {
+            arena_window_for_nodes(dev, arena, &[id])
+        } else {
+            // Span exceeds one storage bind (unsharded >4 GiB arenas) or crosses
+            // shards: anchor on the op output (first non-param) and stage far
+            // inputs into that window.
+            let outish = ids
+                .iter()
+                .copied()
+                .find(|&id| !tensor_is_graph_param(graph, param_offsets, id))
+                .unwrap_or(ids[0]);
+            arena_window_for_nodes(dev, arena, &[outish])
+        };
     if let Some(id) = param_anchor {
         if !arena_tensor_in_window(arena, id, base, size) {
             (base, size) = arena_window_for_nodes(dev, arena, &[id]);
         }
         param_anchored = true;
-    } else {
+    } else if !arena.is_sharded() {
         for &id in ids {
             let nbytes = arena.len_of(id) as u64;
             if tensor_is_graph_param(graph, param_offsets, id)
@@ -2329,8 +1472,12 @@ fn arena_multi_op_window(
         }
     }
     *scratch = arena.scratch_off as u64;
-    if param_anchored {
-        arena_ensure_scratch_in_window(scratch, base, size);
+    // Staging into scratch must land inside the bound window.
+    if param_anchored
+        || arena_span_crosses_shard(arena, ids)
+        || arena_span_bytes(arena, ids) > max_binding
+    {
+        arena_ensure_scratch_for_window(arena, scratch, base, size);
     }
     (base, size, param_anchored)
 }
@@ -2361,6 +1508,54 @@ fn arena_ensure_scratch_in_window(scratch: &mut u64, base: u64, size: u64) {
         *scratch = end.saturating_sub(cap);
         *scratch = (*scratch / 256) * 256;
     }
+}
+
+/// Prefer the dedicated stage reserve (never overlaps live tensors) when the
+/// arena is striped **or** unsharded-but-oversized with a compile-time scratch
+/// tail. Falling back to “scratch at bind-window end” on a single >4 GiB
+/// buffer parked staging on top of F5 params at the arena tail and zeroed the
+/// whole DiT (`RLX_WGPU_LARGE_BUFFERS=1`).
+fn arena_ensure_scratch_for_window(arena: &Arena, scratch: &mut u64, base: u64, size: u64) {
+    if arena.is_sharded() {
+        let stage = arena.shard_stage_off(base as usize) as u64;
+        let reserve = crate::buffer::SHARD_STAGE_RESERVE as u64;
+        let stage_end = stage.saturating_add(reserve);
+        // Keep an already-bumping cursor inside this stripe's reserve. Resetting
+        // to `stage` on every call made the second staged tensor (e.g. LN beta)
+        // overwrite the first (gamma) — F5 FusedResidualLN then read gamma=0
+        // and wrote an all-zero normalized row.
+        if *scratch >= stage && *scratch < stage_end {
+            return;
+        }
+        if stage >= base
+            && stage.saturating_add(ARENA_STAGE_CAP.min(size)) <= base.saturating_add(size)
+        {
+            *scratch = stage;
+            return;
+        }
+        // Window doesn't cover the reserve (sub-window bind) — slide scratch to
+        // the reserve and rely on callers binding the whole shard when staging.
+        *scratch = stage;
+        return;
+    }
+    if arena.scratch_bytes > 0 {
+        let stage = arena.scratch_off as u64;
+        let reserve = arena.scratch_bytes as u64;
+        let stage_end = stage.saturating_add(reserve);
+        if *scratch >= stage && *scratch < stage_end {
+            return;
+        }
+        if stage >= base && stage < base.saturating_add(size) {
+            *scratch = stage;
+            return;
+        }
+        // Point at the safe tail even when the current window doesn't cover it;
+        // `arena_off_in_window_or_stage` widens the bind to include `dst`.
+        let _ = stage_end;
+        *scratch = stage;
+        return;
+    }
+    arena_ensure_scratch_in_window(scratch, base, size);
 }
 
 #[allow(dead_code)]
@@ -2453,7 +1648,7 @@ fn f16_weight_bind_range(
     (base, size, rebased)
 }
 
-const ARENA_STAGE_CAP: u64 = 256 * 1024 * 1024;
+const ARENA_STAGE_CAP: u64 = 576 * 1024 * 1024;
 
 /// Output spatial positions computed per thread by `conv2d.wgsl` (register
 /// tiling for weight reuse). MUST equal `TILE` in that kernel.
@@ -2470,8 +1665,57 @@ fn arena_off_in_window_or_stage(
     max_binding: u64,
     id: NodeId,
 ) -> u32 {
-    let src = arena.offset(id) as u64;
+    let src_tagged = arena.offset(id);
     let len = arena.len_of(id) as u64;
+    if crate::buffer::is_weight_off(src_tagged) {
+        // Params live in a separate buffer — always stage into the act window.
+        if len > ARENA_STAGE_CAP {
+            panic!(
+                "rlx-wgpu: cannot stage {} bytes for weight node {:?} (cap {ARENA_STAGE_CAP})",
+                len, id
+            );
+        }
+        if arena.is_sharded() {
+            let s = arena.shard_size as u64;
+            let win_shard = *base / s;
+            let stage_cap = crate::buffer::SHARD_STAGE_RESERVE as u64;
+            if len > stage_cap {
+                panic!(
+                    "rlx-wgpu: cannot stage {} bytes for weight node {:?} \
+                     (shard reserve {stage_cap})",
+                    len, id
+                );
+            }
+            *base = win_shard * s;
+            *size = s.min(max_binding).max(256);
+            arena_ensure_scratch_for_window(arena, scratch, *base, *size);
+            let stage_begin = arena.shard_stage_off(*base as usize) as u64;
+            let stage_end = stage_begin.saturating_add(stage_cap);
+            let aligned = len.div_ceil(256) * 256;
+            // Bump-allocate inside the reserve; wrap if this op's stages fill it.
+            if scratch.saturating_add(aligned) > stage_end {
+                *scratch = stage_begin;
+            }
+            let dst = *scratch;
+            *scratch = scratch.saturating_add(aligned);
+            schedule.push(Step::BufferCopy {
+                src_byte_off: src_tagged as u64,
+                dst_byte_off: dst,
+                bytes: len as u32,
+            });
+            return ((dst.saturating_sub(*base)) / 4) as u32;
+        }
+        let aligned = len.div_ceil(256) * 256;
+        let dst = *scratch;
+        *scratch = scratch.saturating_add(aligned);
+        schedule.push(Step::BufferCopy {
+            src_byte_off: src_tagged as u64,
+            dst_byte_off: dst,
+            bytes: len as u32,
+        });
+        return ((dst.saturating_sub(*base)) / 4) as u32;
+    }
+    let src = src_tagged as u64;
     if src >= *base && src.saturating_add(len) <= (*base).saturating_add(*size) {
         return arena_local_off_f32(arena, id, *base);
     }
@@ -2481,7 +1725,76 @@ fn arena_off_in_window_or_stage(
             len, id
         );
     }
+    if arena.is_sharded() {
+        let s = arena.shard_size as u64;
+        let win_shard = *base / s;
+        let src_shard = src / s;
+        let src_end_shard = src.saturating_add(len).saturating_sub(1) / s;
+        // Same stripe: open the whole shard instead of copying into the reserve.
+        // Requires the WHOLE tensor (not just its start byte) to sit inside
+        // `win_shard` — a tensor straddling into the next stripe (e.g. a
+        // large per-block param tail-appended near a shard boundary) would
+        // otherwise get a local offset whose tail reads past this shard's
+        // physical buffer (silently clamped/zeroed by wgpu), corrupting
+        // exactly the columns/rows that spilled over — this produced a
+        // small-but-correlated wrong result (e.g. AdaLN modulation Gemm)
+        // instead of a loud failure.
+        if src_shard == win_shard && src_end_shard == win_shard {
+            *base = win_shard * s;
+            *size = s.min(max_binding).max(256);
+            arena_clamp_bind_window(arena, base, size);
+            return arena_local_off_f32(arena, id, *base);
+        }
+        let stage_cap = crate::buffer::SHARD_STAGE_RESERVE as u64;
+        if len > stage_cap {
+            // Too large to stage: open a whole-stripe window on the tensor's
+            // own shard. Callers that need both this tensor and the previous
+            // window's contents must have already packed or used a host path.
+            // Prefer keeping the write target (current window) and erroring
+            // only when we cannot address the tensor at all.
+            panic!(
+                "rlx-wgpu: cannot stage {} bytes for node {:?} across shards \
+                 (shard reserve {stage_cap}; src_shard={src_shard} win_shard={win_shard}). \
+                 Shrink max_seq or raise SHARD_STAGE_RESERVE.",
+                len, id
+            );
+        }
+        // Bind the whole destination stripe so the stage reserve is in-range.
+        *base = win_shard * s;
+        *size = s.min(max_binding).max(256);
+        arena_clamp_bind_window(arena, base, size);
+        // Keep staging inside this stripe's reserved tail — never expand the
+        // bind window across a shard boundary (that used to clobber live slots).
+        arena_ensure_scratch_for_window(arena, scratch, *base, *size);
+        let stage_cap = crate::buffer::SHARD_STAGE_RESERVE as u64;
+        let stage_begin = arena.shard_stage_off(*base as usize) as u64;
+        let stage_end = stage_begin.saturating_add(stage_cap);
+        let aligned = len.div_ceil(256) * 256;
+        if scratch.saturating_add(aligned) > stage_end {
+            *scratch = stage_begin;
+        }
+        let dst = *scratch;
+        *scratch = scratch.saturating_add(aligned);
+        schedule.push(Step::BufferCopy {
+            src_byte_off: src,
+            dst_byte_off: dst,
+            bytes: len as u32,
+        });
+        return ((dst.saturating_sub(*base)) / 4) as u32;
+    }
     let aligned = len.div_ceil(256) * 256;
+    // Prefer the dedicated tail reserve when present (oversized unsharded
+    // arenas). Window-end parking used to clobber live params on F5 DiT.
+    arena_ensure_scratch_for_window(arena, scratch, *base, *size);
+    if arena.scratch_bytes > 0 {
+        let stage_begin = arena.scratch_off as u64;
+        let stage_end = stage_begin.saturating_add(arena.scratch_bytes as u64);
+        if scratch.saturating_add(aligned) > stage_end {
+            *scratch = stage_begin;
+        }
+    } else if scratch.saturating_add(aligned) > (*base).saturating_add(*size) {
+        arena_ensure_scratch_in_window(scratch, *base, *size);
+    }
     let dst = *scratch;
     *scratch = scratch.saturating_add(aligned);
     schedule.push(Step::BufferCopy {
@@ -2503,6 +1816,7 @@ fn arena_off_in_window_or_stage(
             *base = (arena.size as u64).saturating_sub(*size);
             *base = (*base / ALIGN) * ALIGN;
         }
+        arena_clamp_bind_window(arena, base, size);
     }
     if arena_tensor_in_window(arena, id, *base, *size) {
         arena_local_off_f32(arena, id, *base)
@@ -2517,6 +1831,13 @@ fn arena_window_covering_scratch(arena: &Arena, base: u64, size: u64) -> u64 {
     if scratch >= base && scratch.saturating_add(ARENA_STAGE_CAP) <= base.saturating_add(size) {
         return base;
     }
+    if arena.is_sharded() {
+        // Sliding to the logical arena tail would move the bind onto a
+        // different stripe, invalidating every previously rebased offset
+        // (Attention/QKV, norms, …) and writing outputs into the wrong
+        // shard. Keep the current stripe; staging uses `shard_stage_off`.
+        return base;
+    }
     let new_base = (arena.size as u64).saturating_sub(size);
     (new_base / 256) * 256
 }
@@ -2525,10 +1846,16 @@ fn arena_span_bytes(arena: &Arena, ids: &[NodeId]) -> u64 {
     let mut lo: u64 = u64::MAX;
     let mut hi: u64 = 0;
     for &id in ids {
-        let off = arena.offset(id) as u64;
+        let off = arena.offset(id);
+        if crate::buffer::is_weight_off(off) {
+            // Weight-buffer tensors don't enlarge the activation bind span;
+            // callers stage them into the act window separately.
+            continue;
+        }
+        let o = off as u64;
         let len = arena.len_of(id) as u64;
-        lo = lo.min(off);
-        hi = hi.max(off.saturating_add(len));
+        lo = lo.min(o);
+        hi = hi.max(o.saturating_add(len));
     }
     if lo == u64::MAX {
         0
@@ -2595,7 +1922,7 @@ fn bind_op_window(
     } else {
         arena_window_for_nodes(device, arena, &[ids[0]])
     };
-    bind_two_buf0_window(device, kernel, &arena.buffer, base, size, params)
+    bind_arena_window(device, kernel, arena, base, size, params)
 }
 
 /// Storage-buffer binding size for an arena window. wgpu 30 validates that
@@ -2981,6 +2308,39 @@ fn traces_to_param(graph: &Graph, mut id: NodeId) -> bool {
     }
 }
 
+/// True when `id`'s value is fixed after param/constant upload (no Inputs).
+/// Used to mark weight-packing Concat/Expand as run-once for the NFE loop.
+fn is_static_weight_tensor(graph: &Graph, id: NodeId, memo: &mut HashMap<NodeId, bool>) -> bool {
+    if let Some(&v) = memo.get(&id) {
+        return v;
+    }
+    let node = graph.node(id);
+    let v = match &node.op {
+        Op::Param { .. } | Op::Constant { .. } => true,
+        Op::Input { .. } => false,
+        Op::Cast { .. }
+        | Op::Reshape { .. }
+        | Op::Transpose { .. }
+        | Op::Narrow { .. }
+        | Op::Expand { .. }
+        | Op::Activation(_)
+        | Op::Concat { .. } => {
+            !node.inputs.is_empty()
+                && node
+                    .inputs
+                    .iter()
+                    .all(|&inp| is_static_weight_tensor(graph, inp, memo))
+        }
+        Op::Binary { .. } | Op::Where | Op::Fma => node
+            .inputs
+            .iter()
+            .all(|&inp| is_static_weight_tensor(graph, inp, memo)),
+        _ => false,
+    };
+    memo.insert(id, v);
+    v
+}
+
 fn tensor_is_graph_param(
     graph: &Graph,
     param_offsets: &HashMap<String, NodeId>,
@@ -3234,11 +2594,14 @@ fn build_matmul_qkv_coop_f16_vk_bind_group(
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &arena.buffer,
-                        offset: arena_base,
-                        size: NonZeroU64::new(arena_size),
-                    }),
+                    resource: {
+                        let (b, l) = arena_bind_buf(arena, arena_base);
+                        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: b,
+                            offset: l,
+                            size: NonZeroU64::new(arena_size),
+                        })
+                    },
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -3307,8 +2670,8 @@ fn push_cast_f32_to_f16_step(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &arena.buffer,
-                    offset: arena_base,
+                    buffer: arena_bind_buf(arena, arena_base).0,
+                    offset: arena_bind_buf(arena, arena_base).1,
                     size: NonZeroU64::new(arena_size),
                 }),
             },
@@ -3375,8 +2738,8 @@ fn build_matmul_bind_group(
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &arena.buffer,
-                            offset: arena_base,
+                            buffer: arena_bind_buf(arena, arena_base).0,
+                            offset: arena_bind_buf(arena, arena_base).1,
                             size: NonZeroU64::new(arena_size),
                         }),
                     },
@@ -3403,8 +2766,8 @@ fn build_matmul_bind_group(
                     wgpu::BindGroupEntry {
                         binding: 0,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &arena.buffer,
-                            offset: arena_base,
+                            buffer: arena_bind_buf(arena, arena_base).0,
+                            offset: arena_bind_buf(arena, arena_base).1,
                             size: NonZeroU64::new(arena_size),
                         }),
                     },
@@ -3433,8 +2796,8 @@ fn build_matmul_bind_group(
                     wgpu::BindGroupEntry {
                         binding: 0,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &arena.buffer,
-                            offset: arena_base,
+                            buffer: arena_bind_buf(arena, arena_base).0,
+                            offset: arena_bind_buf(arena, arena_base).1,
                             size: NonZeroU64::new(arena_size),
                         }),
                     },
@@ -3464,8 +2827,8 @@ fn build_matmul_bind_group(
                     wgpu::BindGroupEntry {
                         binding: 0,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &arena.buffer,
-                            offset: arena_base,
+                            buffer: arena_bind_buf(arena, arena_base).0,
+                            offset: arena_bind_buf(arena, arena_base).1,
                             size: NonZeroU64::new(arena_size),
                         }),
                     },
@@ -3496,8 +2859,8 @@ fn build_matmul_bind_group(
                     wgpu::BindGroupEntry {
                         binding: 0,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &arena.buffer,
-                            offset: arena_base,
+                            buffer: arena_bind_buf(arena, arena_base).0,
+                            offset: arena_bind_buf(arena, arena_base).1,
                             size: NonZeroU64::new(arena_size),
                         }),
                     },
@@ -3515,7 +2878,7 @@ fn build_matmul_bind_group(
         );
     }
     (
-        bind_two_buf0_window(device, mm_k, &arena.buffer, arena_base, arena_size, params),
+        bind_arena_window(device, mm_k, arena, arena_base, arena_size, params),
         b_off,
     )
 }

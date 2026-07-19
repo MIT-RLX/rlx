@@ -4,7 +4,7 @@
 // element of the iteration `shape`, map it to an input linear index and an
 // output linear index via per-axis strides, then copy. rank ≤ 6.
 //
-//   out[out_off + out_idx] = data[in_off + in_idx]
+//   out[out_off + out_idx] = arena_load(in_off + in_idx)
 //
 // NOTE: push-constant members are individual scalars (NOT `uint[6]` arrays).
 // Array members in a push-constant block get a compiler-chosen std140/std430
@@ -14,7 +14,6 @@
 // the host packer in `backend.rs`.
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint n;
@@ -45,5 +44,5 @@ void main() {
         in_idx += c * istr[ax];
         out_idx += c * ostr[ax];
     }
-    data[pc.out_off + out_idx] = data[pc.in_off + in_idx];
+    arena_store(pc.out_off + out_idx, arena_load(pc.in_off + in_idx));
 }

@@ -13,10 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Host-side RNG fill for device arenas (D2H → fill → H2D).
+//! Host-side RNG fill for ROCm arenas (fill on host → H2D).
+//!
+//! Thin adapter over [`rlx_gpu_host::run_rng_normal`] /
+//! [`rlx_gpu_host::run_rng_uniform`].
 
 use crate::device::RocmContext;
 use crate::hip::HipBuffer;
+use crate::host_stage::RocmArena;
 
 pub fn run_rng_normal(
     ctx: &RocmContext,
@@ -29,27 +33,21 @@ pub fn run_rng_normal(
     op_seed: Option<f32>,
     opts: rlx_ir::RngOptions,
 ) {
-    if len == 0 {
-        return;
-    }
-    assert_eq!(
-        dst_byte_off % 4,
-        0,
-        "rng_host: dst_byte_off must be f32-aligned"
+    let mut arena = RocmArena {
+        ctx,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_rng_normal(
+        &mut arena,
+        dst_byte_off,
+        len,
+        mean,
+        scale,
+        key,
+        op_seed,
+        opts,
     );
-    let byte_len = len * 4;
-    let rt = &ctx.runtime;
-    let mut host = vec![0f32; len];
-    unsafe {
-        let _ = (rt.hip_stream_sync)(ctx.default_stream);
-        let src_ptr = (buffer.ptr as usize + dst_byte_off) as crate::hip::HipDeviceptr;
-        let _ = (rt.hip_memcpy_dtoh)(host.as_mut_ptr() as *mut _, src_ptr, byte_len);
-    }
-    rlx_ir::fill_normal_like(&mut host, mean, scale, opts, key, op_seed);
-    unsafe {
-        let dst_ptr = (buffer.ptr as usize + dst_byte_off) as crate::hip::HipDeviceptr;
-        let _ = (rt.hip_memcpy_htod)(dst_ptr, host.as_ptr() as *const _, byte_len);
-    }
 }
 
 pub fn run_rng_uniform(
@@ -63,25 +61,10 @@ pub fn run_rng_uniform(
     op_seed: Option<f32>,
     opts: rlx_ir::RngOptions,
 ) {
-    if len == 0 {
-        return;
-    }
-    assert_eq!(
-        dst_byte_off % 4,
-        0,
-        "rng_host: dst_byte_off must be f32-aligned"
-    );
-    let byte_len = len * 4;
-    let rt = &ctx.runtime;
-    let mut host = vec![0f32; len];
-    unsafe {
-        let _ = (rt.hip_stream_sync)(ctx.default_stream);
-        let src_ptr = (buffer.ptr as usize + dst_byte_off) as crate::hip::HipDeviceptr;
-        let _ = (rt.hip_memcpy_dtoh)(host.as_mut_ptr() as *mut _, src_ptr, byte_len);
-    }
-    rlx_ir::fill_uniform_like(&mut host, low, high, opts, key, op_seed);
-    unsafe {
-        let dst_ptr = (buffer.ptr as usize + dst_byte_off) as crate::hip::HipDeviceptr;
-        let _ = (rt.hip_memcpy_htod)(dst_ptr, host.as_ptr() as *const _, byte_len);
-    }
+    let mut arena = RocmArena {
+        ctx,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_rng_uniform(&mut arena, dst_byte_off, len, low, high, key, op_seed, opts);
 }

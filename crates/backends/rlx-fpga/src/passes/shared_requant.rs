@@ -52,6 +52,7 @@ mod tests {
             w_zp: 0,
             out_zp: 0,
             weight_bits: 8,
+            weight_encoding: crate::model::WeightEncoding::SignedInt,
             requant: table,
             weights: vec![1; 4 * 4],
             bias: None,

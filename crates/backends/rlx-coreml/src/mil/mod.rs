@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use rlx_ir::op::{CmpOp, ReduceOp};
+use rlx_ir::op::{CmpOp, ReduceOp, ScatterNdReduction};
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
 /// Raw bytes + element type for a non-f32 (typically GGUF-quantized)
@@ -28,6 +28,11 @@ use helpers::*;
 /// staying at CoreML6 keeps the base op set broadly available.
 const OPSET: &str = "CoreML6";
 const SPEC_VERSION: i32 = 7;
+/// iOS18 (CoreML8 / spec 9) opset — required only when the graph uses ops added
+/// there (e.g. `constexpr_lut_to_dense` grouped palettization + UINT1). Selected
+/// per-model so ordinary graphs stay at the broadly-compatible CoreML6 baseline.
+const OPSET_IOS18: &str = "CoreML8";
+const SPEC_VERSION_IOS18: i32 = 9;
 
 /// One model input/output, carried alongside the proto so the runtime
 /// knows feature names + shapes without re-walking the graph.
@@ -96,6 +101,11 @@ pub struct LowerOptions {
     pub flexible_inputs: bool,
     /// Keep GGUF weights quantized in the model and dequant on device.
     pub ondevice_dequant: bool,
+    /// Q1_0 on-device lowering mode. `None` → read `RLX_COREML_Q1_MODE` env
+    /// (default **Lut** 1-bit palettization). `Some(Q1Mode::F32)` forces the
+    /// legacy multi-GiB unfold. Lut keeps weights 1-bit packed in weight.bin
+    /// (`constexpr_lut_to_dense`, iOS18 opset) — required for 27B-class models.
+    pub q1_mode: Option<quant::Q1Mode>,
 }
 
 impl Default for LowerOptions {
@@ -104,6 +114,7 @@ impl Default for LowerOptions {
             float_dtype: DType::F32,
             flexible_inputs: false,
             ondevice_dequant: true,
+            q1_mode: None,
         }
     }
 }
@@ -157,7 +168,16 @@ struct LowerCtx<'a> {
     operations: Vec<proto::Operation>,
     inputs: Vec<IoTensor>,
     used_feature_names: HashMap<String, u32>,
+    /// Bool-node id → the name of its already-emitted `{name}_f32m` cast, so a
+    /// bool tensor reused as a numeric operand (VITS masks feed many ops) is
+    /// cast once — re-emitting would redefine the MIL I/O name.
+    numeric_casts: HashMap<u32, String>,
     blob: crate::mlpackage::BlobWriter,
+    /// Prefix for generated `v{id}` value names. Empty at the top level; set to a
+    /// scan-unique string while lowering an `Op::Scan` body into a nested
+    /// `while_loop` block, so body node names don't collide with the outer graph's
+    /// `v{id}` names that the block references via closure.
+    name_prefix: String,
 }
 
 mod activation;
@@ -167,7 +187,9 @@ mod loss;
 mod matmul;
 mod norm;
 mod quant;
+pub use quant::Q1Mode;
 mod reduce_index;
+mod rnn;
 mod rope;
 mod ssm;
 
@@ -188,7 +210,9 @@ impl<'a> LowerCtx<'a> {
             operations: Vec::new(),
             inputs: Vec::new(),
             used_feature_names: HashMap::new(),
+            numeric_casts: HashMap::new(),
             blob: crate::mlpackage::BlobWriter::new(),
+            name_prefix: String::new(),
         }
     }
 
@@ -205,6 +229,12 @@ impl<'a> LowerCtx<'a> {
     pub(crate) fn val_numeric(&mut self, id: NodeId) -> Result<String> {
         let name = self.val(id);
         if self.graph.shape(id).dtype() == DType::Bool {
+            // Emit the bool→f32 cast at most once per node; a mask reused across
+            // several ops would otherwise redefine `{name}_f32m` (MIL rejects a
+            // block that declares the same I/O name twice).
+            if let Some(existing) = self.numeric_casts.get(&id.0) {
+                return Ok(existing.clone());
+            }
             let cast_name = format!("{name}_f32m");
             let shape = self.graph.shape(id).clone().with_dtype(DType::F32);
             self.emit(
@@ -216,6 +246,7 @@ impl<'a> LowerCtx<'a> {
                     ("dtype", bind_value(scalar_str("fp32"))),
                 ],
             )?;
+            self.numeric_casts.insert(id.0, cast_name.clone());
             Ok(cast_name)
         } else {
             Ok(name)
@@ -232,7 +263,7 @@ impl<'a> LowerCtx<'a> {
 
     pub(crate) fn lower_node(&mut self, id: NodeId) -> Result<()> {
         let node = self.graph.node(id);
-        let out_name = format!("v{}", id.0);
+        let out_name = format!("{}v{}", self.name_prefix, id.0);
         match &node.op {
             Op::Input { name } => {
                 let feat = self.unique_feature_name(name);
@@ -380,6 +411,12 @@ impl<'a> LowerCtx<'a> {
             Op::RmsNorm { axis, eps } => {
                 self.lower_rms_norm(id, *axis, *eps, &out_name)?;
             }
+            Op::AdaLayerNorm { norm, eps } => {
+                self.lower_ada_layer_norm(id, *norm, *eps, &out_name)?;
+            }
+            Op::GatedResidual => {
+                self.lower_gated_residual(id, &out_name)?;
+            }
             // Native MIL backward kernels (training). Tighter than the autodiff
             // decomposition (implicit broadcasting in place of `Expand`-with-ones);
             // mirror `rlx_autodiff::*::compose_rms_norm_backward_*` exactly so ANE
@@ -406,6 +443,16 @@ impl<'a> LowerCtx<'a> {
             #[cfg(feature = "training")]
             Op::LayerNormBackwardGamma { axis, eps } => {
                 self.lower_layer_norm_backward_gamma(id, *axis, *eps, &out_name)?;
+            }
+            // Packed DiT reverse — native composed MIL (implicit broadcast +
+            // concat pack). Graduates from the decompose-route claim.
+            #[cfg(feature = "training")]
+            Op::AdaLayerNormBackward { norm, eps } => {
+                self.lower_ada_layer_norm_backward(id, *norm, *eps, &out_name)?;
+            }
+            #[cfg(feature = "training")]
+            Op::GatedResidualBackward => {
+                self.lower_gated_residual_backward(id, &out_name)?;
             }
             // GroupNorm backward (NCHW). Native composed MIL: reshape [N,C,H,W] →
             // [N,G,M] (M = C/G·H·W) so each group's stats are one last-axis reduce —
@@ -557,6 +604,8 @@ impl<'a> LowerCtx<'a> {
                         ("x", bind_name(&x)),
                         ("indices", bind_name(&idx)),
                         ("axis", bind_value(scalar_i32(*axis as i32))),
+                        // Required by the iOS18 gather opset (LUT path forces spec-9).
+                        ("validate_indices", bind_value(scalar_bool(false))),
                     ],
                 )?;
                 self.push_named(id, out_name, op);
@@ -565,7 +614,18 @@ impl<'a> LowerCtx<'a> {
                 let x = self.val(node.inputs[0]);
                 let rank = node.shape.rank();
                 let mut begin = vec![0i32; rank];
-                let mut size = vec![-1i32; rank];
+                // Use EXPLICIT per-axis sizes from the (static) output shape rather
+                // than the `-1` "to-end" sentinel: CoreML/ANE converts a `-1` size
+                // into an `end_ids` computation that can fail on the Neural Engine
+                // ("generic_general_slice: Invalid values in end_ids"). The output
+                // shape already carries `len` at `axis` and the full extent
+                // elsewhere, so this is identical but ANE-safe.
+                let mut size: Vec<i32> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
                 begin[*axis] = *start as i32;
                 size[*axis] = *len as i32;
                 let op = self.simple_op(
@@ -622,8 +682,30 @@ impl<'a> LowerCtx<'a> {
                     CmpOp::Gt => "greater",
                     CmpOp::Ge => "greater_equal",
                 };
-                let x = self.val(node.inputs[0]);
-                let y = self.val(node.inputs[1]);
+                // MIL's comparison operators reject `bool` operands (only
+                // int32/fp32/fp16). The importer lowers ONNX `Not` to
+                // `Equal(bool_x, 0)`, so cast any bool operand up to int32 first.
+                let mut x = self.val(node.inputs[0]);
+                let mut y = self.val(node.inputs[1]);
+                for (slot, inp, name_ref) in [
+                    (0usize, node.inputs[0], &mut x),
+                    (1usize, node.inputs[1], &mut y),
+                ] {
+                    let _ = slot;
+                    if self.graph.shape(inp).dtype() == DType::Bool {
+                        let cb = format!("{out_name}_i{}", inp.0);
+                        self.emit(
+                            "cast",
+                            &cb,
+                            &self.graph.shape(inp).clone().with_dtype(DType::I32),
+                            vec![
+                                ("x", bind_name(name_ref)),
+                                ("dtype", bind_value(scalar_str("int32"))),
+                            ],
+                        )?;
+                        *name_ref = cb;
+                    }
+                }
                 let op = self.simple_op(
                     ty,
                     &out_name,
@@ -772,6 +854,86 @@ impl<'a> LowerCtx<'a> {
                 )?;
                 self.push_named(id, out_name, op);
             }
+            Op::ScatterNd { reduction } => {
+                let data = self.val(node.inputs[0]);
+                let idx_id = node.inputs[1];
+                let updates = self.val(node.inputs[2]);
+                let idx_i32 = format!("{out_name}_idx");
+                let idx_shape = self.graph.shape(idx_id).clone().with_dtype(DType::I32);
+                self.emit(
+                    "cast",
+                    &idx_i32,
+                    &idx_shape,
+                    vec![
+                        ("x", bind_name(&self.val(idx_id))),
+                        ("dtype", bind_value(scalar_str("int32"))),
+                    ],
+                )?;
+                let mode = match reduction {
+                    ScatterNdReduction::Add => "add",
+                    ScatterNdReduction::Mul => "mul",
+                    ScatterNdReduction::Max => "max",
+                    ScatterNdReduction::Min => "min",
+                    ScatterNdReduction::None => "update",
+                };
+                let op = self.simple_op(
+                    "scatter_nd",
+                    &out_name,
+                    &node.shape,
+                    vec![
+                        ("data", bind_name(&data)),
+                        ("indices", bind_name(&idx_i32)),
+                        ("updates", bind_name(&updates)),
+                        ("mode", bind_value(scalar_str(mode))),
+                    ],
+                )?;
+                self.push_named(id, out_name, op);
+            }
+            // Legacy Custom alias — keep for graphs that still emit onnx.ScatterND.
+            Op::Custom {
+                name,
+                attrs,
+                num_inputs: 3,
+            } if name == "onnx.ScatterND" => {
+                let data = self.val(node.inputs[0]);
+                let idx_id = node.inputs[1];
+                let updates = self.val(node.inputs[2]);
+                let idx_i32 = format!("{out_name}_idx");
+                let idx_shape = self.graph.shape(idx_id).clone().with_dtype(DType::I32);
+                self.emit(
+                    "cast",
+                    &idx_i32,
+                    &idx_shape,
+                    vec![
+                        ("x", bind_name(&self.val(idx_id))),
+                        ("dtype", bind_value(scalar_str("int32"))),
+                    ],
+                )?;
+                let reduction = if attrs.len() >= 4 {
+                    i32::from_le_bytes([attrs[0], attrs[1], attrs[2], attrs[3]])
+                } else {
+                    0
+                };
+                let mode = match reduction {
+                    1 => "add",
+                    2 => "mul",
+                    3 => "max",
+                    4 => "min",
+                    _ => "update",
+                };
+                let op = self.simple_op(
+                    "scatter_nd",
+                    &out_name,
+                    &node.shape,
+                    vec![
+                        ("data", bind_name(&data)),
+                        ("indices", bind_name(&idx_i32)),
+                        ("updates", bind_name(&updates)),
+                        ("mode", bind_value(scalar_str(mode))),
+                    ],
+                )?;
+                self.push_named(id, out_name, op);
+            }
             Op::BatchNormInference { eps } => {
                 self.lower_batch_norm(id, *eps, &out_name)?;
             }
@@ -915,6 +1077,40 @@ impl<'a> LowerCtx<'a> {
             Op::SelectiveScan { state_size } => {
                 self.lower_selective_scan(id, *state_size, &out_name)?;
             }
+            // Native LSTM (carry = false). `carry = true` is filtered to the host
+            // path by `is_host_op`, so it never reaches here.
+            Op::Lstm {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                carry: false,
+            } => {
+                self.lower_lstm(id, *hidden_size, *num_layers, *bidirectional, &out_name)?;
+            }
+            Op::Gru {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                carry: false,
+            } => {
+                self.lower_gru(id, *hidden_size, *num_layers, *bidirectional, &out_name)?;
+            }
+            Op::Rnn {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                carry: false,
+                relu,
+            } => {
+                self.lower_rnn(
+                    id,
+                    *hidden_size,
+                    *num_layers,
+                    *bidirectional,
+                    *relu,
+                    &out_name,
+                )?;
+            }
             Op::GatedDeltaNet {
                 state_size,
                 carry_state,
@@ -930,6 +1126,9 @@ impl<'a> LowerCtx<'a> {
             Op::Reverse { axes } => {
                 self.lower_reverse(id, axes, &out_name)?;
             }
+            Op::Scan { .. } => {
+                self.lower_scan(id, &out_name)?;
+            }
             other => {
                 return Err(CoremlError::Unsupported(format!(
                     "op {:?} (node {})",
@@ -937,6 +1136,180 @@ impl<'a> LowerCtx<'a> {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Lower a final-carry `Op::Scan` to a native CoreML MIL `while_loop`, so the
+    /// scan runs ON-DEVICE — no host split, so the whole graph stays one CoreML
+    /// model instead of `length+1` separately-compiled segments. Loop vars are
+    /// `[i (f32 counter), carry]`; the `cond` block tests `i < length`; the
+    /// `body` block gathers `xs_j[i]`, runs the scan body, and increments `i`.
+    /// Broadcast inputs are constant across iterations and referenced directly
+    /// (block closure). Encoding mirrors coremltools' MIL `while_loop`: two
+    /// blocks (cond, body) sharing the loop-var params; `loop_vars` input holds
+    /// the initial values; op outputs are the final loop vars.
+    fn lower_scan(&mut self, id: NodeId, out_name: &str) -> Result<()> {
+        let outer_graph: &'a Graph = self.graph;
+        // Extract the scan spec + outer operands (node borrow ends with the block).
+        let (body, length, num_bcast, num_xs, inputs, carry_shape) = {
+            let node = outer_graph.node(id);
+            let (body, length, num_bcast, num_xs): (&'a Graph, u32, usize, usize) = match &node.op {
+                Op::Scan {
+                    body,
+                    length,
+                    num_bcast,
+                    num_xs,
+                    ..
+                } => (&**body, *length, *num_bcast as usize, *num_xs as usize),
+                _ => unreachable!("lower_scan on non-Scan node"),
+            };
+            let carry_shape = outer_graph.node(node.inputs[0]).shape.clone();
+            (
+                body,
+                length,
+                num_bcast,
+                num_xs,
+                node.inputs.clone(),
+                carry_shape,
+            )
+        };
+        let init_carry = self.val(inputs[0]);
+        let bcast_names: Vec<String> = (0..num_bcast).map(|j| self.val(inputs[1 + j])).collect();
+        let xs_names: Vec<String> = (0..num_xs)
+            .map(|j| self.val(inputs[1 + num_bcast + j]))
+            .collect();
+
+        // Body Op::Input node ids in construction order: [carry, bcast.., xs..].
+        let body_inputs: Vec<NodeId> = body
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Input { .. }))
+            .map(|n| n.id)
+            .collect();
+
+        let f32s = scalar_shape(DType::F32);
+        let bools = scalar_shape(DType::Bool);
+        let i32s = scalar_shape(DType::I32);
+        let blk_inputs = |ctx: &Self| -> Result<Vec<proto::NamedValueType>> {
+            let _ = ctx;
+            Ok(vec![
+                named_value_type(&format!("{out_name}_lv_i"), &f32s)?,
+                named_value_type(&format!("{out_name}_lv_carry"), &carry_shape)?,
+            ])
+        };
+        let pi = format!("{out_name}_lv_i");
+        let pc = format!("{out_name}_lv_carry");
+
+        // Loop-var init: counter const 0.0. Carry init = outer producer.
+        let i0_name = format!("{out_name}_i0");
+        let c0 = make_const(&mut self.blob, &i0_name, &f32s, &[0.0])?;
+        self.operations.push(c0);
+
+        // --- cond block: less(i, length) -> bool ---
+        let cond_out = format!("{out_name}_cond");
+        let cond_op = self.simple_op(
+            "less",
+            &cond_out,
+            &bools,
+            vec![
+                ("x", bind_name(&pi)),
+                ("y", bind_value(scalar_f32(length as f32))),
+            ],
+        )?;
+        let cond_block = proto::Block {
+            inputs: blk_inputs(self)?,
+            outputs: vec![cond_out],
+            operations: vec![cond_op],
+            attributes: HashMap::new(),
+        };
+
+        // --- body block: build into a fresh op list + name scope ---
+        let saved_ops = std::mem::take(&mut self.operations);
+        let saved_names = std::mem::take(&mut self.names);
+
+        let i_int = format!("{out_name}_i_int");
+        self.emit(
+            "cast",
+            &i_int,
+            &i32s,
+            vec![
+                ("x", bind_name(&pi)),
+                ("dtype", bind_value(scalar_str("int32"))),
+            ],
+        )?;
+
+        // Seed body inputs: carry -> loop param; bcast -> outer name (closure);
+        // xs -> gather(outer_xs, i, axis=0).
+        self.names.insert(body_inputs[0].0, pc.clone());
+        for j in 0..num_bcast {
+            self.names
+                .insert(body_inputs[1 + j].0, bcast_names[j].clone());
+        }
+        for j in 0..num_xs {
+            let in_id = body_inputs[1 + num_bcast + j];
+            let step_shape = body.node(in_id).shape.clone();
+            let gname = format!("{out_name}_xs{j}");
+            self.emit(
+                "gather",
+                &gname,
+                &step_shape,
+                vec![
+                    ("x", bind_name(&xs_names[j])),
+                    ("indices", bind_name(&i_int)),
+                    ("axis", bind_value(scalar_i32(0))),
+                ],
+            )?;
+            self.names.insert(in_id.0, gname);
+        }
+
+        // Lower the body graph (skip its Op::Inputs — already seeded). Prefix its
+        // `v{id}` names so they can't collide with the outer graph's identically
+        // numbered nodes that this block references via closure.
+        let saved_prefix = std::mem::replace(&mut self.name_prefix, format!("{out_name}_b"));
+        self.graph = body;
+        for bn in body.nodes() {
+            if matches!(bn.op, Op::Input { .. }) {
+                continue;
+            }
+            self.lower_node(bn.id)?;
+        }
+        let new_carry = self.val(body.outputs[0]);
+        self.graph = outer_graph;
+        self.name_prefix = saved_prefix;
+
+        let new_i = format!("{out_name}_ni");
+        self.emit(
+            "add",
+            &new_i,
+            &f32s,
+            vec![("x", bind_name(&pi)), ("y", bind_value(scalar_f32(1.0)))],
+        )?;
+
+        let body_ops = std::mem::replace(&mut self.operations, saved_ops);
+        self.names = saved_names;
+        let body_block = proto::Block {
+            inputs: blk_inputs(self)?,
+            outputs: vec![new_i, new_carry],
+            operations: body_ops,
+            attributes: HashMap::new(),
+        };
+
+        // --- while_loop op: loop_vars=[i0, carry]; outputs=[final_i, carry] ---
+        let final_i = format!("{out_name}_fi");
+        let mut attrs = HashMap::new();
+        attrs.insert("name".to_string(), scalar_str(out_name));
+        let while_op = proto::Operation {
+            r#type: "while_loop".to_string(),
+            inputs: HashMap::from([("loop_vars".to_string(), bind_names(&[i0_name, init_carry]))]),
+            outputs: vec![
+                named_value_type(&final_i, &f32s)?,
+                named_value_type(out_name, &carry_shape)?,
+            ],
+            blocks: vec![cond_block, body_block],
+            attributes: attrs,
+        };
+        self.operations.push(while_op);
+        self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
 
@@ -1164,6 +1537,32 @@ impl<'a> LowerCtx<'a> {
         // CoreML parse error.
         self.verify_refs(&output_names)?;
 
+        // Bump to the iOS18 opset only when the graph uses an op that requires
+        // it (currently `constexpr_lut_to_dense` grouped palettization + UINT1);
+        // ordinary graphs stay at CoreML6 so existing behavior is unchanged.
+        let needs_ios18 = self
+            .operations
+            .iter()
+            .any(|op| op.r#type == "constexpr_lut_to_dense");
+        let (opset, spec_version) = if needs_ios18 {
+            (OPSET_IOS18, SPEC_VERSION_IOS18)
+        } else {
+            (OPSET, SPEC_VERSION)
+        };
+
+        // The `gather` op's `validate_indices` param only exists in the
+        // iOS18 / spec-9 opset. At the broadly-compatible CoreML6 (spec-8)
+        // baseline the ANE parser rejects it ("Invalid param name
+        // 'validate_indices'"), so strip it from every `gather` when the graph
+        // stays at CoreML6. (spec-9/LUT graphs keep it — required there.)
+        if !needs_ios18 {
+            for op in self.operations.iter_mut() {
+                if op.r#type == "gather" {
+                    op.inputs.remove("validate_indices");
+                }
+            }
+        }
+
         let block = proto::Block {
             inputs: vec![],
             outputs: output_names,
@@ -1171,11 +1570,11 @@ impl<'a> LowerCtx<'a> {
             attributes: HashMap::new(),
         };
         let mut block_specializations = HashMap::new();
-        block_specializations.insert(OPSET.to_string(), block);
+        block_specializations.insert(opset.to_string(), block);
 
         let function = proto::Function {
             inputs: self.func_inputs,
-            opset: OPSET.to_string(),
+            opset: opset.to_string(),
             block_specializations,
             attributes: HashMap::new(),
         };
@@ -1207,7 +1606,7 @@ impl<'a> LowerCtx<'a> {
         };
 
         let model = proto::Model {
-            specification_version: SPEC_VERSION,
+            specification_version: spec_version,
             description: Some(description),
             is_updatable: false,
             r#type: Some(proto::model::Type::MlProgram(program)),

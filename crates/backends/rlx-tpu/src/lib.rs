@@ -44,6 +44,9 @@ pub mod xla {
 }
 
 pub mod backend;
+pub mod supported_ops;
+pub use supported_ops::SUPPORTED_OPS;
+pub mod collective_host;
 pub mod device;
 pub mod fk_pipeline;
 pub mod hlo;

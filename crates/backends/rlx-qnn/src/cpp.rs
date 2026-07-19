@@ -143,6 +143,49 @@ impl Cpp {
             });
         });
     }
+
+    /// Emit a v1 `Qnn_Tensor_t` with an explicit `clientBuf` (STATIC weights).
+    /// `data_expr` is a C expression for the buffer pointer (e.g. `w_data`);
+    /// `size_expr` is the byte size (e.g. `sizeof(w_data)`).
+    pub fn tensor_v1_buf(
+        &mut self,
+        lead: &str,
+        name: &str,
+        ttype: &str,
+        dims_var: &str,
+        data_expr: &str,
+        size_expr: &str,
+        trail: &str,
+    ) {
+        self.line(&format!("{lead}(Qnn_Tensor_t){{"));
+        self.block(|c| {
+            c.line(".version = QNN_TENSOR_VERSION_1,");
+            c.line(".v1 = {");
+            c.block(|c| {
+                c.line(".id             = 0,");
+                c.line(&format!(".name           = \"{name}\","));
+                c.line(&format!(".type           = {ttype},"));
+                c.line(".dataFormat     = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER,");
+                c.line(".dataType       = QNN_DATATYPE_FLOAT_32,");
+                c.line(".quantizeParams = {QNN_DEFINITION_UNDEFINED,");
+                c.line("                   QNN_QUANTIZATION_ENCODING_UNDEFINED,");
+                c.line(
+                    "                   {.scaleOffsetEncoding = {.scale = 0.0f, .offset = 0}}},",
+                );
+                c.line(".rank           = 2,");
+                c.line(&format!(".dimensions     = {dims_var},"));
+                c.line(".memType        = QNN_TENSORMEMTYPE_RAW,");
+                // Build the line without nesting `}` inside a format string.
+                let mut line = format!(
+                    ".clientBuf      = {{.data = (void*){data_expr}, .dataSize = {size_expr}}}"
+                );
+                line.push('}'); // close .v1
+                line.push('}'); // close Qnn_Tensor_t
+                line.push_str(trail);
+                c.line(&line);
+            });
+        });
+    }
 }
 
 #[cfg(test)]

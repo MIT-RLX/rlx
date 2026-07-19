@@ -21,12 +21,41 @@ use std::collections::HashMap;
 
 use super::*;
 
+/// Sequence length axis for NeoX RoPE layouts.
+fn rope_seq_len(shape: &Shape, heads_packed: bool) -> Result<usize> {
+    let rank = shape.rank();
+    let idx = if heads_packed {
+        // `[B, S, G, head_dim]`
+        1
+    } else if rank == 4 {
+        // `[B, H, S, D]`
+        2
+    } else if rank >= 2 {
+        // `[B, S, D]`
+        1
+    } else {
+        return Err(CoremlError::Unsupported(format!(
+            "rope: cannot infer seq from rank-{rank} shape {:?}",
+            shape.dims()
+        )));
+    };
+    match shape.dim(idx) {
+        Dim::Static(s) => Ok(s),
+        Dim::Dynamic(s) => Err(CoremlError::DynamicShape(format!("rope seq ?{s}"))),
+    }
+}
+
 impl<'a> LowerCtx<'a> {
     /// RoPE (NeoX split-halves). Inputs `[x, cos, sin]`; rotates the first
     /// `n_rot` of the trailing `head_dim` lane, passes the rest through.
     /// Only the layout where the last axis == `head_dim` is supported
     /// (`[B,H,S,D]` or `[B,S,D]`); the cos/sin tables (`[…,n_rot/2]`)
     /// broadcast against the rotated halves.
+    ///
+    /// Production tables are often `[max_pos, head_half]` with
+    /// `max_pos ≫ seq` (Qwen3.5 / Bonsai: max_pos=262144). Metal/CPU RoPE
+    /// index by position; this lowering slices tables to `[seq, rot_half]`
+    /// before any mul so Espresso broadcast matches the activation.
     pub(crate) fn lower_rope(
         &mut self,
         id: NodeId,
@@ -51,19 +80,29 @@ impl<'a> LowerCtx<'a> {
             }
         };
 
+        let rot_half = n_rot / 2;
+        let heads_packed = last != head_dim && head_dim != 0 && last.is_multiple_of(head_dim);
+        let seq = rope_seq_len(&shape, heads_packed)?;
+
         let x = self.val(in0);
-        let cos = self.val(in1);
-        let sin = self.val(in2);
+        let cos0 = self.val(in1);
+        let sin0 = self.val(in2);
+
+        // Slice `[max_pos, half] → [seq, rot_half]` on the Graph-backed tables
+        // before any reshape/broadcast.
+        let cos = self.rope_slice_table(in1, &cos0, seq, rot_half, &format!("{out_name}_cos"))?;
+        let sin = self.rope_slice_table(in2, &sin0, seq, rot_half, &format!("{out_name}_sin"))?;
+        // After slice the effective table shape is always `[seq, rot_half]`.
+        let table_shape = Shape::new(&[seq, rot_half], DType::F32);
 
         // Flexible layout: the rotation runs on a tensor whose LAST axis is
         // exactly `head_dim`. When the last axis instead packs multiple heads
         // (`[.., G*head_dim]`, the fused-QKV layout used by e.g. Qwen3-ASR),
         // reshape to `[.., G, head_dim]`, rotate per head, then reshape back —
         // cos/sin gain a singleton head axis so they broadcast over the heads.
-        // The `last == head_dim` path is byte-for-byte the original lowering.
         let (eff_x, eff_shape, eff_cos, eff_sin, restore) = if last == head_dim {
             (x, shape.clone(), cos, sin, None)
-        } else if head_dim != 0 && last % head_dim == 0 {
+        } else if heads_packed {
             let groups = last / head_dim;
             let mut gd = shape.dims().to_vec();
             gd.pop();
@@ -80,8 +119,12 @@ impl<'a> LowerCtx<'a> {
                     ("shape", bind_value(vec_i32(&dims_i32(&gd)))),
                 ],
             )?;
-            let cos_g = self.rope_insert_head_axis(in1, &cos, &format!("{out_name}_cosg"))?;
-            let sin_g = self.rope_insert_head_axis(in2, &sin, &format!("{out_name}_sing"))?;
+            // Insert head axis into the already-sliced `[seq, rot_half]` tables
+            // → `[seq, 1, rot_half]` to broadcast over G.
+            let cos_g =
+                self.rope_insert_head_axis_shape(&table_shape, &cos, &format!("{out_name}_cosg"))?;
+            let sin_g =
+                self.rope_insert_head_axis_shape(&table_shape, &sin, &format!("{out_name}_sing"))?;
             (xg, gshape, cos_g, sin_g, Some(shape.clone()))
         } else {
             return Err(CoremlError::Unsupported(format!(
@@ -92,7 +135,6 @@ impl<'a> LowerCtx<'a> {
         };
 
         let eff_rank = eff_shape.rank();
-        let rot_half = n_rot / 2;
         let half_shape = with_last(&eff_shape, rot_half);
         let rot_shape = with_last(&eff_shape, n_rot);
 
@@ -211,16 +253,59 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-    /// Reshape a rope cos/sin table to gain a singleton head axis just before
-    /// its last dim, so it broadcasts over the per-head groups when rope runs
-    /// on a fused `[.., G, head_dim]` view.
-    pub(crate) fn rope_insert_head_axis(
+    /// Slice a Graph-backed cos/sin param `[max_pos, half]` down to
+    /// `[seq, rot_half]` (no-op when already that size).
+    fn rope_slice_table(
         &mut self,
         src: NodeId,
         val: &str,
+        seq: usize,
+        rot_half: usize,
+        out_base: &str,
+    ) -> Result<String> {
+        let shape = self.graph.shape(src);
+        if shape.rank() < 2 {
+            return Ok(val.to_string());
+        }
+        let Dim::Static(rows) = shape.dim(0) else {
+            return Ok(val.to_string());
+        };
+        let Dim::Static(last) = shape.dim(shape.rank() - 1) else {
+            return Ok(val.to_string());
+        };
+        let mut cur = val.to_string();
+        let mut cur_shape = shape.clone();
+
+        if rows > seq {
+            let mut d = cur_shape.dims().to_vec();
+            d[0] = Dim::Static(seq);
+            let sliced = Shape::from_dims(&d, DType::F32);
+            let name = format!("{out_base}_seq");
+            self.slice_axis(&cur, cur_shape.rank(), 0, 0, seq, &sliced, &name)?;
+            cur = name;
+            cur_shape = sliced;
+        }
+        if last > rot_half {
+            let mut d = cur_shape.dims().to_vec();
+            *d.last_mut().unwrap() = Dim::Static(rot_half);
+            let sliced = Shape::from_dims(&d, DType::F32);
+            let name = format!("{out_base}_rh");
+            self.slice_last(&cur, cur_shape.rank(), 0, rot_half, &sliced, &name)?;
+            cur = name;
+        }
+        Ok(cur)
+    }
+
+    /// Reshape a rope cos/sin table to gain a singleton head axis just before
+    /// its last dim, so it broadcasts over the per-head groups when rope runs
+    /// on a fused `[.., G, head_dim]` view.
+    fn rope_insert_head_axis_shape(
+        &mut self,
+        shape: &Shape,
+        val: &str,
         out: &str,
     ) -> Result<String> {
-        let mut d = self.graph.shape(src).dims().to_vec();
+        let mut d = shape.dims().to_vec();
         let pos = d.len().saturating_sub(1);
         d.insert(pos, Dim::Static(1));
         let ns = Shape::from_dims(&d, DType::F32);

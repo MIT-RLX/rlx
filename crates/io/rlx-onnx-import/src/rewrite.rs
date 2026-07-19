@@ -64,6 +64,14 @@ pub fn rewrite_graph(
         &mut extra_params,
         &mut extra_shapes,
     );
+    // Kokoro / ISTFTNet exports `atan2(y,x)` as `atan(y/x)` plus quadrant
+    // correction via `Where(Greater(y,0), atan+π, atan−π)`. When `y` is exact
+    // 0 (common for STFT DC / Nyquist imag bins under the native DFT lowering),
+    // `Greater` picks the `atan−π` branch (−π) while numpy/`f32::atan2` and
+    // ORT's slightly-nonzero imag pick `+π`. That π/−π flip is fed as a raw
+    // feature into `noise_convs` and rings at the ISTFT hop rate (~4800 Hz).
+    // Promote the compare to `GreaterOrEqual` so `y==0` matches atan2.
+    rewrite_atan2_greater_to_geq(&mut nodes, params);
     if opts.quantize_bundle_rewrites {
         rewrite_quant_matmul_to_qmatmul(&mut nodes);
         rewrite_dynamic_quant(&mut nodes);
@@ -76,6 +84,110 @@ pub fn rewrite_graph(
         nodes,
         extra_params,
         extra_shapes,
+    }
+}
+
+/// Rewrite `Greater(y, 0)` → `GreaterOrEqual(y, 0)` when it is the quadrant
+/// selector of an `atan(y/x)`-style atan2 expansion (see `rewrite_graph`).
+fn rewrite_atan2_greater_to_geq(nodes: &mut [BundleNode], params: &HashMap<String, Vec<f32>>) {
+    let by_out: HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .flat_map(|(i, n)| n.outputs.iter().map(move |o| (o.as_str(), i)))
+        .collect();
+    let consumers: HashMap<&str, Vec<usize>> = {
+        let mut m: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, n) in nodes.iter().enumerate() {
+            for inp in &n.inputs {
+                if !inp.is_empty() {
+                    m.entry(inp.as_str()).or_default().push(i);
+                }
+            }
+        }
+        m
+    };
+
+    let is_scalar_zero = |name: &str| -> bool {
+        if let Some(v) = params.get(name) {
+            return v.len() == 1 && v[0] == 0.0;
+        }
+        by_out.get(name).and_then(|&i| {
+            let n = &nodes[i];
+            if n.op != "Constant" {
+                return None;
+            }
+            // Constant value may live in attrs (`value` tensor) or already be
+            // folded into `params` under the output name; also accept the common
+            // float-zero attr encoding used by shape-propagated graphs.
+            n.attrs.get("value").and_then(|v| {
+                v.as_f64().map(|f| f == 0.0).or_else(|| {
+                    v.as_array()
+                        .map(|a| a.len() == 1 && a[0].as_f64() == Some(0.0))
+                })
+            })
+        }) == Some(true)
+    };
+
+    let mut promote: Vec<usize> = Vec::new();
+    for (gi, gnode) in nodes.iter().enumerate() {
+        if gnode.op != "Greater" || gnode.inputs.len() < 2 || gnode.outputs.is_empty() {
+            continue;
+        }
+        if !is_scalar_zero(&gnode.inputs[1]) {
+            continue;
+        }
+        let gout = gnode.outputs[0].as_str();
+        let Some(cons) = consumers.get(gout) else {
+            continue;
+        };
+        // Must feed exactly one Where as its condition.
+        if cons.len() != 1 {
+            continue;
+        }
+        let w = &nodes[cons[0]];
+        if w.op != "Where" || w.inputs.len() < 3 || w.inputs[0] != gout {
+            continue;
+        }
+        // True/false branches should be Add/Sub of the same Atan (atan±π).
+        let (t_name, f_name) = (&w.inputs[1], &w.inputs[2]);
+        let (Some(&ti), Some(&fi)) = (by_out.get(t_name.as_str()), by_out.get(f_name.as_str()))
+        else {
+            continue;
+        };
+        let (tn, fn_) = (&nodes[ti], &nodes[fi]);
+        let (add, sub) = match (tn.op.as_str(), fn_.op.as_str()) {
+            ("Add", "Sub") => (tn, fn_),
+            ("Sub", "Add") => (fn_, tn),
+            _ => continue,
+        };
+        if add.inputs.is_empty() || sub.inputs.is_empty() {
+            continue;
+        }
+        if add.inputs[0] != sub.inputs[0] {
+            continue;
+        }
+        let Some(&ai) = by_out.get(add.inputs[0].as_str()) else {
+            continue;
+        };
+        if nodes[ai].op != "Atan" {
+            continue;
+        }
+        // Atan's input should be Div(y, x) with the same y as Greater's left.
+        let atan_in = nodes[ai].inputs.first().map(String::as_str).unwrap_or("");
+        let Some(&di) = by_out.get(atan_in) else {
+            continue;
+        };
+        if nodes[di].op != "Div" || nodes[di].inputs.len() < 2 {
+            continue;
+        }
+        if nodes[di].inputs[0] != gnode.inputs[0] {
+            continue;
+        }
+        promote.push(gi);
+    }
+
+    for gi in promote {
+        nodes[gi].op = "GreaterOrEqual".into();
     }
 }
 
@@ -693,6 +805,133 @@ mod rewrite_tests {
             bias_add.inputs.first().map(String::as_str),
             Some("/F0_proj/Conv_output_0_Cast_to_float16_input_0quant_scaled_output"),
             "bias add should consume scaled conv output"
+        );
+    }
+
+    #[test]
+    fn atan2_quadrant_greater_promoted_to_geq() {
+        // Synthetic atan2 expansion matching Kokoro's ISTFTNet export:
+        //   Div(y,x) → Atan → Add/Sub ±π → Where(Greater(y,0), …)
+        let mut nodes = vec![
+            BundleNode {
+                name: "c0".into(),
+                op: "Constant".into(),
+                inputs: vec![],
+                outputs: vec!["zero".into()],
+                attrs: HashMap::from([("value".into(), serde_json::json!(0.0))]),
+                output_meta: vec![],
+            },
+            BundleNode {
+                name: "div".into(),
+                op: "Div".into(),
+                inputs: vec!["y".into(), "x".into()],
+                outputs: vec!["yx".into()],
+                attrs: HashMap::new(),
+                output_meta: vec![],
+            },
+            BundleNode {
+                name: "atan".into(),
+                op: "Atan".into(),
+                inputs: vec!["yx".into()],
+                outputs: vec!["a".into()],
+                attrs: HashMap::new(),
+                output_meta: vec![],
+            },
+            BundleNode {
+                name: "add".into(),
+                op: "Add".into(),
+                inputs: vec!["a".into(), "pi".into()],
+                outputs: vec!["ap".into()],
+                attrs: HashMap::new(),
+                output_meta: vec![],
+            },
+            BundleNode {
+                name: "sub".into(),
+                op: "Sub".into(),
+                inputs: vec!["a".into(), "pi".into()],
+                outputs: vec!["am".into()],
+                attrs: HashMap::new(),
+                output_meta: vec![],
+            },
+            BundleNode {
+                name: "gt".into(),
+                op: "Greater".into(),
+                inputs: vec!["y".into(), "zero".into()],
+                outputs: vec!["cond".into()],
+                attrs: HashMap::new(),
+                output_meta: vec![],
+            },
+            BundleNode {
+                name: "where".into(),
+                op: "Where".into(),
+                inputs: vec!["cond".into(), "ap".into(), "am".into()],
+                outputs: vec!["ph".into()],
+                attrs: HashMap::new(),
+                output_meta: vec![],
+            },
+        ];
+        let params = HashMap::new();
+        rewrite_atan2_greater_to_geq(&mut nodes, &params);
+        let gt = nodes.iter().find(|n| n.name == "gt").expect("gt");
+        assert_eq!(
+            gt.op, "GreaterOrEqual",
+            "atan2 quadrant Greater(y,0) should become GreaterOrEqual"
+        );
+    }
+
+    #[test]
+    fn unrelated_greater_not_promoted() {
+        let mut nodes = vec![
+            BundleNode {
+                name: "gt".into(),
+                op: "Greater".into(),
+                inputs: vec!["y".into(), "zero".into()],
+                outputs: vec!["cond".into()],
+                attrs: HashMap::new(),
+                output_meta: vec![],
+            },
+            BundleNode {
+                name: "where".into(),
+                op: "Where".into(),
+                inputs: vec!["cond".into(), "a".into(), "b".into()],
+                outputs: vec!["out".into()],
+                attrs: HashMap::new(),
+                output_meta: vec![],
+            },
+        ];
+        let params = HashMap::from([("zero".into(), vec![0.0f32])]);
+        rewrite_atan2_greater_to_geq(&mut nodes, &params);
+        assert_eq!(nodes[0].op, "Greater", "non-atan2 Greater must stay");
+    }
+
+    #[test]
+    fn kokoro_decoder_atan2_greater_promoted_when_weights_present() {
+        let onnx = std::path::Path::new(
+            "/Users/Shared/rlx-models/weights/tts/kokoro-82m/onnx/rlx-split/decoder_raw.onnx",
+        );
+        if !onnx.is_file() {
+            eprintln!("skip: missing {}", onnx.display());
+            return;
+        }
+        let (manifest, nodes, params, _i64, init_shapes) =
+            crate::onnx_file::prepare_onnx_file(onnx).expect("load decoder_raw");
+        let opts = ImportOptions::default();
+        let out = rewrite_graph(
+            nodes,
+            &params,
+            &init_shapes,
+            &manifest,
+            &opts,
+            &HashSet::new(),
+        );
+        let gt = out
+            .nodes
+            .iter()
+            .find(|n| n.name == "/decoder/decoder/generator/Greater")
+            .expect("Kokoro atan2 Greater node");
+        assert_eq!(
+            gt.op, "GreaterOrEqual",
+            "Kokoro generator Greater(imag,0) should become GreaterOrEqual"
         );
     }
 }

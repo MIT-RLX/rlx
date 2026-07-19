@@ -105,6 +105,7 @@ fn op_kind(op: &Op) -> OpKind {
     match op {
         Op::MatMul
         | Op::FusedMatMulBiasAct { .. }
+        | Op::FusedConvBiasAct { .. }
         | Op::Conv { .. }
         | Op::Im2Col { .. }
         | Op::DotGeneral { .. }
@@ -142,7 +143,10 @@ fn op_kind(op: &Op) -> OpKind {
         | Op::SoftmaxCrossEntropyBackward
         | Op::LayerNormBackwardInput { .. }
         | Op::LayerNormBackwardGamma { .. }
-        | Op::GroupNorm { .. } => OpKind::Reduction,
+        | Op::GroupNorm { .. }
+        // DiT adaLN — same reduction-accumulate story as LayerNorm.
+        | Op::AdaLayerNorm { .. }
+        | Op::AdaLayerNormBackward { .. } => OpKind::Reduction,
         Op::Activation(_)
         | Op::Binary(_)
         | Op::FusedSwiGLU { .. }
@@ -163,7 +167,10 @@ fn op_kind(op: &Op) -> OpKind {
         | Op::ActivationBackward { .. }
         | Op::ComplexNormSq
         | Op::ComplexNormSqBackward
-        | Op::Conjugate => OpKind::Elementwise,
+        | Op::Conjugate
+        // DiT gate: x + y * sigmoid(gate) — elementwise fuse.
+        | Op::GatedResidual
+        | Op::GatedResidualBackward => OpKind::Elementwise,
         Op::Gather { .. }
         | Op::Narrow { .. }
         | Op::Reshape { .. }
@@ -176,6 +183,10 @@ fn op_kind(op: &Op) -> OpKind {
         | Op::FusedAttentionBlock { .. }
         | Op::TopK { .. }
         | Op::ScatterAdd
+        | Op::ScatterNd { .. }
+        | Op::ScatterElements { .. }
+        | Op::GatherNd { .. }
+        | Op::GatherElements { .. }
         | Op::MaxPool2dBackward { .. }
         | Op::ResizeNearest2x
         | Op::AxialRope2d { .. } => OpKind::DataMovement,
@@ -195,6 +206,30 @@ fn op_kind(op: &Op) -> OpKind {
         Op::FftButterflyStage { .. } => OpKind::Compute,
         Op::LogMel => OpKind::Compute,
         Op::LogMelBackward => OpKind::Compute,
+        // SPD / eigendecomposition — heavy Compute (host LAPACK or native
+        // solvers); never AutoMixed F16.
+        Op::BiMap
+        | Op::ReEig { .. }
+        | Op::LogEig { .. }
+        | Op::SpdBatchNorm { .. }
+        | Op::SpdKarcherMean { .. }
+        | Op::SpdKarcherMeanWeighted { .. }
+        | Op::SpdLogMap
+        | Op::SpdExpMap
+        | Op::SpdParallelTransport
+        | Op::SpdMatrixFnBatch { .. }
+        | Op::ReEigBackward { .. }
+        | Op::LogEigBackward { .. }
+        | Op::SpdBatchNormBackwardX { .. }
+        | Op::SpdBatchNormBackwardG { .. }
+        | Op::SpdLogMapBackward
+        | Op::SpdExpMapBackward
+        | Op::SpdParallelTransportBackward
+        | Op::SpdMatrixFnBatchBackward { .. }
+        | Op::Eigh
+        | Op::EighBackward
+        | Op::EighBatch
+        | Op::EighBatchBackward => OpKind::Compute,
         _ => OpKind::Compute,
     }
 }
@@ -218,16 +253,16 @@ pub enum PrecisionPolicy {
     ///   DataMovement → F16
     ///   Boundary (input/param/output) → F32
     AutoMixedConservative,
-    /// Mixed precision (Phase G — current default). Reductions stay in
-    /// the input dtype; the kernels themselves promote-to-f32 internally
-    /// for the accumulation. This eliminates the dozens of Cast nodes
-    /// that AutoMixedConservative inserts at LN/Softmax boundaries
-    /// without sacrificing the f32 reduction accumulation that matters.
-    /// Matches what modern PyTorch autocast actually does on Metal.
-    ///   Compute → F16
+    /// Mixed precision (Phase G — current default), tuned against Bonsai-27B
+    /// greedy tokens on Metal. Compute (matmul) and DataMovement stay F32:
+    /// F16 there diverged (residual-stream / Rope/Gather/Narrow paths) even
+    /// with `Cast`-`to` preserved. Elementwise and Reduction run F16 (reduction
+    /// kernels accumulate in f32 internally), which is where the win is without
+    /// the divergence. Boundaries stay user-visible F32.
+    ///   Compute → F32
     ///   Reduction → F16  (kernel accumulates in f32 internally)
     ///   Elementwise → F16
-    ///   DataMovement → F16
+    ///   DataMovement → F32
     ///   Boundary (input/param/output) → F32
     AutoMixed,
     /// Mixed precision targeting BF16 on TPU/XLA. Same shape as
@@ -255,18 +290,21 @@ impl PrecisionPolicy {
                 OpKind::Boundary => Precision::F32, // user-facing stays f32
                 _ => Precision::F16,
             },
-            PrecisionPolicy::AutoMixedConservative => match kind {
-                OpKind::Compute => Precision::F16,
-                OpKind::Reduction => Precision::F32,
-                OpKind::Elementwise => Precision::F16,
-                OpKind::DataMovement => Precision::F16,
-                OpKind::Boundary => Precision::F32,
-            },
             PrecisionPolicy::AutoMixed => match kind {
-                OpKind::Compute => Precision::F16,
+                // Bonsai-27B Metal: Elementwise + Reduction F16 match F32
+                // greedy tokens. DataMovement→F16 still diverges (Rope/Gather/
+                // Narrow/Concat paths) even with Cast-`to` preserved — keep F32.
+                OpKind::Compute => Precision::F32,
                 OpKind::Reduction => Precision::F16,
                 OpKind::Elementwise => Precision::F16,
-                OpKind::DataMovement => Precision::F16,
+                OpKind::DataMovement => Precision::F32,
+                OpKind::Boundary => Precision::F32,
+            },
+            PrecisionPolicy::AutoMixedConservative => match kind {
+                OpKind::Compute => Precision::F32,
+                OpKind::Reduction => Precision::F32,
+                OpKind::Elementwise => Precision::F16,
+                OpKind::DataMovement => Precision::F32,
                 OpKind::Boundary => Precision::F32,
             },
             PrecisionPolicy::AutoMixedBf16 => match kind {
@@ -354,20 +392,141 @@ impl Pass for AutoMixedPrecision {
                 continue;
             }
 
+            // Ops whose Metal kernels are still f32-only. Casting the node to
+            // F16 while the kernel reads/writes floats zeros the residual
+            // stream (Bonsai-27B AMP → all token-0 / "!!!!!!!!"). Keep these at
+            // F32; Cast boundaries reconnect the f16 residual around them.
+            let force_f32 = match &node.op {
+                Op::GatedDeltaNet { .. }
+                | Op::SelectiveScan { .. }
+                | Op::Conv { .. }
+                | Op::Conv3d { .. }
+                | Op::ConvTranspose2d { .. }
+                | Op::ConvTranspose3d { .. }
+                | Op::Im2Col { .. }
+                | Op::Pool { .. }
+                | Op::QConv2d { .. }
+                | Op::Conv2dBackwardInput { .. }
+                | Op::Conv2dBackwardWeight { .. } => true,
+                // Reduction / data-movement ops without Metal `_h` yet.
+                Op::Cumsum { .. }
+                | Op::Sample { .. }
+                | Op::Lstm { .. }
+                | Op::Gru { .. }
+                | Op::Rnn { .. }
+                | Op::Mamba2 { .. }
+                | Op::SoftmaxCrossEntropy
+                | Op::SoftmaxCrossEntropyWithLogits
+                | Op::SoftmaxCrossEntropyBackward
+                | Op::LayerNormBackwardInput { .. }
+                | Op::LayerNormBackwardGamma { .. }
+                | Op::GroupNorm { .. }
+                | Op::FusedAttentionBlock { .. }
+                | Op::TopK { .. }
+                | Op::ScatterAdd
+                | Op::ScatterNd { .. }
+                | Op::ScatterElements { .. }
+                | Op::GatherNd { .. }
+                | Op::GatherElements { .. }
+                | Op::Expand { .. }
+                | Op::MaxPool2dBackward { .. }
+                | Op::ResizeNearest2x
+                | Op::AxialRope2d { .. } => true,
+                // SPD / eigh — host LAPACK or f32 native solvers.
+                Op::BiMap
+                | Op::ReEig { .. }
+                | Op::LogEig { .. }
+                | Op::SpdBatchNorm { .. }
+                | Op::SpdKarcherMean { .. }
+                | Op::SpdKarcherMeanWeighted { .. }
+                | Op::SpdLogMap
+                | Op::SpdExpMap
+                | Op::SpdParallelTransport
+                | Op::SpdMatrixFnBatch { .. }
+                | Op::ReEigBackward { .. }
+                | Op::LogEigBackward { .. }
+                | Op::SpdBatchNormBackwardX { .. }
+                | Op::SpdBatchNormBackwardG { .. }
+                | Op::SpdLogMapBackward
+                | Op::SpdExpMapBackward
+                | Op::SpdParallelTransportBackward
+                | Op::SpdMatrixFnBatchBackward { .. }
+                | Op::Eigh
+                | Op::EighBackward
+                | Op::EighBatch
+                | Op::EighBatchBackward => true,
+                // Keep *all* packed DequantMatMul at F32 until the full-graph
+                // AMP path (dual-Q1 / fused MLP + f16 residual) is proven.
+                Op::DequantMatMul { .. } => true,
+                _ => false,
+            };
+            if force_f32 {
+                let new_inputs: Vec<NodeId> = node
+                    .inputs
+                    .iter()
+                    .map(|&in_id| {
+                        let src = id_map[&in_id];
+                        let sd = new_graph.node(src).shape.dtype();
+                        if matches!(sd, DType::F16 | DType::BF16) {
+                            let shape = new_graph.node(src).shape.clone().with_dtype(DType::F32);
+                            new_graph.add_node(Op::Cast { to: DType::F32 }, vec![src], shape)
+                        } else {
+                            src
+                        }
+                    })
+                    .collect();
+                let new_id = new_graph.add_node(
+                    node.op.clone(),
+                    new_inputs,
+                    node.shape.clone().with_dtype(DType::F32),
+                );
+                id_map.insert(node.id, new_id);
+                node_precision.insert(node.id, Precision::F32);
+                continue;
+            }
+
             let kind = op_kind(&node.op);
-            let target = self.policy.precision_for(kind);
+            let mut target = self.policy.precision_for(kind);
 
             // Inputs / params keep their original dtype (they're external);
             // outputs stay user-visible at F32.
-            let target = match kind {
-                OpKind::Boundary => Precision::F32,
-                _ => target,
-            };
+            if kind == OpKind::Boundary {
+                target = Precision::F32;
+            }
+
+            // `Op::Cast { to }` must keep `to` — DataMovement→F16 was
+            // relabeling Cast-to-F32 nodes as F16 and zeroing AMP graphs.
+            if let Op::Cast { to } = &node.op {
+                target = match to {
+                    DType::F16 => Precision::F16,
+                    DType::BF16 => Precision::BF16,
+                    DType::F32 => Precision::F32,
+                    _ => {
+                        // Bool / int casts: emit unchanged.
+                        let new_id = new_graph.add_node(
+                            node.op.clone(),
+                            vec![id_map[&node.inputs[0]]],
+                            node.shape.clone(),
+                        );
+                        id_map.insert(node.id, new_id);
+                        node_precision.insert(node.id, Precision::F32);
+                        continue;
+                    }
+                };
+            }
 
             // Resolve each input: insert a Cast if precision differs.
+            // Never cast integer / bool / packed-quant (U8/I8) tensors — those
+            // are bit patterns (GGUF weights, indices, masks), not AMP floats.
+            // Casting U8 Q1 packs to F16 silently zeros Metal decode.
             let mut new_inputs = Vec::with_capacity(node.inputs.len());
             for &in_id in &node.inputs {
                 let src_new_id = id_map[&in_id];
+                let src_dtype = new_graph.node(src_new_id).shape.dtype();
+                if !matches!(src_dtype, DType::F32 | DType::F16 | DType::BF16) {
+                    new_inputs.push(src_new_id);
+                    continue;
+                }
                 let src_prec = node_precision
                     .get(&in_id)
                     .copied()
@@ -389,7 +548,18 @@ impl Pass for AutoMixedPrecision {
             }
 
             // Build the rewritten node with the target dtype on its shape.
-            let new_shape = node.shape.clone().with_dtype(target.dtype());
+            // Boundaries (Input/Param/Constant) keep their original dtype —
+            // packed U8/I8 GGUF weights and integer indices must not be
+            // relabeled as F32 (arena would oversize and AMP would try to
+            // cast them into the float stream).
+            // Cast keeps `to` (already reflected in `target` above).
+            let new_shape = if kind == OpKind::Boundary {
+                node.shape.clone()
+            } else if let Op::Cast { to } = &node.op {
+                node.shape.clone().with_dtype(*to)
+            } else {
+                node.shape.clone().with_dtype(target.dtype())
+            };
             let new_id = new_graph.add_node(node.op.clone(), new_inputs, new_shape);
             id_map.insert(node.id, new_id);
             node_precision.insert(node.id, target);
@@ -446,16 +616,53 @@ mod tests {
         let x = g.input("x", Shape::new(&[2, 4], DType::F32));
         let w = g.param("w", Shape::new(&[4, 3], DType::F32));
         let mm = g.matmul(x, w, Shape::new(&[2, 3], DType::F32));
-        g.set_outputs(vec![mm]);
+        // Under `AutoMixed`, MatMul (Compute) stays F32; the F16 region begins at
+        // an elementwise op, so the f32↔f16 boundary casts appear around the relu.
+        let act = g.relu(mm);
+        g.set_outputs(vec![act]);
 
         let pass = AutoMixedPrecision::new(PrecisionPolicy::AutoMixed);
         let out = pass.run(g);
 
-        // Should have: input(f32), param(f32), cast(f32→f16) for x,
-        // cast(f32→f16) for w, matmul(f16), cast(f16→f32) for output.
-        // = 6 nodes total, with the final output being a Cast back to F32.
+        // input(f32), param(f32), matmul(f32), cast(f32→f16) into relu,
+        // relu(f16), cast(f16→f32) at the output boundary = 6 nodes, and the
+        // final output node is a Cast back to F32.
         assert!(out.len() >= 6);
         let final_node = out.node(out.outputs[0]);
         assert!(matches!(final_node.op, Op::Cast { to: DType::F32 }));
+    }
+
+    #[test]
+    fn auto_mixed_preserves_u8_quant_weights() {
+        use rlx_ir::quant::QuantScheme;
+        let mut g = Graph::new("q1_amp");
+        let x = g.input("x", Shape::new(&[1, 128], DType::F32));
+        let w = g.param("w", Shape::new(&[2304], DType::U8));
+        let y = g.add_node(
+            Op::DequantMatMul {
+                scheme: QuantScheme::GgufQ1_0,
+            },
+            vec![x, w],
+            Shape::new(&[1, 64], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+
+        let out = AutoMixedPrecision::new(PrecisionPolicy::AutoMixed).run(g);
+        let params: Vec<_> = out
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Param { .. }))
+            .collect();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].shape.dtype(), DType::U8);
+        for n in out.nodes() {
+            if let Op::Cast { to } = &n.op {
+                let src = out.node(n.inputs[0]);
+                assert!(
+                    !matches!(src.op, Op::Param { .. }),
+                    "AMP must not cast U8 Param to {to:?}"
+                );
+            }
+        }
     }
 }

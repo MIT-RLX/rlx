@@ -50,14 +50,23 @@ Environment knobs:
 
 | Variable | Effect |
 |----------|--------|
-| `RLX_COREML_UNITS` | `cpu` / `gpu` / `all` / default CPU+ANE |
+| `RLX_COREML_UNITS` | `cpu` / `gpu` / `all` / `ane`. **Default (unset):** fp32 graphs → CPU+GPU; f16 graphs → CPU+Neural Engine. Prefer `gpu` for large imported ONNX (TTS, etc.) — Neural-Engine BNNS AOT can SIGSEGV on multi-k-node ML Programs. |
 | `RLX_COREML_HOST_DEQUANT=1` | bake full f32 weights at compile (legacy path) |
 | `RLX_COREML_FLEXIBLE_INPUTS=1` | emit CoreML `ShapeRange` on dynamic inputs |
 | `RLX_COREML_NATIVE_FLEX=1` | ANE: one model + runtime shapes (skip `DeferredExecutable`) |
 
+### Compute units (BNNS note)
+
+`Device::Ane` always goes through CoreML; which silicon runs the graph is
+`MLComputeUnits`. Defaulting fp32 inference to **CPU+GPU** avoids a known Apple
+crash: `bnns::GraphCompile` null-deref on large Shape-heavy programs (LuxTTS
+`encoder_body` / `fm_decoder`, similar VITS/CFM graphs). Force Neural Engine with
+`RLX_COREML_UNITS=ane` or by compiling an f16 graph (AFP). See
+[`default_compute_units`](src/backend.rs).
+
 ## Status
 
-**58** op kinds declared in `COREML_SUPPORTED_OPS` — the complete forward
+**65** op kinds declared in `SUPPORTED_OPS` — the complete forward
 inference surface for transformer + vision + MoE + quantized + SSM graphs.
 
 ### MIL-lowered ops
@@ -66,7 +75,7 @@ Element-wise, matmul, norms, attention (causal / bias / sliding window),
 vision (conv / pool / resize), MoE `grouped_matmul`, SSM (`selective_scan`,
 `gated_delta_net`), quantized `dequant_*` (with on-device block dequant for
 Q8_0 / Q4_0 / IQ4NL), `quantize` / `dequantize`, reductions, gather, rope,
-and the rest of the primitive set listed in `rlx-runtime` `COREML_SUPPORTED_OPS`.
+and the rest of the primitive set listed in `rlx_coreml::SUPPORTED_OPS`.
 
 On-device constexpr dequant also covers **K-quants** Q4_K / Q5_K / Q8_K and
 **Q2_K / Q3_K / Q6_K** (`mul` + optional `sub`; Q2/Q3/Q6 use per-element
@@ -101,10 +110,17 @@ Weights with ≥ 10 elements go to `weights/weight.bin` (MILBlob format).
 Introspection: `chip_info()`, `ane_available()`, `MLComputePlan` routing
 (macOS 14.4+).
 
-### Not in scope for ANE
+### Not in scope for ANE (inference claim)
 
-Training / backward ops, control flow (`if` / `while` / `scan`), fusion
-internals (`Fused*`, `ElementwiseRegion`), `CustomFn`, `QMatMul` / `QConv2d` (int8 I/O), Gaussian splat family.
+Control flow beyond host `Scan*`, fusion internals (`ElementwiseRegion`),
+`CustomFn`, `QMatMul` / `QConv2d` (int8 I/O), Gaussian splat family.
+
+Under the `training` feature, packed / primitive `*Backward` ops are claimed for
+device selection via `COREML_BACKWARD_OPS` (decompose to MIL primitives) or
+`NATIVE_BACKWARD_OPS` (dedicated MIL arms). DiT modulation forward
+(`AdaLayerNorm` / `GatedResidual`) and packed reverse
+(`AdaLayerNormBackward` / `GatedResidualBackward`) use native composed MIL
+(implicit broadcast + concat pack for reverse).
 
 ### Output layout note
 

@@ -14,7 +14,7 @@ use super::helpers::simple_op_flex;
 use super::helpers::*;
 use crate::proto;
 use crate::{CoremlError, Result};
-use rlx_ir::op::{Activation, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::op::{Activation, AdaNormKind, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
 use std::collections::HashMap;
@@ -31,28 +31,116 @@ impl<'a> LowerCtx<'a> {
         eps: f32,
         out_name: &str,
     ) -> Result<()> {
+        // Decompose to primitives rather than emit MIL's native `layer_norm`
+        // op: that op requires `gamma`/`beta` to be compile-time CONST, but the
+        // ConvNeXt/CFM/VITS family feeds affine params that are runtime values
+        // (cast weights, computed tensors) → CoreML load fails "Param 'beta'
+        // must be const". `mul`/`add` accept any operand, so the decomposition
+        // (mathematically identical) works universally. Mirrors `lower_rms_norm`
+        // but centers first.
         let node = self.graph.node(id);
         let x = self.val(node.inputs[0]);
         let rank = node.shape.rank() as i32;
-        let norm_axis = if axis < 0 { axis + rank } else { axis };
-        // MIL layer_norm normalises over `axes`; RLX LayerNorm is over the
-        // trailing dims from `axis` onward.
-        let axes: Vec<i32> = (norm_axis..rank).collect();
-        let mut binds = vec![
-            ("x", bind_name(&x)),
-            ("axes", bind_value(vec_i32(&axes))),
-            ("epsilon", bind_value(scalar_f32(eps))),
-        ];
-        if node.inputs.len() > 1 {
+        let norm_axis = (if axis < 0 { axis + rank } else { axis }) as usize;
+        let axes: Vec<i32> = (norm_axis as i32..rank).collect();
+        let red_shape = reduced_shape(&node.shape, norm_axis);
+
+        // mean = reduce_mean(x, axes); xc = x - mean
+        let mean = format!("{out_name}_mean");
+        self.operations.push(self.simple_op(
+            "reduce_mean",
+            &mean,
+            &red_shape,
+            vec![
+                ("x", bind_name(&x)),
+                ("axes", bind_value(vec_i32(&axes))),
+                ("keep_dims", bind_value(scalar_bool(true))),
+            ],
+        )?);
+        let xc = format!("{out_name}_xc");
+        self.operations.push(self.simple_op(
+            "sub",
+            &xc,
+            &node.shape,
+            vec![("x", bind_name(&x)), ("y", bind_name(&mean))],
+        )?);
+        // var = reduce_mean(xc²); inv = rsqrt(var + eps)
+        let sq = format!("{out_name}_sq");
+        self.operations.push(self.simple_op(
+            "mul",
+            &sq,
+            &node.shape,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&xc))],
+        )?);
+        let var = format!("{out_name}_var");
+        self.operations.push(self.simple_op(
+            "reduce_mean",
+            &var,
+            &red_shape,
+            vec![
+                ("x", bind_name(&sq)),
+                ("axes", bind_value(vec_i32(&axes))),
+                ("keep_dims", bind_value(scalar_bool(true))),
+            ],
+        )?);
+        let vare = format!("{out_name}_vare");
+        self.operations.push(self.simple_op(
+            "add",
+            &vare,
+            &red_shape,
+            vec![("x", bind_name(&var)), ("y", bind_value(scalar_f32(eps)))],
+        )?);
+        let inv = format!("{out_name}_inv");
+        self.operations.push(self.simple_op(
+            "rsqrt",
+            &inv,
+            &red_shape,
+            vec![
+                ("x", bind_name(&vare)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?);
+
+        let has_gamma = node.inputs.len() > 1;
+        let has_beta = node.inputs.len() > 2;
+        // xn = xc * inv
+        let xn_name = if has_gamma || has_beta {
+            format!("{out_name}_xn")
+        } else {
+            out_name.to_string()
+        };
+        self.operations.push(self.simple_op(
+            "mul",
+            &xn_name,
+            &node.shape,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&inv))],
+        )?);
+        let mut last = xn_name;
+        if has_gamma {
             let g = self.val(node.inputs[1]);
-            binds.push(("gamma", bind_name(&g)));
+            let name = if has_beta {
+                format!("{out_name}_xg")
+            } else {
+                out_name.to_string()
+            };
+            self.operations.push(self.simple_op(
+                "mul",
+                &name,
+                &node.shape,
+                vec![("x", bind_name(&last)), ("y", bind_name(&g))],
+            )?);
+            last = name;
         }
-        if node.inputs.len() > 2 {
+        if has_beta {
             let b = self.val(node.inputs[2]);
-            binds.push(("beta", bind_name(&b)));
+            self.operations.push(self.simple_op(
+                "add",
+                out_name,
+                &node.shape,
+                vec![("x", bind_name(&last)), ("y", bind_name(&b))],
+            )?);
         }
-        let op = self.simple_op("layer_norm", out_name, &node.shape, binds)?;
-        self.push_named(id, out_name.to_string(), op);
+        self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
 
@@ -1258,6 +1346,639 @@ impl<'a> LowerCtx<'a> {
             vec![("x", bind_name(&scaled)), ("y", bind_name(&b4))],
         )?;
         // Caller registers the node mapping.
+        Ok(())
+    }
+
+    /// DiT adaLN-Zero forward: `norm(x)·(1+scale)+shift` with broadcast scale/shift.
+    /// Affine-free norm via [`normalize_chain`] (LN) or RMS `x·rsqrt(mean(x²)+eps)`.
+    pub(crate) fn lower_ada_layer_norm(
+        &mut self,
+        id: NodeId,
+        norm: AdaNormKind,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let scale = self.val(node.inputs[1]);
+        let shift = self.val(node.inputs[2]);
+        let x_shape = node.shape.clone();
+        let rank = x_shape.rank();
+        let norm_axis = rank - 1;
+        let axes: Vec<i32> = (norm_axis as i32..rank as i32).collect();
+        let red = reduced_shape(&x_shape, norm_axis);
+
+        let n = match norm {
+            AdaNormKind::LayerNorm => {
+                self.normalize_chain(out_name, &x, &x_shape, &red, &axes, eps)?
+            }
+            AdaNormKind::RmsNorm => {
+                let sq = format!("{out_name}_nsq");
+                self.emit(
+                    "mul",
+                    &sq,
+                    &x_shape,
+                    vec![("x", bind_name(&x)), ("y", bind_name(&x))],
+                )?;
+                let ms = format!("{out_name}_nms");
+                self.emit(
+                    "reduce_mean",
+                    &ms,
+                    &red,
+                    vec![
+                        ("x", bind_name(&sq)),
+                        ("axes", bind_value(vec_i32(&axes))),
+                        ("keep_dims", bind_value(scalar_bool(true))),
+                    ],
+                )?;
+                let mse = format!("{out_name}_nmse");
+                self.emit(
+                    "add",
+                    &mse,
+                    &red,
+                    vec![("x", bind_name(&ms)), ("y", bind_value(scalar_f32(eps)))],
+                )?;
+                let inv = format!("{out_name}_ninv");
+                self.emit(
+                    "rsqrt",
+                    &inv,
+                    &red,
+                    vec![
+                        ("x", bind_name(&mse)),
+                        ("epsilon", bind_value(scalar_f32(0.0))),
+                    ],
+                )?;
+                let nn = format!("{out_name}_n");
+                self.emit(
+                    "mul",
+                    &nn,
+                    &x_shape,
+                    vec![("x", bind_name(&x)), ("y", bind_name(&inv))],
+                )?;
+                nn
+            }
+        };
+
+        let n_el = x_shape
+            .num_elements()
+            .ok_or_else(|| CoremlError::Unsupported("ada forward: dynamic x numel".into()))?;
+        let ones = format!("{out_name}_ones");
+        self.operations.push(make_const(
+            &mut self.blob,
+            &ones,
+            &x_shape,
+            &vec![1.0f32; n_el],
+        )?);
+        let one_plus = format!("{out_name}_1p");
+        self.emit(
+            "add",
+            &one_plus,
+            &x_shape,
+            vec![("x", bind_name(&ones)), ("y", bind_name(&scale))],
+        )?;
+        let scaled = format!("{out_name}_sc");
+        self.emit(
+            "mul",
+            &scaled,
+            &x_shape,
+            vec![("x", bind_name(&n)), ("y", bind_name(&one_plus))],
+        )?;
+        self.emit(
+            "add",
+            out_name,
+            &x_shape,
+            vec![("x", bind_name(&scaled)), ("y", bind_name(&shift))],
+        )?;
+        self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
+
+    /// DiT gated residual forward: `x + gate·y` with broadcast gate.
+    pub(crate) fn lower_gated_residual(&mut self, id: NodeId, out_name: &str) -> Result<()> {
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let y = self.val(node.inputs[1]);
+        let gate = self.val(node.inputs[2]);
+        let shape = node.shape.clone();
+        let gated = format!("{out_name}_gy");
+        self.emit(
+            "mul",
+            &gated,
+            &shape,
+            vec![("x", bind_name(&gate)), ("y", bind_name(&y))],
+        )?;
+        self.emit(
+            "add",
+            out_name,
+            &shape,
+            vec![("x", bind_name(&x)), ("y", bind_name(&gated))],
+        )?;
+        self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
+
+    /// Packed DiT adaLN reverse → 1-D `[dx ∥ dscale ∥ dshift]`.
+    /// Mirrors `compose_ada_layer_norm_backward` with implicit MIL broadcast
+    /// (no Expand-with-ones) and the native LN/RMS input-gradient math.
+    #[cfg(feature = "training")]
+    pub(crate) fn lower_ada_layer_norm_backward(
+        &mut self,
+        id: NodeId,
+        norm: AdaNormKind,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let x = self.val(node.inputs[0]);
+        let scale = self.val(node.inputs[1]);
+        // inputs[2] = shift — additive in the forward, absent from dx/dscale.
+        let dy = self.val(node.inputs[3]);
+        let x_shape = self.graph.shape(node.inputs[0]).clone();
+        let scale_shape = self.graph.shape(node.inputs[1]).clone();
+        let out_shape = node.shape.clone();
+        let rank = x_shape.rank();
+        let norm_axis = rank - 1;
+        let axes: Vec<i32> = (norm_axis as i32..rank as i32).collect();
+        let red = reduced_shape(&x_shape, norm_axis);
+
+        // Affine-free forward norm `n` (γ=1, β=0).
+        let n = match norm {
+            AdaNormKind::LayerNorm => {
+                self.normalize_chain(out_name, &x, &x_shape, &red, &axes, eps)?
+            }
+            AdaNormKind::RmsNorm => {
+                let sq = format!("{out_name}_nsq");
+                self.emit(
+                    "mul",
+                    &sq,
+                    &x_shape,
+                    vec![("x", bind_name(&x)), ("y", bind_name(&x))],
+                )?;
+                let ms = format!("{out_name}_nms");
+                self.emit(
+                    "reduce_mean",
+                    &ms,
+                    &red,
+                    vec![
+                        ("x", bind_name(&sq)),
+                        ("axes", bind_value(vec_i32(&axes))),
+                        ("keep_dims", bind_value(scalar_bool(true))),
+                    ],
+                )?;
+                let mse = format!("{out_name}_nmse");
+                self.emit(
+                    "add",
+                    &mse,
+                    &red,
+                    vec![("x", bind_name(&ms)), ("y", bind_value(scalar_f32(eps)))],
+                )?;
+                let inv = format!("{out_name}_ninv");
+                self.emit(
+                    "rsqrt",
+                    &inv,
+                    &red,
+                    vec![
+                        ("x", bind_name(&mse)),
+                        ("epsilon", bind_value(scalar_f32(0.0))),
+                    ],
+                )?;
+                let nn = format!("{out_name}_n");
+                self.emit(
+                    "mul",
+                    &nn,
+                    &x_shape,
+                    vec![("x", bind_name(&x)), ("y", bind_name(&inv))],
+                )?;
+                nn
+            }
+        };
+
+        // one_plus = ones(x) + scale (broadcast); dn = dy · one_plus
+        let n_el = x_shape
+            .num_elements()
+            .ok_or_else(|| CoremlError::Unsupported("ada reverse: dynamic x numel".into()))?;
+        let ones = format!("{out_name}_ones");
+        self.operations.push(make_const(
+            &mut self.blob,
+            &ones,
+            &x_shape,
+            &vec![1.0f32; n_el],
+        )?);
+        let one_plus = format!("{out_name}_1p");
+        self.emit(
+            "add",
+            &one_plus,
+            &x_shape,
+            vec![("x", bind_name(&ones)), ("y", bind_name(&scale))],
+        )?;
+        let dn = format!("{out_name}_dn");
+        self.emit(
+            "mul",
+            &dn,
+            &x_shape,
+            vec![("x", bind_name(&dy)), ("y", bind_name(&one_plus))],
+        )?;
+
+        // dx via LN/RMS input reverse with γ=1 (dn plays the role of dy·γ).
+        let dx = match norm {
+            AdaNormKind::LayerNorm => {
+                self.mil_layer_norm_dx(out_name, &x, &dn, &x_shape, &red, &axes, eps)?
+            }
+            AdaNormKind::RmsNorm => {
+                self.mil_rms_norm_dx(out_name, &x, &dn, &x_shape, &red, &axes, eps)?
+            }
+        };
+
+        // dscale = unbroadcast(dy · n); dshift = unbroadcast(dy)
+        let dsf = format!("{out_name}_dsf");
+        self.emit(
+            "mul",
+            &dsf,
+            &x_shape,
+            vec![("x", bind_name(&dy)), ("y", bind_name(&n))],
+        )?;
+        let dscale = format!("{out_name}_ds");
+        self.mil_unbroadcast(&dsf, &x_shape, &scale_shape, &dscale)?;
+        let dshift = format!("{out_name}_dt");
+        self.mil_unbroadcast(&dy, &x_shape, &scale_shape, &dshift)?;
+
+        self.mil_pack_flat_grads(
+            id,
+            out_name,
+            &out_shape,
+            &[
+                (&dx, &x_shape),
+                (&dscale, &scale_shape),
+                (&dshift, &scale_shape),
+            ],
+        )
+    }
+
+    /// Packed DiT gated residual reverse → 1-D `[dx ∥ dy ∥ dgate]`.
+    /// Mirrors `compose_gated_residual_backward`.
+    #[cfg(feature = "training")]
+    pub(crate) fn lower_gated_residual_backward(
+        &mut self,
+        id: NodeId,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        // inputs[0] = x — dx = dy (identity).
+        let y = self.val(node.inputs[1]);
+        let gate = self.val(node.inputs[2]);
+        let dy = self.val(node.inputs[3]);
+        let x_shape = self.graph.shape(node.inputs[0]).clone();
+        let gate_shape = self.graph.shape(node.inputs[2]).clone();
+        let out_shape = node.shape.clone();
+
+        let dx = dy.clone();
+        let dy_out = format!("{out_name}_dy");
+        self.emit(
+            "mul",
+            &dy_out,
+            &x_shape,
+            vec![("x", bind_name(&dy)), ("y", bind_name(&gate))],
+        )?;
+        let dgf = format!("{out_name}_dgf");
+        self.emit(
+            "mul",
+            &dgf,
+            &x_shape,
+            vec![("x", bind_name(&dy)), ("y", bind_name(&y))],
+        )?;
+        let dgate = format!("{out_name}_dg");
+        self.mil_unbroadcast(&dgf, &x_shape, &gate_shape, &dgate)?;
+
+        self.mil_pack_flat_grads(
+            id,
+            out_name,
+            &out_shape,
+            &[(&dx, &x_shape), (&dy_out, &x_shape), (&dgate, &gate_shape)],
+        )
+    }
+
+    /// LayerNorm input reverse with `sy = dy` already (γ=1). Returns `dx` name.
+    #[cfg(feature = "training")]
+    fn mil_layer_norm_dx(
+        &mut self,
+        prefix: &str,
+        x: &str,
+        sy: &str,
+        full: &Shape,
+        red: &Shape,
+        axes: &[i32],
+        eps: f32,
+    ) -> Result<String> {
+        let red_axes = || bind_value(vec_i32(axes));
+        let keep = || bind_value(scalar_bool(true));
+        let mean = format!("{prefix}_ln_mean");
+        self.emit(
+            "reduce_mean",
+            &mean,
+            red,
+            vec![
+                ("x", bind_name(x)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let xc = format!("{prefix}_ln_xc");
+        self.emit(
+            "sub",
+            &xc,
+            full,
+            vec![("x", bind_name(x)), ("y", bind_name(&mean))],
+        )?;
+        let xc2 = format!("{prefix}_ln_xc2");
+        self.emit(
+            "mul",
+            &xc2,
+            full,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&xc))],
+        )?;
+        let var = format!("{prefix}_ln_var");
+        self.emit(
+            "reduce_mean",
+            &var,
+            red,
+            vec![
+                ("x", bind_name(&xc2)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let ve = format!("{prefix}_ln_ve");
+        self.emit(
+            "add",
+            &ve,
+            red,
+            vec![("x", bind_name(&var)), ("y", bind_value(scalar_f32(eps)))],
+        )?;
+        let inv = format!("{prefix}_ln_inv");
+        self.emit(
+            "rsqrt",
+            &inv,
+            red,
+            vec![
+                ("x", bind_name(&ve)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?;
+        let x_hat = format!("{prefix}_ln_xh");
+        self.emit(
+            "mul",
+            &x_hat,
+            full,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&inv))],
+        )?;
+        let m_sy = format!("{prefix}_ln_msy");
+        self.emit(
+            "reduce_mean",
+            &m_sy,
+            red,
+            vec![
+                ("x", bind_name(sy)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let sy_xh = format!("{prefix}_ln_syxh");
+        self.emit(
+            "mul",
+            &sy_xh,
+            full,
+            vec![("x", bind_name(sy)), ("y", bind_name(&x_hat))],
+        )?;
+        let m_sxh = format!("{prefix}_ln_msxh");
+        self.emit(
+            "reduce_mean",
+            &m_sxh,
+            red,
+            vec![
+                ("x", bind_name(&sy_xh)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let t1 = format!("{prefix}_ln_t1");
+        self.emit(
+            "sub",
+            &t1,
+            full,
+            vec![("x", bind_name(sy)), ("y", bind_name(&m_sy))],
+        )?;
+        let t2 = format!("{prefix}_ln_t2");
+        self.emit(
+            "mul",
+            &t2,
+            full,
+            vec![("x", bind_name(&x_hat)), ("y", bind_name(&m_sxh))],
+        )?;
+        let t3 = format!("{prefix}_ln_t3");
+        self.emit(
+            "sub",
+            &t3,
+            full,
+            vec![("x", bind_name(&t1)), ("y", bind_name(&t2))],
+        )?;
+        let dx = format!("{prefix}_dx");
+        self.emit(
+            "mul",
+            &dx,
+            full,
+            vec![("x", bind_name(&inv)), ("y", bind_name(&t3))],
+        )?;
+        Ok(dx)
+    }
+
+    /// RMSNorm input reverse with `dy_g = dy` already (γ=1). Returns `dx` name.
+    #[cfg(feature = "training")]
+    fn mil_rms_norm_dx(
+        &mut self,
+        prefix: &str,
+        x: &str,
+        dyg: &str,
+        full: &Shape,
+        red: &Shape,
+        axes: &[i32],
+        eps: f32,
+    ) -> Result<String> {
+        let red_axes = || bind_value(vec_i32(axes));
+        let keep = || bind_value(scalar_bool(true));
+        let x2 = format!("{prefix}_rms_x2");
+        self.emit(
+            "mul",
+            &x2,
+            full,
+            vec![("x", bind_name(x)), ("y", bind_name(x))],
+        )?;
+        let mx2 = format!("{prefix}_rms_mx2");
+        self.emit(
+            "reduce_mean",
+            &mx2,
+            red,
+            vec![
+                ("x", bind_name(&x2)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let ve = format!("{prefix}_rms_ve");
+        self.emit(
+            "add",
+            &ve,
+            red,
+            vec![("x", bind_name(&mx2)), ("y", bind_value(scalar_f32(eps)))],
+        )?;
+        let inv = format!("{prefix}_rms_inv");
+        self.emit(
+            "rsqrt",
+            &inv,
+            red,
+            vec![
+                ("x", bind_name(&ve)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?;
+        let inv2 = format!("{prefix}_rms_inv2");
+        self.emit(
+            "mul",
+            &inv2,
+            red,
+            vec![("x", bind_name(&inv)), ("y", bind_name(&inv))],
+        )?;
+        let xdyg = format!("{prefix}_rms_xdyg");
+        self.emit(
+            "mul",
+            &xdyg,
+            full,
+            vec![("x", bind_name(x)), ("y", bind_name(dyg))],
+        )?;
+        let dot = format!("{prefix}_rms_dot");
+        self.emit(
+            "reduce_mean",
+            &dot,
+            red,
+            vec![
+                ("x", bind_name(&xdyg)),
+                ("axes", red_axes()),
+                ("keep_dims", keep()),
+            ],
+        )?;
+        let xdot = format!("{prefix}_rms_xdot");
+        self.emit(
+            "mul",
+            &xdot,
+            full,
+            vec![("x", bind_name(x)), ("y", bind_name(&dot))],
+        )?;
+        let term2 = format!("{prefix}_rms_t2");
+        self.emit(
+            "mul",
+            &term2,
+            full,
+            vec![("x", bind_name(&xdot)), ("y", bind_name(&inv2))],
+        )?;
+        let diff = format!("{prefix}_rms_diff");
+        self.emit(
+            "sub",
+            &diff,
+            full,
+            vec![("x", bind_name(dyg)), ("y", bind_name(&term2))],
+        )?;
+        let dx = format!("{prefix}_dx");
+        self.emit(
+            "mul",
+            &dx,
+            full,
+            vec![("x", bind_name(&diff)), ("y", bind_name(&inv))],
+        )?;
+        Ok(dx)
+    }
+
+    /// Sum broadcast axes of `src` down to `tgt` (numpy unbroadcast).
+    #[cfg(feature = "training")]
+    fn mil_unbroadcast(
+        &mut self,
+        src: &str,
+        src_shape: &Shape,
+        tgt: &Shape,
+        out: &str,
+    ) -> Result<()> {
+        if src_shape == tgt {
+            let dims: Vec<i64> = (0..tgt.rank())
+                .map(|i| tgt.dim(i).unwrap_static() as i64)
+                .collect();
+            return self.reshape_to(src, &dims, tgt, out);
+        }
+        let g_rank = src_shape.rank();
+        let t_rank = tgt.rank();
+        let extra = g_rank.saturating_sub(t_rank);
+        let mut axes: Vec<usize> = (0..extra).collect();
+        for i in 0..t_rank {
+            let g_dim = src_shape.dim(extra + i);
+            let t_dim = tgt.dim(i);
+            if matches!(t_dim, Dim::Static(1)) && !matches!(g_dim, Dim::Static(1)) {
+                axes.push(extra + i);
+            }
+        }
+        let mut current = src.to_string();
+        let mut running_dims: Vec<Dim> = (0..g_rank).map(|i| src_shape.dim(i)).collect();
+        for (step, &ax) in axes.iter().enumerate() {
+            running_dims[ax] = Dim::Static(1);
+            let step_shape = Shape::from_dims(&running_dims, tgt.dtype());
+            let name = format!("{out}_ub{step}");
+            self.emit(
+                "reduce_sum",
+                &name,
+                &step_shape,
+                vec![
+                    ("x", bind_name(&current)),
+                    ("axes", bind_value(vec_i32(&[ax as i32]))),
+                    ("keep_dims", bind_value(scalar_bool(true))),
+                ],
+            )?;
+            current = name;
+        }
+        let dims: Vec<i64> = (0..t_rank)
+            .map(|i| match tgt.dim(i) {
+                Dim::Static(n) => n as i64,
+                Dim::Dynamic(_) => -1,
+            })
+            .collect();
+        self.reshape_to(&current, &dims, tgt, out)
+    }
+
+    /// Flatten each grad and concat on axis 0 into the packed 1-D output.
+    #[cfg(feature = "training")]
+    fn mil_pack_flat_grads(
+        &mut self,
+        id: NodeId,
+        out_name: &str,
+        out_shape: &Shape,
+        grads: &[(&str, &Shape)],
+    ) -> Result<()> {
+        let mut flats = Vec::with_capacity(grads.len());
+        for (i, &(name, shape)) in grads.iter().enumerate() {
+            let n = shape.num_elements().ok_or_else(|| {
+                CoremlError::Unsupported("dit packed reverse: dynamic grad numel".into())
+            })?;
+            let flat_shape = Shape::new(&[n], shape.dtype());
+            let flat = format!("{out_name}_f{i}");
+            self.reshape_to(name, &[n as i64], &flat_shape, &flat)?;
+            flats.push(flat);
+        }
+        let op = self.simple_op(
+            "concat",
+            out_name,
+            out_shape,
+            vec![
+                ("values", bind_names(&flats)),
+                ("axis", bind_value(scalar_i32(0))),
+                ("interleave", bind_value(scalar_bool(false))),
+            ],
+        )?;
+        self.push_named(id, out_name.to_string(), op);
         Ok(())
     }
 }

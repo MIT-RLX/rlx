@@ -594,4 +594,159 @@ impl Graph {
         );
         self.push(Op::Conjugate, vec![z], z_shape, None)
     }
+
+    /// Packed reverse of [`Op::AdaLayerNorm`]: output is 1-D
+    /// `[dx ∥ dscale ∥ dshift]`. See [`unpack_ada_layer_norm_backward`].
+    pub fn ada_layer_norm_backward(
+        &mut self,
+        x: NodeId,
+        scale: NodeId,
+        shift: NodeId,
+        dy: NodeId,
+        norm: crate::op::AdaNormKind,
+        eps: f32,
+    ) -> NodeId {
+        let x_shape = self.shape(x).clone();
+        let scale_shape = self.shape(scale).clone();
+        let nx = x_shape
+            .num_elements()
+            .expect("ada_layer_norm_backward: static x");
+        let ns = scale_shape
+            .num_elements()
+            .expect("ada_layer_norm_backward: static scale");
+        let out = Shape::new(&[nx + 2 * ns], x_shape.dtype());
+        self.push(
+            Op::AdaLayerNormBackward { norm, eps },
+            vec![x, scale, shift, dy],
+            out,
+            None,
+        )
+    }
+
+    /// Packed reverse of [`Op::GatedResidual`]: output is 1-D
+    /// `[dx ∥ dy ∥ dgate]`. See [`unpack_gated_residual_backward`].
+    pub fn gated_residual_backward(
+        &mut self,
+        x: NodeId,
+        y: NodeId,
+        gate: NodeId,
+        dy: NodeId,
+    ) -> NodeId {
+        let x_shape = self.shape(x).clone();
+        let gate_shape = self.shape(gate).clone();
+        let nx = x_shape
+            .num_elements()
+            .expect("gated_residual_backward: static x");
+        let ng = gate_shape
+            .num_elements()
+            .expect("gated_residual_backward: static gate");
+        let out = Shape::new(&[nx + nx + ng], x_shape.dtype());
+        self.push(Op::GatedResidualBackward, vec![x, y, gate, dy], out, None)
+    }
+}
+
+/// Unpack [`Op::AdaLayerNormBackward`] packed output into `(dx, dscale, dshift)`.
+pub fn unpack_ada_layer_norm_backward(
+    g: &mut Graph,
+    packed: NodeId,
+    x_shape: &Shape,
+    scale_shape: &Shape,
+) -> (NodeId, NodeId, NodeId) {
+    let nx = x_shape.num_elements().expect("unpack ada: static x");
+    let ns = scale_shape
+        .num_elements()
+        .expect("unpack ada: static scale");
+    let dtype = x_shape.dtype();
+    let dx_flat = g.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: 0,
+            len: nx,
+        },
+        vec![packed],
+        Shape::new(&[nx], dtype),
+    );
+    let dscale_flat = g.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: nx,
+            len: ns,
+        },
+        vec![packed],
+        Shape::new(&[ns], dtype),
+    );
+    let dshift_flat = g.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: nx + ns,
+            len: ns,
+        },
+        vec![packed],
+        Shape::new(&[ns], dtype),
+    );
+    let dx = reshape_like(g, dx_flat, x_shape);
+    let dscale = reshape_like(g, dscale_flat, scale_shape);
+    let dshift = reshape_like(g, dshift_flat, scale_shape);
+    (dx, dscale, dshift)
+}
+
+/// Unpack [`Op::GatedResidualBackward`] packed output into `(dx, dy, dgate)`.
+pub fn unpack_gated_residual_backward(
+    g: &mut Graph,
+    packed: NodeId,
+    x_shape: &Shape,
+    gate_shape: &Shape,
+) -> (NodeId, NodeId, NodeId) {
+    let nx = x_shape.num_elements().expect("unpack gate: static x");
+    let ng = gate_shape.num_elements().expect("unpack gate: static gate");
+    let dtype = x_shape.dtype();
+    let dx_flat = g.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: 0,
+            len: nx,
+        },
+        vec![packed],
+        Shape::new(&[nx], dtype),
+    );
+    let dy_flat = g.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: nx,
+            len: nx,
+        },
+        vec![packed],
+        Shape::new(&[nx], dtype),
+    );
+    let dgate_flat = g.add_node(
+        Op::Narrow {
+            axis: 0,
+            start: 2 * nx,
+            len: ng,
+        },
+        vec![packed],
+        Shape::new(&[ng], dtype),
+    );
+    let dx = reshape_like(g, dx_flat, x_shape);
+    let dy = reshape_like(g, dy_flat, x_shape);
+    let dgate = reshape_like(g, dgate_flat, gate_shape);
+    (dx, dy, dgate)
+}
+
+fn reshape_like(g: &mut Graph, flat: NodeId, shape: &Shape) -> NodeId {
+    let dims: Vec<i64> = shape
+        .dims()
+        .iter()
+        .map(|d| match d {
+            crate::shape::Dim::Static(n) => *n as i64,
+            _ => panic!("reshape_like: dynamic dim"),
+        })
+        .collect();
+    g.add_node(
+        Op::Reshape {
+            new_shape: dims.clone(),
+        },
+        vec![flat],
+        shape.clone(),
+    )
 }

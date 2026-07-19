@@ -25,15 +25,18 @@ use rlx_ir::{Graph, Op};
 use crate::buffer::Arena;
 use crate::gguf_host::scheme_from_id;
 use crate::kernels::{
-    DequantGemvGgufParams, DequantGgufParams, Kernel, MatmulParams, dequant_gemv_gguf_kernel,
-    dequant_gguf_kernel, matmul_bt_kernel,
+    DequantGemmQ10Params, DequantGemvGgufParams, DequantGgufParams, Kernel, MatmulParams,
+    dequant_gemm_q1_0_kernel, dequant_gemv_gguf_kernel, dequant_gguf_kernel, matmul_bt_kernel,
 };
 
 /// Schemes the fused decode GEMV ([`run_dequant_matmul_gguf_gemv`]) handles
 /// on-GPU without f32 scratch. Q4_K (0) + Q6_K (2) cover Llama Q4_K_M GGUFs
-/// (q/k/o/gate/up are Q4_K; v/down/embed are Q6_K).
+/// (q/k/o/gate/up are Q4_K; v/down/embed are Q6_K). Q1_0 (24) is the prism-ml
+/// Bonsai-27B 1-bit scheme — scratch-free here avoids re-materializing the whole
+/// 27B to f32 every token (~200s/tok → fused) AND avoids the multi-GiB dequant
+/// scratch that blew wgpu's storage-buffer binding limit.
 pub fn gemv_supports_scheme(scheme_id: u32) -> bool {
-    matches!(scheme_id, 0 | 2)
+    matches!(scheme_id, 0 | 2 | 24)
 }
 
 /// Max f32 scratch for dequantized weights `[n, k]` across all GGUF ops.
@@ -46,11 +49,13 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
             let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
             let total = node.shape.num_elements().unwrap();
             let m = total / n.max(1);
-            // Decode GEMV (m==1, Q4_K/Q6_K) runs scratch-free via
-            // `run_dequant_matmul_gguf_gemv`, so it needs no f32 slab. Skipping
-            // it here keeps the arena from reserving the (multi-GiB) dequant
-            // scratch on pure decode graphs — and avoids binding >4 GiB.
-            if m == 1 && gemv_supports_scheme(crate::gguf_host::gguf_scheme_id(*scheme)) {
+            // Q4_K/Q6_K GGUF matmuls run scratch-free via the windowed GEMV path
+            // (`run_dequant_matmul_gguf_gemv`), looped over rows for m>1. Skipping
+            // them here keeps the arena from reserving the (multi-GiB) dequant
+            // scratch — the LM-head slab (~0.6 GiB for a 0.6B model) is what pushed
+            // the arena over wgpu's 2 GiB storage-buffer binding limit and made the
+            // prefill dequant bind fail (Validation Error: binding range > limit).
+            if gemv_supports_scheme(crate::gguf_host::gguf_scheme_id(*scheme)) {
                 continue;
             }
             let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
@@ -225,6 +230,40 @@ pub fn run_dequant_matmul_gguf_gpu(
     scratch_byte_off: usize,
     out_byte_off: usize,
 ) {
+    // Windowed GEMV covers the sharded / split-weight case; this scratch+matmul_bt
+    // path still assumes one contiguous arena bind.
+    if arena.is_sharded() || crate::buffer::is_weight_off(w_byte_off) {
+        crate::gguf_host::run_dequant_matmul_gguf(
+            arena,
+            device,
+            queue,
+            m,
+            k,
+            n,
+            scheme_id,
+            x_byte_off,
+            w_byte_off,
+            out_byte_off,
+        );
+        return;
+    }
+    // Q4_K/Q6_K/Q1_0: scratch-free windowed GEMV (batched rows → one submit).
+    if gemv_supports_scheme(scheme_id) {
+        run_dequant_matmul_gguf_gemv_rows(
+            arena,
+            device,
+            queue,
+            m,
+            k,
+            n,
+            scheme_id,
+            x_byte_off,
+            w_byte_off,
+            out_byte_off,
+        );
+        return;
+    }
+
     let scheme = scheme_from_id(scheme_id);
     let block_elems = scheme.gguf_block_size() as usize;
     let num_blocks = (k * n) / block_elems.max(1);
@@ -254,6 +293,259 @@ pub fn run_dequant_matmul_gguf_gpu(
 
 const STORAGE_ALIGN: u64 = 256;
 
+/// Reused GEMM/GEMV output slabs — creating a fresh buffer per matmul was a
+/// large fraction of Bonsai-27B prefill time (hundreds of allocs/frame).
+/// Safe across dispatches in one encoder because each dispatch is followed by
+/// a `copy_buffer_to_buffer` into the arena before the next write.
+fn with_pooled_out_buf<R>(
+    device: &wgpu::Device,
+    need_bytes: u64,
+    f: impl FnOnce(&wgpu::Buffer) -> R,
+) -> R {
+    use std::sync::Mutex;
+    static POOL: Mutex<Option<(wgpu::Buffer, u64)>> = Mutex::new(None);
+    let need = need_bytes.max(16).div_ceil(16) * 16;
+    let mut slot = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let recreate = match slot.as_ref() {
+        Some((_, cap)) => *cap < need,
+        None => true,
+    };
+    if recreate {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rlx-wgpu dequant_gemm/gemv out pool"),
+            size: need,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        *slot = Some((buf, need));
+    }
+    let (buf, _) = slot.as_ref().expect("out pool");
+    f(buf)
+}
+
+/// Encode fused GGUF DequantMatMul into `enc` (no `queue.submit`).
+///
+/// Used by the main wgpu run loop so Q1_0 GEMMs share one submission with
+/// surrounding GPU ops instead of flushing ~1× per weight matrix.
+/// Uniforms are unique per dispatch (`queue.write_buffer` is not ordered
+/// inside an encoder the way copies are).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_dequant_matmul_gguf_into(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    enc: &mut wgpu::CommandEncoder,
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme_id: u32,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+) {
+    if m == 0 {
+        return;
+    }
+    if scheme_id == 24
+        && m > 1
+        && !rlx_ir::env::flag("RLX_WGPU_Q1_0_GEMM_DISABLE")
+        && encode_dequant_matmul_gguf_gemm_q1_0(
+            arena,
+            device,
+            queue,
+            enc,
+            m,
+            k,
+            n,
+            x_byte_off,
+            w_byte_off,
+            out_byte_off,
+        )
+    {
+        return;
+    }
+    for row in 0..m {
+        encode_dequant_matmul_gguf_gemv_one(
+            arena,
+            device,
+            queue,
+            enc,
+            k,
+            n,
+            scheme_id,
+            x_byte_off + row * k * 4,
+            w_byte_off,
+            out_byte_off + row * n * 4,
+        );
+    }
+}
+
+/// Fused decode/prefill path: `Y[m,n] = X[m,k] @ W^T` with packed GGUF `W`.
+///
+/// * Q1_0 + `m > 1` → tiled GEMM (Metal `q1_0_mm_f32` parity) — one dispatch,
+///   unless `RLX_WGPU_Q1_0_GEMM_DISABLE=1` or X spans shards.
+/// * Otherwise → per-row GEMV encoded into one command buffer (one submit).
+#[allow(clippy::too_many_arguments)]
+pub fn run_dequant_matmul_gguf_gemv_rows(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme_id: u32,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+) {
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("rlx-wgpu dequant_gguf rows"),
+    });
+    encode_dequant_matmul_gguf_into(
+        arena,
+        device,
+        queue,
+        &mut enc,
+        m,
+        k,
+        n,
+        scheme_id,
+        x_byte_off,
+        w_byte_off,
+        out_byte_off,
+    );
+    queue.submit(std::iter::once(enc.finish()));
+}
+
+/// Tiled Q1_0 GEMM into `enc`. Returns `false` when X/W cannot fit a shard window.
+#[allow(clippy::too_many_arguments)]
+fn encode_dequant_matmul_gguf_gemm_q1_0(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    enc: &mut wgpu::CommandEncoder,
+    m: usize,
+    k: usize,
+    n: usize,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+) -> bool {
+    debug_assert!(k.is_multiple_of(128), "Q1_0 GEMM requires k % 128 == 0");
+    let block_elems = 128usize;
+    let block_bytes = 18usize;
+    let w_total_bytes = (k * n) / block_elems * block_bytes;
+
+    let x0 = x_byte_off as u64;
+    let x_bytes = (m * k * 4) as u64;
+    let x_base = (x0 / STORAGE_ALIGN) * STORAGE_ALIGN;
+    let (x_buf, x_local) = arena.resolve_act(x_base as usize);
+    let x_local = x_local as u64;
+    let x_need = x0 + x_bytes - x_base;
+    let x_size = (x_need.div_ceil(16) * 16).min(x_buf.size().saturating_sub(x_local));
+    if x_size < x_need {
+        return false; // X spans shards — GEMV-per-row is safe
+    }
+
+    let (w_buf, w_raw) = arena.resolve_w(w_byte_off);
+    let w_buf_size = w_buf.size();
+    let w0 = w_raw as u64;
+    let w_base = (w0 / STORAGE_ALIGN) * STORAGE_ALIGN;
+    let w_need = w0 + w_total_bytes as u64 - w_base;
+    let w_size = (w_need.div_ceil(16) * 16).min(w_buf_size.saturating_sub(w_base));
+    if w_size < w_need {
+        return false;
+    }
+
+    let max_bind = device.limits().max_storage_buffer_binding_size;
+    if x_size > max_bind || w_size > max_bind {
+        return false;
+    }
+
+    let out_elems = m * n;
+    let out_bytes = (out_elems * 4) as u64;
+    with_pooled_out_buf(device, out_bytes, |out_buf| {
+        let p = DequantGemmQ10Params {
+            m: m as u32,
+            k: k as u32,
+            n: n as u32,
+            x_f32_off: ((x0 - x_base) / 4) as u32,
+            w_byte_off: (w0 - w_base) as u32,
+            out_f32_off: 0,
+            _p0: 0,
+            _p1: 0,
+        };
+        let dk = dequant_gemm_q1_0_kernel(device);
+        let u = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rlx-wgpu dequant_gemm_q1_0 uni"),
+            size: std::mem::size_of::<DequantGemmQ10Params>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rlx-wgpu dequant_gemm_q1_0 bg"),
+            layout: &dk.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: x_buf,
+                        offset: x_local,
+                        size: wgpu::BufferSize::new(x_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: u.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: w_buf,
+                        offset: w_base,
+                        size: wgpu::BufferSize::new(w_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rlx-wgpu dequant_gemm_q1_0 pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&dk.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            const TM: u32 = 8;
+            pass.dispatch_workgroups((n as u32).div_ceil(64), (m as u32).div_ceil(TM), 1);
+        }
+
+        let (dst0, dst0_off) = arena.resolve_act(out_byte_off);
+        let row_bytes = (n * 4) as u64;
+        let contiguous = (dst0_off as u64) + out_bytes <= dst0.size();
+        if contiguous {
+            enc.copy_buffer_to_buffer(out_buf, 0, dst0, dst0_off as u64, out_bytes);
+        } else {
+            for r in 0..m {
+                let (dst, dst_off) = arena.resolve_act(out_byte_off + r * n * 4);
+                enc.copy_buffer_to_buffer(
+                    out_buf,
+                    (r as u64) * row_bytes,
+                    dst,
+                    dst_off as u64,
+                    row_bytes,
+                );
+            }
+        }
+    });
+    true
+}
+
 /// Fused decode GEMV: `y[1,n] = x[1,k] @ W^T` with `W` GGUF-packed `[n,k]`,
 /// dequantizing each weight block on the fly (no f32 scratch).
 ///
@@ -263,7 +555,8 @@ const STORAGE_ALIGN: u64 = 256;
 /// the arena cannot also be bound read-write in the same dispatch (wgpu treats
 /// STORAGE_READ_WRITE as exclusive) — which is then copied back into the arena.
 ///
-/// Caller guarantees `m == 1` and [`gemv_supports_scheme`].
+/// Caller guarantees `m == 1` and [`gemv_supports_scheme`]. Prefer
+/// [`run_dequant_matmul_gguf_gemv_rows`] when `m > 1`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_dequant_matmul_gguf_gemv(
     arena: &Arena,
@@ -276,21 +569,53 @@ pub fn run_dequant_matmul_gguf_gemv(
     w_byte_off: usize,
     out_byte_off: usize,
 ) {
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("rlx-wgpu dequant_gemv_gguf"),
+    });
+    encode_dequant_matmul_gguf_gemv_one(
+        arena,
+        device,
+        queue,
+        &mut enc,
+        k,
+        n,
+        scheme_id,
+        x_byte_off,
+        w_byte_off,
+        out_byte_off,
+    );
+    queue.submit(std::iter::once(enc.finish()));
+}
+
+fn encode_dequant_matmul_gguf_gemv_one(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    enc: &mut wgpu::CommandEncoder,
+    k: usize,
+    n: usize,
+    scheme_id: u32,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+) {
     let scheme = scheme_from_id(scheme_id);
     let block_elems = scheme.gguf_block_size() as usize;
     let block_bytes = scheme.gguf_block_bytes() as usize;
     let w_total_bytes = (k * n) / block_elems.max(1) * block_bytes;
-    let arena_size = arena.size as u64;
 
-    // x window: cover [x_byte_off, +k*4).
     let x0 = x_byte_off as u64;
     let x_base = (x0 / STORAGE_ALIGN) * STORAGE_ALIGN;
-    let x_size = ((x0 + (k * 4) as u64 - x_base).div_ceil(16) * 16).min(arena_size - x_base);
+    let (x_buf, x_local) = arena.resolve_act(x_base as usize);
+    let x_local = x_local as u64;
+    let x_size = ((x0 + (k * 4) as u64 - x_base).div_ceil(16) * 16)
+        .min(x_buf.size().saturating_sub(x_local));
 
-    // weight window: cover [w_byte_off, +w_total_bytes).
-    let w0 = w_byte_off as u64;
+    let (w_buf, w_raw) = arena.resolve_w(w_byte_off);
+    let w_buf_size = w_buf.size();
+    let w0 = w_raw as u64;
     let w_base = (w0 / STORAGE_ALIGN) * STORAGE_ALIGN;
-    let w_size = ((w0 + w_total_bytes as u64 - w_base).div_ceil(16) * 16).min(arena_size - w_base);
+    let w_size = ((w0 + w_total_bytes as u64 - w_base).div_ceil(16) * 16).min(w_buf_size - w_base);
 
     let max_bind = device.limits().max_storage_buffer_binding_size;
     assert!(
@@ -298,86 +623,71 @@ pub fn run_dequant_matmul_gguf_gemv(
         "rlx-wgpu gguf gemv: window too large (x={x_size}, w={w_size}, max={max_bind})"
     );
 
-    // Separate output buffer (rw) — copied into the arena after the dispatch.
-    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rlx-wgpu dequant_gemv_gguf out"),
-        size: ((n * 4).max(4) as u64).div_ceil(16) * 16,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+    let out_bytes = ((n * 4).max(4) as u64).div_ceil(16) * 16;
+    with_pooled_out_buf(device, out_bytes, |out_buf| {
+        let p = DequantGemvGgufParams {
+            k: k as u32,
+            n: n as u32,
+            scheme_id,
+            x_f32_off: ((x0 - x_base) / 4) as u32,
+            w_byte_off: (w0 - w_base) as u32,
+            out_f32_off: 0,
+            _p0: 0,
+            _p1: 0,
+        };
 
-    let p = DequantGemvGgufParams {
-        k: k as u32,
-        n: n as u32,
-        scheme_id,
-        x_f32_off: ((x0 - x_base) / 4) as u32,
-        w_byte_off: (w0 - w_base) as u32,
-        out_f32_off: 0,
-        _p0: 0,
-        _p1: 0,
-    };
-
-    let dk = dequant_gemv_gguf_kernel(device);
-    let u = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rlx-wgpu dequant_gemv_gguf uniform"),
-        size: std::mem::size_of::<DequantGemvGgufParams>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
-
-    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("rlx-wgpu dequant_gemv_gguf bg"),
-        layout: &dk.bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &arena.buffer,
-                    offset: x_base,
-                    size: wgpu::BufferSize::new(x_size),
-                }),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: u.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &arena.buffer,
-                    offset: w_base,
-                    size: wgpu::BufferSize::new(w_size),
-                }),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: out_buf.as_entire_binding(),
-            },
-        ],
-    });
-
-    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("rlx-wgpu dequant_gemv_gguf"),
-    });
-    {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rlx-wgpu dequant_gemv_gguf pass"),
-            ..Default::default()
+        let dk = dequant_gemv_gguf_kernel(device);
+        let u = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rlx-wgpu dequant_gemv_gguf uniform"),
+            size: std::mem::size_of::<DequantGemvGgufParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
-        pass.set_pipeline(&dk.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
-    }
-    // Copy y back into the arena (distinct buffers → buffer-to-buffer is legal).
-    enc.copy_buffer_to_buffer(
-        &out_buf,
-        0,
-        &arena.buffer,
-        out_byte_off as u64,
-        (n * 4) as u64,
-    );
-    queue.submit(std::iter::once(enc.finish()));
+        queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rlx-wgpu dequant_gemv_gguf bg"),
+            layout: &dk.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: x_buf,
+                        offset: x_local,
+                        size: wgpu::BufferSize::new(x_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: u.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: w_buf,
+                        offset: w_base,
+                        size: wgpu::BufferSize::new(w_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rlx-wgpu dequant_gemv_gguf pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&dk.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
+        }
+        let (dst, dst_off) = arena.resolve_act(out_byte_off);
+        enc.copy_buffer_to_buffer(out_buf, 0, dst, dst_off as u64, (n * 4) as u64);
+    });
 }
 
 /// GPU dequant + grouped matmul for MoE packed expert stacks.
@@ -401,6 +711,23 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
     scratch_byte_off: usize,
     out_byte_off: usize,
 ) {
+    if arena.is_sharded() {
+        crate::gguf_host::run_dequant_grouped_matmul_gguf(
+            arena,
+            device,
+            queue,
+            m,
+            k,
+            n,
+            num_experts,
+            scheme_id,
+            x_byte_off,
+            w_byte_off,
+            idx_byte_off,
+            out_byte_off,
+        );
+        return;
+    }
     let scheme = scheme_from_id(scheme_id);
     let slab_bytes = slab_bytes_for(scheme, k, n);
     let num_blocks = (k * n) / scheme.gguf_block_size() as usize;

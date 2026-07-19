@@ -21,22 +21,24 @@
 //!
 //! Examples that get folded:
 //! - `1.0 / sqrt(head_dim)` (attention scale factor)
-//! - `cast(known_param)` to a different dtype
-//! - small reshapes/expands of constants
+//! - small reshapes/expands of **F32** constants
 //!
-//! For a typical transformer, constant folding only catches scattered
-//! arithmetic — but it eliminates 10–50 redundant ops over a 12-layer
-//! model and shrinks the arena slightly.
+//! Non-F32 constants (F16/BF16/I32/…) are left untouched: the fold
+//! evaluator works in f32 host buffers and used to mis-decode foreign
+//! dtypes as f32 bit patterns, then re-emit `Op::Constant` with the
+//! wrong byte width for the declared shape dtype (CUDA AOT runs this
+//! pass via `post_fusion_cleanup`; CPU AOT historically skipped it —
+//! that asymmetry made F5-TTS text-embed CPU↔CUDA cos collapse to ~0.17).
 
 use rlx_fusion::pass::Pass;
 use rlx_ir::op::{Activation, BinaryOp};
-use rlx_ir::{Graph, NodeId, Op};
+use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
 use std::collections::{HashMap, HashSet};
 
 pub struct ConstantFolding;
 
 /// True if this op can be evaluated symbolically with no runtime state.
-fn is_pure(op: &Op) -> bool {
+pub(crate) fn is_pure(op: &Op) -> bool {
     matches!(
         op,
         Op::Activation(_)
@@ -55,12 +57,75 @@ fn is_foldable(node_id: NodeId, graph: &Graph, folded: &HashSet<NodeId>) -> bool
     if !is_pure(&node.op) {
         return false;
     }
+    // Host evaluator emits F32 constant bytes only — refuse to replace a
+    // non-F32-typed node (would write 4×N bytes into an F16/I32 shape).
+    if node.shape.dtype() != DType::F32 {
+        return false;
+    }
     node.inputs.iter().all(|i| folded.contains(i))
 }
 
-/// Evaluate a foldable node given precomputed input values.
+/// Static dims of a shape, or `None` if any dim is dynamic.
+pub(crate) fn static_dims(shape: &Shape) -> Option<Vec<usize>> {
+    shape
+        .dims()
+        .iter()
+        .map(|d| match d {
+            Dim::Static(n) => Some(*n),
+            _ => None,
+        })
+        .collect()
+}
+
+/// NumPy-broadcast a row-major f32 buffer of shape `src_dims` up to `out_dims`.
+/// `None` if the shapes are not broadcast-compatible. Handles the same-shape
+/// case as an identity copy, so callers can broadcast unconditionally.
+fn broadcast_to(src: &[f32], src_dims: &[usize], out_dims: &[usize]) -> Option<Vec<f32>> {
+    let rank = out_dims.len();
+    if src_dims.len() > rank {
+        return None;
+    }
+    // Right-align src dims into the output rank (prepend 1s).
+    let mut sd = vec![1usize; rank];
+    sd[rank - src_dims.len()..].copy_from_slice(src_dims);
+    for ax in 0..rank {
+        if sd[ax] != 1 && sd[ax] != out_dims[ax] {
+            return None;
+        }
+    }
+    if src.len() != sd.iter().product::<usize>() {
+        return None;
+    }
+    // Row-major strides over `sd` (same layout as the src buffer).
+    let mut strides = vec![1usize; rank];
+    for ax in (0..rank.saturating_sub(1)).rev() {
+        strides[ax] = strides[ax + 1] * sd[ax + 1];
+    }
+    let total: usize = out_dims.iter().product();
+    let mut out = vec![0f32; total];
+    let mut idx = vec![0usize; rank];
+    for slot in out.iter_mut() {
+        // `idx % sd[ax]` collapses to 0 on broadcast (sd==1) axes.
+        let s: usize = (0..rank).map(|ax| (idx[ax] % sd[ax]) * strides[ax]).sum();
+        *slot = src[s];
+        for ax in (0..rank).rev() {
+            idx[ax] += 1;
+            if idx[ax] < out_dims[ax] {
+                break;
+            }
+            idx[ax] = 0;
+        }
+    }
+    Some(out)
+}
+
+/// Evaluate a foldable node given precomputed input values + their static dims.
 /// Returns a flat f32 buffer of the result, or None if not supported.
-fn evaluate(node: &rlx_ir::Node, inputs: &[&Vec<f32>]) -> Option<Vec<f32>> {
+pub(crate) fn evaluate(
+    node: &rlx_ir::Node,
+    inputs: &[&Vec<f32>],
+    in_dims: &[Vec<usize>],
+) -> Option<Vec<f32>> {
     let total = node.shape.num_elements()?;
     let mut out = vec![0f32; total];
 
@@ -92,12 +157,11 @@ fn evaluate(node: &rlx_ir::Node, inputs: &[&Vec<f32>]) -> Option<Vec<f32>> {
             Some(out)
         }
         Op::Binary(op) => {
-            let lhs = inputs[0];
-            let rhs = inputs[1];
-            // Naive: support same-shape only. Broadcast handled later.
-            if lhs.len() != total || rhs.len() != total {
-                return None;
-            }
+            // NumPy broadcast both operands to the output shape (folds
+            // per-channel scale/bias etc.; a no-op copy when already matching).
+            let out_dims = static_dims(&node.shape)?;
+            let lhs = broadcast_to(inputs[0], &in_dims[0], &out_dims)?;
+            let rhs = broadcast_to(inputs[1], &in_dims[1], &out_dims)?;
             for i in 0..total {
                 out[i] = match op {
                     BinaryOp::Add => lhs[i] + rhs[i],
@@ -111,8 +175,20 @@ fn evaluate(node: &rlx_ir::Node, inputs: &[&Vec<f32>]) -> Option<Vec<f32>> {
             }
             Some(out)
         }
-        Op::Reshape { .. } | Op::Expand { .. } | Op::Cast { .. } => {
-            // Same data, just reshape/cast. For now: copy through as f32.
+        Op::Reshape { .. } => {
+            // Reshape preserves element count + row-major order.
+            let src = inputs[0];
+            if src.len() == total {
+                Some(src.clone())
+            } else if src.len() == 1 {
+                Some(vec![src[0]; total])
+            } else {
+                None
+            }
+        }
+        Op::Expand { .. } => broadcast_to(inputs[0], &in_dims[0], &static_dims(&node.shape)?),
+        // Only identity F32→F32 casts — other casts need real dtype conversion.
+        Op::Cast { to } if *to == DType::F32 => {
             let src = inputs[0];
             if src.len() == total {
                 Some(src.clone())
@@ -147,8 +223,13 @@ impl Pass for ConstantFolding {
         let mut values: HashMap<NodeId, Vec<f32>> = HashMap::new();
 
         for node in graph.nodes() {
-            // Constant nodes are trivially foldable (we already have the data).
+            // Only F32 Constants are foldable seeds. Interpreting F16/I32/…
+            // bytes as f32 bit patterns produced wrong values and, when a
+            // downstream node was replaced, wrong-sized Constant payloads.
             if let Op::Constant { data } = &node.op {
+                if node.shape.dtype() != DType::F32 {
+                    continue;
+                }
                 folded.insert(node.id);
                 let f32s: Vec<f32> = data
                     .chunks_exact(4)
@@ -164,7 +245,15 @@ impl Pass for ConstantFolding {
             // Try to fold pure ops with all-constant inputs.
             if is_foldable(node.id, &graph, &folded) {
                 let inputs: Vec<&Vec<f32>> = node.inputs.iter().map(|i| &values[i]).collect();
-                if let Some(result) = evaluate(node, &inputs) {
+                // Static dims of every input; skip fold if any is dynamic.
+                let in_dims: Option<Vec<Vec<usize>>> = node
+                    .inputs
+                    .iter()
+                    .map(|i| static_dims(&graph.node(*i).shape))
+                    .collect();
+                if let Some(in_dims) = in_dims
+                    && let Some(result) = evaluate(node, &inputs, &in_dims)
+                {
                     folded.insert(node.id);
                     values.insert(node.id, result);
                 }
@@ -183,6 +272,11 @@ impl Pass for ConstantFolding {
                     Op::Constant { .. } | Op::Param { .. } | Op::Input { .. }
                 )
             {
+                debug_assert_eq!(
+                    node.shape.dtype(),
+                    DType::F32,
+                    "constant folding must only replace F32 nodes"
+                );
                 let bytes = encode_constant(&values[&node.id]);
                 let new_id =
                     new_graph.add_node(Op::Constant { data: bytes }, vec![], node.shape.clone());
@@ -254,5 +348,41 @@ mod tests {
         let folded = ConstantFolding.run(g);
         // x + c is input-dependent; should NOT be folded.
         assert!(matches!(folded.node(folded.outputs[0]).op, Op::Binary(_)));
+    }
+
+    #[test]
+    fn leaves_f16_constants_and_casts_alone() {
+        // Regression: previously F16 constant bytes were decoded as f32, then
+        // a Cast-to-F32 could be replaced with a wrong-sized F32 Constant.
+        let mut g = Graph::new("f16_const");
+        let c = g.add_node(
+            Op::Constant {
+                // two f16 values (4 bytes) — must NOT be read as one f32
+                data: vec![0x00, 0x3c, 0x00, 0x40], // 1.0f16, 2.0f16
+            },
+            vec![],
+            Shape::new(&[2], DType::F16),
+        );
+        let cast = g.add_node(
+            Op::Cast { to: DType::F32 },
+            vec![c],
+            Shape::new(&[2], DType::F32),
+        );
+        g.set_outputs(vec![cast]);
+
+        let folded = ConstantFolding.run(g);
+        assert!(
+            matches!(folded.node(folded.outputs[0]).op, Op::Cast { .. }),
+            "F16→F32 cast must not be constant-folded without a real converter"
+        );
+        assert!(matches!(
+            folded.node(folded.node(folded.outputs[0]).inputs[0]).op,
+            Op::Constant { .. }
+        ));
+        let c_node = folded.node(folded.node(folded.outputs[0]).inputs[0]);
+        if let Op::Constant { data } = &c_node.op {
+            assert_eq!(data.len(), 4, "F16 constant payload must stay 2 bytes/elem");
+            assert_eq!(c_node.shape.dtype(), DType::F16);
+        }
     }
 }

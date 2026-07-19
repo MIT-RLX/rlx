@@ -55,6 +55,7 @@
 //! | `rlx::driver`   | `rlx-driver`    | `Device` enum, registries                                                       |
 //! | `rlx::runtime`  | `rlx-runtime`   | `Session`, `CompiledGraph`                                                      |
 //! | `rlx::macros`   | `rlx-macros`    | `#[rlx_model]` proc macro                                                       |
+//! | `rlx::collectives` | `rlx-collectives` | in-graph collective ops + mesh/planner *(feature `distributed`)*             |
 //! | `rlx::gguf`     | `rlx-gguf`      | GGUF parser + dequant *(feature `gguf`)*                                        |
 //! | `rlx::onnx`     | `rlx-onnx`      | ONNX Runtime `.onnx` inference *(feature `onnx`)*                               |
 //! | `rlx::bench`    | `rlx-bench`     | benchmark harness *(feature `bench`)*                                           |
@@ -62,7 +63,7 @@
 //! | `rlx::splat`    | `rlx-splat`     | 3D Gaussian splatting *(feature `splat`)* — `register()`, decomposed IR ops      |
 //! | `rlx::linalg`   | `rlx-linalg`    | downstream: dense linalg via LAPACK *(feature `linalg`)*                        |
 //! | `rlx::cortexm`  | `rlx-cortexm`   | INT8 ARMv7E-M kernels *(feature `cortexm`)* — no `Backend` impl, kernels only   |
-//! | `rlx::fpga`     | `rlx-fpga`      | IR → SystemVerilog datapath synthesis *(feature `fpga`)* — no `Backend` impl    |
+//! | `rlx::fpga`     | `rlx-fpga`      | IR → SystemVerilog export *(feature `fpga`)* — target-agnostic RTL; no `Backend` |
 //!
 //! ## Convenience namespaces
 //!
@@ -74,6 +75,7 @@
 //! | [`rlx::quant`]       | `QuantScheme`, `QuantMap` (IR quantization metadata)                          |
 //! | [`rlx::ops`]         | `Activation`, `BinaryOp`, `CmpOp`, `MaskKind`, `ChainStep`, `ChainOperand`    |
 //! | [`rlx::autodiff`]    | `jvp`, `hvp`, `vmap` + the autodiff entry points                              |
+//! | `rlx::distributed`   | transports + in-graph collectives + ship-graph train/infer *(feature `distributed`)* |
 //! | [`rlx::prelude`]     | star-import target covering the 95% case                                      |
 //!
 //! ## Backend feature gates
@@ -193,16 +195,36 @@ pub use rlx_optim as optim;
 pub use rlx_cortexm as cortexm;
 
 #[cfg(feature = "fpga")]
-/// IR → SystemVerilog datapath synthesis. Doesn't implement
-/// `Backend` — synth + P&R takes minutes; the entry point is
-/// `rlx::fpga::codegen::emit_model`.
-/// See [`rlx-fpga`](https://crates.io/crates/rlx-fpga).
+/// IR → SystemVerilog datapath synthesis + runtime [`export`](rlx_runtime::export).
+///
+/// Prefer the prelude when the `fpga` feature is on:
+///
+/// ```ignore
+/// use rlx::prelude::*;
+///
+/// let arts = ExportSession::fpga("hw/out")
+///     .hw_target(HwTarget::Generic)
+///     .export_model(&tinyconv_mnist_from_cortexm())?;
+/// ```
+///
+/// Entry via module path: `rlx::fpga::export_graph` / `emit_with_config`.
+/// Soft-port RTL by default (`HwTarget::Generic`); optional ECP5/iCE40/Xilinx7
+/// synth scripts. See [`rlx-fpga`](https://crates.io/crates/rlx-fpga).
 pub use rlx_fpga as fpga;
 
 #[cfg(feature = "onnx")]
 /// ONNX Runtime inference for `.onnx` files on RLX [`Device`] backends.
 /// See [`rlx-onnx`](https://crates.io/crates/rlx-onnx).
 pub use rlx_onnx as onnx;
+
+#[cfg(feature = "distributed")]
+/// In-graph collective ops (`collective.all_reduce`, all-gather, reduce-scatter,
+/// broadcast, all-to-all, ppermute, send/recv, the Megatron `f`/`g` operators),
+/// the group registry, and the device-mesh / placement planner. The unified
+/// [`rlx::distributed`](crate::distributed) namespace folds this together with
+/// the `rlx-driver` transports and the `rlx-runtime::dist` ship-graph API.
+/// See [`rlx-collectives`](https://crates.io/crates/rlx-collectives).
+pub use rlx_collectives as collectives;
 
 // ── Error types ─────────────────────────────────────────────────
 //
@@ -224,6 +246,11 @@ pub type Error = anyhow::Error;
 // common types stay reachable via the module re-exports above.
 
 pub use rlx_driver::Device;
+#[cfg(feature = "fpga")]
+pub use rlx_fpga::{
+    ExportQuantMode, FpgaExportConfig, GraphIoBind, HwTarget, InputIface, IoConfig, OutputIface,
+    OutputKind, PortNames, SidebandSpec, tinyconv_mnist_from_cortexm,
+};
 pub use rlx_ir::quant::QuantScheme;
 pub use rlx_ir::{
     DType, Element, FusionPolicy, Graph, GraphExt, GraphModule, GraphStage, HirModule, HirOp,
@@ -246,6 +273,11 @@ pub use rlx_runtime::{
     device_from_env, device_label, device_report, devices_for, devices_for_with_policy,
     fastest_device, fastest_device_for, graph_param_names, is_available, parse_device,
     parse_device_list, resolve_device, resolve_device_chain, run_with_fallback,
+};
+#[cfg(feature = "fpga")]
+pub use rlx_runtime::{
+    ExportOptions, ExportSession, ExportTarget, ExportedArtifacts, export_graph,
+    export_tinyconv_mnist,
 };
 
 // ── Grouped namespaces ──────────────────────────────────────────
@@ -297,6 +329,44 @@ pub mod autodiff {
     pub use rlx_opt::{hvp, jvp, vmap};
 }
 
+/// Distributed training + inference — the single front door over all three
+/// layers, which otherwise live in separate crates: the transport layer
+/// (`rlx-driver`: `ProcessGroup`, transports, `Node` discovery, `ReduceMode`),
+/// the in-graph collective op builders + placement planner (`rlx-collectives`),
+/// and the ship-graph worker/coordinator + heterogeneous placement
+/// (`rlx-runtime::dist` / `::hetero`). Feature `distributed`.
+///
+/// ```ignore
+/// use rlx::distributed::*;
+///
+/// register(); // install the in-graph collective kernel once
+/// // reproducible + precise cross-rank gradient reduce, baked into the graph:
+/// let g = all_reduce_op_mode(&mut bwd, grad, gid, ReduceKind::Mean, ReduceMode::Deterministic);
+/// // ship-graph data-parallel training on a heterogeneous cluster:
+/// run_train(&group, rank, &spec, resolve, reduce)?;
+/// // one-machine-vs-cluster divergence diagnostic:
+/// let d = backend_divergence(&graph, &inputs)?;
+/// ```
+///
+/// The collective ops and mesh/planner are also reachable directly on
+/// [`rlx::collectives`](crate::collectives); the ship-graph API on
+/// [`rlx::runtime::dist`](crate::runtime) (always present, no feature).
+#[cfg(feature = "distributed")]
+pub mod distributed {
+    // Transport + in-graph collective ops + device mesh / planner
+    // (rlx-driver + rlx-collectives), via the collectives prelude.
+    pub use rlx_collectives::prelude::*;
+    // Ship-graph inference / training / diagnostics (rlx-runtime::dist).
+    pub use crate::runtime::dist::{
+        BackendDivergence, DataRef, StageSpec, TrainMetrics, TrainSpec, WeightCache, WeightRef,
+        WorkerStage, backend_divergence, pull_shards, push_shards, recv_activation, recv_stage,
+        recv_train, report_backend_divergence, resolve_weight_bytes, resolve_weight_uri, run_train,
+        send_activation, serve_stage, serve_stage_uri, ship_stage, ship_train, uri_resolver,
+    };
+    // Heterogeneous multi-backend placement (rlx-runtime::hetero).
+    pub use crate::runtime::{DeviceMap, HeteroExecutable};
+}
+
 // ── Prelude — single `use rlx::prelude::*;` for the 95% case ────
 //
 // Includes the graph-building / runtime types, common IR helper
@@ -344,6 +414,14 @@ pub mod prelude {
     // Optimizer types — useful when configuring passes / precision
     pub use crate::ir::env::{self, RlxEnv, RuntimeOverrides, flag, set, unset, var};
     pub use crate::{CalibrationRecord, Pass, Precision, PrecisionPolicy};
+
+    // FPGA / ASIC SystemVerilog export (feature `fpga`)
+    #[cfg(feature = "fpga")]
+    pub use crate::{
+        ExportOptions, ExportQuantMode, ExportSession, ExportTarget, ExportedArtifacts,
+        FpgaExportConfig, GraphIoBind, HwTarget, InputIface, IoConfig, OutputIface, OutputKind,
+        PortNames, SidebandSpec, export_graph, export_tinyconv_mnist, tinyconv_mnist_from_cortexm,
+    };
 
     // 3D Gaussian splatting (`rlx-splat` — call `register()` once per process)
     #[cfg(feature = "splat")]

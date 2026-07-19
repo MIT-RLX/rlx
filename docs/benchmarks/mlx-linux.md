@@ -5,7 +5,7 @@ and **macOS** (Metal). This page covers Linux/WSL: how to compile, pick the
 MLX device at runtime, and how `Device::Mlx` compares to `Device::Cpu`.
 
 Primary reference implementation: **WSL2 Ubuntu** on the CUDA rig
-(`./rig.sh --wsl`), RTX 4090 host. Numbers below are from that environment
+(`./rig.sh --wsl`), NVIDIA GPU host. Numbers below are from that environment
 unless noted.
 
 ## Compile
@@ -129,7 +129,7 @@ cargo run -p rlx-bench --release --example bench_mlx_devices --features mlx,mlx-
 
 ## Benchmark: `rlx-cuda` vs `rlx-mlx` (CUDA compile)
 
-Matmul L1 via `bench_mlx_wgpu`, **release** profile, WSL Ubuntu (RTX 4090).
+Matmul L1 via `bench_mlx_wgpu`, **release** profile, WSL Ubuntu (NVIDIA GPU).
 MLX leg uses a CUDA-enabled `libmlx.a` (`RLX_MLX_CUDA=1` or prior
 `./rig.sh --wsl build-mlx cuda`) and **`RLX_MLX_DEVICE=gpu`** at runtime.
 

@@ -11,6 +11,10 @@ After clone:
 git submodule update --init rlx-mlx-sys/vendor/mlx
 ```
 
+The submodule is marked `shallow = true` in `.gitmodules` (depth-1 clone of
+the pinned MLX commit) so local `.git` stays small. A full MLX history is not
+required to build.
+
 ## Linux compile times
 
 | Backend | First build (approx.) | Opt-in |

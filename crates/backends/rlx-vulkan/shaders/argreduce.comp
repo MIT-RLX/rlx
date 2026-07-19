@@ -4,7 +4,6 @@
 // Ties break to the smaller index (matches NumPy / the CPU reference).
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint outer;
@@ -23,15 +22,15 @@ void main() {
     uint j = gid % pc.inner;
     uint base = o * pc.axis_len * pc.inner + j;
 
-    float best = data[pc.in_off + base];
+    float best = arena_load(pc.in_off + base);
     uint best_i = 0u;
     for (uint k = 1u; k < pc.axis_len; k++) {
-        float v = data[pc.in_off + base + k * pc.inner];
+        float v = arena_load(pc.in_off + base + k * pc.inner);
         bool better = (pc.op == 0u) ? (v > best) : (v < best);
         if (better) {
             best = v;
             best_i = k;
         }
     }
-    data[pc.out_off + gid] = float(best_i);
+    arena_store(pc.out_off + gid, float(best_i));
 }

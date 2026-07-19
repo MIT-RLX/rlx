@@ -160,6 +160,42 @@ loaded → custom direct-conv otherwise. Conv1d uses the conv2d helper
 with `H=kh=sh=1, ph=0, dh=1` (degenerate 2-D); Conv3d uses cuDNN's
 nd-descriptor APIs.
 
+### Fused conv + bias + activation (+ residual)
+
+`Op::FusedConvBiasAct` (claimed only by CUDA) folds a convolution's
+bias + activation — and an optional ResNet residual — into cuDNN's
+`cudnnConvolutionBiasActivationForward`. Two fusion passes feed it
+(`crates/core/rlx-fusion/src/fusion/conv_bias_act.rs`):
+
+- `FuseConvBiasAct` — `conv → bias-add → [relu]`.
+- `FuseConvAffineAct` — a host-pre-folded BatchNorm block
+  `conv → Mul(per-channel scale) → Add(shift) → [Add(residual)] → relu`.
+  The per-output-channel scale folds into the weights
+  (`conv(x,w)·scale ≡ conv(x, w·scale)`), the shift becomes the bias,
+  and the residual maps to cuDNN's `z` operand
+  (`y = act(conv + bias + z)`).
+
+Deliberately narrow — fires only for the case that benchmarks faster:
+cuDNN-friendly shapes (`groups==1, kH>1, kW>1`) with a `relu`/identity
+epilogue. On an NVIDIA GPU, fully-fused `conv+bias+relu` is **1.6–2.2×** the
+unfused path at batch 1. cuDNN's fused call only supports `IDENTITY` +
+`RELU`, so sigmoid/tanh/etc. and 1×1 / depthwise stay on the regular
+`conv + elementwise-region` path (which the same benchmarks show beats a
+generic epilogue there).
+
+**cuDNN stays optional.** With libcudnn absent (or `RLX_CUDA_NO_CUDNN=1`),
+the fused step falls back to the custom direct-conv kernel followed by
+`conv_bias_act_epilogue.cu` (bias + residual + activation), all NVRTC —
+bit-exact, just slower.
+
+Env diagnostics / ablation:
+
+| Env | Effect |
+|---|---|
+| `RLX_CUDA_LOG_CONV_PATH=1` | print `CUDNN_FUSED` vs `EPILOGUE` per conv step |
+| `RLX_CUDA_LOG_FALLBACK=1` | log any cuDNN→custom fallback + reason |
+| `RLX_DISABLE_CONV_BIAS_ACT_FUSION=1` | skip the fusion (A/B vs unfused) |
+
 ## Compile + execution modes
 
 `CudaExecutable::compile_with(graph, compile_mode, exec_mode)` selects:

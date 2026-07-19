@@ -46,6 +46,9 @@ pub(crate) const DEVICE_PRIORITY: &[Device] = &[
     Device::Cpu,
 ];
 
+/// Browser backend probe order: WebGPU first, WebGL fallback, then CPU.
+pub const BROWSER_DEVICE_PRIORITY: &[Device] = &[Device::WebGpu, Device::OpenGl, Device::Cpu];
+
 /// Check whether `device` has a compiled-in backend or has been
 /// registered by an external crate.
 ///
@@ -105,7 +108,29 @@ pub fn is_available(device: Device) -> bool {
     }
     #[cfg(feature = "gpu")]
     if device == Device::Gpu {
-        return rlx_wgpu::is_available();
+        #[cfg(target_arch = "wasm32")]
+        {
+            return rlx_wgpu::device::wgpu_device().is_some();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            return rlx_wgpu::is_available();
+        }
+    }
+    #[cfg(feature = "webgpu")]
+    if device == Device::WebGpu {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return rlx_wgpu::device::wgpu_device().is_some();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            return rlx_wgpu::is_available();
+        }
+    }
+    #[cfg(feature = "opengl")]
+    if device == Device::OpenGl {
+        return true;
     }
     #[cfg(feature = "vulkan")]
     if device == Device::Vulkan {
@@ -177,6 +202,20 @@ pub fn available_devices() -> Vec<Device> {
         .copied()
         .filter(|d| is_available(*d))
         .collect()
+}
+
+/// Browser backends currently runnable (`WebGpu` → `OpenGl` → `Cpu`).
+pub fn available_browser_devices() -> Vec<Device> {
+    BROWSER_DEVICE_PRIORITY
+        .iter()
+        .copied()
+        .filter(|d| is_available(*d))
+        .collect()
+}
+
+/// Highest-priority browser backend, or `None` when no browser path is live.
+pub fn preferred_browser_device() -> Option<Device> {
+    available_browser_devices().into_iter().next()
 }
 
 /// Intersection of [`available_devices`] and [`supports_graph`]. Use with
@@ -270,8 +309,8 @@ pub fn supports(device: Device, op: &Op) -> bool {
 }
 
 /// Per-op support for the QNN (Hexagon NPU) backend — the ops the FFI runtime
-/// (`rlx_qnn::runtime`) lowers to QNN: MatMul, element-wise binary, a few
-/// activations, plus the structural input/param/constant tensors.
+/// (`rlx_qnn::runtime`) lowers to QNN, plus fused forms decomposed at compile
+/// (`FusedAttentionBlock`).
 fn qnn_supports(op: &Op) -> bool {
     use rlx_ir::op::Activation;
     match op {
@@ -289,11 +328,14 @@ fn qnn_supports(op: &Op) -> bool {
         | Op::Narrow { .. }
         | Op::Rope { .. }
         | Op::Attention { .. }
+        | Op::FusedAttentionBlock { .. }
+        | Op::Expand { .. }
         | Op::Reduce { .. }
         | Op::Conv { .. }
         | Op::Gather { .. }
         | Op::Quantize { .. }
-        | Op::Dequantize { .. } => true,
+        | Op::Dequantize { .. }
+        | Op::DequantMatMul { .. } => true,
         Op::Activation(a) => matches!(
             a,
             Activation::Relu
@@ -301,6 +343,7 @@ fn qnn_supports(op: &Op) -> bool {
                 | Activation::Sigmoid
                 | Activation::Tanh
                 | Activation::Neg
+                | Activation::Silu
         ),
         _ => false,
     }
@@ -535,19 +578,27 @@ fn metal_supports(op: &Op) -> bool {
 /// legalize/rewrite pass decomposes into supported primitives (or, once landed,
 /// lower through native MIL backward kernels) — so device selection picks
 /// `Device::Ane` for autodiff-produced backward graphs. See
-/// [`crate::backend::COREML_BACKWARD_OPS`].
+/// [`rlx_coreml::BACKWARD_OPS`].
 fn coreml_supports(op: &Op) -> bool {
-    let kind = op.kind();
-    if crate::backend::COREML_SUPPORTED_OPS.contains(&kind) {
-        return true;
-    }
-    #[cfg(feature = "training")]
-    if crate::backend::COREML_BACKWARD_OPS.contains(&kind)
-        || crate::backend::COREML_NATIVE_BACKWARD_OPS.contains(&kind)
+    #[cfg(feature = "coreml")]
     {
-        return true;
+        let kind = op.kind();
+        if rlx_coreml::SUPPORTED_OPS.contains(&kind) {
+            return true;
+        }
+        #[cfg(feature = "training")]
+        if rlx_coreml::BACKWARD_OPS.contains(&kind)
+            || rlx_coreml::NATIVE_BACKWARD_OPS.contains(&kind)
+        {
+            return true;
+        }
+        false
     }
-    false
+    #[cfg(not(feature = "coreml"))]
+    {
+        let _ = op;
+        false
+    }
 }
 
 #[allow(unused_variables)]

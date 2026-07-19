@@ -24,12 +24,14 @@ pub mod lower_fma;
 pub mod lower_logical_kernels;
 pub mod lower_loss_ops;
 pub mod lower_reduce_axes;
+pub mod lower_spectral;
 pub mod lower_vae_ops;
 pub mod pass;
 pub mod unfuse;
 
 pub use control_flow::{
-    LowerControlFlow, inline_if, inline_subgraph_into, inline_subgraph_into_outputs, unroll_while,
+    LowerControlFlow, LowerScan, inline_if, inline_subgraph_into, inline_subgraph_into_outputs,
+    maybe_unroll_scans, maybe_unroll_scans_budget, unroll_scan, unroll_while,
 };
 pub use fk_fusion::{
     DecomposeFusionRegions, FuseBatchPreprocess, FuseRegionPrologue, MarkBatchSliceRegions,
@@ -40,9 +42,11 @@ pub use fk_graphs::{
     resize_relu_region_graph,
 };
 pub use fusion::{
-    FuseAttentionBlock, FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
+    FuseAdaLayerNorm, FuseAttentionBlock, FuseConvAffineAct, FuseConvBiasAct, FuseGatedResidual,
+    FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
     FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul, FuseTransformerLayer,
     MarkElementwiseRegions, UnfuseElementwiseRegions, clip_elementwise_regions,
+    fusible_conv_activation,
 };
 pub use fusion_fragment::{
     FusionFragment, FusionRole, fusion_fragments, is_registered_transform_op,
@@ -56,6 +60,9 @@ pub use lower_fma::LowerFma;
 pub use lower_logical_kernels::lower_logical_kernels;
 pub use lower_loss_ops::LowerSoftmaxCrossEntropy;
 pub use lower_reduce_axes::LowerNonLastAxisReduce;
+pub use lower_spectral::LowerSpectral;
 pub use lower_vae_ops::{LowerBatchNormInference, LowerGroupNorm, LowerResizeNearest2x};
-pub use pass::{Pass, run_passes};
-pub use unfuse::unfuse_fused_for_autodiff;
+pub use pass::{
+    Pass, register_ir_pass, registered_ir_passes, run_passes, run_registered_ir_passes,
+};
+pub use unfuse::{unfuse_attention_block, unfuse_dit_modulation, unfuse_fused_for_autodiff};

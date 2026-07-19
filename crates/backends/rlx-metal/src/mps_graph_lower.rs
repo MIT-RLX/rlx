@@ -33,7 +33,7 @@
 //! Not yet supported (graph stays on thunks / hybrid):
 //!   Op::Rope, Op::FusedAttentionBlock, avg-pool, most higher-order ops
 
-use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, TransformStep};
+use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, MaskKind, TransformStep};
 use rlx_ir::{DType, Graph, Node, NodeId, Op, RegionPrologue};
 use std::collections::HashMap;
 
@@ -191,6 +191,8 @@ fn eval_elementwise_region_chain(
                     Activation::Neg => mg.neg(&xt),
                     Activation::Abs => mg.abs(&xt),
                     Activation::Relu => mg.relu(&xt),
+                    Activation::Sin => mg.sin(&xt),
+                    Activation::Cos => mg.cos(&xt),
                     _ => {
                         if trace {
                             eprintln!(
@@ -346,7 +348,25 @@ pub fn try_lower_with_constants(
             Op::MatMul => {
                 let a = node_to_tensor.get(&node.inputs[0])?;
                 let b = node_to_tensor.get(&node.inputs[1])?;
-                f16_compute2(&mg, fp16, a, b, |a, b| mg.matmul(a, b))
+                // F16 weight × F32 activation (Zonos Metal): cast B inside
+                // MPSGraph so the arena keeps half-sized params.
+                let b_dt = graph.node(node.inputs[1]).shape.dtype();
+                let a_dt = graph.node(node.inputs[0]).shape.dtype();
+                let b_f32;
+                let b_use = if matches!(b_dt, DType::F16) && matches!(a_dt, DType::F32) {
+                    b_f32 = mg.cast(b, F32_DT);
+                    &b_f32
+                } else {
+                    b
+                };
+                let a_f32;
+                let a_use = if matches!(a_dt, DType::F16) && matches!(b_dt, DType::F32) {
+                    a_f32 = mg.cast(a, F32_DT);
+                    &a_f32
+                } else {
+                    a
+                };
+                f16_compute2(&mg, fp16, a_use, b_use, |a, b| mg.matmul(a, b))
             }
             // ── Conv / pool (NCHW) and their gradients ──
             // MPSGraph has native primitives for all five; lowering them keeps
@@ -543,6 +563,14 @@ pub fn try_lower_with_constants(
                 let x = node_to_tensor.get(&node.inputs[0])?;
                 mg.relu(x)
             }
+            Op::Activation(Activation::Sin) => {
+                let x = node_to_tensor.get(&node.inputs[0])?;
+                mg.sin(x)
+            }
+            Op::Activation(Activation::Cos) => {
+                let x = node_to_tensor.get(&node.inputs[0])?;
+                mg.cos(x)
+            }
             Op::Binary(BinaryOp::Sub) => {
                 let a = node_to_tensor.get(&node.inputs[0])?;
                 let b = node_to_tensor.get(&node.inputs[1])?;
@@ -580,7 +608,7 @@ pub fn try_lower_with_constants(
                     }
                     rlx_ir::op::ReduceOp::Max => mg.reduce_max(x, &pos_axes),
                     rlx_ir::op::ReduceOp::Min => mg.reduce_min(x, &pos_axes),
-                    _ => return None,
+                    rlx_ir::op::ReduceOp::Prod => mg.reduce_product(x, &pos_axes),
                 };
                 // MPSGraph always keeps dims after reduction. If the IR
                 // op asked for them to be squeezed, reshape to the IR-
@@ -693,8 +721,22 @@ pub fn try_lower_with_constants(
                 let x = node_to_tensor.get(&node.inputs[0])?;
                 let g = node_to_tensor.get(&node.inputs[1])?;
                 let b = node_to_tensor.get(&node.inputs[2])?;
-                let rank = node.shape.rank() as i32;
-                let pos_axis = if *axis < 0 { rank + *axis } else { *axis };
+                // Resolve the reduction axis against the ACTUAL MPS rank, not
+                // the IR rank: MPSGraph left-pads lower-rank RLX tensors (an
+                // IR rank-2 `[seq, hidden]` hidden-state can arrive as MPS
+                // `[1, seq, hidden]` after an upstream broadcast). Using the
+                // IR rank made `axis=-1` resolve to MPS axis 1 (seq) instead
+                // of the last (hidden) axis — RmsNorm then reduced over the
+                // wrong dimension and degenerated Bonsai-27B's padded prefill
+                // (cos≈-0.14 at max_seq 96; bit-exact once resolved on MPS
+                // rank). Mirrors the Op::Narrow / Op::FusedSwiGLU fixes.
+                let ir_rank = node.shape.rank() as i32;
+                let mps_rank = x.mps_rank().map(|r| r as i32).unwrap_or(ir_rank);
+                let pos_axis = if *axis < 0 {
+                    mps_rank + *axis
+                } else {
+                    *axis + (mps_rank - ir_rank)
+                };
                 mg.rms_norm(x, g, b, &[pos_axis], *eps)
             }
             Op::FusedResidualLN { has_bias, eps } => {
@@ -719,7 +761,9 @@ pub fn try_lower_with_constants(
                     Some(b) => mg.add(&pre, b),
                     None => pre,
                 };
-                let last = (node.shape.rank() - 1) as i32;
+                // Normalize over the MPS last axis (may be left-padded above
+                // the IR rank — see the Op::RmsNorm note).
+                let last = (pre.mps_rank().unwrap_or(node.shape.rank()) - 1) as i32;
                 mg.layer_norm(&pre, gamma, beta, &[last], *eps)
             }
             Op::FusedResidualRmsNorm { has_bias, eps } => {
@@ -740,7 +784,9 @@ pub fn try_lower_with_constants(
                     Some(b) => mg.add(&pre, b),
                     None => pre,
                 };
-                let last = (node.shape.rank() - 1) as i32;
+                // Normalize over the MPS last axis (may be left-padded above
+                // the IR rank — see the Op::RmsNorm note).
+                let last = (pre.mps_rank().unwrap_or(node.shape.rank()) - 1) as i32;
                 mg.rms_norm(&pre, gamma, beta, &[last], *eps)
             }
             Op::Reshape { .. } => {
@@ -801,7 +847,22 @@ pub fn try_lower_with_constants(
             }
             Op::Narrow { axis, start, len } => {
                 let x = node_to_tensor.get(&node.inputs[0])?;
-                mg.slice(x, *axis as u64, *start as i64, *len as i64)
+                // MPSGraph left-pads lower-rank RLX tensors with leading batch
+                // dims (IR `[12,34]` → MPS `[1,12,34]`). The IR `axis` is
+                // relative to the IR rank, so rebase it by the leading-dim
+                // difference; a no-op when the ranks already match (e.g. 3-D
+                // conv-split narrows). Fixes qwen35 GDN degeneration on Metal
+                // where a 2-D channel-axis narrow landed on the seq axis.
+                let mut ax = *axis as u64;
+                // Use the IR rank (available even for dynamic/symbolic dims,
+                // unlike `shape_dims` which returns None on any non-static dim).
+                let ir_rank = graph.node(node.inputs[0]).shape.rank();
+                if let Some(mr) = x.mps_rank()
+                    && mr > ir_rank
+                {
+                    ax += (mr - ir_rank) as u64;
+                }
+                mg.slice(x, ax, *start as i64, *len as i64)
             }
             Op::FusedSwiGLU {
                 cast_to,
@@ -818,7 +879,11 @@ pub fn try_lower_with_constants(
                 let in_shape = shape_dims(graph, node.inputs[0])?;
                 let rank = in_shape.len();
                 let n = in_shape[rank - 1] / 2;
-                let last = (rank - 1) as u64;
+                // Slice the *MPS* last axis: MPSGraph left-pads lower-rank RLX
+                // tensors with leading batch dims (IR `[12,64]` → MPS
+                // `[1,12,64]`), so an IR-rank-based `last` would land on the
+                // seq axis. Fixes qwen35 full-attn Q+gate split on Metal.
+                let last = x.mps_rank().unwrap_or(rank).saturating_sub(1) as u64;
                 let lo = mg.slice(x, last, 0, n as i64);
                 let hi = mg.slice(x, last, n as i64, n as i64);
                 let (gate, up) = if *gate_first { (lo, hi) } else { (hi, lo) };
@@ -917,57 +982,43 @@ pub fn try_lower_with_constants(
                 score_scale,
                 attn_logit_softcap: _,
             } => {
+                // Apple's MPSGraph optimizer mishandles SDPA when Q/K/V are
+                // slice-views of *computed* tensors (narrow of MatMul/RoPE).
+                // Host-fed / leaf views are fine — bail so hybrid can run
+                // attention as a thunk after materializing boundary buffers.
+                if !attn_qkv_feeds_mps_safe(graph, node) {
+                    if trace {
+                        eprintln!(
+                            "[mpsgraph] bail attention computed-slice Q/K/V: node {}",
+                            node.id
+                        );
+                    }
+                    return None;
+                }
                 let q = node_to_tensor.get(&node.inputs[0])?;
                 let k = node_to_tensor.get(&node.inputs[1])?;
                 let v = node_to_tensor.get(&node.inputs[2])?;
                 let q_shape = shape_dims(graph, node.inputs[0])?;
-                // Direct 4D [B, H, S, D] path → call SDPA (macOS 14.4+).
-                // MAET's attention runs with Q/K/V already permuted to
-                // [B, H, S, D] for autodiff decomposer compatibility.
+                let k_shape = shape_dims(graph, node.inputs[1])?;
+                // Direct 4D [B, H, S, D] or [B, S, H, D] → SDPA (macOS 14.4+).
                 if q_shape.len() == 4 {
-                    // Honor Op::Attention::score_scale (Gemma 4 = 1.0); default
-                    // to the standard 1/sqrt(head_dim) when unset.
                     let scale = score_scale.unwrap_or(1.0 / (*head_dim as f32).sqrt());
-                    // MPSGraph SDPA expects [B, H, S, D]. EEG-DINO and CPU use
-                    // [B, S, H, D] — transpose axes 1↔2 when needed.
-                    let is_bhsd = q_shape[1] == *num_heads;
-                    let seq = if is_bhsd { q_shape[2] } else { q_shape[1] };
-                    let mut zero_bytes = Vec::<u8>::with_capacity((seq * seq) * 4);
-                    for _ in 0..(seq * seq) {
-                        zero_bytes.extend_from_slice(&0f32.to_le_bytes());
-                    }
-                    let mask = mg.constant_from_bytes(&zero_bytes, &[1, 1, seq, seq], F32_DT);
-
-                    if is_bhsd {
-                        match mg.scaled_dot_product_attention(q, k, v, &mask, scale) {
-                            Some(t) => t,
-                            None => {
-                                if trace {
-                                    eprintln!(
-                                        "[mpsgraph] bail attention 4D SDPA unavailable: node {}",
-                                        node.id
-                                    );
-                                }
-                                return None;
-                            }
-                        }
-                    } else {
-                        let q4 = mg.transpose(q, 1, 2);
-                        let k4 = mg.transpose(k, 1, 2);
-                        let v4 = mg.transpose(v, 1, 2);
-                        match mg.scaled_dot_product_attention(&q4, &k4, &v4, &mask, scale) {
-                            Some(t) => mg.transpose(&t, 1, 2),
-                            None => {
-                                if trace {
-                                    eprintln!(
-                                        "[mpsgraph] bail attention 4D SDPA unavailable: node {}",
-                                        node.id
-                                    );
-                                }
-                                return None;
-                            }
-                        }
-                    }
+                    lower_attention_4d(
+                        &mg,
+                        q,
+                        k,
+                        v,
+                        node,
+                        graph,
+                        &node_to_tensor,
+                        *num_heads,
+                        *head_dim,
+                        *mask_kind,
+                        scale,
+                        &q_shape,
+                        &k_shape,
+                        trace,
+                    )?
                 } else {
                     if q_shape.len() != 3 {
                         if trace {
@@ -979,7 +1030,6 @@ pub fn try_lower_with_constants(
                         return None;
                     }
                     let (b, s) = (q_shape[0], q_shape[1]);
-                    let k_shape = shape_dims(graph, node.inputs[1])?;
                     let kv_seq = k_shape[1];
                     let scale = score_scale.unwrap_or(1.0 / (*head_dim as f32).sqrt());
                     match mask_kind {
@@ -990,9 +1040,15 @@ pub fn try_lower_with_constants(
                             if kv_seq == s {
                                 mg.attention_causal(q, k, v, b, s, *num_heads, *head_dim, scale)
                             } else {
-                                mg.attention_unmasked(
-                                    q, k, v, b, s, kv_seq, *num_heads, *head_dim, scale,
-                                )
+                                // Asymmetric causal (decode Lq=1, Lk>1) needs an
+                                // absolute-position mask — use Custom / thunks.
+                                if trace {
+                                    eprintln!(
+                                        "[mpsgraph] bail attention causal Lq!=Lk: node {} Lq={s} Lk={kv_seq}",
+                                        node.id
+                                    );
+                                }
+                                return None;
                             }
                         }
                         rlx_ir::op::MaskKind::Custom => {
@@ -1127,5 +1183,162 @@ fn copy_tensor(t: &MpsTensor) -> MpsTensor {
     MpsTensor {
         obj: t.obj,
         shape: t.shape.clone(),
+    }
+}
+
+/// Leaf Q/K/V (or views of leaves) are safe for whole-graph MPSGraph SDPA.
+/// Slice-views of *computed* tensors trip Apple's optimizer (100% rel err).
+fn attn_tensor_is_leaf_materialized(graph: &Graph, id: NodeId) -> bool {
+    match &graph.node(id).op {
+        Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => true,
+        Op::Reshape { .. } | Op::Transpose { .. } | Op::Cast { .. } | Op::Narrow { .. } => graph
+            .node(id)
+            .inputs
+            .first()
+            .copied()
+            .is_some_and(|i| attn_tensor_is_leaf_materialized(graph, i)),
+        _ => false,
+    }
+}
+
+fn attn_qkv_feeds_mps_safe(graph: &Graph, node: &Node) -> bool {
+    node.inputs
+        .iter()
+        .take(3)
+        .all(|&id| attn_tensor_is_leaf_materialized(graph, id))
+}
+
+fn causal_mask_bytes(seq_q: usize, seq_k: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(seq_q * seq_k * 4);
+    for i in 0..seq_q {
+        for j in 0..seq_k {
+            let v: f32 = if j > i { -1.0e9 } else { 0.0 };
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    bytes
+}
+
+fn zero_mask_bytes(seq_q: usize, seq_k: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(seq_q * seq_k * 4);
+    for _ in 0..(seq_q * seq_k) {
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+    }
+    bytes
+}
+
+/// 4-D attention: honor [`MaskKind`], support Lq≠Lk for Custom/None.
+fn lower_attention_4d(
+    mg: &MpsGraph,
+    q: &MpsTensor,
+    k: &MpsTensor,
+    v: &MpsTensor,
+    node: &Node,
+    graph: &Graph,
+    node_to_tensor: &HashMap<NodeId, MpsTensor>,
+    num_heads: usize,
+    head_dim: usize,
+    mask_kind: MaskKind,
+    scale: f32,
+    q_shape: &[usize],
+    k_shape: &[usize],
+    trace: bool,
+) -> Option<MpsTensor> {
+    let _ = head_dim;
+    // MPSGraph SDPA expects [B, H, S, D]. EEG-DINO / Zonos use [B, S, H, D].
+    let is_bhsd = q_shape[1] == num_heads;
+    let (batch, seq_q) = if is_bhsd {
+        (q_shape[0], q_shape[2])
+    } else {
+        (q_shape[0], q_shape[1])
+    };
+    let seq_k = if is_bhsd { k_shape[2] } else { k_shape[1] };
+
+    let (q4, k4, v4) = if is_bhsd {
+        (copy_tensor(q), copy_tensor(k), copy_tensor(v))
+    } else {
+        (
+            mg.transpose(q, 1, 2),
+            mg.transpose(k, 1, 2),
+            mg.transpose(v, 1, 2),
+        )
+    };
+
+    let mask4 = match mask_kind {
+        MaskKind::None => {
+            let bytes = zero_mask_bytes(seq_q, seq_k);
+            mg.constant_from_bytes(&bytes, &[1, 1, seq_q, seq_k], F32_DT)
+        }
+        MaskKind::Causal => {
+            if seq_q != seq_k {
+                if trace {
+                    eprintln!(
+                        "[mpsgraph] bail attention 4D causal Lq!=Lk: node {} Lq={seq_q} Lk={seq_k}",
+                        node.id
+                    );
+                }
+                return None;
+            }
+            let bytes = causal_mask_bytes(seq_q, seq_k);
+            mg.constant_from_bytes(&bytes, &[1, 1, seq_q, seq_k], F32_DT)
+        }
+        MaskKind::Custom => {
+            // Keep-mask `[B, Sk]` → additive `[B, 1, 1, Sk]` via (m-1)·1e9.
+            let mask = node_to_tensor.get(&node.inputs[3])?;
+            let mask_shape = shape_dims(graph, node.inputs[3])?;
+            if mask_shape.len() != 2 || mask_shape[0] != batch || mask_shape[1] != seq_k {
+                if trace {
+                    eprintln!(
+                        "[mpsgraph] bail attention 4D custom mask shape: node {} mask={:?} want [{batch}, {seq_k}]",
+                        node.id, mask_shape
+                    );
+                }
+                return None;
+            }
+            let mask_bc = mg.reshape(mask, &[batch, 1, 1, seq_k]);
+            let neg_one = mg.constant_scalar(-1.0);
+            let large = mg.constant_scalar(1.0e9);
+            let mask_minus = mg.add(&mask_bc, &neg_one);
+            mg.mul(&mask_minus, &large)
+        }
+        other => {
+            if trace {
+                eprintln!(
+                    "[mpsgraph] bail attention 4D mask_kind: node {} kind {:?}",
+                    node.id, other
+                );
+            }
+            return None;
+        }
+    };
+
+    // DEFAULT: numerically-exact hand-rolled SDPA (scores → scale → +mask →
+    // softmax → @V), which matches the CPU `Op::Attention` thunk on every
+    // shape. Apple's MPSGraph `scaledDotProductAttention` uses a fast-softmax
+    // accumulation that DIVERGES for strided / RoPE'd / aliased q/k/v — cos
+    // ~0.98 on EEG-DINO / MantisV2 / CBraMod — and it returns a (wrong) result
+    // rather than an error, so the old `match … { Some => use it }` silently
+    // accepted the divergence. Opt back into MPS SDPA (faster where it's known
+    // safe) via `RLX_METAL_MPS_SDPA=1`.
+    let use_mps = std::env::var("RLX_METAL_MPS_SDPA").as_deref() == Ok("1");
+    let out4 = if use_mps {
+        mg.scaled_dot_product_attention(&q4, &k4, &v4, &mask4, scale)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        let k4_t = mg.transpose(&k4, 2, 3);
+        let scores = mg.matmul(&q4, &k4_t);
+        let scale_t = mg.constant_scalar(scale);
+        let scores = mg.mul(&scores, &scale_t);
+        let scores = mg.add(&scores, &mask4);
+        let weights = mg.softmax(&scores, 3);
+        mg.matmul(&weights, &v4)
+    });
+
+    if is_bhsd {
+        Some(out4)
+    } else {
+        Some(mg.transpose(&out4, 1, 2))
     }
 }

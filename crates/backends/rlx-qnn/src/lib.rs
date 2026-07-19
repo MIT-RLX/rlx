@@ -71,16 +71,16 @@
 //!   `Session::new(Device::Hexagon)` with static weights and executed in-process
 //!   on the CPU reference backend (`libQnnCpu.so`) — 17/17 FFI ops validated
 //!   bit-exact in Docker.
-//! * **Codegen / export (default) — milestone 1.** [`model::Layer::MatMul`] →
-//!   one rank-2 `MatMul` node (`in0[M,K]`, `in1[K,N]` → `out[M,N]`, f32),
-//!   emitted as `qnn_model.cpp`, compiled by `qnn-model-lib-generator` against
-//!   the real QNN headers and run on `libQnnCpu.so` via `qnn-net-run` with numpy
-//!   parity (atol/rtol 1e-3). The graph-construction reference + numerical
-//!   oracle that feeds the context-binary perf path.
-//! * **Remaining.** Quantized *matmul* deployment (per-channel/block scales,
-//!   int4, static quantized weights — builds on the int8 foundation above), then
-//!   the HTP/on-device + context-binary perf path (`libQnnHtp.so`, the one step
-//!   that needs Snapdragon silicon, where the perf — the north star — lives).
+//! * **Codegen / export (default).** [`model::Layer::MatMul`],
+//!   [`model::Layer::Linear`], [`model::Layer::LinearRelu`],
+//!   [`model::Layer::MatMulSoftmax`], [`model::Model::mlp2`], and
+//!   [`model::Layer::LinearStatic`] (STATIC weight/bias) with runtime
+//!   `APP_WRITE` activations, emitted as `qnn_model.cpp`, compiled by
+//!   `qnn-model-lib-generator` against the real QNN headers and run on
+//!   `libQnnCpu.so` via `qnn-net-run` with numpy parity (atol/rtol 1e-3).
+//!   Feeds the context-binary perf path (FFI save/load + offline
+//!   `run_qnn_context.sh` → `qnn-context-binary-generator`).
+//! * **Remaining.** HTP/on-device (`libQnnHtp.so` — needs Snapdragon silicon).
 //!
 //! Both paths are reproducible in Docker via `crates/rlx-qnn/docker/`; the FFI
 //! runtime design + milestones live in `docs/ffi-runtime-backend.md`.
@@ -102,11 +102,21 @@ pub mod codegen;
 pub mod cpp;
 pub mod model;
 pub mod reference;
+pub mod supported_ops;
 
 /// In-process FFI runtime backend (the `Device::Hexagon` path). Off by
 /// default; needs `QNN_SDK_ROOT` at build time. See [`runtime`].
 #[cfg(feature = "runtime")]
 pub mod runtime;
 
+/// Host GGUF dequant helpers used by the FFI runtime's `DequantMatMul` path.
+#[cfg(feature = "runtime")]
+pub mod dequant;
+
+/// Host INT8 `QMatMul` (no f32 weight bake) used by the FFI runtime.
+#[cfg(feature = "runtime")]
+pub mod qmatmul;
+
 pub use codegen::{Artifact, collect_artifacts, emit_model};
 pub use model::{Layer, Model};
+pub use supported_ops::SUPPORTED_OPS;

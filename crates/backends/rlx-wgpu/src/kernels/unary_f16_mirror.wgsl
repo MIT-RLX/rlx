@@ -42,7 +42,7 @@ fn unary_f16_mirror(@builtin(global_invocation_id) gid: vec3<u32>,
     switch (params.op) {
         case 0u:  { y = max(x, 0.0); }
         case 1u:  { y = 1.0 / (1.0 + exp(-x)); }
-        case 2u:  { y = tanh(x); }
+        case 2u:  { y = tanh(clamp(x, -15.0, 15.0)); } // clamp: tanh NaNs on large |x|
         case 3u:  { y = exp(x); }
         case 4u:  { y = log(x); }
         case 5u:  { y = sqrt(x); }

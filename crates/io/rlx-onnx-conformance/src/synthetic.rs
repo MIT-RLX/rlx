@@ -40,6 +40,20 @@ pub fn random_uniform_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rng_uniform.onnx")
 }
 
+/// ONNX fixture exercising the Microsoft contrib fused ops used by
+/// transformers.js / ORT LM exporters (ChatterBox, Phi, Qwen, Llama):
+/// `GroupQueryAttention` (packed QKV + RoPE), `SkipSimplifiedLayerNormalization`,
+/// `SimplifiedLayerNormalization`, and `ArgMax`.
+pub fn gqa_layernorm_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gqa_layernorm.onnx")
+}
+
+/// Minimal FLUX/F5-style adaLN ONNX: affine-free `LayerNormalization` +
+/// `Expand` + `Mul`/`Add` modulation (`n·(1+scale)+shift`).
+pub fn dit_adaln_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dit_adaln.onnx")
+}
+
 /// Build HIR from an ONNX file using generic strict import (no quant-bundle rewrites).
 pub fn import_onnx_strict(path: &Path) -> Result<rlx_ir::hir::HirModule> {
     let opts = ImportOptions {

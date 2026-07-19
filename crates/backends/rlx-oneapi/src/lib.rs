@@ -44,17 +44,29 @@ pub mod device;
 pub mod host;
 pub mod kernels;
 pub mod level_zero;
+pub mod spd;
 
-/// True if a Level Zero GPU device is reachable on this system. The runtime
-/// registry only registers `Device::OneApi` when this returns `true`, so hosts
-/// with no oneAPI runtime (macOS, CI) fall through cleanly.
+/// True when this build can serve `Device::OneApi`.
+///
+/// Always `true` once the crate is linked: the Level Zero native path is used
+/// only when a live GPU **and** embedded SPIR-V kernels exist; otherwise every
+/// op runs through the bit-exact `rlx-cpu` reference (`run_host`). That keeps
+/// `RLX_DEVICE=oneapi` / `--alldev` working on hosts with only `libze_loader`
+/// (no `ze_intel_gpu` plugin) — commodity Linux boxes, macOS CI, etc.
 pub fn is_available() -> bool {
-    device::oneapi_device().is_some()
+    true
 }
 
 /// Human-readable name of the selected Intel device, if any.
 pub fn device_name() -> Option<String> {
     device::oneapi_device().map(|d| d.name.clone())
+}
+
+/// Whether a Level Zero GPU was opened (native path eligible once kernels are
+/// embedded). Distinct from [`is_available`] — the backend stays selectable
+/// without hardware for the CPU-reference path.
+pub fn has_level_zero_device() -> bool {
+    device::oneapi_device().is_some()
 }
 
 /// Whether native SPIR-V kernels were embedded for this build (Intel oneAPI

@@ -253,6 +253,63 @@ fn layer_norm() {
 }
 
 #[test]
+fn dit_packed_ada_layer_norm_backward() {
+    use rlx_ir::op::AdaNormKind;
+    let (b, s, d) = (2usize, 4usize, 8usize);
+    let build = || {
+        let mut g = Graph::new("ada_bwd");
+        let x = g.input("x", f(&[b, s, d]));
+        let scale = g.input("scale", f(&[b, 1, d]));
+        let shift = g.input("shift", f(&[b, 1, d]));
+        let dy = g.input("dy", f(&[b, s, d]));
+        let o = g.ada_layer_norm_backward(x, scale, shift, dy, AdaNormKind::LayerNorm, 1e-5);
+        g.set_outputs(vec![o]);
+        g
+    };
+    let nx = b * s * d;
+    let ns = b * d;
+    parity(
+        "dit_ada_layer_norm_backward",
+        build,
+        &[
+            ("x", &data(nx, 21)),
+            ("scale", &data(ns, 22)),
+            ("shift", &data(ns, 23)),
+            ("dy", &data(nx, 24)),
+        ],
+        2e-3,
+    );
+}
+
+#[test]
+fn dit_packed_gated_residual_backward() {
+    let (b, s, d) = (2usize, 4usize, 8usize);
+    let build = || {
+        let mut g = Graph::new("gate_bwd");
+        let x = g.input("x", f(&[b, s, d]));
+        let y = g.input("y", f(&[b, s, d]));
+        let gate = g.input("gate", f(&[b, 1, d]));
+        let dy = g.input("dy", f(&[b, s, d]));
+        let o = g.gated_residual_backward(x, y, gate, dy);
+        g.set_outputs(vec![o]);
+        g
+    };
+    let nx = b * s * d;
+    let ng = b * d;
+    parity(
+        "dit_gated_residual_backward",
+        build,
+        &[
+            ("x", &data(nx, 31)),
+            ("y", &data(nx, 32)),
+            ("gate", &data(ng, 33)),
+            ("dy", &data(nx, 34)),
+        ],
+        1e-4,
+    );
+}
+
+#[test]
 fn narrow_axis1() {
     let build = || {
         let mut g = Graph::new("nar");

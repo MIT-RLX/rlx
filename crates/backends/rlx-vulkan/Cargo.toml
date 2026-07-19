@@ -19,19 +19,29 @@ default = []
 validation = []
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.12" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.12", default-features = false, features = ["compile"] }
-rlx-compile = { path = "../../core/rlx-compile", version = "0.2.12" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13", default-features = false, features = ["compile", "training"] }
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.13" }
 # CPU reference kernels for the host-fallback path (sequential / specialized
 # ops with no native SPIR-V kernel yet: RNN family, Mamba2, GatedDeltaNet,
-# ConvTranspose2d, FFT, GGUF dequant). The host-visible arena lets the CPU
-# read/write it directly, so the fallback is a plain in-place compute — no
-# staging. `default-features = false` drops rlx-cpu's `blas` link requirement
-# (OpenBLAS on Linux) so the standalone Linux/Docker build needs no BLAS; when
-# built alongside rlx-runtime (which enables `cpu`→`blas`), Cargo's additive
-# feature unification restores the platform BLAS, so host-fallback numerics
-# match the CPU reference exactly.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.12", default-features = false }
+# ConvTranspose2d, FFT, GGUF dequant, and the Riemannian / SPD-manifold ops —
+# BiMap / ReEig / LogEig / SpdBatchNorm / SpdKarcherMean + backwards). The
+# host-visible arena lets the CPU read/write it directly, so the fallback is a
+# plain in-place compute — no staging.
+#
+# `blas` is enabled so the SPD ops' eigendecompositions (LAPACK `dsyevd`, via
+# `rlx_cpu::spd`) resolve: on macOS this links the always-present Accelerate
+# framework, and on Linux/Windows CI it uses OpenBLAS/MKL when present. It does
+# NOT force an OpenBLAS link on a standalone aarch64-Linux/Docker build with no
+# OpenBLAS — rlx-cpu's build.rs leaves the BLAS link (and `rlx_cpu_blas` cfg)
+# off there and falls back to SIMD, so the driverless build still needs no
+# BLAS; only the eigen SPD ops (BiMap, which is pure GEMM, still works) are
+# unavailable in that narrow case. `default-features = false` keeps the other
+# defaults (e.g. `splat`) off.
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.13", default-features = false, features = [
+    "blas",
+] }
+rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.13" }
 
 # Raw Vulkan. `loaded` = libloading-based dynamic load of the system
 # Vulkan loader at runtime via `Entry::load()`; no link-time dependency on

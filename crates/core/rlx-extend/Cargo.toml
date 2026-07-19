@@ -1,0 +1,17 @@
+[package]
+name = "rlx-extend"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "RLX extension surface — one prelude for extending rlx from downstream crates (custom ops, LayerStage blocks, flow DSL)"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[dependencies]
+rlx-ir = { path = "../rlx-ir", version = "0.2.13" }
+rlx-flow = { path = "../rlx-flow", version = "0.2.13" }

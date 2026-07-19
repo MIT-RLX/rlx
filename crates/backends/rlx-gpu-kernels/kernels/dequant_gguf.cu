@@ -63,8 +63,12 @@ static __device__ __forceinline__ unsigned int lut_u16(const unsigned char* lut,
 
 extern "C" __global__ void dequant_gguf(
     float* arena,
-    unsigned int w_byte_off,
-    unsigned int dst_f32_off,
+    // 64-bit arena offsets: a packed 27B (Bonsai Q1_0) arena exceeds 4 GB, so
+    // a `unsigned int` byte offset overflows and the kernel reads/writes the
+    // wrong slot (garbage logits). Matches the vulkan/wgpu >4 GiB u32-offset
+    // fix. Host passes these as u64 (see gguf_gpu.rs).
+    unsigned long long w_byte_off,
+    unsigned long long dst_f32_off,
     unsigned int scheme_id,
     unsigned int num_blocks,
     const unsigned char* iq_lut
@@ -77,7 +81,8 @@ extern "C" __global__ void dequant_gguf(
     // ── 256-elem block schemes ──
     if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u
         && scheme_id != 19u && scheme_id != 20u
-        && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u) {
+        && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u
+        && scheme_id != 24u) {
         float* dst = arena + dst_f32_off + gid * 256u;
 
         if (scheme_id == 3u) {
@@ -562,6 +567,21 @@ extern "C" __global__ void dequant_gguf(
         float* dst = arena + dst_f32_off + gid * 32u;
         for (unsigned int j = 0u; j < 32u; ++j) {
             dst[j] = d * (float)(signed char)qs[j];
+        }
+        return;
+    }
+
+    if (scheme_id == 24u) {
+        // Q1_0 (prism-ml Bonsai-27B): f16 d | 16 sign bytes (18 bytes / 128 elems).
+        // Bit LSB-first within each byte; 1 -> +d, 0 -> -d.
+        unsigned int off = gid * 18u;
+        float d = dq_read_f16(w_base, off);
+        float neg_d = -d;
+        const unsigned char* qs = w_base + off + 2u;
+        float* dst = arena + dst_f32_off + gid * 128u;
+        for (unsigned int j = 0u; j < 128u; ++j) {
+            unsigned int bit = (qs[j >> 3u] >> (j & 7u)) & 1u;
+            dst[j] = bit ? d : neg_d;
         }
         return;
     }

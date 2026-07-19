@@ -6,7 +6,6 @@
 // walking the sequence sequentially while channels/batches run in parallel.
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 const uint MAX_N = 256u;
 
@@ -36,15 +35,15 @@ void main() {
     for (uint si = 0u; si < pc.ss; si++) {
         uint bsh = (bi * pc.ss + si) * pc.hh + ci;
         uint bsn = (bi * pc.ss + si) * pc.nn;
-        float d = data[pc.delta_off + bsh];
-        float xv = data[pc.x_off + bsh];
+        float d = arena_load(pc.delta_off + bsh);
+        float xv = arena_load(pc.x_off + bsh);
         float acc = 0.0;
         for (uint n = 0u; n < pc.nn; n++) {
-            float da = exp(d * data[pc.a_off + ci * pc.nn + n]);
-            float sv = da * state[n] + d * data[pc.b_off + bsn + n] * xv;
+            float da = exp(d * arena_load(pc.a_off + ci * pc.nn + n));
+            float sv = da * state[n] + d * arena_load(pc.b_off + bsn + n) * xv;
             state[n] = sv;
-            acc += data[pc.c_off + bsn + n] * sv;
+            acc += arena_load(pc.c_off + bsn + n) * sv;
         }
-        data[pc.out_off + bsh] = acc;
+        arena_store(pc.out_off + bsh, acc);
     }
 }

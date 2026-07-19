@@ -61,9 +61,19 @@ fn required_features_for(adapter: &wgpu::Adapter) -> wgpu::Features {
 }
 
 fn make_instance(backends: wgpu::Backends) -> wgpu::Instance {
+    // Release defaults set `VALIDATION_INDIRECT_CALL`, which clamps
+    // `max_buffer_size` to `u32::MAX` (~4 GiB). That forces F5-scale arenas
+    // onto sharded stripes. Opt into native Metal-sized buffers with
+    // `RLX_WGPU_LARGE_BUFFERS=1` (or `WGPU_VALIDATION_INDIRECT_CALL=0`).
+    // Oversized unsharded arenas still stage via the dedicated scratch tail
+    // (not bind-window end) so live params are not clobbered.
+    let mut flags = wgpu::InstanceFlags::default().with_env();
+    if rlx_ir::env::flag("RLX_WGPU_LARGE_BUFFERS") {
+        flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+    }
     wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
-        flags: wgpu::InstanceFlags::default(),
+        flags,
         backend_options: wgpu::BackendOptions::default(),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         display: None,
@@ -99,7 +109,26 @@ impl WgpuDevice {
         let adapter = pollster::block_on(instance.request_adapter(&ADAPTER_OPTIONS)).ok()?;
 
         let info = adapter.get_info();
-        let limits = adapter.limits();
+        let mut limits = adapter.limits();
+        // When large buffers are enabled, keep storage *bindings* ≤ ~4 GiB so
+        // ops window into the single physical buffer (whole-buffer binds of
+        // >4 GiB returned all-zero F5 DiT outputs on wgpu-Metal).
+        if rlx_ir::env::flag("RLX_WGPU_LARGE_BUFFERS") {
+            const BIND_CAP: u64 = (4u64 << 30) - 256;
+            if limits.max_buffer_size > BIND_CAP {
+                limits.max_storage_buffer_binding_size =
+                    limits.max_storage_buffer_binding_size.min(BIND_CAP);
+                limits.max_uniform_buffer_binding_size =
+                    limits.max_uniform_buffer_binding_size.min(BIND_CAP);
+            }
+        }
+        if rlx_ir::env::flag("RLX_WGPU_PRINT_LIMITS") {
+            eprintln!(
+                "[rlx-wgpu] adapter limits: max_buffer_size={:.3}GiB max_storage_binding={:.3}GiB",
+                limits.max_buffer_size as f64 / ((1u64 << 30) as f64),
+                limits.max_storage_buffer_binding_size as f64 / ((1u64 << 30) as f64),
+            );
+        }
         let required_features = required_features_for(&adapter);
 
         let (device, queue) = match pollster::block_on(
@@ -111,6 +140,14 @@ impl WgpuDevice {
                 return None;
             }
         };
+        if rlx_ir::env::flag("RLX_WGPU_PRINT_LIMITS") {
+            let dl = device.limits();
+            eprintln!(
+                "[rlx-wgpu] device limits: max_buffer_size={:.3}GiB max_storage_binding={:.3}GiB",
+                dl.max_buffer_size as f64 / ((1u64 << 30) as f64),
+                dl.max_storage_buffer_binding_size as f64 / ((1u64 << 30) as f64),
+            );
+        }
 
         Some(Self {
             instance,

@@ -85,6 +85,85 @@ pub fn cuda_blas_lt_handle() -> Option<cublaslt_sys::cublasLtHandle_t> {
         .map(|h| h as cublaslt_sys::cublasLtHandle_t)
 }
 
+/// Best-effort preload of a real libcudnn so cudarc's soname-based loader binds
+/// to it even when cuDNN is present only via a pip/conda wheel
+/// (`nvidia-cudnn-cuXX`) or PyTorch, rather than on the system loader path — a
+/// very common setup. The pip cuDNN carries `RPATH=$ORIGIN`, so `dlopen`-ing
+/// `libcudnn.so.9` by its full path auto-resolves the sub-libs
+/// (`libcudnn_cnn`, `_ops`, …) and `cublas` from the sibling wheel dirs; no
+/// `LD_LIBRARY_PATH` juggling required. Without this, cudarc dlopens the bare
+/// soname, misses the wheel, and every convolution falls to the ~10× slower
+/// im2col path. Search order: `RLX_CUDNN_DIR` (explicit override) →
+/// `$CONDA_PREFIX`/`$VIRTUAL_ENV` (`lib/` + pip `site-packages/nvidia/cudnn/lib`)
+/// → `$LD_LIBRARY_PATH`. No-op when none is found (cudarc then reports cuDNN
+/// unavailable and we keep the graceful im2col fallback), or when a system
+/// cuDNN is already on the path (this only *adds* a discovery route).
+#[cfg(unix)]
+fn preload_real_cudnn() {
+    use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+    use std::path::PathBuf;
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(d) = std::env::var("RLX_CUDNN_DIR") {
+        dirs.push(PathBuf::from(d));
+    }
+    for var in ["CONDA_PREFIX", "VIRTUAL_ENV"] {
+        if let Ok(p) = std::env::var(var) {
+            let lib = PathBuf::from(&p).join("lib");
+            // pip installs land in <prefix>/lib/pythonX.Y/site-packages/nvidia/cudnn/lib
+            if let Ok(rd) = std::fs::read_dir(&lib) {
+                for e in rd.flatten() {
+                    dirs.push(e.path().join("site-packages/nvidia/cudnn/lib"));
+                }
+            }
+            dirs.push(lib);
+        }
+    }
+    // Failsafe discovery when cuDNN is only under $HOME (pip --user wheels,
+    // or a manual unpack like ~/cudnn13/nvidia/cudnn/lib) — without this,
+    // every conv silently falls to the ~10× slower im2col path.
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        if let Ok(rd) = std::fs::read_dir(home.join(".local/lib")) {
+            for e in rd.flatten() {
+                dirs.push(e.path().join("site-packages/nvidia/cudnn/lib"));
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(&home) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let n = name.to_string_lossy();
+                if n.starts_with("cudnn") {
+                    dirs.push(e.path().join("nvidia/cudnn/lib"));
+                    dirs.push(e.path().join("lib"));
+                }
+            }
+        }
+    }
+    if let Ok(lp) = std::env::var("LD_LIBRARY_PATH") {
+        dirs.extend(lp.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+    }
+
+    for dir in &dirs {
+        for name in ["libcudnn.so.9", "libcudnn.so.8", "libcudnn.so"] {
+            let full = dir.join(name);
+            if full.is_file() {
+                // SAFETY: dlopen of a discovered cuDNN; leaked so it stays resident
+                // for cudarc's subsequent soname load to bind against.
+                unsafe {
+                    if let Ok(lib) = Library::open(Some(&full), RTLD_NOW | RTLD_GLOBAL) {
+                        std::mem::forget(lib);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn preload_real_cudnn() {}
+
 /// cuDNN handle bound to the default stream. Same usize-cast trick as
 /// cuda_blas_lt_handle for `OnceLock` compatibility. Returns `None` if
 /// libcudnn isn't loadable or handle creation fails (graceful fallback
@@ -98,6 +177,7 @@ pub fn cuda_dnn_handle() -> Option<cudnn_sys::cudnnHandle_t> {
     DNN_HANDLE
         .get_or_init(|| {
             let ctx = cuda_context()?;
+            preload_real_cudnn();
             let prev = std::panic::take_hook();
             std::panic::set_hook(Box::new(|_| {}));
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -119,7 +199,14 @@ pub fn cuda_dnn_handle() -> Option<cudnn_sys::cudnnHandle_t> {
 }
 
 pub const CUBLASLT_WORKSPACE_BYTES: usize = 4 * 1024 * 1024;
-pub const CUDNN_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
+// cuDNN conv scratch, shared once per process. Works with the
+// fastest-algo-that-fits selection in `backend.rs` (`pick_conv_*_algo`): that
+// alone stops the old im2col cliff (IMPLICIT_GEMM needs ~0 workspace, so a
+// fitting algo always exists). This larger 256 MiB budget (was 32 MiB — too
+// small for the fastest algo at batch ≥ 512) additionally lets a *faster* algo
+// (Winograd/FFT/GEMM) fit at large batch instead of a slower low-workspace one.
+// Still negligible against modern GPU VRAM.
+pub const CUDNN_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
 
 static BLAS_LT_WORKSPACE: OnceLock<Option<Arc<Mutex<CudaSlice<u8>>>>> = OnceLock::new();
 static DNN_WORKSPACE: OnceLock<Option<Arc<Mutex<CudaSlice<u8>>>>> = OnceLock::new();

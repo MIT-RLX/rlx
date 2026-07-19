@@ -1,3 +1,4 @@
 [submodule "rlx-mlx-sys/vendor/mlx"]
 	path = crates/backends/rlx-mlx-sys/vendor/mlx
 	url = https://github.com/ml-explore/mlx.git
+	shallow = true

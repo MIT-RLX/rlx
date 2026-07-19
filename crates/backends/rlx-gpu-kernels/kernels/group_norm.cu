@@ -42,34 +42,48 @@ extern "C" __global__ void group_norm(
     unsigned int count = cpg * plane;
 
     unsigned int tid = threadIdx.x;
+    __shared__ float partial[GN_BLOCK];
+
+    // ── Pass 1: mean ──
     float local_sum = 0.0f;
-    float local_sumsq = 0.0f;
     for (unsigned int i = tid; i < count; i += GN_BLOCK) {
         unsigned int c_off = i / plane;
         unsigned int s = i % plane;
         unsigned int ch = c0 + c_off;
-        float v = arena[src_off + ((bn * c + ch) * plane) + s];
-        local_sum += v;
-        local_sumsq += v * v;
+        local_sum += arena[src_off + ((bn * c + ch) * plane) + s];
     }
-
-    __shared__ float partial_sum[GN_BLOCK];
-    __shared__ float partial_sumsq[GN_BLOCK];
-    partial_sum[tid] = local_sum;
-    partial_sumsq[tid] = local_sumsq;
+    partial[tid] = local_sum;
     __syncthreads();
     for (unsigned int stride = GN_BLOCK / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partial_sum[tid] += partial_sum[tid + stride];
-            partial_sumsq[tid] += partial_sumsq[tid + stride];
-        }
+        if (tid < stride) partial[tid] += partial[tid + stride];
         __syncthreads();
     }
+    float mean = partial[0] / (float)count;
+    __syncthreads();
 
-    float mean = partial_sum[0] / (float)count;
-    float var = partial_sumsq[0] / (float)count - mean * mean;
+    // ── Pass 2: variance about the mean. TWO-PASS mean((x-mean)^2) — NOT the
+    // one-pass E[x^2]-E[x]^2, which catastrophically cancels in f32 when the
+    // group has a DC offset (E[x^2] ~ mean^2), corrupting the normalization.
+    // For deep generative nets (e.g. bfm2's SplitUNet) that error compounds
+    // per-block; the stable form matches CPU/other GPU backends. Same fix as
+    // the wgpu two-pass LayerNorm.
+    float local_var = 0.0f;
+    for (unsigned int i = tid; i < count; i += GN_BLOCK) {
+        unsigned int c_off = i / plane;
+        unsigned int s = i % plane;
+        unsigned int ch = c0 + c_off;
+        float d = arena[src_off + ((bn * c + ch) * plane) + s] - mean;
+        local_var += d * d;
+    }
+    partial[tid] = local_var;
+    __syncthreads();
+    for (unsigned int stride = GN_BLOCK / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    float var = partial[0] / (float)count;
     float eps = __int_as_float((int)eps_bits);
-    float inv = rsqrtf(var + eps);
+    float inv = 1.0f / sqrtf(var + eps);
 
     for (unsigned int i = tid; i < count; i += GN_BLOCK) {
         unsigned int c_off = i / plane;

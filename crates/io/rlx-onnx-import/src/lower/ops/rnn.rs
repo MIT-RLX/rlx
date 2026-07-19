@@ -86,6 +86,227 @@ fn fold_bias(src: Option<&[f32]>, dirs: usize, hidden: usize) -> Vec<f32> {
     out
 }
 
+/// rlx GRU gate order is `[r, z, n]`; ONNX packs `[z, r, h]`, so rlx gate `g`
+/// reads ONNX gate `GATE_SRC_GRU[g]`.
+const GATE_SRC_GRU: [usize; 3] = [1, 0, 2];
+
+/// Reorder the `3·hidden` gate rows of a `[num_dir, 3h, cols]` weight from ONNX
+/// `[z,r,h]` to rlx `[r,z,n]`.
+fn reorder_gru_rows(src: &[f32], dirs: usize, hidden: usize, cols: usize) -> Vec<f32> {
+    let three_h = 3 * hidden;
+    let mut out = vec![0.0f32; dirs * three_h * cols];
+    for d in 0..dirs {
+        for g in 0..3 {
+            let sg = GATE_SRC_GRU[g];
+            for row in 0..hidden {
+                let dst = (d * three_h + g * hidden + row) * cols;
+                let src_off = (d * three_h + sg * hidden + row) * cols;
+                out[dst..dst + cols].copy_from_slice(&src[src_off..src_off + cols]);
+            }
+        }
+    }
+    out
+}
+
+/// Split the ONNX GRU bias `[num_dir, 6h] = [Wb(3h) | Rb(3h)]` into separate
+/// `b_ih`/`b_hh` `[num_dir·3h]`, each reordered to rlx `[r,z,n]`. GRU cannot
+/// merge the two because the reset gate multiplies the hidden term *after* its
+/// own bias.
+fn split_gru_bias(b: Option<&[f32]>, dirs: usize, hidden: usize) -> (Vec<f32>, Vec<f32>) {
+    let three_h = 3 * hidden;
+    let six_h = 6 * hidden;
+    let mut b_ih = vec![0.0f32; dirs * three_h];
+    let mut b_hh = vec![0.0f32; dirs * three_h];
+    if let Some(b) = b {
+        for d in 0..dirs {
+            for g in 0..3 {
+                let sg = GATE_SRC_GRU[g];
+                for row in 0..hidden {
+                    b_ih[d * three_h + g * hidden + row] = b[d * six_h + sg * hidden + row];
+                    b_hh[d * three_h + g * hidden + row] =
+                        b[d * six_h + three_h + sg * hidden + row];
+                }
+            }
+        }
+    }
+    (b_ih, b_hh)
+}
+
+pub(super) fn lower_gru(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+) -> Result<bool> {
+    let direction = node
+        .attrs
+        .get("direction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("forward");
+    if direction == "reverse" {
+        ctx.unsupported("GRU(reverse)");
+        return Ok(false);
+    }
+    let bidirectional = direction == "bidirectional";
+    let dirs = if bidirectional { 2 } else { 1 };
+
+    let w_name = node.inputs.get(1).map(String::as_str).unwrap_or("");
+    let r_name = node.inputs.get(2).map(String::as_str).unwrap_or("");
+    let (Some(w_shape), Some(w_data)) = (
+        ctx.init_shapes.get(w_name).cloned(),
+        ctx.params.get(w_name).cloned(),
+    ) else {
+        ctx.unsupported("GRU(dynamic W)");
+        return Ok(false);
+    };
+    let (Some(r_shape), Some(r_data)) = (
+        ctx.init_shapes.get(r_name).cloned(),
+        ctx.params.get(r_name).cloned(),
+    ) else {
+        ctx.unsupported("GRU(dynamic R)");
+        return Ok(false);
+    };
+    if w_shape.len() != 3 || r_shape.len() != 3 {
+        ctx.unsupported("GRU(weight rank)");
+        return Ok(false);
+    }
+    let input_size = w_shape[2];
+    let hidden = node
+        .attrs
+        .get("hidden_size")
+        .and_then(|v| v.as_i64())
+        .map(|h| h as usize)
+        .unwrap_or(r_shape[2]);
+    let three_h = 3 * hidden;
+    if w_shape[1] != three_h || r_shape[1] != three_h || r_shape[2] != hidden {
+        ctx.unsupported("GRU(shape mismatch)");
+        return Ok(false);
+    }
+
+    let wih = reorder_gru_rows(&w_data, dirs, hidden, input_size);
+    let whh = reorder_gru_rows(&r_data, dirs, hidden, hidden);
+    let b_data = node
+        .inputs
+        .get(3)
+        .filter(|n| !n.is_empty())
+        .and_then(|n| ctx.params.get(n).cloned());
+    let (b_ih, b_hh) = split_gru_bias(b_data.as_deref(), dirs, hidden);
+
+    let wih_id = insert_param(
+        m,
+        ctx,
+        &format!("__gru_wih__/{}", node.name),
+        wih,
+        &[dirs * three_h, input_size],
+    );
+    let whh_id = insert_param(
+        m,
+        ctx,
+        &format!("__gru_whh__/{}", node.name),
+        whh,
+        &[dirs * three_h, hidden],
+    );
+    let bih_id = insert_param(
+        m,
+        ctx,
+        &format!("__gru_bih__/{}", node.name),
+        b_ih,
+        &[dirs * three_h],
+    );
+    let bhh_id = insert_param(
+        m,
+        ctx,
+        &format!("__gru_bhh__/{}", node.name),
+        b_hh,
+        &[dirs * three_h],
+    );
+
+    // X: ONNX [seq, batch, input] (layout 0) → native [batch, seq, input].
+    let layout = node
+        .attrs
+        .get("layout")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let x = ctx.tensor(&node.inputs[0])?;
+    let x_bsi = if layout == 1 {
+        x
+    } else {
+        let xs = m.shape(x).clone();
+        let out = permuted_shape(&xs, &[1, 0, 2]);
+        m.add_node(
+            Op::Transpose {
+                perm: vec![1, 0, 2],
+            },
+            vec![x],
+            out,
+        )
+    };
+    let xs = m.shape(x_bsi).clone();
+    let batch = xs.dim(0).unwrap_static().max(1);
+    let seq = xs.dim(1).unwrap_static().max(1);
+
+    let y_bshd = m.add_node(
+        Op::Gru {
+            hidden_size: hidden,
+            num_layers: 1,
+            bidirectional,
+            carry: false,
+        },
+        vec![x_bsi, wih_id, whh_id, bih_id, bhh_id],
+        Shape::new(&[batch, seq, dirs * hidden], DType::F32),
+    );
+
+    // Y (output 0): native [batch, seq, D·hidden] → ONNX [seq, num_dir, batch, hidden].
+    if let Some(y_name) = node.outputs.first().filter(|n| !n.is_empty()) {
+        let y4 = m.add_node(
+            Op::Reshape {
+                new_shape: vec![batch as i64, seq as i64, dirs as i64, hidden as i64],
+            },
+            vec![y_bshd],
+            Shape::new(&[batch, seq, dirs, hidden], DType::F32),
+        );
+        let y_out = m.add_node(
+            Op::Transpose {
+                perm: vec![1, 2, 0, 3],
+            },
+            vec![y4],
+            Shape::new(&[seq, dirs, batch, hidden], DType::F32),
+        );
+        ctx.env.insert(y_name.clone(), y_out);
+    }
+
+    // Y_h (output 1): the last hidden state, ONNX `[num_dir, batch, hidden]`.
+    // Forward direction's last step is `seq-1`; a reverse direction's is step 0.
+    if let Some(yh_name) = node.outputs.get(1).filter(|n| !n.is_empty()) {
+        let last_dir = |m: &mut HirMut<'_>, t: usize, off: usize| {
+            // narrow the sequence axis to one step `t`, and the hidden axis to
+            // direction `off`, giving [batch, 1, hidden] → [1, batch, hidden].
+            let step = m.narrow_(y_bshd, 1, t, 1);
+            let one = m.narrow_(step, 2, off * hidden, hidden);
+            m.add_node(
+                Op::Reshape {
+                    new_shape: vec![1, batch as i64, hidden as i64],
+                },
+                vec![one],
+                Shape::new(&[1, batch, hidden], DType::F32),
+            )
+        };
+        let fwd = last_dir(m, seq - 1, 0);
+        let yh = if bidirectional {
+            let bwd = last_dir(m, 0, 1);
+            m.add_node(
+                Op::Concat { axis: 0 },
+                vec![fwd, bwd],
+                Shape::new(&[2, batch, hidden], DType::F32),
+            )
+        } else {
+            fwd
+        };
+        ctx.env.insert(yh_name.clone(), yh);
+    }
+
+    Ok(true)
+}
+
 pub(super) fn lower_lstm(
     m: &mut HirMut<'_>,
     ctx: &mut LowerCtx<'_>,

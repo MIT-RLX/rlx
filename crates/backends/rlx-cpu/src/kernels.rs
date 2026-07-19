@@ -51,13 +51,9 @@ pub unsafe fn neon_exp4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch6
 
 /// AVX2+FMA vectorised exp(x) for 8 floats. Same range reduction +
 /// 6th-order Taylor polynomial as `neon_exp4`. Max relative error
-/// stays in the ~2e-7 range. Requires `+avx2,+fma` codegen.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "fma"
-))]
-#[inline(always)]
+/// stays in the ~2e-7 range. Runtime-dispatch via `is_x86_feature_detected`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub unsafe fn avx2_exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
@@ -254,41 +250,43 @@ pub fn silu_inplace(data: &mut [f32]) {
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "fma"
-))]
-pub fn silu_inplace(data: &mut [f32]) {
+/// SiLU via AVX2+FMA. Caller must have checked `is_x86_feature_detected`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn silu_inplace_avx2(data: &mut [f32]) {
     use std::arch::x86_64::*;
     let chunks = data.len() / 8;
-    unsafe {
-        let one = _mm256_set1_ps(1.0);
-        let zero = _mm256_set1_ps(0.0);
-        for c in 0..chunks {
-            let off = c * 8;
-            let ptr = data.as_mut_ptr().add(off);
-            let x = _mm256_loadu_ps(ptr);
-            // silu(x) = x / (1 + exp(-x))
-            let neg_x = _mm256_sub_ps(zero, x);
-            let denom = _mm256_add_ps(one, avx2_exp8(neg_x));
-            _mm256_storeu_ps(ptr, _mm256_div_ps(x, denom));
-        }
-        for i in (chunks * 8)..data.len() {
-            let x = data[i];
-            data[i] = x / (1.0 + (-x).exp());
-        }
+    let one = _mm256_set1_ps(1.0);
+    let zero = _mm256_set1_ps(0.0);
+    for c in 0..chunks {
+        let off = c * 8;
+        let ptr = data.as_mut_ptr().add(off);
+        let x = _mm256_loadu_ps(ptr);
+        // silu(x) = x / (1 + exp(-x))
+        let neg_x = _mm256_sub_ps(zero, x);
+        let denom = _mm256_add_ps(one, avx2_exp8(neg_x));
+        _mm256_storeu_ps(ptr, _mm256_div_ps(x, denom));
+    }
+    for i in (chunks * 8)..data.len() {
+        let x = data[i];
+        data[i] = x / (1.0 + (-x).exp());
     }
 }
 
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    )
-)))]
+#[cfg(target_arch = "x86_64")]
+pub fn silu_inplace(data: &mut [f32]) {
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        unsafe { silu_inplace_avx2(data) };
+        return;
+    }
+    for v in data.iter_mut() {
+        let x = *v;
+        *v = x / (1.0 + (-x).exp());
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn silu_inplace(data: &mut [f32]) {
     for v in data.iter_mut() {
         let x = *v;
@@ -613,11 +611,35 @@ pub fn par_residual_bias_ln(
     });
 }
 
-// ── NEON softmax ────────────────────────────────────────────────────────
+// ── Softmax (NEON / runtime AVX2 / parallel rows) ───────────────────────
+
+/// Row-parallel wrapper: each row is independent so Rayon can split the outer
+/// loop when there is enough work to amortize hand-off.
+#[inline]
+fn par_softmax_rows<F: Fn(&mut [f32], usize, usize) + Sync>(
+    data: &mut [f32],
+    rows: usize,
+    cols: usize,
+    kernel: &F,
+) {
+    if rows >= 4 && pool::should_parallelize(rows * cols) {
+        let base = data.as_mut_ptr() as usize;
+        pool::par_for(rows, 1, &|off, cnt| {
+            for r in off..off + cnt {
+                let row = unsafe {
+                    std::slice::from_raw_parts_mut((base as *mut f32).add(r * cols), cols)
+                };
+                kernel(row, 1, cols);
+            }
+        });
+    } else {
+        kernel(data, rows, cols);
+    }
+}
 
 /// NEON-vectorized softmax: 3-pass (max, exp+sum, normalize).
 #[cfg(target_arch = "aarch64")]
-pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
+fn softmax_rows_neon(data: &mut [f32], rows: usize, cols: usize) {
     use std::arch::aarch64::*;
     let chunks = cols / 4;
     unsafe {
@@ -665,85 +687,92 @@ pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "fma"
-))]
+#[cfg(target_arch = "aarch64")]
 pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
+    par_softmax_rows(data, rows, cols, &softmax_rows_neon);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn softmax_rows_avx2(data: &mut [f32], rows: usize, cols: usize) {
     use std::arch::x86_64::*;
     let chunks = cols / 8;
-    unsafe {
-        for r in 0..rows {
-            let row = data.as_mut_ptr().add(r * cols);
-            // 1) Vector max for stability.
-            let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
-            for c in 0..chunks {
-                vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(row.add(c * 8)));
+    for r in 0..rows {
+        let row = data.as_mut_ptr().add(r * cols);
+        // 1) Vector max for stability.
+        let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
+        for c in 0..chunks {
+            vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(row.add(c * 8)));
+        }
+        let mut max_v = {
+            let lo = _mm256_castps256_ps128(vmax);
+            let hi = _mm256_extractf128_ps::<1>(vmax);
+            let s4 = _mm_max_ps(lo, hi);
+            let s2 = _mm_max_ps(s4, _mm_movehl_ps(s4, s4));
+            let s1 = _mm_max_ss(s2, _mm_shuffle_ps::<0x55>(s2, s2));
+            _mm_cvtss_f32(s1)
+        };
+        for i in (chunks * 8)..cols {
+            let v = *row.add(i);
+            if v > max_v {
+                max_v = v;
             }
-            let mut max_v = {
-                let lo = _mm256_castps256_ps128(vmax);
-                let hi = _mm256_extractf128_ps::<1>(vmax);
-                let s4 = _mm_max_ps(lo, hi);
-                let s2 = _mm_max_ps(s4, _mm_movehl_ps(s4, s4));
-                let s1 = _mm_max_ss(s2, _mm_shuffle_ps::<0x55>(s2, s2));
-                _mm_cvtss_f32(s1)
-            };
-            for i in (chunks * 8)..cols {
-                let v = *row.add(i);
-                if v > max_v {
-                    max_v = v;
-                }
-            }
-            // 2) exp(x − max) and sum.
-            let vmax = _mm256_set1_ps(max_v);
-            let mut vsum = _mm256_setzero_ps();
-            for c in 0..chunks {
-                let off = c * 8;
-                let e = avx2_exp8(_mm256_sub_ps(_mm256_loadu_ps(row.add(off)), vmax));
-                _mm256_storeu_ps(row.add(off), e);
-                vsum = _mm256_add_ps(vsum, e);
-            }
-            let mut sum_v = {
-                let lo = _mm256_castps256_ps128(vsum);
-                let hi = _mm256_extractf128_ps::<1>(vsum);
-                let s4 = _mm_add_ps(lo, hi);
-                let s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-                let s1 = _mm_add_ss(s2, _mm_shuffle_ps::<0x55>(s2, s2));
-                _mm_cvtss_f32(s1)
-            };
-            for i in (chunks * 8)..cols {
-                let v = (*row.add(i) - max_v).exp();
-                *row.add(i) = v;
-                sum_v += v;
-            }
-            // 3) Normalize.
-            let vinv = _mm256_set1_ps(1.0 / sum_v);
-            for c in 0..chunks {
-                let off = c * 8;
-                _mm256_storeu_ps(
-                    row.add(off),
-                    _mm256_mul_ps(_mm256_loadu_ps(row.add(off)), vinv),
-                );
-            }
-            let inv_sum = 1.0 / sum_v;
-            for i in (chunks * 8)..cols {
-                *row.add(i) *= inv_sum;
-            }
+        }
+        // 2) exp(x − max) and sum.
+        let vmax = _mm256_set1_ps(max_v);
+        let mut vsum = _mm256_setzero_ps();
+        for c in 0..chunks {
+            let off = c * 8;
+            let e = avx2_exp8(_mm256_sub_ps(_mm256_loadu_ps(row.add(off)), vmax));
+            _mm256_storeu_ps(row.add(off), e);
+            vsum = _mm256_add_ps(vsum, e);
+        }
+        let mut sum_v = {
+            let lo = _mm256_castps256_ps128(vsum);
+            let hi = _mm256_extractf128_ps::<1>(vsum);
+            let s4 = _mm_add_ps(lo, hi);
+            let s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            let s1 = _mm_add_ss(s2, _mm_shuffle_ps::<0x55>(s2, s2));
+            _mm_cvtss_f32(s1)
+        };
+        for i in (chunks * 8)..cols {
+            let v = (*row.add(i) - max_v).exp();
+            *row.add(i) = v;
+            sum_v += v;
+        }
+        // 3) Normalize.
+        let vinv = _mm256_set1_ps(1.0 / sum_v);
+        for c in 0..chunks {
+            let off = c * 8;
+            _mm256_storeu_ps(
+                row.add(off),
+                _mm256_mul_ps(_mm256_loadu_ps(row.add(off)), vinv),
+            );
+        }
+        let inv_sum = 1.0 / sum_v;
+        for i in (chunks * 8)..cols {
+            *row.add(i) *= inv_sum;
         }
     }
 }
 
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    )
-)))]
+#[cfg(target_arch = "x86_64")]
 pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
-    crate::naive::softmax(data, rows, cols);
+    let avx2 =
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
+    if avx2 {
+        par_softmax_rows(data, rows, cols, &|d, r, c| unsafe {
+            softmax_rows_avx2(d, r, c);
+        });
+    } else {
+        par_softmax_rows(data, rows, cols, &crate::naive::softmax);
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
+    par_softmax_rows(data, rows, cols, &crate::naive::softmax);
 }
 
 // ── GELU in-place (no bias) ────────────────────────────────────────────
@@ -791,64 +820,65 @@ pub fn gelu_inplace(data: &mut [f32]) {
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "fma"
-))]
-pub fn gelu_inplace(data: &mut [f32]) {
+/// Erf-GELU via AVX2+FMA. Caller must have checked feature bits.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn gelu_inplace_avx2(data: &mut [f32]) {
     use std::arch::x86_64::*;
     let chunks = data.len() / 8;
-    unsafe {
-        let half = _mm256_set1_ps(0.5);
-        let one = _mm256_set1_ps(1.0);
-        let inv_sqrt2 = _mm256_set1_ps(std::f32::consts::FRAC_1_SQRT_2);
-        let p = _mm256_set1_ps(0.3275911);
-        let a1 = _mm256_set1_ps(0.254829592);
-        let a2 = _mm256_set1_ps(-0.284496736);
-        let a3 = _mm256_set1_ps(1.421413741);
-        let a4 = _mm256_set1_ps(-1.453152027);
-        let a5 = _mm256_set1_ps(1.061405429);
-        let neg_one = _mm256_set1_ps(-1.0);
-        let zero = _mm256_set1_ps(0.0);
-        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
-        for c in 0..chunks {
-            let off = c * 8;
-            let ptr = data.as_mut_ptr().add(off);
-            let x = _mm256_loadu_ps(ptr);
-            let erf_arg = _mm256_mul_ps(x, inv_sqrt2);
-            let xa = _mm256_and_ps(erf_arg, abs_mask);
-            let ge0 = _mm256_cmp_ps::<_CMP_GE_OQ>(erf_arg, zero);
-            let sign = _mm256_blendv_ps(neg_one, one, ge0);
-            let denom = _mm256_fmadd_ps(p, xa, one);
-            let t = _mm256_div_ps(one, denom);
-            let mut y = a5;
-            y = _mm256_fmadd_ps(y, t, a4);
-            y = _mm256_fmadd_ps(y, t, a3);
-            y = _mm256_fmadd_ps(y, t, a2);
-            y = _mm256_fmadd_ps(y, t, a1);
-            y = _mm256_mul_ps(y, t);
-            let exp_val = avx2_exp8(_mm256_sub_ps(zero, _mm256_mul_ps(xa, xa)));
-            let erf_val = _mm256_mul_ps(sign, _mm256_fnmadd_ps(y, exp_val, one));
-            _mm256_storeu_ps(
-                ptr,
-                _mm256_mul_ps(x, _mm256_mul_ps(half, _mm256_add_ps(one, erf_val))),
-            );
-        }
-        for i in (chunks * 8)..data.len() {
-            data[i] = scalar_gelu(data[i]);
-        }
+    let half = _mm256_set1_ps(0.5);
+    let one = _mm256_set1_ps(1.0);
+    let inv_sqrt2 = _mm256_set1_ps(std::f32::consts::FRAC_1_SQRT_2);
+    let p = _mm256_set1_ps(0.3275911);
+    let a1 = _mm256_set1_ps(0.254829592);
+    let a2 = _mm256_set1_ps(-0.284496736);
+    let a3 = _mm256_set1_ps(1.421413741);
+    let a4 = _mm256_set1_ps(-1.453152027);
+    let a5 = _mm256_set1_ps(1.061405429);
+    let neg_one = _mm256_set1_ps(-1.0);
+    let zero = _mm256_set1_ps(0.0);
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+    for c in 0..chunks {
+        let off = c * 8;
+        let ptr = data.as_mut_ptr().add(off);
+        let x = _mm256_loadu_ps(ptr);
+        let erf_arg = _mm256_mul_ps(x, inv_sqrt2);
+        let xa = _mm256_and_ps(erf_arg, abs_mask);
+        let ge0 = _mm256_cmp_ps::<_CMP_GE_OQ>(erf_arg, zero);
+        let sign = _mm256_blendv_ps(neg_one, one, ge0);
+        let denom = _mm256_fmadd_ps(p, xa, one);
+        let t = _mm256_div_ps(one, denom);
+        let mut y = a5;
+        y = _mm256_fmadd_ps(y, t, a4);
+        y = _mm256_fmadd_ps(y, t, a3);
+        y = _mm256_fmadd_ps(y, t, a2);
+        y = _mm256_fmadd_ps(y, t, a1);
+        y = _mm256_mul_ps(y, t);
+        let exp_val = avx2_exp8(_mm256_sub_ps(zero, _mm256_mul_ps(xa, xa)));
+        let erf_val = _mm256_mul_ps(sign, _mm256_fnmadd_ps(y, exp_val, one));
+        _mm256_storeu_ps(
+            ptr,
+            _mm256_mul_ps(x, _mm256_mul_ps(half, _mm256_add_ps(one, erf_val))),
+        );
+    }
+    for i in (chunks * 8)..data.len() {
+        data[i] = scalar_gelu(data[i]);
     }
 }
 
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    )
-)))]
+#[cfg(target_arch = "x86_64")]
+pub fn gelu_inplace(data: &mut [f32]) {
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        unsafe { gelu_inplace_avx2(data) };
+        return;
+    }
+    for v in data.iter_mut() {
+        *v = scalar_gelu(*v);
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn gelu_inplace(data: &mut [f32]) {
     for v in data.iter_mut() {
         *v = scalar_gelu(*v);

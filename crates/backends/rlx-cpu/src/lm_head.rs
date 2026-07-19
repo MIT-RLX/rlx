@@ -220,7 +220,20 @@ pub fn f32_tied_lm_argmax(
 }
 
 /// Packed GGUF tied embedding — row-streaming block dequant + argmax (O(1) scratch).
+///
+/// Scans vocab rows in parallel by default (Rayon). Set `RLX_LM_HEAD_PARALLEL=0`
+/// to force the serial path.
 pub fn gguf_tied_lm_argmax(
+    hidden: &[f32],
+    w_bytes: &[u8],
+    n_embd: usize,
+    n_vocab: usize,
+    scheme: QuantScheme,
+) -> (u32, f32) {
+    gguf_tied_lm_argmax_parallel(hidden, w_bytes, n_embd, n_vocab, scheme)
+}
+
+fn gguf_tied_lm_argmax_serial(
     hidden: &[f32],
     w_bytes: &[u8],
     n_embd: usize,
@@ -254,7 +267,7 @@ fn lm_head_parallel_enabled() -> bool {
     )
 }
 
-/// Like [`gguf_tied_lm_argmax`] but scans vocab rows in parallel (Rayon).
+/// Like [`gguf_tied_lm_argmax`] but always attempts a parallel vocab scan.
 pub fn gguf_tied_lm_argmax_parallel(
     hidden: &[f32],
     w_bytes: &[u8],
@@ -263,7 +276,7 @@ pub fn gguf_tied_lm_argmax_parallel(
     scheme: QuantScheme,
 ) -> (u32, f32) {
     if !lm_head_parallel_enabled() || n_vocab < 4096 || crate::pool::num_threads() <= 1 {
-        return gguf_tied_lm_argmax(hidden, w_bytes, n_embd, n_vocab, scheme);
+        return gguf_tied_lm_argmax_serial(hidden, w_bytes, n_embd, n_vocab, scheme);
     }
     use rayon::prelude::*;
     (0..n_vocab)

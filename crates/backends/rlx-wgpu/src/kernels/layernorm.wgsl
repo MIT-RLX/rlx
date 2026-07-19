@@ -50,22 +50,25 @@ fn norm(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let eps = bitcast<f32>(params.eps_bits);
 
     if (params.op == 0u) {
-        // LayerNorm: fused mean + variance pass via E[x²] − (E[x])²
-        // identity. One read pass over `inner` instead of two —
-        // halves memory traffic for the mean+variance phase. f32
-        // accumulation gives plenty of headroom for BERT-class
-        // activations; same identity PyTorch's nn.LayerNorm uses.
-        var sum_x:  f32 = 0.0;
-        var sum_x2: f32 = 0.0;
+        // LayerNorm: STABLE TWO-PASS variance. The one-pass identity
+        // var = E[x²] − (E[x])² catastrophically cancels in f32 when the
+        // row carries a large DC offset (pre-norm transformer activations:
+        // DINOv2/BEiT/ViT, input-projection bias, positional tables) — the
+        // two large terms subtract to near-zero and the variance is lost,
+        // corrupting the norm on wgpu only (cos collapses to ~0.3–0.8).
+        // CPU/Metal/MLX/CoreML all use two-pass/Welford and match. The
+        // extra read pass over `inner` is worth correctness.
+        var sum_x: f32 = 0.0;
         for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-            let v = arena[in_base + i];
-            sum_x  = sum_x  + v;
-            sum_x2 = sum_x2 + v * v;
+            sum_x = sum_x + arena[in_base + i];
         }
         let mean = sum_x * n_inv;
-        // Clamp negative variance from f32 cancellation; see
-        // fused_residual_ln.wgsl for the full rationale.
-        let var_ = max(sum_x2 * n_inv - mean * mean, 0.0);
+        var sum_sq: f32 = 0.0;
+        for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+            let d = arena[in_base + i] - mean;
+            sum_sq = sum_sq + d * d;
+        }
+        let var_ = sum_sq * n_inv;
         let inv_std = inverseSqrt(var_ + eps);
         for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
             let g = arena[params.gamma_off + i];

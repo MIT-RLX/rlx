@@ -1,0 +1,37 @@
+#version 450
+// Packed GatedResidual backward: out = [dx ∥ dy ∥ dgate] (1-D floats).
+// One work-item per unique gate row; loops `seq_per_mod` feature-rows.
+layout(local_size_x = 64) in;
+
+
+layout(push_constant) uniform PC {
+    uint mod_rows;
+    uint seq_per_mod;
+    uint inner;
+    uint y_off;
+    uint gate_off;
+    uint dy_off;
+    uint out_off;
+} pc;
+
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    if (m >= pc.mod_rows || pc.inner == 0u) { return; }
+
+    uint nx = pc.mod_rows * pc.seq_per_mod * pc.inner;
+    uint gate_base = m * pc.inner;
+
+    for (uint i = 0u; i < pc.inner; i++) {
+        float acc = 0.0;
+        float g = arena_load(pc.gate_off + gate_base + i);
+        for (uint seq = 0u; seq < pc.seq_per_mod; seq++) {
+            uint row = m * pc.seq_per_mod + seq;
+            uint idx = row * pc.inner + i;
+            float d = arena_load(pc.dy_off + idx);
+            arena_store(pc.out_off + idx, d);
+            arena_store(pc.out_off + nx + idx, d * g);
+            acc += d * arena_load(pc.y_off + idx);
+        }
+        arena_store(pc.out_off + 2u * nx + gate_base + i, acc);
+    }
+}

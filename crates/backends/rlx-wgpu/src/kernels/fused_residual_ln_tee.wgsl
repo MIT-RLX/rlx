@@ -65,23 +65,26 @@ fn fused_residual_ln_tee(
     let eps = bitcast<f32>(params.eps_bits);
     let with_bias = params.has_bias != 0u;
 
-    // Pass 1: write the SUM to sum_base AND accumulate stats in the
-    // same loop (E[x²] − (E[x])² identity for variance — same trick as
-    // the standard FRL kernel).
-    var sum_x:   f32 = 0.0;
-    var sum_x2:  f32 = 0.0;
+    // Pass 1: write the SUM to sum_base and accumulate the mean.
+    var sum_x: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         var v = arena[in_base + i] + arena[res_base + i];
         if (with_bias) { v = v + arena[params.bias_off + i]; }
         arena[sum_base + i] = v;
-        sum_x  = sum_x  + v;
-        sum_x2 = sum_x2 + v * v;
+        sum_x = sum_x + v;
     }
     let mean = sum_x * n_inv;
-    // Clamp negative variance from f32 cancellation; see
-    // fused_residual_ln.wgsl for the full rationale (inverseSqrt of
-    // a non-positive value is undefined and returns NaN on NVIDIA).
-    let var_ = max(sum_x2 * n_inv - mean * mean, 0.0);
+    // Pass 1b: STABLE TWO-PASS variance = mean((x − mean)²), reading the
+    // summed value back from sum_base. The one-pass E[x²] − (E[x])²
+    // identity catastrophically cancels in f32 under a large DC offset
+    // (pre-norm transformer activations) and corrupts the norm on wgpu
+    // only; two-pass matches CPU/Metal/MLX/CoreML.
+    var sum_sq: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+        let d = arena[sum_base + i] - mean;
+        sum_sq = sum_sq + d * d;
+    }
+    let var_ = sum_sq * n_inv;
     let inv_std = inverseSqrt(var_ + eps);
 
     // Pass 2: read sum_base, write LN result to out_base. Two distinct

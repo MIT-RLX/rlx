@@ -47,6 +47,10 @@ fn complex_block(n: usize) -> Vec<f32> {
 }
 
 fn assert_fft_norm_matches_cpu(device: Device, n: usize, norm: FftNorm, inverse: bool) {
+    if !rlx_runtime::is_available(device) {
+        eprintln!("skip: {device:?} unavailable");
+        return;
+    }
     let x = complex_block(n);
     let build = || {
         let mut g = Graph::new("gpu_fft_norm");
@@ -70,6 +74,10 @@ fn assert_fft_norm_matches_cpu(device: Device, n: usize, norm: FftNorm, inverse:
 }
 
 fn assert_fft_matches_cpu(device: Device, n: usize) {
+    if !rlx_runtime::is_available(device) {
+        eprintln!("skip: {device:?} unavailable");
+        return;
+    }
     let x = complex_block(n);
     let build = || {
         let mut g = Graph::new("gpu_fft_fallback");
@@ -120,6 +128,10 @@ macro_rules! gpu_fft_norm_tests {
 }
 
 fn assert_fft_real_and_psd(device: Device) {
+    if !rlx_runtime::is_available(device) {
+        eprintln!("skip: {device:?} unavailable");
+        return;
+    }
     let signal = [1.0_f32, 2.0, 3.0];
     let build = || {
         let mut g = Graph::new("gpu_fft_real");

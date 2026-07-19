@@ -7,8 +7,7 @@
 // kernels (Phase 2) reuse these same parity checks.
 #![cfg(any(target_os = "macos", target_os = "ios"))]
 
-use rlx_ir::op::Activation;
-use rlx_ir::op::ReduceOp;
+use rlx_ir::op::{Activation, AdaNormKind, ReduceOp};
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
@@ -511,4 +510,51 @@ fn ane_amp_grad_matches_cpu_direction() {
         cosine > 0.99,
         "AMP f16 grad off-direction: cosine={cosine}\n  ane={ane:?}\n  cpu={cpu:?}"
     );
+}
+
+/// Native packed DiT reverse on ANE ≈ CPU (CPU uses its native packed kernel;
+/// ANE uses the new MIL compose arm under `training`).
+#[test]
+fn ane_dit_packed_backward_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Ane) {
+        eprintln!("skip: Device::Ane not available");
+        return;
+    }
+    let (b, s, d) = (2usize, 3usize, 4usize);
+    let eps = 1e-5f32;
+    let mut g = Graph::new("dit_packed_bwd");
+    let x = g.input("x", Shape::new(&[b, s, d], DType::F32));
+    let scale = g.input("scale", Shape::new(&[b, 1, d], DType::F32));
+    let shift = g.input("shift", Shape::new(&[b, 1, d], DType::F32));
+    let dy = g.input("dy", Shape::new(&[b, s, d], DType::F32));
+    let packed = g.ada_layer_norm_backward(x, scale, shift, dy, AdaNormKind::LayerNorm, eps);
+    g.set_outputs(vec![packed]);
+
+    assert!(
+        rlx_runtime::supports(
+            Device::Ane,
+            &Op::AdaLayerNormBackward {
+                norm: AdaNormKind::LayerNorm,
+                eps
+            }
+        ),
+        "Ane should claim AdaLayerNormBackward"
+    );
+
+    let x_data: Vec<f32> = (0..b * s * d).map(|i| (i as f32) * 0.17 - 0.4).collect();
+    let scale_data: Vec<f32> = (0..b * d).map(|i| 0.05 * (i as f32) - 0.1).collect();
+    let shift_data: Vec<f32> = (0..b * d).map(|i| -0.03 * (i as f32)).collect();
+    let dy_data: Vec<f32> = (0..b * s * d).map(|i| 0.1 + 0.02 * (i as f32)).collect();
+    let feeds = [
+        ("x", x_data.as_slice()),
+        ("scale", scale_data.as_slice()),
+        ("shift", shift_data.as_slice()),
+        ("dy", dy_data.as_slice()),
+    ];
+
+    let run = |device: Device| -> Vec<f32> {
+        let mut c = Session::new(device).compile(g.clone());
+        c.run(&feeds).remove(0)
+    };
+    assert_close(&run(Device::Ane), &run(Device::Cpu), "ada packed reverse");
 }

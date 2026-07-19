@@ -43,7 +43,7 @@ pub enum ReduceKind {
 }
 
 impl ReduceKind {
-    fn fold(self, acc: f32, x: f32) -> f32 {
+    pub(crate) fn fold(self, acc: f32, x: f32) -> f32 {
         match self {
             Self::Sum => acc + x,
             Self::Mean => acc + x, // divide at the end
@@ -51,7 +51,7 @@ impl ReduceKind {
             Self::Min => acc.min(x),
         }
     }
-    fn finalize(self, acc: f32, n: usize) -> f32 {
+    pub(crate) fn finalize(self, acc: f32, n: usize) -> f32 {
         match self {
             Self::Mean => acc / (n as f32),
             _ => acc,

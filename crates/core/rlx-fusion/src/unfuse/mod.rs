@@ -52,6 +52,7 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
             Op::FusedMatMulBiasAct { .. } => {
                 unfuse_fused_mat_mul_bias_act(node, new_inputs, &mut out)
             }
+            Op::FusedConvBiasAct { .. } => unfuse_fused_conv_bias_act(node, new_inputs, &mut out),
             Op::FusedResidualLN { .. } => unfuse_fused_residual_l_n(node, new_inputs, &mut out),
             Op::FusedResidualRmsNorm { .. } => {
                 unfuse_fused_residual_rms_norm(node, new_inputs, &mut out)
@@ -71,6 +72,9 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
             Op::Rnn { .. } => unfuse_rnn(node, new_inputs, &mut out),
             Op::Mamba2 { .. } => unfuse_mamba2(node, new_inputs, &mut out),
             Op::SelectiveScan { .. } => unfuse_selective_scan(node, new_inputs, &mut out),
+            // AdaLayerNorm / GatedResidual keep their fused form for AD:
+            // dedicated VJPs emit AdaLayerNormBackward / GatedResidualBackward.
+            // Forward-only claim backends still use `unfuse_dit_modulation`.
             _ => {
                 // Pass through unchanged.
                 out.add_node(node.op.clone(), new_inputs, node.shape.clone())
@@ -339,6 +343,41 @@ pub fn unfuse_attention_block(g: Graph) -> Graph {
                 *has_bias,
                 *has_rope,
             ),
+            other => out.add_node(other.clone(), new_inputs, node.shape.clone()),
+        };
+        id_map.insert(node.id, new_id);
+    }
+
+    let new_outputs: Vec<NodeId> = original_outputs.iter().map(|i| id_map[i]).collect();
+    out.set_outputs(new_outputs);
+    out
+}
+
+/// Expand [`Op::AdaLayerNorm`] / [`Op::GatedResidual`] into primitives.
+///
+/// Same contract as [`unfuse_attention_block`]: claim the ops for fusion /
+/// legalize, then call this in backends that have no native DiT modulation
+/// kernel (Vulkan / OneAPI / CoreML / WebGL). Idempotent — returns `g`
+/// unchanged when neither op is present.
+pub fn unfuse_dit_modulation(g: Graph) -> Graph {
+    if !g
+        .nodes()
+        .iter()
+        .any(|n| matches!(n.op, Op::AdaLayerNorm { .. } | Op::GatedResidual))
+    {
+        return g;
+    }
+
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    let original_outputs = g.outputs.clone();
+    let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
+
+    for node in &nodes {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_id = match &node.op {
+            Op::AdaLayerNorm { .. } => unfuse_ada_layer_norm(node, new_inputs, &mut out),
+            Op::GatedResidual => unfuse_gated_residual(node, new_inputs, &mut out),
             other => out.add_node(other.clone(), new_inputs, node.shape.clone()),
         };
         id_map.insert(node.id, new_id);

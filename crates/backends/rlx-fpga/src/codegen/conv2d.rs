@@ -81,6 +81,7 @@ pub fn emit(layer: &Layer, hints: &Hints) -> LayerArtifacts {
             w_zp,
             out_zp,
             weight_bits,
+            weight_encoding: _,
             requant,
             weights,
             bias,
@@ -258,7 +259,7 @@ pub fn emit(layer: &Layer, hints: &Hints) -> LayerArtifacts {
             } else {
                 v.comment("Combinational weight unpack");
                 v.line("logic signed [31:0] w_val;");
-                v.line("weight_unpack #(.BITS(W_BITS)) u_w_unpack (");
+                v.line("weight_unpack #(.BITS(W_BITS), .ENCODING(0)) u_w_unpack (");
                 v.block(|v| {
                     v.line(".byte_in(w_byte),");
                     v.line(".lane(w_lane_q),");

@@ -91,6 +91,28 @@ pub struct JvpContext<'a> {
     pub bwd: &'a mut Graph,
 }
 
+/// Mutable context handed to a custom op's `lower` rule. The rewriter
+/// has already placed each of the op's inputs into the output graph;
+/// the rule reads their NodeIds from [`inputs`](LowerContext::inputs),
+/// emits a subgraph of *primitive* ops via the builder API on
+/// [`out`](LowerContext::out), and returns the NodeId that replaces the
+/// custom op's output.
+///
+/// This is the "decompose-to-primitives" seam — the middle tier between
+/// an opaque `Op::Custom` (needs a per-backend kernel) and editing the
+/// closed core `Op` enum. A lowered op fuses and runs on every backend
+/// with no kernel, because it *is* primitives after this pass.
+pub struct LowerContext<'a> {
+    /// Per-input NodeIds already materialized in the output graph
+    /// (length = `num_inputs`). Read input shapes via
+    /// `ctx.out.node(ctx.inputs[i]).shape`.
+    pub inputs: &'a [NodeId],
+    /// The output graph being built. Call its builder methods
+    /// (`out.binary`, `out.matmul`, `out.activation`, …) to emit the
+    /// decomposition, then return the final node.
+    pub out: &'a mut Graph,
+}
+
 /// Mutable context handed to a custom op's VJP method. Lets the op
 /// emit gradient subgraph nodes via the same builder API the built-in
 /// VJP rules use, and resolve forward-graph inputs to their backward-
@@ -134,6 +156,28 @@ pub trait OpExtension: Send + Sync {
     /// and the per-instance `attrs` blob. Called once at graph build
     /// time by `Graph::custom_op`.
     fn infer_shape(&self, inputs: &[&Shape], attrs: &[u8]) -> Shape;
+
+    /// Decompose-to-primitives rule. Default: `None` — no lowering, so
+    /// the op stays an opaque `Op::Custom` and must be executed by a
+    /// registered per-backend kernel (see e.g.
+    /// `rlx-cpu/src/op_registry.rs`).
+    ///
+    /// Override to expand the op into built-in primitives. The
+    /// `lower_custom_ops` pass (rlx-compile) then inlines the returned
+    /// subgraph in place of the custom node, which lets the op **fuse
+    /// and run on every backend with no kernel** — the middle tier
+    /// between an opaque custom op and editing the closed core `Op`
+    /// enum. Registering `lower` is an opt-in: it declares "prefer
+    /// decomposition." An op that ships a hand-tuned native kernel and
+    /// wants to keep it simply leaves this unimplemented.
+    ///
+    /// `node` is the `Op::Custom` node (read `attrs` from its op);
+    /// `ctx.inputs` are the op's inputs already in `ctx.out`. Return
+    /// `Some(output_node)` in `ctx.out`, or `None` to decline (stay
+    /// opaque).
+    fn lower(&self, _node: &Node, _ctx: &mut LowerContext) -> Option<NodeId> {
+        None
+    }
 
     /// VJP rule. Default: non-differentiable — returns `vec![]`,
     /// meaning autodiff drops gradients on the floor for this op's
@@ -198,14 +242,72 @@ impl OpRegistry {
         g.insert(name, op);
     }
 
+    /// Register, **erroring** instead of warning if `name` is already taken.
+    /// Prefer this over [`register`](Self::register) when a duplicate name is a
+    /// real conflict (two crates claiming the same op) you want surfaced.
+    pub fn try_register(&self, op: Arc<dyn OpExtension>) -> Result<(), CustomOpError> {
+        let name = op.name().to_string();
+        let mut g = self.ops.write().unwrap();
+        if g.contains_key(&name) {
+            return Err(CustomOpError::AlreadyRegistered(name));
+        }
+        g.insert(name, op);
+        Ok(())
+    }
+
     pub fn lookup(&self, name: &str) -> Option<Arc<dyn OpExtension>> {
         self.ops.read().unwrap().get(name).cloned()
+    }
+
+    /// Whether an op with this name is registered — check before
+    /// [`Graph::custom_op`](crate::Graph::custom_op) to avoid its panic.
+    pub fn contains(&self, name: &str) -> bool {
+        self.ops.read().unwrap().contains_key(name)
     }
 
     pub fn list(&self) -> Vec<String> {
         self.ops.read().unwrap().keys().cloned().collect()
     }
 }
+
+/// Error building an `Op::Custom` node or registering an op extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomOpError {
+    /// No [`OpExtension`] is registered under this name.
+    NotRegistered(String),
+    /// The op takes a different number of inputs than supplied.
+    ArityMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
+    /// [`OpRegistry::try_register`] hit an existing name.
+    AlreadyRegistered(String),
+}
+
+impl std::fmt::Display for CustomOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CustomOpError::NotRegistered(n) => write!(
+                f,
+                "custom op '{n}' is not registered — call `rlx_ir::register_op` first"
+            ),
+            CustomOpError::ArityMismatch {
+                name,
+                expected,
+                got,
+            } => write!(
+                f,
+                "custom op '{name}': registered op expects {expected} inputs, got {got}"
+            ),
+            CustomOpError::AlreadyRegistered(n) => {
+                write!(f, "custom op '{n}' is already registered")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CustomOpError {}
 
 impl Default for OpRegistry {
     fn default() -> Self {
@@ -224,9 +326,20 @@ pub fn register_op(op: Arc<dyn OpExtension>) {
     global_registry().register(op);
 }
 
+/// Convenience: register with the global registry, erroring on a name clash
+/// (strict variant of [`register_op`]).
+pub fn register_op_strict(op: Arc<dyn OpExtension>) -> Result<(), CustomOpError> {
+    global_registry().try_register(op)
+}
+
 /// Convenience: look up an op in the global registry.
 pub fn lookup_op(name: &str) -> Option<Arc<dyn OpExtension>> {
     global_registry().lookup(name)
+}
+
+/// Convenience: whether an op name is registered in the global registry.
+pub fn is_op_registered(name: &str) -> bool {
+    global_registry().contains(name)
 }
 
 #[cfg(test)]
@@ -257,6 +370,19 @@ mod tests {
         let s = Shape::new(&[2, 3], DType::F32);
         let out = op.infer_shape(&[&s], &[]);
         assert_eq!(out, s);
+    }
+
+    #[test]
+    fn contains_and_try_register_collision() {
+        let reg = OpRegistry::new();
+        assert!(!reg.contains("dummy"));
+        reg.try_register(Arc::new(DummyOp))
+            .expect("first register ok");
+        assert!(reg.contains("dummy"));
+        // Second registration under the same name is a surfaced error, not a
+        // silent overwrite.
+        let err = reg.try_register(Arc::new(DummyOp)).unwrap_err();
+        assert_eq!(err, CustomOpError::AlreadyRegistered("dummy".into()));
     }
 
     #[test]

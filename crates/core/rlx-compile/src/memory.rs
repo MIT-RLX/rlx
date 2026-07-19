@@ -625,15 +625,46 @@ pub fn plan_memory_aligned(graph: &Graph, alignment: usize) -> MemoryPlan {
 /// Liveness-aware planning with every slot sized as `num_elements * 4`
 /// bytes (wgpu / uniform-f32 arenas). Reuses dead tensor slots so large
 /// `[n, n]` pairwise graphs stay under WebGPU's 128 MiB binding cap.
+///
+/// When the graph has host indexing (`ScatterNd` / `Gather*`), keep the
+/// output-ancestor pin — same rule as Metal. Unpinning lets later GPU ops
+/// reuse slots that a mid-schedule CPU indexing thunk still needs to read,
+/// which drifts long ODE chains (F5 DiT on a sharded >4 GiB arena).
 pub fn plan_memory_f32_uniform(graph: &Graph, alignment: usize) -> MemoryPlan {
-    // wgpu executes dispatches in schedule order, so the conservative
-    // output-ancestor liveness pin isn't needed — and dropping it is what keeps
-    // deep decoders (HiFi-GAN) under wgpu's 4 GB storage-buffer binding limit.
+    let pin = graph_has_host_indexing(graph);
     let opts = MemoryPlanOptions {
-        pin_output_ancestors: false,
+        // Default off: deep feed-forward vocoders (HiFi-GAN) need reuse to
+        // stay under wgpu's 4 GiB single-buffer / binding limits.
+        pin_output_ancestors: pin,
         ..MemoryPlanOptions::default()
     };
     plan_memory_aligned_inner(graph, alignment, opts, None, true)
+}
+
+/// Same as [`plan_memory_f32_uniform`] but leaves `Op::Param` nodes UNassigned
+/// (`allocate_params: false`) so the caller can park large packed weights in a
+/// separate buffer. Used by wgpu to keep the activation arena under the 4 GiB
+/// single-buffer cap for 27B-class packed GGUF models (Bonsai-27B Q1_0).
+pub fn plan_memory_f32_uniform_no_params(graph: &Graph, alignment: usize) -> MemoryPlan {
+    let pin = graph_has_host_indexing(graph);
+    let opts = MemoryPlanOptions {
+        pin_output_ancestors: pin,
+        allocate_params: false,
+        ..MemoryPlanOptions::default()
+    };
+    plan_memory_aligned_inner(graph, alignment, opts, None, true)
+}
+
+fn graph_has_host_indexing(graph: &Graph) -> bool {
+    graph.nodes().iter().any(|n| {
+        matches!(
+            &n.op,
+            Op::ScatterNd { .. }
+                | Op::ScatterElements { .. }
+                | Op::GatherNd { .. }
+                | Op::GatherElements { .. }
+        )
+    })
 }
 
 /// Plan backward activations, then alias params onto `weights`.

@@ -57,6 +57,16 @@ test-mlx:
 test-cerebras:
     cargo test -p rlx-cerebras
 
+# Static graph checker (`cargo rlx check`) — dispatch, fusion, shape/dtype and
+# numeric diagnostics. Device-free: CPU legality + all-target fusion, no GPU.
+# Pass a graph JSON path or a demo, e.g. `just check-graph "--demo swiglu"`.
+check-graph ARGS="--list-demos":
+    cargo run -q -p rlx-check --bin cargo-rlx -- rlx check {{ARGS}}
+
+# Install `cargo-rlx` so `cargo rlx check …` works from any RLX crate.
+install-check:
+    cargo install --path crates/tooling/rlx-check
+
 # Emit CSL artifacts for an MxKxN matmul (default 32x64x32) into OUT.
 # Compile + run on a Linux host with the Cerebras SDK container:
 #   cd OUT && bash commands_wse2.sh
@@ -84,6 +94,37 @@ test-qnn:
 qnn-emit M="32" K="64" N="32" OUT="qnn-out":
     cargo run -q -p rlx-qnn --bin rlx-qnn-emit -- {{M}} {{K}} {{N}} {{OUT}}
 
+# Emit a MatMul+Softmax QNN model for offline qnn-net-run.
+qnn-emit-matmul-softmax M="8" K="16" N="4" OUT="qnn-mmsm":
+    cargo run -q -p rlx-qnn --bin rlx-qnn-emit -- --matmul-softmax {{M}} {{K}} {{N}} {{OUT}}
+
+# Emit a two-layer MLP (LinearRelu → Linear) QNN model for offline qnn-net-run.
+qnn-emit-mlp2 M="8" K="16" H="32" N="4" OUT="qnn-mlp2":
+    cargo run -q -p rlx-qnn --bin rlx-qnn-emit -- --mlp2 {{M}} {{K}} {{H}} {{N}} {{OUT}}
+
+# Emit a Linear with STATIC weight/bias (activation-only input) for offline qnn-net-run.
+qnn-emit-linear-static M="8" K="16" N="4" OUT="qnn-linstatic":
+    cargo run -q -p rlx-qnn --bin rlx-qnn-emit -- --linear-static {{M}} {{K}} {{N}} {{OUT}}
+
+# Emit LinearStatic then run the offline context-binary path (needs QNN SDK on PATH).
+qnn-run-context M="8" K="16" N="4" OUT="qnn-linstatic": (qnn-emit-linear-static M K N OUT)
+    #!/usr/bin/env bash
+    set -e
+    if command -v qnn-context-binary-generator >/dev/null 2>&1; then
+        cd {{OUT}} && bash run_qnn_context.sh
+    else
+        echo "qnn-context-binary-generator not found — install the Qualcomm AI Engine Direct SDK."
+        echo "artifacts are in {{OUT}}/; then: cd {{OUT}} && bash run_qnn_context.sh"
+    fi
+
+# Emit a Linear (in0·in1+in2) QNN model for offline qnn-net-run.
+qnn-emit-linear M="8" K="16" N="4" OUT="qnn-linear":
+    cargo run -q -p rlx-qnn --bin rlx-qnn-emit -- --linear {{M}} {{K}} {{N}} {{OUT}}
+
+# Emit a LinearRelu (relu(in0·in1+in2)) QNN model for offline qnn-net-run.
+qnn-emit-linear-relu M="8" K="16" N="4" OUT="qnn-linrelu":
+    cargo run -q -p rlx-qnn --bin rlx-qnn-emit -- --linear-relu {{M}} {{K}} {{N}} {{OUT}}
+
 # Emit + (if the QNN SDK tools are on PATH) build & run on the x86 reference backend.
 qnn-run M="32" K="64" N="32" OUT="qnn-out": (qnn-emit M K N OUT)
     #!/usr/bin/env bash
@@ -95,6 +136,27 @@ qnn-run M="32" K="64" N="32" OUT="qnn-out": (qnn-emit M K N OUT)
         echo "artifacts are in {{OUT}}/; then: cd {{OUT}} && bash run_qnn.sh"
     fi
 
+# Run rlx-fpga tests (Verilog codegen + INT8 reference parity). Pure Rust.
+test-fpga:
+    cargo test -p rlx-fpga --release
+    cargo test -p rlx-runtime --features cpu,fpga --lib export::
+
+# Emit target-agnostic SystemVerilog for TinyConv-MNIST.
+# TARGET = latency|size|energy|precision|bandwidth
+# HW     = generic|ecp5|ice40|xilinx7:PART
+fpga-emit TARGET="precision" HW="generic" OUT="":
+    #!/usr/bin/env bash
+    set -e
+    if [ -n "{{OUT}}" ]; then
+        cargo run -q -p rlx-fpga --release --bin rlx-fpga-emit -- --target {{TARGET}} --hw {{HW}} --out {{OUT}}
+    else
+        cargo run -q -p rlx-fpga --release --bin rlx-fpga-emit -- --target {{TARGET}} --hw {{HW}}
+    fi
+
+# Refresh the checked-in MNIST SystemVerilog demo (examples/mnist_sv/).
+fpga-mnist-demo:
+    cargo run -q -p rlx-fpga --release --example export_mnist
+
 # SDK-free Docker self-test of the QNN host harness (verify.py + plumbing).
 # Needs only Docker; uses a numpy stand-in for qnn-net-run.
 qnn-docker-test M="8" K="16" N="4":
@@ -105,6 +167,56 @@ qnn-docker-test M="8" K="16" N="4":
 qnn-docker-run M="32" K="64" N="32":
     python3 crates/backends/rlx-qnn/docker/validate.py run --dims {{M}} {{K}} {{N}}
 
+# Native (no Docker) QNN FFI + Session validation on a Linux host with the SDK.
+# Expects QNN_SDK_ROOT (and typically LD_LIBRARY_PATH for libc++). Skips cleanly
+# without the backend lib. Default backend: libQnnCpu.so.
+qnn-ffi:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${QNN_SDK_ROOT:?set QNN_SDK_ROOT to your QAIRT / QNN SDK root}"
+    export RLX_QNN_BACKEND_LIB="${RLX_QNN_BACKEND_LIB:-$QNN_SDK_ROOT/lib/x86_64-linux-clang/libQnnCpu.so}"
+    export LD_LIBRARY_PATH="$QNN_SDK_ROOT/lib/x86_64-linux-clang${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    cargo test -p rlx-qnn --features runtime -- --nocapture
+    cargo test -p rlx-runtime --features qnn --test qnn_hexagon_matmul -- --nocapture
+    cargo test -p rlx-runtime --features "cpu,qnn" --test fused_attention_block_parity -- --nocapture
+    cargo test -p rlx-runtime --features "cpu,qnn" --test qnn_dequant_matmul -- --nocapture
+    cargo test -p rlx-runtime --features qnn --test qnn_int8_matmul -- --nocapture
+    cargo test -p rlx-runtime --features qnn --test qnn_int4_matmul -- --nocapture
+
+# x86 HTP *functional simulator* (libQnnHtp.so) — no Snapdragon silicon.
+# Re-runs CPU soft-skip probes (sfixed8×sfixed8) plus int4/int8 MatMul and a
+# LinearStatic offline model.so + context-binary path under HTP prepare.
+# Forces HTP even if RLX_QNN_BACKEND_LIB already points at libQnnCpu.so
+# (common in env.sh); override with RLX_QNN_HTP_LIB if needed.
+qnn-htp-sim:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${QNN_SDK_ROOT:?set QNN_SDK_ROOT to your QAIRT / QNN SDK root}"
+    export PYTHONPATH="${PYTHONPATH:-}"
+    TARGET=x86_64-linux-clang
+    export RLX_QNN_BACKEND_LIB="${RLX_QNN_HTP_LIB:-$QNN_SDK_ROOT/lib/$TARGET/libQnnHtp.so}"
+    export LD_LIBRARY_PATH="$QNN_SDK_ROOT/lib/$TARGET${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    test -f "$RLX_QNN_BACKEND_LIB" || { echo "missing HTP backend: $RLX_QNN_BACKEND_LIB"; exit 1; }
+    echo "HTP functional sim: $RLX_QNN_BACKEND_LIB"
+    # FFI probes that CPU soft-skips or that exercise quantized weight paths.
+    # cargo test accepts one filter; run each name separately.
+    for t in \
+        ffi_sfixed8_matmul_probe \
+        ffi_int4_static_matmul \
+        ffi_int8_static_matmul \
+        ffi_int8_per_channel_matmul \
+        ffi_int8_param_matmul
+    do
+        echo "=== $t ==="
+        cargo test -p rlx-qnn --features runtime --lib "$t" -- --nocapture
+    done
+    # Offline LinearStatic on HTP sim (model.so + context binary).
+    OUT=$(mktemp -d)
+    cargo run -q -p rlx-qnn --bin rlx-qnn-emit -- --linear-static 4 8 2 "$OUT"
+    (cd "$OUT" && bash run_qnn.sh)
+    (cd "$OUT" && bash run_qnn_context.sh)
+    echo "qnn-htp-sim OK"
+
 # FKL region fusion parity (docs/fk-fusion.md). Metal MPS tests skip off macOS.
 test-fk:
     cargo test -p rlx-fusion fk_
@@ -114,9 +226,56 @@ test-fk:
     cargo test -p rlx-metal --test mps_graph_batch_region_lower --test mps_graph_prologue_region_lower
     cargo test -p rlx-mlx --test basic batch_elementwise_region_matches_atomic
 
-# Run all unit tests.
+# Logical CPUs for cargo `-j` / libtest `--test-threads` (macOS, else Linux).
+cpus := `sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4`
+
+# Run all unit tests at high parallelism.
+# On Darwin, Metal / MoltenVK / MLX share one GPU — cap concurrent cargo
+# jobs so crates don't deadlock the device; within a binary, libtest still
+# uses the default (CPU count) thread pool. Linux keeps full -j / threads.
+# Keep `--test-threads=1` only on recipes that share a GPU runtime unsafely.
 test:
-    cargo test --release
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CPUS={{cpus}}
+    if [[ "$(uname -s)" == Darwin ]]; then
+        # A few parallel test binaries is enough; more contended Apple GPU.
+        JOBS=$(( CPUS < 4 ? CPUS : 4 ))
+        cargo test --release -j "$JOBS"
+    else
+        cargo test --release -j "$CPUS" -- --test-threads="$CPUS"
+    fi
+
+# GPU backends + runtime feature tests for the host platform.
+# Darwin: Metal, MLX, wgpu, Vulkan (MoltenVK), `cpu,apple` runtime, third-order.
+# Linux: wgpu, Vulkan, optional CUDA/ROCm via `test-third-order-gpu` / `test-rocm`.
+test-gpu:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CPUS={{cpus}}
+    JOBS=$(( CPUS < 4 ? CPUS : 4 ))
+    case "$(uname -s)" in
+      Darwin)
+        cargo test --release -p rlx-metal -j "$JOBS"
+        cargo test --release -p rlx-mlx -j "$JOBS"
+        cargo test --release -p rlx-wgpu -j "$JOBS"
+        cargo test --release -p rlx-vulkan -j "$JOBS"
+        cargo test --release -p rlx-runtime --features cpu,apple -j "$JOBS"
+        just test-mlx
+        just test-third-order-gpu
+        ;;
+      *)
+        cargo test --release -p rlx-wgpu -j "$CPUS" -- --test-threads="$CPUS"
+        cargo test --release -p rlx-vulkan -j "$CPUS" -- --test-threads="$CPUS"
+        cargo test --release -p rlx-runtime --features cpu,gpu -j "$CPUS" -- --test-threads="$CPUS"
+        just test-third-order-gpu
+        if cargo check -p rlx-runtime --features cpu,cuda,gpu --quiet 2>/dev/null; then
+          cargo test --release -p rlx-cuda -j "$CPUS" -- --test-threads="$CPUS"
+          cargo test --release -p rlx-runtime --features cpu,cuda,gpu -j "$CPUS" -- --test-threads=1
+        fi
+        just test-rocm
+        ;;
+    esac
 
 # GGUF grouped MoE integration — serial when multiple GPU backends link in.
 test-gguf-grouped:
@@ -151,11 +310,27 @@ torch-import MODEL OUT:
 
 # rlx-torch-import: run the aten→rlx importer's Rust tests.
 test-torch-import:
-    cargo test -p rlx-torch-import
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CPUS={{cpus}}
+    if [[ "$(uname -s)" == Darwin ]]; then
+        JOBS=$(( CPUS < 4 ? CPUS : 4 ))
+        cargo test -p rlx-torch-import -j "$JOBS"
+    else
+        cargo test -p rlx-torch-import -j "$CPUS" -- --test-threads="$CPUS"
+    fi
 
 # Run a specific filter; use as `just testf narrow_attention`.
 testf FILTER:
-    cargo test --release {{FILTER}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CPUS={{cpus}}
+    if [[ "$(uname -s)" == Darwin ]]; then
+        JOBS=$(( CPUS < 4 ? CPUS : 4 ))
+        cargo test --release -j "$JOBS" {{FILTER}}
+    else
+        cargo test --release -j "$CPUS" {{FILTER}} -- --test-threads="$CPUS"
+    fi
 
 # Format check (no rewrite). Mirrors what CI should run.
 fmt-check:
@@ -168,6 +343,31 @@ fmt:
 # Clippy with warnings as errors.
 lint:
     cargo clippy --all-targets -- -D warnings
+
+# Refresh docs/op-coverage.md checkmarks from backend SUPPORTED_OPS claims.
+gen-op-coverage:
+    python3 scripts/gen-op-coverage.py
+
+# Fail if docs/op-coverage.md drifts from backend SUPPORTED_OPS claims.
+check-op-coverage:
+    python3 scripts/gen-op-coverage.py --check
+
+# Print the curated RLX_* environment catalog (high-signal options only).
+env-catalog:
+    cargo run -q -p rlx-ir --example env_catalog
+
+# Regenerate docs/rlx-env-vars.md from the env registry (+ leftover mentions).
+gen-rlx-env-vars:
+    python3 scripts/gen-rlx-env-vars.py
+
+# Fail if docs/rlx-env-vars.md drifts or crates/ has unregistered env::flag reads.
+check-rlx-env-vars:
+    python3 scripts/gen-rlx-env-vars.py --check
+
+# Print the checklist / stub paths for adding a new Op (does not edit the tree).
+# Usage: `just new-op MyOp` or `just new-op MyOp --write` to create empty stub files.
+new-op NAME *ARGS:
+    python3 scripts/new-op.py {{NAME}} {{ARGS}}
 
 # Cross-compile gate: the CPU + WebGPU stack must build for the browser
 # (wasm32-unknown-unknown). Compile-only — running models in a browser is
@@ -229,8 +429,14 @@ build-web *ARGS:
     python3 crates/bindings/rlx-web/build.py {{ARGS}}
 
 # Build + serve the demo at http://localhost:8000 (Ctrl-C to stop).
+# `--serve-with npx` uses `npx serve`; `miniserve` / `basic-http-server` need
+# `cargo install miniserve` or `cargo install basic-http-server`.
 serve-web *ARGS:
     python3 crates/bindings/rlx-web/build.py --serve {{ARGS}}
+
+# Serve only (no wasm rebuild). Requires `just build-web` first.
+serve-web-static BACKEND="python" PORT="8000":
+    python3 crates/bindings/rlx-web/serve.py --backend {{BACKEND}} --port {{PORT}}
 
 # Run burnembed bench for a single model. `just bench minilm6`.
 bench MODEL:

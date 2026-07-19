@@ -5,7 +5,6 @@
 // duplicate values still advance. Input [..., n] → output [..., k].
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) buffer Arena { float data[]; };
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -28,7 +27,7 @@ void main() {
         uint best_i = 0u;
         bool found = false;
         for (uint i = 0u; i < pc.n; i++) {
-            float v = data[base + i];
+            float v = arena_load(base + i);
             // Strictly after the previous pick in (value desc, index asc) order.
             bool below = !have_prev || (v < prev_val) || (v == prev_val && i > prev_idx);
             bool better = (v > best) || (v == best && i < best_i);
@@ -38,7 +37,7 @@ void main() {
                 found = true;
             }
         }
-        data[pc.out_off + row * pc.k + s] = float(best_i);
+        arena_store(pc.out_off + row * pc.k + s, float(best_i));
         prev_val = best;
         prev_idx = best_i;
         have_prev = true;

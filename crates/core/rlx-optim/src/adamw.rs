@@ -62,6 +62,10 @@ pub struct AdamW {
     /// parameter directly inside the update; `0.01–0.1` typical.
     /// Defaults to `0.01`.
     pub weight_decay: f32,
+    /// When true, moment/parameter updates stay in pure `f32` (PyTorch AdamW /
+    /// `foreach=False` default). Default `false` uses `f64` intermediates
+    /// (slightly more accurate, but drifts vs PyTorch shared-init checks).
+    pub f32_math: bool,
     step: u64,
     m: HashMap<String, Vec<f32>>,
     v: HashMap<String, Vec<f32>>,
@@ -77,6 +81,7 @@ impl AdamW {
             beta2: 0.999,
             eps: 1e-8,
             weight_decay: 0.01,
+            f32_math: false,
             step: 0,
             m: HashMap::new(),
             v: HashMap::new(),
@@ -101,6 +106,12 @@ impl AdamW {
         self.eps = eps;
         self
     }
+
+    /// Pure-`f32` AdamW arithmetic (match PyTorch training trajectories).
+    pub fn with_f32_math(mut self, on: bool) -> Self {
+        self.f32_math = on;
+        self
+    }
 }
 
 impl Optimizer for AdamW {
@@ -110,29 +121,50 @@ impl Optimizer for AdamW {
 
     fn step(&mut self, name: &str, _shape: &[usize], param: &mut [f32], grad: &[f32]) {
         debug_assert_eq!(param.len(), grad.len());
-        let t = (self.step + 1) as f64;
-        let b1 = self.beta1 as f64;
-        let b2 = self.beta2 as f64;
-        let bc1 = 1.0 - b1.powf(t);
-        let bc2 = 1.0 - b2.powf(t);
-        let eps = self.eps as f64;
-        let lr = self.lr as f64;
-        let wd = self.weight_decay as f64;
         let m = zeros_entry(&mut self.m, name, param.len());
         let v = zeros_entry(&mut self.v, name, param.len());
-        zip4_for_each(param, m, v, grad, |p, mi, vi, gi| {
-            let g = gi as f64;
-            let new_m = b1 * *mi as f64 + (1.0 - b1) * g;
-            let new_v = b2 * *vi as f64 + (1.0 - b2) * g * g;
-            *mi = new_m as f32;
-            *vi = new_v as f32;
-            let m_hat = new_m / bc1;
-            let v_hat = new_v / bc2;
-            // Decoupled decay: applied to the parameter, then the
-            // adaptive step is subtracted.
-            let pf = *p as f64;
-            *p = (pf - lr * (m_hat / (v_hat.sqrt() + eps) + wd * pf)) as f32;
-        });
+        if self.f32_math {
+            let t = (self.step + 1) as i32;
+            let b1 = self.beta1;
+            let b2 = self.beta2;
+            let bc1 = 1.0 - b1.powi(t);
+            let bc2 = 1.0 - b2.powi(t);
+            let eps = self.eps;
+            let lr = self.lr;
+            let wd = self.weight_decay;
+            zip4_for_each(param, m, v, grad, |p, mi, vi, gi| {
+                let new_m = b1 * *mi + (1.0 - b1) * gi;
+                let new_v = b2 * *vi + (1.0 - b2) * (gi * gi);
+                *mi = new_m;
+                *vi = new_v;
+                let m_hat = new_m / bc1;
+                let v_hat = new_v / bc2;
+                // PyTorch AdamW: param *= (1 - lr*wd); param += -lr * m_hat/(sqrt(v_hat)+eps)
+                *p = *p * (1.0 - lr * wd) - lr * (m_hat / (v_hat.sqrt() + eps));
+            });
+        } else {
+            let t = (self.step + 1) as f64;
+            let b1 = self.beta1 as f64;
+            let b2 = self.beta2 as f64;
+            let bc1 = 1.0 - b1.powf(t);
+            let bc2 = 1.0 - b2.powf(t);
+            let eps = self.eps as f64;
+            let lr = self.lr as f64;
+            let wd = self.weight_decay as f64;
+            zip4_for_each(param, m, v, grad, |p, mi, vi, gi| {
+                let g = gi as f64;
+                let new_m = b1 * *mi as f64 + (1.0 - b1) * g;
+                let new_v = b2 * *vi as f64 + (1.0 - b2) * g * g;
+                *mi = new_m as f32;
+                *vi = new_v as f32;
+                let m_hat = new_m / bc1;
+                let v_hat = new_v / bc2;
+                // Decoupled decay: applied to the parameter, then the
+                // adaptive step is subtracted.
+                let pf = *p as f64;
+                *p = (pf - lr * (m_hat / (v_hat.sqrt() + eps) + wd * pf)) as f32;
+            });
+        }
     }
 
     fn end_iteration(&mut self) {

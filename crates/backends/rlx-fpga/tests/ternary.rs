@@ -51,6 +51,7 @@ fn ternary_dense_model() -> Model {
         w_zp: 0,
         out_zp: 0,
         weight_bits: 2,
+        weight_encoding: rlx_fpga::WeightEncoding::SignedInt,
         requant: vec![(m0, shift)],
         weights: packed,
         bias: None,
@@ -59,6 +60,7 @@ fn ternary_dense_model() -> Model {
         name: "ternary_dense_check".into(),
         input_len: 4,
         layers: vec![dense],
+        extra_outputs: vec![],
     }
 }
 
@@ -90,7 +92,7 @@ fn ternary_dense_emits_2bit_unpack() {
         "ternary dense should bake W_BITS=2 into localparams"
     );
     assert!(
-        dense_sv.content.contains("weight_unpack #(.BITS(W_BITS))"),
+        dense_sv.content.contains("weight_unpack #(.BITS(W_BITS)"),
         "ternary dense should instantiate weight_unpack"
     );
 
@@ -140,10 +142,12 @@ fn nibble_dense_reference_matches_hand_compute() {
             w_zp: 0,
             out_zp: 0,
             weight_bits: 4,
+            weight_encoding: rlx_fpga::WeightEncoding::SignedInt,
             requant: vec![(m0, shift)],
             weights: packed,
             bias: None,
         }],
+        extra_outputs: vec![],
     };
     let (_pred, ints) = run(&model, &[2, 4, 6, 8]);
     assert_eq!(ints[0], vec![10]);
