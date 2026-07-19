@@ -1553,6 +1553,9 @@ pub enum Thunk {
         indices_len: u32,
         out_len: u32,
         indices_i64: u8,
+        /// Byte width of a data/output element (GatherElements preserves dtype).
+        /// Non-f32 data (e.g. int64 token ids) must be gathered at its true width.
+        data_elem_bytes: u8,
         axis: i32,
     },
     /// Ternary select: out = cond != 0 ? on_true : on_false.

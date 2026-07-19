@@ -70,7 +70,7 @@ pub(super) fn lower_constant_of_shape(
             _ => DType::F32,
         })
         .unwrap_or_else(|| meta_s.dtype());
-    let mut out_s = match eval_static_shape_vector(ctx, m, &node.inputs[0], 0) {
+    let out_s = match eval_static_shape_vector(ctx, m, &node.inputs[0], 0) {
         // Non-empty shape vector → tensor with those dims filled by `value`.
         Some(dims) if !dims.is_empty() => {
             let d: Vec<usize> = dims.iter().map(|&x| x.max(0) as usize).collect();
@@ -85,15 +85,22 @@ pub(super) fn lower_constant_of_shape(
         _ => Shape::from_dims(meta_s.dims(), value_dtype),
     };
     // `num_elements()==0` means a Static(0) dim (not an empty rank-0 shape —
-    // those become `[1]` above). Never emit a 1-element param binding for a
-    // 0-element shape: `specialize_params` asserts binding len == shape elems
-    // and panics (MOSS prefill on CUDA). Promote empty stubs to a scalar `[1]`
-    // so fill length and shape stay consistent.
+    // those become `[1]` above), e.g. an empty KV cache `[1,0,12,64]`. This MUST
+    // stay a genuine 0-element tensor: promoting it to a filled `[1]` scalar adds
+    // a phantom element that a downstream `Concat` then treats as a real sequence
+    // position — MOSS's local-decoder attention attended a spurious all-zero key
+    // (shifting the real key under the causal mask) → zero attention output →
+    // wrong logits → garbage codes on every backend. Emit a true empty `Constant`
+    // (0 bytes, rank preserved) so `Concat` drops it. Using `Op::Constant` here
+    // (not a `param`) sidesteps `specialize_params`, whose `binding len == shape
+    // elems` assertion on a 0-length binding was the original reason for the
+    // force-promotion (MOSS prefill on CUDA) — a Constant carries its own bytes.
+    if out_s.num_elements() == Some(0) {
+        let id = m.add_node(Op::Constant { data: Vec::new() }, vec![], out_s);
+        ctx.env.insert(node.outputs[0].clone(), id);
+        return Ok(true);
+    }
     let n = match out_s.num_elements() {
-        Some(0) => {
-            out_s = Shape::new(&[1], value_dtype);
-            1
-        }
         Some(n) => n.clamp(1, MAX_STUB_ELEMENTS),
         None => 1,
     };

@@ -108,6 +108,7 @@ pub fn indexing_thunk_from_node(
                 indices_len: indices_shape.num_elements().unwrap_or(0) as u32,
                 out_len: node.shape.num_elements().unwrap_or(0) as u32,
                 indices_i64: u8::from(indices_shape.dtype() == rlx_ir::DType::I64),
+                data_elem_bytes: data_shape.dtype().size_bytes() as u8,
                 axis: *axis,
             }
         }
@@ -182,11 +183,12 @@ pub fn indexing_thunk_regions(thunk: &Thunk) -> Vec<(usize, usize)> {
             indices_len,
             out_len,
             indices_i64,
+            data_elem_bytes,
             ..
         } => vec![
-            (*data, *data_len as usize * 4),
+            (*data, *data_len as usize * (*data_elem_bytes as usize).max(1)),
             (*indices, idx_nbytes(*indices_len, *indices_i64)),
-            (*dst, *out_len as usize * 4),
+            (*dst, *out_len as usize * (*data_elem_bytes as usize).max(1)),
         ],
         _ => panic!("indexing_thunk_regions: not an indexing thunk"),
     }
@@ -282,6 +284,7 @@ fn rebase_indexing_thunk(thunk: Thunk, lo: usize) -> Thunk {
             indices_len,
             out_len,
             indices_i64,
+            data_elem_bytes,
             axis,
         } => Thunk::GatherElements {
             data: rebase_off(data, lo),
@@ -293,6 +296,7 @@ fn rebase_indexing_thunk(thunk: Thunk, lo: usize) -> Thunk {
             indices_len,
             out_len,
             indices_i64,
+            data_elem_bytes,
             axis,
         },
         _ => panic!("rebase_indexing_thunk: not an indexing thunk"),
@@ -433,6 +437,7 @@ pub fn remap_indexing_thunk_offsets(thunk: Thunk, mut map: impl FnMut(usize) -> 
             indices_len,
             out_len,
             indices_i64,
+            data_elem_bytes,
             axis,
         } => Thunk::GatherElements {
             data: map(data),
@@ -444,6 +449,7 @@ pub fn remap_indexing_thunk_offsets(thunk: Thunk, mut map: impl FnMut(usize) -> 
             indices_len,
             out_len,
             indices_i64,
+            data_elem_bytes,
             axis,
         },
         _ => panic!("remap_indexing_thunk_offsets: not an indexing thunk"),
@@ -590,6 +596,7 @@ pub fn force_indexing_indices_f32(thunk: Thunk) -> Thunk {
             data_len,
             indices_len,
             out_len,
+            data_elem_bytes,
             axis,
             ..
         } => Thunk::GatherElements {
@@ -602,6 +609,7 @@ pub fn force_indexing_indices_f32(thunk: Thunk) -> Thunk {
             indices_len,
             out_len,
             indices_i64: 0,
+            data_elem_bytes,
             axis,
         },
         other => other,

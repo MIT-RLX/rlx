@@ -305,6 +305,34 @@ impl CudaExecutable {
         let mut last_event: HashMap<usize, cudarc::driver::CudaEvent> = HashMap::new();
         let mut rr_cursor: usize = 0;
 
+        // --- RLX_ARENA_WATCH: bug #4 localizer. After each Step, D2H the arena and
+        // flag any changed f32 that lands in a slot the Step did NOT declare it
+        // writes (step_offsets). Run under RLX_CUDA_ARENA_NO_REUSE=1 so slots are
+        // unique → a stray write into a (dead) neighbour is unambiguous. Prints
+        // (step idx, op, victim node id) of the first out-of-slot writer. Expensive
+        // (whole-arena D2H per step) — debug only.
+        let watch_enabled = rlx_ir::env::flag("RLX_ARENA_WATCH");
+        let watch_from: usize = rlx_ir::env::parse_or("RLX_ARENA_WATCH_FROM", 0usize);
+        let mut watch_slots: Vec<(u32, u32, u32)> = Vec::new(); // (start_f32, end_f32, node_id)
+        let mut watch_prev: Vec<f32> = Vec::new();
+        let mut watch_step: usize = 0;
+        if watch_enabled {
+            // Only buffer-OWNING nodes (views alias their root's slot; including
+            // them with their own len_of makes overlapping ranges → mis-attribution).
+            for node in self.graph.nodes() {
+                let is_view = matches!(
+                    node.op,
+                    rlx_ir::Op::Reshape { .. } | rlx_ir::Op::Cast { .. } | rlx_ir::Op::StopGradient
+                );
+                if self.arena.has(node.id) && !is_view {
+                    let off = (self.arena.offset(node.id) / 4) as u32;
+                    let sz = node.shape.num_elements().unwrap_or(0).max(1) as u32;
+                    watch_slots.push((off, off + sz, node.id.0 as u32));
+                }
+            }
+            watch_slots.sort_by_key(|&(s, _, _)| s);
+        }
+
         // Dispatch each step. Each iteration is wrapped in an NVTX
         // range so nsight-systems traces show step boundaries cleanly.
         // Gated behind the `nvtx` feature because CUDA 13 removed
@@ -4571,6 +4599,61 @@ impl CudaExecutable {
                 for w in &writes {
                     producer_of.insert(*w, idx);
                 }
+            }
+
+            if watch_enabled && watch_step >= watch_from {
+                let s = default_stream.clone();
+                let _ = s.synchronize();
+                let total = self.arena.f32_buf().len();
+                let mut cur = vec![0f32; total];
+                let sl = self.arena.f32_buf().slice(0..total);
+                let _ = s.memcpy_dtoh(&sl, &mut cur);
+                if !watch_prev.is_empty() {
+                    let (_, writes) = step_offsets(step);
+                    let wset: std::collections::HashSet<u32> = writes.iter().copied().collect();
+                    let mut stray: std::collections::HashMap<u32, (usize, f32, u32, u32)> =
+                        std::collections::HashMap::new();
+                    for i in 0..total {
+                        let (a, b) = (watch_prev[i], cur[i]);
+                        if a.to_bits() == b.to_bits() {
+                            continue;
+                        }
+                        let idx = i as u32;
+                        let pp = watch_slots.partition_point(|&(s2, _, _)| s2 <= idx);
+                        if pp > 0 {
+                            let (soff, send, nid) = watch_slots[pp - 1];
+                            if idx < send && !wset.contains(&soff) {
+                                let e = stray.entry(nid).or_insert((0, 0f32, u32::MAX, 0));
+                                e.0 += 1;
+                                e.1 = e.1.max(b.abs());
+                                e.2 = e.2.min(idx);
+                                e.3 = e.3.max(idx);
+                            }
+                        }
+                    }
+                    if !stray.is_empty() {
+                        let name = step_name(step);
+                        let wlist: Vec<u32> = writes.clone();
+                        // Resolve the owning slot of the declared write offset.
+                        let w0 = writes.first().copied().unwrap_or(0);
+                        let wpp = watch_slots.partition_point(|&(s2, _, _)| s2 <= w0);
+                        let wown = if wpp > 0 { watch_slots[wpp - 1] } else { (0, 0, 0) };
+                        let w0_is_slot_start = watch_slots.iter().any(|&(s2, _, _)| s2 == w0);
+                        let mut items: Vec<_> = stray.into_iter().collect();
+                        items.sort_by_key(|&(nid, _)| nid);
+                        for (nid, (cnt, mx, lo, hi)) in items.iter().take(6) {
+                            let vic = watch_slots.iter().find(|&&(_, _, n)| n == *nid).copied().unwrap_or((0,0,0));
+                            eprintln!(
+                                "[ARENA-WATCH] step {watch_step} ({name}) W0={w0}(slotstart={w0_is_slot_start},owner-node={},owner[{}..{}]) STRAY {cnt} -> victim node {nid} slot[{}..{}] range[{lo}..{hi}] max={mx:.5}",
+                                wown.2, wown.0, wown.1, vic.0, vic.1
+                            );
+                        }
+                    }
+                }
+                watch_prev = cur;
+            }
+            if watch_enabled {
+                watch_step += 1;
             }
         }
 

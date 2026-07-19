@@ -539,6 +539,63 @@ impl CpuKernel for ScatterElementsKernel {
 // ---------------------------------------------------------------------------
 
 /// ONNX GatherElements / take_along_axis into `out` (shape = indices shape).
+/// Dtype-agnostic `GatherElements`: copies `elem_bytes`-wide elements verbatim,
+/// so it is correct for I64/I32/F32/… data alike (the f32-only variant silently
+/// reinterpreted int64 token-id data as f32 — MOSS's sampler gathers int64 TopK
+/// indices, and reading `788i64`'s high word as f32 yielded `0.0` → code 0 →
+/// garbage). `data`/`out` are raw byte slices; `indices` are element indices.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_elements_bytes(
+    data: &[u8],
+    indices: &[i64],
+    out: &mut [u8],
+    data_shape: &[usize],
+    indices_shape: &[usize],
+    axis: i32,
+    elem_bytes: usize,
+) {
+    if data_shape.is_empty() || indices_shape.is_empty() || elem_bytes == 0 {
+        return;
+    }
+    let rank = data_shape.len();
+    let axis = normalize_axis(axis, rank);
+    let mut dstride = vec![1usize; rank];
+    for k in (0..rank.saturating_sub(1)).rev() {
+        dstride[k] = dstride[k + 1] * data_shape[k + 1].max(1);
+    }
+    let mut ostride = vec![1usize; rank];
+    for k in (0..rank.saturating_sub(1)).rev() {
+        ostride[k] = ostride[k + 1] * indices_shape[k + 1].max(1);
+    }
+    let total: usize = indices_shape
+        .iter()
+        .product::<usize>()
+        .max(1)
+        .min(out.len() / elem_bytes);
+    let axis_dim = data_shape[axis].max(1) as i64;
+    for lin in 0..total {
+        let mut off = 0usize;
+        for k in 0..rank {
+            let coord = (lin / ostride[k]) % indices_shape[k].max(1);
+            if k == axis {
+                let mut idx = indices.get(lin).copied().unwrap_or(0);
+                if idx < 0 {
+                    idx += axis_dim;
+                }
+                let idx = idx.clamp(0, axis_dim.saturating_sub(1).max(0)) as usize;
+                off += idx * dstride[k];
+            } else {
+                off += coord.min(data_shape[k].saturating_sub(1)) * dstride[k];
+            }
+        }
+        let (ds, de) = (off * elem_bytes, off * elem_bytes + elem_bytes);
+        let (os, oe) = (lin * elem_bytes, lin * elem_bytes + elem_bytes);
+        if de <= data.len() && oe <= out.len() {
+            out[os..oe].copy_from_slice(&data[ds..de]);
+        }
+    }
+}
+
 pub fn gather_elements_f32(
     data: &[f32],
     indices: &[i64],

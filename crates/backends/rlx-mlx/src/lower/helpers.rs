@@ -967,6 +967,7 @@ pub(crate) fn force_indexing_indices_i64(thunk: rlx_cpu::thunk::Thunk) -> rlx_cp
             data_len,
             indices_len,
             out_len,
+            data_elem_bytes,
             axis,
             ..
         } => rlx_cpu::thunk::Thunk::GatherElements {
@@ -979,6 +980,7 @@ pub(crate) fn force_indexing_indices_i64(thunk: rlx_cpu::thunk::Thunk) -> rlx_cp
             indices_len,
             out_len,
             indices_i64: 1,
+            data_elem_bytes,
             axis,
         },
         other => other,

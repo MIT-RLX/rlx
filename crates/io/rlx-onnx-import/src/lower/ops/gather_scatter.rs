@@ -59,6 +59,23 @@ pub(super) fn lower_scatter_nd(
         _ => rlx_ir::ScatterNdReduction::None,
     };
     let s = m.shape(data).clone();
+    // The CPU Scatter/Gather-ND/Elements kernels copy elements as f32 (`sl(*data)`
+    // + `*_f32`). Non-f32 data is silently misread at the wrong byte width — e.g.
+    // ChatterBox's conditional_decoder scatters a BOOL mask, whose 1-byte elements
+    // read as 4-byte f32 corrupt the result. Route non-f32 data+updates through
+    // f32 (Cast is exact for bool / |int| < 2^24 — the only realistic non-f32
+    // operands for these index ops) and cast the scattered result back.
+    let dt = s.dtype();
+    if dt != DType::F32 {
+        let sf = s.clone().with_dtype(DType::F32);
+        let uf = m.shape(updates).clone().with_dtype(DType::F32);
+        let data_f = m.add_node(Op::Cast { to: DType::F32 }, vec![data], sf.clone());
+        let upd_f = m.add_node(Op::Cast { to: DType::F32 }, vec![updates], uf);
+        let scat = m.add_node(Op::ScatterNd { reduction }, vec![data_f, indices, upd_f], sf);
+        let back = m.add_node(Op::Cast { to: dt }, vec![scat], s);
+        ctx.env.insert(node.outputs[0].clone(), back);
+        return Ok(true);
+    }
     let id = m.add_node(Op::ScatterNd { reduction }, vec![data, indices, updates], s);
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
@@ -86,6 +103,22 @@ pub(super) fn lower_scatter_elements(
         _ => rlx_ir::ScatterNdReduction::None,
     };
     let s = m.shape(data).clone();
+    // Same f32-only-kernel guard as ScatterND (see lower_scatter_nd).
+    let dt = s.dtype();
+    if dt != DType::F32 {
+        let sf = s.clone().with_dtype(DType::F32);
+        let uf = m.shape(updates).clone().with_dtype(DType::F32);
+        let data_f = m.add_node(Op::Cast { to: DType::F32 }, vec![data], sf.clone());
+        let upd_f = m.add_node(Op::Cast { to: DType::F32 }, vec![updates], uf);
+        let scat = m.add_node(
+            Op::ScatterElements { axis, reduction },
+            vec![data_f, indices, upd_f],
+            sf,
+        );
+        let back = m.add_node(Op::Cast { to: dt }, vec![scat], s);
+        ctx.env.insert(node.outputs[0].clone(), back);
+        return Ok(true);
+    }
     let id = m.add_node(
         Op::ScatterElements { axis, reduction },
         vec![data, indices, updates],
@@ -129,6 +162,18 @@ pub(super) fn lower_gather_nd(
     } else {
         output_shape(ctx, node, m, data)
     };
+    // Same f32-only-kernel guard as ScatterND (see lower_scatter_nd): GatherND's
+    // CPU kernel copies data elements as f32, so route non-f32 data through f32.
+    let dt = out_s.dtype();
+    if dt != DType::F32 {
+        let df = m.shape(data).clone().with_dtype(DType::F32);
+        let of = out_s.clone().with_dtype(DType::F32);
+        let data_f = m.add_node(Op::Cast { to: DType::F32 }, vec![data], df);
+        let g = m.add_node(Op::GatherNd { batch_dims }, vec![data_f, indices], of);
+        let back = m.add_node(Op::Cast { to: dt }, vec![g], out_s);
+        ctx.env.insert(node.outputs[0].clone(), back);
+        return Ok(true);
+    }
     let id = m.add_node(Op::GatherNd { batch_dims }, vec![data, indices], out_s);
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)

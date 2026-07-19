@@ -528,6 +528,7 @@ pub(crate) fn compile_gather_elements(
         indices_len: indices_shape.num_elements().unwrap_or(0) as u32,
         out_len: node.shape.num_elements().unwrap_or(0) as u32,
         indices_i64: u8::from(indices_shape.dtype() == rlx_ir::DType::I64),
+        data_elem_bytes: data_shape.dtype().size_bytes() as u8,
         axis: *axis,
     }
 }
@@ -1695,6 +1696,7 @@ pub(crate) fn exec_gather_elements(t: &Thunk, base: *mut u8) {
         indices_len,
         out_len,
         indices_i64,
+        data_elem_bytes,
         axis,
     } = t
     else {
@@ -1702,18 +1704,37 @@ pub(crate) fn exec_gather_elements(t: &Thunk, base: *mut u8) {
     };
     let data_shape: Vec<usize> = data_shape.iter().map(|&d| d as usize).collect();
     let indices_shape: Vec<usize> = indices_shape.iter().map(|&d| d as usize).collect();
+    let elem_bytes = (*data_elem_bytes as usize).max(1);
     unsafe {
-        let data_s = sl(*data, base, *data_len as usize);
-        let out = sl_mut(*dst, base, *out_len as usize);
         let idx = load_indices_i64(base, *indices, *indices_len as usize, *indices_i64);
-        crate::onnx_indexing::gather_elements_f32(
-            data_s,
-            &idx,
-            out,
-            &data_shape,
-            &indices_shape,
-            *axis,
-        );
+        if elem_bytes == 4 {
+            // Fast path preserves the (well-tested) f32 element copy.
+            let data_s = sl(*data, base, *data_len as usize);
+            let out = sl_mut(*dst, base, *out_len as usize);
+            crate::onnx_indexing::gather_elements_f32(
+                data_s,
+                &idx,
+                out,
+                &data_shape,
+                &indices_shape,
+                *axis,
+            );
+        } else {
+            // Dtype-agnostic byte copy for I64/I8/… data (e.g. int64 token ids).
+            let data_b =
+                std::slice::from_raw_parts(base.add(*data), *data_len as usize * elem_bytes);
+            let out_b =
+                std::slice::from_raw_parts_mut(base.add(*dst), *out_len as usize * elem_bytes);
+            crate::onnx_indexing::gather_elements_bytes(
+                data_b,
+                &idx,
+                out_b,
+                &data_shape,
+                &indices_shape,
+                *axis,
+                elem_bytes,
+            );
+        }
     }
 }
 
