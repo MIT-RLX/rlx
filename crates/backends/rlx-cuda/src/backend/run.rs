@@ -3751,9 +3751,9 @@ impl CudaExecutable {
                                 *dh,
                                 *dw,
                                 *groups,
-                                *dy_byte_off / 4,
-                                *w_byte_off / 4,
-                                *dx_byte_off / 4,
+                                (*dy_byte_off / 4) as u32,
+                                (*w_byte_off / 4) as u32,
+                                (*dx_byte_off / 4) as u32,
                             )
                         };
                         if let Err(ref e) = r {
@@ -3802,8 +3802,11 @@ impl CudaExecutable {
                                 block_dim: (block, 1, 1),
                                 shared_mem_bytes: 0,
                             };
-                            let (dy_e, w_e, dx_e) =
-                                (*dy_byte_off / 4, *w_byte_off / 4, *dx_byte_off / 4);
+                            let (dy_e, w_e, dx_e) = (
+                                (*dy_byte_off / 4) as u32,
+                                (*w_byte_off / 4) as u32,
+                                (*dx_byte_off / 4) as u32,
+                            );
                             let mut launcher = stream.launch_builder(&kernel.function);
                             launcher
                                 .arg(self.arena.f32_buf_mut())
@@ -3897,9 +3900,9 @@ impl CudaExecutable {
                                 *dh,
                                 *dw_dil,
                                 *groups,
-                                *x_byte_off / 4,
-                                *dy_byte_off / 4,
-                                *dw_byte_off / 4,
+                                (*x_byte_off / 4) as u32,
+                                (*dy_byte_off / 4) as u32,
+                                (*dw_byte_off / 4) as u32,
                             )
                         };
                         if let Err(ref e) = r {
@@ -3948,8 +3951,11 @@ impl CudaExecutable {
                                 block_dim: (block, 1, 1),
                                 shared_mem_bytes: 0,
                             };
-                            let (x_e, dy_e, dw_e) =
-                                (*x_byte_off / 4, *dy_byte_off / 4, *dw_byte_off / 4);
+                            let (x_e, dy_e, dw_e) = (
+                                (*x_byte_off / 4) as u32,
+                                (*dy_byte_off / 4) as u32,
+                                (*dw_byte_off / 4) as u32,
+                            );
                             let mut launcher = stream.launch_builder(&kernel.function);
                             launcher
                                 .arg(self.arena.f32_buf_mut())

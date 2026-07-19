@@ -2763,9 +2763,9 @@ impl CudaExecutable {
                     let out_shape = &node.shape;
                     if kernel_size.len() == 2 && dy_shape.rank() == 4 && out_shape.rank() == 4 {
                         schedule.push(Step::Conv2dBackwardInput {
-                            dy_byte_off: arena.offset(node.inputs[0]) as u32,
-                            w_byte_off: arena.offset(node.inputs[1]) as u32,
-                            dx_byte_off: arena.offset(node.id) as u32,
+                            dy_byte_off: arena.offset(node.inputs[0]) as u64,
+                            w_byte_off: arena.offset(node.inputs[1]) as u64,
+                            dx_byte_off: arena.offset(node.id) as u64,
                             n: out_shape.dim(0).unwrap_static() as u32,
                             c_in: out_shape.dim(1).unwrap_static() as u32,
                             h: out_shape.dim(2).unwrap_static() as u32,
@@ -2798,9 +2798,9 @@ impl CudaExecutable {
                     let dy_shape = &graph.node(node.inputs[1]).shape;
                     if kernel_size.len() == 2 && x_shape.rank() == 4 && dy_shape.rank() == 4 {
                         schedule.push(Step::Conv2dBackwardWeight {
-                            x_byte_off: arena.offset(node.inputs[0]) as u32,
-                            dy_byte_off: arena.offset(node.inputs[1]) as u32,
-                            dw_byte_off: arena.offset(node.id) as u32,
+                            x_byte_off: arena.offset(node.inputs[0]) as u64,
+                            dy_byte_off: arena.offset(node.inputs[1]) as u64,
+                            dw_byte_off: arena.offset(node.id) as u64,
                             n: x_shape.dim(0).unwrap_static() as u32,
                             c_in: x_shape.dim(1).unwrap_static() as u32,
                             h: x_shape.dim(2).unwrap_static() as u32,

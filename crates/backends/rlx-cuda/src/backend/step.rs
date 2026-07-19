@@ -893,9 +893,12 @@ pub(crate) enum Step {
         pw: u32,
     },
     Conv2dBackwardInput {
-        dy_byte_off: u32,
-        w_byte_off: u32,
-        dx_byte_off: u32,
+        // u64: the arena can exceed 4 GiB (e.g. batch-16 codec = 5.6 GiB); a u32
+        // byte offset wraps mod 2^32 and the conv writes its dx to a stray address
+        // that lands on a live gradient buffer under reuse (bug #4).
+        dy_byte_off: u64,
+        w_byte_off: u64,
+        dx_byte_off: u64,
         n: u32,
         c_in: u32,
         h: u32,
@@ -914,9 +917,10 @@ pub(crate) enum Step {
         groups: u32,
     },
     Conv2dBackwardWeight {
-        x_byte_off: u32,
-        dy_byte_off: u32,
-        dw_byte_off: u32,
+        // u64: see Conv2dBackwardInput — same >4 GiB byte-offset overflow (bug #4).
+        x_byte_off: u64,
+        dy_byte_off: u64,
+        dw_byte_off: u64,
         n: u32,
         c_in: u32,
         h: u32,
@@ -2183,8 +2187,8 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dx_byte_off,
             ..
         } => (
-            vec![*dy_byte_off / 4, *w_byte_off / 4],
-            vec![*dx_byte_off / 4],
+            vec![(*dy_byte_off / 4) as u32, (*w_byte_off / 4) as u32],
+            vec![(*dx_byte_off / 4) as u32],
         ),
         Step::Conv2dBackwardWeight {
             x_byte_off,
@@ -2192,8 +2196,8 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dw_byte_off,
             ..
         } => (
-            vec![*x_byte_off / 4, *dy_byte_off / 4],
-            vec![*dw_byte_off / 4],
+            vec![(*x_byte_off / 4) as u32, (*dy_byte_off / 4) as u32],
+            vec![(*dw_byte_off / 4) as u32],
         ),
         Step::Pool1d {
             in_off, out_off, ..
