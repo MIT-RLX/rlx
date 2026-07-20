@@ -343,7 +343,7 @@ impl CudaExecutable {
                     let n = out_dims[1].unwrap_static() as u32;
                     let k = graph.node(node.inputs[0]).shape.dims()[1].unwrap_static() as u32;
                     let bias_byte = if *has_bias {
-                        arena.offset(node.inputs[4]) as u32
+                        arena.offset(node.inputs[4]) as u64
                     } else {
                         0
                     };
@@ -356,11 +356,11 @@ impl CudaExecutable {
                             m,
                             k,
                             n,
-                            lhs_byte_off: arena.offset(node.inputs[0]) as u32,
-                            rhs_byte_off: arena.offset(node.inputs[1]) as u32,
-                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u32,
-                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u32,
-                            out_byte_off: arena.offset(node.id) as u32,
+                            lhs_byte_off: arena.offset(node.inputs[0]) as u64,
+                            rhs_byte_off: arena.offset(node.inputs[1]) as u64,
+                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u64,
+                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
                             has_bias: u32::from(*has_bias),
                             bias_byte_off: bias_byte,
                             lhs_e5m2: u32::from(*lhs_format == rlx_ir::ScaledFormat::F8E5M2),
@@ -373,17 +373,17 @@ impl CudaExecutable {
                             m,
                             k,
                             n,
-                            lhs_byte_off: arena.offset(node.inputs[0]) as u32,
-                            rhs_byte_off: arena.offset(node.inputs[1]) as u32,
-                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u32,
-                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u32,
+                            lhs_byte_off: arena.offset(node.inputs[0]) as u64,
+                            rhs_byte_off: arena.offset(node.inputs[1]) as u64,
+                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u64,
+                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u64,
                             out_off_f32: (arena.offset(node.id) / 4) as u32,
                             lhs_fmt: lhs_format.kernel_id(),
                             rhs_fmt: rhs_format.kernel_id(),
                             scale_mode,
                             block,
                             has_bias: u32::from(*has_bias),
-                            bias_off_f32: bias_byte / 4,
+                            bias_off_f32: (bias_byte / 4) as u32,
                         });
                     }
                 }
@@ -410,7 +410,7 @@ impl CudaExecutable {
                         let (scale_mode, block) = scale_layout.mode_block();
                         schedule.push(Step::ScaledQuantScaleGeneral {
                             x_off_f32: (arena.offset(x_id) / 4) as u32,
-                            scale_byte_off: arena.offset(node.id) as u32,
+                            scale_byte_off: arena.offset(node.id) as u64,
                             rows,
                             cols,
                             fmt: format.kernel_id(),
@@ -432,7 +432,7 @@ impl CudaExecutable {
                         schedule.push(Step::ScaledQuantizeFp8 {
                             x_off_f32: (arena.offset(x_id) / 4) as u32,
                             scale_off_f32: (arena.offset(scale_id) / 4) as u32,
-                            out_byte_off: arena.offset(node.id) as u32,
+                            out_byte_off: arena.offset(node.id) as u64,
                             n,
                             e5m2: u32::from(*format == rlx_ir::ScaledFormat::F8E5M2),
                         });
@@ -444,8 +444,8 @@ impl CudaExecutable {
                         let (scale_mode, block) = scale_layout.mode_block();
                         schedule.push(Step::ScaledQuantizeGeneral {
                             x_off_f32: (arena.offset(x_id) / 4) as u32,
-                            scale_byte_off: arena.offset(scale_id) as u32,
-                            out_byte_off: arena.offset(node.id) as u32,
+                            scale_byte_off: arena.offset(scale_id) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
                             rows,
                             cols,
                             fmt: format.kernel_id(),
@@ -468,8 +468,8 @@ impl CudaExecutable {
                         graph.node(codes_id).shape.num_elements().unwrap() as u32 / cols.max(1);
                     let (scale_mode, block) = scale_layout.mode_block();
                     schedule.push(Step::ScaledDequantizeGeneral {
-                        codes_byte_off: arena.offset(codes_id) as u32,
-                        scale_byte_off: arena.offset(scale_id) as u32,
+                        codes_byte_off: arena.offset(codes_id) as u64,
+                        scale_byte_off: arena.offset(scale_id) as u64,
                         out_off_f32: (arena.offset(node.id) / 4) as u32,
                         rows,
                         cols,
@@ -1749,8 +1749,8 @@ impl CudaExecutable {
                     #[cfg(not(feature = "native-cuda-fft"))]
                     let (src_id, real_input) = (in_id, false);
                     schedule.push(Step::Fft {
-                        src_byte_off: arena.offset(src_id) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        src_byte_off: arena.offset(src_id) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         outer: meta.outer as u32,
                         n_complex: meta.n_complex as u32,
                         inverse: *inverse,
@@ -1766,9 +1766,9 @@ impl CudaExecutable {
                     let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
                         .unwrap_or_else(|e| panic!("Op::LogMel: {e}"));
                     schedule.push(Step::LogMelHost {
-                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
-                        filt_byte_off: arena.offset(node.inputs[1]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        spec_byte_off: arena.offset(node.inputs[0]) as u64,
+                        filt_byte_off: arena.offset(node.inputs[1]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         outer: meta.outer as u32,
                         n_fft: meta.n_fft as u32,
                         n_bins: meta.n_bins as u32,
@@ -1781,10 +1781,10 @@ impl CudaExecutable {
                     let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
                         .unwrap_or_else(|e| panic!("Op::LogMelBackward: {e}"));
                     schedule.push(Step::LogMelBackwardHost {
-                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
-                        filt_byte_off: arena.offset(node.inputs[1]) as u32,
-                        dy_byte_off: arena.offset(node.inputs[2]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        spec_byte_off: arena.offset(node.inputs[0]) as u64,
+                        filt_byte_off: arena.offset(node.inputs[1]) as u64,
+                        dy_byte_off: arena.offset(node.inputs[2]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         outer: meta.outer as u32,
                         n_fft: meta.n_fft as u32,
                         n_bins: meta.n_bins as u32,
@@ -1813,8 +1813,8 @@ impl CudaExecutable {
                         });
                     } else {
                         schedule.push(Step::WelchPeaksHost {
-                            spec_byte_off: arena.offset(node.inputs[0]) as u32,
-                            dst_byte_off: arena.offset(node.id) as u32,
+                            spec_byte_off: arena.offset(node.inputs[0]) as u64,
+                            dst_byte_off: arena.offset(node.id) as u64,
                             welch_batch: meta.welch_batch as u32,
                             n_fft: meta.n_fft as u32,
                             n_segments: meta.n_segments as u32,
@@ -1862,8 +1862,8 @@ impl CudaExecutable {
                         dw_dil as usize,
                     ) as u32;
                     schedule.push(Step::Im2ColHost {
-                        x_byte_off: arena.offset(node.inputs[0]) as u32,
-                        col_byte_off: arena.offset(node.id) as u32,
+                        x_byte_off: arena.offset(node.inputs[0]) as u64,
+                        col_byte_off: arena.offset(node.id) as u64,
                         n,
                         c_in,
                         h,
@@ -1894,8 +1894,8 @@ impl CudaExecutable {
                         }
                     }
                     schedule.push(Step::ReverseHost {
-                        src_byte_off: arena.offset(node.inputs[0]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        src_byte_off: arena.offset(node.inputs[0]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         dims,
                         rev_mask,
                         elem_bytes: in_shape.dtype().size_bytes() as u32,
@@ -1914,8 +1914,8 @@ impl CudaExecutable {
                         .product::<usize>()
                         .max(1);
                     schedule.push(Step::ArgReduceHost {
-                        src_byte_off: arena.offset(node.inputs[0]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        src_byte_off: arena.offset(node.inputs[0]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         outer: outer as u32,
                         reduced: reduced as u32,
                         inner: inner as u32,
@@ -1932,8 +1932,8 @@ impl CudaExecutable {
                 } => {
                     let in_shape = &graph.node(node.inputs[0]).shape;
                     schedule.push(Step::AxialRope2dHost {
-                        src_byte_off: arena.offset(node.inputs[0]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        src_byte_off: arena.offset(node.inputs[0]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         batch: in_shape.dim(0).unwrap_static() as u32,
                         seq: in_shape.dim(1).unwrap_static() as u32,
                         hidden: in_shape.dim(2).unwrap_static() as u32,
@@ -2002,20 +2002,20 @@ impl CudaExecutable {
                     let x_shape = &graph.node(node.inputs[0]).shape;
                     let (h0, c0) = if *carry {
                         (
-                            arena.offset(node.inputs[4]) as u32,
-                            arena.offset(node.inputs[5]) as u32,
+                            arena.offset(node.inputs[4]) as u64,
+                            arena.offset(node.inputs[5]) as u64,
                         )
                     } else {
-                        (0u32, 0u32)
+                        (0u64, 0u64)
                     };
                     schedule.push(Step::Lstm {
-                        x_byte_off: arena.offset(node.inputs[0]) as u32,
-                        w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
-                        w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
-                        bias_byte_off: arena.offset(node.inputs[3]) as u32,
+                        x_byte_off: arena.offset(node.inputs[0]) as u64,
+                        w_ih_byte_off: arena.offset(node.inputs[1]) as u64,
+                        w_hh_byte_off: arena.offset(node.inputs[2]) as u64,
+                        bias_byte_off: arena.offset(node.inputs[3]) as u64,
                         h0_byte_off: h0,
                         c0_byte_off: c0,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         batch: x_shape.dim(0).unwrap_static() as u32,
                         seq: x_shape.dim(1).unwrap_static() as u32,
                         input_size: x_shape.dim(2).unwrap_static() as u32,
@@ -2168,20 +2168,20 @@ impl CudaExecutable {
                         graph.node(id).shape.num_elements().unwrap_or(0) as u32
                     };
                     schedule.push(Step::GaussianSplatRender {
-                        positions_off: arena.offset(node.inputs[0]) as u32,
+                        positions_off: arena.offset(node.inputs[0]) as u64,
                         positions_len: elem_len(node.inputs[0]),
-                        scales_off: arena.offset(node.inputs[1]) as u32,
+                        scales_off: arena.offset(node.inputs[1]) as u64,
                         scales_len: elem_len(node.inputs[1]),
-                        rotations_off: arena.offset(node.inputs[2]) as u32,
+                        rotations_off: arena.offset(node.inputs[2]) as u64,
                         rotations_len: elem_len(node.inputs[2]),
-                        opacities_off: arena.offset(node.inputs[3]) as u32,
+                        opacities_off: arena.offset(node.inputs[3]) as u64,
                         opacities_len: elem_len(node.inputs[3]),
-                        colors_off: arena.offset(node.inputs[4]) as u32,
+                        colors_off: arena.offset(node.inputs[4]) as u64,
                         colors_len: elem_len(node.inputs[4]),
-                        sh_coeffs_off: arena.offset(node.inputs[5]) as u32,
+                        sh_coeffs_off: arena.offset(node.inputs[5]) as u64,
                         sh_coeffs_len: elem_len(node.inputs[5]),
-                        meta_off: arena.offset(node.inputs[6]) as u32,
-                        dst_off: arena.offset(node.id) as u32,
+                        meta_off: arena.offset(node.inputs[6]) as u64,
+                        dst_off: arena.offset(node.id) as u64,
                         dst_len: node.shape.num_elements().unwrap_or(0) as u32,
                         width: *width,
                         height: *height,
@@ -2211,22 +2211,22 @@ impl CudaExecutable {
                         graph.node(id).shape.num_elements().unwrap_or(0) as u32
                     };
                     schedule.push(Step::GaussianSplatRenderBackward {
-                        positions_off: arena.offset(node.inputs[0]) as u32,
+                        positions_off: arena.offset(node.inputs[0]) as u64,
                         positions_len: elem_len(node.inputs[0]),
-                        scales_off: arena.offset(node.inputs[1]) as u32,
+                        scales_off: arena.offset(node.inputs[1]) as u64,
                         scales_len: elem_len(node.inputs[1]),
-                        rotations_off: arena.offset(node.inputs[2]) as u32,
+                        rotations_off: arena.offset(node.inputs[2]) as u64,
                         rotations_len: elem_len(node.inputs[2]),
-                        opacities_off: arena.offset(node.inputs[3]) as u32,
+                        opacities_off: arena.offset(node.inputs[3]) as u64,
                         opacities_len: elem_len(node.inputs[3]),
-                        colors_off: arena.offset(node.inputs[4]) as u32,
+                        colors_off: arena.offset(node.inputs[4]) as u64,
                         colors_len: elem_len(node.inputs[4]),
-                        sh_coeffs_off: arena.offset(node.inputs[5]) as u32,
+                        sh_coeffs_off: arena.offset(node.inputs[5]) as u64,
                         sh_coeffs_len: elem_len(node.inputs[5]),
-                        meta_off: arena.offset(node.inputs[6]) as u32,
-                        d_loss_off: arena.offset(node.inputs[7]) as u32,
+                        meta_off: arena.offset(node.inputs[6]) as u64,
+                        d_loss_off: arena.offset(node.inputs[7]) as u64,
                         d_loss_len: elem_len(node.inputs[7]),
-                        packed_off: arena.offset(node.id) as u32,
+                        packed_off: arena.offset(node.id) as u64,
                         packed_len: node.shape.num_elements().unwrap_or(0) as u32,
                         width: *width,
                         height: *height,
@@ -2256,21 +2256,21 @@ impl CudaExecutable {
                         graph.node(id).shape.num_elements().unwrap_or(0) as u32
                     };
                     schedule.push(Step::GaussianSplatPrepare {
-                        positions_off: arena.offset(node.inputs[0]) as u32,
+                        positions_off: arena.offset(node.inputs[0]) as u64,
                         positions_len: elem_len(node.inputs[0]),
-                        scales_off: arena.offset(node.inputs[1]) as u32,
+                        scales_off: arena.offset(node.inputs[1]) as u64,
                         scales_len: elem_len(node.inputs[1]),
-                        rotations_off: arena.offset(node.inputs[2]) as u32,
+                        rotations_off: arena.offset(node.inputs[2]) as u64,
                         rotations_len: elem_len(node.inputs[2]),
-                        opacities_off: arena.offset(node.inputs[3]) as u32,
+                        opacities_off: arena.offset(node.inputs[3]) as u64,
                         opacities_len: elem_len(node.inputs[3]),
-                        colors_off: arena.offset(node.inputs[4]) as u32,
+                        colors_off: arena.offset(node.inputs[4]) as u64,
                         colors_len: elem_len(node.inputs[4]),
-                        sh_coeffs_off: arena.offset(node.inputs[5]) as u32,
+                        sh_coeffs_off: arena.offset(node.inputs[5]) as u64,
                         sh_coeffs_len: elem_len(node.inputs[5]),
-                        meta_off: arena.offset(node.inputs[6]) as u32,
+                        meta_off: arena.offset(node.inputs[6]) as u64,
                         meta_len: elem_len(node.inputs[6]),
-                        prep_off: arena.offset(node.id) as u32,
+                        prep_off: arena.offset(node.id) as u64,
                         prep_len: node.shape.num_elements().unwrap_or(0) as u32,
                         width: *width,
                         height: *height,
@@ -2303,11 +2303,11 @@ impl CudaExecutable {
                         _ => 1,
                     };
                     schedule.push(Step::GaussianSplatRasterize {
-                        prep_off: arena.offset(prep_id) as u32,
+                        prep_off: arena.offset(prep_id) as u64,
                         prep_len: elem_len(prep_id),
-                        meta_off: arena.offset(node.inputs[1]) as u32,
+                        meta_off: arena.offset(node.inputs[1]) as u64,
                         meta_len: elem_len(node.inputs[1]),
-                        dst_off: arena.offset(node.id) as u32,
+                        dst_off: arena.offset(node.id) as u64,
                         dst_len: node.shape.num_elements().unwrap_or(0) as u32,
                         count,
                         width: *width,
@@ -2604,7 +2604,7 @@ impl CudaExecutable {
                 } => {
                     let len = node.shape.num_elements().unwrap_or(0);
                     schedule.push(Step::RngNormal {
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         len: len as u32,
                         mean: *mean,
                         scale: *scale,
@@ -2620,7 +2620,7 @@ impl CudaExecutable {
                 } => {
                     let len = node.shape.num_elements().unwrap_or(0);
                     schedule.push(Step::RngUniform {
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         len: len as u32,
                         low: *low,
                         high: *high,
@@ -2635,7 +2635,7 @@ impl CudaExecutable {
                     let h = x_shape.dim(x_shape.rank() - 1).unwrap_static() as u32;
                     let rows = (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
                     let eps_bits = eps.to_bits();
-                    let off = |i: usize| arena.offset(node.inputs[i]) as u32;
+                    let off = |i: usize| arena.offset(node.inputs[i]) as u64;
                     let common = (off(0), off(1), off(2), off(3), rows, h, eps_bits);
                     match &node.op {
                         Op::RmsNormBackwardInput { .. } => {
@@ -2644,7 +2644,7 @@ impl CudaExecutable {
                                 gamma_byte_off: common.1,
                                 beta_byte_off: common.2,
                                 dy_byte_off: common.3,
-                                dx_byte_off: arena.offset(node.id) as u32,
+                                dx_byte_off: arena.offset(node.id) as u64,
                                 rows: common.4,
                                 h: common.5,
                                 eps_bits: common.6,
@@ -2656,7 +2656,7 @@ impl CudaExecutable {
                                 gamma_byte_off: common.1,
                                 beta_byte_off: common.2,
                                 dy_byte_off: common.3,
-                                dgamma_byte_off: arena.offset(node.id) as u32,
+                                dgamma_byte_off: arena.offset(node.id) as u64,
                                 rows: common.4,
                                 h: common.5,
                                 eps_bits: common.6,
@@ -2668,7 +2668,7 @@ impl CudaExecutable {
                                 gamma_byte_off: common.1,
                                 beta_byte_off: common.2,
                                 dy_byte_off: common.3,
-                                dbeta_byte_off: arena.offset(node.id) as u32,
+                                dbeta_byte_off: arena.offset(node.id) as u64,
                                 rows: common.4,
                                 h: common.5,
                                 eps_bits: common.6,
@@ -2694,10 +2694,10 @@ impl CudaExecutable {
                     };
                     let cos_len = graph.node(node.inputs[1]).shape.num_elements().unwrap() as u32;
                     schedule.push(Step::RopeBackward {
-                        dy_byte_off: arena.offset(node.inputs[0]) as u32,
-                        cos_byte_off: arena.offset(node.inputs[1]) as u32,
-                        sin_byte_off: arena.offset(node.inputs[2]) as u32,
-                        dx_byte_off: arena.offset(node.id) as u32,
+                        dy_byte_off: arena.offset(node.inputs[0]) as u64,
+                        cos_byte_off: arena.offset(node.inputs[1]) as u64,
+                        sin_byte_off: arena.offset(node.inputs[2]) as u64,
+                        dx_byte_off: arena.offset(node.id) as u64,
                         batch,
                         seq,
                         hidden,
@@ -2711,8 +2711,8 @@ impl CudaExecutable {
                     let cols = dy_shape.dim(dy_shape.rank() - 1).unwrap_static() as u32;
                     let rows = (dy_shape.num_elements().unwrap() / cols.max(1) as usize) as u32;
                     schedule.push(Step::CumsumBackward {
-                        dy_byte_off: arena.offset(node.inputs[0]) as u32,
-                        dx_byte_off: arena.offset(node.id) as u32,
+                        dy_byte_off: arena.offset(node.inputs[0]) as u64,
+                        dx_byte_off: arena.offset(node.id) as u64,
                         rows,
                         cols,
                         exclusive: *exclusive,
@@ -2743,9 +2743,9 @@ impl CudaExecutable {
                         .max(1);
                     let axis_dim = out_shape.dim(axis_u).unwrap_static();
                     schedule.push(Step::GatherBackward {
-                        dy_byte_off: arena.offset(node.inputs[0]) as u32,
-                        indices_byte_off: arena.offset(node.inputs[1]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        dy_byte_off: arena.offset(node.inputs[0]) as u64,
+                        indices_byte_off: arena.offset(node.inputs[1]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         outer: outer as u32,
                         axis_dim: axis_dim as u32,
                         num_idx: num_idx as u32,
@@ -2831,9 +2831,9 @@ impl CudaExecutable {
                     let dy_shape = &graph.node(node.inputs[1]).shape;
                     if kernel_size.len() == 2 && x_shape.rank() == 4 && dy_shape.rank() == 4 {
                         schedule.push(Step::MaxPool2dBackward {
-                            x_byte_off: arena.offset(node.inputs[0]) as u32,
-                            dy_byte_off: arena.offset(node.inputs[1]) as u32,
-                            dx_byte_off: arena.offset(node.id) as u32,
+                            x_byte_off: arena.offset(node.inputs[0]) as u64,
+                            dy_byte_off: arena.offset(node.inputs[1]) as u64,
+                            dx_byte_off: arena.offset(node.id) as u64,
                             n: x_shape.dim(0).unwrap_static() as u32,
                             c: x_shape.dim(1).unwrap_static() as u32,
                             h: x_shape.dim(2).unwrap_static() as u32,

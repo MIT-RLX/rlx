@@ -1,0 +1,58 @@
+[package]
+name = "rlx-bake"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Offline weight bake for RLX — specialize params, fold weight-only compute, emit a single *.rlx artifact"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[[bin]]
+name = "rlx-bake"
+path = "src/bin/rlx-bake.rs"
+
+[features]
+default = []
+# ChaCha20-Poly1305 + Argon2id full-file encryption (`RLXENC01`).
+encrypt = ["dep:chacha20poly1305", "dep:argon2", "dep:rand_core"]
+# Session compile/run for the MNIST bake demos.
+runtime = ["dep:rlx-runtime"]
+# mmap-backed plaintext `read_rlx` (avoids an extra full-file `Vec` copy).
+mmap = ["dep:memmap2"]
+
+[dependencies]
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13", features = ["serialize"] }
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.13" }
+rlx-fusion = { path = "../../core/rlx-fusion", version = "0.2.13" }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.13" }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.13", optional = true, default-features = true }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+safetensors = "0.7"
+half = { version = "2", features = ["bytemuck"] }
+chacha20poly1305 = { version = "0.10", optional = true }
+argon2 = { version = "0.5", optional = true }
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+memmap2 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "mnist_train_bake"
+required-features = ["encrypt", "runtime"]
+
+[[example]]
+name = "mnist_run_encrypted"
+required-features = ["encrypt", "runtime"]
+
+[lints]
+workspace = true

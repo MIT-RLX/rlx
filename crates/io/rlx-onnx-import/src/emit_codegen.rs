@@ -792,7 +792,7 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
             &node.inputs[1],
             &meta0,
             "BinaryOp::Pow",
-            false,
+            true,
             &node.name,
         ),
         "Clip" if !node.inputs.is_empty() => {
@@ -935,17 +935,19 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
                 }}; \
                 if rank == 4 {{ \
                     if {transpose} {{ \
-                        let w_rlx = m.add_node(rlx_ir::Op::Transpose {{ perm: vec![1, 0, 2, 3] }}, vec![w], Shape::new(&[wi, wc, wk, 1], dt)); \
-                        m.conv_transpose2d(x, w_rlx, [{k0}, {k1}], [{s0}, {s1}], [{p0}, {p1}], [1, 1], [0, 0], {groups} as usize, out_sh) \
+                        m.conv_transpose2d(x, w, [{k0}, {k1}], [{s0}, {s1}], [{p0}, {p1}], [1, 1], [0, 0], {groups} as usize, out_sh) \
                     }} else {{ m.conv2d(x, w, [{k0}, {k1}], [{s0}, {s1}], [{p0}, {p1}], {groups} as usize, out_sh) }} \
                 }} else if rank == 3 {{ \
                     let c_out = if out_sh.rank() >= 2 {{ out_sh.dim(1).unwrap_static() }} else if {transpose} {{ wi * ({groups} as usize) }} else {{ wc }}; \
                     let l_out = if out_sh.rank() >= 3 {{ out_sh.dim(2).unwrap_static() }} else {{ l }}; \
                     let resh = m.reshape_(x, vec![n as i64, c as i64, 1, l as i64]); \
-                    let w4 = m.reshape_(w, vec![wc as i64, wi as i64, wk as i64, 1]); \
+                    let w4 = if {transpose} {{ \
+                        m.reshape_(w, vec![wc as i64, wi as i64, 1, wk as i64]) \
+                    }} else {{ \
+                        m.reshape_(w, vec![wc as i64, wi as i64, wk as i64, 1]) \
+                    }}; \
                     let conv = if {transpose} {{ \
-                        let w_rlx = m.add_node(rlx_ir::Op::Transpose {{ perm: vec![1, 0, 2, 3] }}, vec![w4], Shape::new(&[wi, wc, wk, 1], dt)); \
-                        m.conv_transpose2d(resh, w_rlx, [{k0}, 1], [{s0}, 1], [{p0}, 0], [1, 1], [0, 0], {groups} as usize, out_sh) \
+                        m.conv_transpose2d(resh, w4, [1, {k0}], [1, {s0}], [0, {p0}], [1, 1], [0, 0], {groups} as usize, out_sh) \
                     }} else {{ m.conv2d(resh, w4, [{k0}, 1], [{s0}, 1], [{p0}, 0], {groups} as usize, out_sh) }}; \
                     m.reshape_(conv, vec![n as i64, c_out as i64, l_out as i64]) \
                 }} else {{ let stub = format!(\"__conv_stub__/{{}}\", {}); b.params.insert(stub.clone(), vec![0.0; 1]); let mut m0 = HirMut::new(&mut b.hir); m0.param(&stub, out_sh) }} \

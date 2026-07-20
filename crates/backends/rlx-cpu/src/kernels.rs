@@ -1199,6 +1199,12 @@ pub fn conv_transpose2d_nchw(
     groups: usize,
 ) {
     output.fill(0.0);
+    // Guard degenerate grouping: `groups == 0` divides by zero at `c_in / groups`,
+    // and `groups > c_in` makes `c_in_per_g == 0` so `ic / c_in_per_g` panics. Such
+    // a conv-transpose has nothing to accumulate — leave the zeroed output as-is.
+    if groups == 0 || c_in < groups {
+        return;
+    }
     let c_in_per_g = c_in / groups;
     let c_out_per_g = c_out / groups;
     for ni in 0..n {
@@ -1276,6 +1282,12 @@ pub fn conv_transpose3d_ncdhw(
     groups: usize,
 ) {
     output.fill(0.0);
+    // Guard degenerate grouping: `groups == 0` divides by zero at `c_in / groups`,
+    // and `groups > c_in` makes `c_in_per_g == 0` so `ic / c_in_per_g` panics. Such
+    // a conv-transpose has nothing to accumulate — leave the zeroed output as-is.
+    if groups == 0 || c_in < groups {
+        return;
+    }
     let c_in_per_g = c_in / groups;
     let c_out_per_g = c_out / groups;
     for ni in 0..n {

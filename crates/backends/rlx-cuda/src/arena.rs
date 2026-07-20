@@ -606,6 +606,12 @@ impl Arena {
         (self.f32_buf_mut(), size)
     }
 
+    /// Byte offset of `id`'s slot in the f32 arena. NOTE: a `usize` that
+    /// **routinely exceeds `u32::MAX`** — arenas are often > 4 GiB (batch-16 conv
+    /// codec ~5.6 GiB, NO_REUSE graphs ~15 GiB). A `Step` field that stashes this
+    /// must keep it `u64` (byte offset) or store the f32-element index `offset / 4`
+    /// in `u32` — NEVER `offset as u32`, which truncates past 4 GiB and was bug #4.
+    /// See the `Step` enum doc for the full convention.
     pub fn offset(&self, id: NodeId) -> usize {
         match self.offsets.get(&id) {
             Some(&off) => off,

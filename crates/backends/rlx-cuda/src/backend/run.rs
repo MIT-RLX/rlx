@@ -2566,8 +2566,8 @@ impl CudaExecutable {
                                 &self.ctx,
                                 &stream,
                                 self.arena.f32_buf_mut(),
-                                *src_byte_off / 4,
-                                *dst_byte_off / 4,
+                                (*src_byte_off / 4) as u32,
+                                (*dst_byte_off / 4) as u32,
                                 *outer,
                                 *n_complex,
                                 *inverse,
@@ -2584,8 +2584,8 @@ impl CudaExecutable {
                                 &stream,
                                 &mut self.cufft_state,
                                 self.arena.f32_buf_mut(),
-                                *src_byte_off / 4,
-                                *dst_byte_off / 4,
+                                (*src_byte_off / 4) as u32,
+                                (*dst_byte_off / 4) as u32,
                                 *outer,
                                 *n_complex,
                                 *inverse,
@@ -2599,8 +2599,8 @@ impl CudaExecutable {
                                 &self.ctx,
                                 &stream,
                                 self.arena.f32_buf_mut(),
-                                *src_byte_off / 4,
-                                *dst_byte_off / 4,
+                                (*src_byte_off / 4) as u32,
+                                (*dst_byte_off / 4) as u32,
                                 *outer,
                                 *n_complex,
                                 *inverse,
@@ -2678,8 +2678,8 @@ impl CudaExecutable {
                             block_dim: (block, 1, 1),
                             shared_mem_bytes: 0,
                         };
-                        let x_off = *x_byte_off / 4;
-                        let col_off = *col_byte_off / 4;
+                        let x_off = (*x_byte_off / 4) as u32;
+                        let col_off = (*col_byte_off / 4) as u32;
                         let mut launcher = stream.launch_builder(&kernel.function);
                         launcher
                             .arg(self.arena.f32_buf_mut())
@@ -2819,13 +2819,13 @@ impl CudaExecutable {
                             block_dim: (*state_size, 1, 1),
                             shared_mem_bytes: 0,
                         };
-                        let q_off = *q_byte_off / 4;
-                        let k_off = *k_byte_off / 4;
-                        let v_off = *v_byte_off / 4;
-                        let g_off = *g_byte_off / 4;
-                        let beta_off = *beta_byte_off / 4;
+                        let q_off = (*q_byte_off / 4) as u32;
+                        let k_off = (*k_byte_off / 4) as u32;
+                        let v_off = (*v_byte_off / 4) as u32;
+                        let g_off = (*g_byte_off / 4) as u32;
+                        let beta_off = (*beta_byte_off / 4) as u32;
                         let state_off = (state_bytes / 4) as u64;
-                        let dst_off = *dst_byte_off / 4;
+                        let dst_off = (*dst_byte_off / 4) as u32;
                         let use_carry_u: u32 = if *use_carry { 1 } else { 0 };
                         let mut launcher = stream.launch_builder(&kernel.function);
                         launcher
@@ -3489,11 +3489,11 @@ impl CudaExecutable {
                         self.arena.f32_buf_mut(),
                         *rows,
                         *h,
-                        *x_byte_off / 4,
-                        *gamma_byte_off / 4,
-                        *beta_byte_off / 4,
-                        *dy_byte_off / 4,
-                        *dx_byte_off / 4,
+                        (*x_byte_off / 4) as u32,
+                        (*gamma_byte_off / 4) as u32,
+                        (*beta_byte_off / 4) as u32,
+                        (*dy_byte_off / 4) as u32,
+                        (*dx_byte_off / 4) as u32,
                         *eps_bits,
                         0,
                     );
@@ -3514,11 +3514,11 @@ impl CudaExecutable {
                         self.arena.f32_buf_mut(),
                         *rows,
                         *h,
-                        *x_byte_off / 4,
-                        *gamma_byte_off / 4,
-                        *beta_byte_off / 4,
-                        *dy_byte_off / 4,
-                        *dgamma_byte_off / 4,
+                        (*x_byte_off / 4) as u32,
+                        (*gamma_byte_off / 4) as u32,
+                        (*beta_byte_off / 4) as u32,
+                        (*dy_byte_off / 4) as u32,
+                        (*dgamma_byte_off / 4) as u32,
                         *eps_bits,
                         1,
                     );
@@ -3539,11 +3539,11 @@ impl CudaExecutable {
                         self.arena.f32_buf_mut(),
                         *rows,
                         *h,
-                        *x_byte_off / 4,
-                        *gamma_byte_off / 4,
-                        *beta_byte_off / 4,
-                        *dy_byte_off / 4,
-                        *dbeta_byte_off / 4,
+                        (*x_byte_off / 4) as u32,
+                        (*gamma_byte_off / 4) as u32,
+                        (*beta_byte_off / 4) as u32,
+                        (*dy_byte_off / 4) as u32,
+                        (*dbeta_byte_off / 4) as u32,
                         *eps_bits,
                         2,
                     );
@@ -3569,10 +3569,10 @@ impl CudaExecutable {
                         *hidden,
                         *head_dim,
                         *n_rot,
-                        *dy_byte_off / 4,
-                        *cos_byte_off / 4,
-                        *sin_byte_off / 4,
-                        *dx_byte_off / 4,
+                        (*dy_byte_off / 4) as u32,
+                        (*cos_byte_off / 4) as u32,
+                        (*sin_byte_off / 4) as u32,
+                        (*dx_byte_off / 4) as u32,
                         *cos_len,
                     );
                 }
@@ -3589,8 +3589,8 @@ impl CudaExecutable {
                         self.arena.f32_buf_mut(),
                         *rows,
                         *cols,
-                        *dy_byte_off / 4,
-                        *dx_byte_off / 4,
+                        (*dy_byte_off / 4) as u32,
+                        (*dx_byte_off / 4) as u32,
                         if *exclusive { 1 } else { 0 },
                     );
                 }
@@ -3611,9 +3611,9 @@ impl CudaExecutable {
                         *axis_dim,
                         *num_idx,
                         *trailing,
-                        *dy_byte_off / 4,
-                        *indices_byte_off / 4,
-                        *dst_byte_off / 4,
+                        (*dy_byte_off / 4) as u32,
+                        (*indices_byte_off / 4) as u32,
+                        (*dst_byte_off / 4) as u32,
                     );
                 }
                 Step::MaxPool2dBackward {
@@ -3641,9 +3641,9 @@ impl CudaExecutable {
                         block_dim: (block, 1, 1),
                         shared_mem_bytes: 0,
                     };
-                    let x_o = *x_byte_off / 4;
-                    let dy_o = *dy_byte_off / 4;
-                    let dx_o = *dx_byte_off / 4;
+                    let x_o = (*x_byte_off / 4) as u32;
+                    let dy_o = (*dy_byte_off / 4) as u32;
+                    let dx_o = (*dx_byte_off / 4) as u32;
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
                         .arg(self.arena.f32_buf_mut())

@@ -25,6 +25,9 @@ android/**/intermediates/
 /weights
 .venv-sam3/
 
+# rlx-bake demo artifacts (encrypted models)
+crates/io/rlx-bake/examples/out/
+
 # large binaries — fetch/build locally, do not commit
 /papers/
 **/_pyrlx*.so

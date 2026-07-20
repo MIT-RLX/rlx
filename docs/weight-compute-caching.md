@@ -19,6 +19,27 @@ weight-only compute away at compile time, the runtime hoist finds nothing left
 to hoist and is a no-op. Turn on whichever fits how your weights arrive — or
 both.
 
+## Offline bake: `rlx-bake` → `*.rlx`
+
+When you want a **merged** deploy artifact (graph + weights in one file), use
+[`rlx-bake`](../crates/io/rlx-bake/). It specializes params, then applies
+weight-aware opts (skip zero matmuls, pack exact ternary as TQ2_0, optional
+Q8_0 quant), unfolds weights into an explicit table, and writes binary
+`*.rlx` (magic `RLXBAKE1`, schema v2 = graph + weights). Optional cargo
+feature `encrypt` (`--password` / `write_rlx_encrypted`) seals the **entire**
+file (ChaCha20-Poly1305 + Argon2id, magic `RLXENC01`). Load with
+`rlx_bake::read_rlx` or `read_rlx_with_password` and compile `file.graph` —
+baked params need no `set_param`.
+
+**Full walkthrough (MNIST train → bake → encrypt → run):**
+[rlx-bake.md](rlx-bake.md).
+
+```bash
+cargo run -p rlx-bake -- path/to/bundle -o model.rlx
+cargo run -p rlx-bake --features encrypt -- path/to/bundle -o model.rlx --password-env RLX_BAKE_PASSWORD
+# or: graph.json --weights weights.safetensors -o model.rlx [--quant]
+```
+
 ## Compile-time: `param_bindings`
 
 When you know the weight *values* at compile time, hand them to the compiler.
@@ -106,8 +127,10 @@ emits when folding a BatchNorm scale into a conv filter) — those are handled b
   (`crates/core/rlx-compile/src/{param_specialize,const_fold}.rs`) — the
   compile-time fold; `const_fold`'s evaluator does NumPy broadcasting so
   per-channel weight math folds.
+- [`rlx-bake`](../crates/io/rlx-bake/) — offline merge of graph + weights into
+  `*.rlx`, with skip / ternary / quant weight-aware passes.
 - `CompiledGraph` staging (`crates/core/rlx-runtime/src/compiled.rs`) — the
   transparent prepare-once + bind/feed injection.
 
 Tests: `crates/core/rlx-runtime/tests/param_hoist.rs` (CPU) and
-`cuda_param_hoist.rs` (CUDA).
+`cuda_param_hoist.rs` (CUDA); `crates/io/rlx-bake/tests/bake_roundtrip.rs`.
