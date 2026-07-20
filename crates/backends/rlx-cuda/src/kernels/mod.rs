@@ -114,6 +114,23 @@ macro_rules! kernel_cache {
 }
 
 kernel_cache!(BINARY, binary_kernel, BINARY_CU, "binary");
+// On-device complex simulation (f32-lane): standalone complex cast + C64
+// binary. Shared with rlx-wgpu's `complex_cast.wgsl` / `binary_c64.wgsl`.
+kernel_cache!(
+    COMPLEX_CAST,
+    complex_cast_kernel,
+    COMPLEX_CAST_CU,
+    "complex_cast"
+);
+kernel_cache!(BINARY_C64, binary_c64_kernel, BINARY_C64_CU, "binary_c64");
+kernel_cache!(
+    BINARY_BROADCAST,
+    binary_broadcast_kernel,
+    BINARY_BROADCAST_CU,
+    "binary_broadcast"
+);
+kernel_cache!(LSTM_DIR, lstm_dir_kernel, LSTM_CU, "lstm_dir");
+kernel_cache!(LSTM_TRANSPOSE, lstm_transpose_kernel, LSTM_CU, "transpose_rc");
 kernel_cache!(
     FUSED_BINARY_UNARY,
     fused_binary_unary_kernel,

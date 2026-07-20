@@ -150,6 +150,35 @@ pub(super) fn lower_instance_norm(
     broadcast[ch_axis] = c as i64;
     gamma_u = m.reshape_(gamma_u, broadcast.clone());
     beta_u = m.reshape_(beta_u, broadcast);
+    // KittenTTS: the mel/time axis is compiled to a padded slot (~28x the runtime
+    // frames). A plain InstanceNorm reduces mean/variance over the whole padded axis,
+    // so the zero padding dilutes the statistics → the F0/N AdaIN blocks over-normalize
+    // and the vocoder collapses to near-silence. Route rank-3 `[N,C,T]` InstanceNorms to
+    // a host-delegate kernel that reduces over the *active* mel frames only.
+    if rank == 3
+        && ch_axis == 1
+        && std::env::var("RLX_KITTEN_INORM_ACTIVE").is_ok()
+    {
+        // Byte 4 flags a VOCODER-generator AdaIN. The generator runs at several upsampled rates
+        // (ups.0/ups.1/resblocks/noise_res), and for short utterances some of those axis lengths
+        // fall BELOW the prosody cap — so a size threshold in the kernel misclassifies them and
+        // reduces over the padded extent (zero padding pulls mean→0 leaving a positive DC and
+        // shrinks std, inflating the trunk ~1.5×). The node name is the only reliable signal:
+        // `/decoder/generator/*` runs at the vocoder rate, everything else at the prosody rate.
+        let mut attrs = eps.to_le_bytes().to_vec();
+        attrs.push(u8::from(node.name.contains("/generator/")));
+        let id = m.add_node(
+            Op::Custom {
+                name: "onnx.KittenInstanceNormActive".to_string(),
+                num_inputs: 3,
+                attrs,
+            },
+            vec![x, gamma_u, beta_u],
+            out_s,
+        );
+        ctx.env.insert(node.outputs[0].clone(), id);
+        return Ok(true);
+    }
     let spatial: Vec<usize> = (0..rank).filter(|&a| a != 0 && a != ch_axis).collect();
     let mean = m.mean(x, spatial.clone(), true);
     let centered = m.sub(x, mean);

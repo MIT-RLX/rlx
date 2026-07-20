@@ -37,6 +37,10 @@ pub enum HostOut {
 /// Pack f32-encoded arena values into the CPU arena's native dtype bytes.
 fn write_f32_encoded_as_native(raw: &mut [u8], off: usize, dtype: DType, vals: &[f32]) {
     match dtype {
+        // C128 (complex f64) has no f32-uniform arena representation yet;
+        // it is rejected upstream via `is_complex()`. Present only to keep
+        // this exhaustive match compiling until the f32-sim path lands.
+        DType::C128 => panic!("rlx-vulkan: C128 not representable on the f32-uniform arena"),
         DType::F32 | DType::C64 => {
             for (i, &v) in vals.iter().enumerate() {
                 let b = v.to_le_bytes();
@@ -123,6 +127,9 @@ fn write_f32_encoded_as_native(raw: &mut [u8], off: usize, dtype: DType, vals: &
 fn read_native_as_f32_encoded(raw: &[u8], off: usize, dtype: DType, n: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
     match dtype {
+        // C128 (complex f64): rejected upstream via `is_complex()`; arm
+        // present only to keep this exhaustive match compiling.
+        DType::C128 => panic!("rlx-vulkan: C128 not representable on the f32-uniform arena"),
         DType::F32 | DType::C64 => {
             for i in 0..n {
                 let s = off + i * 4;

@@ -17,7 +17,7 @@
 
 #![allow(unused_imports)]
 
-use crate::arena::{Arena, HalfDtype, plan_f32_uniform};
+use crate::arena::{Arena, CastLower, HalfDtype, arena_lane_count, classify_cast, plan_f32_uniform};
 use crate::device::{RocmContext, rocm_blas, rocm_blas_lt, rocm_context, rocm_dnn};
 use crate::hip::{HipBuffer, HipDeviceptr};
 use crate::hipblas::{
@@ -140,9 +140,43 @@ impl RocmExecutable {
             let elems = node.shape.num_elements().unwrap_or(0) as u32;
             match &node.op {
                 Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => continue,
-                Op::Reshape { .. } | Op::Cast { .. } | Op::StopGradient => {
+                Op::Reshape { .. } | Op::StopGradient => {
                     // No-op: arena planner aliased the slot. StopGradient is a
                     // pure forward identity (AD already consumed its semantics).
+                }
+                Op::Cast { to } => {
+                    // Identity relabels are arena-aliased (no-op). float→int /
+                    // →Bool casts got their own f32-sized slot and need a real
+                    // conversion via the unary kernel (value stored as an f32
+                    // lane on the f32-uniform arena).
+                    let src_dtype = graph.node(node.inputs[0]).shape.dtype();
+                    match classify_cast(src_dtype, *to) {
+                        CastLower::Identity => {}
+                        CastLower::Kernel(op) => {
+                            schedule.push(Step::Unary {
+                                n: elems,
+                                in_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                                out_off: (arena.offset(node.id) / 4) as u32,
+                                op,
+                            });
+                        }
+                        CastLower::Complex(mode) => {
+                            // Simulated-complex lane move (real↔C64, real↔C128,
+                            // C64↔C128) via the shared `complex_cast` kernel.
+                            // `elems` is the complex-element count; the kernel
+                            // re-pairs the interleaved f32 lanes.
+                            schedule.push(Step::ComplexCast {
+                                n: elems,
+                                in_byte_off: arena.offset(node.inputs[0]) as u32,
+                                out_byte_off: arena.offset(node.id) as u32,
+                                mode,
+                            });
+                        }
+                        CastLower::Reject => panic!(
+                            "rlx-rocm: Cast {src_dtype:?} → {to:?} touches F64, which has \
+                             no f32-lane storage in this arena — run it on CPU"
+                        ),
+                    }
                 }
                 Op::ScaledMatMul {
                     lhs_format,
@@ -332,6 +366,43 @@ impl RocmExecutable {
                     });
                 }
                 Op::Binary(bop) => {
+                    // Complex binary: C64 add/sub/mul/div reads BOTH `[re, im]`
+                    // lanes per element, so it can't ride the scalar-per-thread
+                    // Binary kernel — lower to the shared `binary_c64` dispatch.
+                    // C128 arithmetic is out of scope (rlx-cpu has none either) →
+                    // reject; broadcast rides the kernel's own `k % n_x` modulo
+                    // (matching CPU), so reading `node.inputs` directly gives the
+                    // right per-operand element counts (mirrors rlx-cuda).
+                    if node.shape.dtype().is_complex() {
+                        if node.shape.dtype() == rlx_ir::DType::C128 {
+                            panic!(
+                                "rlx-rocm Binary on C128: complex-f64 arithmetic is \
+                                 unsupported (rlx-cpu has none either) — only C64 \
+                                 add/sub/mul/div are wired"
+                            );
+                        }
+                        let op_code = binary_op_id(*bop);
+                        if op_code > 3 {
+                            panic!(
+                                "rlx-rocm C64 Binary: {bop:?} is undefined for complex \
+                                 (only Add/Sub/Mul/Div); matches rlx-cpu rejection"
+                            );
+                        }
+                        let a_id = node.inputs[0];
+                        let b_id = node.inputs[1];
+                        let n_a = graph.node(a_id).shape.num_elements().unwrap_or(0).max(1) as u32;
+                        let n_b = graph.node(b_id).shape.num_elements().unwrap_or(0).max(1) as u32;
+                        schedule.push(Step::BinaryC64 {
+                            n: elems,
+                            a_byte_off: arena.offset(a_id) as u32,
+                            b_byte_off: arena.offset(b_id) as u32,
+                            c_byte_off: arena.offset(node.id) as u32,
+                            op: op_code,
+                            n_a,
+                            n_b,
+                        });
+                        continue;
+                    }
                     schedule.push(Step::Binary {
                         n: elems,
                         a_off: (arena.offset(node.inputs[0]) / 4) as u32,
@@ -741,6 +812,16 @@ impl RocmExecutable {
                 Op::Gather { axis } => {
                     let table_id = node.inputs[0];
                     let idx_id = node.inputs[1];
+                    // Complex packs `lanes` contiguous f32 per element. Index
+                    // values select ELEMENTS (indices stay unscaled, real-typed),
+                    // but each gathered element is `lanes` contiguous f32 — so the
+                    // per-element contiguous span (`dim`/`trailing`) and the total
+                    // copy count scale by lanes. lanes=1 ⇒ strict no-op.
+                    let lanes: u32 = match node.shape.dtype() {
+                        rlx_ir::DType::C64 => 2,
+                        rlx_ir::DType::C128 => 4,
+                        _ => 1,
+                    };
                     if *axis == 0 {
                         let table_shape = graph.node(table_id).shape.dims();
                         let idx_shape = graph.node(idx_id).shape.dims();
@@ -749,11 +830,12 @@ impl RocmExecutable {
                             .iter()
                             .map(|d| d.unwrap_static() as u32)
                             .product::<u32>()
-                            .max(1);
+                            .max(1)
+                            * lanes;
                         let n_idx: u32 =
                             idx_shape.iter().map(|d| d.unwrap_static() as u32).product();
                         schedule.push(Step::Gather {
-                            n_out: elems,
+                            n_out: elems * lanes,
                             n_idx,
                             dim,
                             vocab,
@@ -773,7 +855,8 @@ impl RocmExecutable {
                             .iter()
                             .map(|d| d.unwrap_static() as u32)
                             .product::<u32>()
-                            .max(1);
+                            .max(1)
+                            * lanes;
                         let axis_dim = table_shape[*axis].unwrap_static() as u32;
                         let num_idx: u32 =
                             idx_shape.iter().map(|d| d.unwrap_static() as u32).product();
@@ -793,6 +876,16 @@ impl RocmExecutable {
                 Op::Narrow { axis, start, len } => {
                     let in_id = node.inputs[0];
                     let in_dims = graph.node(in_id).shape.dims();
+                    // Complex packs `lanes` contiguous f32 per element. The lane
+                    // axis is innermost, so `axis`/`start`/`len` stay element-
+                    // indexed; only the per-copy contiguous `inner` count (dims
+                    // after `axis`) scales by lanes so each thread moves a whole
+                    // complex element. lanes=1 ⇒ strict no-op.
+                    let lanes: u32 = match node.shape.dtype() {
+                        rlx_ir::DType::C64 => 2,
+                        rlx_ir::DType::C128 => 4,
+                        _ => 1,
+                    };
                     let outer: u32 = in_dims[..*axis]
                         .iter()
                         .map(|d| d.unwrap_static() as u32)
@@ -802,10 +895,11 @@ impl RocmExecutable {
                         .iter()
                         .map(|d| d.unwrap_static() as u32)
                         .product::<u32>()
-                        .max(1);
+                        .max(1)
+                        * lanes;
                     let axis_in = in_dims[*axis].unwrap_static() as u32;
                     schedule.push(Step::Narrow {
-                        total: elems,
+                        total: elems * lanes,
                         outer,
                         inner,
                         axis_in_size: axis_in,
@@ -818,9 +912,29 @@ impl RocmExecutable {
                 Op::Transpose { perm } => {
                     let in_id = node.inputs[0];
                     let in_dims = graph.node(in_id).shape.dims();
-                    let rank = perm.len();
-                    let in_dims_u: Vec<u32> =
+                    // Complex packs `lanes` contiguous f32 per element (C64=2
+                    // [re,im], C128=4 df64). The transpose kernel copies one f32
+                    // per "element" via reindexed strides, so append an INNERMOST
+                    // lane axis that maps to ITSELF (never permuted): each thread
+                    // copies a whole complex element's lanes contiguously instead
+                    // of shattering [re,im]. lanes=1 for real/int ⇒ strict no-op.
+                    let lanes: u32 = match node.shape.dtype() {
+                        rlx_ir::DType::C64 => 2,
+                        rlx_ir::DType::C128 => 4,
+                        _ => 1,
+                    };
+                    let mut perm: Vec<usize> = perm.to_vec();
+                    let mut in_dims_u: Vec<u32> =
                         in_dims.iter().map(|d| d.unwrap_static() as u32).collect();
+                    if lanes > 1 {
+                        // The lane axis is input axis `in_dims_u.len()` (appended
+                        // innermost); it maps to itself as the output's innermost.
+                        perm.push(in_dims_u.len());
+                        in_dims_u.push(lanes);
+                    }
+                    let rank = perm.len();
+                    // Cumulative input strides (row-major, innermost = 1) over the
+                    // extended rank — element strides now count in lane units.
                     let mut in_strides = vec![1u32; rank];
                     for i in (0..rank.saturating_sub(1)).rev() {
                         in_strides[i] = in_strides[i + 1] * in_dims_u[i + 1];
@@ -835,7 +949,7 @@ impl RocmExecutable {
                     meta_buffers.push(meta);
                     schedule.push(Step::Transpose {
                         rank: rank as u32,
-                        out_total: elems,
+                        out_total: elems * lanes,
                         in_off: (arena.offset(in_id) / 4) as u32,
                         out_off: (arena.offset(node.id) / 4) as u32,
                         meta_idx,
@@ -855,6 +969,26 @@ impl RocmExecutable {
                     let out_dims: Vec<u32> = target_shape.iter().map(|&d| d as u32).collect();
                     let in_dims: Vec<u32> =
                         in_shape.iter().map(|d| d.unwrap_static() as u32).collect();
+                    // Complex tensors pack `lanes` contiguous f32 per element
+                    // (C64=2 [re,im], C128=4 df64). The expand kernel copies one
+                    // f32 per "element", so append an innermost lane axis (in==out,
+                    // never a broadcast) — each thread copies a whole complex
+                    // element's lanes contiguously instead of shattering [re,im].
+                    // lanes=1 for real/int ⇒ strict no-op.
+                    let lanes: u32 = match node.shape.dtype() {
+                        rlx_ir::DType::C64 => 2,
+                        rlx_ir::DType::C128 => 4,
+                        _ => 1,
+                    };
+                    let (rank, out_dims, in_dims) = if lanes > 1 {
+                        let mut od = out_dims;
+                        let mut idm = in_dims;
+                        od.push(lanes);
+                        idm.push(lanes);
+                        (rank + 1, od, idm)
+                    } else {
+                        (rank, out_dims, in_dims)
+                    };
                     let mut in_strides_row = vec![1u32; rank];
                     for i in (0..rank.saturating_sub(1)).rev() {
                         in_strides_row[i] = in_strides_row[i + 1] * in_dims[i + 1];
@@ -876,13 +1010,25 @@ impl RocmExecutable {
                     meta_buffers.push(meta);
                     schedule.push(Step::Expand {
                         rank: rank as u32,
-                        out_total: elems,
+                        out_total: elems * lanes,
                         in_off: (arena.offset(in_id) / 4) as u32,
                         out_off: (arena.offset(node.id) / 4) as u32,
                         meta_idx,
                     });
                 }
                 Op::Concat { axis } => {
+                    // Caller convention: one Step::Concat per input, copying
+                    // each input's slice into the output at the right axis offset.
+                    // Complex packs `lanes` contiguous f32 per element; the lane
+                    // axis is innermost, so `axis`/axis offsets stay element-
+                    // indexed and only the per-copy contiguous `inner` count (and
+                    // each input's total copy length) scale by lanes so whole
+                    // complex elements move as a group. lanes=1 ⇒ strict no-op.
+                    let lanes: u32 = match node.shape.dtype() {
+                        rlx_ir::DType::C64 => 2,
+                        rlx_ir::DType::C128 => 4,
+                        _ => 1,
+                    };
                     let mut start: u32 = 0;
                     let out_dims = node.shape.dims();
                     let outer: u32 = out_dims[..*axis]
@@ -894,12 +1040,15 @@ impl RocmExecutable {
                         .iter()
                         .map(|d| d.unwrap_static() as u32)
                         .product::<u32>()
-                        .max(1);
+                        .max(1)
+                        * lanes;
                     let axis_out_size = out_dims[*axis].unwrap_static() as u32;
                     for &in_id in &node.inputs {
                         let in_dims = graph.node(in_id).shape.dims();
                         let axis_in = in_dims[*axis].unwrap_static() as u32;
-                        let total: u32 = in_dims.iter().map(|d| d.unwrap_static() as u32).product();
+                        let total: u32 =
+                            in_dims.iter().map(|d| d.unwrap_static() as u32).product::<u32>()
+                                * lanes;
                         schedule.push(Step::Concat {
                             total,
                             outer,
@@ -2346,20 +2495,25 @@ impl RocmExecutable {
             }
         }
 
+        // Host staging is sized by LANE count, not element count: a complex
+        // output occupies 2 (C64) / 4 (C128) f32 lanes per element, so
+        // `num_elements` would truncate the readback to the real parts (the
+        // "biggest gotcha"). `arena_lane_count` == `num_elements` for every
+        // non-complex dtype, so this is a no-op for real tensors.
         let output_staging: Vec<F32HostSlot> = graph
             .outputs
             .iter()
             .map(|&id| {
-                let elems = graph.node(id).shape.num_elements().unwrap_or(0);
-                F32HostSlot::new(&ctx.runtime, elems, pinned_io_enabled(exec_mode))
+                let lanes = arena_lane_count(&graph.node(id).shape);
+                F32HostSlot::new(&ctx.runtime, lanes, pinned_io_enabled(exec_mode))
             })
             .collect();
 
         let mut input_staging = HashMap::new();
         if pinned_io_enabled(exec_mode) {
             for (name, &id) in &input_offsets {
-                let elems = graph.node(id).shape.num_elements().unwrap_or(0);
-                input_staging.insert(name.clone(), F32HostSlot::new(&ctx.runtime, elems, true));
+                let lanes = arena_lane_count(&graph.node(id).shape);
+                input_staging.insert(name.clone(), F32HostSlot::new(&ctx.runtime, lanes, true));
             }
         }
 
@@ -2372,7 +2526,9 @@ impl RocmExecutable {
                 } else {
                     0
                 };
-                let len = node.shape.num_elements().unwrap_or(0);
+                // Lane count: a complex input feeds 2/4 f32 lanes per element, so
+                // the upload bound must count lanes or the input is truncated.
+                let len = arena_lane_count(&node.shape);
                 input_slot_names.push(name.clone());
                 input_slots.push((off, len));
             }
@@ -2381,7 +2537,7 @@ impl RocmExecutable {
         let mut host_total = 0usize;
         let mut output_slots = Vec::new();
         for &id in &graph.outputs {
-            let n = graph.node(id).shape.num_elements().unwrap_or(0);
+            let n = arena_lane_count(&graph.node(id).shape);
             output_slots.push((host_total * 4, n));
             host_total += n;
         }

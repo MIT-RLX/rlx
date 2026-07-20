@@ -1009,6 +1009,273 @@ pub(crate) fn host_eval_op_f32(
     Array::from_f32_slice(&out, &out_shape, DType::F32)
 }
 
+/// Host-evaluate an `Op::Cast` that involves `DType::C64` on either side.
+///
+/// MLX has no complex dtype in this backend's `map_dtype` (a native
+/// `astype` would panic), so a cast touching C64 cannot go through
+/// [`ops::cast`]. We mirror rlx-cpu's exact `CastScalar` cast semantics on
+/// the host (see `rlx_cpu::thunk::ops::elementwise::exec_cast_generic`):
+///
+///   * real → C64: each element becomes the pair `(value as f32, 0.0)`
+///     — the imaginary part is zero. `to_f32()` widens any real source
+///     dtype to f32, matching rlx-cpu's `value as f32`.
+///   * C64 → real float: take the real part (numpy/torch convention).
+///   * C64 → int: real part, saturating `f32 as iN` (rlx-cpu semantics).
+///   * C64 → Bool: `re != 0 || im != 0`.
+///   * C64 → C64: identity.
+///
+/// A C64 value is represented here as an f32-backed MLX array carrying the
+/// interleaved `[re, im]` pairs (2 f32 per logical element) — byte-for-byte
+/// identical to rlx-cpu's C64 arena layout. A graph output read back via
+/// `MlxExecutable::run_typed` (`Array::to_bytes()` + the node's declared
+/// C64 dtype) therefore matches rlx-cpu exactly.
+///
+/// This path host-evaluates (`to_f32`), so `first_host_eval_op` reports
+/// C64 casts and forces Lazy mode (host eval is forbidden inside
+/// `mlx::compile`).
+pub(crate) fn mlx_cast_c64(
+    x: &Array,
+    src: DType,
+    dst: DType,
+    out_shape: &[usize],
+) -> Result<Array, MlxError> {
+    let logical: usize = out_shape.iter().product();
+    // C64 → C64: identity (interleaved buffer passes straight through).
+    if src == DType::C64 && dst == DType::C64 {
+        return ops::contiguous(x);
+    }
+    // real → C64: interleave (value, 0.0). The flat 2·N-lane f32 buffer
+    // gives `num_elements`/`to_bytes` 8 bytes per logical element (= the
+    // C64 width); the node's logical C64 shape lives in the graph.
+    if dst == DType::C64 {
+        let re = ops::contiguous(x)?.to_f32()?;
+        let mut interleaved = Vec::with_capacity(re.len() * 2);
+        for v in re {
+            interleaved.push(v);
+            interleaved.push(0.0);
+        }
+        let n = interleaved.len();
+        return Array::from_f32_slice(&interleaved, &[n], DType::F32);
+    }
+    // src == C64, dst is a real dtype. Decode interleaved (re, im) pairs.
+    let inter = ops::contiguous(x)?.to_f32()?;
+    if inter.len() != logical * 2 {
+        return Err(MlxError(format!(
+            "mlx_cast_c64: C64 source has {} f32 lanes, expected {} (2 x {logical})",
+            inter.len(),
+            logical * 2
+        )));
+    }
+    let re_at = |i: usize| inter[2 * i];
+    let im_at = |i: usize| inter[2 * i + 1];
+    match dst {
+        DType::Bool => {
+            let bytes: Vec<u8> = (0..logical)
+                .map(|i| u8::from(re_at(i) != 0.0 || im_at(i) != 0.0))
+                .collect();
+            Array::from_bytes(&bytes, out_shape, DType::Bool)
+        }
+        DType::F64 => {
+            let bytes: Vec<u8> = (0..logical)
+                .flat_map(|i| (re_at(i) as f64).to_le_bytes())
+                .collect();
+            Array::from_bytes(&bytes, out_shape, DType::F64)
+        }
+        DType::F32 | DType::F16 | DType::BF16 => {
+            let re: Vec<f32> = (0..logical).map(re_at).collect();
+            Array::from_f32_slice(&re, out_shape, dst)
+        }
+        // Integer dests: real part, saturating f32 → int (Rust `as`),
+        // matching rlx-cpu's `CastScalar::real() as $t`.
+        DType::I8 | DType::I16 | DType::I32 | DType::I64 | DType::U8 | DType::U32 => {
+            let re: Vec<f64> = (0..logical).map(|i| re_at(i) as f64).collect();
+            Array::from_bytes(&real_to_int_bytes(&re, dst), out_shape, dst)
+        }
+        DType::C64 => unreachable!("C64 → C64 handled above"),
+        DType::C128 => {
+            unreachable!("cast involving C128 is routed to mlx_cast_c128, not mlx_cast_c64")
+        }
+    }
+}
+
+/// Host-evaluate an `Op::Cast` that involves `DType::C128` on either side.
+///
+/// The f64-precision sibling of [`mlx_cast_c64`]. MLX has no complex dtype,
+/// so a C128 value is represented here as an **F64-backed** MLX array
+/// carrying the interleaved `[re, im]` f64 pairs (2 f64 lanes per logical
+/// element = 16 bytes / element) — byte-for-byte identical to rlx-cpu's
+/// C128 arena layout. `to_bytes()` on that F64 array therefore matches
+/// rlx-cpu's C128 output exactly. Semantics mirror rlx-cpu's
+/// `exec_cast_generic`:
+///
+///   * real → C128:  `(value as f64, 0.0)` per element (imag = 0).
+///   * C64  → C128:  widen f32 components to f64 (exact).
+///   * C128 → real float: real part (full f64 kept for the F64 dest).
+///   * C128 → int:   real part, saturating `f64 as iN` (rlx-cpu semantics).
+///   * C128 → Bool:  `re != 0 || im != 0`.
+///   * C128 → C64:   narrow f64 components to f32.
+///   * C128 → C128:  identity.
+///
+/// Host-evaluates (`to_bytes` / `ops::cast`), so `first_host_eval_op`
+/// reports C128 casts and forces Lazy mode.
+pub(crate) fn mlx_cast_c128(
+    x: &Array,
+    src: DType,
+    dst: DType,
+    out_shape: &[usize],
+) -> Result<Array, MlxError> {
+    let logical: usize = out_shape.iter().product();
+    // C128 → C128: identity. Clone the handle rather than `contiguous`
+    // (which would schedule a GPU-stream copy that rejects float64).
+    if src == DType::C128 && dst == DType::C128 {
+        return x.clone_handle();
+    }
+    if dst == DType::C128 {
+        // Producing C128 → build an F64-backed 2·N-lane interleaved array.
+        let re: Vec<f64> = if src == DType::C64 {
+            // C64 → C128: `x` is the f32-interleaved (re, im) representation
+            // (2·N f32 lanes). Widen every lane f32→f64, preserving the
+            // interleaved layout — this keeps both components (re AND im).
+            let inter = ops::contiguous(x)?.to_f32()?;
+            let mut bytes = Vec::with_capacity(inter.len() * 8);
+            for v in &inter {
+                bytes.extend_from_slice(&(*v as f64).to_le_bytes());
+            }
+            let n = inter.len();
+            return Array::from_bytes(&bytes, &[n], DType::F64);
+        } else {
+            // real → C128: cast the real source to f64 (F32→F64 exact,
+            // ints→f64) then interleave with a zero imaginary part.
+            mlx_real_source_as_f64(x)?
+        };
+        let mut bytes = Vec::with_capacity(re.len() * 16);
+        for v in &re {
+            bytes.extend_from_slice(&v.to_le_bytes());
+            bytes.extend_from_slice(&0.0_f64.to_le_bytes());
+        }
+        let n = re.len() * 2;
+        return Array::from_bytes(&bytes, &[n], DType::F64);
+    }
+    // src == C128, dst is C64 or a real dtype. Decode interleaved f64 pairs.
+    let inter = mlx_f64_lanes(x)?;
+    if inter.len() != logical * 2 {
+        return Err(MlxError(format!(
+            "mlx_cast_c128: C128 source has {} f64 lanes, expected {} (2 x {logical})",
+            inter.len(),
+            logical * 2
+        )));
+    }
+    let re_at = |i: usize| inter[2 * i];
+    let im_at = |i: usize| inter[2 * i + 1];
+    match dst {
+        DType::Bool => {
+            let bytes: Vec<u8> = (0..logical)
+                .map(|i| u8::from(re_at(i) != 0.0 || im_at(i) != 0.0))
+                .collect();
+            Array::from_bytes(&bytes, out_shape, DType::Bool)
+        }
+        DType::F64 => {
+            let bytes: Vec<u8> = (0..logical).flat_map(|i| re_at(i).to_le_bytes()).collect();
+            Array::from_bytes(&bytes, out_shape, DType::F64)
+        }
+        DType::F32 | DType::F16 | DType::BF16 => {
+            let re: Vec<f32> = (0..logical).map(|i| re_at(i) as f32).collect();
+            Array::from_f32_slice(&re, out_shape, dst)
+        }
+        // Integer dests: real part, saturating f64 → int (Rust `as`),
+        // matching rlx-cpu's `CastScalar::real() as $t`.
+        DType::I8 | DType::I16 | DType::I32 | DType::I64 | DType::U8 | DType::U32 => {
+            let re: Vec<f64> = (0..logical).map(re_at).collect();
+            Array::from_bytes(&real_to_int_bytes(&re, dst), out_shape, dst)
+        }
+        DType::C64 => {
+            // C128 → C64: narrow f64 components to f32 (interleaved),
+            // yielding the f32-backed C64 representation.
+            let inter_f32: Vec<f32> = (0..logical)
+                .flat_map(|i| [re_at(i) as f32, im_at(i) as f32])
+                .collect();
+            let n = inter_f32.len();
+            Array::from_f32_slice(&inter_f32, &[n], DType::F32)
+        }
+        DType::C128 => unreachable!("C128 → C128 handled above"),
+    }
+}
+
+/// Read the real parts of an F64-backed C128 array (or any F64 array) as a
+/// `Vec<f64>` — the 2·N interleaved lanes. Uses `to_bytes` (not `to_f32`)
+/// to preserve full f64 precision.
+///
+/// NB: we deliberately do NOT wrap `x` in `ops::contiguous` here. MLX's
+/// Metal GPU stream rejects float64, and `contiguous` schedules its copy
+/// on the default (GPU) stream — evaluating that on an F64 array throws
+/// "float64 is not supported on the GPU". Our C128 arrays are always
+/// materialized, row-contiguous F64 leaves (`from_bytes`) or CPU-stream
+/// `astype` results, so `to_bytes` (which only contiguous-copies when the
+/// array is strided) evaluates them as a no-op on the CPU-attached stream.
+fn mlx_f64_lanes(x: &Array) -> Result<Vec<f64>, MlxError> {
+    let bytes = x.to_bytes()?;
+    let n = bytes.len() / 8;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+        out.push(f64::from_le_bytes(b));
+    }
+    Ok(out)
+}
+
+/// Cast a real (non-complex) MLX source array to f64 and read it back as a
+/// `Vec<f64>`. F32→F64 is exact; int→f64 matches rlx-cpu's `value as f64`.
+fn mlx_real_source_as_f64(x: &Array) -> Result<Vec<f64>, MlxError> {
+    let as_f64 = ops::cast(x, DType::F64)?;
+    mlx_f64_lanes(&as_f64)
+}
+
+/// Materialize a C128 leaf (Constant / typed Input / typed Param) as the
+/// F64-backed interleaved array the MLX backend uses for complex-f64 values
+/// (see [`mlx_cast_c128`]). `data` is little-endian interleaved `(re, im)`
+/// f64 pairs — 16 bytes per logical element — exactly rlx-cpu's C128 arena
+/// layout. MLX has no native complex dtype, so this materializes the raw
+/// f64 lanes directly.
+pub(crate) fn mlx_c128_leaf_from_bytes(data: &[u8]) -> Result<Array, MlxError> {
+    let n_f64 = data.len() / 8;
+    Array::from_bytes(data, &[n_f64], DType::F64)
+}
+
+/// Materialize a C64 leaf (Constant / typed Input / typed Param) as the
+/// f32-backed interleaved array the MLX backend uses for complex values
+/// (see [`mlx_cast_c64`]). `data` is little-endian interleaved `(re, im)`
+/// f32 pairs — 8 bytes per logical element — exactly rlx-cpu's C64 arena
+/// layout. MLX has no native complex dtype here, so `Array::from_bytes(..,
+/// C64)` would panic in `map_dtype`; this routes around it.
+pub(crate) fn mlx_c64_leaf_from_bytes(data: &[u8]) -> Result<Array, MlxError> {
+    let n_f32 = data.len() / 4;
+    let mut buf = Vec::with_capacity(n_f32);
+    for i in 0..n_f32 {
+        buf.push(f32::from_le_bytes([
+            data[i * 4],
+            data[i * 4 + 1],
+            data[i * 4 + 2],
+            data[i * 4 + 3],
+        ]));
+    }
+    Array::from_f32_slice(&buf, &[n_f32], DType::F32)
+}
+
+/// Little-endian bytes for a real → integer cast, mirroring rlx-cpu's
+/// saturating `f64 as iN` write pass in `exec_cast_generic`.
+fn real_to_int_bytes(vals: &[f64], dst: DType) -> Vec<u8> {
+    match dst {
+        DType::I8 => vals.iter().map(|&v| v as i8 as u8).collect(),
+        DType::U8 => vals.iter().map(|&v| v as u8).collect(),
+        DType::I16 => vals.iter().flat_map(|&v| (v as i16).to_le_bytes()).collect(),
+        DType::I32 => vals.iter().flat_map(|&v| (v as i32).to_le_bytes()).collect(),
+        DType::I64 => vals.iter().flat_map(|&v| (v as i64).to_le_bytes()).collect(),
+        DType::U32 => vals.iter().flat_map(|&v| (v as u32).to_le_bytes()).collect(),
+        other => unreachable!("real_to_int_bytes: non-int dtype {other:?}"),
+    }
+}
+
 /// Materialize gather/scatter indices as I64 (bundle params and TopK
 /// outputs are often F32 at the MLX lazy boundary).
 pub(crate) fn mlx_indices_i64(idx: &Array) -> Result<Array, MlxError> {

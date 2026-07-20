@@ -145,6 +145,18 @@ pub(crate) enum Step {
         c_off: u32,
         op: u32,
     },
+    /// Broadcasting element-wise binary (folds an elided `Op::Expand`): output is
+    /// contiguous `[n]`; operands read through per-axis strides packed in
+    /// `meta_idx` = `[out_dims[rank], a_strides[rank], b_strides[rank]]`.
+    BinaryBroadcast {
+        n: u32,
+        a_off: u32,
+        b_off: u32,
+        c_off: u32,
+        op: u32,
+        rank: u32,
+        meta_idx: usize,
+    },
     Compare {
         n: u32,
         a_off: u32,
@@ -1143,6 +1155,30 @@ pub(crate) enum Step {
         h: u32,
         w: u32,
     },
+    /// Standalone complex `Op::Cast` on the simulated-complex f32-lane arena
+    /// (`complex_cast.cu`). `mode` picks one of six pure lane-move directions
+    /// (real↔C64, real↔C128, C64↔C128); `n` is the complex-element count.
+    /// Byte offsets are u64 (→ f32-element ÷4 in run.rs) so > 4 GiB arenas and
+    /// the `unsigned long long` kernel params stay width-matched.
+    ComplexCast {
+        n: u32,
+        in_byte_off: u64,
+        out_byte_off: u64,
+        mode: u32,
+    },
+    /// Element-wise C64 binary (`binary_c64.cu`): add/sub/mul/div reading BOTH
+    /// `[re, im]` lanes per element, with modulo broadcast (`n_a`/`n_b` are the
+    /// operands' complex-element counts). `n` is the output complex-element
+    /// count; byte offsets are u64 (matching the kernel's `unsigned long long`).
+    BinaryC64 {
+        n: u32,
+        a_byte_off: u64,
+        b_byte_off: u64,
+        c_byte_off: u64,
+        op: u32,
+        n_a: u32,
+        n_b: u32,
+    },
     /// Backend-level fusion of `Binary → Unary` element-wise chains.
     /// Emitted by `fuse_elementwise_chains` when the intermediate
     /// offset has exactly one consumer in the schedule. Avoids one
@@ -1215,6 +1251,7 @@ impl Step {
         matches!(
             self,
             Step::Binary { .. }
+                | Step::BinaryBroadcast { .. }
                 | Step::Compare { .. }
                 | Step::Unary { .. }
                 | Step::Where { .. }
@@ -1270,6 +1307,7 @@ impl Step {
             | Step::ArgReduceHost { .. }
             | Step::AxialRope2dHost { .. }
             | Step::ScanHost { .. }
+            | Step::Lstm { .. }
             | Step::HostOp { .. }
             | Step::CpuIndexing { .. }
             | Step::SpdHost { .. }
@@ -1283,7 +1321,23 @@ impl Step {
 }
 
 pub(crate) fn schedule_graph_capture_safe(schedule: &[Step]) -> bool {
-    schedule.iter().all(Step::graph_capture_safe)
+    let safe = schedule.iter().all(Step::graph_capture_safe);
+    if !safe && rlx_ir::env::flag("RLX_CUDA_CAPTURE_DEBUG") {
+        use std::collections::BTreeMap;
+        let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for s in schedule.iter().filter(|s| !s.graph_capture_safe()) {
+            *counts.entry(step_name(s)).or_insert(0) += 1;
+        }
+        eprintln!(
+            "rlx-cuda: graph capture DISABLED; non-capture-safe steps: {}",
+            counts
+                .iter()
+                .map(|(k, v)| format!("{k}×{v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    safe
 }
 
 pub(crate) fn step_is_tail_host(step: &Step) -> bool {
@@ -1391,6 +1445,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ScaledQuantizeGeneral { .. } => "rlx::ScaledQuantizeGeneral",
         Step::ScaledDequantizeGeneral { .. } => "rlx::ScaledDequantizeGeneral",
         Step::Binary { .. } => "rlx::Binary",
+        Step::BinaryBroadcast { .. } => "rlx::BinaryBroadcast",
         Step::Compare { .. } => "rlx::Compare",
         Step::Unary { .. } => "rlx::Unary",
         Step::Where { .. } => "rlx::Where",
@@ -1471,6 +1526,8 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ConvTranspose2d { .. } => "rlx::ConvTranspose2d",
         Step::GroupNorm { .. } => "rlx::GroupNorm",
         Step::ResizeNearest2x { .. } => "rlx::ResizeNearest2x",
+        Step::ComplexCast { .. } => "rlx::ComplexCast",
+        Step::BinaryC64 { .. } => "rlx::BinaryC64",
         Step::FusedBinaryUnary { .. } => "rlx::FusedBinaryUnary",
         Step::ElementwiseRegion { .. } => "rlx::ElementwiseRegion",
         Step::BatchElementwiseRegion { .. } => "rlx::BatchElementwiseRegion",
@@ -1518,7 +1575,10 @@ pub(crate) fn fuse_elementwise_chains(schedule: Vec<Step>) -> Vec<Step> {
             ) = pair
             {
                 let single_consumer = consumer_counts.get(c_off).copied() == Some(1);
-                if n == n2 && c_off == in_off && single_consumer {
+                // Only fuse real activations (ids 0–16). Cast unary steps use
+                // ids ≥100 which fused_binary_unary.cu does not implement — a
+                // fused cast would silently drop the trunc/saturate.
+                if n == n2 && c_off == in_off && single_consumer && *un_op <= 16 {
                     out.push(Step::FusedBinaryUnary {
                         n: *n,
                         a_off: *a_off,
@@ -1671,6 +1731,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![*out_off_f32],
         ),
         Step::Binary {
+            a_off,
+            b_off,
+            c_off,
+            ..
+        }
+        | Step::BinaryBroadcast {
             a_off,
             b_off,
             c_off,
@@ -2270,6 +2336,23 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         Step::ResizeNearest2x {
             src_off, dst_off, ..
         } => (vec![*src_off], vec![*dst_off]),
+        Step::ComplexCast {
+            in_byte_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![(*in_byte_off / 4) as u32],
+            vec![(*out_byte_off / 4) as u32],
+        ),
+        Step::BinaryC64 {
+            a_byte_off,
+            b_byte_off,
+            c_byte_off,
+            ..
+        } => (
+            vec![(*a_byte_off / 4) as u32, (*b_byte_off / 4) as u32],
+            vec![(*c_byte_off / 4) as u32],
+        ),
         Step::FusedBinaryUnary {
             a_off,
             b_off,

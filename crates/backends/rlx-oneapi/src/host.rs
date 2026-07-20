@@ -52,8 +52,26 @@ pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut 
     let plan = rlx_compile::memory::plan_memory_aligned(&g, 16);
     let mut arena = rlx_cpu::arena::Arena::from_plan(plan);
 
-    for (i, (_, buf)) in inputs.iter().enumerate() {
+    for (i, (sh, buf)) in inputs.iter().enumerate() {
         match buf {
+            // I64 inputs arrive as ONE f32 lane per element (the f32-uniform
+            // arena widens every integer to a single f32 lane, value-cast). But
+            // rlx-cpu stores I64 NATIVELY as 8 bytes/elem and reads it back as
+            // i64 (e.g. `exec_gather`'s `idx_i64` path takes `sl_i64`), so
+            // copying the f32 lanes through the f32 `slice_mut` view leaves the
+            // 8-byte slots half-filled with the wrong bit pattern — an i64
+            // Gather then reads garbage rows (indices out of range → zeros).
+            // Narrow each lane back to a native little-endian i64 first. (Other
+            // integer dtypes rlx-cpu reads as f32 lanes, e.g. `exec_gather`'s
+            // non-`idx_i64` branch, so they keep the plain f32 copy below.)
+            HostBuf::F32(vals) if sh.dtype() == DType::I64 => {
+                let off = arena.byte_offset(ids[i]);
+                let raw = arena.raw_buf_mut();
+                let cap = raw.len().saturating_sub(off) / 8;
+                for (k, &v) in vals.iter().take(cap).enumerate() {
+                    raw[off + k * 8..off + k * 8 + 8].copy_from_slice(&(v as i64).to_le_bytes());
+                }
+            }
             HostBuf::F32(vals) => {
                 let slot = arena.slice_mut(ids[i]);
                 let n = slot.len().min(vals.len());
@@ -79,6 +97,19 @@ pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut 
             let nbytes = n * out_shape.dtype().size_bytes().max(1);
             let off = arena.byte_offset(out);
             HostOut::Bytes(arena.raw_buf()[off..off + nbytes].to_vec())
+        }
+        // Complex outputs occupy 2 (C64) / 4 (C128) f32 lanes per element:
+        // rlx-cpu stores them in `size_bytes()`-granular slots (8 B / 16 B) and
+        // its data-movement ops (Expand/Transpose/Concat/Narrow/…) copy whole
+        // elements, so the `[re, im]` / df64 lanes stay paired. Reading back only
+        // `num_elements` f32 would truncate the output to a fraction of its lanes
+        // (dropping the imaginary / df64-lo lanes) — the same lane-count readback
+        // that `backend.rs::read_outputs` applies via `arena_lane_count`.
+        dt if dt.is_complex() => {
+            let lanes = if dt == DType::C64 { 2 } else { 4 };
+            let slot = arena.slice_mut(out);
+            let take = (n * lanes).min(slot.len());
+            HostOut::F32(slot[..take].to_vec())
         }
         _ => {
             let slot = arena.slice_mut(out);

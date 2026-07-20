@@ -1253,22 +1253,29 @@ impl MetalExecutable {
                     if len == 0 {
                         continue;
                     }
-                    // Integer / mixed-width cast: flush GPU, convert on host
-                    // against the unified-memory arena (same sync pattern as
-                    // CustomOp / SpdHost).
+                    // Integer / bool / mixed-width / exotic (F16/BF16/F64/C64)
+                    // cast: flush GPU, convert on host against the
+                    // unified-memory arena (same sync pattern as CustomOp /
+                    // SpdHost). Reuse rlx-cpu's generic scalar-cast kernel —
+                    // it handles ALL 12 dtypes with correct numeric semantics
+                    // (float→int saturates, int→int wraps, f16/bf16
+                    // round-nearest, C64 real↔complex), so no pair panics.
+                    // The arena is a flat byte buffer whose per-node slots are
+                    // sized by real dtype width, so exotic dtypes (which lack
+                    // Metal *device* storage) are still host-representable and
+                    // convert correctly here.
                     end_msl!();
                     cmd_buf.commit();
                     cmd_buf.wait_until_completed();
                     let arena_ptr = self.arena.buffer.contents() as *mut u8;
-                    if let Err(e) = cast_host(
-                        unsafe { arena_ptr.add(*src) },
-                        unsafe { arena_ptr.add(*dst) },
+                    rlx_cpu::thunk::exec_cast_generic(
+                        *src,
+                        *dst,
                         len as usize,
                         *src_dt,
                         *dst_dt,
-                    ) {
-                        panic!("rlx-metal: CastHost {src_dt:?}->{dst_dt:?} failed: {e}");
-                    }
+                        arena_ptr,
+                    );
                     cmd_buf = dev.queue.new_command_buffer().to_owned();
                 }
                 Thunk::CastTruncF32 { src, dst, len } => {

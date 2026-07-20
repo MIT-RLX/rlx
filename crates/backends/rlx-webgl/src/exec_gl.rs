@@ -209,6 +209,67 @@ void main() {
     o = vec4(float(bj), 0.0, 0.0, 1.0);
 }"#;
 
+// Standalone complex `Op::Cast` lane-move — one OUTPUT lane per fragment.
+// `lin` is the flat output-lane index; `uSrcCols`/`uOutCols` unflatten to the
+// (lane-aware) 2D texture footprints. Mirrors `exec_cpu` ComplexCast + the
+// wgpu/cuda/vulkan `complex_cast` 6-mode table. C64 = 2 lanes, C128 = 4 lanes.
+const FS_COMPLEX_CAST: &str = r#"uniform highp sampler2D SRC;
+uniform int uMode; uniform int uSrcCols; uniform int uOutCols;
+out vec4 o;
+float src(int lin) { return texelFetch(SRC, ivec2(lin % uSrcCols, lin / uSrcCols), 0).r; }
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    int lin = p.y * uOutCols + p.x;
+    float v = 0.0;
+    if (uMode == 0) {            // real → C64
+        int k = lin / 2; int j = lin - 2 * k;
+        v = (j == 0) ? src(k) : 0.0;
+    } else if (uMode == 1) {     // C64 → real
+        v = src(2 * lin);
+    } else if (uMode == 2) {     // real → C128
+        int k = lin / 4; int j = lin - 4 * k;
+        v = (j == 0) ? src(k) : 0.0;
+    } else if (uMode == 3) {     // C128 → real
+        v = src(4 * lin);
+    } else if (uMode == 4) {     // C64 → C128
+        int k = lin / 4; int j = lin - 4 * k;
+        if (j == 0) v = src(2 * k);
+        else if (j == 2) v = src(2 * k + 1);
+        else v = 0.0;
+    } else {                     // uMode == 5: C128 → C64
+        int k = lin / 2; int j = lin - 2 * k;
+        v = (j == 0) ? src(4 * k) : src(4 * k + 2);
+    }
+    o = vec4(v, 0.0, 0.0, 1.0);
+}"#;
+
+// C64 element-wise binary — one OUTPUT lane per fragment. Each fragment reads
+// BOTH `[re, im]` lanes of its operands (the reason this can't ride FS_BINARY's
+// scalar-per-lane model). Broadcast is per-operand complex-element modulo
+// (`k % n_a`, `k % n_b`), matching rlx-cpu. uOp reuses the Bin codes; only
+// Add(0)/Sub(1)/Mul(2)/Div(3) reach here (max/min/pow rejected at lowering).
+const FS_BINARY_C64: &str = r#"uniform highp sampler2D A; uniform highp sampler2D B;
+uniform int uOp; uniform int uNa; uniform int uNb;
+uniform int uACols; uniform int uBCols; uniform int uOutCols;
+out vec4 o;
+float af(int lin) { return texelFetch(A, ivec2(lin % uACols, lin / uACols), 0).r; }
+float bf(int lin) { return texelFetch(B, ivec2(lin % uBCols, lin / uBCols), 0).r; }
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    int lin = p.y * uOutCols + p.x;
+    int k = lin / 2; int j = lin - 2 * k;
+    int ka = k % uNa;
+    int kb = k % uNb;
+    float ar = af(2 * ka); float ai = af(2 * ka + 1);
+    float br = bf(2 * kb); float bi = bf(2 * kb + 1);
+    float cr = 0.0; float ci = 0.0;
+    if (uOp == 0) { cr = ar + br; ci = ai + bi; }
+    else if (uOp == 1) { cr = ar - br; ci = ai - bi; }
+    else if (uOp == 2) { cr = ar * br - ai * bi; ci = ar * bi + ai * br; }
+    else { float d = br * br + bi * bi; cr = (ar * br + ai * bi) / d; ci = (ai * br - ar * bi) / d; }
+    o = vec4(j == 0 ? cr : ci, 0.0, 0.0, 1.0);
+}"#;
+
 const FS_GATHER_RT: &str = r#"uniform highp sampler2D TABLE; uniform highp sampler2D IDXT;
 uniform highp isampler2D WHICH; uniform highp isampler2D BASE;
 uniform int uTableCols; uniform int uIdxCols; uniform int uAxisStride;
@@ -289,6 +350,8 @@ pub struct GlBackend {
     rmsnorm: WebGlProgram,
     argreduce: WebGlProgram,
     gather_rt: WebGlProgram,
+    complex_cast: WebGlProgram,
+    binary_c64: WebGlProgram,
 }
 
 fn err<T: std::fmt::Debug>(ctx: &str, e: T) -> WebglError {
@@ -332,6 +395,8 @@ impl GlBackend {
             rmsnorm: plain(FS_RMSNORM)?,
             argreduce: plain(FS_ARGREDUCE)?,
             gather_rt: plain(FS_GATHER_RT)?,
+            complex_cast: plain(FS_COMPLEX_CAST)?,
+            binary_c64: plain(FS_BINARY_C64)?,
             fbo,
             gl,
         })
@@ -713,6 +778,43 @@ impl GlBackend {
                     self.set_i32(&self.gather_rt, "uTableCols", tc as i32);
                     self.set_i32(&self.gather_rt, "uIdxCols", ic as i32);
                     self.set_i32(&self.gather_rt, "uAxisStride", *axis_stride as i32);
+                    self.draw();
+                    tex[*out] = Some(t);
+                }
+                Step::ComplexCast { out, src, mode, n: _ } => {
+                    // One output lane per fragment; the (lane-aware) out/src slot
+                    // cols unflatten gl_FragCoord and the source lane index.
+                    let (r, c) = dims(*out);
+                    let (_sr, sc) = dims(*src);
+                    let t = self.begin(&self.complex_cast, c, r)?;
+                    self.bind_tex_unit(&self.complex_cast, "SRC", 0, self.tex(&tex, *src)?);
+                    self.set_i32(&self.complex_cast, "uMode", *mode as i32);
+                    self.set_i32(&self.complex_cast, "uSrcCols", sc as i32);
+                    self.set_i32(&self.complex_cast, "uOutCols", c as i32);
+                    self.draw();
+                    tex[*out] = Some(t);
+                }
+                Step::BinaryC64 {
+                    out,
+                    a,
+                    b,
+                    op,
+                    n: _,
+                    n_a,
+                    n_b,
+                } => {
+                    let (r, c) = dims(*out);
+                    let (_ar, ac) = dims(*a);
+                    let (_br, bc) = dims(*b);
+                    let t = self.begin(&self.binary_c64, c, r)?;
+                    self.bind_tex_unit(&self.binary_c64, "A", 0, self.tex(&tex, *a)?);
+                    self.bind_tex_unit(&self.binary_c64, "B", 1, self.tex(&tex, *b)?);
+                    self.set_i32(&self.binary_c64, "uOp", bin_code(*op));
+                    self.set_i32(&self.binary_c64, "uNa", *n_a as i32);
+                    self.set_i32(&self.binary_c64, "uNb", *n_b as i32);
+                    self.set_i32(&self.binary_c64, "uACols", ac as i32);
+                    self.set_i32(&self.binary_c64, "uBCols", bc as i32);
+                    self.set_i32(&self.binary_c64, "uOutCols", c as i32);
                     self.draw();
                     tex[*out] = Some(t);
                 }

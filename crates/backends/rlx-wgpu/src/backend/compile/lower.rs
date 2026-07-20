@@ -41,8 +41,9 @@ use crate::buffer::{
 use crate::device::wgpu_device;
 use crate::kernels::{
     AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams, AttentionBwdParams,
-    AttentionParams, BatchElementwiseRegionParams, BinaryParams, Conv1dParams, Conv2dParams,
-    Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
+    AttentionParams, BatchElementwiseRegionParams, BinaryC64Params, BinaryParams, ComplexCastParams,
+    Conv1dParams, Conv2dParams,
+    Conv3dParams, CastParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
     ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
     FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatedDeltaNetParams,
     GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
@@ -52,8 +53,9 @@ use crate::kernels::{
     RopeParams, SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams,
     TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
     ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, batch_elementwise_region_kernel, binary_kernel, cast_f32_to_f16_kernel,
-    compare_kernel, concat_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
+    attention_kernel, batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel,
+    cast_f32_to_f16_kernel, complex_cast_kernel,
+    cast_kernel, compare_kernel, concat_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
     conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
     elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel, fma_kernel,
     fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
@@ -82,6 +84,77 @@ use std::num::NonZeroU64;
 
 use super::super::*;
 use crate::backend::WgpuExecutable;
+
+/// f32 clamp bounds `[lo, hi]` for a float→int Cast destination (`Op::Cast`
+/// truncate+saturate on the f32-uniform arena). Endpoints are the exact int
+/// range; `i32::MAX`/`u32::MAX`/i64 bounds are not f32-representable and round
+/// to the nearest f32 (an inherent arena limit at the extreme int values).
+fn int_range_f32(dt: rlx_ir::DType) -> (f32, f32) {
+    match dt {
+        rlx_ir::DType::I8 => (i8::MIN as f32, i8::MAX as f32),
+        rlx_ir::DType::I16 => (i16::MIN as f32, i16::MAX as f32),
+        rlx_ir::DType::I32 => (i32::MIN as f32, i32::MAX as f32),
+        rlx_ir::DType::I64 => (i64::MIN as f32, i64::MAX as f32),
+        rlx_ir::DType::U8 => (0.0, u8::MAX as f32),
+        rlx_ir::DType::U32 => (0.0, u32::MAX as f32),
+        // Non-int dst never reaches here (guarded by is_int at the call site).
+        _ => (f32::NEG_INFINITY, f32::INFINITY),
+    }
+}
+
+/// Cast target-class code for a fused `ChainStep::Cast`, packed into the chain
+/// step's `sub` word (op_kind==1) and decoded by `apply_cast` in
+/// `elementwise_region.wgsl`. The fused chain carries only the TARGET dtype, so
+/// the source is assumed float for int targets (the common case; an int→int
+/// narrow inside a region would saturate rather than wrap — unrepresentable in
+/// the f32 arena either way). Float targets (incl. F16/BF16 kept as f32) map to
+/// identity; F64/C64 targets are rejected before this is reached.
+fn cast_region_sub(dt: rlx_ir::DType) -> u32 {
+    match dt {
+        rlx_ir::DType::Bool => 1,
+        rlx_ir::DType::I8 => 2,
+        rlx_ir::DType::I16 => 3,
+        rlx_ir::DType::I32 => 4,
+        rlx_ir::DType::I64 => 5,
+        rlx_ir::DType::U8 => 6,
+        rlx_ir::DType::U32 => 7,
+        _ => 0,
+    }
+}
+
+/// Overwrite each fused `Cast` step's `sub` word with its target-class code
+/// (see [`cast_region_sub`]). The shared `rlx_ir::encode_chain_steps` drops the
+/// Cast dtype (encodes `sub=0` = identity); wgpu re-injects it so the region
+/// kernel performs the real float→int / →Bool conversion.
+fn patch_region_cast_subs(chain: &[rlx_ir::op::ChainStep], chain_enc: &mut [u32]) {
+    for (k, step) in chain.iter().enumerate() {
+        if let rlx_ir::op::ChainStep::Cast(to, _) = step {
+            // F64 has no f32-arena storage — a fused F64 cast can't run here.
+            if matches!(to, rlx_ir::DType::F64) {
+                panic!(
+                    "rlx-wgpu fused Cast->{to:?}: the f32-uniform arena has no \
+                     F64 storage — run this cast on CPU/Metal"
+                );
+            }
+            // Complex casts must never reach a fused region: `mark_elementwise`
+            // excludes complex ops (the f32-scalar region kernel can't re-pair
+            // `[re, im]` lanes), so they stay standalone and route through the
+            // `complex_cast` pass. Reaching here means the exclusion regressed —
+            // panic loudly rather than emit a silently-wrong lane-move.
+            if to.is_complex() {
+                panic!(
+                    "rlx-wgpu fused Cast->{to:?}: complex casts must be excluded \
+                     from region fusion (mark_elementwise) and lowered as a \
+                     standalone complex_cast pass — this is a fusion-exclusion bug"
+                );
+            }
+            let idx = k * 4 + 1;
+            if idx < chain_enc.len() {
+                chain_enc[idx] = cast_region_sub(*to);
+            }
+        }
+    }
+}
 
 pub(crate) fn compile_static_inner(
     graph: Graph,
@@ -189,7 +262,18 @@ pub(crate) fn compile_static_inner(
     // padded for alignment).
     for node in graph.nodes() {
         let elems = node.shape.num_elements().unwrap_or(0);
-        arena.set_actual_len(node.id, elems * 4);
+        // Actual byte length = (# of f32 lanes) × 4. Real/int/bool tensors are
+        // widened to exactly ONE f32 lane per element (→ `elems * 4`). Complex
+        // tensors genuinely occupy MULTIPLE f32 lanes — C64 = 2 lanes (8 B),
+        // C128 = 4 lanes (16 B) — so `elems * 4` would truncate the slot and
+        // drop the imaginary (and df64 lo) lanes on readback / aliasing copies.
+        let dt = node.shape.dtype();
+        let actual = if dt.is_complex() {
+            elems * dt.size_bytes()
+        } else {
+            elems * 4
+        };
+        arena.set_actual_len(node.id, actual);
     }
 
     // Initialize Constants directly into the arena. The wgpu arena is f32-
@@ -734,6 +818,111 @@ pub(crate) fn compile_static_inner(
                 if skip_adds.contains(&node.id) {
                     continue;
                 }
+                // Complex binary: C64 add/sub/mul/div reads BOTH `[re, im]`
+                // lanes per element, so it cannot ride the fused scalar-per-
+                // thread path — lower to a standalone `binary_c64` dispatch
+                // (excluded from region fusion). C128 arithmetic is out of
+                // scope (CPU has none either) → reject. Broadcast is carried
+                // by per-operand element counts (`k % n_x`), matching CPU.
+                let out_dt = node.shape.dtype();
+                if out_dt.is_complex() {
+                    if out_dt == rlx_ir::DType::C128 {
+                        panic!(
+                            "rlx-wgpu Binary on C128: complex-f64 arithmetic is \
+                             unsupported (rlx-cpu has none either) — only C64 \
+                             add/sub/mul/div are wired"
+                        );
+                    }
+                    let op_code = binary_op_id(*bop);
+                    if op_code > 3 {
+                        panic!(
+                            "rlx-wgpu C64 Binary: {bop:?} is undefined for complex \
+                             (only Add/Sub/Mul/Div); matches rlx-cpu rejection"
+                        );
+                    }
+                    let a_id = node.inputs[0];
+                    let b_id = node.inputs[1];
+                    let win_ids = [node.id, a_id, b_id];
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &win_ids,
+                    );
+                    if !fits && !param_anchor {
+                        base = arena_bind_window_covering_scratch_if_needed(
+                            &arena, base, size, scratch,
+                        );
+                    }
+                    let a_off = arena_off_in_bind_window(
+                        &graph, &param_offsets, &dev.device, &arena, &mut schedule, &mut scratch,
+                        a_id, &mut base, &mut size,
+                    );
+                    let b_off = arena_off_in_bind_window(
+                        &graph, &param_offsets, &dev.device, &arena, &mut schedule, &mut scratch,
+                        b_id, &mut base, &mut size,
+                    );
+                    let c_off = arena_off_in_bind_window(
+                        &graph, &param_offsets, &dev.device, &arena, &mut schedule, &mut scratch,
+                        node.id, &mut base, &mut size,
+                    );
+                    let a_off = if arena_tensor_in_window(&arena, a_id, base, size) {
+                        arena_local_off_f32(&arena, a_id, base)
+                    } else {
+                        a_off
+                    };
+                    let b_off = if arena_tensor_in_window(&arena, b_id, base, size) {
+                        arena_local_off_f32(&arena, b_id, base)
+                    } else {
+                        b_off
+                    };
+                    let c_off = if arena_tensor_in_window(&arena, node.id, base, size) {
+                        arena_local_off_f32(&arena, node.id, base)
+                    } else {
+                        c_off
+                    };
+                    let n_a = graph.node(a_id).shape.num_elements().unwrap_or(0) as u32;
+                    let n_b = graph.node(b_id).shape.num_elements().unwrap_or(0) as u32;
+                    let p = BinaryC64Params {
+                        n: elems,
+                        a_off,
+                        b_off,
+                        c_off,
+                        op: op_code,
+                        n_a: n_a.max(1),
+                        n_b: n_b.max(1),
+                        _p0: 0,
+                    };
+                    schedule.push(Step::BinaryC64 { params: p });
+                    // If the output was staged into scratch, copy it back.
+                    let out_src = arena.offset(node.id) as u64;
+                    if !arena_tensor_in_window(&arena, node.id, base, size) {
+                        let staged_dst = base + (c_off as u64) * 4;
+                        schedule.push(Step::BufferCopy {
+                            src_byte_off: staged_dst,
+                            dst_byte_off: out_src,
+                            bytes: arena.len_of(node.id) as u32,
+                        });
+                    }
+                    let u = emit_uniform(std::mem::size_of::<BinaryC64Params>());
+                    let bg = bind_arena_window(
+                        &dev.device,
+                        binary_c64_kernel(&dev.device),
+                        &arena,
+                        base,
+                        size,
+                        &u,
+                    );
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                    continue;
+                }
                 require_equal_shapes(&graph, &node.inputs, "Binary");
                 let a_id = node.inputs[0];
                 let b_id = node.inputs[1];
@@ -1138,7 +1327,8 @@ pub(crate) fn compile_static_inner(
                     base =
                         arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
                 }
-                let chain_enc = rlx_ir::encode_chain_steps(chain);
+                let mut chain_enc = rlx_ir::encode_chain_steps(chain);
+                patch_region_cast_subs(chain, &mut chain_enc);
                 let tail = rlx_ir::encode_prologue_tail(*prologue, &slice_shape, *prologue_input);
                 let base_dst = arena_local_off_f32(&arena, node.id, base);
                 let use_single = rlx_ir::fk_batch_use_single_launch(n, *prologue);
@@ -1283,7 +1473,8 @@ pub(crate) fn compile_static_inner(
                         &mut size,
                     );
                 }
-                let chain_enc = rlx_ir::encode_chain_steps(chain);
+                let mut chain_enc = rlx_ir::encode_chain_steps(chain);
+                patch_region_cast_subs(chain, &mut chain_enc);
                 let tail = rlx_ir::encode_prologue_tail(*prologue, &node.shape, *prologue_input);
                 let p = ElementwiseRegionParams {
                     len: elems,
@@ -1822,23 +2013,189 @@ pub(crate) fn compile_static_inner(
                 }
             }
 
-            Op::Cast { .. } => {
-                // A same-dtype Cast is view-aliased by the planner (src==dst) →
-                // no-op. A dtype-changing Cast (e.g. Bool→F32 for VITS sequence
-                // masks) gets its own slot; on the f32-uniform arena every value
-                // is already f32-encoded, so the cast is a value-preserving copy.
-                // Without this the output slot keeps its (zero) init — a Bool→F32
-                // mask Cast silently produced all-zeros, killing the encoder.
+            Op::Cast { to } => {
+                // The wgpu arena is f32-uniform (every value stored as f32), so
+                // a Cast is a per-element re-encode of the already-f32 value.
+                // Three regimes, matching rlx-cpu:
+                //   * identity (mode 0): int→float / float→float / same-kind /
+                //     Bool→num — the stored f32 already holds the right value, so
+                //     the proven `BufferCopy` value-move suffices.
+                //   * float→int (mode 1): must truncate toward zero and SATURATE
+                //     to the destination int range (Rust `x as iN` semantics);
+                //     a plain copy WRONGLY kept 3.7 as 3.7. Needs a compute pass.
+                //   * →Bool (mode 2): store `value != 0` (1.0/0.0); a plain copy
+                //     WRONGLY kept the source magnitude.
                 let in_id = node.inputs[0];
+                let src_dt = graph.node(in_id).shape.dtype();
+                let dst_dt = *to;
+                // F64 has no f32-arena storage AND this backend performs no
+                // upstream f64→f32 demotion (unlike rlx-vulkan/rlx-oneapi) —
+                // reject rather than silently corrupt. (df64 C128 IS carried,
+                // 4 f32 lanes, so complex casts fall through to the pass below.)
+                if matches!(src_dt, rlx_ir::DType::F64) || matches!(dst_dt, rlx_ir::DType::F64) {
+                    panic!(
+                        "rlx-wgpu Op::Cast {src_dt:?}->{dst_dt:?}: the f32-uniform \
+                         arena has no F64 storage and this backend does not \
+                         demote it to f32 — run this cast on CPU/Metal"
+                    );
+                }
+                // Complex casts route to the standalone `complex_cast` pass
+                // (real↔C64, real↔C128, C64↔C128 — pure lane moves, no df64
+                // compensated math since f32 real sources have lo=0). Excluded
+                // from region fusion (the f32-scalar region kernel can't re-pair
+                // complex lanes). Same-dtype complex is Identity (BufferCopy —
+                // lane-correct now the slot spans every lane).
+                if src_dt.is_complex() || dst_dt.is_complex() {
+                    if src_dt == dst_dt {
+                        let src = arena.offset(in_id);
+                        let dst = arena.offset(node.id);
+                        if src != dst {
+                            let bytes = arena.len_of(in_id).min(arena.len_of(node.id));
+                            schedule.push(Step::BufferCopy {
+                                src_byte_off: src as u64,
+                                dst_byte_off: dst as u64,
+                                bytes: bytes as u32,
+                            });
+                        }
+                        continue;
+                    }
+                    let mode: u32 = match (src_dt, dst_dt) {
+                        (s, rlx_ir::DType::C64) if !s.is_complex() => 0, // real → C64
+                        (rlx_ir::DType::C64, d) if !d.is_complex() => 1, // C64 → real
+                        (s, rlx_ir::DType::C128) if !s.is_complex() => 2, // real → C128
+                        (rlx_ir::DType::C128, d) if !d.is_complex() => 3, // C128 → real
+                        (rlx_ir::DType::C64, rlx_ir::DType::C128) => 4,
+                        (rlx_ir::DType::C128, rlx_ir::DType::C64) => 5,
+                        _ => unreachable!("complex cast {src_dt:?}->{dst_dt:?} unclassified"),
+                    };
+                    // Bind a window covering both operands (staged into scratch
+                    // when they don't fit), mirroring the numeric cast path.
+                    let win_ids = [node.id, in_id];
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &win_ids,
+                    );
+                    if !fits && !param_anchor {
+                        base = arena_bind_window_covering_scratch_if_needed(
+                            &arena, base, size, scratch,
+                        );
+                    }
+                    let in_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        in_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let p = ComplexCastParams {
+                        n: elems,
+                        in_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        mode,
+                        _p0: 0,
+                        _p1: 0,
+                        _p2: 0,
+                        _p3: 0,
+                    };
+                    schedule.push(Step::ComplexCast { params: p });
+                    let u = emit_uniform(std::mem::size_of::<ComplexCastParams>());
+                    let bg = bind_arena_window(
+                        &dev.device,
+                        complex_cast_kernel(&dev.device),
+                        &arena,
+                        base,
+                        size,
+                        &u,
+                    );
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                    continue;
+                }
+                let (mode, lo, hi) = if dst_dt == rlx_ir::DType::Bool {
+                    (2u32, 0.0f32, 0.0f32)
+                } else if dst_dt.is_int() && src_dt.is_float() {
+                    let (lo, hi) = int_range_f32(dst_dt);
+                    (1u32, lo, hi)
+                } else {
+                    // int→float / float→float(incl. F16/BF16, kept full f32 in
+                    // this arena) / int→int (widening; narrowing-wrap isn't
+                    // representable here) / Bool→num — all value-preserving.
+                    (0u32, 0.0f32, 0.0f32)
+                };
                 let src = arena.offset(in_id);
                 let dst = arena.offset(node.id);
-                if src != dst {
-                    let bytes = arena.len_of(in_id).min(arena.len_of(node.id));
-                    schedule.push(Step::BufferCopy {
-                        src_byte_off: src as u64,
-                        dst_byte_off: dst as u64,
-                        bytes: bytes as u32,
-                    });
+                if mode == 0 {
+                    // Value-preserving: same-slot alias is a no-op; distinct
+                    // slots copy (handles arbitrary offsets / >4 GiB tensors).
+                    if src != dst {
+                        let bytes = arena.len_of(in_id).min(arena.len_of(node.id));
+                        schedule.push(Step::BufferCopy {
+                            src_byte_off: src as u64,
+                            dst_byte_off: dst as u64,
+                            bytes: bytes as u32,
+                        });
+                    }
+                } else {
+                    // Numeric conversion → compute pass. Bind a window covering
+                    // both operands (staged into scratch if they don't fit),
+                    // mirroring Op::Activation. In-place (src==dst) is fine: each
+                    // thread reads then writes only its own element.
+                    let win_ids = [node.id, in_id];
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &win_ids,
+                    );
+                    if !fits && !param_anchor {
+                        base = arena_bind_window_covering_scratch_if_needed(
+                            &arena, base, size, scratch,
+                        );
+                    }
+                    let in_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        in_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let p = CastParams {
+                        n: elems,
+                        in_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        mode,
+                        lo_bits: lo.to_bits(),
+                        hi_bits: hi.to_bits(),
+                        _p0: 0,
+                        _p1: 0,
+                    };
+                    schedule.push(Step::Cast { params: p });
+                    let u = emit_uniform(std::mem::size_of::<CastParams>());
+                    let bg = bind_arena_window(&dev.device, cast_kernel(&dev.device), &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
                 }
             }
 
@@ -1846,14 +2203,36 @@ pub(crate) fn compile_static_inner(
                 let in_id = node.inputs[0];
                 let in_shape = graph.node(in_id).shape.dims();
                 let out_shape = node.shape.dims();
-                let rank = perm.len();
-                if rank != in_shape.len() || rank != out_shape.len() {
+                let base_rank = perm.len();
+                if base_rank != in_shape.len() || base_rank != out_shape.len() {
                     panic!("rlx-wgpu Transpose: rank mismatch");
                 }
-                let in_dims: Vec<u32> = in_shape.iter().map(|d| d.unwrap_static() as u32).collect();
-                let out_dims: Vec<u32> =
+                let mut in_dims: Vec<u32> =
+                    in_shape.iter().map(|d| d.unwrap_static() as u32).collect();
+                let mut out_dims: Vec<u32> =
                     out_shape.iter().map(|d| d.unwrap_static() as u32).collect();
-                // Input cumulative strides (row-major).
+                // Complex tensors pack `lanes` contiguous f32 per element (C64=2
+                // [re,im], C128=4 df64). The permute kernel copies one f32 per
+                // "element" via the perm-indexed strides, so append an INNERMOST
+                // lane axis that maps to ITSELF (never permuted): each thread
+                // then copies a whole complex element's lanes as a contiguous
+                // group instead of shattering the [re,im] pairing. lanes=1 for
+                // real/int ⇒ strict no-op (axis is elided).
+                let lanes: u32 = match node.shape.dtype() {
+                    rlx_ir::DType::C64 => 2,
+                    rlx_ir::DType::C128 => 4,
+                    _ => 1,
+                };
+                let mut perm = perm.clone();
+                let rank = if lanes > 1 {
+                    in_dims.push(lanes);
+                    out_dims.push(lanes);
+                    perm.push(base_rank); // lane axis maps to itself (innermost)
+                    base_rank + 1
+                } else {
+                    base_rank
+                };
+                // Input cumulative strides (row-major) over the extended rank.
                 let mut in_strides = vec![1u32; rank];
                 for i in (0..rank.saturating_sub(1)).rev() {
                     in_strides[i] = in_strides[i + 1] * in_dims[i + 1];
@@ -1931,7 +2310,7 @@ pub(crate) fn compile_static_inner(
                 );
                 let p = TransposeParams {
                     rank: rank as u32,
-                    out_total: elems,
+                    out_total: elems * lanes,
                     in_off,
                     out_off,
                     bucket_outermost,
@@ -2046,10 +2425,20 @@ pub(crate) fn compile_static_inner(
                 } else {
                     out_off
                 };
+                // Complex packs `lanes` contiguous f32 per element (C64=2,
+                // C128=4). Narrow copies one f32 per "element"; the narrow axis
+                // is an ELEMENT axis and the lane axis is innermost, so only the
+                // per-copy inner-count and the output total scale by lanes —
+                // axis/start/len stay in element units. lanes=1 ⇒ strict no-op.
+                let lanes: u32 = match node.shape.dtype() {
+                    rlx_ir::DType::C64 => 2,
+                    rlx_ir::DType::C128 => 4,
+                    _ => 1,
+                };
                 let p = NarrowConcatParams {
-                    total: elems,
+                    total: elems * lanes,
                     outer,
-                    inner,
+                    inner: inner * lanes,
                     axis_in_size: axis_in,
                     axis_out_size: *len as u32,
                     start: *start as u32,
@@ -2077,6 +2466,18 @@ pub(crate) fn compile_static_inner(
                     .product::<u32>()
                     .max(1);
                 let axis_out = out_shape[*axis].unwrap_static() as u32;
+                // Complex packs `lanes` contiguous f32 per element (C64=2,
+                // C128=4). Concat copies one f32 per "element"; the concat axis
+                // is an ELEMENT axis (lane axis innermost), so only the per-slice
+                // inner-count and the input-element total scale by lanes —
+                // axis_out/start stay element units. lanes=1 ⇒ strict no-op. The
+                // host fallbacks (ConcatHost/Pieces) keep the element-unit `inner`.
+                let lanes: u32 = match node.shape.dtype() {
+                    rlx_ir::DType::C64 => 2,
+                    rlx_ir::DType::C128 => 4,
+                    _ => 1,
+                };
+                let inner_lanes = inner * lanes;
                 let max_binding = dev.device.limits().max_storage_buffer_binding_size;
                 let once = is_static_weight_tensor(&graph, node.id, &mut static_weight_memo);
                 let sched_before = schedule.len();
@@ -2125,9 +2526,9 @@ pub(crate) fn compile_static_inner(
                         let in_off = arena_local_off_f32(&arena, in_id, base);
                         let out_off = arena_local_off_f32(&arena, node.id, base);
                         let p = NarrowConcatParams {
-                            total: in_total,
+                            total: in_total * lanes,
                             outer,
-                            inner,
+                            inner: inner_lanes,
                             axis_in_size: axis_in,
                             axis_out_size: axis_out,
                             start: start_pos,
@@ -2160,9 +2561,9 @@ pub(crate) fn compile_static_inner(
                         let in_off = ((dst.saturating_sub(base)) / 4) as u32;
                         let out_off = arena_local_off_f32(&arena, node.id, base);
                         let p = NarrowConcatParams {
-                            total: in_total,
+                            total: in_total * lanes,
                             outer,
-                            inner,
+                            inner: inner_lanes,
                             axis_in_size: axis_in,
                             axis_out_size: axis_out,
                             start: start_pos,
@@ -2176,7 +2577,12 @@ pub(crate) fn compile_static_inner(
                         uniforms.push(u);
                         bind_groups.push(bg);
                     } else {
-                        host_inputs.push((arena.offset(in_id), axis_in, numel));
+                        // Complex: the sharded host fallback copies f32 LANES, so
+                        // each input's element count scales by `lanes` (C64=2/
+                        // C128=4). The per-row `inner` span uses `inner_lanes`
+                        // below; axis positions (`axis_in`/`start_pos`) stay
+                        // element units (the lane axis is innermost).
+                        host_inputs.push((arena.offset(in_id), axis_in, numel * lanes));
                         host_starts.push(start_pos);
                     }
                     start_pos += axis_in;
@@ -2186,7 +2592,7 @@ pub(crate) fn compile_static_inner(
                         schedule.push(Step::ConcatHost {
                             dst_byte_off: arena.offset(node.id),
                             outer,
-                            inner,
+                            inner: inner_lanes,
                             total_axis: axis_out,
                             inputs: host_inputs,
                         });
@@ -2194,7 +2600,7 @@ pub(crate) fn compile_static_inner(
                         schedule.push(Step::ConcatHostPieces {
                             dst_byte_off: arena.offset(node.id),
                             outer,
-                            inner,
+                            inner: inner_lanes,
                             total_axis: axis_out,
                             inputs: host_inputs,
                             starts: host_starts,
@@ -2972,6 +3378,26 @@ pub(crate) fn compile_static_inner(
                         }
                     })
                     .collect();
+                // Complex tensors pack `lanes` contiguous f32 per element (C64=2
+                // [re,im], C128=4 df64). The expand kernel copies one f32 per
+                // "element", so append an innermost lane axis (in==out, never a
+                // broadcast) — each thread then copies a whole complex element's
+                // lanes as a contiguous group instead of shattering the [re,im]
+                // pairing. lanes=1 for real/int ⇒ strict no-op (axis is elided).
+                let lanes: u32 = match node.shape.dtype() {
+                    rlx_ir::DType::C64 => 2,
+                    rlx_ir::DType::C128 => 4,
+                    _ => 1,
+                };
+                let (rank, out_dims, in_dims) = if lanes > 1 {
+                    let mut od = out_dims;
+                    let mut idm = in_dims;
+                    od.push(lanes);
+                    idm.push(lanes);
+                    (rank + 1, od, idm)
+                } else {
+                    (rank, out_dims, in_dims)
+                };
                 // Cumulative input strides (row-major). When the
                 // input dim is 1 but target dim > 1, that axis
                 // broadcasts → stride = 0.
@@ -3065,7 +3491,7 @@ pub(crate) fn compile_static_inner(
                 };
                 let p = ExpandParams {
                     rank: rank as u32,
-                    out_total: elems,
+                    out_total: elems * lanes,
                     in_off,
                     out_off,
                     bucket_outermost,
@@ -3125,9 +3551,13 @@ pub(crate) fn compile_static_inner(
                 // gathers through a host segment with separate table / idx
                 // windows and a dedicated output buffer (copied back).
                 let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                // `RLX_WGPU_GATHER_SPLIT` forces the >4 GiB split-binding path on a
+                // small table so it's testable (mirrors `RLX_WGPU_CONCAT_HOST`).
                 let gather_needs_split = *axis == 0
-                    && arena_whole_arena_bind(&arena, max_binding).is_none()
-                    && arena_span_bytes(&arena, &[table_id, idx_id, node.id]) > max_binding;
+                    && (rlx_ir::env::flag("RLX_WGPU_GATHER_SPLIT")
+                        || (arena_whole_arena_bind(&arena, max_binding).is_none()
+                            && arena_span_bytes(&arena, &[table_id, idx_id, node.id])
+                                > max_binding));
                 if gather_needs_split {
                     let table_shape = graph.node(table_id).shape.dims();
                     let idx_shape = graph.node(idx_id).shape.dims();
@@ -3144,10 +3574,19 @@ pub(crate) fn compile_static_inner(
                         "rlx-wgpu gather_split: embedding table {table_w} bytes exceeds \
                          max_storage_buffer_binding_size {max_binding}"
                     );
+                    // Complex: each embedding element is `lanes` contiguous f32
+                    // (C64=2/C128=4), so the per-row copy width `dim` and the
+                    // output total scale by lanes; `vocab`/`n_idx`/indices stay
+                    // element-indexed (1 f32 lane per I64 index).
+                    let lanes: u32 = match node.shape.dtype() {
+                        rlx_ir::DType::C64 => 2,
+                        rlx_ir::DType::C128 => 4,
+                        _ => 1,
+                    };
                     schedule.push(Step::GatherSplit {
-                        n_out: elems,
+                        n_out: elems * lanes,
                         n_idx,
-                        dim,
+                        dim: dim * lanes,
                         vocab,
                         table_byte_off: arena.offset(table_id) as u64,
                         idx_byte_off: arena.offset(idx_id) as u64,
@@ -3158,6 +3597,17 @@ pub(crate) fn compile_static_inner(
                     // group lane (those are indexed by GPU-step count).
                     continue;
                 }
+                // Complex packs `lanes` contiguous f32 per element (C64=2,
+                // C128=4). Gather copies one f32 per "element"; each gathered
+                // element is `lanes` contiguous f32, so scale the inner per-row
+                // copy width (`dim`/`trailing`) and the output total by lanes.
+                // Indices select ELEMENTS (leading axis / `vocab`), so they stay
+                // in element units. lanes=1 (real/int) ⇒ strict no-op.
+                let lanes: u32 = match node.shape.dtype() {
+                    rlx_ir::DType::C64 => 2,
+                    rlx_ir::DType::C128 => 4,
+                    _ => 1,
+                };
                 let gather_win: Vec<NodeId> = if table_is_param && table_bytes > ARENA_STAGE_CAP {
                     vec![table_id, node.id, idx_id]
                 } else {
@@ -3216,9 +3666,9 @@ pub(crate) fn compile_static_inner(
                         .max(1);
                     let n_idx: u32 = idx_shape.iter().map(|d| d.unwrap_static() as u32).product();
                     let p = GatherParams {
-                        n_out: elems,
+                        n_out: elems * lanes,
                         n_idx,
-                        dim,
+                        dim: dim * lanes,
                         vocab,
                         in_off,
                         idx_off,
@@ -3248,11 +3698,11 @@ pub(crate) fn compile_static_inner(
                     let num_idx: u32 = idx_shape.iter().map(|d| d.unwrap_static() as u32).product();
                     let total = outer * num_idx * trailing;
                     let p = GatherAxisParams {
-                        total,
+                        total: total * lanes,
                         outer,
                         axis_dim,
                         num_idx,
-                        trailing,
+                        trailing: trailing * lanes,
                         table_off: in_off,
                         idx_off,
                         out_off,
@@ -6608,7 +7058,6 @@ pub(crate) fn compile_static_inner(
         pending_param_bytes: HashMap::new(),
         active_extent: None,
         uniforms_active_extent: None,
-        input_staging_hashes: HashMap::new(),
         coop_f16_vk,
         coop_f16_b_param,
         coop_f16_vk_wide_b: HashSet::new(),

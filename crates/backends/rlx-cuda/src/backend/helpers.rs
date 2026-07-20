@@ -1578,6 +1578,31 @@ pub(crate) fn binary_op_id(op: BinaryOp) -> u32 {
     }
 }
 
+/// Row-major strides of `in_dims` aligned to `out_dims` (left-padded with 1s),
+/// with stride 0 on axes that broadcast (`in==1 && out>1`). Matches the strides
+/// `Op::Expand` lowering computes — used by `BinaryBroadcast` to read an operand
+/// without materializing the expanded tensor. `in_dims == out_dims` yields plain
+/// contiguous strides.
+pub(crate) fn broadcast_strides_for_out(in_dims: &[usize], out_dims: &[u32]) -> Vec<u32> {
+    let rank = out_dims.len();
+    let pad = rank - in_dims.len();
+    let mut idims: Vec<u32> = vec![1; pad];
+    idims.extend(in_dims.iter().map(|&d| d as u32));
+    let mut cstr = vec![1u32; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        cstr[i] = cstr[i + 1] * idims[i + 1];
+    }
+    (0..rank)
+        .map(|i| {
+            if idims[i] == 1 && out_dims[i] != 1 {
+                0
+            } else {
+                cstr[i]
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn compare_op_id(op: CmpOp) -> u32 {
     match op {
         CmpOp::Eq => 0,

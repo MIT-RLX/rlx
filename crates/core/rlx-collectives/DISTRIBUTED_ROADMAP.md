@@ -48,23 +48,25 @@ on-device (NVLink / PCIe P2P / GPUDirect-RDMA) with ring/tree algorithms.
 `all_sum`/`all_gather` delegating to MLX's distributed backend, and (c)
 registers a device-resident `collective.all_reduce` kernel. Mirror it.
 
-**Seam (rlx-cuda):**
-1. Add `cudarc`'s `nccl` feature; create `rlx-cuda/src/distributed.rs`.
-2. `struct NcclComm { comm: cudarc::nccl::Comm, rank, world }`, built from a
-   bootstrap `ncclUniqueId` broadcast over an existing `rlx_driver::Transport`
-   (reuse `TcpTransport` or the UDP discovery in `dist_node`).
-3. Keep a `OnceLock<RwLock<HashMap<u64, NcclComm>>>` group registry keyed by
-   group id — identical shape to `groups()` in `lib.rs`.
-4. Register a CUDA kernel for `ALL_REDUCE` (`"collective.all_reduce"`) that
-   reads the group id from `attrs[..8]`, looks up the `NcclComm`, and calls
-   `ncclAllReduce` on the device buffer in-place. No host copy.
-5. `rlx-rocm` is the same source against RCCL (the crates already share
-   `rlx-gpu-kernels`).
+**Seam (rlx-cuda) — scaffolded:**
+1. ✅ `cudarc`'s `nccl` feature (`rlx-cuda` cargo feature `nccl`);
+   `rlx-cuda/src/distributed.rs`.
+2. ✅ Bootstrap helpers: `new_nccl_id` / `id_to_bytes` / `id_from_bytes`, then
+   `init_and_register(group_id, stream, rank, world, id)` → group registry.
+3. ✅ `OnceLock<RwLock<HashMap<u64, Arc<NcclComm>>>>` keyed by group id.
+4. ✅ `collective.all_reduce` / `collective.all_to_all` in
+   `collective_host.rs` try NCCL first when a comm is registered; otherwise
+   host-fallback (`GPU→host→TCP→host→GPU`). `moe_dispatch` /
+   `moe_combine` remain on the host `all_to_all_v` path (variable-size).
+5. ⏳ `rlx-rocm` RCCL mirror (same source pattern as shared GPU kernels).
 
 **Cannot validate here:** NCCL is NVIDIA-only, so a Mac(Metal)↔Linux(CUDA)
-all-reduce is fundamentally impossible; and the Linux rig has a single GPU, so even
-intra-node NCCL has nothing to talk to. Needs ≥2 NVIDIA GPUs or ≥2 NVIDIA
-nodes on a real fabric.
+all-reduce is fundamentally impossible. Multi-rank NCCL also needs **≥2 NVIDIA
+GPUs** (NCCL rejects two ranks on one device: `Duplicate GPU detected`). On the
+single-GPU CUDA rig we validated compile + `WORLD=1` all-reduce via
+`rlx-cuda --features nccl --example nccl_all_reduce_toy` (user-space
+`libnccl.so` shim from the conda `nvidia-nccl` package). Enable with
+`cargo build -p rlx-cuda --features nccl`.
 
 ---
 
@@ -120,6 +122,8 @@ benchmarked if the machines are bridged (offered separately).
 | ZeRO/FSDP optimizer-state sharding | ⏳ design only |
 | MPI-shaped launcher / `rsmpi` interop | ⏳ `dist_node` + UDP discovery is the minimal launcher |
 | NIXL (KV/activation transfer for disaggregated inference) | ⏳ design only — NVIDIA lib, not testable here |
+| WideEP MoE (dispatch/combine, `all_to_all_v`, EPLB + replicas + migrate) | ✅ host collectives in `rlx-collectives::{moe_ep,eplb}`; NCCL `all_reduce`/`all_to_all` seam ✅ (`rlx-cuda` `--features nccl`); device `moe_*` still host |
+| NCCL/RCCL device-resident collectives | ✅ CUDA scaffold (`distributed.rs` + collective_host hook); ⏳ multi-GPU validate; ⏳ RCCL |
 
 ---
 

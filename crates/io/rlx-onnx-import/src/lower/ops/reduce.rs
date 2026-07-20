@@ -101,15 +101,26 @@ pub(super) fn lower_reduce(
     let id = match rop {
         ReduceOp::Mean => m.mean(xr, axes, keep),
         ReduceOp::Sum => m.sum(xr, axes, keep),
-        _ => m.add_node(
-            Op::Reduce {
-                op: rop,
-                axes,
-                keep_dim: keep,
-            },
-            vec![xr],
-            output_shape(ctx, node, m, xr),
-        ),
+        _ => {
+            // The Reduce runs on `xr` — which is f32 when the input was integer
+            // (see the int_reduce cast above) — so its *declared* dtype must
+            // follow `xr`, not the ONNX node's output type (the pre-cast integer
+            // dtype). The int_reduce cast-back below restores that dtype.
+            // Declaring the Reduce i64 while feeding it f32 is invalid IR that
+            // only surfaces once the node is inlined out of a subgraph (e.g. a
+            // While cond) and reaches the shape verifier.
+            let xr_dt = m.shape(xr).dtype();
+            let out_s = output_shape(ctx, node, m, xr).with_dtype(xr_dt);
+            m.add_node(
+                Op::Reduce {
+                    op: rop,
+                    axes,
+                    keep_dim: keep,
+                },
+                vec![xr],
+                out_s,
+            )
+        }
     };
     let id = if int_reduce {
         let s = m.shape(id).clone().with_dtype(in_dt);

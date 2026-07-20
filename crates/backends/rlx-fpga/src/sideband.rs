@@ -75,6 +75,7 @@ pub fn resolve_graph_sidebands(g: &Graph, io: &mut IoConfig) -> Result<(), Strin
                 | DType::F32
                 | DType::F64
                 | DType::C64
+                | DType::C128
         );
         io.sidebands.push(SidebandSpec {
             name: sanitize_port(&name),

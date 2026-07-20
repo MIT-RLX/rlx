@@ -67,3 +67,14 @@ arena_slice_accessors!(
     i32
 );
 arena_slice_accessors!(sl_i64, sl_mut_i64, i64);
+// Exotic-width typed accessors used by the generic scalar-cast kernel
+// (`exec_cast_generic`). Every arena buffer is allocated 64-byte aligned and
+// pure views are element-aligned (offset = start * elem_bytes), so viewing a
+// buffer as any of these element types is well-aligned. f16/bf16 are 2-byte
+// `half` types (transparent over u16).
+arena_slice_accessors!(sl_i8, sl_mut_i8, i8);
+arena_slice_accessors!(sl_i16, sl_mut_i16, i16);
+arena_slice_accessors!(sl_u8, sl_mut_u8, u8);
+arena_slice_accessors!(sl_u32, sl_mut_u32, u32);
+arena_slice_accessors!(sl_f16, sl_mut_f16, half::f16);
+arena_slice_accessors!(sl_bf16, sl_mut_bf16, half::bf16);

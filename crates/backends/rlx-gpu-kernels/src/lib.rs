@@ -19,6 +19,14 @@
 //! Backends JIT-compile via NVRTC / hipRTC on first use.
 
 pub const BINARY_CU: &str = include_str!("../kernels/binary.cu");
+/// Standalone complex `Op::Cast` on the f32-uniform arena (real<->C64,
+/// real<->C128, C64<->C128 — six pure lane-move modes). f32-uniform GPU
+/// backends simulate complex as interleaved f32 lanes; this re-pairs them.
+pub const COMPLEX_CAST_CU: &str = include_str!("../kernels/complex_cast.cu");
+/// Element-wise C64 binary op (add/sub/mul/div) reading both `[re, im]`
+/// lanes per element, with modulo broadcast. Mirrors rlx-cpu
+/// `exec_binary_full_c64`; C128 arithmetic + C64 max/min/pow are rejected.
+pub const BINARY_C64_CU: &str = include_str!("../kernels/binary_c64.cu");
 pub const FUSED_BINARY_UNARY_CU: &str = include_str!("../kernels/fused_binary_unary.cu");
 pub const CAST_F32_TO_HALF_CU: &str = include_str!("../kernels/cast_f32_to_half.cu");
 /// Native FP8 quantize producers (per-tensor scale + E4M3/E5M2 encode) for
@@ -29,6 +37,8 @@ pub const SCALED_LOWP_CU: &str = include_str!("../kernels/scaled_lowp.cu");
 /// block-scaled / FP4 / FP6 configs the FP8 tensor-core path can't do.
 pub const SCALED_LOWP_GENERAL_CU: &str = include_str!("../kernels/scaled_lowp_general.cu");
 pub const UNARY_CU: &str = include_str!("../kernels/unary.cu");
+pub const LSTM_CU: &str = include_str!("../kernels/lstm.cu");
+pub const BINARY_BROADCAST_CU: &str = include_str!("../kernels/binary_broadcast.cu");
 pub const COPY_CU: &str = include_str!("../kernels/copy.cu");
 pub const MATMUL_CU: &str = include_str!("../kernels/matmul.cu");
 pub const MATMUL_BT_CU: &str = include_str!("../kernels/matmul_bt.cu");

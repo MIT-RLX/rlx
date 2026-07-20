@@ -417,7 +417,26 @@ pub fn unroll_while(g: Graph) -> Graph {
                     for (body_out, &prev) in body_outs.iter().zip(carried.iter()) {
                         let shape = out.node(prev).shape.clone();
                         let mask = expand_to_shape(active, &shape, &mut out);
-                        let merged = out.add_node(Op::Where, vec![mask, *body_out, prev], shape);
+                        // A loop carry must keep its declared dtype. If the body
+                        // produced a different dtype (e.g. an f32 result for an
+                        // i64 alignment/duration carry), cast it back so the
+                        // `Where` branches agree and the merged carry stays i64 —
+                        // otherwise inference derives the carry dtype from the
+                        // wrong branch and downstream i64 consumers (duration_mask,
+                        // ConcatFromSequence) get an f32.
+                        let body_shape = out.node(*body_out).shape.clone();
+                        let body_in = if body_shape.dtype() != shape.dtype() {
+                            out.add_node(
+                                Op::Cast {
+                                    to: shape.dtype(),
+                                },
+                                vec![*body_out],
+                                body_shape.with_dtype(shape.dtype()),
+                            )
+                        } else {
+                            *body_out
+                        };
+                        let merged = out.add_node(Op::Where, vec![mask, body_in, prev], shape);
                         next.push(merged);
                     }
                     carried = next;

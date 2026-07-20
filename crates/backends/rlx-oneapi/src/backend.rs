@@ -151,6 +151,199 @@ fn native_kernel(op: &Op) -> Option<&'static str> {
     }
 }
 
+/// Cast op ids for the `unary` OpenCL kernel (`unary.cl` cases 100–106). Kept
+/// in sync with rlx-cuda / rlx-rocm (unary.cu) and rlx-vulkan (unary.comp).
+const CAST_F32_TO_I8: u32 = 100;
+const CAST_F32_TO_I16: u32 = 101;
+const CAST_F32_TO_I32: u32 = 102;
+const CAST_F32_TO_I64: u32 = 103;
+const CAST_F32_TO_U8: u32 = 104;
+const CAST_F32_TO_U32: u32 = 105;
+const CAST_TO_BOOL: u32 = 106;
+
+/// How an `Op::Cast` lowers on the f32-uniform arena.
+enum CastLower {
+    /// Value-preserving relabel — alias the input slot (no dispatch). Covers
+    /// same-dtype, int→float, float→float (F16/BF16/F64 are all f32-stored
+    /// here), int→int, and bool→int/float.
+    Identity,
+    /// A real elementwise conversion via the `unary` kernel with this op id
+    /// (float→int trunc-saturate, or →Bool `x != 0`).
+    Kernel(u32),
+    /// A complex cast (real↔C64, real↔C128, C64↔C128) — pure f32-lane moves via
+    /// the standalone `complex_cast` kernel. Carries the mode (0..5, see
+    /// `kernels/complex_cast.cl`). Needs its own (complex-sized) slot, not an
+    /// alias — the lane width changes even though the element count does not.
+    Complex(u32),
+    /// Not representable in an f32 arena (an F64 real component has no lane
+    /// storage here) — reject at lowering.
+    Reject,
+}
+
+/// Classify a `Cast(src → dst)` on the f32-uniform arena. float→int truncates
+/// toward zero + saturates (Rust `as` / rlx-cpu); →Bool is `x != 0`. F16/BF16/
+/// F64 are demoted to f32 storage so real casts to/from them are identity
+/// relabels. Complex casts (real↔C64, real↔C128, C64↔C128) are pure f32-lane
+/// moves on the simulated-complex arena (C64 = 2 lanes/elem, C128 = 4 lanes
+/// df64); only a complex cast touching the one non-lane-storable real component
+/// (F64, demoted to a single lossy lane) rejects. Mirrors rlx-vulkan / rlx-cuda
+/// / rlx-wgpu.
+fn classify_cast(src: DType, dst: DType) -> CastLower {
+    if src == dst {
+        return CastLower::Identity; // pure relabel (also covers C64→C64 / C128→C128)
+    }
+    if src.is_complex() || dst.is_complex() {
+        // F64 is the one component type with no faithful f32-lane storage here
+        // (it is demoted to a single lossy lane elsewhere), so a complex cast
+        // touching it on the real side is still rejected.
+        if src == DType::F64 || dst == DType::F64 {
+            return CastLower::Reject;
+        }
+        let mode = match (src, dst) {
+            (s, DType::C64) if !s.is_complex() => 0,  // real → C64
+            (DType::C64, d) if !d.is_complex() => 1,  // C64 → real
+            (s, DType::C128) if !s.is_complex() => 2, // real → C128
+            (DType::C128, d) if !d.is_complex() => 3, // C128 → real
+            (DType::C64, DType::C128) => 4,
+            (DType::C128, DType::C64) => 5,
+            _ => return CastLower::Reject,
+        };
+        return CastLower::Complex(mode);
+    }
+    if dst == DType::Bool {
+        return CastLower::Kernel(CAST_TO_BOOL);
+    }
+    if src.is_float() && dst.is_int() {
+        return CastLower::Kernel(match dst {
+            DType::I8 => CAST_F32_TO_I8,
+            DType::I16 => CAST_F32_TO_I16,
+            DType::I32 => CAST_F32_TO_I32,
+            DType::I64 => CAST_F32_TO_I64,
+            DType::U8 => CAST_F32_TO_U8,
+            DType::U32 => CAST_F32_TO_U32,
+            _ => unreachable!("is_int() covers all integer dtypes"),
+        });
+    }
+    CastLower::Identity
+}
+
+/// True when a Cast needs its own slot + a conversion kernel (float→int /
+/// →Bool / complex lane-move) or must be rejected — i.e. not an identity
+/// relabel. Complex casts change the lane width (real 1 → C64 2 → C128 4), so
+/// they cannot alias the input slot.
+fn cast_is_kernel(graph: &Graph, node: &rlx_ir::Node) -> bool {
+    match &node.op {
+        Op::Cast { to } => !matches!(
+            classify_cast(graph.node(node.inputs[0]).shape.dtype(), *to),
+            CastLower::Identity
+        ),
+        _ => false,
+    }
+}
+
+/// Number of f32 lanes a node occupies in the f32-uniform arena. Complex is
+/// simulated on f32 lanes — C64 = 2 lanes/elem, C128 = 4 lanes df64; every
+/// OTHER dtype is exactly ONE f32 lane per element (I64/Bool/… are widened to a
+/// single lane, so `size_bytes()/4` must NOT be blanket-applied — that would
+/// make I64 two lanes and Bool zero). Drives slot sizing and lane-aware
+/// readback (reading a complex output by element count would truncate it to the
+/// real parts).
+fn arena_lane_count(shape: &Shape) -> usize {
+    let elems = shape.num_elements().unwrap_or(0);
+    match shape.dtype() {
+        DType::C64 => elems * 2,
+        DType::C128 => elems * 4,
+        _ => elems,
+    }
+}
+
+/// Complex `Op::Cast` on f32 lanes (host-path mirror of `kernels/complex_cast.cl`,
+/// same six lane-move modes). `n` is the complex-element count (cast-invariant).
+/// Used by `run_host` so the CPU-reference path keeps the same df64 lane
+/// convention as the on-device kernels (rather than routing through rlx-cpu's
+/// native-f64 C128 storage, which is a different byte layout).
+fn complex_cast_host(input: &[f32], n: usize, mode: u32) -> Vec<f32> {
+    let ld = |j: usize| input.get(j).copied().unwrap_or(0.0);
+    let out_lanes = match mode {
+        0 | 5 => 2 * n, // → C64
+        1 | 3 => n,     // → real
+        2 | 4 => 4 * n, // → C128
+        _ => n,
+    };
+    let mut out = vec![0.0f32; out_lanes];
+    for k in 0..n {
+        match mode {
+            0 => out[2 * k] = ld(k),                          // real → C64 (im=0)
+            1 => out[k] = ld(2 * k),                          // C64 → real
+            2 => out[4 * k] = ld(k),                          // real → C128 (rest 0)
+            3 => out[k] = ld(4 * k),                          // C128 → real
+            4 => {
+                out[4 * k] = ld(2 * k); // C64 → C128
+                out[4 * k + 2] = ld(2 * k + 1);
+            }
+            5 => {
+                out[2 * k] = ld(4 * k); // C128 → C64
+                out[2 * k + 1] = ld(4 * k + 2);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Element-wise C64 binary op on f32 lanes (host-path mirror of
+/// `kernels/binary_c64.cl`). `op` 0=add/1=sub/2=mul/3=div; `n` is the output
+/// complex-element count; `n_a`/`n_b` are operand complex-element counts for
+/// modulo broadcast. Formulas match rlx-cpu `exec_binary_full_c64`.
+fn binary_c64_host(a: &[f32], b: &[f32], n: usize, n_a: usize, n_b: usize, op: u32) -> Vec<f32> {
+    let na = n_a.max(1);
+    let nb = n_b.max(1);
+    let la = |j: usize| a.get(j).copied().unwrap_or(0.0);
+    let lb = |j: usize| b.get(j).copied().unwrap_or(0.0);
+    let mut out = vec![0.0f32; 2 * n];
+    for k in 0..n {
+        let ka = k % na;
+        let kb = k % nb;
+        let (ar, ai) = (la(2 * ka), la(2 * ka + 1));
+        let (br, bi) = (lb(2 * kb), lb(2 * kb + 1));
+        let (cr, ci) = match op {
+            0 => (ar + br, ai + bi),
+            1 => (ar - br, ai - bi),
+            2 => (ar * br - ai * bi, ar * bi + ai * br),
+            3 => {
+                let d = br * br + bi * bi;
+                ((ar * br + ai * bi) / d, (ai * br - ar * bi) / d)
+            }
+            _ => (0.0, 0.0),
+        };
+        out[2 * k] = cr;
+        out[2 * k + 1] = ci;
+    }
+    out
+}
+
+/// Reject a complex `Op::Binary` that has no simulated path — C128 arithmetic
+/// (rlx-cpu has none either) and C64 max/min/pow (undefined for complex).
+/// Returns the C64 op code (0=add/1=sub/2=mul/3=div) when supported; panics
+/// otherwise, matching the CPU reference's rejection (never a silently-wrong
+/// result). Shared by `run_host` and the L0 dispatch builder.
+fn c64_binary_opcode(dtype: DType, op: rlx_ir::op::BinaryOp) -> u32 {
+    if dtype == DType::C128 {
+        panic!(
+            "rlx-oneapi: Binary on C128: complex-f64 arithmetic is unsupported \
+             (rlx-cpu has none either) — only C64 add/sub/mul/div are wired"
+        );
+    }
+    let code = binop_id(op);
+    if code > 3 {
+        panic!(
+            "rlx-oneapi: C64 Binary: {op:?} is undefined for complex (only \
+             Add/Sub/Mul/Div); matches rlx-cpu rejection"
+        );
+    }
+    code
+}
+
 #[derive(Clone)]
 enum ParamVal {
     F32(Vec<f32>),
@@ -317,6 +510,43 @@ impl OneApiExecutable {
                     });
                     f32v.insert(node.id, out);
                 }
+                // Complex Cast (real↔C64, real↔C128, C64↔C128): pure f32-lane
+                // moves in the df64 convention — handled directly rather than
+                // via rlx-cpu (whose native-f64 C128 storage is a different byte
+                // layout), so `run_host` keeps the SAME lane convention as the
+                // on-device `complex_cast` kernel + the shared widen/narrow
+                // boundary. `numel` is the cast-invariant complex-element count.
+                Op::Cast { to }
+                    if !matches!(
+                        classify_cast(self.graph.node(node.inputs[0]).shape.dtype(), *to),
+                        CastLower::Identity | CastLower::Kernel(_)
+                    ) =>
+                {
+                    let src = self.graph.node(node.inputs[0]).shape.dtype();
+                    match classify_cast(src, *to) {
+                        CastLower::Complex(mode) => {
+                            let input = f32v.get(&node.inputs[0]).cloned().unwrap_or_default();
+                            f32v.insert(node.id, complex_cast_host(&input, numel, mode));
+                        }
+                        CastLower::Reject => panic!(
+                            "rlx-oneapi: Cast {src:?} → {to:?} touches an F64 real \
+                             component with no faithful f32-lane storage — run on CPU"
+                        ),
+                        _ => unreachable!("guard excludes Identity / Kernel"),
+                    }
+                }
+                // Complex Binary (C64 add/sub/mul/div): reads both [re, im]
+                // lanes per element, evaluated directly to match the on-device
+                // `binary_c64` kernel. C128 arithmetic + C64 max/min/pow reject
+                // (matches rlx-cpu). `numel` is the output complex-element count.
+                Op::Binary(op) if node.shape.dtype().is_complex() => {
+                    let code = c64_binary_opcode(node.shape.dtype(), *op);
+                    let a = f32v.get(&node.inputs[0]).cloned().unwrap_or_default();
+                    let b = f32v.get(&node.inputs[1]).cloned().unwrap_or_default();
+                    let na = self.graph.node(node.inputs[0]).shape.num_elements().unwrap_or(0);
+                    let nb = self.graph.node(node.inputs[1]).shape.num_elements().unwrap_or(0);
+                    f32v.insert(node.id, binary_c64_host(&a, &b, numel, na, nb, code));
+                }
                 _ => {
                     let in_specs: Vec<(Shape, HostBuf)> = node
                         .inputs
@@ -405,10 +635,41 @@ impl OneApiExecutable {
                     | Op::Param { .. }
                     | Op::Constant { .. }
                     | Op::Reshape { .. }
-                    | Op::Cast { .. }
                     | Op::StopGradient
             ) {
                 continue;
+            }
+            // Cast: identity relabels are arena-aliased (skip); float→int /
+            // →Bool casts got their own f32-sized slot and dispatch the `unary`
+            // kernel (value stored as an f32 lane). Complex is rejected.
+            if let Op::Cast { to } = &node.op {
+                let src = self.graph.node(node.inputs[0]).shape.dtype();
+                match classify_cast(src, *to) {
+                    CastLower::Identity => continue,
+                    CastLower::Kernel(_) => {
+                        self.dispatch(dev, kerns, list, "unary", node, &arena);
+                        continue;
+                    }
+                    // real↔C64, real↔C128, C64↔C128 — pure f32-lane moves.
+                    CastLower::Complex(_) => {
+                        self.dispatch(dev, kerns, list, "complex_cast", node, &arena);
+                        continue;
+                    }
+                    CastLower::Reject => panic!(
+                        "rlx-oneapi: Cast {src:?} → {to:?} touches an F64 real component \
+                         with no faithful f32-lane storage in the uniform arena — run on CPU"
+                    ),
+                }
+            }
+            // Complex Binary (C64 add/sub/mul/div) reads BOTH [re, im] lanes per
+            // element, so it lowers to the standalone `binary_c64` kernel (not
+            // the scalar `binary`). C128 arithmetic + C64 max/min/pow are
+            // rejected inside the dispatch arg builder (matches rlx-cpu).
+            if let Op::Binary(_) = &node.op {
+                if node.shape.dtype().is_complex() {
+                    self.dispatch(dev, kerns, list, "binary_c64", node, &arena);
+                    continue;
+                }
             }
             // SPD-manifold ops (F64, no native kernel) read the USM arena, run
             // the F64-aware `spd::eval` (widen f32→f64 → CPU thunk → narrow),
@@ -487,6 +748,28 @@ impl OneApiExecutable {
         let out = node.id;
         let mut args: Vec<KArg> = vec![KArg::Ptr(arena.base_ptr())];
         let (global, local): (usize, u32) = match &node.op {
+            // Standalone `binary_c64` kernel for complex output: n = output
+            // complex-element count, n_a/n_b = operand complex-element counts
+            // (>= 1) for modulo broadcast, offsets are f32-lane starts. Rejects
+            // C128 arithmetic + C64 max/min/pow (matches rlx-cpu).
+            Op::Binary(op) if node.shape.dtype().is_complex() => {
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let n = numel(&dims(&self.graph, out));
+                let na = numel(&dims(&self.graph, a));
+                let nb = numel(&dims(&self.graph, b));
+                let code = c64_binary_opcode(node.shape.dtype(), *op);
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(off(a)),
+                    KArg::U32(off(b)),
+                    KArg::U32(off(out)),
+                    KArg::U32(code),
+                    KArg::U32(na.max(1) as u32),
+                    KArg::U32(nb.max(1) as u32),
+                ]);
+                (n, 256)
+            }
             Op::Binary(op) => {
                 let a = node.inputs[0];
                 let b = node.inputs[1];
@@ -512,6 +795,28 @@ impl OneApiExecutable {
                     KArg::U32(off(x)),
                     KArg::U32(off(out)),
                     KArg::U32(act_id(*act)),
+                ]);
+                (n, 256)
+            }
+            // float→int / →Bool cast via the `unary` kernel (op ids 100–106), or
+            // a complex lane-move via the `complex_cast` kernel (mode 0..5). Both
+            // share the (n, in_off, out_off, code) arg layout; the caller routes
+            // to the matching kernel name. `n` is the (cast-invariant) element
+            // count. The caller only routes here for `Kernel` / `Complex`.
+            Op::Cast { to } => {
+                let x = node.inputs[0];
+                let n = numel(&dims(&self.graph, out));
+                let src = self.graph.node(x).shape.dtype();
+                let code = match classify_cast(src, *to) {
+                    CastLower::Kernel(op) => op,      // unary conversion op id
+                    CastLower::Complex(mode) => mode, // complex_cast lane-move mode
+                    _ => unreachable!("dispatch(Cast) only called for kernel / complex casts"),
+                };
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(out)),
+                    KArg::U32(code),
                 ]);
                 (n, 256)
             }
@@ -677,7 +982,11 @@ impl OneApiExecutable {
         want.into_iter()
             .filter_map(|i| {
                 let id = *self.output_ids.get(i)?;
-                let n = self.graph.node(id).shape.num_elements().unwrap_or(0);
+                // Lane count, not element count: a complex output occupies 2 (C64)
+                // / 4 (C128) f32 lanes per element, so reading `num_elements` would
+                // truncate the readback to the real parts. One lane per element for
+                // every other dtype, so this is `num_elements` there.
+                let n = arena_lane_count(&self.graph.node(id).shape);
                 Some(read(id, n))
             })
             .collect()
@@ -728,10 +1037,14 @@ fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     let mut schedule = Vec::with_capacity(graph.nodes().len());
     let mut cursor = 0usize;
     for node in graph.nodes() {
-        if matches!(
-            node.op,
-            Op::Reshape { .. } | Op::Cast { .. } | Op::StopGradient
-        ) {
+        // Reshape / StopGradient, and identity Casts, alias the input slot.
+        // float→int / →Bool casts get their own (f32-sized) slot + a kernel.
+        let is_view = match &node.op {
+            Op::Reshape { .. } | Op::StopGradient => true,
+            Op::Cast { .. } => !cast_is_kernel(graph, node),
+            _ => false,
+        };
+        if is_view {
             if let Some(in_id) = node.inputs.first() {
                 if let Some(slot) = assignments.get(in_id) {
                     let aliased = slot.clone();
@@ -741,8 +1054,12 @@ fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
                 }
             }
         }
-        let elems = node.shape.num_elements().unwrap_or(0);
-        let bytes = (elems * 4).max(4);
+        // Slot length = (#f32 lanes) × 4. Real/int/bool tensors are ONE lane per
+        // element; complex is simulated on lanes (C64 = 2, C128 = 4 df64), so a
+        // complex slot must reserve 2N / 4N lanes or its kernels + readback would
+        // overrun / truncate.
+        let lanes = arena_lane_count(&node.shape);
+        let bytes = (lanes * 4).max(4);
         let aligned = bytes.div_ceil(align) * align;
         assignments.insert(
             node.id,
@@ -862,9 +1179,32 @@ fn widen_const_to_f32(data: &[u8], dt: DType) -> Vec<f32> {
             .collect(),
         DType::I8 => data.iter().map(|&b| b as i8 as f32).collect(),
         DType::U8 | DType::Bool => data.iter().map(|&b| b as f32).collect(),
+        // C64 = 2 interleaved f32 lanes `[re, im]`; the host already stores it as
+        // f32 pairs, so widening is a pure reinterpret (N complex → 2N lanes).
         DType::C64 => data
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+        // C128 = 4 f32 lanes df64 `[re_hi, re_lo, im_hi, im_lo]`, host-stored as
+        // 2×f64 (16 B/elem). This is the df64 SPLIT boundary: each f64 `v` →
+        // `hi=(f32)v` + `lo=(f32)(v-(f64)hi)`, so `(f64)hi + (f64)lo` reconstructs
+        // `v` to double precision. Bit-identical to the shared
+        // `rlx_runtime::backend::widen_bytes_to_f32` (the CPU↔GPU boundary the
+        // complex-cast kernels round-trip against).
+        DType::C128 => {
+            let split = |v: f64| -> [f32; 2] {
+                let hi = v as f32;
+                let lo = (v - hi as f64) as f32;
+                [hi, lo]
+            };
+            let mut out = Vec::with_capacity((data.len() / 16) * 4);
+            for elem in data.chunks_exact(16) {
+                let re = f64::from_le_bytes(elem[0..8].try_into().unwrap());
+                let im = f64::from_le_bytes(elem[8..16].try_into().unwrap());
+                out.extend_from_slice(&split(re));
+                out.extend_from_slice(&split(im));
+            }
+            out
+        }
     }
 }

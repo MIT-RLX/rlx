@@ -971,6 +971,33 @@ pub(crate) enum Step {
         h: u32,
         w: u32,
     },
+    /// Standalone complex `Op::Cast` on the simulated-complex f32-lane arena
+    /// (`complex_cast.cu`, shared with rlx-cuda). `mode` picks one of six pure
+    /// lane-move directions (real↔C64, real↔C128, C64↔C128); `n` is the
+    /// complex-element count. Byte offsets are u32 (rocm arena convention); the
+    /// dispatch widens `byte_off/4` to u64 before launch because the kernel
+    /// declares its offset params `unsigned long long` — passing a u32 would
+    /// leave the high word as stack garbage.
+    ComplexCast {
+        n: u32,
+        in_byte_off: u32,
+        out_byte_off: u32,
+        mode: u32,
+    },
+    /// Element-wise C64 binary (`binary_c64.cu`, shared with rlx-cuda):
+    /// add/sub/mul/div reading BOTH `[re, im]` lanes per element, with modulo
+    /// broadcast (`n_a`/`n_b` are the operands' complex-element counts). `n` is
+    /// the output complex-element count; byte offsets are u32 (widened to u64 at
+    /// launch to match the kernel's `unsigned long long` params).
+    BinaryC64 {
+        n: u32,
+        a_byte_off: u32,
+        b_byte_off: u32,
+        c_byte_off: u32,
+        op: u32,
+        n_a: u32,
+        n_b: u32,
+    },
     FusedBinaryUnary {
         n: u32,
         a_off: u32,
@@ -1105,6 +1132,8 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ConvTranspose2d { .. } => "rlx::ConvTranspose2d",
         Step::GroupNorm { .. } => "rlx::GroupNorm",
         Step::ResizeNearest2x { .. } => "rlx::ResizeNearest2x",
+        Step::ComplexCast { .. } => "rlx::ComplexCast",
+        Step::BinaryC64 { .. } => "rlx::BinaryC64",
         Step::FusedBinaryUnary { .. } => "rlx::FusedBinaryUnary",
         Step::ElementwiseRegion { .. } => "rlx::ElementwiseRegion",
         Step::BatchElementwiseRegion { .. } => "rlx::BatchElementwiseRegion",
@@ -1767,6 +1796,17 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         Step::ResizeNearest2x {
             src_off, dst_off, ..
         } => (vec![*src_off], vec![*dst_off]),
+        Step::ComplexCast {
+            in_byte_off,
+            out_byte_off,
+            ..
+        } => (vec![*in_byte_off / 4], vec![*out_byte_off / 4]),
+        Step::BinaryC64 {
+            a_byte_off,
+            b_byte_off,
+            c_byte_off,
+            ..
+        } => (vec![*a_byte_off / 4, *b_byte_off / 4], vec![*c_byte_off / 4]),
         Step::FusedBinaryUnary {
             a_off,
             b_off,
@@ -1846,7 +1886,10 @@ pub(crate) fn fuse_elementwise_chains(schedule: Vec<Step>) -> Vec<Step> {
             ) = pair
             {
                 let single_consumer = consumer_counts.get(c_off).copied() == Some(1);
-                if n == n2 && c_off == in_off && single_consumer {
+                // Only fuse real activations (ids 0–16). Cast unary steps use
+                // ids ≥100 which fused_binary_unary.cu does not implement — a
+                // fused cast would silently drop the trunc/saturate.
+                if n == n2 && c_off == in_off && single_consumer && *un_op <= 16 {
                     out.push(Step::FusedBinaryUnary {
                         n: *n,
                         a_off: *a_off,

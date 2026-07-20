@@ -280,7 +280,7 @@ pub(crate) fn exec_sgd_momentum(t: &Thunk, base: *mut u8) {
 // this same match — the stubs were dead code shadowed by
 // the specific-pattern arms above. Removed.)
 #[inline(always)]
-pub(crate) fn exec_custom_op(t: &Thunk, base: *mut u8) {
+pub(crate) fn exec_custom_op(t: &Thunk, base: *mut u8, arena_len: usize) {
     let Thunk::CustomOp {
         kernel,
         inputs,
@@ -294,7 +294,7 @@ pub(crate) fn exec_custom_op(t: &Thunk, base: *mut u8) {
         let (out_off, out_len, out_shape) = output;
         unsafe {
             dispatch_custom_op(
-                &**kernel, inputs, *out_off, *out_len, out_shape, attrs, base,
+                &**kernel, inputs, *out_off, *out_len, out_shape, attrs, base, arena_len,
             );
         }
     }
@@ -313,9 +313,18 @@ pub(crate) unsafe fn dispatch_custom_op(
     out_shape: &Shape,
     attrs: &[u8],
     base: *mut u8,
+    arena_len: usize,
 ) {
     use crate::op_registry::{CpuTensorMut, CpuTensorRef};
     use rlx_ir::DType;
+
+    // Clamp a slice length so `[off, off + n*elem)` never runs past the arena.
+    // Mirrors the defensive clamps in the Sgemm / Where thunks: a declared
+    // length can exceed the buffer actually planned for a node (e.g. probe /
+    // headroom-compile graphs pin an activation to a larger static shape than
+    // its producer fills), and reading past the arena `Vec` segfaults. Real
+    // inference has matching sizes, so this is a no-op there.
+    let cap = |off: usize, elem: usize| -> usize { arena_len.saturating_sub(off) / elem.max(1) };
 
     // One arm per `DType` variant — single source of truth for
     // "which dtypes the CPU custom-op dispatcher wires." If a new
@@ -324,7 +333,13 @@ pub(crate) unsafe fn dispatch_custom_op(
     macro_rules! build_in_view {
         ($shape:expr, $off:expr, $n:expr, $variant:ident, $rust_ty:ty) => {
             CpuTensorRef::$variant {
-                data: unsafe { sl_typed::<$rust_ty>($off, base, $n) },
+                data: unsafe {
+                    sl_typed::<$rust_ty>(
+                        $off,
+                        base,
+                        $n.min(cap($off, std::mem::size_of::<$rust_ty>())),
+                    )
+                },
                 shape: $shape,
             }
         };
@@ -332,7 +347,13 @@ pub(crate) unsafe fn dispatch_custom_op(
     macro_rules! build_out_view {
         ($variant:ident, $rust_ty:ty) => {
             CpuTensorMut::$variant {
-                data: unsafe { sl_mut_typed::<$rust_ty>(out_off, base, out_len as usize) },
+                data: unsafe {
+                    sl_mut_typed::<$rust_ty>(
+                        out_off,
+                        base,
+                        (out_len as usize).min(cap(out_off, std::mem::size_of::<$rust_ty>())),
+                    )
+                },
                 shape: out_shape,
             }
         };
@@ -363,6 +384,11 @@ pub(crate) unsafe fn dispatch_custom_op(
                  complex ops handle their own kernels; user-registered \
                  ops don't yet see complex tensors"
                 ),
+                DType::C128 => panic!(
+                    "Op::Custom kernel input has DType::C128 — built-in \
+                 complex ops handle their own kernels; user-registered \
+                 ops don't yet see complex tensors"
+                ),
             }
         })
         .collect();
@@ -380,6 +406,7 @@ pub(crate) unsafe fn dispatch_custom_op(
         DType::U32 => kernel.execute(&in_views, build_out_view!(U32, u32), attrs),
         DType::Bool => kernel.execute(&in_views, build_out_view!(Bool, u8), attrs),
         DType::C64 => panic!("Op::Custom output DType::C64 not supported"),
+        DType::C128 => panic!("Op::Custom output DType::C128 not supported"),
     };
     if let Err(e) = result {
         panic!("Op::Custom('{}') CPU kernel failed: {e}", kernel.name());

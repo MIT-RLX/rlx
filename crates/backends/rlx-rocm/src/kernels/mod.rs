@@ -99,6 +99,15 @@ macro_rules! kernel_cache {
 }
 
 kernel_cache!(BINARY, binary_kernel, BINARY_CU, "binary");
+// On-device complex simulation (f32-lane): standalone complex cast + C64
+// binary. Shared CUDA-C sources compiled via hipRTC (identical to rlx-cuda).
+kernel_cache!(
+    COMPLEX_CAST,
+    complex_cast_kernel,
+    COMPLEX_CAST_CU,
+    "complex_cast"
+);
+kernel_cache!(BINARY_C64, binary_c64_kernel, BINARY_C64_CU, "binary_c64");
 kernel_cache!(
     FUSED_BINARY_UNARY,
     fused_binary_unary_kernel,
@@ -394,6 +403,8 @@ pub fn dispatch_grid_prologue_nchw(w: u32, h: u32, nc: u32) -> ((u32, u32, u32),
 /// `rlx-cuda::backend::prewarm_all`.
 pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = binary_kernel(ctx);
+    let _ = complex_cast_kernel(ctx);
+    let _ = binary_c64_kernel(ctx);
     let _ = fused_binary_unary_kernel(ctx);
     let _ = unary_kernel(ctx);
     let _ = copy_kernel(ctx);

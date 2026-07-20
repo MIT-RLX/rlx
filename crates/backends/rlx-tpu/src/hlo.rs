@@ -70,6 +70,10 @@ pub mod prim {
     pub const TUPLE: i32 = PrimitiveType::Tuple as i32;
     pub const BF16: i32 = PrimitiveType::Bf16 as i32;
     pub const TOKEN: i32 = PrimitiveType::Token as i32;
+    // Complex64 — paired (real, imag) f32, matching rlx-ir `DType::C64`.
+    pub const C64: i32 = PrimitiveType::C64 as i32;
+    // Complex128 — paired (real, imag) f64, matching rlx-ir `DType::C128`.
+    pub const C128: i32 = PrimitiveType::C128 as i32;
 }
 
 pub fn prim_of(dt: DType) -> i32 {
@@ -85,7 +89,10 @@ pub fn prim_of(dt: DType) -> i32 {
         DType::U8 => prim::U8,
         DType::U32 => prim::U32,
         DType::Bool => prim::PRED,
-        DType::C64 => panic!("rlx-tpu: DType::C64 (complex) not yet supported"),
+        // XLA natively supports complex64 (paired f32 real/imag).
+        DType::C64 => prim::C64,
+        // XLA natively supports complex128 (paired f64 real/imag).
+        DType::C128 => prim::C128,
     }
 }
 
@@ -340,6 +347,12 @@ pub enum LiteralData {
     S64(Vec<i64>),
     U32(Vec<u32>),
     U64(Vec<u64>),
+    /// Complex64 — interleaved `[re, im, re, im, ...]` f32 values,
+    /// exactly matching XLA's `LiteralProto.c64s` wire layout.
+    C64(Vec<f32>),
+    /// Complex128 — interleaved `[re, im, re, im, ...]` f64 values,
+    /// exactly matching XLA's `LiteralProto.c128s` wire layout.
+    C128(Vec<f64>),
 }
 
 #[derive(Clone, Debug)]
@@ -366,6 +379,8 @@ impl Literal {
             LiteralData::U64(v) => p.u64s = v.clone(),
             LiteralData::F32(v) => p.f32s = v.clone(),
             LiteralData::F64(v) => p.f64s = v.clone(),
+            LiteralData::C64(v) => p.c64s = v.clone(),
+            LiteralData::C128(v) => p.c128s = v.clone(),
         }
         p
     }
@@ -611,6 +626,12 @@ impl Computation {
         self.constant(Literal {
             shape: Shape::scalar(prim::F32),
             data: LiteralData::F32(vec![v]),
+        })
+    }
+    pub fn constant_f64_scalar(&self, v: f64) -> i64 {
+        self.constant(Literal {
+            shape: Shape::scalar(prim::F64),
+            data: LiteralData::F64(vec![v]),
         })
     }
     pub fn constant_pred_scalar(&self, v: bool) -> i64 {

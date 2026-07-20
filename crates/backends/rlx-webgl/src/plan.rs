@@ -7,7 +7,7 @@
 
 use crate::{Result, WebglError};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, ReduceOp};
-use rlx_ir::{Dim, Graph, NodeId, Op, OpKind};
+use rlx_ir::{Dim, DType, Graph, NodeId, Op, OpKind};
 use std::collections::{HashMap, HashSet};
 
 /// Pointwise activation kinds rlx-webgl can evaluate (forward + backward).
@@ -175,6 +175,37 @@ pub enum Step {
         base: Vec<u32>,
         axis_stride: u32,
     },
+    /// Standalone complex `Op::Cast` lane-move on the f32-uniform arena
+    /// (real↔C64, real↔C128, C64↔C128). Representation:
+    ///   C64  = 2 f32 lanes `[re, im]`;
+    ///   C128 = 4 f32 lanes df64 `[re_hi, re_lo, im_hi, im_lo]`.
+    /// Every real→complex source is an f32 real (lo=0), so all six directions
+    /// are pure lane MOVES — no compensated df64 arithmetic. `mode` 0..5 matches
+    /// the wgpu/cuda/vulkan `complex_cast` table (see the executors). `n` is the
+    /// complex-element count (== the real-element count on the real side). A
+    /// same-dtype complex cast is a plain lane-preserving [`Step::Gather`]
+    /// identity, not this step.
+    ComplexCast {
+        out: usize,
+        src: usize,
+        mode: u32,
+        n: usize,
+    },
+    /// C64 element-wise binary (Add/Sub/Mul/Div). Each output complex element
+    /// reads BOTH `[re, im]` lanes of its operands — the reason it cannot ride
+    /// the scalar-per-lane `Binary` path. Broadcast is per-operand complex-
+    /// element modulo (`k % n_a`, `k % n_b`), matching the rlx-cpu modulo
+    /// fallback. Max/Min/Pow and all C128 arithmetic are rejected at lowering
+    /// (identical to rlx-cpu). `n` = output complex-element count.
+    BinaryC64 {
+        out: usize,
+        a: usize,
+        b: usize,
+        op: Bin,
+        n: usize,
+        n_a: usize,
+        n_b: usize,
+    },
     /// Host/transport custom op (`collective.*`): the single f32 `input` is
     /// staged to a registered CPU kernel via
     /// `rlx_cpu::op_registry::run_f32_custom_op_host`. There is no GPU/GLSL
@@ -332,6 +363,19 @@ fn dims_of(shape: &rlx_ir::Shape) -> Result<Vec<usize>> {
             Dim::Dynamic(s) => Err(WebglError(format!("dynamic dim ?{s} unsupported on WebGL"))),
         })
         .collect()
+}
+
+/// f32 lanes per logical element for a dtype on the f32-uniform WebGL arena.
+/// Real / int / bool are widened to exactly ONE f32 lane; complex is simulated
+/// with multiple lanes — C64 = 2 `[re, im]`, C128 = 4 df64
+/// `[re_hi, re_lo, im_hi, im_lo]`. This is a lane COUNT, deliberately NOT
+/// `size_bytes()/4` (which would wrongly give I64 two lanes and Bool zero).
+pub(crate) fn lanes(dt: DType) -> usize {
+    match dt {
+        DType::C64 => 2,
+        DType::C128 => 4,
+        _ => 1,
+    }
 }
 
 /// Flatten a logical shape to a 2D texture footprint `(rows, cols)`, preserving
@@ -494,10 +538,21 @@ impl Builder {
     }
 
     fn alloc(&mut self, dims: &[usize]) -> usize {
+        self.alloc_lanes(dims, 1)
+    }
+
+    /// Allocate a slot holding `lane` f32 lanes per logical element (see
+    /// [`lanes`]). `lane == 1` for real/int/bool (the historical footprint);
+    /// complex slots widen the texture's column count by the lane factor so the
+    /// whole `[re, im]` (C64) / df64 (C128) footprint is stored, read back, and
+    /// addressable by the complex kernels. The extra lanes ride the last
+    /// (fastest) axis, so complex element `e` occupies flat lanes
+    /// `e*lane .. e*lane+lane`.
+    fn alloc_lanes(&mut self, dims: &[usize], lane: usize) -> usize {
         let (r, c) = rows_cols(dims);
         let i = self.slot_dims.len();
-        self.slot_dims.push((r, c));
-        self.slot_len.push(r * c);
+        self.slot_dims.push((r, c * lane));
+        self.slot_len.push(r * c * lane);
         i
     }
 
@@ -526,21 +581,26 @@ impl Builder {
 fn lower(graph: &Graph) -> Result<Plan> {
     let nodes = graph.nodes();
     let mut b = Builder::new(nodes.len());
-    // NodeId → (output slot, logical dims). Keyed by id because synthetic
-    // intermediate slots make slot indices diverge from node positions.
-    let mut id_info: HashMap<NodeId, (usize, Vec<usize>)> = HashMap::with_capacity(nodes.len());
+    // NodeId → (output slot, logical dims, dtype). Keyed by id because synthetic
+    // intermediate slots make slot indices diverge from node positions. The
+    // dtype is carried so complex casts can classify src/dst and the complex
+    // binary can require C64 operands.
+    let mut id_info: HashMap<NodeId, (usize, Vec<usize>, DType)> =
+        HashMap::with_capacity(nodes.len());
 
     for node in nodes {
         let dims = dims_of(&node.shape)?;
+        let node_dt = node.shape.dtype();
+        let node_lane = lanes(node_dt);
         let (r, c) = rows_cols(&dims);
-        let out = b.alloc(&dims);
-        id_info.insert(node.id, (out, dims.clone()));
+        let out = b.alloc_lanes(&dims, node_lane);
+        id_info.insert(node.id, (out, dims.clone(), node_dt));
 
         let input_slot = |i: usize| -> Result<usize> {
             node.inputs
                 .get(i)
                 .and_then(|id| id_info.get(id))
-                .map(|(s, _)| *s)
+                .map(|(s, _, _)| *s)
                 .ok_or_else(|| {
                     WebglError(format!(
                         "input {i} of {:?} unresolved (graph not topo?)",
@@ -552,10 +612,19 @@ fn lower(graph: &Graph) -> Result<Plan> {
             node.inputs
                 .get(i)
                 .and_then(|id| id_info.get(id))
-                .map(|(_, d)| d.clone())
+                .map(|(_, d, _)| d.clone())
                 .ok_or_else(|| WebglError(format!("input {i} dims unresolved")))
         };
-        let identity = || (0..total(&dims) as u32).collect::<Vec<_>>();
+        let input_dt = |i: usize| -> Result<DType> {
+            node.inputs
+                .get(i)
+                .and_then(|id| id_info.get(id))
+                .map(|(_, _, dt)| *dt)
+                .ok_or_else(|| WebglError(format!("input {i} dtype unresolved")))
+        };
+        // Lane-aware identity: for complex tensors this copies every `[re, im]`
+        // (df64) lane, so Reshape / StopGradient / same-dtype Cast stay correct.
+        let identity = || (0..(total(&dims) * node_lane) as u32).collect::<Vec<_>>();
 
         match &node.op {
             Op::Input { name } => b.emit(Step::Leaf {
@@ -571,14 +640,67 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 src: LeafSource::Const(decode_f32_le(data)),
             }),
             Op::Cast { to } => {
-                if *to != rlx_ir::DType::F32 {
-                    return Err(WebglError(format!("cast to {to:?} unsupported (f32-only)")));
+                let dst = *to;
+                let src_dt = input_dt(0)?;
+                // Real F64 has no storage on the f32-uniform arena and this
+                // backend performs no f64→f32 demotion — reject rather than
+                // silently corrupt. (C128's df64 *components* ARE carried, 4 f32
+                // lanes; those fall through to the complex path below.)
+                if dst == DType::F64 || src_dt == DType::F64 {
+                    return Err(WebglError(format!(
+                        "cast {src_dt:?}->{dst:?} unsupported: the f32 WebGL arena has no \
+                         F64 storage (C128 df64 is the complex path)"
+                    )));
                 }
-                b.emit(Step::Gather {
-                    out,
-                    src: input_slot(0)?,
-                    idx: identity(),
-                });
+                if src_dt.is_complex() || dst.is_complex() {
+                    // Complex simulation: pure lane moves on the f32 arena
+                    // (real↔C64, real↔C128, C64↔C128). Same-dtype complex is a
+                    // full-lane identity copy (identity() is lane-aware). All
+                    // other directions route to the standalone complex_cast
+                    // kernel; modes mirror wgpu/cuda/vulkan.
+                    if src_dt == dst {
+                        b.emit(Step::Gather {
+                            out,
+                            src: input_slot(0)?,
+                            idx: identity(),
+                        });
+                    } else {
+                        // Element count N is shape-preserving across the cast,
+                        // so total(dims) is the complex-element count either way.
+                        let n = total(&dims);
+                        let mode: u32 = match (src_dt, dst) {
+                            (s, DType::C64) if !s.is_complex() => 0, // real → C64
+                            (DType::C64, d) if !d.is_complex() => 1, // C64 → real
+                            (s, DType::C128) if !s.is_complex() => 2, // real → C128
+                            (DType::C128, d) if !d.is_complex() => 3, // C128 → real
+                            (DType::C64, DType::C128) => 4,
+                            (DType::C128, DType::C64) => 5,
+                            _ => {
+                                return Err(WebglError(format!(
+                                    "complex cast {src_dt:?}->{dst:?} unclassified"
+                                )));
+                            }
+                        };
+                        b.emit(Step::ComplexCast {
+                            out,
+                            src: input_slot(0)?,
+                            mode,
+                            n,
+                        });
+                    }
+                } else if dst == DType::F32 {
+                    // Value-preserving copy on the f32-uniform arena (every value
+                    // is already f32-encoded). Handles int→f32 / f32→f32.
+                    b.emit(Step::Gather {
+                        out,
+                        src: input_slot(0)?,
+                        idx: identity(),
+                    });
+                } else {
+                    return Err(WebglError(format!(
+                        "cast to {dst:?} unsupported (f32-only; C64/C128 complex simulated)"
+                    )));
+                }
             }
             Op::StopGradient => {
                 // Forward identity (the AD pass already applied the reverse rule).
@@ -606,6 +728,56 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 act: map_act(*kind)?,
             }),
             Op::Binary(bop) => {
+                // Complex binary: each output element reads BOTH `[re, im]`
+                // lanes of its operands, so it cannot ride the scalar-per-lane
+                // Binary path (nor the pre-gather broadcast, which is element-
+                // unit). Route BEFORE `expand_to` to a standalone binary_c64
+                // step whose broadcast is per-operand complex-element modulo.
+                // Rejections mirror rlx-cpu exactly: C128 arithmetic entirely,
+                // and C64 Max/Min/Pow.
+                if node_dt.is_complex() {
+                    if node_dt == DType::C128 {
+                        return Err(WebglError(
+                            "Binary on C128 unsupported: complex-f64 arithmetic is not wired \
+                             (rlx-cpu rejects it too); only C64 Add/Sub/Mul/Div"
+                                .into(),
+                        ));
+                    }
+                    let op = match bop {
+                        BinaryOp::Add => Bin::Add,
+                        BinaryOp::Sub => Bin::Sub,
+                        BinaryOp::Mul => Bin::Mul,
+                        BinaryOp::Div => Bin::Div,
+                        BinaryOp::Max | BinaryOp::Min | BinaryOp::Pow => {
+                            return Err(WebglError(format!(
+                                "C64 Binary {bop:?} is undefined for complex \
+                                 (only Add/Sub/Mul/Div); matches rlx-cpu rejection"
+                            )));
+                        }
+                    };
+                    // Both operands must be C64-laid-out (2 f32 lanes/elem) — the
+                    // kernel reads 2*k lanes. A real operand (1 lane) would be
+                    // misread, so require an explicit upstream Cast (rlx-cpu's
+                    // complex binary assumes the same 2-lane operand layout).
+                    let (a_dt, b_dt) = (input_dt(0)?, input_dt(1)?);
+                    if a_dt != DType::C64 || b_dt != DType::C64 {
+                        return Err(WebglError(format!(
+                            "C64 Binary requires both operands C64 (got {a_dt:?}, {b_dt:?}); \
+                             insert an explicit Cast to C64 upstream"
+                        )));
+                    }
+                    let (ad, bd) = (input_dims(0)?, input_dims(1)?);
+                    b.emit(Step::BinaryC64 {
+                        out,
+                        a: input_slot(0)?,
+                        b: input_slot(1)?,
+                        op,
+                        n: total(&dims),
+                        n_a: total(&ad).max(1),
+                        n_b: total(&bd).max(1),
+                    });
+                    continue;
+                }
                 let op = match bop {
                     BinaryOp::Add => Bin::Add,
                     BinaryOp::Sub => Bin::Sub,
@@ -682,14 +854,35 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 });
             }
             Op::Transpose { perm } => {
-                let in_dims = input_dims(0)?;
+                // Lane-aware for complex: a complex element spans `node_lane`
+                // contiguous f32 lanes (C64 = 2 `[re, im]`, C128 = 4 df64) and
+                // slots are lane-based. The naive element-indexed reindex copies
+                // ONE lane per output ELEMENT from the wrong source lane,
+                // shattering the `[re, im]` pairing. Append a contiguous
+                // innermost lane axis that maps to ITSELF (never permuted) so a
+                // whole complex element moves as a group; `ravel`/`unravel` then
+                // yield N*lane lane indices matching the lane-based slots.
+                // `node_lane == 1` (real/int/bool) ⇒ the extra axis is a strict
+                // no-op. Mirrors the wgpu Transpose fix.
+                let in_dims0 = input_dims(0)?;
+                let (in_dims, out_dims, perm_l) = if node_lane > 1 {
+                    let mut ind = in_dims0.clone();
+                    ind.push(node_lane);
+                    let mut outd = dims.clone();
+                    outd.push(node_lane);
+                    let mut pl = perm.clone();
+                    pl.push(perm.len()); // new lane axis (index == rank) → itself
+                    (ind, outd, pl)
+                } else {
+                    (in_dims0, dims.clone(), perm.clone())
+                };
                 let in_strides = strides(&in_dims);
-                let n = total(&dims);
+                let n = total(&out_dims);
                 let mut idx = Vec::with_capacity(n);
                 for o in 0..n {
-                    let oc = unravel(o, &dims);
+                    let oc = unravel(o, &out_dims);
                     let mut ic = vec![0usize; in_dims.len()];
-                    for (i, &p) in perm.iter().enumerate() {
+                    for (i, &p) in perm_l.iter().enumerate() {
                         ic[p] = oc[i];
                     }
                     idx.push(ravel(&ic, &in_strides) as u32);
@@ -705,7 +898,28 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 if dims.len() < in_dims.len() {
                     return Err(WebglError("expand cannot reduce rank".into()));
                 }
-                let idx = broadcast_idx(&in_dims, &dims);
+                // Lane-aware broadcast for complex dtypes. A complex element
+                // spans `node_lane` contiguous f32 lanes (C64 = 2 `[re, im]`,
+                // C128 = 4 df64) and slots are lane-based, so a naive element-
+                // indexed broadcast copies ONE lane per output ELEMENT — it
+                // writes only N of the N*lane lanes, from the wrong source
+                // lanes, shattering the `[re, im]` pairing. Append a contiguous
+                // innermost lane axis (size = node_lane, `in == out`, NEVER
+                // broadcast) so whole complex elements copy as a group; the
+                // existing `broadcast_idx` then yields N*lane lane indices that
+                // match the lane-based slot layout. `node_lane == 1` for
+                // real/int/bool ⇒ the extra axis is a strict no-op. Mirrors the
+                // cuda/wgpu Expand fix, which appends the same lane axis to the
+                // expand dims/strides.
+                let idx = if node_lane > 1 {
+                    let mut in_lane = in_dims.clone();
+                    let mut out_lane = dims.clone();
+                    in_lane.push(node_lane);
+                    out_lane.push(node_lane);
+                    broadcast_idx(&in_lane, &out_lane)
+                } else {
+                    broadcast_idx(&in_dims, &dims)
+                };
                 b.emit(Step::Gather {
                     out,
                     src: input_slot(0)?,
@@ -713,12 +927,25 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 });
             }
             Op::Narrow { axis, start, .. } => {
-                let in_dims = input_dims(0)?;
+                // Lane-aware for complex (see Transpose). `axis`/`start` stay in
+                // ELEMENT units; the appended innermost lane axis carries the
+                // `[re, im]` (df64) group so a narrowed complex element keeps all
+                // its lanes. `node_lane == 1` ⇒ strict no-op.
+                let in_dims0 = input_dims(0)?;
+                let (in_dims, out_dims) = if node_lane > 1 {
+                    let mut ind = in_dims0.clone();
+                    ind.push(node_lane);
+                    let mut outd = dims.clone();
+                    outd.push(node_lane);
+                    (ind, outd)
+                } else {
+                    (in_dims0, dims.clone())
+                };
                 let in_strides = strides(&in_dims);
-                let n = total(&dims);
+                let n = total(&out_dims);
                 let mut idx = Vec::with_capacity(n);
                 for o in 0..n {
-                    let mut ic = unravel(o, &dims);
+                    let mut ic = unravel(o, &out_dims);
                     ic[*axis] += *start;
                     idx.push(ravel(&ic, &in_strides) as u32);
                 }
@@ -859,17 +1086,36 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 // Place each input into its slice of the output via a masked
                 // gather, then sum: out = Σ_k (mask_k ⊙ gather_k). Reuses the
                 // gather + binary kernels — no concat-specific shader.
-                let n = total(&dims);
+                //
+                // Lane-aware for complex: the per-input gather indices, the 0/1
+                // mask, and EVERY intermediate slot are widened by `node_lane`
+                // (append an innermost lane axis to the dim lists) so whole
+                // `[re, im]` (df64) complex elements move/mask/accumulate as a
+                // group. `axis`/`span` stay ELEMENT units — the lane axis is
+                // never the concat axis. The mask is uniform across an element's
+                // lanes (it depends on the element-axis coord only), so the
+                // masked-sum stays disjoint and lane-exact. The final
+                // `identity()` gather is already lane-aware. `node_lane == 1` ⇒
+                // every widening is a strict no-op (identical to the old path).
+                let mut out_dims = dims.clone();
+                if node_lane > 1 {
+                    out_dims.push(node_lane);
+                }
+                let n = total(&out_dims);
                 let mut axis_off = 0usize;
                 let mut acc: Option<usize> = None;
                 for ii in 0..node.inputs.len() {
-                    let in_dims = input_dims(ii)?;
+                    let in_dims0 = input_dims(ii)?;
+                    let span = in_dims0[*axis]; // element units
+                    let mut in_dims = in_dims0;
+                    if node_lane > 1 {
+                        in_dims.push(node_lane);
+                    }
                     let in_strides = strides(&in_dims);
-                    let span = in_dims[*axis];
                     let mut idx = vec![0u32; n];
                     let mut mask = vec![0f32; n];
                     for o in 0..n {
-                        let mut oc = unravel(o, &dims);
+                        let mut oc = unravel(o, &out_dims);
                         let a = oc[*axis];
                         if a >= axis_off && a < axis_off + span {
                             oc[*axis] = a - axis_off;
@@ -878,18 +1124,18 @@ fn lower(graph: &Graph) -> Result<Plan> {
                         }
                     }
                     axis_off += span;
-                    let gathered = b.alloc(&dims);
+                    let gathered = b.alloc_lanes(&dims, node_lane);
                     b.emit(Step::Gather {
                         out: gathered,
                         src: input_slot(ii)?,
                         idx,
                     });
-                    let mask_slot = b.alloc(&dims);
+                    let mask_slot = b.alloc_lanes(&dims, node_lane);
                     b.emit(Step::Leaf {
                         out: mask_slot,
                         src: LeafSource::Const(mask),
                     });
-                    let masked = b.alloc(&dims);
+                    let masked = b.alloc_lanes(&dims, node_lane);
                     b.emit(Step::Binary {
                         out: masked,
                         a: gathered,
@@ -899,7 +1145,7 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     acc = Some(match acc {
                         None => masked,
                         Some(prev) => {
-                            let s = b.alloc(&dims);
+                            let s = b.alloc_lanes(&dims, node_lane);
                             b.emit(Step::Binary {
                                 out: s,
                                 a: prev,
@@ -1115,16 +1361,27 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 let a = table_dims[axis];
                 let idx_n = total(&idx_dims).max(1);
                 let n_out = total(&dims);
-                let mut which = vec![0u32; n_out];
-                let mut base = vec![0u32; n_out];
+                // Lane-aware for a complex TABLE: each table/output element spans
+                // `node_lane` f32 lanes. `base`/`axis_stride` become TABLE-LANE
+                // offsets (element offset × node_lane, plus the intra-element lane
+                // `l`), so `base + idx_val*axis_stride == table_element*lane + l`.
+                // Every output lane reuses its element's runtime index (`indices`
+                // is real → 1 lane/elem, so `which` stays an element index).
+                // `node_lane == 1` ⇒ the historical element-unit path.
+                let lane = node_lane;
+                let mut which = vec![0u32; n_out * lane];
+                let mut base = vec![0u32; n_out * lane];
                 for o in 0..n_out {
                     // output flattened row-major over [pre, idx_n, post].
                     let p_post = o % post;
                     let rest = o / post;
                     let ix = rest % idx_n;
                     let p_pre = rest / idx_n;
-                    which[o] = ix as u32;
-                    base[o] = (p_pre * (a * post) + p_post) as u32;
+                    let base_elem = p_pre * (a * post) + p_post;
+                    for l in 0..lane {
+                        which[o * lane + l] = ix as u32;
+                        base[o * lane + l] = (base_elem * lane + l) as u32;
+                    }
                 }
                 b.emit(Step::GatherRuntime {
                     out,
@@ -1132,7 +1389,7 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     indices: input_slot(1)?,
                     which,
                     base,
-                    axis_stride: post as u32,
+                    axis_stride: (post * lane) as u32,
                 });
             }
             Op::Rope {
@@ -1292,7 +1549,7 @@ fn lower(graph: &Graph) -> Result<Plan> {
         .map(|id| {
             id_info
                 .get(id)
-                .map(|(s, _)| *s)
+                .map(|(s, _, _)| *s)
                 .ok_or_else(|| WebglError("graph output not found".into()))
         })
         .collect::<Result<Vec<_>>>()?;

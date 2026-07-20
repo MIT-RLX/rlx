@@ -167,6 +167,21 @@ pub fn first_host_eval_op(graph: &Graph) -> Option<&'static str> {
             Op::Lstm { carry: true, .. } => return Some("Lstm carry (host execute_lstm_f32)"),
             Op::Gru { carry: true, .. } => return Some("Gru carry (host execute_gru_f32)"),
             Op::Rnn { carry: true, .. } => return Some("Rnn carry (host execute_rnn_f32)"),
+            // A cast touching a complex dtype (source or dest) has no native
+            // MLX astype (no complex dtype); it host-evaluates via
+            // `mlx_cast_c64` / `mlx_cast_c128` (host readback), which is
+            // forbidden inside `mlx::compile` — force Lazy. F64 casts stay
+            // native (CPU-stream astype in the shim), so only complex needs
+            // this.
+            Op::Cast { to }
+                if to.is_complex()
+                    || node
+                        .inputs
+                        .first()
+                        .is_some_and(|&i| graph.node(i).shape.dtype().is_complex()) =>
+            {
+                return Some("Cast[complex] (host complex cast)");
+            }
             _ => {}
         }
     }

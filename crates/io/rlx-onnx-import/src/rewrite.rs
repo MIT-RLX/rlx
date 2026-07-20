@@ -240,13 +240,21 @@ fn dequant_weight(
         .strip_suffix("_quantized")
         .map(|p| format!("{p}_zero_point"))?;
     let mut out = w;
-    if let Some(scale) = f32_tensor(params, &scale_name) {
-        let s = scale.first().copied().unwrap_or(1.0);
-        let z = f32_tensor(params, &zp_name)
-            .and_then(|z| z.first().copied())
-            .unwrap_or(0.0) as i32;
-        for x in &mut out {
-            *x = (*x - z as f32) * s;
+    // The `_quantized` params may hold either the RAW integer codes (0..255 / -128..127) —
+    // in which case we must dequantize `(w - zp)·scale` — or values a prior loader ALREADY
+    // dequantized to f32 (e.g. the kitten bundle's `load_f32_params`). Re-dequantizing the
+    // latter turns every weight into ≈`-zp·scale` (a constant), blowing up the conv. Detect
+    // raw codes by their integer-valued-ness and only dequantize those.
+    let already_dequant = out.iter().any(|&x| (x - x.round()).abs() > 1e-4);
+    if !already_dequant {
+        if let Some(scale) = f32_tensor(params, &scale_name) {
+            let s = scale.first().copied().unwrap_or(1.0);
+            let z = f32_tensor(params, &zp_name)
+                .and_then(|z| z.first().copied())
+                .unwrap_or(0.0) as i32;
+            for x in &mut out {
+                *x = (*x - z as f32) * s;
+            }
         }
     }
     let shape = init_shapes
@@ -268,18 +276,54 @@ fn rewrite_conv_integer(
     extra_params: &mut HashMap<String, Vec<f32>>,
     extra_shapes: &mut HashMap<String, Vec<usize>>,
 ) {
-    for node in nodes.iter_mut() {
-        if node.op != "ConvInteger" || node.inputs.len() < 2 {
-            continue;
+    // With `RLX_CONVINT_FLOAT_ACT`, route ConvInteger through the pre-quant FLOAT activation
+    // (mirrors `rewrite_matmul_integer`): `Conv(act_f32, w_f32)` is the full correct dequant,
+    // `conv((act_q-act_zp)·act_scale, (w_q-w_zp)·w_scale)`, so the dropped input zero-point is
+    // no longer missing. The default (flag unset) keeps the legacy `Conv(act_q, w_f32)` path.
+    // The output-scale epilogue is pruned for float-act convs (act_scale is already baked in) —
+    // see `rewrite_f32_quant_conv_bypass_output_scales`. Falls back to `act_q` for any conv whose
+    // activation has no DynamicQuantizeLinear producer (e.g. a static/graph-input activation).
+    let float_act = std::env::var("RLX_CONVINT_FLOAT_ACT").is_ok();
+    struct ConvPlan {
+        idx: usize,
+        w_name: String,
+        act_f32: Option<String>,
+    }
+    let mut plans: Vec<ConvPlan> = Vec::new();
+    {
+        let producers: HashMap<&str, &BundleNode> = nodes
+            .iter()
+            .flat_map(|n| n.outputs.iter().map(move |o| (o.as_str(), n)))
+            .collect();
+        for (i, node) in nodes.iter().enumerate() {
+            if node.op != "ConvInteger" || node.inputs.len() < 2 {
+                continue;
+            }
+            let w_q = node.inputs[1].clone();
+            let Some((w_name, data, shape)) = dequant_weight(params, init_shapes, &w_q) else {
+                continue;
+            };
+            extra_params.insert(w_name.clone(), data);
+            extra_shapes.insert(w_name.clone(), shape);
+            let act_f32 = if float_act {
+                trace_pre_quant(node.inputs[0].as_str(), &producers, params).map(str::to_string)
+            } else {
+                None
+            };
+            plans.push(ConvPlan {
+                idx: i,
+                w_name,
+                act_f32,
+            });
         }
-        let w_q = node.inputs[1].clone();
-        let Some((w_name, data, shape)) = dequant_weight(params, init_shapes, &w_q) else {
-            continue;
-        };
-        extra_params.insert(w_name.clone(), data);
-        extra_shapes.insert(w_name.clone(), shape);
+    }
+    for p in plans {
+        let node = &mut nodes[p.idx];
         node.op = "Conv".to_string();
-        node.inputs[1] = w_name;
+        if let Some(act) = p.act_f32 {
+            node.inputs[0] = act;
+        }
+        node.inputs[1] = p.w_name;
         node.inputs.truncate(2);
         node.output_meta.iter_mut().for_each(|m| {
             if let Some(obj) = m.as_object_mut() {
@@ -549,7 +593,11 @@ fn prune_quant_matmul_epilogue_nodes(nodes: &mut Vec<BundleNode>) {
             return false;
         }
         if (node.name.contains("MatMul_quant_scales_mul")
-            || node.name.contains("Conv_quant_scales_mul"))
+            || node.name.contains("Conv_quant_scales_mul")
+            // Float-activation ConvInteger prunes its output-scale Mul (act_scale is baked
+            // into the float activation); its `scaled_out` is aliased away → unconsumed. The
+            // legacy `Conv(act_q,…)` path keeps it (still feeds the bias add).
+            || node.name.contains("Conv_quant_output_scale_mul"))
             && node.op == "Mul"
         {
             return node
@@ -579,34 +627,48 @@ fn rewrite_f32_quant_conv_bypass_output_scales(nodes: &mut [BundleNode]) {
         act_scale: String,
     }
     let mut patches: Vec<ConvScalePatch> = Vec::new();
-    for node in nodes.iter() {
-        if node.op != "Conv" || node.inputs.len() < 2 {
-            continue;
+    // Float-activation convs (`Conv(act_f32, w_f32)`) already carry BOTH scales, so the
+    // `Conv_quant_output_scale_mul` epilogue must be pruned (not re-applied): alias its output
+    // to the conv output and let later DCE drop the dead Mul (mirrors the MatMulInteger bypass).
+    let mut aliases: HashMap<String, String> = HashMap::new();
+    {
+        for node in nodes.iter() {
+            if node.op != "Conv" || node.inputs.len() < 2 {
+                continue;
+            }
+            if !node.inputs[1].ends_with("_f32_import") {
+                continue;
+            }
+            let Some(conv_out) = node.outputs.first().cloned() else {
+                continue;
+            };
+            let Some(epilogue) = trace_f32_quant_scale_epilogue(&producers, &conv_out) else {
+                continue;
+            };
+            // A quantized (`*_quantized`) input marks the legacy `act_q` path (apply act_scale);
+            // anything else is the pre-quant float activation (prune the scale epilogue).
+            if !node.inputs[0].ends_with("_quantized") {
+                if epilogue.scaled_out != conv_out {
+                    aliases.insert(epilogue.scaled_out, conv_out.clone());
+                }
+                continue;
+            }
+            let Some(scales_mul) = epilogue
+                .scales_mul_out
+                .as_deref()
+                .and_then(|name| producers.get(name).copied())
+            else {
+                continue;
+            };
+            let Some(act_scale) = scales_mul.inputs.first().cloned() else {
+                continue;
+            };
+            patches.push(ConvScalePatch {
+                scaled_out: epilogue.scaled_out,
+                conv_out,
+                act_scale,
+            });
         }
-        if !node.inputs[1].ends_with("_f32_import") {
-            continue;
-        }
-        let Some(conv_out) = node.outputs.first().cloned() else {
-            continue;
-        };
-        let Some(epilogue) = trace_f32_quant_scale_epilogue(&producers, &conv_out) else {
-            continue;
-        };
-        let Some(scales_mul) = epilogue
-            .scales_mul_out
-            .as_deref()
-            .and_then(|name| producers.get(name).copied())
-        else {
-            continue;
-        };
-        let Some(act_scale) = scales_mul.inputs.first().cloned() else {
-            continue;
-        };
-        patches.push(ConvScalePatch {
-            scaled_out: epilogue.scaled_out,
-            conv_out,
-            act_scale,
-        });
     }
     for patch in patches {
         for mul in nodes.iter_mut() {
@@ -621,6 +683,15 @@ fn rewrite_f32_quant_conv_bypass_output_scales(nodes: &mut [BundleNode]) {
             }
             mul.inputs[0] = patch.conv_out.clone();
             mul.inputs[1] = patch.act_scale.clone();
+        }
+    }
+    if !aliases.is_empty() {
+        for node in nodes.iter_mut() {
+            for inp in node.inputs.iter_mut() {
+                if let Some(src) = aliases.get(inp.as_str()) {
+                    *inp = src.clone();
+                }
+            }
         }
     }
 }

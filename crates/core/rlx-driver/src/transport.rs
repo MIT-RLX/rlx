@@ -58,6 +58,9 @@ const TAG_BROADCAST: u32 = TAG_RESERVED_BASE + 3;
 const TAG_ALL_TO_ALL: u32 = TAG_RESERVED_BASE + 4;
 const TAG_REDUCE: u32 = TAG_RESERVED_BASE + 5;
 const TAG_PPERMUTE: u32 = TAG_RESERVED_BASE + 6;
+/// Variable-size all-to-all (counts then payloads); distinct from equal-chunk
+/// [`TAG_ALL_TO_ALL`] so the two can coexist in one graph without tag clashes.
+const TAG_ALL_TO_ALL_V: u32 = TAG_RESERVED_BASE + 7;
 
 /// Two-sided, tagged, byte-oriented point-to-point transport between
 /// `world_size` ranks.
@@ -886,6 +889,10 @@ impl ProcessGroup {
     /// `r`. Both `data` and the result are `world_size * chunk` f32. This is the
     /// per-rank chunk-grid transpose — the primitive for MoE expert
     /// dispatch/combine.
+    ///
+    /// **WideEP:** equal-chunk pad helpers remain valid; prefer
+    /// [`Self::all_to_all_v`] for variable per-destination MoE traffic
+    /// (`rlx_collectives::moe_dispatch` / `moe_combine` Phase 1).
     pub fn all_to_all(&self, data: &[f32]) -> Result<Vec<f32>, CollectiveError> {
         let n = self.world_size() as usize;
         if n <= 1 {
@@ -919,6 +926,107 @@ impl ProcessGroup {
             }
         }
         Ok(out)
+    }
+
+    /// Variable-size all-to-all (WideEP Phase 1).
+    ///
+    /// `send_counts[j]` is the number of `f32` elements destined for rank `j`;
+    /// `data` is the concatenation of those chunks in rank order
+    /// (`sum(send_counts) == data.len()`). Returns `(recv_data, recv_counts)`
+    /// where `recv_counts[j]` is the number of elements received from rank `j`
+    /// and `recv_data` concatenates those chunks in rank order.
+    ///
+    /// Protocol: pairwise exchange of a `u64` count, then the `f32` payload
+    /// (lower rank sends first — same deadlock avoidance as [`Self::all_to_all`]).
+    pub fn all_to_all_v(
+        &self,
+        data: &[f32],
+        send_counts: &[usize],
+    ) -> Result<(Vec<f32>, Vec<usize>), CollectiveError> {
+        let n = self.world_size() as usize;
+        if send_counts.len() != n {
+            return Err(CollectiveError::LengthMismatch {
+                expected: n,
+                got: send_counts.len(),
+            });
+        }
+        let total_send: usize = send_counts.iter().sum();
+        if data.len() != total_send {
+            return Err(CollectiveError::LengthMismatch {
+                expected: total_send,
+                got: data.len(),
+            });
+        }
+        if n <= 1 {
+            return Ok((data.to_vec(), send_counts.to_vec()));
+        }
+
+        let rank = self.rank() as usize;
+        let mut send_off = vec![0usize; n + 1];
+        for i in 0..n {
+            send_off[i + 1] = send_off[i] + send_counts[i];
+        }
+
+        // Phase 1 — exchange element counts.
+        let mut recv_counts = vec![0usize; n];
+        recv_counts[rank] = send_counts[rank];
+        for p in 0..n {
+            if p == rank {
+                continue;
+            }
+            let my_count = (send_counts[p] as u64).to_le_bytes();
+            let their = if rank < p {
+                self.transport
+                    .send_bytes(p as u32, TAG_ALL_TO_ALL_V, &my_count)?;
+                self.transport.recv_bytes(p as u32, TAG_ALL_TO_ALL_V)?
+            } else {
+                let r = self.transport.recv_bytes(p as u32, TAG_ALL_TO_ALL_V)?;
+                self.transport
+                    .send_bytes(p as u32, TAG_ALL_TO_ALL_V, &my_count)?;
+                r
+            };
+            if their.len() != 8 {
+                return Err(CollectiveError::TransportError {
+                    reason: format!(
+                        "all_to_all_v: count from rank {p} has {} bytes, want 8",
+                        their.len()
+                    ),
+                });
+            }
+            recv_counts[p] = u64::from_le_bytes(their[..].try_into().unwrap()) as usize;
+        }
+
+        let mut recv_off = vec![0usize; n + 1];
+        for i in 0..n {
+            recv_off[i + 1] = recv_off[i] + recv_counts[i];
+        }
+        let mut out = vec![0f32; recv_off[n]];
+        out[recv_off[rank]..recv_off[rank + 1]]
+            .copy_from_slice(&data[send_off[rank]..send_off[rank + 1]]);
+
+        // Phase 2 — exchange payloads (same tag; sequenced after counts).
+        for p in 0..n {
+            if p == rank {
+                continue;
+            }
+            let send = &data[send_off[p]..send_off[p + 1]];
+            let got = if rank < p {
+                self.send_f32_tagged(p as u32, TAG_ALL_TO_ALL_V, send)?;
+                self.recv_f32_tagged(p as u32, TAG_ALL_TO_ALL_V)?
+            } else {
+                let r = self.recv_f32_tagged(p as u32, TAG_ALL_TO_ALL_V)?;
+                self.send_f32_tagged(p as u32, TAG_ALL_TO_ALL_V, send)?;
+                r
+            };
+            if got.len() != recv_counts[p] {
+                return Err(CollectiveError::LengthMismatch {
+                    expected: recv_counts[p],
+                    got: got.len(),
+                });
+            }
+            out[recv_off[p]..recv_off[p + 1]].copy_from_slice(&got);
+        }
+        Ok((out, recv_counts))
     }
 
     /// Reduce to `root`: every rank contributes `data`; afterward only `root`'s
@@ -1217,6 +1325,38 @@ mod tests {
             };
             g.broadcast(0, &mut data).unwrap();
             assert_eq!(data, vec![7.0, 8.0, 9.0], "rank {}", g.rank());
+        });
+    }
+
+    #[test]
+    fn all_to_all_v_variable_chunks() {
+        // Every rank uses send_counts[j] = j+1. Rank r therefore receives
+        // from each peer a chunk of length (r+1) filled with (100*peer + r).
+        run_ranks(3, |g| {
+            let n = g.world_size() as usize;
+            let r = g.rank() as usize;
+            let send_counts: Vec<usize> = (0..n).map(|j| j + 1).collect();
+            let mut data = Vec::new();
+            for (j, &c) in send_counts.iter().enumerate() {
+                for _ in 0..c {
+                    data.push((100 * r + j) as f32);
+                }
+            }
+            let (recv, recv_counts) = g.all_to_all_v(&data, &send_counts).unwrap();
+            assert_eq!(
+                recv_counts,
+                vec![r + 1; n],
+                "rank {r} recv_counts"
+            );
+            let mut off = 0usize;
+            for (j, &c) in recv_counts.iter().enumerate() {
+                let chunk = &recv[off..off + c];
+                assert!(
+                    chunk.iter().all(|&v| (v - (100 * j + r) as f32).abs() < 1e-6),
+                    "rank {r} from {j}: {chunk:?}"
+                );
+                off += c;
+            }
         });
     }
 

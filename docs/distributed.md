@@ -84,6 +84,21 @@ Distributed RLX is built bottom-up so each layer is swappable:
   summed (`all_reduce(Sum)`). This is `task = infer`.
 - **Pipeline parallel** — the model is split into sequential stages, one per
   node; activations flow rank→rank (`dist_node`'s `pipeline` mode).
+- **WideEP (Phase 0/1 + EPLB)** — expert-parallel MoE: each rank owns a shard of
+  experts; tokens move with variable-size `all_to_all_v` via
+  `collective.moe_dispatch` / `collective.moe_combine`, then a local
+  `GroupedMatMul`. Builder: `rlx_collectives::moe_ep_ffn`. Online load
+  balancing: `rebalance_placement` / `rebalance_with_replicas` (`num_slots > E`
+  for hot-expert copies) + `register_ep_placement` /
+  `register_ep_replicas`; weight remap via `migrate_to_replica_map` /
+  `migrate_to_placement` (slab exchange over `all_to_all_v`). Toy parity:
+  `cargo run -p rlx-collectives --example wide_ep_toy`. Device-resident EP:
+  enable `rlx-cuda` `--features nccl`, bootstrap with
+  `rlx_cuda::distributed::{new_nccl_id,id_to_bytes,id_from_bytes,init_and_register}`
+  — `collective.all_reduce` / `collective.all_to_all` then use NCCL when a
+  comm is registered; `moe_dispatch`/`moe_combine` still use host
+  `all_to_all_v` (see
+  [`DISTRIBUTED_ROADMAP.md`](../crates/core/rlx-collectives/DISTRIBUTED_ROADMAP.md)).
 
 ## Node discovery
 
@@ -286,6 +301,7 @@ discovery) is exactly what `dist_node MODE=fft` and `dist_job` demonstrate.
 | `crates/core/rlx-driver/src/net.rs` | `TcpTransport` (mesh), `NetTransport` (star), symmetric heap |
 | `crates/core/rlx-driver/src/node.rs` | `Node` builder + discovery (static / mDNS / rendezvous) |
 | `crates/core/rlx-driver/src/iroh_transport.rs` | `IrohTransport` (QUIC + relay, NAT traversal by `EndpointId`) + `process_group_from_env` — feature `iroh`; see [iroh-transport.md](iroh-transport.md) |
-| `crates/core/rlx-collectives/` | in-graph `collective.all_reduce` op (+ `all_reduce_op_mode`) + the examples |
+| `crates/core/rlx-collectives/` | in-graph collectives (`all_reduce`, `moe_dispatch` / `moe_combine`, …) + examples |
+| `crates/core/rlx-collectives/examples/wide_ep_toy.rs` | WideEP Phase 0: 2-expert / 2-rank padded EP MoE parity |
 | `crates/core/rlx-runtime/src/dist/` | ship-graph `{inference, training, diagnostics}` submodules + shared weight resolvers (`mod.rs`) |
 | `crates/core/rlx-collectives/DISTRIBUTED_ROADMAP.md` | the deeper tiers (NCCL/RCCL, UCX/RDMA, NVSHMEM) |

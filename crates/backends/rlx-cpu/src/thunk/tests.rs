@@ -950,6 +950,681 @@ fn cast_f64_to_f32_roundtrip_preserves_values() {
     }
 }
 
+/// Run a graph whose inputs are all f32 and return the raw output bytes. Used
+/// by the integer / bool / half cast tests where `run_graph`'s f32 reader would
+/// reinterpret the (non-f32) output buffer.
+fn run_graph_raw_bytes(
+    g: &Graph,
+    inputs: &[(NodeId, &[f32])],
+    out_id: NodeId,
+    out_bytes: usize,
+) -> Vec<u8> {
+    let plan = rlx_opt::memory::plan_memory(g);
+    let mut arena = crate::arena::Arena::from_plan(plan);
+    let sched = compile_thunks(g, &arena);
+    for &(id, data) in inputs {
+        let off = arena.byte_offset(id);
+        let buf = arena.raw_buf_mut();
+        unsafe {
+            let p = buf.as_mut_ptr().add(off) as *mut f32;
+            for (i, &v) in data.iter().enumerate() {
+                *p.add(i) = v;
+            }
+        }
+    }
+    execute_thunks(&sched, arena.raw_buf_mut());
+    let off = arena.byte_offset(out_id);
+    arena.raw_buf()[off..off + out_bytes].to_vec()
+}
+
+/// f64 → i32 must truncate toward zero (ONNX Cast semantics), not bit-copy the
+/// 8-byte f64 lanes. Before `CastF64ToI32`, the generic 4-byte Copy fallback
+/// read the low half of each f64 as garbage i32s.
+#[test]
+fn cast_f64_to_i32_truncates_toward_zero() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.0, 2.7, -3.9, 0.0, 5.5, -0.4];
+    let mut g = Graph::new("cast_f64_i32");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let wide = g.cast(xn, DType::F64);
+    let ints = g.cast(wide, DType::I32);
+    g.set_outputs(vec![ints]);
+    let bytes = run_graph_raw_bytes(&g, &[(xn, &x)], ints, x.len() * 4);
+    let got: Vec<i32> = (0..x.len())
+        .map(|i| i32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]))
+        .collect();
+    assert_eq!(got, vec![1, 2, -3, 0, 5, 0], "f64→i32 must truncate toward zero");
+}
+
+/// f64 → i64 truncates toward zero.
+#[test]
+fn cast_f64_to_i64_truncates_toward_zero() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.0, 2.7, -3.9, 100.9, -256.5];
+    let mut g = Graph::new("cast_f64_i64");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let wide = g.cast(xn, DType::F64);
+    let ints = g.cast(wide, DType::I64);
+    g.set_outputs(vec![ints]);
+    let bytes = run_graph_raw_bytes(&g, &[(xn, &x)], ints, x.len() * 8);
+    let got: Vec<i64> = (0..x.len())
+        .map(|i| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+            i64::from_le_bytes(a)
+        })
+        .collect();
+    assert_eq!(got, vec![1, 2, -3, 100, -256], "f64→i64 must truncate toward zero");
+}
+
+/// f64 → Bool is `x != 0.0` (1 byte per element).
+#[test]
+fn cast_f64_to_bool_nonzero() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![0.0, 1.0, 2.0, -0.0, -3.5];
+    let mut g = Graph::new("cast_f64_bool");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let wide = g.cast(xn, DType::F64);
+    let bools = g.cast(wide, DType::Bool);
+    g.set_outputs(vec![bools]);
+    let bytes = run_graph_raw_bytes(&g, &[(xn, &x)], bools, x.len());
+    let got: Vec<bool> = bytes.iter().map(|&b| b != 0).collect();
+    assert_eq!(
+        got,
+        vec![false, true, true, false, true],
+        "f64→bool must be (x != 0.0); note -0.0 == 0.0"
+    );
+}
+
+/// i64 → i32 wrapping narrowing (8-byte → 4-byte). Generic Copy kept only the
+/// low 4 bytes of each i64 lane off a mis-strided buffer.
+#[test]
+fn cast_i64_to_i32_narrows() {
+    let f = DType::F32;
+    // Feed via f32 → i64 → i32 so the i64 source is materialized in-graph.
+    let x: Vec<f32> = vec![1.0, -2.0, 3.0, 40000.0, -70000.0];
+    let mut g = Graph::new("cast_i64_i32");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let wide = g.cast(xn, DType::I64);
+    let narrow = g.cast(wide, DType::I32);
+    g.set_outputs(vec![narrow]);
+    let bytes = run_graph_raw_bytes(&g, &[(xn, &x)], narrow, x.len() * 4);
+    let got: Vec<i32> = (0..x.len())
+        .map(|i| i32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]))
+        .collect();
+    assert_eq!(got, vec![1, -2, 3, 40000, -70000], "i64→i32 narrowing mismatch");
+}
+
+/// i64 → f64 and i32 → f64 must numerically convert (both would corrupt via the
+/// generic 4-byte Copy: i64→f64 is a same-width bit-reinterpret that also moves
+/// only half the bytes; i32→f64 under-reads the source).
+#[test]
+fn cast_int_to_f64_converts() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.0, -2.0, 3.0, 123456.0, -1.0];
+
+    // i64 → f64.
+    let mut g = Graph::new("cast_i64_f64");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let wi = g.cast(xn, DType::I64);
+    let wf = g.cast(wi, DType::F64);
+    g.set_outputs(vec![wf]);
+    let bytes = run_graph_raw_bytes(&g, &[(xn, &x)], wf, x.len() * 8);
+    let got: Vec<f64> = (0..x.len())
+        .map(|i| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+            f64::from_le_bytes(a)
+        })
+        .collect();
+    assert_eq!(got, vec![1.0, -2.0, 3.0, 123456.0, -1.0], "i64→f64 conversion");
+
+    // i32 → f64.
+    let mut g2 = Graph::new("cast_i32_f64");
+    let yn = g2.input("y", Shape::new(&[x.len()], f));
+    let wi2 = g2.cast(yn, DType::I32);
+    let wf2 = g2.cast(wi2, DType::F64);
+    g2.set_outputs(vec![wf2]);
+    let bytes2 = run_graph_raw_bytes(&g2, &[(yn, &x)], wf2, x.len() * 8);
+    let got2: Vec<f64> = (0..x.len())
+        .map(|i| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&bytes2[i * 8..i * 8 + 8]);
+            f64::from_le_bytes(a)
+        })
+        .collect();
+    assert_eq!(got2, vec![1.0, -2.0, 3.0, 123456.0, -1.0], "i32→f64 conversion");
+}
+
+/// f32 → f16 → f32 round-trip preserves values exactly representable in f16,
+/// and a genuinely lossy value must round (proving real conversion, not a
+/// byte-copy no-op).
+#[test]
+fn cast_f32_f16_roundtrip() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.0, 2.0, -3.0, 0.5, 0.25, -0.125, 100.0];
+    let mut g = Graph::new("cast_f16_rt");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let h = g.cast(xn, DType::F16);
+    let back = g.cast(h, DType::F32);
+    g.set_outputs(vec![back]);
+    let got = run_graph(&g, &[(xn, &x)], back, x.len());
+    assert_eq!(got, x, "f32→f16→f32 must preserve exactly-representable values");
+
+    // 0.1 is not representable in f16 → must round, not survive unchanged.
+    let y: Vec<f32> = vec![0.1];
+    let mut g2 = Graph::new("cast_f16_lossy");
+    let yn = g2.input("y", Shape::new(&[1], f));
+    let yh = g2.cast(yn, DType::F16);
+    let yb = g2.cast(yh, DType::F32);
+    g2.set_outputs(vec![yb]);
+    let got2 = run_graph(&g2, &[(yn, &y)], yb, 1);
+    let expected = half::f16::from_f32(0.1).to_f32();
+    assert_eq!(got2[0], expected, "f32→f16 must round-to-nearest-even");
+    assert_ne!(got2[0], 0.1, "0.1 is not f16-representable; must have rounded");
+}
+
+/// f32 → bf16 → f32 round-trip preserves values exactly representable in bf16.
+#[test]
+fn cast_f32_bf16_roundtrip() {
+    let f = DType::F32;
+    // bf16 has an 8-bit mantissa; small integers and power-of-two fractions
+    // are exact.
+    let x: Vec<f32> = vec![1.0, 2.0, -3.0, 4.0, 0.5, -0.25, 128.0];
+    let mut g = Graph::new("cast_bf16_rt");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let h = g.cast(xn, DType::BF16);
+    let back = g.cast(h, DType::F32);
+    g.set_outputs(vec![back]);
+    let got = run_graph(&g, &[(xn, &x)], back, x.len());
+    assert_eq!(got, x, "f32→bf16→f32 must preserve exactly-representable values");
+
+    // A value needing >8 mantissa bits must round.
+    let y: Vec<f32> = vec![1.1];
+    let mut g2 = Graph::new("cast_bf16_lossy");
+    let yn = g2.input("y", Shape::new(&[1], f));
+    let yh = g2.cast(yn, DType::BF16);
+    let yb = g2.cast(yh, DType::F32);
+    g2.set_outputs(vec![yb]);
+    let got2 = run_graph(&g2, &[(yn, &y)], yb, 1);
+    let expected = half::bf16::from_f32(1.1).to_f32();
+    assert_eq!(got2[0], expected, "f32→bf16 must round-to-nearest-even");
+}
+
+// ---------------------------------------------------------------------------
+// Generic scalar cast (`Thunk::CastGeneric`): exotic dtype pairs that used to
+// fall through to the corrupting 4-byte `Copy`. Every assertion below returned
+// garbage before the generic kernel existed.
+// ---------------------------------------------------------------------------
+
+/// Build a graph output of arbitrary (non-f32) dtype from f32 inputs and read
+/// its raw i8 bytes.
+fn raw_i8(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<i8> {
+    let bytes = run_graph_raw_bytes(g, inputs, out, n);
+    bytes.iter().map(|&b| b as i8).collect()
+}
+
+fn raw_u8(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<u8> {
+    run_graph_raw_bytes(g, inputs, out, n)
+}
+
+fn raw_u32(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<u32> {
+    let bytes = run_graph_raw_bytes(g, inputs, out, n * 4);
+    (0..n)
+        .map(|i| u32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]))
+        .collect()
+}
+
+fn raw_i32(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<i32> {
+    let bytes = run_graph_raw_bytes(g, inputs, out, n * 4);
+    (0..n)
+        .map(|i| i32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]))
+        .collect()
+}
+
+fn raw_f64(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<f64> {
+    let bytes = run_graph_raw_bytes(g, inputs, out, n * 8);
+    (0..n)
+        .map(|i| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+            f64::from_le_bytes(a)
+        })
+        .collect()
+}
+
+fn raw_f16(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<half::f16> {
+    let bytes = run_graph_raw_bytes(g, inputs, out, n * 2);
+    (0..n)
+        .map(|i| half::f16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]))
+        .collect()
+}
+
+fn raw_bf16(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<half::bf16> {
+    let bytes = run_graph_raw_bytes(g, inputs, out, n * 2);
+    (0..n)
+        .map(|i| half::bf16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]))
+        .collect()
+}
+
+/// Read a C64 output as (re, im) f32 pairs.
+fn raw_c64(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<(f32, f32)> {
+    let bytes = run_graph_raw_bytes(g, inputs, out, n * 8);
+    (0..n)
+        .map(|i| {
+            let re = f32::from_le_bytes([
+                bytes[i * 8],
+                bytes[i * 8 + 1],
+                bytes[i * 8 + 2],
+                bytes[i * 8 + 3],
+            ]);
+            let im = f32::from_le_bytes([
+                bytes[i * 8 + 4],
+                bytes[i * 8 + 5],
+                bytes[i * 8 + 6],
+                bytes[i * 8 + 7],
+            ]);
+            (re, im)
+        })
+        .collect()
+}
+
+/// Read a C128 output as (re, im) f64 pairs (16 bytes/elem, interleaved).
+fn raw_c128(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<(f64, f64)> {
+    let bytes = run_graph_raw_bytes(g, inputs, out, n * 16);
+    let read_f64 = |base: usize| {
+        f64::from_le_bytes([
+            bytes[base],
+            bytes[base + 1],
+            bytes[base + 2],
+            bytes[base + 3],
+            bytes[base + 4],
+            bytes[base + 5],
+            bytes[base + 6],
+            bytes[base + 7],
+        ])
+    };
+    (0..n)
+        .map(|i| (read_f64(i * 16), read_f64(i * 16 + 8)))
+        .collect()
+}
+
+/// F32 → U8 saturates on overflow/underflow (Rust float→int semantics).
+#[test]
+fn cast_f32_to_u8_saturates() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![0.0, 1.0, 255.0, 256.0, -1.0];
+    let mut g = Graph::new("cast_f32_u8");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let u = g.cast(xn, DType::U8);
+    g.set_outputs(vec![u]);
+    let got = raw_u8(&g, &[(xn, &x)], u, x.len());
+    assert_eq!(got, vec![0, 1, 255, 255, 0], "f32→u8 must saturate");
+}
+
+/// I32 → I8 wraps/narrows (Rust int→int semantics).
+#[test]
+fn cast_i32_to_i8_wraps() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![127.0, 128.0, -129.0];
+    let mut g = Graph::new("cast_i32_i8");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let i32n = g.cast(xn, DType::I32);
+    let i8n = g.cast(i32n, DType::I8);
+    g.set_outputs(vec![i8n]);
+    let got = raw_i8(&g, &[(xn, &x)], i8n, x.len());
+    assert_eq!(got, vec![127, -128, 127], "i32→i8 must wrap");
+}
+
+/// U8 → F32 round-trip (0..=255 exact).
+#[test]
+fn cast_u8_to_f32_roundtrip() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![0.0, 1.0, 127.0, 255.0];
+    let mut g = Graph::new("cast_u8_f32");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let u = g.cast(xn, DType::U8);
+    let back = g.cast(u, DType::F32);
+    g.set_outputs(vec![back]);
+    let got = run_graph(&g, &[(xn, &x)], back, x.len());
+    assert_eq!(got, x, "u8→f32 round-trip");
+}
+
+/// I16 → F64 numeric conversion.
+#[test]
+fn cast_i16_to_f64() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.0, -2.0, 300.0, -32768.0];
+    let mut g = Graph::new("cast_i16_f64");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let i16n = g.cast(xn, DType::I16);
+    let d = g.cast(i16n, DType::F64);
+    g.set_outputs(vec![d]);
+    let got = raw_f64(&g, &[(xn, &x)], d, x.len());
+    assert_eq!(got, vec![1.0, -2.0, 300.0, -32768.0], "i16→f64");
+}
+
+/// F64 → U32 truncates toward zero and saturates negatives to 0.
+#[test]
+fn cast_f64_to_u32() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![0.0, 5.9, -1.0, 100.0, 70000.0];
+    let mut g = Graph::new("cast_f64_u32");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let d = g.cast(xn, DType::F64);
+    let u = g.cast(d, DType::U32);
+    g.set_outputs(vec![u]);
+    let got = raw_u32(&g, &[(xn, &x)], u, x.len());
+    assert_eq!(got, vec![0, 5, 0, 100, 70000], "f64→u32 truncate + saturate");
+}
+
+/// F64 → F16 round-to-nearest.
+#[test]
+fn cast_f64_to_f16() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![0.1, 1.0, -2.5, 100.0];
+    let mut g = Graph::new("cast_f64_f16");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let d = g.cast(xn, DType::F64);
+    let h = g.cast(d, DType::F16);
+    g.set_outputs(vec![h]);
+    let got = raw_f16(&g, &[(xn, &x)], h, x.len());
+    let expected: Vec<half::f16> = x.iter().map(|&v| half::f16::from_f32(v)).collect();
+    assert_eq!(got, expected, "f64→f16 round-to-nearest");
+}
+
+/// F16 → F64 widening.
+#[test]
+fn cast_f16_to_f64() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![0.1, 1.0, -2.5];
+    let mut g = Graph::new("cast_f16_f64");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let h = g.cast(xn, DType::F16);
+    let d = g.cast(h, DType::F64);
+    g.set_outputs(vec![d]);
+    let got = raw_f64(&g, &[(xn, &x)], d, x.len());
+    let expected: Vec<f64> = x.iter().map(|&v| half::f16::from_f32(v).to_f32() as f64).collect();
+    assert_eq!(got, expected, "f16→f64 widening");
+}
+
+/// F16 → I32 truncates toward zero.
+#[test]
+fn cast_f16_to_i32_truncates() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.5, 2.9];
+    let mut g = Graph::new("cast_f16_i32");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let h = g.cast(xn, DType::F16);
+    let i = g.cast(h, DType::I32);
+    g.set_outputs(vec![i]);
+    let got = raw_i32(&g, &[(xn, &x)], i, x.len());
+    assert_eq!(got, vec![1, 2], "f16→i32 truncate toward zero");
+}
+
+/// I32 → F16 round-to-nearest.
+#[test]
+fn cast_i32_to_f16() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.0, 2.0, 3.0, 1000.0];
+    let mut g = Graph::new("cast_i32_f16");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let i = g.cast(xn, DType::I32);
+    let h = g.cast(i, DType::F16);
+    g.set_outputs(vec![h]);
+    let got = raw_f16(&g, &[(xn, &x)], h, x.len());
+    let expected: Vec<half::f16> = x.iter().map(|&v| half::f16::from_f32(v)).collect();
+    assert_eq!(got, expected, "i32→f16");
+}
+
+/// F16 → Bool is `x != 0.0`.
+#[test]
+fn cast_f16_to_bool() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![0.0, 1.5, -0.0, 3.0];
+    let mut g = Graph::new("cast_f16_bool");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let h = g.cast(xn, DType::F16);
+    let b = g.cast(h, DType::Bool);
+    g.set_outputs(vec![b]);
+    let got: Vec<bool> = raw_u8(&g, &[(xn, &x)], b, x.len()).iter().map(|&v| v != 0).collect();
+    assert_eq!(got, vec![false, true, false, true], "f16→bool");
+}
+
+/// BF16 → F64 widening.
+#[test]
+fn cast_bf16_to_f64() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![0.1, 1.0, -2.5];
+    let mut g = Graph::new("cast_bf16_f64");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let h = g.cast(xn, DType::BF16);
+    let d = g.cast(h, DType::F64);
+    g.set_outputs(vec![d]);
+    let got = raw_f64(&g, &[(xn, &x)], d, x.len());
+    let expected: Vec<f64> = x.iter().map(|&v| half::bf16::from_f32(v).to_f32() as f64).collect();
+    assert_eq!(got, expected, "bf16→f64");
+}
+
+/// F16 ↔ BF16 (neither is F32; used to fall through to Copy). Direct
+/// conversion plus a round-trip through F32.
+#[test]
+fn cast_f16_bf16() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.0, 2.0, -3.0, 0.5];
+
+    // Direct F16 → BF16.
+    let mut g = Graph::new("cast_f16_bf16");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let h = g.cast(xn, DType::F16);
+    let b = g.cast(h, DType::BF16);
+    g.set_outputs(vec![b]);
+    let got = raw_bf16(&g, &[(xn, &x)], b, x.len());
+    let expected: Vec<half::bf16> = x
+        .iter()
+        .map(|&v| half::bf16::from_f32(half::f16::from_f32(v).to_f32()))
+        .collect();
+    assert_eq!(got, expected, "f16→bf16 direct");
+
+    // Round-trip F32 → F16 → BF16 → F32 (values exact in both formats).
+    let mut g2 = Graph::new("cast_f16_bf16_rt");
+    let yn = g2.input("y", Shape::new(&[x.len()], f));
+    let yh = g2.cast(yn, DType::F16);
+    let yb = g2.cast(yh, DType::BF16);
+    let yf = g2.cast(yb, DType::F32);
+    g2.set_outputs(vec![yf]);
+    let got2 = run_graph(&g2, &[(yn, &x)], yf, x.len());
+    assert_eq!(got2, x, "f32→f16→bf16→f32 exact for small values");
+}
+
+/// F32 → C64 sets real = value, imag = 0.
+#[test]
+fn cast_f32_to_c64() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.5, -2.0, 3.0];
+    let mut g = Graph::new("cast_f32_c64");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let c = g.cast(xn, DType::C64);
+    g.set_outputs(vec![c]);
+    let got = raw_c64(&g, &[(xn, &x)], c, x.len());
+    assert_eq!(got, vec![(1.5, 0.0), (-2.0, 0.0), (3.0, 0.0)], "f32→c64 = (x,0)");
+}
+
+/// F64 → C64 (real = value, imag = 0).
+#[test]
+fn cast_f64_to_c64() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.5, -2.0];
+    let mut g = Graph::new("cast_f64_c64");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let d = g.cast(xn, DType::F64);
+    let c = g.cast(d, DType::C64);
+    g.set_outputs(vec![c]);
+    let got = raw_c64(&g, &[(xn, &x)], c, x.len());
+    assert_eq!(got, vec![(1.5, 0.0), (-2.0, 0.0)], "f64→c64 = (x,0)");
+}
+
+/// I32 → C64 (real = x as f32, imag = 0).
+#[test]
+fn cast_i32_to_c64() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.0, 2.0, -3.0];
+    let mut g = Graph::new("cast_i32_c64");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let i = g.cast(xn, DType::I32);
+    let c = g.cast(i, DType::C64);
+    g.set_outputs(vec![c]);
+    let got = raw_c64(&g, &[(xn, &x)], c, x.len());
+    assert_eq!(got, vec![(1.0, 0.0), (2.0, 0.0), (-3.0, 0.0)], "i32→c64");
+}
+
+/// C64 → F32 takes the real part (imag discarded).
+#[test]
+fn cast_c64_to_f32() {
+    // Seed a C64 input directly as interleaved [re, im] f32 lanes.
+    let c64 = DType::C64;
+    let interleaved: Vec<f32> = vec![1.5, 9.0, -2.0, 3.0]; // (1.5, 9.0), (-2.0, 3.0)
+    let n = 2;
+    let mut g = Graph::new("cast_c64_f32");
+    let cn = g.input("c", Shape::new(&[n], c64));
+    let out = g.cast(cn, DType::F32);
+    g.set_outputs(vec![out]);
+    let got = run_graph(&g, &[(cn, &interleaved)], out, n);
+    assert_eq!(got, vec![1.5, -2.0], "c64→f32 = real part");
+}
+
+/// C64 → I32 truncates the real part toward zero.
+#[test]
+fn cast_c64_to_i32() {
+    let c64 = DType::C64;
+    let interleaved: Vec<f32> = vec![1.9, 5.0, -2.9, 1.0]; // (1.9, 5.0), (-2.9, 1.0)
+    let n = 2;
+    let mut g = Graph::new("cast_c64_i32");
+    let cn = g.input("c", Shape::new(&[n], c64));
+    let out = g.cast(cn, DType::I32);
+    g.set_outputs(vec![out]);
+    let got = raw_i32(&g, &[(cn, &interleaved)], out, n);
+    assert_eq!(got, vec![1, -2], "c64→i32 = real truncated");
+}
+
+/// C64 → Bool is nonzero if EITHER component is nonzero (numpy convention).
+#[test]
+fn cast_c64_to_bool() {
+    let c64 = DType::C64;
+    let interleaved: Vec<f32> = vec![0.0, 0.0, 0.0, 3.0, 2.0, 0.0]; // (0,0),(0,3),(2,0)
+    let n = 3;
+    let mut g = Graph::new("cast_c64_bool");
+    let cn = g.input("c", Shape::new(&[n], c64));
+    let out = g.cast(cn, DType::Bool);
+    g.set_outputs(vec![out]);
+    let got: Vec<bool> = raw_u8(&g, &[(cn, &interleaved)], out, n).iter().map(|&v| v != 0).collect();
+    assert_eq!(got, vec![false, true, true], "c64→bool = re||im nonzero");
+}
+
+// ── C128 (complex f64) native cast round-trips ──────────────────────
+// C128 stores interleaved [re, im] f64 pairs (16 bytes/elem), the
+// double-precision sibling of C64. Complex arithmetic stays C64-only;
+// only the CAST matrix supports C128.
+
+/// F32 → C128 sets real = value (widened f32→f64), imag = 0.
+#[test]
+fn cast_f32_to_c128() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.5, -2.0, 3.0];
+    let mut g = Graph::new("cast_f32_c128");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let c = g.cast(xn, DType::C128);
+    g.set_outputs(vec![c]);
+    let got = raw_c128(&g, &[(xn, &x)], c, x.len());
+    assert_eq!(
+        got,
+        vec![(1.5, 0.0), (-2.0, 0.0), (3.0, 0.0)],
+        "f32→c128 = (x as f64, 0)"
+    );
+}
+
+/// F64 → C128 keeps full f64 precision, imag = 0.
+#[test]
+fn cast_f64_to_c128() {
+    let f = DType::F32;
+    let x: Vec<f32> = vec![1.5, -2.0];
+    let mut g = Graph::new("cast_f64_c128");
+    let xn = g.input("x", Shape::new(&[x.len()], f));
+    let d = g.cast(xn, DType::F64);
+    let c = g.cast(d, DType::C128);
+    g.set_outputs(vec![c]);
+    let got = raw_c128(&g, &[(xn, &x)], c, x.len());
+    assert_eq!(got, vec![(1.5, 0.0), (-2.0, 0.0)], "f64→c128 = (x, 0)");
+}
+
+/// C64 → C128 widens both components f32→f64 (imag preserved).
+#[test]
+fn cast_c64_to_c128() {
+    // Seed a C64 input as interleaved [re, im] f32 lanes.
+    let interleaved: Vec<f32> = vec![1.5, 9.0, -2.0, 3.0]; // (1.5, 9.0), (-2.0, 3.0)
+    let n = 2;
+    let mut g = Graph::new("cast_c64_c128");
+    let cn = g.input("c", Shape::new(&[n], DType::C64));
+    let c128 = g.cast(cn, DType::C128);
+    g.set_outputs(vec![c128]);
+    let got = raw_c128(&g, &[(cn, &interleaved)], c128, n);
+    assert_eq!(
+        got,
+        vec![(1.5, 9.0), (-2.0, 3.0)],
+        "c64→c128 widens re AND im"
+    );
+}
+
+/// C128 → C64 narrows both components f64→f32 (imag preserved).
+#[test]
+fn cast_c128_to_c64() {
+    // Seed C64, widen to C128, narrow back to C64 — round-trip must
+    // preserve exactly (values chosen exact in both f32 and f64).
+    let interleaved: Vec<f32> = vec![1.5, 9.0, -2.0, 3.0];
+    let n = 2;
+    let mut g = Graph::new("cast_c128_c64");
+    let cn = g.input("c", Shape::new(&[n], DType::C64));
+    let c128 = g.cast(cn, DType::C128);
+    let back = g.cast(c128, DType::C64);
+    g.set_outputs(vec![back]);
+    let got = raw_c64(&g, &[(cn, &interleaved)], back, n);
+    assert_eq!(got, vec![(1.5, 9.0), (-2.0, 3.0)], "c64→c128→c64 round-trip");
+}
+
+/// C128 → F32 takes the real part (imag discarded).
+#[test]
+fn cast_c128_to_f32() {
+    // Build a C128 via C64 (to carry a nonzero imaginary part), then
+    // cast to F32 and confirm only the real part survives.
+    let interleaved: Vec<f32> = vec![1.5, 9.0, -2.0, 3.0];
+    let n = 2;
+    let mut g = Graph::new("cast_c128_f32");
+    let cn = g.input("c", Shape::new(&[n], DType::C64));
+    let c128 = g.cast(cn, DType::C128);
+    let out = g.cast(c128, DType::F32);
+    g.set_outputs(vec![out]);
+    let got = run_graph(&g, &[(cn, &interleaved)], out, n);
+    assert_eq!(got, vec![1.5, -2.0], "c128→f32 = real part");
+}
+
+/// C128 → Bool is nonzero if EITHER component is nonzero (numpy convention).
+#[test]
+fn cast_c128_to_bool() {
+    // (0,0) → false, (0,3) → true (imag), (2,0) → true (real).
+    let interleaved: Vec<f32> = vec![0.0, 0.0, 0.0, 3.0, 2.0, 0.0];
+    let n = 3;
+    let mut g = Graph::new("cast_c128_bool");
+    let cn = g.input("c", Shape::new(&[n], DType::C64));
+    let c128 = g.cast(cn, DType::C128);
+    let out = g.cast(c128, DType::Bool);
+    g.set_outputs(vec![out]);
+    let got: Vec<bool> = raw_u8(&g, &[(cn, &interleaved)], out, n)
+        .iter()
+        .map(|&v| v != 0)
+        .collect();
+    assert_eq!(got, vec![false, true, true], "c128→bool = re||im nonzero");
+}
+
 #[test]
 fn relu_backward_matches_mask() {
     let f = DType::F32;

@@ -58,15 +58,18 @@ pub struct CoremlExecutable {
 /// CoreML's ML Program is value-typed with no I64 storage and strict per-op type
 /// rules, unlike the f32-uniform CPU/wgpu arenas. Rather than special-case every op,
 /// promote the graph to an f32 flow once: rewrite every integer tensor (I64/I32/U32/
-/// I8/U8) to F32 — node output dtypes, integer `Constant` data, and `Cast { to: int }`
-/// targets. `Bool` is preserved (CoreML `select`/logical ops need it) and floats are
-/// untouched. Integer-only consumers (e.g. `gather` indices) cast back to int32 in the
-/// MIL lowering. This makes index/shape arithmetic flow as exact integer-valued f32.
+/// I16/I8/U8) to F32 — node output dtypes, integer `Constant` data, and
+/// `Cast { to: int }` targets. `Bool` is preserved (CoreML `select`/logical ops need
+/// it) and floats are untouched. Integer-only consumers (e.g. `gather` indices) cast
+/// back to int32 in the MIL lowering. This makes index/shape arithmetic flow as exact
+/// integer-valued f32. `I16` is included here (CoreML has no int16 storage) so it
+/// mirrors the other ints; the `mil_cast_dtype`/`mil_data_type` widening of I16→int32
+/// is the fallback for the direct `lower_graph` path that skips this promotion.
 fn promote_int_to_f32(graph: &mut Graph) {
     fn is_int(dt: DType) -> bool {
         matches!(
             dt,
-            DType::I64 | DType::I32 | DType::U32 | DType::I8 | DType::U8
+            DType::I64 | DType::I32 | DType::U32 | DType::I16 | DType::I8 | DType::U8
         )
     }
     for node in graph.nodes_mut() {
@@ -86,6 +89,10 @@ fn promote_int_to_f32(graph: &mut Graph) {
                         .chunks_exact(4)
                         .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as f32)
                         .collect(),
+                    DType::I16 => data
+                        .chunks_exact(2)
+                        .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32)
+                        .collect(),
                     DType::U8 => data.iter().map(|&b| b as f32).collect(),
                     DType::I8 => data.iter().map(|&b| (b as i8) as f32).collect(),
                     _ => unreachable!(),
@@ -100,6 +107,54 @@ fn promote_int_to_f32(graph: &mut Graph) {
         }
         if is_int(dt) {
             node.shape = node.shape.clone().with_dtype(DType::F32);
+        }
+    }
+}
+
+/// CoreML/MIL has no f64 or bf16 storage. Demote every such tensor to the
+/// nearest supported float once, before lowering: `F64 → F32`, `BF16 → F16`.
+/// Rewrites node output dtypes, float `Constant` payloads (re-encoded to the
+/// target width), and `Cast { to: F64 | BF16 }` targets — mirroring
+/// `promote_int_to_f32`. This is required (not just cosmetic): CoreML rejects
+/// an f64 MLMultiArray model output outright, so the demotion must reach the
+/// graph's output node dtypes, which the per-op MIL type mappers alone don't.
+fn demote_unsupported_floats(graph: &mut Graph) {
+    for node in graph.nodes_mut() {
+        let dt = node.shape.dtype();
+        if let Op::Constant { data } = &mut node.op {
+            match dt {
+                DType::F64 => {
+                    let f32s: Vec<f32> = data
+                        .chunks_exact(8)
+                        .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+                        .collect();
+                    *data = f32s.iter().flat_map(|f| f.to_le_bytes()).collect();
+                }
+                DType::BF16 => {
+                    // bf16 (2 bytes) → f16 (2 bytes), value-preserving via f32.
+                    *data = data
+                        .chunks_exact(2)
+                        .flat_map(|c| {
+                            let bf = u16::from_le_bytes(c.try_into().unwrap());
+                            let f = f32::from_bits((bf as u32) << 16);
+                            half::f16::from_f32(f).to_le_bytes()
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        if let Op::Cast { to } = &mut node.op {
+            match *to {
+                DType::F64 => *to = DType::F32,
+                DType::BF16 => *to = DType::F16,
+                _ => {}
+            }
+        }
+        match dt {
+            DType::F64 => node.shape = node.shape.clone().with_dtype(DType::F32),
+            DType::BF16 => node.shape = node.shape.clone().with_dtype(DType::F16),
+            _ => {}
         }
     }
 }
@@ -262,6 +317,9 @@ impl CoremlExecutable {
         // No-op when no FAB node is present.
         graph = rlx_opt::unfuse::unfuse_attention_block(graph);
         promote_int_to_f32(&mut graph);
+        // CoreML has no f64/bf16 — demote to f32/f16 before the optional
+        // whole-graph f16 pass (so F64→F32→F16 stays consistent under F16 mode).
+        demote_unsupported_floats(&mut graph);
         if lower_opts.float_dtype == DType::F16 {
             demote_float_to_f16(&mut graph);
         }
@@ -741,6 +799,54 @@ mod tests {
         let y = g.activation(Activation::Relu, x, Shape::new(&[2, 2], DType::F16));
         g.set_outputs(vec![y]);
         g
+    }
+
+    /// I16 is included in `promote_int_to_f32` (CoreML has no int16 storage),
+    /// so both an I16 `Constant` and a `Cast { to: I16 }` are rewritten to F32
+    /// — mirroring how I8/I32/I64 are already handled.
+    #[test]
+    fn promote_int_to_f32_handles_i16() {
+        let mut g = Graph::new("i16_promote");
+        let data: Vec<u8> = [1i16, -2, 3]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let k = g.add_node(Op::Constant { data }, vec![], Shape::new(&[3], DType::I16));
+        let x = g.input("x", Shape::new(&[3], DType::F32));
+        let c = g.add_node(
+            Op::Cast { to: DType::I16 },
+            vec![x],
+            Shape::new(&[3], DType::I16),
+        );
+        g.set_outputs(vec![k, c]);
+
+        promote_int_to_f32(&mut g);
+
+        // No I16 dtype survives the promotion.
+        for n in g.nodes() {
+            assert_ne!(n.shape.dtype(), DType::I16, "I16 must be promoted to F32");
+        }
+        // The cast target was rewritten to F32.
+        let cast = g
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.op, Op::Cast { .. }))
+            .unwrap();
+        assert!(matches!(cast.op, Op::Cast { to: DType::F32 }));
+        // The I16 constant bytes were re-encoded as f32 [1.0, -2.0, 3.0].
+        let konst = g
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.op, Op::Constant { .. }))
+            .unwrap();
+        let Op::Constant { data } = &konst.op else {
+            unreachable!()
+        };
+        let floats: Vec<f32> = data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats, vec![1.0, -2.0, 3.0]);
     }
 
     fn with_units_env(val: Option<&str>, f: impl FnOnce()) {

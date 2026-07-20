@@ -32,6 +32,8 @@ pub(crate) fn parse_dtype(s: &str) -> PyResult<DType> {
         "u32" | "uint32" => DType::U32,
         "i64" | "int64" => DType::I64,
         "bool" => DType::Bool,
+        "c64" | "complex64" => DType::C64,
+        "c128" | "complex128" => DType::C128,
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown dtype '{other}' (f32, f16, bf16, i32, ...)"
@@ -61,5 +63,6 @@ pub(crate) fn dtype_label(d: DType) -> &'static str {
         DType::I64 => "i64",
         DType::Bool => "bool",
         DType::C64 => "c64",
+        DType::C128 => "c128",
     }
 }

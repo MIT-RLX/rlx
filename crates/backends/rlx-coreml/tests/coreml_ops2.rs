@@ -55,6 +55,35 @@ fn compare_gt() {
 }
 
 #[test]
+fn cast_f64_demotes_to_fp32() {
+    // CoreML has no f64 storage. A `Cast { to: F64 }` must demote to fp32 and
+    // still compile + run end-to-end. Route through F16 so the casts are real
+    // type changes (fp32→fp16→fp32) rather than identities; the test values are
+    // all exactly representable in f16, so the round-trip is lossless.
+    let mut g = Graph::new("cast_f64");
+    let x = g.input("x", Shape::new(&[4], DType::F32));
+    let h = node(
+        &mut g,
+        Op::Cast { to: DType::F16 },
+        vec![x],
+        Shape::new(&[4], DType::F16),
+    );
+    let y = node(
+        &mut g,
+        Op::Cast { to: DType::F64 },
+        vec![h],
+        Shape::new(&[4], DType::F64),
+    );
+    g.set_outputs(vec![y]);
+    let mut e = CoremlExecutable::compile(g);
+    let out = e
+        .run(&[("x", &[1.5f32, -2.0, 3.25, 4.0])])
+        .unwrap()
+        .remove(0);
+    approx(&out, &[1.5, -2.0, 3.25, 4.0], 1e-6);
+}
+
+#[test]
 fn where_select() {
     let mut g = Graph::new("where");
     let c = g.input("c", Shape::new(&[4], DType::F32));

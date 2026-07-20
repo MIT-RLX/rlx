@@ -76,6 +76,9 @@ pub const FFT_GPU_R4_16K_WGSL: &str = include_str!("fft_gpu_r4_16k.wgsl");
 #[cfg(feature = "native-gpu-fft")]
 pub const FFT_GPU_MULTIROW_WGSL: &str = include_str!("fft_gpu_multirow.wgsl");
 pub const COPY_WGSL: &str = include_str!("copy.wgsl");
+pub const CAST_WGSL: &str = include_str!("cast.wgsl");
+pub const COMPLEX_CAST_WGSL: &str = include_str!("complex_cast.wgsl");
+pub const BINARY_C64_WGSL: &str = include_str!("binary_c64.wgsl");
 pub const ELEMENTWISE_REGION_WGSL: &str = include_str!("elementwise_region.wgsl");
 pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
 pub const NARROW_WGSL: &str = include_str!("narrow.wgsl");
@@ -450,7 +453,55 @@ pub struct BatchElementwiseRegionParams {
     pub input_modulus: [u32; 16],
 }
 
-/// Layout shared by Reshape / Cast / generic full copy. 32 bytes.
+/// Layout for a numeric `Op::Cast` (`cast.wgsl`). 32 bytes. `mode`:
+/// 0 identity, 1 float→int (trunc + saturate to `[lo_bits, hi_bits]`, NaN→0),
+/// 2 →Bool (`value != 0`). `lo_bits`/`hi_bits` are f32-as-u32 clamp bounds.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct CastParams {
+    pub n: u32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub mode: u32,
+    pub lo_bits: u32,
+    pub hi_bits: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+}
+
+/// Standalone complex `Op::Cast` (`complex_cast.wgsl`). 32 bytes.
+/// `mode` selects one of the six lane-move directions (real↔C64, real↔C128,
+/// C64↔C128); `n` is the complex-element count; offsets are f32-element.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ComplexCastParams {
+    pub n: u32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub mode: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+    pub _p3: u32,
+}
+
+/// C64 element-wise binary (`binary_c64.wgsl`). 32 bytes. `n` is the output
+/// complex-element count; `n_a`/`n_b` are the operands' complex-element counts
+/// (broadcast via `k % n_x`); offsets are f32-element (lane `2*m + j`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BinaryC64Params {
+    pub n: u32,
+    pub a_off: u32,
+    pub b_off: u32,
+    pub c_off: u32,
+    pub op: u32,
+    pub n_a: u32,
+    pub n_b: u32,
+    pub _p0: u32,
+}
+
+/// Layout shared by Reshape / same-dtype Cast / generic full copy. 32 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct CopyParams {
@@ -1789,6 +1840,8 @@ static MATMUL_COOP_F16_VULKAN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new()
 static MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 static CAST_F32_TO_F16: OnceLock<Kernel> = OnceLock::new();
 static BINARY: OnceLock<Kernel> = OnceLock::new();
+static BINARY_C64: OnceLock<Kernel> = OnceLock::new();
+static COMPLEX_CAST: OnceLock<Kernel> = OnceLock::new();
 static UNARY: OnceLock<Kernel> = OnceLock::new();
 static UNARY_F16_MIRROR: OnceLock<Kernel> = OnceLock::new();
 static COMPARE: OnceLock<Kernel> = OnceLock::new();
@@ -1826,6 +1879,7 @@ static FFT_GPU_INNER: OnceLock<Kernel> = OnceLock::new();
 static FFT_GPU_OUTER_R4: OnceLock<Kernel> = OnceLock::new();
 static FFT_GPU_OUTER_R2: OnceLock<Kernel> = OnceLock::new();
 static COPY: OnceLock<Kernel> = OnceLock::new();
+static CAST: OnceLock<Kernel> = OnceLock::new();
 static ELEMENTWISE_REGION: OnceLock<Kernel> = OnceLock::new();
 static ELEMENTWISE_REGION_SPATIAL: OnceLock<Kernel> = OnceLock::new();
 static TRANSPOSE: OnceLock<Kernel> = OnceLock::new();
@@ -2162,6 +2216,21 @@ pub fn cast_f32_to_f16_kernel(device: &wgpu::Device) -> Option<&'static Kernel> 
 pub fn binary_kernel(device: &wgpu::Device) -> &'static Kernel {
     BINARY.get_or_init(|| build_kernel(device, "rlx-wgpu binary", BINARY_WGSL, "binary"))
 }
+pub fn binary_c64_kernel(device: &wgpu::Device) -> &'static Kernel {
+    BINARY_C64.get_or_init(|| {
+        build_kernel(device, "rlx-wgpu binary_c64", BINARY_C64_WGSL, "binary_c64_main")
+    })
+}
+pub fn complex_cast_kernel(device: &wgpu::Device) -> &'static Kernel {
+    COMPLEX_CAST.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu complex_cast",
+            COMPLEX_CAST_WGSL,
+            "complex_cast_main",
+        )
+    })
+}
 pub fn unary_kernel(device: &wgpu::Device) -> &'static Kernel {
     UNARY.get_or_init(|| build_kernel(device, "rlx-wgpu unary", UNARY_WGSL, "unary"))
 }
@@ -2405,6 +2474,9 @@ pub fn fft_gpu_outer_r2_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn copy_kernel(device: &wgpu::Device) -> &'static Kernel {
     COPY.get_or_init(|| build_kernel(device, "rlx-wgpu copy", COPY_WGSL, "copy"))
+}
+pub fn cast_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CAST.get_or_init(|| build_kernel(device, "rlx-wgpu cast", CAST_WGSL, "cast_main"))
 }
 pub fn elementwise_region_kernel(device: &wgpu::Device) -> &'static Kernel {
     // Region params bind as a STORAGE buffer (not uniform) — WGSL's

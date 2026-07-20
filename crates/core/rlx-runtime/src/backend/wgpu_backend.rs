@@ -334,5 +334,16 @@ fn narrow_to_dtype(v: &[f32], dt: rlx_ir::DType) -> Vec<u8> {
             }
             bytes
         }
+        // C128 (complex f64 pair) — like C64, the f32-uniform wgpu arena
+        // never synthesizes complex outputs (C128 casts/ops are rejected
+        // at lowering). Defensive only: widen the raw f32 lanes to f64 so
+        // the byte width matches the declared 16 B/elem C128 layout.
+        DType::C128 => {
+            let mut bytes = Vec::with_capacity(v.len() * 8);
+            for &x in v {
+                bytes.extend_from_slice(&(x as f64).to_le_bytes());
+            }
+            bytes
+        }
     }
 }

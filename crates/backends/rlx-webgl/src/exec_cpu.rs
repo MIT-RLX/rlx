@@ -323,6 +323,88 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
                 }
                 vals[*out] = o;
             }
+            Step::ComplexCast { out, src, mode, n } => {
+                // Lane moves on the f32-uniform arena. Mirrors the wgpu/cuda/
+                // vulkan `complex_cast` table (C64 = 2 lanes, C128 = 4 lanes).
+                // Real sources carry lo=0, so no compensated df64 math.
+                let s = &vals[*src];
+                let out_len = plan.slot_len[*out];
+                let mut o = vec![0f32; out_len];
+                let n = *n;
+                match mode {
+                    0 => {
+                        for k in 0..n {
+                            o[2 * k] = s[k]; // o[2k+1] stays 0
+                        }
+                    }
+                    1 => {
+                        for k in 0..n {
+                            o[k] = s[2 * k];
+                        }
+                    }
+                    2 => {
+                        for k in 0..n {
+                            o[4 * k] = s[k]; // o[4k+1..3] stay 0
+                        }
+                    }
+                    3 => {
+                        for k in 0..n {
+                            o[k] = s[4 * k];
+                        }
+                    }
+                    4 => {
+                        for k in 0..n {
+                            o[4 * k] = s[2 * k];
+                            o[4 * k + 2] = s[2 * k + 1];
+                        }
+                    }
+                    5 => {
+                        for k in 0..n {
+                            o[2 * k] = s[4 * k];
+                            o[2 * k + 1] = s[4 * k + 2];
+                        }
+                    }
+                    other => {
+                        return Err(WebglError(format!("bad complex_cast mode {other}")));
+                    }
+                }
+                vals[*out] = o;
+            }
+            Step::BinaryC64 {
+                out,
+                a,
+                b,
+                op,
+                n,
+                n_a,
+                n_b,
+            } => {
+                // C64 element-wise binary. Formulas + modulo broadcast mirror
+                // rlx-cpu `exec_binary_full_c64`. C64 = 2 f32 lanes `[re, im]`.
+                let (av, bv) = (&vals[*a], &vals[*b]);
+                let mut o = vec![0f32; 2 * *n];
+                for k in 0..*n {
+                    let ka = k % *n_a;
+                    let kb = k % *n_b;
+                    let (ar, ai) = (av[2 * ka], av[2 * ka + 1]);
+                    let (br, bi) = (bv[2 * kb], bv[2 * kb + 1]);
+                    let (cr, ci) = match op {
+                        Bin::Add => (ar + br, ai + bi),
+                        Bin::Sub => (ar - br, ai - bi),
+                        Bin::Mul => (ar * br - ai * bi, ar * bi + ai * br),
+                        Bin::Div => {
+                            let d = br * br + bi * bi;
+                            ((ar * br + ai * bi) / d, (ai * br - ar * bi) / d)
+                        }
+                        Bin::Max | Bin::Min | Bin::Pow => {
+                            unreachable!("C64 max/min/pow rejected at lowering")
+                        }
+                    };
+                    o[2 * k] = cr;
+                    o[2 * k + 1] = ci;
+                }
+                vals[*out] = o;
+            }
             Step::Custom {
                 out,
                 input,
@@ -474,6 +556,170 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out[0], vec![10.0, -2.0, 30.0]);
+    }
+
+    // Complex simulation on the f32-uniform arena. C64 = 2 f32 lanes `[re, im]`.
+    // The GLSL mirrors these exact formulas, so validating the executor here
+    // validates the numerics both paths share.
+    use crate::plan::Bin;
+
+    #[test]
+    fn complex_mul_c64() {
+        // (1+2i)(5+6i) = -7+16i ; (3+4i)(7+8i) = -11+52i.
+        let plan = Plan {
+            steps: vec![
+                Step::Leaf {
+                    out: 0,
+                    src: LeafSource::Input("a".into()),
+                },
+                Step::Leaf {
+                    out: 1,
+                    src: LeafSource::Input("b".into()),
+                },
+                Step::BinaryC64 {
+                    out: 2,
+                    a: 0,
+                    b: 1,
+                    op: Bin::Mul,
+                    n: 2,
+                    n_a: 2,
+                    n_b: 2,
+                },
+            ],
+            slot_dims: vec![(1, 4); 3],
+            slot_len: vec![4; 3],
+            outputs: vec![2],
+        };
+        let out = run_cpu(
+            &plan,
+            &[("a", &[1.0, 2.0, 3.0, 4.0]), ("b", &[5.0, 6.0, 7.0, 8.0])],
+        )
+        .unwrap();
+        assert_eq!(out[0], vec![-7.0, 16.0, -11.0, 52.0]);
+    }
+
+    #[test]
+    fn complex_add_broadcast_scalar() {
+        // [1+2i, 3+4i] + (10+20i) = [11+22i, 13+24i]  (rhs scalar, n_b=1).
+        let plan = Plan {
+            steps: vec![
+                Step::Leaf {
+                    out: 0,
+                    src: LeafSource::Input("a".into()),
+                },
+                Step::Leaf {
+                    out: 1,
+                    src: LeafSource::Input("b".into()),
+                },
+                Step::BinaryC64 {
+                    out: 2,
+                    a: 0,
+                    b: 1,
+                    op: Bin::Add,
+                    n: 2,
+                    n_a: 2,
+                    n_b: 1,
+                },
+            ],
+            slot_dims: vec![(1, 4), (1, 2), (1, 4)],
+            slot_len: vec![4, 2, 4],
+            outputs: vec![2],
+        };
+        let out = run_cpu(&plan, &[("a", &[1.0, 2.0, 3.0, 4.0]), ("b", &[10.0, 20.0])]).unwrap();
+        assert_eq!(out[0], vec![11.0, 22.0, 13.0, 24.0]);
+    }
+
+    #[test]
+    fn complex_div_c64() {
+        // (1+2i)/(3+4i) = (11 + 2i)/25 = 0.44 + 0.08i.
+        let plan = Plan {
+            steps: vec![
+                Step::Leaf {
+                    out: 0,
+                    src: LeafSource::Input("a".into()),
+                },
+                Step::Leaf {
+                    out: 1,
+                    src: LeafSource::Input("b".into()),
+                },
+                Step::BinaryC64 {
+                    out: 2,
+                    a: 0,
+                    b: 1,
+                    op: Bin::Div,
+                    n: 1,
+                    n_a: 1,
+                    n_b: 1,
+                },
+            ],
+            slot_dims: vec![(1, 2); 3],
+            slot_len: vec![2; 3],
+            outputs: vec![2],
+        };
+        let out = run_cpu(&plan, &[("a", &[1.0, 2.0]), ("b", &[3.0, 4.0])]).unwrap();
+        assert!((out[0][0] - 0.44).abs() < 1e-6 && (out[0][1] - 0.08).abs() < 1e-6);
+    }
+
+    #[test]
+    fn complex_cast_real_roundtrip() {
+        // real [1,2,3] → C64 [1,0, 2,0, 3,0] → real [1,2,3].
+        let plan = Plan {
+            steps: vec![
+                Step::Leaf {
+                    out: 0,
+                    src: LeafSource::Input("x".into()),
+                },
+                Step::ComplexCast {
+                    out: 1,
+                    src: 0,
+                    mode: 0,
+                    n: 3,
+                },
+                Step::ComplexCast {
+                    out: 2,
+                    src: 1,
+                    mode: 1,
+                    n: 3,
+                },
+            ],
+            slot_dims: vec![(1, 3), (1, 6), (1, 3)],
+            slot_len: vec![3, 6, 3],
+            outputs: vec![1, 2],
+        };
+        let out = run_cpu(&plan, &[("x", &[1.0, 2.0, 3.0])]).unwrap();
+        assert_eq!(out[0], vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0]);
+        assert_eq!(out[1], vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn complex_cast_c64_c128_roundtrip() {
+        // C64 [1+2i, 3+4i] → C128 (df64 lo=0) → C64 (drop lo) is identity.
+        let plan = Plan {
+            steps: vec![
+                Step::Leaf {
+                    out: 0,
+                    src: LeafSource::Input("z".into()),
+                },
+                Step::ComplexCast {
+                    out: 1,
+                    src: 0,
+                    mode: 4, // C64 → C128
+                    n: 2,
+                },
+                Step::ComplexCast {
+                    out: 2,
+                    src: 1,
+                    mode: 5, // C128 → C64
+                    n: 2,
+                },
+            ],
+            slot_dims: vec![(1, 4), (1, 8), (1, 4)],
+            slot_len: vec![4, 8, 4],
+            outputs: vec![1, 2],
+        };
+        let out = run_cpu(&plan, &[("z", &[1.0, 2.0, 3.0, 4.0])]).unwrap();
+        assert_eq!(out[0], vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0]);
+        assert_eq!(out[1], vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     // A `collective.*` custom op lowers to `Step::Custom` and the NATIVE CPU

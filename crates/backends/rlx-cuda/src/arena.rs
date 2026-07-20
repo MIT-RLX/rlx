@@ -207,14 +207,125 @@ fn arena_slot_bytes(node: &rlx_ir::Node, align: usize) -> usize {
     let elems = node.shape.num_elements().unwrap_or(0).max(1);
     let bytes = match node.shape.dtype() {
         DType::U8 | DType::I8 => elems,
+        // Complex simulates on f32 lanes: C64 = 2 lanes/elem (8 B), C128 = 4
+        // lanes/elem (16 B, df64). Sizing these `elems * 4` (as the `_` arm did)
+        // truncated the imaginary/low lanes — the same class of bug as blanket-
+        // applying `size_bytes()`, which would break U8/Bool (1 native byte but
+        // stored as one f32 lane). So scope the multi-lane widening to complex.
+        DType::C64 => elems * 8,
+        DType::C128 => elems * 16,
         _ => elems * 4,
     };
     bytes.div_ceil(align) * align
 }
 
+/// Number of f32 lanes a node occupies in the f32-uniform arena's host-readback
+/// view. Complex is simulated on f32 lanes (C64 = 2 lanes/elem, C128 = 4); every
+/// other dtype is one f32 lane per element (I64/Bool/… widen to a single lane).
+/// Used to size + read the host staging slot so a complex output reads back ALL
+/// its lanes, not just `num_elements` (which would truncate to the real parts).
+pub(crate) fn arena_lane_count(shape: &rlx_ir::Shape) -> usize {
+    let elems = shape.num_elements().unwrap_or(0);
+    match shape.dtype() {
+        DType::C64 => elems * 2,
+        DType::C128 => elems * 4,
+        _ => elems,
+    }
+}
+
+/// Cast op ids for the shared unary kernel (`unary.cu` cases 100–106). Kept
+/// in sync with rlx-rocm (same kernel) and rlx-vulkan / rlx-oneapi.
+pub(crate) const CAST_F32_TO_I8: u32 = 100;
+pub(crate) const CAST_F32_TO_I16: u32 = 101;
+pub(crate) const CAST_F32_TO_I32: u32 = 102;
+pub(crate) const CAST_F32_TO_I64: u32 = 103;
+pub(crate) const CAST_F32_TO_U8: u32 = 104;
+pub(crate) const CAST_F32_TO_U32: u32 = 105;
+pub(crate) const CAST_TO_BOOL: u32 = 106;
+
+/// How an `Op::Cast` lowers on the f32-uniform arena.
+pub(crate) enum CastLower {
+    /// Value-preserving relabel — alias the input slot. Covers same-dtype,
+    /// int→float, float→float (F16/BF16/F64 are all f32-stored here), int→int,
+    /// and bool→int/float.
+    Identity,
+    /// A real elementwise conversion via the unary kernel with this op id
+    /// (float→int trunc-saturate, or →Bool `x != 0`).
+    Kernel(u32),
+    /// A complex cast (real↔C64, real↔C128, C64↔C128) — pure f32-lane moves via
+    /// the standalone `complex_cast` kernel. Carries the mode (0..5, see
+    /// `complex_cast.cu`). Needs its own (complex-sized) slot, not an alias.
+    Complex(u32),
+    /// Not representable in an f32 arena (F64 has no lane storage) — reject.
+    Reject,
+}
+
+/// Classify a `Cast(src → dst)` on the f32-uniform arena. float→int truncates
+/// toward zero + saturates (Rust `as` / rlx-cpu); →Bool is `x != 0`. F16/BF16/
+/// F64 are demoted to f32 storage so casts to/from them are identity relabels;
+/// only complex (C64) conversions are rejected.
+pub(crate) fn classify_cast(src: DType, dst: DType) -> CastLower {
+    if src == dst {
+        return CastLower::Identity; // pure relabel (also covers C64→C64 / C128→C128)
+    }
+    // Complex casts (real↔C64, real↔C128, C64↔C128) are pure f32-lane moves on
+    // the simulated-complex arena. F64 is the one component type with no f32-lane
+    // storage here, so a complex cast touching F64 (real side) is still rejected.
+    if src.is_complex() || dst.is_complex() {
+        if src == DType::F64 || dst == DType::F64 {
+            return CastLower::Reject;
+        }
+        let mode = match (src, dst) {
+            (s, DType::C64) if !s.is_complex() => 0,  // real → C64
+            (DType::C64, d) if !d.is_complex() => 1,  // C64 → real
+            (s, DType::C128) if !s.is_complex() => 2, // real → C128
+            (DType::C128, d) if !d.is_complex() => 3, // C128 → real
+            (DType::C64, DType::C128) => 4,
+            (DType::C128, DType::C64) => 5,
+            _ => return CastLower::Reject,
+        };
+        return CastLower::Complex(mode);
+    }
+    if dst == DType::Bool {
+        return CastLower::Kernel(CAST_TO_BOOL);
+    }
+    if src.is_float() && dst.is_int() {
+        return CastLower::Kernel(match dst {
+            DType::I8 => CAST_F32_TO_I8,
+            DType::I16 => CAST_F32_TO_I16,
+            DType::I32 => CAST_F32_TO_I32,
+            DType::I64 => CAST_F32_TO_I64,
+            DType::U8 => CAST_F32_TO_U8,
+            DType::U32 => CAST_F32_TO_U32,
+            _ => unreachable!("is_int() covers all integer dtypes"),
+        });
+    }
+    CastLower::Identity
+}
+
+/// True when a Cast node needs its own slot + a conversion kernel (float→int /
+/// →Bool), or must be rejected — i.e. it is *not* an identity relabel and so
+/// must NOT alias the input slot.
+pub(crate) fn cast_is_kernel(graph: &Graph, node: &rlx_ir::Node) -> bool {
+    match &node.op {
+        Op::Cast { to } => !matches!(
+            classify_cast(graph.node(node.inputs[0]).shape.dtype(), *to),
+            CastLower::Identity
+        ),
+        _ => false,
+    }
+}
+
+/// A view (arena-aliased, no kernel): Reshape / StopGradient always, and Cast
+/// only when it is an identity relabel. float→int / →Bool casts get their own
+/// slot (see [`cast_is_kernel`]).
 #[inline]
-fn is_arena_view(op: &Op) -> bool {
-    matches!(op, Op::Reshape { .. } | Op::Cast { .. } | Op::StopGradient)
+fn is_arena_view(graph: &Graph, node: &rlx_ir::Node) -> bool {
+    match &node.op {
+        Op::Reshape { .. } | Op::StopGradient => true,
+        Op::Cast { .. } => !cast_is_kernel(graph, node),
+        _ => false,
+    }
 }
 
 /// Same f32-uniform layout as rlx-wgpu (every tensor is f32; Reshape/Cast/
@@ -243,7 +354,7 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     // Resolve each node to the buffer-owning ancestor it aliases (view chains).
     let mut root_of: HashMap<NodeId, NodeId> = HashMap::with_capacity(n);
     for node in nodes {
-        let root = if is_arena_view(&node.op) {
+        let root = if is_arena_view(graph, node) {
             match node.inputs.first() {
                 Some(in_id) => *root_of.get(in_id).unwrap_or(in_id),
                 None => node.id,
@@ -274,6 +385,23 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
             birth.entry(ri).or_insert(0);
         }
     }
+    // Elided broadcast (see `Step::BinaryBroadcast`): the CUDA backend folds an
+    // `Op::Expand` that feeds only `Op::Binary` into a stride-aware read of the
+    // Expand's *input* at the Binary. That input must therefore stay live as long
+    // as the Expand's output would — otherwise its slot is recycled before the
+    // Binary reads it (silent wrong values). Extend it for every Expand input;
+    // over-extending a materialized Expand's input is harmless (they're small
+    // broadcast tensors) and keeps this independent of the compile-time elide set.
+    for node in nodes {
+        if matches!(node.op, Op::Expand { .. }) {
+            if let Some(&pin) = node.inputs.first() {
+                let de = *death.get(&root(node.id)).unwrap_or(&n);
+                let p = root(pin);
+                death.entry(p).and_modify(|d| *d = (*d).max(de)).or_insert(de);
+            }
+        }
+    }
+
     // Params / Inputs / Constants are resident for the whole execution; graph
     // outputs must survive to the final read-back. Never let these be reused.
     for node in nodes {
@@ -302,7 +430,17 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
         if root(node.id) != node.id {
             continue;
         }
-        let size = arena_slot_bytes(node, align);
+        // A float→int / →Bool Cast writes f32 lanes via the unary kernel, so its
+        // own slot must be f32-sized even when the dst dtype (I8/U8) would
+        // otherwise byte-pack. A COMPLEX cast, however, produces a genuine
+        // multi-lane (C64=2, C128=4) output — it must keep its complex-sized
+        // slot (`arena_slot_bytes`), not the `elems * 4` single-lane sizing.
+        let size = if cast_is_kernel(graph, node) && !node.shape.dtype().is_complex() {
+            let elems = node.shape.num_elements().unwrap_or(0).max(1);
+            (elems * 4).div_ceil(align) * align
+        } else {
+            arena_slot_bytes(node, align)
+        };
         bufs.push(Buf {
             id: node.id,
             size,

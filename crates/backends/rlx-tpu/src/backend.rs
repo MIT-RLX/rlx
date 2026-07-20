@@ -518,7 +518,12 @@ fn pjrt_buffer_type(dt: DType) -> i32 {
         DType::U8 => PJRT_BUFFER_TYPE_U8,
         DType::U32 => PJRT_BUFFER_TYPE_U32,
         DType::Bool => PJRT_BUFFER_TYPE_PRED,
+        // Complex buffer I/O over pjrt is unwired for both C64 and C128
+        // today (the HLO/lower path models them, but real-device buffer
+        // upload/download is not exercised). Reject to avoid a wrong,
+        // untested byte layout — matches C64.
         DType::C64 => panic!("rlx-tpu: DType::C64 (complex) not yet supported"),
+        DType::C128 => panic!("rlx-tpu: DType::C128 (complex) not yet supported"),
     }
 }
 
@@ -596,6 +601,7 @@ pub(crate) fn download_buffer(
         DType::F16 | DType::BF16 | DType::I16 => 2,
         DType::I8 | DType::U8 | DType::Bool => 1,
         DType::C64 => panic!("rlx-tpu: DType::C64 (complex) not yet supported"),
+        DType::C128 => panic!("rlx-tpu: DType::C128 (complex) not yet supported"),
     };
     let mut host_buf: Vec<u8> = vec![0u8; n_elems * elem_bytes];
     let mut args = PJRT_Buffer_ToHostBuffer_Args {
@@ -700,6 +706,7 @@ fn widen_to_f32(bytes: &[u8], dtype: DType, n: usize) -> Vec<f32> {
             }
         }
         DType::C64 => panic!("rlx-tpu: DType::C64 (complex) not yet supported"),
+        DType::C128 => panic!("rlx-tpu: DType::C128 (complex) not yet supported"),
     }
     out
 }

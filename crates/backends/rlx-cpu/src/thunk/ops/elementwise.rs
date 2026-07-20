@@ -156,6 +156,77 @@ pub(crate) fn compile_cast(
                 dst,
                 len: len as u32,
             }
+        } else if in_dtype == rlx_ir::DType::F64 && out_dtype == rlx_ir::DType::I64 {
+            // f64 → i64, truncating toward zero. Generic Copy bit-copies.
+            Thunk::CastF64ToI64 {
+                src,
+                dst,
+                len: len as u32,
+            }
+        } else if in_dtype == rlx_ir::DType::F64 && out_dtype == rlx_ir::DType::I32 {
+            // f64 → i32, truncating toward zero. 8-byte src → 4-byte dst.
+            Thunk::CastF64ToI32 {
+                src,
+                dst,
+                len: len as u32,
+            }
+        } else if in_dtype == rlx_ir::DType::F64 && out_dtype == rlx_ir::DType::Bool {
+            // f64 → Bool (`x != 0.0`). 8-byte src → 1-byte dst.
+            Thunk::CastF64ToBool {
+                src,
+                dst,
+                len: len as u32,
+            }
+        } else if in_dtype == rlx_ir::DType::I64 && out_dtype == rlx_ir::DType::I32 {
+            // i64 → i32 narrowing (mirror of the CastI32ToI64 widening below).
+            // 8-byte src → 4-byte dst; generic Copy keeps only low 4 bytes.
+            Thunk::CastI64ToI32 {
+                src,
+                dst,
+                len: len as u32,
+            }
+        } else if in_dtype == rlx_ir::DType::I64 && out_dtype == rlx_ir::DType::F64 {
+            // i64 → f64. Both 8 bytes; generic Copy moves 4 and bit-reinterprets.
+            Thunk::CastI64ToF64 {
+                src,
+                dst,
+                len: len as u32,
+            }
+        } else if in_dtype == rlx_ir::DType::I32 && out_dtype == rlx_ir::DType::F64 {
+            // i32 → f64 widening (4-byte src → 8-byte dst).
+            Thunk::CastI32ToF64 {
+                src,
+                dst,
+                len: len as u32,
+            }
+        } else if in_dtype == rlx_ir::DType::F32 && out_dtype == rlx_ir::DType::F16 {
+            // f32 → f16 narrowing (4-byte src → 2-byte f16 dst).
+            Thunk::CastF32ToF16 {
+                src,
+                dst,
+                len: len as u32,
+            }
+        } else if in_dtype == rlx_ir::DType::F16 && out_dtype == rlx_ir::DType::F32 {
+            // f16 → f32 widening (2-byte src → 4-byte dst).
+            Thunk::CastF16ToF32 {
+                src,
+                dst,
+                len: len as u32,
+            }
+        } else if in_dtype == rlx_ir::DType::F32 && out_dtype == rlx_ir::DType::BF16 {
+            // f32 → bf16 narrowing (4-byte src → 2-byte bf16 dst).
+            Thunk::CastF32ToBf16 {
+                src,
+                dst,
+                len: len as u32,
+            }
+        } else if in_dtype == rlx_ir::DType::BF16 && out_dtype == rlx_ir::DType::F32 {
+            // bf16 → f32 widening (2-byte src → 4-byte dst).
+            Thunk::CastBf16ToF32 {
+                src,
+                dst,
+                len: len as u32,
+            }
         } else if in_dtype == rlx_ir::DType::F32 && out_dtype == rlx_ir::DType::I32 {
             Thunk::CastF32ToI32 {
                 src,
@@ -232,6 +303,17 @@ pub(crate) fn compile_cast(
                     dst,
                     len: len as u32,
                 },
+                // C128 is 16 bytes/element; the generic `Copy` (4-byte
+                // f32 lanes) would move only a quarter of each element.
+                // Route through the element-wise cast kernel — a
+                // C128→C128 decode/write is bit-identical.
+                rlx_ir::DType::C128 => Thunk::CastGeneric {
+                    src,
+                    dst,
+                    len: len as u32,
+                    src_dtype: in_dtype,
+                    dst_dtype: out_dtype,
+                },
                 _ => Thunk::Copy {
                     src,
                     dst,
@@ -239,10 +321,266 @@ pub(crate) fn compile_cast(
                 },
             }
         } else {
-            Thunk::Copy {
+            // Any remaining dtype pair (exotic widths I8/I16/U8/U32, F16/BF16
+            // against non-F32, and C64 real↔complex). The generic 4-byte Copy
+            // that used to live here silently corrupted these (wrong element
+            // width and/or a raw bit-reinterpret instead of a numeric convert);
+            // route them through the correct element-by-element kernel instead.
+            Thunk::CastGeneric {
                 src,
                 dst,
                 len: len as u32,
+                src_dtype: in_dtype,
+                dst_dtype: out_dtype,
+            }
+        }
+    }
+}
+
+/// Intermediate scalar for [`exec_cast_generic`]: a source element decoded into
+/// a backend-neutral form, then re-encoded to the destination dtype. Floats
+/// (incl. F16/BF16) decode to `F`; ints/bool to `I` (preserving full integer
+/// precision — the only lossy step is `i64 → f64` when the DEST is a float);
+/// complex to `C(re, im)`.
+#[derive(Clone, Copy)]
+enum CastScalar {
+    F(f64),
+    I(i64),
+    C(f64, f64),
+}
+
+impl CastScalar {
+    /// Real magnitude for a real (float/int) destination — complex takes the
+    /// real part (numpy/torch convention).
+    #[inline]
+    fn real(self) -> f64 {
+        match self {
+            CastScalar::F(f) => f,
+            CastScalar::I(i) => i as f64,
+            CastScalar::C(re, _) => re,
+        }
+    }
+
+    /// Truthiness for a Bool destination. Complex is nonzero if EITHER
+    /// component is nonzero (numpy convention).
+    #[inline]
+    fn truthy(self) -> bool {
+        match self {
+            CastScalar::F(f) => f != 0.0,
+            CastScalar::I(i) => i != 0,
+            CastScalar::C(re, im) => re != 0.0 || im != 0.0,
+        }
+    }
+
+    /// `(re, im)` for a C64 (f32-component) destination. Non-complex sources
+    /// map to `(value, 0.0)`.
+    #[inline]
+    fn complex(self) -> (f32, f32) {
+        match self {
+            CastScalar::F(f) => (f as f32, 0.0),
+            CastScalar::I(i) => (i as f32, 0.0),
+            CastScalar::C(re, im) => (re as f32, im as f32),
+        }
+    }
+
+    /// `(re, im)` for a C128 (f64-component) destination. Non-complex sources
+    /// map to `(value, 0.0)`; C64/C128 sources keep full f64 precision (a
+    /// C64→C128 widen is exact, a C128→C128 copy is bit-identical).
+    #[inline]
+    fn complex_f64(self) -> (f64, f64) {
+        match self {
+            CastScalar::F(f) => (f, 0.0),
+            CastScalar::I(i) => (i as f64, 0.0),
+            CastScalar::C(re, im) => (re, im),
+        }
+    }
+}
+
+/// Generic element-wise scalar cast for any dtype pair (see
+/// [`Thunk::CastGeneric`]). Decodes each source element into a [`CastScalar`],
+/// then re-encodes into the destination dtype with correct numeric semantics:
+///   * float dest (F16/BF16/F32/F64): value-as-f64 rounded to the target
+///     (round-to-nearest for F16/BF16).
+///   * int dest (I8/I16/I32/I64/U8/U32): from a float use `as` (Rust SATURATES
+///     on overflow — the ONNX/torch behavior); from an int use `as`
+///     (wrapping/narrowing).
+///   * Bool dest: `!= 0` (int) / `!= 0.0` (float) / `re||im != 0` (complex).
+///   * C64 dest: `(value as f32, 0.0)` from a scalar, `(re, im)` from complex.
+///   * C128 dest: same as C64 but f64 components (C64→C128 widens exactly,
+///     C128→C64 narrows f64→f32, C128→C128 is bit-identical).
+///
+/// Reused by the Metal backend (`rlx_cpu::thunk::exec_cast_generic`): Apple
+/// Silicon's unified memory lets the GPU arena pointer be handed straight to
+/// this host kernel, so every `Op::Cast` dtype pair converts with identical
+/// numeric semantics on CPU and Metal — hence `pub`.
+pub fn exec_cast_generic(
+    src: usize,
+    dst: usize,
+    len: usize,
+    src_dtype: rlx_ir::DType,
+    dst_dtype: rlx_ir::DType,
+    base: *mut u8,
+) {
+    use rlx_ir::DType as DT;
+    if len == 0 {
+        return;
+    }
+    // Decode all source elements into an owned buffer FIRST so the source and
+    // destination arena views never alias during the write pass (they are
+    // disjoint arena buffers, but this also keeps the borrow trivially sound).
+    let mut vals: Vec<CastScalar> = Vec::with_capacity(len);
+    unsafe {
+        match src_dtype {
+            DT::F32 => {
+                let s = sl(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::F(s[i] as f64));
+                }
+            }
+            DT::F64 => {
+                let s = sl_f64(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::F(s[i]));
+                }
+            }
+            DT::F16 => {
+                let s = sl_f16(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::F(s[i].to_f32() as f64));
+                }
+            }
+            DT::BF16 => {
+                let s = sl_bf16(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::F(s[i].to_f32() as f64));
+                }
+            }
+            DT::I8 => {
+                let s = sl_i8(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::I(s[i] as i64));
+                }
+            }
+            DT::I16 => {
+                let s = sl_i16(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::I(s[i] as i64));
+                }
+            }
+            DT::I32 => {
+                let s = sl_i32(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::I(s[i] as i64));
+                }
+            }
+            DT::I64 => {
+                let s = sl_i64(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::I(s[i]));
+                }
+            }
+            DT::U8 => {
+                let s = sl_u8(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::I(s[i] as i64));
+                }
+            }
+            DT::U32 => {
+                let s = sl_u32(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::I(s[i] as i64));
+                }
+            }
+            DT::Bool => {
+                let s = sl_u8(src, base, len);
+                for i in 0..len {
+                    vals.push(CastScalar::I(i64::from(s[i] != 0)));
+                }
+            }
+            DT::C64 => {
+                // Interleaved [re, im] f32 pairs → 2·len f32 lanes.
+                let s = sl(src, base, 2 * len);
+                for i in 0..len {
+                    vals.push(CastScalar::C(s[2 * i] as f64, s[2 * i + 1] as f64));
+                }
+            }
+            DT::C128 => {
+                // Interleaved [re, im] f64 pairs → 2·len f64 lanes.
+                let s = sl_f64(src, base, 2 * len);
+                for i in 0..len {
+                    vals.push(CastScalar::C(s[2 * i], s[2 * i + 1]));
+                }
+            }
+        }
+
+        // Int destinations: from a float source `as` SATURATES (ONNX/torch);
+        // from an int source `as` wraps/narrows. Complex takes the real part.
+        macro_rules! write_int {
+            ($accessor:ident, $t:ty) => {{
+                let o = $accessor(dst, base, len);
+                for i in 0..len {
+                    o[i] = match vals[i] {
+                        CastScalar::I(n) => n as $t,
+                        CastScalar::F(f) => f as $t,
+                        CastScalar::C(re, _) => re as $t,
+                    };
+                }
+            }};
+        }
+        match dst_dtype {
+            DT::F32 => {
+                let o = sl_mut(dst, base, len);
+                for i in 0..len {
+                    o[i] = vals[i].real() as f32;
+                }
+            }
+            DT::F64 => {
+                let o = sl_mut_f64(dst, base, len);
+                for i in 0..len {
+                    o[i] = vals[i].real();
+                }
+            }
+            DT::F16 => {
+                let o = sl_mut_f16(dst, base, len);
+                for i in 0..len {
+                    o[i] = half::f16::from_f32(vals[i].real() as f32);
+                }
+            }
+            DT::BF16 => {
+                let o = sl_mut_bf16(dst, base, len);
+                for i in 0..len {
+                    o[i] = half::bf16::from_f32(vals[i].real() as f32);
+                }
+            }
+            DT::I8 => write_int!(sl_mut_i8, i8),
+            DT::I16 => write_int!(sl_mut_i16, i16),
+            DT::I32 => write_int!(sl_mut_i32, i32),
+            DT::I64 => write_int!(sl_mut_i64, i64),
+            DT::U8 => write_int!(sl_mut_u8, u8),
+            DT::U32 => write_int!(sl_mut_u32, u32),
+            DT::Bool => {
+                let o = sl_mut_u8(dst, base, len);
+                for i in 0..len {
+                    o[i] = u8::from(vals[i].truthy());
+                }
+            }
+            DT::C64 => {
+                // Interleaved [re, im] f32 pairs → 2·len f32 lanes.
+                let o = sl_mut(dst, base, 2 * len);
+                for i in 0..len {
+                    let (re, im) = vals[i].complex();
+                    o[2 * i] = re;
+                    o[2 * i + 1] = im;
+                }
+            }
+            DT::C128 => {
+                // Interleaved [re, im] f64 pairs → 2·len f64 lanes.
+                let o = sl_mut_f64(dst, base, 2 * len);
+                for i in 0..len {
+                    let (re, im) = vals[i].complex_f64();
+                    o[2 * i] = re;
+                    o[2 * i + 1] = im;
+                }
             }
         }
     }

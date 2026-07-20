@@ -36,8 +36,9 @@ use crate::kernels::{
     SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
     TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
     ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, batch_elementwise_region_kernel, binary_kernel, cast_f32_to_f16_kernel,
-    compare_kernel, concat_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
+    attention_kernel, batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel,
+    cast_f32_to_f16_kernel, complex_cast_kernel,
+    cast_kernel, compare_kernel, concat_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
     conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
     elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel, fma_kernel,
     fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
@@ -238,25 +239,17 @@ impl WgpuExecutable {
         }
         let dev = wgpu_device().expect("rlx-wgpu: device gone");
         self.stage_gpu_handle_inputs(dev, inputs);
-        let skip_input_upload =
-            !rlx_ir::env::flag("RLX_WGPU_FORCE_INPUT_UPLOAD") && !self.coop_f16_vk;
+        // Always re-stage graph inputs. Arena liveness reuse may overwrite
+        // input slots once the input dies mid-graph; a hash-based skip across
+        // runs would leave those slots holding stale activations (empty/garbage
+        // outputs on Conformer-CTC and similar). `RLX_WGPU_FORCE_INPUT_UPLOAD`
+        // is retained as a documented no-op for callers that set it.
+        let _ = rlx_ir::env::flag("RLX_WGPU_FORCE_INPUT_UPLOAD");
         for &(name, data) in inputs {
             if let Some(&id) = self.input_offsets.get(name)
                 && self.arena.has(id)
             {
-                if skip_input_upload {
-                    let h = hash_f32_input(data);
-                    if self.input_staging_hashes.get(name) == Some(&h) {
-                        if self.arena.f16_buffer.is_some() {
-                            self.arena.write_f16_shadow(&dev.queue, id, data);
-                        }
-                        continue;
-                    }
-                    self.arena.write_f32(&dev.queue, id, data);
-                    self.input_staging_hashes.insert(name.to_string(), h);
-                } else {
-                    self.arena.write_f32(&dev.queue, id, data);
-                }
+                self.arena.write_f32(&dev.queue, id, data);
             }
         }
         for &(act_id, act, ref src_name) in &self.coop_f16_host_activations {
@@ -482,6 +475,24 @@ impl WgpuExecutable {
                     }
                     Step::FftGpu { .. } => {}
                     Step::Copy { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::Cast { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::ComplexCast { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::BinaryC64 { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
@@ -1264,6 +1275,39 @@ impl WgpuExecutable {
                             }
                             let ck2 = copy_kernel(&dev.device);
                             pass.set_pipeline(&ck2.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::Cast { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let cast_k = cast_kernel(&dev.device);
+                            pass.set_pipeline(&cast_k.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::ComplexCast { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let k = complex_cast_kernel(&dev.device);
+                            pass.set_pipeline(&k.pipeline);
+                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        Step::BinaryC64 { params } => {
+                            let n_s = scale(params.n);
+                            if n_s == 0 {
+                                continue;
+                            }
+                            let k = binary_c64_kernel(&dev.device);
+                            pass.set_pipeline(&k.pipeline);
                             pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                             let (gx, gy, gz) = dispatch_dims(n_s, 64);
                             pass.dispatch_workgroups(gx, gy, gz);

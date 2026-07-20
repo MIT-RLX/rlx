@@ -141,6 +141,12 @@ pub fn build_leaf_for(
                         "typed input '{name}' dtype {dt:?} doesn't match graph's {dtype:?}"
                     )));
                 }
+                if dtype == DType::C64 {
+                    return mlx_c64_leaf_from_bytes(bytes);
+                }
+                if dtype == DType::C128 {
+                    return mlx_c128_leaf_from_bytes(bytes);
+                }
                 return Array::from_bytes(bytes, &shape, dtype);
             }
             let data = inputs
@@ -155,6 +161,12 @@ pub fn build_leaf_for(
                     return Err(MlxError(format!(
                         "typed param '{name}' dtype {dt:?} doesn't match graph's {dtype:?}"
                     )));
+                }
+                if dtype == DType::C64 {
+                    return mlx_c64_leaf_from_bytes(bytes);
+                }
+                if dtype == DType::C128 {
+                    return mlx_c128_leaf_from_bytes(bytes);
                 }
                 return Array::from_bytes(bytes, &shape, dtype);
             }
@@ -218,6 +230,11 @@ pub fn build_leaf_for(
                     }
                     Array::from_f32_slice(&buf, &shape, dtype)
                 }
+                // C64 has no native MLX dtype — materialize as the
+                // f32-backed interleaved (re, im) representation.
+                DType::C64 => mlx_c64_leaf_from_bytes(data),
+                // C128 → F64-backed interleaved (re, im) f64 representation.
+                DType::C128 => mlx_c128_leaf_from_bytes(data),
                 _ => Array::from_bytes(data, &shape, dtype),
             }
         }

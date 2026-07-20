@@ -41,6 +41,14 @@ pub enum DType {
     /// complex math (and in fact, FFT today already encodes complex
     /// as 2N-real-block; this dtype is the natural successor).
     C64,
+    /// Complex with f64 real and f64 imaginary components, stored
+    /// interleaved as `[re, im, re, im, ...]`. 16 bytes per complex
+    /// element — the double-precision sibling of [`Self::C64`]. This
+    /// dtype covers the dtype plumbing (size/flags/promotion/Display)
+    /// and the CAST matrix only: complex *arithmetic* (FFT, cgemm,
+    /// complex binary/activation, Wirtinger AD) remains C64-only, and
+    /// those sites reject C128 rather than compute on it.
+    C128,
 }
 
 impl DType {
@@ -51,6 +59,7 @@ impl DType {
             Self::F16 | Self::BF16 | Self::I16 => 2,
             Self::F32 | Self::I32 | Self::U32 => 4,
             Self::F64 | Self::I64 | Self::C64 => 8,
+            Self::C128 => 16,
         }
     }
 
@@ -62,7 +71,7 @@ impl DType {
     /// standard complex algebra, distinct from the float real/imag
     /// components (e.g. complex multiply ≠ paired-real multiply).
     pub const fn is_complex(self) -> bool {
-        matches!(self, Self::C64)
+        matches!(self, Self::C64 | Self::C128)
     }
 
     pub const fn is_int(self) -> bool {
@@ -80,7 +89,7 @@ impl DType {
     ///
     /// Ranks (low → high):
     ///   0 = Bool, 1 = U8/I8, 2 = I16/BF16, 3 = F16, 4 = U32/I32,
-    ///   5 = I64, 6 = F32, 7 = F64.
+    ///   5 = I64, 6 = F32, 7 = F64, 8 = C64, 9 = C128.
     /// Floats outrank ints of the same width (matches PyTorch /
     /// NumPy). BF16 promotes to F32 against F16 since BF16 has
     /// wider range but F16 has more mantissa.
@@ -95,6 +104,9 @@ impl DType {
             Self::F32 => 6,
             Self::F64 => 7,
             Self::C64 => 8,
+            // C128 (complex f64) outranks C64 (complex f32): a binary
+            // op mixing the two promotes to C128 (wider components).
+            Self::C128 => 9,
         }
     }
 
@@ -216,7 +228,7 @@ pub fn scalar_constant_bytes(value: f64, dtype: DType) -> Result<Vec<u8>, String
             Ok((v as u32).to_le_bytes().to_vec())
         }
         DType::Bool => Ok(vec![u8::from(value != 0.0)]),
-        DType::F16 | DType::BF16 | DType::C64 => Err(format!(
+        DType::F16 | DType::BF16 | DType::C64 | DType::C128 => Err(format!(
             "scalar literal dtype '{dtype:?}' is built via f32 constant + cast"
         )),
     }
@@ -299,6 +311,7 @@ impl std::fmt::Display for DType {
             Self::U32 => write!(f, "u32"),
             Self::Bool => write!(f, "bool"),
             Self::C64 => write!(f, "c64"),
+            Self::C128 => write!(f, "c128"),
         }
     }
 }
@@ -396,5 +409,30 @@ mod tests {
         assert!(scalar_constant_bytes(1.0, DType::F16).is_err());
         assert!(scalar_constant_bytes(1.0, DType::BF16).is_err());
         assert!(scalar_constant_bytes(1.0, DType::C64).is_err());
+        assert!(scalar_constant_bytes(1.0, DType::C128).is_err());
+    }
+
+    #[test]
+    fn c128_size_and_flags() {
+        // 16 bytes: interleaved (re: f64, im: f64), double C64's 8.
+        assert_eq!(DType::C128.size_bytes(), 16);
+        assert_eq!(DType::C64.size_bytes(), 8);
+        // Complex flag: both C64 and C128 are complex, nothing else is.
+        assert!(DType::C128.is_complex());
+        assert!(DType::C64.is_complex());
+        assert!(!DType::F64.is_complex());
+        // C128 is neither float nor int.
+        assert!(!DType::C128.is_float());
+        assert!(!DType::C128.is_int());
+        assert_eq!(DType::C128.to_string(), "c128");
+    }
+
+    #[test]
+    fn c128_promotion() {
+        // C128 outranks C64; mixing the two promotes to C128.
+        assert_eq!(DType::C64.promote(DType::C128), DType::C128);
+        assert_eq!(DType::C128.promote(DType::C64), DType::C128);
+        assert_eq!(DType::C128.promote(DType::C128), DType::C128);
+        assert!(DType::C128.promotion_rank() > DType::C64.promotion_rank());
     }
 }

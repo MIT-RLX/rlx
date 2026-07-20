@@ -47,8 +47,11 @@ hip-cpu-validate = ["dep:cc"]
 cc = { version = "1", optional = true }
 
 [dev-dependencies]
-# (none — hip_cpu_validate.rs links against the static lib produced
-# by build.rs and uses only std for assertions.)
+# hip_cpu_validate.rs links against the static lib produced by build.rs
+# and uses only std for assertions. complex_parity.rs needs rlx-runtime for
+# the rlx-cpu golden reference (`Device::Cpu`) + the f32-lane boundary
+# helpers — mirrors rlx-cuda's dev-dep pattern (cyclic dev-dep is fine).
+rlx-runtime = { path = "../../core/rlx-runtime", features = ["rocm", "cpu"] }
 
 [lints]
 workspace = true

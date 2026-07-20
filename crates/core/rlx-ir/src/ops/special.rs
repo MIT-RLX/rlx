@@ -434,6 +434,45 @@ impl Graph {
         )
     }
 
+    /// Bounded scan with per-step `xs` inputs returning the STACKED
+    /// trajectory (`save_trajectory = true`). Body input convention
+    /// matches [`Self::scan_with_xs`]: `1 + xs.len()` `Op::Input`s in
+    /// NodeId order (carry first, then the xs in order). Each `xs[i]`
+    /// has shape `[length, *per_step_shape_i]`; the body sees the
+    /// `per_step_shape_i` slice on iteration `t`. Output shape is
+    /// `[length, *init.shape]` — row `t` is the carry after step
+    /// `t+1`, so this is `scan_with_xs` that keeps every step.
+    pub fn scan_trajectory_with_xs(
+        &mut self,
+        init: NodeId,
+        xs: &[NodeId],
+        body: Graph,
+        length: u32,
+    ) -> NodeId {
+        let init_shape = self.shape(init).clone();
+        let mut traj_dims: Vec<crate::Dim> = Vec::with_capacity(init_shape.rank() + 1);
+        traj_dims.push(crate::Dim::Static(length as usize));
+        for i in 0..init_shape.rank() {
+            traj_dims.push(init_shape.dim(i));
+        }
+        let traj_shape = crate::Shape::from_dims(&traj_dims, init_shape.dtype());
+        let mut inputs = vec![init];
+        inputs.extend_from_slice(xs);
+        self.push(
+            Op::Scan {
+                body: Box::new(body),
+                length,
+                save_trajectory: true,
+                num_bcast: 0,
+                num_xs: xs.len() as u32,
+                num_checkpoints: 0,
+            },
+            inputs,
+            traj_shape,
+            None,
+        )
+    }
+
     /// Reverse-mode AD companion to [`Self::scan`] /
     /// [`Self::scan_trajectory`]. Typically constructed by the
     /// autodiff pass, not by hand.

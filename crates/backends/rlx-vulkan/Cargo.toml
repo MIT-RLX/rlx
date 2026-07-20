@@ -61,6 +61,16 @@ half = "2"
 naga = { version = "29", features = ["glsl-in", "spv-out"] }
 
 [dev-dependencies]
+# Path-only (no version): test-only cycle on the umbrella crate, which is
+# published last. cargo strips path-only dev-deps from the published manifest,
+# so this never resolves against crates.io and needs no per-release pin bump.
+# `rlx` (cpu) provides the rlx-cpu reference the complex-parity test compares
+# against; `rlx-runtime` exposes the shared df64 CPU↔GPU boundary
+# (`widen_bytes_to_f32` / `narrow_f32_to_bytes`).
+rlx = { path = "../../rlx", default-features = false, features = ["cpu"] }
+rlx-runtime = { path = "../../core/rlx-runtime", default-features = false, features = [
+    "cpu",
+] }
 half = "2"
 
 [lints]

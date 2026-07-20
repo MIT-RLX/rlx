@@ -508,6 +508,80 @@ fn cast_emits_convert_opcode() {
 }
 
 #[test]
+fn cast_real_to_c64_emits_complex_opcode() {
+    // real → C64 lowers to XLA `complex(real, imag=0)`, not `convert`
+    // (XLA disallows real→complex via `convert`).
+    let mut g = Graph::new("cast_c64");
+    let x = g.input("x", Shape::new(&[4], DType::F32));
+    let y = g.add_node(
+        rlx_ir::Op::Cast { to: DType::C64 },
+        vec![x],
+        Shape::new(&[4], DType::C64),
+    );
+    g.set_outputs(vec![y]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "complex"),
+        "real→C64 Cast should emit HLO `complex`"
+    );
+}
+
+#[test]
+fn cast_c64_to_real_emits_real_opcode() {
+    // C64 → real takes the real part via XLA `real`.
+    let mut g = Graph::new("cast_from_c64");
+    let x = g.input("x", Shape::new(&[4], DType::C64));
+    let y = g.add_node(
+        rlx_ir::Op::Cast { to: DType::F32 },
+        vec![x],
+        Shape::new(&[4], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "real"),
+        "C64→real Cast should emit HLO `real`"
+    );
+}
+
+#[test]
+fn cast_real_to_c128_emits_complex_opcode() {
+    // real → C128 lowers to XLA `complex(real_f64, imag=0)` (native
+    // complex128), not `convert`.
+    let mut g = Graph::new("cast_c128");
+    let x = g.input("x", Shape::new(&[4], DType::F32));
+    let y = g.add_node(
+        rlx_ir::Op::Cast { to: DType::C128 },
+        vec![x],
+        Shape::new(&[4], DType::C128),
+    );
+    g.set_outputs(vec![y]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "complex"),
+        "real→C128 Cast should emit HLO `complex`"
+    );
+}
+
+#[test]
+fn cast_c128_to_real_emits_real_opcode() {
+    // C128 → real takes the real part via XLA `real`.
+    let mut g = Graph::new("cast_from_c128");
+    let x = g.input("x", Shape::new(&[4], DType::C128));
+    let y = g.add_node(
+        rlx_ir::Op::Cast { to: DType::F64 },
+        vec![x],
+        Shape::new(&[4], DType::F64),
+    );
+    g.set_outputs(vec![y]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "real"),
+        "C128→real Cast should emit HLO `real`"
+    );
+}
+
+#[test]
 fn constant_emits_constant_opcode() {
     let mut g = Graph::new("k");
     let bytes = [1.0f32, 2.0, 3.0, 4.0]

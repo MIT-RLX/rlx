@@ -17,7 +17,7 @@
 
 #![allow(unused_imports)]
 
-use crate::arena::{Arena, HalfDtype, plan_f32_uniform};
+use crate::arena::{Arena, HalfDtype, arena_lane_count, plan_f32_uniform};
 use crate::device::{RocmContext, rocm_blas, rocm_blas_lt, rocm_context, rocm_dnn};
 use crate::hip::{HipBuffer, HipDeviceptr};
 use crate::hipblas::{
@@ -42,11 +42,14 @@ impl RocmExecutable {
         for &i in indices {
             let id = self.graph.outputs[i];
             let off_f32 = self.arena.offset(id) / 4;
-            let elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+            // Lane count, not element count — a complex output spans 2/4 f32 lanes
+            // per element (see `arena_lane_count`); `num_elements` would truncate
+            // the readback to the real parts.
+            let lanes = arena_lane_count(&self.graph.node(id).shape);
             let src = self.arena.buffer.ptr + (off_f32 as u64) * 4;
-            debug_assert_eq!(self.output_staging[i].len(), elems);
+            debug_assert_eq!(self.output_staging[i].len(), lanes);
             self.output_staging[i]
-                .dtoh(&self.ctx.runtime, src, elems)
+                .dtoh(&self.ctx.runtime, src, lanes)
                 .expect("rlx-rocm: partial output download failed");
         }
     }
@@ -57,11 +60,12 @@ impl RocmExecutable {
         }
         for (i, &id) in self.graph.outputs.iter().enumerate() {
             let off_f32 = self.arena.offset(id) / 4;
-            let elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+            // Lane count, not element count (complex → 2/4 lanes per element).
+            let lanes = arena_lane_count(&self.graph.node(id).shape);
             let src = self.arena.buffer.ptr + (off_f32 as u64) * 4;
-            debug_assert_eq!(self.output_staging[i].len(), elems);
+            debug_assert_eq!(self.output_staging[i].len(), lanes);
             self.output_staging[i]
-                .dtoh(&self.ctx.runtime, src, elems)
+                .dtoh(&self.ctx.runtime, src, lanes)
                 .expect("rlx-rocm: output download failed");
         }
     }

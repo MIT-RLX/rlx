@@ -35,6 +35,17 @@ pub fn load_i64_params(bytes: &[u8]) -> Result<HashMap<String, Vec<i64>>> {
                 .chunks_exact(8)
                 .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
                 .collect(),
+            // Axis / index / shape initializers are commonly exported as I32
+            // (ONNX permits int32 or int64 for CumSum `axis`, Gather indices,
+            // Slice/Squeeze axes, …). Dropping them here silently loses the
+            // constant, so lookups via `i64_tensor` fall back to a default —
+            // e.g. an unresolved axis becomes 0, which turned the KittenTTS
+            // sine-source phase `CumSum` (axis=1) into a no-op over the size-1
+            // batch axis → dead harmonic oscillator → near-silent vocoder.
+            Dtype::I32 => data
+                .chunks_exact(4)
+                .map(|chunk| i64::from(i32::from_le_bytes(chunk.try_into().unwrap())))
+                .collect(),
             Dtype::BOOL => data.iter().map(|&b| i64::from(b != 0)).collect(),
             _ => continue,
         };

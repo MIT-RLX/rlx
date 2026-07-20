@@ -401,7 +401,35 @@ pub fn lower_with_env(
             }
             Op::Cast { to } => {
                 let x = lookup(&env, node.inputs[0])?;
-                ops::cast(x, *to)?
+                let src = graph.node(node.inputs[0]).shape.dtype();
+                // MLX astype covers every scalar dtype pair natively. Two
+                // gaps go off the native path:
+                //   * complex (source or dest): MLX has no complex dtype in
+                //     `map_dtype`; host-cast via rlx-cpu's exact semantics.
+                //     C64 uses the f32-interleaved layout (`mlx_cast_c64`);
+                //     C128 uses the f64-interleaved layout (`mlx_cast_c128`).
+                //     A cast that mentions C128 on either side (incl.
+                //     C64↔C128) routes to the C128 helper; a purely-C64 cast
+                //     routes to the C64 helper.
+                //   * F64: astype touching float64 is routed to MLX's CPU
+                //     stream inside the C++ shim (`rlx_mlx_op_cast`), since
+                //     the Metal GPU stream rejects float64. Handled there,
+                //     so it stays on the native `ops::cast` path here.
+                if to.is_complex() || src.is_complex() {
+                    let out_shape: Vec<usize> = node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect();
+                    if *to == DType::C128 || src == DType::C128 {
+                        mlx_cast_c128(x, src, *to, &out_shape)?
+                    } else {
+                        mlx_cast_c64(x, src, *to, &out_shape)?
+                    }
+                } else {
+                    ops::cast(x, *to)?
+                }
             }
             Op::Softmax { axis } => {
                 let x = lookup(&env, node.inputs[0])?;

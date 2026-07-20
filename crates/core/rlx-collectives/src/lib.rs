@@ -21,6 +21,11 @@
 //! * [`all_reduce`] — sum a tensor across ranks (shape preserved). The
 //!   primitive a tensor-parallel layer needs after its row-sharded
 //!   `o_proj` / `down_proj`.
+//! * [`all_to_all`] — transpose equal chunks across ranks (MoE pad primitive).
+//! * [`moe_dispatch`] / [`moe_combine`] — WideEP expert-parallel MoE over
+//!   [`ProcessGroup::all_to_all_v`](rlx_driver::ProcessGroup::all_to_all_v)
+//!   (see [`moe_ep`]); builder [`moe_ep_ffn`]. EPLB: [`rebalance_placement`] /
+//!   [`register_ep_placement`] (see [`eplb`]).
 //! * [`all_gather`] — concatenate each rank's shard along axis 0
 //!   (extent ×= world size). The inverse of `reduce_scatter`.
 //! * [`reduce_scatter`] — sum across ranks, then keep this rank's axis-0
@@ -86,8 +91,22 @@
 //! can never enter (Cortex-M's trainer runs its graph on CPU, where collectives
 //! do work). None fake a kernel.
 
+pub mod eplb;
 pub mod mesh;
+pub mod moe_ep;
 pub mod planner;
+
+pub use eplb::{
+    all_reduce_hits, count_hits_f32, default_placement, experts_on_rank, local_id_on_owner,
+    local_id_on_rank, lookup_ep_placement, lookup_ep_replicas, migrate_to_placement,
+    migrate_to_replica_map, owner_of, pick_dispatch_rank, rebalance_placement,
+    rebalance_with_replicas, register_ep_placement, register_ep_replicas, replica_map_from_placement,
+    shard_expert_weights, shard_expert_weights_slots, unregister_ep_placement,
+    unregister_ep_replicas, EpReplicaMap,
+};
+pub use moe_ep::{
+    DISPATCH_META, MOE_COMBINE, MOE_DISPATCH, MoeEpConfig, moe_combine, moe_dispatch, moe_ep_ffn,
+};
 
 /// One-import front door for authoring distributed graphs and wiring a group.
 ///
@@ -113,10 +132,15 @@ pub mod planner;
 pub mod prelude {
     // In-graph collective op builders + the group registry (this crate).
     pub use crate::{
-        AsyncAllReduce, all_gather, all_reduce, all_reduce_op, all_reduce_op_mode, all_to_all,
-        broadcast, copy_to_model_parallel, ppermute, recv, reduce, reduce_from_model_parallel,
+        AsyncAllReduce, EpReplicaMap, MoeEpConfig, all_gather, all_reduce, all_reduce_hits,
+        all_reduce_op, all_reduce_op_mode, all_to_all, broadcast, copy_to_model_parallel,
+        count_hits_f32, default_placement, migrate_to_placement, migrate_to_replica_map,
+        moe_combine, moe_dispatch, moe_ep_ffn, ppermute, rebalance_placement,
+        rebalance_with_replicas, recv, reduce, reduce_from_model_parallel,
         reduce_from_model_parallel_op, reduce_op, reduce_scatter, reduce_scatter_op, register,
-        register_group, send, start_all_reduce, unregister_group,
+        register_ep_placement, register_ep_replicas, register_group, send, shard_expert_weights,
+        shard_expert_weights_slots, start_all_reduce, unregister_ep_placement,
+        unregister_ep_replicas, unregister_group,
     };
     // Device mesh + placement planner.
     pub use crate::{mesh, planner};
@@ -753,6 +777,7 @@ pub fn register() {
     register_cpu_kernel(Arc::new(PpermuteCpu));
     register_cpu_kernel(Arc::new(SendCpu));
     register_cpu_kernel(Arc::new(RecvCpu));
+    moe_ep::register_moe_ep();
 }
 
 /// Insert an all-reduce (sum across the group registered under

@@ -46,6 +46,8 @@ pub use config::{CudaRuntimeConfig, install_runtime_config, reload_runtime_confi
 pub use supported_ops::SUPPORTED_OPS;
 pub mod calibrate;
 pub mod collective_host;
+#[cfg(feature = "nccl")]
+pub mod distributed;
 #[cfg(feature = "cufft")]
 pub mod cufft_dispatch;
 pub mod device;
@@ -80,6 +82,7 @@ pub mod log_mel_host {
 pub mod lstm_host {
     pub use super::host_ops::run_lstm;
 }
+pub mod lstm_gpu;
 pub mod ms_deform_attn_host {
     pub use super::host_ops::run_ms_deform_attn;
 }

@@ -184,6 +184,16 @@ pub(crate) fn thunk_kind_name(t: &Thunk) -> &'static str {
         Thunk::CopyI64 { .. } => "CopyI64",
         Thunk::CastF32ToI64 { .. } => "CastF32ToI64",
         Thunk::CastF64ToF32 { .. } => "CastF64ToF32",
+        Thunk::CastF64ToI64 { .. } => "CastF64ToI64",
+        Thunk::CastF64ToI32 { .. } => "CastF64ToI32",
+        Thunk::CastF64ToBool { .. } => "CastF64ToBool",
+        Thunk::CastI64ToI32 { .. } => "CastI64ToI32",
+        Thunk::CastI64ToF64 { .. } => "CastI64ToF64",
+        Thunk::CastI32ToF64 { .. } => "CastI32ToF64",
+        Thunk::CastF32ToF16 { .. } => "CastF32ToF16",
+        Thunk::CastF16ToF32 { .. } => "CastF16ToF32",
+        Thunk::CastF32ToBf16 { .. } => "CastF32ToBf16",
+        Thunk::CastBf16ToF32 { .. } => "CastBf16ToF32",
         Thunk::CastI64ToF32 { .. } => "CastI64ToF32",
         Thunk::CastBoolToI32 { .. } => "CastBoolToI32",
         Thunk::CastBoolToF32 { .. } => "CastBoolToF32",
@@ -193,6 +203,7 @@ pub(crate) fn thunk_kind_name(t: &Thunk) -> &'static str {
         Thunk::CastI32ToBool { .. } => "CastI32ToBool",
         Thunk::CastI64ToBool { .. } => "CastI64ToBool",
         Thunk::CastBoolToI64 { .. } => "CastBoolToI64",
+        Thunk::CastGeneric { .. } => "CastGeneric",
         Thunk::Transpose { .. } => "Transpose",
         Thunk::TransposeF64 { .. } => "TransposeF64",
         Thunk::Where { .. } => "Where",
@@ -715,6 +726,149 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 }
             }
 
+            Thunk::CastF64ToI64 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_f64(*src, base, len);
+                    let out = sl_mut_i64(*dst, base, len);
+                    // ONNX Cast float→int truncates toward zero.
+                    for i in 0..len {
+                        out[i] = inp[i] as i64;
+                    }
+                }
+            }
+
+            Thunk::CastF64ToI32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_f64(*src, base, len);
+                    let out = sl_mut_i32(*dst, base, len);
+                    // ONNX Cast float→int truncates toward zero.
+                    for i in 0..len {
+                        out[i] = inp[i] as i32;
+                    }
+                }
+            }
+
+            Thunk::CastF64ToBool { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                // f64 = 8 bytes, bool = 1 byte — copy the input out first to
+                // avoid aliasing the arena while writing the narrower output.
+                let inp = unsafe { sl_f64(*src, base, len).to_vec() };
+                for i in 0..len {
+                    arena_buf[*dst + i] = u8::from(inp[i] != 0.0);
+                }
+            }
+
+            Thunk::CastI64ToI32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_i64(*src, base, len).to_vec();
+                    let out = sl_mut_i32(*dst, base, len);
+                    // Wrapping narrowing (matches Rust `as`, ONNX int→int).
+                    for i in 0..len {
+                        out[i] = inp[i] as i32;
+                    }
+                }
+            }
+
+            Thunk::CastI64ToF64 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_i64(*src, base, len).to_vec();
+                    let out = sl_mut_f64(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = inp[i] as f64;
+                    }
+                }
+            }
+
+            Thunk::CastI32ToF64 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                unsafe {
+                    let inp = sl_i32(*src, base, len).to_vec();
+                    let out = sl_mut_f64(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = inp[i] as f64;
+                    }
+                }
+            }
+
+            Thunk::CastF32ToF16 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                // f32 (4 bytes) → f16 (2 bytes). No sl_f16 accessor; copy the
+                // input out then write the LE f16 bytes into the arena.
+                let inp = unsafe { sl(*src, base, len).to_vec() };
+                for i in 0..len {
+                    let h = half::f16::from_f32(inp[i]);
+                    arena_buf[*dst + i * 2..*dst + i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+                }
+            }
+
+            Thunk::CastF16ToF32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                // f16 (2 bytes) → f32 (4 bytes). Read the LE f16 bytes first,
+                // then write the widened f32 output.
+                let bytes: Vec<u8> = arena_buf[*src..*src + len * 2].to_vec();
+                unsafe {
+                    let out = sl_mut(*dst, base, len);
+                    for i in 0..len {
+                        out[i] = half::f16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]).to_f32();
+                    }
+                }
+            }
+
+            Thunk::CastF32ToBf16 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                let inp = unsafe { sl(*src, base, len).to_vec() };
+                for i in 0..len {
+                    let h = half::bf16::from_f32(inp[i]);
+                    arena_buf[*dst + i * 2..*dst + i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+                }
+            }
+
+            Thunk::CastBf16ToF32 { src, dst, len } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                let bytes: Vec<u8> = arena_buf[*src..*src + len * 2].to_vec();
+                unsafe {
+                    let out = sl_mut(*dst, base, len);
+                    for i in 0..len {
+                        out[i] =
+                            half::bf16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]).to_f32();
+                    }
+                }
+            }
+
             Thunk::CastF32ToI32 { src, dst, len } => {
                 let len = *len as usize;
                 if len == 0 {
@@ -851,6 +1005,20 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         out[i] = if inp[i] != 0 { 1.0 } else { 0.0 };
                     }
                 }
+            }
+
+            Thunk::CastGeneric {
+                src,
+                dst,
+                len,
+                src_dtype,
+                dst_dtype,
+            } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                exec_cast_generic(*src, *dst, len, *src_dtype, *dst_dtype, base);
             }
 
             Thunk::CastF32ToBool { src, dst, len } => {
@@ -3302,6 +3470,31 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     idx[d] = 0;
                                 }
                             }
+                        } else if *elem_bytes == 16 {
+                            // 16-byte dtypes (C128 = 2×f64 native / 4×f32 lanes).
+                            // Copy each element as two i64 words; without this
+                            // branch the `else` f32 path below reads 4 bytes per
+                            // element and shatters the complex element (keeps only
+                            // the first f32, drops the other 12 bytes).
+                            let inp = sl_i64(*src, base, in_total * 2);
+                            let out = sl_mut_i64(*dst, base, total * 2);
+                            let mut idx = vec![0usize; rank];
+                            for o in 0..total {
+                                let mut src_idx = 0usize;
+                                for d in 0..rank {
+                                    src_idx += idx[d] * in_strides[d] as usize;
+                                }
+                                let s = broadcast_src_index(src_idx, in_total);
+                                out[o * 2] = inp[s * 2];
+                                out[o * 2 + 1] = inp[s * 2 + 1];
+                                for d in (0..rank).rev() {
+                                    idx[d] += 1;
+                                    if idx[d] < out_dims[d] as usize {
+                                        break;
+                                    }
+                                    idx[d] = 0;
+                                }
+                            }
                         } else {
                             let inp = sl(*src, base, in_total);
                             let out = sl_mut(*dst, base, total);
@@ -3484,7 +3677,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 } // total != 0
             }
 
-            Thunk::CustomOp { .. } => exec_custom_op(thunk, base),
+            Thunk::CustomOp { .. } => exec_custom_op(thunk, base, arena_buf.len()),
             Thunk::Reverse { .. } => exec_reverse(thunk, base),
         }
         if trace_done {

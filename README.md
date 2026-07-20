@@ -15,6 +15,13 @@ Hexagon (QNN) NPUs, and microcontrollers (Cortex-M).
 > are mature; CUDA / ROCm / TPU / WGPU work but have seen less mileage;
 > Cortex-M is a separate INT8 product. Multi-backend runtime helpers
 > (`GraphDevices`, `DeviceRouter`) — see [`docs/backend-selection.md`](docs/backend-selection.md).
+> **Since 0.2.13** (in tree): offline **`rlx-bake`** (graph + weights →
+> optimized deployable `*.rlx`, optional encrypt — [`docs/rlx-bake.md`](docs/rlx-bake.md));
+> on-device **C64** complex binary/cast across CUDA / ROCm / Vulkan / wgpu /
+> oneAPI (+ `DType::C128` cast plumbing); **WideEP** MoE
+> (`collective.moe_dispatch` / `moe_combine` + EPLB) and a CUDA **NCCL**
+> collectives scaffold (`rlx-cuda --features nccl`); native CUDA **LSTM**.
+> See [`docs/distributed.md`](docs/distributed.md) and [`CHANGELOG.md`](CHANGELOG.md).
 > **0.2.13** added a Qualcomm **Hexagon / QNN** NPU backend
 > (`Device::Hexagon` — codegen + FFI, on-device INT8/INT4 `QMatMul`,
 > context-binary save/load, fused attention), cuDNN **fused
@@ -212,8 +219,9 @@ real-input spectra and signal-processing workflows:
   and frequency-domain convolution
 
 Pow-2 **f32** transforms run native GPU kernels (CUDA / ROCm / Metal / wgpu);
-non-pow2 uses Bluestein/chirp-z, and f64 / C64 run on the host CPU path (wgpu —
-whose arena is f32-only — rejects them). The `native-gpu-fft` feature adds the
+non-pow2 uses Bluestein/chirp-z, and f64 / C64 FFT still run on the host CPU
+path (wgpu packs complex into its f32-uniform arena for elementwise C64/C128
+cast + C64 arithmetic, but not for FFT). The `native-gpu-fft` feature adds the
 on-chip single-kernel radix-2/4/8 path (Metal / wgpu), CPU radix-4, and rayon
 batch parallelism. Runtime toggles: `RLX_FFT_FAST`, `RLX_FFT_RADIX`,
 `RLX_FFT_CPU_PARALLEL`, `RLX_FFT_RADIX4`, `RLX_FFT_FUSE_REAL`.
@@ -328,8 +336,11 @@ RANK=1 WORLD=2 TOPOLOGY=iroh RLX_IROH_SEED=cafe1234 RLX_DEVICE=cuda \
   cargo run -p rlx-vision-bench --features iroh -- --model cnn --epochs 5
 ```
 
-In-graph collectives (`collective.all_reduce`, …) come from the `distributed`
-feature (`rlx::distributed`); the ship-graph fabric ships a `TrainSpec` to
+In-graph collectives (`collective.all_reduce`, `moe_dispatch` /
+`moe_combine`, …) come from the `distributed` feature (`rlx::distributed`);
+WideEP expert-parallel MoE + EPLB live in `rlx-collectives`, with an optional
+CUDA NCCL path (`rlx-cuda --features nccl`) for device-resident
+`all_reduce` / `all_to_all`. The ship-graph fabric ships a `TrainSpec` to
 model-agnostic workers that train on each node's fastest hardware. See
 [`docs/distributed.md`](docs/distributed.md) and
 [`docs/iroh-transport.md`](docs/iroh-transport.md).
@@ -466,17 +477,21 @@ rlx-cpu        CPU kernels (NEON / AVX / Accelerate / OpenBLAS)
 rlx-metal      Apple Metal native (MSL + MPSGraph + ICB)
 rlx-mlx        Apple MLX (vendored, hand-rolled C++ shim)
 rlx-coreml     Apple CoreML / Neural Engine (IR → MIL ML Program; Device::Ane)
-rlx-cuda       NVIDIA CUDA (cuBLAS + cuDNN + NVRTC + Graphs)
+rlx-cuda       NVIDIA CUDA (cuBLAS + cuDNN + NVRTC + Graphs; optional NCCL)
 rlx-rocm       AMD ROCm/HIP (hipBLAS + MIOpen + hipGraph)
 rlx-tpu        Google TPU via libtpu PJRT
 rlx-wgpu       Cross-platform GPU via wgpu
+rlx-vulkan     native Vulkan compute (ash + SPIR-V)
+rlx-oneapi     Intel oneAPI Level Zero (SPIR-V)
 rlx-qnn        Qualcomm Hexagon / QNN codegen + FFI runtime (Device::Hexagon)
 rlx-gpu-host   shared host-fallback staging (D2H → CPU → H2D) for GPU backends
+rlx-collectives in-graph collectives (all_reduce, WideEP moe_dispatch/combine, EPLB)
 rlx-cortexm    ARMv7E-M INT8 kernels (no_std)
 rlx-fpga       IR → Verilog → bitstream
 rlx-runtime    user-facing Session / CompiledGraph
 rlx-check      static graph checker (shape / dispatch / fusion / NaN lint; `cargo rlx check`)
 rlx-gguf       standalone GGUF parser + dequant (every llama.cpp scheme: Q4_0..Q8_0, Q2_K..Q8_K, IQ1..IQ4, TQ1/TQ2, MXFP4, NVFP4)
+rlx-bake       offline bake: graph + weights → optimized `*.rlx` (optional encrypt)
 rlx-macros     #[rlx_model] AOT macro
 rlx-bench      benchmark harness
 rlx-sparse     downstream: CSR LU / mat-vec / CG (custom-op scaffold)
@@ -518,9 +533,10 @@ Topic guides live in [`docs/`](docs/README.md); the most useful entry points:
 | [`backend-selection.md`](docs/backend-selection.md) | runtime device switching — `GraphDevices`, `DeviceRouter`, cost-based picking |
 | [`gguf-backend-paths.md`](docs/gguf-backend-paths.md) | GGUF quant schemes and each backend's dequant / fused-GEMV path |
 | [`weight-compute-caching.md`](docs/weight-compute-caching.md) | computing weight-derived tensors once, not every forward |
+| [`rlx-bake.md`](docs/rlx-bake.md) | offline bake: graph + weights → optimized / encrypted `*.rlx` |
 | [`fpga-export.md`](docs/fpga-export.md) | IR → SystemVerilog → bitstream export |
 | [`scaled-matmul-fp8.md`](docs/scaled-matmul-fp8.md) | native FP8 / FP6 / FP4 GEMM + `fNeXmY` minifloats |
-| [`distributed.md`](docs/distributed.md) / [`iroh-transport.md`](docs/iroh-transport.md) | data / tensor-parallel training + NAT-traversing transport |
+| [`distributed.md`](docs/distributed.md) / [`iroh-transport.md`](docs/iroh-transport.md) | data / tensor / expert-parallel training + NAT-traversing transport |
 | [`nan-debugging.md`](docs/nan-debugging.md) | `RLX_DEBUG_NANS` / `RLX_LINT_NUMERICS` NaN / Inf localization |
 | [`extending.md`](docs/extending.md) | extension seams for downstream crates (custom ops / stages) |
 | [`development.md`](docs/development.md) | contributor workflow, gates, and conventions |
@@ -630,9 +646,10 @@ LAMB / Adafactor / SOAP / Muon / Sophia / MARS.
   backend does on-device gradient training behind the `training` feature.
 - **Quantization-aware training** — PTQ + straight-through estimator + LSQ
   (EMA / Fixed / PerBatch scale modes).
-- **Distributed data- / tensor-parallel** training with NAT-traversing
-  transport — see [`docs/distributed.md`](docs/distributed.md) and
-  [`docs/iroh-transport.md`](docs/iroh-transport.md) (the `rlx-vision-bench`
+- **Distributed data- / tensor- / expert-parallel** training with NAT-traversing
+  transport — WideEP MoE (`moe_dispatch` / `moe_combine` + EPLB) and optional
+  CUDA NCCL (`--features nccl`); see [`docs/distributed.md`](docs/distributed.md)
+  and [`docs/iroh-transport.md`](docs/iroh-transport.md) (the `rlx-vision-bench`
   trainer is the multi-dataset, multi-machine harness).
 - **NaN / Inf localization** during training via `RLX_DEBUG_NANS` —
   [`docs/nan-debugging.md`](docs/nan-debugging.md).
@@ -644,13 +661,13 @@ LAMB / Adafactor / SOAP / Muon / Sophia / MARS.
 | CPU forward + backward       | Mature; 26 unit tests + integration suites    |
 | Apple Metal forward          | Mature; 78-warning third-party noise silenced |
 | Apple MLX forward + backward | Mature; tier-1/2/3 backward parity            |
-| NVIDIA CUDA                  | Functional; less battle-tested                |
+| NVIDIA CUDA                  | Functional; less battle-tested; optional NCCL (`--features nccl`); native LSTM |
 | AMD ROCm                     | Sister-crate parity to CUDA                   |
 | TPU                          | Real-model E2E parity (MiniLM-L6) via PJRT    |
-| WGPU                         | Functional; coop-matrix paths under test      |
+| WGPU                         | Functional; coop-matrix paths under test; on-device C64/C128 cast + C64 arithmetic |
 | Apple CoreML / ANE (`Device::Ane`) | Full transformer block on-device (IR → MIL ML Program), on-device Q8_0/Q4_0 dequant; backward + on-device gradient training behind the `training` feature |
-| Native Vulkan (`Device::Vulkan`) | `ash` + SPIR-V: ~29 native kernels + host-fallback for the rest; parity validated on MoltenVK / lavapipe (native-driver validation pending) |
-| Intel oneAPI (`Device::OneApi`) | Level Zero + SPIR-V; falls back to a CPU reference when no L0 GPU/kernels; packed DiT reverse kernels |
+| Native Vulkan (`Device::Vulkan`) | `ash` + SPIR-V: ~29 native kernels + host-fallback for the rest; on-device C64/C128 cast + C64 arithmetic; parity validated on MoltenVK / lavapipe (native-driver validation pending) |
+| Intel oneAPI (`Device::OneApi`) | Level Zero + SPIR-V; falls back to a CPU reference when no L0 GPU/kernels; packed DiT reverse kernels; on-device C64/C128 cast + C64 arithmetic |
 | Qualcomm Hexagon (QNN)       | Codegen + FFI runtime (`Device::Hexagon`): on-device INT8/INT4 `QMatMul`, `DequantMatMul`, `FusedAttentionBlock`, persistent session + context-binary save/load; x86 HTP functional sim (`just qnn-htp-sim`) |
 | Cortex-M (INT8)              | Production: 96.6% MNIST on nRF52840 hardware  |
 | FPGA                         | First-class SystemVerilog / bitstream export (`rlx_runtime::export`, `pyrlx.export_fpga`); Int8/Int4/Fp4, soft-port RTL + ECP5 / iCE40 / Xilinx7 synth |
@@ -667,6 +684,9 @@ LAMB / Adafactor / SOAP / Muon / Sophia / MARS.
 | SPD-manifold Riemannian primitives | `SpdKarcherMeanWeighted` / `SpdLogMap` / `SpdExpMap` / `SpdParallelTransport` / `SpdMatrixFnBatch` as first-class ops on all backends, fully differentiable (analytic Riemannian VJPs, incl. the base point). |
 | Static graph checker            | `rlx_runtime::check` folds shape/dtype verify + backend dispatch + missed-fusion hints + provable-NaN/Inf lint into one `CheckReport`; `cargo rlx check` (`--json`) and `#[rlx_model(check)]` (`RLX_CHECK`). |
 | Weight-compute caching          | Compile-time `CompileOptions::param_bindings` (bake + broadcasting `ConstantFolding`) and run-time `cache_param_invariant` / `RLX_CACHE_PARAM_INVARIANT=1` (split prepare graph) compute weight-derived tensors once, not every forward. Validated CPU + CUDA. |
+| Offline bake (`rlx-bake`)       | Merge graph + weights into a deployable `*.rlx` (skip-zero / ternary TQ2_0 / opt-in Q8_0, optional encrypt). CLI + crate; walkthrough [`docs/rlx-bake.md`](docs/rlx-bake.md). |
+| Complex dtypes (`C64` / `C128`) | `DType::C64` arithmetic (add/sub/mul/div) + cast matrix on CPU and on-device CUDA / ROCm / Vulkan / wgpu / oneAPI; `DType::C128` cast plumbing (arithmetic remains C64-only). Parity tests per backend. |
+| WideEP MoE + NCCL               | Host `moe_dispatch` / `moe_combine` + EPLB (`rlx-collectives::{moe_ep,eplb}`); CUDA NCCL scaffold for device-resident `all_reduce` / `all_to_all` (`rlx-cuda --features nccl`). Toy: `wide_ep_toy` / `nccl_all_reduce_toy`. See [`docs/distributed.md`](docs/distributed.md). |
 
 ## Authors
 

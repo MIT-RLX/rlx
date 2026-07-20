@@ -110,7 +110,7 @@ Vulkan/DX12 visibility correct.
 | `RLX_WGPU_COOP_F16_VK_LOAD_T=1` | Force `coopLoadT` on B when `RLX_WGPU_COOP_F16_VK_LARGE_N=1` and N > 768 |
 | `RLX_WGPU_NO_COOP_F32=1` | Disable CoopF32 on Metal |
 | `RLX_WGPU_FORCE_COOP_F32=1` | Opt-in CoopF32 on Vulkan (portable 8×8; correctness not validated) |
-| `RLX_WGPU_FORCE_INPUT_UPLOAD=1` | Always upload inputs (disable hash-based skip) |
+| `RLX_WGPU_FORCE_INPUT_UPLOAD=1` | No-op (inputs are always re-uploaded; kept for older scripts) |
 | `RLX_BENCH_DISPATCH_ONLY=1` | Skip output readback (micro-benchmarks) |
 | `RLX_WGPU_F16_WEIGHTS=1` | Legacy f16-storage matmul experiment |
 | `RLX_WGPU_SCHEDULE=1` | Log compiled dispatch schedule |

@@ -17,8 +17,9 @@ use rlx_ir::Op;
 
 use crate::kernels::{
     AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams, AttentionBwdParams,
-    AttentionParams, BatchElementwiseRegionParams, BinaryParams, Conv1dParams, Conv2dParams,
-    Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
+    AttentionParams, BatchElementwiseRegionParams, BinaryC64Params, BinaryParams, Conv1dParams,
+    Conv2dParams, ComplexCastParams,
+    Conv3dParams, CopyParams, CastParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
     ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
     FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatedDeltaNetParams,
     GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
@@ -290,6 +291,27 @@ pub(crate) enum Step {
     },
     Copy {
         params: CopyParams,
+    },
+    /// Numeric `Op::Cast` compute pass (`cast.wgsl`): float→int truncate+
+    /// saturate, →Bool, or identity, on the f32-uniform arena. Distinct from
+    /// `Copy` (which is a value-preserving move) so the cast semantics are
+    /// explicit; identity casts still take the cheaper `BufferCopy` path.
+    Cast {
+        params: CastParams,
+    },
+    /// Standalone complex `Op::Cast` (`complex_cast.wgsl`): real↔C64,
+    /// real↔C128, C64↔C128 lane moves on the f32-uniform arena. Kept off the
+    /// fused-region path (the region kernel is scalar-per-f32-lane and cannot
+    /// re-pair complex lanes). Dispatched over the complex-element index.
+    ComplexCast {
+        params: ComplexCastParams,
+    },
+    /// C64 element-wise binary (`binary_c64.wgsl`): Add/Sub/Mul/Div with each
+    /// thread reading both `[re, im]` lanes of its operands. Excluded from
+    /// `fuse_elementwise_chains` (the fused scalar-per-thread kernel can't read
+    /// the partner `im` lane). Dispatched over the complex-element index.
+    BinaryC64 {
+        params: BinaryC64Params,
     },
     /// PLAN L2 — fused N-ary element-wise region. Lowered from
     /// `Op::ElementwiseRegion` by `MarkElementwiseRegions`. Kernel
@@ -850,6 +872,9 @@ impl Step {
             | Step::GatedResidualBackward { .. }
             | Step::Cumsum { .. }
             | Step::Copy { .. }
+            | Step::Cast { .. }
+            | Step::ComplexCast { .. }
+            | Step::BinaryC64 { .. }
             | Step::ElementwiseRegion { .. }
             | Step::BatchElementwiseRegion { .. }
             | Step::Argmax { .. }
@@ -1026,6 +1051,9 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::RngUniformHost { .. } => "rng_uniform_host",
         Step::BufferCopy { .. } => "buffer_copy",
         Step::Copy { .. } => "copy",
+        Step::Cast { .. } => "cast",
+        Step::ComplexCast { .. } => "complex_cast",
+        Step::BinaryC64 { .. } => "binary_c64",
         Step::Transpose { .. } => "transpose",
         Step::Narrow { .. } => "narrow",
         Step::Concat { .. } => "concat",

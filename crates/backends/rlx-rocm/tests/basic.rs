@@ -595,7 +595,7 @@ fn kernel_sources_are_reachable() {
     assert!(!IM2COL_CU.is_empty());
     assert!(!DEQUANT_GGUF_CU.is_empty());
     assert!(!WELCH_PEAKS_CU.is_empty());
-    assert_eq!(KERNEL_COUNT, 49);
+    assert_eq!(KERNEL_COUNT, 51);
 }
 
 #[test]

@@ -203,8 +203,22 @@ pub(super) fn lower_if_stub(
         );
     }
     ctx.record_stub(node, "If");
-    for out_name in &node.outputs {
-        let sh = Shape::new(&[1, 1, ctx.opts.sequence_length], DType::F32);
+    // The stub normally guesses `[1, 1, sequence_length]`. That is wrong for KittenTTS'
+    // F0→vocoder `If`, which ORT evaluates to its then/Squeeze branch: a rank-2 `[1, mel]`
+    // at mel resolution (mel = max_wave/300). The wrong rank + resolution makes the
+    // downstream `Unsqueeze → f0_upsamp/Resize` collapse into a zero Param stub, so the NSF
+    // sine source reads garbage and the vocoder is noise-only. When `RLX_KITTEN_IF_STUB_META`
+    // is set, adopt the node's declared `output_meta` shape (which the kitten bundle patch
+    // pins to `[1, mel_cap]`) instead of the guess. Gated so no other `If`-using model
+    // (moss / chatterbox / f5tts / luxtts-zipformer) changes behaviour.
+    let use_meta = std::env::var("RLX_KITTEN_IF_STUB_META").is_ok();
+    for (i, out_name) in node.outputs.iter().enumerate() {
+        let sh = use_meta
+            .then(|| node.output_meta.get(i))
+            .flatten()
+            .and_then(|meta| resolve_shape(meta, ctx.opts).ok())
+            .filter(|s| !s.dims().is_empty() && s.num_elements().is_some())
+            .unwrap_or_else(|| Shape::new(&[1, 1, ctx.opts.sequence_length], DType::F32));
         let key = format!("__stub__/{}", out_name);
         let n = sh.num_elements().unwrap_or(1).min(MAX_STUB_ELEMENTS);
         let id = m.param(&key, sh);

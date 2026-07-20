@@ -662,7 +662,7 @@ impl ExecutableGraph for CpuExecutable {
             for (name, data, dt) in inputs {
                 let direct = matches!(
                     *dt,
-                    DType::F64 | DType::I32 | DType::I64 | DType::U32 | DType::C64
+                    DType::F64 | DType::I32 | DType::I64 | DType::U32 | DType::C64 | DType::C128
                 );
                 if direct {
                     if let Some(&id) = self.input_ids.get(*name) {
@@ -719,6 +719,7 @@ impl ExecutableGraph for CpuExecutable {
                         | DType::I64
                         | DType::U32
                         | DType::C64
+                        | DType::C128
                 ) {
                     let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
                     let n_bytes = n_elems * exec_dtype.size_bytes();

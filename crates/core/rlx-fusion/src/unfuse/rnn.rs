@@ -1224,6 +1224,156 @@ pub(super) fn unfuse_selective_scan(
     let Op::SelectiveScan { state_size } = &node.op else {
         unreachable!()
     };
+    // Default: the compact `Op::Scan`-lowered form (S-independent node
+    // count — the backward stays `Op::ScanBackward` instead of a full
+    // ~20·S-node unroll). Set `RLX_SELSCAN_LEGACY_UNROLL=1` to force the
+    // legacy per-timestep unroll (kept for the parity gate that compares
+    // the two backwards in one build).
+    let legacy = std::env::var("RLX_SELSCAN_LEGACY_UNROLL")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if legacy {
+        unfuse_selective_scan_legacy(node, new_inputs, out, *state_size)
+    } else {
+        unfuse_selective_scan_scan(node, new_inputs, out, *state_size)
+    }
+}
+
+/// Compact lowering of `Op::SelectiveScan` into a single `Op::Scan`
+/// (`save_trajectory: true`) surrounded by S-independent elementwise
+/// pre/post-scan graphs (~20 nodes total, regardless of sequence
+/// length). The forward is numerically identical to the legacy unroll
+/// and to the native CPU kernel; the backward reuses the generic scan
+/// VJP (`vjp_scan` → `Op::ScanBackward` + `Op::ScanBackwardXs`), which
+/// never re-unrolls when `length > SCAN_DECOMPOSE_MAX_LENGTH`.
+///
+/// Recurrence (state resets to 0 per batch row — here each batch lane
+/// is an independent slot of the `[B,H,N]` carry, init = 0):
+///   ā_t = exp(δ_t · A)                         [S,B,H,N]
+///   u_t = δ_t · B_t · x_t                       [S,B,H,N]
+///   h_t = ā_t · h_{t-1} + u_t   (h_{-1}=0)      carry [B,H,N]
+///   y_t = Σ_n C_t · h_t                         [B,S,H]
+///
+/// Inputs: x [B,S,H], delta [B,S,H], a [H,N], b [B,S,N], c [B,S,N].
+fn unfuse_selective_scan_scan(
+    node: &rlx_ir::Node,
+    new_inputs: Vec<NodeId>,
+    out: &mut Graph,
+    n: usize,
+) -> NodeId {
+    use rlx_ir::op::{Activation, BinaryOp, ReduceOp};
+
+    let in_x = new_inputs[0];
+    let in_delta = new_inputs[1];
+    let in_a = new_inputs[2];
+    let in_b = new_inputs[3];
+    let in_c = new_inputs[4];
+
+    let x_shape = out.node(in_x).shape.clone();
+    let dtype = x_shape.dtype();
+    let b_dim = match x_shape.dim(0) {
+        Dim::Static(v) => v,
+        _ => panic!("SelectiveScan unfuse: dynamic B"),
+    };
+    let s_dim = match x_shape.dim(1) {
+        Dim::Static(v) => v,
+        _ => panic!("SelectiveScan unfuse: dynamic S"),
+    };
+    let h_dim = match x_shape.dim(2) {
+        Dim::Static(v) => v,
+        _ => panic!("SelectiveScan unfuse: dynamic H"),
+    };
+
+    // Common shapes (all f32/dtype-carrying, time axis leading).
+    let sh = |dims: &[usize]| -> IrShape {
+        IrShape::from_dims(
+            &dims.iter().map(|&d| Dim::Static(d)).collect::<Vec<_>>(),
+            dtype,
+        )
+    };
+    let sbh = sh(&[s_dim, b_dim, h_dim]);
+    let sbn = sh(&[s_dim, b_dim, n]);
+    let sbh1 = sh(&[s_dim, b_dim, h_dim, 1]);
+    let sb1n = sh(&[s_dim, b_dim, 1, n]);
+    let sbhn = sh(&[s_dim, b_dim, h_dim, n]);
+    let a_11hn = sh(&[1, 1, h_dim, n]);
+    let bhn = sh(&[b_dim, h_dim, n]);
+    let bsh = sh(&[b_dim, s_dim, h_dim]);
+
+    // Transpose the time axis to the front: [B,S,·] → [S,B,·].
+    let t102 = vec![1usize, 0, 2];
+    let x_sbh = out.add_node(Op::Transpose { perm: t102.clone() }, vec![in_x], sbh.clone());
+    let d_sbh = out.add_node(
+        Op::Transpose { perm: t102.clone() },
+        vec![in_delta],
+        sbh.clone(),
+    );
+    let b_sbn = out.add_node(Op::Transpose { perm: t102.clone() }, vec![in_b], sbn.clone());
+    let c_sbn = out.add_node(Op::Transpose { perm: t102.clone() }, vec![in_c], sbn.clone());
+
+    // ā = exp(δ · A):  δ [S,B,H,1] · A [1,1,H,N] → [S,B,H,N].
+    let d_sbh1 = out.reshape(
+        d_sbh,
+        vec![s_dim as i64, b_dim as i64, h_dim as i64, 1],
+        sbh1.clone(),
+    );
+    let a_r = out.reshape(in_a, vec![1, 1, h_dim as i64, n as i64], a_11hn.clone());
+    let da = out.binary(BinaryOp::Mul, d_sbh1, a_r, sbhn.clone());
+    let a_bar = out.activation(Activation::Exp, da, sbhn.clone());
+
+    // u = δ · B · x:  (δ·x) [S,B,H,1] · B [S,B,1,N] → [S,B,H,N].
+    let dx_sbh = out.binary(BinaryOp::Mul, d_sbh, x_sbh, sbh.clone());
+    let dx_sbh1 = out.reshape(
+        dx_sbh,
+        vec![s_dim as i64, b_dim as i64, h_dim as i64, 1],
+        sbh1.clone(),
+    );
+    let b_sb1n = out.reshape(
+        b_sbn,
+        vec![s_dim as i64, b_dim as i64, 1, n as i64],
+        sb1n.clone(),
+    );
+    let u_xs = out.binary(BinaryOp::Mul, dx_sbh1, b_sb1n, sbhn.clone());
+
+    // Zero initial carry h_{-1} = 0, shape [B,H,N].
+    let zero_bytes = vec![0u8; b_dim * h_dim * n * 4];
+    let init = out.add_node(Op::Constant { data: zero_bytes }, vec![], bhn.clone());
+
+    // Body `linrec`: inputs in NodeId order [carry, ā_t, u_t];
+    // out = carry · ā_t + u_t. (Order-sensitive — vjp_scan relies on
+    // the [carry, xs...] input ordering.)
+    let mut body = Graph::new("selscan_linrec");
+    let carry = body.input("carry", bhn.clone());
+    let a_t = body.input("a_t", bhn.clone());
+    let u_t = body.input("u_t", bhn.clone());
+    let damped = body.binary(BinaryOp::Mul, carry, a_t, bhn.clone());
+    let next = body.binary(BinaryOp::Add, damped, u_t, bhn.clone());
+    body.set_outputs(vec![next]);
+
+    // Scan over the time axis, keeping the full trajectory [S,B,H,N].
+    let traj = out.scan_trajectory_with_xs(init, &[a_bar, u_xs], body, s_dim as u32);
+
+    // y_t = Σ_n C_t · h_t:  traj [S,B,H,N] · C [S,B,1,N] → sum over n.
+    let c_sb1n = out.reshape(
+        c_sbn,
+        vec![s_dim as i64, b_dim as i64, 1, n as i64],
+        sb1n.clone(),
+    );
+    let cy = out.binary(BinaryOp::Mul, traj, c_sb1n, sbhn.clone());
+    let y_sbh = out.reduce(cy, ReduceOp::Sum, vec![3], false, sbh.clone());
+
+    // Back to [B,S,H] to match the SelectiveScan output layout.
+    let y_bsh = out.add_node(Op::Transpose { perm: t102 }, vec![y_sbh], bsh);
+    debug_assert_eq!(out.node(y_bsh).shape.dims(), node.shape.dims());
+    y_bsh
+}
+
+fn unfuse_selective_scan_legacy(
+    node: &rlx_ir::Node,
+    new_inputs: Vec<NodeId>,
+    out: &mut Graph,
+    state_size: usize,
+) -> NodeId {
     {
         // Mamba SSM step. Decomposes by unrolling the time
         // loop (which makes every primitive a normal IR op
@@ -1243,7 +1393,7 @@ pub(super) fn unfuse_selective_scan(
         // unrolls the time loop because MLX has no native
         // scan primitive); this version emits IR nodes
         // instead of MLX arrays.
-        let n = *state_size;
+        let n = state_size;
         let in_x = new_inputs[0];
         let in_delta = new_inputs[1];
         let in_a = new_inputs[2];

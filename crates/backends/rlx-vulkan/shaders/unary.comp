@@ -3,6 +3,11 @@
 // op ids (see backend.rs Activation mapping):
 //  0 gelu 1 gelu_approx 2 silu 3 relu 4 sigmoid 5 tanh 6 exp 7 log
 //  8 sqrt 9 rsqrt 10 neg 11 abs 12 sin 13 cos 14 tan 15 atan 16 round
+// Cast op ids (f32-uniform arena; the dst dtype value is stored back as f32 —
+// see `classify_cast` in backend.rs, kept in sync with unary.cu / unary.cl):
+//  100 f32->i8  101 f32->i16 102 f32->i32 103 f32->i64
+//  104 f32->u8  105 f32->u32 106 (x!=0)->bool   255 identity copy
+// float->int truncates toward zero + saturates (Rust `as` / rlx-cpu); NaN->0.
 layout(local_size_x = 256) in;
 
 
@@ -55,7 +60,16 @@ void main() {
         case 14u: y = tan(x); break;
         case 15u: y = atan(x); break;
         case 16u: y = floor(x + 0.5); break;               // round (half up)
-        default:  y = x; break;
+        // f32 -> int: truncate toward zero, saturate to dst range, NaN -> 0.
+        case 100u: y = isnan(x) ? 0.0 : clamp(trunc(x), -128.0, 127.0); break;
+        case 101u: y = isnan(x) ? 0.0 : clamp(trunc(x), -32768.0, 32767.0); break;
+        case 102u: y = isnan(x) ? 0.0 : clamp(trunc(x), -2147483648.0, 2147483647.0); break;
+        case 103u: y = isnan(x) ? 0.0 : clamp(trunc(x), -9223372036854775808.0, 9223372036854775807.0); break;
+        case 104u: y = isnan(x) ? 0.0 : clamp(trunc(x), 0.0, 255.0); break;
+        case 105u: y = isnan(x) ? 0.0 : clamp(trunc(x), 0.0, 4294967295.0); break;
+        // -> Bool: x != 0 ? 1 : 0 (NaN is non-zero -> 1, matching Rust).
+        case 106u: y = (x != 0.0) ? 1.0 : 0.0; break;
+        default:  y = x; break;                            // 255 = identity copy
     }
     arena_store(pc.out_off + i, y);
 }

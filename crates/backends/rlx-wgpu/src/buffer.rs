@@ -798,8 +798,6 @@ impl Arena {
     }
 
     /// Downcast host f32 data into the f16 shadow buffer at `id`'s slot.
-    /// Used when skipping redundant f32 `write_buffer` but CoopF16Vk still
-    /// needs a fresh f16 mirror (e.g. input upload hash cache hits).
     pub fn write_f16_shadow(&self, queue: &wgpu::Queue, id: NodeId, data: &[f32]) {
         self.write_f16_shadow_at(queue, self.offset(id), data);
     }

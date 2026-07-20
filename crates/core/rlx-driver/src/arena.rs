@@ -65,8 +65,8 @@ pub trait DeviceArena {
 /// Used by every CPU-resident-arena backend. GPU backends can call this
 /// after staging into a host buffer, then upload.
 ///
-/// Currently supports F32 / F64 / F16 / BF16 / C64. Other dtypes fall
-/// through to F32.
+/// Currently supports F32 / F64 / F16 / BF16 / C64 / C128. Other dtypes
+/// fall through to F32.
 pub unsafe fn write_typed_from_f32(dst_ptr: *mut u8, dtype: DType, src: &[f32], max_elems: usize) {
     let n = src.len().min(max_elems);
     match dtype {
@@ -96,6 +96,16 @@ pub unsafe fn write_typed_from_f32(dst_ptr: *mut u8, dtype: DType, src: &[f32], 
             let dst = dst_ptr as *mut f32;
             let n = src.len().min(max_elems.saturating_mul(2));
             std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
+        },
+        DType::C128 => unsafe {
+            // Interleaved [re, im, ...] f64 pairs (16 B/elem); `max_elems`
+            // is complex count. This is the f32 entry path: widen each
+            // interleaved f32 lane to f64 (values carry f32 precision).
+            let dst = dst_ptr as *mut f64;
+            let n = src.len().min(max_elems.saturating_mul(2));
+            for i in 0..n {
+                *dst.add(i) = src[i] as f64;
+            }
         },
         _ => unsafe {
             let dst = dst_ptr as *mut f32;
@@ -142,6 +152,17 @@ pub unsafe fn read_typed_to_f32(src_ptr: *const u8, dtype: DType, n_elems: usize
             // Interleaved [re, im, re, im, ...]; `n_elems` is complex count.
             let src = src_ptr as *const f32;
             std::slice::from_raw_parts(src, n_elems.saturating_mul(2)).to_vec()
+        },
+        DType::C128 => unsafe {
+            // Interleaved [re, im, ...] f64 pairs (16 B/elem); `n_elems` is
+            // complex count. f32 read path: narrow each f64 lane to f32.
+            let src = src_ptr as *const f64;
+            let lanes = n_elems.saturating_mul(2);
+            let mut out = Vec::with_capacity(lanes);
+            for i in 0..lanes {
+                out.push(*src.add(i) as f32);
+            }
+            out
         },
         _ => unsafe {
             let src = src_ptr as *const f32;

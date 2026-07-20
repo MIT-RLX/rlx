@@ -60,9 +60,12 @@ impl CudaExecutable {
         for &i in indices {
             let id = self.graph.outputs[i];
             let off_f32 = self.arena.offset(id) / 4;
-            let elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
-            debug_assert_eq!(self.output_staging[i].len(), elems);
-            let slot = self.arena.f32_buf().slice(off_f32..off_f32 + elems);
+            // Lane count, not element count — a complex output spans 2/4 f32
+            // lanes per element (see `arena_lane_count`); reading `num_elements`
+            // would truncate the readback to the real parts.
+            let lanes = crate::arena::arena_lane_count(&self.graph.node(id).shape);
+            debug_assert_eq!(self.output_staging[i].len(), lanes);
+            let slot = self.arena.f32_buf().slice(off_f32..off_f32 + lanes);
             self.output_staging[i].dtoh(stream, &slot)?;
         }
         Ok(())
@@ -83,9 +86,10 @@ impl CudaExecutable {
     ) -> Result<(), cudarc::driver::DriverError> {
         for (i, &id) in self.graph.outputs.iter().enumerate() {
             let off_f32 = self.arena.offset(id) / 4;
-            let elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
-            debug_assert_eq!(self.output_staging[i].len(), elems);
-            let slot = self.arena.f32_buf().slice(off_f32..off_f32 + elems);
+            // Lane count, not element count (complex → 2/4 lanes per element).
+            let lanes = crate::arena::arena_lane_count(&self.graph.node(id).shape);
+            debug_assert_eq!(self.output_staging[i].len(), lanes);
+            let slot = self.arena.f32_buf().slice(off_f32..off_f32 + lanes);
             self.output_staging[i].dtoh(stream, &slot)?;
         }
         Ok(())

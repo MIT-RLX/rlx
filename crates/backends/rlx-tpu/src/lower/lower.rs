@@ -51,8 +51,8 @@ impl<'a> LowerCtx<'a> {
 
             Op::Cast { to } => {
                 let x = self.hlo(n.inputs[0]);
-                let target = Shape::from_dt(*to, &out_shape.dimensions);
-                self.entry.convert(x, target)
+                let from = self.dtype(n.inputs[0]);
+                self.lower_cast(x, from, *to, &out_shape.dimensions)
             }
 
             // INT8 quantization, per-tensor (axis=None) or per-channel
@@ -637,9 +637,107 @@ impl<'a> LowerCtx<'a> {
                     data: LiteralData::U32(v),
                 }
             }
-            DType::C64 => panic!("rlx-tpu: DType::C64 (complex) not yet supported"),
+            DType::C64 => {
+                // Complex64 constants are stored as interleaved
+                // [re, im, re, im, ...] f32 pairs (8 bytes / element),
+                // which is exactly XLA's `c64s` wire layout.
+                let mut v = Vec::with_capacity(n * 2);
+                for i in 0..(n * 2) {
+                    let mut b = [0u8; 4];
+                    b.copy_from_slice(&data[i * 4..i * 4 + 4]);
+                    v.push(f32::from_le_bytes(b));
+                }
+                Literal {
+                    shape: shape.clone(),
+                    data: LiteralData::C64(v),
+                }
+            }
+            DType::C128 => {
+                // Complex128 constants are stored as interleaved
+                // [re, im, re, im, ...] f64 pairs (16 bytes / element),
+                // which is exactly XLA's `c128s` wire layout.
+                let mut v = Vec::with_capacity(n * 2);
+                for i in 0..(n * 2) {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&data[i * 8..i * 8 + 8]);
+                    v.push(f64::from_le_bytes(b));
+                }
+                Literal {
+                    shape: shape.clone(),
+                    data: LiteralData::C128(v),
+                }
+            }
         };
         self.entry.constant(lit)
+    }
+
+    // ── Cast ───────────────────────────────────────────────────
+
+    /// Lower `Op::Cast`. Real↔real casts map straight onto XLA
+    /// `convert`. Complex involvement uses the dedicated HLO ops
+    /// (`complex` / `real`) so the semantics are unambiguous. The
+    /// complex *component* type follows the width of the complex
+    /// dtype: C64 → F32 components, C128 → F64 components.
+    ///   * real → C64:  `complex(convert_f32(x), 0)` — imag = 0.
+    ///   * real → C128: `complex(convert_f64(x), 0)` — imag = 0.
+    ///   * C64 → real:  `real(x)` (F32), then convert to the requested
+    ///     real dtype if it isn't already F32.
+    ///   * C128 → real: `real(x)` (F64), then convert to the requested
+    ///     real dtype if it isn't already F64.
+    ///   * complex → complex: `convert` (covers C64↔C128 width change
+    ///     and same-dtype identity).
+    /// These match rlx's real↔complex cast semantics and XLA's
+    /// `convert` complex handling (which upstream disallows going the
+    /// complex direction, so we spell it out explicitly).
+    pub(crate) fn lower_cast(&self, x: i64, from: DType, to: DType, dims: &[i64]) -> i64 {
+        // Real component (prim + rlx DType) of a complex dtype.
+        fn complex_component(dt: DType) -> (i32, DType) {
+            match dt {
+                DType::C64 => (prim::F32, DType::F32),
+                DType::C128 => (prim::F64, DType::F64),
+                _ => unreachable!("complex_component on non-complex {dt:?}"),
+            }
+        }
+        match (from.is_complex(), to.is_complex()) {
+            // real → real: plain elementwise convert (handles every
+            // scalar pair — XLA `convert` covers int/float/bool).
+            (false, false) => self.entry.convert(x, Shape::array(prim_of(to), dims)),
+            // real → complex: XLA `complex(real, imag)` needs real
+            // operands of the target's component width (F32 for C64,
+            // F64 for C128); convert the source, then pair with a zero
+            // imaginary part.
+            (false, true) => {
+                let (comp_prim, comp_dt) = complex_component(to);
+                let re = if from == comp_dt {
+                    x
+                } else {
+                    self.entry.convert(x, Shape::array(comp_prim, dims))
+                };
+                let zero = if comp_dt == DType::F64 {
+                    self.entry.constant_f64_scalar(0.0)
+                } else {
+                    self.entry.constant_f32_scalar(0.0)
+                };
+                let imag = self.entry.broadcast(zero, &[], Shape::array(comp_prim, dims));
+                self.entry
+                    .binary("complex", re, imag, Shape::array(prim_of(to), dims))
+            }
+            // complex → real: take the real part (source's component
+            // width), then convert to the requested real dtype when it
+            // differs from that component type.
+            (true, false) => {
+                let (comp_prim, comp_dt) = complex_component(from);
+                let re = self.entry.unary("real", x, Shape::array(comp_prim, dims));
+                if to == comp_dt {
+                    re
+                } else {
+                    self.entry.convert(re, Shape::array(prim_of(to), dims))
+                }
+            }
+            // complex → complex: `convert` covers same-dtype identity
+            // and C64↔C128 component-width changes.
+            (true, true) => self.entry.convert(x, Shape::array(prim_of(to), dims)),
+        }
     }
 
     // ── Activation ─────────────────────────────────────────────

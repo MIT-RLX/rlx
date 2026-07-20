@@ -39,7 +39,7 @@ use crate::cpu_low_precision;
 /// the eigendecomposition itself stays f64). Panics on dtypes the f32
 /// arena can't carry.
 #[allow(dead_code)]
-pub(crate) fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> {
+pub fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> {
     use rlx_ir::DType;
     // An empty typed input (e.g. an unused KV-cache slot passed as `Vec::new()`)
     // has a dangling, 1-byte-aligned pointer. `slice::from_raw_parts` requires an
@@ -85,9 +85,42 @@ pub(crate) fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> 
         }
         DType::I8 => data.iter().map(|&b| b as i8 as f32).collect(),
         DType::U8 | DType::Bool => data.iter().map(|&b| b as f32).collect(),
+        // ── Complex (shared f32-uniform GPU boundary) ───────────────────
+        // C64 = 2 f32 lanes `[re, im]`; the host already stores it as
+        // interleaved f32 pairs, so widening is a pure reinterpret — no
+        // conversion, N complex elements → 2N f32 lanes.
+        DType::C64 => {
+            let n = data.len() / 4;
+            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
+            s.to_vec()
+        }
+        // C128 = 4 f32 lanes df64 `[re_hi, re_lo, im_hi, im_lo]`. The host
+        // stores it as 2×f64 (16 B/elem); this is the df64 SPLIT boundary:
+        // each f64 component `v` becomes `hi=(f32)v` + `lo=(f32)(v-(f64)hi)`
+        // so `(f64)hi + (f64)lo` reconstructs `v` to full double precision.
+        // Read via `from_le_bytes` (host `Vec<u8>` is only 1-aligned).
+        DType::C128 => {
+            let split = |v: f64| -> (f32, f32) {
+                let hi = v as f32;
+                let lo = (v - hi as f64) as f32;
+                (hi, lo)
+            };
+            let mut out = Vec::with_capacity((data.len() / 16) * 4);
+            for elem in data.chunks_exact(16) {
+                let re = f64::from_le_bytes(elem[0..8].try_into().unwrap());
+                let im = f64::from_le_bytes(elem[8..16].try_into().unwrap());
+                let (re_hi, re_lo) = split(re);
+                let (im_hi, im_lo) = split(im);
+                out.push(re_hi);
+                out.push(re_lo);
+                out.push(im_hi);
+                out.push(im_lo);
+            }
+            out
+        }
         other => panic!(
             "widen_bytes_to_f32: dtype {other:?} unsupported on f32-arena backends \
-             (only F32/F64/F16/BF16/I64/I32/I8/U8/Bool are accepted on the host I/O surface)"
+             (only F32/F64/F16/BF16/I64/I32/I8/U8/Bool/C64/C128 are accepted on the host I/O surface)"
         ),
     }
 }
@@ -97,7 +130,7 @@ pub(crate) fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> 
 /// backend that stores the native dtype would emit. Used by `run_typed`
 /// to keep the byte-level output contract identical across backends.
 #[allow(dead_code)]
-pub(crate) fn narrow_f32_to_bytes(v: &[f32], dt: rlx_ir::DType) -> Vec<u8> {
+pub fn narrow_f32_to_bytes(v: &[f32], dt: rlx_ir::DType) -> Vec<u8> {
     use rlx_ir::DType;
     match dt {
         DType::F32 => {
@@ -163,13 +196,26 @@ pub(crate) fn narrow_f32_to_bytes(v: &[f32], dt: rlx_ir::DType) -> Vec<u8> {
             .map(|&x| if x != 0.0 { 1u8 } else { 0u8 })
             .collect(),
         DType::C64 => {
-            // Complex narrow path: real part = the f32 value, imaginary
-            // part = 0. Mirrors how the backend stores narrowed f32
-            // operands when promoted to a complex op input.
-            let mut bytes = Vec::with_capacity(v.len() * 8);
+            // C64 = 2 f32 lanes `[re, im]`. The arena already holds a genuine
+            // complex tensor as interleaved f32 pairs (2N lanes for N complex
+            // elements), so narrowing is a pure reinterpret — emit the lanes as
+            // 8-byte `[re, im]` pairs, no real→complex promotion.
+            let mut bytes = Vec::with_capacity(v.len() * 4);
             for &x in v {
                 bytes.extend_from_slice(&x.to_le_bytes());
-                bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+            }
+            bytes
+        }
+        DType::C128 => {
+            // C128 = 4 f32 lanes df64 `[re_hi, re_lo, im_hi, im_lo]` per
+            // complex element. This is the df64 COMBINE boundary: each host f64
+            // component = `(f64)hi + (f64)lo`. Emit 16-byte `[re_f64, im_f64]`.
+            let mut bytes = Vec::with_capacity((v.len() / 4) * 16);
+            for lanes in v.chunks_exact(4) {
+                let re = lanes[0] as f64 + lanes[1] as f64;
+                let im = lanes[2] as f64 + lanes[3] as f64;
+                bytes.extend_from_slice(&re.to_le_bytes());
+                bytes.extend_from_slice(&im.to_le_bytes());
             }
             bytes
         }
@@ -200,6 +246,60 @@ mod f64_boundary_tests {
         let bytes = narrow_f32_to_bytes(&v, DType::F64);
         assert_eq!(bytes.len(), v.len() * 8);
         assert_eq!(widen_bytes_to_f32(&bytes, DType::F64), v.to_vec());
+    }
+
+    /// C64 widen is a pure reinterpret: N complex host elements (`[re,im]`
+    /// f32 pairs) → 2N f32 lanes, byte-identical.
+    #[test]
+    fn c64_widen_is_reinterpret() {
+        // 2 complex elements: (1.5+2.5i), (-3.0+4.0i).
+        let comps = [1.5f32, 2.5, -3.0, 4.0];
+        let bytes: Vec<u8> = comps.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let lanes = widen_bytes_to_f32(&bytes, DType::C64);
+        assert_eq!(lanes, comps.to_vec());
+        // Narrow back → identical bytes.
+        assert_eq!(narrow_f32_to_bytes(&lanes, DType::C64), bytes);
+    }
+
+    /// df64 C128 boundary: host f64 → widen(SPLIT) → 4 f32 lanes → narrow
+    /// (COMBINE) → host f64. Sweeps π, 1/3, and an exactly-f32-representable
+    /// value (round-trips bit-exact); rel err ≤ 1e-14.
+    #[test]
+    fn c128_df64_boundary_round_trips() {
+        let reals = [
+            std::f64::consts::PI,
+            1.0 / 3.0,
+            0.5,      // exactly f32-representable → bit-exact
+            -2.25,    // exactly f32-representable → bit-exact
+            1.0e-12,
+            123456.789012345,
+        ];
+        // Build a C128 host buffer: element k = reals[k] + reals[k]*2 i.
+        let mut host = Vec::new();
+        for &r in &reals {
+            host.extend_from_slice(&r.to_le_bytes());
+            host.extend_from_slice(&(r * 2.0).to_le_bytes());
+        }
+        let lanes = widen_bytes_to_f32(&host, DType::C128);
+        assert_eq!(lanes.len(), reals.len() * 4, "4 f32 lanes per C128 element");
+        let back = narrow_f32_to_bytes(&lanes, DType::C128);
+        assert_eq!(back.len(), host.len());
+        for (k, &r) in reals.iter().enumerate() {
+            let re = f64::from_le_bytes(back[k * 16..k * 16 + 8].try_into().unwrap());
+            let im = f64::from_le_bytes(back[k * 16 + 8..k * 16 + 16].try_into().unwrap());
+            let rel = |a: f64, b: f64| if b == 0.0 { a.abs() } else { (a - b).abs() / b.abs() };
+            assert!(rel(re, r) <= 1e-14, "re[{k}]={re} vs {r}");
+            assert!(rel(im, r * 2.0) <= 1e-14, "im[{k}]={im} vs {}", r * 2.0);
+        }
+        // f32-exact values round-trip bit-exact.
+        for &exact in &[0.5f64, -2.25] {
+            let mut h = Vec::new();
+            h.extend_from_slice(&exact.to_le_bytes());
+            h.extend_from_slice(&0.0f64.to_le_bytes());
+            let l = widen_bytes_to_f32(&h, DType::C128);
+            let b = narrow_f32_to_bytes(&l, DType::C128);
+            assert_eq!(b, h, "f32-exact C128 value {exact} must round-trip bit-exact");
+        }
     }
 }
 

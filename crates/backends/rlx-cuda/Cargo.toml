@@ -90,6 +90,10 @@ native-cuda-fft = []
 # this off by default keeps builds runnable on modern installs. Turn
 # on when profiling with nsight-systems on a CUDA 12.x host.
 nvtx = ["cudarc/nvtx"]
+# Device-resident NCCL collectives (`src/distributed.rs`) for WideEP / TP.
+# Dynamic-loads libnccl at runtime (same as libcuda). Off by default so Mac
+# / single-GPU CI stays light; enable on multi-GPU NVIDIA hosts.
+nccl = ["cudarc/nccl"]
 hip-cpu-validate = ["dep:cc"]
 
 [build-dependencies]
@@ -97,6 +101,10 @@ cc = { version = "1", optional = true }
 
 [dev-dependencies]
 rlx-runtime = { path = "../../core/rlx-runtime", features = ["cuda", "cpu"] }
+
+[[example]]
+name = "nccl_all_reduce_toy"
+required-features = ["nccl"]
 
 [lints]
 workspace = true

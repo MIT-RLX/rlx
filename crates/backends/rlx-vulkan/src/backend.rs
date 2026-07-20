@@ -379,6 +379,95 @@ fn numel(d: &[usize]) -> usize {
         .max(if d.is_empty() { 1 } else { 0 })
 }
 
+/// Number of f32 lanes a node occupies in the f32-uniform arena's host-readback
+/// view. Complex is simulated on f32 lanes — C64 = 2 lanes/elem, C128 = 4 lanes
+/// (df64); every OTHER dtype is exactly ONE f32 lane per element (I64/Bool/… are
+/// widened to a single lane, so `size_bytes()` must NOT be blanket-applied here).
+/// Used to read a complex output back with ALL its lanes rather than just
+/// `num_elements` (which would truncate to the real parts).
+fn arena_lane_count(shape: &rlx_ir::Shape) -> usize {
+    let elems = shape.num_elements().unwrap_or(0);
+    match shape.dtype() {
+        DType::C64 => elems * 2,
+        DType::C128 => elems * 4,
+        _ => elems,
+    }
+}
+
+/// Cast op ids for the `unary` shader (`unary.comp` cases 100–106). Kept in
+/// sync with rlx-cuda / rlx-rocm (unary.cu) and rlx-oneapi (unary.cl).
+const CAST_F32_TO_I8: u32 = 100;
+const CAST_F32_TO_I16: u32 = 101;
+const CAST_F32_TO_I32: u32 = 102;
+const CAST_F32_TO_I64: u32 = 103;
+const CAST_F32_TO_U8: u32 = 104;
+const CAST_F32_TO_U32: u32 = 105;
+const CAST_TO_BOOL: u32 = 106;
+/// `unary` op id whose default branch is a value-preserving f32 copy.
+const CAST_IDENTITY_COPY: u32 = 255;
+
+/// How an `Op::Cast` lowers on the f32-uniform arena.
+enum CastLower {
+    /// Value-preserving relabel: a same-slot no-op, or (distinct slot) an
+    /// identity f32 copy. Covers int→float, float→float (F16/BF16/F64 are all
+    /// f32-stored here), int→int, bool→int/float, same-dtype.
+    Identity,
+    /// A real elementwise conversion via the `unary` shader with this op id
+    /// (float→int trunc-saturate, or →Bool `x != 0`).
+    Kernel(u32),
+    /// A complex cast (real↔C64, real↔C128, C64↔C128) — pure f32-lane moves via
+    /// the standalone `complex_cast` shader. Carries the mode (0..5, see
+    /// `complex_cast.comp`). Needs its own (complex-sized) slot, not an alias.
+    Complex(u32),
+    /// Not representable in an f32 arena (an F64 real component has no lane
+    /// storage here) — reject at lowering.
+    Reject,
+}
+
+/// Classify a `Cast(src → dst)` on the f32-uniform arena. float→int truncates
+/// toward zero + saturates (Rust `as` / rlx-cpu); →Bool is `x != 0`. F16/BF16/
+/// F64 are demoted to f32 storage so casts to/from them are identity copies.
+/// Complex casts (real↔C64, real↔C128, C64↔C128) are pure f32-lane moves on the
+/// simulated-complex arena (C64 = 2 lanes/elem, C128 = 4 lanes df64); only a
+/// complex cast touching the one non-lane-storable real component (F64) rejects.
+fn classify_cast(src: DType, dst: DType) -> CastLower {
+    if src == dst {
+        return CastLower::Identity; // pure relabel (also covers C64→C64 / C128→C128)
+    }
+    if src.is_complex() || dst.is_complex() {
+        // F64 is the one component type with no f32-lane storage here, so a
+        // complex cast touching it (real side) is still rejected.
+        if src == DType::F64 || dst == DType::F64 {
+            return CastLower::Reject;
+        }
+        let mode = match (src, dst) {
+            (s, DType::C64) if !s.is_complex() => 0,  // real → C64
+            (DType::C64, d) if !d.is_complex() => 1,  // C64 → real
+            (s, DType::C128) if !s.is_complex() => 2, // real → C128
+            (DType::C128, d) if !d.is_complex() => 3, // C128 → real
+            (DType::C64, DType::C128) => 4,
+            (DType::C128, DType::C64) => 5,
+            _ => return CastLower::Reject,
+        };
+        return CastLower::Complex(mode);
+    }
+    if dst == DType::Bool {
+        return CastLower::Kernel(CAST_TO_BOOL);
+    }
+    if src.is_float() && dst.is_int() {
+        return CastLower::Kernel(match dst {
+            DType::I8 => CAST_F32_TO_I8,
+            DType::I16 => CAST_F32_TO_I16,
+            DType::I32 => CAST_F32_TO_I32,
+            DType::I64 => CAST_F32_TO_I64,
+            DType::U8 => CAST_F32_TO_U8,
+            DType::U32 => CAST_F32_TO_U32,
+            _ => unreachable!("is_int() covers all integer dtypes"),
+        });
+    }
+    CastLower::Identity
+}
+
 /// Row-major contiguous strides for `d`.
 fn contig_strides(d: &[usize]) -> Vec<usize> {
     let mut s = vec![1usize; d.len()];
@@ -1300,7 +1389,12 @@ impl VulkanExecutable {
         want.into_iter()
             .filter_map(|i| {
                 let id = *self.output_ids.get(i)?;
-                let n = self.graph.node(id).shape.num_elements().unwrap_or(0);
+                // Lane count, not element count: a complex output occupies 2 (C64)
+                // / 4 (C128) f32 lanes per element, so reading `num_elements`
+                // would truncate the readback to the real parts (and a slot-sizing
+                // regression would surface here as a short buffer). Every other
+                // dtype is one lane per element, so this is `num_elements` there.
+                let n = arena_lane_count(&self.graph.node(id).shape);
                 let buf = self.arena.read_f32(id, n);
                 if scanner.enabled() {
                     scanner.check(&self.graph, id, &buf, &[]);
@@ -1561,10 +1655,33 @@ fn widen_const_to_f32(data: &[u8], dt: DType) -> Vec<f32> {
             .collect(),
         DType::I8 => data.iter().map(|&b| b as i8 as f32).collect(),
         DType::U8 | DType::Bool => data.iter().map(|&b| b as f32).collect(),
+        // C64 = 2 interleaved f32 lanes `[re, im]`; the host already stores it as
+        // f32 pairs, so widening is a pure reinterpret (N complex → 2N lanes).
         DType::C64 => data
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+        // C128 = 4 f32 lanes df64 `[re_hi, re_lo, im_hi, im_lo]`, host-stored as
+        // 2×f64 (16 B/elem). This is the df64 SPLIT boundary: each f64 `v` →
+        // `hi=(f32)v` + `lo=(f32)(v-(f64)hi)`, so `(f64)hi+(f64)lo` reconstructs
+        // `v` to double precision. Bit-identical to the shared
+        // `rlx_runtime::backend::widen_bytes_to_f32` (the CPU↔GPU boundary the
+        // complex-cast kernels round-trip against).
+        DType::C128 => {
+            let split = |v: f64| -> [f32; 2] {
+                let hi = v as f32;
+                let lo = (v - hi as f64) as f32;
+                [hi, lo]
+            };
+            let mut out = Vec::with_capacity((data.len() / 16) * 4);
+            for elem in data.chunks_exact(16) {
+                let re = f64::from_le_bytes(elem[0..8].try_into().unwrap());
+                let im = f64::from_le_bytes(elem[8..16].try_into().unwrap());
+                out.extend_from_slice(&split(re));
+                out.extend_from_slice(&split(im));
+            }
+            out
+        }
     }
 }
 
@@ -1805,30 +1922,71 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
             | Op::Reshape { .. }
             | Op::StopGradient => {}
 
-            Op::Cast { .. } => {
+            Op::Cast { to } => {
                 let x = node.inputs[0];
+                // Same-slot (planner-aliased same-dtype view) is a pure no-op.
+                // A distinct out slot means the planner saw a dtype-changing
+                // cast. Complex casts (real↔C64, real↔C128, C64↔C128) route to
+                // the standalone `complex_cast` shader (pure f32-lane moves,
+                // dispatched over the complex-element index — the fused/unary
+                // scalar-per-lane path can't re-pair `[re, im]` lanes). Every
+                // other cast emits the `unary` shader: an identity f32 copy
+                // (255) for value-preserving casts, or a real conversion
+                // (float→int trunc-saturate, →Bool).
                 if arena.has(out) && arena.has(x) && arena.byte_offset(out) != arena.byte_offset(x)
                 {
-                    // f32-uniform: values are already f32-encoded; cast is a
-                    // value-preserving element copy into the distinct out slot.
-                    let n = numel(&dims(graph, out))
-                        .min(arena.slot_elems(out))
-                        .min(arena.slot_elems(x));
-                    // unary `default` branch is identity (op id 255).
-                    let push = Push::default()
-                        .u(n as u32)
-                        .u(binder.off(arena, x))
-                        .u(binder.off(arena, out))
-                        .u(255)
-                        .bytes();
-                    push_gpu_step(
-                        &mut binder,
-                        &mut steps,
-                        &mut deps,
-                        "unary",
-                        push,
-                        groups1d(n, 256),
-                    );
+                    let src_dtype = graph.node(x).shape.dtype();
+                    if let CastLower::Complex(mode) = classify_cast(src_dtype, *to) {
+                        // `n` is the complex-element count (identical for src and
+                        // dst — a cast preserves element count, only the lane
+                        // width changes). The kernel reads/writes the right lanes
+                        // per `mode`. Falls through to the node footprint attach
+                        // (the standalone complex slot is sized 2N/4N lanes by the
+                        // planner, so the barrier span it records is correct).
+                        let n = numel(&dims(graph, out));
+                        let push = Push::default()
+                            .u(n as u32)
+                            .u(binder.off(arena, x)) // in_off (f32-lane start)
+                            .u(binder.off(arena, out)) // out_off
+                            .u(mode)
+                            .bytes();
+                        push_gpu_step(
+                            &mut binder,
+                            &mut steps,
+                            &mut deps,
+                            "complex_cast",
+                            push,
+                            groups1d(n, 256),
+                        );
+                    } else {
+                        let op = match classify_cast(src_dtype, *to) {
+                            CastLower::Identity => CAST_IDENTITY_COPY,
+                            CastLower::Kernel(op) => op,
+                            CastLower::Complex(_) => unreachable!("handled above"),
+                            CastLower::Reject => panic!(
+                                "rlx-vulkan: Cast {src_dtype:?} → {to:?} involves an F64 \
+                                 real component, which has no f32-lane storage in the \
+                                 uniform arena — run this cast on CPU"
+                            ),
+                        };
+                        let n = numel(&dims(graph, out))
+                            .min(arena.slot_elems(out))
+                            .min(arena.slot_elems(x));
+                        let push = Push::default()
+                            .u(n as u32)
+                            .u(binder.off(arena, x))
+                            .u(binder.off(arena, out))
+                            .u(op)
+                            .bytes();
+                        push_gpu_step(
+                            &mut binder,
+                            &mut steps,
+                            &mut deps,
+                            "unary",
+                            push,
+                            groups1d(n, 256),
+                        );
+                    }
                 }
             }
 
@@ -1841,6 +1999,54 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                     out_shape: node.shape.clone(),
                     inputs: node.inputs.clone(),
                 });
+            }
+
+            Op::Binary(op) if node.shape.dtype().is_complex() => {
+                // C64 add/sub/mul/div reads BOTH `[re, im]` lanes per element, so
+                // it cannot ride the scalar-per-thread `binary` kernel — lower to
+                // a standalone `binary_c64` dispatch over the complex-element
+                // index. C128 arithmetic is out of scope (rlx-cpu has none
+                // either) → reject; C64 max/min/pow are undefined for complex →
+                // reject (matches the CPU). Broadcast is carried by per-operand
+                // complex-element counts (`k % n_x`), matching the CPU modulo
+                // fallback. Mirrors rlx-wgpu / rlx-cuda binary_c64 lowering.
+                let out_dt = node.shape.dtype();
+                if out_dt == DType::C128 {
+                    panic!(
+                        "rlx-vulkan: Binary on C128: complex-f64 arithmetic is \
+                         unsupported (rlx-cpu has none either) — only C64 \
+                         add/sub/mul/div are wired"
+                    );
+                }
+                let op_code = binop_id(*op);
+                if op_code > 3 {
+                    panic!(
+                        "rlx-vulkan: C64 Binary: {op:?} is undefined for complex \
+                         (only Add/Sub/Mul/Div); matches rlx-cpu rejection"
+                    );
+                }
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let n = numel(&dims(graph, out)); // output complex-element count
+                let na = numel(&dims(graph, a));
+                let nb = numel(&dims(graph, b));
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(binder.off(arena, a)) // a_off (f32-lane start)
+                    .u(binder.off(arena, b)) // b_off
+                    .u(binder.off(arena, out)) // c_off
+                    .u(op_code)
+                    .u(na.max(1) as u32) // n_a (broadcast, complex-element units)
+                    .u(nb.max(1) as u32) // n_b
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "binary_c64",
+                    push,
+                    groups1d(n, 256),
+                );
             }
 
             Op::Binary(op) => {
@@ -2284,8 +2490,40 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
 
             Op::Transpose { perm } => {
                 let x = node.inputs[0];
-                let xd = dims(graph, x);
-                let od = dims(graph, out);
+                let mut xd = dims(graph, x);
+                let mut od = dims(graph, out);
+                // Complex tensors pack `lanes` contiguous f32 per element
+                // (C64=2 [re,im], C128=4 df64). The `reindex` kernel copies one
+                // f32 per "element" via reindexed strides, so append an INNERMOST
+                // lane axis to input+output dims and extend the permutation so the
+                // lane axis maps to ITSELF (never permuted). `contig_strides` then
+                // yields lane-unit strides on the element axes and stride-1 on the
+                // lane axis in BOTH istr/ostr, so each thread copies a whole
+                // complex element's lanes as a group instead of shattering [re,im].
+                // lanes=1 (real/int) ⇒ dims/perm/rank unchanged ⇒ strict no-op.
+                let lanes: usize = match node.shape.dtype() {
+                    DType::C64 => 2,
+                    DType::C128 => 4,
+                    _ => 1,
+                };
+                let mut perm: Vec<usize> = perm.to_vec();
+                if lanes > 1 {
+                    // The fixed [u32; 6] push arrays cap rank at 6; the appended
+                    // lane axis therefore limits complex Transpose to element-rank
+                    // ≤ 5. Guard rather than overflow.
+                    assert!(
+                        od.len() < 6,
+                        "rlx-vulkan: complex Transpose element-rank {} exceeds 5 \
+                         (lane axis + [u32; 6] cap)",
+                        od.len()
+                    );
+                    // Lane axis is input axis `xd.len()` (appended innermost);
+                    // it maps to itself as the output's innermost axis.
+                    let lane_ax = xd.len();
+                    xd.push(lanes);
+                    od.push(lanes);
+                    perm.push(lane_ax);
+                }
                 let in_str = contig_strides(&xd);
                 let out_str = contig_strides(&od);
                 let rank = od.len();
@@ -2319,8 +2557,29 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
 
             Op::Narrow { axis, start, .. } => {
                 let x = node.inputs[0];
-                let xd = dims(graph, x);
-                let od = dims(graph, out);
+                let mut xd = dims(graph, x);
+                let mut od = dims(graph, out);
+                // Complex packs `lanes` contiguous f32 per element; the `reindex`
+                // kernel copies one f32 per "element". Append an INNERMOST lane
+                // axis to input+output dims so `contig_strides`/`numel` follow in
+                // lane units: `axis`/`start` stay element-indexed, but `in_str
+                // [*axis]` is now lane-scaled so the source offset lands on the
+                // right complex element. lanes=1 ⇒ dims/rank unchanged ⇒ no-op.
+                let lanes: usize = match node.shape.dtype() {
+                    DType::C64 => 2,
+                    DType::C128 => 4,
+                    _ => 1,
+                };
+                if lanes > 1 {
+                    assert!(
+                        od.len() < 6,
+                        "rlx-vulkan: complex Narrow element-rank {} exceeds 5 \
+                         (lane axis + [u32; 6] cap)",
+                        od.len()
+                    );
+                    xd.push(lanes);
+                    od.push(lanes);
+                }
                 let in_str = contig_strides(&xd);
                 let out_str = contig_strides(&od);
                 let rank = od.len();
@@ -2355,8 +2614,35 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
 
             Op::Expand { .. } => {
                 let x = node.inputs[0];
-                let xd = dims(graph, x);
-                let od = dims(graph, out);
+                let mut xd = dims(graph, x);
+                let mut od = dims(graph, out);
+                // Complex tensors pack `lanes` contiguous f32 per element
+                // (C64=2 [re,im], C128=4 df64). The `reindex` kernel copies one
+                // f32 per "element", so append an INNERMOST lane axis (xd==od==
+                // lanes, never a 1→N broadcast). `contig_strides` then yields
+                // lane-unit strides on the element axes and stride-1 on the lane
+                // axis in BOTH istr/ostr, so each thread copies a whole complex
+                // element's lanes as a contiguous group instead of shattering
+                // [re,im]. `rank` and `n = numel(&od)` follow automatically.
+                // lanes=1 (real/int) ⇒ dims/rank unchanged ⇒ strict no-op.
+                let lanes: usize = match node.shape.dtype() {
+                    DType::C64 => 2,
+                    DType::C128 => 4,
+                    _ => 1,
+                };
+                if lanes > 1 {
+                    // The fixed [u32; 6] push arrays cap rank at 6; the appended
+                    // lane axis therefore limits complex Expand to element-rank
+                    // ≤ 5 (fine for real graphs). Guard rather than overflow.
+                    assert!(
+                        od.len() < 6,
+                        "rlx-vulkan: complex Expand element-rank {} exceeds 5 \
+                         (lane axis + [u32; 6] cap)",
+                        od.len()
+                    );
+                    xd.push(lanes);
+                    od.push(lanes);
+                }
                 let rank = od.len();
                 // Right-align input dims to output rank.
                 let pad = rank - xd.len();
@@ -2400,12 +2686,35 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
             }
 
             Op::Concat { axis } => {
-                let od = dims(graph, out);
+                // Complex packs `lanes` contiguous f32 per element; the `reindex`
+                // kernel copies one f32 per "element". Append an INNERMOST lane
+                // axis to the output AND each input's dims so `contig_strides`/
+                // `numel` follow in lane units: `axis`/`axis_cursor` stay element-
+                // indexed, but `out_str[*axis]` is now lane-scaled so each input
+                // lands at the right complex offset. lanes=1 ⇒ dims unchanged.
+                let lanes: usize = match node.shape.dtype() {
+                    DType::C64 => 2,
+                    DType::C128 => 4,
+                    _ => 1,
+                };
+                let mut od = dims(graph, out);
+                if lanes > 1 {
+                    assert!(
+                        od.len() < 6,
+                        "rlx-vulkan: complex Concat element-rank {} exceeds 5 \
+                         (lane axis + [u32; 6] cap)",
+                        od.len()
+                    );
+                    od.push(lanes);
+                }
                 let out_str = contig_strides(&od);
                 let rank = od.len();
                 let mut axis_cursor = 0usize;
                 for &inp in &node.inputs {
-                    let id_dims = dims(graph, inp);
+                    let mut id_dims = dims(graph, inp);
+                    if lanes > 1 {
+                        id_dims.push(lanes);
+                    }
                     let in_str = contig_strides(&id_dims);
                     let mut shape = [1u32; 6];
                     let mut istr = [0u32; 6];
@@ -2443,9 +2752,20 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 let idx = node.inputs[1];
                 let dd = dims(graph, data);
                 let ax = *axis;
+                // Complex packs `lanes` contiguous f32 per element. Index values
+                // select ELEMENTS (indices stay unscaled, one f32 lane each), but
+                // each gathered element is `lanes` contiguous f32 — so the inner
+                // contiguous copy span (`out_inner`) and the total copy count
+                // scale by lanes. `out_outer`/`axis_dim`/`n_idx` stay element
+                // units. lanes=1 (real/int) ⇒ strict no-op.
+                let lanes: usize = match node.shape.dtype() {
+                    DType::C64 => 2,
+                    DType::C128 => 4,
+                    _ => 1,
+                };
                 let out_outer = numel(&dd[..ax]);
                 let axis_dim = dd[ax];
-                let out_inner = numel(&dd[ax + 1..]);
+                let out_inner = numel(&dd[ax + 1..]) * lanes;
                 let n_idx = numel(&dims(graph, idx));
                 let total = out_outer * n_idx * out_inner;
                 let push = Push::default()

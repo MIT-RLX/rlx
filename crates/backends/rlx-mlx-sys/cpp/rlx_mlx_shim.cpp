@@ -453,7 +453,14 @@ int rlx_mlx_array_to_f32(
 {
     return guarded([&] {
         mc::array& a = unwrap(h);
-        mc::array f32 = (a.dtype() == mc::float32) ? a : mc::astype(a, mc::float32);
+        // float64 → float32 must run on MLX's CPU stream: the Metal GPU
+        // stream rejects float64 ("float64 is not supported on the GPU").
+        // Other dtypes astype natively on the default stream.
+        mc::array f32 = (a.dtype() == mc::float32)
+            ? a
+            : (a.dtype() == mc::float64
+                   ? mc::astype(a, mc::float32, mc::default_stream(mc::Device::cpu))
+                   : mc::astype(a, mc::float32));
         // Force a row-contiguous materialization. Ops like transpose
         // can leave the result as a strided view, so data<float>() on
         // the original would give the pre-transpose buffer order.
@@ -658,7 +665,20 @@ int rlx_mlx_op_silu(rlx_mlx_array_t* a, rlx_mlx_array_t** out) {
 
 int rlx_mlx_op_cast(rlx_mlx_array_t* a, rlx_mlx_dtype_t dtype, rlx_mlx_array_t** out) {
     return guarded([&] {
-        *out = wrap(mc::astype(unwrap(a), to_mlx_dtype(dtype)));
+        const mc::array& x = unwrap(a);
+        mc::Dtype to = to_mlx_dtype(dtype);
+        // MLX's Metal (GPU) backend does not implement float64: an astype
+        // to/from float64 scheduled on the GPU stream throws
+        // "float64 is not supported on the GPU" at eval time (verified on
+        // Apple Silicon). Pin any float64-touching cast to MLX's CPU
+        // stream — the same tactic the linalg::solve shim uses — so the
+        // cast computes correctly instead of aborting. All other dtype
+        // pairs stay on the default (GPU) stream where astype is native.
+        if (to == mc::float64 || x.dtype() == mc::float64) {
+            *out = wrap(mc::astype(x, to, mc::default_stream(mc::Device::cpu)));
+        } else {
+            *out = wrap(mc::astype(x, to));
+        }
     });
 }
 

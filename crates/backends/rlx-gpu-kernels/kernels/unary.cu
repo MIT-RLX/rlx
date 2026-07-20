@@ -18,6 +18,14 @@
 //   7=neg  8=abs     9=gelu 10=silu 11=gelu_approx
 //   12=round 13=sin 14=cos 15=tan 16=atan
 // Keep in sync with `activation_op_id` in the CUDA/ROCm backends.
+//
+// Cast selectors (f32-uniform arena — inputs/outputs are f32 lanes; the
+// dst dtype's *value* is written back as f32). Keep in sync with
+// `classify_cast` in the CUDA/ROCm backends and unary.comp / unary.cl:
+//   100=f32->i8  101=f32->i16 102=f32->i32 103=f32->i64
+//   104=f32->u8  105=f32->u32 106=(x!=0)->bool
+// float->int truncates toward zero and saturates to the dst range (matches
+// Rust `as`, i.e. rlx-cpu); NaN maps to 0.
 
 extern "C" __global__ void unary(
     float* arena,
@@ -52,6 +60,15 @@ extern "C" __global__ void unary(
         case 14: y = cosf(x); break;
         case 15: y = tanf(x); break;
         case 16: y = atanf(x); break;
+        // f32 -> int: truncate toward zero, saturate to dst range, NaN -> 0.
+        case 100: y = isnan(x) ? 0.0f : fminf(fmaxf(truncf(x), -128.0f), 127.0f); break;
+        case 101: y = isnan(x) ? 0.0f : fminf(fmaxf(truncf(x), -32768.0f), 32767.0f); break;
+        case 102: y = isnan(x) ? 0.0f : fminf(fmaxf(truncf(x), -2147483648.0f), 2147483647.0f); break;
+        case 103: y = isnan(x) ? 0.0f : fminf(fmaxf(truncf(x), -9223372036854775808.0f), 9223372036854775807.0f); break;
+        case 104: y = isnan(x) ? 0.0f : fminf(fmaxf(truncf(x), 0.0f), 255.0f); break;
+        case 105: y = isnan(x) ? 0.0f : fminf(fmaxf(truncf(x), 0.0f), 4294967295.0f); break;
+        // -> Bool: x != 0 ? 1 : 0 (NaN is non-zero -> 1, matching Rust).
+        case 106: y = (x != 0.0f) ? 1.0f : 0.0f; break;
         default: y = x;
     }
     arena[out_off + i] = y;

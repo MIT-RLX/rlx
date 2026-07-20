@@ -266,6 +266,81 @@ pub enum Thunk {
         dst: usize,
         len: u32,
     },
+    /// Truncating f64 → i64 (ONNX Cast; toward zero). The generic 4-byte Copy
+    /// fallback reads/writes the wrong lane width against the 8-byte f64/i64
+    /// buffers (and would be a bit-copy, not a numeric convert).
+    CastF64ToI64 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// Truncating f64 → i32 (ONNX Cast; toward zero). f64 is 8 bytes, i32 is 4;
+    /// the generic Copy reads only the low 4 bytes of each f64 as garbage.
+    CastF64ToI32 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// f64 → Bool (`x != 0.0`). f64 is 8 bytes, Bool is 1; the generic Copy
+    /// misreads widths entirely.
+    CastF64ToBool {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// Narrowing i64 → i32 (`x as i32`, wrapping). 8-byte → 4-byte; the generic
+    /// Copy would keep only the low 4 bytes of each i64 (correct only for the
+    /// bit-truncation case, wrong as a Copy of `len` 4-byte lanes off an 8-byte
+    /// buffer). Mirror of the existing `CastI32ToI64` widening.
+    CastI64ToI32 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// i64 → f64 (`x as f64`). Both are 8 bytes, but the generic 4-byte Copy
+    /// would move only half of each element AND bit-reinterpret (not a numeric
+    /// convert). Uses the existing i64/f64 accessors.
+    CastI64ToF64 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// i32 → f64 (`x as f64`). 4-byte src → 8-byte dst; the generic Copy reads
+    /// too few source bytes and writes the wrong width.
+    CastI32ToF64 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// f32 → f16 (`half::f16::from_f32`, round-to-nearest-even). Output is
+    /// 2-byte f16; there is no `sl_f16` accessor so the kernel writes the
+    /// little-endian f16 bytes straight into the arena.
+    CastF32ToF16 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// f16 → f32 (`half::f16::to_f32`, exact). Input is 2-byte f16 read from the
+    /// arena bytes; output is native f32.
+    CastF16ToF32 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// f32 → bf16 (`half::bf16::from_f32`, round-to-nearest-even). 2-byte bf16
+    /// output written as little-endian arena bytes.
+    CastF32ToBf16 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// bf16 → f32 (`half::bf16::to_f32`, exact). 2-byte bf16 input read from the
+    /// arena bytes; output is native f32.
+    CastBf16ToF32 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
     /// Truncating f32 → i32 (ONNX Cast; toward zero).
     CastF32ToI32 {
         src: usize,
@@ -332,6 +407,20 @@ pub enum Thunk {
         src: usize,
         dst: usize,
         len: u32,
+    },
+    /// Generic scalar cast for any numeric dtype pair not covered by a
+    /// hand-written fast-path arm above (exotic widths: I8/I16/U8/U32, and
+    /// F16/BF16 against any non-F32 dtype). Converts element-by-element with
+    /// correct numeric semantics (float→int saturates, int→int wraps,
+    /// round-to-nearest for F16/BF16) instead of the corrupting generic 4-byte
+    /// `Copy` that silently mis-strides / bit-reinterprets. C64 is never routed
+    /// here (no scalar conversion is defined for complex).
+    CastGeneric {
+        src: usize,
+        dst: usize,
+        len: u32,
+        src_dtype: rlx_ir::DType,
+        dst_dtype: rlx_ir::DType,
     },
     /// f64 element-wise binary with broadcast. `len`/`lhs_len`/`rhs_len`
     /// are element counts; kernel does `out[i] = lhs[i % lhs_len] OP rhs[i % rhs_len]`.

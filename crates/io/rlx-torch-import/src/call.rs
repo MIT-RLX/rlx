@@ -265,6 +265,7 @@ pub fn dtype_from_str(s: &str) -> Result<DType> {
         "u32" => DType::U32,
         "bool" => DType::Bool,
         "c64" => DType::C64,
+        "c128" => DType::C128,
         other => bail!("unsupported dtype token: {other:?}"),
     })
 }
@@ -283,6 +284,7 @@ pub fn dtype_token(dt: DType) -> &'static str {
         DType::U32 => "U32",
         DType::Bool => "Bool",
         DType::C64 => "C64",
+        DType::C128 => "C128",
     }
 }
 

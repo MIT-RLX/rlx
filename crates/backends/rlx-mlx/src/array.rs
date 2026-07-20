@@ -241,6 +241,7 @@ pub(crate) fn map_dtype(d: DType) -> MlxDtype {
         DType::U32 => MlxDtype::U32,
         DType::Bool => MlxDtype::Bool,
         DType::C64 => panic!("rlx-mlx: DType::C64 (complex) not supported"),
+        DType::C128 => panic!("rlx-mlx: DType::C128 (complex) not supported"),
     }
 }
 

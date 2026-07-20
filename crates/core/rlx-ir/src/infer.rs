@@ -60,8 +60,17 @@ pub trait GraphExt {
     fn relu(&mut self, x: NodeId) -> NodeId;
     fn exp(&mut self, x: NodeId) -> NodeId;
     fn sqrt(&mut self, x: NodeId) -> NodeId;
+    /// Reciprocal square root `1/sqrt(x)`.
+    fn rsqrt(&mut self, x: NodeId) -> NodeId;
     fn neg(&mut self, x: NodeId) -> NodeId;
     fn tanh(&mut self, x: NodeId) -> NodeId;
+    /// Logistic sigmoid `1/(1+exp(-x))`. Its CDF interpretation makes it the
+    /// natural building block for discretized (bin-mass) entropy rates.
+    fn sigmoid(&mut self, x: NodeId) -> NodeId;
+    /// Natural logarithm `ln(x)`.
+    fn log(&mut self, x: NodeId) -> NodeId;
+    /// Elementwise absolute value `|x|`.
+    fn abs(&mut self, x: NodeId) -> NodeId;
 
     // ── Normalization ───────────────────────────────────────
     fn ln(&mut self, x: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId;
@@ -309,6 +318,11 @@ impl GraphExt for Graph {
         self.activation(Activation::Sqrt, x, s)
     }
 
+    fn rsqrt(&mut self, x: NodeId) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.activation(Activation::Rsqrt, x, s)
+    }
+
     fn neg(&mut self, x: NodeId) -> NodeId {
         let s = shape::unary_shape(self.shape(x));
         self.activation(Activation::Neg, x, s)
@@ -317,6 +331,21 @@ impl GraphExt for Graph {
     fn tanh(&mut self, x: NodeId) -> NodeId {
         let s = shape::unary_shape(self.shape(x));
         self.activation(Activation::Tanh, x, s)
+    }
+
+    fn sigmoid(&mut self, x: NodeId) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.activation(Activation::Sigmoid, x, s)
+    }
+
+    fn log(&mut self, x: NodeId) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.activation(Activation::Log, x, s)
+    }
+
+    fn abs(&mut self, x: NodeId) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.activation(Activation::Abs, x, s)
     }
 
     fn ln(&mut self, x: NodeId, gamma: NodeId, beta: NodeId, eps: f32) -> NodeId {

@@ -313,6 +313,63 @@ fn extend_node_chain_liveness_to_end(
     }
 }
 
+/// Pin Param/Constant packing subgraphs (Concat/Expand/Cast/…) through graph
+/// end. wgpu marks those steps `static_once` and skips them on later `run()`s;
+/// if their arena slots are reused by activations after the last consumer,
+/// run 2+ reads clobbered weights (empty Conformer-CTC transcripts, etc.).
+fn extend_static_weight_pack_liveness(
+    graph: &Graph,
+    ranges: &mut HashMap<NodeId, (usize, usize)>,
+) {
+    let last_step = graph.len();
+    let mut memo: HashMap<NodeId, bool> = HashMap::new();
+    for node in graph.nodes() {
+        if !is_static_weight_tensor(graph, node.id, &mut memo) {
+            continue;
+        }
+        // Params/Constants are already boundary-pinned; extend derived packs.
+        if matches!(
+            &node.op,
+            Op::Param { .. } | Op::Constant { .. } | Op::Input { .. }
+        ) {
+            continue;
+        }
+        ranges.entry(node.id).and_modify(|r| r.1 = last_step);
+    }
+}
+
+/// True when `id`'s value is fixed after param/constant upload (no Inputs).
+fn is_static_weight_tensor(graph: &Graph, id: NodeId, memo: &mut HashMap<NodeId, bool>) -> bool {
+    if let Some(&v) = memo.get(&id) {
+        return v;
+    }
+    let node = graph.node(id);
+    let v = match &node.op {
+        Op::Param { .. } | Op::Constant { .. } => true,
+        Op::Input { .. } => false,
+        Op::Cast { .. }
+        | Op::Reshape { .. }
+        | Op::Transpose { .. }
+        | Op::Narrow { .. }
+        | Op::Expand { .. }
+        | Op::Activation(_)
+        | Op::Concat { .. } => {
+            !node.inputs.is_empty()
+                && node
+                    .inputs
+                    .iter()
+                    .all(|&inp| is_static_weight_tensor(graph, inp, memo))
+        }
+        Op::Binary(_) | Op::Where | Op::Fma => node
+            .inputs
+            .iter()
+            .all(|&inp| is_static_weight_tensor(graph, inp, memo)),
+        _ => false,
+    };
+    memo.insert(id, v);
+    v
+}
+
 /// Keep primary data inputs alive through graph end for `Op::Custom("onnx.*")`
 /// thunks that read activations after parallel branches would otherwise reuse slots.
 fn extend_custom_op_input_liveness(graph: &Graph, ranges: &mut HashMap<NodeId, (usize, usize)>) {
@@ -724,6 +781,7 @@ fn plan_memory_aligned_inner(
     extend_custom_op_input_liveness(graph, &mut ranges);
     extend_bert_hidden_liveness(graph, &mut ranges);
     extend_onnx_duration_epilogue_liveness(graph, &mut ranges);
+    extend_static_weight_pack_liveness(graph, &mut ranges);
     let mut opts = opts;
     if graph_exports_onnx_duration(graph) {
         opts.arena_no_reuse = true;

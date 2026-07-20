@@ -23,7 +23,8 @@ use crate::device::{
 use crate::host_staging::F32HostSlot;
 use crate::kernels::{
     ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, attention_row_kernel, batch_elementwise_region_kernel, binary_kernel,
+    attention_kernel, attention_row_kernel, batch_elementwise_region_kernel, binary_broadcast_kernel,
+    binary_c64_kernel, binary_kernel, complex_cast_kernel,
     compare_kernel, concat_kernel, conv_bias_act_epilogue_kernel, conv_transpose2d_kernel,
     conv1d_kernel, conv2d_backward_input_kernel, conv2d_backward_weight_kernel, conv2d_kernel,
     conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
@@ -305,12 +306,26 @@ impl CudaExecutable {
         let mut last_event: HashMap<usize, cudarc::driver::CudaEvent> = HashMap::new();
         let mut rr_cursor: usize = 0;
 
+        // Per-step wall-time profiler (RLX_CUDA_STEP_PROFILE=1). Syncs the
+        // default stream around every step and accumulates time by step name;
+        // dumped after the loop. Disabled during graph capture (the syncs would
+        // corrupt the capture) and skipped in multi-stream mode.
+        let step_profile =
+            rlx_ir::env::flag("RLX_CUDA_STEP_PROFILE") && !capturing && !multi_stream;
+        let mut step_prof: HashMap<&'static str, (f64, usize)> = HashMap::new();
+
         // Dispatch each step. Each iteration is wrapped in an NVTX
         // range so nsight-systems traces show step boundaries cleanly.
         // Gated behind the `nvtx` feature because CUDA 13 removed
         // `nvToolsExt.dll`; cudarc panics on first call when the lib
         // isn't loadable.
         for step in &self.schedule {
+            let _prof_t0 = if step_profile {
+                let _ = default_stream.synchronize();
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             #[cfg(feature = "nvtx")]
             let _nvtx = cudarc::nvtx::scoped_range(step_name(step));
             // PLAN L3: cross-backend Perfetto trace; no-op when env
@@ -1003,6 +1018,42 @@ impl CudaExecutable {
                         launcher
                             .launch(cfg)
                             .expect("rlx-cuda: binary launch failed");
+                    }
+                }
+                Step::BinaryBroadcast {
+                    n,
+                    a_off,
+                    b_off,
+                    c_off,
+                    op,
+                    rank,
+                    meta_idx,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = binary_broadcast_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(a_off)
+                        .arg(b_off)
+                        .arg(c_off)
+                        .arg(op)
+                        .arg(rank)
+                        .arg(&self.meta_buffers[*meta_idx]);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: binary_broadcast launch failed");
                     }
                 }
                 Step::ElementwiseRegion {
@@ -2819,13 +2870,18 @@ impl CudaExecutable {
                             block_dim: (*state_size, 1, 1),
                             shared_mem_bytes: 0,
                         };
-                        let q_off = (*q_byte_off / 4) as u32;
-                        let k_off = (*k_byte_off / 4) as u32;
-                        let v_off = (*v_byte_off / 4) as u32;
-                        let g_off = (*g_byte_off / 4) as u32;
-                        let beta_off = (*beta_byte_off / 4) as u32;
+                        // Kernel params are all `unsigned long long` (see
+                        // gated_delta_net.cu). These MUST be u64 to match: cuLaunchKernel
+                        // reads each arg at the kernel-declared 8-byte width, so passing a
+                        // 4-byte u32 makes it read 4 bytes of adjacent stack as the high
+                        // word → a multi-GB garbage offset → CUDA_ERROR_ILLEGAL_ADDRESS.
+                        let q_off = *q_byte_off / 4;
+                        let k_off = *k_byte_off / 4;
+                        let v_off = *v_byte_off / 4;
+                        let g_off = *g_byte_off / 4;
+                        let beta_off = *beta_byte_off / 4;
                         let state_off = (state_bytes / 4) as u64;
-                        let dst_off = (*dst_byte_off / 4) as u32;
+                        let dst_off = *dst_byte_off / 4;
                         let use_carry_u: u32 = if *use_carry { 1 } else { 0 };
                         let mut launcher = stream.launch_builder(&kernel.function);
                         launcher
@@ -2885,11 +2941,12 @@ impl CudaExecutable {
                     bidirectional,
                     carry,
                 } => {
-                    let (buf, arena_size) = self.arena.f32_buf_and_size();
-                    crate::lstm_host::run_lstm(
+                    // Native GPU LSTM; falls back to the host path only when the
+                    // layer geometry overflows the shared-memory budget.
+                    let handled = crate::lstm_gpu::run_lstm(
+                        &self.ctx,
                         &stream,
-                        buf,
-                        arena_size,
+                        self.arena.f32_buf_mut(),
                         *x_byte_off as usize,
                         *w_ih_byte_off as usize,
                         *w_hh_byte_off as usize,
@@ -2905,6 +2962,28 @@ impl CudaExecutable {
                         *bidirectional,
                         *carry,
                     );
+                    if !handled {
+                        let (buf, arena_size) = self.arena.f32_buf_and_size();
+                        crate::lstm_host::run_lstm(
+                            &stream,
+                            buf,
+                            arena_size,
+                            *x_byte_off as usize,
+                            *w_ih_byte_off as usize,
+                            *w_hh_byte_off as usize,
+                            *bias_byte_off as usize,
+                            *h0_byte_off as usize,
+                            *c0_byte_off as usize,
+                            *dst_byte_off as usize,
+                            *batch as usize,
+                            *seq as usize,
+                            *input_size as usize,
+                            *hidden as usize,
+                            *num_layers as usize,
+                            *bidirectional,
+                            *carry,
+                        );
+                    }
                 }
                 Step::ScanHost { desc } => {
                     let (buf, arena_size) = self.arena.f32_buf_and_size();
@@ -3228,6 +3307,81 @@ impl CudaExecutable {
                         launcher
                             .launch(cfg)
                             .expect("rlx-cuda: resize_nearest_2x launch failed");
+                    }
+                }
+                Step::ComplexCast {
+                    n,
+                    in_byte_off,
+                    out_byte_off,
+                    mode,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = complex_cast_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // f32-element offsets as u64 — the kernel declares its offset
+                    // params `unsigned long long`, so passing u32 here would leave
+                    // the high word as stack garbage → CUDA_ERROR_ILLEGAL_ADDRESS.
+                    let in_off: u64 = *in_byte_off / 4;
+                    let out_off: u64 = *out_byte_off / 4;
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(&in_off)
+                        .arg(&out_off)
+                        .arg(mode);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: complex_cast launch failed");
+                    }
+                }
+                Step::BinaryC64 {
+                    n,
+                    a_byte_off,
+                    b_byte_off,
+                    c_byte_off,
+                    op,
+                    n_a,
+                    n_b,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = binary_c64_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // f32-element offsets as u64 (kernel params are u64 — see above).
+                    let a_off: u64 = *a_byte_off / 4;
+                    let b_off: u64 = *b_byte_off / 4;
+                    let c_off: u64 = *c_byte_off / 4;
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(&a_off)
+                        .arg(&b_off)
+                        .arg(&c_off)
+                        .arg(op)
+                        .arg(n_a)
+                        .arg(n_b);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: binary_c64 launch failed");
                     }
                 }
                 Step::GaussianSplatRender {
@@ -4603,6 +4757,22 @@ impl CudaExecutable {
                 for w in &writes {
                     producer_of.insert(*w, idx);
                 }
+            }
+            if let Some(t0) = _prof_t0 {
+                let _ = default_stream.synchronize();
+                let dt = t0.elapsed().as_secs_f64() * 1e3;
+                let e = step_prof.entry(step_name(step)).or_insert((0.0, 0));
+                e.0 += dt;
+                e.1 += 1;
+            }
+        }
+        if step_profile {
+            let mut v: Vec<_> = step_prof.iter().collect();
+            v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            let total: f64 = v.iter().map(|(_, (ms, _))| ms).sum();
+            eprintln!("rlx-cuda: step profile (total {total:.1}ms):");
+            for (name, (ms, n)) in v.iter().take(12) {
+                eprintln!("  {name:<28} {ms:8.2}ms  ({n}×, {:.3}ms/call)", ms / *n as f64);
             }
         }
 

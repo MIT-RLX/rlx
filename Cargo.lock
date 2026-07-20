@@ -4760,6 +4760,7 @@ dependencies = [
  "rlx-gpu-kernels",
  "rlx-ir",
  "rlx-opt",
+ "rlx-runtime",
  "rlx-unfuse",
  "serde",
  "serde_json",
@@ -4922,11 +4923,13 @@ dependencies = [
  "bytemuck",
  "half",
  "naga 29.0.3",
+ "rlx",
  "rlx-compile",
  "rlx-cpu",
  "rlx-gpu-host",
  "rlx-ir",
  "rlx-opt",
+ "rlx-runtime",
 ]
 
 [[package]]

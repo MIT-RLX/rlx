@@ -66,6 +66,19 @@ impl Pass for MarkElementwiseRegions {
         // mis-size the final write (an F16 output slot is half the
         // bytes of f32). Same-dtype Casts are trivially propagated.
         let chain_step_safe = |graph: &Graph, node: &rlx_ir::Node| -> bool {
+            // Complex ops (C64/C128) can never join an element-wise region: the
+            // region kernel processes one f32 lane per thread and cannot re-pair
+            // the interleaved `[re, im]` lanes (complex mul ≠ per-lane mul, a
+            // complex cast is a lane MOVE). Keep them as standalone Binary/Cast
+            // nodes so each backend's dedicated complex kernel runs instead.
+            if node.shape.dtype().is_complex()
+                || node
+                    .inputs
+                    .iter()
+                    .any(|id| graph.shape(*id).dtype().is_complex())
+            {
+                return false;
+            }
             match &node.op {
                 Op::Cast { to } => {
                     let in_dt = graph.shape(node.inputs[0]).dtype();

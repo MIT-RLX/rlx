@@ -4907,10 +4907,12 @@ mod tests {
 
     #[test]
     fn unfuse_decomposes_selective_scan() {
-        // After unfuse, no Op::SelectiveScan; instead we see Concat
-        // (one for S>1), per-step Reduce(Sum), per-step Activation::Exp,
-        // and many Mul / Add / Narrow / Reshape / Expand nodes.
-        // S=3 → 3 timesteps.
+        // Compact lowering (default path): no Op::SelectiveScan; instead
+        // exactly one Op::Scan { save_trajectory: true, num_xs: 2 }
+        // wrapped by an S-INDEPENDENT elementwise pre/post graph — a
+        // single exp(δA), a single Σ_n Reduce, no Concat, no per-step
+        // Narrow. The whole subgraph is a fixed handful of nodes
+        // regardless of S (was ~20·S in the legacy unroll).
         let (g, _x, _params) = build_ssm_graph();
         let unfused = rlx_fusion::unfuse_fused_for_autodiff(g);
 
@@ -4920,13 +4922,38 @@ mod tests {
             .any(|n| matches!(n.op, Op::SelectiveScan { .. }));
         assert!(!has_ssm, "Op::SelectiveScan should be unfused");
 
+        let scans: Vec<&Node> = unfused
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Scan { .. }))
+            .collect();
+        assert_eq!(scans.len(), 1, "expected exactly one Op::Scan");
+        assert!(
+            matches!(
+                scans[0].op,
+                Op::Scan {
+                    save_trajectory: true,
+                    num_xs: 2,
+                    num_bcast: 0,
+                    ..
+                }
+            ),
+            "expected save_trajectory Scan with 2 xs, got {:?}",
+            scans[0].op
+        );
+
         let count = |pred: fn(&Op) -> bool| -> usize {
             unfused.nodes().iter().filter(|n| pred(&n.op)).count()
         };
         assert_eq!(
             count(|o| matches!(o, Op::Concat { .. })),
-            1,
-            "expected 1 Concat (over the 3 time steps)"
+            0,
+            "compact lowering emits no Concat"
+        );
+        assert_eq!(
+            count(|o| matches!(o, Op::Narrow { .. })),
+            0,
+            "compact lowering emits no per-step Narrow"
         );
         assert_eq!(
             count(|o| matches!(
@@ -4936,27 +4963,29 @@ mod tests {
                     ..
                 }
             )),
-            3,
-            "expected one Reduce(Sum) per time step (S=3)"
+            1,
+            "expected exactly one Σ_n Reduce (S-independent)"
         );
         assert_eq!(
             count(|o| matches!(o, Op::Activation(Activation::Exp))),
-            3,
-            "expected one exp(δA) per time step (S=3)"
+            1,
+            "expected exactly one exp(δA) (S-independent)"
         );
+        // Node count must NOT scale with S (S=3 here); the whole
+        // lowering is a fixed ~20 nodes.
         assert!(
-            count(|o| matches!(o, Op::Narrow { .. })) >= 12,
-            "expected >=12 Narrows (4 per step × 3 steps)"
+            unfused.nodes().len() < 40,
+            "compact lowering should be a fixed handful of nodes, got {}",
+            unfused.nodes().len()
         );
     }
 
     #[test]
     fn grad_through_selective_scan_propagates() {
-        // End-to-end: grad_with_loss through SelectiveScan returns
-        // [loss, da] — confirms every primitive emitted by the
-        // unroll has a VJP rule on the gradient walk (Mul, Add,
-        // Activation::Exp, Reduce::Sum, Concat, Narrow, Reshape,
-        // Expand).
+        // End-to-end: grad_with_loss through the compact SelectiveScan
+        // lowering returns [loss, da] and the backward graph carries an
+        // Op::ScanBackward (the generic scan VJP) rather than a fully
+        // unrolled per-step primitive chain.
         let (g, _x, params) = build_ssm_graph();
         let bwd = grad_with_loss(&g, &params);
         assert_eq!(
@@ -4964,6 +4993,12 @@ mod tests {
             1 + params.len(),
             "expected loss + {} param grads",
             params.len()
+        );
+        assert!(
+            bwd.nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::ScanBackward { .. })),
+            "expected Op::ScanBackward in the compact backward graph"
         );
     }
 

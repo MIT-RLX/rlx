@@ -2987,6 +2987,58 @@ impl RocmExecutable {
                         [&mut arena_ptr, src_off, dst_off, n, c, h, w]
                     );
                 }
+                Step::ComplexCast {
+                    n,
+                    in_byte_off,
+                    out_byte_off,
+                    mode,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = complex_cast_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    // f32-element offsets as u64 — the kernel declares its offset
+                    // params `unsigned long long`, so passing a u32 here would
+                    // leave the high word as stack garbage → illegal address.
+                    let in_off: u64 = (*in_byte_off / 4) as u64;
+                    let out_off: u64 = (*out_byte_off / 4) as u64;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, &n_s, &in_off, &out_off, mode]
+                    );
+                }
+                Step::BinaryC64 {
+                    n,
+                    a_byte_off,
+                    b_byte_off,
+                    c_byte_off,
+                    op,
+                    n_a,
+                    n_b,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = binary_c64_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    // f32-element offsets as u64 (kernel params are u64 — see above).
+                    let a_off: u64 = (*a_byte_off / 4) as u64;
+                    let b_off: u64 = (*b_byte_off / 4) as u64;
+                    let c_off: u64 = (*c_byte_off / 4) as u64;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, &n_s, &a_off, &b_off, &c_off, op, n_a, n_b]
+                    );
+                }
                 Step::Pool1d {
                     n,
                     c,

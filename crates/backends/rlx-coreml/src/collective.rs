@@ -30,6 +30,8 @@ const COLLECTIVE_OPS: &[&str] = &[
     "collective.broadcast",
     "collective.reduce",
     "collective.all_to_all",
+    "collective.moe_dispatch",
+    "collective.moe_combine",
     "collective.ppermute",
     "collective.send",
     "collective.recv",

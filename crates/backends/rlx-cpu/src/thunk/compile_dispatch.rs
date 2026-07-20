@@ -2308,9 +2308,10 @@ pub fn compile_thunks_with_rng(
                     let attrs = attrs.clone();
                     let inputs = inputs.clone();
                     let (out_off, out_len, out_shape) = output.clone();
+                    let arena_len = arena.size();
                     Arc::new(move |base: *mut u8| unsafe {
                         dispatch_custom_op(
-                            &*kernel, &inputs, out_off, out_len, &out_shape, &attrs, base,
+                            &*kernel, &inputs, out_off, out_len, &out_shape, &attrs, base, arena_len,
                         );
                     })
                 }

@@ -157,6 +157,26 @@ fn apply_binary(sub: u32, a: f32, b: f32) -> f32 {
     return a;
 }
 
+// Fused `ChainStep::Cast` on the f32-uniform arena. `sub` is the target-class
+// code injected by wgpu's `cast_region_sub`: 0=identity (float target), 1=Bool,
+// 2..=7 = int targets. Int casts truncate toward zero and SATURATE to the
+// destination range (matches rlx-cpu `x as iN`); NaN → 0.
+fn apply_cast(sub: u32, x: f32) -> f32 {
+    if (sub == 0u) { return x; }                             // → float: identity
+    if (sub == 1u) { return select(0.0f, 1.0f, x != 0.0f); } // → Bool
+    var lo: f32 = 0.0f;
+    var hi: f32 = 0.0f;
+    if (sub == 2u) { lo = -128.0f; hi = 127.0f; }                       // I8
+    else if (sub == 3u) { lo = -32768.0f; hi = 32767.0f; }             // I16
+    else if (sub == 4u) { lo = -2147483648.0f; hi = 2147483647.0f; }   // I32
+    else if (sub == 5u) { lo = -9223372036854775808.0f; hi = 9223372036854775807.0f; } // I64
+    else if (sub == 6u) { lo = 0.0f; hi = 255.0f; }                    // U8
+    else if (sub == 7u) { lo = 0.0f; hi = 4294967295.0f; }             // U32
+    else { return x; }
+    let t = clamp(trunc(x), lo, hi);
+    return select(t, 0.0f, x != x); // NaN → 0
+}
+
 fn apply_compare(sub: u32, a: f32, b: f32) -> f32 {
     if (sub == 0u) { return select(0.0f, 1.0f, a == b); } // Eq
     if (sub == 1u) { return select(0.0f, 1.0f, a != b); } // Ne
@@ -190,8 +210,8 @@ fn run_region(i: u32) {
         if (op_kind == 0u) {
             result = apply_activation(op_sub, lhs);
         } else if (op_kind == 1u) {
-            // Cast at f32-arena layer is identity.
-            result = lhs;
+            // Cast. op_sub carries the target-class code (cast_region_sub).
+            result = apply_cast(op_sub, lhs);
         } else if (op_kind == 2u) {
             let rhs = resolve_operand(rhs_enc, i, &scratch, prologue_row0, has_prologue_row0);
             result = apply_binary(op_sub, lhs, rhs);
@@ -287,7 +307,7 @@ fn run_batch_region(i: u32, batch_idx: u32) {
         if (op_kind == 0u) {
             result = apply_activation(op_sub, lhs);
         } else if (op_kind == 1u) {
-            result = lhs;
+            result = apply_cast(op_sub, lhs);
         } else if (op_kind == 2u) {
             let rhs = resolve_operand_batch(rhs_enc, i, batch_idx, &scratch);
             result = apply_binary(op_sub, lhs, rhs);

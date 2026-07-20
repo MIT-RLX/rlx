@@ -30,15 +30,38 @@ pub(super) fn binary_mil(b: BinaryOp) -> &'static str {
 }
 
 /// MIL `DataType` (proto enum value) for an RLX dtype.
+///
+/// CoreML/MIL has no f64, bf16, int16, or complex storage types, so the
+/// dtypes RLX carries but MIL lacks are demoted/widened to the nearest MIL
+/// type here (matching `mil_cast_dtype`, so a `Cast`'s `dtype` attribute and
+/// its output value type always agree):
+///   * `F64  → fp32`  (demote — no double precision on CoreML)
+///   * `BF16 → fp16`  (nearest float — no bf16)
+///   * `I16  → int32` (widen — no int16)
+/// `C64` (complex) has no MIL analogue at all and is rejected explicitly.
+/// Integer dtypes normally never reach here: `promote_int_to_f32` rewrites
+/// them to f32 before lowering; the int arms are the fallback for the direct
+/// `lower_graph` path (tests) that skips promotion.
 pub(super) fn mil_data_type(dt: DType) -> Result<i32> {
     let v = match dt {
         DType::F32 => proto::DataType::Float32,
         DType::F16 => proto::DataType::Float16,
+        // No f64 on CoreML — demote to single precision.
+        DType::F64 => proto::DataType::Float32,
+        // No bf16 on CoreML — fp16 is the nearest supported float.
+        DType::BF16 => proto::DataType::Float16,
         DType::I32 => proto::DataType::Int32,
         DType::I64 => proto::DataType::Int64,
+        // No int16 on CoreML — widen to int32.
+        DType::I16 => proto::DataType::Int32,
         DType::I8 => proto::DataType::Int8,
         DType::U8 => proto::DataType::Uint8,
         DType::Bool => proto::DataType::Bool,
+        DType::C64 => {
+            return Err(CoremlError::Unsupported(
+                "C64 (complex) has no CoreML/MIL data type".to_string(),
+            ));
+        }
         other => {
             return Err(CoremlError::Unsupported(format!("dtype {other:?}")));
         }
@@ -149,14 +172,34 @@ pub(super) fn pad_begin_end(padding: &[usize]) -> Vec<i32> {
 }
 
 /// MIL `cast` dtype string for an RLX dtype.
+///
+/// Dtypes MIL lacks are demoted/widened to the nearest supported MIL type,
+/// kept in lock-step with [`mil_data_type`] so a `Cast`'s `dtype` attribute
+/// and its output value type never disagree:
+///   * `F64  → fp32`  (demote — CoreML has no double precision)
+///   * `BF16 → fp16`  (nearest float — CoreML has no bf16)
+///   * `I16  → int32` (widen — CoreML has no int16)
+/// `C64` (complex) has no MIL analogue and is rejected with a clear typed
+/// error rather than silently corrupting the interleaved re/im layout.
 pub(super) fn mil_cast_dtype(dt: DType) -> Result<&'static str> {
     Ok(match dt {
         DType::F32 => "fp32",
         DType::F16 => "fp16",
+        // No f64 on CoreML — demote to single precision.
+        DType::F64 => "fp32",
+        // No bf16 on CoreML — fp16 is the nearest supported float.
+        DType::BF16 => "fp16",
         DType::I32 => "int32",
+        // No int16 on CoreML — widen to int32.
+        DType::I16 => "int32",
         DType::I8 => "int8",
         DType::U8 => "uint8",
         DType::Bool => "bool",
+        DType::C64 => {
+            return Err(CoremlError::Unsupported(
+                "cast to C64 (complex): CoreML has no complex dtype".to_string(),
+            ));
+        }
         other => return Err(CoremlError::Unsupported(format!("cast to {other:?}"))),
     })
 }
@@ -2215,5 +2258,51 @@ mod tests {
             immediate_tensor(&op).value.as_ref().unwrap(),
             proto::tensor_value::Value::Floats(_)
         ));
+    }
+
+    /// `Cast` targets MIL lacks are demoted/widened, and the string returned by
+    /// `mil_cast_dtype` must match the MIL type `mil_data_type` emits for the
+    /// same dtype so a cast op's `dtype` attr and its output value type agree.
+    #[test]
+    fn cast_dtype_demotes_unsupported_types() {
+        // Natively-supported types are unchanged.
+        assert_eq!(mil_cast_dtype(DType::F32).unwrap(), "fp32");
+        assert_eq!(mil_cast_dtype(DType::F16).unwrap(), "fp16");
+        assert_eq!(mil_cast_dtype(DType::I32).unwrap(), "int32");
+        assert_eq!(mil_cast_dtype(DType::Bool).unwrap(), "bool");
+        // Demotions / widenings for types CoreML has no storage for.
+        assert_eq!(mil_cast_dtype(DType::F64).unwrap(), "fp32", "no f64 → fp32");
+        assert_eq!(mil_cast_dtype(DType::BF16).unwrap(), "fp16", "no bf16 → fp16");
+        assert_eq!(mil_cast_dtype(DType::I16).unwrap(), "int32", "no int16 → int32");
+    }
+
+    /// `mil_data_type` (the output tensor type) demotes the same set the cast
+    /// string does — otherwise the cast op and its result type would disagree.
+    #[test]
+    fn data_type_demotes_match_cast_dtype() {
+        assert_eq!(
+            mil_data_type(DType::F64).unwrap(),
+            proto::DataType::Float32 as i32,
+        );
+        assert_eq!(
+            mil_data_type(DType::BF16).unwrap(),
+            proto::DataType::Float16 as i32,
+        );
+        assert_eq!(
+            mil_data_type(DType::I16).unwrap(),
+            proto::DataType::Int32 as i32,
+        );
+    }
+
+    /// C64 (complex) has no MIL equivalent → both dtype mappers reject it with
+    /// a clear typed `Unsupported`, never silently corrupting the re/im layout.
+    #[test]
+    fn c64_is_cleanly_rejected() {
+        let e = mil_cast_dtype(DType::C64).unwrap_err();
+        assert!(matches!(e, CoremlError::Unsupported(_)), "got {e:?}");
+        assert!(format!("{e:?}").contains("C64"));
+        let e2 = mil_data_type(DType::C64).unwrap_err();
+        assert!(matches!(e2, CoremlError::Unsupported(_)), "got {e2:?}");
+        assert!(format!("{e2:?}").contains("C64"));
     }
 }

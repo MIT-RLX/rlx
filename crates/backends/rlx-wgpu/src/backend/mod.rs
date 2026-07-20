@@ -239,22 +239,6 @@ fn conv_im2col_scratch_bytes(graph: &Graph, planned_arena_size: usize, max_bindi
     (max_col_bytes.div_ceil(256) * 256) as usize
 }
 
-/// FNV-1a over f32 payload bytes — skips redundant `queue.write_buffer`
-/// when bench/inference feeds identical input tensors across runs.
-fn hash_f32_input(data: &[f32]) -> u64 {
-    let bytes = bytemuck::cast_slice(data);
-    let mut h: u64 = 0xcbf29ce484222325;
-    h ^= data.len() as u64;
-    h = h.wrapping_mul(0x100000001b3);
-    for chunk in bytes.chunks(8) {
-        let mut arr = [0u8; 8];
-        arr[..chunk.len()].copy_from_slice(chunk);
-        h ^= u64::from_le_bytes(arr);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
 /// Inner-FMA precision for matmul.
 ///   F32    — full f32 path (matmul.wgsl / matmul_wide.wgsl).
 ///   F16    — f16 multiply, f32 acc (matmul_f16_compute.wgsl).
@@ -310,10 +294,7 @@ pub struct WgpuExecutable {
     /// schedule) skip the entire uniform-write loop. `None` ⇒ never
     /// written; `Some(x)` ⇒ uniforms hold params for active_extent=x.
     uniforms_active_extent: Option<Option<(usize, usize)>>,
-    /// Last-upload fingerprint per input name; skips staging when unchanged.
-    input_staging_hashes: HashMap<String, u64>,
-    /// True when the schedule contains CoopF16Vk matmul (disables f32-only
-    /// input upload skip — the f16 shadow must stay in sync each run).
+    /// True when the schedule contains CoopF16Vk matmul.
     coop_f16_vk: bool,
     /// CoopF16Vk Param B offsets (f32 arena / 4) → param name for wide routing.
     coop_f16_b_param: HashMap<u32, String>,
@@ -346,7 +327,9 @@ pub struct WgpuExecutable {
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
     /// Schedule indices that only pack Param/Constant subgraphs (F5 weight
     /// Concat, static Expand, …). Executed on the first `run()`, then skipped
-    /// so the NFE loop stays device-resident like ORT I/O binding.
+    /// so the NFE loop stays device-resident like ORT I/O binding. Safe because
+    /// the memory planner pins those packed tensors through graph end (see
+    /// `extend_static_weight_pack_liveness`).
     static_once_steps: HashSet<usize>,
     static_once_done: bool,
 }
@@ -408,7 +391,6 @@ impl WgpuExecutable {
         // Recompiled — uniforms are now empty buffers; force re-write
         // on next run().
         self.uniforms_active_extent = None;
-        self.input_staging_hashes.clear();
         self.coop_f16_vk = fresh.coop_f16_vk;
         self.coop_f16_b_param = fresh.coop_f16_b_param;
         self.coop_f16_vk_wide_bind_groups = fresh.coop_f16_vk_wide_bind_groups;
@@ -476,7 +458,6 @@ impl WgpuExecutable {
             pending_param_bytes: HashMap::new(),
             active_extent: None,
             uniforms_active_extent: None,
-            input_staging_hashes: HashMap::new(),
             coop_f16_vk: false,
             coop_f16_b_param: HashMap::new(),
             coop_f16_vk_wide_b: HashSet::new(),
@@ -747,7 +728,6 @@ impl WgpuExecutable {
                 && self.arena.has(id)
             {
                 self.arena.write_f32(&dev.queue, id, data);
-                self.input_staging_hashes.remove(name);
             }
         }
     }
@@ -2331,7 +2311,7 @@ fn is_static_weight_tensor(graph: &Graph, id: NodeId, memo: &mut HashMap<NodeId,
                     .iter()
                     .all(|&inp| is_static_weight_tensor(graph, inp, memo))
         }
-        Op::Binary { .. } | Op::Where | Op::Fma => node
+        Op::Binary(_) | Op::Where | Op::Fma => node
             .inputs
             .iter()
             .all(|&inp| is_static_weight_tensor(graph, inp, memo)),

@@ -279,8 +279,16 @@ pub fn unfuse(graph: Graph, policy: &dyn DecomposePolicy) -> Graph {
             // strict-shape-matched. Other backends auto-broadcast in the
             // op itself.
             Op::Binary(_) | Op::Compare(_) | Op::Where => {
-                let broadcasted = broadcast_inputs(&mut out, &new_inputs, &node.shape);
-                out.add_node(node.op.clone(), broadcasted, node.shape.clone())
+                // Complex Binary broadcasts in complex-element units inside the
+                // backend's dedicated complex kernel; a lane-wise Expand
+                // prologue would corrupt the interleaved `[re, im]` lanes, so
+                // pass the mismatched-shape node straight through.
+                if node.shape.dtype().is_complex() {
+                    out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+                } else {
+                    let broadcasted = broadcast_inputs(&mut out, &new_inputs, &node.shape);
+                    out.add_node(node.op.clone(), broadcasted, node.shape.clone())
+                }
             }
             // Pass through everything else.
             _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
@@ -366,6 +374,14 @@ pub fn collapse_reshapes(graph: Graph) -> Graph {
 fn needs_broadcast_prologue(graph: &Graph, node: &rlx_ir::Node) -> bool {
     let is_elt = matches!(node.op, Op::Binary(_) | Op::Compare(_) | Op::Where);
     if !is_elt {
+        return false;
+    }
+    // Complex element-wise ops broadcast in complex-element units INSIDE the
+    // backend's dedicated complex kernel (e.g. wgpu `binary_c64`): each element
+    // is 2 (C64) / 4 (C128) interleaved f32 lanes, so a lane-wise Expand
+    // prologue would corrupt the `[re, im]` pairing. Skip it — the kernel reads
+    // per-operand element counts and does the modulo broadcast itself.
+    if node.shape.dtype().is_complex() {
         return false;
     }
     let target_n = node.shape.num_elements().unwrap_or(0);
