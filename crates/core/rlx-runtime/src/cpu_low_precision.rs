@@ -81,6 +81,7 @@ pub fn prepare_f32_exec_graph(graph: Graph) -> (Graph, IoDtypeManifest) {
 /// Mirrors Metal's `widen_integer_activations_to_f32` Param branch. Packed
 /// U8/I8 weights and floating params are left alone. Callers must also widen
 /// matching `set_param_typed` uploads via [`crate::backend::widen_bytes_to_f32`].
+#[allow(dead_code)] // mlx_backend only; metal/wgpu widen params in-graph instead
 pub fn widen_integer_control_params_to_f32(mut graph: Graph) -> Graph {
     for node in graph.nodes_mut() {
         if !matches!(node.op, Op::Param { .. }) {
