@@ -22,22 +22,33 @@ use crate::device::{
 };
 use crate::host_staging::F32HostSlot;
 use crate::kernels::{
-    ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, attention_row_kernel, batch_elementwise_region_kernel, binary_broadcast_kernel,
-    binary_c64_kernel, binary_kernel, complex_cast_kernel,
-    compare_kernel, concat_kernel, conv_bias_act_epilogue_kernel, conv_transpose2d_kernel,
-    conv1d_kernel, conv2d_backward_input_kernel, conv2d_backward_weight_kernel, conv2d_kernel,
-    conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
+    activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
+    argmax_kernel, attention_bwd_kernel, attention_kernel, attention_row_kernel,
+    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
+    batch_norm_inference_kernel, binary_broadcast_kernel, binary_c64_kernel, binary_kernel,
+    compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel, complex_norm_sq_kernel,
+    concat_kernel, conjugate_c64_kernel, conv_bias_act_epilogue_kernel, conv_transpose2d_kernel,
+    conv_transpose3d_kernel, conv1d_kernel, conv2d_backward_input_kernel,
+    conv2d_backward_weight_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dequantize_i8_kernel,
     dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel,
-    fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
-    fused_residual_rms_norm_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
+    fake_quantize_backward_kernel, fake_quantize_ema_kernel, fake_quantize_fixed_kernel,
+    fake_quantize_lsq_bwd_scale_kernel, fake_quantize_lsq_bwd_x_kernel,
+    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel, fused_attn_kernel,
+    fused_binary_unary_kernel, fused_residual_ln_kernel, fused_residual_rms_norm_kernel,
+    fused_swiglu_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
     gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
-    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, layer_norm2d_kernel, layernorm_kernel,
-    matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel,
-    narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
-    resize_nearest_2x_kernel, rms_norm_backward_kernel, rms_norm_bwd_zero_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_acc_kernel,
-    scatter_add_zero_kernel, selective_scan_kernel, softmax_kernel, topk_kernel, transpose_kernel,
+    group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel,
+    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, layer_norm_bwd_gamma_kernel,
+    layer_norm_bwd_input_kernel, layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel,
+    matmul_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel, narrow_kernel, pool1d_kernel,
+    pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel,
+    reduce_kernel, relu_backward_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
+    rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
+    scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel,
+    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
     unary_kernel, where_kernel,
 };
 use cudarc::cublas::{CudaBlas, sys as cublas_sys};
@@ -1272,6 +1283,36 @@ impl CudaExecutable {
                         launcher.launch(cfg).expect("rlx-cuda: where launch failed");
                     }
                 }
+                Step::Fma {
+                    n,
+                    a_off,
+                    b_off,
+                    c_off,
+                    out_off,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = fma_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(a_off)
+                        .arg(b_off)
+                        .arg(c_off)
+                        .arg(out_off);
+                    unsafe {
+                        launcher.launch(cfg).expect("rlx-cuda: fma launch failed");
+                    }
+                }
                 Step::Reduce {
                     outer,
                     inner,
@@ -1333,6 +1374,163 @@ impl CudaExecutable {
                         launcher
                             .launch(cfg)
                             .expect("rlx-cuda: softmax launch failed");
+                    }
+                }
+                Step::ReluBackward {
+                    n,
+                    x_off,
+                    dy_off,
+                    dx_off,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = relu_backward_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(x_off)
+                        .arg(dy_off)
+                        .arg(dx_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: relu_backward launch failed");
+                    }
+                }
+                Step::ActivationBackward {
+                    n,
+                    x_off,
+                    dy_off,
+                    dx_off,
+                    op,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = activation_backward_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(x_off)
+                        .arg(dy_off)
+                        .arg(dx_off)
+                        .arg(op);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: activation_backward launch failed");
+                    }
+                }
+                Step::SoftmaxCrossEntropy {
+                    outer,
+                    inner,
+                    logits_off,
+                    targets_off,
+                    out_off,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = softmax_cross_entropy_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: (outer_s, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&outer_s)
+                        .arg(inner)
+                        .arg(logits_off)
+                        .arg(targets_off)
+                        .arg(out_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: softmax_cross_entropy launch failed");
+                    }
+                }
+                Step::SoftmaxCrossEntropyWithLogits {
+                    outer,
+                    inner,
+                    logits_off,
+                    labels_off,
+                    out_off,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = softmax_cross_entropy_with_logits_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: (outer_s, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&outer_s)
+                        .arg(inner)
+                        .arg(logits_off)
+                        .arg(labels_off)
+                        .arg(out_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: softmax_cross_entropy_with_logits launch failed");
+                    }
+                }
+                Step::SoftmaxCrossEntropyBackward {
+                    outer,
+                    inner,
+                    logits_off,
+                    labels_off,
+                    d_loss_off,
+                    out_off,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = softmax_cross_entropy_backward_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: (outer_s, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&outer_s)
+                        .arg(inner)
+                        .arg(logits_off)
+                        .arg(labels_off)
+                        .arg(d_loss_off)
+                        .arg(out_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: softmax_cross_entropy_backward launch failed");
                     }
                 }
                 Step::LayerNorm {
@@ -2512,7 +2710,8 @@ impl CudaExecutable {
                     op_seed,
                 } => {
                     let opts = *self.rng.read().expect("rng lock");
-                    crate::rng_host::run_rng_normal(
+                    if !crate::rng_gpu::try_rng_normal(
+                        &self.ctx,
                         &stream,
                         self.arena.f32_buf_mut(),
                         *dst_byte_off as usize,
@@ -2522,7 +2721,19 @@ impl CudaExecutable {
                         *key,
                         *op_seed,
                         opts,
-                    );
+                    ) {
+                        crate::rng_host::run_rng_normal(
+                            &stream,
+                            self.arena.f32_buf_mut(),
+                            *dst_byte_off as usize,
+                            *len as usize,
+                            *mean,
+                            *scale,
+                            *key,
+                            *op_seed,
+                            opts,
+                        );
+                    }
                 }
                 Step::RngUniform {
                     dst_byte_off,
@@ -2533,7 +2744,8 @@ impl CudaExecutable {
                     op_seed,
                 } => {
                     let opts = *self.rng.read().expect("rng lock");
-                    crate::rng_host::run_rng_uniform(
+                    if !crate::rng_gpu::try_rng_uniform(
+                        &self.ctx,
                         &stream,
                         self.arena.f32_buf_mut(),
                         *dst_byte_off as usize,
@@ -2543,7 +2755,19 @@ impl CudaExecutable {
                         *key,
                         *op_seed,
                         opts,
-                    );
+                    ) {
+                        crate::rng_host::run_rng_uniform(
+                            &stream,
+                            self.arena.f32_buf_mut(),
+                            *dst_byte_off as usize,
+                            *len as usize,
+                            *low,
+                            *high,
+                            *key,
+                            *op_seed,
+                            opts,
+                        );
+                    }
                 }
                 Step::SelectiveScan {
                     batch,
@@ -2696,6 +2920,43 @@ impl CudaExecutable {
                         *n_bins,
                     );
                 }
+                Step::FftButterflyStage {
+                    state_off,
+                    out_off,
+                    gate_off,
+                    rev_off,
+                    tw_re_off,
+                    tw_im_off,
+                    batch,
+                    n_fft,
+                    stage,
+                } => {
+                    let kernel = fft_butterfly_stage_kernel(&self.ctx);
+                    let block = 256u32;
+                    let grid = (*batch).max(1);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(state_off)
+                        .arg(out_off)
+                        .arg(gate_off)
+                        .arg(rev_off)
+                        .arg(tw_re_off)
+                        .arg(tw_im_off)
+                        .arg(batch)
+                        .arg(n_fft)
+                        .arg(stage);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: fft_butterfly_stage launch failed");
+                    }
+                }
                 Step::LogMelHost { .. }
                 | Step::LogMelBackwardHost { .. }
                 | Step::WelchPeaksHost { .. } => {}
@@ -2814,9 +3075,9 @@ impl CudaExecutable {
                         *is_max,
                     );
                 }
-                Step::AxialRope2dHost {
-                    src_byte_off,
-                    dst_byte_off,
+                Step::AxialRope2d {
+                    in_off,
+                    out_off,
                     batch,
                     seq,
                     hidden,
@@ -2827,21 +3088,34 @@ impl CudaExecutable {
                     theta,
                     repeat_factor,
                 } => {
-                    crate::host_misc::run_axial_rope2d(
-                        &stream,
-                        self.arena.f32_buf_mut(),
-                        *src_byte_off as usize,
-                        *dst_byte_off as usize,
-                        *batch as usize,
-                        *seq as usize,
-                        *hidden as usize,
-                        *end_x as usize,
-                        *end_y as usize,
-                        *head_dim as usize,
-                        *num_heads as usize,
-                        *theta,
-                        *repeat_factor as usize,
-                    );
+                    let n_total = batch * seq * hidden;
+                    let kernel = axial_rope2d_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_total, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(batch)
+                        .arg(seq)
+                        .arg(hidden)
+                        .arg(end_x)
+                        .arg(end_y)
+                        .arg(head_dim)
+                        .arg(num_heads)
+                        .arg(repeat_factor)
+                        .arg(theta)
+                        .arg(in_off)
+                        .arg(out_off)
+                        .arg(&n_total);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: axial_rope2d launch failed");
+                    }
                 }
                 Step::GatedDeltaNet {
                     q_byte_off,
@@ -2985,6 +3259,197 @@ impl CudaExecutable {
                         );
                     }
                 }
+                Step::Gru {
+                    x_byte_off,
+                    w_ih_byte_off,
+                    w_hh_byte_off,
+                    b_ih_byte_off,
+                    b_hh_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                } => {
+                    crate::gru_gpu::run_gru(
+                        &self.ctx,
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *x_byte_off as usize,
+                        *w_ih_byte_off as usize,
+                        *w_hh_byte_off as usize,
+                        *b_ih_byte_off as usize,
+                        *b_hh_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *input_size as usize,
+                        *hidden as usize,
+                    );
+                }
+                Step::GruHost {
+                    x_byte_off,
+                    w_ih_byte_off,
+                    w_hh_byte_off,
+                    b_ih_byte_off,
+                    b_hh_byte_off,
+                    h0_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
+                    crate::gru_host::run_gru(
+                        &stream,
+                        buf,
+                        arena_size,
+                        *x_byte_off as usize,
+                        *w_ih_byte_off as usize,
+                        *w_hh_byte_off as usize,
+                        *b_ih_byte_off as usize,
+                        *b_hh_byte_off as usize,
+                        *h0_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *input_size as usize,
+                        *hidden as usize,
+                        *num_layers as usize,
+                        *bidirectional,
+                        *carry,
+                    );
+                }
+                Step::Rnn {
+                    x_byte_off,
+                    w_ih_byte_off,
+                    w_hh_byte_off,
+                    bias_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                    relu,
+                } => {
+                    crate::rnn_gpu::run_rnn(
+                        &self.ctx,
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *x_byte_off as usize,
+                        *w_ih_byte_off as usize,
+                        *w_hh_byte_off as usize,
+                        *bias_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *input_size as usize,
+                        *hidden as usize,
+                        *relu,
+                    );
+                }
+                Step::RnnHost {
+                    x_byte_off,
+                    w_ih_byte_off,
+                    w_hh_byte_off,
+                    bias_byte_off,
+                    h0_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                    relu,
+                } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
+                    crate::rnn_host::run_rnn(
+                        &stream,
+                        buf,
+                        arena_size,
+                        *x_byte_off as usize,
+                        *w_ih_byte_off as usize,
+                        *w_hh_byte_off as usize,
+                        *bias_byte_off as usize,
+                        *h0_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *input_size as usize,
+                        *hidden as usize,
+                        *num_layers as usize,
+                        *bidirectional,
+                        *carry,
+                        *relu,
+                    );
+                }
+                Step::Mamba2 {
+                    x_byte_off,
+                    dt_byte_off,
+                    a_byte_off,
+                    b_byte_off,
+                    c_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    heads,
+                    head_dim,
+                    state_size,
+                } => {
+                    crate::mamba2_gpu::run_mamba2(
+                        &self.ctx,
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *x_byte_off as usize,
+                        *dt_byte_off as usize,
+                        *a_byte_off as usize,
+                        *b_byte_off as usize,
+                        *c_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *heads as usize,
+                        *head_dim as usize,
+                        *state_size as usize,
+                    );
+                }
+                Step::Mamba2Host {
+                    x_byte_off,
+                    dt_byte_off,
+                    a_byte_off,
+                    b_byte_off,
+                    c_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    heads,
+                    head_dim,
+                    state_size,
+                } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
+                    crate::mamba2_host::run_mamba2(
+                        &stream,
+                        buf,
+                        arena_size,
+                        *x_byte_off as usize,
+                        *dt_byte_off as usize,
+                        *a_byte_off as usize,
+                        *b_byte_off as usize,
+                        *c_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *heads as usize,
+                        *head_dim as usize,
+                        *state_size as usize,
+                    );
+                }
                 Step::ScanHost { desc } => {
                     let (buf, arena_size) = self.arena.f32_buf_and_size();
                     crate::scan_host::run_scan(&stream, buf, arena_size, desc);
@@ -2995,7 +3460,9 @@ impl CudaExecutable {
                 }
                 Step::CpuIndexing { thunk } => {
                     let (buf, arena_size) = self.arena.f32_buf_and_size();
-                    crate::scan_host::run_indexing(&stream, buf, arena_size, thunk);
+                    if !crate::scatter_nd_gpu::try_run(&self.ctx, &stream, buf, thunk) {
+                        crate::scan_host::run_indexing(&stream, buf, arena_size, thunk);
+                    }
                 }
                 Step::SpdHost {
                     op,
@@ -3016,6 +3483,45 @@ impl CudaExecutable {
                 } => {
                     let buf = self.arena.f32_buf_mut();
                     crate::eigh_native::run(&self.ctx, &stream, buf, *in_off, *out_off, *n, *batch);
+                }
+                Step::DenseSolveNative {
+                    a_off,
+                    b_off,
+                    x_off,
+                    n,
+                    nrhs,
+                } => {
+                    let buf = self.arena.f32_buf_mut();
+                    crate::dense_solve_native::run_dense(
+                        &self.ctx, &stream, buf, *a_off, *b_off, *x_off, *n, *nrhs,
+                    );
+                }
+                Step::BatchedDenseSolveNative {
+                    a_off,
+                    b_off,
+                    x_off,
+                    batch,
+                    n,
+                    nrhs,
+                } => {
+                    let blas = self
+                        .blas
+                        .as_ref()
+                        .expect("rlx-cuda: BatchedDenseSolveNative requires cuBLAS");
+                    let blas = blas.lock().unwrap();
+                    let buf = self.arena.f32_buf_mut();
+                    crate::dense_solve_native::run_batched(
+                        &self.ctx,
+                        &stream,
+                        *blas.handle(),
+                        buf,
+                        *a_off,
+                        *b_off,
+                        *x_off,
+                        *batch,
+                        *n,
+                        *nrhs,
+                    );
                 }
                 Step::Llada2GroupLimitedGate {
                     sig_off,
@@ -3061,9 +3567,22 @@ impl CudaExecutable {
                     attrs,
                 } => {
                     let (buf, _arena_size) = self.arena.f32_buf_and_size();
-                    crate::onnx_custom_host::run_custom_host(
-                        &stream, buf, name, in_specs, *out_off, out_shape, attrs,
-                    );
+                    if crate::dyn_quant_lstm_gpu::try_run(
+                        &self.ctx,
+                        &stream,
+                        buf,
+                        name,
+                        in_specs,
+                        *out_off,
+                        out_shape,
+                        attrs,
+                    ) {
+                        // Handled on-device (Kitten DynamicQuantizeLSTM).
+                    } else {
+                        crate::onnx_custom_host::run_custom_host(
+                            &stream, buf, name, in_specs, *out_off, out_shape, attrs,
+                        );
+                    }
                 }
                 Step::CollectiveHost {
                     name,
@@ -3145,6 +3664,8 @@ impl CudaExecutable {
                     out_off,
                     out_len,
                     in_offs,
+                    attrs,
+                    out_shape,
                 } => {
                     // Raw-GPU custom op: fetch (NVRTC-compiling on first use) the
                     // kernel and launch it against the whole arena. Offsets are
@@ -3153,21 +3674,23 @@ impl CudaExecutable {
                     let gk = crate::cuda_gpu_kernels::lookup(name)
                         .expect("CudaGpuKernel vanished from the registry between compile and run");
                     let kernel = crate::cuda_gpu_kernels::get_or_build(&self.ctx, &*gk);
-                    let bs = gk.block_size();
-                    let (grid, block) = dispatch_grid_1d(*out_len, bs);
-                    let cfg = LaunchConfig {
-                        grid_dim: (grid, 1, 1),
-                        block_dim: (block, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
                     // Pad (off,len) to MAX_INPUTS with (0,0); `n_inputs` says how
-                    // many are real. Matches the fixed 12-arg kernel signature.
+                    // many are real. Trailing e0..e3 are runtime extras.
                     let n_inputs = in_offs.len() as u32;
                     let mut io = [0u32; crate::cuda_gpu_kernels::MAX_INPUTS * 2];
                     for (i, (o, l)) in in_offs.iter().enumerate() {
                         io[i * 2] = *o;
                         io[i * 2 + 1] = *l;
                     }
+                    let extras = gk.extras(attrs, out_shape);
+                    let bs = gk.block_size().max(1);
+                    let launch_n = gk.launch_elems(*out_len, extras).max(1);
+                    let grid = gk.grid_blocks(launch_n, bs).max(1);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (bs, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
                         .arg(self.arena.f32_buf_mut())
@@ -3176,6 +3699,9 @@ impl CudaExecutable {
                         .arg(&n_inputs);
                     for v in &io {
                         launcher.arg(v);
+                    }
+                    for e in &extras {
+                        launcher.arg(e);
                     }
                     unsafe {
                         launcher
@@ -3204,8 +3730,145 @@ impl CudaExecutable {
                     dw,
                     groups,
                 } => {
-                    let kernel = conv_transpose2d_kernel(&self.ctx);
-                    let total = n * c_out * h_out * w_out;
+                    // ConvTranspose2d ≡ cuDNN convolutionBackwardData with the
+                    // PyTorch weight layout [C_in, C_out/g, kH, kW]. The naive
+                    // gather kernel is ~10–50× slower on vocoder upsamplers
+                    // (Kitten: 7× ≈ 1.5 s of a 3.4 s wave pass).
+                    // Kitten / HiFi-GAN use 1×k kernels and depthwise groups —
+                    // do NOT reuse the training fwd gate (`kh>1 && groups==1`).
+                    // Opt out with `RLX_CUDA_CONV_T_KERNEL=1` or `RLX_CUDA_NO_CUDNN=1`.
+                    let try_cudnn = self.dnn.is_some()
+                        && self.dnn_workspace.is_some()
+                        && !rlx_ir::env::flag("RLX_CUDA_NO_CUDNN")
+                        && !rlx_ir::env::flag("RLX_CUDA_CONV_T_KERNEL");
+                    let used_cudnn = if try_cudnn {
+                        let handle = self.dnn.expect("dnn handle");
+                        let workspace = self.dnn_workspace.as_ref().expect("dnn workspace");
+                        let mut workspace = workspace.lock().unwrap();
+                        let (ws_ptr, _ws) = workspace.device_ptr_mut(&stream);
+                        let (arena_ptr, _ar) = self.arena.f32_buf_mut().device_ptr_mut(&stream);
+                        // Map transpose → forward-bwd_data:
+                        //   dy = transpose input  [N, C_in, H, W]
+                        //   dx = transpose output [N, C_out, H_out, W_out]
+                        //   W  = [C_in, C_out/g, kH, kW] (= forward filter [K, C/g, R, S]
+                        //         with K=C_in, C=C_out).
+                        let r = unsafe {
+                            cudnn_conv2d_backward_data(
+                                handle,
+                                ws_ptr,
+                                CUDNN_WORKSPACE_BYTES,
+                                arena_ptr,
+                                *n,
+                                *c_out,
+                                *c_in,
+                                *h_out,
+                                *w_out,
+                                *h,
+                                *w_in,
+                                *kh,
+                                *kw,
+                                *sh,
+                                *sw,
+                                *ph,
+                                *pw,
+                                *dh,
+                                *dw,
+                                *groups,
+                                *src_off,
+                                *w_off,
+                                *dst_off,
+                            )
+                        };
+                        if let Err(ref e) = r {
+                            log_fallback("conv_transpose2d.cudnn", e);
+                        }
+                        r.is_ok()
+                    } else {
+                        false
+                    };
+                    if rlx_ir::env::flag("RLX_CUDA_CONV_TRACE") {
+                        eprintln!(
+                            "[CONV-TRACE] ConvTranspose2d n={} c_in={} c_out={} {}x{}→{}x{} k={}x{} g={} -> {}",
+                            *n,
+                            *c_in,
+                            *c_out,
+                            *h,
+                            *w_in,
+                            *h_out,
+                            *w_out,
+                            *kh,
+                            *kw,
+                            *groups,
+                            if used_cudnn { "cuDNN" } else { "kernel" }
+                        );
+                    }
+                    if !used_cudnn {
+                        let kernel = conv_transpose2d_kernel(&self.ctx);
+                        let total = n * c_out * h_out * w_out;
+                        let (grid, block) = dispatch_grid_1d(total, 256);
+                        let cfg = LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(src_off)
+                            .arg(w_off)
+                            .arg(dst_off)
+                            .arg(n)
+                            .arg(c_in)
+                            .arg(h)
+                            .arg(w_in)
+                            .arg(c_out)
+                            .arg(h_out)
+                            .arg(w_out)
+                            .arg(kh)
+                            .arg(kw)
+                            .arg(sh)
+                            .arg(sw)
+                            .arg(ph)
+                            .arg(pw)
+                            .arg(dh)
+                            .arg(dw)
+                            .arg(groups);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: conv_transpose2d launch failed");
+                        }
+                    }
+                }
+                Step::ConvTranspose3d {
+                    n,
+                    c_in,
+                    c_out,
+                    d,
+                    h,
+                    w,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                    dd,
+                    dh,
+                    dw,
+                    groups,
+                    in_off,
+                    w_off,
+                    out_off,
+                } => {
+                    let kernel = conv_transpose3d_kernel(&self.ctx);
+                    let total = n * c_out * d_out * h_out * w_out;
                     let (grid, block) = dispatch_grid_1d(total, 256);
                     let cfg = LaunchConfig {
                         grid_dim: (grid, 1, 1),
@@ -3215,29 +3878,63 @@ impl CudaExecutable {
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
                         .arg(self.arena.f32_buf_mut())
-                        .arg(src_off)
-                        .arg(w_off)
-                        .arg(dst_off)
                         .arg(n)
                         .arg(c_in)
-                        .arg(h)
-                        .arg(w_in)
                         .arg(c_out)
+                        .arg(d)
+                        .arg(h)
+                        .arg(w)
+                        .arg(d_out)
                         .arg(h_out)
                         .arg(w_out)
+                        .arg(kd)
                         .arg(kh)
                         .arg(kw)
+                        .arg(sd)
                         .arg(sh)
                         .arg(sw)
+                        .arg(pd)
                         .arg(ph)
                         .arg(pw)
+                        .arg(dd)
                         .arg(dh)
                         .arg(dw)
-                        .arg(groups);
+                        .arg(groups)
+                        .arg(in_off)
+                        .arg(w_off)
+                        .arg(out_off);
                     unsafe {
                         launcher
                             .launch(cfg)
-                            .expect("rlx-cuda: conv_transpose2d launch failed");
+                            .expect("rlx-cuda: conv_transpose3d launch failed");
+                    }
+                }
+                Step::FusedSwiGLU {
+                    in_off,
+                    out_off,
+                    n_half,
+                    total,
+                    gate_first,
+                } => {
+                    let kernel = fused_swiglu_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*total, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n_half)
+                        .arg(total)
+                        .arg(gate_first)
+                        .arg(in_off)
+                        .arg(out_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: fused_swiglu launch failed");
                     }
                 }
                 Step::GroupNorm {
@@ -3276,6 +3973,664 @@ impl CudaExecutable {
                         launcher
                             .launch(cfg)
                             .expect("rlx-cuda: group_norm launch failed");
+                    }
+                }
+                Step::GroupNormBackwardInput {
+                    x_off,
+                    gamma_off,
+                    dy_off,
+                    out_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                    num_groups,
+                    eps_bits,
+                } => {
+                    let kernel = group_norm_bwd_input_kernel(&self.ctx);
+                    let grid = n * num_groups;
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(x_off)
+                        .arg(gamma_off)
+                        .arg(dy_off)
+                        .arg(out_off)
+                        .arg(n)
+                        .arg(c)
+                        .arg(h)
+                        .arg(w)
+                        .arg(num_groups)
+                        .arg(eps_bits);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: group_norm_bwd_input launch failed");
+                    }
+                }
+                Step::GroupNormBackwardGamma {
+                    x_off,
+                    dy_off,
+                    out_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                    num_groups,
+                    eps_bits,
+                } => {
+                    let kernel = group_norm_bwd_gamma_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(x_off)
+                        .arg(dy_off)
+                        .arg(out_off)
+                        .arg(n)
+                        .arg(c)
+                        .arg(h)
+                        .arg(w)
+                        .arg(num_groups)
+                        .arg(eps_bits);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: group_norm_bwd_gamma launch failed");
+                    }
+                }
+                Step::GroupNormBackwardBeta {
+                    dy_off,
+                    out_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                } => {
+                    let kernel = group_norm_bwd_beta_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(dy_off)
+                        .arg(out_off)
+                        .arg(n)
+                        .arg(c)
+                        .arg(h)
+                        .arg(w);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: group_norm_bwd_beta launch failed");
+                    }
+                }
+                Step::BatchNormInference {
+                    src_off,
+                    g_off,
+                    b_off,
+                    mean_off,
+                    var_off,
+                    dst_off,
+                    count,
+                    channels,
+                    eps_bits,
+                } => {
+                    let kernel = batch_norm_inference_kernel(&self.ctx);
+                    let n = count * channels;
+                    let (grid, block) = dispatch_grid_1d(n, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(src_off)
+                        .arg(g_off)
+                        .arg(b_off)
+                        .arg(mean_off)
+                        .arg(var_off)
+                        .arg(dst_off)
+                        .arg(count)
+                        .arg(channels)
+                        .arg(eps_bits);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: batch_norm_inference launch failed");
+                    }
+                }
+                Step::BatchNormInferenceBackwardInput {
+                    gamma_off,
+                    var_off,
+                    dy_off,
+                    out_off,
+                    count,
+                    channels,
+                    eps_bits,
+                } => {
+                    let kernel = batch_norm_inference_bwd_input_kernel(&self.ctx);
+                    let n = count * channels;
+                    let (grid, block) = dispatch_grid_1d(n, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(gamma_off)
+                        .arg(var_off)
+                        .arg(dy_off)
+                        .arg(out_off)
+                        .arg(count)
+                        .arg(channels)
+                        .arg(eps_bits);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: batch_norm_inference_bwd_input launch failed");
+                    }
+                }
+                Step::BatchNormInferenceBackwardGamma {
+                    x_off,
+                    mean_off,
+                    var_off,
+                    dy_off,
+                    out_off,
+                    count,
+                    channels,
+                    eps_bits,
+                } => {
+                    let kernel = batch_norm_inference_bwd_gamma_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*channels, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(x_off)
+                        .arg(mean_off)
+                        .arg(var_off)
+                        .arg(dy_off)
+                        .arg(out_off)
+                        .arg(count)
+                        .arg(channels)
+                        .arg(eps_bits);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: batch_norm_inference_bwd_gamma launch failed");
+                    }
+                }
+                Step::BatchNormInferenceBackwardBeta {
+                    dy_off,
+                    out_off,
+                    count,
+                    channels,
+                } => {
+                    let kernel = batch_norm_inference_bwd_beta_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*channels, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(dy_off)
+                        .arg(out_off)
+                        .arg(count)
+                        .arg(channels);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: batch_norm_inference_bwd_beta launch failed");
+                    }
+                }
+                Step::LayerNormBackwardInput {
+                    x_off,
+                    gamma_off,
+                    dy_off,
+                    out_off,
+                    rows,
+                    h,
+                    eps_bits,
+                } => {
+                    let kernel = layer_norm_bwd_input_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: (*rows, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(rows)
+                        .arg(h)
+                        .arg(x_off)
+                        .arg(gamma_off)
+                        .arg(dy_off)
+                        .arg(out_off)
+                        .arg(eps_bits);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: layer_norm_bwd_input launch failed");
+                    }
+                }
+                Step::LayerNormBackwardGamma {
+                    x_off,
+                    dy_off,
+                    out_off,
+                    rows,
+                    h,
+                    eps_bits,
+                } => {
+                    let kernel = layer_norm_bwd_gamma_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(rows)
+                        .arg(h)
+                        .arg(x_off)
+                        .arg(dy_off)
+                        .arg(out_off)
+                        .arg(eps_bits);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: layer_norm_bwd_gamma launch failed");
+                    }
+                }
+                Step::FakeQuantizeFixed {
+                    in_off,
+                    scale_off,
+                    out_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                } => {
+                    let kernel = fake_quantize_fixed_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(chan_dim)
+                        .arg(inner)
+                        .arg(q_max_bits)
+                        .arg(in_off)
+                        .arg(scale_off)
+                        .arg(out_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: fake_quantize_fixed launch failed");
+                    }
+                }
+                Step::FakeQuantizePerBatch {
+                    in_off,
+                    out_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                } => {
+                    let kernel = fake_quantize_perbatch_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*chan_dim, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(chan_dim)
+                        .arg(inner)
+                        .arg(q_max_bits)
+                        .arg(in_off)
+                        .arg(out_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: fake_quantize_perbatch launch failed");
+                    }
+                }
+                Step::FakeQuantizeEma {
+                    in_off,
+                    scale_off,
+                    out_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                    decay_bits,
+                } => {
+                    let kernel = fake_quantize_ema_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*chan_dim, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(chan_dim)
+                        .arg(inner)
+                        .arg(q_max_bits)
+                        .arg(decay_bits)
+                        .arg(in_off)
+                        .arg(scale_off)
+                        .arg(out_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: fake_quantize_ema launch failed");
+                    }
+                }
+                Step::QuantizeI8 {
+                    in_off,
+                    q_byte_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    meta_idx,
+                } => {
+                    let kernel = quantize_i8_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(chan_dim)
+                        .arg(inner)
+                        .arg(in_off)
+                        .arg(q_byte_off)
+                        .arg(&self.meta_buffers[*meta_idx]);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: quantize_i8 launch failed");
+                    }
+                }
+                Step::DequantizeI8 {
+                    q_byte_off,
+                    out_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    meta_idx,
+                } => {
+                    let kernel = dequantize_i8_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(chan_dim)
+                        .arg(inner)
+                        .arg(q_byte_off)
+                        .arg(out_off)
+                        .arg(&self.meta_buffers[*meta_idx]);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: dequantize_i8 launch failed");
+                    }
+                }
+                Step::QMatMul {
+                    m,
+                    k,
+                    n,
+                    x_byte_off,
+                    w_byte_off,
+                    bias_off,
+                    out_byte_off,
+                    x_zp,
+                    w_zp,
+                    out_zp,
+                    mult_bits,
+                } => {
+                    let total = *m * *n;
+                    let kernel = q_matmul_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(m)
+                        .arg(k)
+                        .arg(n)
+                        .arg(x_byte_off)
+                        .arg(w_byte_off)
+                        .arg(bias_off)
+                        .arg(out_byte_off)
+                        .arg(x_zp)
+                        .arg(w_zp)
+                        .arg(out_zp)
+                        .arg(mult_bits);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: q_matmul launch failed");
+                    }
+                }
+                Step::QConv2d {
+                    n,
+                    c_in,
+                    c_out,
+                    h,
+                    w,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw,
+                    groups,
+                    x_byte_off,
+                    w_byte_off,
+                    bias_off,
+                    out_byte_off,
+                    x_zp,
+                    w_zp,
+                    out_zp,
+                    mult_bits,
+                } => {
+                    let total = *n * *c_out * *h_out * *w_out;
+                    let kernel = q_conv2d_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(c_in)
+                        .arg(c_out)
+                        .arg(h)
+                        .arg(w)
+                        .arg(h_out)
+                        .arg(w_out)
+                        .arg(kh)
+                        .arg(kw)
+                        .arg(sh)
+                        .arg(sw)
+                        .arg(ph)
+                        .arg(pw)
+                        .arg(dh)
+                        .arg(dw)
+                        .arg(groups)
+                        .arg(x_byte_off)
+                        .arg(w_byte_off)
+                        .arg(bias_off)
+                        .arg(out_byte_off)
+                        .arg(x_zp)
+                        .arg(w_zp)
+                        .arg(out_zp)
+                        .arg(mult_bits);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: q_conv2d launch failed");
+                    }
+                }
+                Step::FakeQuantizeLsqBwdX {
+                    x_off,
+                    scale_off,
+                    dy_off,
+                    dx_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                } => {
+                    let kernel = fake_quantize_lsq_bwd_x_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(chan_dim)
+                        .arg(inner)
+                        .arg(q_max_bits)
+                        .arg(x_off)
+                        .arg(scale_off)
+                        .arg(dy_off)
+                        .arg(dx_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: fake_quantize_lsq_bwd_x launch failed");
+                    }
+                }
+                Step::FakeQuantizeLsqBwdScale {
+                    x_off,
+                    scale_off,
+                    dy_off,
+                    dscale_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                } => {
+                    let kernel = fake_quantize_lsq_bwd_scale_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*chan_dim, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(chan_dim)
+                        .arg(inner)
+                        .arg(q_max_bits)
+                        .arg(x_off)
+                        .arg(scale_off)
+                        .arg(dy_off)
+                        .arg(dscale_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: fake_quantize_lsq_bwd_scale launch failed");
+                    }
+                }
+                Step::FakeQuantizeBackward {
+                    x_off,
+                    dy_off,
+                    dx_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                    ste_kind,
+                } => {
+                    let kernel = fake_quantize_backward_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*chan_dim, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(chan_dim)
+                        .arg(inner)
+                        .arg(q_max_bits)
+                        .arg(ste_kind)
+                        .arg(x_off)
+                        .arg(dy_off)
+                        .arg(dx_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: fake_quantize_backward launch failed");
                     }
                 }
                 Step::ResizeNearest2x {
@@ -3382,6 +4737,99 @@ impl CudaExecutable {
                         launcher
                             .launch(cfg)
                             .expect("rlx-cuda: binary_c64 launch failed");
+                    }
+                }
+                Step::ComplexNormSq {
+                    n,
+                    src_byte_off,
+                    dst_byte_off,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = complex_norm_sq_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let src_off: u64 = *src_byte_off / 4;
+                    let dst_off: u64 = *dst_byte_off / 4;
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(&src_off)
+                        .arg(&dst_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: complex_norm_sq launch failed");
+                    }
+                }
+                Step::ComplexNormSqBackward {
+                    n,
+                    z_byte_off,
+                    g_byte_off,
+                    dz_byte_off,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = complex_norm_sq_backward_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let z_off: u64 = *z_byte_off / 4;
+                    let g_off: u64 = *g_byte_off / 4;
+                    let dz_off: u64 = *dz_byte_off / 4;
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(&z_off)
+                        .arg(&g_off)
+                        .arg(&dz_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: complex_norm_sq_backward launch failed");
+                    }
+                }
+                Step::ConjugateC64 {
+                    n,
+                    src_byte_off,
+                    dst_byte_off,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = conjugate_c64_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let src_off: u64 = *src_byte_off / 4;
+                    let dst_off: u64 = *dst_byte_off / 4;
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(&src_off)
+                        .arg(&dst_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: conjugate_c64 launch failed");
                     }
                 }
                 Step::GaussianSplatRender {
@@ -3899,7 +5347,16 @@ impl CudaExecutable {
                         };
                         eprintln!(
                             "[CONV-TRACE] Conv2dBackwardInput n={} c_in={} c_out={} {}x{} k={}x{} g={} | cudnn_ok_shape={} dnn_loaded={} -> {path}",
-                            *n, *c_in, *c_out, *h, *w_in, *kh, *kw, *groups, cudnn_ok_shape, self.dnn.is_some()
+                            *n,
+                            *c_in,
+                            *c_out,
+                            *h,
+                            *w_in,
+                            *kh,
+                            *kw,
+                            *groups,
+                            cudnn_ok_shape,
+                            self.dnn.is_some()
                         );
                     }
                     if !used_cudnn {
@@ -4061,7 +5518,16 @@ impl CudaExecutable {
                         };
                         eprintln!(
                             "[CONV-TRACE] Conv2dBackwardWeight n={} c_in={} c_out={} {}x{} k={}x{} g={} | cudnn_ok_shape={} dnn_loaded={} -> {path}",
-                            *n, *c_in, *c_out, *h, *w, *kh, *kw, *groups, cudnn_ok_shape, self.dnn.is_some()
+                            *n,
+                            *c_in,
+                            *c_out,
+                            *h,
+                            *w,
+                            *kh,
+                            *kw,
+                            *groups,
+                            cudnn_ok_shape,
+                            self.dnn.is_some()
                         );
                     }
                     if !used_cudnn {
@@ -4761,18 +6227,32 @@ impl CudaExecutable {
             if let Some(t0) = _prof_t0 {
                 let _ = default_stream.synchronize();
                 let dt = t0.elapsed().as_secs_f64() * 1e3;
-                let e = step_prof.entry(step_name(step)).or_insert((0.0, 0));
+                let key: &'static str = match step {
+                    Step::CustomHost { name, .. } => {
+                        // Leak short labels so the existing HashMap<&'static str, …>
+                        // profiler can break CustomHost down by op name.
+                        Box::leak(format!("CustomHost:{name}").into_boxed_str())
+                    }
+                    Step::CudaGpuKernel { name, .. } => {
+                        Box::leak(format!("CudaGpu:{name}").into_boxed_str())
+                    }
+                    _ => step_name(step),
+                };
+                let e = step_prof.entry(key).or_insert((0.0, 0));
                 e.0 += dt;
                 e.1 += 1;
             }
         }
         if step_profile {
             let mut v: Vec<_> = step_prof.iter().collect();
-            v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
             let total: f64 = v.iter().map(|(_, (ms, _))| ms).sum();
             eprintln!("rlx-cuda: step profile (total {total:.1}ms):");
-            for (name, (ms, n)) in v.iter().take(12) {
-                eprintln!("  {name:<28} {ms:8.2}ms  ({n}×, {:.3}ms/call)", ms / *n as f64);
+            for (name, (ms, n)) in v.iter().take(20) {
+                eprintln!(
+                    "  {name:<28} {ms:8.2}ms  ({n}×, {:.3}ms/call)",
+                    ms / *n as f64
+                );
             }
         }
 

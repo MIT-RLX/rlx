@@ -180,6 +180,40 @@ pub fn run_argreduce(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn run_axial_rope2d(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    src: usize,
+    dst: usize,
+    batch: usize,
+    seq: usize,
+    hidden: usize,
+    end_x: usize,
+    end_y: usize,
+    head_dim: usize,
+    num_heads: usize,
+    theta: f32,
+    repeat_factor: usize,
+) {
+    let mut a = full(arena, device, queue);
+    rlx_gpu_host::run_axial_rope2d(
+        &mut a,
+        src,
+        dst,
+        batch,
+        seq,
+        hidden,
+        end_x,
+        end_y,
+        head_dim,
+        num_heads,
+        theta,
+        repeat_factor,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_resize_nearest_2x(
     arena: &Arena,
     device: &wgpu::Device,

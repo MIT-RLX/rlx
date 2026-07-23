@@ -52,9 +52,7 @@ pub enum EnvStability {
     /// Bench / tooling / example-only.
     Internal,
     /// Still accepted; prefer `replace_with`.
-    Deprecated {
-        replace_with: &'static str,
-    },
+    Deprecated { replace_with: &'static str },
 }
 
 /// Which subsystem owns the option.
@@ -114,9 +112,9 @@ pub fn lookup(name: &str) -> Option<&'static EnvVarEntry> {
         .find(|e| e.name == name || e.aliases.iter().any(|a| *a == name))
         .or_else(|| {
             // Deprecated rows are looked up by their own `name`.
-            REGISTRY.iter().find(|e| {
-                matches!(e.stability, EnvStability::Deprecated { .. }) && e.name == name
-            })
+            REGISTRY
+                .iter()
+                .find(|e| matches!(e.stability, EnvStability::Deprecated { .. }) && e.name == name)
         })
 }
 
@@ -137,10 +135,8 @@ fn maybe_warn_deprecated(used: &str, entry: &EnvVarEntry) {
     if used == entry.name {
         return;
     }
-    if !matches!(
-        entry.stability,
-        EnvStability::Deprecated { .. }
-    ) && !entry.aliases.iter().any(|a| *a == used)
+    if !matches!(entry.stability, EnvStability::Deprecated { .. })
+        && !entry.aliases.iter().any(|a| *a == used)
     {
         return;
     }

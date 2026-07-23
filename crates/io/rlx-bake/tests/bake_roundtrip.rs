@@ -31,11 +31,13 @@ fn bake_mul_param_includes_weights() {
     assert_eq!(file.weights[0].name, "w");
     assert_eq!(file.weights[0].encoding, "f32");
     assert_eq!(file.weights[0].data.len(), 16);
-    assert!(!file
-        .graph
-        .nodes()
-        .iter()
-        .any(|n| matches!(&n.op, Op::Param { name } if name == "w")));
+    assert!(
+        !file
+            .graph
+            .nodes()
+            .iter()
+            .any(|n| matches!(&n.op, Op::Param { name } if name == "w"))
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.rlx");

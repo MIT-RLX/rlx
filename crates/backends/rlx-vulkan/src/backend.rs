@@ -14,21 +14,26 @@
 //! arena), submit once per `run`, and read outputs back from the host-visible
 //! mapping.
 //!
-//! Op coverage is the transformer-inference hot path: elementwise (binary /
-//! unary / compare / where), matmul, last-axis reduce, softmax, RMS/Layer
-//! norm, RoPE, attention, gather, cumsum, and the shape ops (narrow / concat /
-//! expand / transpose) via one strided-copy kernel. Fused ops, DotGeneral,
-//! Fma, non-last-axis reduce, GroupNorm, etc. are decomposed to these
-//! primitives by `legalize_or_rewrite_for_backend`. Anything left unsupported
-//! (Conv, Pool, quantized matmul, SSM, …) fails loudly with a "pin to CPU"
-//! diagnostic — like rlx-wgpu's stance for ops it can't lower.
+//! Op coverage is the transformer-inference hot path plus vision / QAT /
+//! spectral / SPD host fallbacks claimed to CUDA parity (153 OpKinds).
+//! Native SPIR-V covers elementwise, matmul (+ fused bias/act compose),
+//! norms (+ bwd), fused residual norms / SwiGLU, C64 Wirtinger, RoPE,
+//! attention, conv2d/3d (+ transpose2d/3d, fused conv-bias-act), gather/
+//! cumsum, FFT butterfly, simple Gru/Rnn/Lstm/Mamba2, and shape ops via
+//! strided-copy. Region / GatedDeltaNet forms decompose before schedule.
+//! Composed ops (LoraMatMul, FTL, DotGeneral, If/While) expand via
+//! `crate::unfuse`. Host-fallback covers oversized RNN, FFT, splat, solves,
+//! and QAT LSQ EMA.
 
-use crate::buffer::{Arena, SHARD_STAGE_RESERVE, is_weight_elem, raw_elem_off};
+use crate::buffer::{Arena, is_weight_elem, raw_elem_off, shard_stage_reserve};
 use crate::device::vulkan_device;
+use crate::host_stage::VulkanArena;
 use crate::kernels::kernels;
 use ash::vk;
 use rlx_compile::memory::MemoryPlan;
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp, RopeStyle};
+use rlx_ir::op::{
+    Activation, AttentionBwdWrt, BinaryOp, CmpOp, MaskKind, ReduceOp, RopeStyle, SteKind,
+};
 use rlx_ir::{DType, Graph, NodeId, Op, RngOptions};
 use std::collections::{HashMap, HashSet};
 
@@ -46,13 +51,36 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Binary,
         Compare,
         Where,
+        Fma,
+        // Claimed; `DecomposeFusionRegions` + `UnfuseElementwiseRegions`
+        // expand to ResizeNearest2x / Binary / Activation before schedule.
+        ElementwiseRegion,
+        TransformRegion,
+        BatchElementwiseRegion,
         Activation, // elementwise
         MatMul,
+        // Claimed; `unfuse` expands DotGeneral → MatMul (+ reshape/transpose).
+        DotGeneral,
+        // Native: schedule composes MatMul + Binary(Add bias) + Activation.
+        FusedMatMulBiasAct,
         Reduce,
-        Softmax, // contraction / reduction
+        Softmax,
+        SoftmaxCrossEntropy,
+        SoftmaxCrossEntropyWithLogits,
+        SoftmaxCrossEntropyBackward, // contraction / reduction / loss
         LayerNorm,
         RmsNorm,
-        LayerNorm2d, // normalization
+        LayerNorm2d,
+        GroupNorm,
+        GroupNormBackwardInput,
+        GroupNormBackwardGamma,
+        GroupNormBackwardBeta, // normalization
+        FusedResidualLN,
+        FusedResidualRmsNorm,
+        FusedSwiGLU, // fused residual+norm / MLP
+        ComplexNormSq,
+        ComplexNormSqBackward,
+        Conjugate, // C64 Wirtinger
         Rope,
         Attention, // transformer
         // Claimed so the block is a first-class op; `compile_rng` runs
@@ -67,6 +95,45 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // `gated_residual_backward` shaders).
         AdaLayerNormBackward,
         GatedResidualBackward,
+        // QAT: Fixed/PerBatch native SPIR-V; EMA / LSQ / STE HostOp.
+        FakeQuantize,
+        FakeQuantizeLSQ,
+        FakeQuantizeLSQBackwardX,
+        FakeQuantizeLSQBackwardScale,
+        FakeQuantizeBackward,
+        // INT8 Quantize/Dequantize + QMatMul/QConv2d — native SPIR-V with
+        // packed i8 byte slots (CAS stores into the uint arena view).
+        Quantize,
+        Dequantize,
+        // Inference BN + closed-form bwd trio (native SPIR-V).
+        BatchNormInference,
+        BatchNormInferenceBackwardInput,
+        BatchNormInferenceBackwardGamma,
+        BatchNormInferenceBackwardBeta,
+        // 3-D conv / transposed — native SPIR-V.
+        Conv3d,
+        ConvTranspose3d,
+        // SAM2 axial 2-D RoPE — native SPIR-V.
+        AxialRope2d,
+        // Norm reverse — native SPIR-V (GroupNorm bwd already native).
+        LayerNormBackwardInput,
+        LayerNormBackwardGamma,
+        RmsNormBackwardInput,
+        RmsNormBackwardGamma,
+        RmsNormBackwardBeta,
+        // Activation reverse — native SPIR-V (`activation_backward`).
+        ReluBackward,
+        ActivationBackward,
+        // Fused conv+bias+act — native (conv2d + epilogue).
+        FusedConvBiasAct,
+        // Training reverse / vision — native SPIR-V (Cumsum/Gather bwd included).
+        AttentionBackward,
+        RopeBackward,
+        CumsumBackward,
+        GatherBackward,
+        Conv2dBackwardInput,
+        Conv2dBackwardWeight,
+        MaxPool2dBackward,
         Transpose,
         Narrow,
         Concat,
@@ -88,12 +155,13 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         GatherNd,
         GatherElements,
         TopK, // vision / indexing / generation
-        // Host-fallback (run on the CPU reference against the mapped arena —
-        // sequential / specialized families with no native SPIR-V kernel yet):
+        // Gru / Rnn / Lstm / Mamba2: native SPIR-V when simple + size caps;
+        // oversized / multi-layer / bidir / carry still host via schedule arms.
         Lstm,
         Gru,
         Rnn,
         Mamba2,
+        // Claimed; `expand_gated_delta_net` → MatMul/Mul/Add primitives.
         GatedDeltaNet,
         // General Op::Scan (arbitrary-body recurrence, e.g. IIR biquad) — the
         // host fallback builds a one-op CPU graph and runs rlx-cpu's native
@@ -101,8 +169,13 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Scan,
         ScanBackward,
         ScanBackwardXs,
+        // Native SPIR-V (`conv_transpose2d`).
         ConvTranspose2d,
         Fft,
+        FftButterflyStage, // native SPIR-V
+        LogMel,            // packed HostOpDesc (no WGSL/SPIR-V LogMel; same as wgpu)
+        LogMelBackward,    // packed HostOpDesc
+        WelchPeaks,        // native when `welch_peaks_gpu_native_eligible`; else HostOp
         DequantMatMul,
         DequantGroupedMatMul,
         DequantMoEWeights, // GGUF quant
@@ -116,6 +189,24 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         RngNormal,
         RngUniform,
         Sample, // RNG / generation
+        // Unfuse expands LoraMatMul / FusedTransformerLayer / If / While.
+        LoraMatMul,
+        FusedTransformerLayer,
+        If,
+        While,
+        // Packed HostOpDesc → rlx-cpu LAPACK (`sgesv`) on mapped arena (wgpu-shaped).
+        // No device-side solver on Vulkan (no cuSOLVER/oneMKL equivalent here).
+        DenseSolve,
+        BatchedDenseSolve,
+        // Native SPIR-V packed-INT8 matmul / conv (see quantize_i8 / q_matmul).
+        QMatMul,
+        QConv2d,
+        PartitionedConv,
+        CustomFn,
+        GaussianSplatRender,
+        GaussianSplatRenderBackward,
+        GaussianSplatPrepare,
+        GaussianSplatRasterize,
         // Core Riemannian / SPD-manifold ops — no native SPIR-V eigen kernel,
         // so they host-fallback to `rlx_cpu::spd` (F64) against the mapped
         // arena. See `crate::spd`.
@@ -165,13 +256,10 @@ fn is_host_fallback(op: &Op) -> bool {
     }
     matches!(
         op,
-        Op::Lstm { .. }
-            | Op::Gru { .. }
-            | Op::Rnn { .. }
-            | Op::Mamba2 { .. }
-            | Op::GatedDeltaNet { .. }
-            | Op::ConvTranspose2d { .. }
-            | Op::Fft { .. }
+        // Lstm / Gru / Rnn / Mamba2 / ConvTranspose2d / FusedMatMulBiasAct /
+        // ElementwiseRegion* / GatedDeltaNet: native or decomposed before
+        // schedule (oversized RNN still uses dedicated Host schedule arms).
+        Op::Fft { .. }
             | Op::DequantGroupedMatMul { .. }
             | Op::DequantMoEWeights { .. }
             | Op::ScaledMatMul { .. }
@@ -181,6 +269,19 @@ fn is_host_fallback(op: &Op) -> bool {
             | Op::RngNormal { .. }
             | Op::RngUniform { .. }
             | Op::Sample { .. } // ScanBackward* uses dedicated `Step::HostOp` / `HostOpDesc`.
+            // Packed-INT8 Quantize/Dequantize/QMatMul/QConv2d: native SPIR-V.
+            // DenseSolve / LogMel / WelchPeaks(ineligible) / CumsumBackward /
+            // GatherBackward use dedicated schedule arms (HostOpDesc or SPIR-V).
+            | Op::PartitionedConv { .. }
+            | Op::CustomFn { .. }
+            | Op::GaussianSplatRender { .. }
+            | Op::GaussianSplatRenderBackward { .. }
+            | Op::GaussianSplatPrepare { .. }
+            | Op::GaussianSplatRasterize { .. }
+            | Op::FakeQuantize {
+                scale_mode: rlx_ir::op::ScaleMode::EMA { .. },
+                ..
+            }
     )
 }
 
@@ -208,18 +309,31 @@ fn host_ops_forced(op: &Op) -> bool {
             "expand",
             "concat",
         ]),
-        Op::Binary(_) | Op::Compare(_) | Op::Where => hit(&["binary", "elemwise"]),
+        Op::Binary(_) | Op::Compare(_) | Op::Where | Op::Fma => hit(&["binary", "elemwise", "fma"]),
         Op::Activation(_) | Op::Cast { .. } => hit(&["unary", "activation", "cast"]),
         Op::Reduce { .. } => hit(&["reduce"]),
-        Op::Softmax { .. } => hit(&["softmax"]),
+        Op::Softmax { .. }
+        | Op::SoftmaxCrossEntropy
+        | Op::SoftmaxCrossEntropyWithLogits
+        | Op::SoftmaxCrossEntropyBackward => hit(&["softmax", "loss"]),
         Op::ArgMax { .. } | Op::ArgMin { .. } => hit(&["reduce", "argreduce"]),
         Op::Gather { .. } => hit(&["gather"]),
         Op::Cumsum { .. } | Op::Reverse { .. } => hit(&["cumsum", "reverse", "reindex"]),
         Op::Pool { .. } | Op::Im2Col { .. } | Op::ResizeNearest2x => {
             hit(&["pool", "im2col", "vision", "conv"])
         }
-        Op::RmsNorm { .. } | Op::LayerNorm { .. } | Op::LayerNorm2d { .. } => {
-            hit(&["norm", "rmsnorm", "layernorm"])
+        Op::RmsNorm { .. }
+        | Op::LayerNorm { .. }
+        | Op::LayerNorm2d { .. }
+        | Op::GroupNorm { .. }
+        | Op::GroupNormBackwardInput { .. }
+        | Op::GroupNormBackwardGamma { .. }
+        | Op::GroupNormBackwardBeta { .. }
+        | Op::FusedResidualLN { .. }
+        | Op::FusedResidualRmsNorm { .. } => hit(&["norm", "rmsnorm", "layernorm", "groupnorm"]),
+        Op::FusedSwiGLU { .. } => hit(&["swiglu", "mlp", "unary"]),
+        Op::ComplexNormSq | Op::ComplexNormSqBackward | Op::Conjugate => {
+            hit(&["complex", "binary", "elemwise"])
         }
         Op::Attention { .. } | Op::Rope { .. } => hit(&["attn", "attention", "rope"]),
         Op::ScatterAdd | Op::TopK { .. } => hit(&["scatter", "topk"]),
@@ -265,8 +379,16 @@ enum Step {
     },
     /// General `Op::Scan` via `execute_scan_host_desc` on the mapped arena.
     ScanHost { desc: rlx_cpu::thunk::ScanHostDesc },
-    /// Nested-body AD (`ScanBackward` / `ScanBackwardXs`) via shared HostOpDesc.
+    /// Nested-body AD / DenseSolve / LogMel via shared HostOpDesc
+    /// (rlx-cpu LAPACK for solves; mapped-arena packed eval).
     HostOp { desc: rlx_cpu::thunk::HostOpDesc },
+    /// ScatterNd / ScatterElements / GatherNd / GatherElements on the mapped
+    /// f32-uniform arena. Uses [`rlx_cpu::thunk::IndexingThunk::force_indices_f32`]
+    /// — same fix as wgpu — so float-encoded indices are not re-read as i64
+    /// (that zeroed Kitten alignment → quiet NSF mush on discrete NVIDIA).
+    CpuIndexing {
+        thunk: rlx_cpu::thunk::IndexingThunk,
+    },
 }
 
 /// A pre-recorded execution segment. The schedule is partitioned into maximal
@@ -303,6 +425,10 @@ enum Segment {
     ScanHost { desc: rlx_cpu::thunk::ScanHostDesc },
     /// Nested-body AD on the mapped arena (see [`Step::HostOp`]).
     HostOp { desc: rlx_cpu::thunk::HostOpDesc },
+    /// Indexing ops on the mapped arena (see [`Step::CpuIndexing`]).
+    CpuIndexing {
+        thunk: rlx_cpu::thunk::IndexingThunk,
+    },
 }
 
 pub struct VulkanExecutable {
@@ -504,6 +630,13 @@ impl Push {
         self.words.extend_from_slice(vs);
         self
     }
+    fn append(mut self, other: Push) -> Self {
+        self.words.extend(other.words);
+        self
+    }
+    fn i(self, v: i32) -> Self {
+        self.u(v as u32)
+    }
     fn bytes(self) -> Vec<u8> {
         let mut b = Vec::with_capacity(self.words.len() * 4);
         for w in self.words {
@@ -585,7 +718,68 @@ fn act_id(a: Activation) -> u32 {
         Activation::Tan => 14,
         Activation::Atan => 15,
         Activation::Round => 16,
+        Activation::Recip => 17,
     }
+}
+
+/// Op ids for `activation_backward.comp` — match CUDA / wgpu (not forward unary).
+fn activation_bwd_op_id(a: Activation) -> u32 {
+    match a {
+        Activation::Relu => 0,
+        Activation::Sigmoid => 1,
+        Activation::Tanh => 2,
+        Activation::Exp => 3,
+        Activation::Log => 4,
+        Activation::Sqrt => 5,
+        Activation::Rsqrt => 6,
+        Activation::Neg => 7,
+        Activation::Abs => 8,
+        Activation::Gelu => 9,
+        Activation::Silu => 10,
+        Activation::GeluApprox => 11,
+        Activation::Round => 12,
+        Activation::Sin => 13,
+        Activation::Cos => 14,
+        Activation::Tan => 15,
+        Activation::Atan => 16,
+        Activation::Recip => 17,
+    }
+}
+
+fn fake_quantize_q_max(bits: u8) -> f32 {
+    match bits {
+        8 => 127.0,
+        4 => 7.0,
+        2 => 1.0,
+        other => panic!("rlx-vulkan FakeQuantize: unsupported bits {other}"),
+    }
+}
+
+fn fake_quantize_layout(axis: Option<usize>, dims: &[usize], n: usize) -> (usize, usize) {
+    match axis {
+        None => (1, n.max(1)),
+        Some(d) => {
+            let chan = dims[d];
+            let inn: usize = dims[d + 1..].iter().product::<usize>().max(1);
+            (chan, inn)
+        }
+    }
+}
+
+/// Max per-channel affine pairs that fit in the Quantize/Dequantize push block
+/// (`affine[26]` → 13 channels) alongside the scalar header.
+const QUANTIZE_I8_MAX_CHAN: usize = 13;
+
+fn push_quantize_affine(scales: &[f32], zero_points: &[i32], chan_dim: usize) -> Push {
+    let mut p = Push::default();
+    for c in 0..QUANTIZE_I8_MAX_CHAN {
+        if c < chan_dim {
+            p = p.u(scales[c].to_bits()).u(zero_points[c] as u32);
+        } else {
+            p = p.u(0).u(0);
+        }
+    }
+    p
 }
 
 fn binop_id(op: BinaryOp) -> u32 {
@@ -641,12 +835,17 @@ impl VulkanExecutable {
         use rlx_opt::pass::Pass as _;
 
         let graph = rlx_opt::LowerControlFlow.run(graph);
-        // `FusedAttentionBlock` is claimed (so it legalizes), but there is
-        // no monolithic fused-attention kernel — decompose it to primitives
-        // first. FAB-only (not the whole-graph unfuse) so nothing else is
-        // touched. No-op when no FAB node is present.
-        let graph = rlx_opt::unfuse::unfuse_attention_block(graph);
+        // Full GPU-family unfuse (LoraMatMul / FTL / DotGeneral / If / While /
+        // FAB) plus DiT modulation expand. Idempotent when no composed ops.
+        // Folds biased projections into FusedMatMulBiasAct (native compose).
+        let graph = crate::unfuse::unfuse(graph);
         let graph = rlx_opt::unfuse::unfuse_dit_modulation(graph);
+        // GatedDeltaNet → MatMul/Mul/Add time-unroll (no dedicated GDN kernel).
+        let graph = crate::unfuse::expand_gated_delta_net(graph);
+        // TransformRegion / BatchElementwiseRegion → Resize + ElementwiseRegion;
+        // then ElementwiseRegion → Binary / Activation / … primitives.
+        let graph = rlx_opt::rlx_fusion::DecomposeFusionRegions.run(graph);
+        let graph = rlx_opt::UnfuseElementwiseRegions::FOR_CPU.run(graph);
         let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, SUPPORTED_OPS)
             .unwrap_or_else(|errs| panic!("{}", rlx_opt::format_legalize_error("vulkan", &errs)));
         let graph = rlx_cpu::rlx_maybe_unroll_scans!(graph, scan_unroll_max_length);
@@ -662,7 +861,8 @@ impl VulkanExecutable {
         let dev = vulkan_device().expect("rlx-vulkan: no device");
         let kern = kernels().expect("rlx-vulkan: no kernels");
 
-        let plan = plan_f32_uniform(&graph, 16);
+        let mut plan = plan_f32_uniform(&graph, 16);
+        crate::buffer::pack_i8_u8_slot_sizes(&graph, &mut plan);
         let max_range = dev.limits.max_storage_buffer_range as usize;
         let arena = if plan.arena_size > max_range {
             Arena::from_plan_split(&graph)
@@ -670,14 +870,20 @@ impl VulkanExecutable {
             Arena::from_plan(&plan)
         };
 
-        // Upload constants (widened to f32 — the arena is f32-uniform).
+        // Upload constants. U8/I8 stay packed bytes (Quantize codes / QMatMul
+        // weights); every other dtype widens to f32 for the f32-uniform arena.
         for node in graph.nodes() {
             if let Op::Constant { data } = &node.op
                 && arena.has(node.id)
                 && !data.is_empty()
             {
-                let f = widen_const_to_f32(data, node.shape.dtype());
-                arena.write_f32(node.id, &f);
+                let dt = node.shape.dtype();
+                if matches!(dt, DType::U8 | DType::I8) {
+                    arena.write_bytes(node.id, data);
+                } else {
+                    let f = widen_const_to_f32(data, dt);
+                    arena.write_f32(node.id, &f);
+                }
             }
         }
 
@@ -1163,14 +1369,38 @@ impl VulkanExecutable {
                         self.run_spd_host(op, *out, out_shape, in_ids);
                         self.arena.sync_gpu_after_host();
                     }
-                    Segment::ScanHost { desc } => unsafe {
-                        rlx_cpu::rlx_execute_scan_on_bytes!(self.arena.mapped_ptr(), desc);
-                        self.arena.sync_gpu_after_host();
-                    },
-                    Segment::HostOp { desc } => unsafe {
-                        rlx_cpu::rlx_execute_host_op_on_bytes!(self.arena.mapped_ptr(), desc);
-                        self.arena.sync_gpu_after_host();
-                    },
+                    Segment::ScanHost { desc } => {
+                        let mut a = VulkanArena { arena: &self.arena };
+                        if self.arena.is_sharded() {
+                            rlx_gpu_host::run_scan_span(&mut a, desc.clone());
+                        } else {
+                            unsafe {
+                                rlx_cpu::rlx_execute_scan_on_bytes!(self.arena.mapped_ptr(), desc);
+                            }
+                            self.arena.sync_gpu_after_host();
+                        }
+                    }
+                    Segment::HostOp { desc } => {
+                        let mut a = VulkanArena { arena: &self.arena };
+                        if self.arena.is_sharded() {
+                            rlx_gpu_host::run_host_op_packed(&mut a, desc);
+                        } else {
+                            unsafe {
+                                rlx_cpu::rlx_execute_host_op_on_bytes!(
+                                    self.arena.mapped_ptr(),
+                                    desc
+                                );
+                            }
+                            self.arena.sync_gpu_after_host();
+                        }
+                    }
+                    Segment::CpuIndexing { thunk } => {
+                        // Always stage via DeviceArena: sharded arenas SIGSEGV
+                        // if we pass shard-0 `mapped_ptr()` alone (KittenTTS
+                        // wave≥64k). Unsharded is a cheap in-process memcpy.
+                        let mut a = VulkanArena { arena: &self.arena };
+                        rlx_gpu_host::run_indexing(&mut a, 0, thunk, usize::MAX);
+                    }
                 }
             }
             // Fall through to the feed/readback tail below.
@@ -1292,14 +1522,35 @@ impl VulkanExecutable {
                         self.run_spd_host(&op, out, &out_shape, &in_ids);
                         self.arena.sync_gpu_after_host();
                     }
-                    Step::ScanHost { desc } => unsafe {
-                        rlx_cpu::rlx_execute_scan_on_bytes!(self.arena.mapped_ptr(), &desc);
-                        self.arena.sync_gpu_after_host();
-                    },
-                    Step::HostOp { desc } => unsafe {
-                        rlx_cpu::rlx_execute_host_op_on_bytes!(self.arena.mapped_ptr(), &desc);
-                        self.arena.sync_gpu_after_host();
-                    },
+                    Step::ScanHost { desc } => {
+                        let mut a = VulkanArena { arena: &self.arena };
+                        if self.arena.is_sharded() {
+                            rlx_gpu_host::run_scan_span(&mut a, desc.clone());
+                        } else {
+                            unsafe {
+                                rlx_cpu::rlx_execute_scan_on_bytes!(self.arena.mapped_ptr(), &desc);
+                            }
+                            self.arena.sync_gpu_after_host();
+                        }
+                    }
+                    Step::HostOp { desc } => {
+                        let mut a = VulkanArena { arena: &self.arena };
+                        if self.arena.is_sharded() {
+                            rlx_gpu_host::run_host_op_packed(&mut a, &desc);
+                        } else {
+                            unsafe {
+                                rlx_cpu::rlx_execute_host_op_on_bytes!(
+                                    self.arena.mapped_ptr(),
+                                    &desc
+                                );
+                            }
+                            self.arena.sync_gpu_after_host();
+                        }
+                    }
+                    Step::CpuIndexing { thunk } => {
+                        let mut a = VulkanArena { arena: &self.arena };
+                        rlx_gpu_host::run_indexing(&mut a, 0, &thunk, usize::MAX);
+                    }
                     Step::Gpu { .. } => {}
                 }
                 i += 1;
@@ -1435,6 +1686,7 @@ impl Drop for VulkanExecutable {
                     | Segment::SpdHost { .. }
                     | Segment::ScanHost { .. }
                     | Segment::HostOp { .. }
+                    | Segment::CpuIndexing { .. }
                     | Segment::ActCopy { .. } => None,
                 })
                 .collect();
@@ -1611,6 +1863,9 @@ fn record_segments(
                 }),
                 Step::ScanHost { desc } => segments.push(Segment::ScanHost { desc: desc.clone() }),
                 Step::HostOp { desc } => segments.push(Segment::HostOp { desc: desc.clone() }),
+                Step::CpuIndexing { thunk } => segments.push(Segment::CpuIndexing {
+                    thunk: thunk.clone(),
+                }),
                 Step::Gpu { .. } => {}
             }
             if !matches!(schedule[i], Step::ActCopy { .. }) {
@@ -1773,18 +2028,19 @@ impl ActBinder {
     }
 
     fn stage_activation(&mut self, arena: &Arena, id: NodeId, byte: usize, len: usize) -> u32 {
-        if len > SHARD_STAGE_RESERVE {
+        let reserve = shard_stage_reserve();
+        if len > reserve {
             eprintln!(
                 "[rlx-vulkan] cross-shard staging: tensor {id:?} is {len} bytes \
-                 (>{SHARD_STAGE_RESERVE} reserve); cannot run this op on sharded arena"
+                 (>{reserve} reserve); cannot run this op on sharded arena"
             );
             panic!(
                 "rlx-vulkan: cannot stage {len} bytes for {id:?} across activation shards \
-                 (reserve {SHARD_STAGE_RESERVE})"
+                 (reserve {reserve})"
             );
         }
         let stage_begin = arena.shard_stage_off(self.bind_base);
-        let stage_end = stage_begin.saturating_add(SHARD_STAGE_RESERVE);
+        let stage_end = stage_begin.saturating_add(reserve);
         let aligned = len.div_ceil(256) * 256;
         if self.scratch.saturating_add(aligned) > stage_end {
             self.scratch = stage_begin;
@@ -1874,7 +2130,7 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 Op::Activation(_) => "unary",
                 Op::MatMul | Op::GroupedMatMul => "matmul",
                 Op::Conv { .. } => "conv2d",
-                Op::ConvTranspose2d { .. } => "conv_transpose(host)",
+                Op::ConvTranspose2d { .. } => "conv_transpose2d",
                 Op::Transpose { .. }
                 | Op::Narrow { .. }
                 | Op::Expand { .. }
@@ -2090,6 +2346,107 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 );
             }
 
+            Op::Fma => {
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let c = node.inputs[2];
+                let n = numel(&dims(graph, out));
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(binder.off(arena, a))
+                    .u(binder.off(arena, b))
+                    .u(binder.off(arena, c))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "fma",
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
+            Op::ComplexNormSq => {
+                let src = node.inputs[0];
+                if graph.node(src).shape.dtype() != DType::C64 {
+                    panic!(
+                        "rlx-vulkan ComplexNormSq: expected C64 input, got {:?}",
+                        graph.node(src).shape.dtype()
+                    );
+                }
+                let n = numel(&dims(graph, out));
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(binder.off(arena, src))
+                    .u(0) // b unused
+                    .u(binder.off(arena, out))
+                    .u(0) // mode: ComplexNormSq
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "complex_wirtinger",
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
+            Op::ComplexNormSqBackward => {
+                let z = node.inputs[0];
+                let g = node.inputs[1];
+                if graph.node(z).shape.dtype() != DType::C64 {
+                    panic!(
+                        "rlx-vulkan ComplexNormSqBackward: expected C64 z, got {:?}",
+                        graph.node(z).shape.dtype()
+                    );
+                }
+                let n = numel(&dims(graph, out));
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(binder.off(arena, z))
+                    .u(binder.off(arena, g))
+                    .u(binder.off(arena, out))
+                    .u(1) // mode: ComplexNormSqBackward
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "complex_wirtinger",
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
+            Op::Conjugate => {
+                let src = node.inputs[0];
+                if graph.node(src).shape.dtype() != DType::C64 {
+                    panic!(
+                        "rlx-vulkan Conjugate: expected C64 input, got {:?}",
+                        graph.node(src).shape.dtype()
+                    );
+                }
+                let n = numel(&dims(graph, out));
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(binder.off(arena, src))
+                    .u(0)
+                    .u(binder.off(arena, out))
+                    .u(2) // mode: Conjugate
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "complex_wirtinger",
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
             Op::Compare(op) => {
                 let a = node.inputs[0];
                 let b = node.inputs[1];
@@ -2216,6 +2573,98 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 );
             }
 
+            Op::FusedMatMulBiasAct { activation } => {
+                // Compose existing matmul + Binary(Add) + optional Activation
+                // into `out` (no dedicated matmul epilogue shader yet).
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let bias = node.inputs[2];
+                let ad = dims(graph, a);
+                let bd = dims(graph, b);
+                let od = dims(graph, out);
+                let (m, k) = (ad[ad.len() - 2], ad[ad.len() - 1]);
+                let n = bd[bd.len() - 1];
+                let batch = if od.len() > 2 {
+                    numel(&od[..od.len() - 2])
+                } else {
+                    1
+                };
+                let a_batch = if ad.len() > 2 {
+                    numel(&ad[..ad.len() - 2])
+                } else {
+                    1
+                };
+                let b_batch = if bd.len() > 2 {
+                    numel(&bd[..bd.len() - 2])
+                } else {
+                    1
+                };
+                let a_bs = if a_batch <= 1 { 0 } else { m * k };
+                let b_bs = if b_batch <= 1 { 0 } else { k * n };
+                let push = Push::default()
+                    .u(m as u32)
+                    .u(k as u32)
+                    .u(n as u32)
+                    .u(binder.off(arena, a))
+                    .u(binder.off(arena, b))
+                    .u(binder.off(arena, out))
+                    .u(batch as u32)
+                    .u(a_bs as u32)
+                    .u(b_bs as u32)
+                    .u((m * n) as u32)
+                    .bytes();
+                let kernel = if is_weight_elem(binder.off(arena, a))
+                    || is_weight_elem(binder.off(arena, b))
+                {
+                    "matmul"
+                } else {
+                    matmul_kernel(m, k, n)
+                };
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    kernel,
+                    push,
+                    (ceil_div(n, 16), ceil_div(m, 16), batch.max(1) as u32),
+                );
+                let total = numel(&od);
+                let bn = numel(&dims(graph, bias));
+                let add = Push::default()
+                    .u(total as u32)
+                    .u(binder.off(arena, out))
+                    .u(binder.off(arena, bias))
+                    .u(binder.off(arena, out))
+                    .u(0) // a contiguous (matmul result)
+                    .u(if bn == total { 0 } else { bn as u32 })
+                    .u(binop_id(BinaryOp::Add))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "binary",
+                    add,
+                    groups1d(total, 256),
+                );
+                if let Some(act) = activation {
+                    let act_push = Push::default()
+                        .u(total as u32)
+                        .u(binder.off(arena, out))
+                        .u(binder.off(arena, out))
+                        .u(act_id(*act))
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "unary",
+                        act_push,
+                        groups1d(total, 256),
+                    );
+                }
+            }
+
             Op::Reduce { .. } => {
                 // SPIR-V reduce is last-axis only and had no legalize for other
                 // axes; host every Reduce until a general kernel / rewrite lands
@@ -2310,6 +2759,245 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 );
             }
 
+            Op::SoftmaxCrossEntropy | Op::SoftmaxCrossEntropyWithLogits => {
+                let logits = node.inputs[0];
+                let targets = node.inputs[1];
+                let ld = dims(graph, logits);
+                let inner = *ld.last().unwrap_or(&1);
+                let outer = numel(&ld) / inner.max(1);
+                let integer_labels = matches!(node.op, Op::SoftmaxCrossEntropyWithLogits) as u32;
+                let push = Push::default()
+                    .u(outer as u32)
+                    .u(inner as u32)
+                    .u(binder.off(arena, logits))
+                    .u(binder.off(arena, targets))
+                    .u(binder.off(arena, out))
+                    .u(integer_labels)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "softmax_cross_entropy",
+                    push,
+                    groups1d(outer, 64),
+                );
+            }
+
+            Op::SoftmaxCrossEntropyBackward => {
+                let logits = node.inputs[0];
+                let labels = node.inputs[1];
+                let d_loss = node.inputs[2];
+                let ld = dims(graph, logits);
+                let inner = *ld.last().unwrap_or(&1);
+                let outer = numel(&ld) / inner.max(1);
+                let push = Push::default()
+                    .u(outer as u32)
+                    .u(inner as u32)
+                    .u(binder.off(arena, logits))
+                    .u(binder.off(arena, labels))
+                    .u(binder.off(arena, d_loss))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "softmax_cross_entropy_backward",
+                    push,
+                    groups1d(outer, 64),
+                );
+            }
+
+            Op::GroupNorm { num_groups, eps } => {
+                let x = node.inputs[0];
+                let gamma = node.inputs[1];
+                let beta = node.inputs[2];
+                let xd = dims(graph, x);
+                assert!(
+                    xd.len() == 4,
+                    "rlx-vulkan GroupNorm expects NCHW rank-4, got {xd:?}"
+                );
+                let (n, c, h, w) = (xd[0], xd[1], xd[2], xd[3]);
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(c as u32)
+                    .u(h as u32)
+                    .u(w as u32)
+                    .u(*num_groups as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, gamma))
+                    .u(binder.off(arena, beta))
+                    .u(binder.off(arena, out))
+                    .f(*eps)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "group_norm",
+                    push,
+                    groups1d(n * (*num_groups as usize), 64),
+                );
+            }
+
+            Op::GroupNormBackwardInput { num_groups, eps } => {
+                let x = node.inputs[0];
+                let gamma = node.inputs[1];
+                // inputs[2] unused in CUDA/Metal path for dx
+                let dy = node.inputs[3];
+                let xd = dims(graph, x);
+                assert!(
+                    xd.len() == 4,
+                    "rlx-vulkan GroupNormBackwardInput expects NCHW rank-4, got {xd:?}"
+                );
+                let (n, c, h, w) = (xd[0], xd[1], xd[2], xd[3]);
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(c as u32)
+                    .u(h as u32)
+                    .u(w as u32)
+                    .u(*num_groups as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, gamma))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .f(*eps)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "group_norm_backward_input",
+                    push,
+                    groups1d(n * (*num_groups as usize), 64),
+                );
+            }
+
+            Op::GroupNormBackwardGamma { num_groups, eps } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let xd = dims(graph, x);
+                assert!(
+                    xd.len() == 4,
+                    "rlx-vulkan GroupNormBackwardGamma expects NCHW rank-4, got {xd:?}"
+                );
+                let (n, c, h, w) = (xd[0], xd[1], xd[2], xd[3]);
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(c as u32)
+                    .u(h as u32)
+                    .u(w as u32)
+                    .u(*num_groups as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .f(*eps)
+                    .bytes();
+                // Single serial invocation (local_size_x = 1).
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "group_norm_backward_gamma",
+                    push,
+                    (1, 1, 1),
+                );
+            }
+
+            Op::GroupNormBackwardBeta {
+                num_groups: _,
+                eps: _,
+            } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let xd = dims(graph, x);
+                assert!(
+                    xd.len() == 4,
+                    "rlx-vulkan GroupNormBackwardBeta expects NCHW rank-4, got {xd:?}"
+                );
+                let (n, c, h, w) = (xd[0], xd[1], xd[2], xd[3]);
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(c as u32)
+                    .u(h as u32)
+                    .u(w as u32)
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "group_norm_backward_beta",
+                    push,
+                    (1, 1, 1),
+                );
+            }
+
+            Op::FusedResidualLN { has_bias, eps } | Op::FusedResidualRmsNorm { has_bias, eps } => {
+                let x = node.inputs[0];
+                let residual = node.inputs[1];
+                let (bias, gamma, beta) = if *has_bias {
+                    (node.inputs[2], node.inputs[3], node.inputs[4])
+                } else {
+                    (x, node.inputs[2], node.inputs[3])
+                };
+                let od = dims(graph, out);
+                let inner = *od.last().unwrap_or(&1);
+                let outer = numel(&od) / inner.max(1);
+                let is_rms = matches!(node.op, Op::FusedResidualRmsNorm { .. });
+                let push = Push::default()
+                    .u(outer as u32)
+                    .u(inner as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, residual))
+                    .u(binder.off(arena, bias))
+                    .u(binder.off(arena, gamma))
+                    .u(binder.off(arena, beta))
+                    .u(binder.off(arena, out))
+                    .u(if *has_bias { 1 } else { 0 })
+                    .f(*eps)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    if is_rms {
+                        "fused_residual_rms_norm"
+                    } else {
+                        "fused_residual_ln"
+                    },
+                    push,
+                    groups1d(outer, 64),
+                );
+            }
+
+            Op::FusedSwiGLU {
+                cast_to: _,
+                gate_first,
+            } => {
+                let x = node.inputs[0];
+                let od = dims(graph, out);
+                let n_half = *od.last().unwrap_or(&1);
+                let total = numel(&od);
+                let push = Push::default()
+                    .u(n_half as u32)
+                    .u(total as u32)
+                    .u(if *gate_first { 1 } else { 0 })
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "fused_swiglu",
+                    push,
+                    groups1d(total, 256),
+                );
+            }
+
             Op::AdaLayerNormBackward { norm, eps } => {
                 use rlx_ir::ada_modulation_launch;
                 use rlx_ir::op::AdaNormKind;
@@ -2369,6 +3057,531 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                     "gated_residual_backward",
                     push,
                     groups1d(mod_rows as usize, 64),
+                );
+            }
+
+            Op::FakeQuantize {
+                bits,
+                axis,
+                scale_mode,
+                ..
+            } => {
+                use rlx_ir::op::ScaleMode;
+                let q_max = fake_quantize_q_max(*bits);
+                let xd = dims(graph, out);
+                let n = numel(&xd);
+                let (chan_dim, inner) = fake_quantize_layout(*axis, &xd, n);
+                match scale_mode {
+                    ScaleMode::EMA { .. } => {
+                        steps.push(Step::Host {
+                            op: node.op.clone(),
+                            out: node.id,
+                            out_shape: node.shape.clone(),
+                            inputs: node.inputs.clone(),
+                        });
+                    }
+                    ScaleMode::Fixed => {
+                        let x = node.inputs[0];
+                        let scale = node.inputs[1];
+                        let push = Push::default()
+                            .u(n as u32)
+                            .u(chan_dim as u32)
+                            .u(inner as u32)
+                            .f(q_max)
+                            .u(binder.off(arena, x))
+                            .u(binder.off(arena, scale))
+                            .u(binder.off(arena, out))
+                            .bytes();
+                        push_gpu_step(
+                            &mut binder,
+                            &mut steps,
+                            &mut deps,
+                            "fake_quantize_fixed",
+                            push,
+                            groups1d(n, 256),
+                        );
+                    }
+                    ScaleMode::PerBatch => {
+                        let x = node.inputs[0];
+                        let push = Push::default()
+                            .u(n as u32)
+                            .u(chan_dim as u32)
+                            .u(inner as u32)
+                            .f(q_max)
+                            .u(binder.off(arena, x))
+                            .u(binder.off(arena, out))
+                            .bytes();
+                        push_gpu_step(
+                            &mut binder,
+                            &mut steps,
+                            &mut deps,
+                            "fake_quantize_perbatch",
+                            push,
+                            groups1d(chan_dim, 64),
+                        );
+                    }
+                }
+            }
+
+            // FakeQuantizeLSQ forward is identical to Fixed — reuse the shader.
+            Op::FakeQuantizeLSQ { bits, axis } => {
+                let q_max = fake_quantize_q_max(*bits);
+                let xd = dims(graph, out);
+                let n = numel(&xd);
+                let (chan_dim, inner) = fake_quantize_layout(*axis, &xd, n);
+                let x = node.inputs[0];
+                let scale = node.inputs[1];
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(chan_dim as u32)
+                    .u(inner as u32)
+                    .f(q_max)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, scale))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "fake_quantize_fixed",
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
+            Op::FakeQuantizeLSQBackwardX { bits, axis } => {
+                let q_max = fake_quantize_q_max(*bits);
+                let xd = dims(graph, out);
+                let n = numel(&xd);
+                let (chan_dim, inner) = fake_quantize_layout(*axis, &xd, n);
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(chan_dim as u32)
+                    .u(inner as u32)
+                    .f(q_max)
+                    .u(binder.off(arena, node.inputs[0]))
+                    .u(binder.off(arena, node.inputs[1]))
+                    .u(binder.off(arena, node.inputs[2]))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "fake_quantize_lsq_bwd_x",
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
+            Op::FakeQuantizeLSQBackwardScale { bits, axis } => {
+                let q_max = fake_quantize_q_max(*bits);
+                let xd = dims(graph, node.inputs[0]);
+                let n = numel(&xd);
+                let (chan_dim, inner) = fake_quantize_layout(*axis, &xd, n);
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(chan_dim as u32)
+                    .u(inner as u32)
+                    .f(q_max)
+                    .u(binder.off(arena, node.inputs[0]))
+                    .u(binder.off(arena, node.inputs[1]))
+                    .u(binder.off(arena, node.inputs[2]))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "fake_quantize_lsq_bwd_scale",
+                    push,
+                    groups1d(chan_dim, 64),
+                );
+            }
+
+            Op::FakeQuantizeBackward { bits, axis, ste } => {
+                let q_max = fake_quantize_q_max(*bits);
+                let xd = dims(graph, out);
+                let n = numel(&xd);
+                let (chan_dim, inner) = fake_quantize_layout(*axis, &xd, n);
+                let ste_kind = match ste {
+                    SteKind::Identity => 0u32,
+                    SteKind::ClippedIdentity => 1,
+                    SteKind::Tanh => 2,
+                    SteKind::HardTanh => 3,
+                };
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(chan_dim as u32)
+                    .u(inner as u32)
+                    .f(q_max)
+                    .u(ste_kind)
+                    .u(binder.off(arena, node.inputs[0]))
+                    .u(binder.off(arena, node.inputs[1]))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "fake_quantize_backward",
+                    push,
+                    groups1d(chan_dim, 64),
+                );
+            }
+
+            Op::Quantize {
+                axis,
+                scales,
+                zero_points,
+            } => {
+                let xd = dims(graph, out);
+                let n = numel(&xd);
+                let (chan_dim, inner) = fake_quantize_layout(*axis, &xd, n);
+                if chan_dim > QUANTIZE_I8_MAX_CHAN {
+                    // Affine table exceeds push-constant budget — CPU packed path.
+                    steps.push(Step::Host {
+                        op: node.op.clone(),
+                        out: node.id,
+                        out_shape: node.shape.clone(),
+                        inputs: node.inputs.clone(),
+                    });
+                } else {
+                    let x = node.inputs[0];
+                    let push = Push::default()
+                        .u(n as u32)
+                        .u(chan_dim as u32)
+                        .u(inner as u32)
+                        .u(binder.off(arena, x))
+                        .u(binder.off(arena, out))
+                        .append(push_quantize_affine(scales, zero_points, chan_dim))
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "quantize_i8",
+                        push,
+                        groups1d(n, 256),
+                    );
+                }
+            }
+
+            Op::Dequantize {
+                axis,
+                scales,
+                zero_points,
+            } => {
+                let xd = dims(graph, out);
+                let n = numel(&xd);
+                let (chan_dim, inner) = fake_quantize_layout(*axis, &xd, n);
+                if chan_dim > QUANTIZE_I8_MAX_CHAN {
+                    steps.push(Step::Host {
+                        op: node.op.clone(),
+                        out: node.id,
+                        out_shape: node.shape.clone(),
+                        inputs: node.inputs.clone(),
+                    });
+                } else {
+                    let q = node.inputs[0];
+                    let push = Push::default()
+                        .u(n as u32)
+                        .u(chan_dim as u32)
+                        .u(inner as u32)
+                        .u(binder.off(arena, q))
+                        .u(binder.off(arena, out))
+                        .append(push_quantize_affine(scales, zero_points, chan_dim))
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "dequantize_i8",
+                        push,
+                        groups1d(n, 256),
+                    );
+                }
+            }
+
+            Op::QMatMul {
+                x_zp,
+                w_zp,
+                out_zp,
+                mult,
+            } => {
+                let x = node.inputs[0];
+                let w = node.inputs[1];
+                let bias = node.inputs[2];
+                let x_shape = &graph.node(x).shape;
+                let w_shape = &graph.node(w).shape;
+                let m = x_shape.dim(0).unwrap_static();
+                let k = x_shape.dim(1).unwrap_static();
+                let n = w_shape.dim(1).unwrap_static();
+                let push = Push::default()
+                    .u(m as u32)
+                    .u(k as u32)
+                    .u(n as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, w))
+                    .u(binder.off(arena, bias))
+                    .u(binder.off(arena, out))
+                    .i(*x_zp)
+                    .i(*w_zp)
+                    .i(*out_zp)
+                    .u(mult.to_bits())
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "q_matmul",
+                    push,
+                    groups1d(m * n, 256),
+                );
+            }
+
+            Op::QConv2d {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+                x_zp,
+                w_zp,
+                out_zp,
+                mult,
+            } => {
+                let x = node.inputs[0];
+                let w = node.inputs[1];
+                let bias = node.inputs[2];
+                let in_shape = &graph.node(x).shape;
+                let out_shape = &node.shape;
+                let total = out_shape.num_elements().unwrap_or(0);
+                let push = Push::default()
+                    .u(in_shape.dim(0).unwrap_static() as u32)
+                    .u(in_shape.dim(1).unwrap_static() as u32)
+                    .u(out_shape.dim(1).unwrap_static() as u32)
+                    .u(in_shape.dim(2).unwrap_static() as u32)
+                    .u(in_shape.dim(3).unwrap_static() as u32)
+                    .u(out_shape.dim(2).unwrap_static() as u32)
+                    .u(out_shape.dim(3).unwrap_static() as u32)
+                    .u(kernel_size[0] as u32)
+                    .u(kernel_size[1] as u32)
+                    .u(stride.first().copied().unwrap_or(1) as u32)
+                    .u(stride.get(1).copied().unwrap_or(1) as u32)
+                    .u(padding.first().copied().unwrap_or(0) as u32)
+                    .u(padding.get(1).copied().unwrap_or(0) as u32)
+                    .u(dilation.first().copied().unwrap_or(1) as u32)
+                    .u(dilation.get(1).copied().unwrap_or(1) as u32)
+                    .u(*groups as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, w))
+                    .u(binder.off(arena, bias))
+                    .u(binder.off(arena, out))
+                    .i(*x_zp)
+                    .i(*w_zp)
+                    .i(*out_zp)
+                    .u(mult.to_bits())
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "q_conv2d",
+                    push,
+                    groups1d(total, 256),
+                );
+            }
+
+            Op::BatchNormInference { eps } => {
+                let x = node.inputs[0];
+                let gamma = node.inputs[1];
+                let beta = node.inputs[2];
+                let mean = node.inputs[3];
+                let var = node.inputs[4];
+                let xd = dims(graph, x);
+                let channels = *xd.last().unwrap_or(&1);
+                let n = numel(&xd);
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(channels as u32)
+                    .f(*eps)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, gamma))
+                    .u(binder.off(arena, beta))
+                    .u(binder.off(arena, mean))
+                    .u(binder.off(arena, var))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "batch_norm_inference",
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
+            Op::BatchNormInferenceBackwardInput { eps } => {
+                // inputs: [x, gamma, mean, var, dy] — x/mean unused on GPU path
+                let gamma = node.inputs[1];
+                let var = node.inputs[3];
+                let dy = node.inputs[4];
+                let xd = dims(graph, dy);
+                let channels = *xd.last().unwrap_or(&1);
+                let n = numel(&xd);
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(channels as u32)
+                    .f(*eps)
+                    .u(binder.off(arena, gamma))
+                    .u(binder.off(arena, var))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "batch_norm_inference_bwd_input",
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
+            Op::BatchNormInferenceBackwardGamma { eps } => {
+                // inputs: [x, mean, var, dy]
+                let x = node.inputs[0];
+                let mean = node.inputs[1];
+                let var = node.inputs[2];
+                let dy = node.inputs[3];
+                let xd = dims(graph, x);
+                let channels = *xd.last().unwrap_or(&1);
+                let n = numel(&xd);
+                let count = n / channels.max(1);
+                let push = Push::default()
+                    .u(count as u32)
+                    .u(channels as u32)
+                    .f(*eps)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, mean))
+                    .u(binder.off(arena, var))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "batch_norm_inference_bwd_gamma",
+                    push,
+                    groups1d(channels, 64),
+                );
+            }
+
+            Op::BatchNormInferenceBackwardBeta => {
+                let dy = node.inputs[0];
+                let xd = dims(graph, dy);
+                let channels = *xd.last().unwrap_or(&1);
+                let n = numel(&xd);
+                let count = n / channels.max(1);
+                let push = Push::default()
+                    .u(count as u32)
+                    .u(channels as u32)
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "batch_norm_inference_bwd_beta",
+                    push,
+                    groups1d(channels, 64),
+                );
+            }
+
+            Op::ReluBackward => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let n = numel(&dims(graph, out));
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .u(0) // relu
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "activation_backward",
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
+            Op::ActivationBackward { kind } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let n = numel(&dims(graph, out));
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .u(activation_bwd_op_id(*kind))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "activation_backward",
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
+            Op::AxialRope2d {
+                end_x,
+                end_y,
+                head_dim,
+                num_heads,
+                theta,
+                repeat_factor,
+            } => {
+                let x = node.inputs[0];
+                let xd = dims(graph, x);
+                let (batch, seq, hidden) = if xd.len() >= 3 {
+                    (xd[0], xd[1], xd[2])
+                } else {
+                    panic!("rlx-vulkan AxialRope2d: expected rank ≥ 3, got {xd:?}");
+                };
+                let n_total = batch * seq * hidden;
+                let push = Push::default()
+                    .u(batch as u32)
+                    .u(seq as u32)
+                    .u(hidden as u32)
+                    .u(*end_x as u32)
+                    .u(*end_y as u32)
+                    .u(*head_dim as u32)
+                    .u(*num_heads as u32)
+                    .u(*repeat_factor as u32)
+                    .f(*theta)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, out))
+                    .u(n_total as u32)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "axial_rope2d",
+                    push,
+                    groups1d(n_total, 256),
                 );
             }
 
@@ -2485,6 +3698,113 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                     "attention",
                     push,
                     groups1d(batch * nh * q_s, 64),
+                );
+            }
+
+            Op::AttentionBackward {
+                num_heads,
+                head_dim,
+                mask_kind,
+                wrt,
+            } => {
+                let q = node.inputs[0];
+                let k = node.inputs[1];
+                let v = node.inputs[2];
+                let dy = node.inputs[3];
+                let qd = dims(graph, q);
+                let kd = dims(graph, k);
+                // SPIR-V kernel is BHSD [B,H,S,D]; host for other layouts or
+                // when private-array caps are exceeded (hd≤256, seq≤512).
+                let native = qd.len() == 4
+                    && qd[1] == *num_heads
+                    && *head_dim <= 256
+                    && qd[2] <= 512
+                    && kd[2] <= 512;
+                if native {
+                    let batch = qd[0];
+                    let nh = *num_heads;
+                    let dh = *head_dim;
+                    let q_s = qd[2];
+                    let k_s = kd[2];
+                    let scale = 1.0_f32 / (dh as f32).sqrt();
+                    let (mask_kind_id, mask_off, window) = match mask_kind {
+                        MaskKind::None => (0u32, 0u32, 0u32),
+                        MaskKind::Causal => (1, 0, 0),
+                        MaskKind::Custom => (2, binder.off(arena, node.inputs[4]), 0),
+                        MaskKind::SlidingWindow(w) => (3, 0, *w as u32),
+                        MaskKind::Bias => (4, binder.off(arena, node.inputs[4]), 0),
+                    };
+                    let wrt_id = match wrt {
+                        AttentionBwdWrt::Query => 0u32,
+                        AttentionBwdWrt::Key => 1,
+                        AttentionBwdWrt::Value => 2,
+                    };
+                    let axis_len = if wrt_id == 0 { q_s } else { k_s };
+                    let push = Push::default()
+                        .u(batch as u32)
+                        .u(nh as u32)
+                        .u(q_s as u32)
+                        .u(k_s as u32)
+                        .u(dh as u32)
+                        .u(binder.off(arena, q))
+                        .u(binder.off(arena, k))
+                        .u(binder.off(arena, v))
+                        .u(binder.off(arena, dy))
+                        .u(binder.off(arena, out))
+                        .u(mask_off)
+                        .u(mask_kind_id)
+                        .u(scale.to_bits())
+                        .u(window)
+                        .u(wrt_id)
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "attention_backward",
+                        push,
+                        groups1d(batch * nh * axis_len, 64),
+                    );
+                } else {
+                    steps.push(Step::Host {
+                        op: node.op.clone(),
+                        out: node.id,
+                        out_shape: node.shape.clone(),
+                        inputs: node.inputs.clone(),
+                    });
+                }
+            }
+
+            Op::RopeBackward { head_dim, n_rot } => {
+                let dy = node.inputs[0];
+                let cos = node.inputs[1];
+                let sin = node.inputs[2];
+                let dy_d = dims(graph, dy);
+                let (batch, seq, hidden) = if dy_d.len() >= 3 {
+                    (dy_d[0], dy_d[1], dy_d[2])
+                } else {
+                    (1, dy_d[0], dy_d[1])
+                };
+                let cos_len = numel(&dims(graph, cos));
+                let push = Push::default()
+                    .u(batch as u32)
+                    .u(seq as u32)
+                    .u(hidden as u32)
+                    .u(*head_dim as u32)
+                    .u(*n_rot as u32)
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, cos))
+                    .u(binder.off(arena, sin))
+                    .u(binder.off(arena, out))
+                    .u(cos_len as u32)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "rope_backward",
+                    push,
+                    groups1d(batch * seq * hidden, 64),
                 );
             }
 
@@ -2934,6 +4254,42 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 );
             }
 
+            Op::MaxPool2dBackward {
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let xd = dims(graph, x);
+                let dyd = dims(graph, dy);
+                let (nn, cc, hh, ww) = (xd[0], xd[1], xd[2], xd[3]);
+                let (oh, ow) = (dyd[2], dyd[3]);
+                let (kh, kw) = (kernel_size[0], kernel_size[1]);
+                let sh = stride.first().copied().unwrap_or(1);
+                let sw = stride.get(1).copied().unwrap_or(1);
+                let ph = padding.first().copied().unwrap_or(0);
+                let pw = padding.get(1).copied().unwrap_or(0);
+                let push = Push::default()
+                    .us(&[nn as u32, cc as u32, hh as u32, ww as u32])
+                    .us(&[oh as u32, ow as u32])
+                    .us(&[
+                        kh as u32, kw as u32, sh as u32, sw as u32, ph as u32, pw as u32,
+                    ])
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "maxpool2d_backward",
+                    push,
+                    groups1d(nn * cc * hh * ww, 64),
+                );
+            }
+
             Op::ResizeNearest2x => {
                 let x = node.inputs[0];
                 let xd = dims(graph, x);
@@ -3035,6 +4391,437 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 }
             }
 
+            Op::ConvTranspose2d {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                output_padding: _,
+                groups,
+            } => {
+                let x = node.inputs[0];
+                let weight = node.inputs[1];
+                let xd = dims(graph, x);
+                let od = dims(graph, out);
+                let (nn, cin, hh, ww) = (xd[0], xd[1], xd[2], xd[3]);
+                let (cout, oh, ow) = (od[1], od[2], od[3]);
+                let (kh, kw) = (kernel_size[0], kernel_size[1]);
+                let push = Push::default()
+                    .us(&[nn as u32, cin as u32, hh as u32, ww as u32])
+                    .us(&[cout as u32, oh as u32, ow as u32])
+                    .us(&[kh as u32, kw as u32])
+                    .us(&[
+                        stride[0] as u32,
+                        stride[1] as u32,
+                        padding[0] as u32,
+                        padding[1] as u32,
+                        dilation[0] as u32,
+                        dilation[1] as u32,
+                    ])
+                    .u((*groups).max(1) as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, weight))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "conv_transpose2d",
+                    push,
+                    groups1d(nn * cout * oh * ow, 64),
+                );
+            }
+
+            Op::Conv2dBackwardInput {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                // inputs [dy, w]; output dx [n, c_in, h, w].
+                let dy = node.inputs[0];
+                let weight = node.inputs[1];
+                let dyd = dims(graph, dy);
+                let dxd = dims(graph, out);
+                let (nn, cin, hh, ww) = (dxd[0], dxd[1], dxd[2], dxd[3]);
+                let (cout, oh, ow) = (dyd[1], dyd[2], dyd[3]);
+                let (kh, kw) = (kernel_size[0], kernel_size[1]);
+                let sh = stride.first().copied().unwrap_or(1);
+                let sw = stride.get(1).copied().unwrap_or(1);
+                let ph = padding.first().copied().unwrap_or(0);
+                let pw = padding.get(1).copied().unwrap_or(0);
+                let dh = dilation.first().copied().unwrap_or(1);
+                let dw = dilation.get(1).copied().unwrap_or(1);
+                let push = Push::default()
+                    .us(&[nn as u32, cin as u32, cout as u32])
+                    .us(&[hh as u32, ww as u32])
+                    .us(&[oh as u32, ow as u32])
+                    .us(&[kh as u32, kw as u32])
+                    .us(&[
+                        sh as u32, sw as u32, ph as u32, pw as u32, dh as u32, dw as u32,
+                    ])
+                    .u((*groups).max(1) as u32)
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, weight))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "conv2d_backward_input",
+                    push,
+                    groups1d(nn * cin * hh * ww, 64),
+                );
+            }
+
+            Op::Conv2dBackwardWeight {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let xd = dims(graph, x);
+                let dyd = dims(graph, dy);
+                let (nn, cin, hh, ww) = (xd[0], xd[1], xd[2], xd[3]);
+                let (cout, oh, ow) = (dyd[1], dyd[2], dyd[3]);
+                let (kh, kw) = (kernel_size[0], kernel_size[1]);
+                let sh = stride.first().copied().unwrap_or(1);
+                let sw = stride.get(1).copied().unwrap_or(1);
+                let ph = padding.first().copied().unwrap_or(0);
+                let pw = padding.get(1).copied().unwrap_or(0);
+                let dh = dilation.first().copied().unwrap_or(1);
+                let dw = dilation.get(1).copied().unwrap_or(1);
+                let g = (*groups).max(1);
+                let cin_pg = cin / g;
+                let push = Push::default()
+                    .us(&[nn as u32, cin as u32, cout as u32])
+                    .us(&[hh as u32, ww as u32])
+                    .us(&[oh as u32, ow as u32])
+                    .us(&[kh as u32, kw as u32])
+                    .us(&[
+                        sh as u32, sw as u32, ph as u32, pw as u32, dh as u32, dw as u32,
+                    ])
+                    .u(g as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "conv2d_backward_weight",
+                    push,
+                    groups1d(cout * cin_pg * kh * kw, 64),
+                );
+            }
+
+            Op::Conv3d {
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                let x = node.inputs[0];
+                let weight = node.inputs[1];
+                let xd = dims(graph, x);
+                let wd = dims(graph, weight);
+                let od = dims(graph, out);
+                let (nn, cin, d, h, w) = (xd[0], xd[1], xd[2], xd[3], xd[4]);
+                let (cout, kd, kh, kw) = (wd[0], wd[2], wd[3], wd[4]);
+                let (d_out, h_out, w_out) = (od[2], od[3], od[4]);
+                let push = Push::default()
+                    .us(&[nn as u32, cin as u32, cout as u32])
+                    .us(&[d as u32, h as u32, w as u32])
+                    .us(&[d_out as u32, h_out as u32, w_out as u32])
+                    .us(&[kd as u32, kh as u32, kw as u32])
+                    .us(&[
+                        stride[0] as u32,
+                        stride[1] as u32,
+                        stride[2] as u32,
+                        padding[0] as u32,
+                        padding[1] as u32,
+                        padding[2] as u32,
+                        dilation[0] as u32,
+                        dilation[1] as u32,
+                        dilation[2] as u32,
+                    ])
+                    .u((*groups).max(1) as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, weight))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "conv3d",
+                    push,
+                    groups1d(nn * cout * d_out * h_out * w_out, 64),
+                );
+            }
+
+            Op::ConvTranspose3d {
+                stride,
+                padding,
+                dilation,
+                output_padding: _,
+                groups,
+            } => {
+                let x = node.inputs[0];
+                let weight = node.inputs[1];
+                let xd = dims(graph, x);
+                let wd = dims(graph, weight);
+                let od = dims(graph, out);
+                let (nn, cin, d, h, w) = (xd[0], xd[1], xd[2], xd[3], xd[4]);
+                let (cout, kd, kh, kw) = (od[1], wd[2], wd[3], wd[4]);
+                let (d_out, h_out, w_out) = (od[2], od[3], od[4]);
+                let push = Push::default()
+                    .us(&[nn as u32, cin as u32, cout as u32])
+                    .us(&[d as u32, h as u32, w as u32])
+                    .us(&[d_out as u32, h_out as u32, w_out as u32])
+                    .us(&[kd as u32, kh as u32, kw as u32])
+                    .us(&[
+                        stride[0] as u32,
+                        stride[1] as u32,
+                        stride[2] as u32,
+                        padding[0] as u32,
+                        padding[1] as u32,
+                        padding[2] as u32,
+                        dilation[0] as u32,
+                        dilation[1] as u32,
+                        dilation[2] as u32,
+                    ])
+                    .u((*groups).max(1) as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, weight))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "conv_transpose3d",
+                    push,
+                    groups1d(nn * cout * d_out * h_out * w_out, 64),
+                );
+            }
+
+            Op::FusedConvBiasAct {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+                activation,
+                has_residual,
+            } => {
+                // 2-D only (matches FuseConvBiasAct). Plain conv into `out`, then
+                // bias + optional residual + activation epilogue in-place.
+                let x = node.inputs[0];
+                let weight = node.inputs[1];
+                let bias = node.inputs[2];
+                let xd = dims(graph, x);
+                let od = dims(graph, out);
+                let (nn, cin, hh, ww) = (xd[0], xd[1], xd[2], xd[3]);
+                let (cout, oh, ow) = (od[1], od[2], od[3]);
+                let (kh, kw) = (kernel_size[0], kernel_size[1]);
+                let push = Push::default()
+                    .us(&[nn as u32, cin as u32, hh as u32, ww as u32])
+                    .us(&[cout as u32, kh as u32, kw as u32])
+                    .us(&[oh as u32, ow as u32])
+                    .us(&[
+                        stride[0] as u32,
+                        stride[1] as u32,
+                        padding[0] as u32,
+                        padding[1] as u32,
+                        dilation[0] as u32,
+                        dilation[1] as u32,
+                    ])
+                    .u(*groups as u32)
+                    .u(0) // bias applied in epilogue
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, weight))
+                    .u(binder.off(arena, bias))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "conv2d",
+                    push,
+                    groups1d(nn * cout * oh * ow, 64),
+                );
+                let act = match activation {
+                    None => 0xFFFFu32,
+                    Some(a) => act_id(*a),
+                };
+                let (has_res, res_off) = if *has_residual {
+                    (1u32, binder.off(arena, node.inputs[3]))
+                } else {
+                    (0u32, 0u32)
+                };
+                let total = nn * cout * oh * ow;
+                let ep = Push::default()
+                    .u(total as u32)
+                    .u((oh * ow) as u32)
+                    .u(cout as u32)
+                    .u(binder.off(arena, out))
+                    .u(1)
+                    .u(binder.off(arena, bias))
+                    .u(act)
+                    .u(has_res)
+                    .u(res_off)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "conv_bias_act_epilogue",
+                    ep,
+                    groups1d(total, 256),
+                );
+            }
+
+            Op::LayerNormBackwardInput { eps, .. } => {
+                let x = node.inputs[0];
+                let gamma = node.inputs[1];
+                let dy = node.inputs[2];
+                let xd = dims(graph, x);
+                let h = *xd.last().unwrap_or(&1);
+                let rows = numel(&xd) / h.max(1);
+                let push = Push::default()
+                    .u(rows as u32)
+                    .u(h as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, gamma))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .f(*eps)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "layer_norm_backward_input",
+                    push,
+                    groups1d(rows, 64),
+                );
+            }
+
+            Op::LayerNormBackwardGamma { eps, .. } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let xd = dims(graph, x);
+                let h = *xd.last().unwrap_or(&1);
+                let rows = numel(&xd) / h.max(1);
+                let push = Push::default()
+                    .u(rows as u32)
+                    .u(h as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .f(*eps)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "layer_norm_backward_gamma",
+                    push,
+                    groups1d(1, 64),
+                );
+            }
+
+            Op::RmsNormBackwardInput { eps, .. }
+            | Op::RmsNormBackwardGamma { eps, .. }
+            | Op::RmsNormBackwardBeta { eps, .. } => {
+                let x = node.inputs[0];
+                let gamma = node.inputs[1];
+                let beta = node.inputs[2];
+                let dy = node.inputs[3];
+                let xd = dims(graph, x);
+                let h = *xd.last().unwrap_or(&1);
+                let rows = numel(&xd) / h.max(1);
+                let wrt = match &node.op {
+                    Op::RmsNormBackwardInput { .. } => 0u32,
+                    Op::RmsNormBackwardGamma { .. } => 1u32,
+                    Op::RmsNormBackwardBeta { .. } => 2u32,
+                    _ => unreachable!(),
+                };
+                let push = Push::default()
+                    .u(rows as u32)
+                    .u(h as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, gamma))
+                    .u(binder.off(arena, beta))
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .f(*eps)
+                    .u(wrt)
+                    .bytes();
+                let groups = if wrt == 0 {
+                    groups1d(rows, 64)
+                } else {
+                    groups1d(1, 64)
+                };
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "rms_norm_backward",
+                    push,
+                    groups,
+                );
+            }
+
+            Op::FftButterflyStage { stage, n_fft } => {
+                let state = node.inputs[0];
+                assert_eq!(
+                    graph.node(state).shape.dtype(),
+                    DType::F32,
+                    "rlx-vulkan Op::FftButterflyStage requires F32 state"
+                );
+                let gate = node.inputs[1];
+                let rev = node.inputs[2];
+                let tw_re = node.inputs[3];
+                let tw_im = node.inputs[4];
+                let sd = dims(graph, state);
+                let batch = if sd.len() >= 2 {
+                    numel(&sd[..sd.len() - 2])
+                } else {
+                    1
+                };
+                let half = (*n_fft as usize / 2).max(1);
+                let push = Push::default()
+                    .u(batch as u32)
+                    .u(*n_fft as u32)
+                    .u(*stage as u32)
+                    .u(half as u32)
+                    .u(binder.off(arena, state))
+                    .u(binder.off(arena, out))
+                    .u(binder.off(arena, gate))
+                    .u(binder.off(arena, rev))
+                    .u(binder.off(arena, tw_re))
+                    .u(binder.off(arena, tw_im))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "fft_butterfly_stage",
+                    push,
+                    groups1d(batch * half, 64),
+                );
+            }
+
             Op::SelectiveScan { state_size } => {
                 // inputs: [x, delta, a, b, c]; x,delta [B,S,H], a [H,N], b,c [B,S,N]
                 let x = node.inputs[0];
@@ -3065,6 +4852,175 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                     push,
                     groups1d(bb * hh, 64),
                 );
+            }
+
+            Op::Mamba2 {
+                head_dim,
+                state_size,
+            } => {
+                if *state_size > 256 {
+                    steps.push(Step::Host {
+                        op: node.op.clone(),
+                        out: node.id,
+                        out_shape: node.shape.clone(),
+                        inputs: node.inputs.clone(),
+                    });
+                } else {
+                    let x = node.inputs[0];
+                    let xd = dims(graph, x); // [B,S,H,P]
+                    let (batch, seq, heads) = (xd[0], xd[1], xd[2]);
+                    let push = Push::default()
+                        .u(batch as u32)
+                        .u(seq as u32)
+                        .u(heads as u32)
+                        .u(*head_dim as u32)
+                        .u(*state_size as u32)
+                        .u(binder.off(arena, x))
+                        .u(binder.off(arena, node.inputs[1]))
+                        .u(binder.off(arena, node.inputs[2]))
+                        .u(binder.off(arena, node.inputs[3]))
+                        .u(binder.off(arena, node.inputs[4]))
+                        .u(binder.off(arena, out))
+                        .u(seq as u32)
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "mamba2",
+                        push,
+                        groups1d(batch * heads * *head_dim, 64),
+                    );
+                }
+            }
+
+            Op::Lstm {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                carry,
+            } => {
+                let x = node.inputs[0];
+                let xd = dims(graph, x); // [B,S,In]
+                let (batch, seq, input_size) = (xd[0], xd[1], xd[2]);
+                let hidden = *hidden_size;
+                let simple = *num_layers == 1 && !*bidirectional && !*carry && hidden <= 256;
+                if simple {
+                    let push = Push::default()
+                        .u(batch as u32)
+                        .u(seq as u32)
+                        .u(input_size as u32)
+                        .u(hidden as u32)
+                        .u(binder.off(arena, x))
+                        .u(binder.off(arena, node.inputs[1]))
+                        .u(binder.off(arena, node.inputs[2]))
+                        .u(binder.off(arena, node.inputs[3]))
+                        .u(binder.off(arena, out))
+                        .u(seq as u32)
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "lstm",
+                        push,
+                        groups1d(batch, 64),
+                    );
+                } else {
+                    steps.push(Step::Host {
+                        op: node.op.clone(),
+                        out: node.id,
+                        out_shape: node.shape.clone(),
+                        inputs: node.inputs.clone(),
+                    });
+                }
+            }
+
+            Op::Gru {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                carry,
+            } => {
+                let x = node.inputs[0];
+                let xd = dims(graph, x); // [B,S,In]
+                let (batch, seq, input_size) = (xd[0], xd[1], xd[2]);
+                let hidden = *hidden_size;
+                let simple = *num_layers == 1 && !*bidirectional && !*carry && hidden <= 256;
+                if simple {
+                    let push = Push::default()
+                        .u(batch as u32)
+                        .u(seq as u32)
+                        .u(input_size as u32)
+                        .u(hidden as u32)
+                        .u(binder.off(arena, x))
+                        .u(binder.off(arena, node.inputs[1]))
+                        .u(binder.off(arena, node.inputs[2]))
+                        .u(binder.off(arena, node.inputs[3]))
+                        .u(binder.off(arena, node.inputs[4]))
+                        .u(binder.off(arena, out))
+                        .u(seq as u32)
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "gru",
+                        push,
+                        groups1d(batch, 64),
+                    );
+                } else {
+                    steps.push(Step::Host {
+                        op: node.op.clone(),
+                        out: node.id,
+                        out_shape: node.shape.clone(),
+                        inputs: node.inputs.clone(),
+                    });
+                }
+            }
+
+            Op::Rnn {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                carry,
+                relu,
+            } => {
+                let x = node.inputs[0];
+                let xd = dims(graph, x);
+                let (batch, seq, input_size) = (xd[0], xd[1], xd[2]);
+                let hidden = *hidden_size;
+                let simple = *num_layers == 1 && !*bidirectional && !*carry && hidden <= 256;
+                if simple {
+                    let push = Push::default()
+                        .u(batch as u32)
+                        .u(seq as u32)
+                        .u(input_size as u32)
+                        .u(hidden as u32)
+                        .u(binder.off(arena, x))
+                        .u(binder.off(arena, node.inputs[1]))
+                        .u(binder.off(arena, node.inputs[2]))
+                        .u(binder.off(arena, node.inputs[3]))
+                        .u(binder.off(arena, out))
+                        .u(seq as u32)
+                        .u(u32::from(*relu))
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "rnn",
+                        push,
+                        groups1d(batch, 64),
+                    );
+                } else {
+                    steps.push(Step::Host {
+                        op: node.op.clone(),
+                        out: node.id,
+                        out_shape: node.shape.clone(),
+                        inputs: node.inputs.clone(),
+                    });
+                }
             }
 
             Op::Im2Col {
@@ -3296,12 +5252,125 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
 
             Op::ScanBackward { .. }
             | Op::ScanBackwardXs { .. }
-            | Op::ScatterNd { .. }
+            | Op::DenseSolve
+            | Op::BatchedDenseSolve
+            | Op::LogMel
+            | Op::LogMelBackward => {
+                // DenseSolve → rlx-cpu LAPACK on the mapped f32 arena (same
+                // HostOpDesc contract as wgpu). LogMel has no SPIR-V twin.
+                steps.push(Step::HostOp {
+                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.byte_offset(id)),
+                });
+            }
+
+            Op::CumsumBackward { exclusive, .. } => {
+                let dy = node.inputs[0];
+                let xd = dims(graph, dy);
+                let cols = *xd.last().unwrap_or(&1);
+                let rows = numel(&xd) / cols.max(1);
+                let push = Push::default()
+                    .u(rows as u32)
+                    .u(cols as u32)
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, out))
+                    .u(if *exclusive { 1 } else { 0 })
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "cumsum_backward",
+                    push,
+                    groups1d(rows, 64),
+                );
+            }
+
+            Op::GatherBackward { axis } => {
+                let dy = node.inputs[0];
+                let idx = node.inputs[1];
+                let dy_d = dims(graph, dy);
+                let out_d = dims(graph, out);
+                let rank = out_d.len();
+                let ax = if *axis < 0 {
+                    (rank as i32 + *axis) as usize
+                } else {
+                    *axis as usize
+                };
+                let outer = numel(&dy_d[..ax]).max(1);
+                let num_idx = dims(graph, idx).get(ax).copied().unwrap_or(1);
+                let trailing = numel(&dy_d[ax + 1..]).max(1);
+                let axis_dim = out_d.get(ax).copied().unwrap_or(1);
+                let push = Push::default()
+                    .u(outer as u32)
+                    .u(axis_dim as u32)
+                    .u(num_idx as u32)
+                    .u(trailing as u32)
+                    .u(binder.off(arena, dy))
+                    .u(binder.off(arena, idx))
+                    .u(binder.off(arena, out))
+                    .bytes();
+                let n_zero = outer * axis_dim * trailing;
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "gather_backward_zero",
+                    push.clone(),
+                    groups1d(n_zero, 256),
+                );
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "gather_backward_acc",
+                    push,
+                    groups1d(outer, 1),
+                );
+            }
+
+            Op::WelchPeaks { k, n_segments } => {
+                let spec = node.inputs[0];
+                let spec_shape = graph.node(spec).shape.clone();
+                let meta = rlx_ir::audio::welch_peaks_meta(&spec_shape, *k, *n_segments)
+                    .unwrap_or_else(|e| panic!("Op::WelchPeaks: {e}"));
+                let use_gpu =
+                    rlx_ir::audio::welch_peaks_gpu_native_eligible(&spec_shape, *k, *n_segments)
+                        .unwrap_or(false);
+                if use_gpu {
+                    let push = Push::default()
+                        .u(binder.off(arena, spec))
+                        .u(binder.off(arena, out))
+                        .u(meta.welch_batch as u32)
+                        .u(meta.n_fft as u32)
+                        .u(meta.n_segments as u32)
+                        .u(meta.k as u32)
+                        .u(meta.n_bins as u32)
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "welch_peaks",
+                        push,
+                        groups1d(meta.welch_batch, 64),
+                    );
+                } else {
+                    steps.push(Step::HostOp {
+                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.byte_offset(id)),
+                    });
+                }
+            }
+
+            Op::ScatterNd { .. }
             | Op::ScatterElements { .. }
             | Op::GatherNd { .. }
             | Op::GatherElements { .. } => {
-                steps.push(Step::HostOp {
-                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.byte_offset(id)),
+                // f32-uniform arena: indices are float-encoded. Mirror wgpu —
+                // HostOpDesc would set indices_i64 from IR dtype and re-read
+                // float bits as i64 (Kitten alignment → NSF mush on NVIDIA).
+                steps.push(Step::CpuIndexing {
+                    thunk: rlx_cpu::rlx_indexing_thunk!(graph, node, |id| arena.byte_offset(id))
+                        .force_indices_f32(),
                 });
             }
 

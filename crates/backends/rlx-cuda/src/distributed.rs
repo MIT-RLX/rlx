@@ -54,9 +54,7 @@ pub fn new_nccl_id() -> Result<Id, String> {
     match std::panic::catch_unwind(Id::new) {
         Ok(Ok(id)) => Ok(id),
         Ok(Err(e)) => Err(format!("nccl Id::new: {e:?}")),
-        Err(_) => Err(
-            "nccl Id::new: libnccl not loadable (missing shared library)".into(),
-        ),
+        Err(_) => Err("nccl Id::new: libnccl not loadable (missing shared library)".into()),
     }
 }
 

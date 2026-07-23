@@ -1,0 +1,32 @@
+#version 450
+// GroupNorm (NCHW) dbeta — single serial invocation (matches WGSL/CUDA).
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint c;
+    uint h;
+    uint w;
+    uint dy_off;
+    uint out_off;
+} pc;
+
+void main() {
+    if (gl_GlobalInvocationID.x != 0u) { return; }
+    uint spatial = pc.h * pc.w;
+    uint plane = pc.c * spatial;
+    for (uint ch = 0u; ch < pc.c; ch++) {
+        arena_store(pc.out_off + ch, 0.0);
+    }
+    for (uint bn = 0u; bn < pc.n; bn++) {
+        uint b_base = bn * plane;
+        for (uint ch = 0u; ch < pc.c; ch++) {
+            uint dy_base = pc.dy_off + b_base + ch * spatial;
+            float acc = arena_load(pc.out_off + ch);
+            for (uint s = 0u; s < spatial; s++) {
+                acc += arena_load(dy_base + s);
+            }
+            arena_store(pc.out_off + ch, acc);
+        }
+    }
+}

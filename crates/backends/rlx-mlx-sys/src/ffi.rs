@@ -64,6 +64,7 @@ pub enum MlxUnary {
     Cos = 12,
     Tan = 13,
     Atan = 14,
+    Reciprocal = 15,
 }
 
 // Mirror rlx_mlx_reduce_t.
@@ -398,6 +399,40 @@ unsafe extern "C" {
         dil_d: c_int,
         dil_h: c_int,
         dil_w: c_int,
+        groups: c_int,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+
+    pub fn rlx_mlx_op_conv_transpose2d(
+        input: *mut mlx_array_t,
+        weight: *mut mlx_array_t,
+        stride_h: c_int,
+        stride_w: c_int,
+        pad_h: c_int,
+        pad_w: c_int,
+        dil_h: c_int,
+        dil_w: c_int,
+        out_pad_h: c_int,
+        out_pad_w: c_int,
+        groups: c_int,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+
+    pub fn rlx_mlx_op_conv_transpose3d(
+        input: *mut mlx_array_t,
+        weight: *mut mlx_array_t,
+        stride_d: c_int,
+        stride_h: c_int,
+        stride_w: c_int,
+        pad_d: c_int,
+        pad_h: c_int,
+        pad_w: c_int,
+        dil_d: c_int,
+        dil_h: c_int,
+        dil_w: c_int,
+        out_pad_d: c_int,
+        out_pad_h: c_int,
+        out_pad_w: c_int,
         groups: c_int,
         out: *mut *mut mlx_array_t,
     ) -> c_int;

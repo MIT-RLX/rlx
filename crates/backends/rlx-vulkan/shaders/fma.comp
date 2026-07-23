@@ -1,0 +1,21 @@
+#version 450
+// Single-rounded fused multiply-add: out[i] = fma(a[i], b[i], c[i]).
+// Matches CUDA `fma_elem` / wgpu `fma.wgsl` (one rounding).
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint a_off;
+    uint b_off;
+    uint c_off;
+    uint out_off;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    float a = arena_load(pc.a_off + i);
+    float b = arena_load(pc.b_off + i);
+    float c = arena_load(pc.c_off + i);
+    arena_store(pc.out_off + i, fma(a, b, c));
+}

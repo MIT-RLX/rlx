@@ -165,5 +165,50 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     OpKind::EighBackward,
     OpKind::EighBatch,
     OpKind::EighBatchBackward,
-    // LoRA, If, While: not yet wired in wgpu — fail loudly.
+    // Training / vision (native WGSL where listed; else host / HostOp).
+    OpKind::AxialRope2d,
+    OpKind::MaxPool2dBackward,
+    OpKind::SoftmaxCrossEntropyWithLogits,
+    OpKind::SoftmaxCrossEntropyBackward,
+    OpKind::GroupNormBackwardInput,
+    OpKind::GroupNormBackwardGamma,
+    OpKind::GroupNormBackwardBeta,
+    OpKind::BatchNormInference,
+    OpKind::BatchNormInferenceBackwardInput,
+    OpKind::BatchNormInferenceBackwardGamma,
+    OpKind::BatchNormInferenceBackwardBeta,
+    // Native activation_backward.wgsl (Fixed kinds, op id 0–16).
+    OpKind::ReluBackward,
+    OpKind::ActivationBackward,
+    // Scaled FP8 (Metal-parity host).
+    OpKind::ScaledMatMul,
+    OpKind::ScaledQuantize,
+    OpKind::ScaledQuantScale,
+    OpKind::ScaledDequantize,
+    // Native FakeQuantize Fixed/PerBatch; EMA + LSQ/Backward stay HostOp.
+    OpKind::FakeQuantize,
+    OpKind::FakeQuantizeBackward,
+    OpKind::FakeQuantizeLSQ,
+    OpKind::FakeQuantizeLSQBackwardX,
+    OpKind::FakeQuantizeLSQBackwardScale,
+    OpKind::Quantize,
+    OpKind::Dequantize,
+    OpKind::QMatMul,
+    OpKind::QConv2d,
+    OpKind::DenseSolve,
+    OpKind::BatchedDenseSolve,
+    // Native WGSL C64 Wirtinger surface (`complex_wirtinger.wgsl`).
+    OpKind::ComplexNormSq,
+    OpKind::ComplexNormSqBackward,
+    OpKind::Conjugate,
+    // Native WGSL ternary-pruned FFT butterfly (`fft_butterfly_stage.wgsl`).
+    OpKind::FftButterflyStage,
+    // Remaining QAT / INT8 / fuse forms (HostOp → CPU).
+    OpKind::LoraMatMul,
+    OpKind::FusedConvBiasAct,
+    OpKind::PartitionedConv,
+    OpKind::CustomFn,
+    // Session + WgpuExecutable compile run LowerControlFlow first.
+    OpKind::If,
+    OpKind::While,
 ];

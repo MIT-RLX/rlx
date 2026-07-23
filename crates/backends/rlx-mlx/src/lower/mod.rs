@@ -36,6 +36,7 @@ use crate::ops;
 
 mod env;
 mod helpers;
+mod host_eval;
 mod subgraph;
 
 pub use env::lower_with_env;
@@ -147,10 +148,84 @@ pub fn first_host_eval_op(graph: &Graph) -> Option<&'static str> {
             Op::ScatterElements { .. } => return Some("ScatterElements (host reference)"),
             Op::GatherNd { .. } => return Some("GatherNd (host reference)"),
             Op::GatherElements { .. } => return Some("GatherElements (host reference)"),
-            // Vocos ISTFT ConvTranspose — native MLX CT has been wrong here;
-            // host via rlx-cpu `execute_conv_transpose2d` (O(activation) scratch).
-            // Avoids the decompose→inflate→im2col path (~627 GB).
-            Op::ConvTranspose2d { .. } => return Some("ConvTranspose2d (host reference)"),
+            // Oversized CT2d (Vocos/ISTFT k≈1024) — MLX im2col OOMs; small
+            // CT2d lowers natively via `ops::conv_transpose2d`.
+            Op::ConvTranspose2d {
+                kernel_size,
+                groups,
+                ..
+            } if mlx_conv_im2col_too_large(graph, node, kernel_size, *groups) => {
+                return Some("ConvTranspose2d (oversized im2col → host)");
+            }
+            // Oversized / grouped CT3d — MLX 3D transpose is groups=1 only;
+            // oversized im2col still host-evals like forward Conv.
+            Op::ConvTranspose3d { groups, .. } => {
+                let w_shape = node_input_shape(graph, node.inputs[1]);
+                if w_shape.len() >= 5 {
+                    let kernel_size = [
+                        w_shape[2].max(0) as usize,
+                        w_shape[3].max(0) as usize,
+                        w_shape[4].max(0) as usize,
+                    ];
+                    if *groups > 1 || mlx_conv_im2col_too_large(graph, node, &kernel_size, *groups)
+                    {
+                        return Some(if *groups > 1 {
+                            "ConvTranspose3d (groups>1 → host)"
+                        } else {
+                            "ConvTranspose3d (oversized im2col → host)"
+                        });
+                    }
+                }
+            }
+            Op::CustomFn { .. } => return Some("CustomFn (host body)"),
+            Op::GaussianSplatPrepare { .. } | Op::GaussianSplatRasterize { .. } => {
+                return Some("GaussianSplat prepare/rasterize (host)");
+            }
+            Op::ScaledQuantize { .. } => {
+                return Some("ScaledQuantize (host typed encode)");
+            }
+            Op::ScaledMatMul {
+                lhs_format,
+                rhs_format,
+                scale_layout,
+                ..
+            } if !helpers::scaled_fp8_mlx_ok(*lhs_format, *scale_layout)
+                || !helpers::scaled_fp8_mlx_ok(*rhs_format, *scale_layout) =>
+            {
+                return Some("ScaledMatMul (non-PerTensor-FP8 → host typed)");
+            }
+            Op::ScaledQuantScale {
+                format,
+                scale_layout,
+            }
+            | Op::ScaledDequantize {
+                format,
+                scale_layout,
+            } if !helpers::scaled_fp8_mlx_ok(*format, *scale_layout) => {
+                return Some("ScaledQuantScale/Dequantize (non-PerTensor-FP8 → host typed)");
+            }
+            Op::BiMap
+            | Op::ReEig { .. }
+            | Op::LogEig { .. }
+            | Op::SpdBatchNorm { .. }
+            | Op::SpdKarcherMean { .. }
+            | Op::ReEigBackward { .. }
+            | Op::LogEigBackward { .. }
+            | Op::SpdBatchNormBackwardX { .. }
+            | Op::SpdBatchNormBackwardG { .. }
+            | Op::SpdKarcherMeanWeighted { .. }
+            | Op::SpdLogMap
+            | Op::SpdExpMap
+            | Op::SpdParallelTransport
+            | Op::SpdMatrixFnBatch { .. }
+            | Op::SpdLogMapBackward
+            | Op::SpdExpMapBackward
+            | Op::SpdParallelTransportBackward
+            | Op::SpdMatrixFnBatchBackward { .. }
+            | Op::Eigh
+            | Op::EighBackward
+            | Op::EighBatch
+            | Op::EighBatchBackward => return Some("SPD/Eigh (host typed)"),
             // Oversized ISTFT-as-conv (legacy decompose path) — MLX's conv1d
             // materializes a c_in·k·out_len im2col. Force Lazy + host naive.
             Op::Conv {
@@ -478,6 +553,7 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::LayerNorm { .. }
             | Op::LayerNorm2d { .. }
             | Op::GroupNorm { .. }
+            | Op::BatchNormInference { .. }
             | Op::RmsNorm { .. }
             | Op::ResizeNearest2x => {}
             // Rope / Attention / matmul: batch in outer dim, computation
@@ -498,9 +574,8 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             // DequantMatMul / LoraMatMul follow MatMul's batch-outer
             // contract.
             Op::DequantMatMul { .. } | Op::LoraMatMul { .. } => {}
-            // Real INT8 ops: not lowered on MLX yet — train/quantize
-            // on CPU, run inference there. Reject so the dispatch
-            // surfaces a clear error.
+            // Real INT8 ops lower natively via f32 GEMM/conv + requant, but
+            // active-extent bucketing is still unsafe (full-tensor zp/mult).
             Op::QMatMul { .. } | Op::QConv2d { .. } => return false,
             // Reduce / Cumsum: safe iff the operation doesn't touch
             // axis 0.
@@ -572,8 +647,9 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::Custom { .. }
             | Op::If { .. }
             | Op::While { .. } => return false,
-            // Quantization: not lowered on MLX yet — train/quantize on
-            // CPU, run inference on the dequantized fp32/fp16 path.
+            // Quantize/Dequantize/LSQ/FakeQuantize lower natively (`fq_*` /
+            // INT8 helpers) but reduce / broadcast over the full tensor, so
+            // active-extent bucketing is unsafe.
             Op::Quantize { .. }
             | Op::Dequantize { .. }
             | Op::FakeQuantize { .. }
@@ -604,7 +680,10 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::GatherBackward { .. }
             | Op::GroupNormBackwardInput { .. }
             | Op::GroupNormBackwardGamma { .. }
-            | Op::GroupNormBackwardBeta { .. } => return false,
+            | Op::GroupNormBackwardBeta { .. }
+            | Op::BatchNormInferenceBackwardInput { .. }
+            | Op::BatchNormInferenceBackwardGamma { .. }
+            | Op::BatchNormInferenceBackwardBeta => return false,
             Op::Scan { .. }
             | Op::ScanBackward { .. }
             | Op::ScanBackwardXs { .. }
@@ -616,8 +695,16 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             Op::CustomFn { .. } => return false,
             // FFT lowered natively via `mlx::fft::fft` FFI shim.
             Op::Fft { .. } => return true,
-            // C64 ops are CPU-only today; pin to Device::Cpu.
+            // C64 ops lower via interleaved f32 even/odd lanes; still unsafe
+            // for active-extent (flat interleaved layout).
             Op::ComplexNormSq | Op::ComplexNormSqBackward | Op::Conjugate => return false,
+            Op::Conv3d { .. }
+            | Op::ConvTranspose3d { .. }
+            | Op::FusedConvBiasAct { .. }
+            | Op::PartitionedConv { .. }
+            | Op::AxialRope2d { .. }
+            | Op::Mamba2 { .. }
+            | Op::FftButterflyStage { .. } => return false,
             _ => return false,
         }
     }

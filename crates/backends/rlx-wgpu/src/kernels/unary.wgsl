@@ -22,7 +22,8 @@ struct Params {
     out_off: u32,
     op: u32,
     // 0=relu, 1=sigmoid, 2=tanh, 3=exp, 4=log, 5=sqrt, 6=rsqrt,
-    // 7=neg, 8=abs, 9=gelu, 10=silu, 11=gelu_approx
+    // 7=neg, 8=abs, 9=gelu, 10=silu, 11=gelu_approx,
+    // 12=round, 13=sin, 14=cos, 15=tan, 16=atan, 17=recip
     _p0: u32, _p1: u32, _p2: u32, _p3: u32,
 };
 
@@ -76,6 +77,7 @@ fn unary(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         case 14u: { y = cos(x); }
         case 15u: { y = tan(x); }
         case 16u: { y = atan(x); }
+        case 17u: { y = 1.0 / x; } // vvrecf
         default: { y = x; }
     }
     arena[params.out_off + i] = y;

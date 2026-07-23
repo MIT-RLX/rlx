@@ -1343,16 +1343,14 @@ mod tests {
                 }
             }
             let (recv, recv_counts) = g.all_to_all_v(&data, &send_counts).unwrap();
-            assert_eq!(
-                recv_counts,
-                vec![r + 1; n],
-                "rank {r} recv_counts"
-            );
+            assert_eq!(recv_counts, vec![r + 1; n], "rank {r} recv_counts");
             let mut off = 0usize;
             for (j, &c) in recv_counts.iter().enumerate() {
                 let chunk = &recv[off..off + c];
                 assert!(
-                    chunk.iter().all(|&v| (v - (100 * j + r) as f32).abs() < 1e-6),
+                    chunk
+                        .iter()
+                        .all(|&v| (v - (100 * j + r) as f32).abs() < 1e-6),
                     "rank {r} from {j}: {chunk:?}"
                 );
                 off += c;

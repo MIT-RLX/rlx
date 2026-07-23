@@ -24,38 +24,43 @@ use crate::buffer::{
 };
 use crate::device::wgpu_device;
 use crate::kernels::{
-    AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams, AttentionBwdParams,
-    AttentionParams, BatchElementwiseRegionParams, BinaryParams, Conv1dParams, Conv2dParams,
-    Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
+    ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
+    AttentionBwdParams, AttentionParams, BatchElementwiseRegionParams, BinaryParams, Conv1dParams,
+    Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
     ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
     FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatedDeltaNetParams,
     GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
     GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNormBwdParams, LayerNormParams,
     Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
     Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
-    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
-    ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel,
-    cast_f32_to_f16_kernel, complex_cast_kernel,
-    cast_kernel, compare_kernel, concat_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
-    conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel, fma_kernel,
+    SampleParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams,
+    TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
+    activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
+    argmax_kernel, attention_bwd_kernel, attention_kernel, axial_rope2d_kernel,
+    batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
+    cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
+    complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel, conv_transpose3d_kernel,
+    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel,
+    elementwise_region_spatial_kernel, expand_kernel, fake_quantize_fixed_kernel,
+    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel,
     fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
     gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
     gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
-    gather_split_kernel, grouped_matmul_kernel, gru_kernel, im2col2d_kernel,
+    gather_split_kernel, group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
+    group_norm_backward_input_kernel, grouped_matmul_kernel, gru_kernel, im2col2d_kernel,
     layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
     layer_norm_backward_input_kernel, layernorm_kernel, mamba2_kernel,
     matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
-    matmul_wide_active_kernel, matmul_wide_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel,
-    pool3d_kernel, reduce_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel,
-    rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_kernel,
-    selective_scan_kernel, softmax_cross_entropy_kernel, softmax_kernel, topk_kernel,
-    transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
+    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel, narrow_kernel,
+    pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel, rms_norm_backward_kernel,
+    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
+    scatter_add_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
+    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
+    topk_kernel, transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
     welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
@@ -395,6 +400,12 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::ReluBackward { params } | Step::ActivationBackward { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::Reduce { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
@@ -408,6 +419,18 @@ impl WgpuExecutable {
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::SoftmaxCrossEntropy { params } => {
+                        let mut p = *params;
+                        p.outer = scale(p.outer);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::SoftmaxCrossEntropyWithLogits { params } => {
+                        let mut p = *params;
+                        p.outer = scale(p.outer);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::SoftmaxCrossEntropyBackward { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
@@ -495,6 +518,20 @@ impl WgpuExecutable {
                     Step::BinaryC64 { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::ComplexNormSq { params }
+                    | Step::ComplexNormSqBackward { params }
+                    | Step::ConjugateC64 { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::FftButterflyStage { params } => {
+                        let mut p = *params;
+                        p.batch = scale(p.batch);
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
@@ -607,6 +644,46 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::MaxPool2dBackward { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::GroupNormBackwardInput { params }
+                    | Step::GroupNormBackwardGamma { params }
+                    | Step::GroupNormBackwardBeta { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::AxialRope2d { params } => {
+                        let mut p = *params;
+                        p.batch = scale(p.batch);
+                        p.n_total = p.batch * p.seq * p.hidden;
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::FakeQuantizeFixed { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        // axis=None: inner tracks full extent with n.
+                        if p.chan_dim <= 1 {
+                            p.inner = p.n.max(1);
+                        }
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::FakeQuantizePerBatch { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        if p.chan_dim <= 1 {
+                            p.inner = p.n.max(1);
+                        }
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::Conv2d { params } | Step::Conv2dTiled { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
@@ -632,6 +709,12 @@ impl WgpuExecutable {
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Conv3d { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::ConvTranspose3d { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
@@ -724,15 +807,19 @@ impl WgpuExecutable {
                     Step::Im2ColGpu { .. }
                     | Step::GatherSplit { .. }
                     | Step::DequantMatmulGguf { .. }
+                    | Step::DequantMatmulInt8Host { .. }
+                    | Step::Conv2dHost { .. }
                     | Step::DequantGroupedMatmulGguf { .. }
                     | Step::GatedDeltaNet { use_gpu: false, .. }
                     | Step::Lstm { .. }
                     | Step::ConvTranspose2d { .. }
+                    | Step::ConvTranspose3dHost { .. }
                     | Step::GroupNormHost { .. }
                     | Step::LayerNorm2dHost { .. }
                     | Step::ResizeNearest2xHost { .. }
                     | Step::ReverseHost { .. }
                     | Step::ArgReduceHost { .. }
+                    | Step::AxialRope2dHost { .. }
                     | Step::GruHost { .. }
                     | Step::RnnHost { .. }
                     | Step::Llada2GroupLimitedGate { .. }
@@ -746,6 +833,8 @@ impl WgpuExecutable {
                     | Step::CpuIndexing { .. }
                     | Step::ConcatHost { .. }
                     | Step::ConcatHostPieces { .. }
+                    | Step::TransposeHost { .. }
+                    | Step::NarrowHost { .. }
                     | Step::ExpandHost { .. }
                     | Step::SpdHost { .. }
                     | Step::Im2ColHost { .. }
@@ -836,1145 +925,1298 @@ impl WgpuExecutable {
         let ck = compare_kernel(&dev.device);
         let wk = where_kernel(&dev.device);
         let fk = fma_kernel(&dev.device);
+        let abk = activation_backward_kernel(&dev.device);
         let mut step_i = 0;
         let mut gpu_bi = 0usize;
         let mut fft_i = 0usize;
+        let mut host_cache = rlx_gpu_host::HostTensorCache::new();
         while step_i < self.schedule.len() {
-            let mut enc = dev
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("rlx-wgpu run"),
-                });
-            {
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("rlx-wgpu compute pass"),
-                    timestamp_writes: None,
-                });
-                let mut pass_dispatched = false;
-                while step_i < self.schedule.len() {
-                    if step_is_tail_host(&self.schedule[step_i]) {
-                        step_i += 1;
-                        continue;
-                    }
-                    if self.static_once_done && self.static_once_steps.contains(&step_i) {
-                        let step = &self.schedule[step_i];
-                        if step_runs_on_host(step) {
+            // Host→Host streaks: skip empty compute encodes/submits between
+            // HostOps (was dominating Kitten discrete wall time alongside D2H).
+            let starting_on_host = step_runs_on_host(&self.schedule[step_i])
+                || step_is_tail_host(&self.schedule[step_i]);
+            let mut pass_dispatched = false;
+            if !starting_on_host {
+                let mut enc = dev
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("rlx-wgpu run"),
+                    });
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("rlx-wgpu compute pass"),
+                        timestamp_writes: None,
+                    });
+                    while step_i < self.schedule.len() {
+                        if step_is_tail_host(&self.schedule[step_i]) {
                             step_i += 1;
                             continue;
                         }
-                        if !matches!(step, Step::FftGpu { .. }) {
-                            gpu_bi += 1;
-                        }
-                        step_i += 1;
-                        continue;
-                    }
-                    if step_runs_on_host(&self.schedule[step_i]) {
-                        break;
-                    }
-                    // Vulkan/DX12: end the pass after unary/cast so f32→f16
-                    // mirrors are visible to the next step. Only split once
-                    // we've dispatched in *this* pass — otherwise the step that
-                    // needs the flush would never run (infinite empty passes).
-                    if pass_dispatched
-                        && step_i > 0
-                        && step_needs_pass_flush(&self.schedule[step_i], &self.schedule[step_i - 1])
-                    {
-                        break;
-                    }
-                    let step = &self.schedule[step_i];
-                    // PLAN L3: per-step Perfetto trace span; no-op when
-                    // env var RLX_TRACE_PERFETTO unset.
-                    let _perf = rlx_ir::perfetto::TraceSpan::new(step_name(step), "wgpu");
-                    if std::env::var("RLX_DBG_STEP").is_ok() {
-                        eprintln!("[wgpu-step] {}", step_name(step));
-                    }
-                    match step {
-                        Step::CastF32ToF16 { params } => {
-                            // Pre-pass for matmul_coop16: mirror f32 arena
-                            // region into f16 shadow buffer so the matmul
-                            // kernel can read A as f16. One thread per
-                            // element; 64-thread workgroups.
-                            if let Some(cast_k) = mm_cast {
-                                pass.set_pipeline(&cast_k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(params.len, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                        }
-                        Step::Matmul {
-                            m,
-                            n,
-                            batch,
-                            b_off_f32,
-                            b_is_param,
-                            compute_precision,
-                            ..
-                        } =>
-                        // The dispatch branches below use a chain of
-                        // `is_some() && …unwrap()` to pick a pipeline
-                        // because each variant cares about a different
-                        // Option<Pipeline>. `if let Some(p) = …` chains
-                        // would require nesting per variant; the flat
-                        // form is the readable shape here.
-                        {
-                            #[allow(clippy::unnecessary_unwrap)]
-                            // Safe at any batch (see safe_for_active_extent
-                            // comment); scale m, output rows past m_s per
-                            // batch retain prior values via c_batch_stride.
-                            let m_s = scale(*m);
-                            if m_s == 0 {
+                        if self.static_once_done && self.static_once_steps.contains(&step_i) {
+                            let step = &self.schedule[step_i];
+                            if step_runs_on_host(step) {
+                                step_i += 1;
                                 continue;
                             }
-                            let coop_f16_wide = mm_coop_f16_vk.is_some()
-                                && *compute_precision == MatmulCompute::CoopF16Vk
-                                && crate::coop_f16_vk::use_wide_matmul(
-                                    *b_off_f32,
-                                    *n,
-                                    &self.coop_f16_b_param,
-                                    &self.coop_f16_vk_wide_b,
-                                );
-                            pass.set_bind_group(
-                                0,
-                                coop_f16_vk_bind_group(self, gpu_bi, coop_f16_wide),
-                                &[],
-                            );
-                            // Kernel selection priority:
-                            //   1. compute_precision == F16 + b_is_param +
-                            //      SHADER_F16 → matmul_f16_compute
-                            //      (f16 multiply, f32 acc — 2× ALU on Apple)
-                            //   2. legacy RLX_WGPU_F16_WEIGHTS opt-in →
-                            //      matmul_f16w (storage-only f16; experimental,
-                            //      currently regresses on Apple)
-                            //   3. wide-N (m≥32, n≥64)   → matmul_wide
-                            //   4. otherwise            → matmul (small/skinny)
-                            let f16w_opt_in = rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS");
-                            if let Some(coop) = mm_coop.as_ref()
-                                && *b_is_param
-                                && *compute_precision == MatmulCompute::Coop16
+                            if !matches!(step, Step::FftGpu { .. }) {
+                                gpu_bi += 1;
+                            }
+                            step_i += 1;
+                            continue;
+                        }
+                        if step_runs_on_host(&self.schedule[step_i]) {
+                            break;
+                        }
+                        // Vulkan/DX12: end the pass after unary/cast so f32→f16
+                        // mirrors are visible to the next step. Only split once
+                        // we've dispatched in *this* pass — otherwise the step that
+                        // needs the flush would never run (infinite empty passes).
+                        if pass_dispatched
+                            && step_i > 0
+                            && step_needs_pass_flush(
+                                &self.schedule[step_i],
+                                &self.schedule[step_i - 1],
+                            )
+                        {
+                            break;
+                        }
+                        let step = &self.schedule[step_i];
+                        // PLAN L3: per-step Perfetto trace span; no-op when
+                        // env var RLX_TRACE_PERFETTO unset.
+                        let _perf = rlx_ir::perfetto::TraceSpan::new(step_name(step), "wgpu");
+                        if std::env::var("RLX_DBG_STEP").is_ok() {
+                            eprintln!("[wgpu-step] {}", step_name(step));
+                        }
+                        match step {
+                            Step::CastF32ToF16 { params } => {
+                                // Pre-pass for matmul_coop16: mirror f32 arena
+                                // region into f16 shadow buffer so the matmul
+                                // kernel can read A as f16. One thread per
+                                // element; 64-thread workgroups.
+                                if let Some(cast_k) = mm_cast {
+                                    pass.set_pipeline(&cast_k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(params.len, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                            }
+                            Step::Matmul {
+                                m,
+                                n,
+                                batch,
+                                b_off_f32,
+                                b_is_param,
+                                compute_precision,
+                                ..
+                            } =>
+                            // The dispatch branches below use a chain of
+                            // `is_some() && …unwrap()` to pick a pipeline
+                            // because each variant cares about a different
+                            // Option<Pipeline>. `if let Some(p) = …` chains
+                            // would require nesting per variant; the flat
+                            // form is the readable shape here.
                             {
-                                // Hardware GEMM via simdgroup_matrix /
-                                // KHR_cooperative_matrix. 32×32 output tile
-                                // per workgroup (16 hardware-GEMM ops with
-                                // shared A/B loads). Caller guaranteed m, n,
-                                // k are multiples of 32/32/8.
-                                pass.set_pipeline(&coop.pipeline);
-                                pass.dispatch_workgroups(n.div_ceil(32), m_s.div_ceil(32), *batch);
-                            } else if mm_coop_f16_vk.is_some()
-                                && *compute_precision == MatmulCompute::CoopF16Vk
-                            {
-                                if coop_f16_wide {
-                                    dispatch_wide_f32_matmul(
-                                        &mut pass,
-                                        mm_w_active,
-                                        mm_k,
-                                        m_s,
+                                #[allow(clippy::unnecessary_unwrap)]
+                                // Safe at any batch (see safe_for_active_extent
+                                // comment); scale m, output rows past m_s per
+                                // batch retain prior values via c_batch_stride.
+                                let m_s = scale(*m);
+                                if m_s == 0 {
+                                    continue;
+                                }
+                                let coop_f16_wide = mm_coop_f16_vk.is_some()
+                                    && *compute_precision == MatmulCompute::CoopF16Vk
+                                    && crate::coop_f16_vk::use_wide_matmul(
+                                        *b_off_f32,
                                         *n,
+                                        &self.coop_f16_b_param,
+                                        &self.coop_f16_vk_wide_b,
+                                    );
+                                pass.set_bind_group(
+                                    0,
+                                    coop_f16_vk_bind_group(self, gpu_bi, coop_f16_wide),
+                                    &[],
+                                );
+                                // Kernel selection priority:
+                                //   1. compute_precision == F16 + b_is_param +
+                                //      SHADER_F16 → matmul_f16_compute
+                                //      (f16 multiply, f32 acc — 2× ALU on Apple)
+                                //   2. legacy RLX_WGPU_F16_WEIGHTS opt-in →
+                                //      matmul_f16w (storage-only f16; experimental,
+                                //      currently regresses on Apple)
+                                //   3. wide-N (m≥32, n≥64)   → matmul_wide
+                                //   4. otherwise            → matmul (small/skinny)
+                                let f16w_opt_in = rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS");
+                                if let Some(coop) = mm_coop.as_ref()
+                                    && *b_is_param
+                                    && *compute_precision == MatmulCompute::Coop16
+                                {
+                                    // Hardware GEMM via simdgroup_matrix /
+                                    // KHR_cooperative_matrix. 32×32 output tile
+                                    // per workgroup (16 hardware-GEMM ops with
+                                    // shared A/B loads). Caller guaranteed m, n,
+                                    // k are multiples of 32/32/8.
+                                    pass.set_pipeline(&coop.pipeline);
+                                    pass.dispatch_workgroups(
+                                        n.div_ceil(32),
+                                        m_s.div_ceil(32),
                                         *batch,
                                     );
-                                } else {
-                                    let n_eff = scale(*n);
-                                    let coop_vk =
-                                        matmul_coop_f16_vulkan_active_kernel(&dev.device, n_eff)
-                                            .expect("coop f16 vk kernel missing");
-                                    pass.set_pipeline(&coop_vk.pipeline);
+                                } else if mm_coop_f16_vk.is_some()
+                                    && *compute_precision == MatmulCompute::CoopF16Vk
+                                {
+                                    if coop_f16_wide {
+                                        dispatch_wide_f32_matmul(
+                                            &mut pass,
+                                            mm_w_active,
+                                            mm_k,
+                                            m_s,
+                                            *n,
+                                            *batch,
+                                        );
+                                    } else {
+                                        let n_eff = scale(*n);
+                                        let coop_vk = matmul_coop_f16_vulkan_active_kernel(
+                                            &dev.device,
+                                            n_eff,
+                                        )
+                                        .expect("coop f16 vk kernel missing");
+                                        pass.set_pipeline(&coop_vk.pipeline);
+                                        pass.dispatch_workgroups(
+                                            m_s.div_ceil(16),
+                                            n.div_ceil(16),
+                                            *batch,
+                                        );
+                                    }
+                                } else if let Some(coop_f32) = mm_coop_f32.as_ref()
+                                    && *b_is_param
+                                    && *compute_precision == MatmulCompute::CoopF32
+                                {
+                                    // CoopF32: Metal uses 32×32 simdgroup tiles;
+                                    // Vulkan uses 8×8 coopLoadT portable kernel.
+                                    pass.set_pipeline(&coop_f32.pipeline);
+                                    let backend = wgpu_device()
+                                        .map(|d| d.backend)
+                                        .unwrap_or(wgpu::Backend::Noop);
+                                    let (gx, gy) = if backend == wgpu::Backend::Metal {
+                                        (n.div_ceil(32), m_s.div_ceil(32))
+                                    } else {
+                                        (m_s.div_ceil(8), n.div_ceil(8))
+                                    };
+                                    pass.dispatch_workgroups(gx, gy, *batch);
+                                } else if let Some(f16c) = mm_f16c.as_ref()
+                                    && *b_is_param
+                                    && *compute_precision == MatmulCompute::F16
+                                {
+                                    pass.set_pipeline(&f16c.pipeline);
                                     pass.dispatch_workgroups(
-                                        m_s.div_ceil(16),
-                                        n.div_ceil(16),
+                                        n.div_ceil(32),
+                                        m_s.div_ceil(32),
+                                        *batch,
+                                    );
+                                } else if let Some(f16w) = mm_f16w.as_ref()
+                                    && *b_is_param
+                                    && f16w_opt_in
+                                {
+                                    pass.set_pipeline(&f16w.pipeline);
+                                    pass.dispatch_workgroups(
+                                        n.div_ceil(32),
+                                        m_s.div_ceil(32),
+                                        *batch,
+                                    );
+                                } else if m_s >= 32 && *n >= 64 {
+                                    pass.set_pipeline(&mm_w_active.pipeline);
+                                    let backend = wgpu_device()
+                                        .map(|d| d.backend)
+                                        .unwrap_or(wgpu::Backend::Noop);
+                                    let (gx, gy) = if matches!(
+                                        backend,
+                                        wgpu::Backend::Vulkan | wgpu::Backend::Dx12
+                                    ) {
+                                        (n.div_ceil(64), m_s.div_ceil(64))
+                                    } else {
+                                        (n.div_ceil(64), m_s.div_ceil(32))
+                                    };
+                                    pass.dispatch_workgroups(gx, gy, *batch);
+                                } else {
+                                    pass.set_pipeline(&mm_k.pipeline);
+                                    pass.dispatch_workgroups(
+                                        n.div_ceil(32),
+                                        m_s.div_ceil(32),
                                         *batch,
                                     );
                                 }
-                            } else if let Some(coop_f32) = mm_coop_f32.as_ref()
-                                && *b_is_param
-                                && *compute_precision == MatmulCompute::CoopF32
-                            {
-                                // CoopF32: Metal uses 32×32 simdgroup tiles;
-                                // Vulkan uses 8×8 coopLoadT portable kernel.
-                                pass.set_pipeline(&coop_f32.pipeline);
-                                let backend = wgpu_device()
-                                    .map(|d| d.backend)
-                                    .unwrap_or(wgpu::Backend::Noop);
-                                let (gx, gy) = if backend == wgpu::Backend::Metal {
-                                    (n.div_ceil(32), m_s.div_ceil(32))
-                                } else {
-                                    (m_s.div_ceil(8), n.div_ceil(8))
-                                };
-                                pass.dispatch_workgroups(gx, gy, *batch);
-                            } else if let Some(f16c) = mm_f16c.as_ref()
-                                && *b_is_param
-                                && *compute_precision == MatmulCompute::F16
-                            {
-                                pass.set_pipeline(&f16c.pipeline);
-                                pass.dispatch_workgroups(n.div_ceil(32), m_s.div_ceil(32), *batch);
-                            } else if let Some(f16w) = mm_f16w.as_ref()
-                                && *b_is_param
-                                && f16w_opt_in
-                            {
-                                pass.set_pipeline(&f16w.pipeline);
-                                pass.dispatch_workgroups(n.div_ceil(32), m_s.div_ceil(32), *batch);
-                            } else if m_s >= 32 && *n >= 64 {
-                                pass.set_pipeline(&mm_w_active.pipeline);
-                                let backend = wgpu_device()
-                                    .map(|d| d.backend)
-                                    .unwrap_or(wgpu::Backend::Noop);
-                                let (gx, gy) = if matches!(
-                                    backend,
-                                    wgpu::Backend::Vulkan | wgpu::Backend::Dx12
-                                ) {
-                                    (n.div_ceil(64), m_s.div_ceil(64))
-                                } else {
-                                    (n.div_ceil(64), m_s.div_ceil(32))
-                                };
-                                pass.dispatch_workgroups(gx, gy, *batch);
-                            } else {
-                                pass.set_pipeline(&mm_k.pipeline);
-                                pass.dispatch_workgroups(n.div_ceil(32), m_s.div_ceil(32), *batch);
                             }
-                        }
-                        Step::Binary { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
+                            Step::Binary { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                pass.set_pipeline(&bk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
                             }
-                            pass.set_pipeline(&bk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Compare { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
+                            Step::Compare { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                pass.set_pipeline(&ck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
                             }
-                            pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Unary { params, f16_mirror } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            if *f16_mirror {
-                                if let Some(uk_f16) = unary_f16_mirror_kernel(&dev.device) {
-                                    pass.set_pipeline(&uk_f16.pipeline);
+                            Step::Unary { params, f16_mirror } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                if *f16_mirror {
+                                    if let Some(uk_f16) = unary_f16_mirror_kernel(&dev.device) {
+                                        pass.set_pipeline(&uk_f16.pipeline);
+                                    } else {
+                                        pass.set_pipeline(&uk.pipeline);
+                                    }
                                 } else {
                                     pass.set_pipeline(&uk.pipeline);
                                 }
-                            } else {
-                                pass.set_pipeline(&uk.pipeline);
-                            }
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Where { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            pass.set_pipeline(&wk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Fma { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            pass.set_pipeline(&fk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Reduce { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let rk = reduce_kernel(&dev.device);
-                            pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total_out = outer_s.saturating_mul(params.inner);
-                            if params.reduce_dim <= 64 {
-                                // Fast path: 1 thread per output cell.
-                                let (gx, gy, gz) = dispatch_dims(total_out, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            } else {
-                                // Tree-reduce path: 1 workgroup (64
-                                // threads) per output cell, parallel
-                                // reduction with shared scratch.
-                                let (gx, gy, gz) = dispatch_dims(total_out, 1);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                        }
-                        Step::Softmax { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let sk = softmax_kernel(&dev.device);
-                            pass.set_pipeline(&sk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::SoftmaxCrossEntropy { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let sk = softmax_cross_entropy_kernel(&dev.device);
-                            pass.set_pipeline(&sk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::LayerNorm { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let lk = layernorm_kernel(&dev.device);
-                            pass.set_pipeline(&lk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::RmsNormBackwardInput { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let rk = rms_norm_backward_kernel(&dev.device);
-                            pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(outer_s, 1, 1);
-                        }
-                        Step::RmsNormBackwardGamma { params }
-                        | Step::RmsNormBackwardBeta { params } => {
-                            if params.inner == 0 {
-                                continue;
-                            }
-                            let rk = rms_norm_backward_param_kernel(&dev.device);
-                            pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(1, 1, 1);
-                        }
-                        Step::LayerNormBackwardInput { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let lk = layer_norm_backward_input_kernel(&dev.device);
-                            pass.set_pipeline(&lk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(outer_s, 1, 1);
-                        }
-                        Step::LayerNormBackwardGammaPartial {
-                            params,
-                            num_workgroups,
-                        } => {
-                            if params.inner == 0 || *num_workgroups == 0 {
-                                continue;
-                            }
-                            let lk = layer_norm_backward_gamma_partial_kernel(&dev.device);
-                            pass.set_pipeline(&lk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(*num_workgroups, 1, 1);
-                        }
-                        Step::LayerNormBackwardGammaReduce { params } => {
-                            if params.inner == 0 {
-                                continue;
-                            }
-                            let lk = layer_norm_backward_gamma_reduce_kernel(&dev.device);
-                            pass.set_pipeline(&lk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(1, 1, 1);
-                        }
-                        Step::CumsumBackward { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let ck = cumsum_backward_kernel(&dev.device);
-                            pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::RopeBackward { params } => {
-                            let seq_s = scale(params.seq);
-                            if seq_s == 0 {
-                                continue;
-                            }
-                            let rk = rope_backward_kernel(&dev.device);
-                            pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total = params.batch * seq_s * params.hidden;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::GatherBackward { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let total = outer_s * params.axis_dim * params.trailing;
-                            if total > 0 {
-                                let zk = gather_backward_zero_kernel(&dev.device);
-                                pass.set_pipeline(&zk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, _, _) = dispatch_dims(total, 256);
-                                pass.dispatch_workgroups(gx, 1, 1);
-                            }
-                            let ak = gather_backward_acc_kernel(&dev.device);
-                            pass.set_pipeline(&ak.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(outer_s, 1, 1);
-                        }
-                        Step::Cumsum { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let ck2 = cumsum_kernel(&dev.device);
-                            pass.set_pipeline(&ck2.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::FftGpu {
-                            src_off,
-                            dst_off,
-                            outer,
-                            n,
-                            inverse,
-                            norm_scale,
-                        } => {
-                            let res = &self.fft_gpu_steps[fft_i];
-                            fft_i += 1;
-                            crate::fft_dispatch::dispatch_fft_gpu_in_pass(
-                                &dev.device,
-                                &dev.queue,
-                                &mut pass,
-                                res,
-                                *src_off,
-                                *dst_off,
-                                *outer,
-                                *n,
-                                *inverse != 0,
-                                *norm_scale,
-                            );
-                        }
-                        Step::Copy { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let ck2 = copy_kernel(&dev.device);
-                            pass.set_pipeline(&ck2.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Cast { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let cast_k = cast_kernel(&dev.device);
-                            pass.set_pipeline(&cast_k.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::ComplexCast { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let k = complex_cast_kernel(&dev.device);
-                            pass.set_pipeline(&k.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::BinaryC64 { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let k = binary_c64_kernel(&dev.device);
-                            pass.set_pipeline(&k.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::BufferCopy { .. } => {
-                            // Host step: `copy_buffer_to_buffer` runs outside compute passes.
-                        }
-                        Step::ElementwiseRegion { params } => {
-                            let len_s = scale(params.len);
-                            if len_s == 0 {
-                                continue;
-                            }
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            if params.prologue == rlx_ir::REGION_PROLOGUE_RESIZE_NEAREST_2X_NCHW {
-                                let ek = elementwise_region_spatial_kernel(&dev.device);
-                                pass.set_pipeline(&ek.pipeline);
-                                let (gx, gy, gz) = dispatch_prologue_nchw(
-                                    params.out_w,
-                                    params.out_h,
-                                    params.out_n * params.out_c,
-                                );
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            } else {
-                                let ek = elementwise_region_kernel(&dev.device);
-                                pass.set_pipeline(&ek.pipeline);
-                                let (gx, gy, gz) = dispatch_dims(len_s, 64);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
-                        }
-                        Step::BatchElementwiseRegion { params } => {
-                            let slice_len_s = scale(params.slice_len);
-                            let num_batch_s = scale(params.num_batch);
-                            if slice_len_s == 0 || num_batch_s == 0 {
-                                continue;
-                            }
-                            let ek = batch_elementwise_region_kernel(&dev.device);
-                            pass.set_pipeline(&ek.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, _) = dispatch_dims(slice_len_s, 64);
-                            pass.dispatch_workgroups(gx, gy, num_batch_s);
-                        }
-                        Step::Transpose { params, .. } => {
-                            // Compute scaled grid count to match the
-                            // uniform's scaled out_total when bucket axis
-                            // is outermost.
-                            let total_s = if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
-                                let scaled_d0 = scale(params.out_dim_0);
-                                let inner = params.out_total / params.out_dim_0;
-                                scaled_d0 * inner
-                            } else {
-                                params.out_total
-                            };
-                            if total_s == 0 {
-                                continue;
-                            }
-                            let tk = transpose_kernel(&dev.device);
-                            pass.set_pipeline(&tk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Narrow { params } => {
-                            let total_s = scale(params.total);
-                            if total_s == 0 {
-                                continue;
-                            }
-                            let nk = narrow_kernel(&dev.device);
-                            pass.set_pipeline(&nk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Concat { params } => {
-                            let total_s = scale(params.total);
-                            if total_s == 0 {
-                                continue;
-                            }
-                            let cck = concat_kernel(&dev.device);
-                            pass.set_pipeline(&cck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Gather { params } => {
-                            let n_out_s = scale(params.n_out);
-                            if n_out_s == 0 {
-                                continue;
-                            }
-                            let gk = gather_kernel(&dev.device);
-                            pass.set_pipeline(&gk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_out_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::GatherAxis { params } => {
-                            let total_s = scale(params.total);
-                            if total_s == 0 {
-                                continue;
-                            }
-                            let gk = gather_axis_kernel(&dev.device);
-                            pass.set_pipeline(&gk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Attention { params, .. } => {
-                            // Scale seq_q for grid dim; per-head strides
-                            // come from seq_q_stride / seq_k_stride (full
-                            // extent) inside the WGSL.
-                            let seq_q_s = scale(params.seq_q);
-                            if seq_q_s == 0 {
-                                continue;
-                            }
-                            let ak = attention_kernel(&dev.device);
-                            pass.set_pipeline(&ak.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total = params.batch * params.heads * seq_q_s;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::AttentionBackward { params, .. } => {
-                            let axis = if params.wrt == 0 {
-                                params.seq_q
-                            } else {
-                                params.seq_k
-                            };
-                            let axis_s = scale(axis);
-                            if axis_s == 0 {
-                                continue;
-                            }
-                            let ak = attention_bwd_kernel(&dev.device);
-                            pass.set_pipeline(&ak.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total = params.batch * params.heads * axis_s;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Rope { params } => {
-                            // Multi-batch via stride-field WGSL fix:
-                            // iterate `batch * scaled_seq * last_dim` items.
-                            let s_active = scale(params.seq);
-                            let total_s = params.batch * s_active * params.last_dim;
-                            if total_s == 0 {
-                                continue;
-                            }
-                            let rk = rope_kernel(&dev.device);
-                            pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Expand { params, .. } => {
-                            let total_s = if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
-                                let scaled_d0 = scale(params.out_dim_0);
-                                let inner = params.out_total / params.out_dim_0;
-                                scaled_d0 * inner
-                            } else {
-                                params.out_total
-                            };
-                            if total_s == 0 {
-                                continue;
-                            }
-                            let ek = expand_kernel(&dev.device);
-                            pass.set_pipeline(&ek.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Argmax { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let amk = argmax_kernel(&dev.device);
-                            pass.set_pipeline(&amk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Pool2d { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let pk = pool2d_kernel(&dev.device);
-                            pass.set_pipeline(&pk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total = n_s * params.c * params.h_out * params.w_out;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Conv2d { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let ck2 = conv2d_kernel(&dev.device);
-                            pass.set_pipeline(&ck2.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            // conv2d.wgsl tiles `CONV2D_TILE` output spatial
-                            // positions per thread (const must match the kernel).
-                            let spatial = params.h_out * params.w_out;
-                            let sp_tiles = spatial.div_ceil(CONV2D_TILE);
-                            let total = n_s * params.c_out * sp_tiles;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Conv2dTiled { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let ck = conv1d_tiled_kernel(&dev.device);
-                            pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            // conv1d_tiled.wgsl: one thread per output element
-                            // (c_out * l_out), N == 1, w_out == 1.
-                            let total = n_s * params.c_out * params.h_out;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Im2ColGpu { params } => {
-                            // One thread per col element (k_total * spatial);
-                            // the following Step::Matmul consumes the col matrix.
-                            let imk = im2col2d_kernel(&dev.device);
-                            pass.set_pipeline(&imk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total = params.k_total.saturating_mul(params.spatial);
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Pool1d { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let pk = pool1d_kernel(&dev.device);
-                            pass.set_pipeline(&pk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total = n_s * params.c * params.l_out;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Pool3d { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let pk = pool3d_kernel(&dev.device);
-                            pass.set_pipeline(&pk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total = n_s * params.c * params.d_out * params.h_out * params.w_out;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Conv1d { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let ck = conv1d_kernel(&dev.device);
-                            pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total = n_s * params.c_out * params.l_out;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Conv3d { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
-                            }
-                            let ck = conv3d_kernel(&dev.device);
-                            pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total =
-                                n_s * params.c_out * params.d_out * params.h_out * params.w_out;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::ScatterAdd { params } => {
-                            let sk = scatter_add_kernel(&dev.device);
-                            pass.set_pipeline(&sk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            // Phase 0 zeros the FULL output (preserves
-                            // accumulator semantics). Phase 1 scatters first
-                            // num_updates_active updates only; serial single
-                            // workgroup either way (atomic CAS unsupported in
-                            // naga's MSL emitter — see scatter_add.wgsl).
-                            if params.op == 0 {
-                                let (gx, gy, gz) = dispatch_dims(params.out_total, 64);
+                            Step::Where { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                pass.set_pipeline(&wk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
-                            } else {
+                            }
+                            Step::Fma { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                pass.set_pipeline(&fk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::ReluBackward { params } | Step::ActivationBackward { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                pass.set_pipeline(&abk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Reduce { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let rk = reduce_kernel(&dev.device);
+                                pass.set_pipeline(&rk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total_out = outer_s.saturating_mul(params.inner);
+                                if params.reduce_dim <= 64 {
+                                    // Fast path: 1 thread per output cell.
+                                    let (gx, gy, gz) = dispatch_dims(total_out, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                } else {
+                                    // Tree-reduce path: 1 workgroup (64
+                                    // threads) per output cell, parallel
+                                    // reduction with shared scratch.
+                                    let (gx, gy, gz) = dispatch_dims(total_out, 1);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                            }
+                            Step::Softmax { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let sk = softmax_kernel(&dev.device);
+                                pass.set_pipeline(&sk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::SoftmaxCrossEntropy { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let sk = softmax_cross_entropy_kernel(&dev.device);
+                                pass.set_pipeline(&sk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::SoftmaxCrossEntropyWithLogits { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let sk = softmax_cross_entropy_with_logits_kernel(&dev.device);
+                                pass.set_pipeline(&sk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::SoftmaxCrossEntropyBackward { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let sk = softmax_cross_entropy_backward_kernel(&dev.device);
+                                pass.set_pipeline(&sk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::LayerNorm { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let lk = layernorm_kernel(&dev.device);
+                                pass.set_pipeline(&lk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::RmsNormBackwardInput { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let rk = rms_norm_backward_kernel(&dev.device);
+                                pass.set_pipeline(&rk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(outer_s, 1, 1);
+                            }
+                            Step::RmsNormBackwardGamma { params }
+                            | Step::RmsNormBackwardBeta { params } => {
+                                if params.inner == 0 {
+                                    continue;
+                                }
+                                let rk = rms_norm_backward_param_kernel(&dev.device);
+                                pass.set_pipeline(&rk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 pass.dispatch_workgroups(1, 1, 1);
                             }
-                        }
-                        Step::TopK { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
+                            Step::LayerNormBackwardInput { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let lk = layer_norm_backward_input_kernel(&dev.device);
+                                pass.set_pipeline(&lk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(outer_s, 1, 1);
                             }
-                            let tk = topk_kernel(&dev.device);
-                            pass.set_pipeline(&tk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::WelchPeaksGpu { params } => {
-                            let batch_s = scale(params.welch_batch);
-                            if batch_s == 0 {
-                                continue;
+                            Step::LayerNormBackwardGammaPartial {
+                                params,
+                                num_workgroups,
+                            } => {
+                                if params.inner == 0 || *num_workgroups == 0 {
+                                    continue;
+                                }
+                                let lk = layer_norm_backward_gamma_partial_kernel(&dev.device);
+                                pass.set_pipeline(&lk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(*num_workgroups, 1, 1);
                             }
-                            let wk = welch_peaks_gpu_kernel(&dev.device);
-                            pass.set_pipeline(&wk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(batch_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::UmapKnn { params } => {
-                            let n_s = scale(params.n);
-                            if n_s == 0 {
-                                continue;
+                            Step::LayerNormBackwardGammaReduce { params } => {
+                                if params.inner == 0 {
+                                    continue;
+                                }
+                                let lk = layer_norm_backward_gamma_reduce_kernel(&dev.device);
+                                pass.set_pipeline(&lk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(1, 1, 1);
                             }
-                            let uk = umap_knn_kernel(&dev.device);
-                            pass.set_pipeline(&uk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::WgpuGpuKernel { name, workgroups } => {
-                            // Raw-GPU custom op: fetch the cached pipeline by name
-                            // and dispatch against the compile-time bind group.
-                            let gk = crate::wgpu_gpu_custom::lookup(name).expect(
+                            Step::CumsumBackward { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let ck = cumsum_backward_kernel(&dev.device);
+                                pass.set_pipeline(&ck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::RopeBackward { params } => {
+                                let seq_s = scale(params.seq);
+                                if seq_s == 0 {
+                                    continue;
+                                }
+                                let rk = rope_backward_kernel(&dev.device);
+                                pass.set_pipeline(&rk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = params.batch * seq_s * params.hidden;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::GatherBackward { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let total = outer_s * params.axis_dim * params.trailing;
+                                if total > 0 {
+                                    let zk = gather_backward_zero_kernel(&dev.device);
+                                    pass.set_pipeline(&zk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, _, _) = dispatch_dims(total, 256);
+                                    pass.dispatch_workgroups(gx, 1, 1);
+                                }
+                                let ak = gather_backward_acc_kernel(&dev.device);
+                                pass.set_pipeline(&ak.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(outer_s, 1, 1);
+                            }
+                            Step::Cumsum { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let ck2 = cumsum_kernel(&dev.device);
+                                pass.set_pipeline(&ck2.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::FftGpu {
+                                src_off,
+                                dst_off,
+                                outer,
+                                n,
+                                inverse,
+                                norm_scale,
+                            } => {
+                                let res = &self.fft_gpu_steps[fft_i];
+                                fft_i += 1;
+                                crate::fft_dispatch::dispatch_fft_gpu_in_pass(
+                                    &dev.device,
+                                    &dev.queue,
+                                    &mut pass,
+                                    res,
+                                    *src_off,
+                                    *dst_off,
+                                    *outer,
+                                    *n,
+                                    *inverse != 0,
+                                    *norm_scale,
+                                );
+                            }
+                            Step::Copy { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let ck2 = copy_kernel(&dev.device);
+                                pass.set_pipeline(&ck2.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Cast { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let cast_k = cast_kernel(&dev.device);
+                                pass.set_pipeline(&cast_k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::ComplexCast { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let k = complex_cast_kernel(&dev.device);
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::BinaryC64 { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let k = binary_c64_kernel(&dev.device);
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::ComplexNormSq { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let k = complex_norm_sq_kernel(&dev.device);
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::ComplexNormSqBackward { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let k = complex_norm_sq_backward_kernel(&dev.device);
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::ConjugateC64 { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let k = conjugate_c64_kernel(&dev.device);
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::FftButterflyStage { params } => {
+                                let batch_s = scale(params.batch);
+                                let n = batch_s.saturating_mul(params.half);
+                                if n == 0 {
+                                    continue;
+                                }
+                                let k = fft_butterfly_stage_kernel(&dev.device);
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::BufferCopy { .. } => {
+                                // Host step: `copy_buffer_to_buffer` runs outside compute passes.
+                            }
+                            Step::ElementwiseRegion { params } => {
+                                let len_s = scale(params.len);
+                                if len_s == 0 {
+                                    continue;
+                                }
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                if params.prologue == rlx_ir::REGION_PROLOGUE_RESIZE_NEAREST_2X_NCHW
+                                {
+                                    let ek = elementwise_region_spatial_kernel(&dev.device);
+                                    pass.set_pipeline(&ek.pipeline);
+                                    let (gx, gy, gz) = dispatch_prologue_nchw(
+                                        params.out_w,
+                                        params.out_h,
+                                        params.out_n * params.out_c,
+                                    );
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                } else {
+                                    let ek = elementwise_region_kernel(&dev.device);
+                                    pass.set_pipeline(&ek.pipeline);
+                                    let (gx, gy, gz) = dispatch_dims(len_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                            }
+                            Step::BatchElementwiseRegion { params } => {
+                                let slice_len_s = scale(params.slice_len);
+                                let num_batch_s = scale(params.num_batch);
+                                if slice_len_s == 0 || num_batch_s == 0 {
+                                    continue;
+                                }
+                                let ek = batch_elementwise_region_kernel(&dev.device);
+                                pass.set_pipeline(&ek.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, _) = dispatch_dims(slice_len_s, 64);
+                                pass.dispatch_workgroups(gx, gy, num_batch_s);
+                            }
+                            Step::Transpose { params, .. } => {
+                                // Compute scaled grid count to match the
+                                // uniform's scaled out_total when bucket axis
+                                // is outermost.
+                                let total_s =
+                                    if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
+                                        let scaled_d0 = scale(params.out_dim_0);
+                                        let inner = params.out_total / params.out_dim_0;
+                                        scaled_d0 * inner
+                                    } else {
+                                        params.out_total
+                                    };
+                                if total_s == 0 {
+                                    continue;
+                                }
+                                let tk = transpose_kernel(&dev.device);
+                                pass.set_pipeline(&tk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Narrow { params } => {
+                                let total_s = scale(params.total);
+                                if total_s == 0 {
+                                    continue;
+                                }
+                                let nk = narrow_kernel(&dev.device);
+                                pass.set_pipeline(&nk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Concat { params } => {
+                                let total_s = scale(params.total);
+                                if total_s == 0 {
+                                    continue;
+                                }
+                                let cck = concat_kernel(&dev.device);
+                                pass.set_pipeline(&cck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Gather { params } => {
+                                let n_out_s = scale(params.n_out);
+                                if n_out_s == 0 {
+                                    continue;
+                                }
+                                let gk = gather_kernel(&dev.device);
+                                pass.set_pipeline(&gk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_out_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::GatherAxis { params } => {
+                                let total_s = scale(params.total);
+                                if total_s == 0 {
+                                    continue;
+                                }
+                                let gk = gather_axis_kernel(&dev.device);
+                                pass.set_pipeline(&gk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Attention { params, .. } => {
+                                // Scale seq_q for grid dim; per-head strides
+                                // come from seq_q_stride / seq_k_stride (full
+                                // extent) inside the WGSL.
+                                let seq_q_s = scale(params.seq_q);
+                                if seq_q_s == 0 {
+                                    continue;
+                                }
+                                let ak = attention_kernel(&dev.device);
+                                pass.set_pipeline(&ak.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = params.batch * params.heads * seq_q_s;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::AttentionBackward { params, .. } => {
+                                let axis = if params.wrt == 0 {
+                                    params.seq_q
+                                } else {
+                                    params.seq_k
+                                };
+                                let axis_s = scale(axis);
+                                if axis_s == 0 {
+                                    continue;
+                                }
+                                let ak = attention_bwd_kernel(&dev.device);
+                                pass.set_pipeline(&ak.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = params.batch * params.heads * axis_s;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Rope { params } => {
+                                // Multi-batch via stride-field WGSL fix:
+                                // iterate `batch * scaled_seq * last_dim` items.
+                                let s_active = scale(params.seq);
+                                let total_s = params.batch * s_active * params.last_dim;
+                                if total_s == 0 {
+                                    continue;
+                                }
+                                let rk = rope_kernel(&dev.device);
+                                pass.set_pipeline(&rk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Expand { params, .. } => {
+                                let total_s =
+                                    if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
+                                        let scaled_d0 = scale(params.out_dim_0);
+                                        let inner = params.out_total / params.out_dim_0;
+                                        scaled_d0 * inner
+                                    } else {
+                                        params.out_total
+                                    };
+                                if total_s == 0 {
+                                    continue;
+                                }
+                                let ek = expand_kernel(&dev.device);
+                                pass.set_pipeline(&ek.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Argmax { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let amk = argmax_kernel(&dev.device);
+                                pass.set_pipeline(&amk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Pool2d { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let pk = pool2d_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = n_s * params.c * params.h_out * params.w_out;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::MaxPool2dBackward { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let pk = maxpool2d_backward_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let gx = params.w.div_ceil(8);
+                                let gy = params.h.div_ceil(8);
+                                let gz = n_s * params.c;
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::GroupNormBackwardInput { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let pk = group_norm_backward_input_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(n_s * params.num_groups, 1, 1);
+                            }
+                            Step::GroupNormBackwardGamma { .. } => {
+                                let pk = group_norm_backward_gamma_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(1, 1, 1);
+                            }
+                            Step::GroupNormBackwardBeta { .. } => {
+                                let pk = group_norm_backward_beta_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(1, 1, 1);
+                            }
+                            Step::AxialRope2d { params } => {
+                                let batch_s = scale(params.batch);
+                                if batch_s == 0 {
+                                    continue;
+                                }
+                                let total = batch_s * params.seq * params.hidden;
+                                let pk = axial_rope2d_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::FakeQuantizeFixed { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let pk = fake_quantize_fixed_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::FakeQuantizePerBatch { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 || params.chan_dim == 0 {
+                                    continue;
+                                }
+                                let pk = fake_quantize_perbatch_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(params.chan_dim, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Conv2d { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let ck2 = conv2d_kernel(&dev.device);
+                                pass.set_pipeline(&ck2.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // conv2d.wgsl tiles `CONV2D_TILE` output spatial
+                                // positions per thread (const must match the kernel).
+                                let spatial = params.h_out * params.w_out;
+                                let sp_tiles = spatial.div_ceil(CONV2D_TILE);
+                                let total = n_s * params.c_out * sp_tiles;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Conv2dTiled { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let ck = conv1d_tiled_kernel(&dev.device);
+                                pass.set_pipeline(&ck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // conv1d_tiled.wgsl: one thread per output element
+                                // (c_out * l_out), N == 1, w_out == 1.
+                                let total = n_s * params.c_out * params.h_out;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Im2ColGpu { params } => {
+                                // One thread per col element (k_total * spatial);
+                                // the following Step::Matmul consumes the col matrix.
+                                let imk = im2col2d_kernel(&dev.device);
+                                pass.set_pipeline(&imk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = params.k_total.saturating_mul(params.spatial);
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Pool1d { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let pk = pool1d_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = n_s * params.c * params.l_out;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Pool3d { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let pk = pool3d_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total =
+                                    n_s * params.c * params.d_out * params.h_out * params.w_out;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Conv1d { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let ck = conv1d_kernel(&dev.device);
+                                pass.set_pipeline(&ck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = n_s * params.c_out * params.l_out;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Conv3d { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let ck = conv3d_kernel(&dev.device);
+                                pass.set_pipeline(&ck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total =
+                                    n_s * params.c_out * params.d_out * params.h_out * params.w_out;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::ConvTranspose3d { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let ck = conv_transpose3d_kernel(&dev.device);
+                                pass.set_pipeline(&ck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total =
+                                    n_s * params.c_out * params.d_out * params.h_out * params.w_out;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::ScatterAdd { params } => {
+                                let sk = scatter_add_kernel(&dev.device);
+                                pass.set_pipeline(&sk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // Phase 0 zeros the FULL output (preserves
+                                // accumulator semantics). Phase 1 scatters first
+                                // num_updates_active updates only; serial single
+                                // workgroup either way (atomic CAS unsupported in
+                                // naga's MSL emitter — see scatter_add.wgsl).
+                                if params.op == 0 {
+                                    let (gx, gy, gz) = dispatch_dims(params.out_total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                } else {
+                                    pass.dispatch_workgroups(1, 1, 1);
+                                }
+                            }
+                            Step::TopK { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let tk = topk_kernel(&dev.device);
+                                pass.set_pipeline(&tk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::WelchPeaksGpu { params } => {
+                                let batch_s = scale(params.welch_batch);
+                                if batch_s == 0 {
+                                    continue;
+                                }
+                                let wk = welch_peaks_gpu_kernel(&dev.device);
+                                pass.set_pipeline(&wk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(batch_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::UmapKnn { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let uk = umap_knn_kernel(&dev.device);
+                                pass.set_pipeline(&uk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::WgpuGpuKernel { name, workgroups } => {
+                                // Raw-GPU custom op: fetch the cached pipeline by name
+                                // and dispatch against the compile-time bind group.
+                                let gk = crate::wgpu_gpu_custom::lookup(name).expect(
                                 "WgpuGpuKernel vanished from the registry between compile and run",
                             );
-                            let kernel =
-                                crate::wgpu_gpu_custom::get_or_build_pipeline(&dev.device, &*gk);
-                            pass.set_pipeline(&kernel.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = *workgroups;
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::GroupedMatmul { params } => {
-                            let m_s = scale(params.m);
-                            if m_s == 0 {
-                                continue;
-                            }
-                            let gk = grouped_matmul_kernel(&dev.device);
-                            pass.set_pipeline(&gk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
-                        }
-                        Step::Sample { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let sk = sample_kernel(&dev.device);
-                            pass.set_pipeline(&sk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::SelectiveScan { params } => {
-                            // Predicate-gated to batch=1; the seq scaling
-                            // happens inside the kernel (uniform sees scaled
-                            // seq). Dispatch grid here is per-(batch, hidden);
-                            // unaffected by seq scaling.
-                            let ssk = selective_scan_kernel(&dev.device);
-                            pass.set_pipeline(&ssk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total = params.batch * params.hidden;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::GatedDeltaNet {
-                            params,
-                            use_gpu: true,
-                            ..
-                        } => {
-                            // One workgroup per (batch, head); workgroup_size=128.
-                            let gk = gated_delta_net_kernel(&dev.device);
-                            pass.set_pipeline(&gk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(params.batch * params.heads, 1, 1);
-                        }
-                        Step::Mamba2 { params } => {
-                            let mk = mamba2_kernel(&dev.device);
-                            pass.set_pipeline(&mk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let total = params.batch * params.heads * params.head_dim;
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::Gru { params } => {
-                            // One workgroup per batch item (workgroup_size=256).
-                            let gk = gru_kernel(&dev.device);
-                            pass.set_pipeline(&gk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(params.batch, 1, 1);
-                        }
-                        Step::Rnn { params } => {
-                            let rk = rnn_kernel(&dev.device);
-                            pass.set_pipeline(&rk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(params.batch, 1, 1);
-                        }
-                        Step::DequantMatmul { params } => {
-                            let m_s = scale(params.m);
-                            if m_s == 0 {
-                                continue;
-                            }
-                            let dk = dequant_matmul_kernel(&dev.device);
-                            pass.set_pipeline(&dk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
-                        }
-                        Step::FusedResidualLn { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let frk = fused_residual_ln_kernel(&dev.device);
-                            pass.set_pipeline(&frk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::FusedResidualLnTee { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let frtk = fused_residual_ln_tee_kernel(&dev.device);
-                            pass.set_pipeline(&frtk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::FusedResidualRmsNorm { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let frk = fused_residual_rms_norm_kernel(&dev.device);
-                            pass.set_pipeline(&frk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::AdaLayerNorm { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let ak = ada_layer_norm_kernel(&dev.device);
-                            pass.set_pipeline(&ak.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::GatedResidual { params } => {
-                            let outer_s = scale(params.outer);
-                            if outer_s == 0 {
-                                continue;
-                            }
-                            let total = outer_s.saturating_mul(params.inner);
-                            let gk = gated_residual_kernel(&dev.device);
-                            pass.set_pipeline(&gk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            let (gx, gy, gz) = dispatch_dims(total, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
-                        Step::AdaLayerNormBackward { params } => {
-                            let mod_rows_s = scale(params.mod_rows);
-                            if mod_rows_s == 0 {
-                                continue;
-                            }
-                            let ak = ada_layer_norm_backward_kernel(&dev.device);
-                            pass.set_pipeline(&ak.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(mod_rows_s, 1, 1);
-                        }
-                        Step::GatedResidualBackward { params } => {
-                            let mod_rows_s = scale(params.mod_rows);
-                            if mod_rows_s == 0 {
-                                continue;
-                            }
-                            let gk = gated_residual_backward_kernel(&dev.device);
-                            pass.set_pipeline(&gk.pipeline);
-                            pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                            pass.dispatch_workgroups(mod_rows_s, 1, 1);
-                        }
-                        Step::MatmulQkv { params, kind } => {
-                            let m_s = scale(params.m);
-                            if m_s == 0 {
-                                continue;
-                            }
-                            let qkv_coop_wide = matches!(kind, MatmulQkvKind::CoopF16Vk)
-                                && crate::coop_f16_vk::use_wide_matmul(
-                                    params.b_off,
-                                    params.n,
-                                    &self.coop_f16_b_param,
-                                    &self.coop_f16_vk_wide_b,
+                                let kernel = crate::wgpu_gpu_custom::get_or_build_pipeline(
+                                    &dev.device,
+                                    &*gk,
                                 );
-                            pass.set_bind_group(
-                                0,
-                                coop_f16_vk_bind_group(self, gpu_bi, qkv_coop_wide),
-                                &[],
-                            );
-                            match kind {
-                                MatmulQkvKind::CoopF16Vk => {
-                                    if qkv_coop_wide {
+                                pass.set_pipeline(&kernel.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = *workgroups;
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::GroupedMatmul { params } => {
+                                let m_s = scale(params.m);
+                                if m_s == 0 {
+                                    continue;
+                                }
+                                let gk = grouped_matmul_kernel(&dev.device);
+                                pass.set_pipeline(&gk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
+                            }
+                            Step::Sample { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let sk = sample_kernel(&dev.device);
+                                pass.set_pipeline(&sk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::SelectiveScan { params } => {
+                                // Predicate-gated to batch=1; the seq scaling
+                                // happens inside the kernel (uniform sees scaled
+                                // seq). Dispatch grid here is per-(batch, hidden);
+                                // unaffected by seq scaling.
+                                let ssk = selective_scan_kernel(&dev.device);
+                                pass.set_pipeline(&ssk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = params.batch * params.hidden;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::GatedDeltaNet {
+                                params,
+                                use_gpu: true,
+                                ..
+                            } => {
+                                // One workgroup per (batch, head); workgroup_size=128.
+                                let gk = gated_delta_net_kernel(&dev.device);
+                                pass.set_pipeline(&gk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(params.batch * params.heads, 1, 1);
+                            }
+                            Step::Mamba2 { params } => {
+                                let mk = mamba2_kernel(&dev.device);
+                                pass.set_pipeline(&mk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = params.batch * params.heads * params.head_dim;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Gru { params } => {
+                                // One workgroup per batch item (workgroup_size=256).
+                                let gk = gru_kernel(&dev.device);
+                                pass.set_pipeline(&gk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(params.batch, 1, 1);
+                            }
+                            Step::Rnn { params } => {
+                                let rk = rnn_kernel(&dev.device);
+                                pass.set_pipeline(&rk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(params.batch, 1, 1);
+                            }
+                            Step::DequantMatmul { params } => {
+                                let m_s = scale(params.m);
+                                if m_s == 0 {
+                                    continue;
+                                }
+                                let dk = dequant_matmul_kernel(&dev.device);
+                                pass.set_pipeline(&dk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
+                            }
+                            Step::FusedResidualLn { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let frk = fused_residual_ln_kernel(&dev.device);
+                                pass.set_pipeline(&frk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::FusedResidualLnTee { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let frtk = fused_residual_ln_tee_kernel(&dev.device);
+                                pass.set_pipeline(&frtk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::FusedResidualRmsNorm { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let frk = fused_residual_rms_norm_kernel(&dev.device);
+                                pass.set_pipeline(&frk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::AdaLayerNorm { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let ak = ada_layer_norm_kernel(&dev.device);
+                                pass.set_pipeline(&ak.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::GatedResidual { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let total = outer_s.saturating_mul(params.inner);
+                                let gk = gated_residual_kernel(&dev.device);
+                                pass.set_pipeline(&gk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::AdaLayerNormBackward { params } => {
+                                let mod_rows_s = scale(params.mod_rows);
+                                if mod_rows_s == 0 {
+                                    continue;
+                                }
+                                let ak = ada_layer_norm_backward_kernel(&dev.device);
+                                pass.set_pipeline(&ak.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(mod_rows_s, 1, 1);
+                            }
+                            Step::GatedResidualBackward { params } => {
+                                let mod_rows_s = scale(params.mod_rows);
+                                if mod_rows_s == 0 {
+                                    continue;
+                                }
+                                let gk = gated_residual_backward_kernel(&dev.device);
+                                pass.set_pipeline(&gk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(mod_rows_s, 1, 1);
+                            }
+                            Step::MatmulQkv { params, kind } => {
+                                let m_s = scale(params.m);
+                                if m_s == 0 {
+                                    continue;
+                                }
+                                let qkv_coop_wide = matches!(kind, MatmulQkvKind::CoopF16Vk)
+                                    && crate::coop_f16_vk::use_wide_matmul(
+                                        params.b_off,
+                                        params.n,
+                                        &self.coop_f16_b_param,
+                                        &self.coop_f16_vk_wide_b,
+                                    );
+                                pass.set_bind_group(
+                                    0,
+                                    coop_f16_vk_bind_group(self, gpu_bi, qkv_coop_wide),
+                                    &[],
+                                );
+                                match kind {
+                                    MatmulQkvKind::CoopF16Vk => {
+                                        if qkv_coop_wide {
+                                            pass.set_pipeline(
+                                                &matmul_qkv_kernel(&dev.device).pipeline,
+                                            );
+                                            pass.dispatch_workgroups(
+                                                params.n.div_ceil(32),
+                                                m_s.div_ceil(32),
+                                                1,
+                                            );
+                                        } else {
+                                            let n_eff = scale(params.n);
+                                            let mqk = matmul_qkv_coop_f16_vk_active_kernel(
+                                                &dev.device,
+                                                n_eff,
+                                            )
+                                            .expect("coop f16 matmul_qkv kernel missing");
+                                            pass.set_pipeline(&mqk.pipeline);
+                                            pass.dispatch_workgroups(
+                                                m_s.div_ceil(16),
+                                                params.n.div_ceil(16),
+                                                1,
+                                            );
+                                        }
+                                    }
+                                    MatmulQkvKind::CoopF32 => {
+                                        pass.set_pipeline(
+                                            &matmul_qkv_coop_f32_kernel(&dev.device)
+                                                .expect("coop matmul_qkv kernel missing")
+                                                .pipeline,
+                                        );
+                                        pass.dispatch_workgroups(
+                                            params.n.div_ceil(32),
+                                            m_s.div_ceil(32),
+                                            1,
+                                        );
+                                    }
+                                    MatmulQkvKind::F32 => {
                                         pass.set_pipeline(&matmul_qkv_kernel(&dev.device).pipeline);
                                         pass.dispatch_workgroups(
                                             params.n.div_ceil(32),
                                             m_s.div_ceil(32),
                                             1,
                                         );
-                                    } else {
-                                        let n_eff = scale(params.n);
-                                        let mqk = matmul_qkv_coop_f16_vk_active_kernel(
-                                            &dev.device,
-                                            n_eff,
-                                        )
-                                        .expect("coop f16 matmul_qkv kernel missing");
-                                        pass.set_pipeline(&mqk.pipeline);
-                                        pass.dispatch_workgroups(
-                                            m_s.div_ceil(16),
-                                            params.n.div_ceil(16),
-                                            1,
-                                        );
                                     }
                                 }
-                                MatmulQkvKind::CoopF32 => {
-                                    pass.set_pipeline(
-                                        &matmul_qkv_coop_f32_kernel(&dev.device)
-                                            .expect("coop matmul_qkv kernel missing")
-                                            .pipeline,
-                                    );
-                                    pass.dispatch_workgroups(
-                                        params.n.div_ceil(32),
-                                        m_s.div_ceil(32),
-                                        1,
-                                    );
-                                }
-                                MatmulQkvKind::F32 => {
-                                    pass.set_pipeline(&matmul_qkv_kernel(&dev.device).pipeline);
-                                    pass.dispatch_workgroups(
-                                        params.n.div_ceil(32),
-                                        m_s.div_ceil(32),
-                                        1,
-                                    );
-                                }
                             }
+                            Step::GatherSplit { .. }
+                            | Step::DequantMatmulGguf { .. }
+                            | Step::DequantMatmulInt8Host { .. }
+                            | Step::Conv2dHost { .. }
+                            | Step::DequantGroupedMatmulGguf { .. }
+                            | Step::GatedDeltaNet { use_gpu: false, .. }
+                            | Step::Lstm { .. }
+                            | Step::ConvTranspose2d { .. }
+                            | Step::ConvTranspose3dHost { .. }
+                            | Step::GroupNormHost { .. }
+                            | Step::LayerNorm2dHost { .. }
+                            | Step::ResizeNearest2xHost { .. }
+                            | Step::ReverseHost { .. }
+                            | Step::ArgReduceHost { .. }
+                            | Step::AxialRope2dHost { .. }
+                            | Step::GruHost { .. }
+                            | Step::RnnHost { .. }
+                            | Step::Llada2GroupLimitedGate { .. }
+                            | Step::UmapKnnHost { .. }
+                            | Step::MsDeformAttnHost { .. }
+                            | Step::CollectiveHost { .. }
+                            | Step::CustomHost { .. }
+                            | Step::FftHost { .. }
+                            | Step::ScanHost { .. }
+                            | Step::HostOp { .. }
+                            | Step::CpuIndexing { .. }
+                            | Step::ConcatHost { .. }
+                            | Step::ConcatHostPieces { .. }
+                            | Step::TransposeHost { .. }
+                            | Step::NarrowHost { .. }
+                            | Step::ExpandHost { .. }
+                            | Step::SpdHost { .. }
+                            | Step::Im2ColHost { .. }
+                            | Step::Conv2dBackwardWeightHost { .. }
+                            | Step::Conv2dBackwardInputHost { .. }
+                            | Step::RngNormalHost { .. }
+                            | Step::RngUniformHost { .. }
+                            | Step::WelchPeaksHost { .. }
+                            | Step::LogMelHost { .. }
+                            | Step::LogMelBackwardHost { .. } => {}
+                            #[cfg(feature = "splat")]
+                            Step::GaussianSplatRender { .. }
+                            | Step::GaussianSplatRenderBackward { .. }
+                            | Step::GaussianSplatPrepare { .. }
+                            | Step::GaussianSplatRasterize { .. } => {}
                         }
-                        Step::GatherSplit { .. }
-                        | Step::DequantMatmulGguf { .. }
-                        | Step::DequantGroupedMatmulGguf { .. }
-                        | Step::GatedDeltaNet { use_gpu: false, .. }
-                        | Step::Lstm { .. }
-                        | Step::ConvTranspose2d { .. }
-                        | Step::GroupNormHost { .. }
-                        | Step::LayerNorm2dHost { .. }
-                        | Step::ResizeNearest2xHost { .. }
-                        | Step::ReverseHost { .. }
-                        | Step::ArgReduceHost { .. }
-                        | Step::GruHost { .. }
-                        | Step::RnnHost { .. }
-                        | Step::Llada2GroupLimitedGate { .. }
-                        | Step::UmapKnnHost { .. }
-                        | Step::MsDeformAttnHost { .. }
-                        | Step::CollectiveHost { .. }
-                        | Step::CustomHost { .. }
-                        | Step::FftHost { .. }
-                        | Step::ScanHost { .. }
-                        | Step::HostOp { .. }
-                        | Step::CpuIndexing { .. }
-                        | Step::ConcatHost { .. }
-                        | Step::ConcatHostPieces { .. }
-                        | Step::ExpandHost { .. }
-                        | Step::SpdHost { .. }
-                        | Step::Im2ColHost { .. }
-                        | Step::Conv2dBackwardWeightHost { .. }
-                        | Step::Conv2dBackwardInputHost { .. }
-                        | Step::RngNormalHost { .. }
-                        | Step::RngUniformHost { .. }
-                        | Step::WelchPeaksHost { .. }
-                        | Step::LogMelHost { .. }
-                        | Step::LogMelBackwardHost { .. } => {}
-                        #[cfg(feature = "splat")]
-                        Step::GaussianSplatRender { .. }
-                        | Step::GaussianSplatRenderBackward { .. }
-                        | Step::GaussianSplatPrepare { .. }
-                        | Step::GaussianSplatRasterize { .. } => {}
+                        if !matches!(step, Step::FftGpu { .. }) {
+                            gpu_bi += 1;
+                        }
+                        step_i += 1;
+                        pass_dispatched = true;
                     }
-                    if !matches!(step, Step::FftGpu { .. }) {
-                        gpu_bi += 1;
-                    }
-                    step_i += 1;
-                    pass_dispatched = true;
                 }
-            }
-            let needs_f16_drain = step_i < self.schedule.len()
-                && !step_runs_on_host(&self.schedule[step_i])
-                && step_i > 0
-                && step_needs_pass_flush(&self.schedule[step_i], &self.schedule[step_i - 1]);
-            let gpu_schedule_done = step_i >= self.schedule.len();
-            let skip_readback = rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") || self.dispatch_only;
-            let defer_tail = gpu_schedule_done && self.schedule.iter().any(step_is_tail_host);
-            let mut fused_readback: Option<(
-                ReadbackLayout,
-                std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-                Vec<usize>,
-            )> = None;
-            if gpu_schedule_done && !skip_readback && !defer_tail {
-                if !self.gpu_handle_feeds.is_empty() {
-                    self.propagate_gpu_handle_feeds_on_gpu(dev, &mut enc);
-                }
-                let plan = self.readback_plan();
-                let out_ids_all: Vec<_> = self.graph.outputs.clone();
-                let out_ids: Vec<_> = plan.iter().map(|&i| out_ids_all[i]).collect();
-                let layout = ReadbackLayout::for_nodes(&self.arena, &out_ids);
-                if use_tiny_readback(&layout, out_ids.len()) && plan == vec![0] {
-                    if self.tiny_readback.is_none() {
-                        self.tiny_readback = Some(TinyReadbackStaging::new(&dev.device));
-                    }
-                    let tiny = self.tiny_readback.as_ref().expect("tiny readback");
-                    encode_readback_copies(&mut enc, &self.arena, tiny.buffer(), &out_ids, &layout);
-                    let map_rx = schedule_readback_map(&mut enc, tiny.buffer(), &layout);
-                    let sub = dev.queue.submit(std::iter::once(enc.finish()));
-                    wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
-                    map_rx.recv().unwrap().unwrap();
-                    return self.pack_readback_outputs(
-                        &plan,
-                        vec![decode_tiny_mapped_f32(tiny.buffer(), layout.total_bytes)],
-                    );
-                }
-                ReadbackStaging::prepare(
-                    &dev.device,
-                    &mut self.readback_staging,
-                    layout.total_bytes,
-                );
-                if let Some(staging) = self.readback_staging.as_ref() {
-                    encode_readback_copies(
-                        &mut enc,
-                        &self.arena,
-                        staging.buffer(),
-                        &out_ids,
-                        &layout,
-                    );
-                    let map_rx = schedule_readback_map(&mut enc, staging.buffer(), &layout);
-                    fused_readback = Some((layout, map_rx, plan));
-                }
-            }
-            let main_submission = dev.queue.submit(std::iter::once(enc.finish()));
-            if defer_tail {
-                let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-                self.run_tail_host_audio_ops(dev);
-                if !skip_readback {
-                    let mut rb_enc =
-                        dev.device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("rlx-wgpu readback after tail-host"),
-                            });
+                let needs_f16_drain = step_i < self.schedule.len()
+                    && !step_runs_on_host(&self.schedule[step_i])
+                    && step_i > 0
+                    && step_needs_pass_flush(&self.schedule[step_i], &self.schedule[step_i - 1]);
+                let gpu_schedule_done = step_i >= self.schedule.len();
+                let skip_readback =
+                    rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") || self.dispatch_only;
+                let defer_tail = gpu_schedule_done && self.schedule.iter().any(step_is_tail_host);
+                let mut fused_readback: Option<(
+                    ReadbackLayout,
+                    std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+                    Vec<usize>,
+                )> = None;
+                if gpu_schedule_done && !skip_readback && !defer_tail {
                     if !self.gpu_handle_feeds.is_empty() {
-                        self.propagate_gpu_handle_feeds_on_gpu(dev, &mut rb_enc);
+                        self.propagate_gpu_handle_feeds_on_gpu(dev, &mut enc);
                     }
                     let plan = self.readback_plan();
                     let out_ids_all: Vec<_> = self.graph.outputs.clone();
@@ -1986,14 +2228,14 @@ impl WgpuExecutable {
                         }
                         let tiny = self.tiny_readback.as_ref().expect("tiny readback");
                         encode_readback_copies(
-                            &mut rb_enc,
+                            &mut enc,
                             &self.arena,
                             tiny.buffer(),
                             &out_ids,
                             &layout,
                         );
-                        let map_rx = schedule_readback_map(&mut rb_enc, tiny.buffer(), &layout);
-                        let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
+                        let map_rx = schedule_readback_map(&mut enc, tiny.buffer(), &layout);
+                        let sub = dev.queue.submit(std::iter::once(enc.finish()));
                         wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                         map_rx.recv().unwrap().unwrap();
                         return self.pack_readback_outputs(
@@ -2008,59 +2250,128 @@ impl WgpuExecutable {
                     );
                     if let Some(staging) = self.readback_staging.as_ref() {
                         encode_readback_copies(
-                            &mut rb_enc,
+                            &mut enc,
                             &self.arena,
                             staging.buffer(),
                             &out_ids,
                             &layout,
                         );
-                        let map_rx = schedule_readback_map(&mut rb_enc, staging.buffer(), &layout);
-                        let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
-                        wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
+                        let map_rx = schedule_readback_map(&mut enc, staging.buffer(), &layout);
+                        fused_readback = Some((layout, map_rx, plan));
+                    }
+                }
+                let main_submission = dev.queue.submit(std::iter::once(enc.finish()));
+                if defer_tail {
+                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    self.run_tail_host_audio_ops(dev);
+                    if !skip_readback {
+                        let mut rb_enc =
+                            dev.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("rlx-wgpu readback after tail-host"),
+                                });
+                        if !self.gpu_handle_feeds.is_empty() {
+                            self.propagate_gpu_handle_feeds_on_gpu(dev, &mut rb_enc);
+                        }
+                        let plan = self.readback_plan();
+                        let out_ids_all: Vec<_> = self.graph.outputs.clone();
+                        let out_ids: Vec<_> = plan.iter().map(|&i| out_ids_all[i]).collect();
+                        let layout = ReadbackLayout::for_nodes(&self.arena, &out_ids);
+                        if use_tiny_readback(&layout, out_ids.len()) && plan == vec![0] {
+                            if self.tiny_readback.is_none() {
+                                self.tiny_readback = Some(TinyReadbackStaging::new(&dev.device));
+                            }
+                            let tiny = self.tiny_readback.as_ref().expect("tiny readback");
+                            encode_readback_copies(
+                                &mut rb_enc,
+                                &self.arena,
+                                tiny.buffer(),
+                                &out_ids,
+                                &layout,
+                            );
+                            let map_rx = schedule_readback_map(&mut rb_enc, tiny.buffer(), &layout);
+                            let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
+                            wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
+                            map_rx.recv().unwrap().unwrap();
+                            return self.pack_readback_outputs(
+                                &plan,
+                                vec![decode_tiny_mapped_f32(tiny.buffer(), layout.total_bytes)],
+                            );
+                        }
+                        ReadbackStaging::prepare(
+                            &dev.device,
+                            &mut self.readback_staging,
+                            layout.total_bytes,
+                        );
+                        if let Some(staging) = self.readback_staging.as_ref() {
+                            encode_readback_copies(
+                                &mut rb_enc,
+                                &self.arena,
+                                staging.buffer(),
+                                &out_ids,
+                                &layout,
+                            );
+                            let map_rx =
+                                schedule_readback_map(&mut rb_enc, staging.buffer(), &layout);
+                            let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
+                            wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
+                            map_rx.recv().unwrap().unwrap();
+                            self.dump_node_stats_if_requested(dev);
+                            let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
+                            return self.pack_readback_outputs(&plan, partial);
+                        }
+                    }
+                }
+                if needs_f16_drain {
+                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                }
+                let need_host_sync =
+                    step_i < self.schedule.len() && step_runs_on_host(&self.schedule[step_i]);
+                if need_host_sync {
+                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    // Only invalidate after real GPU work. Host→Host chains share
+                    // one outer loop iteration's empty encode; clearing there made
+                    // HostTensorCache always miss (full D2H every HostOp).
+                    if pass_dispatched {
+                        host_cache.clear();
+                    }
+                }
+                if gpu_schedule_done {
+                    if skip_readback || defer_tail {
+                        if !self.static_once_done && !self.static_once_steps.is_empty() {
+                            self.static_once_done = true;
+                        }
+                        return self
+                            .graph
+                            .outputs
+                            .iter()
+                            .map(|&id| {
+                                let n = self.graph.node(id).shape.num_elements().unwrap_or(0);
+                                vec![0.0; n]
+                            })
+                            .collect();
+                    }
+                    if let (Some((layout, map_rx, plan)), Some(staging)) =
+                        (fused_readback, self.readback_staging.as_ref())
+                    {
+                        wait_readback_map(
+                            &dev.device,
+                            main_submission,
+                            &map_rx,
+                            layout.total_bytes,
+                        );
                         map_rx.recv().unwrap().unwrap();
                         self.dump_node_stats_if_requested(dev);
                         let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
+                        if !self.static_once_done && !self.static_once_steps.is_empty() {
+                            self.static_once_done = true;
+                        }
                         return self.pack_readback_outputs(&plan, partial);
                     }
+                    break;
                 }
-            }
-            if needs_f16_drain {
-                let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-            }
-            let need_host_sync =
-                step_i < self.schedule.len() && step_runs_on_host(&self.schedule[step_i]);
-            if need_host_sync {
-                let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-            }
-            if gpu_schedule_done {
-                if skip_readback || defer_tail {
-                    if !self.static_once_done && !self.static_once_steps.is_empty() {
-                        self.static_once_done = true;
-                    }
-                    return self
-                        .graph
-                        .outputs
-                        .iter()
-                        .map(|&id| {
-                            let n = self.graph.node(id).shape.num_elements().unwrap_or(0);
-                            vec![0.0; n]
-                        })
-                        .collect();
-                }
-                if let (Some((layout, map_rx, plan)), Some(staging)) =
-                    (fused_readback, self.readback_staging.as_ref())
-                {
-                    wait_readback_map(&dev.device, main_submission, &map_rx, layout.total_bytes);
-                    map_rx.recv().unwrap().unwrap();
-                    self.dump_node_stats_if_requested(dev);
-                    let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
-                    if !self.static_once_done && !self.static_once_steps.is_empty() {
-                        self.static_once_done = true;
-                    }
-                    return self.pack_readback_outputs(&plan, partial);
-                }
-                break;
-            }
+            } // !starting_on_host — GPU encode/submit/readback path
+
             // Skip already-baked static weight packing (Concat/Expand of Params).
             while step_i < self.schedule.len()
                 && self.static_once_done
@@ -2074,6 +2385,29 @@ impl WgpuExecutable {
             }
             if !step_runs_on_host(&self.schedule[step_i]) {
                 continue;
+            }
+            // Deferred HostOp/Conv/structure outputs live only in the mirror
+            // until a device-reading host step or GPU pass needs them.
+            if host_cache.has_deferred_writes()
+                && !matches!(
+                    &self.schedule[step_i],
+                    Step::HostOp { .. }
+                        | Step::Conv2dHost { .. }
+                        | Step::ExpandHost { .. }
+                        | Step::NarrowHost { .. }
+                        | Step::TransposeHost { .. }
+                        | Step::ConcatHost { .. }
+                        | Step::BufferCopy { .. }
+                )
+            {
+                let mut a = crate::host_stage::WgpuArena {
+                    arena: &self.arena,
+                    device: &dev.device,
+                    queue: &dev.queue,
+                    size_bytes: 0,
+                };
+                host_cache.flush_to_device(&mut a);
+                let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
             }
             match &self.schedule[step_i] {
                 Step::BufferCopy {
@@ -2106,6 +2440,11 @@ impl WgpuExecutable {
                         src.saturating_add(nbytes).max(dst.saturating_add(nbytes))
                     };
                     // Same for sharded arenas when src/dst live on different stripes.
+                    // Virtually-sharded NVIDIA arenas: GPU copy kernels corrupt
+                    // Kitten NSF — host those. Unsharded discrete can use the
+                    // GPU copy kernel (was blanket-hosted via coop_discrete and
+                    // dominated Kitten wall time). Force host with
+                    // RLX_WGPU_HOST_BUFFER_COPY=1.
                     let cross_shard =
                         self.arena.is_sharded() && !src_is_weight && !dst_is_weight && {
                             let s = self.arena.shard_size as u64;
@@ -2115,21 +2454,59 @@ impl WgpuExecutable {
                         };
                     if hi.saturating_sub(lo) > max_binding
                         || cross_shard
+                        || self.arena.is_sharded()
                         || src_is_weight
                         || dst_is_weight
+                        || host_cache.has_deferred_writes()
+                        || crate::device::coop_discrete_backend()
                         || rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
                     {
-                        let bytes_host = self.arena.read_bytes_range(
-                            &dev.device,
-                            &dev.queue,
-                            src as usize,
-                            nbytes as usize,
-                        );
-                        self.arena
-                            .write_bytes_range(&dev.queue, dst as usize, &bytes_host);
-                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                        let n_f32 = (nbytes as usize) / 4;
+                        let src_u = src as usize;
+                        let dst_u = dst as usize;
+                        let data = if let Some(hit) = host_cache.get_arc_covering(src_u, n_f32) {
+                            hit[..n_f32].to_vec()
+                        } else {
+                            if host_cache.is_dirty(src_u) {
+                                let mut a = crate::host_stage::WgpuArena {
+                                    arena: &self.arena,
+                                    device: &dev.device,
+                                    queue: &dev.queue,
+                                    size_bytes: 0,
+                                };
+                                host_cache.flush_offset(&mut a, src_u);
+                            }
+                            let bytes_host = self.arena.read_bytes_range(
+                                &dev.device,
+                                &dev.queue,
+                                src_u,
+                                nbytes as usize,
+                            );
+                            bytemuck::cast_slice(&bytes_host).to_vec()
+                        };
+                        let defer = !rlx_ir::env::flag("RLX_WGPU_HOST_EAGER_H2D");
+                        if !defer {
+                            self.arena.write_bytes_range(
+                                &dev.queue,
+                                dst_u,
+                                bytemuck::cast_slice(data.as_slice()),
+                            );
+                            let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                        }
+                        host_cache.insert(dst_u, data, defer);
                         step_i += 1;
                         continue;
+                    }
+                    // GPU copy — deferred mirrors must be on device first.
+                    if host_cache.has_deferred_writes() {
+                        let mut a = crate::host_stage::WgpuArena {
+                            arena: &self.arena,
+                            device: &dev.device,
+                            queue: &dev.queue,
+                            size_bytes: 0,
+                        };
+                        host_cache.flush_to_device(&mut a);
+                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     }
                     let mut base = (lo / 256) * 256;
                     // The bind window must cover [base, hi]. `base` is floored to 256B
@@ -2180,6 +2557,7 @@ impl WgpuExecutable {
                     }
                     dev.queue.submit(std::iter::once(enc.finish()));
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    host_cache.invalidate(dst as usize);
                 }
                 Step::GatherSplit {
                     n_out,
@@ -2216,10 +2594,22 @@ impl WgpuExecutable {
                     let mm = scale(*m) as usize;
                     let kk = *k as usize;
                     let nn = *n as usize;
-                    // Decode GEMV for all supported schemes; Q1_0 also covers
-                    // prefill (m>1) via tiled GEMM (or per-row GEMV fallback).
-                    let use_gemv = crate::gguf_gpu::gemv_supports_scheme(*scheme_id)
-                        && (mm == 1 || *scheme_id == 24);
+                    // Scratch-free windowed GEMV for Q4_K / Q6_K / Q1_0.
+                    // - m==1 (decode): always OK for supported schemes.
+                    // - Q1_0 + m>1: tiled GEMM (or per-row GEMV) inside gemv_rows.
+                    // - Other schemes + m>1: per-row GEMV only when k is an
+                    //   integer number of GGUF blocks — flat pack is block-linear
+                    //   over n*k, so unaligned k makes row slices invalid and used
+                    //   to force the host D2H/H2D fallback for *all* m>1 (very slow).
+                    let use_gemv = if !crate::gguf_gpu::gemv_supports_scheme(*scheme_id) {
+                        false
+                    } else if mm == 1 || *scheme_id == 24 {
+                        true
+                    } else {
+                        let be =
+                            crate::gguf_host::scheme_from_id(*scheme_id).gguf_block_size() as usize;
+                        kk.is_multiple_of(be.max(1))
+                    };
                     if use_gemv {
                         crate::gguf_gpu::run_dequant_matmul_gguf_gemv_rows(
                             &self.arena,
@@ -2261,6 +2651,82 @@ impl WgpuExecutable {
                             *out_byte_off as usize,
                         );
                     }
+                }
+                Step::DequantMatmulInt8Host {
+                    m,
+                    k,
+                    n,
+                    block_size,
+                    is_asymmetric,
+                    x_byte_off,
+                    w_byte_off,
+                    scale_byte_off,
+                    zp_byte_off,
+                    out_byte_off,
+                } => {
+                    let mm = scale(*m) as usize;
+                    crate::int8_host::run_dequant_matmul_int8(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        mm,
+                        *k as usize,
+                        *n as usize,
+                        *block_size as usize,
+                        *is_asymmetric,
+                        *x_byte_off as usize,
+                        *w_byte_off as usize,
+                        *scale_byte_off as usize,
+                        *zp_byte_off as usize,
+                        *out_byte_off as usize,
+                    );
+                }
+                Step::Conv2dHost {
+                    n,
+                    c_in,
+                    c_out,
+                    h,
+                    w,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw,
+                    groups,
+                    in_byte_off,
+                    w_byte_off,
+                    out_byte_off,
+                } => {
+                    crate::conv_host::run_conv2d_cached(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *n as usize,
+                        *c_in as usize,
+                        *c_out as usize,
+                        *h as usize,
+                        *w as usize,
+                        *h_out as usize,
+                        *w_out as usize,
+                        *kh as usize,
+                        *kw as usize,
+                        *sh as usize,
+                        *sw as usize,
+                        *ph as usize,
+                        *pw as usize,
+                        *dh as usize,
+                        *dw as usize,
+                        *groups as usize,
+                        *in_byte_off as usize,
+                        *w_byte_off as usize,
+                        *out_byte_off as usize,
+                        Some(&mut host_cache),
+                    );
                 }
                 Step::DequantGroupedMatmulGguf {
                     m,
@@ -2420,6 +2886,64 @@ impl WgpuExecutable {
                         *groups as usize,
                     );
                 }
+                Step::ConvTranspose3dHost {
+                    src_byte_off,
+                    weight_byte_off,
+                    dst_byte_off,
+                    n,
+                    c_in,
+                    d,
+                    h,
+                    w_in,
+                    c_out,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                    dd,
+                    dh,
+                    dw,
+                    groups,
+                } => {
+                    crate::conv_transpose3d_host::run_conv_transpose3d(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *src_byte_off as usize,
+                        *weight_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *n as usize,
+                        *c_in as usize,
+                        *d as usize,
+                        *h as usize,
+                        *w_in as usize,
+                        *c_out as usize,
+                        *d_out as usize,
+                        *h_out as usize,
+                        *w_out as usize,
+                        *kd as usize,
+                        *kh as usize,
+                        *kw as usize,
+                        *sd as usize,
+                        *sh as usize,
+                        *sw as usize,
+                        *pd as usize,
+                        *ph as usize,
+                        *pw as usize,
+                        *dd as usize,
+                        *dh as usize,
+                        *dw as usize,
+                        *groups as usize,
+                    );
+                }
                 Step::GroupNormHost {
                     src_byte_off,
                     gamma_byte_off,
@@ -2530,6 +3054,36 @@ impl WgpuExecutable {
                         *reduced as usize,
                         *inner as usize,
                         *is_max,
+                    );
+                }
+                Step::AxialRope2dHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    hidden,
+                    end_x,
+                    end_y,
+                    head_dim,
+                    num_heads,
+                    theta,
+                    repeat_factor,
+                } => {
+                    crate::vision_host::run_axial_rope2d(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *hidden as usize,
+                        *end_x as usize,
+                        *end_y as usize,
+                        *head_dim as usize,
+                        *num_heads as usize,
+                        *theta,
+                        *repeat_factor as usize,
                     );
                 }
                 Step::GruHost {
@@ -2718,7 +3272,13 @@ impl WgpuExecutable {
                     crate::scan_host::run_scan(&self.arena, &dev.device, &dev.queue, desc);
                 }
                 Step::HostOp { desc } => {
-                    crate::scan_host::run_host_op(&self.arena, &dev.device, &dev.queue, desc);
+                    crate::scan_host::run_host_op_with_cache(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        desc,
+                        Some(&mut host_cache),
+                    );
                 }
                 Step::CpuIndexing { thunk } => {
                     crate::scan_host::run_indexing(&self.arena, &dev.device, &dev.queue, thunk);
@@ -2730,7 +3290,7 @@ impl WgpuExecutable {
                     total_axis,
                     inputs,
                 } => {
-                    crate::scan_host::run_concat_host(
+                    crate::scan_host::run_concat_host_cached(
                         &self.arena,
                         &dev.device,
                         &dev.queue,
@@ -2739,6 +3299,7 @@ impl WgpuExecutable {
                         *inner,
                         *total_axis,
                         inputs,
+                        Some(&mut host_cache),
                     );
                 }
                 Step::ConcatHostPieces {
@@ -2749,6 +3310,17 @@ impl WgpuExecutable {
                     inputs,
                     starts,
                 } => {
+                    // Partial fill — other columns already on device; flush first.
+                    if host_cache.has_deferred_writes() {
+                        let mut a = crate::host_stage::WgpuArena {
+                            arena: &self.arena,
+                            device: &dev.device,
+                            queue: &dev.queue,
+                            size_bytes: 0,
+                        };
+                        host_cache.flush_to_device(&mut a);
+                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    }
                     crate::scan_host::run_concat_host_pieces(
                         &self.arena,
                         &dev.device,
@@ -2762,13 +3334,14 @@ impl WgpuExecutable {
                         /*clear=*/ false,
                     );
                 }
-                Step::ExpandHost {
+                Step::TransposeHost {
                     in_byte_off,
                     out_byte_off,
                     in_dims,
                     out_dims,
+                    in_strides,
                 } => {
-                    crate::scan_host::run_expand_host(
+                    crate::scan_host::run_transpose_host_cached(
                         &self.arena,
                         &dev.device,
                         &dev.queue,
@@ -2776,6 +3349,48 @@ impl WgpuExecutable {
                         *out_byte_off,
                         in_dims,
                         out_dims,
+                        in_strides,
+                        Some(&mut host_cache),
+                    );
+                }
+                Step::NarrowHost {
+                    in_byte_off,
+                    out_byte_off,
+                    outer,
+                    inner,
+                    axis_in_size,
+                    start,
+                    axis_out_size,
+                } => {
+                    crate::scan_host::run_narrow_host_cached(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *in_byte_off,
+                        *out_byte_off,
+                        *outer,
+                        *inner,
+                        *axis_in_size,
+                        *start,
+                        *axis_out_size,
+                        Some(&mut host_cache),
+                    );
+                }
+                Step::ExpandHost {
+                    in_byte_off,
+                    out_byte_off,
+                    in_dims,
+                    out_dims,
+                } => {
+                    crate::scan_host::run_expand_host_cached(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *in_byte_off,
+                        *out_byte_off,
+                        in_dims,
+                        out_dims,
+                        Some(&mut host_cache),
                     );
                 }
                 Step::SpdHost {
@@ -3192,6 +3807,48 @@ impl WgpuExecutable {
                 _ => break,
             }
             step_i += 1;
+            // Host paths stage with `queue.write_buffer` (no submit). Flush
+            // deferred mirrors before the next GPU compute pass so kernels see
+            // host results on discrete Vulkan/DX12.
+            if step_i < self.schedule.len() {
+                let next = &self.schedule[step_i];
+                if !step_runs_on_host(next) && !step_is_tail_host(next) {
+                    if host_cache.has_deferred_writes() {
+                        let mut a = crate::host_stage::WgpuArena {
+                            arena: &self.arena,
+                            device: &dev.device,
+                            queue: &dev.queue,
+                            size_bytes: 0,
+                        };
+                        host_cache.flush_to_device(&mut a);
+                    }
+                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    // Keep mirrors until GPU actually runs (cleared when
+                    // `pass_dispatched` on the next host sync).
+                }
+            } else if host_cache.has_deferred_writes() {
+                let mut a = crate::host_stage::WgpuArena {
+                    arena: &self.arena,
+                    device: &dev.device,
+                    queue: &dev.queue,
+                    size_bytes: 0,
+                };
+                host_cache.flush_to_device(&mut a);
+                let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+            } else {
+                let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+            }
+        }
+
+        if host_cache.has_deferred_writes() {
+            let mut a = crate::host_stage::WgpuArena {
+                arena: &self.arena,
+                device: &dev.device,
+                queue: &dev.queue,
+                size_bytes: 0,
+            };
+            host_cache.flush_to_device(&mut a);
+            let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
         }
 
         self.dump_node_stats_if_requested(dev);

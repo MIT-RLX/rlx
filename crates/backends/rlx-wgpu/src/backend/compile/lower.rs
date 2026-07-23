@@ -40,39 +40,46 @@ use crate::buffer::{
 };
 use crate::device::wgpu_device;
 use crate::kernels::{
-    AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams, AttentionBwdParams,
-    AttentionParams, BatchElementwiseRegionParams, BinaryC64Params, BinaryParams, ComplexCastParams,
-    Conv1dParams, Conv2dParams,
-    Conv3dParams, CastParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
-    ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
-    FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatedDeltaNetParams,
-    GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupedMatmulParams, GruParams, Im2Col2dParams, Kernel, LayerNormBwdParams,
-    LayerNormParams, Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams,
-    Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
-    RopeParams, SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams,
-    TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
-    ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel,
-    cast_f32_to_f16_kernel, complex_cast_kernel,
-    cast_kernel, compare_kernel, concat_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
-    conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel, fma_kernel,
-    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
-    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
-    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
-    gather_split_kernel, grouped_matmul_kernel, gru_kernel, im2col2d_kernel,
+    ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
+    AttentionBwdParams, AttentionParams, AxialRope2dParams, BatchElementwiseRegionParams,
+    BinaryC64Params, BinaryParams, CastParams, ComplexCastParams, ComplexWirtingerParams,
+    Conv1dParams, Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams,
+    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
+    FftButterflyStageParams, FmaParams, FusedResidualLnParams, FusedResidualLnTeeParams,
+    FusedResidualRmsNormParams, GatedDeltaNetParams, GatedResidualBackwardParams,
+    GatedResidualParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupNormBwdParams,
+    GroupedMatmulParams, GruParams, Im2Col2dParams, Kernel, LayerNormBwdParams, LayerNormParams,
+    Mamba2Params, MatmulParams, MatmulQkvParams, MaxPool2dBwdParams, NarrowConcatParams,
+    Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams,
+    RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams,
+    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
+    WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
+    ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_kernel,
+    axial_rope2d_kernel, batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel,
+    cast_f32_to_f16_kernel, cast_kernel, compare_kernel, complex_cast_kernel,
+    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel,
+    conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_kernel,
+    copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
+    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
+    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
+    fma_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    fused_residual_rms_norm_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
+    gated_residual_kernel, gather_axis_kernel, gather_backward_acc_kernel,
+    gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
+    group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
+    group_norm_backward_input_kernel, grouped_matmul_kernel, gru_kernel, im2col2d_kernel,
     layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
     layer_norm_backward_input_kernel, layernorm_kernel, lead_pack_uniform, mamba2_kernel,
     matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
-    matmul_wide_active_kernel, matmul_wide_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel,
-    pool3d_kernel, reduce_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel,
-    rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_kernel,
-    selective_scan_kernel, softmax_cross_entropy_kernel, softmax_kernel, topk_kernel,
-    transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
+    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel, narrow_kernel,
+    pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel, rms_norm_backward_kernel,
+    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
+    scatter_add_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
+    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
+    topk_kernel, transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
     welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
@@ -156,6 +163,90 @@ fn patch_region_cast_subs(chain: &[rlx_ir::op::ChainStep], chain_enc: &mut [u32]
     }
 }
 
+/// True when SPIR-V paths should host-fallback.
+///
+/// Virtually-sharded arenas (NVIDIA 2 GiB bind) force host for most ops.
+/// Discrete Vulkan/DX12 no longer blankets every op through host (that was
+/// ~20 s/chunk on Kitten 32 k wave graphs); instead:
+/// - Elementwise Binary/Where/Fma/Activation → host on discrete (SPIR-V still
+///   collapses Kitten NSF; peak ~0.05 if left on GPU) — see
+///   [`should_pack_host_op`].
+/// - Structural Expand/Concat/Transpose/Narrow/Conv → host on discrete — see
+///   [`wgpu_prefer_structure_host`] / [`wgpu_prefer_conv_host`].
+/// Metal keeps GPU kernels. Opt out of hosting with `RLX_WGPU_SHARD_GPU=1`.
+/// Force full discrete hosting with `RLX_WGPU_DISCRETE_HOST=1` (via
+/// [`wgpu_prefer_host_fallback`] for norms/sharded paths).
+fn wgpu_prefer_host_fallback(arena: &crate::buffer::Arena) -> bool {
+    if rlx_ir::env::flag("RLX_WGPU_FORCE_HOST") {
+        return true;
+    }
+    if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
+        return false;
+    }
+    if arena.is_sharded() {
+        return true;
+    }
+    rlx_ir::env::flag("RLX_WGPU_DISCRETE_HOST") && crate::device::coop_discrete_backend()
+}
+
+/// Expand / Concat / Transpose / Narrow: host on discrete Vulkan/DX12 even when
+/// the arena is unsharded (GPU paths collapse Kitten NSF). Also when virtually
+/// sharded / `RLX_WGPU_FORCE_HOST`.
+fn wgpu_prefer_structure_host(arena: &crate::buffer::Arena) -> bool {
+    if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
+        return false;
+    }
+    wgpu_prefer_host_fallback(arena) || crate::device::coop_discrete_backend()
+}
+
+/// Ops routed to packed [`Step::HostOp`] when hosting is required.
+/// Expand / Conv / Transpose / Narrow / Concat / DequantMatMul / Custom keep
+/// dedicated host paths. View-like Gather stays on GPU GatherSplit / axis
+/// kernels unless separately hosted.
+fn should_pack_host_op(arena: &crate::buffer::Arena, op: &Op) -> bool {
+    if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
+        return false;
+    }
+    if matches!(op, Op::MatMul) {
+        return rlx_ir::env::flag("RLX_WGPU_HOST_MATMUL");
+    }
+    if matches!(
+        op,
+        Op::Softmax { .. }
+            | Op::LayerNorm { .. }
+            | Op::RmsNorm { .. }
+            | Op::FusedResidualLN { .. }
+            | Op::FusedResidualRmsNorm { .. }
+    ) {
+        if rlx_ir::env::flag("RLX_WGPU_GPU_NORM") {
+            return false;
+        }
+        // Norms: host on discrete NVIDIA (unsharded Kitten still needs this)
+        // and whenever the arena is virtually sharded.
+        return wgpu_prefer_host_fallback(arena)
+            || crate::device::coop_discrete_backend()
+            || rlx_ir::env::flag("RLX_WGPU_HOST_NORM");
+    }
+    if matches!(
+        op,
+        Op::Binary(_) | Op::Where | Op::Fma | Op::Activation(_) | Op::GatedResidual
+    ) {
+        // Elementwise SPIR-V still collapses Kitten NSF on discrete NVIDIA
+        // (peak ~0.05) even with MatMul→Binary pass flushes and Expand hosted.
+        // Host on discrete / sharded; Metal keeps GPU kernels. Force GPU
+        // elementwise (unsafe for Kitten) with RLX_WGPU_SHARD_GPU=1.
+        return wgpu_prefer_host_fallback(arena) || crate::device::coop_discrete_backend();
+    }
+    false
+}
+
+/// Conv2d SPIR-V is still wrong on discrete NVIDIA even for unsharded arenas
+/// (Kitten vocoder 1×L "2d" convs → NSF mush). Keep hosting independently of
+/// [`wgpu_prefer_host_fallback`].
+fn wgpu_prefer_conv_host(arena: &crate::buffer::Arena) -> bool {
+    wgpu_prefer_structure_host(arena) || rlx_ir::env::flag("RLX_WGPU_CONV_HOST")
+}
+
 pub(crate) fn compile_static_inner(
     graph: Graph,
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
@@ -234,7 +325,7 @@ pub(crate) fn compile_static_inner(
         // Large unsharded arenas (> storage bind cap) stage far operands into
         // a dedicated tail so `scratch_off` is not stuck at `arena.size`.
         let stage = if (plan.arena_size as u64) > max_bind {
-            crate::buffer::SHARD_STAGE_RESERVE
+            crate::buffer::shard_stage_reserve()
         } else {
             0
         };
@@ -356,6 +447,7 @@ pub(crate) fn compile_static_inner(
     let ck = compare_kernel(&dev.device);
     let wk = where_kernel(&dev.device);
     let fk = fma_kernel(&dev.device);
+    let abk = activation_backward_kernel(&dev.device);
 
     let mut schedule = Vec::new();
     let mut uniforms = Vec::new();
@@ -492,6 +584,18 @@ pub(crate) fn compile_static_inner(
         let elems = node.shape.num_elements().unwrap_or(0) as u32;
         match &node.op {
             Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => continue,
+            // Virtually-sharded arenas: SPIR-V windowed elementwise / matmul /
+            // norm paths collapse NSF (peak ~0.05). Host those ops with packed
+            // per-tensor staging. Dedicated paths below still own Expand / Conv /
+            // DequantMatMul / Custom / indexing / ConvTranspose.
+            // Unsharded discrete: Binary/Activation stay on GPU; Expand/Conv/…
+            // still host via wgpu_prefer_structure_host / wgpu_prefer_conv_host.
+            op if should_pack_host_op(&arena, op) => {
+                schedule.push(Step::HostOp {
+                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+                });
+                continue;
+            }
             Op::MatMul => {
                 let a_id = node.inputs[0];
                 let b_id = node.inputs[1];
@@ -861,16 +965,37 @@ pub(crate) fn compile_static_inner(
                         );
                     }
                     let a_off = arena_off_in_bind_window(
-                        &graph, &param_offsets, &dev.device, &arena, &mut schedule, &mut scratch,
-                        a_id, &mut base, &mut size,
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        a_id,
+                        &mut base,
+                        &mut size,
                     );
                     let b_off = arena_off_in_bind_window(
-                        &graph, &param_offsets, &dev.device, &arena, &mut schedule, &mut scratch,
-                        b_id, &mut base, &mut size,
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        b_id,
+                        &mut base,
+                        &mut size,
                     );
                     let c_off = arena_off_in_bind_window(
-                        &graph, &param_offsets, &dev.device, &arena, &mut schedule, &mut scratch,
-                        node.id, &mut base, &mut size,
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        node.id,
+                        &mut base,
+                        &mut size,
                     );
                     let a_off = if arena_tensor_in_window(&arena, a_id, base, size) {
                         arena_local_off_f32(&arena, a_id, base)
@@ -1291,6 +1416,124 @@ pub(crate) fn compile_static_inner(
                 bind_groups.push(bg);
             }
 
+            Op::ReluBackward => {
+                let x_id = node.inputs[0];
+                let dy_id = node.inputs[1];
+                let win_ids = [node.id, x_id, dy_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win_ids,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let x_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    x_id,
+                    &mut base,
+                    &mut size,
+                );
+                let dy_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    dy_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = ActivationBackwardParams {
+                    n: elems,
+                    x_off,
+                    dy_off,
+                    dx_off: arena_local_off_f32(&arena, node.id, base),
+                    op: 0, // relu
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                };
+                schedule.push(Step::ReluBackward { params: p });
+                let u = emit_uniform(std::mem::size_of::<ActivationBackwardParams>());
+                let bg = bind_arena_window(&dev.device, abk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+
+            Op::ActivationBackward { kind } => {
+                let x_id = node.inputs[0];
+                let dy_id = node.inputs[1];
+                let win_ids = [node.id, x_id, dy_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win_ids,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let x_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    x_id,
+                    &mut base,
+                    &mut size,
+                );
+                let dy_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    dy_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = ActivationBackwardParams {
+                    n: elems,
+                    x_off,
+                    dy_off,
+                    dx_off: arena_local_off_f32(&arena, node.id, base),
+                    op: activation_op_id(*kind),
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                };
+                schedule.push(Step::ActivationBackward { params: p });
+                let u = emit_uniform(std::mem::size_of::<ActivationBackwardParams>());
+                let bg = bind_arena_window(&dev.device, abk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+
             Op::BatchElementwiseRegion {
                 chain,
                 num_batch_inputs,
@@ -1530,11 +1773,11 @@ pub(crate) fn compile_static_inner(
                 sorted.sort_unstable();
                 let contiguous = sorted.windows(2).all(|w| w[1] == w[0] + 1);
                 if !contiguous {
-                    panic!(
-                        "rlx-wgpu Reduce: non-contiguous axes not yet wired \
-                         (got axes={axes:?}, rank={})",
-                        in_shape.len()
-                    );
+                    // Non-contiguous axes: packed HostOp (CPU thunk).
+                    schedule.push(Step::HostOp {
+                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+                    });
+                    continue;
                 }
                 let ax_first = sorted[0];
                 let ax_last = *sorted.last().unwrap();
@@ -1594,7 +1837,11 @@ pub(crate) fn compile_static_inner(
                 let in_shape = graph.node(in_id).shape.dims();
                 let last = (in_shape.len() - 1) as i32;
                 if *axis != -1 && *axis != last {
-                    panic!("rlx-wgpu Softmax: only last-axis wired (got axis={axis})");
+                    // Non-last-axis Softmax: packed HostOp (CPU thunk).
+                    schedule.push(Step::HostOp {
+                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+                    });
+                    continue;
                 }
                 let inner = in_shape[in_shape.len() - 1].unwrap_static() as u32;
                 let total: u32 = in_shape.iter().map(|d| d.unwrap_static() as u32).product();
@@ -1734,6 +1981,156 @@ pub(crate) fn compile_static_inner(
                 schedule.push(Step::SoftmaxCrossEntropy { params: p });
                 let sk = softmax_cross_entropy_kernel(&dev.device);
                 let u = emit_uniform(std::mem::size_of::<SceParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+
+            Op::SoftmaxCrossEntropyWithLogits => {
+                // Integer-label CE: logits [N,C], labels [N] → loss [N].
+                let logits_id = node.inputs[0];
+                let labels_id = node.inputs[1];
+                let logits_shape = graph.node(logits_id).shape.dims();
+                let inner = logits_shape[logits_shape.len() - 1].unwrap_static() as u32;
+                let total: u32 = logits_shape
+                    .iter()
+                    .map(|d| d.unwrap_static() as u32)
+                    .product();
+                let outer = total / inner.max(1);
+
+                let sce_win = vec![node.id, logits_id, labels_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let sce_fits = arena_span_bytes(&arena, &sce_win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &sce_win,
+                );
+                if !sce_fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let logits_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    logits_id,
+                    &mut base,
+                    &mut size,
+                );
+                let labels_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    labels_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = SceParams {
+                    outer,
+                    inner,
+                    logits_off,
+                    targets_off: labels_off,
+                    out_off: arena_local_off_f32(&arena, node.id, base),
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                };
+                schedule.push(Step::SoftmaxCrossEntropyWithLogits { params: p });
+                let sk = softmax_cross_entropy_with_logits_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<SceParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+
+            Op::SoftmaxCrossEntropyBackward => {
+                // Integer-label CE bwd: [logits, labels, d_loss] → dlogits.
+                let logits_id = node.inputs[0];
+                let labels_id = node.inputs[1];
+                let d_loss_id = node.inputs[2];
+                let logits_shape = graph.node(logits_id).shape.dims();
+                let inner = logits_shape[logits_shape.len() - 1].unwrap_static() as u32;
+                let total: u32 = logits_shape
+                    .iter()
+                    .map(|d| d.unwrap_static() as u32)
+                    .product();
+                let outer = total / inner.max(1);
+
+                let sce_win = vec![node.id, logits_id, labels_id, d_loss_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let sce_fits = arena_span_bytes(&arena, &sce_win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &sce_win,
+                );
+                if !sce_fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let logits_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    logits_id,
+                    &mut base,
+                    &mut size,
+                );
+                let labels_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    labels_id,
+                    &mut base,
+                    &mut size,
+                );
+                let d_loss_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    d_loss_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = SceBwdParams {
+                    outer,
+                    inner,
+                    logits_off,
+                    labels_off,
+                    d_loss_off,
+                    out_off: arena_local_off_f32(&arena, node.id, base),
+                    _p0: 0,
+                    _p1: 0,
+                };
+                schedule.push(Step::SoftmaxCrossEntropyBackward { params: p });
+                let sk = softmax_cross_entropy_backward_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<SceBwdParams>());
                 let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
                 uniforms.push(u);
                 bind_groups.push(bg);
@@ -2193,7 +2590,14 @@ pub(crate) fn compile_static_inner(
                     };
                     schedule.push(Step::Cast { params: p });
                     let u = emit_uniform(std::mem::size_of::<CastParams>());
-                    let bg = bind_arena_window(&dev.device, cast_kernel(&dev.device), &arena, base, size, &u);
+                    let bg = bind_arena_window(
+                        &dev.device,
+                        cast_kernel(&dev.device),
+                        &arena,
+                        base,
+                        size,
+                        &u,
+                    );
                     uniforms.push(u);
                     bind_groups.push(bg);
                 }
@@ -2240,6 +2644,21 @@ pub(crate) fn compile_static_inner(
                 // For each *output* axis i, the corresponding input
                 // axis is perm[i] — its stride is in_strides[perm[i]].
                 let strides_for_out: Vec<u32> = (0..rank).map(|i| in_strides[perm[i]]).collect();
+                if wgpu_prefer_structure_host(&arena)
+                    || rlx_ir::env::flag("RLX_WGPU_TRANSPOSE_HOST")
+                {
+                    schedule.push(Step::TransposeHost {
+                        in_byte_off: arena.offset(in_id),
+                        out_byte_off: arena.offset(node.id),
+                        in_dims,
+                        out_dims,
+                        in_strides: strides_for_out
+                            .into_iter()
+                            .map(|stride| stride as usize)
+                            .collect(),
+                    });
+                    continue;
+                }
 
                 // Build meta buffer: dims (rank u32s) + strides (rank u32s).
                 let mut meta_data: Vec<u32> = Vec::with_capacity(rank * 2);
@@ -2376,6 +2795,23 @@ pub(crate) fn compile_static_inner(
                     .product::<u32>()
                     .max(1);
                 let axis_in = in_shape[*axis].unwrap_static() as u32;
+                if wgpu_prefer_structure_host(&arena) {
+                    let lanes = match node.shape.dtype() {
+                        rlx_ir::DType::C64 => 2,
+                        rlx_ir::DType::C128 => 4,
+                        _ => 1,
+                    };
+                    schedule.push(Step::NarrowHost {
+                        in_byte_off: arena.offset(in_id),
+                        out_byte_off: arena.offset(node.id),
+                        outer,
+                        inner: inner * lanes,
+                        axis_in_size: axis_in,
+                        start: *start as u32,
+                        axis_out_size: *len as u32,
+                    });
+                    continue;
+                }
                 let win_ids = [node.id, in_id];
                 let max_binding = dev.device.limits().max_storage_buffer_binding_size;
                 let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
@@ -2488,7 +2924,11 @@ pub(crate) fn compile_static_inner(
                 // a full ConcatHost of the 0.5 GiB result every NFE was both
                 // slow and host-heavy vs ORT I/O binding.
                 let pair_ok = |in_id: NodeId| {
-                    if rlx_ir::env::flag("RLX_WGPU_CONCAT_HOST") {
+                    // Discrete Vulkan/DX12 + virtually-sharded: GPU Concat
+                    // collapses Kitten NSF — host every piece.
+                    if wgpu_prefer_structure_host(&arena)
+                        || rlx_ir::env::flag("RLX_WGPU_CONCAT_HOST")
+                    {
                         return false;
                     }
                     // Weight-buffer inputs cannot share an act bind window —
@@ -2507,7 +2947,7 @@ pub(crate) fn compile_static_inner(
                     arena.scratch_off as u64
                 };
                 let stage_end = if arena.is_sharded() {
-                    scratch + crate::buffer::SHARD_STAGE_RESERVE as u64
+                    scratch + crate::buffer::shard_stage_reserve() as u64
                 } else {
                     (arena.size as u64).saturating_add(1)
                 };
@@ -2541,12 +2981,13 @@ pub(crate) fn compile_static_inner(
                         let bg = bind_arena_window(&dev.device, cck, &arena, base, size, &u);
                         uniforms.push(u);
                         bind_groups.push(bg);
-                    } else if arena.is_sharded()
+                    } else if !wgpu_prefer_structure_host(&arena)
                         && in_bytes > 0
-                        && in_bytes <= crate::buffer::SHARD_STAGE_RESERVE as u64
+                        && in_bytes <= crate::buffer::shard_stage_reserve() as u64
                         && scratch.saturating_add(in_bytes.div_ceil(256) * 256) <= stage_end
                     {
-                        // Stage this piece into the output stripe, then GPU Concat.
+                        // GPU Concat with scratch staging — skipped when
+                        // discrete / sharded structure host is preferred.
                         let aligned = in_bytes.div_ceil(256) * 256;
                         let dst = scratch;
                         scratch = scratch.saturating_add(aligned);
@@ -2555,9 +2996,7 @@ pub(crate) fn compile_static_inner(
                             dst_byte_off: dst,
                             bytes: in_bytes as u32,
                         });
-                        let s = arena.shard_size as u64;
-                        let base = (out_byte / s) * s;
-                        let size = s.min(max_binding).max(256);
+                        let (base, size) = arena_window_for_nodes(&dev.device, &arena, &[node.id]);
                         let in_off = ((dst.saturating_sub(base)) / 4) as u32;
                         let out_off = arena_local_off_f32(&arena, node.id, base);
                         let p = NarrowConcatParams {
@@ -2928,7 +3367,7 @@ pub(crate) fn compile_static_inner(
                     scratch = scratch.saturating_add(tmp_aligned);
                     if arena.is_sharded() {
                         let stage_end = arena.shard_stage_off(base as usize) as u64
-                            + crate::buffer::SHARD_STAGE_RESERVE as u64;
+                            + crate::buffer::shard_stage_reserve() as u64;
                         assert!(
                             tmp_byte >= base
                                 && scratch <= stage_end
@@ -3359,12 +3798,6 @@ pub(crate) fn compile_static_inner(
                             (in_rank={in_rank}, target_rank={rank})"
                     );
                 }
-                // Prefer GPU Expand with shard-local staging over ExpandHost.
-                // F5 DiT on a 16 GiB sharded arena used ~300 ExpandHost ops;
-                // Metal (unsharded, GPU Expand only) matches CPU at cos=1.0
-                // while ExpandHost left a ~5% teacher-forced peak under-shoot
-                // that the ODE then amplifies. Cross-shard inputs are staged
-                // into the output stripe via `arena_off_in_bind_window`.
                 // Implicit leading 1s when input rank < target rank (e.g.
                 // scalar → vector from `LegalizeBroadcast`).
                 let pad = rank.saturating_sub(in_rank);
@@ -3378,6 +3811,24 @@ pub(crate) fn compile_static_inner(
                         }
                     })
                     .collect();
+                // Prefer GPU Expand with shard-local staging over ExpandHost on
+                // Metal (unsharded): F5 DiT matched CPU at cos=1.0 that way,
+                // while ExpandHost left a ~5% teacher-forced peak under-shoot.
+                //
+                // Discrete Vulkan/DX12 and virtually-sharded arenas: GPU Expand
+                // collapses Kitten NSF (peak ~0.05). Host there — and whenever
+                // `RLX_WGPU_EXPAND_HOST=1`.
+                let force_expand_host =
+                    wgpu_prefer_structure_host(&arena) || rlx_ir::env::flag("RLX_WGPU_EXPAND_HOST");
+                if force_expand_host {
+                    schedule.push(Step::ExpandHost {
+                        in_byte_off: arena.offset(in_id),
+                        out_byte_off: arena.offset(node.id),
+                        in_dims,
+                        out_dims,
+                    });
+                    continue;
+                }
                 // Complex tensors pack `lanes` contiguous f32 per element (C64=2
                 // [re,im], C128=4 df64). The expand kernel copies one f32 per
                 // "element", so append an innermost lane axis (in==out, never a
@@ -3553,8 +4004,10 @@ pub(crate) fn compile_static_inner(
                 let max_binding = dev.device.limits().max_storage_buffer_binding_size;
                 // `RLX_WGPU_GATHER_SPLIT` forces the >4 GiB split-binding path on a
                 // small table so it's testable (mirrors `RLX_WGPU_CONCAT_HOST`).
+                // Also force on virtually-sharded arenas (NVIDIA 2 GiB bind).
                 let gather_needs_split = *axis == 0
-                    && (rlx_ir::env::flag("RLX_WGPU_GATHER_SPLIT")
+                    && (arena.is_sharded()
+                        || rlx_ir::env::flag("RLX_WGPU_GATHER_SPLIT")
                         || (arena_whole_arena_bind(&arena, max_binding).is_none()
                             && arena_span_bytes(&arena, &[table_id, idx_id, node.id])
                                 > max_binding));
@@ -4502,49 +4955,14 @@ pub(crate) fn compile_static_inner(
                             w_off,
                             out_off,
                         };
-                        // Two accelerated conv paths for the `one_d`
-                        // (kw==1) vocoder convs:
-                        //   • conv1d_tiled (default): 2D register-blocked
-                        //     direct conv — reuses input across the output-
-                        //     channel tile. Drop-in for the direct conv
-                        //     (same params + bind window); no scratch.
-                        //   • im2col + GEMM (opt-in, RLX_WGPU_CONV_IM2COL):
-                        //     materialize `col` in scratch, run the tiled
-                        //     f32 GEMM. Wins only for GEMM-friendly shapes;
-                        //     needs whole-arena bind + reserved scratch.
-                        // Everything else falls back to the direct conv.
-                        let spatial = (p2.h_out as u64) * (p2.w_out as u64);
-                        let k_total = (p2.c_in as u64) * (p2.kh as u64) * (p2.kw as u64);
-                        let col_bytes = k_total.saturating_mul(spatial).saturating_mul(4);
-                        let max_binding = dev.device.limits().max_storage_buffer_binding_size;
-                        let whole = arena_whole_arena_bind(&arena, max_binding);
-                        let im2col_opt_in = rlx_ir::env::flag("RLX_WGPU_CONV_IM2COL");
-                        let use_im2col = im2col_opt_in
-                            && p2.groups == 1
-                            && p2.n == 1
-                            && (p2.kh as u64) * (p2.kw as u64) >= 2
-                            && spatial >= im2col_min_spatial()
-                            && k_total >= im2col_min_k()
-                            && (p2.c_out as u64) >= im2col_min_cout()
-                            && col_bytes <= CONV_IM2COL_MAX_COL_BYTES
-                            && col_bytes <= arena.scratch_bytes as u64
-                            && whole.is_some();
-                        let use_tiled = !use_im2col
-                            && one_d
-                            && p2.kw == 1
-                            && p2.w == 1
-                            && p2.w_out == 1
-                            && p2.groups == 1
-                            && p2.n == 1
-                            && spatial >= conv_tiled_min_spatial()
-                            && !rlx_ir::env::flag("RLX_WGPU_NO_TILED_CONV");
-                        if use_im2col {
-                            let (base_w, size_w) = whole.expect("whole-arena bind");
-                            // col lives at the reserved scratch tail (free of
-                            // live data); consumed immediately by the GEMM.
-                            let col_word_off = (arena.scratch_off / 4) as u32;
-                            let im_params = Im2Col2dParams {
+                        // Host NCHW conv on discrete Vulkan/DX12 (NVIDIA SPIR-V
+                        // conv mush even unsharded) and on virtually-sharded
+                        // arenas. Opt-in anywhere with `RLX_WGPU_CONV_HOST=1`.
+                        if wgpu_prefer_conv_host(&arena) {
+                            schedule.push(Step::Conv2dHost {
+                                n: p2.n,
                                 c_in: p2.c_in,
+                                c_out: p2.c_out,
                                 h: p2.h,
                                 w: p2.w,
                                 h_out: p2.h_out,
@@ -4557,67 +4975,141 @@ pub(crate) fn compile_static_inner(
                                 pw: p2.pw,
                                 dh: p2.dh,
                                 dw: p2.dw,
-                                in_off: (arena.offset(in_id) / 4) as u32,
-                                col_off: col_word_off,
-                                k_total: k_total as u32,
-                                spatial: spatial as u32,
-                                _p0: 0,
-                                _p1: 0,
-                                _p2: 0,
-                            };
-                            schedule.push(Step::Im2ColGpu { params: im_params });
-                            let imk = im2col2d_kernel(&dev.device);
-                            let u_im = emit_uniform(std::mem::size_of::<Im2Col2dParams>());
-                            // Static params — write once at compile (the
-                            // active-extent rewrite pass is a no-op here).
-                            dev.queue
-                                .write_buffer(&u_im, 0, bytemuck::bytes_of(&im_params));
-                            let bg_im =
-                                bind_arena_window(&dev.device, imk, &arena, base_w, size_w, &u_im);
-                            uniforms.push(u_im);
-                            bind_groups.push(bg_im);
-                            // GEMM: weight[c_out, K] @ col[K, spatial]
-                            //   → out[c_out, spatial]  (NCHW, N==1).
-                            let m = p2.c_out;
-                            let kk = k_total as u32;
-                            let nn2 = spatial as u32;
-                            schedule.push(Step::Matmul {
-                                m,
-                                k: kk,
-                                n: nn2,
-                                batch: 1,
-                                a_batch_stride: m.saturating_mul(kk),
-                                b_batch_stride: kk.saturating_mul(nn2),
-                                c_batch_stride: m.saturating_mul(nn2),
-                                a_off_f32: (arena.offset(w_id) / 4) as u32,
-                                b_off_f32: col_word_off,
-                                c_off_f32: (arena.offset(node.id) / 4) as u32,
-                                has_bias: 0,
-                                bias_off_f32: 0,
-                                act_id: 0xFFFF,
-                                b_is_param: false,
-                                compute_precision: MatmulCompute::F32,
+                                groups: p2.groups,
+                                in_byte_off: arena.offset(in_id) as u64,
+                                w_byte_off: arena.offset(w_id) as u64,
+                                out_byte_off: arena.offset(node.id) as u64,
                             });
-                            let u_mm = emit_uniform(std::mem::size_of::<MatmulParams>());
-                            let bg_mm =
-                                bind_arena_window(&dev.device, mm_k, &arena, base_w, size_w, &u_mm);
-                            uniforms.push(u_mm);
-                            bind_groups.push(bg_mm);
                         } else {
-                            schedule.push(if use_tiled {
-                                Step::Conv2dTiled { params: p2 }
+                            // Two accelerated conv paths for the `one_d`
+                            // (kw==1) vocoder convs:
+                            //   • conv1d_tiled (default): 2D register-blocked
+                            //     direct conv — reuses input across the output-
+                            //     channel tile. Drop-in for the direct conv
+                            //     (same params + bind window); no scratch.
+                            //   • im2col + GEMM (opt-in, RLX_WGPU_CONV_IM2COL):
+                            //     materialize `col` in scratch, run the tiled
+                            //     f32 GEMM. Wins only for GEMM-friendly shapes;
+                            //     needs whole-arena bind + reserved scratch.
+                            // Everything else falls back to the direct conv.
+                            let spatial = (p2.h_out as u64) * (p2.w_out as u64);
+                            let k_total = (p2.c_in as u64) * (p2.kh as u64) * (p2.kw as u64);
+                            let col_bytes = k_total.saturating_mul(spatial).saturating_mul(4);
+                            let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                            let whole = arena_whole_arena_bind(&arena, max_binding);
+                            let im2col_opt_in = rlx_ir::env::flag("RLX_WGPU_CONV_IM2COL");
+                            let use_im2col = im2col_opt_in
+                                && p2.groups == 1
+                                && p2.n == 1
+                                && (p2.kh as u64) * (p2.kw as u64) >= 2
+                                && spatial >= im2col_min_spatial()
+                                && k_total >= im2col_min_k()
+                                && (p2.c_out as u64) >= im2col_min_cout()
+                                && col_bytes <= CONV_IM2COL_MAX_COL_BYTES
+                                && col_bytes <= arena.scratch_bytes as u64
+                                && whole.is_some();
+                            let use_tiled = !use_im2col
+                                && one_d
+                                && p2.kw == 1
+                                && p2.w == 1
+                                && p2.w_out == 1
+                                && p2.groups == 1
+                                && p2.n == 1
+                                && spatial >= conv_tiled_min_spatial()
+                                && !rlx_ir::env::flag("RLX_WGPU_NO_TILED_CONV");
+                            if use_im2col {
+                                let (base_w, size_w) = whole.expect("whole-arena bind");
+                                // col lives at the reserved scratch tail (free of
+                                // live data); consumed immediately by the GEMM.
+                                let col_word_off = (arena.scratch_off / 4) as u32;
+                                let im_params = Im2Col2dParams {
+                                    c_in: p2.c_in,
+                                    h: p2.h,
+                                    w: p2.w,
+                                    h_out: p2.h_out,
+                                    w_out: p2.w_out,
+                                    kh: p2.kh,
+                                    kw: p2.kw,
+                                    sh: p2.sh,
+                                    sw: p2.sw,
+                                    ph: p2.ph,
+                                    pw: p2.pw,
+                                    dh: p2.dh,
+                                    dw: p2.dw,
+                                    in_off: (arena.offset(in_id) / 4) as u32,
+                                    col_off: col_word_off,
+                                    k_total: k_total as u32,
+                                    spatial: spatial as u32,
+                                    _p0: 0,
+                                    _p1: 0,
+                                    _p2: 0,
+                                };
+                                schedule.push(Step::Im2ColGpu { params: im_params });
+                                let imk = im2col2d_kernel(&dev.device);
+                                let u_im = emit_uniform(std::mem::size_of::<Im2Col2dParams>());
+                                // Static params — write once at compile (the
+                                // active-extent rewrite pass is a no-op here).
+                                dev.queue
+                                    .write_buffer(&u_im, 0, bytemuck::bytes_of(&im_params));
+                                let bg_im = bind_arena_window(
+                                    &dev.device,
+                                    imk,
+                                    &arena,
+                                    base_w,
+                                    size_w,
+                                    &u_im,
+                                );
+                                uniforms.push(u_im);
+                                bind_groups.push(bg_im);
+                                // GEMM: weight[c_out, K] @ col[K, spatial]
+                                //   → out[c_out, spatial]  (NCHW, N==1).
+                                let m = p2.c_out;
+                                let kk = k_total as u32;
+                                let nn2 = spatial as u32;
+                                schedule.push(Step::Matmul {
+                                    m,
+                                    k: kk,
+                                    n: nn2,
+                                    batch: 1,
+                                    a_batch_stride: m.saturating_mul(kk),
+                                    b_batch_stride: kk.saturating_mul(nn2),
+                                    c_batch_stride: m.saturating_mul(nn2),
+                                    a_off_f32: (arena.offset(w_id) / 4) as u32,
+                                    b_off_f32: col_word_off,
+                                    c_off_f32: (arena.offset(node.id) / 4) as u32,
+                                    has_bias: 0,
+                                    bias_off_f32: 0,
+                                    act_id: 0xFFFF,
+                                    b_is_param: false,
+                                    compute_precision: MatmulCompute::F32,
+                                });
+                                let u_mm = emit_uniform(std::mem::size_of::<MatmulParams>());
+                                let bg_mm = bind_arena_window(
+                                    &dev.device,
+                                    mm_k,
+                                    &arena,
+                                    base_w,
+                                    size_w,
+                                    &u_mm,
+                                );
+                                uniforms.push(u_mm);
+                                bind_groups.push(bg_mm);
                             } else {
-                                Step::Conv2d { params: p2 }
-                            });
-                            let ck = if use_tiled {
-                                conv1d_tiled_kernel(&dev.device)
-                            } else {
-                                conv2d_kernel(&dev.device)
-                            };
-                            let u = emit_uniform(std::mem::size_of::<Conv2dParams>());
-                            let bg = bind_arena_window(&dev.device, ck, &arena, base, size, &u);
-                            uniforms.push(u);
-                            bind_groups.push(bg);
+                                schedule.push(if use_tiled {
+                                    Step::Conv2dTiled { params: p2 }
+                                } else {
+                                    Step::Conv2d { params: p2 }
+                                });
+                                let ck = if use_tiled {
+                                    conv1d_tiled_kernel(&dev.device)
+                                } else {
+                                    conv2d_kernel(&dev.device)
+                                };
+                                let u = emit_uniform(std::mem::size_of::<Conv2dParams>());
+                                let bg = bind_arena_window(&dev.device, ck, &arena, base, size, &u);
+                                uniforms.push(u);
+                                bind_groups.push(bg);
+                            }
                         }
                     }
                     (3, 5, 5, 5) => {
@@ -4792,7 +5284,11 @@ pub(crate) fn compile_static_inner(
                 let in_shape = graph.node(in_id).shape.dims();
                 let last = (in_shape.len() - 1) as i32;
                 if *axis != -1 && *axis != last {
-                    panic!("rlx-wgpu Cumsum: only last-axis wired (got axis={axis})");
+                    // Non-last-axis Cumsum: packed HostOp (CPU thunk).
+                    schedule.push(Step::HostOp {
+                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+                    });
+                    continue;
                 }
                 let inner = in_shape[in_shape.len() - 1].unwrap_static() as u32;
                 let total: u32 = in_shape.iter().map(|d| d.unwrap_static() as u32).product();
@@ -5188,7 +5684,7 @@ pub(crate) fn compile_static_inner(
                     };
                 let can_pack = arena.is_sharded()
                     && !colocated
-                    && pack_bytes <= crate::buffer::SHARD_STAGE_RESERVE as u64;
+                    && pack_bytes <= crate::buffer::shard_stage_reserve() as u64;
                 let use_gpu = !rlx_ir::env::flag("RLX_WGPU_GDN_HOST")
                     && (colocated || can_pack)
                     && (*carry_state || gdn_scratch_off > 0 || arena.is_sharded() || can_pack);
@@ -5269,7 +5765,7 @@ pub(crate) fn compile_static_inner(
                         (d, None)
                     };
                     assert!(
-                        cur <= stage + crate::buffer::SHARD_STAGE_RESERVE as u64,
+                        cur <= stage + crate::buffer::shard_stage_reserve() as u64,
                         "rlx-wgpu GDN pack overflowed shard stage reserve"
                     );
                     let _ = shard_base;
@@ -5428,6 +5924,233 @@ pub(crate) fn compile_static_inner(
                 // The uniform/bind_group lanes are indexed by GPU-step count
                 // (`gpu_ui`), so host steps must NOT push to them.
             }
+            Op::Conv3d {
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                let in_id = node.inputs[0];
+                let w_id = node.inputs[1];
+                let win_ids = [node.id, in_id, w_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win_ids,
+                );
+                arena_expand_bind_window(&arena, &win_ids, &mut base, &mut size, max_binding);
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let in_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    in_id,
+                    &mut base,
+                    &mut size,
+                );
+                let w_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    w_id,
+                    &mut base,
+                    &mut size,
+                );
+                let out_off = arena_local_off_f32(&arena, node.id, base);
+                let in_shape = graph.node(in_id).shape.dims();
+                let w_shape = graph.node(w_id).shape.dims();
+                let out_shape = node.shape.dims();
+                let p3 = Conv3dParams {
+                    n: in_shape[0].unwrap_static() as u32,
+                    c_in: in_shape[1].unwrap_static() as u32,
+                    c_out: out_shape[1].unwrap_static() as u32,
+                    d: in_shape[2].unwrap_static() as u32,
+                    h: in_shape[3].unwrap_static() as u32,
+                    w: in_shape[4].unwrap_static() as u32,
+                    d_out: out_shape[2].unwrap_static() as u32,
+                    h_out: out_shape[3].unwrap_static() as u32,
+                    w_out: out_shape[4].unwrap_static() as u32,
+                    kd: w_shape[2].unwrap_static() as u32,
+                    kh: w_shape[3].unwrap_static() as u32,
+                    kw: w_shape[4].unwrap_static() as u32,
+                    sd: stride[0] as u32,
+                    sh: stride[1] as u32,
+                    sw: stride[2] as u32,
+                    pd: padding[0] as u32,
+                    ph: padding[1] as u32,
+                    pw: padding[2] as u32,
+                    dd: dilation[0] as u32,
+                    dh: dilation[1] as u32,
+                    dw: dilation[2] as u32,
+                    groups: (*groups).max(1) as u32,
+                    in_off,
+                    w_off,
+                    out_off,
+                    _p0: 0,
+                };
+                schedule.push(Step::Conv3d { params: p3 });
+                let ck = conv3d_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<Conv3dParams>());
+                let bg = bind_arena_window(&dev.device, ck, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::ConvTranspose3d {
+                stride,
+                padding,
+                dilation,
+                output_padding: _,
+                groups,
+            } => {
+                let in_id = node.inputs[0];
+                let w_id = node.inputs[1];
+                let in_shape = &graph.node(in_id).shape;
+                let w_shape = &graph.node(w_id).shape;
+                let out_shape = &node.shape;
+                let n = in_shape.dim(0).unwrap_static() as u32;
+                let c_in = in_shape.dim(1).unwrap_static() as u32;
+                let d = in_shape.dim(2).unwrap_static() as u32;
+                let h = in_shape.dim(3).unwrap_static() as u32;
+                let w_in = in_shape.dim(4).unwrap_static() as u32;
+                let c_out = out_shape.dim(1).unwrap_static() as u32;
+                let d_out = out_shape.dim(2).unwrap_static() as u32;
+                let h_out = out_shape.dim(3).unwrap_static() as u32;
+                let w_out = out_shape.dim(4).unwrap_static() as u32;
+                let kd = w_shape.dim(2).unwrap_static() as u32;
+                let kh = w_shape.dim(3).unwrap_static() as u32;
+                let kw = w_shape.dim(4).unwrap_static() as u32;
+                let sd = stride[0] as u32;
+                let sh = stride[1] as u32;
+                let sw = stride[2] as u32;
+                let pd = padding[0] as u32;
+                let ph = padding[1] as u32;
+                let pw = padding[2] as u32;
+                let dd = dilation[0] as u32;
+                let dh = dilation[1] as u32;
+                let dw = dilation[2] as u32;
+                let groups_u = (*groups).max(1) as u32;
+
+                if wgpu_prefer_structure_host(&arena) || rlx_ir::env::flag("RLX_WGPU_CONV_HOST") {
+                    schedule.push(Step::ConvTranspose3dHost {
+                        src_byte_off: arena.offset(in_id) as u32,
+                        weight_byte_off: arena.offset(w_id) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        n,
+                        c_in,
+                        d,
+                        h,
+                        w_in,
+                        c_out,
+                        d_out,
+                        h_out,
+                        w_out,
+                        kd,
+                        kh,
+                        kw,
+                        sd,
+                        sh,
+                        sw,
+                        pd,
+                        ph,
+                        pw,
+                        dd,
+                        dh,
+                        dw,
+                        groups: groups_u,
+                    });
+                } else {
+                    let ct_win = vec![node.id, in_id, w_id];
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let ct_fits = arena_span_bytes(&arena, &ct_win) <= max_binding;
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &ct_win,
+                    );
+                    if !ct_fits && !param_anchor {
+                        base = arena_bind_window_covering_scratch_if_needed(
+                            &arena, base, size, scratch,
+                        );
+                    }
+                    let in_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        in_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let w_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        w_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let p3 = Conv3dParams {
+                        n,
+                        c_in,
+                        c_out,
+                        d,
+                        h,
+                        w: w_in,
+                        d_out,
+                        h_out,
+                        w_out,
+                        kd,
+                        kh,
+                        kw,
+                        sd,
+                        sh,
+                        sw,
+                        pd,
+                        ph,
+                        pw,
+                        dd,
+                        dh,
+                        dw,
+                        groups: groups_u,
+                        in_off,
+                        w_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        _p0: 0,
+                    };
+                    schedule.push(Step::ConvTranspose3d { params: p3 });
+                    let sk = conv_transpose3d_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<Conv3dParams>());
+                    let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
+            }
             Op::GroupNorm { num_groups, eps } => {
                 // NCHW: x [n,c,h,w], gamma/beta [c]. Host step (schedule-only).
                 let in_shape = &graph.node(node.inputs[0]).shape;
@@ -5513,6 +6236,842 @@ pub(crate) fn compile_static_inner(
                     inner: inner as u32,
                     is_max: matches!(node.op, Op::ArgMax { .. }),
                 });
+            }
+            Op::AxialRope2d {
+                end_x,
+                end_y,
+                head_dim,
+                num_heads,
+                theta,
+                repeat_factor,
+            } => {
+                let in_id = node.inputs[0];
+                let in_shape = &graph.node(in_id).shape;
+                let batch = in_shape.dim(0).unwrap_static() as u32;
+                let seq = in_shape.dim(1).unwrap_static() as u32;
+                let hidden = in_shape.dim(2).unwrap_static() as u32;
+                if wgpu_prefer_structure_host(&arena) {
+                    schedule.push(Step::AxialRope2dHost {
+                        src_byte_off: arena.offset(in_id) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        batch,
+                        seq,
+                        hidden,
+                        end_x: *end_x as u32,
+                        end_y: *end_y as u32,
+                        head_dim: *head_dim as u32,
+                        num_heads: *num_heads as u32,
+                        theta: *theta,
+                        repeat_factor: *repeat_factor as u32,
+                    });
+                } else {
+                    let win = vec![node.id, in_id];
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &win,
+                    );
+                    if !fits && !param_anchor {
+                        base = arena_bind_window_covering_scratch_if_needed(
+                            &arena, base, size, scratch,
+                        );
+                    }
+                    let in_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        in_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let p = AxialRope2dParams {
+                        batch,
+                        seq,
+                        hidden,
+                        end_x: *end_x as u32,
+                        end_y: *end_y as u32,
+                        head_dim: *head_dim as u32,
+                        num_heads: *num_heads as u32,
+                        repeat_factor: *repeat_factor as u32,
+                        theta: *theta,
+                        in_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        n_total: batch * seq * hidden,
+                    };
+                    schedule.push(Step::AxialRope2d { params: p });
+                    let sk = axial_rope2d_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<AxialRope2dParams>());
+                    let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
+            }
+            Op::MaxPool2dBackward {
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let x_id = node.inputs[0];
+                let dy_id = node.inputs[1];
+                let x_shape = &graph.node(x_id).shape;
+                let dy_shape = &graph.node(dy_id).shape;
+                let mp_win = vec![node.id, x_id, dy_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let mp_fits = arena_span_bytes(&arena, &mp_win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &mp_win,
+                );
+                if !mp_fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let x_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    x_id,
+                    &mut base,
+                    &mut size,
+                );
+                let dy_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    dy_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = MaxPool2dBwdParams {
+                    n: x_shape.dim(0).unwrap_static() as u32,
+                    c: x_shape.dim(1).unwrap_static() as u32,
+                    h: x_shape.dim(2).unwrap_static() as u32,
+                    w: x_shape.dim(3).unwrap_static() as u32,
+                    h_out: dy_shape.dim(2).unwrap_static() as u32,
+                    w_out: dy_shape.dim(3).unwrap_static() as u32,
+                    kh: kernel_size[0] as u32,
+                    kw: kernel_size[1] as u32,
+                    sh: stride.first().copied().unwrap_or(1) as u32,
+                    sw: stride.get(1).copied().unwrap_or(1) as u32,
+                    ph: padding.first().copied().unwrap_or(0) as u32,
+                    pw: padding.get(1).copied().unwrap_or(0) as u32,
+                    x_off,
+                    dy_off,
+                    dx_off: arena_local_off_f32(&arena, node.id, base),
+                    _p0: 0,
+                };
+                schedule.push(Step::MaxPool2dBackward { params: p });
+                let sk = maxpool2d_backward_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<MaxPool2dBwdParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::GroupNormBackwardInput { num_groups, eps }
+            | Op::GroupNormBackwardGamma { num_groups, eps }
+            | Op::GroupNormBackwardBeta { num_groups, eps } => {
+                let x_id = node.inputs[0];
+                let x_shape = &graph.node(x_id).shape;
+                let n = x_shape.dim(0).unwrap_static() as u32;
+                let c = x_shape.dim(1).unwrap_static() as u32;
+                let h = x_shape.dim(2).unwrap_static() as u32;
+                let w = x_shape.dim(3).unwrap_static() as u32;
+                let is_input = matches!(node.op, Op::GroupNormBackwardInput { .. });
+                let is_gamma = matches!(node.op, Op::GroupNormBackwardGamma { .. });
+                let win: Vec<NodeId> = if is_input {
+                    vec![
+                        node.id,
+                        x_id,
+                        node.inputs[1],
+                        node.inputs[2],
+                        node.inputs[3],
+                    ]
+                } else {
+                    // gamma/beta: [x, dy]
+                    vec![node.id, x_id, node.inputs[1]]
+                };
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let x_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    x_id,
+                    &mut base,
+                    &mut size,
+                );
+                let (gamma_off, dy_off) = if is_input {
+                    let g_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        node.inputs[1],
+                        &mut base,
+                        &mut size,
+                    );
+                    let _beta_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        node.inputs[2],
+                        &mut base,
+                        &mut size,
+                    );
+                    let dy = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        node.inputs[3],
+                        &mut base,
+                        &mut size,
+                    );
+                    (g_off, dy)
+                } else {
+                    let dy = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        node.inputs[1],
+                        &mut base,
+                        &mut size,
+                    );
+                    (0u32, dy)
+                };
+                let p = GroupNormBwdParams {
+                    n,
+                    c,
+                    h,
+                    w,
+                    num_groups: (*num_groups).max(1) as u32,
+                    eps_bits: eps.to_bits(),
+                    x_off,
+                    gamma_off,
+                    dy_off,
+                    out_off: arena_local_off_f32(&arena, node.id, base),
+                    _p0: 0,
+                    _p1: 0,
+                };
+                let (sk, step) = if is_input {
+                    (
+                        group_norm_backward_input_kernel(&dev.device),
+                        Step::GroupNormBackwardInput { params: p },
+                    )
+                } else if is_gamma {
+                    (
+                        group_norm_backward_gamma_kernel(&dev.device),
+                        Step::GroupNormBackwardGamma { params: p },
+                    )
+                } else {
+                    (
+                        group_norm_backward_beta_kernel(&dev.device),
+                        Step::GroupNormBackwardBeta { params: p },
+                    )
+                };
+                schedule.push(step);
+                let u = emit_uniform(std::mem::size_of::<GroupNormBwdParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::BatchNormInference { .. }
+            | Op::BatchNormInferenceBackwardInput { .. }
+            | Op::BatchNormInferenceBackwardGamma { .. }
+            | Op::BatchNormInferenceBackwardBeta
+            | Op::ScaledMatMul { .. }
+            | Op::ScaledQuantize { .. }
+            | Op::ScaledQuantScale { .. }
+            | Op::ScaledDequantize { .. }
+            | Op::FakeQuantizeBackward { .. }
+            | Op::FakeQuantizeLSQ { .. }
+            | Op::FakeQuantizeLSQBackwardX { .. }
+            | Op::FakeQuantizeLSQBackwardScale { .. }
+            | Op::Quantize { .. }
+            | Op::Dequantize { .. }
+            | Op::QMatMul { .. }
+            | Op::QConv2d { .. }
+            | Op::DenseSolve
+            | Op::BatchedDenseSolve
+            | Op::LoraMatMul { .. }
+            | Op::FusedConvBiasAct { .. }
+            | Op::PartitionedConv { .. }
+            | Op::CustomFn { .. } => {
+                schedule.push(Step::HostOp {
+                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+                });
+            }
+            Op::FftButterflyStage { stage, n_fft } => {
+                let state = node.inputs[0];
+                let state_shape = &graph.node(state).shape;
+                assert_eq!(
+                    state_shape.dtype(),
+                    rlx_ir::DType::F32,
+                    "rlx-wgpu Op::FftButterflyStage requires F32 state"
+                );
+                let gate = node.inputs[1];
+                let rev = node.inputs[2];
+                let tw_re = node.inputs[3];
+                let tw_im = node.inputs[4];
+                let win_ids = [node.id, state, gate, rev, tw_re, tw_im];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win_ids,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let state_raw = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    state,
+                    &mut base,
+                    &mut size,
+                );
+                let gate_raw = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    gate,
+                    &mut base,
+                    &mut size,
+                );
+                let rev_raw = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    rev,
+                    &mut base,
+                    &mut size,
+                );
+                let tw_re_raw = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    tw_re,
+                    &mut base,
+                    &mut size,
+                );
+                let tw_im_raw = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    tw_im,
+                    &mut base,
+                    &mut size,
+                );
+                let out_raw = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    node.id,
+                    &mut base,
+                    &mut size,
+                );
+                let state_off = if arena_tensor_in_window(&arena, state, base, size) {
+                    arena_local_off_f32(&arena, state, base)
+                } else {
+                    state_raw
+                };
+                let gate_off = if arena_tensor_in_window(&arena, gate, base, size) {
+                    arena_local_off_f32(&arena, gate, base)
+                } else {
+                    gate_raw
+                };
+                let rev_off = if arena_tensor_in_window(&arena, rev, base, size) {
+                    arena_local_off_f32(&arena, rev, base)
+                } else {
+                    rev_raw
+                };
+                let tw_re_off = if arena_tensor_in_window(&arena, tw_re, base, size) {
+                    arena_local_off_f32(&arena, tw_re, base)
+                } else {
+                    tw_re_raw
+                };
+                let tw_im_off = if arena_tensor_in_window(&arena, tw_im, base, size) {
+                    arena_local_off_f32(&arena, tw_im, base)
+                } else {
+                    tw_im_raw
+                };
+                let out_off = if arena_tensor_in_window(&arena, node.id, base, size) {
+                    arena_local_off_f32(&arena, node.id, base)
+                } else {
+                    out_raw
+                };
+                let batch = state_shape.dim(0).unwrap_static() as u32;
+                let half = *n_fft / 2;
+                let p = FftButterflyStageParams {
+                    batch,
+                    n_fft: *n_fft,
+                    stage: *stage,
+                    half,
+                    state_off,
+                    out_off,
+                    gate_off,
+                    rev_off,
+                    tw_re_off,
+                    tw_im_off,
+                    _p0: 0,
+                    _p1: 0,
+                };
+                schedule.push(Step::FftButterflyStage { params: p });
+                let u = emit_uniform(std::mem::size_of::<FftButterflyStageParams>());
+                let bg = bind_arena_window(
+                    &dev.device,
+                    fft_butterfly_stage_kernel(&dev.device),
+                    &arena,
+                    base,
+                    size,
+                    &u,
+                );
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            // C64 Wirtinger surface — native WGSL (mirrors CUDA
+            // `complex_wirtinger.cu`). Interleaved [re, im] pairs; `n` is the
+            // complex-element count (ComplexNormSq output is real F32).
+            Op::ComplexNormSq => {
+                let src = node.inputs[0];
+                if graph.node(src).shape.dtype() != rlx_ir::DType::C64 {
+                    panic!(
+                        "rlx-wgpu ComplexNormSq: expected C64 input, got {:?}",
+                        graph.node(src).shape.dtype()
+                    );
+                }
+                let win_ids = [node.id, src];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win_ids,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let src_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    src,
+                    &mut base,
+                    &mut size,
+                );
+                let dst_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    node.id,
+                    &mut base,
+                    &mut size,
+                );
+                let src_off = if arena_tensor_in_window(&arena, src, base, size) {
+                    arena_local_off_f32(&arena, src, base)
+                } else {
+                    src_off
+                };
+                let dst_off = if arena_tensor_in_window(&arena, node.id, base, size) {
+                    arena_local_off_f32(&arena, node.id, base)
+                } else {
+                    dst_off
+                };
+                let p = ComplexWirtingerParams {
+                    n: elems,
+                    a_off: src_off,
+                    b_off: 0,
+                    c_off: dst_off,
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                    _p3: 0,
+                };
+                schedule.push(Step::ComplexNormSq { params: p });
+                let u = emit_uniform(std::mem::size_of::<ComplexWirtingerParams>());
+                let bg = bind_arena_window(
+                    &dev.device,
+                    complex_norm_sq_kernel(&dev.device),
+                    &arena,
+                    base,
+                    size,
+                    &u,
+                );
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::ComplexNormSqBackward => {
+                let z = node.inputs[0];
+                let g = node.inputs[1];
+                if graph.node(z).shape.dtype() != rlx_ir::DType::C64 {
+                    panic!(
+                        "rlx-wgpu ComplexNormSqBackward: expected C64 z, got {:?}",
+                        graph.node(z).shape.dtype()
+                    );
+                }
+                let win_ids = [node.id, z, g];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win_ids,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let z_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    z,
+                    &mut base,
+                    &mut size,
+                );
+                let g_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    g,
+                    &mut base,
+                    &mut size,
+                );
+                let dz_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    node.id,
+                    &mut base,
+                    &mut size,
+                );
+                let z_off = if arena_tensor_in_window(&arena, z, base, size) {
+                    arena_local_off_f32(&arena, z, base)
+                } else {
+                    z_off
+                };
+                let g_off = if arena_tensor_in_window(&arena, g, base, size) {
+                    arena_local_off_f32(&arena, g, base)
+                } else {
+                    g_off
+                };
+                let dz_off = if arena_tensor_in_window(&arena, node.id, base, size) {
+                    arena_local_off_f32(&arena, node.id, base)
+                } else {
+                    dz_off
+                };
+                let p = ComplexWirtingerParams {
+                    n: elems,
+                    a_off: z_off,
+                    b_off: g_off,
+                    c_off: dz_off,
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                    _p3: 0,
+                };
+                schedule.push(Step::ComplexNormSqBackward { params: p });
+                let u = emit_uniform(std::mem::size_of::<ComplexWirtingerParams>());
+                let bg = bind_arena_window(
+                    &dev.device,
+                    complex_norm_sq_backward_kernel(&dev.device),
+                    &arena,
+                    base,
+                    size,
+                    &u,
+                );
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::Conjugate => {
+                let src = node.inputs[0];
+                if graph.node(src).shape.dtype() != rlx_ir::DType::C64 {
+                    panic!(
+                        "rlx-wgpu Conjugate: expected C64 input, got {:?}",
+                        graph.node(src).shape.dtype()
+                    );
+                }
+                let win_ids = [node.id, src];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win_ids,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let src_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    src,
+                    &mut base,
+                    &mut size,
+                );
+                let dst_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    node.id,
+                    &mut base,
+                    &mut size,
+                );
+                let src_off = if arena_tensor_in_window(&arena, src, base, size) {
+                    arena_local_off_f32(&arena, src, base)
+                } else {
+                    src_off
+                };
+                let dst_off = if arena_tensor_in_window(&arena, node.id, base, size) {
+                    arena_local_off_f32(&arena, node.id, base)
+                } else {
+                    dst_off
+                };
+                let p = ComplexWirtingerParams {
+                    n: elems,
+                    a_off: src_off,
+                    b_off: 0,
+                    c_off: dst_off,
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                    _p3: 0,
+                };
+                schedule.push(Step::ConjugateC64 { params: p });
+                let u = emit_uniform(std::mem::size_of::<ComplexWirtingerParams>());
+                let bg = bind_arena_window(
+                    &dev.device,
+                    conjugate_c64_kernel(&dev.device),
+                    &arena,
+                    base,
+                    size,
+                    &u,
+                );
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::FakeQuantize {
+                bits,
+                axis,
+                ste: _,
+                scale_mode,
+            } => {
+                use rlx_ir::op::ScaleMode;
+                let q_max = match *bits {
+                    8 => 127.0f32,
+                    4 => 7.0,
+                    2 => 1.0,
+                    n => panic!("rlx-wgpu FakeQuantize: unsupported bits {n}"),
+                };
+                // EMA needs mutable running-scale state — keep HostOp.
+                if matches!(scale_mode, ScaleMode::EMA { .. }) {
+                    schedule.push(Step::HostOp {
+                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+                    });
+                    continue;
+                }
+                let in_id = node.inputs[0];
+                // Mirror `rlx_cpu::thunk::ops::quant::quant_layout`.
+                let (chan_dim, inner) = match *axis {
+                    None => (1usize, node.shape.num_elements().unwrap_or(0).max(1)),
+                    Some(d) => {
+                        let chan_dim = node.shape.dim(d).unwrap_static();
+                        let inner: usize = (d + 1..node.shape.rank())
+                            .map(|i| node.shape.dim(i).unwrap_static())
+                            .product::<usize>()
+                            .max(1);
+                        (chan_dim, inner)
+                    }
+                };
+                let n = node.shape.num_elements().unwrap() as u32;
+                let chan_dim = chan_dim as u32;
+                let inner = inner as u32;
+
+                let mut win = vec![node.id, in_id];
+                if matches!(scale_mode, ScaleMode::Fixed) {
+                    win.push(node.inputs[1]);
+                }
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let in_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    in_id,
+                    &mut base,
+                    &mut size,
+                );
+                let scale_off = match scale_mode {
+                    ScaleMode::Fixed => arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        node.inputs[1],
+                        &mut base,
+                        &mut size,
+                    ),
+                    ScaleMode::PerBatch | ScaleMode::EMA { .. } => 0,
+                };
+                let p = FakeQuantizeParams {
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max,
+                    in_off,
+                    scale_off,
+                    out_off: arena_local_off_f32(&arena, node.id, base),
+                    _pad: 0,
+                };
+                let (sk, step) = match scale_mode {
+                    ScaleMode::Fixed => (
+                        fake_quantize_fixed_kernel(&dev.device),
+                        Step::FakeQuantizeFixed { params: p },
+                    ),
+                    ScaleMode::PerBatch => (
+                        fake_quantize_perbatch_kernel(&dev.device),
+                        Step::FakeQuantizePerBatch { params: p },
+                    ),
+                    ScaleMode::EMA { .. } => unreachable!(),
+                };
+                schedule.push(step);
+                let u = emit_uniform(std::mem::size_of::<FakeQuantizeParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
             }
             // Core Riemannian / SPD-manifold ops — no WGSL eigen kernel, so
             // they host-fallback to `rlx_cpu::spd` (F64) via a readback of
@@ -6529,6 +8088,33 @@ pub(crate) fn compile_static_inner(
                     // would shift every later GPU op's lane — fatal in the
                     // packed decode graph where GGUF ops interleave with
                     // RmsNorm/RoPE/Attention/SwiGLU. Do NOT push.
+                } else if matches!(
+                    scheme,
+                    QuantScheme::Int8Block { .. } | QuantScheme::Int8BlockAsym { .. }
+                ) && crate::device::coop_discrete_backend()
+                {
+                    // Discrete Vulkan/DX12: SPIR-V Int8 dequant is wrong on
+                    // NVIDIA (Kitten NSF mush). Host like rlx-vulkan non-GGUF.
+                    // Metal wgpu keeps the GPU kernel below.
+                    let (block_size, is_asymmetric) = match scheme {
+                        QuantScheme::Int8Block { block_size } => (*block_size, false),
+                        QuantScheme::Int8BlockAsym { block_size } => (*block_size, true),
+                        _ => unreachable!(),
+                    };
+                    let scale_id = node.inputs[2];
+                    let zp_id = node.inputs[3];
+                    schedule.push(Step::DequantMatmulInt8Host {
+                        m,
+                        k,
+                        n,
+                        block_size,
+                        is_asymmetric,
+                        x_byte_off: arena.offset(x_id) as u64,
+                        w_byte_off: arena.offset(w_id) as u64,
+                        scale_byte_off: arena.offset(scale_id) as u64,
+                        zp_byte_off: arena.offset(zp_id) as u64,
+                        out_byte_off: arena.offset(node.id) as u64,
+                    });
                 } else {
                     let (block_size, scheme_id) = match scheme {
                         QuantScheme::Int8Block { block_size } => (*block_size, 0u32),

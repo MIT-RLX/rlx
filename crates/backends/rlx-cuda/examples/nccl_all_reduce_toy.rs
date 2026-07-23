@@ -30,9 +30,8 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    let id_file = PathBuf::from(
-        std::env::var("ID_FILE").unwrap_or_else(|_| "/tmp/rlx_nccl_id.bin".into()),
-    );
+    let id_file =
+        PathBuf::from(std::env::var("ID_FILE").unwrap_or_else(|_| "/tmp/rlx_nccl_id.bin".into()));
     let n: usize = std::env::var("N")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -73,7 +72,9 @@ fn main() {
     rlx_cuda::distributed::init_and_register(group_id, stream.clone(), rank, world, id)
         .expect("init_and_register");
 
-    let host: Vec<f32> = (0..n).map(|i| (rank as f32 + 1.0) * (i as f32 + 1.0)).collect();
+    let host: Vec<f32> = (0..n)
+        .map(|i| (rank as f32 + 1.0) * (i as f32 + 1.0))
+        .collect();
     let mut buf = stream.alloc_zeros::<f32>(n).expect("alloc");
     stream.memcpy_htod(&host, &mut buf).expect("htod");
 
@@ -97,7 +98,10 @@ fn main() {
         }
     }
     if ok {
-        println!("rank {rank}/{world}: all_reduce ok n={n} out[0]={:.3}", out[0]);
+        println!(
+            "rank {rank}/{world}: all_reduce ok n={n} out[0]={:.3}",
+            out[0]
+        );
     } else {
         std::process::exit(1);
     }

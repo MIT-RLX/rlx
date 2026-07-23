@@ -3,13 +3,13 @@
 Google TPU backend for RLX. Drives `libtpu.so` (the same library JAX
 and PyTorch-XLA dlopen) directly from Rust — no Python.
 
-## Status: full inference op parity with rlx-cuda / rlx-rocm; off-TPU numerical + parse validation in Docker
+## Status: full **153/`OpKind`** claim parity with CUDA/ROCm; off-TPU numerical + parse validation in Docker
 
 Compiles on any host. `is_available()` returns true iff a libtpu /
 libpjrt-compatible plugin is on the loader path **and**
 `Plugin_Initialize` + `Client_Create` succeed. `TpuExecutable::compile`
 emits HLO and calls `PJRT_Client_Compile`; `run` executes through
-`PJRT_LoadedExecutable_Execute`.
+`PJRT_LoadedExecutable_Execute`. See [`docs/op-coverage.md`](../../docs/op-coverage.md).
 
 ## How it works
 
@@ -47,8 +47,11 @@ hlo.rs     — HloModuleProto / HloComputationProto / HloInstructionProto
 unfuse.rs  — composite ops (FusedSwiGLU, FusedAttentionBlock,
              FusedTransformerLayer, LoraMatMul, If, While, rank-3
              Attention) decomposed before lowering
-lower/     — Graph → HLO walker covering ~40 ops (LowerCtx split into
-             per-topic submodules; see lower/mod.rs)
+lower/     — Graph → HLO walker + compose helpers (`compose_ops` /
+             `compose_bwd`); full OpKind claim via HLO / unfuse / host
+             segments (see `host_ops.rs`)
+host_ops.rs — remaining host-segment ops (DenseSolve, FftButterflyStage,
+             SPD/Eigh, ScaledQuantize, splat prepare/rasterize, …)
 backend.rs — TpuExecutable: compile, set_param, run; param-cache,
              buffer drain, executable destroy on Drop
 ```
@@ -147,10 +150,14 @@ Tier-3 ops (all lowered, full parity with rlx-cuda / rlx-rocm):
   with `dynamic-slice` on the inputs and `dynamic-update-slice` on
   the outputs each step.
 
-Backward / training ops (`ReluBackward`, `LayerNormBackward*`,
-`Conv2dBackward*`, `MaxPool2dBackward`, `SoftmaxCrossEntropy*`)
-are explicitly out of scope — rlx-tpu is inference-only, like the
-TPU-class targets in rlx-cuda / rlx-rocm.
+Backward / training: many ops compose to HLO (`LayerNorm`/`RmsNorm`/
+`GroupNorm`/`Rope`/`Cumsum`/`Gather`/`Conv2d`/`MaxPool2d` bwd, FakeQuantize*).
+`AttentionBackward` expands via autodiff decompose to MatMul/Softmax before
+HLO. Still host-segmented: `FftButterflyStage`, `DenseSolve` (LAPACK),
+`ScaledQuantize` / non-PerTensor-FP8 Scaled*, SPD / scan residuals. See
+`host_ops::is_host_op`. `AxialRope2d` / `Im2Col` / `ConvTranspose*` /
+PerTensor 8-bit `ScaledMatMul`/`ScaledQuantScale`/`ScaledDequantize` compose
+to HLO.
 
 ## Install
 

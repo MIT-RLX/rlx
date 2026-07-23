@@ -1,0 +1,48 @@
+#version 450
+// RoPE backward (NeoX rotate-half pairing). One invocation per element of dx.
+// Cos/sin table rows indexed by seq position; dims [n_rot, head_dim) pass through.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint seq;
+    uint hidden;
+    uint head_dim;
+    uint n_rot;
+    uint dy_off;
+    uint cos_off;
+    uint sin_off;
+    uint dx_off;
+    uint cos_len;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = pc.batch * pc.seq * pc.hidden;
+    if (i >= total) { return; }
+
+    uint nh = pc.hidden / pc.head_dim;
+    uint d = i % pc.head_dim;
+    uint q1 = i / pc.head_dim;
+    uint hi = q1 % nh;
+    uint q2 = q1 / nh;
+    uint si = q2 % pc.seq;
+    uint bi = q2 / pc.seq;
+    uint rot_half = pc.n_rot / 2u;
+    uint half_dh = pc.head_dim / 2u;
+    uint tab_off = (si * half_dh) % max(pc.cos_len, 1u);
+
+    uint dy_base = pc.dy_off + bi * pc.seq * pc.hidden + si * pc.hidden + hi * pc.head_dim;
+    uint dx_base = pc.dx_off + bi * pc.seq * pc.hidden + si * pc.hidden + hi * pc.head_dim;
+
+    if (d < rot_half) {
+        float y1 = arena_load(dy_base + d);
+        float y2 = arena_load(dy_base + rot_half + d);
+        float c = arena_load(pc.cos_off + tab_off + d);
+        float s = arena_load(pc.sin_off + tab_off + d);
+        arena_store(dx_base + d, y1 * c + y2 * s);
+        arena_store(dx_base + rot_half + d, -y1 * s + y2 * c);
+    } else if (d >= pc.n_rot) {
+        arena_store(dx_base + d, arena_load(dy_base + d));
+    }
+}

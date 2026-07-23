@@ -135,6 +135,7 @@ fn activation_grad_ref(kind: Activation, x: f32, dy: f32) -> f32 {
             dy * (1.0 + t * t)
         }
         Activation::Atan => dy / (1.0 + x * x),
+        Activation::Recip => -dy / (x * x),
     }
 }
 

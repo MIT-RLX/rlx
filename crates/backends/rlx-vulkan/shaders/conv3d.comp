@@ -1,0 +1,62 @@
+#version 450
+// 3-D NCDHW conv. Weight: [c_out, c_in/groups, kd, kh, kw].
+// One invocation per output element. Port of wgpu conv3d.wgsl.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint nn; uint cin; uint cout;
+    uint d; uint h; uint w;
+    uint d_out; uint h_out; uint w_out;
+    uint kd; uint kh; uint kw;
+    uint sd; uint sh; uint sw;
+    uint pd; uint ph; uint pw;
+    uint dd; uint dh; uint dw;
+    uint groups;
+    uint in_off; uint w_off; uint out_off;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = pc.nn * pc.cout * pc.d_out * pc.h_out * pc.w_out;
+    if (gid >= total) { return; }
+    uint wo = gid % pc.w_out;
+    uint q1 = gid / pc.w_out;
+    uint ho = q1 % pc.h_out;
+    uint q2 = q1 / pc.h_out;
+    uint do_ = q2 % pc.d_out;
+    uint q3 = q2 / pc.d_out;
+    uint co = q3 % pc.cout;
+    uint n = q3 / pc.cout;
+
+    uint cin_pg = pc.cin / pc.groups;
+    uint cout_pg = pc.cout / pc.groups;
+    uint g = co / cout_pg;
+    uint ci_start = g * cin_pg;
+
+    float acc = 0.0;
+    for (uint ci_off = 0u; ci_off < cin_pg; ci_off++) {
+        uint ci = ci_start + ci_off;
+        for (uint kd = 0u; kd < pc.kd; kd++) {
+            for (uint kh = 0u; kh < pc.kh; kh++) {
+                for (uint kw = 0u; kw < pc.kw; kw++) {
+                    int in_d_s = int(do_ * pc.sd + kd * pc.dd) - int(pc.pd);
+                    int in_h_s = int(ho * pc.sh + kh * pc.dh) - int(pc.ph);
+                    int in_w_s = int(wo * pc.sw + kw * pc.dw) - int(pc.pw);
+                    if (in_d_s < 0 || in_h_s < 0 || in_w_s < 0
+                        || in_d_s >= int(pc.d)
+                        || in_h_s >= int(pc.h)
+                        || in_w_s >= int(pc.w)) {
+                        continue;
+                    }
+                    uint id = uint(in_d_s);
+                    uint ih = uint(in_h_s);
+                    uint iw = uint(in_w_s);
+                    uint in_idx = (((n * pc.cin + ci) * pc.d + id) * pc.h + ih) * pc.w + iw;
+                    uint w_idx = (((co * cin_pg + ci_off) * pc.kd + kd) * pc.kh + kh) * pc.kw + kw;
+                    acc += arena_load(pc.in_off + in_idx) * arena_load(pc.w_off + w_idx);
+                }
+            }
+        }
+    }
+    arena_store(pc.out_off + gid, acc);
+}

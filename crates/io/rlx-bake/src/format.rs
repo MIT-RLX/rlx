@@ -93,7 +93,7 @@ pub struct RlxFile {
     pub meta: RlxMeta,
     pub graph: Graph,
     /// Authoritative weight table. With [`crate::MemoryMode::Compact`], this holds
-/// the bytes while graph Constants are empty until `materialize_weights`.
+    /// the bytes while graph Constants are empty until `materialize_weights`.
     pub weights: Vec<RlxWeight>,
 }
 
@@ -190,11 +190,7 @@ pub fn write_rlx(path: impl AsRef<Path>, file: &RlxFile) -> Result<()> {
 ///
 /// Requires the `encrypt` cargo feature.
 #[cfg(feature = "encrypt")]
-pub fn write_rlx_encrypted(
-    path: impl AsRef<Path>,
-    file: &RlxFile,
-    password: &str,
-) -> Result<()> {
+pub fn write_rlx_encrypted(path: impl AsRef<Path>, file: &RlxFile, password: &str) -> Result<()> {
     let path = path.as_ref();
     let plain = to_bytes(file).context("serializing *.rlx")?;
     let enc = crate::crypto::encrypt_bytes(&plain, password).context("encrypting *.rlx")?;
@@ -218,8 +214,8 @@ pub fn read_rlx_mmap(path: impl AsRef<Path>) -> Result<RlxFile> {
     let path = path.as_ref();
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     // Safety: read-only map of a local artifact file for the duration of parse.
-    let map = unsafe { memmap2::Mmap::map(&file) }
-        .with_context(|| format!("mmap {}", path.display()))?;
+    let map =
+        unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
     parse_rlx_bytes(&map, path)
 }
 

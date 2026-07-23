@@ -41,7 +41,9 @@ pub fn run_collective(
 ) {
     #[cfg(feature = "nccl")]
     {
-        if try_nccl(stream, buffer, name, in_off, in_len, out_off, out_len, attrs) {
+        if try_nccl(
+            stream, buffer, name, in_off, in_len, out_off, out_len, attrs,
+        ) {
             return;
         }
     }
@@ -116,11 +118,9 @@ fn try_nccl(
                 return false;
             };
             match distributed::try_all_to_all_equal_f32(&send_tmp, &mut recv_tmp, attrs) {
-                Ok(true) => {
-                    stream
-                        .memcpy_dtod(&recv_tmp, &mut buffer.slice_mut(out_off..out_off + out_len))
-                        .is_ok()
-                }
+                Ok(true) => stream
+                    .memcpy_dtod(&recv_tmp, &mut buffer.slice_mut(out_off..out_off + out_len))
+                    .is_ok(),
                 Ok(false) => false,
                 Err(e) => {
                     eprintln!("rlx-cuda: NCCL all_to_all failed ({e}); falling back to host");

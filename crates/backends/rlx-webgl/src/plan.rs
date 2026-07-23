@@ -7,7 +7,7 @@
 
 use crate::{Result, WebglError};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, ReduceOp};
-use rlx_ir::{Dim, DType, Graph, NodeId, Op, OpKind};
+use rlx_ir::{DType, Dim, Graph, NodeId, Op, OpKind};
 use std::collections::{HashMap, HashSet};
 
 /// Pointwise activation kinds rlx-webgl can evaluate (forward + backward).
@@ -25,6 +25,7 @@ pub enum Act {
     Sin,
     Cos,
     Silu,
+    Recip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -350,6 +351,7 @@ fn map_act(a: Activation) -> Result<Act> {
         Activation::Sin => Act::Sin,
         Activation::Cos => Act::Cos,
         Activation::Silu => Act::Silu,
+        Activation::Recip => Act::Recip,
         other => return Err(WebglError(format!("activation {other:?} not supported"))),
     })
 }
@@ -669,8 +671,8 @@ fn lower(graph: &Graph) -> Result<Plan> {
                         // so total(dims) is the complex-element count either way.
                         let n = total(&dims);
                         let mode: u32 = match (src_dt, dst) {
-                            (s, DType::C64) if !s.is_complex() => 0, // real → C64
-                            (DType::C64, d) if !d.is_complex() => 1, // C64 → real
+                            (s, DType::C64) if !s.is_complex() => 0,  // real → C64
+                            (DType::C64, d) if !d.is_complex() => 1,  // C64 → real
                             (s, DType::C128) if !s.is_complex() => 2, // real → C128
                             (DType::C128, d) if !d.is_complex() => 3, // C128 → real
                             (DType::C64, DType::C128) => 4,

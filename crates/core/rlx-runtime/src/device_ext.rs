@@ -658,6 +658,7 @@ mod tests {
             Activation::Cos,
             Activation::Tan,
             Activation::Atan,
+            Activation::Recip,
             Activation::Exp,
         ] {
             assert!(

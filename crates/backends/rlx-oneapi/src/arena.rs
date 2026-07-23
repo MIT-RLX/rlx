@@ -53,6 +53,12 @@ impl Arena {
         self.offsets.contains_key(&id)
     }
 
+    /// Byte offset of a node's slot in the USM arena.
+    #[inline]
+    pub fn byte_offset(&self, id: NodeId) -> usize {
+        self.offsets[&id]
+    }
+
     /// Element offset (f32) of a node's slot — what the kernels index by.
     #[inline]
     pub fn elem_offset(&self, id: NodeId) -> u32 {

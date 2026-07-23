@@ -17,11 +17,9 @@ impl Backend for CpuBackend {
         use rlx_opt::pass::Pass as _;
         static ONNX_KERNELS: std::sync::Once = std::sync::Once::new();
         ONNX_KERNELS.call_once(rlx_cpu::onnx_ref::register_onnx_reference_kernels);
-        // Lower Op::If / Op::While to primitives BEFORE legalize
-        // so the supported-op check doesn't reject them — the CPU
-        // backend has no native sub-graph executor; this rewrite
-        // makes If/While invisible to the rest of the pipeline.
-        // No-op when neither op is in the graph.
+        // Claimed `Op::If` / `Op::While` → primitives before legalize (CPU has
+        // no native sub-graph executor). Also runs again in the fusion
+        // pipeline; no-op when neither op is present.
         let graph = rlx_opt::LowerControlFlow.run(graph);
         // Lower f32 SPD-manifold ops (ReEig/LogEig/BiMap/SpdBatchNorm) to the
         // graph-primitive Jacobi eigensolver BEFORE legalize — like If/While,
@@ -52,6 +50,10 @@ impl Backend for CpuBackend {
         );
         crate::stages::maybe_log_fusion(&compile_result.fusion);
         let fused = compile_result.lir.into_graph();
+        // FusedConvBiasAct / PartitionedConv / FusedTransformerLayer /
+        // TransformRegion / BatchElementwiseRegion may survive fusion now
+        // that they are claimed — expand to primitives the thunk path runs.
+        let fused = rlx_cpu::prepare_graph_for_thunks(fused);
 
         // Apply precision policy AFTER fusion — Cast nodes don't disrupt
         // the now-flattened fused ops.
@@ -97,6 +99,9 @@ impl Backend for CpuBackend {
         };
         let alignment = lir.buffers.alignment.max(options.arena_alignment);
         let mut graph = lir.into_graph();
+        // Session path: fusion may leave claimed fused/region ops in LIR;
+        // expand before broadcast legalize + arena plan + thunks.
+        graph = rlx_cpu::prepare_graph_for_thunks(graph);
         {
             use rlx_opt::pass::Pass as _;
             graph = rlx_opt::LegalizeBroadcast.run(graph);

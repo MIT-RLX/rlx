@@ -128,7 +128,15 @@ fn ref_loss(inp: &[Vec<f32>; 5], b: usize, s: usize, h: usize, n: usize) -> f64 
 
 /// Central finite-difference gradient of `ref_loss` w.r.t. input array
 /// `k` (0=x,1=delta,2=a,3=b,4=c).
-fn fd_grad(inp: &[Vec<f32>; 5], k: usize, eps: f32, b: usize, s: usize, h: usize, n: usize) -> Vec<f32> {
+fn fd_grad(
+    inp: &[Vec<f32>; 5],
+    k: usize,
+    eps: f32,
+    b: usize,
+    s: usize,
+    h: usize,
+    n: usize,
+) -> Vec<f32> {
     let mut out = vec![0f32; inp[k].len()];
     for i in 0..inp[k].len() {
         let mut plus = inp.clone();

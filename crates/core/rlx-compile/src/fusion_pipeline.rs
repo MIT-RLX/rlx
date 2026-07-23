@@ -265,9 +265,7 @@ pub fn fusion_passes_for_supported(
     // `RLX_DISABLE_CONV_BIAS_ACT_FUSION=1` skips it (ablation / A-B benchmarking
     // vs the unfused conv+bias+act path). `FuseConvAffineAct` folds a
     // host-pre-folded BatchNorm affine (`conv→Mul→Add→relu`) into the same op.
-    if supports_op(supported, OpKind::FusedConvBiasAct)
-        && !opts.disable_conv_bias_act_fusion
-    {
+    if supports_op(supported, OpKind::FusedConvBiasAct) && !opts.disable_conv_bias_act_fusion {
         passes.push(&FuseConvBiasAct);
         passes.push(&FuseConvAffineAct);
     }

@@ -268,7 +268,11 @@ fn cpu_expand_bytes(in_dims: &[usize], out_dims: &[usize], dt: DType, in_bytes: 
     let mut g = Graph::new("cexp_ref");
     let x = g.input("x", Shape::new(in_dims, dt));
     let tgt: Vec<i64> = out_dims.iter().map(|&d| d as i64).collect();
-    let y = g.add_node(Op::Expand { target_shape: tgt }, vec![x], Shape::new(out_dims, dt));
+    let y = g.add_node(
+        Op::Expand { target_shape: tgt },
+        vec![x],
+        Shape::new(out_dims, dt),
+    );
     g.set_outputs(vec![y]);
     let mut c = rlx_runtime::Session::new(rlx_runtime::Device::Cpu).compile(g);
     c.run_typed(&[("x", in_bytes, dt)]).remove(0).0
@@ -277,12 +281,21 @@ fn cpu_expand_bytes(in_dims: &[usize], out_dims: &[usize], dt: DType, in_bytes: 
 /// webgl candidate: complex `Expand` through `build_plan` + `run_cpu`. Feeds f32
 /// lanes (widened from native bytes) and re-narrows the output lanes to NATIVE
 /// bytes, so the comparison is in the same representation rlx-cpu emits.
-fn webgl_expand_bytes(in_dims: &[usize], out_dims: &[usize], dt: DType, in_bytes: &[u8]) -> Vec<u8> {
+fn webgl_expand_bytes(
+    in_dims: &[usize],
+    out_dims: &[usize],
+    dt: DType,
+    in_bytes: &[u8],
+) -> Vec<u8> {
     let lanes_in = widen_bytes_to_f32(in_bytes, dt);
     let mut g = Graph::new("cexp_webgl");
     let x = g.input("x", Shape::new(in_dims, dt));
     let tgt: Vec<i64> = out_dims.iter().map(|&d| d as i64).collect();
-    let y = g.add_node(Op::Expand { target_shape: tgt }, vec![x], Shape::new(out_dims, dt));
+    let y = g.add_node(
+        Op::Expand { target_shape: tgt },
+        vec![x],
+        Shape::new(out_dims, dt),
+    );
     g.set_outputs(vec![y]);
     let plan = rlx_webgl::build_plan(&g).expect("plan");
     let lanes_out = rlx_webgl::run_cpu(&plan, &[("x", &lanes_in)])
@@ -297,13 +310,19 @@ fn expand_complex_materialized() {
     let c64 = [1.5f32, 2.5, -3.0, 4.0];
     let cpu = cpu_expand_bytes(&[1, 2], &[3, 2], DType::C64, &c64_bytes(&c64));
     let webgl = webgl_expand_bytes(&[1, 2], &[3, 2], DType::C64, &c64_bytes(&c64));
-    assert_eq!(webgl, cpu, "C64 materialized Expand [1,2]->[3,2] webgl vs cpu mismatch");
+    assert_eq!(
+        webgl, cpu,
+        "C64 materialized Expand [1,2]->[3,2] webgl vs cpu mismatch"
+    );
 
     // C128[2,1] -> [2,3]: broadcast the INNER dim (f32-exact df64 values).
     let c128 = [1.5f64, -2.5, 3.25, -4.75];
     let cpu = cpu_expand_bytes(&[2, 1], &[2, 3], DType::C128, &c128_bytes(&c128));
     let webgl = webgl_expand_bytes(&[2, 1], &[2, 3], DType::C128, &c128_bytes(&c128));
-    assert_eq!(webgl, cpu, "C128 materialized Expand [2,1]->[2,3] webgl vs cpu mismatch");
+    assert_eq!(
+        webgl, cpu,
+        "C128 materialized Expand [2,1]->[2,3] webgl vs cpu mismatch"
+    );
 }
 
 // --- Other element-indexed movement ops must be lane-aware too ----------------
@@ -371,7 +390,11 @@ fn concat_complex() {
         let mut g = Graph::new("ccat_ref");
         let x = g.input("a", Shape::new(&[2], DType::C64));
         let y = g.input("b", Shape::new(&[3], DType::C64));
-        let z = g.add_node(Op::Concat { axis: 0 }, vec![x, y], Shape::new(&[5], DType::C64));
+        let z = g.add_node(
+            Op::Concat { axis: 0 },
+            vec![x, y],
+            Shape::new(&[5], DType::C64),
+        );
         g.set_outputs(vec![z]);
         let mut c = rlx_runtime::Session::new(rlx_runtime::Device::Cpu).compile(g);
         c.run_typed(&[
@@ -387,7 +410,11 @@ fn concat_complex() {
         let mut g = Graph::new("ccat_webgl");
         let x = g.input("a", Shape::new(&[2], DType::C64));
         let y = g.input("b", Shape::new(&[3], DType::C64));
-        let z = g.add_node(Op::Concat { axis: 0 }, vec![x, y], Shape::new(&[5], DType::C64));
+        let z = g.add_node(
+            Op::Concat { axis: 0 },
+            vec![x, y],
+            Shape::new(&[5], DType::C64),
+        );
         g.set_outputs(vec![z]);
         let plan = rlx_webgl::build_plan(&g).expect("plan");
         let out = rlx_webgl::run_cpu(&plan, &[("a", &al), ("b", &bl)])
@@ -411,7 +438,11 @@ fn gather_complex() {
         let mut g = Graph::new("cgat_ref");
         let t = g.input("t", Shape::new(&[4], DType::C64));
         let ix = g.input("ix", Shape::new(&[4], DType::I64));
-        let z = g.add_node(Op::Gather { axis: 0 }, vec![t, ix], Shape::new(&[4], DType::C64));
+        let z = g.add_node(
+            Op::Gather { axis: 0 },
+            vec![t, ix],
+            Shape::new(&[4], DType::C64),
+        );
         g.set_outputs(vec![z]);
         let mut c = rlx_runtime::Session::new(rlx_runtime::Device::Cpu).compile(g);
         c.run_typed(&[
@@ -427,7 +458,11 @@ fn gather_complex() {
         let mut g = Graph::new("cgat_webgl");
         let t = g.input("t", Shape::new(&[4], DType::C64));
         let ix = g.input("ix", Shape::new(&[4], DType::I64));
-        let z = g.add_node(Op::Gather { axis: 0 }, vec![t, ix], Shape::new(&[4], DType::C64));
+        let z = g.add_node(
+            Op::Gather { axis: 0 },
+            vec![t, ix],
+            Shape::new(&[4], DType::C64),
+        );
         g.set_outputs(vec![z]);
         let plan = rlx_webgl::build_plan(&g).expect("plan");
         let out = rlx_webgl::run_cpu(&plan, &[("t", &tl), ("ix", &il)])

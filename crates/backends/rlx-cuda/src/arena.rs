@@ -397,7 +397,10 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
             if let Some(&pin) = node.inputs.first() {
                 let de = *death.get(&root(node.id)).unwrap_or(&n);
                 let p = root(pin);
-                death.entry(p).and_modify(|d| *d = (*d).max(de)).or_insert(de);
+                death
+                    .entry(p)
+                    .and_modify(|d| *d = (*d).max(de))
+                    .or_insert(de);
             }
         }
     }

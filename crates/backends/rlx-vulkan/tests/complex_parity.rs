@@ -215,7 +215,10 @@ fn cast_c64_c128_both_ways() {
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "lane count mismatch: {a:?} vs {b:?}");
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 /// Max complex relative error over N elements (lanes `[re, im]`).
 fn max_rel_complex(a: &[f32], b: &[f32]) -> f32 {
@@ -262,7 +265,10 @@ fn c64_mul_div_close() {
         let cpu = cpu_binary_c64_lanes(n, n, n, op, &c64_bytes(&a), &c64_bytes(&b));
         let gpu = vulkan_binary_c64_lanes(n, n, n, op, &c64_bytes(&a), &c64_bytes(&b));
         let rel = max_rel_complex(&gpu, &cpu);
-        assert!(rel <= 1e-6, "C64 {op:?} rel err {rel} > 1e-6\ncpu={cpu:?}\ngpu={gpu:?}");
+        assert!(
+            rel <= 1e-6,
+            "C64 {op:?} rel err {rel} > 1e-6\ncpu={cpu:?}\ngpu={gpu:?}"
+        );
     }
 }
 
@@ -277,16 +283,35 @@ fn c64_scalar_vector_broadcast_mul() {
     let scalar = [2.0f32, -1.0]; // (2 - i)
     let vec = [1.0f32, 1.0, -2.0, 0.5, 0.0, 3.0];
     let n = 3;
-    let cpu =
-        cpu_binary_c64_lanes(n, 1, n, BinaryOp::Mul, &c64_bytes(&scalar), &c64_bytes(&vec));
-    let gpu =
-        vulkan_binary_c64_lanes(n, 1, n, BinaryOp::Mul, &c64_bytes(&scalar), &c64_bytes(&vec));
+    let cpu = cpu_binary_c64_lanes(
+        n,
+        1,
+        n,
+        BinaryOp::Mul,
+        &c64_bytes(&scalar),
+        &c64_bytes(&vec),
+    );
+    let gpu = vulkan_binary_c64_lanes(
+        n,
+        1,
+        n,
+        BinaryOp::Mul,
+        &c64_bytes(&scalar),
+        &c64_bytes(&vec),
+    );
     // Mul is not bit-exact (FMA/order), but a scalar×vector has small enough
     // magnitudes here that both back-ends agree closely.
     let rel = max_rel_complex(&gpu, &cpu);
-    assert!(rel <= 1e-6, "C64 broadcast mul rel err {rel} > 1e-6\ncpu={cpu:?}\ngpu={gpu:?}");
+    assert!(
+        rel <= 1e-6,
+        "C64 broadcast mul rel err {rel} > 1e-6\ncpu={cpu:?}\ngpu={gpu:?}"
+    );
     // Sanity: element 0 = (2-i)(1+i) = 3 + i.
-    assert!(max_abs(&gpu[0..2], &[3.0, 1.0]) < 1e-5, "broadcast mul elem0 {:?}", &gpu[0..2]);
+    assert!(
+        max_abs(&gpu[0..2], &[3.0, 1.0]) < 1e-5,
+        "broadcast mul elem0 {:?}",
+        &gpu[0..2]
+    );
 }
 
 // ── Gate 3: df64 boundary round-trip ──────────────────────────────────────
@@ -316,7 +341,13 @@ fn df64_boundary_round_trip() {
     for (k, &r) in reals.iter().enumerate() {
         let re = f64::from_le_bytes(back[k * 16..k * 16 + 8].try_into().unwrap());
         let im = f64::from_le_bytes(back[k * 16 + 8..k * 16 + 16].try_into().unwrap());
-        let rel = |a: f64, b: f64| if b == 0.0 { a.abs() } else { (a - b).abs() / b.abs() };
+        let rel = |a: f64, b: f64| {
+            if b == 0.0 {
+                a.abs()
+            } else {
+                (a - b).abs() / b.abs()
+            }
+        };
         assert!(rel(re, r) <= 1e-14, "re[{k}]={re} vs {r}");
         assert!(rel(im, -r * 0.5) <= 1e-14, "im[{k}]={im} vs {}", -r * 0.5);
     }
@@ -326,7 +357,11 @@ fn df64_boundary_round_trip() {
         h.extend_from_slice(&exact.to_le_bytes());
         h.extend_from_slice(&0.0f64.to_le_bytes());
         let l = widen_bytes_to_f32(&h, DType::C128);
-        assert_eq!(narrow_f32_to_bytes(&l, DType::C128), h, "f32-exact {exact} not bit-exact");
+        assert_eq!(
+            narrow_f32_to_bytes(&l, DType::C128),
+            h,
+            "f32-exact {exact} not bit-exact"
+        );
     }
 }
 
@@ -344,10 +379,18 @@ fn slot_sizing_c64_c128() {
     // C64 output slot must read back 2N lanes (8N bytes) — a `elems * 4` slot
     // sizing would truncate it to N (the imaginary lanes would be dropped).
     let (_, c64_lanes) = vulkan_cast_bytes(n, DType::F32, DType::C64, &f32_bytes(&reals));
-    assert_eq!(c64_lanes, 2 * n, "C64[{n}] must read back 2N f32 lanes (8N bytes)");
+    assert_eq!(
+        c64_lanes,
+        2 * n,
+        "C64[{n}] must read back 2N f32 lanes (8N bytes)"
+    );
     // C128 output slot must read back 4N lanes (16N bytes).
     let (_, c128_lanes) = vulkan_cast_bytes(n, DType::F32, DType::C128, &f32_bytes(&reals));
-    assert_eq!(c128_lanes, 4 * n, "C128[{n}] must read back 4N f32 lanes (16N bytes)");
+    assert_eq!(
+        c128_lanes,
+        4 * n,
+        "C128[{n}] must read back 4N f32 lanes (16N bytes)"
+    );
 }
 
 // ── Gate 5: materialized complex Expand (lane-aware broadcast) ─────────────
@@ -364,19 +407,32 @@ fn cpu_expand_bytes(in_dims: &[usize], out_dims: &[usize], dt: DType, in_bytes: 
     let mut g = Graph::new("cexp_ref");
     let x = g.input("x", Shape::new(in_dims, dt));
     let tgt: Vec<i64> = out_dims.iter().map(|&d| d as i64).collect();
-    let y = g.add_node(Op::Expand { target_shape: tgt }, vec![x], Shape::new(out_dims, dt));
+    let y = g.add_node(
+        Op::Expand { target_shape: tgt },
+        vec![x],
+        Shape::new(out_dims, dt),
+    );
     g.set_outputs(vec![y]);
     let mut c = Session::new(Device::Cpu).compile(g);
     c.run_typed(&[("x", in_bytes, dt)]).remove(0).0
 }
 
 /// Vulkan candidate: complex `Expand`, output lanes re-narrowed to NATIVE bytes.
-fn vulkan_expand_bytes(in_dims: &[usize], out_dims: &[usize], dt: DType, in_bytes: &[u8]) -> Vec<u8> {
+fn vulkan_expand_bytes(
+    in_dims: &[usize],
+    out_dims: &[usize],
+    dt: DType,
+    in_bytes: &[u8],
+) -> Vec<u8> {
     let lanes_in = widen_bytes_to_f32(in_bytes, dt);
     let mut g = Graph::new("cexp_vk");
     let x = g.input("x", Shape::new(in_dims, dt));
     let tgt: Vec<i64> = out_dims.iter().map(|&d| d as i64).collect();
-    let y = g.add_node(Op::Expand { target_shape: tgt }, vec![x], Shape::new(out_dims, dt));
+    let y = g.add_node(
+        Op::Expand { target_shape: tgt },
+        vec![x],
+        Shape::new(out_dims, dt),
+    );
     g.set_outputs(vec![y]);
     let mut exe = VulkanExecutable::compile(g);
     let lanes_out = exe.run(&[("x", &lanes_in)]).remove(0);
@@ -394,13 +450,19 @@ fn expand_complex_materialized() {
     let c64 = [1.5f32, 2.5, -3.0, 4.0];
     let cpu = cpu_expand_bytes(&[1, 2], &[3, 2], DType::C64, &c64_bytes(&c64));
     let gpu = vulkan_expand_bytes(&[1, 2], &[3, 2], DType::C64, &c64_bytes(&c64));
-    assert_eq!(gpu, cpu, "C64 materialized Expand [1,2]->[3,2] vulkan vs cpu mismatch");
+    assert_eq!(
+        gpu, cpu,
+        "C64 materialized Expand [1,2]->[3,2] vulkan vs cpu mismatch"
+    );
 
     // C128[2,1] -> [2,3]: broadcast the INNER dim (f32-exact df64 values).
     let c128 = [1.5f64, -2.5, 3.25, -4.75];
     let cpu = cpu_expand_bytes(&[2, 1], &[2, 3], DType::C128, &c128_bytes(&c128));
     let gpu = vulkan_expand_bytes(&[2, 1], &[2, 3], DType::C128, &c128_bytes(&c128));
-    assert_eq!(gpu, cpu, "C128 materialized Expand [2,1]->[2,3] vulkan vs cpu mismatch");
+    assert_eq!(
+        gpu, cpu,
+        "C128 materialized Expand [2,1]->[2,3] vulkan vs cpu mismatch"
+    );
 }
 
 // ── Gate 6: OTHER element-indexed movement ops must be lane-aware too ───────
@@ -421,7 +483,13 @@ fn cpu_op1_bytes(in_dims: &[usize], out_dims: &[usize], dt: DType, op: Op, xb: &
     c.run_typed(&[("x", xb, dt)]).remove(0).0
 }
 /// Vulkan candidate for a single-input op → NATIVE bytes (narrowed).
-fn vulkan_op1_bytes(in_dims: &[usize], out_dims: &[usize], dt: DType, op: Op, xb: &[u8]) -> Vec<u8> {
+fn vulkan_op1_bytes(
+    in_dims: &[usize],
+    out_dims: &[usize],
+    dt: DType,
+    op: Op,
+    xb: &[u8],
+) -> Vec<u8> {
     let lanes_in = widen_bytes_to_f32(xb, dt);
     let mut g = Graph::new("cop1_vk");
     let x = g.input("x", Shape::new(in_dims, dt));
@@ -450,7 +518,13 @@ fn transpose_complex() {
     // C128[2,2] --perm[1,0]--> [2,2] (f32-exact df64 values).
     let c128: Vec<f64> = vec![1.5, -2.5, 3.25, -4.75, 0.5, -6.0, 7.0, -8.25];
     let op = Op::Transpose { perm: vec![1, 0] };
-    let cpu = cpu_op1_bytes(&[2, 2], &[2, 2], DType::C128, op.clone(), &c128_bytes(&c128));
+    let cpu = cpu_op1_bytes(
+        &[2, 2],
+        &[2, 2],
+        DType::C128,
+        op.clone(),
+        &c128_bytes(&c128),
+    );
     let gpu = vulkan_op1_bytes(&[2, 2], &[2, 2], DType::C128, op, &c128_bytes(&c128));
     assert_eq!(gpu, cpu, "C128 Transpose vulkan vs cpu mismatch");
 }
@@ -464,7 +538,11 @@ fn narrow_complex() {
     let _g = gpu_lock();
     // C64[4] --narrow axis0 [1..3)--> [2]. Keep complex elems 1,2.
     let c64 = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
-    let op = Op::Narrow { axis: 0, start: 1, len: 2 };
+    let op = Op::Narrow {
+        axis: 0,
+        start: 1,
+        len: 2,
+    };
     let cpu = cpu_op1_bytes(&[4], &[2], DType::C64, op.clone(), &c64_bytes(&c64));
     let gpu = vulkan_op1_bytes(&[4], &[2], DType::C64, op, &c64_bytes(&c64));
     assert_eq!(gpu, cpu, "C64 Narrow vulkan vs cpu mismatch");
@@ -472,7 +550,11 @@ fn narrow_complex() {
     // C64[2,3] --narrow axis1 [1..3)--> [2,2]: inner (trailing) dim is copied,
     // so the lane axis must be innermost of the contiguous copy.
     let c64b: Vec<f32> = (0..12).map(|i| i as f32 + 0.25).collect();
-    let op = Op::Narrow { axis: 1, start: 1, len: 2 };
+    let op = Op::Narrow {
+        axis: 1,
+        start: 1,
+        len: 2,
+    };
     let cpu = cpu_op1_bytes(&[2, 3], &[2, 2], DType::C64, op.clone(), &c64_bytes(&c64b));
     let gpu = vulkan_op1_bytes(&[2, 3], &[2, 2], DType::C64, op, &c64_bytes(&c64b));
     assert_eq!(gpu, cpu, "C64 Narrow axis1 vulkan vs cpu mismatch");
@@ -493,12 +575,19 @@ fn concat_complex() {
         let mut g = Graph::new("ccat_ref");
         let x = g.input("a", Shape::new(&[2], DType::C64));
         let y = g.input("b", Shape::new(&[3], DType::C64));
-        let z = g.add_node(Op::Concat { axis: 0 }, vec![x, y], Shape::new(&[5], DType::C64));
+        let z = g.add_node(
+            Op::Concat { axis: 0 },
+            vec![x, y],
+            Shape::new(&[5], DType::C64),
+        );
         g.set_outputs(vec![z]);
         let mut c = Session::new(Device::Cpu).compile(g);
-        c.run_typed(&[("a", &c64_bytes(&a), DType::C64), ("b", &c64_bytes(&b), DType::C64)])
-            .remove(0)
-            .0
+        c.run_typed(&[
+            ("a", &c64_bytes(&a), DType::C64),
+            ("b", &c64_bytes(&b), DType::C64),
+        ])
+        .remove(0)
+        .0
     };
     let gpu = {
         let al = widen_bytes_to_f32(&c64_bytes(&a), DType::C64);
@@ -506,7 +595,11 @@ fn concat_complex() {
         let mut g = Graph::new("ccat_vk");
         let x = g.input("a", Shape::new(&[2], DType::C64));
         let y = g.input("b", Shape::new(&[3], DType::C64));
-        let z = g.add_node(Op::Concat { axis: 0 }, vec![x, y], Shape::new(&[5], DType::C64));
+        let z = g.add_node(
+            Op::Concat { axis: 0 },
+            vec![x, y],
+            Shape::new(&[5], DType::C64),
+        );
         g.set_outputs(vec![z]);
         let mut exe = VulkanExecutable::compile(g);
         let out = exe.run(&[("a", &al), ("b", &bl)]).remove(0);
@@ -533,7 +626,11 @@ fn gather_complex() {
         let mut g = Graph::new("cgat_ref");
         let t = g.input("t", Shape::new(&[4], DType::C64));
         let ix = g.input("ix", Shape::new(&[4], DType::I64));
-        let z = g.add_node(Op::Gather { axis: 0 }, vec![t, ix], Shape::new(&[4], DType::C64));
+        let z = g.add_node(
+            Op::Gather { axis: 0 },
+            vec![t, ix],
+            Shape::new(&[4], DType::C64),
+        );
         g.set_outputs(vec![z]);
         let mut c = Session::new(Device::Cpu).compile(g);
         c.run_typed(&[
@@ -549,7 +646,11 @@ fn gather_complex() {
         let mut g = Graph::new("cgat_vk");
         let t = g.input("t", Shape::new(&[4], DType::C64));
         let ix = g.input("ix", Shape::new(&[4], DType::I64));
-        let z = g.add_node(Op::Gather { axis: 0 }, vec![t, ix], Shape::new(&[4], DType::C64));
+        let z = g.add_node(
+            Op::Gather { axis: 0 },
+            vec![t, ix],
+            Shape::new(&[4], DType::C64),
+        );
         g.set_outputs(vec![z]);
         let mut exe = VulkanExecutable::compile(g);
         let out = exe.run(&[("t", &tl), ("ix", &il)]).remove(0);

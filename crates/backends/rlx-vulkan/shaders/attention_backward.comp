@@ -1,0 +1,180 @@
+#version 450
+// Scaled dot-product attention backward for [B,H,S,D] f32 layout.
+// Recomputes per-row scores + softmax, then emits dQ / dK / dV by `wrt`
+// (0=Query, 1=Key, 2=Value). Caps: head_dim ≤ 256, seq ≤ 512 — else host.
+// Mask: 0 none, 1 causal, 2 custom (thresh 0.5), 3 sliding-window, 4 bias.
+layout(local_size_x = 64) in;
+
+const uint MAX_HEAD_DIM = 256u;
+const uint MAX_ATTN_SEQ = 512u;
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint heads;
+    uint seq_q;
+    uint seq_k;
+    uint head_dim;
+    uint q_off;
+    uint k_off;
+    uint v_off;
+    uint dy_off;
+    uint out_off;
+    uint mask_off;
+    uint mask_kind;
+    uint scale_bits;
+    uint window;
+    uint wrt;
+} pc;
+
+float mask_score(float dot, uint qi, uint ki, uint bh) {
+    float s = dot;
+    if (pc.mask_kind == 1u) {
+        if (ki > qi) { s = -3.4e38; }
+    } else if (pc.mask_kind == 2u) {
+        uint m_idx = (bh * pc.seq_q + qi) * pc.seq_k + ki;
+        if (arena_load(pc.mask_off + m_idx) < 0.5) { s = -1e9; }
+    } else if (pc.mask_kind == 3u) {
+        if (ki > qi) { s = -3.4e38; }
+        else if (qi - ki > pc.window) { s = -3.4e38; }
+    } else if (pc.mask_kind == 4u) {
+        s += arena_load(pc.mask_off + (bh * pc.seq_q + qi) * pc.seq_k + ki);
+    }
+    return s;
+}
+
+void softmax_row(inout float scores[MAX_ATTN_SEQ], uint seq_k) {
+    float m = -3.4e38;
+    for (uint s = 0u; s < seq_k; s++) {
+        m = max(m, scores[s]);
+    }
+    float sum = 0.0;
+    for (uint s = 0u; s < seq_k; s++) {
+        float e = (scores[s] <= -1e30) ? 0.0 : exp(scores[s] - m);
+        scores[s] = e;
+        sum += e;
+    }
+    float inv = (sum > 0.0) ? (1.0 / sum) : 0.0;
+    for (uint s = 0u; s < seq_k; s++) {
+        scores[s] *= inv;
+    }
+}
+
+void main() {
+    if (pc.head_dim > MAX_HEAD_DIM || pc.seq_k > MAX_ATTN_SEQ || pc.seq_q > MAX_ATTN_SEQ) {
+        return;
+    }
+    float scale = uintBitsToFloat(pc.scale_bits);
+    uint hd = pc.head_dim;
+
+    uint axis_len = (pc.wrt == 0u) ? pc.seq_q : pc.seq_k;
+    uint total = pc.batch * pc.heads * axis_len;
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= total) { return; }
+    uint axis_idx = row % axis_len;
+    uint q1 = row / axis_len;
+    uint h = q1 % pc.heads;
+    uint b = q1 / pc.heads;
+    uint bh = b * pc.heads + h;
+
+    uint q_bh = pc.q_off + bh * pc.seq_q * hd;
+    uint k_bh = pc.k_off + bh * pc.seq_k * hd;
+    uint v_bh = pc.v_off + bh * pc.seq_k * hd;
+    uint dy_bh = pc.dy_off + bh * pc.seq_q * hd;
+
+    float scores[MAX_ATTN_SEQ];
+    float dp[MAX_ATTN_SEQ];
+
+    if (pc.wrt == 0u) {
+        uint qi = axis_idx;
+        uint q_base = q_bh + qi * hd;
+        uint dy_base = dy_bh + qi * hd;
+        uint o_base = pc.out_off + (bh * pc.seq_q + qi) * hd;
+        for (uint ki = 0u; ki < pc.seq_k; ki++) {
+            uint k_base = k_bh + ki * hd;
+            float dot = 0.0;
+            for (uint d = 0u; d < hd; d++) {
+                dot += arena_load(q_base + d) * arena_load(k_base + d);
+            }
+            scores[ki] = mask_score(dot * scale, qi, ki, bh);
+        }
+        softmax_row(scores, pc.seq_k);
+        for (uint ki = 0u; ki < pc.seq_k; ki++) {
+            uint v_base = v_bh + ki * hd;
+            float acc = 0.0;
+            for (uint d = 0u; d < hd; d++) {
+                acc += arena_load(dy_base + d) * arena_load(v_base + d);
+            }
+            dp[ki] = acc;
+        }
+        float row_sum = 0.0;
+        for (uint ki = 0u; ki < pc.seq_k; ki++) {
+            row_sum += scores[ki] * dp[ki];
+        }
+        for (uint d = 0u; d < hd; d++) {
+            float acc = 0.0;
+            for (uint ki = 0u; ki < pc.seq_k; ki++) {
+                float ds = scores[ki] * (dp[ki] - row_sum) * scale;
+                acc += ds * arena_load(k_bh + ki * hd + d);
+            }
+            arena_store(o_base + d, acc);
+        }
+    } else if (pc.wrt == 2u) {
+        uint ki = axis_idx;
+        uint o_base = pc.out_off + (bh * pc.seq_k + ki) * hd;
+        for (uint d = 0u; d < hd; d++) {
+            arena_store(o_base + d, 0.0);
+        }
+        for (uint qi = 0u; qi < pc.seq_q; qi++) {
+            uint q_base = q_bh + qi * hd;
+            uint dy_base = dy_bh + qi * hd;
+            for (uint kj = 0u; kj < pc.seq_k; kj++) {
+                uint kb = k_bh + kj * hd;
+                float dot = 0.0;
+                for (uint d = 0u; d < hd; d++) {
+                    dot += arena_load(q_base + d) * arena_load(kb + d);
+                }
+                scores[kj] = mask_score(dot * scale, qi, kj, bh);
+            }
+            softmax_row(scores, pc.seq_k);
+            for (uint d = 0u; d < hd; d++) {
+                arena_store(o_base + d, arena_load(o_base + d) + scores[ki] * arena_load(dy_base + d));
+            }
+        }
+    } else {
+        // wrt == 1 (dK)
+        uint ki = axis_idx;
+        uint o_base = pc.out_off + (bh * pc.seq_k + ki) * hd;
+        for (uint d = 0u; d < hd; d++) {
+            arena_store(o_base + d, 0.0);
+        }
+        for (uint qi = 0u; qi < pc.seq_q; qi++) {
+            uint q_base = q_bh + qi * hd;
+            uint dy_base = dy_bh + qi * hd;
+            for (uint kj = 0u; kj < pc.seq_k; kj++) {
+                uint kb = k_bh + kj * hd;
+                float dot = 0.0;
+                for (uint d = 0u; d < hd; d++) {
+                    dot += arena_load(q_base + d) * arena_load(kb + d);
+                }
+                scores[kj] = mask_score(dot * scale, qi, kj, bh);
+            }
+            softmax_row(scores, pc.seq_k);
+            for (uint kj = 0u; kj < pc.seq_k; kj++) {
+                uint vb = v_bh + kj * hd;
+                float acc = 0.0;
+                for (uint d = 0u; d < hd; d++) {
+                    acc += arena_load(dy_base + d) * arena_load(vb + d);
+                }
+                dp[kj] = acc;
+            }
+            float row_sum = 0.0;
+            for (uint kj = 0u; kj < pc.seq_k; kj++) {
+                row_sum += scores[kj] * dp[kj];
+            }
+            float ds_ki = scores[ki] * (dp[ki] - row_sum) * scale;
+            for (uint d = 0u; d < hd; d++) {
+                arena_store(o_base + d, arena_load(o_base + d) + ds_ki * arena_load(q_base + d));
+            }
+        }
+    }
+}

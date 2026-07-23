@@ -50,8 +50,11 @@ extern "C" __global__ void rlx_custom(
     unsigned in0_off, unsigned in0_len,
     unsigned in1_off, unsigned in1_len,
     unsigned in2_off, unsigned in2_len,
-    unsigned in3_off, unsigned in3_len)
+    unsigned in3_off, unsigned in3_len,
+    unsigned e0, unsigned e1, unsigned e2, unsigned e3)
 {
+    (void)n_inputs; (void)in1_off; (void)in1_len; (void)in2_off; (void)in2_len;
+    (void)in3_off; (void)in3_len; (void)e0; (void)e1; (void)e2; (void)e3;
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < out_len) {
         arena[out_off + i] = arena[in0_off + i] * 3.0f;

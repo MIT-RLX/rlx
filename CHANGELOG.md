@@ -7,6 +7,61 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ## [Unreleased]
 
+### Added
+
+- **CPU activation vmath.** Added `Activation::Recip` and host
+  `vvexpf`/`vvtanhf`/`vvrecf`/`vvlogf`/`vvsqrtf`/`vvrsqrtf`; CPU activation hot
+  paths use SIMD fast exp/tanh by default (`RLX_VMATH_ACCURATE=1` →
+  Accelerate/libm). Forward + `ActivationBackward` parity for Recip/Exp/Tanh on
+  Metal, wgpu, and CUDA.
+
+- **Full `OpKind` claim parity (153/153) across backends.** CPU, Metal, MLX,
+  wgpu, CoreML/ANE, CUDA, ROCm, Vulkan, OneAPI, and TPU all claim every
+  `OpKind`. Coverage matrix regenerated via `just gen-op-coverage`
+  ([`docs/op-coverage.md`](docs/op-coverage.md)). Specialty paths that stay
+  host-by-design (`CustomFn`, SPD/Eigh LAPACK, splat prepare/rasterize, some
+  Scaled* encode) still legalize; they are no longer claim gaps.
+
+- **Native depth — CUDA / ROCm (shared `rlx-gpu-kernels`).** Training and
+  inference kernels wired end-to-end (Step/compile/run): LayerNorm/GroupNorm
+  backward, FakeQuantize Fixed/PerBatch/EMA + LSQ/STE, SoftmaxCrossEntropy*,
+  Relu/ActivationBackward, BatchNormInference (+bwd), ComplexNormSq*/Conjugate,
+  Gru/Rnn/Mamba2 (size-capped + host fallback), FftButterflyStage, packed-I8
+  `QMatMul`/`QConv2d`, PartitionedConv unfuse, DenseSolve via cuSOLVER /
+  hipSOLVER (+ batched LU). ROCm brought to CUDA parity for Conv2d/MaxPool2d
+  backward and FusedConvBiasAct.
+
+- **Native depth — Metal / wgpu.** Conv3d/ConvTranspose3d, LayerNorm/GroupNorm
+  backward, FakeQuantize, ActivationBackward, ComplexNormSq*/Conjugate (plus
+  Metal C64 host I/O fix), FftButterflyStage, fused Gru/Rnn/Mamba2 (existing
+  path kept; parity extended).
+
+- **Native depth — CoreML / MLX.** MIL: Fma, FusedMatMulBiasAct, FusedSwiGLU,
+  FusedResidual LN/RMS, FakeQuantize, Conv3d (Param weights), ComplexNormSq*/
+  Conjugate, FftButterflyStage. MLX: FakeQuantize rounding (half-away-from-zero),
+  BatchNormInference (+bwd), Complex*/Quantize/QMatMul/QConv2d, FakeQuantizeLSQ*,
+  FftButterflyStage, Mamba2 time-unroll, PerTensor ScaledMatMul/Dequant/QuantScale.
+
+- **Native depth — Vulkan / OneAPI.** Claim parity to 153; SPIR-V / OpenCL for
+  GroupNorm (+bwd), fused residual/SwiGLU, SoftmaxCE*, Complex*, Fma,
+  FakeQuantize, BatchNormInference, AxialRope2d, act bwd, Conv3d, LN/RMS bwd,
+  FusedConvBiasAct, FftButterflyStage, Gru/Rnn/Mamba2/Lstm (capped), Conv2d
+  bwd, MaxPool2d bwd, Rope/Attention bwd, packed-I8 Quantize/QMatMul/QConv2d,
+  Cumsum/Gather bwd, WelchPeaks. Unfuse for LoraMatMul / FusedTransformerLayer /
+  If / While / DotGeneral / GatedDeltaNet / regions; DenseSolve via HostOpDesc
+  + CPU LAPACK.
+
+- **Native depth — TPU.** Claim parity to 153. HLO compose for Fma, norms/QAT,
+  Complex*, ReluBackward, Conv3d, Conv2d bwd (ConvGeneralDilated VJP),
+  MaxPool2dBackward (`SelectAndScatter`), AttentionBackward (autodiff expand),
+  AxialRope2d, Im2Col, ConvTranspose*, PerTensor Scaled*, Reverse,
+  ResizeNearest2x. Unfuse for recurrent/fused/control-flow. Host segments for
+  DenseSolve, FftButterflyStage, SPD/Eigh, splat prepare/rasterize.
+
+- **CPU fused/control expand.** Claims + `prepare_graph_for_thunks` expand for
+  `If`/`While`/`FusedTransformerLayer`/`PartitionedConv`/`FusedConvBiasAct`/
+  `TransformRegion`/`BatchElementwiseRegion` (was 146 → 153).
+
 ### Changed
 
 - **`RLX_*` unification (phased).** Single registry in

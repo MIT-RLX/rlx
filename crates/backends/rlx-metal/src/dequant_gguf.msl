@@ -817,30 +817,22 @@ kernel void q4_0_mv_f32(
     device const float* x   = (device const float*)((device char*)arena + x_off);
     device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
     device float*       dst = (device float*)((device char*)arena + dst_off);
-    float4 acc4 = float4(0.0f);
+    // GGML Q4_0 block layout (match `dequant_gguf` scheme 19 / quantize_q4_0):
+    // qs[j] low nibble → elems 0..15, high nibble → elems 16..31.
+    float acc = 0.0f;
     uint x_idx = 0u;
     for (uint b = 0u; b < nblocks; ++b) {
         uint off = b * BLK_BYTES;
         float d = dq_read_f16(w0, off);
         device const uchar* qs = w0 + off + 2u;
-        for (uint l = 0u; l < 32u; l += 4u) {
-            float4 ww;
-            for (uint i = 0u; i < 4u; ++i) {
-                uint idx = l + i;
-                uint byte_idx = idx >> 1;
-                uint nib = (idx & 1u) == 0u ? (uint(qs[byte_idx]) & 0x0Fu) : (uint(qs[byte_idx]) >> 4);
-                float w = d * float(int(nib) - 8);
-                if (i == 0u) ww.x = w;
-                else if (i == 1u) ww.y = w;
-                else if (i == 2u) ww.z = w;
-                else ww.w = w;
-            }
-            float4 xv = *(device const float4*)(x + x_idx);
-            acc4 += xv * ww;
-            x_idx += 4u;
+        for (uint j = 0u; j < 16u; ++j) {
+            acc += x[x_idx++] * (d * float(int(qs[j] & 0x0Fu) - 8));
+        }
+        for (uint j = 0u; j < 16u; ++j) {
+            acc += x[x_idx++] * (d * float(int(qs[j] >> 4) - 8));
         }
     }
-    dst[gid] = acc4.x + acc4.y + acc4.z + acc4.w;
+    dst[gid] = acc;
 }
 
 kernel void q4_1_mv_f32(

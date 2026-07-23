@@ -31,6 +31,10 @@ impl Backend for MlxBackend {
 
 fn build_mlx_executable(graph: Graph, rng: rlx_ir::RngOptions) -> MlxExecutableWrapper {
     let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
+    // Integer control params (Kitten duration carry, masks) must live as F32
+    // so `set_param_typed` can widen values — raw i64 bytes are read as
+    // denormals by f32 Where/Expand and break alignment (same as Metal).
+    let graph = cpu_low_precision::widen_integer_control_params_to_f32(graph);
     let mode = mlx_mode_from_env();
     let mut exe = MlxExecutable::compile_from_fused_with_rng(graph, mode, rng);
     if mode == rlx_mlx::lower::MlxMode::Compiled {
@@ -154,6 +158,18 @@ impl ExecutableGraph for MlxExecutableWrapper {
             .ok()
     }
     fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+        // Integer control params live as F32 after
+        // `widen_integer_control_params_to_f32`. Match Metal/wgpu: encode
+        // values as floats. Raw i64 bytes would fail MLX's typed-param
+        // dtype check (I64 vs graph F32) or be read as denormals.
+        if matches!(
+            dtype,
+            rlx_ir::DType::I32 | rlx_ir::DType::I64 | rlx_ir::DType::U32 | rlx_ir::DType::Bool
+        ) {
+            let f32_buf = super::widen_bytes_to_f32(data, dtype);
+            self.inner.set_param(name, &f32_buf);
+            return;
+        }
         self.inner.set_param_typed(name, data, dtype);
     }
     fn run_typed(

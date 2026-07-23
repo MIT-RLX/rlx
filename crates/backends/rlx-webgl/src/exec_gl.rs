@@ -21,7 +21,7 @@ use web_sys::{
 const HEAD: &str = "#version 300 es\nprecision highp float; precision highp int;\n";
 
 // Activation forward/derivative — must match `exec_cpu::act_f` / `act_df`.
-// Codes: 0 Relu 1 Neg 2 Exp 3 Log 4 Sqrt 5 Rsqrt 6 Sigmoid 7 Tanh 8 Abs 9 Sin 10 Cos 11 Silu.
+// Codes: 0 Relu 1 Neg 2 Exp 3 Log 4 Sqrt 5 Rsqrt 6 Sigmoid 7 Tanh 8 Abs 9 Sin 10 Cos 11 Silu 12 Recip.
 const ACT_FNS: &str = r#"
 float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
 float actF(int k, float x) {
@@ -36,7 +36,8 @@ float actF(int k, float x) {
     else if (k == 8) return abs(x);
     else if (k == 9) return sin(x);
     else if (k == 10) return cos(x);
-    else return x * sigmoidf(x);
+    else if (k == 11) return x * sigmoidf(x);
+    else return 1.0 / x;
 }
 float actDF(int k, float x) {
     if (k == 0) return x > 0.0 ? 1.0 : 0.0;
@@ -50,7 +51,8 @@ float actDF(int k, float x) {
     else if (k == 8) return sign(x);
     else if (k == 9) return cos(x);
     else if (k == 10) return -sin(x);
-    else { float s = sigmoidf(x); return s + x * s * (1.0 - s); }
+    else if (k == 11) { float s = sigmoidf(x); return s + x * s * (1.0 - s); }
+    else return -1.0 / (x * x);
 }
 "#;
 
@@ -297,6 +299,7 @@ fn act_code(a: Act) -> i32 {
         Act::Sin => 9,
         Act::Cos => 10,
         Act::Silu => 11,
+        Act::Recip => 12,
     }
 }
 
@@ -781,7 +784,12 @@ impl GlBackend {
                     self.draw();
                     tex[*out] = Some(t);
                 }
-                Step::ComplexCast { out, src, mode, n: _ } => {
+                Step::ComplexCast {
+                    out,
+                    src,
+                    mode,
+                    n: _,
+                } => {
                     // One output lane per fragment; the (lane-aware) out/src slot
                     // cols unflatten gl_FragCoord and the source lane index.
                     let (r, c) = dims(*out);

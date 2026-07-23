@@ -1302,14 +1302,26 @@ fn unfuse_selective_scan_scan(
 
     // Transpose the time axis to the front: [B,S,·] → [S,B,·].
     let t102 = vec![1usize, 0, 2];
-    let x_sbh = out.add_node(Op::Transpose { perm: t102.clone() }, vec![in_x], sbh.clone());
+    let x_sbh = out.add_node(
+        Op::Transpose { perm: t102.clone() },
+        vec![in_x],
+        sbh.clone(),
+    );
     let d_sbh = out.add_node(
         Op::Transpose { perm: t102.clone() },
         vec![in_delta],
         sbh.clone(),
     );
-    let b_sbn = out.add_node(Op::Transpose { perm: t102.clone() }, vec![in_b], sbn.clone());
-    let c_sbn = out.add_node(Op::Transpose { perm: t102.clone() }, vec![in_c], sbn.clone());
+    let b_sbn = out.add_node(
+        Op::Transpose { perm: t102.clone() },
+        vec![in_b],
+        sbn.clone(),
+    );
+    let c_sbn = out.add_node(
+        Op::Transpose { perm: t102.clone() },
+        vec![in_c],
+        sbn.clone(),
+    );
 
     // ā = exp(δ · A):  δ [S,B,H,1] · A [1,1,H,N] → [S,B,H,N].
     let d_sbh1 = out.reshape(

@@ -1,0 +1,53 @@
+#version 450
+// NCHW transposed convolution (PyTorch ConvTranspose2d, no bias).
+// Weight layout [C_in, C_out/groups, kH, kW]. One invocation per output.
+// Port of rlx-gpu-kernels/kernels/conv_transpose2d.cu.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint nn; uint cin; uint hh; uint ww;
+    uint cout; uint oh; uint ow;
+    uint kh; uint kw;
+    uint sh; uint sw; uint ph; uint pw; uint dh; uint dw;
+    uint groups;
+    uint x_off; uint w_off; uint out_off;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = pc.nn * pc.cout * pc.oh * pc.ow;
+    if (gid >= total) { return; }
+    uint wo = gid % pc.ow;
+    uint q1 = gid / pc.ow;
+    uint ho = q1 % pc.oh;
+    uint q2 = q1 / pc.oh;
+    uint co = q2 % pc.cout;
+    uint n = q2 / pc.cout;
+
+    uint cin_pg = pc.cin / pc.groups;
+    uint cout_pg = pc.cout / pc.groups;
+    uint g = co / cout_pg;
+    uint oc_off = co % cout_pg;
+    uint ci_start = g * cin_pg;
+
+    float acc = 0.0;
+    for (uint ci_off = 0u; ci_off < cin_pg; ci_off++) {
+        uint ci = ci_start + ci_off;
+        for (uint ky = 0u; ky < pc.kh; ky++) {
+            int t_h = int(ho) + int(pc.ph) - int(ky * pc.dh);
+            if (t_h < 0 || (t_h % int(pc.sh)) != 0) { continue; }
+            uint iy = uint(t_h / int(pc.sh));
+            if (iy >= pc.hh) { continue; }
+            for (uint kx = 0u; kx < pc.kw; kx++) {
+                int t_w = int(wo) + int(pc.pw) - int(kx * pc.dw);
+                if (t_w < 0 || (t_w % int(pc.sw)) != 0) { continue; }
+                uint ix = uint(t_w / int(pc.sw));
+                if (ix >= pc.ww) { continue; }
+                uint w_idx = ((ci * cout_pg + oc_off) * pc.kh + ky) * pc.kw + kx;
+                float v = arena_load(pc.x_off + ((n * pc.cin + ci) * pc.hh + iy) * pc.ww + ix);
+                acc += v * arena_load(pc.w_off + w_idx);
+            }
+        }
+    }
+    arena_store(pc.out_off + gid, acc);
+}

@@ -57,16 +57,22 @@ pub trait DecomposePolicy {
     /// then keeps it native (see [`DecomposePolicy::fab_native`]) or expands
     /// it.
     fn should_unfuse(&self, op: &Op) -> bool {
-        matches!(
-            op,
-            Op::FusedSwiGLU { .. }
-                | Op::LoraMatMul { .. }
-                | Op::FusedAttentionBlock { .. }
-                | Op::FusedTransformerLayer { .. }
-                | Op::DotGeneral { .. }
-                | Op::If { .. }
-                | Op::While { .. }
-        )
+        match op {
+            Op::FusedSwiGLU { .. } => !self.swiglu_native(),
+            Op::LoraMatMul { .. }
+            | Op::FusedAttentionBlock { .. }
+            | Op::FusedTransformerLayer { .. }
+            | Op::DotGeneral { .. }
+            | Op::If { .. }
+            | Op::While { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Keep `Op::FusedSwiGLU` intact for a native fused kernel (CUDA/ROCm).
+    /// Default: decompose to Narrow + Silu + Mul.
+    fn swiglu_native(&self) -> bool {
+        false
     }
 
     /// True when a `FusedAttentionBlock` with this output shape can be served

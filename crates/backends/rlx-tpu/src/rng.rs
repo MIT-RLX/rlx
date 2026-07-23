@@ -38,7 +38,7 @@ pub fn warn_xla_rng_on_execute(warned: &mut bool) {
     *warned = true;
     eprintln!(
         "rlx-tpu: executing Op::RngNormal/Op::RngUniform via native XLA `rng` — \
-         not bit-identical to RLX Philox or ONNX Runtime CPU. For Philox/Ort parity \
+         not bit-identical to RLX Philox, BNNS AES-CTR, or ONNX Runtime CPU. For Philox/Ort/Bnns parity \
          use Device::Cpu (or Device::Metal/Cuda/Rocm/wgpu host-fill). \
          RngBackend::Zero fills zeros at compile time."
     );

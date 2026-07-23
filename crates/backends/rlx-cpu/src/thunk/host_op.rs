@@ -58,7 +58,11 @@ pub unsafe fn execute_host_op_on_bytes(base: *mut u8, desc: &HostOpDesc) {
         .inputs
         .iter()
         .map(|(off, sh)| {
-            let n = sh.num_elements().unwrap_or(0);
+            let n = sh
+                .size_bytes()
+                .unwrap_or(0)
+                .div_ceil(4)
+                .max(sh.num_elements().unwrap_or(0));
             let mut v = vec![0f32; n];
             unsafe {
                 let src = base.add(*off) as *const f32;
@@ -88,7 +92,11 @@ pub fn eval_host_op_on_f32_arena(host: &mut [f32], desc: &HostOpDesc) {
         .map(|(off, sh)| {
             debug_assert!(off.is_multiple_of(4));
             let off_f32 = *off / 4;
-            let n = sh.num_elements().unwrap_or(0);
+            let n = sh
+                .size_bytes()
+                .unwrap_or(0)
+                .div_ceil(4)
+                .max(sh.num_elements().unwrap_or(0));
             let end = (off_f32 + n).min(host.len());
             (sh.clone(), host[off_f32..end].to_vec())
         })

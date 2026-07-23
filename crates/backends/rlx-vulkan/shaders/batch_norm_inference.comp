@@ -1,0 +1,26 @@
+#version 450
+// BatchNormInference (channels-last): y = γ · x̂ + β, x̂ = (x − μ) / √(σ² + ε).
+// Layout: idx = row * channels + c.
+layout(local_size_x = 256) in;
+
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint channels;
+    float eps;
+    uint src_off;
+    uint g_off;
+    uint b_off;
+    uint mean_off;
+    uint var_off;
+    uint dst_off;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n || pc.channels == 0u) { return; }
+    uint c = i % pc.channels;
+    float inv = inversesqrt(arena_load(pc.var_off + c) + pc.eps);
+    float xhat = (arena_load(pc.src_off + i) - arena_load(pc.mean_off + c)) * inv;
+    arena_store(pc.dst_off + i, arena_load(pc.g_off + c) * xhat + arena_load(pc.b_off + c));
+}

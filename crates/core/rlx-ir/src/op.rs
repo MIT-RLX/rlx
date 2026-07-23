@@ -44,6 +44,8 @@ pub enum Activation {
     Tan,
     /// `atan(x)`. Backward: `dx = upstream · (1 / (1 + x²))`.
     Atan,
+    /// Reciprocal `1 / x`.
+    Recip,
     /// Round to nearest integer (half-to-even), in f32.
     /// Forward: `x.round()`. Backward: STE — treats as identity, so
     /// the gradient passes through unchanged. Useful as a primitive

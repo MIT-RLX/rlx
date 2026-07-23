@@ -52,12 +52,17 @@ only in its Linux Docker image.)
 
 ## Status
 
+Claims the full **153/`OpKind`** surface ([`docs/op-coverage.md`](../../docs/op-coverage.md)).
+Native OpenCL-C kernels (when embedded) cover norms/fused/SoftmaxCE/RNN/SSM/
+vision-bwd/QAT/I8/FFT butterfly — mirroring the Vulkan depth wave. Ops without
+an embedded kernel use the bit-exact `rlx-cpu` path.
+
 | Component | State |
 |---|---|
 | Level Zero FFI + driver/device/context/queue bring-up | implemented |
 | USM-shared arena, SPIR-V module/kernel cache, per-op dispatch | implemented |
-| OpenCL-C kernels: `binary`, `unary`, `matmul`, `softmax`, `rmsnorm`, `ada_layer_norm_backward`, `gated_residual_backward` | written |
-| CPU-reference path (whole graph) | **validated** (tests green on macOS) |
+| OpenCL-C kernels: elementwise + matmul/softmax/rmsnorm + DiT reverse + GroupNorm/fused/SoftmaxCE/RNN/vision-bwd/QAT/I8/… | written (`kernels/*.cl`) |
+| CPU-reference path (whole graph / missing kernel) | **validated** (tests green on macOS) |
 | Native dispatch on Intel hardware | **NOT yet validated** — no Intel GPU on the dev box |
 
 ### Pending hardware validation
@@ -74,9 +79,15 @@ items to confirm on real Arc / Data Center Max:
 
 Forward-inference correctness first; the perf milestones are: route GEMM through
 **oneMKL** (`gemm` on the Level Zero backend) instead of the naive `matmul.cl`,
-grow the native kernel set past the elementwise hot path (layernorm / rope /
-attention / reduce / gather), and tile the kernels with SLM. These mirror the
+tile hot kernels with SLM, and deepen remaining host ops (DenseSolve via
+device LAPACK only if oneMKL can stay optional). These mirror the
 "perf-naive; tile + promote" follow-ups the other native backends carry.
+
+**DenseSolve / BatchedDenseSolve** stay on host by design for now: packed
+`HostOpDesc` → rlx-cpu LAPACK (`sgesv` / Accelerate / OpenBLAS) against the
+USM-shared arena. Device oneMKL LAPACK is **not** linked (would need a
+link-time oneMKL dep that breaks the driverless build). Same HostOpDesc path
+as wgpu / Vulkan.
 
 ## Build
 

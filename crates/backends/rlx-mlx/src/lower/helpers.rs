@@ -521,6 +521,12 @@ pub(crate) fn mlx_fix_reshape_shape(in_shape: &[usize], target: &[i64]) -> Vec<i
         if declared <= 0 || candidate <= 0 {
             return false;
         }
+        // Never grow a unit axis. Declared `1` is almost always batch/singleton;
+        // rewriting `1→N` (abs≤16) silently turns `[1,1,1,T]` into `[N,1,1,T]` when
+        // the producer buffer is accidentally `N·T` — Kitten F0 Unsqueeze→Conv.
+        if declared == 1 && candidate != 1 {
+            return false;
+        }
         let abs = (declared - candidate).unsigned_abs();
         if abs <= 16 {
             return true;
@@ -1268,10 +1274,22 @@ fn real_to_int_bytes(vals: &[f64], dst: DType) -> Vec<u8> {
     match dst {
         DType::I8 => vals.iter().map(|&v| v as i8 as u8).collect(),
         DType::U8 => vals.iter().map(|&v| v as u8).collect(),
-        DType::I16 => vals.iter().flat_map(|&v| (v as i16).to_le_bytes()).collect(),
-        DType::I32 => vals.iter().flat_map(|&v| (v as i32).to_le_bytes()).collect(),
-        DType::I64 => vals.iter().flat_map(|&v| (v as i64).to_le_bytes()).collect(),
-        DType::U32 => vals.iter().flat_map(|&v| (v as u32).to_le_bytes()).collect(),
+        DType::I16 => vals
+            .iter()
+            .flat_map(|&v| (v as i16).to_le_bytes())
+            .collect(),
+        DType::I32 => vals
+            .iter()
+            .flat_map(|&v| (v as i32).to_le_bytes())
+            .collect(),
+        DType::I64 => vals
+            .iter()
+            .flat_map(|&v| (v as i64).to_le_bytes())
+            .collect(),
+        DType::U32 => vals
+            .iter()
+            .flat_map(|&v| (v as u32).to_le_bytes())
+            .collect(),
         other => unreachable!("real_to_int_bytes: non-int dtype {other:?}"),
     }
 }
@@ -1438,6 +1456,7 @@ pub(crate) fn eval_elementwise_region_on_inputs(
                     Activation::Cos => ops::unary(x, MlxUnary::Cos)?,
                     Activation::Tan => ops::unary(x, MlxUnary::Tan)?,
                     Activation::Atan => ops::unary(x, MlxUnary::Atan)?,
+                    Activation::Recip => ops::unary(x, MlxUnary::Reciprocal)?,
                 }
             }
             ChainStep::Cast(to, x_op) => {
@@ -2126,8 +2145,27 @@ pub(crate) fn fq_scale_from_state(
     }
 }
 
-/// Shared quant + dequant tail of `Op::FakeQuantize`. Same formula
-/// regardless of which `scale_mode` produced `scale`.
+/// Rounding matches Rust `f32::round` (half away from zero) — same as
+/// Metal/wgpu FakeQuantize kernels — not MLX `rint` (ties to even).
+/// Values with `|x| > lim` are clamped before the floor cast so the
+/// F32→I32 path stays defined.
+pub(crate) fn round_half_away(x: &Array, lim: f32, dtype: DType) -> Result<Array, MlxError> {
+    let abs_s = ops::unary(x, MlxUnary::Abs)?;
+    let half = Array::from_f32_slice(&[0.5], &[1], dtype)?;
+    let shifted = ops::add(&abs_s, &half)?;
+    let lim_arr = Array::from_f32_slice(&[lim], &[1], dtype)?;
+    let shifted = ops::min(&shifted, &lim_arr)?;
+    let floored = ops::cast(&ops::cast(&shifted, DType::I32)?, dtype)?;
+    let zero = Array::from_f32_slice(&[0.0], &[1], dtype)?;
+    let one = Array::from_f32_slice(&[1.0], &[1], dtype)?;
+    let neg_one = Array::from_f32_slice(&[-1.0], &[1], dtype)?;
+    let nonneg = ops::ge(x, &zero)?;
+    let sign = ops::select(&nonneg, &one, &neg_one)?;
+    ops::mul(&sign, &floored)
+}
+
+/// Shared quant + dequant tail of `Op::FakeQuantize` / `Op::FakeQuantizeLSQ`.
+/// Same formula regardless of which `scale_mode` produced `scale`.
 pub(crate) fn fq_quantize_dequantize(
     x: &Array,
     scale: &Array,
@@ -2135,12 +2173,430 @@ pub(crate) fn fq_quantize_dequantize(
     dtype: DType,
 ) -> Result<Array, MlxError> {
     let scaled = ops::div(x, scale)?;
-    let rounded = ops::unary(&scaled, MlxUnary::Round)?;
+    let rounded = round_half_away(&scaled, q_max + 1.0, dtype)?;
     let neg_qmax = Array::from_f32_slice(&[-q_max], &[1], dtype)?;
     let pos_qmax = Array::from_f32_slice(&[q_max], &[1], dtype)?;
     let clamped = ops::max(&rounded, &neg_qmax)?;
     let clamped = ops::min(&clamped, &pos_qmax)?;
     ops::mul(&clamped, scale)
+}
+
+/// Broadcast per-channel `scales` / `zero_points` against `x_shape`
+/// (same layout as the CPU `quant_layout` / `fq_scale_from_state`).
+pub(crate) fn quant_attr_broadcast(
+    scales: &[f32],
+    zero_points: &[i32],
+    x_shape: &[i32],
+    axis: Option<usize>,
+) -> Result<(Array, Array), MlxError> {
+    let scale = Array::from_f32_slice(scales, &[scales.len()], DType::F32)?;
+    let zp_f: Vec<f32> = zero_points.iter().map(|&z| z as f32).collect();
+    let zp = Array::from_f32_slice(&zp_f, &[zp_f.len()], DType::F32)?;
+    match axis {
+        None => Ok((scale, zp)),
+        Some(c) => {
+            let mut bcast: Vec<i32> = vec![1; x_shape.len()];
+            bcast[c] = scales.len() as i32;
+            Ok((ops::reshape(&scale, &bcast)?, ops::reshape(&zp, &bcast)?))
+        }
+    }
+}
+
+/// Native `Op::Quantize` (INT8 packed): `q = clamp(round(x/s) + zp, -128, 127)`.
+pub(crate) fn lower_quantize(
+    x: &Array,
+    x_shape: &[i32],
+    axis: Option<usize>,
+    scales: &[f32],
+    zero_points: &[i32],
+) -> Result<Array, MlxError> {
+    let (scale, zp) = quant_attr_broadcast(scales, zero_points, x_shape, axis)?;
+    let scaled = ops::div(x, &scale)?;
+    let rounded = round_half_away(&scaled, 256.0, DType::F32)?;
+    let with_zp = ops::add(&rounded, &zp)?;
+    let lo = Array::from_f32_slice(&[-128.0], &[1], DType::F32)?;
+    let hi = Array::from_f32_slice(&[127.0], &[1], DType::F32)?;
+    let clamped = ops::max(&with_zp, &lo)?;
+    let clamped = ops::min(&clamped, &hi)?;
+    ops::cast(&clamped, DType::I8)
+}
+
+/// Native `Op::Dequantize`: `x = (q − zp) · s`.
+pub(crate) fn lower_dequantize(
+    q: &Array,
+    x_shape: &[i32],
+    axis: Option<usize>,
+    scales: &[f32],
+    zero_points: &[i32],
+) -> Result<Array, MlxError> {
+    let (scale, zp) = quant_attr_broadcast(scales, zero_points, x_shape, axis)?;
+    let qf = ops::cast(q, DType::F32)?;
+    let centered = ops::sub(&qf, &zp)?;
+    ops::mul(&centered, &scale)
+}
+
+/// Requantize f32 accumulator → i8: `clamp(round(acc·mult) + out_zp, ±127)`.
+pub(crate) fn requant_i8(acc: &Array, mult: f32, out_zp: i32) -> Result<Array, MlxError> {
+    let mult_a = Array::from_f32_slice(&[mult], &[1], DType::F32)?;
+    let scaled = ops::mul(acc, &mult_a)?;
+    let rounded = round_half_away(&scaled, 1e6, DType::F32)?;
+    let zp = Array::from_f32_slice(&[out_zp as f32], &[1], DType::F32)?;
+    let with_zp = ops::add(&rounded, &zp)?;
+    let lo = Array::from_f32_slice(&[-128.0], &[1], DType::F32)?;
+    let hi = Array::from_f32_slice(&[127.0], &[1], DType::F32)?;
+    let clamped = ops::max(&with_zp, &lo)?;
+    let clamped = ops::min(&clamped, &hi)?;
+    ops::cast(&clamped, DType::I8)
+}
+
+/// Native INT8 `Op::QMatMul` via f32 GEMM + requant (i8·i8 products are
+/// exact in f32 for typical K).
+pub(crate) fn lower_q_mat_mul(
+    x: &Array,
+    w: &Array,
+    bias: &Array,
+    x_zp: i32,
+    w_zp: i32,
+    out_zp: i32,
+    mult: f32,
+) -> Result<Array, MlxError> {
+    let xf = ops::cast(x, DType::F32)?;
+    let wf = ops::cast(w, DType::F32)?;
+    let x_zp_a = Array::from_f32_slice(&[x_zp as f32], &[1], DType::F32)?;
+    let w_zp_a = Array::from_f32_slice(&[w_zp as f32], &[1], DType::F32)?;
+    let x0 = ops::sub(&xf, &x_zp_a)?;
+    let w0 = ops::sub(&wf, &w_zp_a)?;
+    let mut acc = ops::matmul(&x0, &w0)?;
+    let bias_f = ops::cast(bias, DType::F32)?;
+    acc = ops::add(&acc, &bias_f)?;
+    requant_i8(&acc, mult, out_zp)
+}
+
+/// Native INT8 `Op::QConv2d` (NCHW) via f32 conv2d + requant.
+pub(crate) fn lower_q_conv2d(
+    x: &Array,
+    w: &Array,
+    bias: &Array,
+    stride: (i32, i32),
+    padding: (i32, i32),
+    dilation: (i32, i32),
+    groups: i32,
+    x_zp: i32,
+    w_zp: i32,
+    out_zp: i32,
+    mult: f32,
+) -> Result<Array, MlxError> {
+    let xf = ops::cast(x, DType::F32)?;
+    let wf = ops::cast(w, DType::F32)?;
+    let x_zp_a = Array::from_f32_slice(&[x_zp as f32], &[1], DType::F32)?;
+    let w_zp_a = Array::from_f32_slice(&[w_zp as f32], &[1], DType::F32)?;
+    let x0 = ops::sub(&xf, &x_zp_a)?;
+    let w0 = ops::sub(&wf, &w_zp_a)?;
+    let x_nhwc = ops::transpose(&x0, &[0, 2, 3, 1])?;
+    let w_mlx = ops::transpose(&w0, &[0, 2, 3, 1])?;
+    let y_nhwc = ops::conv2d(&x_nhwc, &w_mlx, stride, padding, dilation, groups)?;
+    let mut acc = ops::transpose(&y_nhwc, &[0, 3, 1, 2])?;
+    // bias [C_out] → [1, C_out, 1, 1]
+    let bias_f = ops::cast(bias, DType::F32)?;
+    let bshape = bias_f.shape()?;
+    let c_out = *bshape.first().unwrap_or(&1) as i32;
+    let bias_b = ops::reshape(&bias_f, &[1, c_out, 1, 1])?;
+    acc = ops::add(&acc, &bias_b)?;
+    requant_i8(&acc, mult, out_zp)
+}
+
+/// C64 values are stored as flat interleaved f32 `[re, im, …]` (no native
+/// MLX complex dtype). Reshape to `[n, 2]` for even/odd lane ops.
+pub(crate) fn c64_as_pairs(z: &Array, logical_n: i32) -> Result<Array, MlxError> {
+    let flat = ops::reshape(z, &[logical_n * 2])?;
+    ops::reshape(&flat, &[logical_n, 2])
+}
+
+pub(crate) fn lower_complex_norm_sq(z: &Array, out_shape: &[i32]) -> Result<Array, MlxError> {
+    let n: i32 = out_shape.iter().product();
+    let pairs = c64_as_pairs(z, n)?;
+    let re = ops::slice(&pairs, &[0, 0], &[n, 1])?;
+    let im = ops::slice(&pairs, &[0, 1], &[n, 2])?;
+    let re2 = ops::mul(&re, &re)?;
+    let im2 = ops::mul(&im, &im)?;
+    let sq = ops::add(&re2, &im2)?;
+    ops::reshape(&sq, out_shape)
+}
+
+pub(crate) fn lower_complex_norm_sq_backward(
+    z: &Array,
+    g: &Array,
+    out_logical: &[i32],
+) -> Result<Array, MlxError> {
+    let n: i32 = out_logical.iter().product();
+    let pairs = c64_as_pairs(z, n)?;
+    let g_col = ops::reshape(g, &[n, 1])?;
+    let dz = ops::mul(&pairs, &g_col)?;
+    ops::reshape(&dz, &[n * 2])
+}
+
+pub(crate) fn lower_conjugate(z: &Array, logical_n: i32) -> Result<Array, MlxError> {
+    let pairs = c64_as_pairs(z, logical_n)?;
+    let re = ops::slice(&pairs, &[0, 0], &[logical_n, 1])?;
+    let im = ops::slice(&pairs, &[0, 1], &[logical_n, 2])?;
+    let neg_im = ops::unary(&im, MlxUnary::Neg)?;
+    let out = ops::concat(&[&re, &neg_im], 1)?;
+    ops::reshape(&out, &[logical_n * 2])
+}
+
+/// LSQ STE for `x`: `dx = dy` when `|x/s| ≤ q_max`, else 0.
+pub(crate) fn lower_lsq_backward_x(
+    x: &Array,
+    scale: &Array,
+    dy: &Array,
+    x_shape: &[i32],
+    axis: Option<usize>,
+    q_max: f32,
+) -> Result<Array, MlxError> {
+    let scale_b = fq_scale_from_state(scale, x_shape, axis, DType::F32)?;
+    let z = ops::div(x, &scale_b)?;
+    let abs_z = ops::unary(&z, MlxUnary::Abs)?;
+    let bound = Array::from_f32_slice(&[q_max], &[1], DType::F32)?;
+    let mask = ops::le(&abs_z, &bound)?;
+    let zero = Array::from_f32_slice(&[0.0], &[1], DType::F32)?;
+    ops::select(&mask, dy, &zero)
+}
+
+/// LSQ scale gradient: `dscale[c] = Σ ψ(x/s) · dy` with
+/// `ψ(z) = -z + round(z)` inside range else `sign(z)·q_max`.
+pub(crate) fn lower_lsq_backward_scale(
+    x: &Array,
+    scale: &Array,
+    dy: &Array,
+    x_shape: &[i32],
+    axis: Option<usize>,
+    q_max: f32,
+) -> Result<Array, MlxError> {
+    let scale_b = fq_scale_from_state(scale, x_shape, axis, DType::F32)?;
+    let z = ops::div(x, &scale_b)?;
+    let abs_z = ops::unary(&z, MlxUnary::Abs)?;
+    let bound = Array::from_f32_slice(&[q_max], &[1], DType::F32)?;
+    let in_range = ops::le(&abs_z, &bound)?;
+    let rounded = round_half_away(&z, q_max + 1.0, DType::F32)?;
+    let neg_z = ops::unary(&z, MlxUnary::Neg)?;
+    let psi_in = ops::add(&neg_z, &rounded)?;
+    let zero = Array::from_f32_slice(&[0.0], &[1], DType::F32)?;
+    let pos_q = Array::from_f32_slice(&[q_max], &[1], DType::F32)?;
+    let neg_q = Array::from_f32_slice(&[-q_max], &[1], DType::F32)?;
+    let nonneg = ops::ge(&z, &zero)?;
+    let psi_out = ops::select(&nonneg, &pos_q, &neg_q)?;
+    let psi = ops::select(&in_range, &psi_in, &psi_out)?;
+    let contrib = ops::mul(&psi, dy)?;
+    let reduce_axes: Vec<i32> = match axis {
+        None => (0..x_shape.len() as i32).collect(),
+        Some(c) => (0..x_shape.len() as i32)
+            .filter(|&i| i != c as i32)
+            .collect(),
+    };
+    let reduced = ops::reduce(
+        &contrib,
+        MlxReduce::Sum,
+        &reduce_axes,
+        /*keep_dim=*/ false,
+    )?;
+    // Output should match scale rank-1 shape.
+    let s_shape = scale.shape()?;
+    ops::reshape(
+        &reduced,
+        &s_shape.iter().map(|&d| d as i32).collect::<Vec<_>>(),
+    )
+}
+
+/// Native `Op::FftButterflyStage` — radix-2 butterfly with gate/rev/twiddle,
+/// matching `execute_fft_butterfly_stage_f32`. State is interleaved
+/// `[batch, n_fft*2]` (re/im pairs).
+pub(crate) fn lower_fft_butterfly_stage(
+    state: &Array,
+    gate: &Array,
+    rev: &Array,
+    tw_re: &Array,
+    tw_im: &Array,
+    batch: i32,
+    n_fft: i32,
+    stage: u32,
+) -> Result<Array, MlxError> {
+    let stride = 1i32 << stage;
+    let n_groups = n_fft / (2 * stride);
+    // [B, n_fft, 2] → [B, n_groups, 2, stride, 2]
+    let pairs = ops::reshape(state, &[batch, n_fft, 2])?;
+    let grouped = ops::reshape(&pairs, &[batch, n_groups, 2, stride, 2])?;
+    let a = ops::slice(&grouped, &[0, 0, 0, 0, 0], &[batch, n_groups, 1, stride, 2])?;
+    let b = ops::slice(&grouped, &[0, 0, 1, 0, 0], &[batch, n_groups, 2, stride, 2])?;
+    let a = ops::reshape(&a, &[batch, n_groups, stride, 2])?;
+    let b = ops::reshape(&b, &[batch, n_groups, stride, 2])?;
+    let a_re = ops::slice(&a, &[0, 0, 0, 0], &[batch, n_groups, stride, 1])?;
+    let a_im = ops::slice(&a, &[0, 0, 0, 1], &[batch, n_groups, stride, 2])?;
+    let b_re = ops::slice(&b, &[0, 0, 0, 0], &[batch, n_groups, stride, 1])?;
+    let b_im = ops::slice(&b, &[0, 0, 0, 1], &[batch, n_groups, stride, 2])?;
+
+    // gate/rev/twiddle: layout [half] ↔ [n_groups, stride] (bf = group*stride + k)
+    let g2 = ops::reshape(gate, &[1, n_groups, stride, 1])?;
+    let g2 = ops::broadcast_to(&g2, &[batch, n_groups, stride, 1])?;
+    let rev2 = ops::reshape(rev, &[1, n_groups, stride, 1])?;
+    let rev2 = ops::broadcast_to(&rev2, &[batch, n_groups, stride, 1])?;
+    let tw_re2 = ops::reshape(tw_re, &[1, n_groups, stride, 1])?;
+    let tw_re2 = ops::broadcast_to(&tw_re2, &[batch, n_groups, stride, 1])?;
+    let tw_im2 = ops::reshape(tw_im, &[1, n_groups, stride, 1])?;
+    let tw_im2 = ops::broadcast_to(&tw_im2, &[batch, n_groups, stride, 1])?;
+
+    // b * w (complex)
+    let bw_re = ops::sub(&ops::mul(&b_re, &tw_re2)?, &ops::mul(&b_im, &tw_im2)?)?;
+    let bw_im = ops::add(&ops::mul(&b_re, &tw_im2)?, &ops::mul(&b_im, &tw_re2)?)?;
+    let top_re = ops::add(&a_re, &bw_re)?;
+    let top_im = ops::add(&a_im, &bw_im)?;
+    let bot_re = ops::sub(&a_re, &bw_re)?;
+    let bot_im = ops::sub(&a_im, &bw_im)?;
+
+    let half_t = Array::from_f32_slice(&[0.5], &[1], DType::F32)?;
+    let do_rev = ops::ge(&rev2, &half_t)?;
+    let oa_re = ops::select(&do_rev, &bot_re, &top_re)?;
+    let oa_im = ops::select(&do_rev, &bot_im, &top_im)?;
+    let ob_re = ops::select(&do_rev, &top_re, &bot_re)?;
+    let ob_im = ops::select(&do_rev, &top_im, &bot_im)?;
+
+    let zero = Array::from_f32_slice(&[0.0], &[1], DType::F32)?;
+    let active = ops::ne(&g2, &zero)?;
+    let out_a_re = ops::select(&active, &oa_re, &a_re)?;
+    let out_a_im = ops::select(&active, &oa_im, &a_im)?;
+    let out_b_re = ops::select(&active, &ob_re, &b_re)?;
+    let out_b_im = ops::select(&active, &ob_im, &b_im)?;
+
+    let out_a = ops::concat(&[&out_a_re, &out_a_im], 3)?;
+    let out_b = ops::concat(&[&out_b_re, &out_b_im], 3)?;
+    // [B, n_groups, stride, 2] → stack into [B, n_groups, 2, stride, 2]
+    let out_a = ops::reshape(&out_a, &[batch, n_groups, 1, stride, 2])?;
+    let out_b = ops::reshape(&out_b, &[batch, n_groups, 1, stride, 2])?;
+    let stacked = ops::concat(&[&out_a, &out_b], 2)?;
+    let flat = ops::reshape(&stacked, &[batch, n_fft, 2])?;
+    ops::reshape(&flat, &[batch, n_fft * 2])
+}
+
+/// Per-tensor 8-bit scaled formats that compose to F32 MLX (LUT decode + scale),
+/// mirroring `rlx_tpu::lower::scaled_fp8_hlo_ok`.
+pub(crate) fn scaled_fp8_mlx_ok(format: rlx_ir::ScaledFormat, layout: rlx_ir::ScaleLayout) -> bool {
+    matches!(layout, rlx_ir::ScaleLayout::PerTensor) && format.bit_width() == 8
+}
+
+fn scaled_decode_lut(format: rlx_ir::ScaledFormat) -> Result<Array, MlxError> {
+    let lut: Vec<f32> = (0..256)
+        .map(|c| rlx_ir::lowp_codec::decode(format, c as u8))
+        .collect();
+    Array::from_f32_slice(&lut, &[256], DType::F32)
+}
+
+/// U8 codes → f32 via 256-entry decode LUT × per-tensor scale.
+pub(crate) fn lower_scaled_dequantize(
+    codes: &Array,
+    scale: &Array,
+    format: rlx_ir::ScaledFormat,
+    out_shape: &[i32],
+) -> Result<Array, MlxError> {
+    let lut = scaled_decode_lut(format)?;
+    let idx = ops::cast(codes, DType::I32)?;
+    let decoded = ops::take(&lut, &idx, 0)?;
+    let decoded = ops::reshape(&decoded, out_shape)?;
+    let scale_b = ops::broadcast_to(scale, out_shape)?;
+    ops::mul(&decoded, &scale_b)
+}
+
+/// Per-tensor scale = max(|x|) / max_finite(format), with 0 → 1.
+pub(crate) fn lower_scaled_quant_scale(
+    x: &Array,
+    format: rlx_ir::ScaledFormat,
+    x_shape: &[i32],
+) -> Result<Array, MlxError> {
+    let abs_x = ops::unary(x, MlxUnary::Abs)?;
+    let axes: Vec<i32> = (0..x_shape.len() as i32).collect();
+    let vmax = ops::reduce(&abs_x, MlxReduce::Max, &axes, /*keep_dim=*/ false)?;
+    let maxf = Array::from_f32_slice(&[format.max_finite()], &[1], DType::F32)?;
+    let scale = ops::div(&vmax, &maxf)?;
+    let zero = Array::from_f32_slice(&[0.0], &[1], DType::F32)?;
+    let one = Array::from_f32_slice(&[1.0], &[1], DType::F32)?;
+    let pos = ops::gt(&scale, &zero)?;
+    let scale = ops::select(&pos, &scale, &one)?;
+    ops::reshape(&scale, &[1])
+}
+
+/// FP8 ScaledMatMul as dequant(lhs)·dequant(rhs)ᵀ (+ optional bias) in F32.
+pub(crate) fn lower_scaled_matmul(
+    lhs: &Array,
+    rhs: &Array,
+    lhs_scale: &Array,
+    rhs_scale: &Array,
+    bias: Option<&Array>,
+    lhs_format: rlx_ir::ScaledFormat,
+    rhs_format: rlx_ir::ScaledFormat,
+    m: i32,
+    k: i32,
+    n: i32,
+) -> Result<Array, MlxError> {
+    let lhs_f = lower_scaled_dequantize(lhs, lhs_scale, lhs_format, &[m, k])?;
+    let rhs_f = lower_scaled_dequantize(rhs, rhs_scale, rhs_format, &[n, k])?;
+    // TN: out[i,j] = Σ_p lhs[i,p]·rhs[j,p]  ⇒  lhs @ rhsᵀ
+    let rhs_t = ops::transpose(&rhs_f, &[1, 0])?;
+    let mut y = ops::matmul(&lhs_f, &rhs_t)?;
+    if let Some(b) = bias {
+        let b = ops::reshape(b, &[1, n])?;
+        y = ops::add(&y, &b)?;
+    }
+    Ok(y)
+}
+
+/// Native `Op::Mamba2` — same recurrence as `execute_mamba2_f32` /
+/// `unfuse_mamba2`, unrolled like `Op::SelectiveScan`.
+pub(crate) fn lower_mamba2(
+    x: &Array,
+    dt: &Array,
+    a: &Array,
+    b_in: &Array,
+    c_in: &Array,
+    batch: i32,
+    seq: i32,
+    heads: i32,
+    head_dim: i32,
+    state_size: i32,
+) -> Result<Array, MlxError> {
+    let zero = Array::from_f32_slice(&[0.0], &[1], DType::F32)?;
+    let mut state = ops::broadcast_to(&zero, &[batch, heads, head_dim, state_size])?;
+    let mut ys: Vec<Array> = Vec::with_capacity(seq as usize);
+    for t in 0..seq {
+        let dt_t = ops::slice(dt, &[0, t, 0], &[batch, t + 1, heads])?;
+        let dt_bh = ops::reshape(&dt_t, &[batch, heads])?;
+        let x_t = ops::slice(x, &[0, t, 0, 0], &[batch, t + 1, heads, head_dim])?;
+        let x_bhp = ops::reshape(&x_t, &[batch, heads, head_dim])?;
+        let b_t = ops::slice(b_in, &[0, t, 0, 0], &[batch, t + 1, heads, state_size])?;
+        let b_bhn = ops::reshape(&b_t, &[batch, heads, state_size])?;
+        let c_t = ops::slice(c_in, &[0, t, 0, 0], &[batch, t + 1, heads, state_size])?;
+        let c_bhn = ops::reshape(&c_t, &[batch, heads, state_size])?;
+
+        // dA = exp(dt · a)  [B,H]
+        let dta = ops::mul(&dt_bh, a)?;
+        let da = ops::unary(&dta, MlxUnary::Exp)?;
+
+        // (dt · x) ⊗ b → [B,H,P,N]
+        let dt_bh1 = ops::reshape(&dt_bh, &[batch, heads, 1])?;
+        let dtx = ops::mul(&dt_bh1, &x_bhp)?;
+        let dtx_4 = ops::reshape(&dtx, &[batch, heads, head_dim, 1])?;
+        let b_4 = ops::reshape(&b_bhn, &[batch, heads, 1, state_size])?;
+        let outer = ops::mul(&dtx_4, &b_4)?;
+
+        let da_4 = ops::reshape(&da, &[batch, heads, 1, 1])?;
+        let decayed = ops::mul(&da_4, &state)?;
+        state = ops::add(&decayed, &outer)?;
+
+        let c_4 = ops::reshape(&c_bhn, &[batch, heads, 1, state_size])?;
+        let sc = ops::mul(&state, &c_4)?;
+        let y_bhp = ops::reduce(&sc, MlxReduce::Sum, &[3], /*keep_dim=*/ false)?;
+        let y_t = ops::reshape(&y_bhp, &[batch, 1, heads, head_dim])?;
+        ys.push(y_t);
+    }
+    let refs: Vec<&Array> = ys.iter().collect();
+    ops::concat(&refs, 1)
 }
 
 /// `[N, C]` one-hot encoding of f32-valued integer labels.
@@ -2320,6 +2776,11 @@ pub(crate) fn activation_backward_compose(
             let one = Array::from_f32_slice(&[1.0], &[1], dtype)?;
             let denom = ops::add(&one, &x2)?;
             ops::div(dy, &denom)
+        }
+        Recip => {
+            let x2 = ops::mul(x, x)?;
+            let neg_dy = ops::unary(dy, MlxUnary::Neg)?;
+            ops::div(&neg_dy, &x2)
         }
     }
 }

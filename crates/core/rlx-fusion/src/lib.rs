@@ -65,4 +65,6 @@ pub use lower_vae_ops::{LowerBatchNormInference, LowerGroupNorm, LowerResizeNear
 pub use pass::{
     Pass, register_ir_pass, registered_ir_passes, run_passes, run_registered_ir_passes,
 };
-pub use unfuse::{unfuse_attention_block, unfuse_dit_modulation, unfuse_fused_for_autodiff};
+pub use unfuse::{
+    unfuse_attention_block, unfuse_dit_modulation, unfuse_fused_for_autodiff, unfuse_recurrent_ops,
+};

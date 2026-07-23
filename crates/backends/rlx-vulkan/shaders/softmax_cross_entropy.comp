@@ -1,0 +1,47 @@
+#version 450
+// Softmax cross-entropy along the last axis (one invocation per row).
+// integer_labels=0: dense/soft targets [N,C]
+//   loss[n] = logsumexp(logits[n]) - Σ_c targets[n,c]·logits[n,c]
+// integer_labels=1: f32-encoded class ids [N]
+//   loss[n] = logsumexp(logits[n]) - logits[n, label]
+// Matches WGSL / CUDA softmax_cross_entropy{,_with_logits}.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint outer;
+    uint inner;
+    uint logits_off;
+    uint targets_off;
+    uint out_off;
+    uint integer_labels;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.outer || pc.inner == 0u) { return; }
+    uint lbase = pc.logits_off + row * pc.inner;
+
+    float m = arena_load(lbase);
+    for (uint i = 1u; i < pc.inner; i++) {
+        m = max(m, arena_load(lbase + i));
+    }
+
+    float s = 0.0;
+    float dot = 0.0;
+    if (pc.integer_labels != 0u) {
+        for (uint i = 0u; i < pc.inner; i++) {
+            s += exp(arena_load(lbase + i) - m);
+        }
+        uint label = uint(arena_load(pc.targets_off + row));
+        if (label >= pc.inner) { label = pc.inner - 1u; }
+        arena_store(pc.out_off + row, (m + log(s)) - arena_load(lbase + label));
+    } else {
+        uint tbase = pc.targets_off + row * pc.inner;
+        for (uint i = 0u; i < pc.inner; i++) {
+            float v = arena_load(lbase + i);
+            s += exp(v - m);
+            dot += arena_load(tbase + i) * v;
+        }
+        arena_store(pc.out_off + row, (m + log(s)) - dot);
+    }
+}

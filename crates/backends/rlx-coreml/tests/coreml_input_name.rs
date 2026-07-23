@@ -26,4 +26,6 @@ fn qk_rotated_empty_input_name() {
     try_name("qk", &[2, 200, 64]);
     try_name("empty", &[2, 200, 64]);
     try_name("rope_cos", &[1, 200, 64]);
+    // Scalar-ish TTS controls (Kitten `speed`) must load on CoreML.
+    try_name("speed", &[1]);
 }

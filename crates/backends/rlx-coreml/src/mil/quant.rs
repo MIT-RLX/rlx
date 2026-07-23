@@ -271,6 +271,9 @@ impl<'a> LowerCtx<'a> {
     /// so we host-dequantize to f32 `[N, K]`, bake it, and matmul with
     /// `transpose_y`. The dequant happens at finalize (weights present),
     /// trading the proto's on-device dequant for size — correct + simple.
+    ///
+    /// Linear int schemes (`Int8Block` / `Int8BlockAsym` / `Int4Block`) carry
+    /// separate scale (+ zp) side tensors; those are host-folded the same way.
     pub(crate) fn lower_dequant_matmul(
         &mut self,
         id: NodeId,
@@ -296,7 +299,77 @@ impl<'a> LowerCtx<'a> {
             )));
         }
 
-        let wf = dequant_scheme(scheme, self.quant_bytes(w_id)?, k * n)?;
+        let wf = match scheme {
+            QuantScheme::Int8Block { block_size } | QuantScheme::Int8BlockAsym { block_size } => {
+                let asym = matches!(scheme, QuantScheme::Int8BlockAsym { .. });
+                if node.inputs.len() < 3 + usize::from(asym) {
+                    return Err(CoremlError::Runtime(format!(
+                        "DequantMatMul {scheme:?} needs scale{} inputs",
+                        if asym { "+zp" } else { "" }
+                    )));
+                }
+                let w_bytes = self.quant_bytes(w_id)?;
+                if w_bytes.len() < k * n {
+                    return Err(CoremlError::Runtime(format!(
+                        "Int8 weight bytes {} < k*n={}",
+                        w_bytes.len(),
+                        k * n
+                    )));
+                }
+                let bs = block_size.max(1) as usize;
+                let n_blocks = k.div_ceil(bs);
+                let scales = self.f32_side_tensor(node.inputs[2], n_blocks * n, "scale")?;
+                let zps = if asym {
+                    self.f32_side_tensor(node.inputs[3], n_blocks * n, "zp")?
+                } else {
+                    Vec::new()
+                };
+                // Bake as `[n, k]` (B-transposed) to match the GGUF path.
+                let mut wf = vec![0.0f32; n * k];
+                for p in 0..k {
+                    let block = p / bs;
+                    for j in 0..n {
+                        let q = w_bytes[p * n + j] as i8 as f32;
+                        let s = scales[block * n + j];
+                        let z = if asym { zps[block * n + j] } else { 0.0 };
+                        wf[j * k + p] = (q - z) * s;
+                    }
+                }
+                wf
+            }
+            QuantScheme::Int4Block { block_size } => {
+                if node.inputs.len() < 3 {
+                    return Err(CoremlError::Runtime(
+                        "DequantMatMul Int4Block needs a scale input".into(),
+                    ));
+                }
+                let w_bytes = self.quant_bytes(w_id)?;
+                let packed = (k * n).div_ceil(2);
+                if w_bytes.len() < packed {
+                    return Err(CoremlError::Runtime(format!(
+                        "Int4 weight bytes {} < packed={}",
+                        w_bytes.len(),
+                        packed
+                    )));
+                }
+                let bs = block_size.max(1) as usize;
+                let n_blocks = k.div_ceil(bs);
+                let scales = self.f32_side_tensor(node.inputs[2], n_blocks * n, "scale")?;
+                let mut wf = vec![0.0f32; n * k];
+                for p in 0..k {
+                    let block = p / bs;
+                    for j in 0..n {
+                        let idx = p * n + j;
+                        let byte = w_bytes[idx / 2];
+                        let nibble = if idx % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                        let s = scales[block * n + j];
+                        wf[j * k + p] = (nibble as f32) * s;
+                    }
+                }
+                wf
+            }
+            _ => dequant_scheme(scheme, self.quant_bytes(w_id)?, k * n)?,
+        };
         let x = self.val(x_id);
         let wc = format!("{out_name}_w");
         self.operations.push(make_const(
@@ -318,6 +391,41 @@ impl<'a> LowerCtx<'a> {
         )?;
         self.push_named(id, out_name.to_string(), op);
         Ok(())
+    }
+
+    /// Load an f32 scale/zp side tensor from a Param or Constant node.
+    fn f32_side_tensor(&self, id: NodeId, expect: usize, label: &str) -> Result<Vec<f32>> {
+        let floats = match &self.graph.node(id).op {
+            Op::Param { name } => {
+                if let Some(v) = self.params.get(name) {
+                    v.clone()
+                } else if let Some((bytes, dt)) = self.typed_params.get(name) {
+                    if *dt != DType::F32 {
+                        return Err(CoremlError::Runtime(format!(
+                            "{label} param '{name}' has dtype {dt:?}, expected F32"
+                        )));
+                    }
+                    bytes_to_f32(bytes, &Shape::new(&[bytes.len() / 4], DType::F32))?
+                } else {
+                    return Err(CoremlError::Runtime(format!(
+                        "missing {label} param '{name}'"
+                    )));
+                }
+            }
+            Op::Constant { data } => bytes_to_f32(data, &self.graph.node(id).shape)?,
+            other => {
+                return Err(CoremlError::Unsupported(format!(
+                    "dequant {label} must be Param/Constant, got {other:?}"
+                )));
+            }
+        };
+        if floats.len() < expect {
+            return Err(CoremlError::Runtime(format!(
+                "dequant {label} len {} < expected {expect}",
+                floats.len()
+            )));
+        }
+        Ok(floats)
     }
 
     /// Dequantize packed MoE weights to a plain f32 const (no matmul).
@@ -697,6 +805,140 @@ impl<'a> LowerCtx<'a> {
                 ("alpha", bind_value(scalar_f32(-128.0))),
                 ("beta", bind_value(scalar_f32(127.0))),
             ],
+        )?;
+        self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
+
+    /// FakeQuantize forward: `clamp(round(x/s), -qmax, qmax) * s`.
+    /// Fixed/EMA use the scale input; PerBatch derives `s = max(|x|)/qmax`.
+    pub(crate) fn lower_fake_quantize(
+        &mut self,
+        id: NodeId,
+        bits: u8,
+        axis: Option<usize>,
+        scale_mode: rlx_ir::op::ScaleMode,
+        out_name: &str,
+    ) -> Result<()> {
+        use rlx_ir::op::ScaleMode;
+        let node = self.graph.node(id);
+        let shape = node.shape.clone();
+        let f32_shape = shape.clone().with_dtype(DType::F32);
+        let rank = shape.rank();
+        let x = self.val(node.inputs[0]);
+        let q_max = match bits {
+            8 => 127.0f32,
+            4 => 7.0,
+            2 => 1.0,
+            n => {
+                return Err(CoremlError::Unsupported(format!(
+                    "FakeQuantize: unsupported bits {n}"
+                )));
+            }
+        };
+        let scale_name = match scale_mode {
+            ScaleMode::Fixed | ScaleMode::EMA { .. } => {
+                if node.inputs.len() < 2 {
+                    return Err(CoremlError::Unsupported(
+                        "FakeQuantize Fixed/EMA requires scale input".into(),
+                    ));
+                }
+                self.val(node.inputs[1])
+            }
+            ScaleMode::PerBatch => {
+                let ax = format!("{out_name}_abs");
+                self.emit("abs", &ax, &f32_shape, vec![("x", bind_name(&x))])?;
+                let reduce_axes: Vec<i32> = match axis {
+                    None => (0..rank as i32).collect(),
+                    Some(a) => (0..rank as i32).filter(|&i| i != a as i32).collect(),
+                };
+                let mut red_dims: Vec<usize> =
+                    (0..rank).map(|i| shape.dim(i).unwrap_static()).collect();
+                for &a in &reduce_axes {
+                    red_dims[a as usize] = 1;
+                }
+                let red_shape = Shape::new(&red_dims, DType::F32);
+                let red = format!("{out_name}_amax");
+                self.emit(
+                    "reduce_max",
+                    &red,
+                    &red_shape,
+                    vec![
+                        ("x", bind_name(&ax)),
+                        ("axes", bind_value(vec_i32(&reduce_axes))),
+                        ("keep_dims", bind_value(scalar_bool(true))),
+                    ],
+                )?;
+                let s = format!("{out_name}_s");
+                self.emit(
+                    "mul",
+                    &s,
+                    &red_shape,
+                    vec![
+                        ("x", bind_name(&red)),
+                        ("y", bind_value(scalar_f32(1.0 / q_max))),
+                    ],
+                )?;
+                let s_eps = format!("{out_name}_se");
+                self.emit(
+                    "maximum",
+                    &s_eps,
+                    &red_shape,
+                    vec![("x", bind_name(&s)), ("y", bind_value(scalar_f32(1e-8)))],
+                )?;
+                s_eps
+            }
+        };
+        let scaled = format!("{out_name}_xs");
+        self.emit(
+            "real_div",
+            &scaled,
+            &f32_shape,
+            vec![("x", bind_name(&x)), ("y", bind_name(&scale_name))],
+        )?;
+        // Half away from zero (Rust `f32::round`), not MIL `round` (ties-to-even).
+        // sign(s) * floor(|s| + 0.5)
+        let abs_s = format!("{out_name}_ab");
+        self.emit("abs", &abs_s, &f32_shape, vec![("x", bind_name(&scaled))])?;
+        let shifted = format!("{out_name}_sh");
+        self.emit(
+            "add",
+            &shifted,
+            &f32_shape,
+            vec![("x", bind_name(&abs_s)), ("y", bind_value(scalar_f32(0.5)))],
+        )?;
+        let floored = format!("{out_name}_fl");
+        self.emit(
+            "floor",
+            &floored,
+            &f32_shape,
+            vec![("x", bind_name(&shifted))],
+        )?;
+        let sgn = format!("{out_name}_sg");
+        self.emit("sign", &sgn, &f32_shape, vec![("x", bind_name(&scaled))])?;
+        let rounded = format!("{out_name}_rnd");
+        self.emit(
+            "mul",
+            &rounded,
+            &f32_shape,
+            vec![("x", bind_name(&floored)), ("y", bind_name(&sgn))],
+        )?;
+        let clipped = format!("{out_name}_clip");
+        self.emit(
+            "clip",
+            &clipped,
+            &f32_shape,
+            vec![
+                ("x", bind_name(&rounded)),
+                ("alpha", bind_value(scalar_f32(-q_max))),
+                ("beta", bind_value(scalar_f32(q_max))),
+            ],
+        )?;
+        self.emit(
+            "mul",
+            out_name,
+            &f32_shape,
+            vec![("x", bind_name(&clipped)), ("y", bind_name(&scale_name))],
         )?;
         self.names.insert(id.0, out_name.to_string());
         Ok(())

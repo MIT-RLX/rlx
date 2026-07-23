@@ -108,6 +108,7 @@ pub(crate) fn activation_op_id(act: Activation) -> u32 {
         Activation::Cos => 14,
         Activation::Tan => 15,
         Activation::Atan => 16,
+        Activation::Recip => 17,
     }
 }
 

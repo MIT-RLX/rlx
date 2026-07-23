@@ -66,6 +66,8 @@ pub mod icb;
 #[cfg(rlx_metal_host)]
 pub mod kernels;
 
+pub mod vmath;
+
 #[cfg(rlx_metal_host)]
 pub mod fft_dispatch;
 
@@ -84,7 +86,9 @@ pub mod ms_deform_attn;
 #[cfg(rlx_metal_host)]
 pub mod config;
 #[cfg(rlx_metal_host)]
-pub use config::{MetalRuntimeConfig, install_runtime_config, reload_runtime_config, runtime_config};
+pub use config::{
+    MetalRuntimeConfig, install_runtime_config, reload_runtime_config, runtime_config,
+};
 
 #[cfg(rlx_metal_host)]
 pub mod cost;

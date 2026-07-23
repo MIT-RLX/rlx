@@ -321,6 +321,9 @@ struct LowerCtx<'a> {
 
 mod apply;
 mod broadcast;
+mod compose_bwd;
+mod compose_ops;
+pub(crate) use compose_ops::scaled_fp8_hlo_ok;
 mod const_ops;
 mod gguf;
 mod ir;
@@ -413,6 +416,7 @@ impl<'a> LowerCtx<'a> {
                 padding_high: 0,
                 window_dilation: 1,
                 base_dilation: 1,
+                window_reversal: false,
             };
             dims.len()
         ];
@@ -423,6 +427,7 @@ impl<'a> LowerCtx<'a> {
             padding_high: 0,
             window_dilation: 1,
             base_dilation: 1,
+            window_reversal: false,
         };
         let window = Window {
             dimensions: window_dims,

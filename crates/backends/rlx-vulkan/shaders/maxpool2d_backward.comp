@@ -1,0 +1,62 @@
+#version 450
+// MaxPool2d backward (NCHW). One invocation per input spatial location;
+// accumulates dy from pool windows whose argmax (first-max ties) lands here.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint nn; uint cc; uint hh; uint ww;
+    uint ho; uint wo;
+    uint kh; uint kw; uint sh; uint sw; uint ph; uint pw;
+    uint x_off; uint dy_off; uint dx_off;
+} pc;
+
+void main() {
+    uint total = pc.nn * pc.cc * pc.hh * pc.ww;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) { return; }
+    uint iw = idx % pc.ww;
+    uint ih = (idx / pc.ww) % pc.hh;
+    uint c = (idx / (pc.ww * pc.hh)) % pc.cc;
+    uint n = idx / (pc.ww * pc.hh * pc.cc);
+
+    uint base_nc = (n * pc.cc + c) * pc.hh * pc.ww;
+    int ph_i = int(pc.ph);
+    int pw_i = int(pc.pw);
+    int sh_i = int(pc.sh);
+    int sw_i = int(pc.sw);
+
+    int ho_lo = int(ih) + ph_i - int(pc.kh) + 1;
+    ho_lo = ho_lo <= 0 ? 0 : (ho_lo + sh_i - 1) / sh_i;
+    int ho_hi = (int(ih) + ph_i) / sh_i;
+    int wo_lo = int(iw) + pw_i - int(pc.kw) + 1;
+    wo_lo = wo_lo <= 0 ? 0 : (wo_lo + sw_i - 1) / sw_i;
+    int wo_hi = (int(iw) + pw_i) / sw_i;
+
+    float acc = 0.0;
+    for (int ho = ho_lo; ho <= ho_hi && ho < int(pc.ho); ho++) {
+        int hstart = ho * sh_i - ph_i;
+        for (int wo = wo_lo; wo <= wo_hi && wo < int(pc.wo); wo++) {
+            int wstart = wo * sw_i - pw_i;
+            float best = -3.402823466e38;
+            int best_idx = -1;
+            for (uint i = 0u; i < pc.kh; i++) {
+                int ir = hstart + int(i);
+                if (ir < 0 || ir >= int(pc.hh)) { continue; }
+                for (uint j = 0u; j < pc.kw; j++) {
+                    int ic = wstart + int(j);
+                    if (ic < 0 || ic >= int(pc.ww)) { continue; }
+                    uint id2 = base_nc + uint(ir) * pc.ww + uint(ic);
+                    float v = arena_load(pc.x_off + id2);
+                    if (v > best) {
+                        best = v;
+                        best_idx = int(id2);
+                    }
+                }
+            }
+            if (best_idx == int(idx)) {
+                acc += arena_load(pc.dy_off + ((n * pc.cc + c) * pc.ho + uint(ho)) * pc.wo + uint(wo));
+            }
+        }
+    }
+    arena_store(pc.dx_off + idx, acc);
+}

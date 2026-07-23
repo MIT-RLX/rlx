@@ -503,6 +503,7 @@ fn all_activations() {
         (Activation::Cos, "cos", false, 1e-5),
         (Activation::Tan, "tan", false, 1e-3),
         (Activation::Atan, "atan", false, 1e-5),
+        (Activation::Recip, "recip", false, 1e-6),
         (Activation::Round, "round", false, 1e-6),
     ];
     for (act, tag, need_pos, tol) in cases {

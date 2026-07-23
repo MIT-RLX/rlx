@@ -1,0 +1,79 @@
+#version 450
+// FakeQuantize Backward (STE). Derives PerBatch scale from x, then:
+//   0 Identity:         dx = dy
+//   1 ClippedIdentity:  dx = dy if |x| ≤ q_max·s else 0
+//   2 Tanh:             dx = dy · (1 − tanh²(x/s))
+//   3 HardTanh:         dx = dy · max(0, 1 − |x/(q_max·s)|)
+// One work-item per channel.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint chan_dim;
+    uint inner;
+    float q_max;
+    uint ste_kind;
+    uint x_off;
+    uint dy_off;
+    uint dx_off;
+} pc;
+
+float fq_ste_dx(float x, float dy, float s, float bound) {
+    if (pc.ste_kind == 0u) {
+        return dy;
+    }
+    if (pc.ste_kind == 1u) {
+        return (abs(x) <= bound) ? dy : 0.0;
+    }
+    if (pc.ste_kind == 2u) {
+        float t = tanh(x / s);
+        return dy * (1.0 - t * t);
+    }
+    float attenuation = max(1.0 - abs(x / bound), 0.0);
+    return dy * attenuation;
+}
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.chan_dim) { return; }
+
+    float max_abs = 0.0;
+    uint stride = pc.chan_dim * pc.inner;
+    uint outer = (stride == 0u) ? 0u : (pc.n / stride);
+    if (outer * stride == pc.n) {
+        for (uint o = 0u; o < outer; o++) {
+            uint base = o * stride + c * pc.inner;
+            for (uint j = 0u; j < pc.inner; j++) {
+                max_abs = max(max_abs, abs(arena_load(pc.x_off + base + j)));
+            }
+        }
+    } else {
+        for (uint i = 0u; i < pc.n; i++) {
+            uint ch = (pc.chan_dim <= 1u) ? 0u : ((i / pc.inner) % pc.chan_dim);
+            if (ch == c) {
+                max_abs = max(max_abs, abs(arena_load(pc.x_off + i)));
+            }
+        }
+    }
+    float s = max(max_abs / pc.q_max, 1e-12);
+    float bound = pc.q_max * s;
+
+    if (outer * stride == pc.n) {
+        for (uint o = 0u; o < outer; o++) {
+            uint base = o * stride + c * pc.inner;
+            for (uint j = 0u; j < pc.inner; j++) {
+                uint idx = base + j;
+                arena_store(pc.dx_off + idx, fq_ste_dx(
+                    arena_load(pc.x_off + idx), arena_load(pc.dy_off + idx), s, bound));
+            }
+        }
+    } else {
+        for (uint i = 0u; i < pc.n; i++) {
+            uint ch = (pc.chan_dim <= 1u) ? 0u : ((i / pc.inner) % pc.chan_dim);
+            if (ch == c) {
+                arena_store(pc.dx_off + i, fq_ste_dx(
+                    arena_load(pc.x_off + i), arena_load(pc.dy_off + i), s, bound));
+            }
+        }
+    }
+}

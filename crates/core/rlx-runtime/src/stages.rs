@@ -41,8 +41,8 @@ pub fn fusion_target_for(device: Device) -> FusionTarget {
         Device::Tpu => FusionTarget::Tpu,
         // CoreML runs its own graph optimizer, so we want minimal RLX-side
         // fusion: the CPU fusion target only synthesizes Fused* ops the
-        // backend *claims*, and CoreML claims none of them, so the raw
-        // primitives are preserved for MIL lowering.
+        // backend *claims*. Claimed fused forms without a MIL arm are
+        // host-segmented or expanded in `CoremlExecutable::compile_with_options`.
         Device::Ane => FusionTarget::Cpu,
         // Other devices without a dedicated fusion pipeline: CPU patterns
         // (safe superset for graph-level rewrites).

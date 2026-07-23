@@ -1,0 +1,72 @@
+#version 450
+// Real INT8 Op::QConv2d (NCHW, grouped) matching CUDA q_conv2d.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint c_in;
+    uint c_out;
+    uint h;
+    uint w;
+    uint h_out;
+    uint w_out;
+    uint kh;
+    uint kw;
+    uint sh;
+    uint sw;
+    uint ph;
+    uint pw;
+    uint dh;
+    uint dw;
+    uint groups;
+    uint x_word;
+    uint w_word;
+    uint bias_off;
+    uint out_word;
+    int x_zp;
+    int w_zp;
+    int out_zp;
+    uint mult_bits;
+} pc;
+
+void main() {
+    uint total = pc.n * pc.c_out * pc.h_out * pc.w_out;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= total) { return; }
+
+    uint wo = i % pc.w_out;
+    uint q1 = i / pc.w_out;
+    uint ho = q1 % pc.h_out;
+    uint q2 = q1 / pc.h_out;
+    uint co = q2 % pc.c_out;
+    uint nn = q2 / pc.c_out;
+
+    uint c_in_per_g = pc.c_in / pc.groups;
+    uint c_out_per_g = pc.c_out / pc.groups;
+    uint g = co / c_out_per_g;
+    uint ci_start = g * c_in_per_g;
+
+    int acc = int(trunc(arena_load_f(pc.bias_off + co)));
+    for (uint ci_off = 0u; ci_off < c_in_per_g; ci_off++) {
+        uint ci = ci_start + ci_off;
+        uint in_chan = ((nn * pc.c_in) + ci) * pc.h * pc.w;
+        uint wt_chan = ((co * c_in_per_g) + ci_off) * pc.kh * pc.kw;
+        for (uint ki = 0u; ki < pc.kh; ki++) {
+            for (uint kj = 0u; kj < pc.kw; kj++) {
+                int ih = int(ho * pc.sh + ki * pc.dh) - int(pc.ph);
+                int iw = int(wo * pc.sw + kj * pc.dw) - int(pc.pw);
+                if (ih < 0 || iw < 0 || ih >= int(pc.h) || iw >= int(pc.w)) {
+                    continue;
+                }
+                int xv = arena_load_i8(pc.x_word, in_chan + uint(ih) * pc.w + uint(iw)) - pc.x_zp;
+                int wv = arena_load_i8(pc.w_word, wt_chan + ki * pc.kw + kj) - pc.w_zp;
+                acc += xv * wv;
+            }
+        }
+    }
+    float mult = uintBitsToFloat(pc.mult_bits);
+    int r = int(q_round_half_away(float(acc) * mult)) + pc.out_zp;
+    if (r < -128) { r = -128; }
+    if (r > 127) { r = 127; }
+    arena_store_i8(pc.out_word, i, r);
+}

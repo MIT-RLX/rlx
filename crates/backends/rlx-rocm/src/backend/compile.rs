@@ -17,7 +17,9 @@
 
 #![allow(unused_imports)]
 
-use crate::arena::{Arena, CastLower, HalfDtype, arena_lane_count, classify_cast, plan_f32_uniform};
+use crate::arena::{
+    Arena, CastLower, HalfDtype, arena_lane_count, classify_cast, plan_f32_uniform,
+};
 use crate::device::{RocmContext, rocm_blas, rocm_blas_lt, rocm_context, rocm_dnn};
 use crate::hip::{HipBuffer, HipDeviceptr};
 use crate::hipblas::{
@@ -365,6 +367,61 @@ impl RocmExecutable {
                         act_id,
                     });
                 }
+                Op::FusedConvBiasAct {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                    activation,
+                    has_residual,
+                } => {
+                    // Only the 2-D conv is fused (matches `FuseConvBiasAct`).
+                    // Same `Step::Conv2d` as a plain conv, plus bias + act (+
+                    // optional residual). MIOpen has no fused path — runtime
+                    // applies `conv_bias_act_epilogue` after the forward conv.
+                    let in_id = node.inputs[0];
+                    let w_id = node.inputs[1];
+                    let bias_id = node.inputs[2];
+                    let in_dims = graph.node(in_id).shape.dims();
+                    let w_dims = graph.node(w_id).shape.dims();
+                    let out_dims = node.shape.dims();
+                    let act_id = match activation {
+                        None => 0xFFFFu32,
+                        Some(a) => activation_op_id(*a),
+                    };
+                    let (has_res, res_off) = if *has_residual {
+                        (1u32, (arena.offset(node.inputs[3]) / 4) as u32)
+                    } else {
+                        (0u32, 0u32)
+                    };
+                    schedule.push(Step::Conv2d {
+                        n: in_dims[0].unwrap_static() as u32,
+                        c_in: in_dims[1].unwrap_static() as u32,
+                        c_out: w_dims[0].unwrap_static() as u32,
+                        h: in_dims[2].unwrap_static() as u32,
+                        w: in_dims[3].unwrap_static() as u32,
+                        h_out: out_dims[2].unwrap_static() as u32,
+                        w_out: out_dims[3].unwrap_static() as u32,
+                        kh: kernel_size[0] as u32,
+                        kw: kernel_size[1] as u32,
+                        sh: stride[0] as u32,
+                        sw: stride[1] as u32,
+                        ph: padding[0] as u32,
+                        pw: padding[1] as u32,
+                        dh: dilation[0] as u32,
+                        dw: dilation[1] as u32,
+                        groups: *groups as u32,
+                        in_off: (arena.offset(in_id) / 4) as u32,
+                        w_off: (arena.offset(w_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        has_bias: 1,
+                        bias_off_f32: (arena.offset(bias_id) / 4) as u32,
+                        act_id,
+                        has_residual: has_res,
+                        residual_off_f32: res_off,
+                    });
+                }
                 Op::Binary(bop) => {
                     // Complex binary: C64 add/sub/mul/div reads BOTH `[re, im]`
                     // lanes per element, so it can't ride the scalar-per-thread
@@ -434,6 +491,15 @@ impl RocmExecutable {
                         cond_off: (arena.offset(node.inputs[0]) / 4) as u32,
                         x_off: (arena.offset(node.inputs[1]) / 4) as u32,
                         y_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                    });
+                }
+                Op::Fma => {
+                    schedule.push(Step::Fma {
+                        n: elems,
+                        a_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        b_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        c_off: (arena.offset(node.inputs[2]) / 4) as u32,
                         out_off: (arena.offset(node.id) / 4) as u32,
                     });
                 }
@@ -621,6 +687,83 @@ impl RocmExecutable {
                         outer,
                         inner,
                         in_off: (arena.offset(in_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                    });
+                }
+                Op::ReluBackward => {
+                    let x_id = node.inputs[0];
+                    let dy_id = node.inputs[1];
+                    schedule.push(Step::ReluBackward {
+                        n: elems,
+                        x_off: (arena.offset(x_id) / 4) as u32,
+                        dy_off: (arena.offset(dy_id) / 4) as u32,
+                        dx_off: (arena.offset(node.id) / 4) as u32,
+                    });
+                }
+                Op::ActivationBackward { kind } => {
+                    let x_id = node.inputs[0];
+                    let dy_id = node.inputs[1];
+                    schedule.push(Step::ActivationBackward {
+                        n: elems,
+                        x_off: (arena.offset(x_id) / 4) as u32,
+                        dy_off: (arena.offset(dy_id) / 4) as u32,
+                        dx_off: (arena.offset(node.id) / 4) as u32,
+                        op: activation_op_id(*kind),
+                    });
+                }
+                Op::SoftmaxCrossEntropy => {
+                    let logits_id = node.inputs[0];
+                    let targets_id = node.inputs[1];
+                    let logits_shape = graph.node(logits_id).shape.dims();
+                    let inner = logits_shape.last().unwrap().unwrap_static() as u32;
+                    let total: u32 = logits_shape
+                        .iter()
+                        .map(|d| d.unwrap_static() as u32)
+                        .product();
+                    let outer = total / inner.max(1);
+                    schedule.push(Step::SoftmaxCrossEntropy {
+                        outer,
+                        inner,
+                        logits_off: (arena.offset(logits_id) / 4) as u32,
+                        targets_off: (arena.offset(targets_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                    });
+                }
+                Op::SoftmaxCrossEntropyWithLogits => {
+                    let logits_id = node.inputs[0];
+                    let labels_id = node.inputs[1];
+                    let logits_shape = graph.node(logits_id).shape.dims();
+                    let inner = logits_shape.last().unwrap().unwrap_static() as u32;
+                    let total: u32 = logits_shape
+                        .iter()
+                        .map(|d| d.unwrap_static() as u32)
+                        .product();
+                    let outer = total / inner.max(1);
+                    schedule.push(Step::SoftmaxCrossEntropyWithLogits {
+                        outer,
+                        inner,
+                        logits_off: (arena.offset(logits_id) / 4) as u32,
+                        labels_off: (arena.offset(labels_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                    });
+                }
+                Op::SoftmaxCrossEntropyBackward => {
+                    let logits_id = node.inputs[0];
+                    let labels_id = node.inputs[1];
+                    let d_loss_id = node.inputs[2];
+                    let logits_shape = graph.node(logits_id).shape.dims();
+                    let inner = logits_shape.last().unwrap().unwrap_static() as u32;
+                    let total: u32 = logits_shape
+                        .iter()
+                        .map(|d| d.unwrap_static() as u32)
+                        .product();
+                    let outer = total / inner.max(1);
+                    schedule.push(Step::SoftmaxCrossEntropyBackward {
+                        outer,
+                        inner,
+                        logits_off: (arena.offset(logits_id) / 4) as u32,
+                        labels_off: (arena.offset(labels_id) / 4) as u32,
+                        d_loss_off: (arena.offset(d_loss_id) / 4) as u32,
                         out_off: (arena.offset(node.id) / 4) as u32,
                     });
                 }
@@ -1046,9 +1189,11 @@ impl RocmExecutable {
                     for &in_id in &node.inputs {
                         let in_dims = graph.node(in_id).shape.dims();
                         let axis_in = in_dims[*axis].unwrap_static() as u32;
-                        let total: u32 =
-                            in_dims.iter().map(|d| d.unwrap_static() as u32).product::<u32>()
-                                * lanes;
+                        let total: u32 = in_dims
+                            .iter()
+                            .map(|d| d.unwrap_static() as u32)
+                            .product::<u32>()
+                            * lanes;
                         schedule.push(Step::Concat {
                             total,
                             outer,
@@ -1530,6 +1675,25 @@ impl RocmExecutable {
                         });
                     }
                 }
+                Op::FftButterflyStage { stage, n_fft } => {
+                    let state_shape = &graph.node(node.inputs[0]).shape;
+                    assert_eq!(
+                        state_shape.dtype(),
+                        rlx_ir::DType::F32,
+                        "rlx-rocm Op::FftButterflyStage requires F32 state"
+                    );
+                    schedule.push(Step::FftButterflyStage {
+                        state_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        gate_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        rev_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        tw_re_off: (arena.offset(node.inputs[3]) / 4) as u32,
+                        tw_im_off: (arena.offset(node.inputs[4]) / 4) as u32,
+                        batch: state_shape.dim(0).unwrap_static() as u32,
+                        n_fft: *n_fft,
+                        stage: *stage,
+                    });
+                }
                 Op::Im2Col {
                     kernel_size,
                     stride,
@@ -1639,9 +1803,9 @@ impl RocmExecutable {
                     repeat_factor,
                 } => {
                     let in_shape = &graph.node(node.inputs[0]).shape;
-                    schedule.push(Step::AxialRope2dHost {
-                        src_byte_off: arena.offset(node.inputs[0]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                    schedule.push(Step::AxialRope2d {
+                        in_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
                         batch: in_shape.dim(0).unwrap_static() as u32,
                         seq: in_shape.dim(1).unwrap_static() as u32,
                         hidden: in_shape.dim(2).unwrap_static() as u32,
@@ -1716,6 +1880,165 @@ impl RocmExecutable {
                         bidirectional: *bidirectional,
                         carry: *carry,
                     });
+                }
+                Op::Gru {
+                    hidden_size,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let batch = x_shape.dim(0).unwrap_static() as u32;
+                    let seq = x_shape.dim(1).unwrap_static() as u32;
+                    let input_size = x_shape.dim(2).unwrap_static() as u32;
+                    let hidden = *hidden_size as u32;
+                    let force_host = rlx_ir::env::flag("RLX_ROCM_RNN_HOST_FALLBACK");
+                    let native = !force_host
+                        && crate::gru_gpu::native_gru_ok(
+                            *num_layers,
+                            *bidirectional,
+                            *carry,
+                            *hidden_size,
+                        );
+                    if native {
+                        schedule.push(Step::Gru {
+                            x_byte_off: arena.offset(node.inputs[0]) as u32,
+                            w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
+                            w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
+                            b_ih_byte_off: arena.offset(node.inputs[3]) as u32,
+                            b_hh_byte_off: arena.offset(node.inputs[4]) as u32,
+                            dst_byte_off: arena.offset(node.id) as u32,
+                            batch,
+                            seq,
+                            input_size,
+                            hidden,
+                        });
+                    } else {
+                        let h0 = if *carry {
+                            arena.offset(node.inputs[5]) as u32
+                        } else {
+                            0u32
+                        };
+                        schedule.push(Step::GruHost {
+                            x_byte_off: arena.offset(node.inputs[0]) as u32,
+                            w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
+                            w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
+                            b_ih_byte_off: arena.offset(node.inputs[3]) as u32,
+                            b_hh_byte_off: arena.offset(node.inputs[4]) as u32,
+                            h0_byte_off: h0,
+                            dst_byte_off: arena.offset(node.id) as u32,
+                            batch,
+                            seq,
+                            input_size,
+                            hidden,
+                            num_layers: *num_layers as u32,
+                            bidirectional: *bidirectional,
+                            carry: *carry,
+                        });
+                    }
+                }
+                Op::Rnn {
+                    hidden_size,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                    relu,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let batch = x_shape.dim(0).unwrap_static() as u32;
+                    let seq = x_shape.dim(1).unwrap_static() as u32;
+                    let input_size = x_shape.dim(2).unwrap_static() as u32;
+                    let hidden = *hidden_size as u32;
+                    let force_host = rlx_ir::env::flag("RLX_ROCM_RNN_HOST_FALLBACK");
+                    let native = !force_host
+                        && crate::rnn_gpu::native_rnn_ok(
+                            *num_layers,
+                            *bidirectional,
+                            *carry,
+                            *hidden_size,
+                        );
+                    if native {
+                        schedule.push(Step::Rnn {
+                            x_byte_off: arena.offset(node.inputs[0]) as u32,
+                            w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
+                            w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
+                            bias_byte_off: arena.offset(node.inputs[3]) as u32,
+                            dst_byte_off: arena.offset(node.id) as u32,
+                            batch,
+                            seq,
+                            input_size,
+                            hidden,
+                            relu: *relu,
+                        });
+                    } else {
+                        let h0 = if *carry {
+                            arena.offset(node.inputs[4]) as u32
+                        } else {
+                            0u32
+                        };
+                        schedule.push(Step::RnnHost {
+                            x_byte_off: arena.offset(node.inputs[0]) as u32,
+                            w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
+                            w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
+                            bias_byte_off: arena.offset(node.inputs[3]) as u32,
+                            h0_byte_off: h0,
+                            dst_byte_off: arena.offset(node.id) as u32,
+                            batch,
+                            seq,
+                            input_size,
+                            hidden,
+                            num_layers: *num_layers as u32,
+                            bidirectional: *bidirectional,
+                            carry: *carry,
+                            relu: *relu,
+                        });
+                    }
+                }
+                Op::Mamba2 {
+                    head_dim,
+                    state_size,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let batch = x_shape.dim(0).unwrap_static() as u32;
+                    let seq = x_shape.dim(1).unwrap_static() as u32;
+                    let heads = x_shape.dim(2).unwrap_static() as u32;
+                    let force_host = rlx_ir::env::flag("RLX_ROCM_SSM_HOST_FALLBACK");
+                    let native = !force_host && crate::mamba2_gpu::native_mamba2_ok(*state_size);
+                    let x_byte_off = arena.offset(node.inputs[0]) as u32;
+                    let dt_byte_off = arena.offset(node.inputs[1]) as u32;
+                    let a_byte_off = arena.offset(node.inputs[2]) as u32;
+                    let b_byte_off = arena.offset(node.inputs[3]) as u32;
+                    let c_byte_off = arena.offset(node.inputs[4]) as u32;
+                    let dst_byte_off = arena.offset(node.id) as u32;
+                    if native {
+                        schedule.push(Step::Mamba2 {
+                            x_byte_off,
+                            dt_byte_off,
+                            a_byte_off,
+                            b_byte_off,
+                            c_byte_off,
+                            dst_byte_off,
+                            batch,
+                            seq,
+                            heads,
+                            head_dim: *head_dim as u32,
+                            state_size: *state_size as u32,
+                        });
+                    } else {
+                        schedule.push(Step::Mamba2Host {
+                            x_byte_off,
+                            dt_byte_off,
+                            a_byte_off,
+                            b_byte_off,
+                            c_byte_off,
+                            dst_byte_off,
+                            batch,
+                            seq,
+                            heads,
+                            head_dim: *head_dim as u32,
+                            state_size: *state_size as u32,
+                        });
+                    }
                 }
                 Op::Scan { .. } => {
                     schedule.push(Step::ScanHost {
@@ -2038,6 +2361,60 @@ impl RocmExecutable {
                         groups: *groups as u32,
                     });
                 }
+                Op::ConvTranspose3d {
+                    stride,
+                    padding,
+                    dilation,
+                    output_padding: _,
+                    groups,
+                } => {
+                    let in_id = node.inputs[0];
+                    let w_id = node.inputs[1];
+                    let in_dims = graph.node(in_id).shape.dims();
+                    let w_dims = graph.node(w_id).shape.dims();
+                    let out_dims = node.shape.dims();
+                    schedule.push(Step::ConvTranspose3d {
+                        n: in_dims[0].unwrap_static() as u32,
+                        c_in: in_dims[1].unwrap_static() as u32,
+                        c_out: out_dims[1].unwrap_static() as u32,
+                        d: in_dims[2].unwrap_static() as u32,
+                        h: in_dims[3].unwrap_static() as u32,
+                        w: in_dims[4].unwrap_static() as u32,
+                        d_out: out_dims[2].unwrap_static() as u32,
+                        h_out: out_dims[3].unwrap_static() as u32,
+                        w_out: out_dims[4].unwrap_static() as u32,
+                        kd: w_dims[2].unwrap_static() as u32,
+                        kh: w_dims[3].unwrap_static() as u32,
+                        kw: w_dims[4].unwrap_static() as u32,
+                        sd: stride[0] as u32,
+                        sh: stride[1] as u32,
+                        sw: stride[2] as u32,
+                        pd: padding[0] as u32,
+                        ph: padding[1] as u32,
+                        pw: padding[2] as u32,
+                        dd: dilation[0] as u32,
+                        dh: dilation[1] as u32,
+                        dw: dilation[2] as u32,
+                        groups: (*groups).max(1) as u32,
+                        in_off: (arena.offset(in_id) / 4) as u32,
+                        w_off: (arena.offset(w_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                    });
+                }
+                Op::FusedSwiGLU {
+                    cast_to: _,
+                    gate_first,
+                } => {
+                    let n_half = node.shape.dim(node.shape.rank() - 1).unwrap_static() as u32;
+                    let total = node.shape.num_elements().unwrap() as u32;
+                    schedule.push(Step::FusedSwiGLU {
+                        in_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        n_half,
+                        total,
+                        gate_first: if *gate_first { 1 } else { 0 },
+                    });
+                }
                 Op::GroupNorm { num_groups, eps } => {
                     let in_shape = &graph.node(node.inputs[0]).shape;
                     schedule.push(Step::GroupNorm {
@@ -2051,6 +2428,463 @@ impl RocmExecutable {
                         w: in_shape.dim(3).unwrap_static() as u32,
                         num_groups: *num_groups as u32,
                         eps_bits: eps.to_bits(),
+                    });
+                }
+                Op::BatchNormInference { eps } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let channels = in_shape.dim(rank - 1).unwrap_static() as u32;
+                    let total = in_shape.num_elements().unwrap_or(0) as u32;
+                    schedule.push(Step::BatchNormInference {
+                        src_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        g_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        b_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        mean_off: (arena.offset(node.inputs[3]) / 4) as u32,
+                        var_off: (arena.offset(node.inputs[4]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        count: total / channels.max(1),
+                        channels,
+                        eps_bits: eps.to_bits(),
+                    });
+                }
+                Op::BatchNormInferenceBackwardInput { eps } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = x_shape.rank();
+                    let channels = x_shape.dim(rank - 1).unwrap_static() as u32;
+                    let total = x_shape.num_elements().unwrap_or(0) as u32;
+                    schedule.push(Step::BatchNormInferenceBackwardInput {
+                        gamma_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        var_off: (arena.offset(node.inputs[3]) / 4) as u32,
+                        dy_off: (arena.offset(node.inputs[4]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        count: total / channels.max(1),
+                        channels,
+                        eps_bits: eps.to_bits(),
+                    });
+                }
+                Op::BatchNormInferenceBackwardGamma { eps } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = x_shape.rank();
+                    let channels = x_shape.dim(rank - 1).unwrap_static() as u32;
+                    let total = x_shape.num_elements().unwrap_or(0) as u32;
+                    schedule.push(Step::BatchNormInferenceBackwardGamma {
+                        x_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        mean_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        var_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        dy_off: (arena.offset(node.inputs[3]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        count: total / channels.max(1),
+                        channels,
+                        eps_bits: eps.to_bits(),
+                    });
+                }
+                Op::BatchNormInferenceBackwardBeta => {
+                    let dy_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = dy_shape.rank();
+                    let channels = dy_shape.dim(rank - 1).unwrap_static() as u32;
+                    let total = dy_shape.num_elements().unwrap_or(0) as u32;
+                    schedule.push(Step::BatchNormInferenceBackwardBeta {
+                        dy_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        count: total / channels.max(1),
+                        channels,
+                    });
+                }
+                Op::GroupNormBackwardInput { num_groups, eps }
+                | Op::GroupNormBackwardGamma { num_groups, eps }
+                | Op::GroupNormBackwardBeta { num_groups, eps } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let n = x_shape.dim(0).unwrap_static() as u32;
+                    let c = x_shape.dim(1).unwrap_static() as u32;
+                    let h = x_shape.dim(2).unwrap_static() as u32;
+                    let w = x_shape.dim(3).unwrap_static() as u32;
+                    let eps_bits = eps.to_bits();
+                    let num_groups = *num_groups as u32;
+                    match &node.op {
+                        Op::GroupNormBackwardInput { .. } => {
+                            schedule.push(Step::GroupNormBackwardInput {
+                                x_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                                gamma_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                                dy_off: (arena.offset(node.inputs[3]) / 4) as u32,
+                                out_off: (arena.offset(node.id) / 4) as u32,
+                                n,
+                                c,
+                                h,
+                                w,
+                                num_groups,
+                                eps_bits,
+                            });
+                        }
+                        Op::GroupNormBackwardGamma { .. } => {
+                            schedule.push(Step::GroupNormBackwardGamma {
+                                x_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                                dy_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                                out_off: (arena.offset(node.id) / 4) as u32,
+                                n,
+                                c,
+                                h,
+                                w,
+                                num_groups,
+                                eps_bits,
+                            });
+                        }
+                        Op::GroupNormBackwardBeta { .. } => {
+                            schedule.push(Step::GroupNormBackwardBeta {
+                                dy_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                                out_off: (arena.offset(node.id) / 4) as u32,
+                                n,
+                                c,
+                                h,
+                                w,
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Op::LayerNormBackwardInput { eps, .. } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let h = x_shape.dim(x_shape.rank() - 1).unwrap_static() as u32;
+                    let rows = (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
+                    schedule.push(Step::LayerNormBackwardInput {
+                        x_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        gamma_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        dy_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        rows,
+                        h,
+                        eps_bits: eps.to_bits(),
+                    });
+                }
+                Op::LayerNormBackwardGamma { eps, .. } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let h = x_shape.dim(x_shape.rank() - 1).unwrap_static() as u32;
+                    let rows = (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
+                    schedule.push(Step::LayerNormBackwardGamma {
+                        x_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        dy_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        rows,
+                        h,
+                        eps_bits: eps.to_bits(),
+                    });
+                }
+                Op::FakeQuantize {
+                    bits,
+                    axis,
+                    ste: _,
+                    scale_mode,
+                } => {
+                    use rlx_ir::op::ScaleMode;
+                    let q_max = match *bits {
+                        8 => 127.0f32,
+                        4 => 7.0,
+                        2 => 1.0,
+                        n => panic!("rlx-rocm FakeQuantize: unsupported bits {n}"),
+                    };
+                    let (chan_dim, inner) = match *axis {
+                        None => (1usize, node.shape.num_elements().unwrap_or(0).max(1)),
+                        Some(d) => {
+                            let chan_dim = node.shape.dim(d).unwrap_static();
+                            let inner: usize = (d + 1..node.shape.rank())
+                                .map(|i| node.shape.dim(i).unwrap_static())
+                                .product::<usize>()
+                                .max(1);
+                            (chan_dim, inner)
+                        }
+                    };
+                    let n = node.shape.num_elements().unwrap() as u32;
+                    let chan_dim = chan_dim as u32;
+                    let inner = inner as u32;
+                    let q_max_bits = q_max.to_bits();
+                    match scale_mode {
+                        ScaleMode::Fixed => {
+                            schedule.push(Step::FakeQuantizeFixed {
+                                in_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                                scale_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                                out_off: (arena.offset(node.id) / 4) as u32,
+                                n,
+                                chan_dim,
+                                inner,
+                                q_max_bits,
+                            });
+                        }
+                        ScaleMode::PerBatch => {
+                            schedule.push(Step::FakeQuantizePerBatch {
+                                in_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                                out_off: (arena.offset(node.id) / 4) as u32,
+                                n,
+                                chan_dim,
+                                inner,
+                                q_max_bits,
+                            });
+                        }
+                        ScaleMode::EMA { decay } => {
+                            schedule.push(Step::FakeQuantizeEma {
+                                in_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                                scale_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                                out_off: (arena.offset(node.id) / 4) as u32,
+                                n,
+                                chan_dim,
+                                inner,
+                                q_max_bits,
+                                decay_bits: decay.to_bits(),
+                            });
+                        }
+                    }
+                }
+                Op::FakeQuantizeLSQ { bits, axis } => {
+                    let q_max = match *bits {
+                        8 => 127.0f32,
+                        4 => 7.0,
+                        2 => 1.0,
+                        n => panic!("rlx-rocm FakeQuantizeLSQ: unsupported bits {n}"),
+                    };
+                    let (chan_dim, inner) = match *axis {
+                        None => (1usize, node.shape.num_elements().unwrap_or(0).max(1)),
+                        Some(d) => {
+                            let chan_dim = node.shape.dim(d).unwrap_static();
+                            let inner: usize = (d + 1..node.shape.rank())
+                                .map(|i| node.shape.dim(i).unwrap_static())
+                                .product::<usize>()
+                                .max(1);
+                            (chan_dim, inner)
+                        }
+                    };
+                    schedule.push(Step::FakeQuantizeFixed {
+                        in_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        scale_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        n: node.shape.num_elements().unwrap() as u32,
+                        chan_dim: chan_dim as u32,
+                        inner: inner as u32,
+                        q_max_bits: q_max.to_bits(),
+                    });
+                }
+                Op::FakeQuantizeLSQBackwardX { bits, axis } => {
+                    let q_max = match *bits {
+                        8 => 127.0f32,
+                        4 => 7.0,
+                        2 => 1.0,
+                        n => panic!("rlx-rocm FakeQuantizeLSQBackwardX: unsupported bits {n}"),
+                    };
+                    let (chan_dim, inner) = match *axis {
+                        None => (1usize, node.shape.num_elements().unwrap_or(0).max(1)),
+                        Some(d) => {
+                            let chan_dim = node.shape.dim(d).unwrap_static();
+                            let inner: usize = (d + 1..node.shape.rank())
+                                .map(|i| node.shape.dim(i).unwrap_static())
+                                .product::<usize>()
+                                .max(1);
+                            (chan_dim, inner)
+                        }
+                    };
+                    schedule.push(Step::FakeQuantizeLsqBwdX {
+                        x_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        scale_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        dy_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        dx_off: (arena.offset(node.id) / 4) as u32,
+                        n: node.shape.num_elements().unwrap() as u32,
+                        chan_dim: chan_dim as u32,
+                        inner: inner as u32,
+                        q_max_bits: q_max.to_bits(),
+                    });
+                }
+                Op::FakeQuantizeLSQBackwardScale { bits, axis } => {
+                    let q_max = match *bits {
+                        8 => 127.0f32,
+                        4 => 7.0,
+                        2 => 1.0,
+                        n => panic!("rlx-rocm FakeQuantizeLSQBackwardScale: unsupported bits {n}"),
+                    };
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let (chan_dim, inner) = match *axis {
+                        None => (1usize, in_shape.num_elements().unwrap_or(0).max(1)),
+                        Some(d) => {
+                            let chan_dim = in_shape.dim(d).unwrap_static();
+                            let inner: usize = (d + 1..in_shape.rank())
+                                .map(|i| in_shape.dim(i).unwrap_static())
+                                .product::<usize>()
+                                .max(1);
+                            (chan_dim, inner)
+                        }
+                    };
+                    schedule.push(Step::FakeQuantizeLsqBwdScale {
+                        x_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        scale_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        dy_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        dscale_off: (arena.offset(node.id) / 4) as u32,
+                        n: in_shape.num_elements().unwrap() as u32,
+                        chan_dim: chan_dim as u32,
+                        inner: inner as u32,
+                        q_max_bits: q_max.to_bits(),
+                    });
+                }
+                Op::FakeQuantizeBackward { bits, axis, ste } => {
+                    use rlx_ir::op::SteKind;
+                    let q_max = match *bits {
+                        8 => 127.0f32,
+                        4 => 7.0,
+                        2 => 1.0,
+                        n => panic!("rlx-rocm FakeQuantizeBackward: unsupported bits {n}"),
+                    };
+                    let ste_kind = match ste {
+                        SteKind::Identity => 0u32,
+                        SteKind::ClippedIdentity => 1,
+                        SteKind::Tanh => 2,
+                        SteKind::HardTanh => 3,
+                    };
+                    let (chan_dim, inner) = match *axis {
+                        None => (1usize, node.shape.num_elements().unwrap_or(0).max(1)),
+                        Some(d) => {
+                            let chan_dim = node.shape.dim(d).unwrap_static();
+                            let inner: usize = (d + 1..node.shape.rank())
+                                .map(|i| node.shape.dim(i).unwrap_static())
+                                .product::<usize>()
+                                .max(1);
+                            (chan_dim, inner)
+                        }
+                    };
+                    schedule.push(Step::FakeQuantizeBackward {
+                        x_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        dy_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        dx_off: (arena.offset(node.id) / 4) as u32,
+                        n: node.shape.num_elements().unwrap() as u32,
+                        chan_dim: chan_dim as u32,
+                        inner: inner as u32,
+                        q_max_bits: q_max.to_bits(),
+                        ste_kind,
+                    });
+                }
+                Op::Quantize {
+                    axis,
+                    scales,
+                    zero_points,
+                } => {
+                    let (chan_dim, inner) = match *axis {
+                        None => (1usize, node.shape.num_elements().unwrap_or(0).max(1)),
+                        Some(d) => {
+                            let chan_dim = node.shape.dim(d).unwrap_static();
+                            let inner: usize = (d + 1..node.shape.rank())
+                                .map(|i| node.shape.dim(i).unwrap_static())
+                                .product::<usize>()
+                                .max(1);
+                            (chan_dim, inner)
+                        }
+                    };
+                    debug_assert_eq!(scales.len(), chan_dim);
+                    debug_assert_eq!(zero_points.len(), chan_dim);
+                    let mut affine = Vec::with_capacity(chan_dim * 2);
+                    for c in 0..chan_dim {
+                        affine.push(scales[c].to_bits());
+                        affine.push(zero_points[c] as u32);
+                    }
+                    let meta = upload_meta(&ctx, &affine);
+                    let meta_idx = meta_buffers.len();
+                    meta_buffers.push(meta);
+                    schedule.push(Step::QuantizeI8 {
+                        in_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        q_byte_off: arena.offset(node.id) as u32,
+                        n: node.shape.num_elements().unwrap() as u32,
+                        chan_dim: chan_dim as u32,
+                        inner: inner as u32,
+                        meta_idx,
+                    });
+                }
+                Op::Dequantize {
+                    axis,
+                    scales,
+                    zero_points,
+                } => {
+                    let (chan_dim, inner) = match *axis {
+                        None => (1usize, node.shape.num_elements().unwrap_or(0).max(1)),
+                        Some(d) => {
+                            let chan_dim = node.shape.dim(d).unwrap_static();
+                            let inner: usize = (d + 1..node.shape.rank())
+                                .map(|i| node.shape.dim(i).unwrap_static())
+                                .product::<usize>()
+                                .max(1);
+                            (chan_dim, inner)
+                        }
+                    };
+                    debug_assert_eq!(scales.len(), chan_dim);
+                    debug_assert_eq!(zero_points.len(), chan_dim);
+                    let mut affine = Vec::with_capacity(chan_dim * 2);
+                    for c in 0..chan_dim {
+                        affine.push(scales[c].to_bits());
+                        affine.push(zero_points[c] as u32);
+                    }
+                    let meta = upload_meta(&ctx, &affine);
+                    let meta_idx = meta_buffers.len();
+                    meta_buffers.push(meta);
+                    schedule.push(Step::DequantizeI8 {
+                        q_byte_off: arena.offset(node.inputs[0]) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        n: node.shape.num_elements().unwrap() as u32,
+                        chan_dim: chan_dim as u32,
+                        inner: inner as u32,
+                        meta_idx,
+                    });
+                }
+                Op::QMatMul {
+                    x_zp,
+                    w_zp,
+                    out_zp,
+                    mult,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let w_shape = &graph.node(node.inputs[1]).shape;
+                    schedule.push(Step::QMatMul {
+                        m: x_shape.dim(0).unwrap_static() as u32,
+                        k: x_shape.dim(1).unwrap_static() as u32,
+                        n: w_shape.dim(1).unwrap_static() as u32,
+                        x_byte_off: arena.offset(node.inputs[0]) as u32,
+                        w_byte_off: arena.offset(node.inputs[1]) as u32,
+                        bias_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        out_byte_off: arena.offset(node.id) as u32,
+                        x_zp: *x_zp,
+                        w_zp: *w_zp,
+                        out_zp: *out_zp,
+                        mult_bits: mult.to_bits(),
+                    });
+                }
+                Op::QConv2d {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                    x_zp,
+                    w_zp,
+                    out_zp,
+                    mult,
+                } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let out_shape = &node.shape;
+                    schedule.push(Step::QConv2d {
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c_in: in_shape.dim(1).unwrap_static() as u32,
+                        c_out: out_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                        h_out: out_shape.dim(2).unwrap_static() as u32,
+                        w_out: out_shape.dim(3).unwrap_static() as u32,
+                        kh: kernel_size[0] as u32,
+                        kw: kernel_size[1] as u32,
+                        sh: stride.first().copied().unwrap_or(1) as u32,
+                        sw: stride.get(1).copied().unwrap_or(1) as u32,
+                        ph: padding.first().copied().unwrap_or(0) as u32,
+                        pw: padding.get(1).copied().unwrap_or(0) as u32,
+                        dh: dilation.first().copied().unwrap_or(1) as u32,
+                        dw: dilation.get(1).copied().unwrap_or(1) as u32,
+                        groups: *groups as u32,
+                        x_byte_off: arena.offset(node.inputs[0]) as u32,
+                        w_byte_off: arena.offset(node.inputs[1]) as u32,
+                        bias_off: (arena.offset(node.inputs[2]) / 4) as u32,
+                        out_byte_off: arena.offset(node.id) as u32,
+                        x_zp: *x_zp,
+                        w_zp: *w_zp,
+                        out_zp: *out_zp,
+                        mult_bits: mult.to_bits(),
                     });
                 }
                 Op::ResizeNearest2x => {
@@ -2183,6 +3017,11 @@ impl RocmExecutable {
                             in_off,
                             w_off,
                             out_off,
+                            has_bias: 0,
+                            bias_off_f32: 0,
+                            act_id: 0xFFFF,
+                            has_residual: 0,
+                            residual_off_f32: 0,
                         }),
                         3 => schedule.push(Step::Conv3d {
                             n: in_dims[0].unwrap_static() as u32,
@@ -2213,6 +3052,45 @@ impl RocmExecutable {
                         }),
                         other => panic!("rlx-rocm Conv: unsupported kernel rank {other}"),
                     }
+                }
+                Op::Conv3d {
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    let in_id = node.inputs[0];
+                    let w_id = node.inputs[1];
+                    let in_dims = graph.node(in_id).shape.dims();
+                    let w_dims = graph.node(w_id).shape.dims();
+                    let out_dims = node.shape.dims();
+                    schedule.push(Step::Conv3d {
+                        n: in_dims[0].unwrap_static() as u32,
+                        c_in: in_dims[1].unwrap_static() as u32,
+                        c_out: w_dims[0].unwrap_static() as u32,
+                        d: in_dims[2].unwrap_static() as u32,
+                        h: in_dims[3].unwrap_static() as u32,
+                        w: in_dims[4].unwrap_static() as u32,
+                        d_out: out_dims[2].unwrap_static() as u32,
+                        h_out: out_dims[3].unwrap_static() as u32,
+                        w_out: out_dims[4].unwrap_static() as u32,
+                        kd: w_dims[2].unwrap_static() as u32,
+                        kh: w_dims[3].unwrap_static() as u32,
+                        kw: w_dims[4].unwrap_static() as u32,
+                        sd: stride[0] as u32,
+                        sh: stride[1] as u32,
+                        sw: stride[2] as u32,
+                        pd: padding[0] as u32,
+                        ph: padding[1] as u32,
+                        pw: padding[2] as u32,
+                        dd: dilation[0] as u32,
+                        dh: dilation[1] as u32,
+                        dw: dilation[2] as u32,
+                        groups: *groups as u32,
+                        in_off: (arena.offset(in_id) / 4) as u32,
+                        w_off: (arena.offset(w_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                    });
                 }
                 Op::Sample {
                     top_k,
@@ -2408,6 +3286,105 @@ impl RocmExecutable {
                         trailing: trailing as u32,
                     });
                 }
+                Op::Conv2dBackwardInput {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    let dy_shape = &graph.node(node.inputs[0]).shape;
+                    let out_shape = &node.shape;
+                    if kernel_size.len() == 2 && dy_shape.rank() == 4 && out_shape.rank() == 4 {
+                        schedule.push(Step::Conv2dBackwardInput {
+                            dy_byte_off: arena.offset(node.inputs[0]) as u64,
+                            w_byte_off: arena.offset(node.inputs[1]) as u64,
+                            dx_byte_off: arena.offset(node.id) as u64,
+                            n: out_shape.dim(0).unwrap_static() as u32,
+                            c_in: out_shape.dim(1).unwrap_static() as u32,
+                            h: out_shape.dim(2).unwrap_static() as u32,
+                            w_in: out_shape.dim(3).unwrap_static() as u32,
+                            c_out: dy_shape.dim(1).unwrap_static() as u32,
+                            h_out: dy_shape.dim(2).unwrap_static() as u32,
+                            w_out: dy_shape.dim(3).unwrap_static() as u32,
+                            kh: kernel_size[0] as u32,
+                            kw: kernel_size[1] as u32,
+                            sh: stride.first().copied().unwrap_or(1) as u32,
+                            sw: stride.get(1).copied().unwrap_or(1) as u32,
+                            ph: padding.first().copied().unwrap_or(0) as u32,
+                            pw: padding.get(1).copied().unwrap_or(0) as u32,
+                            dh: dilation.first().copied().unwrap_or(1) as u32,
+                            dw: dilation.get(1).copied().unwrap_or(1) as u32,
+                            groups: *groups as u32,
+                        });
+                    } else {
+                        panic!("rlx-rocm: Conv2dBackwardInput expects 2-D conv on NCHW tensors");
+                    }
+                }
+                Op::Conv2dBackwardWeight {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let dy_shape = &graph.node(node.inputs[1]).shape;
+                    if kernel_size.len() == 2 && x_shape.rank() == 4 && dy_shape.rank() == 4 {
+                        schedule.push(Step::Conv2dBackwardWeight {
+                            x_byte_off: arena.offset(node.inputs[0]) as u64,
+                            dy_byte_off: arena.offset(node.inputs[1]) as u64,
+                            dw_byte_off: arena.offset(node.id) as u64,
+                            n: x_shape.dim(0).unwrap_static() as u32,
+                            c_in: x_shape.dim(1).unwrap_static() as u32,
+                            h: x_shape.dim(2).unwrap_static() as u32,
+                            w: x_shape.dim(3).unwrap_static() as u32,
+                            c_out: dy_shape.dim(1).unwrap_static() as u32,
+                            h_out: dy_shape.dim(2).unwrap_static() as u32,
+                            w_out: dy_shape.dim(3).unwrap_static() as u32,
+                            kh: kernel_size[0] as u32,
+                            kw: kernel_size[1] as u32,
+                            sh: stride.first().copied().unwrap_or(1) as u32,
+                            sw: stride.get(1).copied().unwrap_or(1) as u32,
+                            ph: padding.first().copied().unwrap_or(0) as u32,
+                            pw: padding.get(1).copied().unwrap_or(0) as u32,
+                            dh: dilation.first().copied().unwrap_or(1) as u32,
+                            dw_dil: dilation.get(1).copied().unwrap_or(1) as u32,
+                            groups: *groups as u32,
+                        });
+                    } else {
+                        panic!("rlx-rocm: Conv2dBackwardWeight expects 2-D conv on NCHW tensors");
+                    }
+                }
+                Op::MaxPool2dBackward {
+                    kernel_size,
+                    stride,
+                    padding,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let dy_shape = &graph.node(node.inputs[1]).shape;
+                    if kernel_size.len() == 2 && x_shape.rank() == 4 && dy_shape.rank() == 4 {
+                        schedule.push(Step::MaxPool2dBackward {
+                            x_byte_off: arena.offset(node.inputs[0]) as u64,
+                            dy_byte_off: arena.offset(node.inputs[1]) as u64,
+                            dx_byte_off: arena.offset(node.id) as u64,
+                            n: x_shape.dim(0).unwrap_static() as u32,
+                            c: x_shape.dim(1).unwrap_static() as u32,
+                            h: x_shape.dim(2).unwrap_static() as u32,
+                            w: x_shape.dim(3).unwrap_static() as u32,
+                            h_out: dy_shape.dim(2).unwrap_static() as u32,
+                            w_out: dy_shape.dim(3).unwrap_static() as u32,
+                            kh: kernel_size[0] as u32,
+                            kw: kernel_size[1] as u32,
+                            sh: stride.first().copied().unwrap_or(1) as u32,
+                            sw: stride.get(1).copied().unwrap_or(1) as u32,
+                            ph: padding.first().copied().unwrap_or(0) as u32,
+                            pw: padding.get(1).copied().unwrap_or(0) as u32,
+                        });
+                    } else {
+                        panic!("rlx-rocm: MaxPool2dBackward expects 2-D pool on NCHW tensors");
+                    }
+                }
                 // Native batched symmetric eigendecomposition: `Op::Eigh` /
                 // `Op::EighBatch` (n ≤ 32) run on-device via hipSOLVER
                 // `SsyevjBatched` when libhipsolver is loadable. Larger `n` or
@@ -2454,6 +3431,102 @@ impl RocmExecutable {
                         out_off: arena.offset(node.id) / 4,
                         out_shape: node.shape.clone(),
                         inputs,
+                    });
+                }
+                // C64 Wirtinger surface — native `complex_wirtinger.cu` (shared
+                // with CUDA). Interleaved [re, im] pairs; `elems` is the
+                // complex-element count (output of ComplexNormSq is real F32).
+                Op::ComplexNormSq => {
+                    let src = node.inputs[0];
+                    if graph.node(src).shape.dtype() != rlx_ir::DType::C64 {
+                        panic!(
+                            "rlx-rocm ComplexNormSq: expected C64 input, got {:?}",
+                            graph.node(src).shape.dtype()
+                        );
+                    }
+                    schedule.push(Step::ComplexNormSq {
+                        n: elems,
+                        src_byte_off: arena.offset(src) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                    });
+                }
+                Op::ComplexNormSqBackward => {
+                    let z = node.inputs[0];
+                    let g = node.inputs[1];
+                    if graph.node(z).shape.dtype() != rlx_ir::DType::C64 {
+                        panic!(
+                            "rlx-rocm ComplexNormSqBackward: expected C64 z, got {:?}",
+                            graph.node(z).shape.dtype()
+                        );
+                    }
+                    schedule.push(Step::ComplexNormSqBackward {
+                        n: elems,
+                        z_byte_off: arena.offset(z) as u32,
+                        g_byte_off: arena.offset(g) as u32,
+                        dz_byte_off: arena.offset(node.id) as u32,
+                    });
+                }
+                Op::Conjugate => {
+                    let src = node.inputs[0];
+                    if graph.node(src).shape.dtype() != rlx_ir::DType::C64 {
+                        panic!(
+                            "rlx-rocm Conjugate: expected C64 input, got {:?}",
+                            graph.node(src).shape.dtype()
+                        );
+                    }
+                    schedule.push(Step::ConjugateC64 {
+                        n: elems,
+                        src_byte_off: arena.offset(src) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                    });
+                }
+                // Native F32 dense solve via hipSOLVER getrf+getrs /
+                // hipBLAS getrfBatched+getrsBatched when libraries load.
+                // Otherwise (or F64) fall through to HostOp.
+                Op::DenseSolve
+                    if node.shape.dtype() == rlx_ir::DType::F32
+                        && crate::dense_solve_native::is_available() =>
+                {
+                    let a_shape = &graph.node(node.inputs[0]).shape;
+                    let n = a_shape.dim(0).unwrap_static();
+                    let b_elems = node.shape.num_elements().unwrap();
+                    let nrhs = b_elems / n;
+                    schedule.push(Step::DenseSolveNative {
+                        a_off: arena.offset(node.inputs[0]) / 4,
+                        b_off: arena.offset(node.inputs[1]) / 4,
+                        x_off: arena.offset(node.id) / 4,
+                        n,
+                        nrhs,
+                    });
+                }
+                Op::BatchedDenseSolve
+                    if node.shape.dtype() == rlx_ir::DType::F32
+                        && crate::device::rocm_blas().as_ref().is_some_and(|b| {
+                            crate::hipblas::batched_lu_available(&b.lock().unwrap().runtime)
+                        }) =>
+                {
+                    let a_shape = &graph.node(node.inputs[0]).shape;
+                    let batch = a_shape.dim(0).unwrap_static();
+                    let n = a_shape.dim(1).unwrap_static();
+                    let total = node.shape.num_elements().unwrap();
+                    let nrhs = total / (batch * n);
+                    schedule.push(Step::BatchedDenseSolveNative {
+                        a_off: arena.offset(node.inputs[0]) / 4,
+                        b_off: arena.offset(node.inputs[1]) / 4,
+                        x_off: arena.offset(node.id) / 4,
+                        batch,
+                        n,
+                        nrhs,
+                    });
+                }
+                // Host-staged ops (D2H → CPU `eval_single_op_f32` → H2D), same
+                // catch-all as wgpu `lower.rs`. DenseSolve / BatchedDenseSolve
+                // fall here when native libs/dtypes are unavailable; CustomFn
+                // runs the opaque body. `PartitionedConv` is expanded to
+                // Fft/MatMul in `crate::unfuse` before this match.
+                Op::DenseSolve | Op::BatchedDenseSolve | Op::CustomFn { .. } => {
+                    schedule.push(Step::HostOp {
+                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
                     });
                 }
                 other => panic!(

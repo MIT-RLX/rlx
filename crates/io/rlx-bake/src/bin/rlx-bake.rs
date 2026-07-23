@@ -228,11 +228,7 @@ fn run() -> Result<()> {
     let had_weights_file = weights_path.is_some();
     if let Some(wp) = &weights_path {
         bindings = load_safetensors_f32(wp)?;
-        eprintln!(
-            "loaded {} tensors from {}",
-            bindings.len(),
-            wp.display()
-        );
+        eprintln!("loaded {} tensors from {}", bindings.len(), wp.display());
     }
 
     eprintln!(

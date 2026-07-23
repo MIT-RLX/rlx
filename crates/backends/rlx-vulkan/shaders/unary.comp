@@ -2,7 +2,7 @@
 // Element-wise activation / unary math over the f32 arena.
 // op ids (see backend.rs Activation mapping):
 //  0 gelu 1 gelu_approx 2 silu 3 relu 4 sigmoid 5 tanh 6 exp 7 log
-//  8 sqrt 9 rsqrt 10 neg 11 abs 12 sin 13 cos 14 tan 15 atan 16 round
+//  8 sqrt 9 rsqrt 10 neg 11 abs 12 sin 13 cos 14 tan 15 atan 16 round 17 recip
 // Cast op ids (f32-uniform arena; the dst dtype value is stored back as f32 —
 // see `classify_cast` in backend.rs, kept in sync with unary.cu / unary.cl):
 //  100 f32->i8  101 f32->i16 102 f32->i32 103 f32->i64
@@ -60,6 +60,7 @@ void main() {
         case 14u: y = tan(x); break;
         case 15u: y = atan(x); break;
         case 16u: y = floor(x + 0.5); break;               // round (half up)
+        case 17u: y = 1.0 / x; break;                      // recip / vvrecf
         // f32 -> int: truncate toward zero, saturate to dst range, NaN -> 0.
         case 100u: y = isnan(x) ? 0.0 : clamp(trunc(x), -128.0, 127.0); break;
         case 101u: y = isnan(x) ? 0.0 : clamp(trunc(x), -32768.0, 32767.0); break;

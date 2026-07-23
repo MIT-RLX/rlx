@@ -13,26 +13,21 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// LSTM forward. The timestep recurrence is inherently sequential, so one
-// direction runs in a single threadblock (batch=1 in the common CRNN case);
-// the win over the host path comes from staying on-device and, crucially, from
-// COALESCED weight reads.
+// LSTM forward. The recurrent Whh·h step is sequential, but Wih·X across the
+// whole sequence is a fat GEMV that we precompute in parallel (`lstm_pre_wih`)
+// so the per-step kernel only pays for Whh·h + gates.
 //
-// Naive thread-per-output-row (thread r reads weight row r, stride = in_features)
-// is fully uncoalesced and ~20x too slow. Instead the caller pre-transposes the
-// gate weights to `[in_features, 4h]` with `transpose_rc`, so at a fixed input
-// index j consecutive threads r read consecutive addresses `w_t[j*4h + r]`.
+// Weight layout after `transpose_rc`: wih_t [in_l, 4h], whh_t [hidden, 4h]
+// (coalesced: consecutive threads r read consecutive addresses at fixed j).
 //
-// Bit-exact mirror of `rlx_cpu::thunk::execute_lstm_f32`:
+// Bit-exact intent of `rlx_cpu::thunk::execute_lstm_f32` (FP assoc may differ
+// slightly because bias+Wih are folded before Whh):
 //   z[r] = bias[r] + sum_j wih[r,j] x_t[j] + sum_j whh[r,j] h[j]
 //   i=sig(z[0..h]) f=sig(z[h..2h]) g=tanh(z[2h..3h]) o=sig(z[3h..4h])
 //   c = f*c + i*g ;  h = o*tanh(c)
-// (wih_t[j*4h+r] == wih[r,j], likewise whh_t — so the sums are identical.)
 // Output layout [batch, seq, out_width]; this direction owns the
 // `dir*hidden .. dir*hidden+hidden` feature slice. All *_off are FLOAT offsets.
 
-// Transpose src[rows, cols] (in `arena`) into dst[cols, rows] (in `scratch`):
-//   dst[c*rows + r] = src[r*cols + c].
 extern "C" __global__ void transpose_rc(
     const float* arena,
     float* scratch,
@@ -49,6 +44,48 @@ extern "C" __global__ void transpose_rc(
     scratch[dst_off + (size_t)c * rows + r] = arena[src_off + (size_t)r * cols + c];
 }
 
+extern "C" __global__ void lstm_pre_wih(
+    float* arena,
+    float* scratch,
+    unsigned int in_off,
+    unsigned int in_is_scratch,
+    unsigned int wih_t_off,
+    unsigned int bias_off,
+    unsigned int pre_off,
+    unsigned int batch,
+    unsigned int seq,
+    unsigned int in_l,
+    unsigned int four_h
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = batch * seq * four_h;
+    if (idx >= total) return;
+    unsigned int r = idx % four_h;
+    unsigned int t = (idx / four_h) % seq;
+    unsigned int b = idx / (four_h * seq);
+    float* in_base = in_is_scratch ? scratch : arena;
+    const float* x_t = in_base + in_off + (size_t)(b * seq + t) * in_l;
+    const float* wih_t = scratch + wih_t_off;
+    float acc = arena[bias_off + r];
+    for (unsigned int j = 0; j < in_l; ++j) {
+        acc += x_t[j] * wih_t[(size_t)j * four_h + r];
+    }
+    scratch[pre_off + (size_t)(b * seq + t) * four_h + r] = acc;
+}
+
+extern "C" __global__ void lstm_pre_add_bias(
+    float* scratch,
+    unsigned int pre_off,
+    unsigned int bias_off,
+    float* arena,
+    unsigned int len,
+    unsigned int four_h
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= len) return;
+    scratch[pre_off + i] += arena[bias_off + (i % four_h)];
+}
+
 extern "C" __global__ void lstm_dir(
     float* arena,
     float* scratch,
@@ -56,9 +93,9 @@ extern "C" __global__ void lstm_dir(
     unsigned int in_is_scratch,
     unsigned int out_off,
     unsigned int out_is_scratch,
-    unsigned int wih_t_off,   // transposed weights live in scratch: [in_l, 4h]
-    unsigned int whh_t_off,   // [hidden, 4h]
-    unsigned int bias_off,    // arena: [4h]
+    unsigned int wih_t_off,
+    unsigned int whh_t_off,
+    unsigned int bias_off,
     unsigned int h0_off,
     unsigned int c0_off,
     unsigned int carry,
@@ -68,13 +105,14 @@ extern "C" __global__ void lstm_dir(
     unsigned int hidden,
     unsigned int out_width,
     unsigned int dir,
-    unsigned int reverse
+    unsigned int reverse,
+    unsigned int pre_off
 ) {
+    (void)in_off; (void)in_is_scratch; (void)wih_t_off; (void)bias_off; (void)in_l;
     extern __shared__ float sh[];
-    float* x_sh = sh;              // in_l
-    float* h_sh = x_sh + in_l;     // hidden
-    float* c_sh = h_sh + hidden;   // hidden
-    float* z_sh = c_sh + hidden;   // 4*hidden
+    float* h_sh = sh;
+    float* c_sh = h_sh + hidden;
+    float* z_sh = c_sh + hidden;
 
     unsigned int b = blockIdx.x;
     if (b >= batch) return;
@@ -82,11 +120,9 @@ extern "C" __global__ void lstm_dir(
     unsigned int nth = blockDim.x;
     unsigned int four_h = 4u * hidden;
 
-    float* in_base  = in_is_scratch  ? scratch : arena;
     float* out_base = out_is_scratch ? scratch : arena;
-    const float* wih_t = scratch + wih_t_off;  // [in_l, 4h]
-    const float* whh_t = scratch + whh_t_off;  // [hidden, 4h]
-    const float* bias  = arena + bias_off;     // [4h]
+    const float* whh_t = scratch + whh_t_off;
+    const float* pre = scratch + pre_off;
 
     for (unsigned int k = tid; k < hidden; k += nth) {
         if (carry) {
@@ -101,19 +137,11 @@ extern "C" __global__ void lstm_dir(
 
     for (unsigned int step = 0; step < seq; ++step) {
         unsigned int t = reverse ? (seq - 1u - step) : step;
-        const float* x_t = in_base + in_off + (size_t)(b * seq + t) * in_l;
-        for (unsigned int j = tid; j < in_l; j += nth) {
-            x_sh[j] = x_t[j];
-        }
-        __syncthreads();
+        const float* pre_t = pre + (size_t)(b * seq + t) * four_h;
 
-        // z[r] = bias[r] + sum_j wih_t[j,r] x[j] + sum_j whh_t[j,r] h[j]
-        // Consecutive threads r read consecutive addresses (coalesced).
         for (unsigned int r = tid; r < four_h; r += nth) {
-            float acc = bias[r];
-            for (unsigned int j = 0; j < in_l; ++j) {
-                acc += wih_t[(size_t)j * four_h + r] * x_sh[j];
-            }
+            float acc = pre_t[r];
+#pragma unroll 8
             for (unsigned int j = 0; j < hidden; ++j) {
                 acc += whh_t[(size_t)j * four_h + r] * h_sh[j];
             }

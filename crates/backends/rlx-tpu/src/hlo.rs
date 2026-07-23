@@ -236,6 +236,8 @@ pub struct WindowDim {
     pub padding_high: i64,
     pub window_dilation: i64,
     pub base_dilation: i64,
+    /// Flip the window along this dim before applying (conv VJP / transpose).
+    pub window_reversal: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -256,7 +258,7 @@ impl Window {
                     padding_high: d.padding_high,
                     window_dilation: d.window_dilation,
                     base_dilation: d.base_dilation,
-                    window_reversal: false,
+                    window_reversal: d.window_reversal,
                 })
                 .collect(),
         }
@@ -687,6 +689,14 @@ impl Computation {
         self.add_instr(i)
     }
 
+    /// XLA `reverse` — flip element order along `dimensions`.
+    pub fn reverse(&self, x: i64, dimensions: &[i64], shape: Shape) -> i64 {
+        let mut i = Instr::new(0, "reverse".into(), "reverse", shape);
+        i.operand_ids = vec![x];
+        i.dimensions = dimensions.to_vec();
+        self.add_instr(i)
+    }
+
     pub fn fft(
         &self,
         x: i64,
@@ -821,6 +831,27 @@ impl Computation {
         i.operand_ids = vec![x, init];
         i.window = Some(window);
         i.called_computation_ids = vec![reducer.id()];
+        self.add_instr(i)
+    }
+
+    /// `kSelectAndScatter` — windowed select on `operand`, then scatter
+    /// `source` into the selected slots via `scatter` (typically add).
+    /// Used for MaxPool VJP. Proto fields: `window` + two
+    /// `called_computation_ids` (select, then scatter); no new wire fields.
+    pub fn select_and_scatter(
+        &self,
+        operand: i64,
+        source: i64,
+        init: i64,
+        select: &Computation,
+        scatter: &Computation,
+        window: Window,
+        shape: Shape,
+    ) -> i64 {
+        let mut i = Instr::new(0, "select-and-scatter".into(), "select-and-scatter", shape);
+        i.operand_ids = vec![operand, source, init];
+        i.window = Some(window);
+        i.called_computation_ids = vec![select.id(), scatter.id()];
         self.add_instr(i)
     }
 
@@ -1030,6 +1061,24 @@ impl HloBuilder {
             parameters: vec![s.clone(), s.clone()],
             parameter_names: vec!["x".into(), "y".into()],
             result: s,
+        });
+        c
+    }
+
+    /// Select subcomputation for MaxPool `select-and-scatter`: `GE`
+    /// (prefer first argmax on ties). Returns a PRED scalar.
+    pub fn make_ge_select(&mut self, name: &str, prim_ty: i32) -> Computation {
+        let c = self.computation(name);
+        let s = Shape::scalar(prim_ty);
+        let pred = Shape::scalar(prim::PRED);
+        let p0 = c.parameter(0, "lhs", s.clone());
+        let p1 = c.parameter(1, "rhs", s.clone());
+        let r = c.compare(p0, p1, "GE", pred.clone());
+        c.set_root(r);
+        c.set_program_shape(ProgramShape {
+            parameters: vec![s.clone(), s],
+            parameter_names: vec!["lhs".into(), "rhs".into()],
+            result: pred,
         });
         c
     }

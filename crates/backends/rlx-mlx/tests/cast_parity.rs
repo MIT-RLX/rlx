@@ -59,12 +59,14 @@ impl Scalar {
 fn decode(src: &[u8], dt: DType, n: usize) -> Vec<Scalar> {
     let mut v = Vec::with_capacity(n);
     match dt {
-        DType::F32 => src.chunks_exact(4).take(n).for_each(|c| {
-            v.push(Scalar::F(f32::from_le_bytes(c.try_into().unwrap()) as f64))
-        }),
-        DType::F64 => src.chunks_exact(8).take(n).for_each(|c| {
-            v.push(Scalar::F(f64::from_le_bytes(c.try_into().unwrap())))
-        }),
+        DType::F32 => src
+            .chunks_exact(4)
+            .take(n)
+            .for_each(|c| v.push(Scalar::F(f32::from_le_bytes(c.try_into().unwrap()) as f64))),
+        DType::F64 => src
+            .chunks_exact(8)
+            .take(n)
+            .for_each(|c| v.push(Scalar::F(f64::from_le_bytes(c.try_into().unwrap())))),
         DType::F16 => src.chunks_exact(2).take(n).for_each(|c| {
             v.push(Scalar::F(
                 half::f16::from_le_bytes([c[0], c[1]]).to_f32() as f64
@@ -75,21 +77,34 @@ fn decode(src: &[u8], dt: DType, n: usize) -> Vec<Scalar> {
                 half::bf16::from_le_bytes([c[0], c[1]]).to_f32() as f64
             ))
         }),
-        DType::I8 => src.iter().take(n).for_each(|&b| v.push(Scalar::I(b as i8 as i64))),
-        DType::I16 => src.chunks_exact(2).take(n).for_each(|c| {
-            v.push(Scalar::I(i16::from_le_bytes([c[0], c[1]]) as i64))
-        }),
-        DType::I32 => src.chunks_exact(4).take(n).for_each(|c| {
-            v.push(Scalar::I(i32::from_le_bytes(c.try_into().unwrap()) as i64))
-        }),
-        DType::I64 => src.chunks_exact(8).take(n).for_each(|c| {
-            v.push(Scalar::I(i64::from_le_bytes(c.try_into().unwrap())))
-        }),
-        DType::U8 => src.iter().take(n).for_each(|&b| v.push(Scalar::I(b as i64))),
-        DType::U32 => src.chunks_exact(4).take(n).for_each(|c| {
-            v.push(Scalar::I(u32::from_le_bytes(c.try_into().unwrap()) as i64))
-        }),
-        DType::Bool => src.iter().take(n).for_each(|&b| v.push(Scalar::I((b != 0) as i64))),
+        DType::I8 => src
+            .iter()
+            .take(n)
+            .for_each(|&b| v.push(Scalar::I(b as i8 as i64))),
+        DType::I16 => src
+            .chunks_exact(2)
+            .take(n)
+            .for_each(|c| v.push(Scalar::I(i16::from_le_bytes([c[0], c[1]]) as i64))),
+        DType::I32 => src
+            .chunks_exact(4)
+            .take(n)
+            .for_each(|c| v.push(Scalar::I(i32::from_le_bytes(c.try_into().unwrap()) as i64))),
+        DType::I64 => src
+            .chunks_exact(8)
+            .take(n)
+            .for_each(|c| v.push(Scalar::I(i64::from_le_bytes(c.try_into().unwrap())))),
+        DType::U8 => src
+            .iter()
+            .take(n)
+            .for_each(|&b| v.push(Scalar::I(b as i64))),
+        DType::U32 => src
+            .chunks_exact(4)
+            .take(n)
+            .for_each(|c| v.push(Scalar::I(u32::from_le_bytes(c.try_into().unwrap()) as i64))),
+        DType::Bool => src
+            .iter()
+            .take(n)
+            .for_each(|&b| v.push(Scalar::I((b != 0) as i64))),
         DType::C64 => src.chunks_exact(8).take(n).for_each(|c| {
             let re = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64;
             let im = f32::from_le_bytes([c[4], c[5], c[6], c[7]]) as f64;
@@ -230,26 +245,56 @@ fn i64b(v: &[i64]) -> Vec<u8> {
 fn scalar_int_float_roundtrips() {
     let iv = [7i32, -3, 100000, 0];
     check(&i32b(&iv), DType::I32, DType::F32, 4, None);
-    check(&f32b(&[7.0, -3.0, 100000.0, 0.0]), DType::F32, DType::I32, 4, None);
-    check(&i64b(&[1i64, -2, 5_000_000_000]), DType::I64, DType::F32, 3, None);
+    check(
+        &f32b(&[7.0, -3.0, 100000.0, 0.0]),
+        DType::F32,
+        DType::I32,
+        4,
+        None,
+    );
+    check(
+        &i64b(&[1i64, -2, 5_000_000_000]),
+        DType::I64,
+        DType::F32,
+        3,
+        None,
+    );
 }
 
 #[test]
 fn scalar_float_to_int_truncates_toward_zero() {
     // In-range values: MLX astype float->int truncates toward zero,
     // matching rlx-cpu's `f as iN`.
-    check(&f32b(&[1.9, -1.9, 3.5, -3.5]), DType::F32, DType::I32, 4, None);
+    check(
+        &f32b(&[1.9, -1.9, 3.5, -3.5]),
+        DType::F32,
+        DType::I32,
+        4,
+        None,
+    );
     check(&f32b(&[2.9, 0.1, -0.9]), DType::F32, DType::I64, 3, None);
 }
 
 #[test]
 fn scalar_narrowing_and_bool() {
-    check(&f32b(&[0.0, 1.0, -2.0, 0.0]), DType::F32, DType::Bool, 4, None);
+    check(
+        &f32b(&[0.0, 1.0, -2.0, 0.0]),
+        DType::F32,
+        DType::Bool,
+        4,
+        None,
+    );
     let bool_bytes = vec![1u8, 0, 1, 0];
     check(&bool_bytes, DType::Bool, DType::F32, 4, None);
     // U8 <-> F32 in range.
     check(&[0u8, 42, 255, 7], DType::U8, DType::F32, 4, None);
-    check(&f32b(&[0.0, 42.0, 255.0, 7.0]), DType::F32, DType::U8, 4, None);
+    check(
+        &f32b(&[0.0, 42.0, 255.0, 7.0]),
+        DType::F32,
+        DType::U8,
+        4,
+        None,
+    );
 }
 
 #[test]
@@ -265,7 +310,13 @@ fn scalar_half_precision_pairs() {
 
 #[test]
 fn f64_pairs_via_cpu_stream() {
-    check(&f32b(&[1.5, -2.25, 4096.0, 0.0]), DType::F32, DType::F64, 4, None);
+    check(
+        &f32b(&[1.5, -2.25, 4096.0, 0.0]),
+        DType::F32,
+        DType::F64,
+        4,
+        None,
+    );
     let f64src: Vec<u8> = [1.5f64, -2.25, 4096.0, 0.0]
         .iter()
         .flat_map(|x| x.to_le_bytes())
@@ -281,8 +332,20 @@ fn f64_pairs_via_cpu_stream() {
 #[test]
 fn c64_real_to_complex() {
     // real -> C64: interleaved (v, 0.0) f32 pairs, 8 bytes/elem.
-    check(&f32b(&[1.0, -2.0, 3.5]), DType::F32, DType::C64, 3, Some(MlxMode::Lazy));
-    check(&i32b(&[4, -5, 6]), DType::I32, DType::C64, 3, Some(MlxMode::Lazy));
+    check(
+        &f32b(&[1.0, -2.0, 3.5]),
+        DType::F32,
+        DType::C64,
+        3,
+        Some(MlxMode::Lazy),
+    );
+    check(
+        &i32b(&[4, -5, 6]),
+        DType::I32,
+        DType::C64,
+        3,
+        Some(MlxMode::Lazy),
+    );
 }
 
 #[test]
@@ -313,8 +376,16 @@ fn c64_roundtrip_real_to_c64_to_real() {
         vec![],
         Shape::new(&[4], DType::F32),
     );
-    let cx = g.add_node(Op::Cast { to: DType::C64 }, vec![c], Shape::new(&[4], DType::C64));
-    let back = g.add_node(Op::Cast { to: DType::F32 }, vec![cx], Shape::new(&[4], DType::F32));
+    let cx = g.add_node(
+        Op::Cast { to: DType::C64 },
+        vec![c],
+        Shape::new(&[4], DType::C64),
+    );
+    let back = g.add_node(
+        Op::Cast { to: DType::F32 },
+        vec![cx],
+        Shape::new(&[4], DType::F32),
+    );
     g.set_outputs(vec![back]);
     let mut exe = MlxExecutable::compile(g);
     let outs = exe.run_typed(&[]);
@@ -324,7 +395,11 @@ fn c64_roundtrip_real_to_c64_to_real() {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    assert_eq!(got, vals.to_vec(), "C64 round-trip should recover the reals");
+    assert_eq!(
+        got,
+        vals.to_vec(),
+        "C64 round-trip should recover the reals"
+    );
 }
 
 // ── C128 pairs (host complex-f64 cast) ──────────────────────────────
@@ -343,8 +418,20 @@ fn c128b(pairs: &[(f64, f64)]) -> Vec<u8> {
 #[test]
 fn c128_real_to_complex() {
     // real -> C128: interleaved (v as f64, 0.0) f64 pairs, 16 bytes/elem.
-    check(&f32b(&[1.0, -2.0, 3.5]), DType::F32, DType::C128, 3, Some(MlxMode::Lazy));
-    check(&i32b(&[4, -5, 6]), DType::I32, DType::C128, 3, Some(MlxMode::Lazy));
+    check(
+        &f32b(&[1.0, -2.0, 3.5]),
+        DType::F32,
+        DType::C128,
+        3,
+        Some(MlxMode::Lazy),
+    );
+    check(
+        &i32b(&[4, -5, 6]),
+        DType::I32,
+        DType::C128,
+        3,
+        Some(MlxMode::Lazy),
+    );
     let f64src: Vec<u8> = [1.5f64, -2.25, 4096.0]
         .iter()
         .flat_map(|x| x.to_le_bytes())
@@ -394,7 +481,11 @@ fn c128_roundtrip_real_to_c128_to_real() {
         vec![c],
         Shape::new(&[4], DType::C128),
     );
-    let back = g.add_node(Op::Cast { to: DType::F32 }, vec![cx], Shape::new(&[4], DType::F32));
+    let back = g.add_node(
+        Op::Cast { to: DType::F32 },
+        vec![cx],
+        Shape::new(&[4], DType::F32),
+    );
     g.set_outputs(vec![back]);
     let mut exe = MlxExecutable::compile(g);
     let outs = exe.run_typed(&[]);
@@ -404,5 +495,9 @@ fn c128_roundtrip_real_to_c128_to_real() {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    assert_eq!(got, vals.to_vec(), "C128 round-trip should recover the reals");
+    assert_eq!(
+        got,
+        vals.to_vec(),
+        "C128 round-trip should recover the reals"
+    );
 }

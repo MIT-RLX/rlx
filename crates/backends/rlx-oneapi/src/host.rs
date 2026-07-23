@@ -30,7 +30,76 @@ pub enum HostOut {
 
 /// Run a single op on the CPU reference and return its output in its native
 /// dtype. `inputs[i]` is `(declared_shape, buffer)`.
+///
+/// `FusedConvBiasAct` / `PartitionedConv` are CPU Nops — expand to primitives
+/// first (same as `unfuse::expand_cpu_nop_fused`) so the host path stays correct
+/// when the native fused kernel is unavailable.
 pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut {
+    if matches!(op, Op::FusedConvBiasAct { .. } | Op::PartitionedConv { .. }) {
+        return eval_expanded_fused(op, out_shape, inputs);
+    }
+    eval_direct(op, out_shape, inputs)
+}
+
+fn eval_expanded_fused(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut {
+    let mut mini = Graph::new("oneapi_host_unfuse");
+    let mut mini_ins = Vec::with_capacity(inputs.len());
+    for (i, (sh, _)) in inputs.iter().enumerate() {
+        mini_ins.push(mini.append_node(
+            Op::Input {
+                name: format!("in{i}"),
+            },
+            vec![],
+            sh.clone(),
+            None,
+        ));
+    }
+    let out_id = mini.append_node(op.clone(), mini_ins, out_shape.clone(), None);
+    mini.set_outputs(vec![out_id]);
+    let expanded = rlx_opt::unfuse_fused_for_autodiff(mini);
+    // Evaluate the expanded graph end-to-end on CPU with the same inputs.
+    let plan = rlx_compile::memory::plan_memory_aligned(&expanded, 16);
+    let mut arena = rlx_cpu::arena::Arena::from_plan(plan);
+    for n in expanded.nodes() {
+        if let Op::Input { name } = &n.op {
+            if let Some(rest) = name.strip_prefix("in") {
+                if let Ok(i) = rest.parse::<usize>() {
+                    match &inputs[i].1 {
+                        HostBuf::F32(vals) => {
+                            let slot = arena.slice_mut(n.id);
+                            let take = slot.len().min(vals.len());
+                            slot[..take].copy_from_slice(&vals[..take]);
+                        }
+                        HostBuf::Bytes(bytes) => {
+                            let off = arena.byte_offset(n.id);
+                            let raw = arena.raw_buf_mut();
+                            let take = bytes.len().min(raw.len().saturating_sub(off));
+                            raw[off..off + take].copy_from_slice(&bytes[..take]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let schedule = rlx_cpu::thunk::compile_thunks(&expanded, &arena);
+    rlx_cpu::thunk::execute_thunks(&schedule, arena.raw_buf_mut());
+    let out = expanded.outputs[0];
+    let n = out_shape.num_elements().unwrap_or(0);
+    match out_shape.dtype() {
+        DType::U8 | DType::I8 | DType::Bool => {
+            let nbytes = n * out_shape.dtype().size_bytes().max(1);
+            let off = arena.byte_offset(out);
+            HostOut::Bytes(arena.raw_buf()[off..off + nbytes].to_vec())
+        }
+        _ => {
+            let slot = arena.slice_mut(out);
+            let take = n.min(slot.len());
+            HostOut::F32(slot[..take].to_vec())
+        }
+    }
+}
+
+fn eval_direct(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut {
     let mut g = Graph::new("oneapi_host_eval");
     let ids: Vec<rlx_ir::NodeId> = inputs
         .iter()

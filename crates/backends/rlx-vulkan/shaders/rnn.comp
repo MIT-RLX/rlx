@@ -1,0 +1,51 @@
+#version 450
+// Single-layer unidirectional Elman RNN (relu!=0 ? relu : tanh; h0 = 0).
+// One invocation per batch item; private hidden state. hidden ≤ 256.
+layout(local_size_x = 64) in;
+
+const uint MAX_H = 256u;
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint seq;
+    uint input_size;
+    uint hidden;
+    uint x_off;
+    uint wih_off;
+    uint whh_off;
+    uint bias_off;
+    uint out_off;
+    uint seq_stride;
+    uint relu;
+} pc;
+
+void main() {
+    uint bi = gl_GlobalInvocationID.x;
+    if (bi >= pc.batch || pc.hidden > MAX_H) { return; }
+    uint h = pc.hidden;
+    uint in_sz = pc.input_size;
+
+    float hs[MAX_H];
+    for (uint k = 0u; k < h; k++) { hs[k] = 0.0; }
+
+    for (uint t = 0u; t < pc.seq; t++) {
+        uint x_base = pc.x_off + (bi * pc.seq_stride + t) * in_sz;
+        float next_h[MAX_H];
+        for (uint k = 0u; k < h; k++) {
+            float acc = arena_load(pc.bias_off + k);
+            uint wih_row = pc.wih_off + k * in_sz;
+            for (uint j = 0u; j < in_sz; j++) {
+                acc += arena_load(wih_row + j) * arena_load(x_base + j);
+            }
+            uint whh_row = pc.whh_off + k * h;
+            for (uint j = 0u; j < h; j++) {
+                acc += arena_load(whh_row + j) * hs[j];
+            }
+            next_h[k] = (pc.relu != 0u) ? max(acc, 0.0) : tanh(acc);
+        }
+        for (uint k = 0u; k < h; k++) {
+            hs[k] = next_h[k];
+            arena_store(pc.out_off + (bi * pc.seq_stride + t) * h + k, hs[k]);
+        }
+    }
+}

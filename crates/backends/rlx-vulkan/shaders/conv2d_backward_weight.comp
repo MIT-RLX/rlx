@@ -1,0 +1,56 @@
+#version 450
+// Conv2d backward-weight (dw) NCHW. Weight [Cout, Cin/groups, kH, kW].
+// One invocation per dw element; gathers over batch × output spatial.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint nn; uint cin; uint cout;
+    uint hh; uint ww;
+    uint oh; uint ow;
+    uint kh; uint kw;
+    uint sh; uint sw; uint ph; uint pw; uint dh; uint dw;
+    uint groups;
+    uint x_off; uint dy_off; uint dw_off;
+} pc;
+
+void main() {
+    uint cin_pg = pc.cin / pc.groups;
+    uint cout_pg = pc.cout / pc.groups;
+    uint total = pc.cout * cin_pg * pc.kh * pc.kw;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= total) { return; }
+    uint kj = i % pc.kw;
+    uint q1 = i / pc.kw;
+    uint ki = q1 % pc.kh;
+    uint q2 = q1 / pc.kh;
+    uint ci_off = q2 % cin_pg;
+    uint co = q2 / cin_pg;
+
+    uint g = co / cout_pg;
+    uint ci = g * cin_pg + ci_off;
+
+    float hi = 0.0;
+    float lo = 0.0;
+    for (uint n = 0u; n < pc.nn; n++) {
+        for (uint ho = 0u; ho < pc.oh; ho++) {
+            int ih = int(ho * pc.sh + ki * pc.dh) - int(pc.ph);
+            if (ih < 0 || ih >= int(pc.hh)) { continue; }
+            for (uint wo = 0u; wo < pc.ow; wo++) {
+                int iw = int(wo * pc.sw + kj * pc.dw) - int(pc.pw);
+                if (iw < 0 || iw >= int(pc.ww)) { continue; }
+                float dyv = arena_load(pc.dy_off + ((n * pc.cout + co) * pc.oh + ho) * pc.ow + wo);
+                float xv = arena_load(pc.x_off + ((n * pc.cin + ci) * pc.hh + uint(ih)) * pc.ww + uint(iw));
+                float p = dyv * xv;
+                float ep = fma(dyv, xv, -p);
+                float s = hi + p;
+                float bb = s - hi;
+                float es = (hi - (s - bb)) + (p - bb);
+                lo += ep + es;
+                float t = s + lo;
+                lo -= t - s;
+                hi = t;
+            }
+        }
+    }
+    arena_store(pc.dw_off + i, hi);
+}

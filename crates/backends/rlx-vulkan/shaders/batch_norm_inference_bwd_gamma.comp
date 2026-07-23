@@ -1,0 +1,30 @@
+#version 450
+// BatchNormInferenceBackwardGamma: one work-item per channel.
+// dγ_c = Σ dy · x̂ over rows.
+layout(local_size_x = 64) in;
+
+
+layout(push_constant) uniform PC {
+    uint count;
+    uint channels;
+    float eps;
+    uint x_off;
+    uint mean_off;
+    uint var_off;
+    uint dy_off;
+    uint out_off;
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.channels) { return; }
+    float inv = inversesqrt(arena_load(pc.var_off + c) + pc.eps);
+    float mean = arena_load(pc.mean_off + c);
+    float acc = 0.0;
+    for (uint row = 0u; row < pc.count; row++) {
+        uint idx = row * pc.channels + c;
+        float xhat = (arena_load(pc.x_off + idx) - mean) * inv;
+        acc += arena_load(pc.dy_off + idx) * xhat;
+    }
+    arena_store(pc.out_off + c, acc);
+}

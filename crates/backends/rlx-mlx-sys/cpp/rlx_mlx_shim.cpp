@@ -760,6 +760,7 @@ int rlx_mlx_op_unary(
                 case RLX_MLX_UN_COS:     return mc::cos(x);
                 case RLX_MLX_UN_TAN:     return mc::tan(x);
                 case RLX_MLX_UN_ATAN:    return mc::arctan(x);
+                case RLX_MLX_UN_RECIPROCAL: return mc::reciprocal(x);
             }
             throw std::runtime_error("invalid unary kind");
         }();
@@ -1069,6 +1070,48 @@ int rlx_mlx_op_conv3d(
             std::tuple<int,int,int>{stride_d, stride_h, stride_w},
             std::tuple<int,int,int>{pad_d, pad_h, pad_w},
             std::tuple<int,int,int>{dil_d, dil_h, dil_w},
+            groups));
+    });
+}
+
+int rlx_mlx_op_conv_transpose2d(
+    rlx_mlx_array_t* input,
+    rlx_mlx_array_t* weight,
+    int stride_h, int stride_w,
+    int pad_h,    int pad_w,
+    int dil_h,    int dil_w,
+    int out_pad_h, int out_pad_w,
+    int groups,
+    rlx_mlx_array_t** out)
+{
+    return guarded([&] {
+        *out = wrap(mc::conv_transpose2d(
+            unwrap(input), unwrap(weight),
+            std::pair<int, int>{stride_h, stride_w},
+            std::pair<int, int>{pad_h, pad_w},
+            std::pair<int, int>{dil_h, dil_w},
+            std::pair<int, int>{out_pad_h, out_pad_w},
+            groups));
+    });
+}
+
+int rlx_mlx_op_conv_transpose3d(
+    rlx_mlx_array_t* input,
+    rlx_mlx_array_t* weight,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d,    int pad_h,    int pad_w,
+    int dil_d,    int dil_h,    int dil_w,
+    int out_pad_d, int out_pad_h, int out_pad_w,
+    int groups,
+    rlx_mlx_array_t** out)
+{
+    return guarded([&] {
+        *out = wrap(mc::conv_transpose3d(
+            unwrap(input), unwrap(weight),
+            std::tuple<int,int,int>{stride_d, stride_h, stride_w},
+            std::tuple<int,int,int>{pad_d, pad_h, pad_w},
+            std::tuple<int,int,int>{dil_d, dil_h, dil_w},
+            std::tuple<int,int,int>{out_pad_d, out_pad_h, out_pad_w},
             groups));
     });
 }

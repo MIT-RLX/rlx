@@ -52,6 +52,11 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         RmsNormBackwardInput,
         RmsNormBackwardGamma,
         RmsNormBackwardBeta,
+        LayerNormBackwardInput,
+        LayerNormBackwardGamma,
+        GroupNormBackwardInput,
+        GroupNormBackwardGamma,
+        GroupNormBackwardBeta,
         RopeBackward,
         Cumsum,
         CumsumBackward,
@@ -167,5 +172,43 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         EighBackward,
         EighBatch,
         EighBatchBackward,
+        // Full OpKind coverage (host-fallback via `Thunk::HostOp` /
+        // `eval_single_op_f32`, or primitive expand for fused ops the
+        // CPU catch-all would Nop). See `lower_cpu_nop_fused_for_metal`
+        // + the HostOp arm in `thunk/compile.rs`.
+        Quantize,
+        Dequantize,
+        FakeQuantize,
+        FakeQuantizeLSQ,
+        FakeQuantizeLSQBackwardX,
+        FakeQuantizeLSQBackwardScale,
+        DenseSolve,
+        BatchedDenseSolve,
+        BatchNormInference,
+        BatchNormInferenceBackwardInput,
+        BatchNormInferenceBackwardGamma,
+        BatchNormInferenceBackwardBeta,
+        Conv3d,
+        ConvTranspose3d,
+        // Native MSL ReluBackward / ActivationBackward (Fixed kinds).
+        ReluBackward,
+        ActivationBackward,
+        FakeQuantizeBackward,
+        // Native MSL C64 Wirtinger surface (`complex_norm_sq` /
+        // `complex_norm_sq_backward` / `conjugate_c64`).
+        ComplexNormSq,
+        ComplexNormSqBackward,
+        Conjugate,
+        // Native MSL ternary-pruned FFT butterfly (`fft_butterfly_stage`).
+        FftButterflyStage,
+        LoraMatMul,
+        PartitionedConv,
+        QMatMul,
+        QConv2d,
+        FusedConvBiasAct,
+        FusedTransformerLayer,
+        If,
+        While,
+        CustomFn,
     ]
 };

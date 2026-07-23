@@ -1,0 +1,57 @@
+#version 450
+// FakeQuantizeLSQ ∂L/∂s[c]: sum_i ψ(x_i/s) * dy_i
+// ψ(z) = -z + round(z) inside range, sign(z)·q_max outside.
+// One work-item per channel.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint chan_dim;
+    uint inner;
+    float q_max;
+    uint x_off;
+    uint scale_off;
+    uint dy_off;
+    uint dscale_off;
+} pc;
+
+float round_half_away(float x) {
+    return sign(x) * floor(abs(x) + 0.5);
+}
+
+float lsq_psi(float z) {
+    if (abs(z) <= pc.q_max) {
+        return -z + round_half_away(z);
+    }
+    return (z > 0.0) ? pc.q_max : -pc.q_max;
+}
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.chan_dim) { return; }
+    float s = max(arena_load(pc.scale_off + c), 1e-12);
+
+    float acc = 0.0;
+    uint stride = pc.chan_dim * pc.inner;
+    uint outer = (stride == 0u) ? 0u : (pc.n / stride);
+
+    if (outer * stride == pc.n) {
+        for (uint o = 0u; o < outer; o++) {
+            uint base = o * stride + c * pc.inner;
+            for (uint j = 0u; j < pc.inner; j++) {
+                uint idx = base + j;
+                float z = arena_load(pc.x_off + idx) / s;
+                acc += lsq_psi(z) * arena_load(pc.dy_off + idx);
+            }
+        }
+    } else {
+        for (uint i = 0u; i < pc.n; i++) {
+            uint ch = (pc.chan_dim <= 1u) ? 0u : ((i / pc.inner) % pc.chan_dim);
+            if (ch == c) {
+                float z = arena_load(pc.x_off + i) / s;
+                acc += lsq_psi(z) * arena_load(pc.dy_off + i);
+            }
+        }
+    }
+    arena_store(pc.dscale_off + c, acc);
+}

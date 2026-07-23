@@ -31,6 +31,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Binary,
         Compare,
         Where,
+        Fma,
         ElementwiseRegion,
         TransformRegion,
         BatchElementwiseRegion,
@@ -41,8 +42,17 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         ScaledDequantize,
         DotGeneral,
         LayerNorm,
+        LayerNormBackwardInput,
+        LayerNormBackwardGamma,
         LayerNorm2d,
         GroupNorm,
+        GroupNormBackwardInput,
+        GroupNormBackwardGamma,
+        GroupNormBackwardBeta,
+        BatchNormInference,
+        BatchNormInferenceBackwardInput,
+        BatchNormInferenceBackwardGamma,
+        BatchNormInferenceBackwardBeta,
         ResizeNearest2x,
         AxialRope2d,
         Reverse,
@@ -69,11 +79,18 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Gather,
         Reduce,
         Softmax,
+        SoftmaxCrossEntropy,
+        SoftmaxCrossEntropyWithLogits,
+        SoftmaxCrossEntropyBackward,
+        ReluBackward,
+        ActivationBackward,
         Cumsum,
         TopK,
         Sample,
         Conv,
+        Conv3d,
         ConvTranspose2d,
+        ConvTranspose3d,
         Pool,
         GroupedMatMul,
         DequantGroupedMatMul,
@@ -91,6 +108,11 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // reads zeros and Qwen3.5/Bonsai decode diverges from Metal/CPU.
         GatedDeltaNet,
         Lstm,
+        // Native CUDA kernel (L=1/unidir/no-carry, hidden≤1024) + host fallback.
+        Gru,
+        Rnn,
+        // Native CUDA kernel (state_size≤256) + host fallback.
+        Mamba2,
         // General Op::Scan (arbitrary-body recurrence, e.g. IIR biquad) via
         // D2H→CPU→H2D host fallback (forces eager, not graph-captured).
         Scan,
@@ -100,10 +122,20 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         FusedConvBiasAct,
         FusedResidualLN,
         FusedResidualRmsNorm,
+        FusedSwiGLU,
         AdaLayerNorm,
         GatedResidual,
         AdaLayerNormBackward,
         GatedResidualBackward,
+        // Native Fixed + PerBatch; LSQ forward reuses Fixed; LSQ bwd + STE
+        // FakeQuantizeBackward + INT8 Quantize/Dequantize are native kernels.
+        FakeQuantize,
+        FakeQuantizeLSQ,
+        FakeQuantizeLSQBackwardX,
+        FakeQuantizeLSQBackwardScale,
+        FakeQuantizeBackward,
+        Quantize,
+        Dequantize,
         // Fused, then decomposed by the backend's own `unfuse` pass
         // (rlx-cuda / rlx-rocm) before lowering — no monolithic
         // fused-attention kernel yet, same fuse-then-unfuse as WGPU.
@@ -145,5 +177,31 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         EighBackward,
         EighBatch,
         EighBatchBackward,
+        // C64 Wirtinger surface — native `complex_wirtinger.cu` (shared with
+        // ROCm). Interleaved [re, im] pairs matching CPU / Metal MSL /
+        // wgpu WGSL semantics.
+        ComplexNormSq,
+        ComplexNormSqBackward,
+        Conjugate,
+        // Decomposed by the backend `unfuse` pass (`rlx_unfuse::expand_lora`
+        // → MatMul + Mul + Add) before lowering — same path as wgpu. No fused
+        // LoRA kernel; claiming keeps legalize from rejecting the op.
+        LoraMatMul,
+        // Same unfuse pass expands these to primitives CUDA already runs
+        // (`expand_ftl` / `expand_if` / bounded `expand_while`).
+        FusedTransformerLayer,
+        If,
+        While,
+        // DenseSolve / BatchedDenseSolve: native F32 via cuSOLVER/cuBLAS;
+        // other dtypes stay HostOp. QMatMul / QConv2d are native INT8;
+        // CustomFn remains host-staged. PartitionedConv expands in
+        // `crate::unfuse` to Fft/MatMul (batched-GEMM frequency path).
+        DenseSolve,
+        BatchedDenseSolve,
+        QMatMul,
+        QConv2d,
+        FftButterflyStage,
+        PartitionedConv,
+        CustomFn,
     ]
 };

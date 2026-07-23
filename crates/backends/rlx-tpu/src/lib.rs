@@ -50,6 +50,7 @@ pub mod collective_host;
 pub mod device;
 pub mod fk_pipeline;
 pub mod hlo;
+pub mod host_ops;
 pub mod ir_passes;
 pub mod libtpu;
 pub mod lower;

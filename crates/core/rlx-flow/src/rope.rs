@@ -224,6 +224,10 @@ pub fn mrope_section_for_pair(global_pair_j: usize, sections: [usize; 4]) -> usi
 /// the per-modality positions `[p0, p1, p2, p3]`. Pairs beyond
 /// `n_rot / 2` (up to `head_half`) stay at identity rotation — supports
 /// partial-RoPE head dims where only the first `n_rot` dims rotate.
+///
+/// When `interleaved` is true (HF `mrope_interleaved`), pair ownership
+/// cycles THWTHW… per Qwen3.5 / Qwen3-VL `apply_interleaved_mrope`
+/// instead of contiguous TTT…HHH…WWW sections.
 pub fn mrope_row_for_sections(
     rope_theta: f64,
     n_rot: usize,
@@ -231,12 +235,28 @@ pub fn mrope_row_for_sections(
     section_pos: [usize; 4],
     head_half: usize,
 ) -> (Vec<f32>, Vec<f32>) {
+    mrope_row_for_sections_ex(rope_theta, n_rot, sections, section_pos, head_half, false)
+}
+
+/// Like [`mrope_row_for_sections`] with an explicit interleaved layout flag.
+pub fn mrope_row_for_sections_ex(
+    rope_theta: f64,
+    n_rot: usize,
+    sections: [usize; 4],
+    section_pos: [usize; 4],
+    head_half: usize,
+    interleaved: bool,
+) -> (Vec<f32>, Vec<f32>) {
     let half_rot = n_rot / 2;
     let mut cos = vec![0f32; head_half];
     let mut sin = vec![0f32; head_half];
 
     for global_j in 0..half_rot.min(head_half) {
-        let sec_i = mrope_section_for_pair(global_j, sections);
+        let sec_i = if interleaved {
+            interleaved_mrope_section_for_pair(global_j, sections)
+        } else {
+            mrope_section_for_pair(global_j, sections)
+        };
         let p = section_pos[sec_i] as f64;
         let freq = 1.0 / rope_theta.powf((2 * global_j) as f64 / n_rot as f64);
         let angle = p * freq;
@@ -249,6 +269,18 @@ pub fn mrope_row_for_sections(
         sin[j] = 0.0;
     }
     (cos, sin)
+}
+
+/// HF interleaved layout: start as T for every pair, then overwrite
+/// `slice(1, s_h*3, 3)` with H and `slice(2, s_w*3, 3)` with W.
+fn interleaved_mrope_section_for_pair(global_pair_j: usize, sections: [usize; 4]) -> usize {
+    let s_h = sections[1];
+    let s_w = sections[2];
+    match global_pair_j % 3 {
+        1 if global_pair_j < s_h.saturating_mul(3) => 1,
+        2 if global_pair_j < s_w.saturating_mul(3) => 2,
+        _ => 0,
+    }
 }
 
 /// Build MRoPE cos/sin tables for the text modality (positions repeat

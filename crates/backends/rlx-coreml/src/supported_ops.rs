@@ -89,6 +89,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         LogMel,
         Sample,
         RngNormal,
+        RngUniform,
         Lstm,
         // General Op::Scan (arbitrary-body recurrence, e.g. IIR biquad) runs on
         // the host between MIL segments via rlx-cpu's execute_scan_host.
@@ -100,6 +101,97 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Mamba2,
         WelchPeaks,
         Custom,
+        // Full OpKind coverage: ops without a MIL arm run as hybrid host
+        // segments via `host_exec::is_host_op` + `run_host_op_node_f32`.
+        // Fused forms the CPU catch-all would Nop are expanded in
+        // `CoremlExecutable::compile_with_options` before planning.
+        FakeQuantize,
+        FakeQuantizeLSQ,
+        FakeQuantizeLSQBackwardX,
+        FakeQuantizeLSQBackwardScale,
+        Fma,
+        ElementwiseRegion,
+        TransformRegion,
+        BatchElementwiseRegion,
+        DotGeneral,
+        DenseSolve,
+        BatchedDenseSolve,
+        Im2Col,
+        Conv3d,
+        ConvTranspose3d,
+        ReluBackward,
+        ActivationBackward,
+        FakeQuantizeBackward,
+        ComplexNormSq,
+        ComplexNormSqBackward,
+        Conjugate,
+        MaxPool2dBackward,
+        Conv2dBackwardInput,
+        Conv2dBackwardWeight,
+        SoftmaxCrossEntropy,
+        SoftmaxCrossEntropyWithLogits,
+        SoftmaxCrossEntropyBackward,
+        AttentionBackward,
+        LayerNormBackwardInput,
+        LayerNormBackwardGamma,
+        RmsNormBackwardInput,
+        RmsNormBackwardGamma,
+        RmsNormBackwardBeta,
+        RopeBackward,
+        GroupNormBackwardInput,
+        GroupNormBackwardGamma,
+        GroupNormBackwardBeta,
+        BatchNormInferenceBackwardInput,
+        BatchNormInferenceBackwardGamma,
+        BatchNormInferenceBackwardBeta,
+        CumsumBackward,
+        GatherBackward,
+        PartitionedConv,
+        QMatMul,
+        QConv2d,
+        ScaledMatMul,
+        ScaledQuantize,
+        ScaledQuantScale,
+        ScaledDequantize,
+        FusedSwiGLU,
+        FusedMatMulBiasAct,
+        FusedConvBiasAct,
+        FusedResidualLN,
+        FusedResidualRmsNorm,
+        FusedTransformerLayer,
+        If,
+        While,
+        GaussianSplatRender,
+        GaussianSplatRenderBackward,
+        GaussianSplatPrepare,
+        GaussianSplatRasterize,
+        CustomFn,
+        FftButterflyStage,
+        LogMelBackward,
+        BiMap,
+        ReEig,
+        LogEig,
+        SpdBatchNorm,
+        SpdKarcherMean,
+        ReEigBackward,
+        LogEigBackward,
+        SpdBatchNormBackwardX,
+        SpdBatchNormBackwardG,
+        SpdKarcherMeanWeighted,
+        SpdLogMap,
+        SpdExpMap,
+        SpdParallelTransport,
+        SpdMatrixFnBatch,
+        SpdLogMapBackward,
+        SpdExpMapBackward,
+        SpdParallelTransportBackward,
+        SpdMatrixFnBatchBackward,
+        Eigh,
+        EighBackward,
+        EighBatch,
+        EighBatchBackward,
+        AdaLayerNormBackward,
+        GatedResidualBackward,
     ]
 };
 
@@ -208,29 +300,10 @@ pub const NATIVE_BACKWARD_OPS: &[rlx_ir::OpKind] = {
     ]
 };
 
-/// `SUPPORTED_OPS` ∪ `NATIVE_BACKWARD_OPS` — the op claim under the
-/// `training` feature, returned by `CoremlBackend::supported_ops`.
-///
-/// This matters because the fusion pipeline (`stages::compile_module_stages`, run
-/// by the default `Backend::compile_module` *before* the backend's own lowering)
-/// decides what to decompose from `supported_ops()`. If the native backward
-/// kernels aren't claimed *here*, the pipeline decomposes them into primitives
-/// before `rlx_coreml`'s dedicated arm can fire — which silently sent MaxPool2d
-/// backward down the (rank-6, CoreML-illegal) upsample decomposition instead of
-/// the native O(input) kernel.
+/// Op claim under the `training` feature. Native backward kernels are already
+/// in [`SUPPORTED_OPS`] (full coverage); this alias keeps
+/// `CoremlBackend::supported_ops` and the fusion pipeline on one list so MIL
+/// arms (MaxPool2d / Conv2d / RmsNorm / … backward) stay intact instead of
+/// being decomposed before lowering.
 #[cfg(feature = "training")]
-pub const SUPPORTED_OPS_TRAINING: [rlx_ir::OpKind;
-    SUPPORTED_OPS.len() + NATIVE_BACKWARD_OPS.len()] = {
-    let mut arr = [rlx_ir::OpKind::Input; SUPPORTED_OPS.len() + NATIVE_BACKWARD_OPS.len()];
-    let mut i = 0;
-    while i < SUPPORTED_OPS.len() {
-        arr[i] = SUPPORTED_OPS[i];
-        i += 1;
-    }
-    let mut j = 0;
-    while j < NATIVE_BACKWARD_OPS.len() {
-        arr[SUPPORTED_OPS.len() + j] = NATIVE_BACKWARD_OPS[j];
-        j += 1;
-    }
-    arr
-};
+pub const SUPPORTED_OPS_TRAINING: &[rlx_ir::OpKind] = SUPPORTED_OPS;

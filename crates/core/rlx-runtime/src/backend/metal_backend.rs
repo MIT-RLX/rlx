@@ -176,14 +176,21 @@ impl ExecutableGraph for MetalExecutableWrapper {
     /// directly into the arena. F16 host bytes skip the widen only
     /// when the param's storage is already F16 (Zonos half-weights).
     fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+        // Integer control params (duration carry, masks) live as F32 in the
+        // Metal arena after `widen_integer_activations_to_f32`. Match
+        // `run_typed`: encode values as floats. Raw i64 bytes would be read
+        // as denormals (i64 3 → ~4e-45) and zero Kitten ConcatFromSequence.
         if matches!(
             dtype,
-            rlx_ir::DType::U8
-                | rlx_ir::DType::I8
-                | rlx_ir::DType::I32
-                | rlx_ir::DType::I64
-                | rlx_ir::DType::U32
-                | rlx_ir::DType::F64
+            rlx_ir::DType::I32 | rlx_ir::DType::I64 | rlx_ir::DType::U32 | rlx_ir::DType::Bool
+        ) {
+            let f32_buf = super::widen_bytes_to_f32(data, dtype);
+            self.inner.set_param(name, &f32_buf);
+            return;
+        }
+        if matches!(
+            dtype,
+            rlx_ir::DType::U8 | rlx_ir::DType::I8 | rlx_ir::DType::F64
         ) {
             self.inner.set_param_bytes(name, data);
             return;

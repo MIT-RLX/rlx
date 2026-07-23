@@ -1729,6 +1729,31 @@ pub enum Thunk {
         pw: u32,
         kind: ReduceOp,
     },
+    /// 3D pooling (Max or Mean). Input `[N, C, D, H, W]`, output
+    /// `[N, C, D_out, H_out, W_out]`. Mean divides by the full kernel volume
+    /// (`count_include_pad=True`).
+    Pool3D {
+        src: usize,
+        dst: usize,
+        n: u32,
+        c: u32,
+        d: u32,
+        h: u32,
+        w: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        kind: ReduceOp,
+    },
     /// 2D convolution. Input [N, C_in, H, W], weight [C_out, C_in_per_group, kH, kW],
     /// output [N, C_out, H_out, W_out]. Bias is a separate Op::Binary::Add
     /// after the conv (matching the IR's input layout — Op::Conv has 2 inputs).

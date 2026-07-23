@@ -27,6 +27,10 @@ pub const COMPLEX_CAST_CU: &str = include_str!("../kernels/complex_cast.cu");
 /// lanes per element, with modulo broadcast. Mirrors rlx-cpu
 /// `exec_binary_full_c64`; C128 arithmetic + C64 max/min/pow are rejected.
 pub const BINARY_C64_CU: &str = include_str!("../kernels/binary_c64.cu");
+/// C64 Wirtinger surface: `ComplexNormSq` / `ComplexNormSqBackward` /
+/// `Conjugate` on interleaved `[re, im]` f32 pairs. Mirrors rlx-cpu
+/// `exec_complex_norm_sq{,_backward}_f32` / `exec_conjugate_c64`.
+pub const COMPLEX_WIRINGER_CU: &str = include_str!("../kernels/complex_wirtinger.cu");
 pub const FUSED_BINARY_UNARY_CU: &str = include_str!("../kernels/fused_binary_unary.cu");
 pub const CAST_F32_TO_HALF_CU: &str = include_str!("../kernels/cast_f32_to_half.cu");
 /// Native FP8 quantize producers (per-tensor scale + E4M3/E5M2 encode) for
@@ -38,6 +42,14 @@ pub const SCALED_LOWP_CU: &str = include_str!("../kernels/scaled_lowp.cu");
 pub const SCALED_LOWP_GENERAL_CU: &str = include_str!("../kernels/scaled_lowp_general.cu");
 pub const UNARY_CU: &str = include_str!("../kernels/unary.cu");
 pub const LSTM_CU: &str = include_str!("../kernels/lstm.cu");
+/// Philox4×32-10 RNG fill (`rng_normal_philox` / `rng_uniform_philox` / `rng_fill_zero`).
+pub const RNG_PHILOX_CU: &str = include_str!("../kernels/rng_philox.cu");
+/// Single-layer unidirectional GRU (`gru`). Gate order r/z/n; separate b_ih/b_hh.
+pub const GRU_CU: &str = include_str!("../kernels/gru.cu");
+/// Single-layer unidirectional Elman RNN (`rnn`). `relu_flag` selects relu vs tanh.
+pub const RNN_CU: &str = include_str!("../kernels/rnn.cu");
+/// Mamba-2 / SSD scalar-decay scan (`mamba2`). `state_size ≤ 256`.
+pub const MAMBA2_CU: &str = include_str!("../kernels/mamba2.cu");
 pub const BINARY_BROADCAST_CU: &str = include_str!("../kernels/binary_broadcast.cu");
 pub const COPY_CU: &str = include_str!("../kernels/copy.cu");
 pub const MATMUL_CU: &str = include_str!("../kernels/matmul.cu");
@@ -46,10 +58,21 @@ pub const MATMUL_EPILOGUE_CU: &str = include_str!("../kernels/matmul_epilogue.cu
 pub const MATMUL_WMMA_CU: &str = include_str!("../kernels/matmul_wmma.cu");
 pub const COMPARE_CU: &str = include_str!("../kernels/compare.cu");
 pub const WHERE_CU: &str = include_str!("../kernels/where_select.cu");
+pub const FMA_CU: &str = include_str!("../kernels/fma.cu");
 pub const REDUCE_CU: &str = include_str!("../kernels/reduce.cu");
 pub const SOFTMAX_CU: &str = include_str!("../kernels/softmax.cu");
+pub const ACTIVATION_BACKWARD_CU: &str = include_str!("../kernels/activation_backward.cu");
+pub const SOFTMAX_CROSS_ENTROPY_CU: &str = include_str!("../kernels/softmax_cross_entropy.cu");
 pub const LAYERNORM_CU: &str = include_str!("../kernels/layernorm.cu");
+pub const LAYER_NORM_BWD_CU: &str = include_str!("../kernels/layer_norm_backward.cu");
 pub const RMS_NORM_BWD_CU: &str = include_str!("../kernels/rms_norm_backward.cu");
+pub const FAKE_QUANTIZE_CU: &str = include_str!("../kernels/fake_quantize.cu");
+/// INT8 asymmetric Quantize / Dequantize (`quantize_i8` / `dequantize_i8`).
+pub const QUANTIZE_CU: &str = include_str!("../kernels/quantize.cu");
+/// Real INT8 `Op::QMatMul` (`q_matmul`) — packed i8 x/w/out + f32-lane bias.
+pub const Q_MATMUL_CU: &str = include_str!("../kernels/q_matmul.cu");
+/// Real INT8 `Op::QConv2d` (`q_conv2d`) — NCHW packed i8 + f32-lane bias.
+pub const Q_CONV2D_CU: &str = include_str!("../kernels/q_conv2d.cu");
 pub const CUMSUM_BWD_CU: &str = include_str!("../kernels/cumsum_backward.cu");
 pub const ROPE_BWD_CU: &str = include_str!("../kernels/rope_backward.cu");
 pub const GATHER_BWD_CU: &str = include_str!("../kernels/gather_backward.cu");
@@ -75,6 +98,8 @@ pub const CUMSUM_CU: &str = include_str!("../kernels/cumsum.cu");
 pub const TOPK_CU: &str = include_str!("../kernels/topk.cu");
 pub const GROUPED_MATMUL_CU: &str = include_str!("../kernels/grouped_matmul.cu");
 pub const SCATTER_ADD_CU: &str = include_str!("../kernels/scatter_add.cu");
+/// ONNX ScatterND (reduction=none) on the f32-uniform arena.
+pub const SCATTER_ND_CU: &str = include_str!("../kernels/scatter_nd.cu");
 pub const DEQUANT_MATMUL_CU: &str = include_str!("../kernels/dequant_matmul.cu");
 pub const DEQUANT_GGUF_CU: &str = include_str!("../kernels/dequant_gguf.cu");
 pub const DEQUANT_MATMUL_GGUF_CU: &str = include_str!("../kernels/dequant_matmul_gguf.cu");
@@ -84,15 +109,21 @@ pub const GATED_DELTA_NET_CU: &str = include_str!("../kernels/gated_delta_net.cu
 pub const POOL1D_CU: &str = include_str!("../kernels/pool1d.cu");
 pub const POOL2D_CU: &str = include_str!("../kernels/pool2d.cu");
 pub const POOL3D_CU: &str = include_str!("../kernels/pool3d.cu");
+pub const MAXPOOL2D_BACKWARD_CU: &str = include_str!("../kernels/maxpool2d_backward.cu");
 pub const CONV1D_CU: &str = include_str!("../kernels/conv1d.cu");
 pub const CONV2D_CU: &str = include_str!("../kernels/conv2d.cu");
 pub const CONV2D_BACKWARD_INPUT_CU: &str = include_str!("../kernels/conv2d_backward_input.cu");
 pub const CONV2D_BACKWARD_WEIGHT_CU: &str = include_str!("../kernels/conv2d_backward_weight.cu");
 pub const IM2COL_CU: &str = include_str!("../kernels/im2col.cu");
 pub const CONV3D_CU: &str = include_str!("../kernels/conv3d.cu");
+pub const CONV_TRANSPOSE3D_CU: &str = include_str!("../kernels/conv_transpose3d.cu");
 pub const LAYER_NORM2D_CU: &str = include_str!("../kernels/layer_norm2d.cu");
 pub const CONV_TRANSPOSE2D_CU: &str = include_str!("../kernels/conv_transpose2d.cu");
+pub const FUSED_SWIGLU_CU: &str = include_str!("../kernels/fused_swiglu.cu");
+pub const AXIAL_ROPE2D_CU: &str = include_str!("../kernels/axial_rope2d.cu");
 pub const GROUP_NORM_CU: &str = include_str!("../kernels/group_norm.cu");
+pub const GROUP_NORM_BWD_CU: &str = include_str!("../kernels/group_norm_backward.cu");
+pub const BATCH_NORM_INFERENCE_CU: &str = include_str!("../kernels/batch_norm_inference.cu");
 pub const RESIZE_NEAREST_2X_CU: &str = include_str!("../kernels/resize_nearest_2x.cu");
 pub const ELEMENTWISE_REGION_CU: &str = include_str!("../kernels/elementwise_region.cu");
 pub const BATCH_ELEMENTWISE_REGION_CU: &str =
@@ -100,6 +131,7 @@ pub const BATCH_ELEMENTWISE_REGION_CU: &str =
 pub const GAUSSIAN_SPLAT_RASTERIZE_CU: &str =
     include_str!("../kernels/gaussian_splat_rasterize.cu");
 pub const FFT_CU: &str = include_str!("../kernels/fft.cu");
+pub const FFT_BUTTERFLY_STAGE_CU: &str = include_str!("../kernels/fft_butterfly_stage.cu");
 pub const WELCH_PEAKS_CU: &str = include_str!("../kernels/welch_peaks.cu");
 
 const GELU_CUH: &str = include_str!("../kernels/gelu.cuh");

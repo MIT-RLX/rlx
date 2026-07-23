@@ -16,18 +16,20 @@
 use rlx_ir::Op;
 
 use crate::kernels::{
-    AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams, AttentionBwdParams,
-    AttentionParams, BatchElementwiseRegionParams, BinaryC64Params, BinaryParams, Conv1dParams,
-    Conv2dParams, ComplexCastParams,
-    Conv3dParams, CopyParams, CastParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
-    ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
-    FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatedDeltaNetParams,
-    GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupedMatmulParams, GruParams, Im2Col2dParams, LayerNormBwdParams,
-    LayerNormParams, Mamba2Params, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
-    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
-    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
+    ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
+    AttentionBwdParams, AttentionParams, AxialRope2dParams, BatchElementwiseRegionParams,
+    BinaryC64Params, BinaryParams, CastParams, ComplexCastParams, ComplexWirtingerParams,
+    Conv1dParams, Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams,
+    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
+    FftButterflyStageParams, FmaParams, FusedResidualLnParams, FusedResidualLnTeeParams,
+    FusedResidualRmsNormParams, GatedDeltaNetParams, GatedResidualBackwardParams,
+    GatedResidualParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupNormBwdParams,
+    GroupedMatmulParams, GruParams, Im2Col2dParams, LayerNormBwdParams, LayerNormParams,
+    Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams, NarrowConcatParams, Pool1dParams,
+    Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
+    RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams,
+    SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams,
+    WhereParams,
 };
 
 use super::helpers::{MatmulCompute, MatmulQkvKind};
@@ -108,6 +110,12 @@ pub(crate) enum Step {
     Fma {
         params: FmaParams,
     },
+    ReluBackward {
+        params: ActivationBackwardParams,
+    },
+    ActivationBackward {
+        params: ActivationBackwardParams,
+    },
     Reduce {
         params: ReduceParams,
     },
@@ -116,6 +124,12 @@ pub(crate) enum Step {
     },
     SoftmaxCrossEntropy {
         params: SceParams,
+    },
+    SoftmaxCrossEntropyWithLogits {
+        params: SceParams,
+    },
+    SoftmaxCrossEntropyBackward {
+        params: SceBwdParams,
     },
     LayerNorm {
         params: LayerNormParams,
@@ -313,6 +327,23 @@ pub(crate) enum Step {
     BinaryC64 {
         params: BinaryC64Params,
     },
+    /// `|z|² = re² + im²` (`complex_wirtinger.wgsl` / `complex_norm_sq`).
+    /// `n` is the complex-element count; output is real F32.
+    ComplexNormSq {
+        params: ComplexWirtingerParams,
+    },
+    /// Wirtinger VJP of ComplexNormSq: `dz = g · z` (`complex_norm_sq_backward`).
+    ComplexNormSqBackward {
+        params: ComplexWirtingerParams,
+    },
+    /// Element-wise C64 conjugate: `(re, -im)` (`conjugate_c64`).
+    ConjugateC64 {
+        params: ComplexWirtingerParams,
+    },
+    /// Ternary-pruned radix-2 butterfly stage (`fft_butterfly_stage.wgsl`).
+    FftButterflyStage {
+        params: FftButterflyStageParams,
+    },
     /// PLAN L2 — fused N-ary element-wise region. Lowered from
     /// `Op::ElementwiseRegion` by `MarkElementwiseRegions`. Kernel
     /// interprets the chain encoding per-element (saves N kernel
@@ -327,6 +358,26 @@ pub(crate) enum Step {
     Transpose {
         params: TransposeParams,
         meta_idx: usize,
+    },
+    /// Host permutation for a virtual arena whose input and output cannot
+    /// share one storage binding window.
+    TransposeHost {
+        in_byte_off: usize,
+        out_byte_off: usize,
+        in_dims: Vec<u32>,
+        out_dims: Vec<u32>,
+        in_strides: Vec<usize>,
+    },
+    /// Host slice for a virtual arena whose source and destination straddle
+    /// storage binding windows.
+    NarrowHost {
+        in_byte_off: usize,
+        out_byte_off: usize,
+        outer: u32,
+        inner: u32,
+        axis_in_size: u32,
+        start: u32,
+        axis_out_size: u32,
     },
     Narrow {
         params: NarrowConcatParams,
@@ -485,6 +536,49 @@ pub(crate) enum Step {
     DequantMatmul {
         params: DequantMatmulParams,
     },
+    /// Int8 block dequant+matmul on the host (Kitten / ONNX Int8BlockAsym).
+    ///
+    /// The wgpu SPIR-V `dequant_matmul` path is wrong on discrete NVIDIA
+    /// (Kitten NSF → ~0.05 DC mush) while Apple Metal is fine. rlx-vulkan
+    /// already hosts all non-GGUF DequantMatMul; mirror that here.
+    DequantMatmulInt8Host {
+        m: u32,
+        k: u32,
+        n: u32,
+        block_size: u32,
+        is_asymmetric: bool,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        zp_byte_off: u64,
+        out_byte_off: u64,
+    },
+    /// NCHW Conv2d on the host (discrete Vulkan/DX12 wgpu).
+    ///
+    /// Kitten's vocoder is dominated by 1×L "2d" convs; the SPIR-V tiled/direct
+    /// paths still collapse NSF on NVIDIA even when Int8 dequant is hosted.
+    /// Absolute byte offsets (may be weight-tagged).
+    Conv2dHost {
+        n: u32,
+        c_in: u32,
+        c_out: u32,
+        h: u32,
+        w: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+        in_byte_off: u64,
+        w_byte_off: u64,
+        out_byte_off: u64,
+    },
     /// Split-binding embedding gather for >4 GiB arenas. The table and the
     /// idx/output slots are more than one ≤4 GiB binding window apart, so the
     /// single-arena-binding `Step::Gather` cannot reach the output. Runs as a
@@ -576,6 +670,38 @@ pub(crate) enum Step {
         dw: u32,
         groups: u32,
     },
+    /// Native WGSL `Op::ConvTranspose3d` (reuses [`Conv3dParams`] layout).
+    ConvTranspose3d {
+        params: Conv3dParams,
+    },
+    /// Host-staged NCDHW `Op::ConvTranspose3d`.
+    ConvTranspose3dHost {
+        src_byte_off: u32,
+        weight_byte_off: u32,
+        dst_byte_off: u32,
+        n: u32,
+        c_in: u32,
+        d: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        dd: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+    },
     /// Host-staged NCHW GroupNorm (readback → CPU → writeback).
     GroupNormHost {
         src_byte_off: u32,
@@ -626,6 +752,48 @@ pub(crate) enum Step {
         reduced: u32,
         inner: u32,
         is_max: bool,
+    },
+    /// Host-staged `Op::AxialRope2d` (readback → CPU → writeback).
+    AxialRope2dHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        batch: u32,
+        seq: u32,
+        hidden: u32,
+        end_x: u32,
+        end_y: u32,
+        head_dim: u32,
+        num_heads: u32,
+        theta: f32,
+        repeat_factor: u32,
+    },
+    /// Native WGSL `Op::AxialRope2d`.
+    AxialRope2d {
+        params: AxialRope2dParams,
+    },
+    /// Native WGSL `Op::FakeQuantize` Fixed (scale input).
+    FakeQuantizeFixed {
+        params: FakeQuantizeParams,
+    },
+    /// Native WGSL `Op::FakeQuantize` PerBatch (derive scale from max abs).
+    FakeQuantizePerBatch {
+        params: FakeQuantizeParams,
+    },
+    /// Native WGSL GroupNorm backward w.r.t. input.
+    GroupNormBackwardInput {
+        params: GroupNormBwdParams,
+    },
+    /// Native WGSL GroupNorm backward w.r.t. gamma.
+    GroupNormBackwardGamma {
+        params: GroupNormBwdParams,
+    },
+    /// Native WGSL GroupNorm backward w.r.t. beta.
+    GroupNormBackwardBeta {
+        params: GroupNormBwdParams,
+    },
+    /// Native WGSL `Op::MaxPool2dBackward` (f32 element offsets in params).
+    MaxPool2dBackward {
+        params: MaxPool2dBwdParams,
     },
     Llada2GroupLimitedGate {
         sig_byte_off: u32,
@@ -859,9 +1027,13 @@ impl Step {
             | Step::Unary { .. }
             | Step::Where { .. }
             | Step::Fma { .. }
+            | Step::ReluBackward { .. }
+            | Step::ActivationBackward { .. }
             | Step::Reduce { .. }
             | Step::Softmax { .. }
             | Step::SoftmaxCrossEntropy { .. }
+            | Step::SoftmaxCrossEntropyWithLogits { .. }
+            | Step::SoftmaxCrossEntropyBackward { .. }
             | Step::LayerNorm { .. }
             | Step::FusedResidualLn { .. }
             | Step::FusedResidualLnTee { .. }
@@ -875,6 +1047,10 @@ impl Step {
             | Step::Cast { .. }
             | Step::ComplexCast { .. }
             | Step::BinaryC64 { .. }
+            | Step::ComplexNormSq { .. }
+            | Step::ComplexNormSqBackward { .. }
+            | Step::ConjugateC64 { .. }
+            | Step::FftButterflyStage { .. }
             | Step::ElementwiseRegion { .. }
             | Step::BatchElementwiseRegion { .. }
             | Step::Argmax { .. }
@@ -887,14 +1063,18 @@ impl Step {
             | Step::GroupedMatmul { .. }
             | Step::DequantMatmul { .. }
             | Step::DequantMatmulGguf { .. }
+            | Step::DequantMatmulInt8Host { .. }
+            | Step::Conv2dHost { .. }
             | Step::DequantGroupedMatmulGguf { .. }
             | Step::Lstm { .. }
             | Step::ConvTranspose2d { .. }
+            | Step::ConvTranspose3dHost { .. }
             | Step::GroupNormHost { .. }
             | Step::LayerNorm2dHost { .. }
             | Step::ResizeNearest2xHost { .. }
             | Step::ReverseHost { .. }
             | Step::ArgReduceHost { .. }
+            | Step::AxialRope2dHost { .. }
             | Step::GruHost { .. }
             | Step::RnnHost { .. }
             | Step::Llada2GroupLimitedGate { .. }
@@ -906,9 +1086,17 @@ impl Step {
             | Step::Conv2d { .. }
             | Step::Conv2dTiled { .. }
             | Step::Conv3d { .. }
+            | Step::ConvTranspose3d { .. }
             | Step::Pool1d { .. }
             | Step::Pool2d { .. }
             | Step::Pool3d { .. }
+            | Step::MaxPool2dBackward { .. }
+            | Step::AxialRope2d { .. }
+            | Step::FakeQuantizeFixed { .. }
+            | Step::FakeQuantizePerBatch { .. }
+            | Step::GroupNormBackwardInput { .. }
+            | Step::GroupNormBackwardGamma { .. }
+            | Step::GroupNormBackwardBeta { .. }
             | Step::ScatterAdd { .. }
             | Step::BufferCopy { .. } => true,
             // FFT: full-extent transform per row, no active-extent
@@ -922,6 +1110,8 @@ impl Step {
             | Step::CpuIndexing { .. }
             | Step::ConcatHost { .. }
             | Step::ConcatHostPieces { .. }
+            | Step::TransposeHost { .. }
+            | Step::NarrowHost { .. }
             | Step::ExpandHost { .. } => true,
             // SPD ops transform full square matrices (no bucket/seq axis to
             // scale); mark true so a mixed graph still gets the fast path for
@@ -1034,9 +1224,13 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Unary { .. } => "unary",
         Step::Where { .. } => "where",
         Step::Fma { .. } => "fma",
+        Step::ReluBackward { .. } => "relu_backward",
+        Step::ActivationBackward { .. } => "activation_backward",
         Step::Reduce { .. } => "reduce",
         Step::Softmax { .. } => "softmax",
         Step::SoftmaxCrossEntropy { .. } => "softmax_cross_entropy",
+        Step::SoftmaxCrossEntropyWithLogits { .. } => "softmax_cross_entropy_with_logits",
+        Step::SoftmaxCrossEntropyBackward { .. } => "softmax_cross_entropy_backward",
         Step::LayerNorm { .. } => "layer_norm",
         Step::Cumsum { .. } => "cumsum",
         Step::FftGpu { .. } => "fft_gpu",
@@ -1054,7 +1248,13 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Cast { .. } => "cast",
         Step::ComplexCast { .. } => "complex_cast",
         Step::BinaryC64 { .. } => "binary_c64",
+        Step::ComplexNormSq { .. } => "complex_norm_sq",
+        Step::ComplexNormSqBackward { .. } => "complex_norm_sq_backward",
+        Step::FftButterflyStage { .. } => "fft_butterfly_stage",
+        Step::ConjugateC64 { .. } => "conjugate_c64",
         Step::Transpose { .. } => "transpose",
+        Step::TransposeHost { .. } => "transpose_host",
+        Step::NarrowHost { .. } => "narrow_host",
         Step::Narrow { .. } => "narrow",
         Step::Concat { .. } => "concat",
         Step::ConcatHost { .. } => "concat_host",
@@ -1089,15 +1289,27 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::DequantMatmul { .. } => "dequant_matmul",
         Step::GatherSplit { .. } => "gather_split",
         Step::DequantMatmulGguf { .. } => "dequant_matmul_gguf",
+        Step::DequantMatmulInt8Host { .. } => "dequant_matmul_int8_host",
+        Step::Conv2dHost { .. } => "conv2d_host",
         Step::DequantGroupedMatmulGguf { .. } => "dequant_grouped_matmul_gguf",
         Step::GatedDeltaNet { .. } => "gated_delta_net",
         Step::Lstm { .. } => "lstm",
         Step::ConvTranspose2d { .. } => "conv_transpose2d",
+        Step::ConvTranspose3d { .. } => "conv_transpose3d",
+        Step::ConvTranspose3dHost { .. } => "conv_transpose3d_host",
         Step::GroupNormHost { .. } => "group_norm_host",
         Step::LayerNorm2dHost { .. } => "layer_norm2d_host",
         Step::ResizeNearest2xHost { .. } => "resize_nearest2x_host",
         Step::ReverseHost { .. } => "reverse_host",
         Step::ArgReduceHost { .. } => "argreduce_host",
+        Step::AxialRope2dHost { .. } => "axial_rope2d_host",
+        Step::AxialRope2d { .. } => "axial_rope2d",
+        Step::FakeQuantizeFixed { .. } => "fake_quantize_fixed",
+        Step::FakeQuantizePerBatch { .. } => "fake_quantize_perbatch",
+        Step::GroupNormBackwardInput { .. } => "group_norm_backward_input",
+        Step::GroupNormBackwardGamma { .. } => "group_norm_backward_gamma",
+        Step::GroupNormBackwardBeta { .. } => "group_norm_backward_beta",
+        Step::MaxPool2dBackward { .. } => "maxpool2d_backward",
         Step::Llada2GroupLimitedGate { .. } => "llada2_group_limited_gate",
         Step::UmapKnn { .. } => "umap_knn",
         Step::WgpuGpuKernel { .. } => "wgpu_gpu_kernel",
@@ -1151,14 +1363,18 @@ pub(crate) fn step_runs_on_host(step: &Step) -> bool {
         Step::GatedDeltaNet { use_gpu, .. } => !*use_gpu,
         Step::GatherSplit { .. }
         | Step::DequantMatmulGguf { .. }
+        | Step::DequantMatmulInt8Host { .. }
+        | Step::Conv2dHost { .. }
         | Step::DequantGroupedMatmulGguf { .. }
         | Step::Lstm { .. }
         | Step::ConvTranspose2d { .. }
+        | Step::ConvTranspose3dHost { .. }
         | Step::GroupNormHost { .. }
         | Step::LayerNorm2dHost { .. }
         | Step::ResizeNearest2xHost { .. }
         | Step::ReverseHost { .. }
         | Step::ArgReduceHost { .. }
+        | Step::AxialRope2dHost { .. }
         | Step::GruHost { .. }
         | Step::RnnHost { .. }
         | Step::Llada2GroupLimitedGate { .. }
@@ -1172,6 +1388,8 @@ pub(crate) fn step_runs_on_host(step: &Step) -> bool {
         | Step::CpuIndexing { .. }
         | Step::ConcatHost { .. }
         | Step::ConcatHostPieces { .. }
+        | Step::TransposeHost { .. }
+        | Step::NarrowHost { .. }
         | Step::ExpandHost { .. }
         | Step::SpdHost { .. }
         | Step::Im2ColHost { .. }
@@ -1206,6 +1424,25 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
             kind: MatmulQkvKind::CoopF16Vk,
             ..
         } => matches!(prev, Step::Unary { .. } | Step::CastF32ToF16 { .. }),
+        // Discrete Vulkan/DX12: Kitten NSF collapses when Binary/Unary follow
+        // MatMul in the same compute pass (peak ~0.05). End the pass so the
+        // matmul writes are visible before elementwise. Metal is fine without.
+        Step::Binary { .. }
+        | Step::Unary { .. }
+        | Step::Where { .. }
+        | Step::Fma { .. }
+        | Step::Compare { .. }
+            if crate::device::coop_discrete_backend() =>
+        {
+            matches!(
+                prev,
+                Step::Matmul { .. }
+                    | Step::MatmulQkv { .. }
+                    | Step::BufferCopy { .. }
+                    | Step::Gather { .. }
+                    | Step::Reduce { .. }
+            )
+        }
         _ => false,
     }
 }

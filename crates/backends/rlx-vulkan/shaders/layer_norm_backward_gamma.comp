@@ -1,0 +1,43 @@
+#version 450
+// LayerNorm backward w.r.t. gamma: dgamma[d] = sum_r dy[r,d] * x_hat[r,d].
+// One invocation (gid==0) walks all rows — matches wgpu reduce semantics.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint outer;
+    uint inner;
+    uint x_off;
+    uint dy_off;
+    uint out_off;
+    float eps;
+} pc;
+
+void main() {
+    if (gl_GlobalInvocationID.x != 0u || pc.inner == 0u) { return; }
+    uint h = pc.inner;
+    float n_inv = 1.0 / float(h);
+    for (uint i = 0u; i < h; i++) {
+        arena_store(pc.out_off + i, 0.0);
+    }
+    for (uint row = 0u; row < pc.outer; row++) {
+        uint x_base = pc.x_off + row * h;
+        uint dy_base = pc.dy_off + row * h;
+        float mean = 0.0;
+        for (uint i = 0u; i < h; i++) {
+            mean += arena_load(x_base + i);
+        }
+        mean *= n_inv;
+        float var_ = 0.0;
+        for (uint i = 0u; i < h; i++) {
+            float d = arena_load(x_base + i) - mean;
+            var_ += d * d;
+        }
+        float inv_std = inversesqrt(var_ * n_inv + pc.eps);
+        for (uint i = 0u; i < h; i++) {
+            float xv = arena_load(x_base + i);
+            float dyv = arena_load(dy_base + i);
+            float acc = arena_load(pc.out_off + i);
+            arena_store(pc.out_off + i, acc + dyv * (xv - mean) * inv_std);
+        }
+    }
+}

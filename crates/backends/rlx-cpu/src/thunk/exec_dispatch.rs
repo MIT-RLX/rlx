@@ -238,6 +238,7 @@ pub(crate) fn thunk_kind_name(t: &Thunk) -> &'static str {
         Thunk::Conv2dBackwardInput { .. } => "Conv2dBackwardInput",
         Thunk::Conv2dBackwardWeight { .. } => "Conv2dBackwardWeight",
         Thunk::Pool2D { .. } => "Pool2D",
+        Thunk::Pool3D { .. } => "Pool3D",
         Thunk::MaxPool2dBackward { .. } => "MaxPool2dBackward",
         Thunk::ReluBackward { .. } => "ReluBackward",
         Thunk::ActivationBackward { .. } => "ActivationBackward",
@@ -837,7 +838,8 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 unsafe {
                     let out = sl_mut(*dst, base, len);
                     for i in 0..len {
-                        out[i] = half::f16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]).to_f32();
+                        out[i] =
+                            half::f16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]).to_f32();
                     }
                 }
             }
@@ -3266,6 +3268,95 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     } else {
                         for nc in 0..n * c {
                             pool_plane(nc);
+                        }
+                    }
+                }
+            }
+
+            Thunk::Pool3D {
+                src,
+                dst,
+                n,
+                c,
+                d,
+                h,
+                w,
+                d_out,
+                h_out,
+                w_out,
+                kd,
+                kh,
+                kw,
+                sd,
+                sh,
+                sw,
+                pd,
+                ph,
+                pw,
+                kind,
+            } => {
+                let n = *n as usize;
+                let c = *c as usize;
+                let d = *d as usize;
+                let h = *h as usize;
+                let w = *w as usize;
+                let d_out = *d_out as usize;
+                let h_out = *h_out as usize;
+                let w_out = *w_out as usize;
+                let kd = *kd as usize;
+                let kh = *kh as usize;
+                let kw = *kw as usize;
+                let sd = *sd as usize;
+                let sh = *sh as usize;
+                let sw = *sw as usize;
+                let pd = *pd as usize;
+                let ph = *ph as usize;
+                let pw = *pw as usize;
+                let kernel_vol = (kd * kh * kw) as f32;
+                let is_max = matches!(kind, ReduceOp::Max);
+                let is_mean = matches!(kind, ReduceOp::Mean);
+                unsafe {
+                    let inp = sl(*src, base, n * c * d * h * w);
+                    let out = sl_mut(*dst, base, n * c * d_out * h_out * w_out);
+                    for ni in 0..n {
+                        for ci in 0..c {
+                            let in_base = (ni * c + ci) * d * h * w;
+                            let out_base = (ni * c + ci) * d_out * h_out * w_out;
+                            for od in 0..d_out {
+                                for ho in 0..h_out {
+                                    for wo in 0..w_out {
+                                        let mut acc = if is_max { f32::NEG_INFINITY } else { 0.0 };
+                                        for kz in 0..kd {
+                                            for ki in 0..kh {
+                                                for kj in 0..kw {
+                                                    let di = od * sd + kz;
+                                                    let hi = ho * sh + ki;
+                                                    let wi = wo * sw + kj;
+                                                    if di < pd || hi < ph || wi < pw {
+                                                        continue;
+                                                    }
+                                                    let di = di - pd;
+                                                    let hi = hi - ph;
+                                                    let wi = wi - pw;
+                                                    if di >= d || hi >= h || wi >= w {
+                                                        continue;
+                                                    }
+                                                    let v = inp[in_base + (di * h + hi) * w + wi];
+                                                    if is_max {
+                                                        acc = acc.max(v);
+                                                    } else {
+                                                        acc += v;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if is_mean {
+                                            acc /= kernel_vol;
+                                        }
+                                        out[out_base + (od * h_out + ho) * w_out + wo] = acc;
+                                    }
+                                }
+                            }
                         }
                     }
                 }

@@ -1190,6 +1190,13 @@ fn tan_atan_match_reference() {
         close(&g_atan, &w_atan, 1e-5),
         "atan: got {g_atan:?} want {w_atan:?}"
     );
+    let recip_xs = [-1.2_f32, -0.5, 0.5, 1.2];
+    let g_recip = run_unary(Activation::Recip, &recip_xs);
+    let w_recip: Vec<f32> = recip_xs.iter().map(|x| 1.0 / x).collect();
+    assert!(
+        close(&g_recip, &w_recip, 1e-6),
+        "recip: got {g_recip:?} want {w_recip:?}"
+    );
 }
 
 #[test]

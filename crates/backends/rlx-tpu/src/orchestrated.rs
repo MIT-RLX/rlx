@@ -21,6 +21,7 @@ use rlx_ir::{DType, Graph, NodeId, Op};
 use crate::backend::{compile_pjrt_executable, destroy_buffer, download_buffer, upload_buffer};
 use crate::collective_host::run_collective;
 use crate::device::tpu_context;
+use crate::host_ops::run_host_op;
 use crate::lower::{HloModule, LowerParamBytes, lower_graph_with_rng_and_params};
 use crate::segment::{Segment, plan};
 use crate::splat_host::{HostTensors, run_splat_backward, run_splat_render};
@@ -49,6 +50,9 @@ enum CompiledSegment {
         node: NodeId,
     },
     Collective {
+        node: NodeId,
+    },
+    Host {
         node: NodeId,
     },
 }
@@ -98,6 +102,9 @@ impl OrchestratedExecutable {
                 }
                 Segment::Collective { node } => {
                     compiled.push(CompiledSegment::Collective { node });
+                }
+                Segment::Host { node } => {
+                    compiled.push(CompiledSegment::Host { node });
                 }
             }
         }
@@ -201,6 +208,9 @@ impl OrchestratedExecutable {
                 }
                 CompiledSegment::Collective { node } => {
                     run_collective(&self.graph, *node, &mut env);
+                }
+                CompiledSegment::Host { node } => {
+                    run_host_op(&self.graph, *node, &mut env);
                 }
             }
         }

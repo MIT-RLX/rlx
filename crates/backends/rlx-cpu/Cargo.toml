@@ -73,6 +73,10 @@ harness = false
 name = "cumsum"
 harness = false
 
+[[bench]]
+name = "vmath"
+harness = false
+
 # Plan #13: one driver that reads bench-configs/*.toml and
 # dispatches per-shape criterion timings. Add a new TOML to
 # extend coverage without writing a new .rs.

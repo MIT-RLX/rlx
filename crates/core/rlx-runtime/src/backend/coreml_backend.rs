@@ -22,6 +22,9 @@ impl Backend for CoremlBackend {
     }
 
     fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+        use rlx_opt::pass::Pass as _;
+        // Same If/While → primitive rewrite as CPU / Metal / wgpu.
+        let graph = rlx_opt::LowerControlFlow.run(graph);
         // `supported_ops()` already includes the native backward kernels under
         // `training`, so the rewrite keeps them intact for their MIL arm while
         // decomposing the decompose-route backward ops to primitives.

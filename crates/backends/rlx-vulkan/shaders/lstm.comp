@@ -1,0 +1,68 @@
+#version 450
+// Single-layer unidirectional LSTM (gate order i,f,g,o; h0=c0=0).
+// One invocation per batch item; private hidden/cell. hidden ≤ 256;
+// larger / multi-layer / bidir / carry take the host fallback.
+// Bit-exact with rlx_cpu::thunk::execute_lstm_f32 for the simple case.
+layout(local_size_x = 64) in;
+
+const uint MAX_H = 256u;
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint seq;
+    uint input_size;
+    uint hidden;
+    uint x_off;
+    uint wih_off;
+    uint whh_off;
+    uint bias_off;
+    uint out_off;
+    uint seq_stride;
+} pc;
+
+void main() {
+    uint bi = gl_GlobalInvocationID.x;
+    if (bi >= pc.batch || pc.hidden > MAX_H) { return; }
+    uint h = pc.hidden;
+    uint in_sz = pc.input_size;
+
+    float hs[MAX_H];
+    float cs[MAX_H];
+    for (uint k = 0u; k < h; k++) {
+        hs[k] = 0.0;
+        cs[k] = 0.0;
+    }
+
+    for (uint t = 0u; t < pc.seq; t++) {
+        uint x_base = pc.x_off + (bi * pc.seq_stride + t) * in_sz;
+        float next_h[MAX_H];
+        float next_c[MAX_H];
+        for (uint k = 0u; k < h; k++) {
+            float zacc[4];
+            for (uint g = 0u; g < 4u; g++) {
+                uint r = g * h + k;
+                float acc = arena_load(pc.bias_off + r);
+                uint wih_row = pc.wih_off + r * in_sz;
+                for (uint j = 0u; j < in_sz; j++) {
+                    acc += arena_load(wih_row + j) * arena_load(x_base + j);
+                }
+                uint whh_row = pc.whh_off + r * h;
+                for (uint j = 0u; j < h; j++) {
+                    acc += arena_load(whh_row + j) * hs[j];
+                }
+                zacc[g] = acc;
+            }
+            float ig = 1.0 / (1.0 + exp(-zacc[0]));
+            float fg = 1.0 / (1.0 + exp(-zacc[1]));
+            float gg = tanh(zacc[2]);
+            float og = 1.0 / (1.0 + exp(-zacc[3]));
+            next_c[k] = fg * cs[k] + ig * gg;
+            next_h[k] = og * tanh(next_c[k]);
+        }
+        for (uint k = 0u; k < h; k++) {
+            hs[k] = next_h[k];
+            cs[k] = next_c[k];
+            arena_store(pc.out_off + (bi * pc.seq_stride + t) * h + k, hs[k]);
+        }
+    }
+}

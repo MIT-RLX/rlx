@@ -29,9 +29,8 @@ use rlx_ir::{DType, Dim, Graph, NodeId, Op, RngOptions, Shape};
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-/// OpKinds this backend lowers (claim set). Identical to rlx-vulkan's: the
-/// rewrite pass decomposes everything else into this primitive set, and the
-/// CPU reference covers every entry, so a legalized graph always executes.
+/// OpKinds this backend lowers (claim set). Closes gaps vs CUDA/wgpu via
+/// `rlx_unfuse` + CPU host-fallback; native OpenCL-C when kernels are embedded.
 pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
     use rlx_ir::OpKind::*;
     &[
@@ -44,18 +43,46 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Binary,
         Compare,
         Where,
+        Fma,
         Activation, // elementwise
+        // Region fused forms — claimed so fusion may emit them; `compile_rng`
+        // runs `DecomposeFusionRegions` then `UnfuseElementwiseRegions` before
+        // legalize (Transform/Batch → Resize + ElementwiseRegion → primitives).
+        ElementwiseRegion,
+        TransformRegion,
+        BatchElementwiseRegion,
         MatMul,
+        // Scaled low-p GEMM / QAT — host-fallback (same as Vulkan).
+        ScaledMatMul,
+        ScaledQuantize,
+        ScaledQuantScale,
+        ScaledDequantize,
+        // Claimed; `rlx_unfuse` expands to MatMul (+ reshape) before legalize.
+        DotGeneral,
+        // Host via rlx-cpu LAPACK (`sgesv`) on USM / value-map — no device
+        // oneMKL LAPACK linked (same HostOpDesc contract as wgpu / Vulkan).
+        DenseSolve,
+        BatchedDenseSolve,
         Reduce,
         Softmax, // contraction / reduction
         LayerNorm,
         RmsNorm,
         LayerNorm2d, // normalization
+        GroupNorm,
+        GroupNormBackwardInput,
+        GroupNormBackwardGamma,
+        GroupNormBackwardBeta,
         Rope,
         Attention, // transformer
-        // Claimed first-class; `compile_rng` runs `unfuse_attention_block`
-        // to lower it to the primitive chain above before legalization.
+        AttentionBackward,
+        // Claimed first-class; `compile_rng` runs `crate::unfuse` /
+        // `unfuse_attention_block` to lower to primitives before legalization.
         FusedAttentionBlock,
+        FusedResidualLN,
+        FusedResidualRmsNorm,
+        FusedSwiGLU,
+        // Native compose: matmul + Binary(Add) + optional Activation.
+        FusedMatMulBiasAct,
         // DiT modulation — claimed for fusion; `unfuse_dit_modulation`
         // expands forward Ada/Gated before host / SPIR-V lowering.
         AdaLayerNorm,
@@ -64,6 +91,48 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // embedded (`RLX_ONEAPI_BUILD_KERNELS=1`); else CPU host-fallback.
         AdaLayerNormBackward,
         GatedResidualBackward,
+        SoftmaxCrossEntropy,
+        SoftmaxCrossEntropyWithLogits,
+        SoftmaxCrossEntropyBackward,
+        // C64 Wirtinger surface — native SPIR-V when kernels embedded.
+        ComplexNormSq,
+        ComplexNormSqBackward,
+        Conjugate,
+        // QAT: Fixed/PerBatch + INT8 Quantize/Dequantize native; EMA / LSQ host.
+        FakeQuantize,
+        FakeQuantizeLSQ,
+        FakeQuantizeLSQBackwardX,
+        FakeQuantizeLSQBackwardScale,
+        FakeQuantizeBackward,
+        Quantize,
+        Dequantize,
+        // Inference BN + bwd trio — native when kernels embedded.
+        BatchNormInference,
+        BatchNormInferenceBackwardInput,
+        BatchNormInferenceBackwardGamma,
+        BatchNormInferenceBackwardBeta,
+        // 3-D conv + transpose — native when kernels embedded.
+        Conv3d,
+        ConvTranspose3d,
+        // SAM2 axial 2-D RoPE — native when kernels embedded.
+        AxialRope2d,
+        // Norm reverse — native OpenCL when kernels embedded (GroupNorm bwd too).
+        LayerNormBackwardInput,
+        LayerNormBackwardGamma,
+        RmsNormBackwardInput,
+        RmsNormBackwardGamma,
+        RmsNormBackwardBeta,
+        // Activation / RoPE / vision reverse — native when kernels embedded.
+        ReluBackward,
+        ActivationBackward,
+        RopeBackward,
+        CumsumBackward, // native `cumsum_backward.cl` when embedded
+        GatherBackward, // native `gather_backward.cl` when embedded
+        MaxPool2dBackward,
+        Conv2dBackwardInput,
+        Conv2dBackwardWeight,
+        // Fused conv+bias+act — native `fused_conv_bias_act.cl` when embedded.
+        FusedConvBiasAct,
         Transpose,
         Narrow,
         Concat,
@@ -85,24 +154,46 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         GatherNd,
         GatherElements,
         TopK, // vision / indexing / generation
+        // RNN family — native OpenCL when hidden/state ≤ 256 (else host).
         Lstm,
         Gru,
         Rnn,
         Mamba2,
+        // Expanded to MatMul/Mul/Add… before legalize (no dedicated kernel).
         GatedDeltaNet,
         // General Op::Scan (arbitrary-body recurrence, e.g. IIR biquad):
         // no native kernel → routed to the rlx-cpu host fallback (USM-shared arena).
         Scan,
         ScanBackward,
         ScanBackwardXs,
-        ConvTranspose2d,
+        ConvTranspose2d, // native `conv_transpose2d.cl` when embedded
         Fft,
+        FftButterflyStage, // native `fft_butterfly_stage.cl` when embedded
+        LogMel,            // packed HostOpDesc (no OpenCL LogMel; same as wgpu)
+        LogMelBackward,    // packed HostOpDesc
+        WelchPeaks,        // native when eligible + embedded; else HostOpDesc
         DequantMatMul,
         DequantGroupedMatMul,
         DequantMoEWeights, // GGUF quant
+        QMatMul,
+        QConv2d,
         RngNormal,
         RngUniform,
         Sample, // RNG / generation
+        // Gaussian splat CPU reference — host-fallback.
+        GaussianSplatRender,
+        GaussianSplatRenderBackward,
+        GaussianSplatPrepare,
+        GaussianSplatRasterize,
+        // Decomposed by `crate::unfuse` (`expand_lora` / `expand_ftl` /
+        // `expand_if` / `expand_while`) before lowering.
+        LoraMatMul,
+        FusedTransformerLayer,
+        If,
+        While,
+        // PartitionedConv expanded by `expand_cpu_nop_fused` (CPU would Nop).
+        PartitionedConv,
+        CustomFn,
         // Core Riemannian / SPD-manifold ops (F64): no native kernel → routed
         // to the F64-aware CPU host fallback (`crate::spd`), on both the
         // value-map (`run_host`) and USM-arena (`run_l0`) paths.
@@ -136,9 +227,11 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
 };
 
 /// Ops with a native OpenCL-C SPIR-V kernel under `kernels/`. Everything else
-/// routes to the CPU host-fallback on the native path. The set grows as kernels
-/// land (next: layernorm, rope, gather, reduce, attention, then oneMKL gemm).
+/// routes to the CPU host-fallback on the native path. GRU/LSTM/RNN/Mamba2
+/// require simple geometry and a ≤256 compile-time cap (mirrors Vulkan/wgpu).
+/// `FusedMatMulBiasAct` is composed from matmul+binary[+unary] in `run_l0`.
 fn native_kernel(op: &Op) -> Option<&'static str> {
+    use rlx_ir::op::ScaleMode;
     match op {
         Op::Binary(_) => Some("binary"),
         Op::Activation(_) => Some("unary"),
@@ -147,6 +240,112 @@ fn native_kernel(op: &Op) -> Option<&'static str> {
         Op::RmsNorm { .. } => Some("rmsnorm"),
         Op::AdaLayerNormBackward { .. } => Some("ada_layer_norm_backward"),
         Op::GatedResidualBackward => Some("gated_residual_backward"),
+        Op::GroupNorm { .. } => Some("group_norm"),
+        Op::GroupNormBackwardInput { .. } => Some("group_norm_bwd_input"),
+        Op::GroupNormBackwardGamma { .. } => Some("group_norm_bwd_gamma"),
+        Op::GroupNormBackwardBeta { .. } => Some("group_norm_bwd_beta"),
+        Op::FusedResidualLN { .. } => Some("fused_residual_ln"),
+        Op::FusedResidualRmsNorm { .. } => Some("fused_residual_rms_norm"),
+        Op::FusedSwiGLU { .. } => Some("fused_swiglu"),
+        Op::SoftmaxCrossEntropy => Some("softmax_cross_entropy"),
+        Op::SoftmaxCrossEntropyWithLogits => Some("softmax_cross_entropy_with_logits"),
+        Op::SoftmaxCrossEntropyBackward => Some("softmax_cross_entropy_backward"),
+        Op::Fma => Some("fma_elem"),
+        Op::ComplexNormSq => Some("complex_norm_sq"),
+        Op::ComplexNormSqBackward => Some("complex_norm_sq_backward"),
+        Op::Conjugate => Some("conjugate_c64"),
+        Op::FakeQuantize {
+            scale_mode: ScaleMode::Fixed,
+            ..
+        } => Some("fake_quantize_fixed"),
+        Op::FakeQuantize {
+            scale_mode: ScaleMode::PerBatch,
+            ..
+        } => Some("fake_quantize_perbatch"),
+        Op::Quantize { .. } => Some("quantize_i8"),
+        Op::Dequantize { .. } => Some("dequantize_i8"),
+        Op::CumsumBackward { .. } => Some("cumsum_backward"),
+        Op::GatherBackward { .. } => Some("gather_backward"),
+        Op::BatchNormInference { .. } => Some("batch_norm_inference"),
+        Op::BatchNormInferenceBackwardInput { .. } => Some("batch_norm_inference_bwd_input"),
+        Op::BatchNormInferenceBackwardGamma { .. } => Some("batch_norm_inference_bwd_gamma"),
+        Op::BatchNormInferenceBackwardBeta => Some("batch_norm_inference_bwd_beta"),
+        Op::ReluBackward | Op::ActivationBackward { .. } => Some("activation_backward"),
+        Op::AxialRope2d { .. } => Some("axial_rope2d"),
+        Op::LayerNormBackwardInput { .. } => Some("layer_norm_bwd_input"),
+        Op::LayerNormBackwardGamma { .. } => Some("layer_norm_bwd_gamma"),
+        Op::RmsNormBackwardInput { .. } => Some("rms_norm_bwd_input"),
+        Op::RmsNormBackwardGamma { .. } | Op::RmsNormBackwardBeta { .. } => {
+            Some("rms_norm_bwd_param")
+        }
+        Op::FftButterflyStage { .. } => Some("fft_butterfly_stage"),
+        Op::Conv3d { .. } => Some("conv3d"),
+        Op::ConvTranspose3d { .. } => Some("conv_transpose3d"),
+        Op::ConvTranspose2d { .. } => Some("conv_transpose2d"),
+        Op::Conv2dBackwardInput { .. } => Some("conv2d_backward_input"),
+        Op::Conv2dBackwardWeight { .. } => Some("conv2d_backward_weight"),
+        Op::MaxPool2dBackward { .. } => Some("maxpool2d_backward"),
+        Op::FusedConvBiasAct { .. } => Some("fused_conv_bias_act"),
+        Op::RopeBackward { .. } => Some("rope_backward"),
+        Op::Lstm {
+            hidden_size,
+            num_layers,
+            bidirectional,
+            carry,
+        } => {
+            if *num_layers == 1
+                && !*bidirectional
+                && !*carry
+                && *hidden_size > 0
+                && *hidden_size <= 256
+            {
+                Some("lstm")
+            } else {
+                None
+            }
+        }
+        Op::Gru {
+            hidden_size,
+            num_layers,
+            bidirectional,
+            carry,
+        } => {
+            if *num_layers == 1
+                && !*bidirectional
+                && !*carry
+                && *hidden_size > 0
+                && *hidden_size <= 256
+            {
+                Some("gru")
+            } else {
+                None
+            }
+        }
+        Op::Rnn {
+            hidden_size,
+            num_layers,
+            bidirectional,
+            carry,
+            ..
+        } => {
+            if *num_layers == 1
+                && !*bidirectional
+                && !*carry
+                && *hidden_size > 0
+                && *hidden_size <= 256
+            {
+                Some("rnn")
+            } else {
+                None
+            }
+        }
+        Op::Mamba2 { state_size, .. } => {
+            if *state_size > 0 && *state_size <= 256 {
+                Some("mamba2")
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -160,6 +359,30 @@ const CAST_F32_TO_I64: u32 = 103;
 const CAST_F32_TO_U8: u32 = 104;
 const CAST_F32_TO_U32: u32 = 105;
 const CAST_TO_BOOL: u32 = 106;
+
+/// Op ids for `activation_backward.cl` — match CUDA / wgpu (not forward unary).
+fn activation_bwd_op_id(a: Activation) -> u32 {
+    match a {
+        Activation::Relu => 0,
+        Activation::Sigmoid => 1,
+        Activation::Tanh => 2,
+        Activation::Exp => 3,
+        Activation::Log => 4,
+        Activation::Sqrt => 5,
+        Activation::Rsqrt => 6,
+        Activation::Neg => 7,
+        Activation::Abs => 8,
+        Activation::Gelu => 9,
+        Activation::Silu => 10,
+        Activation::GeluApprox => 11,
+        Activation::Round => 12,
+        Activation::Sin => 13,
+        Activation::Cos => 14,
+        Activation::Tan => 15,
+        Activation::Atan => 16,
+        Activation::Recip => 17,
+    }
+}
 
 /// How an `Op::Cast` lowers on the f32-uniform arena.
 enum CastLower {
@@ -273,10 +496,10 @@ fn complex_cast_host(input: &[f32], n: usize, mode: u32) -> Vec<f32> {
     let mut out = vec![0.0f32; out_lanes];
     for k in 0..n {
         match mode {
-            0 => out[2 * k] = ld(k),                          // real → C64 (im=0)
-            1 => out[k] = ld(2 * k),                          // C64 → real
-            2 => out[4 * k] = ld(k),                          // real → C128 (rest 0)
-            3 => out[k] = ld(4 * k),                          // C128 → real
+            0 => out[2 * k] = ld(k), // real → C64 (im=0)
+            1 => out[k] = ld(2 * k), // C64 → real
+            2 => out[4 * k] = ld(k), // real → C128 (rest 0)
+            3 => out[k] = ld(4 * k), // C128 → real
             4 => {
                 out[4 * k] = ld(2 * k); // C64 → C128
                 out[4 * k + 2] = ld(2 * k + 1);
@@ -380,11 +603,20 @@ impl OneApiExecutable {
         use rlx_opt::pass::Pass as _;
 
         let graph = rlx_opt::LowerControlFlow.run(graph);
-        // Decompose `FusedAttentionBlock` (claimed, but no monolithic
-        // kernel) to primitives before legalization. FAB-only; no-op when
-        // absent.
-        let graph = rlx_opt::unfuse::unfuse_attention_block(graph);
+        // Decompose composed ops (LoraMatMul, FusedTransformerLayer, FAB,
+        // DotGeneral, If/While) while keeping native FusedSwiGLU / residual-norm.
+        // Folds biased projections into FusedMatMulBiasAct (native compose).
+        let graph = crate::unfuse::unfuse(graph);
         let graph = rlx_opt::unfuse::unfuse_dit_modulation(graph);
+        // PartitionedConv: CPU HostOp would Nop — expand. FusedConvBiasAct
+        // stays first-class for the native `fused_conv_bias_act` kernel.
+        let graph = crate::unfuse::expand_cpu_nop_fused(graph);
+        // GatedDeltaNet → MatMul/Mul/Add time-unroll (no dedicated GDN kernel).
+        let graph = crate::unfuse::expand_gated_delta_net(graph);
+        // TransformRegion / BatchElementwiseRegion → Resize + ElementwiseRegion;
+        // then ElementwiseRegion → Binary / Activation / … primitives.
+        let graph = rlx_opt::rlx_fusion::DecomposeFusionRegions.run(graph);
+        let graph = rlx_opt::UnfuseElementwiseRegions::FOR_CPU.run(graph);
         let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, SUPPORTED_OPS)
             .unwrap_or_else(|errs| panic!("{}", rlx_opt::format_legalize_error("oneapi", &errs)));
         let graph = rlx_cpu::rlx_maybe_unroll_scans!(graph, scan_unroll_max_length);
@@ -543,8 +775,18 @@ impl OneApiExecutable {
                     let code = c64_binary_opcode(node.shape.dtype(), *op);
                     let a = f32v.get(&node.inputs[0]).cloned().unwrap_or_default();
                     let b = f32v.get(&node.inputs[1]).cloned().unwrap_or_default();
-                    let na = self.graph.node(node.inputs[0]).shape.num_elements().unwrap_or(0);
-                    let nb = self.graph.node(node.inputs[1]).shape.num_elements().unwrap_or(0);
+                    let na = self
+                        .graph
+                        .node(node.inputs[0])
+                        .shape
+                        .num_elements()
+                        .unwrap_or(0);
+                    let nb = self
+                        .graph
+                        .node(node.inputs[1])
+                        .shape
+                        .num_elements()
+                        .unwrap_or(0);
                     f32v.insert(node.id, binary_c64_host(&a, &b, numel, na, nb, code));
                 }
                 _ => {
@@ -628,6 +870,9 @@ impl OneApiExecutable {
         // Execute node-by-node: native kernel where available, else CPU
         // host-fallback against the (host-coherent) USM arena.
         let list = dev.create_command_list().expect("rlx-oneapi: command list");
+        // Transient USM allocations (e.g. Quantize affine tables) live until
+        // the command list finishes; freed after `execute_sync`.
+        let mut scratch: Vec<*mut c_void> = Vec::new();
         for node in self.graph.nodes() {
             if matches!(
                 node.op,
@@ -647,12 +892,12 @@ impl OneApiExecutable {
                 match classify_cast(src, *to) {
                     CastLower::Identity => continue,
                     CastLower::Kernel(_) => {
-                        self.dispatch(dev, kerns, list, "unary", node, &arena);
+                        self.dispatch(dev, kerns, list, "unary", node, &arena, &mut scratch);
                         continue;
                     }
                     // real↔C64, real↔C128, C64↔C128 — pure f32-lane moves.
                     CastLower::Complex(_) => {
-                        self.dispatch(dev, kerns, list, "complex_cast", node, &arena);
+                        self.dispatch(dev, kerns, list, "complex_cast", node, &arena, &mut scratch);
                         continue;
                     }
                     CastLower::Reject => panic!(
@@ -667,7 +912,7 @@ impl OneApiExecutable {
             // rejected inside the dispatch arg builder (matches rlx-cpu).
             if let Op::Binary(_) = &node.op {
                 if node.shape.dtype().is_complex() {
-                    self.dispatch(dev, kerns, list, "binary_c64", node, &arena);
+                    self.dispatch(dev, kerns, list, "binary_c64", node, &arena, &mut scratch);
                     continue;
                 }
             }
@@ -697,8 +942,53 @@ impl OneApiExecutable {
                 arena.write_f32(node.id, &out);
                 continue;
             }
+            // Packed HostOpDesc on the USM arena (wgpu-shaped): DenseSolve →
+            // rlx-cpu LAPACK; LogMel has no OpenCL twin. No device oneMKL LAPACK.
+            if matches!(
+                node.op,
+                Op::DenseSolve | Op::BatchedDenseSolve | Op::LogMel | Op::LogMelBackward
+            ) {
+                let desc = rlx_cpu::thunk::host_op_desc_from_node(&self.graph, node, |id| {
+                    arena.byte_offset(id)
+                });
+                unsafe {
+                    rlx_cpu::thunk::execute_host_op_on_bytes(arena.base_ptr() as *mut u8, &desc);
+                }
+                continue;
+            }
+            if let Op::WelchPeaks { k, n_segments } = &node.op {
+                let spec_shape = self.graph.node(node.inputs[0]).shape.clone();
+                let use_gpu =
+                    rlx_ir::audio::welch_peaks_gpu_native_eligible(&spec_shape, *k, *n_segments)
+                        .unwrap_or(false);
+                if use_gpu && kerns.get("welch_peaks").is_some() {
+                    self.dispatch(dev, kerns, list, "welch_peaks", node, &arena, &mut scratch);
+                } else {
+                    let desc = rlx_cpu::thunk::host_op_desc_from_node(&self.graph, node, |id| {
+                        arena.byte_offset(id)
+                    });
+                    unsafe {
+                        rlx_cpu::thunk::execute_host_op_on_bytes(
+                            arena.base_ptr() as *mut u8,
+                            &desc,
+                        );
+                    }
+                }
+                continue;
+            }
+            // FusedMatMulBiasAct: compose existing matmul + Binary(Add) +
+            // optional Activation into `out` (mirrors Vulkan schedule compose).
+            if let Op::FusedMatMulBiasAct { activation } = &node.op {
+                let can_compose = kerns.get("matmul").is_some()
+                    && kerns.get("binary").is_some()
+                    && (activation.is_none() || kerns.get("unary").is_some());
+                if can_compose {
+                    self.dispatch_fused_matmul_bias_act(dev, kerns, list, node, &arena);
+                    continue;
+                }
+            }
             match native_kernel(&node.op).filter(|name| kerns.get(name).is_some()) {
-                Some(name) => self.dispatch(dev, kerns, list, name, node, &arena),
+                Some(name) => self.dispatch(dev, kerns, list, name, node, &arena, &mut scratch),
                 None => {
                     // Read inputs out of the arena, eval on CPU, write back.
                     let in_specs: Vec<(Shape, HostBuf)> = node
@@ -726,12 +1016,106 @@ impl OneApiExecutable {
         unsafe {
             let _ = (dev.lib.command_list_destroy)(list);
         }
+        for p in scratch {
+            dev.free(p);
+        }
 
         self.read_outputs(read_indices, |id, n| arena.read_f32(id, n))
     }
 
+    /// Compose `FusedMatMulBiasAct` as matmul → Binary(Add bias) → optional
+    /// Activation, writing through `out` (same schedule as rlx-vulkan).
+    fn dispatch_fused_matmul_bias_act(
+        &self,
+        dev: &crate::device::OneApiDevice,
+        kerns: &crate::kernels::Kernels,
+        list: crate::level_zero::CommandListHandle,
+        node: &rlx_ir::Node,
+        arena: &crate::arena::Arena,
+    ) {
+        let Op::FusedMatMulBiasAct { activation } = &node.op else {
+            return;
+        };
+        let off = |id: NodeId| arena.elem_offset(id);
+        let out = node.id;
+        let a = node.inputs[0];
+        let b = node.inputs[1];
+        let bias = node.inputs[2];
+        let ad = dims(&self.graph, a);
+        let bd = dims(&self.graph, b);
+        let od = dims(&self.graph, out);
+        let (m, k) = (ad[ad.len() - 2], ad[ad.len() - 1]);
+        let n = bd[bd.len() - 1];
+        let batch = if od.len() > 2 {
+            numel(&od[..od.len() - 2])
+        } else {
+            1
+        };
+        let a_batch = if ad.len() > 2 {
+            numel(&ad[..ad.len() - 2])
+        } else {
+            1
+        };
+        let b_batch = if bd.len() > 2 {
+            numel(&bd[..bd.len() - 2])
+        } else {
+            1
+        };
+        let a_bs = if a_batch <= 1 { 0 } else { m * k };
+        let b_bs = if b_batch <= 1 { 0 } else { k * n };
+        let base = arena.base_ptr();
+
+        let matmul_args = [
+            KArg::Ptr(base),
+            KArg::U32(m as u32),
+            KArg::U32(k as u32),
+            KArg::U32(n as u32),
+            KArg::U32(off(a)),
+            KArg::U32(off(b)),
+            KArg::U32(off(out)),
+            KArg::U32(batch as u32),
+            KArg::U32(a_bs as u32),
+            KArg::U32(b_bs as u32),
+            KArg::U32((m * n) as u32),
+        ];
+        if let Some(kernel) = kerns.get("matmul") {
+            append_kernel_launch(dev, kernel, list, &matmul_args, batch.max(1) * m * n, 64);
+        }
+
+        let total = numel(&od);
+        let bn = numel(&dims(&self.graph, bias));
+        let add_args = [
+            KArg::Ptr(base),
+            KArg::U32(total as u32),
+            KArg::U32(off(out)),
+            KArg::U32(off(bias)),
+            KArg::U32(off(out)),
+            KArg::U32(0), // a contiguous (matmul result)
+            KArg::U32(if bn == total { 0 } else { bn as u32 }),
+            KArg::U32(binop_id(rlx_ir::op::BinaryOp::Add)),
+        ];
+        if let Some(kernel) = kerns.get("binary") {
+            append_kernel_launch(dev, kernel, list, &add_args, total.max(1), 256);
+        }
+
+        if let Some(act) = activation {
+            let act_args = [
+                KArg::Ptr(base),
+                KArg::U32(total as u32),
+                KArg::U32(off(out)),
+                KArg::U32(off(out)),
+                KArg::U32(act_id(*act)),
+            ];
+            if let Some(kernel) = kerns.get("unary") {
+                append_kernel_launch(dev, kernel, list, &act_args, total.max(1), 256);
+            }
+        }
+    }
+
     /// Set kernel arguments (arg 0 = arena base pointer, then scalars) and
     /// append a launch onto `list`. Arg layouts match `kernels/<name>.cl`.
+    /// `scratch` collects transient USM allocations (Quantize affine) freed by
+    /// the caller after `execute_sync`.
     fn dispatch(
         &self,
         dev: &crate::device::OneApiDevice,
@@ -740,6 +1124,7 @@ impl OneApiExecutable {
         name: &str,
         node: &rlx_ir::Node,
         arena: &crate::arena::Arena,
+        scratch: &mut Vec<*mut c_void>,
     ) {
         let Some(kernel) = kerns.get(name) else {
             return;
@@ -938,36 +1323,1092 @@ impl OneApiExecutable {
                 ]);
                 (mod_rows as usize, 64)
             }
+            Op::GroupNorm { num_groups, eps } => {
+                let x = node.inputs[0];
+                let xd = dims(&self.graph, x);
+                let (n, c, h, w) = (xd[0], xd[1], xd[2], xd[3]);
+                args.extend([
+                    KArg::U32(off(x)),
+                    KArg::U32(off(node.inputs[1])),
+                    KArg::U32(off(node.inputs[2])),
+                    KArg::U32(off(out)),
+                    KArg::U32(n as u32),
+                    KArg::U32(c as u32),
+                    KArg::U32(h as u32),
+                    KArg::U32(w as u32),
+                    KArg::U32(*num_groups as u32),
+                    KArg::F32(*eps),
+                ]);
+                (n * *num_groups, 64)
+            }
+            Op::GroupNormBackwardInput { num_groups, eps } => {
+                let x = node.inputs[0];
+                let xd = dims(&self.graph, x);
+                let (n, c, h, w) = (xd[0], xd[1], xd[2], xd[3]);
+                args.extend([
+                    KArg::U32(off(x)),
+                    KArg::U32(off(node.inputs[1])),
+                    KArg::U32(off(node.inputs[3])),
+                    KArg::U32(off(out)),
+                    KArg::U32(n as u32),
+                    KArg::U32(c as u32),
+                    KArg::U32(h as u32),
+                    KArg::U32(w as u32),
+                    KArg::U32(*num_groups as u32),
+                    KArg::F32(*eps),
+                ]);
+                (n * *num_groups, 64)
+            }
+            Op::GroupNormBackwardGamma { num_groups, eps } => {
+                let x = node.inputs[0];
+                let xd = dims(&self.graph, x);
+                let (n, c, h, w) = (xd[0], xd[1], xd[2], xd[3]);
+                args.extend([
+                    KArg::U32(off(x)),
+                    KArg::U32(off(node.inputs[1])),
+                    KArg::U32(off(out)),
+                    KArg::U32(n as u32),
+                    KArg::U32(c as u32),
+                    KArg::U32(h as u32),
+                    KArg::U32(w as u32),
+                    KArg::U32(*num_groups as u32),
+                    KArg::F32(*eps),
+                ]);
+                (1, 1)
+            }
+            Op::GroupNormBackwardBeta { .. } => {
+                let x = node.inputs[0];
+                let xd = dims(&self.graph, x);
+                let (n, c, h, w) = (xd[0], xd[1], xd[2], xd[3]);
+                args.extend([
+                    KArg::U32(off(node.inputs[1])),
+                    KArg::U32(off(out)),
+                    KArg::U32(n as u32),
+                    KArg::U32(c as u32),
+                    KArg::U32(h as u32),
+                    KArg::U32(w as u32),
+                ]);
+                (1, 1)
+            }
+            Op::FusedResidualLN { has_bias, eps } | Op::FusedResidualRmsNorm { has_bias, eps } => {
+                let x = node.inputs[0];
+                let residual = node.inputs[1];
+                let (bias, gamma, beta) = if *has_bias {
+                    (node.inputs[2], node.inputs[3], node.inputs[4])
+                } else {
+                    (x, node.inputs[2], node.inputs[3]) // bias unused
+                };
+                let xd = dims(&self.graph, out);
+                let inner = *xd.last().unwrap_or(&1);
+                let total = numel(&xd);
+                let outer = total / inner.max(1);
+                args.extend([
+                    KArg::U32(outer as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(residual)),
+                    KArg::U32(off(bias)),
+                    KArg::U32(off(gamma)),
+                    KArg::U32(off(beta)),
+                    KArg::U32(off(out)),
+                    KArg::F32(*eps),
+                    KArg::U32(if *has_bias { 1 } else { 0 }),
+                ]);
+                (outer, 64)
+            }
+            Op::FusedSwiGLU {
+                cast_to: _,
+                gate_first,
+            } => {
+                let x = node.inputs[0];
+                let od = dims(&self.graph, out);
+                let n_half = *od.last().unwrap_or(&1);
+                let total = numel(&od);
+                args.extend([
+                    KArg::U32(n_half as u32),
+                    KArg::U32(total as u32),
+                    KArg::U32(if *gate_first { 1 } else { 0 }),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(out)),
+                ]);
+                (total, 256)
+            }
+            Op::SoftmaxCrossEntropy => {
+                let logits = node.inputs[0];
+                let targets = node.inputs[1];
+                let ld = dims(&self.graph, logits);
+                let inner = *ld.last().unwrap_or(&1);
+                let outer = numel(&ld) / inner.max(1);
+                args.extend([
+                    KArg::U32(outer as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(off(logits)),
+                    KArg::U32(off(targets)),
+                    KArg::U32(off(out)),
+                ]);
+                (outer, 64)
+            }
+            Op::SoftmaxCrossEntropyWithLogits => {
+                let logits = node.inputs[0];
+                let labels = node.inputs[1];
+                let ld = dims(&self.graph, logits);
+                let inner = *ld.last().unwrap_or(&1);
+                let outer = numel(&ld) / inner.max(1);
+                args.extend([
+                    KArg::U32(outer as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(off(logits)),
+                    KArg::U32(off(labels)),
+                    KArg::U32(off(out)),
+                ]);
+                (outer, 64)
+            }
+            Op::SoftmaxCrossEntropyBackward => {
+                let logits = node.inputs[0];
+                let labels = node.inputs[1];
+                let d_loss = node.inputs[2];
+                let ld = dims(&self.graph, logits);
+                let inner = *ld.last().unwrap_or(&1);
+                let outer = numel(&ld) / inner.max(1);
+                args.extend([
+                    KArg::U32(outer as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(off(logits)),
+                    KArg::U32(off(labels)),
+                    KArg::U32(off(d_loss)),
+                    KArg::U32(off(out)),
+                ]);
+                (outer, 64)
+            }
+            Op::Fma => {
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let c = node.inputs[2];
+                let n = numel(&dims(&self.graph, out));
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(off(a)),
+                    KArg::U32(off(b)),
+                    KArg::U32(off(c)),
+                    KArg::U32(off(out)),
+                ]);
+                (n, 256)
+            }
+            Op::ComplexNormSq => {
+                let z = node.inputs[0];
+                let n = numel(&dims(&self.graph, out)); // complex-element count
+                args.extend([KArg::U32(n as u32), KArg::U32(off(z)), KArg::U32(off(out))]);
+                (n, 256)
+            }
+            Op::ComplexNormSqBackward => {
+                let z = node.inputs[0];
+                let g = node.inputs[1];
+                let n = numel(&dims(&self.graph, z)); // complex-element count
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(off(z)),
+                    KArg::U32(off(g)),
+                    KArg::U32(off(out)),
+                ]);
+                (n, 256)
+            }
+            Op::Conjugate => {
+                let z = node.inputs[0];
+                let n = numel(&dims(&self.graph, out));
+                args.extend([KArg::U32(n as u32), KArg::U32(off(z)), KArg::U32(off(out))]);
+                (n, 256)
+            }
+            Op::FakeQuantize {
+                bits,
+                axis,
+                scale_mode: rlx_ir::op::ScaleMode::Fixed,
+                ..
+            } => {
+                let x = node.inputs[0];
+                let scale = node.inputs[1];
+                let n = numel(&dims(&self.graph, out));
+                let (chan_dim, inner) = match *axis {
+                    None => (1usize, n.max(1)),
+                    Some(d) => {
+                        let xd = dims(&self.graph, out);
+                        let chan = xd[d];
+                        let inn: usize = xd[d + 1..].iter().product::<usize>().max(1);
+                        (chan, inn)
+                    }
+                };
+                let q_max = match *bits {
+                    8 => 127.0f32,
+                    4 => 7.0,
+                    2 => 1.0,
+                    other => panic!("rlx-oneapi FakeQuantize Fixed: unsupported bits {other}"),
+                };
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(chan_dim as u32),
+                    KArg::U32(inner as u32),
+                    KArg::F32(q_max),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(scale)),
+                    KArg::U32(off(out)),
+                ]);
+                (n, 256)
+            }
+            Op::FakeQuantize {
+                bits,
+                axis,
+                scale_mode: rlx_ir::op::ScaleMode::PerBatch,
+                ..
+            } => {
+                let x = node.inputs[0];
+                let n = numel(&dims(&self.graph, out));
+                let (chan_dim, inner) = match *axis {
+                    None => (1usize, n.max(1)),
+                    Some(d) => {
+                        let xd = dims(&self.graph, out);
+                        let chan = xd[d];
+                        let inn: usize = xd[d + 1..].iter().product::<usize>().max(1);
+                        (chan, inn)
+                    }
+                };
+                let q_max = match *bits {
+                    8 => 127.0f32,
+                    4 => 7.0,
+                    2 => 1.0,
+                    other => panic!("rlx-oneapi FakeQuantize PerBatch: unsupported bits {other}"),
+                };
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(chan_dim as u32),
+                    KArg::U32(inner as u32),
+                    KArg::F32(q_max),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(out)),
+                ]);
+                (chan_dim, 64)
+            }
+            Op::BatchNormInference { eps } => {
+                let x = node.inputs[0];
+                let gamma = node.inputs[1];
+                let beta = node.inputs[2];
+                let mean = node.inputs[3];
+                let var = node.inputs[4];
+                let xd = dims(&self.graph, x);
+                let channels = *xd.last().unwrap_or(&1);
+                let n = numel(&xd);
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(channels as u32),
+                    KArg::F32(*eps),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(gamma)),
+                    KArg::U32(off(beta)),
+                    KArg::U32(off(mean)),
+                    KArg::U32(off(var)),
+                    KArg::U32(off(out)),
+                ]);
+                (n, 256)
+            }
+            Op::BatchNormInferenceBackwardInput { eps } => {
+                let gamma = node.inputs[1];
+                let var = node.inputs[3];
+                let dy = node.inputs[4];
+                let xd = dims(&self.graph, dy);
+                let channels = *xd.last().unwrap_or(&1);
+                let n = numel(&xd);
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(channels as u32),
+                    KArg::F32(*eps),
+                    KArg::U32(off(gamma)),
+                    KArg::U32(off(var)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                ]);
+                (n, 256)
+            }
+            Op::BatchNormInferenceBackwardGamma { eps } => {
+                let x = node.inputs[0];
+                let mean = node.inputs[1];
+                let var = node.inputs[2];
+                let dy = node.inputs[3];
+                let xd = dims(&self.graph, x);
+                let channels = *xd.last().unwrap_or(&1);
+                let n = numel(&xd);
+                let count = n / channels.max(1);
+                args.extend([
+                    KArg::U32(count as u32),
+                    KArg::U32(channels as u32),
+                    KArg::F32(*eps),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(mean)),
+                    KArg::U32(off(var)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                ]);
+                (channels, 64)
+            }
+            Op::BatchNormInferenceBackwardBeta => {
+                let dy = node.inputs[0];
+                let xd = dims(&self.graph, dy);
+                let channels = *xd.last().unwrap_or(&1);
+                let n = numel(&xd);
+                let count = n / channels.max(1);
+                args.extend([
+                    KArg::U32(count as u32),
+                    KArg::U32(channels as u32),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                ]);
+                (channels, 64)
+            }
+            Op::ReluBackward => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let n = numel(&dims(&self.graph, out));
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                    KArg::U32(0), // relu
+                ]);
+                (n, 256)
+            }
+            Op::ActivationBackward { kind } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let n = numel(&dims(&self.graph, out));
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                    KArg::U32(activation_bwd_op_id(*kind)),
+                ]);
+                (n, 256)
+            }
+            Op::AxialRope2d {
+                end_x,
+                end_y,
+                head_dim,
+                num_heads,
+                theta,
+                repeat_factor,
+            } => {
+                let x = node.inputs[0];
+                let xd = dims(&self.graph, x);
+                let (batch, seq, hidden) = if xd.len() >= 3 {
+                    (xd[0], xd[1], xd[2])
+                } else {
+                    panic!("rlx-oneapi AxialRope2d: expected rank ≥ 3, got {xd:?}");
+                };
+                let n_total = batch * seq * hidden;
+                args.extend([
+                    KArg::U32(batch as u32),
+                    KArg::U32(seq as u32),
+                    KArg::U32(hidden as u32),
+                    KArg::U32(*end_x as u32),
+                    KArg::U32(*end_y as u32),
+                    KArg::U32(*head_dim as u32),
+                    KArg::U32(*num_heads as u32),
+                    KArg::U32(*repeat_factor as u32),
+                    KArg::F32(*theta),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(out)),
+                    KArg::U32(n_total as u32),
+                ]);
+                (n_total, 256)
+            }
+            Op::LayerNormBackwardInput { axis, eps } => {
+                let x = node.inputs[0];
+                let gamma = node.inputs[1];
+                let dy = node.inputs[2];
+                let xd = dims(&self.graph, x);
+                let ax = norm_axis(*axis, xd.len());
+                let inner = xd[ax];
+                let outer = numel(&xd) / inner.max(1);
+                args.extend([
+                    KArg::U32(outer as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(gamma)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                    KArg::F32(*eps),
+                ]);
+                (outer.max(1), 64)
+            }
+            Op::LayerNormBackwardGamma { axis, eps } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let xd = dims(&self.graph, x);
+                let ax = norm_axis(*axis, xd.len());
+                let inner = xd[ax];
+                let outer = numel(&xd) / inner.max(1);
+                args.extend([
+                    KArg::U32(outer as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                    KArg::F32(*eps),
+                ]);
+                (1, 1)
+            }
+            Op::RmsNormBackwardInput { axis, eps } => {
+                let x = node.inputs[0];
+                let gamma = node.inputs[1];
+                let dy = node.inputs[3];
+                let xd = dims(&self.graph, x);
+                let ax = norm_axis(*axis, xd.len());
+                let inner = xd[ax];
+                let outer = numel(&xd) / inner.max(1);
+                args.extend([
+                    KArg::U32(outer as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(gamma)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                    KArg::F32(*eps),
+                ]);
+                (outer.max(1), 64)
+            }
+            Op::RmsNormBackwardGamma { axis, eps } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[3];
+                let xd = dims(&self.graph, x);
+                let ax = norm_axis(*axis, xd.len());
+                let inner = xd[ax];
+                let outer = numel(&xd) / inner.max(1);
+                args.extend([
+                    KArg::U32(outer as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                    KArg::F32(*eps),
+                    KArg::U32(1), // wrt = dgamma
+                ]);
+                (1, 1)
+            }
+            Op::RmsNormBackwardBeta { axis, eps } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[3];
+                let xd = dims(&self.graph, x);
+                let ax = norm_axis(*axis, xd.len());
+                let inner = xd[ax];
+                let outer = numel(&xd) / inner.max(1);
+                args.extend([
+                    KArg::U32(outer as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                    KArg::F32(*eps),
+                    KArg::U32(2), // wrt = dbeta
+                ]);
+                (1, 1)
+            }
+            Op::FftButterflyStage { stage, n_fft } => {
+                let state = node.inputs[0];
+                let gate = node.inputs[1];
+                let rev = node.inputs[2];
+                let tw_re = node.inputs[3];
+                let tw_im = node.inputs[4];
+                let sd = dims(&self.graph, state);
+                let batch = if sd.is_empty() { 1 } else { sd[0] };
+                let half = (*n_fft as usize / 2).max(1);
+                args.extend([
+                    KArg::U32(batch as u32),
+                    KArg::U32(*n_fft),
+                    KArg::U32(*stage),
+                    KArg::U32(half as u32),
+                    KArg::U32(off(state)),
+                    KArg::U32(off(out)),
+                    KArg::U32(off(gate)),
+                    KArg::U32(off(rev)),
+                    KArg::U32(off(tw_re)),
+                    KArg::U32(off(tw_im)),
+                ]);
+                (batch * half, 64)
+            }
+            Op::Conv3d {
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                let x = node.inputs[0];
+                let w = node.inputs[1];
+                let xd = dims(&self.graph, x);
+                let wd = dims(&self.graph, w);
+                let od = dims(&self.graph, out);
+                assert!(
+                    xd.len() == 5 && wd.len() == 5 && od.len() == 5,
+                    "rlx-oneapi Conv3d: expected NCDHW ranks, got x={xd:?} w={wd:?} o={od:?}"
+                );
+                let (n, c_in, d, h, ww) = (xd[0], xd[1], xd[2], xd[3], xd[4]);
+                let (c_out, _, kd, kh, kw) = (wd[0], wd[1], wd[2], wd[3], wd[4]);
+                let (d_out, h_out, w_out) = (od[2], od[3], od[4]);
+                let total = n * c_out * d_out * h_out * w_out;
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(c_in as u32),
+                    KArg::U32(c_out as u32),
+                    KArg::U32(d as u32),
+                    KArg::U32(h as u32),
+                    KArg::U32(ww as u32),
+                    KArg::U32(d_out as u32),
+                    KArg::U32(h_out as u32),
+                    KArg::U32(w_out as u32),
+                    KArg::U32(kd as u32),
+                    KArg::U32(kh as u32),
+                    KArg::U32(kw as u32),
+                    KArg::U32(stride[0] as u32),
+                    KArg::U32(stride[1] as u32),
+                    KArg::U32(stride[2] as u32),
+                    KArg::U32(padding[0] as u32),
+                    KArg::U32(padding[1] as u32),
+                    KArg::U32(padding[2] as u32),
+                    KArg::U32(dilation[0] as u32),
+                    KArg::U32(dilation[1] as u32),
+                    KArg::U32(dilation[2] as u32),
+                    KArg::U32(*groups as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(w)),
+                    KArg::U32(off(out)),
+                ]);
+                (total.max(1), 256)
+            }
+            Op::ConvTranspose3d {
+                stride,
+                padding,
+                dilation,
+                groups,
+                ..
+            } => {
+                let x = node.inputs[0];
+                let w = node.inputs[1];
+                let xd = dims(&self.graph, x);
+                let wd = dims(&self.graph, w);
+                let od = dims(&self.graph, out);
+                assert!(
+                    xd.len() == 5 && wd.len() == 5 && od.len() == 5,
+                    "rlx-oneapi ConvTranspose3d: expected NCDHW ranks, got x={xd:?} w={wd:?} o={od:?}"
+                );
+                let (n, c_in, d, h, ww) = (xd[0], xd[1], xd[2], xd[3], xd[4]);
+                let (_, c_out_pg, kd, kh, kw) = (wd[0], wd[1], wd[2], wd[3], wd[4]);
+                let (d_out, h_out, w_out) = (od[2], od[3], od[4]);
+                let c_out = od[1];
+                let _ = c_out_pg;
+                let total = n * c_out * d_out * h_out * w_out;
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(c_in as u32),
+                    KArg::U32(c_out as u32),
+                    KArg::U32(d as u32),
+                    KArg::U32(h as u32),
+                    KArg::U32(ww as u32),
+                    KArg::U32(d_out as u32),
+                    KArg::U32(h_out as u32),
+                    KArg::U32(w_out as u32),
+                    KArg::U32(kd as u32),
+                    KArg::U32(kh as u32),
+                    KArg::U32(kw as u32),
+                    KArg::U32(stride[0] as u32),
+                    KArg::U32(stride[1] as u32),
+                    KArg::U32(stride[2] as u32),
+                    KArg::U32(padding[0] as u32),
+                    KArg::U32(padding[1] as u32),
+                    KArg::U32(padding[2] as u32),
+                    KArg::U32(dilation[0] as u32),
+                    KArg::U32(dilation[1] as u32),
+                    KArg::U32(dilation[2] as u32),
+                    KArg::U32(*groups as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(w)),
+                    KArg::U32(off(out)),
+                ]);
+                (total.max(1), 256)
+            }
+            Op::ConvTranspose2d {
+                stride,
+                padding,
+                dilation,
+                groups,
+                ..
+            } => {
+                let x = node.inputs[0];
+                let w = node.inputs[1];
+                let xd = dims(&self.graph, x);
+                let wd = dims(&self.graph, w);
+                let od = dims(&self.graph, out);
+                assert!(
+                    xd.len() == 4 && wd.len() == 4 && od.len() == 4,
+                    "rlx-oneapi ConvTranspose2d: expected NCHW ranks, got x={xd:?} w={wd:?} o={od:?}"
+                );
+                let (nn, cin, hh, ww) = (xd[0], xd[1], xd[2], xd[3]);
+                let (_, _cout_pg, kh, kw) = (wd[0], wd[1], wd[2], wd[3]);
+                let (cout, oh, ow) = (od[1], od[2], od[3]);
+                let total = nn * cout * oh * ow;
+                args.extend([
+                    KArg::U32(nn as u32),
+                    KArg::U32(cin as u32),
+                    KArg::U32(hh as u32),
+                    KArg::U32(ww as u32),
+                    KArg::U32(cout as u32),
+                    KArg::U32(oh as u32),
+                    KArg::U32(ow as u32),
+                    KArg::U32(kh as u32),
+                    KArg::U32(kw as u32),
+                    KArg::U32(stride[0] as u32),
+                    KArg::U32(stride[1] as u32),
+                    KArg::U32(padding[0] as u32),
+                    KArg::U32(padding[1] as u32),
+                    KArg::U32(dilation[0] as u32),
+                    KArg::U32(dilation[1] as u32),
+                    KArg::U32((*groups).max(1) as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(w)),
+                    KArg::U32(off(out)),
+                ]);
+                (total.max(1), 64)
+            }
+            Op::Conv2dBackwardInput {
+                stride,
+                padding,
+                dilation,
+                groups,
+                ..
+            } => {
+                let dy = node.inputs[0];
+                let w = node.inputs[1];
+                let dyd = dims(&self.graph, dy);
+                let wd = dims(&self.graph, w);
+                let od = dims(&self.graph, out); // dx
+                let (n, c_out, h_out, w_out) = (dyd[0], dyd[1], dyd[2], dyd[3]);
+                let (_, c_in_pg, kh, kw) = (wd[0], wd[1], wd[2], wd[3]);
+                let (c_in, h, ww) = (od[1], od[2], od[3]);
+                let _ = c_in_pg;
+                let total = n * c_in * h * ww;
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(c_in as u32),
+                    KArg::U32(c_out as u32),
+                    KArg::U32(h as u32),
+                    KArg::U32(ww as u32),
+                    KArg::U32(h_out as u32),
+                    KArg::U32(w_out as u32),
+                    KArg::U32(kh as u32),
+                    KArg::U32(kw as u32),
+                    KArg::U32(stride[0] as u32),
+                    KArg::U32(stride[1] as u32),
+                    KArg::U32(padding[0] as u32),
+                    KArg::U32(padding[1] as u32),
+                    KArg::U32(dilation[0] as u32),
+                    KArg::U32(dilation[1] as u32),
+                    KArg::U32(*groups as u32),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(w)),
+                    KArg::U32(off(out)),
+                ]);
+                (total.max(1), 256)
+            }
+            Op::Conv2dBackwardWeight {
+                stride,
+                padding,
+                dilation,
+                groups,
+                ..
+            } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let xd = dims(&self.graph, x);
+                let dyd = dims(&self.graph, dy);
+                let od = dims(&self.graph, out); // dw
+                let (n, c_in, h, ww) = (xd[0], xd[1], xd[2], xd[3]);
+                let (c_out, h_out, w_out) = (dyd[1], dyd[2], dyd[3]);
+                let (_, _, kh, kw) = (od[0], od[1], od[2], od[3]);
+                let c_in_per_g = c_in / (*groups).max(1);
+                let total = c_out * c_in_per_g * kh * kw;
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(c_in as u32),
+                    KArg::U32(c_out as u32),
+                    KArg::U32(h as u32),
+                    KArg::U32(ww as u32),
+                    KArg::U32(h_out as u32),
+                    KArg::U32(w_out as u32),
+                    KArg::U32(kh as u32),
+                    KArg::U32(kw as u32),
+                    KArg::U32(stride[0] as u32),
+                    KArg::U32(stride[1] as u32),
+                    KArg::U32(padding[0] as u32),
+                    KArg::U32(padding[1] as u32),
+                    KArg::U32(dilation[0] as u32),
+                    KArg::U32(dilation[1] as u32),
+                    KArg::U32(*groups as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                ]);
+                (total.max(1), 256)
+            }
+            Op::MaxPool2dBackward {
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let x = node.inputs[0];
+                let dy = node.inputs[1];
+                let xd = dims(&self.graph, x);
+                let dyd = dims(&self.graph, dy);
+                let (n, c, h, ww) = (xd[0], xd[1], xd[2], xd[3]);
+                let (h_out, w_out) = (dyd[2], dyd[3]);
+                let kh = kernel_size[0];
+                let kw = kernel_size.get(1).copied().unwrap_or(kh);
+                let sh = stride.first().copied().unwrap_or(1);
+                let sw = stride.get(1).copied().unwrap_or(sh);
+                let ph = padding.first().copied().unwrap_or(0);
+                let pw = padding.get(1).copied().unwrap_or(ph);
+                let total = n * c * h * ww;
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(c as u32),
+                    KArg::U32(h as u32),
+                    KArg::U32(ww as u32),
+                    KArg::U32(h_out as u32),
+                    KArg::U32(w_out as u32),
+                    KArg::U32(kh as u32),
+                    KArg::U32(kw as u32),
+                    KArg::U32(sh as u32),
+                    KArg::U32(sw as u32),
+                    KArg::U32(ph as u32),
+                    KArg::U32(pw as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                ]);
+                (total.max(1), 256)
+            }
+            Op::FusedConvBiasAct {
+                stride,
+                padding,
+                dilation,
+                groups,
+                activation,
+                has_residual,
+                ..
+            } => {
+                let x = node.inputs[0];
+                let w = node.inputs[1];
+                let bias = node.inputs[2];
+                let xd = dims(&self.graph, x);
+                let wd = dims(&self.graph, w);
+                let od = dims(&self.graph, out);
+                let (n, c_in, h, ww) = (xd[0], xd[1], xd[2], xd[3]);
+                let (c_out, _, kh, kw) = (wd[0], wd[1], wd[2], wd[3]);
+                let (h_out, w_out) = (od[2], od[3]);
+                let residual = if *has_residual {
+                    node.inputs[3]
+                } else {
+                    x // unused
+                };
+                let act = match activation {
+                    None => 0xFFFFu32,
+                    Some(a) => act_id(*a),
+                };
+                let total = n * c_out * h_out * w_out;
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(c_in as u32),
+                    KArg::U32(c_out as u32),
+                    KArg::U32(h as u32),
+                    KArg::U32(ww as u32),
+                    KArg::U32(h_out as u32),
+                    KArg::U32(w_out as u32),
+                    KArg::U32(kh as u32),
+                    KArg::U32(kw as u32),
+                    KArg::U32(stride[0] as u32),
+                    KArg::U32(stride[1] as u32),
+                    KArg::U32(padding[0] as u32),
+                    KArg::U32(padding[1] as u32),
+                    KArg::U32(dilation[0] as u32),
+                    KArg::U32(dilation[1] as u32),
+                    KArg::U32(*groups as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(w)),
+                    KArg::U32(off(bias)),
+                    KArg::U32(off(residual)),
+                    KArg::U32(off(out)),
+                    KArg::U32(if *has_residual { 1 } else { 0 }),
+                    KArg::U32(act),
+                ]);
+                (total.max(1), 256)
+            }
+            Op::RopeBackward { head_dim, n_rot } => {
+                let dy = node.inputs[0];
+                let cos = node.inputs[1];
+                let sin = node.inputs[2];
+                let dyd = dims(&self.graph, dy);
+                let (batch, seq, hidden) = if dyd.len() >= 3 {
+                    (dyd[0], dyd[1], dyd[2])
+                } else {
+                    (1, dyd[0], dyd.get(1).copied().unwrap_or(1))
+                };
+                let cos_len = numel(&dims(&self.graph, cos));
+                let total = batch * seq * hidden;
+                args.extend([
+                    KArg::U32(batch as u32),
+                    KArg::U32(seq as u32),
+                    KArg::U32(hidden as u32),
+                    KArg::U32(*head_dim as u32),
+                    KArg::U32(*n_rot as u32),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(cos)),
+                    KArg::U32(off(sin)),
+                    KArg::U32(off(out)),
+                    KArg::U32(cos_len as u32),
+                ]);
+                (total.max(1), 256)
+            }
+            Op::Lstm { hidden_size, .. } => {
+                let x = node.inputs[0];
+                let xd = dims(&self.graph, x);
+                let (batch, seq, input_size) = (xd[0], xd[1], xd[2]);
+                let hidden = *hidden_size;
+                args.extend([
+                    KArg::U32(batch as u32),
+                    KArg::U32(seq as u32),
+                    KArg::U32(input_size as u32),
+                    KArg::U32(hidden as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(node.inputs[1])),
+                    KArg::U32(off(node.inputs[2])),
+                    KArg::U32(off(node.inputs[3])),
+                    KArg::U32(off(out)),
+                    KArg::U32(seq as u32), // seq_stride
+                ]);
+                // One work-group per batch item; local size = LSTM_MAX_H.
+                (batch.max(1) * 256, 256)
+            }
+            Op::Gru { hidden_size, .. } => {
+                let x = node.inputs[0];
+                let xd = dims(&self.graph, x);
+                let (batch, seq, input_size) = (xd[0], xd[1], xd[2]);
+                let hidden = *hidden_size;
+                args.extend([
+                    KArg::U32(batch as u32),
+                    KArg::U32(seq as u32),
+                    KArg::U32(input_size as u32),
+                    KArg::U32(hidden as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(node.inputs[1])),
+                    KArg::U32(off(node.inputs[2])),
+                    KArg::U32(off(node.inputs[3])),
+                    KArg::U32(off(node.inputs[4])),
+                    KArg::U32(off(out)),
+                    KArg::U32(seq as u32), // seq_stride
+                ]);
+                // One work-group per batch item; local size = GRU_MAX_H.
+                (batch.max(1) * 256, 256)
+            }
+            Op::Rnn {
+                hidden_size, relu, ..
+            } => {
+                let x = node.inputs[0];
+                let xd = dims(&self.graph, x);
+                let (batch, seq, input_size) = (xd[0], xd[1], xd[2]);
+                let hidden = *hidden_size;
+                args.extend([
+                    KArg::U32(batch as u32),
+                    KArg::U32(seq as u32),
+                    KArg::U32(input_size as u32),
+                    KArg::U32(hidden as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(node.inputs[1])),
+                    KArg::U32(off(node.inputs[2])),
+                    KArg::U32(off(node.inputs[3])),
+                    KArg::U32(off(out)),
+                    KArg::U32(seq as u32),
+                    KArg::U32(u32::from(*relu)),
+                ]);
+                (batch.max(1) * 256, 256)
+            }
+            Op::Mamba2 {
+                head_dim,
+                state_size,
+            } => {
+                let x = node.inputs[0];
+                let xd = dims(&self.graph, x); // [B,S,H,P]
+                let (batch, seq, heads) = (xd[0], xd[1], xd[2]);
+                let total = batch * heads * *head_dim;
+                args.extend([
+                    KArg::U32(batch as u32),
+                    KArg::U32(seq as u32),
+                    KArg::U32(heads as u32),
+                    KArg::U32(*head_dim as u32),
+                    KArg::U32(*state_size as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(off(node.inputs[1])),
+                    KArg::U32(off(node.inputs[2])),
+                    KArg::U32(off(node.inputs[3])),
+                    KArg::U32(off(node.inputs[4])),
+                    KArg::U32(off(out)),
+                    KArg::U32(seq as u32),
+                ]);
+                (total.max(1), 64)
+            }
+            Op::Quantize {
+                axis,
+                scales,
+                zero_points,
+            } => {
+                let x = node.inputs[0];
+                let n = numel(&dims(&self.graph, out));
+                let (chan_dim, inner) = match *axis {
+                    None => (1usize, n.max(1)),
+                    Some(d) => {
+                        let xd = dims(&self.graph, out);
+                        let chan = xd[d];
+                        let inn: usize = xd[d + 1..].iter().product::<usize>().max(1);
+                        (chan, inn)
+                    }
+                };
+                let mut affine = Vec::with_capacity(chan_dim * 2);
+                for c in 0..chan_dim {
+                    affine.push(scales[c].to_bits());
+                    affine.push(zero_points[c] as u32);
+                }
+                let bytes = affine.len() * 4;
+                let ptr = dev
+                    .alloc_shared(bytes)
+                    .expect("rlx-oneapi: Quantize affine USM alloc failed");
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        affine.as_ptr() as *const u8,
+                        ptr as *mut u8,
+                        bytes,
+                    );
+                }
+                scratch.push(ptr);
+                let q_byte_off = off(out) * 4; // packed i8 at start of f32 slot
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(chan_dim as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(off(x)),
+                    KArg::U32(q_byte_off),
+                    KArg::Ptr(ptr),
+                ]);
+                (n.max(1), 256)
+            }
+            Op::Dequantize {
+                axis,
+                scales,
+                zero_points,
+            } => {
+                let q = node.inputs[0];
+                let n = numel(&dims(&self.graph, out));
+                let (chan_dim, inner) = match *axis {
+                    None => (1usize, n.max(1)),
+                    Some(d) => {
+                        let xd = dims(&self.graph, out);
+                        let chan = xd[d];
+                        let inn: usize = xd[d + 1..].iter().product::<usize>().max(1);
+                        (chan, inn)
+                    }
+                };
+                let mut affine = Vec::with_capacity(chan_dim * 2);
+                for c in 0..chan_dim {
+                    affine.push(scales[c].to_bits());
+                    affine.push(zero_points[c] as u32);
+                }
+                let bytes = affine.len() * 4;
+                let ptr = dev
+                    .alloc_shared(bytes)
+                    .expect("rlx-oneapi: Dequantize affine USM alloc failed");
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        affine.as_ptr() as *const u8,
+                        ptr as *mut u8,
+                        bytes,
+                    );
+                }
+                scratch.push(ptr);
+                let q_byte_off = off(q) * 4;
+                args.extend([
+                    KArg::U32(n as u32),
+                    KArg::U32(chan_dim as u32),
+                    KArg::U32(inner as u32),
+                    KArg::U32(q_byte_off),
+                    KArg::U32(off(out)),
+                    KArg::Ptr(ptr),
+                ]);
+                (n.max(1), 256)
+            }
+            Op::CumsumBackward { exclusive, .. } => {
+                let dy = node.inputs[0];
+                let xd = dims(&self.graph, dy);
+                let cols = *xd.last().unwrap_or(&1);
+                let rows = numel(&xd) / cols.max(1);
+                args.extend([
+                    KArg::U32(rows as u32),
+                    KArg::U32(cols as u32),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(out)),
+                    KArg::U32(if *exclusive { 1 } else { 0 }),
+                ]);
+                (rows.max(1), 64)
+            }
+            Op::GatherBackward { axis } => {
+                let dy = node.inputs[0];
+                let idx = node.inputs[1];
+                let dy_d = dims(&self.graph, dy);
+                let out_d = dims(&self.graph, out);
+                let idx_d = dims(&self.graph, idx);
+                let rank = out_d.len();
+                let ax = if *axis < 0 {
+                    (rank as i32 + *axis) as usize
+                } else {
+                    *axis as usize
+                };
+                let outer = numel(&dy_d[..ax]).max(1);
+                let num_idx = idx_d.get(ax).copied().unwrap_or(1);
+                let trailing = numel(&dy_d[ax + 1..]).max(1);
+                let axis_dim = out_d.get(ax).copied().unwrap_or(1);
+                args.extend([
+                    KArg::U32(outer as u32),
+                    KArg::U32(axis_dim as u32),
+                    KArg::U32(num_idx as u32),
+                    KArg::U32(trailing as u32),
+                    KArg::U32(off(dy)),
+                    KArg::U32(off(idx)),
+                    KArg::U32(off(out)),
+                ]);
+                (outer.max(1), 1)
+            }
+            Op::WelchPeaks { k, n_segments } => {
+                let spec = node.inputs[0];
+                let spec_shape = self.graph.node(spec).shape.clone();
+                let meta = rlx_ir::audio::welch_peaks_meta(&spec_shape, *k, *n_segments)
+                    .unwrap_or_else(|e| panic!("Op::WelchPeaks: {e}"));
+                args.extend([
+                    KArg::U32(off(spec)),
+                    KArg::U32(off(out)),
+                    KArg::U32(meta.welch_batch as u32),
+                    KArg::U32(meta.n_fft as u32),
+                    KArg::U32(meta.n_segments as u32),
+                    KArg::U32(meta.k as u32),
+                    KArg::U32(meta.n_bins as u32),
+                ]);
+                (meta.welch_batch.max(1), 64)
+            }
             _ => return,
         };
 
-        unsafe {
-            let _ = (dev.lib.kernel_set_group_size)(kernel, local, 1, 1);
-            for (i, a) in args.iter().enumerate() {
-                let (size, ptr) = a.as_arg();
-                let _ = (dev.lib.kernel_set_argument_value)(kernel, i as u32, size, ptr);
-            }
-            let groups = crate::level_zero::GroupCount {
-                group_count_x: ceil_div(global, local).max(1),
-                group_count_y: 1,
-                group_count_z: 1,
-            };
-            let _ = (dev.lib.command_list_append_launch_kernel)(
-                list,
-                kernel,
-                &groups,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-            );
-            // Each kernel reads/writes the shared arena; barrier between launches.
-            let _ = (dev.lib.command_list_append_barrier)(
-                list,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-            );
-        }
+        append_kernel_launch(dev, kernel, list, &args, global, local);
     }
 
     fn read_outputs(
@@ -1027,6 +2468,43 @@ impl KArg {
             KArg::U32(v) => (4, v as *const u32 as *const c_void),
             KArg::F32(v) => (4, v as *const f32 as *const c_void),
         }
+    }
+}
+
+fn append_kernel_launch(
+    dev: &crate::device::OneApiDevice,
+    kernel: crate::level_zero::KernelHandle,
+    list: crate::level_zero::CommandListHandle,
+    args: &[KArg],
+    global: usize,
+    local: u32,
+) {
+    unsafe {
+        let _ = (dev.lib.kernel_set_group_size)(kernel, local, 1, 1);
+        for (i, a) in args.iter().enumerate() {
+            let (size, ptr) = a.as_arg();
+            let _ = (dev.lib.kernel_set_argument_value)(kernel, i as u32, size, ptr);
+        }
+        let groups = crate::level_zero::GroupCount {
+            group_count_x: ceil_div(global, local).max(1),
+            group_count_y: 1,
+            group_count_z: 1,
+        };
+        let _ = (dev.lib.command_list_append_launch_kernel)(
+            list,
+            kernel,
+            &groups,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+        );
+        // Each kernel reads/writes the shared arena; barrier between launches.
+        let _ = (dev.lib.command_list_append_barrier)(
+            list,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+        );
     }
 }
 
@@ -1130,6 +2608,7 @@ fn act_id(a: Activation) -> u32 {
         Activation::Tan => 14,
         Activation::Atan => 15,
         Activation::Round => 16,
+        Activation::Recip => 17,
     }
 }
 

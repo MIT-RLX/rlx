@@ -1,0 +1,63 @@
+#version 450
+// NCHW epilogue: y = act(y + bias[c] + residual). In-place on out_off.
+// Activation ids match unary.comp / act_id() in backend.rs:
+//   0 gelu 1 gelu_approx 2 silu 3 relu 4 sigmoid 5 tanh
+//   8 sqrt 10 neg 11 abs; 0xFFFF = identity.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint total;      // N * C * H * W
+    uint hw;         // H * W
+    uint channels;
+    uint out_off;
+    uint has_bias;
+    uint bias_off;
+    uint act_id;
+    uint has_residual;
+    uint residual_off;
+} pc;
+
+float gelu_erf(float x) {
+    float z = x * 0.7071067811865476;
+    float t = 1.0 / (1.0 + 0.3275911 * abs(z));
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+              - 0.284496736) * t + 0.254829592) * t * exp(-z * z);
+    float erf = (z >= 0.0) ? y : -y;
+    return 0.5 * x * (1.0 + erf);
+}
+
+float gelu_tanh(float x) {
+    float c = 0.7978845608028654;
+    float inner = c * (x + 0.044715 * x * x * x);
+    return 0.5 * x * (1.0 + tanh(inner));
+}
+
+float apply_act(float v, uint id) {
+    if (id == 0xFFFFu) { return v; }
+    switch (id) {
+        case 0u:  return gelu_erf(v);
+        case 1u:  return gelu_tanh(v);
+        case 2u:  return v / (1.0 + exp(-v));
+        case 3u:  return max(v, 0.0);
+        case 4u:  return 1.0 / (1.0 + exp(-v));
+        case 5u:  return tanh(v);
+        case 8u:  return sqrt(v);
+        case 10u: return -v;
+        case 11u: return abs(v);
+        default:  return v;
+    }
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) { return; }
+    float v = arena_load(pc.out_off + i);
+    if (pc.has_bias != 0u) {
+        uint c = (i / pc.hw) % pc.channels;
+        v += arena_load(pc.bias_off + c);
+    }
+    if (pc.has_residual != 0u) {
+        v += arena_load(pc.residual_off + i);
+    }
+    arena_store(pc.out_off + i, apply_act(v, pc.act_id));
+}

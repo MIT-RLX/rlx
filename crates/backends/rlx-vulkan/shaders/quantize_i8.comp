@@ -1,0 +1,44 @@
+#version 450
+// INT8 Quantize matching CUDA `quantize_i8` / rlx-cpu exec_quantize.
+// Affine table in push constants: affine[2*c]=scale bits, affine[2*c+1]=zp.
+// Max 13 channels (push-constant budget); larger chan_dim stays host.
+//
+// Packed i8 store is word-serial (one writer per uint) so naga can build
+// without `atomicCompSwap` (unsupported in the GLSL front-end). Threads with
+// `i % 4 != 0` return early; the owner packs all four bytes in the word.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint chan_dim;
+    uint inner;
+    uint in_off;
+    uint q_word;
+    uint affine[26];
+} pc;
+
+int quantize_one(uint i) {
+    uint c = (pc.chan_dim <= 1u) ? 0u : ((i / pc.inner) % pc.chan_dim);
+    float s = uintBitsToFloat(pc.affine[2u * c]);
+    int zp = int(pc.affine[2u * c + 1u]);
+    float scaled = arena_load_f(pc.in_off + i) / s;
+    int v = int(q_round_half_away(scaled)) + zp;
+    if (v < -128) { v = -128; }
+    if (v > 127) { v = 127; }
+    return v;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    // One thread owns each packed uint word.
+    if ((i & 3u) != 0u) { return; }
+    uint word = 0u;
+    for (uint lane = 0u; lane < 4u; lane++) {
+        uint j = i + lane;
+        if (j >= pc.n) { break; }
+        uint bits = uint(quantize_one(j)) & 0xFFu;
+        word |= bits << (lane * 8u);
+    }
+    arena_store_u(pc.q_word + (i >> 2u), word);
+}

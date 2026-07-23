@@ -17,7 +17,13 @@ Keep both paths in sync when changing a Thunk variant.
 ## Features
 
 - NEON / AVX2 + FMA SIMD kernels for softmax, layer norm, RMS norm,
-  GELU / SiLU / RoPE, fused matmul-bias-act.
+  GELU / SiLU / RoPE, fused matmul-bias-act, and vForce-style
+  `vmath` (`vvexpf` / `vvtanhf` / `vvrecf` / `vvlogf` / `vvsqrtf` /
+  `vvrsqrtf`, plus `*_fast` SIMD). Exp/tanh activation paths use SIMD fast
+  math by default; set `RLX_VMATH_ACCURATE=1` for Accelerate/libm. The same
+  host API is re-exported from Metal / CUDA / ROCm / wgpu / Vulkan / oneAPI /
+  MLX / `rlx-gpu-host` for staging; GPU unary kernels cover exp/tanh/recip
+  on-device.
 - BLAS dispatch via Apple Accelerate (default on macOS) or OpenBLAS /
   MKL via Cargo features.
 - LAPACK bindings (`dgesv`, `dpotrf`, `dgeqrf`, `dgesvd`, `dsyevd`,

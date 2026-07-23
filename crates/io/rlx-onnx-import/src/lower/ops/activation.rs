@@ -323,8 +323,7 @@ pub(super) fn lower_round_dir(
     Ok(true)
 }
 
-/// ONNX `Reciprocal(x) = 1/x` — no native op; lower as `1 / x` (scalar numerator
-/// broadcasts). Used e.g. for the CFM timestep `1/total_step`.
+/// ONNX `Reciprocal(x) = 1/x`.
 pub(super) fn lower_reciprocal(
     m: &mut HirMut<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -332,8 +331,7 @@ pub(super) fn lower_reciprocal(
 ) -> Result<bool> {
     let x = ctx.tensor(&node.inputs[0])?;
     let out_s = unary_out_shape(ctx, node, m, x);
-    let one = ctx.f32_scalar_param(m, &format!("__recip_one__/{}", node.name), 1.0);
-    let id = m.add_node(Op::Binary(BinaryOp::Div), vec![one, x], out_s);
+    let id = m.add_node(Op::Activation(Activation::Recip), vec![x], out_s);
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
 }

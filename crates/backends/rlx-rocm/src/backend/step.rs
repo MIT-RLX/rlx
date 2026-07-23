@@ -143,6 +143,14 @@ pub(crate) enum Step {
         y_off: u32,
         out_off: u32,
     },
+    /// Element-wise fused multiply-add: `out = a * b + c` (single rounding).
+    Fma {
+        n: u32,
+        a_off: u32,
+        b_off: u32,
+        c_off: u32,
+        out_off: u32,
+    },
     Reduce {
         outer: u32,
         inner: u32,
@@ -154,6 +162,41 @@ pub(crate) enum Step {
         outer: u32,
         inner: u32,
         in_off: u32,
+        out_off: u32,
+    },
+    ReluBackward {
+        n: u32,
+        x_off: u32,
+        dy_off: u32,
+        dx_off: u32,
+    },
+    ActivationBackward {
+        n: u32,
+        x_off: u32,
+        dy_off: u32,
+        dx_off: u32,
+        op: u32,
+    },
+    SoftmaxCrossEntropy {
+        outer: u32,
+        inner: u32,
+        logits_off: u32,
+        targets_off: u32,
+        out_off: u32,
+    },
+    SoftmaxCrossEntropyWithLogits {
+        outer: u32,
+        inner: u32,
+        logits_off: u32,
+        labels_off: u32,
+        out_off: u32,
+    },
+    SoftmaxCrossEntropyBackward {
+        outer: u32,
+        inner: u32,
+        logits_off: u32,
+        labels_off: u32,
+        d_loss_off: u32,
         out_off: u32,
     },
     LayerNorm {
@@ -493,6 +536,18 @@ pub(crate) enum Step {
         k: u32,
         n_bins: u32,
     },
+    /// Ternary-pruned radix-2 butterfly stage (interleaved C64).
+    FftButterflyStage {
+        state_off: u32,
+        out_off: u32,
+        gate_off: u32,
+        rev_off: u32,
+        tw_re_off: u32,
+        tw_im_off: u32,
+        batch: u32,
+        n_fft: u32,
+        stage: u32,
+    },
     Im2ColHost {
         x_byte_off: u32,
         col_byte_off: u32,
@@ -529,10 +584,10 @@ pub(crate) enum Step {
         inner: u32,
         is_max: bool,
     },
-    /// Host-staged axial 2-D RoPE.
-    AxialRope2dHost {
-        src_byte_off: u32,
-        dst_byte_off: u32,
+    /// Native axial 2-D RoPE (SAM2-style).
+    AxialRope2d {
+        in_off: u32,
+        out_off: u32,
         batch: u32,
         seq: u32,
         hidden: u32,
@@ -573,6 +628,94 @@ pub(crate) enum Step {
         bidirectional: bool,
         carry: bool,
     },
+    /// Native ROCm GRU (L=1 / unidir / no-carry / hidden ≤ 1024).
+    Gru {
+        x_byte_off: u32,
+        w_ih_byte_off: u32,
+        w_hh_byte_off: u32,
+        b_ih_byte_off: u32,
+        b_hh_byte_off: u32,
+        dst_byte_off: u32,
+        batch: u32,
+        seq: u32,
+        input_size: u32,
+        hidden: u32,
+    },
+    /// Host-staged GRU fallback (multi-layer / bidir / carry / hidden > 1024).
+    GruHost {
+        x_byte_off: u32,
+        w_ih_byte_off: u32,
+        w_hh_byte_off: u32,
+        b_ih_byte_off: u32,
+        b_hh_byte_off: u32,
+        h0_byte_off: u32,
+        dst_byte_off: u32,
+        batch: u32,
+        seq: u32,
+        input_size: u32,
+        hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        carry: bool,
+    },
+    /// Native ROCm Elman RNN (L=1 / unidir / no-carry / hidden ≤ 1024).
+    Rnn {
+        x_byte_off: u32,
+        w_ih_byte_off: u32,
+        w_hh_byte_off: u32,
+        bias_byte_off: u32,
+        dst_byte_off: u32,
+        batch: u32,
+        seq: u32,
+        input_size: u32,
+        hidden: u32,
+        relu: bool,
+    },
+    /// Host-staged Elman RNN fallback.
+    RnnHost {
+        x_byte_off: u32,
+        w_ih_byte_off: u32,
+        w_hh_byte_off: u32,
+        bias_byte_off: u32,
+        h0_byte_off: u32,
+        dst_byte_off: u32,
+        batch: u32,
+        seq: u32,
+        input_size: u32,
+        hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        carry: bool,
+        relu: bool,
+    },
+    /// Native ROCm Mamba-2 SSD scan (`state_size ≤ 256`).
+    Mamba2 {
+        x_byte_off: u32,
+        dt_byte_off: u32,
+        a_byte_off: u32,
+        b_byte_off: u32,
+        c_byte_off: u32,
+        dst_byte_off: u32,
+        batch: u32,
+        seq: u32,
+        heads: u32,
+        head_dim: u32,
+        state_size: u32,
+    },
+    /// Host-staged Mamba-2 fallback (`state_size > 256` or force-host).
+    Mamba2Host {
+        x_byte_off: u32,
+        dt_byte_off: u32,
+        a_byte_off: u32,
+        b_byte_off: u32,
+        c_byte_off: u32,
+        dst_byte_off: u32,
+        batch: u32,
+        seq: u32,
+        heads: u32,
+        head_dim: u32,
+        state_size: u32,
+    },
     /// General `Op::Scan` recurrence (e.g. IIR biquad) via host fallback
     /// (D2H → CPU body loop → H2D). Not graph-capture-safe.
     ScanHost {
@@ -608,6 +751,25 @@ pub(crate) enum Step {
         out_off: usize,
         n: usize,
         batch: usize,
+    },
+    /// Native dense linear solve (`Op::DenseSolve`, F32) via hipSOLVER
+    /// `Sgetrf`+`Sgetrs`. See [`crate::dense_solve_native`]. Eager (scratch).
+    DenseSolveNative {
+        a_off: usize,
+        b_off: usize,
+        x_off: usize,
+        n: usize,
+        nrhs: usize,
+    },
+    /// Native batched dense solve (`Op::BatchedDenseSolve`, F32) via hipBLAS
+    /// `SgetrfBatched`+`SgetrsBatched`. See [`crate::dense_solve_native`].
+    BatchedDenseSolveNative {
+        a_off: usize,
+        b_off: usize,
+        x_off: usize,
+        batch: usize,
+        n: usize,
+        nrhs: usize,
     },
     Llada2GroupLimitedGate {
         sig_off: u32,
@@ -805,6 +967,66 @@ pub(crate) enum Step {
         num_idx: u32,
         trailing: u32,
     },
+    MaxPool2dBackward {
+        x_byte_off: u64,
+        dy_byte_off: u64,
+        dx_byte_off: u64,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+    },
+    Conv2dBackwardInput {
+        // u64: arena can exceed 4 GiB; u32 byte offsets wrap (same as CUDA).
+        dy_byte_off: u64,
+        w_byte_off: u64,
+        dx_byte_off: u64,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+    },
+    Conv2dBackwardWeight {
+        x_byte_off: u64,
+        dy_byte_off: u64,
+        dw_byte_off: u64,
+        n: u32,
+        c_in: u32,
+        h: u32,
+        w: u32,
+        c_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw_dil: u32,
+        groups: u32,
+    },
     Pool1d {
         n: u32,
         c: u32,
@@ -891,6 +1113,17 @@ pub(crate) enum Step {
         in_off: u32,
         w_off: u32,
         out_off: u32,
+        // Fused bias + activation epilogue (from `Op::FusedConvBiasAct`).
+        // `has_bias=0` / `act_id=0xFFFF` for a plain `Op::Conv`. MIOpen has
+        // no fused conv-bias-act path; when set, run `conv_bias_act_epilogue`
+        // after MIOpen or the direct conv kernel (same as CUDA without cuDNN).
+        has_bias: u32,
+        bias_off_f32: u32,
+        act_id: u32,
+        // Optional residual add before the activation, from
+        // `Op::FusedConvBiasAct { has_residual: true }`.
+        has_residual: u32,
+        residual_off_f32: u32,
     },
     Conv3d {
         n: u32,
@@ -951,6 +1184,42 @@ pub(crate) enum Step {
         dw: u32,
         groups: u32,
     },
+    /// NCDHW ConvTranspose3d (PyTorch weight layout).
+    ConvTranspose3d {
+        n: u32,
+        c_in: u32,
+        c_out: u32,
+        d: u32,
+        h: u32,
+        w: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        dd: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+        in_off: u32,
+        w_off: u32,
+        out_off: u32,
+    },
+    /// Fused SwiGLU: `up * silu(gate)` on concatenated `[..., 2*n_half]`.
+    FusedSwiGLU {
+        in_off: u32,
+        out_off: u32,
+        n_half: u32,
+        total: u32,
+        gate_first: u32,
+    },
     GroupNorm {
         src_off: u32,
         g_off: u32,
@@ -962,6 +1231,226 @@ pub(crate) enum Step {
         w: u32,
         num_groups: u32,
         eps_bits: u32,
+    },
+    GroupNormBackwardInput {
+        x_off: u32,
+        gamma_off: u32,
+        dy_off: u32,
+        out_off: u32,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        num_groups: u32,
+        eps_bits: u32,
+    },
+    GroupNormBackwardGamma {
+        x_off: u32,
+        dy_off: u32,
+        out_off: u32,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        num_groups: u32,
+        eps_bits: u32,
+    },
+    GroupNormBackwardBeta {
+        dy_off: u32,
+        out_off: u32,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+    },
+    /// Channels-last BatchNormInference (frozen μ/σ²). Inputs
+    /// `[x, gamma, beta, mean, var]`.
+    BatchNormInference {
+        src_off: u32,
+        g_off: u32,
+        b_off: u32,
+        mean_off: u32,
+        var_off: u32,
+        dst_off: u32,
+        count: u32,
+        channels: u32,
+        eps_bits: u32,
+    },
+    /// Channels-last BatchNormInference dx. Inputs `[x, gamma, mean, var, dy]`
+    /// (x/mean unused at runtime).
+    BatchNormInferenceBackwardInput {
+        gamma_off: u32,
+        var_off: u32,
+        dy_off: u32,
+        out_off: u32,
+        count: u32,
+        channels: u32,
+        eps_bits: u32,
+    },
+    /// Channels-last BatchNormInference dγ. Inputs `[x, mean, var, dy]`.
+    BatchNormInferenceBackwardGamma {
+        x_off: u32,
+        mean_off: u32,
+        var_off: u32,
+        dy_off: u32,
+        out_off: u32,
+        count: u32,
+        channels: u32,
+        eps_bits: u32,
+    },
+    /// Channels-last BatchNormInference dβ. Input `[dy]`.
+    BatchNormInferenceBackwardBeta {
+        dy_off: u32,
+        out_off: u32,
+        count: u32,
+        channels: u32,
+    },
+    /// Last-axis LayerNorm backward w.r.t. input. Inputs `[x, gamma, dy]`.
+    LayerNormBackwardInput {
+        x_off: u32,
+        gamma_off: u32,
+        dy_off: u32,
+        out_off: u32,
+        rows: u32,
+        h: u32,
+        eps_bits: u32,
+    },
+    /// Last-axis LayerNorm backward w.r.t. gamma. Inputs `[x, dy]`.
+    LayerNormBackwardGamma {
+        x_off: u32,
+        dy_off: u32,
+        out_off: u32,
+        rows: u32,
+        h: u32,
+        eps_bits: u32,
+    },
+    /// Native `Op::FakeQuantize` Fixed (scale input).
+    /// Also used for `Op::FakeQuantizeLSQ` (same forward).
+    FakeQuantizeFixed {
+        in_off: u32,
+        scale_off: u32,
+        out_off: u32,
+        n: u32,
+        chan_dim: u32,
+        inner: u32,
+        q_max_bits: u32,
+    },
+    /// Native `Op::FakeQuantize` PerBatch (derive scale from max abs).
+    FakeQuantizePerBatch {
+        in_off: u32,
+        out_off: u32,
+        n: u32,
+        chan_dim: u32,
+        inner: u32,
+        q_max_bits: u32,
+    },
+    /// Native `Op::FakeQuantize` EMA (running scale state, mutated in place).
+    FakeQuantizeEma {
+        in_off: u32,
+        scale_off: u32,
+        out_off: u32,
+        n: u32,
+        chan_dim: u32,
+        inner: u32,
+        q_max_bits: u32,
+        decay_bits: u32,
+    },
+    /// Native INT8 `Op::Quantize`. Affine table in `meta_buffers[meta_idx]`
+    /// as `[scale_bits, zp_i32, …]` per channel. `q_byte_off` is an arena
+    /// byte offset (I8 slot).
+    QuantizeI8 {
+        in_off: u32,
+        q_byte_off: u32,
+        n: u32,
+        chan_dim: u32,
+        inner: u32,
+        meta_idx: usize,
+    },
+    /// Native INT8 `Op::Dequantize`. Affine packing matches `QuantizeI8`.
+    DequantizeI8 {
+        q_byte_off: u32,
+        out_off: u32,
+        n: u32,
+        chan_dim: u32,
+        inner: u32,
+        meta_idx: usize,
+    },
+    /// Native real-INT8 `Op::QMatMul`. `x`/`w`/`out` are packed i8 byte
+    /// offsets; `bias_off` is an f32-lane index (I32 stored as float).
+    QMatMul {
+        m: u32,
+        k: u32,
+        n: u32,
+        x_byte_off: u32,
+        w_byte_off: u32,
+        bias_off: u32,
+        out_byte_off: u32,
+        x_zp: i32,
+        w_zp: i32,
+        out_zp: i32,
+        mult_bits: u32,
+    },
+    /// Native real-INT8 `Op::QConv2d` (NCHW). Packed i8 x/w/out; bias is
+    /// f32-lane I32 (same convention as `QMatMul`).
+    QConv2d {
+        n: u32,
+        c_in: u32,
+        c_out: u32,
+        h: u32,
+        w: u32,
+        h_out: u32,
+        w_out: u32,
+        kh: u32,
+        kw: u32,
+        sh: u32,
+        sw: u32,
+        ph: u32,
+        pw: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+        x_byte_off: u32,
+        w_byte_off: u32,
+        bias_off: u32,
+        out_byte_off: u32,
+        x_zp: i32,
+        w_zp: i32,
+        out_zp: i32,
+        mult_bits: u32,
+    },
+    /// Native `Op::FakeQuantizeLSQBackwardX` (STE-clipped).
+    FakeQuantizeLsqBwdX {
+        x_off: u32,
+        scale_off: u32,
+        dy_off: u32,
+        dx_off: u32,
+        n: u32,
+        chan_dim: u32,
+        inner: u32,
+        q_max_bits: u32,
+    },
+    /// Native `Op::FakeQuantizeLSQBackwardScale` (per-channel ψ reduce).
+    FakeQuantizeLsqBwdScale {
+        x_off: u32,
+        scale_off: u32,
+        dy_off: u32,
+        dscale_off: u32,
+        n: u32,
+        chan_dim: u32,
+        inner: u32,
+        q_max_bits: u32,
+    },
+    /// Native `Op::FakeQuantizeBackward` (PerBatch scale + STE).
+    /// `ste_kind`: 0 Identity, 1 ClippedIdentity, 2 Tanh, 3 HardTanh.
+    FakeQuantizeBackward {
+        x_off: u32,
+        dy_off: u32,
+        dx_off: u32,
+        n: u32,
+        chan_dim: u32,
+        inner: u32,
+        q_max_bits: u32,
+        ste_kind: u32,
     },
     ResizeNearest2x {
         src_off: u32,
@@ -997,6 +1486,27 @@ pub(crate) enum Step {
         op: u32,
         n_a: u32,
         n_b: u32,
+    },
+    /// `|z|² = re² + im²` (`complex_wirtinger.cu` / `complex_norm_sq`).
+    /// `n` is the complex-element count; output is real F32 (one lane per elem).
+    ComplexNormSq {
+        n: u32,
+        src_byte_off: u32,
+        dst_byte_off: u32,
+    },
+    /// Wirtinger VJP of ComplexNormSq: `dz = g · z` (`complex_norm_sq_backward`).
+    /// `z` is C64, `g` is real F32, `dz` is C64.
+    ComplexNormSqBackward {
+        n: u32,
+        z_byte_off: u32,
+        g_byte_off: u32,
+        dz_byte_off: u32,
+    },
+    /// Element-wise C64 conjugate: `(re, -im)` (`conjugate_c64`).
+    ConjugateC64 {
+        n: u32,
+        src_byte_off: u32,
+        dst_byte_off: u32,
     },
     FusedBinaryUnary {
         n: u32,
@@ -1061,8 +1571,14 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Compare { .. } => "rlx::Compare",
         Step::Unary { .. } => "rlx::Unary",
         Step::Where { .. } => "rlx::Where",
+        Step::Fma { .. } => "rlx::Fma",
         Step::Reduce { .. } => "rlx::Reduce",
         Step::Softmax { .. } => "rlx::Softmax",
+        Step::ReluBackward { .. } => "rlx::ReluBackward",
+        Step::ActivationBackward { .. } => "rlx::ActivationBackward",
+        Step::SoftmaxCrossEntropy { .. } => "rlx::SoftmaxCrossEntropy",
+        Step::SoftmaxCrossEntropyWithLogits { .. } => "rlx::SoftmaxCrossEntropyWithLogits",
+        Step::SoftmaxCrossEntropyBackward { .. } => "rlx::SoftmaxCrossEntropyBackward",
         Step::LayerNorm { .. } => "rlx::LayerNorm",
         Step::FusedResidualLn { .. } => "rlx::FusedResidualLN",
         Step::AdaLayerNorm { .. } => "rlx::AdaLayerNorm",
@@ -1096,17 +1612,26 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::LogMelBackwardHost { .. } => "rlx::LogMelBackwardHost",
         Step::WelchPeaksHost { .. } => "rlx::WelchPeaksHost",
         Step::WelchPeaksGpu { .. } => "rlx::WelchPeaksGpu",
+        Step::FftButterflyStage { .. } => "rlx::FftButterflyStage",
         Step::Im2ColHost { .. } => "rlx::Im2ColHost",
         Step::ReverseHost { .. } => "rlx::ReverseHost",
         Step::ArgReduceHost { .. } => "rlx::ArgReduceHost",
-        Step::AxialRope2dHost { .. } => "rlx::AxialRope2dHost",
+        Step::AxialRope2d { .. } => "rlx::AxialRope2d",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
         Step::Lstm { .. } => "rlx::Lstm",
+        Step::Gru { .. } => "rlx::Gru",
+        Step::GruHost { .. } => "rlx::GruHost",
+        Step::Rnn { .. } => "rlx::Rnn",
+        Step::RnnHost { .. } => "rlx::RnnHost",
+        Step::Mamba2 { .. } => "rlx::Mamba2",
+        Step::Mamba2Host { .. } => "rlx::Mamba2Host",
         Step::ScanHost { .. } => "rlx::ScanHost",
         Step::HostOp { .. } => "rlx::HostOp",
         Step::CpuIndexing { .. } => "rlx::CpuIndexing",
         Step::SpdHost { .. } => "rlx::SpdHost",
         Step::EighNative { .. } => "rlx::EighNative",
+        Step::DenseSolveNative { .. } => "rlx::DenseSolveNative",
+        Step::BatchedDenseSolveNative { .. } => "rlx::BatchedDenseSolveNative",
         Step::Llada2GroupLimitedGate { .. } => "rlx::Llada2GroupLimitedGate",
         Step::MsDeformAttnHost { .. } => "rlx::MsDeformAttnHost",
         Step::CollectiveHost { .. } => "rlx::CollectiveHost",
@@ -1122,6 +1647,9 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::RopeBackward { .. } => "rlx::RopeBackward",
         Step::CumsumBackward { .. } => "rlx::CumsumBackward",
         Step::GatherBackward { .. } => "rlx::GatherBackward",
+        Step::MaxPool2dBackward { .. } => "rlx::MaxPool2dBackward",
+        Step::Conv2dBackwardInput { .. } => "rlx::Conv2dBackwardInput",
+        Step::Conv2dBackwardWeight { .. } => "rlx::Conv2dBackwardWeight",
         Step::Pool1d { .. } => "rlx::Pool1d",
         Step::Pool2d { .. } => "rlx::Pool2d",
         Step::Pool3d { .. } => "rlx::Pool3d",
@@ -1130,10 +1658,34 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Conv3d { .. } => "rlx::Conv3d",
         Step::LayerNorm2d { .. } => "rlx::LayerNorm2d",
         Step::ConvTranspose2d { .. } => "rlx::ConvTranspose2d",
+        Step::ConvTranspose3d { .. } => "rlx::ConvTranspose3d",
+        Step::FusedSwiGLU { .. } => "rlx::FusedSwiGLU",
         Step::GroupNorm { .. } => "rlx::GroupNorm",
+        Step::GroupNormBackwardInput { .. } => "rlx::GroupNormBackwardInput",
+        Step::GroupNormBackwardGamma { .. } => "rlx::GroupNormBackwardGamma",
+        Step::GroupNormBackwardBeta { .. } => "rlx::GroupNormBackwardBeta",
+        Step::BatchNormInference { .. } => "rlx::BatchNormInference",
+        Step::BatchNormInferenceBackwardInput { .. } => "rlx::BatchNormInferenceBackwardInput",
+        Step::BatchNormInferenceBackwardGamma { .. } => "rlx::BatchNormInferenceBackwardGamma",
+        Step::BatchNormInferenceBackwardBeta { .. } => "rlx::BatchNormInferenceBackwardBeta",
+        Step::LayerNormBackwardInput { .. } => "rlx::LayerNormBackwardInput",
+        Step::LayerNormBackwardGamma { .. } => "rlx::LayerNormBackwardGamma",
+        Step::FakeQuantizeFixed { .. } => "rlx::FakeQuantizeFixed",
+        Step::FakeQuantizePerBatch { .. } => "rlx::FakeQuantizePerBatch",
+        Step::FakeQuantizeEma { .. } => "rlx::FakeQuantizeEma",
+        Step::QuantizeI8 { .. } => "rlx::QuantizeI8",
+        Step::DequantizeI8 { .. } => "rlx::DequantizeI8",
+        Step::QMatMul { .. } => "rlx::QMatMul",
+        Step::QConv2d { .. } => "rlx::QConv2d",
+        Step::FakeQuantizeLsqBwdX { .. } => "rlx::FakeQuantizeLsqBwdX",
+        Step::FakeQuantizeLsqBwdScale { .. } => "rlx::FakeQuantizeLsqBwdScale",
+        Step::FakeQuantizeBackward { .. } => "rlx::FakeQuantizeBackward",
         Step::ResizeNearest2x { .. } => "rlx::ResizeNearest2x",
         Step::ComplexCast { .. } => "rlx::ComplexCast",
         Step::BinaryC64 { .. } => "rlx::BinaryC64",
+        Step::ComplexNormSq { .. } => "rlx::ComplexNormSq",
+        Step::ComplexNormSqBackward { .. } => "rlx::ComplexNormSqBackward",
+        Step::ConjugateC64 { .. } => "rlx::ConjugateC64",
         Step::FusedBinaryUnary { .. } => "rlx::FusedBinaryUnary",
         Step::ElementwiseRegion { .. } => "rlx::ElementwiseRegion",
         Step::BatchElementwiseRegion { .. } => "rlx::BatchElementwiseRegion",
@@ -1176,6 +1728,18 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         Step::EighNative {
             in_off, out_off, ..
         } => (vec![*in_off as u32], vec![*out_off as u32]),
+        Step::DenseSolveNative {
+            a_off,
+            b_off,
+            x_off,
+            ..
+        }
+        | Step::BatchedDenseSolveNative {
+            a_off,
+            b_off,
+            x_off,
+            ..
+        } => (vec![*a_off as u32, *b_off as u32], vec![*x_off as u32]),
         Step::Matmul {
             a_off_f32,
             b_off_f32,
@@ -1288,6 +1852,13 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             out_off,
             ..
         } => (vec![*cond_off, *x_off, *y_off], vec![*out_off]),
+        Step::Fma {
+            a_off,
+            b_off,
+            c_off,
+            out_off,
+            ..
+        } => (vec![*a_off, *b_off, *c_off], vec![*out_off]),
         Step::Reduce {
             in_off, out_off, ..
         }
@@ -1303,6 +1874,37 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         | Step::Sample {
             in_off, out_off, ..
         } => (vec![*in_off], vec![*out_off]),
+        Step::ReluBackward {
+            x_off,
+            dy_off,
+            dx_off,
+            ..
+        }
+        | Step::ActivationBackward {
+            x_off,
+            dy_off,
+            dx_off,
+            ..
+        } => (vec![*x_off, *dy_off], vec![*dx_off]),
+        Step::SoftmaxCrossEntropy {
+            logits_off,
+            targets_off,
+            out_off,
+            ..
+        }
+        | Step::SoftmaxCrossEntropyWithLogits {
+            logits_off,
+            labels_off: targets_off,
+            out_off,
+            ..
+        } => (vec![*logits_off, *targets_off], vec![*out_off]),
+        Step::SoftmaxCrossEntropyBackward {
+            logits_off,
+            labels_off,
+            d_loss_off,
+            out_off,
+            ..
+        } => (vec![*logits_off, *labels_off, *d_loss_off], vec![*out_off]),
         Step::RngNormal { dst_byte_off, .. } | Step::RngUniform { dst_byte_off, .. } => {
             (vec![], vec![*dst_byte_off / 4])
         }
@@ -1511,6 +2113,18 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         Step::WelchPeaksGpu {
             spec_off, dst_off, ..
         } => (vec![*spec_off], vec![*dst_off]),
+        Step::FftButterflyStage {
+            state_off,
+            out_off,
+            gate_off,
+            rev_off,
+            tw_re_off,
+            tw_im_off,
+            ..
+        } => (
+            vec![*state_off, *gate_off, *rev_off, *tw_re_off, *tw_im_off],
+            vec![*out_off],
+        ),
         Step::Im2ColHost {
             x_byte_off,
             col_byte_off,
@@ -1525,12 +2139,10 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             src_byte_off,
             dst_byte_off,
             ..
-        }
-        | Step::AxialRope2dHost {
-            src_byte_off,
-            dst_byte_off,
-            ..
         } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
+        Step::AxialRope2d {
+            in_off, out_off, ..
+        } => (vec![*in_off], vec![*out_off]),
         Step::GatedDeltaNet {
             q_byte_off,
             k_byte_off,
@@ -1585,6 +2197,115 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             }
             (reads, writes)
         }
+        Step::Gru {
+            x_byte_off,
+            w_ih_byte_off,
+            w_hh_byte_off,
+            b_ih_byte_off,
+            b_hh_byte_off,
+            dst_byte_off,
+            ..
+        } => (
+            vec![
+                x_byte_off / 4,
+                w_ih_byte_off / 4,
+                w_hh_byte_off / 4,
+                b_ih_byte_off / 4,
+                b_hh_byte_off / 4,
+            ],
+            vec![dst_byte_off / 4],
+        ),
+        Step::GruHost {
+            x_byte_off,
+            w_ih_byte_off,
+            w_hh_byte_off,
+            b_ih_byte_off,
+            b_hh_byte_off,
+            h0_byte_off,
+            dst_byte_off,
+            carry,
+            ..
+        } => {
+            let mut reads = vec![
+                x_byte_off / 4,
+                w_ih_byte_off / 4,
+                w_hh_byte_off / 4,
+                b_ih_byte_off / 4,
+                b_hh_byte_off / 4,
+            ];
+            let mut writes = vec![dst_byte_off / 4];
+            if *carry {
+                reads.push(h0_byte_off / 4);
+                writes.push(h0_byte_off / 4);
+            }
+            (reads, writes)
+        }
+        Step::Rnn {
+            x_byte_off,
+            w_ih_byte_off,
+            w_hh_byte_off,
+            bias_byte_off,
+            dst_byte_off,
+            ..
+        } => (
+            vec![
+                x_byte_off / 4,
+                w_ih_byte_off / 4,
+                w_hh_byte_off / 4,
+                bias_byte_off / 4,
+            ],
+            vec![dst_byte_off / 4],
+        ),
+        Step::RnnHost {
+            x_byte_off,
+            w_ih_byte_off,
+            w_hh_byte_off,
+            bias_byte_off,
+            h0_byte_off,
+            dst_byte_off,
+            carry,
+            ..
+        } => {
+            let mut reads = vec![
+                x_byte_off / 4,
+                w_ih_byte_off / 4,
+                w_hh_byte_off / 4,
+                bias_byte_off / 4,
+            ];
+            let mut writes = vec![dst_byte_off / 4];
+            if *carry {
+                reads.push(h0_byte_off / 4);
+                writes.push(h0_byte_off / 4);
+            }
+            (reads, writes)
+        }
+        Step::Mamba2 {
+            x_byte_off,
+            dt_byte_off,
+            a_byte_off,
+            b_byte_off,
+            c_byte_off,
+            dst_byte_off,
+            ..
+        }
+        | Step::Mamba2Host {
+            x_byte_off,
+            dt_byte_off,
+            a_byte_off,
+            b_byte_off,
+            c_byte_off,
+            dst_byte_off,
+            ..
+        } => (
+            vec![
+                x_byte_off / 4,
+                dt_byte_off / 4,
+                a_byte_off / 4,
+                b_byte_off / 4,
+                c_byte_off / 4,
+            ],
+            vec![dst_byte_off / 4],
+        ),
         Step::GaussianSplatRender {
             positions_off,
             positions_len: _,
@@ -1746,6 +2467,33 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![dy_byte_off / 4, indices_byte_off / 4],
             vec![dst_byte_off / 4],
         ),
+        Step::MaxPool2dBackward {
+            x_byte_off,
+            dy_byte_off,
+            dx_byte_off,
+            ..
+        } => (
+            vec![(*x_byte_off / 4) as u32, (*dy_byte_off / 4) as u32],
+            vec![(*dx_byte_off / 4) as u32],
+        ),
+        Step::Conv2dBackwardInput {
+            dy_byte_off,
+            w_byte_off,
+            dx_byte_off,
+            ..
+        } => (
+            vec![(*dy_byte_off / 4) as u32, (*w_byte_off / 4) as u32],
+            vec![(*dx_byte_off / 4) as u32],
+        ),
+        Step::Conv2dBackwardWeight {
+            x_byte_off,
+            dy_byte_off,
+            dw_byte_off,
+            ..
+        } => (
+            vec![(*x_byte_off / 4) as u32, (*dy_byte_off / 4) as u32],
+            vec![(*dw_byte_off / 4) as u32],
+        ),
         Step::Pool1d {
             in_off, out_off, ..
         }
@@ -1786,6 +2534,15 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dst_off,
             ..
         } => (vec![*src_off, *w_off], vec![*dst_off]),
+        Step::ConvTranspose3d {
+            in_off,
+            w_off,
+            out_off,
+            ..
+        } => (vec![*in_off, *w_off], vec![*out_off]),
+        Step::FusedSwiGLU {
+            in_off, out_off, ..
+        } => (vec![*in_off], vec![*out_off]),
         Step::GroupNorm {
             src_off,
             g_off,
@@ -1793,6 +2550,128 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dst_off,
             ..
         } => (vec![*src_off, *g_off, *b_off], vec![*dst_off]),
+        Step::GroupNormBackwardInput {
+            x_off,
+            gamma_off,
+            dy_off,
+            out_off,
+            ..
+        } => (vec![*x_off, *gamma_off, *dy_off], vec![*out_off]),
+        Step::GroupNormBackwardGamma {
+            x_off,
+            dy_off,
+            out_off,
+            ..
+        } => (vec![*x_off, *dy_off], vec![*out_off]),
+        Step::GroupNormBackwardBeta {
+            dy_off, out_off, ..
+        } => (vec![*dy_off], vec![*out_off]),
+        Step::BatchNormInference {
+            src_off,
+            g_off,
+            b_off,
+            mean_off,
+            var_off,
+            dst_off,
+            ..
+        } => (
+            vec![*src_off, *g_off, *b_off, *mean_off, *var_off],
+            vec![*dst_off],
+        ),
+        Step::BatchNormInferenceBackwardInput {
+            gamma_off,
+            var_off,
+            dy_off,
+            out_off,
+            ..
+        } => (vec![*gamma_off, *var_off, *dy_off], vec![*out_off]),
+        Step::BatchNormInferenceBackwardGamma {
+            x_off,
+            mean_off,
+            var_off,
+            dy_off,
+            out_off,
+            ..
+        } => (vec![*x_off, *mean_off, *var_off, *dy_off], vec![*out_off]),
+        Step::BatchNormInferenceBackwardBeta {
+            dy_off, out_off, ..
+        } => (vec![*dy_off], vec![*out_off]),
+        Step::LayerNormBackwardInput {
+            x_off,
+            gamma_off,
+            dy_off,
+            out_off,
+            ..
+        } => (vec![*x_off, *gamma_off, *dy_off], vec![*out_off]),
+        Step::LayerNormBackwardGamma {
+            x_off,
+            dy_off,
+            out_off,
+            ..
+        } => (vec![*x_off, *dy_off], vec![*out_off]),
+        Step::FakeQuantizeFixed {
+            in_off,
+            scale_off,
+            out_off,
+            ..
+        } => (vec![*in_off, *scale_off], vec![*out_off]),
+        Step::FakeQuantizePerBatch {
+            in_off, out_off, ..
+        } => (vec![*in_off], vec![*out_off]),
+        Step::FakeQuantizeEma {
+            in_off,
+            scale_off,
+            out_off,
+            ..
+        } => (vec![*in_off, *scale_off], vec![*out_off, *scale_off]),
+        Step::QuantizeI8 {
+            in_off, q_byte_off, ..
+        } => (vec![*in_off], vec![*q_byte_off / 4]),
+        Step::DequantizeI8 {
+            q_byte_off,
+            out_off,
+            ..
+        } => (vec![*q_byte_off / 4], vec![*out_off]),
+        Step::QMatMul {
+            x_byte_off,
+            w_byte_off,
+            bias_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![*x_byte_off / 4, *w_byte_off / 4, *bias_off],
+            vec![*out_byte_off / 4],
+        ),
+        Step::QConv2d {
+            x_byte_off,
+            w_byte_off,
+            bias_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![*x_byte_off / 4, *w_byte_off / 4, *bias_off],
+            vec![*out_byte_off / 4],
+        ),
+        Step::FakeQuantizeLsqBwdX {
+            x_off,
+            scale_off,
+            dy_off,
+            dx_off,
+            ..
+        } => (vec![*x_off, *scale_off, *dy_off], vec![*dx_off]),
+        Step::FakeQuantizeLsqBwdScale {
+            x_off,
+            scale_off,
+            dy_off,
+            dscale_off,
+            ..
+        } => (vec![*x_off, *scale_off, *dy_off], vec![*dscale_off]),
+        Step::FakeQuantizeBackward {
+            x_off,
+            dy_off,
+            dx_off,
+            ..
+        } => (vec![*x_off, *dy_off], vec![*dx_off]),
         Step::ResizeNearest2x {
             src_off, dst_off, ..
         } => (vec![*src_off], vec![*dst_off]),
@@ -1806,7 +2685,29 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             b_byte_off,
             c_byte_off,
             ..
-        } => (vec![*a_byte_off / 4, *b_byte_off / 4], vec![*c_byte_off / 4]),
+        } => (
+            vec![*a_byte_off / 4, *b_byte_off / 4],
+            vec![*c_byte_off / 4],
+        ),
+        Step::ComplexNormSq {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
+        Step::ComplexNormSqBackward {
+            z_byte_off,
+            g_byte_off,
+            dz_byte_off,
+            ..
+        } => (
+            vec![*z_byte_off / 4, *g_byte_off / 4],
+            vec![*dz_byte_off / 4],
+        ),
+        Step::ConjugateC64 {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
         Step::FusedBinaryUnary {
             a_off,
             b_off,
@@ -1921,9 +2822,17 @@ impl Step {
                 | Step::Compare { .. }
                 | Step::Unary { .. }
                 | Step::Where { .. }
+                | Step::Fma { .. }
                 | Step::Reduce { .. }
                 | Step::Softmax { .. }
+                | Step::ReluBackward { .. }
+                | Step::ActivationBackward { .. }
+                | Step::SoftmaxCrossEntropy { .. }
+                | Step::SoftmaxCrossEntropyWithLogits { .. }
+                | Step::SoftmaxCrossEntropyBackward { .. }
                 | Step::LayerNorm { .. }
+                | Step::BatchNormInference { .. }
+                | Step::BatchNormInferenceBackwardInput { .. }
                 | Step::FusedResidualLn { .. }
                 | Step::AdaLayerNorm { .. }
                 | Step::GatedResidual { .. }
@@ -1955,9 +2864,13 @@ impl Step {
             | Step::CpuIndexing { .. }
             | Step::SpdHost { .. }
             | Step::EighNative { .. }
+            | Step::DenseSolveNative { .. }
+            | Step::BatchedDenseSolveNative { .. }
             | Step::ReverseHost { .. }
             | Step::ArgReduceHost { .. }
-            | Step::AxialRope2dHost { .. }
+            | Step::GruHost { .. }
+            | Step::RnnHost { .. }
+            | Step::Mamba2Host { .. }
             | Step::GaussianSplatRender { .. }
             | Step::GaussianSplatRenderBackward { .. }
             | Step::GaussianSplatPrepare { .. }

@@ -991,9 +991,20 @@ fn cast_f64_to_i32_truncates_toward_zero() {
     g.set_outputs(vec![ints]);
     let bytes = run_graph_raw_bytes(&g, &[(xn, &x)], ints, x.len() * 4);
     let got: Vec<i32> = (0..x.len())
-        .map(|i| i32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]))
+        .map(|i| {
+            i32::from_le_bytes([
+                bytes[i * 4],
+                bytes[i * 4 + 1],
+                bytes[i * 4 + 2],
+                bytes[i * 4 + 3],
+            ])
+        })
         .collect();
-    assert_eq!(got, vec![1, 2, -3, 0, 5, 0], "f64→i32 must truncate toward zero");
+    assert_eq!(
+        got,
+        vec![1, 2, -3, 0, 5, 0],
+        "f64→i32 must truncate toward zero"
+    );
 }
 
 /// f64 → i64 truncates toward zero.
@@ -1014,7 +1025,11 @@ fn cast_f64_to_i64_truncates_toward_zero() {
             i64::from_le_bytes(a)
         })
         .collect();
-    assert_eq!(got, vec![1, 2, -3, 100, -256], "f64→i64 must truncate toward zero");
+    assert_eq!(
+        got,
+        vec![1, 2, -3, 100, -256],
+        "f64→i64 must truncate toward zero"
+    );
 }
 
 /// f64 → Bool is `x != 0.0` (1 byte per element).
@@ -1050,9 +1065,20 @@ fn cast_i64_to_i32_narrows() {
     g.set_outputs(vec![narrow]);
     let bytes = run_graph_raw_bytes(&g, &[(xn, &x)], narrow, x.len() * 4);
     let got: Vec<i32> = (0..x.len())
-        .map(|i| i32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]))
+        .map(|i| {
+            i32::from_le_bytes([
+                bytes[i * 4],
+                bytes[i * 4 + 1],
+                bytes[i * 4 + 2],
+                bytes[i * 4 + 3],
+            ])
+        })
         .collect();
-    assert_eq!(got, vec![1, -2, 3, 40000, -70000], "i64→i32 narrowing mismatch");
+    assert_eq!(
+        got,
+        vec![1, -2, 3, 40000, -70000],
+        "i64→i32 narrowing mismatch"
+    );
 }
 
 /// i64 → f64 and i32 → f64 must numerically convert (both would corrupt via the
@@ -1077,7 +1103,11 @@ fn cast_int_to_f64_converts() {
             f64::from_le_bytes(a)
         })
         .collect();
-    assert_eq!(got, vec![1.0, -2.0, 3.0, 123456.0, -1.0], "i64→f64 conversion");
+    assert_eq!(
+        got,
+        vec![1.0, -2.0, 3.0, 123456.0, -1.0],
+        "i64→f64 conversion"
+    );
 
     // i32 → f64.
     let mut g2 = Graph::new("cast_i32_f64");
@@ -1093,7 +1123,11 @@ fn cast_int_to_f64_converts() {
             f64::from_le_bytes(a)
         })
         .collect();
-    assert_eq!(got2, vec![1.0, -2.0, 3.0, 123456.0, -1.0], "i32→f64 conversion");
+    assert_eq!(
+        got2,
+        vec![1.0, -2.0, 3.0, 123456.0, -1.0],
+        "i32→f64 conversion"
+    );
 }
 
 /// f32 → f16 → f32 round-trip preserves values exactly representable in f16,
@@ -1109,7 +1143,10 @@ fn cast_f32_f16_roundtrip() {
     let back = g.cast(h, DType::F32);
     g.set_outputs(vec![back]);
     let got = run_graph(&g, &[(xn, &x)], back, x.len());
-    assert_eq!(got, x, "f32→f16→f32 must preserve exactly-representable values");
+    assert_eq!(
+        got, x,
+        "f32→f16→f32 must preserve exactly-representable values"
+    );
 
     // 0.1 is not representable in f16 → must round, not survive unchanged.
     let y: Vec<f32> = vec![0.1];
@@ -1121,7 +1158,10 @@ fn cast_f32_f16_roundtrip() {
     let got2 = run_graph(&g2, &[(yn, &y)], yb, 1);
     let expected = half::f16::from_f32(0.1).to_f32();
     assert_eq!(got2[0], expected, "f32→f16 must round-to-nearest-even");
-    assert_ne!(got2[0], 0.1, "0.1 is not f16-representable; must have rounded");
+    assert_ne!(
+        got2[0], 0.1,
+        "0.1 is not f16-representable; must have rounded"
+    );
 }
 
 /// f32 → bf16 → f32 round-trip preserves values exactly representable in bf16.
@@ -1137,7 +1177,10 @@ fn cast_f32_bf16_roundtrip() {
     let back = g.cast(h, DType::F32);
     g.set_outputs(vec![back]);
     let got = run_graph(&g, &[(xn, &x)], back, x.len());
-    assert_eq!(got, x, "f32→bf16→f32 must preserve exactly-representable values");
+    assert_eq!(
+        got, x,
+        "f32→bf16→f32 must preserve exactly-representable values"
+    );
 
     // A value needing >8 mantissa bits must round.
     let y: Vec<f32> = vec![1.1];
@@ -1171,14 +1214,28 @@ fn raw_u8(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<
 fn raw_u32(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<u32> {
     let bytes = run_graph_raw_bytes(g, inputs, out, n * 4);
     (0..n)
-        .map(|i| u32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]))
+        .map(|i| {
+            u32::from_le_bytes([
+                bytes[i * 4],
+                bytes[i * 4 + 1],
+                bytes[i * 4 + 2],
+                bytes[i * 4 + 3],
+            ])
+        })
         .collect()
 }
 
 fn raw_i32(g: &Graph, inputs: &[(NodeId, &[f32])], out: NodeId, n: usize) -> Vec<i32> {
     let bytes = run_graph_raw_bytes(g, inputs, out, n * 4);
     (0..n)
-        .map(|i| i32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]))
+        .map(|i| {
+            i32::from_le_bytes([
+                bytes[i * 4],
+                bytes[i * 4 + 1],
+                bytes[i * 4 + 2],
+                bytes[i * 4 + 3],
+            ])
+        })
         .collect()
 }
 
@@ -1315,7 +1372,11 @@ fn cast_f64_to_u32() {
     let u = g.cast(d, DType::U32);
     g.set_outputs(vec![u]);
     let got = raw_u32(&g, &[(xn, &x)], u, x.len());
-    assert_eq!(got, vec![0, 5, 0, 100, 70000], "f64→u32 truncate + saturate");
+    assert_eq!(
+        got,
+        vec![0, 5, 0, 100, 70000],
+        "f64→u32 truncate + saturate"
+    );
 }
 
 /// F64 → F16 round-to-nearest.
@@ -1344,7 +1405,10 @@ fn cast_f16_to_f64() {
     let d = g.cast(h, DType::F64);
     g.set_outputs(vec![d]);
     let got = raw_f64(&g, &[(xn, &x)], d, x.len());
-    let expected: Vec<f64> = x.iter().map(|&v| half::f16::from_f32(v).to_f32() as f64).collect();
+    let expected: Vec<f64> = x
+        .iter()
+        .map(|&v| half::f16::from_f32(v).to_f32() as f64)
+        .collect();
     assert_eq!(got, expected, "f16→f64 widening");
 }
 
@@ -1387,7 +1451,10 @@ fn cast_f16_to_bool() {
     let h = g.cast(xn, DType::F16);
     let b = g.cast(h, DType::Bool);
     g.set_outputs(vec![b]);
-    let got: Vec<bool> = raw_u8(&g, &[(xn, &x)], b, x.len()).iter().map(|&v| v != 0).collect();
+    let got: Vec<bool> = raw_u8(&g, &[(xn, &x)], b, x.len())
+        .iter()
+        .map(|&v| v != 0)
+        .collect();
     assert_eq!(got, vec![false, true, false, true], "f16→bool");
 }
 
@@ -1402,7 +1469,10 @@ fn cast_bf16_to_f64() {
     let d = g.cast(h, DType::F64);
     g.set_outputs(vec![d]);
     let got = raw_f64(&g, &[(xn, &x)], d, x.len());
-    let expected: Vec<f64> = x.iter().map(|&v| half::bf16::from_f32(v).to_f32() as f64).collect();
+    let expected: Vec<f64> = x
+        .iter()
+        .map(|&v| half::bf16::from_f32(v).to_f32() as f64)
+        .collect();
     assert_eq!(got, expected, "bf16→f64");
 }
 
@@ -1447,7 +1517,11 @@ fn cast_f32_to_c64() {
     let c = g.cast(xn, DType::C64);
     g.set_outputs(vec![c]);
     let got = raw_c64(&g, &[(xn, &x)], c, x.len());
-    assert_eq!(got, vec![(1.5, 0.0), (-2.0, 0.0), (3.0, 0.0)], "f32→c64 = (x,0)");
+    assert_eq!(
+        got,
+        vec![(1.5, 0.0), (-2.0, 0.0), (3.0, 0.0)],
+        "f32→c64 = (x,0)"
+    );
 }
 
 /// F64 → C64 (real = value, imag = 0).
@@ -1517,7 +1591,10 @@ fn cast_c64_to_bool() {
     let cn = g.input("c", Shape::new(&[n], c64));
     let out = g.cast(cn, DType::Bool);
     g.set_outputs(vec![out]);
-    let got: Vec<bool> = raw_u8(&g, &[(cn, &interleaved)], out, n).iter().map(|&v| v != 0).collect();
+    let got: Vec<bool> = raw_u8(&g, &[(cn, &interleaved)], out, n)
+        .iter()
+        .map(|&v| v != 0)
+        .collect();
     assert_eq!(got, vec![false, true, true], "c64→bool = re||im nonzero");
 }
 
@@ -1588,7 +1665,11 @@ fn cast_c128_to_c64() {
     let back = g.cast(c128, DType::C64);
     g.set_outputs(vec![back]);
     let got = raw_c64(&g, &[(cn, &interleaved)], back, n);
-    assert_eq!(got, vec![(1.5, 9.0), (-2.0, 3.0)], "c64→c128→c64 round-trip");
+    assert_eq!(
+        got,
+        vec![(1.5, 9.0), (-2.0, 3.0)],
+        "c64→c128→c64 round-trip"
+    );
 }
 
 /// C128 → F32 takes the real part (imag discarded).
@@ -4707,6 +4788,7 @@ fn activation_backward_matches_numerical_per_kind() {
                 Activation::Cos => x.cos(),
                 Activation::Tan => x.tan(),
                 Activation::Atan => x.atan(),
+                Activation::Recip => 1.0 / x,
             }
         };
         for i in 0..len {
@@ -6352,6 +6434,53 @@ fn layer_norm2d_and_conv_transpose2d_kernels() {
     );
     assert!((up[0] - 2.0).abs() < 1e-5);
     assert!((up[3] - 2.0).abs() < 1e-5);
+}
+
+/// The fast GEMM + col2im transposed-conv forward must match the naive scalar
+/// scatter kernel across strided / padded / dilated / grouped shapes (it's the
+/// hot vocoder upsampler on CPU).
+#[test]
+fn conv_transpose2d_fast_matches_naive() {
+    use crate::thunk::conv_transpose2d_forward_gemm;
+    // (n, c_in, h, w_in, c_out, kh, kw, sh, sw, ph, pw, dh, dw, groups)
+    let cases = [
+        (1usize, 3, 5, 7, 4, 3, 3, 2, 2, 1, 1, 1, 1, 1),
+        (2, 4, 4, 4, 6, 2, 2, 2, 2, 0, 0, 1, 1, 2),
+        (1, 8, 6, 1, 4, 4, 1, 8, 1, 2, 0, 1, 1, 1), // 1D-style (kw=1)
+        (1, 2, 3, 3, 2, 3, 3, 1, 1, 1, 1, 2, 2, 1), // dilation
+    ];
+    for (idx, &(n, c_in, h, w_in, c_out, kh, kw, sh, sw, ph, pw, dh, dw, groups)) in
+        cases.iter().enumerate()
+    {
+        let c_out_per_g = c_out / groups;
+        let in_len = n * c_in * h * w_in;
+        let w_len = c_in * c_out_per_g * kh * kw;
+        let inp: Vec<f32> = (0..in_len)
+            .map(|i| ((i * 7 + 3) % 11) as f32 * 0.31 - 1.4)
+            .collect();
+        let wt: Vec<f32> = (0..w_len)
+            .map(|i| ((i * 5 + 1) % 9) as f32 * 0.27 - 1.1)
+            .collect();
+        let out_h = (h - 1) * sh + dh * (kh - 1) + 1 - 2 * ph;
+        let out_w = (w_in - 1) * sw + dw * (kw - 1) + 1 - 2 * pw;
+        let out_len = n * c_out * out_h * out_w;
+        let mut naive = vec![0f32; out_len];
+        crate::kernels::conv_transpose2d_nchw(
+            &inp, &wt, &mut naive, n, c_in, h, w_in, c_out, out_h, out_w, kh, kw, sh, sw, ph, pw,
+            dh, dw, groups,
+        );
+        let mut fast = vec![0f32; out_len];
+        conv_transpose2d_forward_gemm(
+            &inp, &wt, &mut fast, n, c_in, h, w_in, c_out, out_h, out_w, kh, kw, sh, sw, ph, pw,
+            dh, dw, groups,
+        );
+        for (i, (a, b)) in naive.iter().zip(fast.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "case {idx} idx {i}: naive {a} vs fast {b}"
+            );
+        }
+    }
 }
 
 /// End-to-end native-low-precision GEMM oracle: build the full

@@ -19,6 +19,7 @@ default = []
 [dependencies]
 rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
 rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13", default-features = false, features = ["compile", "training"] }
+rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.13" }
 rlx-compile = { path = "../../core/rlx-compile", version = "0.2.13" }
 # CPU reference kernels for the host-fallback path. On a host with no Intel
 # Level Zero device (this macOS dev box, CI), the whole legalized graph runs on
@@ -37,6 +38,7 @@ rlx-compile = { path = "../../core/rlx-compile", version = "0.2.13" }
 # (BiMap, pure GEMM, still works) are unavailable in that narrow case.
 rlx-cpu = { path = "../rlx-cpu", version = "0.2.13", default-features = false, features = [
     "blas",
+    "splat",
 ] }
 rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.13" }
 

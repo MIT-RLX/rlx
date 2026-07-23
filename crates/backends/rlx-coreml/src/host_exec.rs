@@ -19,6 +19,10 @@ fn mil_lowerable_custom(name: &str) -> bool {
 }
 
 /// Ops executed on the host between CoreML segments (not lowered to MIL).
+///
+/// Prefer [`is_host_node`] when a graph is available — `Conv3d` /
+/// `ConvTranspose3d` are MIL-native only with baked Param/Constant weights
+/// (CoreML rejects dynamic 3D weights).
 pub fn is_host_op(op: &Op) -> bool {
     match op {
         Op::Fft { .. }
@@ -52,13 +56,110 @@ pub fn is_host_op(op: &Op) -> bool {
         } => {
             *save_trajectory
                 || std::env::var("RLX_COREML_NATIVE_SCAN").as_deref() == Ok("0")
-                || body.nodes().iter().any(|n| is_host_op(&n.op))
+                || body.nodes().iter().any(|n| is_host_node(body, n.id))
         }
         // Most `Op::Custom` stay host (ONNX reference kernels). ScatterND has a
         // MIL `scatter_nd` path so F5-TTS Transformer does not hybridize into
         // ~88 host segments (which breaks CoreML input declaration).
         Op::Custom { name, .. } => !mil_lowerable_custom(name),
+        // Full-coverage host fallbacks (no MIL arm, or CPU-only kernels).
+        // Fma / fused epilogues / FakeQuantize / Conv3d(with Param weights)
+        // lower to MIL — see `mil::{activation,conv_pool,matmul,norm,quant}`.
+        Op::FakeQuantizeLSQ { .. }
+        | Op::FakeQuantizeLSQBackwardX { .. }
+        | Op::FakeQuantizeLSQBackwardScale { .. }
+        | Op::ElementwiseRegion { .. }
+        | Op::TransformRegion { .. }
+        | Op::BatchElementwiseRegion { .. }
+        | Op::DotGeneral { .. }
+        | Op::DenseSolve
+        | Op::BatchedDenseSolve
+        | Op::Im2Col { .. }
+        | Op::ReluBackward
+        | Op::ActivationBackward { .. }
+        | Op::FakeQuantizeBackward { .. }
+        // ComplexNormSq / ComplexNormSqBackward / Conjugate / FftButterflyStage
+        // lower natively to MIL (interleaved F32); see `mil::complex`.
+        | Op::SoftmaxCrossEntropy
+        | Op::PartitionedConv { .. }
+        | Op::QMatMul { .. }
+        | Op::QConv2d { .. }
+        | Op::ScaledMatMul { .. }
+        | Op::ScaledQuantize { .. }
+        | Op::ScaledQuantScale { .. }
+        | Op::ScaledDequantize { .. }
+        | Op::FusedConvBiasAct { .. }
+        | Op::FusedTransformerLayer { .. }
+        | Op::If { .. }
+        | Op::While { .. }
+        | Op::GaussianSplatRender { .. }
+        | Op::GaussianSplatRenderBackward { .. }
+        | Op::GaussianSplatPrepare { .. }
+        | Op::GaussianSplatRasterize { .. }
+        | Op::CustomFn { .. }
+        | Op::LogMelBackward
+        | Op::BiMap
+        | Op::ReEig { .. }
+        | Op::LogEig { .. }
+        | Op::SpdBatchNorm { .. }
+        | Op::SpdKarcherMean { .. }
+        | Op::ReEigBackward { .. }
+        | Op::LogEigBackward { .. }
+        | Op::SpdBatchNormBackwardX { .. }
+        | Op::SpdBatchNormBackwardG { .. }
+        | Op::SpdKarcherMeanWeighted { .. }
+        | Op::SpdLogMap
+        | Op::SpdExpMap
+        | Op::SpdParallelTransport
+        | Op::SpdMatrixFnBatch { .. }
+        | Op::SpdLogMapBackward
+        | Op::SpdExpMapBackward
+        | Op::SpdParallelTransportBackward
+        | Op::SpdMatrixFnBatchBackward { .. }
+        | Op::Eigh
+        | Op::EighBackward
+        | Op::EighBatch
+        | Op::EighBatchBackward
+        | Op::RopeBackward { .. }
+        | Op::CumsumBackward { .. }
+        | Op::GatherBackward { .. }
+        | Op::BatchNormInferenceBackwardInput { .. }
+        | Op::BatchNormInferenceBackwardGamma { .. }
+        | Op::BatchNormInferenceBackwardBeta => true,
+        // Native MIL under `training`; host-fallback otherwise so claiming the
+        // OpKind for coverage does not hit the MIL Unsupported arm.
+        #[cfg(not(feature = "training"))]
+        Op::MaxPool2dBackward { .. }
+        | Op::Conv2dBackwardInput { .. }
+        | Op::Conv2dBackwardWeight { .. }
+        | Op::SoftmaxCrossEntropyWithLogits
+        | Op::SoftmaxCrossEntropyBackward
+        | Op::AttentionBackward { .. }
+        | Op::LayerNormBackwardInput { .. }
+        | Op::LayerNormBackwardGamma { .. }
+        | Op::RmsNormBackwardInput { .. }
+        | Op::RmsNormBackwardGamma { .. }
+        | Op::RmsNormBackwardBeta { .. }
+        | Op::GroupNormBackwardInput { .. }
+        | Op::GroupNormBackwardGamma { .. }
+        | Op::GroupNormBackwardBeta { .. }
+        | Op::AdaLayerNormBackward { .. }
+        | Op::GatedResidualBackward { .. } => true,
         _ => false,
+    }
+}
+
+/// Graph-aware host decision (see [`is_host_op`]).
+pub fn is_host_node(graph: &Graph, id: NodeId) -> bool {
+    let node = graph.node(id);
+    match &node.op {
+        // CoreML's 3D `conv` / `conv_transpose` reject dynamic weights —
+        // only Param/Constant weights stay on the MIL path.
+        Op::Conv3d { .. } | Op::ConvTranspose3d { .. } => {
+            let w = &graph.node(node.inputs[1]).op;
+            !matches!(w, Op::Param { .. } | Op::Constant { .. })
+        }
+        other => is_host_op(other),
     }
 }
 
@@ -68,6 +169,7 @@ pub fn run_host_node(
     id: NodeId,
     env: &HashMap<u32, Vec<f32>>,
     _params: &HashMap<String, Vec<f32>>,
+    typed_params: &crate::mil::TypedParams,
 ) -> Result<Vec<f32>> {
     let node = graph.node(id);
     let load = |nid: NodeId| -> Result<Vec<f32>> {
@@ -230,7 +332,9 @@ pub fn run_host_node(
             head_dim,
             state_size,
         } => run_mamba2_f32(graph, node, env, *head_dim, *state_size),
-        Op::Custom { name, attrs, .. } => run_custom_f32(graph, node, env, name, attrs),
+        Op::Custom { name, attrs, .. } => {
+            run_custom_f32(graph, node, env, name, attrs, typed_params)
+        }
         Op::Scan { .. } => {
             for nid in &node.inputs {
                 if !env.contains_key(&nid.0) {
@@ -270,10 +374,22 @@ pub fn run_host_node(
                 env.get(&nid.0).cloned().unwrap_or_default()
             }))
         }
-        other => Err(CoremlError::Unsupported(format!(
-            "host_exec: not a host op {:?}",
-            other
-        ))),
+        // Generic CPU one-op eval for host-segmented nodes. Segment planning
+        // (including graph-aware Conv3d dynamic-weight host) decides the split;
+        // do not re-gate on `is_host_op` here.
+        _other => {
+            for nid in &node.inputs {
+                if !env.contains_key(&nid.0) {
+                    return Err(CoremlError::Runtime(format!(
+                        "host_exec: missing value for v{}",
+                        nid.0
+                    )));
+                }
+            }
+            Ok(rlx_cpu::thunk::run_host_op_node_f32(graph, node, |nid| {
+                env.get(&nid.0).cloned().unwrap_or_default()
+            }))
+        }
     }
 }
 
@@ -525,6 +641,7 @@ fn run_custom_f32(
     env: &HashMap<u32, Vec<f32>>,
     name: &str,
     attrs: &[u8],
+    typed_params: &crate::mil::TypedParams,
 ) -> Result<Vec<f32>> {
     // Gather each operand from the f32 `env`.
     let mut in_f32: Vec<(Vec<f32>, Shape)> = Vec::with_capacity(node.inputs.len());
@@ -565,10 +682,11 @@ fn run_custom_f32(
             "host_exec: no CoremlKernel or rlx-cpu reference kernel for Op::Custom('{name}')"
         )));
     }
-    // The index operand of Gather/Scatter/OneHot must be I64 (the reference
-    // kernel `expect_i64`s it), but CoreML's `promote_int_to_f32` demoted it to
-    // F32 in the arena. Force those positions back to I64 (re-rounding the f32
-    // index values) so the host-delegate kernel sees the dtype it needs.
+    // CoreML's `promote_int_to_f32` demotes integer tensors to F32 in the graph.
+    // Host reference kernels still expect the original integer dtypes — restore
+    // them here (same idea as the Gather/Scatter index override below).
+    let (in_dtype_override, out_dtype_override) =
+        custom_int_dtype_overrides(name, attrs, in_f32.len(), graph, node, typed_params);
     let idx_pos: Option<usize> = match name {
         "onnx.GatherND" | "onnx.ScatterND" | "onnx.ScatterElements" | "onnx.GatherElements" => {
             Some(1)
@@ -582,11 +700,17 @@ fn run_custom_f32(
         .map(|(i, (_, s))| {
             if Some(i) == idx_pos {
                 s.clone().with_dtype(DType::I64)
+            } else if let Some(dt) = in_dtype_override.get(i).copied().flatten() {
+                s.clone().with_dtype(dt)
             } else {
                 s.clone()
             }
         })
         .collect();
+    let run_out_shape = match out_dtype_override {
+        Some(dt) => out_shape.clone().with_dtype(dt),
+        None => out_shape.clone(),
+    };
     let in_bytes: Vec<Vec<u8>> = in_f32
         .iter()
         .zip(in_shapes.iter())
@@ -597,11 +721,101 @@ fn run_custom_f32(
         .zip(in_shapes.iter())
         .map(|(b, s)| (b.as_slice(), s))
         .collect();
-    let out_n = out_shape.num_elements().unwrap_or(0);
-    let mut out = vec![0u8; out_n * out_shape.dtype().size_bytes()];
-    rlx_cpu::op_registry::run_custom_op_host(name, &in_pairs, (&mut out, &out_shape), attrs)
+    let out_n = run_out_shape.num_elements().unwrap_or(0);
+    let mut out = vec![0u8; out_n * run_out_shape.dtype().size_bytes()];
+    rlx_cpu::op_registry::run_custom_op_host(name, &in_pairs, (&mut out, &run_out_shape), attrs)
         .map_err(|e| CoremlError::Runtime(format!("Op::Custom('{name}'): {e}")))?;
-    Ok(dtype_bytes_to_f32(&out, out_shape.dtype()))
+    Ok(dtype_bytes_to_f32(&out, run_out_shape.dtype()))
+}
+
+/// Integer dtypes that `promote_int_to_f32` stripped, but the CPU reference
+/// kernel still requires. Returns per-input overrides + optional output override.
+fn custom_int_dtype_overrides(
+    name: &str,
+    attrs: &[u8],
+    n_inputs: usize,
+    graph: &Graph,
+    node: &rlx_ir::Node,
+    typed_params: &crate::mil::TypedParams,
+) -> (Vec<Option<DType>>, Option<DType>) {
+    let param_dtype = |inp_idx: usize| -> Option<DType> {
+        let pid = *node.inputs.get(inp_idx)?;
+        match &graph.node(pid).op {
+            Op::Param { name } => typed_params.get(name).map(|(_, d)| *d),
+            _ => None,
+        }
+    };
+    let mut ins = vec![None; n_inputs];
+    let out = match name {
+        // attrs[0]: 0=quantized u8, 1=scale f32, 2=zero_point u8
+        "onnx.DynamicQuantizeLinearExport" => match attrs.first().copied().unwrap_or(0) {
+            0 | 2 => Some(DType::U8),
+            _ => None,
+        },
+        // act_q is u8; act_zp u8; weight i8 when still quantized.
+        "onnx.QMatMul" => {
+            if !ins.is_empty() {
+                ins[0] = Some(DType::U8);
+            }
+            if ins.len() > 2 {
+                ins[2] = Some(DType::U8);
+            }
+            if let Some(DType::I8) = param_dtype(3) {
+                ins[3] = Some(DType::I8);
+            }
+            if ins.len() > 5 {
+                ins[5] = Some(DType::I8);
+            }
+            None
+        }
+        "onnx.QMatMulBaked" => {
+            if !ins.is_empty() {
+                ins[0] = Some(DType::U8);
+            }
+            if ins.len() > 2 {
+                ins[2] = Some(DType::U8);
+            }
+            None
+        }
+        // ONNX DynamicQuantizeLSTM: W/R are int8 (inputs 1,2); trailing zp may be u8.
+        "onnx.DynamicQuantizeLSTM" => {
+            if ins.len() > 1 {
+                ins[1] = Some(DType::I8);
+            }
+            if ins.len() > 2 {
+                ins[2] = Some(DType::I8);
+            }
+            // When quantized: trailing W_zp / R_zp accept I8 (not U8).
+            if n_inputs >= 8 {
+                ins[n_inputs - 3] = Some(DType::I8);
+                ins[n_inputs - 1] = Some(DType::I8);
+            }
+            None
+        }
+        // I64 alignment / control-flow ops (all inputs + output are i64).
+        "onnx.ConcatFromSequence"
+        | "onnx.KittenConcatFromSequence"
+        | "onnx.ExpandI64Align"
+        | "onnx.AlignmentRange"
+        | "onnx.AlignmentScatterIndices" => {
+            for slot in ins.iter_mut() {
+                *slot = Some(DType::I64);
+            }
+            Some(DType::I64)
+        }
+        // F0IfSelect: align is i64; f0/n are f32; output f32.
+        "onnx.F0IfSelect" => {
+            if ins.len() > 1 {
+                // typical: [f0, align] or [f0, n, align] — force any non-f32-looking
+                // trailing control input. Safer: mark all but first as I64 when
+                // they came from integer params; otherwise force input 1.
+                ins[1] = Some(DType::I64);
+            }
+            None
+        }
+        _ => None,
+    };
+    (ins, out)
 }
 
 #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]

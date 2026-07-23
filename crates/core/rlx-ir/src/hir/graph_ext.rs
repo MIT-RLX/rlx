@@ -832,6 +832,7 @@ pub trait HirGraphExt {
     fn silu(&mut self, x: HirNodeId) -> HirNodeId;
     fn relu(&mut self, x: HirNodeId) -> HirNodeId;
     fn exp(&mut self, x: HirNodeId) -> HirNodeId;
+    fn recip(&mut self, x: HirNodeId) -> HirNodeId;
     fn sqrt(&mut self, x: HirNodeId) -> HirNodeId;
     fn neg(&mut self, x: HirNodeId) -> HirNodeId;
     fn tanh(&mut self, x: HirNodeId) -> HirNodeId;
@@ -1054,6 +1055,11 @@ impl HirGraphExt for HirMut<'_> {
     fn exp(&mut self, x: HirNodeId) -> HirNodeId {
         let s = shape::unary_shape(self.shape(x));
         self.0.mir(Op::Activation(Activation::Exp), vec![x], s)
+    }
+
+    fn recip(&mut self, x: HirNodeId) -> HirNodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.0.mir(Op::Activation(Activation::Recip), vec![x], s)
     }
 
     fn sqrt(&mut self, x: HirNodeId) -> HirNodeId {

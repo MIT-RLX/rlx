@@ -156,7 +156,11 @@ fn metal_cast_f32_to_c64() {
     let n = xs.len();
     let mut g = Graph::new("f32_to_c64");
     let x = g.input("x", Shape::new(&[n], DType::F32));
-    let c = g.add_node(Op::Cast { to: DType::C64 }, vec![x], Shape::new(&[n], DType::C64));
+    let c = g.add_node(
+        Op::Cast { to: DType::C64 },
+        vec![x],
+        Shape::new(&[n], DType::C64),
+    );
     g.set_outputs(vec![c]);
     let x_bytes: Vec<u8> = xs.iter().flat_map(|v| v.to_le_bytes()).collect();
     let opts = CompileOptions::default();
@@ -175,7 +179,11 @@ fn metal_cast_f32_to_c64() {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();
-    assert_eq!(lanes, vec![1.0, 0.0, -2.5, 0.0, 3.0, 0.0], "re/im interleave");
+    assert_eq!(
+        lanes,
+        vec![1.0, 0.0, -2.5, 0.0, 3.0, 0.0],
+        "re/im interleave"
+    );
 }
 
 #[test]

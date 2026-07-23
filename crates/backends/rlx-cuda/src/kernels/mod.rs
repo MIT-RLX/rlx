@@ -123,6 +123,26 @@ kernel_cache!(
     "complex_cast"
 );
 kernel_cache!(BINARY_C64, binary_c64_kernel, BINARY_C64_CU, "binary_c64");
+// C64 Wirtinger surface (ComplexNormSq / Backward / Conjugate). Three entry
+// points share `complex_wirtinger.cu`; each gets its own OnceLock cache.
+kernel_cache!(
+    COMPLEX_NORM_SQ,
+    complex_norm_sq_kernel,
+    COMPLEX_WIRINGER_CU,
+    "complex_norm_sq"
+);
+kernel_cache!(
+    COMPLEX_NORM_SQ_BWD,
+    complex_norm_sq_backward_kernel,
+    COMPLEX_WIRINGER_CU,
+    "complex_norm_sq_backward"
+);
+kernel_cache!(
+    CONJUGATE_C64,
+    conjugate_c64_kernel,
+    COMPLEX_WIRINGER_CU,
+    "conjugate_c64"
+);
 kernel_cache!(
     BINARY_BROADCAST,
     binary_broadcast_kernel,
@@ -130,7 +150,35 @@ kernel_cache!(
     "binary_broadcast"
 );
 kernel_cache!(LSTM_DIR, lstm_dir_kernel, LSTM_CU, "lstm_dir");
-kernel_cache!(LSTM_TRANSPOSE, lstm_transpose_kernel, LSTM_CU, "transpose_rc");
+kernel_cache!(LSTM_PRE_WIH, lstm_pre_wih_kernel, LSTM_CU, "lstm_pre_wih");
+kernel_cache!(
+    LSTM_PRE_ADD_BIAS,
+    lstm_pre_add_bias_kernel,
+    LSTM_CU,
+    "lstm_pre_add_bias"
+);
+kernel_cache!(
+    LSTM_TRANSPOSE,
+    lstm_transpose_kernel,
+    LSTM_CU,
+    "transpose_rc"
+);
+kernel_cache!(
+    RNG_NORMAL_PHILOX,
+    rng_normal_philox_kernel,
+    RNG_PHILOX_CU,
+    "rng_normal_philox"
+);
+kernel_cache!(
+    RNG_UNIFORM_PHILOX,
+    rng_uniform_philox_kernel,
+    RNG_PHILOX_CU,
+    "rng_uniform_philox"
+);
+kernel_cache!(RNG_FILL_ZERO, rng_fill_zero_kernel, RNG_PHILOX_CU, "rng_fill_zero");
+kernel_cache!(GRU, gru_kernel, GRU_CU, "gru");
+kernel_cache!(RNN, rnn_kernel, RNN_CU, "rnn");
+kernel_cache!(MAMBA2, mamba2_kernel, MAMBA2_CU, "mamba2");
 kernel_cache!(
     FUSED_BINARY_UNARY,
     fused_binary_unary_kernel,
@@ -218,9 +266,97 @@ kernel_cache!(
 );
 kernel_cache!(COMPARE, compare_kernel, COMPARE_CU, "compare");
 kernel_cache!(WHEREK, where_kernel, WHERE_CU, "where_select");
+kernel_cache!(FMA, fma_kernel, FMA_CU, "fma_elem");
 kernel_cache!(REDUCE, reduce_kernel, REDUCE_CU, "reduce");
 kernel_cache!(SOFTMAX, softmax_kernel, SOFTMAX_CU, "softmax");
+kernel_cache!(
+    RELU_BACKWARD,
+    relu_backward_kernel,
+    ACTIVATION_BACKWARD_CU,
+    "relu_backward"
+);
+kernel_cache!(
+    ACTIVATION_BACKWARD,
+    activation_backward_kernel,
+    ACTIVATION_BACKWARD_CU,
+    "activation_backward"
+);
+kernel_cache!(
+    SOFTMAX_CROSS_ENTROPY,
+    softmax_cross_entropy_kernel,
+    SOFTMAX_CROSS_ENTROPY_CU,
+    "softmax_cross_entropy"
+);
+kernel_cache!(
+    SOFTMAX_CROSS_ENTROPY_WITH_LOGITS,
+    softmax_cross_entropy_with_logits_kernel,
+    SOFTMAX_CROSS_ENTROPY_CU,
+    "softmax_cross_entropy_with_logits"
+);
+kernel_cache!(
+    SOFTMAX_CROSS_ENTROPY_BACKWARD,
+    softmax_cross_entropy_backward_kernel,
+    SOFTMAX_CROSS_ENTROPY_CU,
+    "softmax_cross_entropy_backward"
+);
 kernel_cache!(LAYERNORM, layernorm_kernel, LAYERNORM_CU, "rlx_norm");
+kernel_cache!(
+    LAYER_NORM_BWD_INPUT,
+    layer_norm_bwd_input_kernel,
+    LAYER_NORM_BWD_CU,
+    "layer_norm_bwd_input"
+);
+kernel_cache!(
+    LAYER_NORM_BWD_GAMMA,
+    layer_norm_bwd_gamma_kernel,
+    LAYER_NORM_BWD_CU,
+    "layer_norm_bwd_gamma"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_FIXED,
+    fake_quantize_fixed_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_fixed"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_PERBATCH,
+    fake_quantize_perbatch_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_perbatch"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_EMA,
+    fake_quantize_ema_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_ema"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_LSQ_BWD_X,
+    fake_quantize_lsq_bwd_x_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_lsq_bwd_x"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_LSQ_BWD_SCALE,
+    fake_quantize_lsq_bwd_scale_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_lsq_bwd_scale"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_BACKWARD,
+    fake_quantize_backward_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_backward"
+);
+kernel_cache!(QUANTIZE_I8, quantize_i8_kernel, QUANTIZE_CU, "quantize_i8");
+kernel_cache!(
+    DEQUANTIZE_I8,
+    dequantize_i8_kernel,
+    QUANTIZE_CU,
+    "dequantize_i8"
+);
+kernel_cache!(Q_MATMUL, q_matmul_kernel, Q_MATMUL_CU, "q_matmul");
+kernel_cache!(Q_CONV2D, q_conv2d_kernel, Q_CONV2D_CU, "q_conv2d");
 kernel_cache!(
     RMS_NORM_BWD,
     rms_norm_backward_kernel,
@@ -334,6 +470,7 @@ kernel_cache!(
     SCATTER_ADD_CU,
     "scatter_add_acc"
 );
+kernel_cache!(SCATTER_ND, scatter_nd_kernel, SCATTER_ND_CU, "scatter_nd_f32");
 kernel_cache!(
     DEQUANT_MATMUL,
     dequant_matmul_kernel,
@@ -373,59 +510,10 @@ kernel_cache!(
 );
 kernel_cache!(POOL1D, pool1d_kernel, POOL1D_CU, "pool1d");
 kernel_cache!(POOL2D, pool2d_kernel, POOL2D_CU, "pool2d");
-const MAXPOOL2D_BWD_CU: &str = r#"
-extern "C" __global__ void maxpool2d_backward(
-    float* arena, unsigned n, unsigned c, unsigned h, unsigned w,
-    unsigned h_out, unsigned w_out, unsigned kh, unsigned kw,
-    unsigned sh, unsigned sw, unsigned ph, unsigned pw,
-    unsigned x_off, unsigned dy_off, unsigned dx_off)
-{
-    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned total = n*c*h*w;
-    if (idx >= total) return;
-    unsigned iw = idx % w;
-    unsigned ih = (idx / w) % h;
-    unsigned cc = (idx / (w*h)) % c;
-    unsigned nn = idx / (w*h*c);
-    const float* x = arena + x_off;
-    unsigned base_nc = (nn*c + cc)*h*w;
-    int ph_i = (int)ph, pw_i = (int)pw, sh_i = (int)sh, sw_i = (int)sw;
-    // output windows (ho,wo) whose receptive field covers input (ih,iw)
-    int ho_lo = (int)ih + ph_i - (int)kh + 1;
-    ho_lo = ho_lo <= 0 ? 0 : (ho_lo + sh_i - 1) / sh_i;
-    int ho_hi = ((int)ih + ph_i) / sh_i;
-    int wo_lo = (int)iw + pw_i - (int)kw + 1;
-    wo_lo = wo_lo <= 0 ? 0 : (wo_lo + sw_i - 1) / sw_i;
-    int wo_hi = ((int)iw + pw_i) / sw_i;
-    float acc = 0.0f;
-    for (int ho = ho_lo; ho <= ho_hi && ho < (int)h_out; ho++) {
-        int hstart = ho*sh_i - ph_i;
-        for (int wo = wo_lo; wo <= wo_hi && wo < (int)w_out; wo++) {
-            int wstart = wo*sw_i - pw_i;
-            float best = -3.402823466e+38f; int best_idx = -1;
-            for (unsigned i=0;i<kh;i++){
-                int ir = hstart + (int)i;
-                if (ir < 0 || ir >= (int)h) continue;
-                for (unsigned j=0;j<kw;j++){
-                    int ic = wstart + (int)j;
-                    if (ic < 0 || ic >= (int)w) continue;
-                    unsigned id2 = base_nc + (unsigned)ir*w + (unsigned)ic;
-                    float v = x[id2];
-                    if (v > best){ best = v; best_idx = (int)id2; }
-                }
-            }
-            if (best_idx == (int)idx) {
-                acc += arena[dy_off + ((nn*c+cc)*h_out + (unsigned)ho)*w_out + (unsigned)wo];
-            }
-        }
-    }
-    arena[dx_off + idx] = acc;
-}
-"#;
 kernel_cache!(
     MAXPOOL2D_BWD,
     maxpool2d_backward_kernel,
-    MAXPOOL2D_BWD_CU,
+    MAXPOOL2D_BACKWARD_CU,
     "maxpool2d_backward"
 );
 kernel_cache!(POOL3D, pool3d_kernel, POOL3D_CU, "pool3d");
@@ -446,6 +534,12 @@ kernel_cache!(
 kernel_cache!(IM2COL, im2col_kernel, IM2COL_CU, "im2col");
 kernel_cache!(CONV3D, conv3d_kernel, CONV3D_CU, "conv3d");
 kernel_cache!(
+    CONV_TRANSPOSE3D,
+    conv_transpose3d_kernel,
+    CONV_TRANSPOSE3D_CU,
+    "conv_transpose3d"
+);
+kernel_cache!(
     LAYER_NORM2D,
     layer_norm2d_kernel,
     LAYER_NORM2D_CU,
@@ -457,7 +551,61 @@ kernel_cache!(
     CONV_TRANSPOSE2D_CU,
     "conv_transpose2d"
 );
+kernel_cache!(
+    FUSED_SWIGLU,
+    fused_swiglu_kernel,
+    FUSED_SWIGLU_CU,
+    "fused_swiglu"
+);
+kernel_cache!(
+    AXIAL_ROPE2D,
+    axial_rope2d_kernel,
+    AXIAL_ROPE2D_CU,
+    "axial_rope2d"
+);
 kernel_cache!(GROUP_NORM, group_norm_kernel, GROUP_NORM_CU, "group_norm");
+kernel_cache!(
+    GROUP_NORM_BWD_INPUT,
+    group_norm_bwd_input_kernel,
+    GROUP_NORM_BWD_CU,
+    "group_norm_bwd_input"
+);
+kernel_cache!(
+    GROUP_NORM_BWD_GAMMA,
+    group_norm_bwd_gamma_kernel,
+    GROUP_NORM_BWD_CU,
+    "group_norm_bwd_gamma"
+);
+kernel_cache!(
+    GROUP_NORM_BWD_BETA,
+    group_norm_bwd_beta_kernel,
+    GROUP_NORM_BWD_CU,
+    "group_norm_bwd_beta"
+);
+kernel_cache!(
+    BATCH_NORM_INFERENCE,
+    batch_norm_inference_kernel,
+    BATCH_NORM_INFERENCE_CU,
+    "batch_norm_inference"
+);
+kernel_cache!(
+    BATCH_NORM_INFERENCE_BWD_INPUT,
+    batch_norm_inference_bwd_input_kernel,
+    BATCH_NORM_INFERENCE_CU,
+    "batch_norm_inference_bwd_input"
+);
+kernel_cache!(
+    BATCH_NORM_INFERENCE_BWD_GAMMA,
+    batch_norm_inference_bwd_gamma_kernel,
+    BATCH_NORM_INFERENCE_CU,
+    "batch_norm_inference_bwd_gamma"
+);
+kernel_cache!(
+    BATCH_NORM_INFERENCE_BWD_BETA,
+    batch_norm_inference_bwd_beta_kernel,
+    BATCH_NORM_INFERENCE_CU,
+    "batch_norm_inference_bwd_beta"
+);
 kernel_cache!(
     RESIZE_NEAREST_2X,
     resize_nearest_2x_kernel,
@@ -547,6 +695,12 @@ kernel_cache!(
     welch_peaks_gpu_kernel,
     WELCH_PEAKS_CU,
     "welch_peaks_gpu"
+);
+kernel_cache!(
+    FFT_BUTTERFLY_STAGE,
+    fft_butterfly_stage_kernel,
+    FFT_BUTTERFLY_STAGE_CU,
+    "fft_butterfly_stage"
 );
 
 /// Dispatch grid for a 1-D workload of `n` threads with workgroup

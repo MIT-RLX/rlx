@@ -26,6 +26,30 @@ use std::sync::Arc;
 
 use super::*;
 
+/// Matches CUDA / wgpu `activation_op_id` (0=relu … 17=reciprocal).
+fn activation_backward_op_id(act: Activation) -> u32 {
+    match act {
+        Activation::Relu => 0,
+        Activation::Sigmoid => 1,
+        Activation::Tanh => 2,
+        Activation::Exp => 3,
+        Activation::Log => 4,
+        Activation::Sqrt => 5,
+        Activation::Rsqrt => 6,
+        Activation::Neg => 7,
+        Activation::Abs => 8,
+        Activation::Gelu => 9,
+        Activation::Silu => 10,
+        Activation::GeluApprox => 11,
+        Activation::Round => 12,
+        Activation::Sin => 13,
+        Activation::Cos => 14,
+        Activation::Tan => 15,
+        Activation::Atan => 16,
+        Activation::Recip => 17,
+    }
+}
+
 impl ThunkSchedule {
     pub fn compile(graph: &Graph, arena: &Arena) -> Self {
         Self::compile_with_rng_fab(
@@ -606,6 +630,85 @@ impl ThunkSchedule {
                         dh: dilation.first().copied().unwrap_or(1) as u32,
                         dw: dilation.get(1).copied().unwrap_or(1) as u32,
                         groups: *groups as u32,
+                        dt: node.shape.dtype().into(),
+                    }
+                }
+
+                Op::Conv3d {
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let w_shape = &graph.node(node.inputs[1]).shape;
+                    let out_shape = &node.shape;
+                    Thunk::Conv3d {
+                        src: off(node.inputs[0]),
+                        weight: off(node.inputs[1]),
+                        dst: off(node.id),
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c_in: in_shape.dim(1).unwrap_static() as u32,
+                        d: in_shape.dim(2).unwrap_static() as u32,
+                        h: in_shape.dim(3).unwrap_static() as u32,
+                        w_in: in_shape.dim(4).unwrap_static() as u32,
+                        c_out: out_shape.dim(1).unwrap_static() as u32,
+                        d_out: out_shape.dim(2).unwrap_static() as u32,
+                        h_out: out_shape.dim(3).unwrap_static() as u32,
+                        w_out: out_shape.dim(4).unwrap_static() as u32,
+                        kd: w_shape.dim(2).unwrap_static() as u32,
+                        kh: w_shape.dim(3).unwrap_static() as u32,
+                        kw: w_shape.dim(4).unwrap_static() as u32,
+                        sd: stride[0] as u32,
+                        sh: stride[1] as u32,
+                        sw: stride[2] as u32,
+                        pd: padding[0] as u32,
+                        ph: padding[1] as u32,
+                        pw: padding[2] as u32,
+                        dd: dilation[0] as u32,
+                        dh: dilation[1] as u32,
+                        dw: dilation[2] as u32,
+                        groups: (*groups).max(1) as u32,
+                        dt: node.shape.dtype().into(),
+                    }
+                }
+
+                Op::ConvTranspose3d {
+                    stride,
+                    padding,
+                    dilation,
+                    output_padding: _,
+                    groups,
+                } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let w_shape = &graph.node(node.inputs[1]).shape;
+                    let out_shape = &node.shape;
+                    Thunk::ConvTranspose3d {
+                        src: off(node.inputs[0]),
+                        weight: off(node.inputs[1]),
+                        dst: off(node.id),
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c_in: in_shape.dim(1).unwrap_static() as u32,
+                        d: in_shape.dim(2).unwrap_static() as u32,
+                        h: in_shape.dim(3).unwrap_static() as u32,
+                        w_in: in_shape.dim(4).unwrap_static() as u32,
+                        c_out: out_shape.dim(1).unwrap_static() as u32,
+                        d_out: out_shape.dim(2).unwrap_static() as u32,
+                        h_out: out_shape.dim(3).unwrap_static() as u32,
+                        w_out: out_shape.dim(4).unwrap_static() as u32,
+                        kd: w_shape.dim(2).unwrap_static() as u32,
+                        kh: w_shape.dim(3).unwrap_static() as u32,
+                        kw: w_shape.dim(4).unwrap_static() as u32,
+                        sd: stride[0] as u32,
+                        sh: stride[1] as u32,
+                        sw: stride[2] as u32,
+                        pd: padding[0] as u32,
+                        ph: padding[1] as u32,
+                        pw: padding[2] as u32,
+                        dd: dilation[0] as u32,
+                        dh: dilation[1] as u32,
+                        dw: dilation[2] as u32,
+                        groups: (*groups).max(1) as u32,
                         dt: node.shape.dtype().into(),
                     }
                 }
@@ -1671,6 +1774,156 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::ReluBackward => {
+                    let len = node.shape.num_elements().unwrap();
+                    Thunk::ReluBackward {
+                        x: off(node.inputs[0]),
+                        dy: off(node.inputs[1]),
+                        dx: off(node.id),
+                        len: len as u32,
+                    }
+                }
+
+                Op::ActivationBackward { kind } => {
+                    let len = node.shape.num_elements().unwrap();
+                    Thunk::ActivationBackward {
+                        x: off(node.inputs[0]),
+                        dy: off(node.inputs[1]),
+                        dx: off(node.id),
+                        len: len as u32,
+                        op: activation_backward_op_id(*kind),
+                    }
+                }
+
+                // C64 Wirtinger surface — native MSL (mirrors CUDA
+                // `complex_wirtinger.cu`). Interleaved [re, im] pairs; `len`
+                // is the complex-element count.
+                Op::ComplexNormSq => {
+                    let src = node.inputs[0];
+                    if graph.node(src).shape.dtype() != rlx_ir::DType::C64 {
+                        panic!(
+                            "rlx-metal ComplexNormSq: expected C64 input, got {:?}",
+                            graph.node(src).shape.dtype()
+                        );
+                    }
+                    let len = node.shape.num_elements().unwrap();
+                    Thunk::ComplexNormSq {
+                        src: off(src),
+                        dst: off(node.id),
+                        len: len as u32,
+                    }
+                }
+                Op::ComplexNormSqBackward => {
+                    let z = node.inputs[0];
+                    let g = node.inputs[1];
+                    if graph.node(z).shape.dtype() != rlx_ir::DType::C64 {
+                        panic!(
+                            "rlx-metal ComplexNormSqBackward: expected C64 z, got {:?}",
+                            graph.node(z).shape.dtype()
+                        );
+                    }
+                    let len = node.shape.num_elements().unwrap();
+                    Thunk::ComplexNormSqBackward {
+                        z: off(z),
+                        g: off(g),
+                        dz: off(node.id),
+                        len: len as u32,
+                    }
+                }
+                Op::Conjugate => {
+                    let src = node.inputs[0];
+                    if graph.node(src).shape.dtype() != rlx_ir::DType::C64 {
+                        panic!(
+                            "rlx-metal Conjugate: expected C64 input, got {:?}",
+                            graph.node(src).shape.dtype()
+                        );
+                    }
+                    let len = node.shape.num_elements().unwrap();
+                    Thunk::ConjugateC64 {
+                        src: off(src),
+                        dst: off(node.id),
+                        len: len as u32,
+                    }
+                }
+
+                Op::FftButterflyStage { stage, n_fft } => {
+                    let state_shape = &graph.node(node.inputs[0]).shape;
+                    assert_eq!(
+                        state_shape.dtype(),
+                        rlx_ir::DType::F32,
+                        "rlx-metal Op::FftButterflyStage requires F32 state"
+                    );
+                    Thunk::FftButterflyStage {
+                        state: off(node.inputs[0]),
+                        out: off(node.id),
+                        gate: off(node.inputs[1]),
+                        rev: off(node.inputs[2]),
+                        tw_re: off(node.inputs[3]),
+                        tw_im: off(node.inputs[4]),
+                        batch: state_shape.dim(0).unwrap_static() as u32,
+                        n_fft: *n_fft,
+                        stage: *stage,
+                    }
+                }
+
+                Op::FakeQuantize {
+                    bits,
+                    axis,
+                    ste: _,
+                    scale_mode,
+                } => {
+                    use rlx_ir::op::ScaleMode;
+                    let q_max = match *bits {
+                        8 => 127.0f32,
+                        4 => 7.0,
+                        2 => 1.0,
+                        n => panic!("rlx-metal FakeQuantize: unsupported bits {n}"),
+                    };
+                    // EMA needs mutable running-scale state — keep HostOp.
+                    // FakeQuantizeBackward / LSQ also stay on HostOp (catch-all).
+                    if matches!(scale_mode, ScaleMode::EMA { .. }) {
+                        Thunk::HostOp {
+                            desc: rlx_cpu::rlx_host_op_desc!(graph, node, &off),
+                        }
+                    } else {
+                        // Mirror `rlx_cpu::thunk::ops::quant::quant_layout`.
+                        let (chan_dim, inner) = match *axis {
+                            None => (1usize, node.shape.num_elements().unwrap_or(0).max(1)),
+                            Some(d) => {
+                                let chan_dim = node.shape.dim(d).unwrap_static();
+                                let inner: usize = (d + 1..node.shape.rank())
+                                    .map(|i| node.shape.dim(i).unwrap_static())
+                                    .product::<usize>()
+                                    .max(1);
+                                (chan_dim, inner)
+                            }
+                        };
+                        let n = node.shape.num_elements().unwrap() as u32;
+                        let chan_dim = chan_dim as u32;
+                        let inner = inner as u32;
+                        match scale_mode {
+                            ScaleMode::Fixed => Thunk::FakeQuantizeFixed {
+                                src: off(node.inputs[0]),
+                                scale: off(node.inputs[1]),
+                                dst: off(node.id),
+                                n,
+                                chan_dim,
+                                inner,
+                                q_max,
+                            },
+                            ScaleMode::PerBatch => Thunk::FakeQuantizePerBatch {
+                                src: off(node.inputs[0]),
+                                dst: off(node.id),
+                                n,
+                                chan_dim,
+                                inner,
+                                q_max,
+                            },
+                            ScaleMode::EMA { .. } => unreachable!(),
+                        }
+                    }
+                }
+
                 Op::ElementwiseRegion {
                     chain,
                     num_inputs,
@@ -2558,6 +2811,88 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::LayerNormBackwardInput { eps, .. } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal LayerNormBackwardInput: F32 only");
+                    }
+                    let h = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                    let total = node.shape.num_elements().unwrap();
+                    Thunk::LayerNormBackwardInput {
+                        x: off(node.inputs[0]),
+                        gamma: off(node.inputs[1]),
+                        dy: off(node.inputs[2]),
+                        dx: off(node.id),
+                        rows: (total / h) as u32,
+                        h: h as u32,
+                        eps: *eps,
+                    }
+                }
+
+                Op::LayerNormBackwardGamma { eps, .. } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal LayerNormBackwardGamma: F32 only");
+                    }
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let h = x_shape.dim(x_shape.rank() - 1).unwrap_static();
+                    let x_total = x_shape.num_elements().unwrap();
+                    Thunk::LayerNormBackwardGamma {
+                        x: off(node.inputs[0]),
+                        dy: off(node.inputs[1]),
+                        dgamma: off(node.id),
+                        rows: (x_total / h) as u32,
+                        h: h as u32,
+                        eps: *eps,
+                    }
+                }
+
+                Op::GroupNormBackwardInput { num_groups, eps }
+                | Op::GroupNormBackwardGamma { num_groups, eps }
+                | Op::GroupNormBackwardBeta { num_groups, eps } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal GroupNormBackward: F32 only");
+                    }
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let n = x_shape.dim(0).unwrap_static() as u32;
+                    let c = x_shape.dim(1).unwrap_static() as u32;
+                    let h = x_shape.dim(2).unwrap_static() as u32;
+                    let w = x_shape.dim(3).unwrap_static() as u32;
+                    match &node.op {
+                        Op::GroupNormBackwardInput { .. } => Thunk::GroupNormBackwardInput {
+                            x: off(node.inputs[0]),
+                            gamma: off(node.inputs[1]),
+                            beta: off(node.inputs[2]),
+                            dy: off(node.inputs[3]),
+                            dx: off(node.id),
+                            n,
+                            c,
+                            h,
+                            w,
+                            num_groups: *num_groups as u32,
+                            eps: *eps,
+                        },
+                        Op::GroupNormBackwardGamma { .. } => Thunk::GroupNormBackwardGamma {
+                            x: off(node.inputs[0]),
+                            dy: off(node.inputs[1]),
+                            dgamma: off(node.id),
+                            n,
+                            c,
+                            h,
+                            w,
+                            num_groups: *num_groups as u32,
+                            eps: *eps,
+                        },
+                        Op::GroupNormBackwardBeta { .. } => Thunk::GroupNormBackwardBeta {
+                            dy: off(node.inputs[1]),
+                            dbeta: off(node.id),
+                            n,
+                            c,
+                            h,
+                            w,
+                        },
+                        _ => unreachable!(),
+                    }
+                }
+
                 Op::RopeBackward { head_dim, n_rot } => {
                     if node.shape.dtype() != rlx_ir::DType::F32 {
                         panic!("rlx-metal RopeBackward: F32 only");
@@ -2857,14 +3192,14 @@ impl ThunkSchedule {
                     }
                 }
 
-                other => panic!(
-                    "rlx-metal: Op::{:?} (kind {:?}) not yet implemented on Metal. \
-                     Either pin this graph to a backend that supports it (Device::Cpu, \
-                     Device::Mlx) or add a Thunk variant for it. Silently emitting Nop \
-                     in the past caused runtime corruption — make the gap explicit.",
-                    other.kind(),
-                    other.kind()
-                ),
+                // Remaining claimed ops (GroupNorm bwd, FakeQuantize EMA /
+                // Backward / LSQ, DenseSolve, CustomFn, …): sync + CPU one-op
+                // eval against the unified-memory arena. FusedConvBiasAct /
+                // PartitionedConv / FusedTransformerLayer are expanded earlier
+                // by `lower_cpu_nop_fused_for_metal` (CPU would Nop them).
+                _other => Thunk::HostOp {
+                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, &off),
+                },
             };
             thunks.push(t);
         }

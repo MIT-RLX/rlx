@@ -205,7 +205,9 @@ pub(crate) fn decode_moe_ep_attrs(attrs: &[u8]) -> Result<MoeEpConfig, String> {
         }
         let mut placement = Vec::with_capacity(num_experts as usize);
         for i in 0..num_experts as usize {
-            placement.push(u32::from_le_bytes(rest[i * 4..i * 4 + 4].try_into().unwrap()));
+            placement.push(u32::from_le_bytes(
+                rest[i * 4..i * 4 + 4].try_into().unwrap(),
+            ));
         }
         cfg = cfg.with_placement(placement);
     }
@@ -233,11 +235,7 @@ pub(crate) fn decode_moe_ep_attrs(attrs: &[u8]) -> Result<MoeEpConfig, String> {
 // ── op extensions + CPU kernels ───────────────────────────────────
 
 fn static_dims(shape: &Shape) -> Vec<usize> {
-    shape
-        .dims()
-        .iter()
-        .map(|d| d.unwrap_static())
-        .collect()
+    shape.dims().iter().map(|d| d.unwrap_static()).collect()
 }
 
 struct MoeDispatchExt;
@@ -445,7 +443,11 @@ impl CpuKernel for MoeCombineCpu {
             return Err(format!("moe_combine: gate len {} != {m}", gate.len()));
         }
         if out.len() != m * h {
-            return Err(format!("moe_combine: output len {} != {}", out.len(), m * h));
+            return Err(format!(
+                "moe_combine: output len {} != {}",
+                out.len(),
+                m * h
+            ));
         }
 
         // Return payload: token[H] | src_row  (presence ⇒ valid).
@@ -916,8 +918,7 @@ mod tests {
                     register_ep_placement(gid, placement.clone());
 
                     let cfg = MoeEpConfig::new(gid, world, rank, e as u32, h as u32, m as u32);
-                    let w_local =
-                        shard_expert_weights(&expert_w, e, h, h, &placement, rank);
+                    let w_local = shard_expert_weights(&expert_w, e, h, h, &placement, rank);
                     assert_eq!(w_local.len(), 2 * h * h); // 2 experts per rank
 
                     let mut g = Graph::new("eplb_ep");
@@ -1146,17 +1147,10 @@ mod tests {
                     let gid = gid_base + rank as u64;
                     register_group(gid, group.clone());
 
-                    let old_w =
-                        shard_expert_weights(&expert_w, e, h, h, &old_placement, rank);
-                    let new_w = migrate_to_placement(
-                        &group,
-                        &old_placement,
-                        &old_w,
-                        &new_placement,
-                        h,
-                        h,
-                    )
-                    .unwrap();
+                    let old_w = shard_expert_weights(&expert_w, e, h, h, &old_placement, rank);
+                    let new_w =
+                        migrate_to_placement(&group, &old_placement, &old_w, &new_placement, h, h)
+                            .unwrap();
                     register_ep_placement(gid, new_placement.clone());
 
                     let cfg = MoeEpConfig::new(gid, world, rank, e as u32, h as u32, m as u32);

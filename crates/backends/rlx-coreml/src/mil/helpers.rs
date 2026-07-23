@@ -2272,8 +2272,16 @@ mod tests {
         assert_eq!(mil_cast_dtype(DType::Bool).unwrap(), "bool");
         // Demotions / widenings for types CoreML has no storage for.
         assert_eq!(mil_cast_dtype(DType::F64).unwrap(), "fp32", "no f64 → fp32");
-        assert_eq!(mil_cast_dtype(DType::BF16).unwrap(), "fp16", "no bf16 → fp16");
-        assert_eq!(mil_cast_dtype(DType::I16).unwrap(), "int32", "no int16 → int32");
+        assert_eq!(
+            mil_cast_dtype(DType::BF16).unwrap(),
+            "fp16",
+            "no bf16 → fp16"
+        );
+        assert_eq!(
+            mil_cast_dtype(DType::I16).unwrap(),
+            "int32",
+            "no int16 → int32"
+        );
     }
 
     /// `mil_data_type` (the output tensor type) demotes the same set the cast

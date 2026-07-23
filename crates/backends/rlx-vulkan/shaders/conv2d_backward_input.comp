@@ -1,0 +1,63 @@
+#version 450
+// Conv2d backward-input (dx) NCHW. Weight [Cout, Cin/groups, kH, kW].
+// One invocation per dx element; gathers over covering (ho,wo,co).
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint nn; uint cin; uint cout;
+    uint hh; uint ww;
+    uint oh; uint ow;
+    uint kh; uint kw;
+    uint sh; uint sw; uint ph; uint pw; uint dh; uint dw;
+    uint groups;
+    uint dy_off; uint w_off; uint dx_off;
+} pc;
+
+void main() {
+    uint total = pc.nn * pc.cin * pc.hh * pc.ww;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= total) { return; }
+    uint iw = i % pc.ww;
+    uint q1 = i / pc.ww;
+    uint ih = q1 % pc.hh;
+    uint q2 = q1 / pc.hh;
+    uint ci = q2 % pc.cin;
+    uint n = q2 / pc.cin;
+
+    uint cin_pg = pc.cin / pc.groups;
+    uint cout_pg = pc.cout / pc.groups;
+    uint g = ci / cin_pg;
+    uint ci_off = ci - g * cin_pg;
+    uint co_start = g * cout_pg;
+
+    // Compensated f32+f32 sum (matches CUDA double-single).
+    float hi = 0.0;
+    float lo = 0.0;
+    for (uint ki = 0u; ki < pc.kh; ki++) {
+        int num_h = int(ih + pc.ph) - int(ki * pc.dh);
+        if (num_h < 0 || uint(num_h) % pc.sh != 0u) { continue; }
+        uint ho = uint(num_h) / pc.sh;
+        if (ho >= pc.oh) { continue; }
+        for (uint kj = 0u; kj < pc.kw; kj++) {
+            int num_w = int(iw + pc.pw) - int(kj * pc.dw);
+            if (num_w < 0 || uint(num_w) % pc.sw != 0u) { continue; }
+            uint wo = uint(num_w) / pc.sw;
+            if (wo >= pc.ow) { continue; }
+            for (uint co_off = 0u; co_off < cout_pg; co_off++) {
+                uint co = co_start + co_off;
+                float dyv = arena_load(pc.dy_off + ((n * pc.cout + co) * pc.oh + ho) * pc.ow + wo);
+                float wv = arena_load(pc.w_off + (((co * cin_pg + ci_off) * pc.kh + ki) * pc.kw + kj));
+                float p = dyv * wv;
+                float ep = fma(dyv, wv, -p);
+                float s = hi + p;
+                float bb = s - hi;
+                float es = (hi - (s - bb)) + (p - bb);
+                lo += ep + es;
+                float t = s + lo;
+                lo -= t - s;
+                hi = t;
+            }
+        }
+    }
+    arena_store(pc.dx_off + i, hi);
+}

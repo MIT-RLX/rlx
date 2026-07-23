@@ -1,0 +1,27 @@
+#version 450
+// Gather-axis backward: scatter-add dy into the zeroed table (one outer/row).
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform PC {
+    uint outer;
+    uint axis_dim;
+    uint num_idx;
+    uint trailing;
+    uint dy_off;
+    uint idx_off;
+    uint dst_off;
+} pc;
+
+void main() {
+    uint o = gl_GlobalInvocationID.x;
+    if (o >= pc.outer) { return; }
+    for (uint k = 0u; k < pc.num_idx; k++) {
+        uint row = uint(arena_load(pc.idx_off + k));
+        if (row >= pc.axis_dim) { continue; }
+        for (uint j = 0u; j < pc.trailing; j++) {
+            float v = arena_load(pc.dy_off + (o * pc.num_idx + k) * pc.trailing + j);
+            uint dst = pc.dst_off + (o * pc.axis_dim + row) * pc.trailing + j;
+            arena_store(dst, arena_load(dst) + v);
+        }
+    }
+}

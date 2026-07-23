@@ -52,6 +52,9 @@ pub fn unfuse(graph: Graph) -> Graph {
             Op::FusedSwiGLU { cast_to: _, .. } => {
                 expand_swiglu(&mut out, &graph, node.inputs[0], &new_inputs, &node.shape)
             }
+            Op::FusedResidualRmsNorm { has_bias, eps } => {
+                expand_residual_rms_norm(&mut out, &new_inputs, &node.shape, *has_bias, *eps)
+            }
             Op::LoraMatMul { scale } => expand_lora(
                 &mut out,
                 &graph,
@@ -192,13 +195,13 @@ fn needs_broadcast_prologue(graph: &Graph, node: &rlx_ir::Node) -> bool {
 }
 
 fn should_unfuse(op: &Op) -> bool {
-    // FusedMatMulBiasAct and FusedResidualLN are now lowered natively
-    // — the matmul kernel folds bias + activation into its epilogue,
-    // and `fused_residual_ln.wgsl` does (Add[+bias] + LayerNorm) in
-    // one pass.
+    // FusedMatMulBiasAct and FusedResidualLN stay native HLO.
+    // FusedResidualRmsNorm expands here (Add[+bias]+RmsNorm) — same
+    // primitives the walker already emits.
     matches!(
         op,
         Op::FusedSwiGLU { .. }
+            | Op::FusedResidualRmsNorm { .. }
             | Op::LoraMatMul { .. }
             | Op::FusedAttentionBlock { .. }
             | Op::FusedTransformerLayer { .. }
@@ -251,6 +254,29 @@ fn expand_residual_ln(
     };
     let (gi, bi) = if has_bias { (3, 4) } else { (2, 3) };
     out.layer_norm(summed, inputs[gi], inputs[bi], -1, eps, shape.clone())
+}
+
+fn expand_residual_rms_norm(
+    out: &mut Graph,
+    inputs: &[NodeId],
+    shape: &Shape,
+    has_bias: bool,
+    eps: f32,
+) -> NodeId {
+    // inputs: [x, residual, [bias], gamma, beta]
+    let summed = out.binary(BinaryOp::Add, inputs[0], inputs[1], shape.clone());
+    let summed = if has_bias {
+        let bias_b = broadcast_to(out, inputs[2], shape);
+        out.binary(BinaryOp::Add, summed, bias_b, shape.clone())
+    } else {
+        summed
+    };
+    let (gi, bi) = if has_bias { (3, 4) } else { (2, 3) };
+    out.add_node(
+        Op::RmsNorm { axis: -1, eps },
+        vec![summed, inputs[gi], inputs[bi]],
+        shape.clone(),
+    )
 }
 
 fn expand_swiglu(

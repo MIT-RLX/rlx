@@ -31,15 +31,13 @@ pub use crypto::{
     DEFAULT_M_KIB, DEFAULT_P_COST, DEFAULT_T_COST, RLX_ENC_MAGIC, RLX_ENC_VERSION, decrypt_bytes,
     encrypt_bytes, encrypt_bytes_with_params, is_encrypted,
 };
-#[cfg(feature = "encrypt")]
-pub use format::{read_rlx_with_password, write_rlx_encrypted};
 #[cfg(feature = "mmap")]
 pub use format::read_rlx_mmap;
 pub use format::{RlxFile, RlxIo, RlxMeta, RlxWeight, read_rlx, write_rlx};
+#[cfg(feature = "encrypt")]
+pub use format::{read_rlx_with_password, write_rlx_encrypted};
 pub use load::{LoadedGraph, load_graph};
-pub use memory::{
-    MemoryMode, MemoryStats, dedupe_identical_constants, ensure_runtime_ready,
-};
+pub use memory::{MemoryMode, MemoryStats, dedupe_identical_constants, ensure_runtime_ready};
 pub use optimize::{OptimizeStats, WeightEncoding, WeightRewrite, is_ternary_f32};
 pub use profile::BakeProfile;
 pub use weights::load_safetensors_f32;
@@ -168,13 +166,8 @@ pub fn bake(
 
     let out = specialize_named(graph, bindings);
 
-    let (mut out, mut rewrites, opt_stats) = optimize_weights(
-        out,
-        opts.skip_zero,
-        opts.ternary,
-        opts.quant,
-        opts.unfold,
-    );
+    let (mut out, mut rewrites, opt_stats) =
+        optimize_weights(out, opts.skip_zero, opts.ternary, opts.quant, opts.unfold);
 
     // Fold / simplify passes often rebuild nodes without copying `.name`.
     // Snapshot named Constants so we can re-stamp after cleanup.
@@ -499,10 +492,12 @@ mod tests {
             "merged *.rlx must include weights"
         );
         assert!(file.weights.iter().any(|w| w.name == "w"));
-        assert!(!file
-            .graph
-            .nodes()
-            .iter()
-            .any(|n| matches!(&n.op, Op::Param { name } if name == "w")));
+        assert!(
+            !file
+                .graph
+                .nodes()
+                .iter()
+                .any(|n| matches!(&n.op, Op::Param { name } if name == "w"))
+        );
     }
 }

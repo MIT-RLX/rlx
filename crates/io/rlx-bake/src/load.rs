@@ -74,10 +74,7 @@ pub fn load_graph(path: &Path) -> Result<LoadedGraph> {
 fn load_bundle(dir: &Path) -> Result<LoadedGraph> {
     let hir_path = dir.join("model.hir.json");
     if !hir_path.is_file() {
-        bail!(
-            "bundle dir {} missing model.hir.json",
-            dir.display()
-        );
+        bail!("bundle dir {} missing model.hir.json", dir.display());
     }
     let text = std::fs::read_to_string(&hir_path)
         .with_context(|| format!("reading {}", hir_path.display()))?;

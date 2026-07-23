@@ -1,0 +1,60 @@
+#version 450
+// LayerNorm backward w.r.t. input over the last axis (one invocation per row).
+// Recomputes mean/inv_std from x. Matches wgpu / CPU thunk semantics.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint outer;
+    uint inner;
+    uint x_off;
+    uint gamma_off;
+    uint dy_off;
+    uint out_off;
+    float eps;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.outer || pc.inner == 0u) { return; }
+    uint h = pc.inner;
+    uint x_base = pc.x_off + row * h;
+    uint dy_base = pc.dy_off + row * h;
+    uint out_base = pc.out_off + row * h;
+    float n_inv = 1.0 / float(h);
+
+    float mean = 0.0;
+    for (uint i = 0u; i < h; i++) {
+        mean += arena_load(x_base + i);
+    }
+    mean *= n_inv;
+
+    float var_ = 0.0;
+    for (uint i = 0u; i < h; i++) {
+        float d = arena_load(x_base + i) - mean;
+        var_ += d * d;
+    }
+    float inv_std = inversesqrt(var_ * n_inv + pc.eps);
+
+    float s_sy = 0.0;
+    float s_sxh = 0.0;
+    for (uint i = 0u; i < h; i++) {
+        float xv = arena_load(x_base + i);
+        float dyv = arena_load(dy_base + i);
+        float gv = arena_load(pc.gamma_off + i);
+        float xh = (xv - mean) * inv_std;
+        float sy = dyv * gv;
+        s_sy += sy;
+        s_sxh += sy * xh;
+    }
+    float m_sy = s_sy * n_inv;
+    float m_sxh = s_sxh * n_inv;
+
+    for (uint i = 0u; i < h; i++) {
+        float xv = arena_load(x_base + i);
+        float dyv = arena_load(dy_base + i);
+        float gv = arena_load(pc.gamma_off + i);
+        float xh = (xv - mean) * inv_std;
+        float sy = dyv * gv;
+        arena_store(out_base + i, inv_std * (sy - m_sy - xh * m_sxh));
+    }
+}

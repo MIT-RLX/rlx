@@ -152,6 +152,7 @@ pub(crate) fn evaluate(
                     Activation::Cos => v.cos(),
                     Activation::Tan => v.tan(),
                     Activation::Atan => v.atan(),
+                    Activation::Recip => 1.0 / v,
                 };
             }
             Some(out)

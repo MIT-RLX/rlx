@@ -1,0 +1,64 @@
+#version 450
+// 3-D NCDHW transposed conv (output-centric gather).
+// Weight: [c_in, c_out/groups, kd, kh, kw] (PyTorch ConvTranspose3d).
+// Port of wgpu conv_transpose3d.wgsl.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint nn; uint cin; uint cout;
+    uint d; uint h; uint w;
+    uint d_out; uint h_out; uint w_out;
+    uint kd; uint kh; uint kw;
+    uint sd; uint sh; uint sw;
+    uint pd; uint ph; uint pw;
+    uint dd; uint dh; uint dw;
+    uint groups;
+    uint in_off; uint w_off; uint out_off;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = pc.nn * pc.cout * pc.d_out * pc.h_out * pc.w_out;
+    if (gid >= total) { return; }
+    uint wo = gid % pc.w_out;
+    uint q1 = gid / pc.w_out;
+    uint ho = q1 % pc.h_out;
+    uint q2 = q1 / pc.h_out;
+    uint do_ = q2 % pc.d_out;
+    uint q3 = q2 / pc.d_out;
+    uint co = q3 % pc.cout;
+    uint n = q3 / pc.cout;
+
+    uint cin_pg = pc.cin / pc.groups;
+    uint cout_pg = pc.cout / pc.groups;
+    uint g = co / cout_pg;
+    uint oc_off = co % cout_pg;
+    uint ci_start = g * cin_pg;
+
+    float acc = 0.0;
+    for (uint kz = 0u; kz < pc.kd; kz++) {
+        int num_d = int(do_) + int(pc.pd) - int(kz * pc.dd);
+        if (num_d < 0 || (num_d % int(pc.sd)) != 0) { continue; }
+        uint id = uint(num_d / int(pc.sd));
+        if (id >= pc.d) { continue; }
+        for (uint ky = 0u; ky < pc.kh; ky++) {
+            int num_h = int(ho) + int(pc.ph) - int(ky * pc.dh);
+            if (num_h < 0 || (num_h % int(pc.sh)) != 0) { continue; }
+            uint ih = uint(num_h / int(pc.sh));
+            if (ih >= pc.h) { continue; }
+            for (uint kx = 0u; kx < pc.kw; kx++) {
+                int num_w = int(wo) + int(pc.pw) - int(kx * pc.dw);
+                if (num_w < 0 || (num_w % int(pc.sw)) != 0) { continue; }
+                uint iw = uint(num_w / int(pc.sw));
+                if (iw >= pc.w) { continue; }
+                for (uint ci_off = 0u; ci_off < cin_pg; ci_off++) {
+                    uint ci = ci_start + ci_off;
+                    uint in_idx = (((n * pc.cin + ci) * pc.d + id) * pc.h + ih) * pc.w + iw;
+                    uint w_idx = (((ci * cout_pg + oc_off) * pc.kd + kz) * pc.kh + ky) * pc.kw + kx;
+                    acc += arena_load(pc.in_off + in_idx) * arena_load(pc.w_off + w_idx);
+                }
+            }
+        }
+    }
+    arena_store(pc.out_off + gid, acc);
+}

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
-use crate::host_exec::is_host_op;
+use crate::host_exec::is_host_node;
 use crate::{CoremlError, Result};
 
 /// One MIL subgraph plus synthetic inputs wired from host tensors.
@@ -86,7 +86,7 @@ fn build_segments(graph: &Graph) -> Result<Vec<Segment>> {
     let mut host_chain: Vec<NodeId> = Vec::new();
 
     for id in order {
-        if is_host_op(&graph.node(id).op) {
+        if is_host_node(graph, id) {
             flush_mil(graph, &mut segments, &mut mil_nodes)?;
             host_chain.push(id);
         } else {
@@ -249,13 +249,27 @@ fn mil_segment_outputs(graph: &Graph, mil_set: &HashSet<NodeId>) -> Vec<NodeId> 
     // `env`. (Previously an early return after collecting graph outputs dropped
     // the cross-segment-consumed nodes, so a later segment's `host_v{id}` input
     // had no producer in `env`.)
+    //
+    // Skip Input/Param/Constant leaves: `seed_leaf_env` already places them in
+    // `env`, and exporting an Input as a MIL output reuses its feature name
+    // (e.g. `speed`) for both the model input and output — CoreML then fails
+    // load with "Error in declaring input <name> with error -1".
+    let is_leaf = |id: NodeId| {
+        matches!(
+            graph.node(id).op,
+            Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+        )
+    };
     let mut outs: Vec<NodeId> = graph
         .outputs
         .iter()
-        .filter(|o| mil_set.contains(o))
+        .filter(|o| mil_set.contains(o) && !is_leaf(**o))
         .copied()
         .collect();
     for &id in mil_set {
+        if is_leaf(id) {
+            continue;
+        }
         for user in graph.users(id) {
             if !mil_set.contains(&user) {
                 outs.push(id);
@@ -266,4 +280,71 @@ fn mil_segment_outputs(graph: &Graph, mil_set: &HashSet<NodeId>) -> Vec<NodeId> 
     outs.sort_by_key(|id| id.0);
     outs.dedup();
     outs
+}
+
+/// Expand fused ops claimed for coverage that CPU HostOp would Nop:
+/// `FusedConvBiasAct`, `PartitionedConv`, `FusedTransformerLayer`.
+pub fn lower_cpu_nop_fused_for_coreml(g: Graph) -> Graph {
+    let needs = g.nodes().iter().any(|n| {
+        matches!(
+            n.op,
+            Op::FusedConvBiasAct { .. }
+                | Op::PartitionedConv { .. }
+                | Op::FusedTransformerLayer { .. }
+        )
+    });
+    if !needs {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
+    for node in &nodes {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_id = match &node.op {
+            Op::FusedConvBiasAct { .. }
+            | Op::PartitionedConv { .. }
+            | Op::FusedTransformerLayer { .. } => {
+                inline_unfused_fused_op(&mut out, &node.op, &new_inputs, &node.shape)
+            }
+            _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+fn inline_unfused_fused_op(out: &mut Graph, op: &Op, inputs: &[NodeId], shape: &Shape) -> NodeId {
+    let mut mini = Graph::new("coreml_unfuse");
+    let mut mini_ins = Vec::with_capacity(inputs.len());
+    for (i, &src) in inputs.iter().enumerate() {
+        let sh = out.node(src).shape.clone();
+        mini_ins.push(mini.append_node(
+            Op::Input {
+                name: format!("in{i}"),
+            },
+            vec![],
+            sh,
+            None,
+        ));
+    }
+    let out_id = mini.append_node(op.clone(), mini_ins, shape.clone(), None);
+    mini.set_outputs(vec![out_id]);
+    let expanded = rlx_opt::unfuse_fused_for_autodiff(mini);
+    let mut map: HashMap<NodeId, NodeId> = HashMap::new();
+    for n in expanded.nodes() {
+        if let Op::Input { name } = &n.op {
+            if let Some(rest) = name.strip_prefix("in") {
+                if let Ok(i) = rest.parse::<usize>() {
+                    map.insert(n.id, inputs[i]);
+                    continue;
+                }
+            }
+        }
+        let mapped_ins: Vec<NodeId> = n.inputs.iter().map(|i| map[i]).collect();
+        let id = out.add_node(n.op.clone(), mapped_ins, n.shape.clone());
+        map.insert(n.id, id);
+    }
+    map[&expanded.outputs[0]]
 }

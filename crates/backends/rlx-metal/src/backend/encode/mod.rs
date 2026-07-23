@@ -1950,6 +1950,132 @@ impl MetalExecutable {
                         *groups,
                     );
                 }
+                Thunk::Conv3d {
+                    src,
+                    weight,
+                    dst,
+                    n,
+                    c_in,
+                    d,
+                    h,
+                    w_in,
+                    c_out,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                    dd,
+                    dh,
+                    dw,
+                    groups,
+                    dt: _,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_conv3d(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *weight,
+                        *dst,
+                        n,
+                        *c_in,
+                        *d,
+                        *h,
+                        *w_in,
+                        *c_out,
+                        *d_out,
+                        *h_out,
+                        *w_out,
+                        *kd,
+                        *kh,
+                        *kw,
+                        *sd,
+                        *sh,
+                        *sw,
+                        *pd,
+                        *ph,
+                        *pw,
+                        *dd,
+                        *dh,
+                        *dw,
+                        *groups,
+                    );
+                }
+                Thunk::ConvTranspose3d {
+                    src,
+                    weight,
+                    dst,
+                    n,
+                    c_in,
+                    d,
+                    h,
+                    w_in,
+                    c_out,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                    dd,
+                    dh,
+                    dw,
+                    groups,
+                    dt: _,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_conv_transpose3d(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *weight,
+                        *dst,
+                        n,
+                        *c_in,
+                        *d,
+                        *h,
+                        *w_in,
+                        *c_out,
+                        *d_out,
+                        *h_out,
+                        *w_out,
+                        *kd,
+                        *kh,
+                        *kw,
+                        *sd,
+                        *sh,
+                        *sw,
+                        *pd,
+                        *ph,
+                        *pw,
+                        *dd,
+                        *dh,
+                        *dw,
+                        *groups,
+                    );
+                }
                 Thunk::ResizeNearest2x {
                     src,
                     dst,
@@ -2994,6 +3120,144 @@ impl MetalExecutable {
                         self.rms_norm_bwd_scratch_off,
                     );
                 }
+                Thunk::LayerNormBackwardInput {
+                    x,
+                    gamma,
+                    dy,
+                    dx,
+                    rows,
+                    h,
+                    eps,
+                } => {
+                    let rows = scale(*rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_layer_norm_bwd_input(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *gamma,
+                        *dy,
+                        *dx,
+                        rows,
+                        *h,
+                        *eps,
+                    );
+                }
+                Thunk::LayerNormBackwardGamma {
+                    x,
+                    dy,
+                    dgamma,
+                    rows,
+                    h,
+                    eps,
+                } => {
+                    let rows = scale(*rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_layer_norm_bwd_gamma(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *dy,
+                        *dgamma,
+                        rows,
+                        *h,
+                        *eps,
+                        self.rms_norm_bwd_scratch_off,
+                    );
+                }
+                Thunk::GroupNormBackwardInput {
+                    x,
+                    gamma,
+                    beta: _,
+                    dy,
+                    dx,
+                    n,
+                    c,
+                    h,
+                    w,
+                    num_groups,
+                    eps,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_group_norm_bwd_input(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *gamma,
+                        *dy,
+                        *dx,
+                        n,
+                        *c,
+                        *h,
+                        *w,
+                        *num_groups,
+                        *eps,
+                    );
+                }
+                Thunk::GroupNormBackwardGamma {
+                    x,
+                    dy,
+                    dgamma,
+                    n,
+                    c,
+                    h,
+                    w,
+                    num_groups,
+                    eps,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_group_norm_bwd_gamma(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *dy,
+                        *dgamma,
+                        n,
+                        *c,
+                        *h,
+                        *w,
+                        *num_groups,
+                        *eps,
+                    );
+                }
+                Thunk::GroupNormBackwardBeta {
+                    dy,
+                    dbeta,
+                    n,
+                    c,
+                    h,
+                    w,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_group_norm_bwd_beta(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *dy,
+                        *dbeta,
+                        n,
+                        *c,
+                        *h,
+                        *w,
+                    );
+                }
                 Thunk::RopeBackward {
                     dy,
                     cos,
@@ -3775,6 +4039,123 @@ impl MetalExecutable {
                         continue;
                     }
                     encode_fma(e!(), k, &self.arena.buffer, *a, *b, *c, *dst, len);
+                }
+                Thunk::ReluBackward { x, dy, dx, len } => {
+                    let len = scale(*len);
+                    if len == 0 {
+                        continue;
+                    }
+                    encode_relu_backward(e!(), k, &self.arena.buffer, *x, *dy, *dx, len);
+                }
+                Thunk::ActivationBackward { x, dy, dx, len, op } => {
+                    let len = scale(*len);
+                    if len == 0 {
+                        continue;
+                    }
+                    encode_activation_backward(e!(), k, &self.arena.buffer, *x, *dy, *dx, len, *op);
+                }
+                Thunk::ComplexNormSq { src, dst, len } => {
+                    let len = scale(*len);
+                    if len == 0 {
+                        continue;
+                    }
+                    encode_complex_norm_sq(e!(), k, &self.arena.buffer, *src, *dst, len);
+                }
+                Thunk::ComplexNormSqBackward { z, g, dz, len } => {
+                    let len = scale(*len);
+                    if len == 0 {
+                        continue;
+                    }
+                    encode_complex_norm_sq_backward(e!(), k, &self.arena.buffer, *z, *g, *dz, len);
+                }
+                Thunk::ConjugateC64 { src, dst, len } => {
+                    let len = scale(*len);
+                    if len == 0 {
+                        continue;
+                    }
+                    encode_conjugate_c64(e!(), k, &self.arena.buffer, *src, *dst, len);
+                }
+                Thunk::FftButterflyStage {
+                    state,
+                    out,
+                    gate,
+                    rev,
+                    tw_re,
+                    tw_im,
+                    batch,
+                    n_fft,
+                    stage,
+                } => {
+                    let batch = scale(*batch);
+                    if batch == 0 || *n_fft == 0 {
+                        continue;
+                    }
+                    encode_fft_butterfly_stage(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *state,
+                        *out,
+                        *gate,
+                        *rev,
+                        *tw_re,
+                        *tw_im,
+                        batch,
+                        *n_fft,
+                        *stage,
+                    );
+                }
+                Thunk::FakeQuantizeFixed {
+                    src,
+                    scale: scale_off,
+                    dst,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max,
+                } => {
+                    let n = scale(*n);
+                    let inner = if *chan_dim <= 1 { n.max(1) } else { *inner };
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_fake_quantize_fixed(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *scale_off,
+                        *dst,
+                        n,
+                        *chan_dim,
+                        inner,
+                        *q_max,
+                    );
+                }
+                Thunk::FakeQuantizePerBatch {
+                    src,
+                    dst,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max,
+                } => {
+                    let n = scale(*n);
+                    let inner = if *chan_dim <= 1 { n.max(1) } else { *inner };
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_fake_quantize_perbatch(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *dst,
+                        n,
+                        *chan_dim,
+                        inner,
+                        *q_max,
+                    );
                 }
                 Thunk::Reduce {
                     src,
@@ -4978,16 +5359,20 @@ impl MetalExecutable {
                     state_size,
                     f16,
                 } => {
-                    // Native MSL kernel supports f32 with n ≤ 128 (qwen35 uses 128).
-                    // GPU path is the default; opt out with RLX_METAL_GDN_CPU=1 or
-                    // RLX_METAL_GDN_HOST_FALLBACK=1. f16 tensors and state_size > 128
-                    // still take the CPU thunk regardless of the flag.
+                    // Native MSL GDN (one thread per head). Opt out with
+                    // RLX_METAL_GDN_HOST_FALLBACK=1 / RLX_METAL_GDN_CPU=1.
                     let force_host = rlx_ir::env::flag("RLX_METAL_GDN_HOST_FALLBACK")
                         || rlx_ir::env::flag("RLX_METAL_GDN_CPU");
                     let prefer_cpu_blas = false;
                     let use_carry = *state != 0;
+                    // Prefill (`!use_carry`): native MSL needs an ephemeral scratch
+                    // slot (zeroed inside the kernel). Host CPU GDN treats any
+                    // nonzero `state` as a live carry — reusing the shared scratch
+                    // would leak layer N's final SSM into layer N+1 prefill.
                     let state_byte = if use_carry {
                         *state
+                    } else if force_host || prefer_cpu_blas || *f16 || *state_size > 128 {
+                        0
                     } else {
                         self.gdn_scratch_off
                     };

@@ -222,3 +222,97 @@ fn cpu_gated_delta_net_resets_state_between_batches() {
         );
     }
 }
+
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_gated_delta_net_host_matches_cpu_n128() {
+    // Default Metal path uses CPU GDN unless RLX_METAL_GDN_NATIVE=1.
+    let (b, s, h, n) = (1, 11, 32, 128);
+    let nqkv = b * s * h * n;
+    let ngb = b * s * h;
+    let q_data: Vec<f32> = (0..nqkv).map(|i| 0.05 + 0.001 * ((i % n) as f32)).collect();
+    let k_data: Vec<f32> = (0..nqkv).map(|i| 0.10 + 0.001 * ((i % n) as f32)).collect();
+    let v_data: Vec<f32> = (0..nqkv).map(|i| 0.30 + 0.001 * ((i % n) as f32)).collect();
+    let g_data: Vec<f32> = (0..ngb).map(|i| -0.20 - 0.01 * ((i % h) as f32)).collect();
+    let beta_data: Vec<f32> = (0..ngb).map(|i| 0.40 + 0.02 * ((i % h) as f32)).collect();
+
+    let inputs: [(&str, &[f32]); 5] = [
+        ("q", &q_data),
+        ("k", &k_data),
+        ("v", &v_data),
+        ("g", &g_data),
+        ("beta", &beta_data),
+    ];
+
+    let mut cpu = Session::new(Device::Cpu).compile(build_gdn_graph(b, s, h, n));
+    let cpu_out = cpu.run(&inputs);
+
+    let mut metal = Session::new(Device::Metal).compile(build_gdn_graph(b, s, h, n));
+    let metal_out = metal.run(&inputs);
+
+    let c = &cpu_out[0];
+    let m = &metal_out[0];
+    assert_eq!(c.len(), m.len());
+    let mut maxdiff = 0f32;
+    for i in 0..c.len() {
+        maxdiff = maxdiff.max((c[i] - m[i]).abs());
+    }
+    assert!(
+        maxdiff < 1e-4,
+        "Metal host-fallback GDN diverges: maxdiff={maxdiff}"
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_gated_delta_net_native_matches_cpu_n128() {
+    // Default native path (one thread per head). Bounded inputs — a linear
+    // ramp over Fara-sized extents overflows f32 in the recurrence on every
+    // backend.
+    let (b, s, h, n) = (1, 11, 32, 128);
+    let nqkv = b * s * h * n;
+    let ngb = b * s * h;
+    let q_data: Vec<f32> = (0..nqkv).map(|i| 0.05 + 0.001 * ((i % n) as f32)).collect();
+    let k_data: Vec<f32> = (0..nqkv).map(|i| 0.10 + 0.001 * ((i % n) as f32)).collect();
+    let v_data: Vec<f32> = (0..nqkv).map(|i| 0.30 + 0.001 * ((i % n) as f32)).collect();
+    let g_data: Vec<f32> = (0..ngb).map(|i| -0.20 - 0.01 * ((i % h) as f32)).collect();
+    let beta_data: Vec<f32> = (0..ngb).map(|i| 0.40 + 0.02 * ((i % h) as f32)).collect();
+
+    let inputs: [(&str, &[f32]); 5] = [
+        ("q", &q_data),
+        ("k", &k_data),
+        ("v", &v_data),
+        ("g", &g_data),
+        ("beta", &beta_data),
+    ];
+
+    let mut cpu = Session::new(Device::Cpu).compile(build_gdn_graph(b, s, h, n));
+    let cpu_out = cpu.run(&inputs);
+
+    let mut metal = Session::new(Device::Metal).compile(build_gdn_graph(b, s, h, n));
+    let metal_out = metal.run(&inputs);
+
+    let c = &cpu_out[0];
+    let m = &metal_out[0];
+    assert_eq!(c.len(), m.len());
+    let mut maxdiff = 0f32;
+    let mut nan = 0usize;
+    let mut inf = 0usize;
+    for i in 0..c.len() {
+        maxdiff = maxdiff.max((c[i] - m[i]).abs());
+        if m[i].is_nan() {
+            nan += 1;
+        }
+        if m[i].is_infinite() {
+            inf += 1;
+        }
+    }
+    eprintln!("native metal GDN maxdiff={maxdiff} nan={nan} inf={inf}");
+    assert_eq!(nan, 0, "native metal GDN produced NaNs");
+    assert_eq!(inf, 0, "native metal GDN produced Infs");
+    assert!(
+        maxdiff < 1e-3,
+        "native metal GDN diverges: maxdiff={maxdiff}"
+    );
+}

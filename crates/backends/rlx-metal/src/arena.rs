@@ -114,6 +114,12 @@ impl Arena {
                     let src = std::slice::from_raw_parts(base as *const half::f16, len);
                     src.iter().map(|h| h.to_f32()).collect()
                 }
+                // Host f32-lane interface for interleaved complex storage:
+                // C64 = 2 lanes/elem, C128 = 4 lanes/elem.
+                DType::C64 | DType::C128 => {
+                    let lanes = len * (dt.size_bytes() / 4).max(1);
+                    std::slice::from_raw_parts(base as *const f32, lanes).to_vec()
+                }
                 _ => std::slice::from_raw_parts(base as *const f32, len).to_vec(),
             }
         }
@@ -125,20 +131,22 @@ impl Arena {
         let dt = self.dtype(id);
         let off = self.byte_offset(id);
         let cap = *self.element_counts.get(&id).unwrap_or(&0);
-        let len = data.len().min(cap);
         unsafe {
             let base = (self.buffer.contents() as *mut u8).add(off);
             match dt {
                 DType::F32 => {
+                    let len = data.len().min(cap);
                     std::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut f32, len);
                 }
                 DType::F16 => {
+                    let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base as *mut half::f16, len);
                     for (i, &v) in data.iter().take(len).enumerate() {
                         dst[i] = half::f16::from_f32(v);
                     }
                 }
                 DType::BF16 => {
+                    let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base as *mut half::bf16, len);
                     for (i, &v) in data.iter().take(len).enumerate() {
                         dst[i] = half::bf16::from_f32(v);
@@ -149,49 +157,65 @@ impl Arena {
                 // bit-pattern-reinterpreted the floats as ints, which
                 // produced stable garbled-token streams from gather/take.
                 DType::I32 => {
+                    let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base as *mut i32, len);
                     for (i, &v) in data.iter().take(len).enumerate() {
                         dst[i] = v as i32;
                     }
                 }
                 DType::I64 => {
+                    let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base as *mut i64, len);
                     for (i, &v) in data.iter().take(len).enumerate() {
                         dst[i] = v as i64;
                     }
                 }
                 DType::U32 => {
+                    let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base as *mut u32, len);
                     for (i, &v) in data.iter().take(len).enumerate() {
                         dst[i] = v as u32;
                     }
                 }
                 DType::I16 => {
+                    let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base as *mut i16, len);
                     for (i, &v) in data.iter().take(len).enumerate() {
                         dst[i] = v as i16;
                     }
                 }
                 DType::I8 => {
+                    let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base as *mut i8, len);
                     for (i, &v) in data.iter().take(len).enumerate() {
                         dst[i] = v as i8;
                     }
                 }
                 DType::U8 => {
+                    let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base, len);
                     for (i, &v) in data.iter().take(len).enumerate() {
                         dst[i] = v as u8;
                     }
                 }
                 DType::Bool => {
+                    let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base, len);
                     for (i, &v) in data.iter().take(len).enumerate() {
                         dst[i] = if v != 0.0 { 1 } else { 0 };
                     }
                 }
-                // F64 / Complex64 don't appear in user input feeds today.
-                _ => {
+                // Interleaved complex: host feeds f32 lanes (C64=2, C128=4
+                // per element). `cap` is the complex-element count.
+                DType::C64 | DType::C128 => {
+                    let lane_cap = cap * (dt.size_bytes() / 4).max(1);
+                    let len = data.len().min(lane_cap);
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut f32, len);
+                }
+                // F64: two f32 lanes per element when fed via the f32 host path.
+                DType::F64 => {
+                    let lane_cap = cap * 2;
+                    let len = data.len().min(lane_cap);
                     std::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut f32, len);
                 }
             }

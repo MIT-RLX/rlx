@@ -40,24 +40,29 @@ mod vision;
 
 pub use collective::{COLLECTIVE_OPS, run_collective_bytes, run_collective_f32};
 pub use custom::{
-    dtype_bytes_to_f32, f32_slots_to_dtype, has_host_kernel, run_custom_host_bytes,
-    run_custom_host_f32,
+    clear_custom_param_cache, dtype_bytes_to_f32, f32_slots_to_dtype, has_host_kernel,
+    run_custom_host_bytes, run_custom_host_f32,
 };
 pub use gguf::{
     gguf_scheme_id, run_dequant_grouped_matmul_gguf, run_dequant_matmul_gguf, scheme_from_id,
     upload_param_bytes,
 };
 pub use rng::{run_rng_normal, run_rng_uniform};
-pub use scan::{run_host_op, run_host_op_span, run_indexing, run_scan, run_scan_span};
+pub use scan::{
+    HostTensorCache, run_host_op, run_host_op_packed, run_host_op_packed_cached, run_host_op_span,
+    run_indexing, run_scan, run_scan_span,
+};
 pub use spd::{SpdInput, eval as eval_spd, is_spd_host, run_spd, run_spd_spans};
 pub use training_bwd::{
     run_conv2d_backward_input, run_conv2d_backward_weight, run_conv2d_forward,
     run_maxpool2d_backward,
 };
 pub use vision::{
-    run_conv_transpose2d_nchw, run_group_norm_nchw, run_gru, run_layer_norm2d_nchw,
-    run_resize_nearest_2x, run_rnn,
+    run_conv_transpose2d_nchw, run_conv_transpose3d_ncdhw, run_group_norm_nchw, run_gru,
+    run_layer_norm2d_nchw, run_mamba2, run_resize_nearest_2x, run_rnn,
 };
+
+pub mod vmath;
 
 /// Forward a host-fallback op through a backend-specific [`DeviceArena`] wrapper.
 ///

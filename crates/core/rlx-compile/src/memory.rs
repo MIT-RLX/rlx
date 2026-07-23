@@ -317,10 +317,7 @@ fn extend_node_chain_liveness_to_end(
 /// end. wgpu marks those steps `static_once` and skips them on later `run()`s;
 /// if their arena slots are reused by activations after the last consumer,
 /// run 2+ reads clobbered weights (empty Conformer-CTC transcripts, etc.).
-fn extend_static_weight_pack_liveness(
-    graph: &Graph,
-    ranges: &mut HashMap<NodeId, (usize, usize)>,
-) {
+fn extend_static_weight_pack_liveness(graph: &Graph, ranges: &mut HashMap<NodeId, (usize, usize)>) {
     let last_step = graph.len();
     let mut memo: HashMap<NodeId, bool> = HashMap::new();
     for node in graph.nodes() {

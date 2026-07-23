@@ -278,6 +278,132 @@ pub fn run_lstm(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn run_gru(
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<f32>,
+    arena_size_bytes: usize,
+    x_byte_off: usize,
+    w_ih_byte_off: usize,
+    w_hh_byte_off: usize,
+    b_ih_byte_off: usize,
+    b_hh_byte_off: usize,
+    h0_byte_off: usize,
+    dst_byte_off: usize,
+    batch: usize,
+    seq: usize,
+    input_size: usize,
+    hidden: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    carry: bool,
+) {
+    let mut arena = CudaArena {
+        stream,
+        buffer,
+        size_bytes: arena_size_bytes,
+    };
+    rlx_gpu_host::run_gru(
+        &mut arena,
+        x_byte_off,
+        w_ih_byte_off,
+        w_hh_byte_off,
+        b_ih_byte_off,
+        b_hh_byte_off,
+        h0_byte_off,
+        dst_byte_off,
+        batch,
+        seq,
+        input_size,
+        hidden,
+        num_layers,
+        bidirectional,
+        carry,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_rnn(
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<f32>,
+    arena_size_bytes: usize,
+    x_byte_off: usize,
+    w_ih_byte_off: usize,
+    w_hh_byte_off: usize,
+    bias_byte_off: usize,
+    h0_byte_off: usize,
+    dst_byte_off: usize,
+    batch: usize,
+    seq: usize,
+    input_size: usize,
+    hidden: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    carry: bool,
+    relu: bool,
+) {
+    let mut arena = CudaArena {
+        stream,
+        buffer,
+        size_bytes: arena_size_bytes,
+    };
+    rlx_gpu_host::run_rnn(
+        &mut arena,
+        x_byte_off,
+        w_ih_byte_off,
+        w_hh_byte_off,
+        bias_byte_off,
+        h0_byte_off,
+        dst_byte_off,
+        batch,
+        seq,
+        input_size,
+        hidden,
+        num_layers,
+        bidirectional,
+        carry,
+        relu,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_mamba2(
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<f32>,
+    arena_size_bytes: usize,
+    x_byte_off: usize,
+    dt_byte_off: usize,
+    a_byte_off: usize,
+    b_byte_off: usize,
+    c_byte_off: usize,
+    dst_byte_off: usize,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    state_size: usize,
+) {
+    let mut arena = CudaArena {
+        stream,
+        buffer,
+        size_bytes: arena_size_bytes,
+    };
+    rlx_gpu_host::run_mamba2(
+        &mut arena,
+        x_byte_off,
+        dt_byte_off,
+        a_byte_off,
+        b_byte_off,
+        c_byte_off,
+        dst_byte_off,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        state_size,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_ms_deform_attn(
     stream: &Arc<CudaStream>,
     buffer: &mut CudaSlice<f32>,

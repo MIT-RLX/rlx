@@ -61,14 +61,7 @@ fn main() -> Result<()> {
         weights.w1.len()
     );
     eprintln!("fine-tuning head with frozen ternary w1 …");
-    let (weights, acc2) = train_sgd_ex(
-        &images,
-        &labels,
-        n,
-        4,
-        0.1,
-        Some(weights),
-    );
+    let (weights, acc2) = train_sgd_ex(&images, &labels, n, 4, 0.1, Some(weights));
     eprintln!("post-ternary accuracy ≈ {:.1}%", acc2 * 100.0);
 
     let graph = build_infer_graph();
@@ -135,6 +128,8 @@ fn main() -> Result<()> {
         out.display(),
         std::fs::metadata(&out)?.len()
     );
-    eprintln!("next: cargo run -p rlx-bake --example mnist_run_encrypted --features encrypt,runtime");
+    eprintln!(
+        "next: cargo run -p rlx-bake --example mnist_run_encrypted --features encrypt,runtime"
+    );
     Ok(())
 }

@@ -1,0 +1,79 @@
+#version 450
+// RMSNorm backward. wrt: 0=dx (one inv/row), 1=dgamma / 2=dbeta (gid==0).
+// Port of wgpu rms_norm_backward.wgsl.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint outer;
+    uint inner;
+    uint x_off;
+    uint gamma_off;
+    uint beta_off;
+    uint dy_off;
+    uint out_off;
+    float eps;
+    uint wrt;
+} pc;
+
+void main() {
+    if (pc.inner == 0u) { return; }
+    float n_inv = 1.0 / float(pc.inner);
+
+    if (pc.wrt == 0u) {
+        uint row = gl_GlobalInvocationID.x;
+        if (row >= pc.outer) { return; }
+        uint x_base = pc.x_off + row * pc.inner;
+        uint dy_base = pc.dy_off + row * pc.inner;
+        uint out_base = pc.out_off + row * pc.inner;
+
+        float dot = 0.0;
+        float sumsq = 0.0;
+        for (uint i = 0u; i < pc.inner; i++) {
+            float xv = arena_load(x_base + i);
+            float gv = arena_load(pc.gamma_off + i);
+            float dyv = arena_load(dy_base + i);
+            dot += dyv * gv * xv;
+            sumsq += xv * xv;
+        }
+        dot *= n_inv;
+        float inv_r = inversesqrt(sumsq * n_inv + pc.eps);
+        float inv_r2 = inv_r * inv_r;
+        for (uint i = 0u; i < pc.inner; i++) {
+            float xv = arena_load(x_base + i);
+            float gv = arena_load(pc.gamma_off + i);
+            float dyv = arena_load(dy_base + i);
+            float term = gv * dyv - xv * dot * inv_r2;
+            arena_store(out_base + i, term * inv_r);
+        }
+        return;
+    }
+
+    if (gl_GlobalInvocationID.x != 0u) { return; }
+    for (uint i = 0u; i < pc.inner; i++) {
+        arena_store(pc.out_off + i, 0.0);
+    }
+    for (uint row = 0u; row < pc.outer; row++) {
+        uint x_base = pc.x_off + row * pc.inner;
+        uint dy_base = pc.dy_off + row * pc.inner;
+        float sumsq = 0.0;
+        for (uint i = 0u; i < pc.inner; i++) {
+            float xv = arena_load(x_base + i);
+            sumsq += xv * xv;
+        }
+        float inv_r = inversesqrt(sumsq * n_inv + pc.eps);
+        if (pc.wrt == 1u) {
+            for (uint i = 0u; i < pc.inner; i++) {
+                float xv = arena_load(x_base + i);
+                float dyv = arena_load(dy_base + i);
+                float acc = arena_load(pc.out_off + i);
+                arena_store(pc.out_off + i, acc + dyv * xv * inv_r);
+            }
+        } else {
+            for (uint i = 0u; i < pc.inner; i++) {
+                float dyv = arena_load(dy_base + i);
+                float acc = arena_load(pc.out_off + i);
+                arena_store(pc.out_off + i, acc + dyv);
+            }
+        }
+    }
+}

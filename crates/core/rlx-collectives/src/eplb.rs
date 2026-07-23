@@ -468,11 +468,11 @@ pub fn migrate_to_replica_map(
         if primary != rank {
             continue;
         }
-        let slab = inventory.get(&(e as u32)).ok_or_else(|| {
-            CollectiveError::TransportError {
+        let slab = inventory
+            .get(&(e as u32))
+            .ok_or_else(|| CollectiveError::TransportError {
                 reason: format!("migrate: primary rank {rank} missing expert {e}"),
-            }
-        })?;
+            })?;
         for &dest in &new_map.owners[e] {
             let d = dest as usize;
             buckets[d].extend_from_slice(slab);
@@ -705,7 +705,7 @@ mod tests {
             .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
             .collect();
         let addrs: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
-        // old: e0@0, e1@1  →  new: e0 on both ranks, e1 on rank1 only (3 slots? 
+        // old: e0@0, e1@1  →  new: e0 on both ranks, e1 on rank1 only (3 slots?
         // Use map: local_slots [[0], [0,1]] — rank0 needs e0 (already has), rank1 needs e0+e1
         let handles: Vec<_> = listeners
             .into_iter()

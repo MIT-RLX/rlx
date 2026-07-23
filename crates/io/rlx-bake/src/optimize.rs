@@ -202,7 +202,9 @@ fn pack_matmul_weight(
                 packed += 1;
                 let name = w_name.unwrap_or_else(|| format!("w{}", w_id.0));
                 let packed_id = out.add_node(
-                    Op::Constant { data: bytes.clone() },
+                    Op::Constant {
+                        data: bytes.clone(),
+                    },
                     vec![],
                     Shape::new(&[bytes.len()], DType::U8),
                 );
@@ -299,10 +301,7 @@ pub fn unfold_weights(graph: &Graph) -> Vec<WeightRewrite> {
             };
             let dims = static_dims(&wn.shape).unwrap_or_else(|| vec![data.len()]);
             let encoding = encoding_for_weight(&node.op, wn.shape.dtype());
-            let name = wn
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("w{}", wid.0));
+            let name = wn.name.clone().unwrap_or_else(|| format!("w{}", wid.0));
             out.push(WeightRewrite {
                 name,
                 shape: dims,

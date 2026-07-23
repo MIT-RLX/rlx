@@ -36,6 +36,8 @@
 pub mod supported_ops;
 pub use supported_ops::SUPPORTED_OPS;
 
+pub mod vmath;
+
 #[cfg(rlx_mlx_host)]
 pub(crate) mod ffi {
     pub use rlx_mlx_sys::ffi::*;

@@ -36,6 +36,7 @@
 //! - [`Op`]: the operation kind with parameters
 
 pub mod ad;
+pub mod apple_bnns;
 pub mod async_copy;
 pub mod attention_layout;
 pub mod audio;
@@ -111,8 +112,6 @@ pub fn env_catalog() -> &'static [EnvVarDoc] {
     public_catalog_docs()
 }
 
-/// Alias kept for existing `ENV_CATALOG` imports.
-pub use public_catalog_docs as ENV_CATALOG;
 pub use fft::{FftGpuPlan, FftMeta, FftNorm, fft_meta, fftn_axes_all, normalize_fftn_axes};
 pub use graph::{Graph, Node, NodeId};
 pub use hir::{
@@ -149,6 +148,8 @@ pub use ops::backward::{unpack_ada_layer_norm_backward, unpack_gated_residual_ba
 pub use ops::dsp::{FirMode, iir_impulse_response};
 pub use phase::{Phase, PhaseSchedule, derive_phases};
 pub use provenance::{NodeOrigin, node_label, stamp_pass_origins};
+/// Alias kept for existing `ENV_CATALOG` imports.
+pub use public_catalog_docs as ENV_CATALOG;
 pub use quant::{QuantMap, QuantScheme, ScaleLayout, ScaledFormat};
 pub use region_encode::{
     FK_BATCH_SINGLE_KERNEL_MAX, PrologueLaunchGrid, REGION_META_WORDS, REGION_PROLOGUE_NONE,
@@ -158,8 +159,12 @@ pub use region_encode::{
     fk_batch_use_single_launch,
 };
 pub use rng::{
-    Philox4x32, RngBackend, RngOptions, combine_seed, fill_normal_like, fill_uniform_like,
-    ort_engine_seed,
+    BNNS_AES_CTR_STATE_SIZE, BnnsAesCtr128, GUMBEL_UNIFORM_EPS, NativeBnnsGumbelMax, Philox4x32,
+    RngBackend, RngOptions, argmax_f32, bnns_categorical_from_uniform, bnns_entropy_seed,
+    bnns_generator_state_is_fresh, bnns_gumbel_from_uniform, bnns_gumbel01_from_bytes,
+    bnns_seed_from_generator_state, bnns_uniform_f32_from_bytes, bnns_uniform_f32_from_u32,
+    bnns_uniform_int_from_u32, combine_seed, fill_normal_like, fill_uniform_like,
+    gumbel_max_argmax_with, gumbel01_from_uniform, ort_engine_seed,
 };
 #[cfg(feature = "serialize")]
 pub use serialize::{

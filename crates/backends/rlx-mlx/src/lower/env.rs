@@ -32,6 +32,7 @@ use crate::ffi::{MlxMask, MlxReduce, MlxUnary};
 use crate::ops;
 
 use super::helpers::*;
+use super::host_eval::{host_eval_op_typed, is_mlx_typed_host_op};
 use super::subgraph::*;
 use super::*;
 
@@ -397,6 +398,7 @@ pub fn lower_with_env(
                     Activation::Cos => ops::unary(x, MlxUnary::Cos)?,
                     Activation::Tan => ops::unary(x, MlxUnary::Tan)?,
                     Activation::Atan => ops::unary(x, MlxUnary::Atan)?,
+                    Activation::Recip => ops::unary(x, MlxUnary::Reciprocal)?,
                 }
             }
             Op::Cast { to } => {
@@ -810,6 +812,7 @@ pub fn lower_with_env(
                     Some(Activation::Cos) => ops::unary(&biased, MlxUnary::Cos)?,
                     Some(Activation::Tan) => ops::unary(&biased, MlxUnary::Tan)?,
                     Some(Activation::Atan) => ops::unary(&biased, MlxUnary::Atan)?,
+                    Some(Activation::Recip) => ops::unary(&biased, MlxUnary::Reciprocal)?,
                 }
             }
             Op::FusedResidualLN { has_bias, eps } => {
@@ -1316,6 +1319,34 @@ pub fn lower_with_env(
                 let beta_b = ops::reshape(beta, &[1, c, 1, 1])?;
                 ops::add(&ops::mul(&x_hat, &gamma_b)?, &beta_b)?
             }
+            Op::BatchNormInference { eps } => {
+                // Feature dim is the last axis of `x` (IR + CPU thunk).
+                // Frozen running stats: y = γ · x̂ + β,
+                // x̂ = (x − μ) / √(σ² + ε).
+                let x = lookup(&env, node.inputs[0])?;
+                let gamma = lookup(&env, node.inputs[1])?;
+                let beta = lookup(&env, node.inputs[2])?;
+                let mean = lookup(&env, node.inputs[3])?;
+                let var = lookup(&env, node.inputs[4])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let dtype = node.shape.dtype();
+                if x_shape.is_empty() {
+                    return Err(MlxError(
+                        "BatchNormInference on MLX: scalar input unsupported".into(),
+                    ));
+                }
+                let c = *x_shape.last().unwrap();
+                let mut bshape = vec![1i32; x_shape.len()];
+                *bshape.last_mut().unwrap() = c;
+                let gamma_b = ops::reshape(&mlx_norm_scale_1d(gamma)?, &bshape)?;
+                let beta_b = ops::reshape(&mlx_norm_scale_1d(beta)?, &bshape)?;
+                let mean_b = ops::reshape(&mlx_norm_scale_1d(mean)?, &bshape)?;
+                let var_b = ops::reshape(&mlx_norm_scale_1d(var)?, &bshape)?;
+                let eps_arr = Array::from_f32_slice(&[*eps], &[1], dtype)?;
+                let inv = ops::unary(&ops::add(&var_b, &eps_arr)?, MlxUnary::Rsqrt)?;
+                let x_hat = ops::mul(&ops::sub(x, &mean_b)?, &inv)?;
+                ops::add(&ops::mul(&x_hat, &gamma_b)?, &beta_b)?
+            }
             Op::Im2Col {
                 kernel_size,
                 stride,
@@ -1379,10 +1410,216 @@ pub fn lower_with_env(
                 output_padding,
                 groups,
             } => {
-                // Host-eval Vocos/ISTFT CT via rlx-cpu (native MLX CT has been
-                // wrong for F5's k=1024/s=256 head; decompose→im2col OOMs).
-                let _ = (kernel_size, stride, padding, dilation, output_padding, groups);
-                host_eval_op_f32(graph, node, &env)?
+                // rlx NCHW + PyTorch weight [C_in, C_out/g, kH, kW].
+                // MLX expects NHWC and weight [C_out, kH, kW, C_in/g].
+                // Oversized ISTFT heads (k≈1024, huge out spatial) still
+                // host-eval — same im2col ceiling as forward Conv.
+                if mlx_conv_im2col_too_large(graph, node, kernel_size, *groups) {
+                    host_eval_op_f32(graph, node, &env)?
+                } else {
+                    let in_shape = node_input_shape(graph, node.inputs[0]);
+                    let w_shape = node_input_shape(graph, node.inputs[1]);
+                    if in_shape.len() != 4 || w_shape.len() != 4 {
+                        return Err(MlxError(
+                            "ConvTranspose2d on MLX: expects NCHW rank-4 input/weight"
+                                .into(),
+                        ));
+                    }
+                    let x = lookup(&env, node.inputs[0])?;
+                    let w = lookup(&env, node.inputs[1])?;
+                    let g = (*groups).max(1) as i32;
+                    let c_in = w_shape[0] as i32;
+                    let c_out_per_g = w_shape[1] as i32;
+                    let kh = w_shape[2] as i32;
+                    let kw = w_shape[3] as i32;
+                    let c_out = c_out_per_g * g;
+                    let c_in_per_g = c_in / g;
+                    let s = |i: usize| stride.get(i).copied().unwrap_or(1) as i32;
+                    let p = |i: usize| padding.get(i).copied().unwrap_or(0) as i32;
+                    let d = |i: usize| dilation.get(i).copied().unwrap_or(1) as i32;
+                    let op = |i: usize| output_padding.get(i).copied().unwrap_or(0) as i32;
+
+                    let x_nhwc = ops::transpose(x, &[0, 2, 3, 1])?;
+                    let w_mlx = if g == 1 {
+                        ops::transpose(w, &[1, 2, 3, 0])?
+                    } else {
+                        let split =
+                            ops::reshape(w, &[g, c_in_per_g, c_out_per_g, kh, kw])?;
+                        let perm = ops::transpose(&split, &[0, 2, 3, 4, 1])?;
+                        ops::reshape(&perm, &[c_out, kh, kw, c_in_per_g])?
+                    };
+                    let y_nhwc = ops::conv_transpose2d(
+                        &x_nhwc,
+                        &w_mlx,
+                        (s(0), s(1)),
+                        (p(0), p(1)),
+                        (d(0), d(1)),
+                        (op(0), op(1)),
+                        g,
+                    )?;
+                    ops::transpose(&y_nhwc, &[0, 3, 1, 2])?
+                }
+            }
+            Op::ConvTranspose3d {
+                stride,
+                padding,
+                dilation,
+                output_padding,
+                groups,
+            } => {
+                // rlx NCDHW + PyTorch weight [C_in, C_out/g, kD, kH, kW].
+                // MLX expects NDHWC and weight [C_out, kD, kH, kW, C_in]
+                // with groups=1 only. Oversized / grouped → host.
+                let w_shape = node_input_shape(graph, node.inputs[1]);
+                let kernel_size = if w_shape.len() >= 5 {
+                    [
+                        w_shape[2].max(0) as usize,
+                        w_shape[3].max(0) as usize,
+                        w_shape[4].max(0) as usize,
+                    ]
+                } else {
+                    [1, 1, 1]
+                };
+                if *groups > 1
+                    || mlx_conv_im2col_too_large(graph, node, &kernel_size, *groups)
+                {
+                    host_eval_op_f32(graph, node, &env)?
+                } else {
+                    let in_shape = node_input_shape(graph, node.inputs[0]);
+                    if in_shape.len() != 5 || w_shape.len() != 5 {
+                        return Err(MlxError(
+                            "ConvTranspose3d on MLX: expects NCDHW rank-5 input/weight"
+                                .into(),
+                        ));
+                    }
+                    let x = lookup(&env, node.inputs[0])?;
+                    let w = lookup(&env, node.inputs[1])?;
+                    // PyTorch → MLX: [C_in, C_out, kD, kH, kW] → [C_out, kD, kH, kW, C_in]
+                    let x_ndhwc = ops::transpose(x, &[0, 2, 3, 4, 1])?;
+                    let w_mlx = ops::transpose(w, &[1, 2, 3, 4, 0])?;
+                    let y_ndhwc = ops::conv_transpose3d(
+                        &x_ndhwc,
+                        &w_mlx,
+                        (stride[0] as i32, stride[1] as i32, stride[2] as i32),
+                        (padding[0] as i32, padding[1] as i32, padding[2] as i32),
+                        (dilation[0] as i32, dilation[1] as i32, dilation[2] as i32),
+                        (
+                            output_padding[0] as i32,
+                            output_padding[1] as i32,
+                            output_padding[2] as i32,
+                        ),
+                        (*groups).max(1) as i32,
+                    )?;
+                    ops::transpose(&y_ndhwc, &[0, 4, 1, 2, 3])?
+                }
+            }
+            Op::AxialRope2d {
+                end_x,
+                end_y,
+                head_dim,
+                num_heads,
+                theta,
+                repeat_factor,
+            } => {
+                // SAM2-style axial 2-D RoPE on `[B, seq, nh*hd]`.
+                // Matches `rlx_ir::ops::axial_rope2d::apply_axial_rope2d`:
+                // first half rotates with X freqs (interleaved pairs),
+                // second half with Y freqs. Cos/sin tables are tiny
+                // (seq × hd/4) and built as MLX constant arrays; the
+                // rotate itself is native reshape/mul/add on device.
+                let x = lookup(&env, node.inputs[0])?;
+                let in_shape = node_input_shape(graph, node.inputs[0]);
+                if in_shape.len() != 3 {
+                    return Err(MlxError(format!(
+                        "AxialRope2d: expected rank-3 [B,seq,hidden], got {}",
+                        in_shape.len()
+                    )));
+                }
+                let batch = in_shape[0];
+                let seq = in_shape[1] as usize;
+                let hidden = in_shape[2] as usize;
+                let hd = *head_dim;
+                let nh = *num_heads;
+                if hd == 0 || !hd.is_multiple_of(4) {
+                    return Err(MlxError(format!(
+                        "AxialRope2d: head_dim={hd} must be a positive multiple of 4"
+                    )));
+                }
+                if nh == 0 || hidden != nh * hd {
+                    return Err(MlxError(format!(
+                        "AxialRope2d: hidden={hidden} != num_heads={nh} * head_dim={hd}"
+                    )));
+                }
+                let half = hd / 2;
+                let q4 = hd / 4;
+                let spatial = end_x * end_y;
+                let repeat = (*repeat_factor).max(1);
+                if seq != spatial * repeat {
+                    return Err(MlxError(format!(
+                        "AxialRope2d: seq={seq} != end_x*end_y*repeat={spatial}*{repeat}"
+                    )));
+                }
+
+                // Build [seq, q4] cos/sin tables (host → device constants).
+                let mut freqs = vec![0f32; q4];
+                for i in 0..q4 {
+                    freqs[i] = 1.0 / theta.powf((4 * i) as f32 / hd as f32);
+                }
+                let mut cos_x = vec![0f32; seq * q4];
+                let mut sin_x = vec![0f32; seq * q4];
+                let mut cos_y = vec![0f32; seq * q4];
+                let mut sin_y = vec![0f32; seq * q4];
+                for tok in 0..seq {
+                    let pos = tok / repeat;
+                    let tx = (pos % end_x) as f32;
+                    let ty = (pos / end_x) as f32;
+                    for c in 0..q4 {
+                        let ax = tx * freqs[c];
+                        let ay = ty * freqs[c];
+                        cos_x[tok * q4 + c] = ax.cos();
+                        sin_x[tok * q4 + c] = ax.sin();
+                        cos_y[tok * q4 + c] = ay.cos();
+                        sin_y[tok * q4 + c] = ay.sin();
+                    }
+                }
+                let cos_x = Array::from_f32_slice(&cos_x, &[seq, q4], DType::F32)?;
+                let sin_x = Array::from_f32_slice(&sin_x, &[seq, q4], DType::F32)?;
+                let cos_y = Array::from_f32_slice(&cos_y, &[seq, q4], DType::F32)?;
+                let sin_y = Array::from_f32_slice(&sin_y, &[seq, q4], DType::F32)?;
+
+                let b = batch;
+                let s = seq as i32;
+                let nh_i = nh as i32;
+                let hd_i = hd as i32;
+                let half_i = half as i32;
+                let q4_i = q4 as i32;
+                let x4 = ops::reshape(x, &[b, s, nh_i, hd_i])?;
+                let x_lo = ops::slice(&x4, &[0, 0, 0, 0], &[b, s, nh_i, half_i])?;
+                let x_hi = ops::slice(&x4, &[0, 0, 0, half_i], &[b, s, nh_i, hd_i])?;
+
+                let rotate_interleaved =
+                    |half_x: &Array, cos: &Array, sin: &Array| -> Result<Array, MlxError> {
+                        // [B, S, NH, half] → [B, S, NH, q4, 2]
+                        let pairs = ops::reshape(half_x, &[b, s, nh_i, q4_i, 2])?;
+                        let x_even =
+                            ops::slice(&pairs, &[0, 0, 0, 0, 0], &[b, s, nh_i, q4_i, 1])?;
+                        let x_odd =
+                            ops::slice(&pairs, &[0, 0, 0, 0, 1], &[b, s, nh_i, q4_i, 2])?;
+                        // Broadcast [S, q4] → [1, S, 1, q4, 1]
+                        let cos_b = ops::reshape(cos, &[1, s, 1, q4_i, 1])?;
+                        let sin_b = ops::reshape(sin, &[1, s, 1, q4_i, 1])?;
+                        let y_even =
+                            ops::sub(&ops::mul(&x_even, &cos_b)?, &ops::mul(&x_odd, &sin_b)?)?;
+                        let y_odd =
+                            ops::add(&ops::mul(&x_odd, &cos_b)?, &ops::mul(&x_even, &sin_b)?)?;
+                        let y_pairs = ops::concat(&[&y_even, &y_odd], 4)?;
+                        ops::reshape(&y_pairs, &[b, s, nh_i, half_i])
+                    };
+
+                let y_lo = rotate_interleaved(&x_lo, &cos_x, &sin_x)?;
+                let y_hi = rotate_interleaved(&x_hi, &cos_y, &sin_y)?;
+                let y4 = ops::concat(&[&y_lo, &y_hi], 3)?;
+                ops::reshape(&y4, &[b, s, (nh * hd) as i32])?
             }
             Op::TopK { k } => {
                 // Op::TopK returns f32-encoded indices of the k largest
@@ -1867,6 +2104,7 @@ pub fn lower_with_env(
                     Activation::Cos => ops::unary(&ffn1, MlxUnary::Cos)?,
                     Activation::Tan => ops::unary(&ffn1, MlxUnary::Tan)?,
                     Activation::Atan => ops::unary(&ffn1, MlxUnary::Atan)?,
+                    Activation::Recip => ops::unary(&ffn1, MlxUnary::Reciprocal)?,
                 };
                 let ffn2 = ops::matmul(&ffn1, fc2_w)?;
                 let ffn_out = maybe_add(ffn2, fc2_b)?;
@@ -3471,6 +3709,106 @@ pub fn lower_with_env(
                 }
             }
 
+            Op::BatchNormInferenceBackwardInput { eps } => {
+                // dx = dy · γ · 1/√(σ²+ε). Mean is unused (frozen stats);
+                // matches `batch_norm_inference_backward_input` on CPU.
+                let gamma = lookup(&env, node.inputs[1])?;
+                let var = lookup(&env, node.inputs[3])?;
+                let dy = lookup(&env, node.inputs[4])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let dtype = node.shape.dtype();
+                if x_shape.is_empty() {
+                    return Err(MlxError(
+                        "BatchNormInferenceBackwardInput on MLX: scalar unsupported".into(),
+                    ));
+                }
+                let c = *x_shape.last().unwrap();
+                let mut bshape = vec![1i32; x_shape.len()];
+                *bshape.last_mut().unwrap() = c;
+                let gamma_b = ops::reshape(&mlx_norm_scale_1d(gamma)?, &bshape)?;
+                let var_b = ops::reshape(&mlx_norm_scale_1d(var)?, &bshape)?;
+                let eps_arr = Array::from_f32_slice(&[*eps], &[1], dtype)?;
+                let inv = ops::unary(&ops::add(&var_b, &eps_arr)?, MlxUnary::Rsqrt)?;
+                ops::mul(dy, &ops::mul(&gamma_b, &inv)?)?
+            }
+
+            Op::BatchNormInferenceBackwardGamma { eps } => {
+                // dγ_c = Σ dy · x̂ over all axes except the channel (last).
+                let x = lookup(&env, node.inputs[0])?;
+                let mean = lookup(&env, node.inputs[1])?;
+                let var = lookup(&env, node.inputs[2])?;
+                let dy = lookup(&env, node.inputs[3])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let dtype = node.shape.dtype();
+                if x_shape.is_empty() {
+                    return Err(MlxError(
+                        "BatchNormInferenceBackwardGamma on MLX: scalar unsupported".into(),
+                    ));
+                }
+                let c = *x_shape.last().unwrap();
+                let last = (x_shape.len() - 1) as i32;
+                let mut bshape = vec![1i32; x_shape.len()];
+                *bshape.last_mut().unwrap() = c;
+                let mean_b = ops::reshape(&mlx_norm_scale_1d(mean)?, &bshape)?;
+                let var_b = ops::reshape(&mlx_norm_scale_1d(var)?, &bshape)?;
+                let eps_arr = Array::from_f32_slice(&[*eps], &[1], dtype)?;
+                let inv = ops::unary(&ops::add(&var_b, &eps_arr)?, MlxUnary::Rsqrt)?;
+                let x_hat = ops::mul(&ops::sub(x, &mean_b)?, &inv)?;
+                let prod = ops::mul(dy, &x_hat)?;
+                if last == 0 {
+                    prod
+                } else {
+                    let reduce_axes: Vec<i32> = (0..last).collect();
+                    let summed =
+                        ops::reduce(&prod, MlxReduce::Sum, &reduce_axes, /*keep_dim=*/ false)?;
+                    let want: Vec<i32> = node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static() as i32)
+                        .collect();
+                    let got = summed.shape()?;
+                    let got_i32: Vec<i32> = got.iter().map(|&d| d as i32).collect();
+                    if got_i32 == want {
+                        summed
+                    } else {
+                        ops::reshape(&summed, &want)?
+                    }
+                }
+            }
+
+            Op::BatchNormInferenceBackwardBeta => {
+                // dβ_c = Σ dy over all axes except the channel (last).
+                let dy = lookup(&env, node.inputs[0])?;
+                let dy_shape = node_input_shape(graph, node.inputs[0]);
+                if dy_shape.is_empty() {
+                    return Err(MlxError(
+                        "BatchNormInferenceBackwardBeta on MLX: scalar unsupported".into(),
+                    ));
+                }
+                let last = (dy_shape.len() - 1) as i32;
+                if last == 0 {
+                    dy.clone_handle()?
+                } else {
+                    let reduce_axes: Vec<i32> = (0..last).collect();
+                    let summed =
+                        ops::reduce(dy, MlxReduce::Sum, &reduce_axes, /*keep_dim=*/ false)?;
+                    let want: Vec<i32> = node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static() as i32)
+                        .collect();
+                    let got = summed.shape()?;
+                    let got_i32: Vec<i32> = got.iter().map(|&d| d as i32).collect();
+                    if got_i32 == want {
+                        summed
+                    } else {
+                        ops::reshape(&summed, &want)?
+                    }
+                }
+            }
+
             Op::CumsumBackward { axis, exclusive } => {
                 let dy = lookup(&env, node.inputs[0])?;
                 let axis_pos = if *axis < 0 {
@@ -3851,6 +4189,327 @@ pub fn lower_with_env(
                 let x = lookup(&env, node.inputs[0])?;
                 x.clone_handle()?
             }
+
+            Op::Fma => {
+                let a = lookup(&env, node.inputs[0])?;
+                let b = lookup(&env, node.inputs[1])?;
+                let c = lookup(&env, node.inputs[2])?;
+                let ab = ops::mul(a, b)?;
+                ops::add(&ab, c)?
+            }
+
+            Op::Conv3d {
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                let in_shape = node_input_shape(graph, node.inputs[0]);
+                if in_shape.len() != 5 {
+                    return Err(MlxError(format!(
+                        "Conv3d: expected NCDHW input rank 5, got {}",
+                        in_shape.len()
+                    )));
+                }
+                let x = lookup(&env, node.inputs[0])?;
+                let w = lookup(&env, node.inputs[1])?;
+                let x_nd = ops::transpose(x, &[0, 2, 3, 4, 1])?;
+                let w_mlx = ops::transpose(w, &[0, 2, 3, 4, 1])?;
+                let y_nd = ops::conv3d(
+                    &x_nd,
+                    &w_mlx,
+                    (stride[0] as i32, stride[1] as i32, stride[2] as i32),
+                    (padding[0] as i32, padding[1] as i32, padding[2] as i32),
+                    (dilation[0] as i32, dilation[1] as i32, dilation[2] as i32),
+                    (*groups).max(1) as i32,
+                )?;
+                ops::transpose(&y_nd, &[0, 4, 1, 2, 3])?
+            }
+
+            Op::FusedConvBiasAct { .. } | Op::PartitionedConv { .. } => {
+                let mut g = Graph::new("mlx_unfuse");
+                let mut ids = Vec::with_capacity(node.inputs.len());
+                for (i, &in_id) in node.inputs.iter().enumerate() {
+                    let sh = graph.node(in_id).shape.clone();
+                    ids.push(g.append_node(
+                        Op::Input {
+                            name: format!("in{i}"),
+                        },
+                        vec![],
+                        sh,
+                        None,
+                    ));
+                }
+                let out_id = g.append_node(node.op.clone(), ids, node.shape.clone(), None);
+                g.set_outputs(vec![out_id]);
+                let g2 = rlx_opt::unfuse_fused_for_autodiff(g);
+                let mut env2: HashMap<NodeId, Array> = HashMap::new();
+                for n2 in g2.nodes() {
+                    if let Op::Input { name } = &n2.op {
+                        if let Some(rest) = name.strip_prefix("in") {
+                            if let Ok(i) = rest.parse::<usize>() {
+                                if let Some(&src) = node.inputs.get(i) {
+                                    env2.insert(n2.id, lookup(&env, src)?.clone_handle()?);
+                                }
+                            }
+                        }
+                    }
+                }
+                let outs =
+                    lower_with_env(&g2, env2, params, params_typed, rng, eval_barriers)?;
+                outs.into_iter()
+                    .next()
+                    .ok_or_else(|| MlxError("mlx unfuse: empty outputs".into()))?
+            }
+
+            Op::ComplexNormSq => {
+                let z = lookup(&env, node.inputs[0])?;
+                let out_dims: Vec<i32> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
+                lower_complex_norm_sq(z, &out_dims)?
+            }
+            Op::ComplexNormSqBackward => {
+                let z = lookup(&env, node.inputs[0])?;
+                let g = lookup(&env, node.inputs[1])?;
+                let logical: Vec<i32> = graph
+                    .node(node.inputs[1])
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
+                lower_complex_norm_sq_backward(z, g, &logical)?
+            }
+            Op::Conjugate => {
+                let z = lookup(&env, node.inputs[0])?;
+                let n: i32 = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .product();
+                lower_conjugate(z, n)?
+            }
+
+            Op::Quantize {
+                axis,
+                scales,
+                zero_points,
+            } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                lower_quantize(x, &x_shape, *axis, scales, zero_points)?
+            }
+            Op::Dequantize {
+                axis,
+                scales,
+                zero_points,
+            } => {
+                let q = lookup(&env, node.inputs[0])?;
+                let dims: Vec<i32> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
+                lower_dequantize(q, &dims, *axis, scales, zero_points)?
+            }
+
+            Op::FakeQuantizeLSQ { bits, axis } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let scale = lookup(&env, node.inputs[1])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let q_max = fq_q_max(*bits)?;
+                let scale_b = fq_scale_from_state(scale, &x_shape, *axis, DType::F32)?;
+                fq_quantize_dequantize(x, &scale_b, q_max, DType::F32)?
+            }
+            Op::FakeQuantizeLSQBackwardX { bits, axis } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let scale = lookup(&env, node.inputs[1])?;
+                let dy = lookup(&env, node.inputs[2])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let q_max = fq_q_max(*bits)?;
+                lower_lsq_backward_x(x, scale, dy, &x_shape, *axis, q_max)?
+            }
+            Op::FakeQuantizeLSQBackwardScale { bits, axis } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let scale = lookup(&env, node.inputs[1])?;
+                let dy = lookup(&env, node.inputs[2])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let q_max = fq_q_max(*bits)?;
+                lower_lsq_backward_scale(x, scale, dy, &x_shape, *axis, q_max)?
+            }
+
+            Op::QMatMul {
+                x_zp,
+                w_zp,
+                out_zp,
+                mult,
+            } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let w = lookup(&env, node.inputs[1])?;
+                let bias = lookup(&env, node.inputs[2])?;
+                lower_q_mat_mul(x, w, bias, *x_zp, *w_zp, *out_zp, *mult)?
+            }
+            Op::QConv2d {
+                kernel_size: _,
+                stride,
+                padding,
+                dilation,
+                groups,
+                x_zp,
+                w_zp,
+                out_zp,
+                mult,
+            } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let w = lookup(&env, node.inputs[1])?;
+                let bias = lookup(&env, node.inputs[2])?;
+                let s = |i: usize| stride.get(i).copied().unwrap_or(1) as i32;
+                let p = |i: usize| padding.get(i).copied().unwrap_or(0) as i32;
+                let d = |i: usize| dilation.get(i).copied().unwrap_or(1) as i32;
+                lower_q_conv2d(
+                    x,
+                    w,
+                    bias,
+                    (s(0), s(1)),
+                    (p(0), p(1)),
+                    (d(0), d(1)),
+                    (*groups).max(1) as i32,
+                    *x_zp,
+                    *w_zp,
+                    *out_zp,
+                    *mult,
+                )?
+            }
+
+            Op::FftButterflyStage { stage, n_fft } => {
+                let state = lookup(&env, node.inputs[0])?;
+                let gate = lookup(&env, node.inputs[1])?;
+                let rev = lookup(&env, node.inputs[2])?;
+                let tw_re = lookup(&env, node.inputs[3])?;
+                let tw_im = lookup(&env, node.inputs[4])?;
+                let st_shape = node_input_shape(graph, node.inputs[0]);
+                if st_shape.len() != 2 {
+                    return Err(MlxError(format!(
+                        "FftButterflyStage: state must be rank-2 [B, 2N], got {:?}",
+                        st_shape
+                    )));
+                }
+                lower_fft_butterfly_stage(
+                    state,
+                    gate,
+                    rev,
+                    tw_re,
+                    tw_im,
+                    st_shape[0],
+                    *n_fft as i32,
+                    *stage,
+                )?
+            }
+
+            Op::ScaledQuantScale {
+                format,
+                scale_layout,
+            } if scaled_fp8_mlx_ok(*format, *scale_layout) => {
+                let x = lookup(&env, node.inputs[0])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                lower_scaled_quant_scale(x, *format, &x_shape)?
+            }
+            Op::ScaledDequantize {
+                format,
+                scale_layout,
+            } if scaled_fp8_mlx_ok(*format, *scale_layout) => {
+                let codes = lookup(&env, node.inputs[0])?;
+                let scale = lookup(&env, node.inputs[1])?;
+                let out_dims: Vec<i32> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
+                lower_scaled_dequantize(codes, scale, *format, &out_dims)?
+            }
+            Op::ScaledMatMul {
+                lhs_format,
+                rhs_format,
+                scale_layout,
+                has_bias,
+            } if scaled_fp8_mlx_ok(*lhs_format, *scale_layout)
+                && scaled_fp8_mlx_ok(*rhs_format, *scale_layout) =>
+            {
+                let lhs = lookup(&env, node.inputs[0])?;
+                let rhs = lookup(&env, node.inputs[1])?;
+                let lhs_scale = lookup(&env, node.inputs[2])?;
+                let rhs_scale = lookup(&env, node.inputs[3])?;
+                let bias = if *has_bias {
+                    Some(lookup(&env, node.inputs[4])?)
+                } else {
+                    None
+                };
+                let lhs_shape = node_input_shape(graph, node.inputs[0]);
+                let rhs_shape = node_input_shape(graph, node.inputs[1]);
+                if lhs_shape.len() != 2 || rhs_shape.len() != 2 {
+                    return Err(MlxError(
+                        "ScaledMatMul: expected rank-2 TN operands".into(),
+                    ));
+                }
+                let (m, k) = (lhs_shape[0], lhs_shape[1]);
+                let (n, k2) = (rhs_shape[0], rhs_shape[1]);
+                if k != k2 {
+                    return Err(MlxError(format!(
+                        "ScaledMatMul: K mismatch {k} vs {k2}"
+                    )));
+                }
+                lower_scaled_matmul(
+                    lhs,
+                    rhs,
+                    lhs_scale,
+                    rhs_scale,
+                    bias,
+                    *lhs_format,
+                    *rhs_format,
+                    m,
+                    k,
+                    n,
+                )?
+            }
+
+            Op::Mamba2 {
+                head_dim,
+                state_size,
+            } => {
+                let x = lookup(&env, node.inputs[0])?;
+                let dt = lookup(&env, node.inputs[1])?;
+                let a = lookup(&env, node.inputs[2])?;
+                let b_in = lookup(&env, node.inputs[3])?;
+                let c_in = lookup(&env, node.inputs[4])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                if x_shape.len() != 4 {
+                    return Err(MlxError(format!(
+                        "Mamba2: x must be rank-4 [B,S,H,P], got rank {}",
+                        x_shape.len()
+                    )));
+                }
+                lower_mamba2(
+                    x,
+                    dt,
+                    a,
+                    b_in,
+                    c_in,
+                    x_shape[0],
+                    x_shape[1],
+                    x_shape[2],
+                    *head_dim as i32,
+                    *state_size as i32,
+                )?
+            }
+
+            other if is_mlx_typed_host_op(other) => host_eval_op_typed(graph, node, &env)?,
 
             other => {
                 return unsupported(format!("{other:?}"));

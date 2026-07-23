@@ -130,3 +130,30 @@ pub fn run_gather_backward(
     let mut a = arena(arena_buf, device, queue);
     rlx_gpu_host::run_gather_backward(&mut a, dy, indices, dst, outer, axis_dim, num_idx, trailing);
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_maxpool2d_backward(
+    arena_buf: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    x_f32_off: usize,
+    dy_f32_off: usize,
+    dx_f32_off: usize,
+    n: u32,
+    c: u32,
+    h: u32,
+    w: u32,
+    h_out: u32,
+    w_out: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    ph: u32,
+    pw: u32,
+) {
+    let mut a = arena(arena_buf, device, queue);
+    rlx_gpu_host::run_maxpool2d_backward(
+        &mut a, x_f32_off, dy_f32_off, dx_f32_off, n, c, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw,
+    );
+}

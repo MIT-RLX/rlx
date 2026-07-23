@@ -88,6 +88,11 @@ pub fn activation_deriv_wrt_x(
             let one2 = scalar_const(1.0, shape, g);
             g.binary(BinaryOp::Div, one2, denom, shape.clone())
         }
+        Activation::Recip => {
+            let y = y.unwrap_or_else(|| g.activation(Activation::Recip, x, shape.clone()));
+            let y2 = g.binary(BinaryOp::Mul, y, y, shape.clone());
+            g.activation(Activation::Neg, y2, shape.clone())
+        }
         Activation::Abs => {
             let ax = g.activation(Activation::Abs, x, shape.clone());
             g.binary(BinaryOp::Div, x, ax, shape.clone())

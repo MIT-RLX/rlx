@@ -59,6 +59,8 @@ pub trait GraphExt {
     fn silu(&mut self, x: NodeId) -> NodeId;
     fn relu(&mut self, x: NodeId) -> NodeId;
     fn exp(&mut self, x: NodeId) -> NodeId;
+    /// Elementwise reciprocal `1 / x`.
+    fn recip(&mut self, x: NodeId) -> NodeId;
     fn sqrt(&mut self, x: NodeId) -> NodeId;
     /// Reciprocal square root `1/sqrt(x)`.
     fn rsqrt(&mut self, x: NodeId) -> NodeId;
@@ -311,6 +313,11 @@ impl GraphExt for Graph {
     fn exp(&mut self, x: NodeId) -> NodeId {
         let s = shape::unary_shape(self.shape(x));
         self.activation(Activation::Exp, x, s)
+    }
+
+    fn recip(&mut self, x: NodeId) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.activation(Activation::Recip, x, s)
     }
 
     fn sqrt(&mut self, x: NodeId) -> NodeId {

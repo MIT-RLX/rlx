@@ -37,7 +37,14 @@ fn det(seed: usize, n: usize, scale: f32) -> Vec<f32> {
         .collect()
 }
 
-fn dense_moe_reference(x: &[f32], gate_w: &[f32], expert_w: &[f32], m: usize, h: usize, e: usize) -> Vec<f32> {
+fn dense_moe_reference(
+    x: &[f32],
+    gate_w: &[f32],
+    expert_w: &[f32],
+    m: usize,
+    h: usize,
+    e: usize,
+) -> Vec<f32> {
     let mut reference = vec![0f32; m * h];
     for i in 0..m {
         let mut logits = vec![0f32; e];
@@ -137,7 +144,9 @@ fn main() {
     }
 
     if max_err < 1e-5 {
-        println!("PASS — WideEP Phase 1 (2 experts × 2 ranks, all_to_all_v) matches dense reference.");
+        println!(
+            "PASS — WideEP Phase 1 (2 experts × 2 ranks, all_to_all_v) matches dense reference."
+        );
     } else {
         eprintln!("FAIL — max_err={max_err:.3e}");
         std::process::exit(1);

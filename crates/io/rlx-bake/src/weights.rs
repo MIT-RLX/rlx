@@ -23,8 +23,8 @@ pub fn load_safetensors_f32(path: &Path) -> Result<HashMap<String, Vec<f32>>> {
     let mut out = HashMap::new();
     for name in st.names() {
         let view = st.tensor(name)?;
-        let data =
-            decode_f32(view.data(), view.dtype()).with_context(|| format!("decoding tensor {name}"))?;
+        let data = decode_f32(view.data(), view.dtype())
+            .with_context(|| format!("decoding tensor {name}"))?;
         out.insert(name.to_string(), data);
     }
     Ok(out)

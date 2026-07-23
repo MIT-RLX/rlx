@@ -36,16 +36,20 @@
 //!     unsigned in0_off, unsigned in0_len,
 //!     unsigned in1_off, unsigned in1_len,
 //!     unsigned in2_off, unsigned in2_len,
-//!     unsigned in3_off, unsigned in3_len);
+//!     unsigned in3_off, unsigned in3_len,
+//!     unsigned e0, unsigned e1, unsigned e2, unsigned e3);
 //! ```
 //!
 //! Index the output at `arena[out_off + i]` and input `j` at
-//! `arena[inJ_off + i]`, guarded by `i < out_len`.
+//! `arena[inJ_off + i]`, guarded by `i < out_len`. The trailing `e0..e3` are
+//! optional runtime extras ([`CudaGpuKernel::extras`]); unused kernels may
+//! ignore them (pass-through zeros).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::CudaContext;
+use rlx_ir::Shape;
 
 use crate::kernels::{CudaKernel, compile};
 
@@ -69,9 +73,30 @@ pub trait CudaGpuKernel: Send + Sync + std::fmt::Debug {
         "rlx_custom"
     }
 
-    /// Threads per block (default 256). Grid is `ceil(out_len / block_size)`.
+    /// Threads per block (default 256). Grid is
+    /// [`grid_blocks`](Self::grid_blocks)`(launch_elems, block_size)`.
     fn block_size(&self) -> u32 {
         256
+    }
+
+    /// Optional runtime extras (`e0..e3` in the fixed signature). Default zeros.
+    /// Override to pass shape / active-window hints resolved at launch time.
+    fn extras(&self, _attrs: &[u8], _out_shape: &Shape) -> [u32; 4] {
+        [0, 0, 0, 0]
+    }
+
+    /// Elements that define the 1-D launch domain (default = `out_len`). Override
+    /// when the kernel indexes a coarser domain (e.g. one thread / block per
+    /// channel row).
+    fn launch_elems(&self, out_len: u32, _extras: [u32; 4]) -> u32 {
+        out_len
+    }
+
+    /// Number of CUDA blocks for `launch_elems` + `block_size`. Default is
+    /// `ceil(launch_elems / block_size)` (one thread per element). Override to
+    /// `launch_elems` when each block cooperates on one element (reductions).
+    fn grid_blocks(&self, launch_elems: u32, block_size: u32) -> u32 {
+        launch_elems.div_ceil(block_size.max(1)).max(1)
     }
 }
 

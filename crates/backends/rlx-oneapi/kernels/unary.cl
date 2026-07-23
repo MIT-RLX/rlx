@@ -35,6 +35,7 @@ __kernel void unary(__global float* arena,
         case 14u: r = tan(x); break;                                       // Tan
         case 15u: r = atan(x); break;                                      // Atan
         case 16u: r = round(x); break;                                     // Round
+        case 17u: r = 1.0f / x; break;                                     // Recip / vvrecf
         // f32 -> int: truncate toward zero, saturate to dst range, NaN -> 0.
         case 100u: r = isnan(x) ? 0.0f : clamp(trunc(x), -128.0f, 127.0f); break;
         case 101u: r = isnan(x) ? 0.0f : clamp(trunc(x), -32768.0f, 32767.0f); break;

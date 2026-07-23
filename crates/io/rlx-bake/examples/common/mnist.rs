@@ -102,7 +102,12 @@ fn relu_inplace(x: &mut [f32]) {
     }
 }
 
-fn softmax_ce_grad(logits: &[f32], labels: &[usize], batch: usize, classes: usize) -> (f32, Vec<f32>) {
+fn softmax_ce_grad(
+    logits: &[f32],
+    labels: &[usize],
+    batch: usize,
+    classes: usize,
+) -> (f32, Vec<f32>) {
     let mut loss = 0.0;
     let mut dlogits = vec![0.0; batch * classes];
     for b in 0..batch {
@@ -283,19 +288,15 @@ pub fn train_sgd_ex(
             "  epoch {epoch}: loss={:.4} acc={:.1}%{}",
             loss_sum / batches.max(1) as f32,
             last_acc * 100.0,
-            if freeze_w1 { " (w1 frozen ternary)" } else { "" }
+            if freeze_w1 {
+                " (w1 frozen ternary)"
+            } else {
+                ""
+            }
         );
     }
 
-    (
-        Weights {
-            w1,
-            b1,
-            w2,
-            b2,
-        },
-        last_acc,
-    )
+    (Weights { w1, b1, w2, b2 }, last_acc)
 }
 
 /// Ternarize by magnitude: top ~⅓ of |w| → ±1 by sign, rest → 0 (BitNet-ish).
@@ -367,11 +368,7 @@ fn mnist_raw_dir() -> Option<PathBuf> {
     }
     let home = std::env::var("HOME").ok()?;
     let p = PathBuf::from(format!("{home}/.cache/torchvision-mnist/MNIST/raw"));
-    if p.is_dir() {
-        Some(p)
-    } else {
-        None
-    }
+    if p.is_dir() { Some(p) } else { None }
 }
 
 pub fn default_out_path() -> PathBuf {

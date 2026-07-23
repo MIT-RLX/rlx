@@ -83,6 +83,180 @@ pub fn run_host_op_span<A: DeviceArena>(a: &mut A, desc: HostOpDesc) {
     a.htod(span.lo, &host);
 }
 
+/// Host-side tensor mirror for consecutive HostOp / ConvHost chains.
+///
+/// Avoids re-DTOHing activations that a prior host step just produced (Kitten
+/// on discrete wgpu: hundreds of Binary/Activation HostOps per chunk). Cleared
+/// whenever a GPU compute pass may overwrite the arena.
+///
+/// Outputs can be **deferred**: kept only in the mirror until
+/// [`HostTensorCache::flush_to_device`] before the next GPU pass, so a long
+/// host-only chain does one batched H2D instead of one per op.
+#[derive(Default)]
+pub struct HostTensorCache {
+    map: std::collections::HashMap<usize, std::sync::Arc<[f32]>>,
+    /// Byte offsets that exist in `map` but may not yet be on the device.
+    dirty: std::collections::HashSet<usize>,
+}
+
+impl HostTensorCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.dirty.clear();
+    }
+
+    pub fn has_deferred_writes(&self) -> bool {
+        !self.dirty.is_empty()
+    }
+
+    pub fn get(&self, byte_off: usize) -> Option<&[f32]> {
+        self.map.get(&byte_off).map(|v| &v[..])
+    }
+
+    pub fn get_arc(&self, byte_off: usize) -> Option<std::sync::Arc<[f32]>> {
+        self.map.get(&byte_off).cloned()
+    }
+
+    /// Cache hit when the mirror covers at least `n` f32s (HostOp may pad to
+    /// `size_bytes` while Expand/Narrow ask for `num_elements`).
+    pub fn get_arc_covering(&self, byte_off: usize, n: usize) -> Option<std::sync::Arc<[f32]>> {
+        let hit = self.map.get(&byte_off)?;
+        if hit.len() >= n {
+            Some(hit.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn is_dirty(&self, byte_off: usize) -> bool {
+        self.dirty.contains(&byte_off)
+    }
+
+    pub fn invalidate(&mut self, byte_off: usize) {
+        self.map.remove(&byte_off);
+        self.dirty.remove(&byte_off);
+    }
+
+    pub fn insert(&mut self, byte_off: usize, data: Vec<f32>, defer_htod: bool) {
+        if defer_htod {
+            self.dirty.insert(byte_off);
+        } else {
+            self.dirty.remove(&byte_off);
+        }
+        self.map
+            .insert(byte_off, std::sync::Arc::<[f32]>::from(data));
+    }
+
+    /// Write all deferred host outputs to the device (call before a GPU pass).
+    pub fn flush_to_device<A: DeviceArena>(&mut self, a: &mut A) {
+        if self.dirty.is_empty() {
+            return;
+        }
+        let offs: Vec<usize> = self.dirty.iter().copied().collect();
+        for off in offs {
+            if let Some(v) = self.map.get(&off) {
+                if !v.is_empty() {
+                    a.htod(off, bytemuck::cast_slice(v));
+                }
+            }
+        }
+        self.dirty.clear();
+    }
+
+    /// Flush one deferred offset (before a cache-miss D2H that would otherwise
+    /// read zeros for a HostOp that deferred its write).
+    pub fn flush_offset<A: DeviceArena>(&mut self, a: &mut A, byte_off: usize) {
+        if !self.dirty.remove(&byte_off) {
+            return;
+        }
+        if let Some(v) = self.map.get(&byte_off) {
+            if !v.is_empty() {
+                a.htod(byte_off, bytemuck::cast_slice(v));
+            }
+        }
+    }
+}
+
+/// Per-tensor HostOp staging (sharded / multi-GiB arenas).
+///
+/// Unlike [`run_host_op_span`], this never mirrors the contiguous gap between
+/// operands — each input is read independently, evaluated on the host, and the
+/// output is written back. Required when inputs sit on different bind stripes
+/// (NVIDIA Kitten: 2 GiB storage bind + ~3.7 GiB arena).
+///
+/// When `cache` is provided, inputs already produced by a prior host step are
+/// reused without a device round-trip; the output is stored for the next host
+/// step. Always writes the result back to the device (GPU MatMul may consume it).
+pub fn run_host_op_packed<A: DeviceArena>(a: &mut A, desc: &HostOpDesc) {
+    run_host_op_packed_cached(a, desc, None);
+}
+
+/// Like [`run_host_op_packed`], with an optional [`HostTensorCache`].
+pub fn run_host_op_packed_cached<A: DeviceArena>(
+    a: &mut A,
+    desc: &HostOpDesc,
+    mut cache: Option<&mut HostTensorCache>,
+) {
+    use rlx_cpu::thunk::eval_single_op_f32;
+    a.sync();
+    if rlx_ir::env::flag("RLX_WGPU_DBG_HOST_OP") {
+        eprintln!(
+            "[host_op] {:?} out={:?} out_off={:#x} ins={:?}",
+            desc.op.kind(),
+            desc.out_shape.dims(),
+            desc.out_byte_off,
+            desc.inputs
+                .iter()
+                .map(|(o, s)| (*o, s.dims(), s.num_elements()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    // Stage inputs: prefer host-mirror hits (no DTOH), else read from device.
+    // Keep Arc clones so refs stay valid through eval without re-DTOH copies.
+    let staged: Vec<(rlx_ir::Shape, std::sync::Arc<[f32]>)> = desc
+        .inputs
+        .iter()
+        .map(|(off, sh)| {
+            let n_elems = sh.num_elements().unwrap_or(0);
+            let n = sh.size_bytes().unwrap_or(0).div_ceil(4).max(n_elems);
+            if let Some(c) = cache.as_ref() {
+                if let Some(hit) = c.get_arc_covering(*off, n_elems) {
+                    return (sh.clone(), hit);
+                }
+            }
+            // Deferred producer at this offset but length mismatch — push to
+            // device before D2H so we don't read zeros.
+            if let Some(c) = cache.as_mut() {
+                c.flush_offset(a, *off);
+            }
+            let mut v = vec![0f32; n];
+            if n > 0 {
+                a.dtoh(*off, bytemuck::cast_slice_mut(v.as_mut_slice()));
+            }
+            (sh.clone(), std::sync::Arc::<[f32]>::from(v))
+        })
+        .collect();
+    let refs: Vec<(rlx_ir::Shape, &[f32])> =
+        staged.iter().map(|(sh, v)| (sh.clone(), &v[..])).collect();
+    let y = eval_single_op_f32(&desc.op, &desc.out_shape, &refs);
+    if !y.is_empty() {
+        // Defer H2D when a host mirror is active: long HostOp chains (Kitten
+        // NSF elementwise) batch one flush before the next GPU / Expand /
+        // Concat. Opt out with `RLX_WGPU_HOST_EAGER_H2D=1`.
+        let defer = cache.is_some() && !rlx_ir::env::flag("RLX_WGPU_HOST_EAGER_H2D");
+        if !defer {
+            a.htod(desc.out_byte_off, bytemuck::cast_slice(y.as_slice()));
+        }
+        if let Some(c) = cache.as_mut() {
+            c.insert(desc.out_byte_off, y, defer);
+        }
+    }
+}
+
 fn packed_region_off(regions: &[(usize, usize)], packed_at: &[usize], old: usize) -> usize {
     for (i, &(off, _)) in regions.iter().enumerate() {
         if off == old {
@@ -157,7 +331,29 @@ pub fn run_indexing<A: DeviceArena>(
 
     a.sync();
 
-    if span_len > 0 && span_len <= cap && lo.is_multiple_of(4) && span_len.is_multiple_of(4) {
+    let region_bytes: usize = regions.iter().map(|&(_, n)| n).sum();
+    // Prefer packed per-region transfers when the bounding span is mostly holes
+    // (Kitten wave: ~88 MiB span for a few small index/update tensors).
+    let span_dense = region_bytes > 0 && span_len <= region_bytes.saturating_mul(2);
+
+    if rlx_ir::env::flag("RLX_CUDA_INDEXING_TRACE") {
+        eprintln!(
+            "[cuda_indexing] regions={} span_lo={lo} span_hi={hi} span_len={span_len} \
+             region_bytes={region_bytes} dense={span_dense} cap={}",
+            regions.len(),
+            contiguous_span_cap.min(INDEXING_CONTIGUOUS_SPAN_CAP)
+        );
+        for (i, &(off, n)) in regions.iter().enumerate() {
+            eprintln!("  region[{i}] off={off} nbytes={n}");
+        }
+    }
+
+    if span_len > 0
+        && span_len <= cap
+        && span_dense
+        && lo.is_multiple_of(4)
+        && span_len.is_multiple_of(4)
+    {
         let span = IndexingHostSpan::from_thunk(inner);
         let mut host = dtoh_bytes(a, span.lo, span.len());
         unsafe {

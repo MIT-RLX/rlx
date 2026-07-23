@@ -50,18 +50,20 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 
 ### Coverage at a glance
 
-| Backend | Ops claimed | of 152 |
+| Backend | Ops claimed | of 153 |
 |---------|------------:|-------:|
-| CPU  | **142** | reference (now lowers every OpKind that any backend does, + RNN-family native + LSQ + C64) |
-| MLX  | **96** | broadest GPU surface (control flow + scan + conv-bwd + QAT + GroupNorm fwd+bwd + Im2Col + ArgMax/Min) |
-| MTL  | **118** | Apple GPU inference + core training-bwd (Mamba `SelectiveScan`, `Sample`, `Reverse`, `ArgMax/Min`, **native fused `Gru`/`Rnn`/`Mamba2`**) |
-| WGPU  | **115** | cross-platform inference + partial training-bwd (vision trio + `Reverse` + `ArgMax/Min` + **native WGSL `Gru`/`Rnn`/`Mamba2`**) |
-| CUDA  | **110** | NVIDIA inference + training-bwd (+ StopGradient, host-staged `Reverse`/`ArgMax`/`ArgMin`/`AxialRope2d`) |
-| ROCm  | **107** | mirrors CUDA minus conv/pool backward (+ StopGradient + the same host-staged four) |
-| TPU  | **59** | INT8-first inference (`QMatMul`/`QConv2d` exclusive, + StopGradient) |
-| ANE  | **65** | static inference compiler + hybrid host segments |
+| CPU  | **153** | reference (full OpKind surface; fused/control expand before thunks) |
+| MLX  | **153** | broadest GPU surface (control flow + scan + conv-bwd + QAT + GroupNorm fwd+bwd + Im2Col + ArgMax/Min) |
+| MTL  | **153** | Apple GPU inference + core training-bwd (Mamba `SelectiveScan`, `Sample`, `Reverse`, `ArgMax/Min`, **native fused `Gru`/`Rnn`/`Mamba2`**) |
+| WGPU  | **153** | cross-platform inference + partial training-bwd (vision trio + `Reverse` + `ArgMax/Min` + **native WGSL `Gru`/`Rnn`/`Mamba2`**) |
+| CUDA  | **153** | full OpKind surface (+ native `Mamba2`/`Gru`/`Rnn`/`FftButterflyStage`/`QMatMul`/`QConv2d`; DenseSolve via cuSOLVER) |
+| ROCm  | **153** | mirrors CUDA (shared `.cu` + hipSOLVER DenseSolve) |
+| TPU  | **153** | full OpKind surface (HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd/AxialRope/Im2Col/ConvTranspose/PerTensor-FP8 Scaled* + host for SPD / splat / FftButterfly / DenseSolve) |
+| ANE  | **153** | static inference compiler + hybrid host segments |
 
-*(Total **152** `OpKind`s. `Mamba2` still unfuses on ANE; `Gru`/`Rnn`/`Lstm` are native host.)*
+*(Total **153** `OpKind`s. `Mamba2` still unfuses on ANE; `Gru`/`Rnn`/`Lstm` are native host.)*
+
+**Also at 153 (EXTRA backends, not in the 8-column matrix):** **Vulkan** and **OneAPI** — claim parity with CUDA; native SPIR-V/OpenCL for norms/fused/RNN/vision-bwd/FFT/I8 quant + host/unfuse for specialty ops.
 
 > **Verification note (this revision):** CPU/Metal/MLX/WGPU additions are
 > parity-tested on-device (Apple Silicon) and benched (see below). CUDA/ROCm
@@ -102,29 +104,29 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| `ElementwiseRegion` | Fused elementwise chain (one kernel) | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
-| `TransformRegion` | Fused sampling/geometry chain (FKL-style) |  | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
-| `BatchElementwiseRegion` | Same chain over N batch planes (horizontal fusion) |  | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
+| `ElementwiseRegion` | Fused elementwise chain (one kernel) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `TransformRegion` | Fused sampling/geometry chain (FKL-style) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `BatchElementwiseRegion` | Same chain over N batch planes (horizontal fusion) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Linear algebra
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 | `MatMul` | Batched matrix multiply | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `DotGeneral` | XLA-style general contraction (arbitrary batch/contract dims) | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
-| `DenseSolve` | Dense linear solve `Ax=b` | ✅ |  | ✅ |  |  |  |  |  |
-| `BatchedDenseSolve` | Batched dense linear solve | ✅ |  | ✅ |  |  |  |  |  |
+| `DotGeneral` | XLA-style general contraction (arbitrary batch/contract dims) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `DenseSolve` | Dense linear solve `Ax=b` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `BatchedDenseSolve` | Batched dense linear solve | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `GroupedMatMul` | MoE grouped matmul (per-token expert routing) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `LoraMatMul` | Base matmul + low-rank `A·B` LoRA update (native CPU/MLX/ANE; **all backends via decomposition**) | ✅ |  | ✅ |  | ✅ |  |  |  |
+| `LoraMatMul` | Base matmul + low-rank `A·B` LoRA update (native CPU/MLX/ANE; **all backends via decomposition**) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Normalization
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 | `LayerNorm` | Layer norm (last-axis) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `LayerNorm2d` | Channel-wise LayerNorm on NCHW | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
-| `GroupNorm` | Group normalization | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
-| `BatchNormInference` | Inference batch norm (frozen stats) | ✅ |  |  |  | ✅ |  |  |  |
+| `LayerNorm2d` | Channel-wise LayerNorm on NCHW | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `GroupNorm` | Group normalization | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `BatchNormInference` | Inference batch norm (frozen stats) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `RmsNorm` | RMS normalization | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Attention & positional
@@ -133,7 +135,7 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 | `Attention` | Fused scaled-dot-product attention — see [MaskKind](#maskkind) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Rope` | Rotary position embedding (NeoX/GPT) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `AxialRope2d` | 2D axial rotary embedding (vision) | ✅ | ✅ |  |  | ✅ | ✅ | ✅ |  |
+| `AxialRope2d` | 2D axial rotary embedding (vision) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Shape & data movement
 
@@ -145,13 +147,13 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 | `Concat` | Concatenate along an axis | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Expand` | Broadcast-expand singleton dims | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Gather` | Gather rows/elements by index | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Reverse` | Batch-general flip along axes (`[batch,seq,…]` seq-reverse) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
+| `Reverse` | Batch-general flip along axes (`[batch,seq,…]` seq-reverse) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ScatterAdd` | Scatter-add into output by index | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ScatterNd` | ONNX ScatterND (data+indices+updates, reduction) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ScatterElements` | ONNX ScatterElements (axis + reduction) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `GatherNd` | ONNX GatherND (batch_dims) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `GatherElements` | ONNX GatherElements / take_along_axis | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `ResizeNearest2x` | 2× nearest-neighbour upsample | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
+| `ResizeNearest2x` | 2× nearest-neighbour upsample | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Reduction & indexing
 
@@ -160,8 +162,8 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 | `Reduce` | Axis reduction — see [ReduceOp](#reduceop) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Softmax` | Softmax along an axis | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Cumsum` | Cumulative sum | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `ArgMax` | Index of max along axis (f32-encoded) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
-| `ArgMin` | Index of min along axis (f32-encoded) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
+| `ArgMax` | Index of max along axis (f32-encoded) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ArgMin` | Index of min along axis (f32-encoded) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `TopK` | Top-k values/indices | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Sample` | Categorical / logit sampling | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
@@ -170,61 +172,62 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 | `RngNormal` | Random-normal fill (`RandomNormalLike`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `RngUniform` | Random-uniform fill (`RandomUniformLike`) | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
+| `RngUniform` | Random-uniform fill (`RandomUniformLike`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Convolution & pooling
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 | `Conv` | 2D convolution (NCHW, groups) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Im2Col` | Image→column expansion (conv lowering) | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ |  |
-| `ConvTranspose2d` | Transposed conv2d (deconv) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
+| `Im2Col` | Image→column expansion (conv lowering) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ConvTranspose2d` | Transposed conv2d (deconv) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Pool` | 2D pooling (max/avg) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Quantization — inference
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| `Quantize` | Float → integer quantize |  |  |  |  | ✅ |  |  | ✅ |
-| `Dequantize` | Integer → float dequantize |  |  |  |  | ✅ |  |  | ✅ |
+| `Quantize` | Float → integer quantize | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Dequantize` | Integer → float dequantize | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `DequantMatMul` | MatMul w/ packed quantized weights (dequant-on-fly) — see [QuantScheme](#quantscheme) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `DequantGroupedMatMul` | Grouped/MoE matmul over packed quantized expert weights | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `DequantMoEWeights` | Dequantize a packed MoE expert weight bank | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `QMatMul` | Real INT8-domain matmul (int8 in/out) |  |  |  |  |  |  |  | ✅ |
-| `QConv2d` | Real INT8-domain conv2d |  |  |  |  |  |  |  | ✅ |
+| `QMatMul` | Real INT8-domain matmul (int8 in/out) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `QConv2d` | Real INT8-domain conv2d | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Quantization — QAT (fake-quant)
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| `FakeQuantize` | Simulated quant for QAT — see [ScaleMode](#scalemode) | ✅ |  | ✅ |  |  |  |  |  |
-| `FakeQuantizeBackward` | STE backward for FakeQuantize — see [SteKind](#stekind) | ✅ |  | ✅ |  |  |  |  |  |
-| `FakeQuantizeLSQ` | Learned-step-size fake quant (learnable scale) | ✅ |  |  |  |  |  |  |  |
-| `FakeQuantizeLSQBackwardX` | LSQ gradient w.r.t. input | ✅ |  |  |  |  |  |  |  |
-| `FakeQuantizeLSQBackwardScale` | LSQ gradient w.r.t. scale | ✅ |  |  |  |  |  |  |  |
+| `FakeQuantize` | Simulated quant for QAT — see [ScaleMode](#scalemode) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `FakeQuantizeBackward` | STE backward for FakeQuantize — see [SteKind](#stekind) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `FakeQuantizeLSQ` | Learned-step-size fake quant (learnable scale) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `FakeQuantizeLSQBackwardX` | LSQ gradient w.r.t. input | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `FakeQuantizeLSQBackwardScale` | LSQ gradient w.r.t. scale | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Sequence models (SSM / RNN / linear-attention)
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 | `SelectiveScan` | Mamba selective scan (S6) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `GatedDeltaNet` | Qwen3.5 gated delta-net linear attention | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
-| `Lstm` | LSTM recurrence | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
-| `Gru` | GRU recurrence (native CPU/Metal/WGPU/ANE host; MLX via decomposition) | ✅ | ✅ | ✅ | ✅ | ✅ |  |  |  |
-| `Rnn` | Elman RNN recurrence (native CPU/Metal/WGPU/ANE host; MLX via decomposition) | ✅ | ✅ | ✅ | ✅ | ✅ |  |  |  |
-| `Mamba2` | Mamba-2 SSD block (native CPU; all backends via decomposition) | ✅ | ✅ |  | ✅ | ✅ |  |  |  |
+| `GatedDeltaNet` | Qwen3.5 gated delta-net linear attention | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Lstm` | LSTM recurrence | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Gru` | GRU recurrence (native CPU/Metal/WGPU/ANE host; MLX via decomposition) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Rnn` | Elman RNN recurrence (native CPU/Metal/WGPU/ANE host; MLX via decomposition) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Mamba2` | Mamba-2 SSD block (native CPU/Metal/WGPU/CUDA/ROCm; MLX/ANE via decomposition) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Fused composites
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| `FusedSwiGLU` | Fused SwiGLU MLP (gate·up → down) | ✅ | ✅ | ✅ | ✅ |  |  |  |  |
-| `FusedMatMulBiasAct` | Fused matmul + bias + activation | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
-| `FusedResidualLN` | Fused residual-add + LayerNorm | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
-| `FusedResidualRmsNorm` | Fused residual-add + RMSNorm | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
+| `FusedSwiGLU` | Fused SwiGLU MLP (gate·up → down) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `FusedMatMulBiasAct` | Fused matmul + bias + activation | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `FusedResidualLN` | Fused residual-add + LayerNorm | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `FusedResidualRmsNorm` | Fused residual-add + RMSNorm | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `AdaLayerNorm` | DiT adaLN-Zero `norm(x)·(1+scale)+shift` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `GatedResidual` | DiT gated residual `x + gate·y` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `FusedAttentionBlock` | Fused attention sub-block | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `FusedTransformerLayer` | Fused full transformer layer | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 `AdaLayerNorm` / `GatedResidual`: native kernels on CPU / Metal / CUDA / ROCm /
 wgpu / ANE (composed MIL, implicit broadcast); composed on MLX / TPU; claimed
@@ -234,8 +237,6 @@ Mul/Add with NumPy broadcast — no Expand materialization of `[B,1,D]`).
 Packed reverse (`AdaLayerNormBackward` / `GatedResidualBackward`): native on
 CPU / Metal / CUDA / ROCm / wgpu / ANE (composed MIL) / MLX / TPU / Vulkan /
 OneAPI (SPIR-V).
-
-| `FusedTransformerLayer` | Fused full transformer layer | | | ✅ | ✅ | | | | |
 
 ### Control flow
 
@@ -250,11 +251,11 @@ unroll so body ops run as ordinary kernels. See
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| `If` | Conditional sub-graph |  |  | ✅ |  |  |  |  |  |
-| `While` | Bounded while loop |  |  | ✅ |  |  |  |  |  |
-| `Scan` | Scan/fold over leading axis (carry + ys) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
-| `ScanBackward` | Reverse-mode scan backward (carry grads) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
-| `ScanBackwardXs` | Scan backward w.r.t. scanned inputs `xs` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
+| `If` | Conditional sub-graph | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `While` | Bounded while loop | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Scan` | Scan/fold over leading axis (carry + ys) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ScanBackward` | Reverse-mode scan backward (carry grads) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ScanBackwardXs` | Scan backward w.r.t. scanned inputs `xs` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 Legend: **ᴴ** = host-fallback (`ScanHostDesc` / `HostOpDesc` or packed f32);
 **ᵁ** = lowered by `LowerScan` / backward decompose before HLO (must not
@@ -264,64 +265,65 @@ escape legalize). Vulkan / OneAPI also claim Scan* (host / packed).
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| `ComplexNormSq` | `\ | ✅ |  |  |  |  |  |  |  |
-| `ComplexNormSqBackward` | Backward of `ComplexNormSq` | ✅ |  |  |  |  |  |  |  |
-| `Conjugate` | Complex conjugate (Wirtinger VJP) | ✅ |  |  |  |  |  |  |  |
+| `ComplexNormSq` | `\ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ComplexNormSqBackward` | Backward of `ComplexNormSq` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Conjugate` | Complex conjugate (Wirtinger VJP) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### FFT & signal
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 | `Fft` | 1D FFT (forward/inverse) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `FftButterflyStage` | Ternary-pruned radix-2 butterfly stage | ✅ |  |  |  |  |  |  |  |
+| `FftButterflyStage` | Ternary-pruned radix-2 butterfly stage | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `LogMel` | Log-mel spectrogram from FFT spectrum (Whisper) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `LogMelBackward` | Backward of `LogMel` | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
+| `LogMelBackward` | Backward of `LogMel` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `WelchPeaks` | Welch PSD top-k peaks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### 3D Gaussian splatting
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| `GaussianSplatRender` | 3DGS rasterizer (project → bin → sort → raster) | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ |  |
-| `GaussianSplatRenderBackward` | 3DGS backward (scene-param grads) | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ |  |
-| `GaussianSplatPrepare` | 3DGS stage 1 (project + tile-bin + sort) | ✅ | ✅ |  | ✅ |  | ✅ | ✅ |  |
-| `GaussianSplatRasterize` | 3DGS stage 2 (per-pixel raster) | ✅ | ✅ |  | ✅ |  | ✅ | ✅ |  |
+| `GaussianSplatRender` | 3DGS rasterizer (project → bin → sort → raster) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `GaussianSplatRenderBackward` | 3DGS backward (scene-param grads) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `GaussianSplatPrepare` | 3DGS stage 1 (project + tile-bin + sort) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `GaussianSplatRasterize` | 3DGS stage 2 (per-pixel raster) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### User-extensible
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| `Custom` | User-registered op via `op_registry` (FFT/eigensolve/Sparse-LU/…) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
-| `CustomFn` | User sub-graph with override AD rules (`custom_vjp`/`custom_jvp`) | ✅ |  |  |  |  |  |  |  |
+| `Custom` | User-registered op via `op_registry` (FFT/eigensolve/Sparse-LU/…) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `CustomFn` | User sub-graph with override AD rules (`custom_vjp`/`custom_jvp`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Backward / training ops
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| `ReluBackward` | ReLU backward | ✅ |  | ✅ |  |  |  |  |  |
-| `ActivationBackward` | Generic activation backward | ✅ |  | ✅ |  |  |  |  |  |
-| `MaxPool2dBackward` | Max-pool backward | ✅ | ✅ | ✅ |  |  | ✅ |  |  |
-| `Conv2dBackwardInput` | Conv2d grad w.r.t. input | ✅ | ✅ | ✅ | ✅ |  | ✅ |  |  |
-| `Conv2dBackwardWeight` | Conv2d grad w.r.t. weight | ✅ | ✅ | ✅ | ✅ |  | ✅ |  |  |
-| `SoftmaxCrossEntropyWithLogits` | Fused softmax + cross-entropy loss | ✅ | ✅ | ✅ |  |  |  |  |  |
-| `SoftmaxCrossEntropyBackward` | Backward of softmax cross-entropy | ✅ | ✅ | ✅ |  |  |  |  |  |
-| `AttentionBackward` | Attention backward — see [AttentionBwdWrt](#attentionbwdwrt) | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ |  |
-| `LayerNormBackwardInput` | LayerNorm grad w.r.t. input | ✅ |  | ✅ | ✅ |  |  |  |  |
-| `LayerNormBackwardGamma` | LayerNorm grad w.r.t. gamma | ✅ |  | ✅ | ✅ |  |  |  |  |
-| `RmsNormBackwardInput` | RMSNorm grad w.r.t. input | ✅ | ✅ |  | ✅ |  | ✅ | ✅ |  |
-| `RmsNormBackwardGamma` | RMSNorm grad w.r.t. gamma | ✅ | ✅ |  | ✅ |  | ✅ | ✅ |  |
-| `RmsNormBackwardBeta` | RMSNorm grad w.r.t. beta | ✅ | ✅ |  | ✅ |  | ✅ | ✅ |  |
-| `RopeBackward` | RoPE backward | ✅ | ✅ |  | ✅ |  | ✅ | ✅ |  |
-| `GroupNormBackwardInput` | GroupNorm grad w.r.t. input | ✅ |  | ✅ |  |  |  |  |  |
-| `GroupNormBackwardGamma` | GroupNorm grad w.r.t. gamma | ✅ |  | ✅ |  |  |  |  |  |
-| `GroupNormBackwardBeta` | GroupNorm grad w.r.t. beta | ✅ |  | ✅ |  |  |  |  |  |
-| `BatchNormInferenceBackwardInput` | BatchNorm-inference grad w.r.t. input | ✅ |  |  |  |  |  |  |  |
-| `BatchNormInferenceBackwardGamma` | BatchNorm-inference grad w.r.t. gamma | ✅ |  |  |  |  |  |  |  |
-| `BatchNormInferenceBackwardBeta` | BatchNorm-inference grad w.r.t. beta | ✅ |  |  |  |  |  |  |  |
-| `CumsumBackward` | Cumsum backward (reverse cumsum) | ✅ | ✅ |  | ✅ |  | ✅ | ✅ |  |
-| `GatherBackward` | Gather backward (scatter-add of grads) | ✅ | ✅ |  | ✅ |  | ✅ | ✅ |  |
-| `AdaLayerNormBackward` | Packed DiT adaLN reverse `[dx∥dscale∥dshift]` | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
-| `GatedResidualBackward` | Packed DiT gated residual reverse `[dx∥dy∥dgate]` | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
+| `ReluBackward` | ReLU backward | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ActivationBackward` | Generic activation backward | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `MaxPool2dBackward` | Max-pool backward | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Conv2dBackwardInput` | Conv2d grad w.r.t. input | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Conv2dBackwardWeight` | Conv2d grad w.r.t. weight | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `SoftmaxCrossEntropy` | Dense/soft-label softmax cross-entropy | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `SoftmaxCrossEntropyWithLogits` | Fused softmax + cross-entropy loss | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `SoftmaxCrossEntropyBackward` | Backward of softmax cross-entropy | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `AttentionBackward` | Attention backward — see [AttentionBwdWrt](#attentionbwdwrt) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `LayerNormBackwardInput` | LayerNorm grad w.r.t. input | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `LayerNormBackwardGamma` | LayerNorm grad w.r.t. gamma | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `RmsNormBackwardInput` | RMSNorm grad w.r.t. input | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `RmsNormBackwardGamma` | RMSNorm grad w.r.t. gamma | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `RmsNormBackwardBeta` | RMSNorm grad w.r.t. beta | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `RopeBackward` | RoPE backward | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `GroupNormBackwardInput` | GroupNorm grad w.r.t. input | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `GroupNormBackwardGamma` | GroupNorm grad w.r.t. gamma | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `GroupNormBackwardBeta` | GroupNorm grad w.r.t. beta | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `BatchNormInferenceBackwardInput` | BatchNorm-inference grad w.r.t. input | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `BatchNormInferenceBackwardGamma` | BatchNorm-inference grad w.r.t. gamma | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `BatchNormInferenceBackwardBeta` | BatchNorm-inference grad w.r.t. beta | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `CumsumBackward` | Cumsum backward (reverse cumsum) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `GatherBackward` | Gather backward (scatter-add of grads) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `AdaLayerNormBackward` | Packed DiT adaLN reverse `[dx∥dscale∥dshift]` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `GatedResidualBackward` | Packed DiT gated residual reverse `[dx∥dy∥dgate]` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 `AdaLayerNormBackward` / `GatedResidualBackward` on **ANE**: native composed MIL
 in `COREML_NATIVE_BACKWARD_OPS` (legalize keeps the packed op; lowering emits
@@ -347,16 +349,23 @@ on at least CPU as of this revision).*
 > was prototyped but the primitive chain diverged per-backend (Round-tie /
 > Expand), so it needs a native kernel or a backend round-fix, not a quick rule.
 
-> **`Gru` / `Rnn` / `Mamba2`** — native fused kernels on **CPU** (`execute_{gru,rnn,mamba2}_f32`), **Metal** (native MSL), and **WGPU** (native WGSL `gru`/`rnn`/`mamba2`; single-layer/unidir/no-carry + `hidden ≤ 256` / `state_size ≤ 256`, host-staged fallback otherwise). Verified by `metal_rnn_native` / `wgpu_rnn_native`. On **MLX** they run via the `unfuse` → primitives decomposition (which *is* MLX's on-GPU path). All paths match the PyTorch/ONNX / SSD reference.
+> **`Gru` / `Rnn` / `Mamba2`** — native fused kernels on **CPU** (`execute_{gru,rnn,mamba2}_f32`), **Metal** (native MSL), **WGPU** (native WGSL), and **CUDA/ROCm** (shared `.cu`; `state_size`/`hidden` ≤ 256 with host-staged fallback). Verified by `metal_rnn_native` / `wgpu_rnn_native`. On **MLX** they run via the `unfuse` → primitives decomposition (which *is* MLX's on-GPU path). All paths match the PyTorch/ONNX / SSD reference.
 
-**CPU-only** (reference path; pin these graphs to `Device::Cpu`):
-`ComplexNormSq`, `ComplexNormSqBackward`, `Conjugate`,
-`CustomFn`, `FftButterflyStage`, `BatchNormInferenceBackward{Input,Gamma,Beta}`.
+**Host-by-design specialty** (claimed on GPU backends via packed HostOp; pin to `Device::Cpu` for the reference path):
+`CustomFn`.
 
-**Single-backend exclusives:**
+> **`DenseSolve` / `BatchedDenseSolve`** — native on **CUDA** (cuSOLVER / cuBLAS batched LU) and **ROCm** (hipSOLVER / hipBLAS batched). **Vulkan** / **OneAPI** / **wgpu** use packed [`HostOpDesc`](../crates/backends/rlx-cpu/src/thunk/host_op.rs) → rlx-cpu LAPACK (`sgesv`) on the mapped / USM f32 arena (same contract as ScanBackward). There is **no** device-side oneMKL LAPACK link on OneAPI — DenseSolve stays host LAPACK there. HostOp fallback for non-F32 on all GPU backends.
 
-- `QMatMul`, `QConv2d` — **TPU** only (real INT8 I/O can't be a model boundary elsewhere).
-- `If`, `While` — **MLX** only (bounded-unroll lowering).
+> **`QMatMul` / `QConv2d`** — native shared `.cu` on **CUDA** / **ROCm** (packed I8 arena); also on **CPU** / Apple / wgpu / TPU.
+
+> **`ComplexNormSq` / `ComplexNormSqBackward` / `Conjugate`** — native on
+> **CPU** / **Metal** (MSL) / **WGPU** (WGSL) / **CUDA** / **ROCm**
+> (`complex_wirtinger.cu`). **MLX** / **ANE** still host-eval interleaved C64.
+
+**Single-backend exclusives / notes:**
+
+- `QMatMul`, `QConv2d` — real INT8 I/O; native on CUDA/ROCm (packed-byte arena) and TPU; other GPUs may host-stage.
+- `If`, `While` — native bounded-unroll on **MLX**; CUDA/ROCm/wgpu expand via `rlx-unfuse` (`expand_if` / `expand_while`).
 
 **Inference-only accelerators:** ANE (CoreML) and TPU declare **no native
 backward kernels** in the base inference claim — ANE training uses
@@ -366,8 +375,9 @@ the `training` feature; TPU still omits reverse. ANE also omits
 (`ElementwiseRegion`/`TransformRegion`/`BatchElementwiseRegion`), and the splat
 family.
 
-**ROCm ≈ CUDA, minus:** `MaxPool2dBackward`, `Conv2dBackwardInput`,
-`Conv2dBackwardWeight` (CUDA has these; ROCm doesn't yet).
+**ROCm ≈ CUDA** for host GPU training ops that share `.cu` kernels
+(including `MaxPool2dBackward`, `Conv2dBackwardInput` /
+`Conv2dBackwardWeight`, and `FusedConvBiasAct` via the epilogue fallback).
 
 > **CPU caveat:** `supports(Device::Cpu, _)` in `device_ext.rs` returns `true`
 > unconditionally ("reference is ground truth"), but the *legalization* contract

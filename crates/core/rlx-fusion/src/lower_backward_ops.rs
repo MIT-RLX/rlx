@@ -247,6 +247,11 @@ fn lower_activation_backward(
             let denom = g.add(one, x_sq);
             g.div(dy, denom)
         }
+        Activation::Recip => {
+            let x_sq = g.mul(x, x);
+            let neg_dy = g.neg(dy);
+            g.div(neg_dy, x_sq)
+        }
         Activation::Gelu | Activation::GeluApprox => {
             lower_gelu_approx_backward(g, x, dy, out_shape)
         }

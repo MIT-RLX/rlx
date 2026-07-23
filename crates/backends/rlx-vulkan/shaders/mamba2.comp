@@ -1,0 +1,54 @@
+#version 450
+// Mamba-2 / SSD scalar-decay SSM scan.
+//   dA = exp(dt * a);  S = dA * S + (dt * x) ⊗ b;  y = Σ_n S[:,n] * c[n]
+// One thread per (batch, head, head_dim_pos). Private N-state (cap 256).
+// Inputs: x [B,S,H,P], dt [B,S,H], a [H], b/c [B,S,H,N]; y [B,S,H,P].
+layout(local_size_x = 64) in;
+
+const uint MAX_STATE = 256u;
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint seq;
+    uint heads;
+    uint head_dim;
+    uint state_size;
+    uint x_off;
+    uint dt_off;
+    uint a_off;
+    uint b_off;
+    uint c_off;
+    uint out_off;
+    uint seq_stride;
+} pc;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint p = pc.head_dim;
+    uint n = pc.state_size;
+    uint total = pc.batch * pc.heads * p;
+    if (id >= total || n > MAX_STATE) { return; }
+
+    uint pi = id % p;
+    uint hi = (id / p) % pc.heads;
+    uint bi = id / (p * pc.heads);
+
+    float state[MAX_STATE];
+    for (uint i = 0u; i < n; i++) { state[i] = 0.0; }
+    float ah = arena_load(pc.a_off + hi);
+
+    for (uint si = 0u; si < pc.seq; si++) {
+        uint bsh = (bi * pc.seq_stride + si) * pc.heads + hi;
+        float dt_t = arena_load(pc.dt_off + bsh);
+        float da = exp(dt_t * ah);
+        float dtx = dt_t * arena_load(pc.x_off + bsh * p + pi);
+        uint bc = bsh * n;
+        float acc = 0.0;
+        for (uint ni = 0u; ni < n; ni++) {
+            float st = da * state[ni] + dtx * arena_load(pc.b_off + bc + ni);
+            state[ni] = st;
+            acc += st * arena_load(pc.c_off + bc + ni);
+        }
+        arena_store(pc.out_off + bsh * p + pi, acc);
+    }
+}

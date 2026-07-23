@@ -182,6 +182,8 @@ struct LowerCtx<'a> {
 
 mod activation;
 mod attention;
+/// Interleaved-C64 Wirtinger + FFT butterfly MIL lowers.
+mod complex;
 mod conv_pool;
 mod loss;
 mod matmul;
@@ -315,10 +317,44 @@ impl<'a> LowerCtx<'a> {
                     )?;
                     self.operations.push(op);
                     self.names.insert(id.0, out_name);
-                } else if self.typed_params.contains_key(name) {
-                    // Quantized weight — host-dequantized by the consuming
-                    // Dequant* op, which bakes its own f32 const. Emit
-                    // nothing here.
+                } else if let Some((bytes, dtype)) = self.typed_params.get(name) {
+                    // Quantized weight bytes (I8/U8 packing) are host-dequantized
+                    // by the consuming Dequant* op — emit nothing here.
+                    // Integer *control* params (I64/I32 duration carry, alignment
+                    // frame count, runtime shapes) must still materialize: CoreML
+                    // has no I64 storage, so bake them as f32 consts (same
+                    // convention as promote_int_to_f32 / f32-uniform arenas).
+                    match *dtype {
+                        DType::I8 | DType::U8 => {
+                            // packed quant weight — Dequant* bakes the f32 const
+                        }
+                        DType::I64
+                        | DType::I32
+                        | DType::U32
+                        | DType::I16
+                        | DType::F32
+                        | DType::F16
+                        | DType::BF16
+                        | DType::Bool => {
+                            let floats =
+                                bytes_to_f32(bytes, &node.shape.clone().with_dtype(*dtype))?;
+                            let shape = node.shape.clone().with_dtype(DType::F32);
+                            let op = make_const_float(
+                                &mut self.blob,
+                                &out_name,
+                                &shape,
+                                &floats,
+                                self.opts.float_dtype,
+                            )?;
+                            self.operations.push(op);
+                            self.names.insert(id.0, out_name);
+                        }
+                        other => {
+                            return Err(CoremlError::Unsupported(format!(
+                                "CoreML typed param '{name}' dtype {other:?}"
+                            )));
+                        }
+                    }
                 } else {
                     return Err(CoremlError::Runtime(format!(
                         "missing baked param '{name}' for CoreML"
@@ -366,6 +402,9 @@ impl<'a> LowerCtx<'a> {
                     vec![("x", bind_name(&x)), ("y", bind_name(&y))],
                 )?;
                 self.push_named(id, out_name, op);
+            }
+            Op::Fma => {
+                self.lower_fma(id, &out_name)?;
             }
             Op::Activation(act) => {
                 self.lower_activation(id, *act, &out_name)?;
@@ -983,6 +1022,61 @@ impl<'a> LowerCtx<'a> {
                     &out_name,
                 )?;
             }
+            Op::Conv3d {
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                self.lower_conv(
+                    id,
+                    false,
+                    stride,
+                    padding,
+                    dilation,
+                    &[],
+                    *groups,
+                    &out_name,
+                )?;
+            }
+            Op::ConvTranspose3d {
+                stride,
+                padding,
+                dilation,
+                output_padding,
+                groups,
+            } => {
+                self.lower_conv(
+                    id,
+                    true,
+                    stride,
+                    padding,
+                    dilation,
+                    output_padding,
+                    *groups,
+                    &out_name,
+                )?;
+            }
+            Op::FusedMatMulBiasAct { activation } => {
+                self.lower_fused_matmul_bias_act(id, *activation, &out_name)?;
+            }
+            Op::FusedSwiGLU { .. } => {
+                self.lower_fused_swiglu(id, &out_name)?;
+            }
+            Op::FusedResidualLN { has_bias, eps } => {
+                self.lower_fused_residual_ln(id, *has_bias, *eps, &out_name)?;
+            }
+            Op::FusedResidualRmsNorm { has_bias, eps } => {
+                self.lower_fused_residual_rms_norm(id, *has_bias, *eps, &out_name)?;
+            }
+            Op::FakeQuantize {
+                bits,
+                axis,
+                ste: _,
+                scale_mode,
+            } => {
+                self.lower_fake_quantize(id, *bits, *axis, *scale_mode, &out_name)?;
+            }
             Op::Pool {
                 kind,
                 kernel_size,
@@ -1128,6 +1222,19 @@ impl<'a> LowerCtx<'a> {
             }
             Op::Scan { .. } => {
                 self.lower_scan(id, &out_name)?;
+            }
+            // Interleaved C64 (promoted to F32 `[…, 2n]`) Wirtinger surface.
+            Op::ComplexNormSq => {
+                self.lower_complex_norm_sq(id, &out_name)?;
+            }
+            Op::ComplexNormSqBackward => {
+                self.lower_complex_norm_sq_backward(id, &out_name)?;
+            }
+            Op::Conjugate => {
+                self.lower_conjugate(id, &out_name)?;
+            }
+            Op::FftButterflyStage { stage, n_fft } => {
+                self.lower_fft_butterfly_stage(id, *stage, *n_fft, &out_name)?;
             }
             other => {
                 return Err(CoremlError::Unsupported(format!(
@@ -1463,8 +1570,21 @@ impl<'a> LowerCtx<'a> {
             }
         }
         let undefined = |name: &str| -> CoremlError {
+            // Resolve which graph node owns this dangling name for a precise
+            // diagnosis (usually a quantized Param that emitted nothing).
+            let hint = self
+                .graph
+                .nodes()
+                .iter()
+                .find(|n| match &n.op {
+                    Op::Param { name: p } => sanitize(p) == name || format!("v{}", n.id.0) == name,
+                    Op::Input { name: p } => sanitize(p) == name || format!("v{}", n.id.0) == name,
+                    _ => format!("v{}", n.id.0) == name,
+                })
+                .map(|n| format!(" — source node {:?}: {:?}", n.id, n.op))
+                .unwrap_or_default();
             CoremlError::Runtime(format!(
-                "CoreML lowering produced a dangling reference to value '{name}': the source node \
+                "CoreML lowering produced a dangling reference to value '{name}'{hint}: the source node \
                  was not lowered (e.g. a quantized Param used outside a Dequant* op, or an \
                  unhandled op). This is a backend bug, not a model error."
             ))
@@ -1537,13 +1657,16 @@ impl<'a> LowerCtx<'a> {
         // CoreML parse error.
         self.verify_refs(&output_names)?;
 
-        // Bump to the iOS18 opset only when the graph uses an op that requires
-        // it (currently `constexpr_lut_to_dense` grouped palettization + UINT1);
-        // ordinary graphs stay at CoreML6 so existing behavior is unchanged.
-        let needs_ios18 = self
-            .operations
-            .iter()
-            .any(|op| op.r#type == "constexpr_lut_to_dense");
+        // Bump to the iOS18 opset when the graph uses an op that requires it
+        // (currently `constexpr_lut_to_dense` grouped palettization + UINT1),
+        // OR when the model has no inputs — CoreML only allows empty-input
+        // models at specification version ≥ 9 (iOS 18 / macOS 15). Ordinary
+        // graphs stay at CoreML6 so existing behavior is unchanged.
+        let needs_ios18 = self.inputs.is_empty()
+            || self
+                .operations
+                .iter()
+                .any(|op| op.r#type == "constexpr_lut_to_dense");
         let (opset, spec_version) = if needs_ios18 {
             (OPSET_IOS18, SPEC_VERSION_IOS18)
         } else {

@@ -34,9 +34,12 @@ pub mod backend;
 pub mod buffer;
 pub mod device;
 pub mod host;
+pub mod host_stage;
 pub mod kernels;
 pub mod shaders;
 pub mod spd;
+pub mod unfuse;
+pub mod vmath;
 
 /// True if a Vulkan compute device is reachable on this system. The
 /// runtime registry only registers `Device::Vulkan` when this returns

@@ -99,17 +99,26 @@ fn ref_softmax(x: &[f32], dims: &[usize], axis: usize) -> Vec<f32> {
 }
 
 /// Two-pass LayerNorm over the last axis (matches the fixed wgpu kernel).
-fn ref_layer_norm_two_pass(x: &[f32], rows: usize, inner: usize, gamma: &[f32], beta: &[f32]) -> Vec<f32> {
+fn ref_layer_norm_two_pass(
+    x: &[f32],
+    rows: usize,
+    inner: usize,
+    gamma: &[f32],
+    beta: &[f32],
+) -> Vec<f32> {
     let mut y = vec![0.0f32; x.len()];
     let n_inv = 1.0 / inner as f32;
     for r in 0..rows {
         let off = r * inner;
         let row = &x[off..off + inner];
         let mean = row.iter().sum::<f32>() * n_inv;
-        let var = row.iter().map(|v| {
-            let d = v - mean;
-            d * d
-        }).sum::<f32>()
+        let var = row
+            .iter()
+            .map(|v| {
+                let d = v - mean;
+                d * d
+            })
+            .sum::<f32>()
             * n_inv;
         let inv = 1.0 / (var + EPS).sqrt();
         for i in 0..inner {
@@ -122,13 +131,21 @@ fn ref_layer_norm_two_pass(x: &[f32], rows: usize, inner: usize, gamma: &[f32], 
 /// One-pass `E[x²]−mean²` LayerNorm — the form the wgpu bug used. Exposed so
 /// the DC-offset case asserts the two formulas actually diverge (otherwise the
 /// micro-test is not stressing cancellation).
-fn ref_layer_norm_one_pass(x: &[f32], rows: usize, inner: usize, gamma: &[f32], beta: &[f32]) -> Vec<f32> {
+fn ref_layer_norm_one_pass(
+    x: &[f32],
+    rows: usize,
+    inner: usize,
+    gamma: &[f32],
+    beta: &[f32],
+) -> Vec<f32> {
     let mut y = vec![0.0f32; x.len()];
     let n_inv = 1.0 / inner as f32;
     for r in 0..rows {
         let off = r * inner;
         let row = &x[off..off + inner];
-        let (sum, sumsq) = row.iter().fold((0.0f32, 0.0f32), |(s, ss), &v| (s + v, ss + v * v));
+        let (sum, sumsq) = row
+            .iter()
+            .fold((0.0f32, 0.0f32), |(s, ss), &v| (s + v, ss + v * v));
         let mean = sum * n_inv;
         let var = (sumsq * n_inv - mean * mean).max(0.0);
         let inv = 1.0 / (var + EPS).sqrt();
@@ -190,8 +207,14 @@ fn cuda_group_norm_dc_offset_matches_cpu() {
     }
     let (n, c, h, w, groups) = (2usize, 8usize, 4usize, 4usize, 2usize);
     let x = dc_ramp(n * c * h * w, 1);
-    let gamma = dc_ramp(c, 3).into_iter().map(|v| v - DC + 1.0).collect::<Vec<_>>();
-    let beta = dc_ramp(c, 7).into_iter().map(|v| v - DC).collect::<Vec<_>>();
+    let gamma = dc_ramp(c, 3)
+        .into_iter()
+        .map(|v| v - DC + 1.0)
+        .collect::<Vec<_>>();
+    let beta = dc_ramp(c, 7)
+        .into_iter()
+        .map(|v| v - DC)
+        .collect::<Vec<_>>();
 
     let mut g = Graph::new("gn_dc");
     let xin = g.input("x", Shape::new(&[n, c, h, w], F));

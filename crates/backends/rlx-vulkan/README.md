@@ -38,50 +38,74 @@ ICD exists: **desktop Linux/Windows NVIDIA/AMD/Intel and Android Adreno/Mali.**
 | file | role |
 |------|------|
 | `device.rs`  | instance / device / queue singleton, memory-type query, one-shot submit |
-| `buffer.rs`  | host-visible f32 arena + the f32-uniform memory plan |
+| `buffer.rs`  | host-visible f32 arena (+ multi-buffer sharding when over `maxStorageBufferRange`) |
+| `host_stage.rs` | [`DeviceArena`](../rlx-gpu-host) adapter for shard-safe Scan / HostOp / indexing |
 | `kernels.rs` | shared descriptor-set + pipeline layout, lazy per-kernel pipeline cache |
 | `shaders.rs` | embedded SPIR-V blobs (generated from `shaders/`) |
 | `backend.rs` | `VulkanExecutable`: legalize → schedule of dispatches → run |
 
-Every tensor is an f32 slot in one arena buffer; each schedule step is one
+Every tensor is an f32 slot in the activation arena; each schedule step is one
 compute pipeline + push constants + a workgroup count. A global shader-memory
 barrier separates dispatches; one submit per `run`; outputs read back from the
 persistently-mapped arena.
 
+### Sharded arenas
+
+When the planned act arena exceeds `maxStorageBufferRange` (~4 GiB on many NVIDIA
+cards), activations are striped across multiple `VkBuffer`s. Host paths that
+used a single `mapped_ptr()` (shard 0 only) SIGSEGV'd on large graphs (e.g.
+KittenTTS wave ≥64 k before the fix). Indexing / Scan / HostOp now go through
+`host_stage::VulkanArena` + `rlx_gpu_host::run_*` (per-region D2H when sharded).
+
+`snap_plan_to_shards` mirrors wgpu: scratch may live in the per-stripe stage
+reserve — it does **not** open an empty extra shard for tail bytes. Override
+stage size with `RLX_VULKAN_SHARD_STAGE_MIB` (bytes = MiB×2²⁰, capped at the
+576 MiB compile-time default). KittenTTS sets `64` so long-wave plans stay
+unsharded longer.
+
+**Note:** sharded KittenTTS still produces near-silent audio; keep wave compile
+width under the unsharded window (see Kitten `device_policy`). The host-staging
+fix only removes the crash.
+
 ## Op coverage
 
-~29 native compute kernels spanning the forward-inference surface:
+Claims the full **153/`OpKind`** surface ([`docs/op-coverage.md`](../../docs/op-coverage.md)).
+Native SPIR-V covers the transformer / vision / training hot path:
 
 - **Transformer**: matmul, attention (online softmax; causal / sliding-window /
   custom / bias masks; `[B,S,H,D]` & `[B,H,S,D]`), RoPE (NeoX **and** GptJ,
-  full / partial), RMS/Layer norm, softmax.
-- **Elementwise**: binary (×7), unary/activation (×16), compare (×6), where.
-- **Reduction / shape**: reduce, cumsum, argmax/argmin, transpose, narrow,
-  concat, expand, gather, reverse (one strided-copy kernel backs the shape ops).
-- **Vision**: conv2d (stride/pad/dilation/groups incl. depthwise), pool2d
-  (max/avg), im2col, layernorm2d, nearest-2× resize.
-- **MoE / SSM / generation**: grouped matmul, selective-scan (Mamba), top-k.
+  full / partial), RMS/Layer/Group norm (+ bwd), softmax, SoftmaxCrossEntropy*.
+- **Elementwise**: binary (×7), unary/activation (×16), compare (×6), where,
+  Fma, ActivationBackward.
+- **Reduction / shape**: reduce, cumsum (+ bwd), argmax/argmin, transpose,
+  narrow, concat, expand, gather (+ bwd), reverse (one strided-copy kernel
+  backs the shape ops).
+- **Vision**: conv2d/3d (+ bwd), ConvTranspose2d/3d, pool2d (+ MaxPool2d bwd),
+  im2col, layernorm2d, nearest-2× resize, FusedConvBiasAct.
+- **MoE / SSM / generation**: grouped matmul, selective-scan (Mamba),
+  Gru/Rnn/Mamba2/Lstm (size-capped; oversized → host), top-k,
+  FftButterflyStage.
+- **QAT / I8**: FakeQuantize Fixed/PerBatch/LSQ (+ STE bwd), packed-I8
+  Quantize/Dequantize/QMatMul/QConv2d.
+- **C64**: ComplexNormSq / Backward / Conjugate (interleaved).
 
-Fused ops, `DotGeneral`, `Fma`, non-last-axis reduce, `GroupNorm`,
-`BatchNormInference`, `LoraMatMul`, etc. are decomposed into the native set by
+Fused residual norms / SwiGLU, `FusedMatMulBiasAct`, fusion regions,
+`LoraMatMul` / `FusedTransformerLayer` / `If` / `While` / `DotGeneral` /
+`GatedDeltaNet` deepen via native SPIR-V or `rlx-unfuse` before schedule.
+`DotGeneral`, non-last-axis reduce, etc. also decompose via
 `legalize_or_rewrite_for_backend`.
 
-**Host-fallback** (no native SPIR-V kernel yet, run on the CPU reference against
-the host-visible mapped arena — same design as `rlx-wgpu`'s host ops, so results
-are bit-for-bit the reference): the RNN/SSM families
-(`Lstm`/`Gru`/`Rnn`/`Mamba2`/`GatedDeltaNet`), `ConvTranspose2d`, `Fft`,
-quantized matmul (`DequantMatMul` + GGUF block decode reads the packed U8 weight
-straight from the arena), `DequantGroupedMatMul`/`DequantMoEWeights`, and
-`RngNormal`/`RngUniform`/`Sample`. The run loop submits GPU dispatches in
-segments and flushes around each host op. These are correctness-complete and
-parity-validated; promoting the hot ones to native SPIR-V is a perf follow-up.
+**Host-fallback** (no native SPIR-V yet, or exceeds a native size cap —
+run on the CPU reference against the host-visible mapped arena): oversized
+RNN/SSM, `Fft`, quantized matmul (`DequantMatMul` + GGUF block decode),
+`DequantGroupedMatMul`/`DequantMoEWeights`, `RngNormal`/`RngUniform`/`Sample`,
+DenseSolve (HostOpDesc → LAPACK), `CustomFn`, splat prepare/rasterize.
+The run loop submits GPU dispatches in segments and flushes around each host op.
 
-Out of scope for a forward-inference kernel set: int8-I/O `QMatMul`/`QConv2d`,
-and domain custom ops (Gaussian splat). Packed DiT reverse
-(`AdaLayerNormBackward` / `GatedResidualBackward`) has dedicated SPIR-V shaders
-(`ada_layer_norm_backward.comp` / `gated_residual_backward.comp`); forward
-`AdaLayerNorm` / `GatedResidual` still claim-then-`unfuse_dit_modulation`. Host
-`Scan*` / SPD / Eigh backward stay as arena CPU fallbacks.
+Packed DiT reverse (`AdaLayerNormBackward` / `GatedResidualBackward`) has
+dedicated SPIR-V shaders; forward `AdaLayerNorm` / `GatedResidual` still
+claim-then-`unfuse_dit_modulation`. Host `Scan*` / SPD / Eigh backward stay
+as arena CPU fallbacks.
 
 ## Status
 
@@ -94,7 +118,7 @@ real GPU driver:
   tests): every Binary/Activation/Compare/Reduce variant, attention across mask
   kinds + both head layouts, RoPE (NeoX/GptJ × full/partial), matmul, norms,
   softmax, vision (conv/pool/im2col/resize), MoE grouped-matmul, Mamba SSM, and
-  the host-fallback families (RNN, ConvTranspose2d, FFT, GGUF dequant, RNG).
+  the host-fallback families (oversized RNN/SSM, FFT, GGUF dequant, RNG).
 - **lavapipe** (Mesa CPU/software Vulkan, Linux) — exact-value device tests via
   the `./docker` container.
 
@@ -104,8 +128,8 @@ strided-copy kernel; a missing RMSNorm `beta` term), both fixed.
 **Not yet validated on a native Vulkan driver / real GPU** — that's the pending
 step on the Linux CUDA rig. Kernels are also still naive (correctness first):
 shared-memory tiling, a device-local arena + staging, grid-stride dispatch, and
-promoting hot host-fallback ops (esp. `DequantMatMul`) to native SPIR-V are the
-perf follow-ups, best done there.
+promoting remaining hot host ops (esp. `DequantMatMul` / GGUF) to native SPIR-V
+are the perf follow-ups, best done there.
 
 Run the parity suite locally with a Vulkan driver present:
 

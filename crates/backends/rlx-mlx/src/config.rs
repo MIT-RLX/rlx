@@ -105,7 +105,8 @@ impl MlxRuntimeConfig {
             q1_mv_disable: reg::var("RLX_MLX_Q1_MV_DISABLE").as_deref() == Some("1"),
             dequant_cache_disable: reg::var("RLX_MLX_DEQUANT_CACHE_DISABLE").as_deref()
                 == Some("1"),
-            dequant_cache_bytes: reg::var("RLX_MLX_DEQUANT_CACHE_BYTES").and_then(|s| s.parse().ok()),
+            dequant_cache_bytes: reg::var("RLX_MLX_DEQUANT_CACHE_BYTES")
+                .and_then(|s| s.parse().ok()),
             compile_max_nodes,
             warn_lazy_all: reg::var("RLX_MLX_WARN_LAZY")
                 .as_deref()

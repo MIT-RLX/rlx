@@ -75,6 +75,28 @@ pub fn prepare_f32_exec_graph(graph: Graph) -> (Graph, IoDtypeManifest) {
     (exec, manifest)
 }
 
+/// Widen integer *control* `Param` nodes (duration carry, masks, trip counts)
+/// to F32 so f32-uniform backends don't treat raw i64 uploads as denormals.
+///
+/// Mirrors Metal's `widen_integer_activations_to_f32` Param branch. Packed
+/// U8/I8 weights and floating params are left alone. Callers must also widen
+/// matching `set_param_typed` uploads via [`crate::backend::widen_bytes_to_f32`].
+pub fn widen_integer_control_params_to_f32(mut graph: Graph) -> Graph {
+    for node in graph.nodes_mut() {
+        if !matches!(node.op, Op::Param { .. }) {
+            continue;
+        }
+        let old = node.shape.dtype();
+        if matches!(
+            old,
+            DType::I32 | DType::I64 | DType::U32 | DType::Bool | DType::I16
+        ) {
+            node.shape = node.shape.clone().with_dtype(DType::F32);
+        }
+    }
+    graph
+}
+
 pub fn needs_f32_exec(g: &Graph) -> bool {
     g.nodes().iter().any(|n| {
         if !matches!(n.shape.dtype(), DType::F16 | DType::BF16) {

@@ -281,6 +281,72 @@ pub fn conv3d(
     Ok(Array::from_raw(out))
 }
 
+pub fn conv_transpose2d(
+    input: &Array,
+    weight: &Array,
+    stride: (i32, i32),
+    padding: (i32, i32),
+    dilation: (i32, i32),
+    output_padding: (i32, i32),
+    groups: i32,
+) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
+    let mut out: *mut mlx_array_t = ptr::null_mut();
+    let rc = unsafe {
+        ffi::rlx_mlx_op_conv_transpose2d(
+            input.ptr,
+            weight.ptr,
+            stride.0,
+            stride.1,
+            padding.0,
+            padding.1,
+            dilation.0,
+            dilation.1,
+            output_padding.0,
+            output_padding.1,
+            groups,
+            &mut out,
+        )
+    };
+    check(rc)?;
+    Ok(Array::from_raw(out))
+}
+
+pub fn conv_transpose3d(
+    input: &Array,
+    weight: &Array,
+    stride: (i32, i32, i32),
+    padding: (i32, i32, i32),
+    dilation: (i32, i32, i32),
+    output_padding: (i32, i32, i32),
+    groups: i32,
+) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
+    let mut out: *mut mlx_array_t = ptr::null_mut();
+    let rc = unsafe {
+        ffi::rlx_mlx_op_conv_transpose3d(
+            input.ptr,
+            weight.ptr,
+            stride.0,
+            stride.1,
+            stride.2,
+            padding.0,
+            padding.1,
+            padding.2,
+            dilation.0,
+            dilation.1,
+            dilation.2,
+            output_padding.0,
+            output_padding.1,
+            output_padding.2,
+            groups,
+            &mut out,
+        )
+    };
+    check(rc)?;
+    Ok(Array::from_raw(out))
+}
+
 pub fn conv_general(
     input: &Array,
     weight: &Array,

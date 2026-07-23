@@ -98,12 +98,39 @@ pub fn run_custom_host_bytes<A: DeviceArena>(
     let mut in_bufs: Vec<Vec<u8>> = Vec::with_capacity(in_specs.len());
     for &(byte_off, ref sh) in in_specs {
         let n = sh.num_elements().unwrap_or(0);
-        let mut raw = vec![0u8; n * 4];
-        if n > 0 {
-            a.dtoh(byte_off, &mut raw);
+        if is_byte_packed(sh.dtype()) {
+            // U8/I8 tensors are byte-packed in the f32-uniform arena (4 elems per
+            // f32 slot — matches `set_param_bytes` and the backend arena's
+            // `elems`-byte slot). Read the raw dtype bytes directly; do NOT treat
+            // each element as its own f32 slot (that reads 4x too much and mangles
+            // quantized activations/weights, e.g. Kitten `QMatMul` act_q / weights).
+            //
+            // Quantized weight params are immutable for the life of a compiled
+            // graph — cache by arena offset so Kitten's DynamicQuantizeLSTM
+            // (5×/wave) does not re-D2H the same int8 W/R every call.
+            let cached = PARAM_CACHE.with(|c| c.borrow().get(&byte_off).cloned());
+            let raw = if let Some(hit) = cached {
+                hit
+            } else {
+                let mut raw = vec![0u8; round_up_4(n)];
+                if n > 0 {
+                    a.dtoh(byte_off, &mut raw);
+                }
+                raw.truncate(n);
+                PARAM_CACHE.with(|c| {
+                    c.borrow_mut().insert(byte_off, raw.clone());
+                });
+                raw
+            };
+            in_bufs.push(raw);
+        } else {
+            let mut raw = vec![0u8; n * 4];
+            if n > 0 {
+                a.dtoh(byte_off, &mut raw);
+            }
+            let f: &[f32] = bytemuck::cast_slice(&raw);
+            in_bufs.push(f32_slots_to_dtype(f, sh.dtype()));
         }
-        let f: &[f32] = bytemuck::cast_slice(&raw);
-        in_bufs.push(f32_slots_to_dtype(f, sh.dtype()));
     }
     let in_pairs: Vec<(&[u8], &Shape)> = in_bufs
         .iter()
@@ -116,7 +143,6 @@ pub fn run_custom_host_bytes<A: DeviceArena>(
     rlx_cpu::op_registry::run_custom_op_host(name, &in_pairs, (&mut out, out_shape), attrs)
         .unwrap_or_else(|e| panic!("rlx-gpu-host custom-op '{name}': {e}"));
 
-    let out_f32 = dtype_bytes_to_f32(&out, out_shape.dtype());
     if std::env::var("RLX_DBG_CUSTOM").is_ok() {
         eprintln!(
             "[gpu-host-custom] {name} out_off={out_byte_off} out_dtype={:?} out_n={out_n} in={:?}",
@@ -127,9 +153,45 @@ pub fn run_custom_host_bytes<A: DeviceArena>(
                 .collect::<Vec<_>>(),
         );
     }
-    if !out_f32.is_empty() {
-        a.htod(out_byte_off, bytemuck::cast_slice(&out_f32));
+    if out_n == 0 {
+        return;
     }
+    if is_byte_packed(out_shape.dtype()) {
+        // Byte-packed output: write the raw dtype bytes back, padded up to the
+        // f32-slot boundary the arena allocated (never treated as f32 elements).
+        let mut packed = out;
+        packed.resize(round_up_4(out_n), 0);
+        a.htod(out_byte_off, &packed);
+    } else {
+        let out_f32 = dtype_bytes_to_f32(&out, out_shape.dtype());
+        if !out_f32.is_empty() {
+            a.htod(out_byte_off, bytemuck::cast_slice(&out_f32));
+        }
+    }
+}
+
+thread_local! {
+    static PARAM_CACHE: std::cell::RefCell<std::collections::HashMap<usize, Vec<u8>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Drop cached int8/u8 custom-op params (call after recompiling / swapping arenas).
+pub fn clear_custom_param_cache() {
+    PARAM_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+/// U8/I8 tensors live byte-packed (1 native byte/elem) in the f32-uniform arena,
+/// unlike Bool (written as 1.0/0.0 f32 lanes) and every wider dtype (one f32 lane
+/// per element). Keep in sync with the backend arenas' slot sizing.
+#[inline]
+fn is_byte_packed(dtype: DType) -> bool {
+    matches!(dtype, DType::U8 | DType::I8)
+}
+
+/// Round a byte length up to the f32-slot (4-byte) boundary the arena aligns to.
+#[inline]
+fn round_up_4(n: usize) -> usize {
+    n.div_ceil(4) * 4
 }
 
 /// Same as [`run_custom_host_bytes`] with **f32-element** offsets (CUDA layout).

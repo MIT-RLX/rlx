@@ -243,6 +243,7 @@ typedef enum {
     RLX_MLX_UN_COS = 12,
     RLX_MLX_UN_TAN = 13,
     RLX_MLX_UN_ATAN = 14,
+    RLX_MLX_UN_RECIPROCAL = 15,
 } rlx_mlx_unary_t;
 int rlx_mlx_op_unary(rlx_mlx_array_t* a, rlx_mlx_unary_t kind, rlx_mlx_array_t** out);
 
@@ -370,6 +371,33 @@ int rlx_mlx_op_conv3d(
     int stride_d, int stride_h, int stride_w,
     int pad_d,    int pad_h,    int pad_w,
     int dil_d,    int dil_h,    int dil_w,
+    int groups,
+    rlx_mlx_array_t** out);
+
+// 2D transposed convolution. Input/weight in MLX NHWC /
+// [C_out, kH, kW, C_in/groups] layout (caller transposes from NCHW /
+// PyTorch [C_in, C_out/groups, kH, kW] upstream).
+int rlx_mlx_op_conv_transpose2d(
+    rlx_mlx_array_t* input,
+    rlx_mlx_array_t* weight,
+    int stride_h, int stride_w,
+    int pad_h,    int pad_w,
+    int dil_h,    int dil_w,
+    int out_pad_h, int out_pad_w,
+    int groups,
+    rlx_mlx_array_t** out);
+
+// 3D transposed convolution. Input/weight in MLX NDHWC /
+// [C_out, kD, kH, kW, C_in] layout (caller transposes from NCDHW /
+// PyTorch [C_in, C_out/groups, kD, kH, kW] upstream). MLX only
+// supports groups=1 for 3D transpose.
+int rlx_mlx_op_conv_transpose3d(
+    rlx_mlx_array_t* input,
+    rlx_mlx_array_t* weight,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d,    int pad_h,    int pad_w,
+    int dil_d,    int dil_h,    int dil_w,
+    int out_pad_d, int out_pad_h, int out_pad_w,
     int groups,
     rlx_mlx_array_t** out);
 

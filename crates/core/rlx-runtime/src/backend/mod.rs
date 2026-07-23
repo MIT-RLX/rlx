@@ -83,6 +83,11 @@ pub fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> {
             let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n) };
             s.iter().map(|&x| x as f32).collect()
         }
+        DType::U32 => {
+            let n = data.len() / 4;
+            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, n) };
+            s.iter().map(|&x| x as f32).collect()
+        }
         DType::I8 => data.iter().map(|&b| b as i8 as f32).collect(),
         DType::U8 | DType::Bool => data.iter().map(|&b| b as f32).collect(),
         // ── Complex (shared f32-uniform GPU boundary) ───────────────────
@@ -120,7 +125,7 @@ pub fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> {
         }
         other => panic!(
             "widen_bytes_to_f32: dtype {other:?} unsupported on f32-arena backends \
-             (only F32/F64/F16/BF16/I64/I32/I8/U8/Bool/C64/C128 are accepted on the host I/O surface)"
+             (only F32/F64/F16/BF16/I64/I32/U32/I8/U8/Bool/C64/C128 are accepted on the host I/O surface)"
         ),
     }
 }
@@ -269,8 +274,8 @@ mod f64_boundary_tests {
         let reals = [
             std::f64::consts::PI,
             1.0 / 3.0,
-            0.5,      // exactly f32-representable → bit-exact
-            -2.25,    // exactly f32-representable → bit-exact
+            0.5,   // exactly f32-representable → bit-exact
+            -2.25, // exactly f32-representable → bit-exact
             1.0e-12,
             123456.789012345,
         ];
@@ -287,7 +292,13 @@ mod f64_boundary_tests {
         for (k, &r) in reals.iter().enumerate() {
             let re = f64::from_le_bytes(back[k * 16..k * 16 + 8].try_into().unwrap());
             let im = f64::from_le_bytes(back[k * 16 + 8..k * 16 + 16].try_into().unwrap());
-            let rel = |a: f64, b: f64| if b == 0.0 { a.abs() } else { (a - b).abs() / b.abs() };
+            let rel = |a: f64, b: f64| {
+                if b == 0.0 {
+                    a.abs()
+                } else {
+                    (a - b).abs() / b.abs()
+                }
+            };
             assert!(rel(re, r) <= 1e-14, "re[{k}]={re} vs {r}");
             assert!(rel(im, r * 2.0) <= 1e-14, "im[{k}]={im} vs {}", r * 2.0);
         }
@@ -298,7 +309,10 @@ mod f64_boundary_tests {
             h.extend_from_slice(&0.0f64.to_le_bytes());
             let l = widen_bytes_to_f32(&h, DType::C128);
             let b = narrow_f32_to_bytes(&l, DType::C128);
-            assert_eq!(b, h, "f32-exact C128 value {exact} must round-trip bit-exact");
+            assert_eq!(
+                b, h,
+                "f32-exact C128 value {exact} must round-trip bit-exact"
+            );
         }
     }
 }

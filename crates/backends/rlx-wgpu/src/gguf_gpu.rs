@@ -5,12 +5,12 @@
 
 //! GPU GGUF dequant + wgpu matmul for `Op::DequantMatMul`.
 //!
-//! Flow: `dequant_gguf` compute (scheme ids 0–23, shared with Metal/CUDA) writes
-//! f32 `[n,k]` into arena scratch, then `matmul_bt` (`C = X @ W^T`).
+//! Preferred path: scratch-free windowed GEMV ([`run_dequant_matmul_gguf_gemv_rows`])
+//! for Q4_K / Q6_K / Q1_0 (decode `m=1` and prefill `m>1`). Older scratch+`matmul_bt`
+//! path still exists for schemes without a GEMV kernel.
 //!
-//! **When the GPU path runs:** `dequant_scratch_off > 0` after arena planning
-//! (scratch must fit `device.limits().max_buffer_size`). Otherwise
-//! [`crate::gguf_host`] handles dequant + matmul on CPU.
+//! **Host fallback:** [`crate::gguf_host`] when the scheme is unsupported on GPU
+//! and no dequant scratch was reserved.
 //!
 //! **Grouped MoE:** [`run_dequant_grouped_matmul_gguf_gpu`] when scratch fits;
 //! otherwise [`crate::gguf_host::run_dequant_grouped_matmul_gguf`].
@@ -555,8 +555,8 @@ fn encode_dequant_matmul_gguf_gemm_q1_0(
 /// the arena cannot also be bound read-write in the same dispatch (wgpu treats
 /// STORAGE_READ_WRITE as exclusive) — which is then copied back into the arena.
 ///
-/// Caller guarantees `m == 1` and [`gemv_supports_scheme`]. Prefer
-/// [`run_dequant_matmul_gguf_gemv_rows`] when `m > 1`.
+/// Caller guarantees [`gemv_supports_scheme`]. Prefer
+/// [`run_dequant_matmul_gguf_gemv_rows`] when `m > 1` (this helper is m=1 only).
 #[allow(clippy::too_many_arguments)]
 pub fn run_dequant_matmul_gguf_gemv(
     arena: &Arena,

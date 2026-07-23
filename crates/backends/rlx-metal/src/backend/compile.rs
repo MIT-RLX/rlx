@@ -160,6 +160,9 @@ impl MetalExecutable {
         // so the f32 gate sees the final dtype. FAB-only — Metal's native
         // FusedMatMulBiasAct / FusedResidualLN / FusedSwiGLU survive.
         let fused = lower_fab_for_metal(fused);
+        // Claimed for coverage but no Metal / CPU HostOp path: expand to
+        // primitives Metal already lowers (keeps SwiGLU / FMBA / ResidualLN).
+        let fused = lower_cpu_nop_fused_for_metal(fused);
         // Apple MPSGraph + the fused sgemm epilogue mis-execute an erf-GELU
         // fused onto matmul→bias (O(1) divergence); split it into matmul+bias
         // and a standalone (correct) GELU. No-op unless such a node exists.
@@ -722,8 +725,17 @@ impl MetalExecutable {
                 } else {
                     0
                 };
-                let logical = fused.node(id).shape.num_elements().unwrap_or(0);
-                (off, logical)
+                let shape = &fused.node(id).shape;
+                let logical = shape.num_elements().unwrap_or(0);
+                // Host f32-lane length: C64/C128 occupy 2/4 lanes per element
+                // (matches `Arena::read_as_f32` / `write_from_f32`).
+                let f32_len = match shape.dtype() {
+                    rlx_ir::DType::C64 => logical * 2,
+                    rlx_ir::DType::C128 => logical * 4,
+                    rlx_ir::DType::F64 => logical * 2,
+                    _ => logical,
+                };
+                (off, f32_len)
             })
             .collect();
 
@@ -746,9 +758,7 @@ impl MetalExecutable {
         // outperform our per-op MSL encoder across the qwen3 prefill
         // range once RmsNorm + SDPA are wired (see mps_graph.rs).
         // Opt out with RLX_DISABLE_MPSGRAPH=1.
-        let mps_plan = if disable_mpsgraph
-            || amp_active
-            || crate::runtime_config().disable_mpsgraph
+        let mps_plan = if disable_mpsgraph || amp_active || crate::runtime_config().disable_mpsgraph
         {
             None
         } else {
@@ -905,8 +915,22 @@ fn widen_integer_activations_to_f32(mut graph: Graph) -> Graph {
         .flat_map(|n| std::iter::once(n.id).chain(n.inputs.iter().copied()))
         .collect();
     for node in graph.nodes_mut() {
-        // Packed/quantized weight params live at their true byte width.
+        // Packed/quantized weight params (U8/I8) and floating params keep
+        // their true byte width. Integer *control* params (duration carry,
+        // masks, trip counts) must widen to F32 — otherwise `set_param_typed`
+        // writes raw i64 bytes into a slot that f32 kernels (Where/Expand)
+        // read as denormals (e.g. i64 3 → 4e-45), zeroing Kitten alignment.
         if matches!(node.op, Op::Param { .. }) {
+            let old = node.shape.dtype();
+            if matches!(
+                old,
+                DType::U8 | DType::I8 | DType::F16 | DType::BF16 | DType::F32 | DType::F64
+            ) {
+                continue;
+            }
+            if metal_widened_dtype(old) {
+                node.shape = node.shape.clone().with_dtype(DType::F32);
+            }
             continue;
         }
         // Host Custom kernels that need true integer widths (CSR I32

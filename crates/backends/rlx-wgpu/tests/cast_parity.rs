@@ -79,7 +79,10 @@ fn i32_bytes(xs: &[i32]) -> Vec<u8> {
 }
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "len mismatch cpu={a:?} gpu={b:?}");
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 #[test]
@@ -183,7 +186,10 @@ fn cast_fused_after_mul_matches_cpu() {
     };
     // mul(x,2.5)=[2.5,5,7.5,-3.75,0.75,12.25] → trunc = [2,5,7,-3,0,12]
     assert_eq!(cpu, vec![2.0, 5.0, 7.0, -3.0, 0.0, 12.0]);
-    assert!(max_abs(&cpu, &gpu) == 0.0, "fused cast wgpu {gpu:?} vs cpu {cpu:?}");
+    assert!(
+        max_abs(&cpu, &gpu) == 0.0,
+        "fused cast wgpu {gpu:?} vs cpu {cpu:?}"
+    );
 }
 
 /// Explicit `Op::ElementwiseRegion` with a fused `Cast` chain step, exercising
@@ -220,7 +226,11 @@ fn region_fused_relu_then_cast_i32() {
     let mut exe = WgpuExecutable::compile(g);
     let gpu = exe.run(&[("x", &xs)]).into_iter().next().unwrap();
     // relu = [0, 3.7, 5.9, 0, 8.8, 0] → trunc→i32 = [0, 3, 5, 0, 8, 0]
-    assert_eq!(gpu, vec![0.0, 3.0, 5.0, 0.0, 8.0, 0.0], "region cast gpu {gpu:?}");
+    assert_eq!(
+        gpu,
+        vec![0.0, 3.0, 5.0, 0.0, 8.0, 0.0],
+        "region cast gpu {gpu:?}"
+    );
 }
 
 /// F64 casts have no f32-arena storage and this backend performs no upstream
@@ -234,7 +244,11 @@ fn cast_to_f64_is_rejected() {
     let r = std::panic::catch_unwind(|| {
         let mut g = Graph::new("cast_f64");
         let x = g.input("x", Shape::new(&[4usize], DType::F32));
-        let y = g.add_node(Op::Cast { to: DType::F64 }, vec![x], Shape::new(&[4usize], DType::F64));
+        let y = g.add_node(
+            Op::Cast { to: DType::F64 },
+            vec![x],
+            Shape::new(&[4usize], DType::F64),
+        );
         g.set_outputs(vec![y]);
         let _ = WgpuExecutable::compile(g);
     });

@@ -672,6 +672,7 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
         "Neg" => unary_activation(out_ident, &node.inputs[0], "Activation::Neg"),
         "Abs" => unary_activation(out_ident, &node.inputs[0], "Activation::Abs"),
         "Atan" => unary_activation(out_ident, &node.inputs[0], "Activation::Atan"),
+        "Reciprocal" => unary_activation(out_ident, &node.inputs[0], "Activation::Recip"),
         "Floor" | "Round" => unary_activation(out_ident, &node.inputs[0], "Activation::Round"),
         "Cast" => {
             let to = node.attrs.get("to").and_then(|v| v.as_i64()).unwrap_or(1);
@@ -797,10 +798,7 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
         ),
         "Clip" if !node.inputs.is_empty() => {
             // Opset 11+ supplies min/max as inputs; attrs are often ±inf placeholders.
-            if node.inputs.len() >= 3
-                && !node.inputs[1].is_empty()
-                && !node.inputs[2].is_empty()
-            {
+            if node.inputs.len() >= 3 && !node.inputs[1].is_empty() && !node.inputs[2].is_empty() {
                 let (pre, ids) = prefetch_inputs(
                     out_ident,
                     &[&node.inputs[0], &node.inputs[1], &node.inputs[2]],

@@ -1,0 +1,38 @@
+#version 450
+// Real INT8 Op::QMatMul matching CUDA q_matmul / rlx-cpu exec_q_mat_mul.
+//   x[M,K] i8, w[K,N] i8, bias[N] i32 (f32-lane) → out[M,N] i8
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint k;
+    uint n;
+    uint x_word;
+    uint w_word;
+    uint bias_off;
+    uint out_word;
+    int x_zp;
+    int w_zp;
+    int out_zp;
+    uint mult_bits;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.m * pc.n;
+    if (idx >= total) { return; }
+    uint mi = idx / pc.n;
+    uint ni = idx - mi * pc.n;
+
+    int acc = int(trunc(arena_load_f(pc.bias_off + ni)));
+    for (uint ki = 0u; ki < pc.k; ki++) {
+        int xv = arena_load_i8(pc.x_word, mi * pc.k + ki) - pc.x_zp;
+        int wv = arena_load_i8(pc.w_word, ki * pc.n + ni) - pc.w_zp;
+        acc += xv * wv;
+    }
+    float mult = uintBitsToFloat(pc.mult_bits);
+    int r = int(q_round_half_away(float(acc) * mult)) + pc.out_zp;
+    if (r < -128) { r = -128; }
+    if (r > 127) { r = 127; }
+    arena_store_i8(pc.out_word, mi * pc.n + ni, r);
+}

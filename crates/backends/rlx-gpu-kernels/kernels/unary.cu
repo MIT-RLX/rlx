@@ -16,7 +16,7 @@
 // Element-wise unary / activation. Selector in `op`:
 //   0=relu 1=sigmoid 2=tanh 3=exp 4=log 5=sqrt 6=rsqrt
 //   7=neg  8=abs     9=gelu 10=silu 11=gelu_approx
-//   12=round 13=sin 14=cos 15=tan 16=atan
+//   12=round 13=sin 14=cos 15=tan 16=atan 17=recip (1/x)
 // Keep in sync with `activation_op_id` in the CUDA/ROCm backends.
 //
 // Cast selectors (f32-uniform arena — inputs/outputs are f32 lanes; the
@@ -60,6 +60,7 @@ extern "C" __global__ void unary(
         case 14: y = cosf(x); break;
         case 15: y = tanf(x); break;
         case 16: y = atanf(x); break;
+        case 17: y = 1.0f / x; break; // vvrecf
         // f32 -> int: truncate toward zero, saturate to dst range, NaN -> 0.
         case 100: y = isnan(x) ? 0.0f : fminf(fmaxf(truncf(x), -128.0f), 127.0f); break;
         case 101: y = isnan(x) ? 0.0f : fminf(fmaxf(truncf(x), -32768.0f), 32767.0f); break;

@@ -37,7 +37,7 @@ impl BakeProfile {
     pub fn all_names() -> &'static [&'static str] {
         &[
             "merge", "fold", "exact", "size", // canonical
-            "none", "raw", // → merge
+            "none", "raw",     // → merge
             "cleanup", // → fold
             "lossless", "default", "compute", // → exact
             "compact", "quant", // → size
@@ -107,7 +107,10 @@ mod tests {
         assert_eq!("none".parse::<BakeProfile>().unwrap(), BakeProfile::Merge);
         assert_eq!("fold".parse::<BakeProfile>().unwrap(), BakeProfile::Fold);
         assert_eq!("exact".parse::<BakeProfile>().unwrap(), BakeProfile::Exact);
-        assert_eq!("compute".parse::<BakeProfile>().unwrap(), BakeProfile::Exact);
+        assert_eq!(
+            "compute".parse::<BakeProfile>().unwrap(),
+            BakeProfile::Exact
+        );
         assert_eq!("size".parse::<BakeProfile>().unwrap(), BakeProfile::Size);
         assert_eq!("quant".parse::<BakeProfile>().unwrap(), BakeProfile::Size);
         assert!("bogus".parse::<BakeProfile>().is_err());

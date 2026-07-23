@@ -34,6 +34,7 @@ pub mod supported_ops;
 pub use supported_ops::SUPPORTED_OPS;
 pub mod calibrate;
 pub mod collective_host;
+pub mod dense_solve_native;
 pub mod device;
 pub mod eigh_native;
 pub mod fft_dispatch;
@@ -59,6 +60,7 @@ pub mod im2col_host {
 pub mod kernels;
 pub mod launch;
 pub mod rocm_gpu_kernels;
+pub mod vmath;
 pub mod llada2_gate_host {
     pub use super::host_ops::run_llada2_group_limited_gate;
 }
@@ -71,6 +73,18 @@ pub mod log_mel_host {
 pub mod lstm_host {
     pub use super::host_ops::run_lstm;
 }
+pub mod gru_host {
+    pub use super::host_ops::run_gru;
+}
+pub mod gru_gpu;
+pub mod rnn_host {
+    pub use super::host_ops::run_rnn;
+}
+pub mod rnn_gpu;
+pub mod mamba2_host {
+    pub use super::host_ops::run_mamba2;
+}
+pub mod mamba2_gpu;
 pub mod miopen;
 pub mod ms_deform_attn_host {
     pub use super::host_ops::run_ms_deform_attn;

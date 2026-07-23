@@ -83,8 +83,8 @@ pub fn encrypt_bytes_with_params(
     OsRng.fill_bytes(&mut nonce_bytes);
 
     let key = derive_key(password.as_bytes(), &salt, m_kib, t_cost, p_cost)?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|e| anyhow::anyhow!("chacha20 key: {e}"))?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&key).map_err(|e| anyhow::anyhow!("chacha20 key: {e}"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
@@ -131,8 +131,8 @@ pub fn decrypt_bytes(encrypted: &[u8], password: &str) -> Result<Vec<u8>> {
     let ciphertext = &encrypted[HEADER_LEN..];
 
     let key = derive_key(password.as_bytes(), salt, m_kib, t_cost, p_cost)?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|e| anyhow::anyhow!("chacha20 key: {e}"))?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&key).map_err(|e| anyhow::anyhow!("chacha20 key: {e}"))?;
     let nonce = Nonce::from_slice(nonce_bytes);
     cipher
         .decrypt(nonce, ciphertext)
@@ -165,8 +165,7 @@ mod tests {
     fn encrypt_decrypt_roundtrip() {
         let plain = b"RLXBAKE1\x02\x00\x00\x00hello-payload-bytes";
         // Fast params for unit tests.
-        let enc =
-            encrypt_bytes_with_params(plain, "s3cret", 8, 1, 1).expect("encrypt");
+        let enc = encrypt_bytes_with_params(plain, "s3cret", 8, 1, 1).expect("encrypt");
         assert!(is_encrypted(&enc));
         assert_ne!(&enc[..8], b"RLXBAKE1");
         let back = decrypt_bytes(&enc, "s3cret").expect("decrypt");

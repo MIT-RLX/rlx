@@ -433,6 +433,12 @@ fn jvp_rule(
                     let one2 = scalar_const(1.0, &s, bwd);
                     bwd.binary(BinaryOp::Div, one2, denom, s.clone())
                 }
+                Activation::Recip => {
+                    // act'(x) = -recip(x)².
+                    let y = fwd_map[&node.id];
+                    let y2 = bwd.binary(BinaryOp::Mul, y, y, s.clone());
+                    bwd.activation(Activation::Neg, y2, s.clone())
+                }
                 Activation::Abs => {
                     let zero = scalar_const(0.0, &s, bwd);
                     let mask = bwd.add_node(

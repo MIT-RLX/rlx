@@ -42,19 +42,22 @@ pub mod arena;
 pub mod backend;
 pub mod config;
 pub mod supported_ops;
-pub use config::{CudaRuntimeConfig, install_runtime_config, reload_runtime_config, runtime_config};
+pub use config::{
+    CudaRuntimeConfig, install_runtime_config, reload_runtime_config, runtime_config,
+};
 pub use supported_ops::SUPPORTED_OPS;
 pub mod calibrate;
 pub mod collective_host;
-#[cfg(feature = "nccl")]
-pub mod distributed;
 #[cfg(feature = "cufft")]
 pub mod cufft_dispatch;
 pub mod device;
+#[cfg(feature = "nccl")]
+pub mod distributed;
 pub mod fft_dispatch;
 pub mod fft_host {
     pub use super::host_ops::run_fft1d;
 }
+pub mod dense_solve_native;
 pub mod eigh_native;
 pub mod gdn_host {
     pub use super::host_ops::run_gated_delta_net;
@@ -70,6 +73,7 @@ pub mod im2col_host {
 }
 pub mod iq_grid;
 pub mod kernels;
+pub mod vmath;
 pub mod llada2_gate_host {
     pub use super::host_ops::run_llada2_group_limited_gate;
 }
@@ -83,6 +87,20 @@ pub mod lstm_host {
     pub use super::host_ops::run_lstm;
 }
 pub mod lstm_gpu;
+pub mod lstm_cudnn;
+pub mod dyn_quant_lstm_gpu;
+pub mod gru_host {
+    pub use super::host_ops::run_gru;
+}
+pub mod gru_gpu;
+pub mod rnn_host {
+    pub use super::host_ops::run_rnn;
+}
+pub mod rnn_gpu;
+pub mod mamba2_host {
+    pub use super::host_ops::run_mamba2;
+}
+pub mod mamba2_gpu;
 pub mod ms_deform_attn_host {
     pub use super::host_ops::run_ms_deform_attn;
 }
@@ -91,6 +109,8 @@ pub mod cuda_gpu_kernels;
 pub mod native_fft_dispatch;
 pub mod onnx_custom_host;
 pub mod rng_host;
+pub mod rng_gpu;
+pub mod scatter_nd_gpu;
 pub mod sam_ops_host;
 pub mod scan_host;
 pub mod spd;

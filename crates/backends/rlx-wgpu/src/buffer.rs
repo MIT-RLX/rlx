@@ -50,21 +50,30 @@ fn f16_shadow_arena_size(plan: &MemoryPlan) -> usize {
 
 /// Bytes reserved at the end of every shard for cross-stripe staging copies.
 /// Tensors are never placed here; ops that bind a shard can stage outliers into
-/// this zone without clobbering live activations (the previous “scratch at
-/// window end” heuristic overwrote mid-arena slots and corrupted decode).
+/// this zone without clobbering live activations.
 ///
-/// Cross-stripe staging reserve. Must fit the largest tensor we still stage
-/// through the arena (Bonsai hits 128 MiB); keep it below ~½ of that which
-/// previously distorted snap packing at max_seq=272 (256 MiB).
+/// Must fit the largest tensor still staged through the arena (Bonsai ~128 MiB).
+/// Override with `RLX_WGPU_SHARD_STAGE_MIB` (KittenTTS defaults to 64 on discrete
+/// wgpu so long-wave plans do not snap into multi-×4 GiB OOM).
 pub const SHARD_STAGE_RESERVE: usize = 576 * 1024 * 1024;
+
+/// Effective stage reserve (see [`SHARD_STAGE_RESERVE`]).
+pub fn shard_stage_reserve() -> usize {
+    if let Ok(raw) = std::env::var("RLX_WGPU_SHARD_STAGE_MIB") {
+        if let Ok(mib) = raw.parse::<usize>() {
+            return (mib.max(1) * 1024 * 1024).min(SHARD_STAGE_RESERVE);
+        }
+    }
+    SHARD_STAGE_RESERVE
+}
 
 /// Re-place unique buffer slots so no slot crosses a shard boundary.
 /// Preserves shared offsets (true reuse); may insert padding gaps and grow
 /// `arena_size`. Tail bytes past the last slot (scratch) are preserved.
 ///
-/// Each stripe keeps [`SHARD_STAGE_RESERVE`] free at its end for staging.
-fn snap_plan_to_shards(plan: &mut MemoryPlan, shard_cap: usize) {
-    let usable = shard_cap.saturating_sub(SHARD_STAGE_RESERVE).max(256);
+/// Each stripe keeps `stage_reserve` free at its end for staging.
+fn snap_plan_to_shards_ex(plan: &mut MemoryPlan, shard_cap: usize, stage_reserve: usize) {
+    let usable = shard_cap.saturating_sub(stage_reserve).max(256);
     let mut slot_size: HashMap<usize, usize> = HashMap::new();
     let mut max_end = 0usize;
     for a in plan.assignments.values() {
@@ -84,21 +93,12 @@ fn snap_plan_to_shards(plan: &mut MemoryPlan, shard_cap: usize) {
     let mut cursor = 0usize;
     for (old_off, size) in ordered {
         if size > usable {
-            // A single tensor can't exceed one shard: wgpu/Metal cap a storage
-            // buffer at ~4 GiB (`BIND_CAP`), and a shader binding can't span
-            // shards. This is almost always a huge *parameter* (e.g. a
-            // Linear(k → very_large_n) weight), not activations — so "shrink
-            // max_seq" won't help. Fix at the graph level: CHUNK the oversized
-            // matmul over its output dim into pieces whose weight ≤ ~2 GiB
-            // (mathematically identical, also lowers peak memory), or store the
-            // weight in a lower-precision dtype so its slot fits.
             panic!(
                 "rlx-wgpu: tensor slot at byte {old_off} is {size} bytes \
                  ({:.2} GiB) — exceeds the usable shard of {usable} bytes \
-                 ({:.2} GiB = {SHARD_STAGE_RESERVE}-byte stage reserve below the \
-                 ~4 GiB wgpu buffer cap). A single tensor cannot exceed one \
-                 buffer; chunk the oversized op (usually a large Linear weight) \
-                 over its output dimension at the graph level.",
+                 ({:.2} GiB = {stage_reserve}-byte stage reserve below the \
+                 shard cap). A single tensor cannot exceed one buffer; chunk \
+                 the oversized op over its output dimension at the graph level.",
                 size as f64 / (1u64 << 30) as f64,
                 usable as f64 / (1u64 << 30) as f64,
             );
@@ -118,21 +118,34 @@ fn snap_plan_to_shards(plan: &mut MemoryPlan, shard_cap: usize) {
         a.offset = *remap.get(&a.offset).expect("rlx-wgpu: missing slot remap");
     }
 
-    // Preserve scratch / padding past the last assigned slot. Keep tensors out
-    // of the per-shard stage reserve; round the logical end up to a shard
-    // boundary so the final stripe still has its reserve region.
+    // Preserve scratch / padding past the last assigned slot.
+    //
+    // Scratch MAY live in the per-stripe stage reserve (that zone exists for
+    // staging copies). Do **not** open a brand-new empty shard just to host
+    // tail bytes — that turned a ~3 GiB KittenTTS wave arena into 2×4 GiB
+    // buffers (8 GiB) and is an easy GPU OOM on 8–16 GiB cards.
     cursor = cursor.div_ceil(16) * 16;
     if tail_extra > 0 {
         let local = cursor % shard_cap;
-        if local + tail_extra > usable {
+        // Jump only when even usable+reserve (the full stripe) can't hold it.
+        if local.saturating_add(tail_extra) > shard_cap {
             cursor = cursor.div_ceil(shard_cap) * shard_cap;
         }
-        cursor += tail_extra;
+        cursor = cursor.saturating_add(tail_extra);
     }
-    if !cursor.is_multiple_of(shard_cap) {
+    // Pad to the end of the *current* stripe when we still sit in the data
+    // zone, so that stripe keeps its stage reserve. If we're already in the
+    // reserve (or exactly on a boundary), keep the exact byte size — the
+    // last physical buffer is allocated as `(size - begin).min(shard_cap)`.
+    let local = cursor % shard_cap;
+    if local > 0 && local <= usable {
         cursor = cursor.div_ceil(shard_cap) * shard_cap;
     }
     plan.arena_size = cursor.max(1);
+}
+
+fn snap_plan_to_shards(plan: &mut MemoryPlan, shard_cap: usize) {
+    snap_plan_to_shards_ex(plan, shard_cap, shard_stage_reserve());
 }
 
 #[cfg(test)]
@@ -184,7 +197,38 @@ mod shard_pack_tests {
                 a.size
             );
         }
-        assert!(plan.arena_size.is_multiple_of(shard_cap));
+        // Last stripe may be partial when scratch sits in the stage reserve.
+        assert!(plan.arena_size >= usable);
+    }
+
+    #[test]
+    fn snap_plan_does_not_open_empty_shard_for_scratch() {
+        // Mimic KittenTTS wave: ~3 GiB of tensors + modest scratch under a
+        // ~4 GiB shard. Old packing opened a second full 4 GiB stripe for the
+        // tail → 8 GiB GPU alloc (OOM risk). Scratch must stay in-stripe.
+        let shard_cap = 4 * 1024 * 1024 * 1024usize; // 4 GiB
+        let usable = shard_cap.saturating_sub(SHARD_STAGE_RESERVE).max(256);
+        let data = usable - 64 * 1024 * 1024; // leave headroom in data zone
+        let scratch = 32 * 1024 * 1024usize;
+        let mut plan = MemoryPlan {
+            arena_size: data + scratch,
+            assignments: HashMap::from([(
+                NodeId(0),
+                rlx_opt::memory::BufferSlot {
+                    offset: 0,
+                    size: data,
+                },
+            )]),
+            schedule: Vec::new(),
+        };
+        snap_plan_to_shards(&mut plan, shard_cap);
+        assert!(
+            plan.arena_size <= shard_cap,
+            "scratch opened an extra shard: arena={} > shard_cap={shard_cap} (OOM risk)",
+            plan.arena_size
+        );
+        let a = plan.assignments.get(&NodeId(0)).unwrap();
+        assert!(a.offset + a.size <= usable);
     }
 }
 
@@ -313,10 +357,60 @@ impl Arena {
         if size_hint > max_buf {
             snap_plan_to_shards(&mut plan, shard_cap);
         } else if size_hint > bind_shard_cap {
-            // One physical buffer, bind-sized virtual stripes.
-            snap_plan_to_shards(&mut plan, bind_shard_cap);
+            // One physical buffer, bind-sized virtual stripes. Full stage
+            // reserve packing can inflate a compact plan that still fits
+            // `max_buf` into multi-GiB waste (KittenTTS: 3.7 GiB → 6–8 GiB →
+            // GPU OOM). Shrink the per-stripe reserve until the packed plan
+            // fits in one allocation.
+            let compact = plan.clone();
+            let default_reserve = shard_stage_reserve();
+            let mut reserve = default_reserve.min(bind_shard_cap / 2);
+            loop {
+                let mut trial = compact.clone();
+                snap_plan_to_shards_ex(&mut trial, bind_shard_cap, reserve);
+                if trial.arena_size <= max_buf || reserve <= 1024 * 1024 {
+                    if trial.arena_size <= max_buf {
+                        if reserve < default_reserve
+                            && (rlx_ir::env::flag("RLX_WGPU_DEBUG")
+                                || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG"))
+                        {
+                            eprintln!(
+                                "[rlx-wgpu] bind-stripe snap with {:.0} MiB stage reserve \
+                                 (default {:.0} MiB) → {:.3} GiB arena (fits max_buf)",
+                                reserve as f64 / (1024.0 * 1024.0),
+                                default_reserve as f64 / (1024.0 * 1024.0),
+                                trial.arena_size as f64 / (1u64 << 30) as f64,
+                            );
+                        }
+                        plan = trial;
+                    } else if rlx_ir::env::flag("RLX_WGPU_DEBUG")
+                        || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG")
+                    {
+                        eprintln!(
+                            "[rlx-wgpu] bind-stripe snap still {:.3} GiB (> max_buf) at \
+                             {:.0} MiB reserve; keeping compact {:.3} GiB layout",
+                            trial.arena_size as f64 / (1u64 << 30) as f64,
+                            reserve as f64 / (1024.0 * 1024.0),
+                            size_hint as f64 / (1u64 << 30) as f64,
+                        );
+                        plan = compact;
+                    } else {
+                        plan = compact;
+                    }
+                    break;
+                }
+                reserve = (reserve / 2).max(1024 * 1024);
+            }
         }
-        let size = plan.arena_size.max(1); // wgpu hates zero-sized allocs
+        let mut size = plan.arena_size.max(1); // wgpu hates zero-sized allocs
+        // Bind-stripe snap can still leave size > max_buf when size_hint was
+        // already over the cap; re-pack onto physical shard boundaries.
+        // Guard: never prefer an inflated multi-shard layout when the compact
+        // plan fit in one buffer (handled above).
+        if size > max_buf {
+            snap_plan_to_shards(&mut plan, shard_cap);
+            size = plan.arena_size.max(1);
+        }
 
         let (buffer, extra_shards, shard_size) = if size <= max_buf {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -389,9 +483,16 @@ impl Arena {
         // On arenas larger than one bind window, allocate a capped f16
         // buffer (≤ max_storage_buffer_binding_size) so matmul can use
         // f16_weight_bind_range instead of staging multi‑GiB weights.
-        let f16_buffer = if device.features().contains(wgpu::Features::SHADER_F16)
+        //
+        // Discrete Vulkan/DX12 Kitten paths host Int8 dequant and do not need
+        // a 2 GiB f16 mirror — that alone OOMs 12 GiB cards next to a sharded
+        // act arena. Skip unless `RLX_WGPU_F16_WEIGHTS=1`.
+        let want_f16 = device.features().contains(wgpu::Features::SHADER_F16)
             && !rlx_ir::env::flag("RLX_WGPU_NO_F16_SHADOW")
-        {
+            && (shard_size == 0
+                || rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS")
+                || !crate::device::coop_discrete_backend());
+        let f16_buffer = if want_f16 {
             let f16_size = if size <= max_binding && shard_size == 0 {
                 f16_shadow_arena_size(&plan)
             } else {
@@ -469,12 +570,23 @@ impl Arena {
             }
             let ne = node.shape.num_elements().unwrap_or(0).max(1);
             let dt = node.shape.dtype();
-            let is_quant = matches!(&node.op, Op::Param { .. })
-                && matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8);
-            if is_quant {
+            let is_param = matches!(&node.op, Op::Param { .. });
+            // Default: only packed quant (U8/I8) goes to the weight buffer.
+            // Opt-in `RLX_WGPU_ALL_PARAMS_WEIGHT=1` also parks f32/f16 params
+            // there so the act arena can fit under NVIDIA's 2 GiB storage bind
+            // (KittenTTS otherwise virtual-shards and collapses NSF).
+            let to_weight = is_param
+                && (matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8)
+                    || rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT"));
+            if to_weight {
+                let nbytes = if matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
+                    ne * dt.size_bytes()
+                } else {
+                    ne * 4
+                };
                 weight_cursor = weight_cursor.div_ceil(walign) * walign;
                 weight_offsets.insert(node.id, weight_cursor);
-                weight_cursor += ne * dt.size_bytes();
+                weight_cursor += nbytes;
             } else {
                 tail = tail.div_ceil(a) * a;
                 new_plan.assignments.insert(
@@ -543,10 +655,11 @@ impl Arena {
         new_plan.arena_size = tail;
         if rlx_ir::env::flag("RLX_WGPU_DEBUG") {
             eprintln!(
-                "[rlx-wgpu split] quant_params={} weight_buf={:.3}GiB act_arena={:.3}GiB",
+                "[rlx-wgpu split] weight_params={} weight_buf={:.3}GiB act_arena={:.3}GiB all_params={}",
                 weight_offsets.len(),
                 weight_cursor as f64 / (1u64 << 30) as f64,
                 new_plan.arena_size as f64 / (1u64 << 30) as f64,
+                rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT"),
             );
         }
         let mut arena = Self::from_plan_with_scratch(device, &new_plan, scratch_bytes);
@@ -576,7 +689,7 @@ impl Arena {
     }
 
     /// Logical byte offset of the staging reserve for the shard that contains
-    /// `logical_off` (end of that stripe minus [`SHARD_STAGE_RESERVE`]).
+    /// `logical_off` (end of that stripe minus [`shard_stage_reserve`]).
     pub fn shard_stage_off(&self, logical_off: usize) -> usize {
         if !self.is_sharded() {
             return self.scratch_off;
@@ -586,7 +699,7 @@ impl Arena {
         let shard_begin = shard_idx * s;
         let shard_end = (shard_begin + s).min(self.size);
         shard_end
-            .saturating_sub(SHARD_STAGE_RESERVE)
+            .saturating_sub(shard_stage_reserve())
             .max(shard_begin)
     }
 

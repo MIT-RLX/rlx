@@ -62,7 +62,9 @@ mod ffi;
 pub mod backend;
 
 #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
-pub use backend::{CoremlExecutable, default_compute_units, default_lower_options};
+pub use backend::{
+    CoremlExecutable, default_compute_units, default_lower_options, promote_c64_to_interleaved_f32,
+};
 
 /// Which CoreML compute units the model may use. Mirrors `MLComputeUnits`.
 ///

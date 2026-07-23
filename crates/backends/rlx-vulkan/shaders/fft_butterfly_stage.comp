@@ -1,0 +1,70 @@
+#version 450
+// Ternary-pruned radix-2 butterfly stage (interleaved C64 [batch, n_fft, 2]).
+// Port of wgpu fft_butterfly_stage.wgsl / CUDA fft_butterfly_stage.cu.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint n_fft;
+    uint stage;
+    uint half;
+    uint state_off;
+    uint out_off;
+    uint gate_off;
+    uint rev_off;
+    uint tw_re_off;
+    uint tw_im_off;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint n = pc.batch * pc.half;
+    if (idx >= n) { return; }
+    uint b = idx / pc.half;
+    uint bf = idx % pc.half;
+
+    uint stride = 1u << pc.stage;
+    uint row_elems = pc.n_fft * 2u;
+    uint inp_base = pc.state_off + b * row_elems;
+    uint out_base = pc.out_off + b * row_elems;
+
+    uint group = bf / stride;
+    uint k = bf % stride;
+    uint i0 = group * 2u * stride + k;
+    uint i1 = i0 + stride;
+
+    if (arena_load(pc.gate_off + bf) == 0.0) {
+        arena_store(out_base + i0 * 2u, arena_load(inp_base + i0 * 2u));
+        arena_store(out_base + i0 * 2u + 1u, arena_load(inp_base + i0 * 2u + 1u));
+        arena_store(out_base + i1 * 2u, arena_load(inp_base + i1 * 2u));
+        arena_store(out_base + i1 * 2u + 1u, arena_load(inp_base + i1 * 2u + 1u));
+        return;
+    }
+
+    float w_re = arena_load(pc.tw_re_off + bf);
+    float w_im = arena_load(pc.tw_im_off + bf);
+    float in_a_re = arena_load(inp_base + i0 * 2u);
+    float in_a_im = arena_load(inp_base + i0 * 2u + 1u);
+    float in_b_re = arena_load(inp_base + i1 * 2u);
+    float in_b_im = arena_load(inp_base + i1 * 2u + 1u);
+
+    float b_re = in_b_re * w_re - in_b_im * w_im;
+    float b_im = in_b_re * w_im + in_b_im * w_re;
+    float top_re = in_a_re + b_re;
+    float top_im = in_a_im + b_im;
+    float bot_re = in_a_re - b_re;
+    float bot_im = in_a_im - b_im;
+
+    float oa_re; float oa_im; float ob_re; float ob_im;
+    if (arena_load(pc.rev_off + bf) >= 0.5) {
+        oa_re = bot_re; oa_im = bot_im;
+        ob_re = top_re; ob_im = top_im;
+    } else {
+        oa_re = top_re; oa_im = top_im;
+        ob_re = bot_re; ob_im = bot_im;
+    }
+    arena_store(out_base + i0 * 2u, oa_re);
+    arena_store(out_base + i0 * 2u + 1u, oa_im);
+    arena_store(out_base + i1 * 2u, ob_re);
+    arena_store(out_base + i1 * 2u + 1u, ob_im);
+}

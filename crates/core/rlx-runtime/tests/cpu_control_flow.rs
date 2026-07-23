@@ -14,9 +14,9 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Verify that the runtime's `LowerControlFlow` pre-pass lets the CPU
-//! backend execute graphs containing `Op::If` and `Op::While` end-to-end
-//! — neither op is in `rlx_cpu::SUPPORTED_OPS`, so without the rewrite the
-//! legalize check would reject them.
+//! backend execute graphs containing claimed `Op::If` and `Op::While`
+//! end-to-end. CPU has no native sub-graph executor, so both kinds are
+//! expanded to primitives before thunks (`Where` / unrolled body replicas).
 //!
 //! `Op::If` rewrites to `Where(predicate, then_inlined, else_inlined)`
 //! and `Op::While` to a chain of body replicas up to `max_iterations`.

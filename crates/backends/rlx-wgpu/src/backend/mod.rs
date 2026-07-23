@@ -1498,7 +1498,7 @@ fn arena_ensure_scratch_in_window(scratch: &mut u64, base: u64, size: u64) {
 fn arena_ensure_scratch_for_window(arena: &Arena, scratch: &mut u64, base: u64, size: u64) {
     if arena.is_sharded() {
         let stage = arena.shard_stage_off(base as usize) as u64;
-        let reserve = crate::buffer::SHARD_STAGE_RESERVE as u64;
+        let reserve = crate::buffer::shard_stage_reserve() as u64;
         let stage_end = stage.saturating_add(reserve);
         // Keep an already-bumping cursor inside this stripe's reserve. Resetting
         // to `stage` on every call made the second staged tensor (e.g. LN beta)
@@ -1658,7 +1658,7 @@ fn arena_off_in_window_or_stage(
         if arena.is_sharded() {
             let s = arena.shard_size as u64;
             let win_shard = *base / s;
-            let stage_cap = crate::buffer::SHARD_STAGE_RESERVE as u64;
+            let stage_cap = crate::buffer::shard_stage_reserve() as u64;
             if len > stage_cap {
                 panic!(
                     "rlx-wgpu: cannot stage {} bytes for weight node {:?} \
@@ -1725,7 +1725,7 @@ fn arena_off_in_window_or_stage(
             arena_clamp_bind_window(arena, base, size);
             return arena_local_off_f32(arena, id, *base);
         }
-        let stage_cap = crate::buffer::SHARD_STAGE_RESERVE as u64;
+        let stage_cap = crate::buffer::shard_stage_reserve() as u64;
         if len > stage_cap {
             // Too large to stage: open a whole-stripe window on the tensor's
             // own shard. Callers that need both this tensor and the previous
@@ -1746,7 +1746,7 @@ fn arena_off_in_window_or_stage(
         // Keep staging inside this stripe's reserved tail — never expand the
         // bind window across a shard boundary (that used to clobber live slots).
         arena_ensure_scratch_for_window(arena, scratch, *base, *size);
-        let stage_cap = crate::buffer::SHARD_STAGE_RESERVE as u64;
+        let stage_cap = crate::buffer::shard_stage_reserve() as u64;
         let stage_begin = arena.shard_stage_off(*base as usize) as u64;
         let stage_end = stage_begin.saturating_add(stage_cap);
         let aligned = len.div_ceil(256) * 256;
@@ -2437,6 +2437,7 @@ fn apply_activation_host(act: Activation, data: &[f32]) -> Vec<f32> {
             Activation::Cos => x.cos(),
             Activation::Tan => x.tan(),
             Activation::Atan => x.atan(),
+            Activation::Recip => 1.0 / x,
         })
         .collect()
 }

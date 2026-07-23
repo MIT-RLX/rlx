@@ -97,12 +97,12 @@ pub mod moe_ep;
 pub mod planner;
 
 pub use eplb::{
-    all_reduce_hits, count_hits_f32, default_placement, experts_on_rank, local_id_on_owner,
-    local_id_on_rank, lookup_ep_placement, lookup_ep_replicas, migrate_to_placement,
-    migrate_to_replica_map, owner_of, pick_dispatch_rank, rebalance_placement,
-    rebalance_with_replicas, register_ep_placement, register_ep_replicas, replica_map_from_placement,
-    shard_expert_weights, shard_expert_weights_slots, unregister_ep_placement,
-    unregister_ep_replicas, EpReplicaMap,
+    EpReplicaMap, all_reduce_hits, count_hits_f32, default_placement, experts_on_rank,
+    local_id_on_owner, local_id_on_rank, lookup_ep_placement, lookup_ep_replicas,
+    migrate_to_placement, migrate_to_replica_map, owner_of, pick_dispatch_rank,
+    rebalance_placement, rebalance_with_replicas, register_ep_placement, register_ep_replicas,
+    replica_map_from_placement, shard_expert_weights, shard_expert_weights_slots,
+    unregister_ep_placement, unregister_ep_replicas,
 };
 pub use moe_ep::{
     DISPATCH_META, MOE_COMBINE, MOE_DISPATCH, MoeEpConfig, moe_combine, moe_dispatch, moe_ep_ffn,

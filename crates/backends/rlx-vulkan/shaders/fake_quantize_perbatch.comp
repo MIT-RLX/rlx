@@ -1,0 +1,61 @@
+#version 450
+// FakeQuantize PerBatch: one work-item per channel.
+// s = max(|x|) / q_max, then clamp(round(x/s), -q_max, q_max) * s.
+layout(local_size_x = 64) in;
+
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint chan_dim;
+    uint inner;
+    float q_max;
+    uint in_off;
+    uint out_off;
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.chan_dim) { return; }
+
+    float max_abs = 0.0;
+    uint stride = pc.chan_dim * pc.inner;
+    uint outer = (stride == 0u) ? 0u : (pc.n / stride);
+    for (uint o = 0u; o < outer; o++) {
+        uint base = o * stride + c * pc.inner;
+        for (uint j = 0u; j < pc.inner; j++) {
+            max_abs = max(max_abs, abs(arena_load(pc.in_off + base + j)));
+        }
+    }
+    if (outer * stride != pc.n) {
+        for (uint i = 0u; i < pc.n; i++) {
+            uint ch = (pc.chan_dim <= 1u) ? 0u : ((i / pc.inner) % pc.chan_dim);
+            if (ch == c) {
+                max_abs = max(max_abs, abs(arena_load(pc.in_off + i)));
+            }
+        }
+    }
+
+    float s = max(max_abs / pc.q_max, 1e-12);
+
+    for (uint o = 0u; o < outer; o++) {
+        uint base = o * stride + c * pc.inner;
+        for (uint j = 0u; j < pc.inner; j++) {
+            uint idx = base + j;
+            float scaled = arena_load(pc.in_off + idx) / s;
+            float rounded = sign(scaled) * floor(abs(scaled) + 0.5);
+            float qv = clamp(rounded, -pc.q_max, pc.q_max);
+            arena_store(pc.out_off + idx, qv * s);
+        }
+    }
+    if (outer * stride != pc.n) {
+        for (uint i = 0u; i < pc.n; i++) {
+            uint ch = (pc.chan_dim <= 1u) ? 0u : ((i / pc.inner) % pc.chan_dim);
+            if (ch == c) {
+                float scaled = arena_load(pc.in_off + i) / s;
+                float rounded = sign(scaled) * floor(abs(scaled) + 0.5);
+                float qv = clamp(rounded, -pc.q_max, pc.q_max);
+                arena_store(pc.out_off + i, qv * s);
+            }
+        }
+    }
+}

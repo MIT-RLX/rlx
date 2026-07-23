@@ -547,6 +547,30 @@ impl GgufFile {
             GgmlType::IQ1M => iq_dequant::dequant_iq1_m(bytes, n)?,
             GgmlType::Q1_0 => q1_dequant::dequant_q1_0(bytes, n)?,
             GgmlType::Q2_0 => q2_dequant::dequant_q2_0(bytes, n)?,
+            GgmlType::I8 => {
+                if bytes.len() != n {
+                    bail!("I8 tensor {name}: expected {n} bytes, got {}", bytes.len());
+                }
+                bytes.iter().map(|&b| b as i8 as f32).collect()
+            }
+            GgmlType::I16 => {
+                if bytes.len() != n * 2 {
+                    bail!("I16 tensor {name}: bad byte length {}", bytes.len());
+                }
+                bytes
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32)
+                    .collect()
+            }
+            GgmlType::I32 => {
+                if bytes.len() != n * 4 {
+                    bail!("I32 tensor {name}: bad byte length {}", bytes.len());
+                }
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+                    .collect()
+            }
             other => bail!("dequant for {other:?} not implemented yet (tensor {name})"),
         };
         Ok((data, t.shape.clone()))
@@ -639,6 +663,11 @@ fn bytes_for(dtype: GgmlType, n: usize) -> Option<usize> {
         // Custom 1-bit format (PrismML Bonsai-27B): f16 scale + 128 sign bits.
         GgmlType::Q1_0 => q1_dequant::q1_0_bytes(n),
         GgmlType::Q2_0 => q2_dequant::q2_0_bytes(n),
+        GgmlType::I8 => Some(n),
+        GgmlType::I16 => Some(n * 2),
+        GgmlType::I32 => Some(n * 4),
+        GgmlType::I64 => Some(n * 8),
+        GgmlType::F64 => Some(n * 8),
         // Anything else: not yet supported. dequant_f32 will reject
         // these too; tensor_bytes returns None to stay consistent.
         _ => None,

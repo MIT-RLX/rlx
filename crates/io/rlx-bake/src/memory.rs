@@ -129,8 +129,7 @@ pub fn dedupe_identical_constants(graph: &Graph) -> (Graph, usize) {
 
 /// Clear Constant payloads whose names appear in the weight table.
 pub fn strip_graph_weight_bytes(graph: &mut Graph, weights: &[RlxWeight]) -> usize {
-    let names: std::collections::HashSet<&str> =
-        weights.iter().map(|w| w.name.as_str()).collect();
+    let names: std::collections::HashSet<&str> = weights.iter().map(|w| w.name.as_str()).collect();
     let mut stripped = 0usize;
     for node in graph.nodes_mut() {
         let Some(name) = node.name.as_deref() else {

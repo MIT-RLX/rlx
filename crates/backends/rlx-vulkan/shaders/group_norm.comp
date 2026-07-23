@@ -1,0 +1,64 @@
+#version 450
+// NCHW GroupNorm: normalize each (C/G)×H×W block.
+// One invocation per (batch, group); serial two-pass mean/var (naga-friendly —
+// no shared-memory barriers). Matches CUDA `group_norm.cu` / CPU reference.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint c;
+    uint h;
+    uint w;
+    uint num_groups;
+    uint src_off;
+    uint g_off;
+    uint b_off;
+    uint dst_off;
+    float eps;
+} pc;
+
+void main() {
+    uint ng = gl_GlobalInvocationID.x;
+    if (ng >= pc.n * pc.num_groups) { return; }
+    uint bn = ng / pc.num_groups;
+    uint g = ng % pc.num_groups;
+    uint cpg = pc.c / pc.num_groups;
+    uint c0 = g * cpg;
+    uint spatial = pc.h * pc.w;
+    uint count = cpg * spatial;
+    float n_inv = 1.0 / float(count);
+    uint plane = pc.c * spatial;
+    uint b_base = bn * plane;
+
+    float mean = 0.0;
+    for (uint ci = 0u; ci < cpg; ci++) {
+        uint base = pc.src_off + b_base + (c0 + ci) * spatial;
+        for (uint s = 0u; s < spatial; s++) {
+            mean += arena_load(base + s);
+        }
+    }
+    mean *= n_inv;
+
+    // Stable two-pass variance mean((x-mean)^2) — not E[x^2]-E[x]^2.
+    float var_ = 0.0;
+    for (uint ci = 0u; ci < cpg; ci++) {
+        uint base = pc.src_off + b_base + (c0 + ci) * spatial;
+        for (uint s = 0u; s < spatial; s++) {
+            float d = arena_load(base + s) - mean;
+            var_ += d * d;
+        }
+    }
+    var_ *= n_inv;
+    float inv = inversesqrt(var_ + pc.eps);
+
+    for (uint ci = 0u; ci < cpg; ci++) {
+        uint ch = c0 + ci;
+        float gamma = arena_load(pc.g_off + ch);
+        float beta = arena_load(pc.b_off + ch);
+        uint base = b_base + ch * spatial;
+        for (uint s = 0u; s < spatial; s++) {
+            float v = (arena_load(pc.src_off + base + s) - mean) * inv;
+            arena_store(pc.dst_off + base + s, v * gamma + beta);
+        }
+    }
+}

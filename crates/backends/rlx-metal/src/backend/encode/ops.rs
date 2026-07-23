@@ -677,6 +677,7 @@ pub(crate) fn encode_activation(
         (HalfFlag::F16, Activation::Cos) => &k.cos_inplace_h,
         (HalfFlag::F16, Activation::Tan) => &k.tan_inplace_h,
         (HalfFlag::F16, Activation::Atan) => &k.atan_inplace_h,
+        (HalfFlag::F16, Activation::Recip) => &k.rec_inplace_h,
         (HalfFlag::F16, Activation::Round) => &k.round_inplace_h,
         (_, Activation::Gelu) => &k.gelu_inplace,
         (_, Activation::GeluApprox) => &k.gelu_approx_inplace,
@@ -694,6 +695,7 @@ pub(crate) fn encode_activation(
         (_, Activation::Cos) => &k.cos_inplace,
         (_, Activation::Tan) => &k.tan_inplace,
         (_, Activation::Atan) => &k.atan_inplace,
+        (_, Activation::Recip) => &k.rec_inplace,
         (_, Activation::Round) => &k.round_inplace,
     };
     enc.set_compute_pipeline_state(pipeline);
@@ -3071,6 +3073,80 @@ pub(crate) fn fab_is_native(node: &rlx_ir::Node) -> bool {
     }
 }
 
+/// Expand fused ops that Metal claims for coverage but cannot HostOp through
+/// CPU (`Thunk::Nop` catch-all): `FusedConvBiasAct`, `PartitionedConv`,
+/// `FusedTransformerLayer`. Metal-native fused kernels (SwiGLU / FMBA /
+/// ResidualLN / FAB) are left intact.
+pub(crate) fn lower_cpu_nop_fused_for_metal(g: Graph) -> Graph {
+    let needs = g.nodes().iter().any(|n| {
+        matches!(
+            n.op,
+            Op::FusedConvBiasAct { .. }
+                | Op::PartitionedConv { .. }
+                | Op::FusedTransformerLayer { .. }
+        )
+    });
+    if !needs {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: std::collections::HashMap<NodeId, NodeId> = std::collections::HashMap::new();
+    let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
+    for node in &nodes {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_id = match &node.op {
+            Op::FusedConvBiasAct { .. }
+            | Op::PartitionedConv { .. }
+            | Op::FusedTransformerLayer { .. } => {
+                inline_unfused_fused_op(&mut out, &node.op, &new_inputs, &node.shape)
+            }
+            _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+fn inline_unfused_fused_op(
+    out: &mut Graph,
+    op: &Op,
+    inputs: &[NodeId],
+    shape: &rlx_ir::Shape,
+) -> NodeId {
+    let mut mini = Graph::new("mtl_unfuse");
+    let mut mini_ins = Vec::with_capacity(inputs.len());
+    for (i, &src) in inputs.iter().enumerate() {
+        let sh = out.node(src).shape.clone();
+        mini_ins.push(mini.append_node(
+            Op::Input {
+                name: format!("in{i}"),
+            },
+            vec![],
+            sh,
+            None,
+        ));
+    }
+    let out_id = mini.append_node(op.clone(), mini_ins, shape.clone(), None);
+    mini.set_outputs(vec![out_id]);
+    let expanded = rlx_opt::unfuse_fused_for_autodiff(mini);
+    let mut map: std::collections::HashMap<NodeId, NodeId> = std::collections::HashMap::new();
+    for n in expanded.nodes() {
+        if let Op::Input { name } = &n.op {
+            if let Some(rest) = name.strip_prefix("in") {
+                if let Ok(i) = rest.parse::<usize>() {
+                    map.insert(n.id, inputs[i]);
+                    continue;
+                }
+            }
+        }
+        let mapped_ins: Vec<NodeId> = n.inputs.iter().map(|i| map[i]).collect();
+        let id = out.add_node(n.op.clone(), mapped_ins, n.shape.clone());
+        map.insert(n.id, id);
+    }
+    map[&expanded.outputs[0]]
+}
+
 /// Decompose non-native `Op::FusedAttentionBlock` nodes to the primitive chain
 /// (via the shared `expand_attention_block`), leaving native-eligible blocks
 /// intact for the `fused_attn_block` kernel. No rewrite when there is no FAB,
@@ -3273,19 +3349,244 @@ pub(crate) fn fab_scratch_layout(graph: &Graph) -> (usize, Vec<(NodeId, usize, u
 }
 
 pub(crate) fn rms_norm_bwd_scratch_bytes(graph: &Graph) -> usize {
-    let mut max_rows = 0usize;
+    let mut max_bytes = 0usize;
     for node in graph.nodes() {
-        if matches!(
-            node.op,
-            Op::RmsNormBackwardGamma { .. } | Op::RmsNormBackwardBeta { .. }
-        ) {
-            let x_shape = &graph.node(node.inputs[0]).shape;
-            let h = x_shape.dim(x_shape.rank() - 1).unwrap_static();
-            let rows = x_shape.num_elements().unwrap() / h;
-            max_rows = max_rows.max(rows);
+        match &node.op {
+            Op::RmsNormBackwardGamma { .. } | Op::RmsNormBackwardBeta { .. } => {
+                let x_shape = &graph.node(node.inputs[0]).shape;
+                let h = x_shape.dim(x_shape.rank() - 1).unwrap_static();
+                let rows = x_shape.num_elements().unwrap() / h;
+                max_bytes = max_bytes.max(rows * std::mem::size_of::<f32>());
+            }
+            Op::LayerNormBackwardGamma { .. } => {
+                let x_shape = &graph.node(node.inputs[0]).shape;
+                let h = x_shape.dim(x_shape.rank() - 1).unwrap_static();
+                let rows = x_shape.num_elements().unwrap() / h;
+                // mean + inv_std per row
+                max_bytes = max_bytes.max(rows * 2 * std::mem::size_of::<f32>());
+            }
+            _ => {}
         }
     }
-    max_rows * std::mem::size_of::<f32>()
+    max_bytes
+}
+
+pub(crate) fn encode_layer_norm_bwd_input(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    gamma: usize,
+    dy: usize,
+    dx: usize,
+    rows: u32,
+    h: u32,
+    eps: f32,
+) {
+    enc.set_compute_pipeline_state(&k.layer_norm_bwd);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), gamma as u64);
+    enc.set_buffer(2, Some(buffer), dy as u64);
+    enc.set_buffer(3, Some(buffer), dx as u64);
+    enc.set_bytes(4, 4, &h as *const u32 as *const _);
+    enc.set_bytes(5, 4, &eps as *const f32 as *const _);
+    let mut tg_w: u64 = 1;
+    while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
+        tg_w *= 2;
+    }
+    enc.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w.max(1),
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+pub(crate) fn encode_layer_norm_bwd_gamma(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    dy: usize,
+    dgamma: usize,
+    rows: u32,
+    h: u32,
+    eps: f32,
+    stats_scratch: usize,
+) {
+    let use_parallel = stats_scratch != 0 && rows > 1;
+    if !use_parallel {
+        enc.set_compute_pipeline_state(&k.layer_norm_bwd_gamma);
+        enc.set_buffer(0, Some(buffer), x as u64);
+        enc.set_buffer(1, Some(buffer), dy as u64);
+        enc.set_buffer(2, Some(buffer), dgamma as u64);
+        enc.set_bytes(3, 4, &rows as *const u32 as *const _);
+        enc.set_bytes(4, 4, &h as *const u32 as *const _);
+        enc.set_bytes(5, 4, &eps as *const f32 as *const _);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
+
+    enc.set_compute_pipeline_state(&k.layer_norm_bwd_stats_f32);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), stats_scratch as u64);
+    enc.set_bytes(2, 4, &h as *const u32 as *const _);
+    enc.set_bytes(3, 4, &eps as *const f32 as *const _);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256.min(rows as u64).max(1),
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    enc.set_compute_pipeline_state(&k.layer_norm_bwd_gamma_reduce_f32);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), dy as u64);
+    enc.set_buffer(2, Some(buffer), stats_scratch as u64);
+    enc.set_buffer(3, Some(buffer), dgamma as u64);
+    enc.set_bytes(4, 4, &rows as *const u32 as *const _);
+    enc.set_bytes(5, 4, &h as *const u32 as *const _);
+    let tg_w = 256u64.min(h as u64).max(1);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: h as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+pub(crate) fn encode_group_norm_bwd_input(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    gamma: usize,
+    dy: usize,
+    dx: usize,
+    n: u32,
+    c: u32,
+    h: u32,
+    w: u32,
+    num_groups: u32,
+    eps: f32,
+) {
+    let nchw: [u32; 4] = [n, c, h, w];
+    enc.set_compute_pipeline_state(&k.group_norm_bwd_input);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), gamma as u64);
+    enc.set_buffer(2, Some(buffer), dy as u64);
+    enc.set_buffer(3, Some(buffer), dx as u64);
+    enc.set_bytes(4, 16, nchw.as_ptr() as *const _);
+    enc.set_bytes(5, 4, &num_groups as *const u32 as *const _);
+    enc.set_bytes(6, 4, &eps as *const f32 as *const _);
+    let groups = (n * num_groups) as u64;
+    enc.dispatch_thread_groups(
+        metal::MTLSize {
+            width: groups.max(1),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+pub(crate) fn encode_group_norm_bwd_gamma(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    dy: usize,
+    dgamma: usize,
+    n: u32,
+    c: u32,
+    h: u32,
+    w: u32,
+    num_groups: u32,
+    eps: f32,
+) {
+    let nchw: [u32; 4] = [n, c, h, w];
+    enc.set_compute_pipeline_state(&k.group_norm_bwd_gamma);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), dy as u64);
+    enc.set_buffer(2, Some(buffer), dgamma as u64);
+    enc.set_bytes(3, 16, nchw.as_ptr() as *const _);
+    enc.set_bytes(4, 4, &num_groups as *const u32 as *const _);
+    enc.set_bytes(5, 4, &eps as *const f32 as *const _);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+pub(crate) fn encode_group_norm_bwd_beta(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    dy: usize,
+    dbeta: usize,
+    n: u32,
+    c: u32,
+    h: u32,
+    w: u32,
+) {
+    let nchw: [u32; 4] = [n, c, h, w];
+    enc.set_compute_pipeline_state(&k.group_norm_bwd_beta);
+    enc.set_buffer(0, Some(buffer), dy as u64);
+    enc.set_buffer(1, Some(buffer), dbeta as u64);
+    enc.set_bytes(2, 16, nchw.as_ptr() as *const _);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 
 pub(crate) fn encode_rope_bwd(
@@ -4600,45 +4901,83 @@ pub(crate) fn encode_dequant_grouped_matmul_gguf(
             packed_in.len(),
         );
 
-        // Per expert: dequant the slab into `dequant_off` on a dedicated MSL
-        // compute encoder, END that encoder, then MPS sgemm. The compute
-        // encoder MUST be ended before the MPS call — MPS opens its own
-        // encoder internally, and two live encoders on one command buffer is a
-        // hard Metal abort (`A command encoder is already encoding...`).
-        // Encoders execute serially in submission order, so expert e's sgemm
-        // reads `dequant_off` before expert e+1's dequant overwrites it.
-        let cmd_buf = queue.new_command_buffer();
-        for e in 0..num_experts {
-            let count = offsets[e + 1] - offsets[e];
-            if count == 0 {
-                continue;
-            }
-            let enc =
-                cmd_buf.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
-            encode_dequant_gguf(
-                enc,
-                k,
-                buffer,
-                w_q + e * slab_bytes,
-                dequant_off,
+        // Decode / small-batch fast path: when every active expert has a single
+        // token (typical MoE decode with m=top_k routing), use fused Q4_0/Q8_0
+        // GEMV and skip full-slab f32 dequant + MPS sgemm.
+        let use_fused_gemv = k_dim.is_multiple_of(32)
+            && matches!(
                 scheme,
-                k_dim,
-                n,
-            );
-            enc.end_encoding();
-            let in_start = offsets[e];
-            crate::mps_blas::encode_mps_sgemm_bt(
-                cmd_buf,
-                buffer,
-                pack_in_off + in_start * k_dim * 4,
-                dequant_off,
-                pack_out_off + in_start * n * 4,
-                count,
-                k_dim,
-                n,
-            );
+                rlx_ir::quant::QuantScheme::GgufQ4_0 | rlx_ir::quant::QuantScheme::GgufQ8_0
+            )
+            && !rlx_ir::env::flag("RLX_METAL_GROUPED_GEMV_DISABLE")
+            && (0..num_experts).all(|e| {
+                let c = offsets[e + 1] - offsets[e];
+                c == 0 || c == 1
+            });
+
+        let cmd_buf = queue.new_command_buffer();
+        if use_fused_gemv {
+            for e in 0..num_experts {
+                let count = offsets[e + 1] - offsets[e];
+                if count == 0 {
+                    continue;
+                }
+                let enc = cmd_buf
+                    .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+                let x_off = pack_in_off + offsets[e] * k_dim * 4;
+                let y_off = pack_out_off + offsets[e] * n * 4;
+                let w_off = w_q + e * slab_bytes;
+                match scheme {
+                    rlx_ir::quant::QuantScheme::GgufQ8_0 => {
+                        encode_q8_0_mv_f32(enc, k, buffer, x_off, w_off, y_off, k_dim, n)
+                    }
+                    rlx_ir::quant::QuantScheme::GgufQ4_0 => {
+                        encode_q4_0_mv_f32(enc, k, buffer, x_off, w_off, y_off, k_dim, n)
+                    }
+                    _ => unreachable!("fused grouped GEMV scheme guard"),
+                }
+                enc.end_encoding();
+            }
+        } else {
+            // Per expert: dequant the slab into `dequant_off` on a dedicated MSL
+            // compute encoder, END that encoder, then MPS sgemm. The compute
+            // encoder MUST be ended before the MPS call — MPS opens its own
+            // encoder internally, and two live encoders on one command buffer is a
+            // hard Metal abort (`A command encoder is already encoding...`).
+            // Encoders execute serially in submission order, so expert e's sgemm
+            // reads `dequant_off` before expert e+1's dequant overwrites it.
+            for e in 0..num_experts {
+                let count = offsets[e + 1] - offsets[e];
+                if count == 0 {
+                    continue;
+                }
+                let enc = cmd_buf
+                    .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+                encode_dequant_gguf(
+                    enc,
+                    k,
+                    buffer,
+                    w_q + e * slab_bytes,
+                    dequant_off,
+                    scheme,
+                    k_dim,
+                    n,
+                );
+                enc.end_encoding();
+                let in_start = offsets[e];
+                crate::mps_blas::encode_mps_sgemm_bt(
+                    cmd_buf,
+                    buffer,
+                    pack_in_off + in_start * k_dim * 4,
+                    dequant_off,
+                    pack_out_off + in_start * n * 4,
+                    count,
+                    k_dim,
+                    n,
+                );
+            }
         }
-        // Sgemm results must land before the host-side unpermute reads them.
+        // Sgemm/GEMV results must land before the host-side unpermute reads them.
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
 
@@ -4693,8 +5032,9 @@ pub(crate) fn encode_gated_delta_net(
     state_size: u32,
     use_carry: bool,
 ) {
-    let f32_idx = |byte_off: usize| -> u32 { (byte_off / 4) as u32 };
-    let use_sg = state_size == 128;
+    // ulong float indices — Fara arenas put GDN scratch past 16 GiB.
+    let f32_idx = |byte_off: usize| -> u64 { (byte_off / 4) as u64 };
+    let use_sg = state_size == 128 && rlx_ir::env::flag("RLX_METAL_GDN_SG");
     if use_sg {
         enc.set_compute_pipeline_state(&k.gated_delta_net_sg);
     } else {
@@ -4708,13 +5048,13 @@ pub(crate) fn encode_gated_delta_net(
     let beta_u = f32_idx(beta);
     let state_u = f32_idx(state);
     let dst_u = f32_idx(dst);
-    enc.set_bytes(1, 4, &q_u as *const u32 as *const _);
-    enc.set_bytes(2, 4, &k_u as *const u32 as *const _);
-    enc.set_bytes(3, 4, &v_u as *const u32 as *const _);
-    enc.set_bytes(4, 4, &g_u as *const u32 as *const _);
-    enc.set_bytes(5, 4, &beta_u as *const u32 as *const _);
-    enc.set_bytes(6, 4, &state_u as *const u32 as *const _);
-    enc.set_bytes(7, 4, &dst_u as *const u32 as *const _);
+    enc.set_bytes(1, 8, &q_u as *const u64 as *const _);
+    enc.set_bytes(2, 8, &k_u as *const u64 as *const _);
+    enc.set_bytes(3, 8, &v_u as *const u64 as *const _);
+    enc.set_bytes(4, 8, &g_u as *const u64 as *const _);
+    enc.set_bytes(5, 8, &beta_u as *const u64 as *const _);
+    enc.set_bytes(6, 8, &state_u as *const u64 as *const _);
+    enc.set_bytes(7, 8, &dst_u as *const u64 as *const _);
     let dims = [batch, seq, heads, state_size];
     enc.set_bytes(8, 16, dims.as_ptr() as *const _);
     let use_carry_u: u32 = if use_carry { 1 } else { 0 };
@@ -4733,17 +5073,21 @@ pub(crate) fn encode_gated_delta_net(
         };
         enc.dispatch_thread_groups(grid, tg);
     } else {
-        let grid = metal::MTLSize {
-            width: (batch * heads) as u64,
-            height: 1,
-            depth: 1,
-        };
-        let tg = metal::MTLSize {
-            width: state_size as u64,
-            height: 1,
-            depth: 1,
-        };
-        enc.dispatch_thread_groups(grid, tg);
+        // One thread per (batch, head) — matches selective_scan.
+        let threads = (batch * heads).max(1) as u64;
+        let tg_w = k.gated_delta_net.thread_execution_width().min(threads);
+        enc.dispatch_threads(
+            metal::MTLSize {
+                width: threads,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg_w,
+                height: 1,
+                depth: 1,
+            },
+        );
     }
 }
 
@@ -5365,6 +5709,126 @@ pub(crate) fn encode_conv_transpose2d(
         width: w_out as u64,
         height: h_out as u64,
         depth: (n * c_out) as u64,
+    };
+    let tg = metal::MTLSize {
+        width: 8.min(w_out as u64),
+        height: 8.min(h_out as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_conv3d(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    weight: usize,
+    dst: usize,
+    n: u32,
+    c_in: u32,
+    d: u32,
+    h: u32,
+    w: u32,
+    c_out: u32,
+    d_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kd: u32,
+    kh: u32,
+    kw: u32,
+    sd: u32,
+    sh: u32,
+    sw: u32,
+    pd: u32,
+    ph: u32,
+    pw: u32,
+    dd: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+) {
+    let a: [u32; 4] = [n, c_in, d, h];
+    let b: [u32; 4] = [w, c_out, d_out, h_out];
+    let c: [u32; 4] = [w_out, kd, kh, kw];
+    let dparams: [u32; 4] = [sd, sh, sw, groups];
+    let e: [u32; 4] = [pd, ph, pw, dd];
+    let f: [u32; 4] = [dh, dw, 0, 0];
+    enc.set_compute_pipeline_state(&k.conv3d);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), weight as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 16, a.as_ptr() as *const _);
+    enc.set_bytes(4, 16, b.as_ptr() as *const _);
+    enc.set_bytes(5, 16, c.as_ptr() as *const _);
+    enc.set_bytes(6, 16, dparams.as_ptr() as *const _);
+    enc.set_bytes(7, 16, e.as_ptr() as *const _);
+    enc.set_bytes(8, 16, f.as_ptr() as *const _);
+    // Grid: (w_out, h_out, n * c_out * d_out). Kernel decodes
+    // d_o = z % d_out, then (n, c_out) from z / d_out.
+    let grid = metal::MTLSize {
+        width: w_out as u64,
+        height: h_out as u64,
+        depth: (n * c_out * d_out) as u64,
+    };
+    let tg = metal::MTLSize {
+        width: 8.min(w_out as u64),
+        height: 8.min(h_out as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn encode_conv_transpose3d(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    weight: usize,
+    dst: usize,
+    n: u32,
+    c_in: u32,
+    d: u32,
+    h: u32,
+    w: u32,
+    c_out: u32,
+    d_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kd: u32,
+    kh: u32,
+    kw: u32,
+    sd: u32,
+    sh: u32,
+    sw: u32,
+    pd: u32,
+    ph: u32,
+    pw: u32,
+    dd: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+) {
+    let a: [u32; 4] = [n, c_in, d, h];
+    let b: [u32; 4] = [w, c_out, d_out, h_out];
+    let c: [u32; 4] = [w_out, kd, kh, kw];
+    let dparams: [u32; 4] = [sd, sh, sw, groups];
+    let e: [u32; 4] = [pd, ph, pw, dd];
+    let f: [u32; 4] = [dh, dw, 0, 0];
+    enc.set_compute_pipeline_state(&k.conv_transpose3d);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), weight as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(3, 16, a.as_ptr() as *const _);
+    enc.set_bytes(4, 16, b.as_ptr() as *const _);
+    enc.set_bytes(5, 16, c.as_ptr() as *const _);
+    enc.set_bytes(6, 16, dparams.as_ptr() as *const _);
+    enc.set_bytes(7, 16, e.as_ptr() as *const _);
+    enc.set_bytes(8, 16, f.as_ptr() as *const _);
+    let grid = metal::MTLSize {
+        width: w_out as u64,
+        height: h_out as u64,
+        depth: (n * c_out * d_out) as u64,
     };
     let tg = metal::MTLSize {
         width: 8.min(w_out as u64),
@@ -6446,6 +6910,321 @@ pub(crate) fn encode_fma(
     enc.dispatch_threads(
         metal::MTLSize {
             width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+pub(crate) fn encode_relu_backward(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    dy: usize,
+    dx: usize,
+    len: u32,
+) {
+    enc.set_compute_pipeline_state(&k.relu_backward);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), dy as u64);
+    enc.set_buffer(2, Some(buffer), dx as u64);
+    enc.set_bytes(3, 4, &len as *const u32 as *const _);
+    let tg_w = k.relu_backward.thread_execution_width().min(len as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_activation_backward(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    dy: usize,
+    dx: usize,
+    len: u32,
+    op: u32,
+) {
+    enc.set_compute_pipeline_state(&k.activation_backward);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), dy as u64);
+    enc.set_buffer(2, Some(buffer), dx as u64);
+    enc.set_bytes(3, 4, &len as *const u32 as *const _);
+    enc.set_bytes(4, 4, &op as *const u32 as *const _);
+    let tg_w = k
+        .activation_backward
+        .thread_execution_width()
+        .min(len as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+pub(crate) fn encode_complex_norm_sq(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    dst: usize,
+    len: u32,
+) {
+    enc.set_compute_pipeline_state(&k.complex_norm_sq);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), dst as u64);
+    enc.set_bytes(2, 4, &len as *const u32 as *const _);
+    let tg_w = k.complex_norm_sq.thread_execution_width().min(len as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+pub(crate) fn encode_complex_norm_sq_backward(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    z: usize,
+    g: usize,
+    dz: usize,
+    len: u32,
+) {
+    enc.set_compute_pipeline_state(&k.complex_norm_sq_backward);
+    enc.set_buffer(0, Some(buffer), z as u64);
+    enc.set_buffer(1, Some(buffer), g as u64);
+    enc.set_buffer(2, Some(buffer), dz as u64);
+    enc.set_bytes(3, 4, &len as *const u32 as *const _);
+    let tg_w = k
+        .complex_norm_sq_backward
+        .thread_execution_width()
+        .min(len as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+pub(crate) fn encode_conjugate_c64(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    dst: usize,
+    len: u32,
+) {
+    enc.set_compute_pipeline_state(&k.conjugate_c64);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), dst as u64);
+    enc.set_bytes(2, 4, &len as *const u32 as *const _);
+    let tg_w = k.conjugate_c64.thread_execution_width().min(len as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[repr(C)]
+struct FftButterflyStageParams {
+    batch: u32,
+    n_fft: u32,
+    stage: u32,
+    n_half: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fft_butterfly_stage(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    state: usize,
+    out: usize,
+    gate: usize,
+    rev: usize,
+    tw_re: usize,
+    tw_im: usize,
+    batch: u32,
+    n_fft: u32,
+    stage: u32,
+) {
+    let n_half = n_fft / 2;
+    if batch == 0 || n_half == 0 {
+        return;
+    }
+    let p = FftButterflyStageParams {
+        batch,
+        n_fft,
+        stage,
+        n_half,
+    };
+    enc.set_compute_pipeline_state(&k.fft_butterfly_stage);
+    enc.set_buffer(0, Some(buffer), state as u64);
+    enc.set_buffer(1, Some(buffer), out as u64);
+    enc.set_buffer(2, Some(buffer), gate as u64);
+    enc.set_buffer(3, Some(buffer), rev as u64);
+    enc.set_buffer(4, Some(buffer), tw_re as u64);
+    enc.set_buffer(5, Some(buffer), tw_im as u64);
+    enc.set_bytes(
+        6,
+        std::mem::size_of::<FftButterflyStageParams>() as u64,
+        &p as *const FftButterflyStageParams as *const _,
+    );
+    let tg_w = k
+        .fft_butterfly_stage
+        .thread_execution_width()
+        .min(n_half as u64)
+        .max(1);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: n_half as u64,
+            height: batch as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[repr(C)]
+struct FakeQuantizeParams {
+    n: u32,
+    chan_dim: u32,
+    inner: u32,
+    q_max: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fake_quantize_fixed(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    scale: usize,
+    dst: usize,
+    n: u32,
+    chan_dim: u32,
+    inner: u32,
+    q_max: f32,
+) {
+    if n == 0 {
+        return;
+    }
+    let p = FakeQuantizeParams {
+        n,
+        chan_dim,
+        inner,
+        q_max,
+    };
+    enc.set_compute_pipeline_state(&k.fake_quantize_fixed);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), scale as u64);
+    enc.set_buffer(2, Some(buffer), dst as u64);
+    enc.set_bytes(
+        3,
+        std::mem::size_of::<FakeQuantizeParams>() as u64,
+        &p as *const FakeQuantizeParams as *const _,
+    );
+    let tg_w = k.fake_quantize_fixed.thread_execution_width().min(n as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: n as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fake_quantize_perbatch(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    dst: usize,
+    n: u32,
+    chan_dim: u32,
+    inner: u32,
+    q_max: f32,
+) {
+    if n == 0 || chan_dim == 0 {
+        return;
+    }
+    let p = FakeQuantizeParams {
+        n,
+        chan_dim,
+        inner,
+        q_max,
+    };
+    enc.set_compute_pipeline_state(&k.fake_quantize_perbatch);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), dst as u64);
+    enc.set_bytes(
+        2,
+        std::mem::size_of::<FakeQuantizeParams>() as u64,
+        &p as *const FakeQuantizeParams as *const _,
+    );
+    let tg_w = k
+        .fake_quantize_perbatch
+        .thread_execution_width()
+        .min(chan_dim as u64);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: chan_dim as u64,
             height: 1,
             depth: 1,
         },

@@ -380,7 +380,7 @@ pub(crate) fn compile_pool(
         unreachable!()
     };
     {
-        // Currently support 2D pooling on rank-4 NCHW tensors.
+        // 2D pooling on rank-4 NCHW; 3D pooling on rank-5 NCDHW.
         let in_shape = &graph.node(node.inputs[0]).shape;
         let out_shape = &node.shape;
         if kernel_size.len() == 2 && in_shape.rank() == 4 && out_shape.rank() == 4 {
@@ -399,6 +399,29 @@ pub(crate) fn compile_pool(
                 sw: stride.get(1).copied().unwrap_or(1) as u32,
                 ph: padding.first().copied().unwrap_or(0) as u32,
                 pw: padding.get(1).copied().unwrap_or(0) as u32,
+                kind: *kind,
+            }
+        } else if kernel_size.len() == 3 && in_shape.rank() == 5 && out_shape.rank() == 5 {
+            Thunk::Pool3D {
+                src: node_offset(arena, node.inputs[0]),
+                dst: node_offset(arena, node.id),
+                n: in_shape.dim(0).unwrap_static() as u32,
+                c: in_shape.dim(1).unwrap_static() as u32,
+                d: in_shape.dim(2).unwrap_static() as u32,
+                h: in_shape.dim(3).unwrap_static() as u32,
+                w: in_shape.dim(4).unwrap_static() as u32,
+                d_out: out_shape.dim(2).unwrap_static() as u32,
+                h_out: out_shape.dim(3).unwrap_static() as u32,
+                w_out: out_shape.dim(4).unwrap_static() as u32,
+                kd: kernel_size[0] as u32,
+                kh: kernel_size[1] as u32,
+                kw: kernel_size[2] as u32,
+                sd: stride.first().copied().unwrap_or(1) as u32,
+                sh: stride.get(1).copied().unwrap_or(1) as u32,
+                sw: stride.get(2).copied().unwrap_or(1) as u32,
+                pd: padding.first().copied().unwrap_or(0) as u32,
+                ph: padding.get(1).copied().unwrap_or(0) as u32,
+                pw: padding.get(2).copied().unwrap_or(0) as u32,
                 kind: *kind,
             }
         } else {
@@ -670,35 +693,182 @@ pub(crate) fn exec_conv_transpose2d(t: &Thunk, base: *mut u8) {
         let c_out = *c_out as usize;
         let h_out = *h_out as usize;
         let w_out = *w_out as usize;
+        let groups = *groups as usize;
+        let c_out_per_g = if groups == 0 { c_out } else { c_out / groups };
         unsafe {
             let inp = sl(*src, base, n * c_in * h * w_in);
             let wt = sl(
                 *weight,
                 base,
-                c_in * (c_out / *groups as usize) * (*kh as usize) * (*kw as usize),
+                c_in * c_out_per_g * (*kh as usize) * (*kw as usize),
             );
             let out = sl_mut(*dst, base, n * c_out * h_out * w_out);
-            crate::kernels::conv_transpose2d_nchw(
-                inp,
-                wt,
-                out,
-                n,
-                c_in,
-                h,
-                w_in,
-                c_out,
-                h_out,
-                w_out,
-                *kh as usize,
-                *kw as usize,
-                *sh as usize,
-                *sw as usize,
-                *ph as usize,
-                *pw as usize,
-                *dh as usize,
-                *dw as usize,
-                *groups as usize,
-            );
+            // Transposed conv forward is `col2im(Wᵀ @ input)` — the same GEMM +
+            // col2im as `Conv2dBackwardInput`. The fast path dispatches vectorized
+            // (optionally threaded) BLAS + a scatter, orders of magnitude faster than
+            // the naive scalar scatter kept below as the parity reference.
+            if fast_conv_enabled() && groups != 0 && c_in >= groups {
+                conv_transpose2d_forward_gemm(
+                    inp,
+                    wt,
+                    out,
+                    n,
+                    c_in,
+                    h,
+                    w_in,
+                    c_out,
+                    h_out,
+                    w_out,
+                    *kh as usize,
+                    *kw as usize,
+                    *sh as usize,
+                    *sw as usize,
+                    *ph as usize,
+                    *pw as usize,
+                    *dh as usize,
+                    *dw as usize,
+                    groups,
+                );
+            } else {
+                crate::kernels::conv_transpose2d_nchw(
+                    inp,
+                    wt,
+                    out,
+                    n,
+                    c_in,
+                    h,
+                    w_in,
+                    c_out,
+                    h_out,
+                    w_out,
+                    *kh as usize,
+                    *kw as usize,
+                    *sh as usize,
+                    *sw as usize,
+                    *ph as usize,
+                    *pw as usize,
+                    *dh as usize,
+                    *dw as usize,
+                    groups,
+                );
+            }
+        }
+    }
+}
+
+/// Fast NCHW `ConvTranspose2d` forward via per-(batch,group) GEMM + `col2im`.
+///
+/// Structurally identical to [`exec_conv2d_backward_input`] (transposed conv is the
+/// gradient-w.r.t.-input of a forward conv):
+///
+/// ```text
+///   col_n_g  = weight_gᵀ @ input_n_g          (sgemm, [c_out_per_g·kH·kW, h·w_in])
+///   out_n_g  = col2im(col_n_g)                (scatter into [c_out_per_g, h_out, w_out])
+/// ```
+///
+/// Weight layout is `[c_in, c_out/g, kH, kW]` (row `ic_off`, col `oc_off·kH·kW+kY·kW+kX`),
+/// so with `trans_a` the GEMM contracts over `c_in_per_g`. Each `(ni, g)` writes a disjoint
+/// output window, so the batch loop fans out over the pool; single-utterance (n=1) convs
+/// still win from the vectorized BLAS GEMM vs. the scalar scatter.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv_transpose2d_forward_gemm(
+    inp: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    n: usize,
+    c_in: usize,
+    h: usize,
+    w_in: usize,
+    c_out: usize,
+    h_out: usize,
+    w_out: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    dh: usize,
+    dw: usize,
+    groups: usize,
+) {
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+    let c_in_per_g = c_in / groups;
+    let c_out_per_g = c_out / groups;
+    // GEMM: [M, N] = [c_out_per_g·kH·kW, h·w_in], contracting K = c_in_per_g.
+    let m_dim = c_out_per_g * kh * kw;
+    let n_dim = h * w_in;
+    let k_dim = c_in_per_g;
+    if m_dim == 0 || n_dim == 0 || k_dim == 0 {
+        return;
+    }
+    let in_stride_n = c_in * h * w_in;
+    let in_stride_g = c_in_per_g * h * w_in;
+    let w_stride_g = c_in_per_g * c_out_per_g * kh * kw;
+    let out_stride_n = c_out * h_out * w_out;
+    let out_stride_g = c_out_per_g * h_out * w_out;
+
+    let run_unit = |ni: usize, g: usize, col: &mut [f32], out_ptr: usize| unsafe {
+        let w_g_off = g * w_stride_g;
+        let in_n_g_off = ni * in_stride_n + g * in_stride_g;
+        let out_n_g_off = ni * out_stride_n + g * out_stride_g;
+        // col = weight_gᵀ @ input_n_g.  weight_g stored [k_dim, m_dim] row-major → trans_a.
+        crate::blas::sgemm_general(
+            wt.as_ptr().add(w_g_off),
+            inp.as_ptr().add(in_n_g_off),
+            col.as_mut_ptr(),
+            m_dim,
+            n_dim,
+            k_dim,
+            1.0,
+            0.0,
+            /*lda=*/ m_dim,
+            /*ldb=*/ n_dim,
+            /*ldc=*/ n_dim,
+            /*trans_a=*/ true,
+            /*trans_b=*/ false,
+        );
+        // out_n_g += col2im(col): image dims are the (larger) output spatial; the
+        // im2col "positions" (h_out/w_out params) are the input spatial h·w_in.
+        let out_g =
+            std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(out_n_g_off), out_stride_g);
+        col2im(
+            col,
+            out_g,
+            c_out_per_g,
+            h_out,
+            w_out,
+            h,
+            w_in,
+            kh,
+            kw,
+            sh,
+            sw,
+            ph,
+            pw,
+            dh,
+            dw,
+        );
+    };
+
+    let out_addr = out.as_mut_ptr() as usize;
+    if crate::pool::num_threads() > 1 && n * groups > 1 {
+        crate::pool::par_for(n, 1, &|off, cnt| {
+            let mut col = vec![0f32; m_dim * n_dim];
+            for ni in off..off + cnt {
+                for g in 0..groups {
+                    run_unit(ni, g, &mut col, out_addr);
+                }
+            }
+        });
+    } else {
+        let mut col = vec![0f32; m_dim * n_dim];
+        for ni in 0..n {
+            for g in 0..groups {
+                run_unit(ni, g, &mut col, out_addr);
+            }
         }
     }
 }

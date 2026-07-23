@@ -53,9 +53,12 @@ pub const UNARY_F16_MIRROR_WGSL: &str = include_str!("unary_f16_mirror.wgsl");
 pub const COMPARE_WGSL: &str = include_str!("compare.wgsl");
 pub const WHERE_WGSL: &str = include_str!("where.wgsl");
 pub const FMA_WGSL: &str = include_str!("fma.wgsl");
+pub const ACTIVATION_BACKWARD_WGSL: &str = include_str!("activation_backward.wgsl");
 pub const REDUCE_WGSL: &str = include_str!("reduce.wgsl");
 pub const SOFTMAX_WGSL: &str = include_str!("softmax.wgsl");
 pub const SOFTMAX_CROSS_ENTROPY_WGSL: &str = include_str!("softmax_cross_entropy.wgsl");
+pub const SOFTMAX_CROSS_ENTROPY_BWD_WGSL: &str = include_str!("softmax_cross_entropy_bwd.wgsl");
+pub const MAXPOOL2D_BWD_WGSL: &str = include_str!("maxpool2d_backward.wgsl");
 pub const LAYERNORM_WGSL: &str = include_str!("layernorm.wgsl");
 pub const RMS_NORM_BWD_WGSL: &str = include_str!("rms_norm_backward.wgsl");
 pub const LAYER_NORM_BWD_WGSL: &str = include_str!("layer_norm_backward.wgsl");
@@ -79,6 +82,8 @@ pub const COPY_WGSL: &str = include_str!("copy.wgsl");
 pub const CAST_WGSL: &str = include_str!("cast.wgsl");
 pub const COMPLEX_CAST_WGSL: &str = include_str!("complex_cast.wgsl");
 pub const BINARY_C64_WGSL: &str = include_str!("binary_c64.wgsl");
+pub const COMPLEX_WIRINGER_WGSL: &str = include_str!("complex_wirtinger.wgsl");
+pub const FFT_BUTTERFLY_STAGE_WGSL: &str = include_str!("fft_butterfly_stage.wgsl");
 pub const ELEMENTWISE_REGION_WGSL: &str = include_str!("elementwise_region.wgsl");
 pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
 pub const NARROW_WGSL: &str = include_str!("narrow.wgsl");
@@ -99,6 +104,10 @@ pub const POOL1D_WGSL: &str = include_str!("pool1d.wgsl");
 pub const POOL3D_WGSL: &str = include_str!("pool3d.wgsl");
 pub const CONV1D_WGSL: &str = include_str!("conv1d.wgsl");
 pub const CONV3D_WGSL: &str = include_str!("conv3d.wgsl");
+pub const CONV_TRANSPOSE3D_WGSL: &str = include_str!("conv_transpose3d.wgsl");
+pub const GROUP_NORM_BWD_WGSL: &str = include_str!("group_norm_backward.wgsl");
+pub const AXIAL_ROPE2D_WGSL: &str = include_str!("axial_rope2d.wgsl");
+pub const FAKE_QUANTIZE_WGSL: &str = include_str!("fake_quantize.wgsl");
 pub const SCATTER_ADD_WGSL: &str = include_str!("scatter_add.wgsl");
 pub const TOPK_WGSL: &str = include_str!("topk.wgsl");
 pub const WELCH_PEAKS_GPU_WGSL: &str = include_str!("welch_peaks_gpu.wgsl");
@@ -201,6 +210,20 @@ pub struct FmaParams {
     pub _p2: u32,
 }
 
+/// Layout for ReluBackward / ActivationBackward. 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ActivationBackwardParams {
+    pub n: u32,
+    pub x_off: u32,
+    pub dy_off: u32,
+    pub dx_off: u32,
+    pub op: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+}
+
 /// Layout for reductions. 32 bytes.
 ///
 /// Supports arbitrary-axis reductions. The reduce kernel walks the
@@ -258,6 +281,8 @@ pub struct SoftmaxParams {
 }
 
 /// Layout for the fused dense softmax cross-entropy. 32 bytes.
+/// Also used by integer-label `SoftmaxCrossEntropyWithLogits` (labels in
+/// `targets_off`, one f32 per row).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct SceParams {
@@ -269,6 +294,93 @@ pub struct SceParams {
     pub _p0: u32,
     pub _p1: u32,
     pub _p2: u32,
+}
+
+/// Layout for integer-label softmax cross-entropy backward. 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct SceBwdParams {
+    pub outer: u32,
+    pub inner: u32,
+    pub logits_off: u32,
+    pub labels_off: u32,
+    pub d_loss_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+}
+
+/// Layout for MaxPool2d backward. 64 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct MaxPool2dBwdParams {
+    pub n: u32,
+    pub c: u32,
+    pub h: u32,
+    pub w: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub kh: u32,
+    pub kw: u32,
+    pub sh: u32,
+    pub sw: u32,
+    pub ph: u32,
+    pub pw: u32,
+    pub x_off: u32,
+    pub dy_off: u32,
+    pub dx_off: u32,
+    pub _p0: u32,
+}
+
+/// Layout for GroupNorm (NCHW) backward. 48 bytes. Shared by dx/dgamma/dbeta
+/// entry points (`group_norm_bwd_{input,gamma,beta}`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GroupNormBwdParams {
+    pub n: u32,
+    pub c: u32,
+    pub h: u32,
+    pub w: u32,
+    pub num_groups: u32,
+    pub eps_bits: u32,
+    pub x_off: u32,
+    pub gamma_off: u32,
+    pub dy_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+}
+
+/// Layout for AxialRope2d. 48 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct AxialRope2dParams {
+    pub batch: u32,
+    pub seq: u32,
+    pub hidden: u32,
+    pub end_x: u32,
+    pub end_y: u32,
+    pub head_dim: u32,
+    pub num_heads: u32,
+    pub repeat_factor: u32,
+    pub theta: f32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub n_total: u32,
+}
+
+/// Layout for FakeQuantize (Fixed / PerBatch). 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct FakeQuantizeParams {
+    pub n: u32,
+    pub chan_dim: u32,
+    pub inner: u32,
+    pub q_max: f32,
+    pub in_off: u32,
+    pub scale_off: u32,
+    pub out_off: u32,
+    pub _pad: u32,
 }
 
 /// Layout for LayerNorm / RmsNorm.
@@ -499,6 +611,43 @@ pub struct BinaryC64Params {
     pub n_a: u32,
     pub n_b: u32,
     pub _p0: u32,
+}
+
+/// C64 Wirtinger surface (`complex_wirtinger.wgsl`). 32 bytes.
+/// Shared by ComplexNormSq / ComplexNormSqBackward / Conjugate:
+/// - NormSq / Conjugate: `a_off`=src, `c_off`=dst (`b_off` unused)
+/// - NormSqBackward: `a_off`=z, `b_off`=g, `c_off`=dz
+/// `n` is the complex-element count; offsets are f32-element.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ComplexWirtingerParams {
+    pub n: u32,
+    pub a_off: u32,
+    pub b_off: u32,
+    pub c_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+    pub _p3: u32,
+}
+
+/// Ternary-pruned radix-2 butterfly (`fft_butterfly_stage.wgsl`). 48 bytes.
+/// Offsets are f32-element; `half = n_fft / 2`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct FftButterflyStageParams {
+    pub batch: u32,
+    pub n_fft: u32,
+    pub stage: u32,
+    pub half: u32,
+    pub state_off: u32,
+    pub out_off: u32,
+    pub gate_off: u32,
+    pub rev_off: u32,
+    pub tw_re_off: u32,
+    pub tw_im_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
 }
 
 /// Layout shared by Reshape / same-dtype Cast / generic full copy. 32 bytes.
@@ -1842,14 +1991,28 @@ static CAST_F32_TO_F16: OnceLock<Kernel> = OnceLock::new();
 static BINARY: OnceLock<Kernel> = OnceLock::new();
 static BINARY_C64: OnceLock<Kernel> = OnceLock::new();
 static COMPLEX_CAST: OnceLock<Kernel> = OnceLock::new();
+static COMPLEX_NORM_SQ: OnceLock<Kernel> = OnceLock::new();
+static COMPLEX_NORM_SQ_BACKWARD: OnceLock<Kernel> = OnceLock::new();
+static CONJUGATE_C64: OnceLock<Kernel> = OnceLock::new();
+static FFT_BUTTERFLY_STAGE: OnceLock<Kernel> = OnceLock::new();
 static UNARY: OnceLock<Kernel> = OnceLock::new();
 static UNARY_F16_MIRROR: OnceLock<Kernel> = OnceLock::new();
 static COMPARE: OnceLock<Kernel> = OnceLock::new();
 static WHEREK: OnceLock<Kernel> = OnceLock::new();
 static FMAK: OnceLock<Kernel> = OnceLock::new();
+static ACTIVATION_BACKWARD: OnceLock<Kernel> = OnceLock::new();
 static REDUCE: OnceLock<Kernel> = OnceLock::new();
 static SOFTMAX: OnceLock<Kernel> = OnceLock::new();
 static SOFTMAX_CROSS_ENTROPY: OnceLock<Kernel> = OnceLock::new();
+static SOFTMAX_CROSS_ENTROPY_WITH_LOGITS: OnceLock<Kernel> = OnceLock::new();
+static SOFTMAX_CROSS_ENTROPY_BWD: OnceLock<Kernel> = OnceLock::new();
+static MAXPOOL2D_BWD: OnceLock<Kernel> = OnceLock::new();
+static GROUP_NORM_BWD_INPUT: OnceLock<Kernel> = OnceLock::new();
+static GROUP_NORM_BWD_GAMMA: OnceLock<Kernel> = OnceLock::new();
+static GROUP_NORM_BWD_BETA: OnceLock<Kernel> = OnceLock::new();
+static AXIAL_ROPE2D: OnceLock<Kernel> = OnceLock::new();
+static FAKE_QUANTIZE_FIXED: OnceLock<Kernel> = OnceLock::new();
+static FAKE_QUANTIZE_PERBATCH: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD_PARAM: OnceLock<Kernel> = OnceLock::new();
@@ -1901,6 +2064,7 @@ static POOL1D: OnceLock<Kernel> = OnceLock::new();
 static POOL3D: OnceLock<Kernel> = OnceLock::new();
 static CONV1D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D: OnceLock<Kernel> = OnceLock::new();
+static CONV_TRANSPOSE3D: OnceLock<Kernel> = OnceLock::new();
 static SCATTER_ADD: OnceLock<Kernel> = OnceLock::new();
 static TOPK: OnceLock<Kernel> = OnceLock::new();
 static WELCH_PEAKS_GPU: OnceLock<Kernel> = OnceLock::new();
@@ -2218,7 +2382,12 @@ pub fn binary_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn binary_c64_kernel(device: &wgpu::Device) -> &'static Kernel {
     BINARY_C64.get_or_init(|| {
-        build_kernel(device, "rlx-wgpu binary_c64", BINARY_C64_WGSL, "binary_c64_main")
+        build_kernel(
+            device,
+            "rlx-wgpu binary_c64",
+            BINARY_C64_WGSL,
+            "binary_c64_main",
+        )
     })
 }
 pub fn complex_cast_kernel(device: &wgpu::Device) -> &'static Kernel {
@@ -2228,6 +2397,46 @@ pub fn complex_cast_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu complex_cast",
             COMPLEX_CAST_WGSL,
             "complex_cast_main",
+        )
+    })
+}
+pub fn complex_norm_sq_kernel(device: &wgpu::Device) -> &'static Kernel {
+    COMPLEX_NORM_SQ.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu complex_norm_sq",
+            COMPLEX_WIRINGER_WGSL,
+            "complex_norm_sq",
+        )
+    })
+}
+pub fn complex_norm_sq_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
+    COMPLEX_NORM_SQ_BACKWARD.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu complex_norm_sq_backward",
+            COMPLEX_WIRINGER_WGSL,
+            "complex_norm_sq_backward",
+        )
+    })
+}
+pub fn conjugate_c64_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONJUGATE_C64.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conjugate_c64",
+            COMPLEX_WIRINGER_WGSL,
+            "conjugate_c64",
+        )
+    })
+}
+pub fn fft_butterfly_stage_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FFT_BUTTERFLY_STAGE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fft_butterfly_stage",
+            FFT_BUTTERFLY_STAGE_WGSL,
+            "fft_butterfly_stage",
         )
     })
 }
@@ -2256,6 +2465,16 @@ pub fn where_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn fma_kernel(device: &wgpu::Device) -> &'static Kernel {
     FMAK.get_or_init(|| build_kernel(device, "rlx-wgpu fma", FMA_WGSL, "fma_main"))
 }
+pub fn activation_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ACTIVATION_BACKWARD.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu activation_backward",
+            ACTIVATION_BACKWARD_WGSL,
+            "activation_backward",
+        )
+    })
+}
 pub fn reduce_kernel(device: &wgpu::Device) -> &'static Kernel {
     REDUCE.get_or_init(|| build_kernel(device, "rlx-wgpu reduce", REDUCE_WGSL, "reduce"))
 }
@@ -2269,6 +2488,96 @@ pub fn softmax_cross_entropy_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu softmax_cross_entropy",
             SOFTMAX_CROSS_ENTROPY_WGSL,
             "softmax_cross_entropy",
+        )
+    })
+}
+pub fn softmax_cross_entropy_with_logits_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SOFTMAX_CROSS_ENTROPY_WITH_LOGITS.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu softmax_cross_entropy_with_logits",
+            SOFTMAX_CROSS_ENTROPY_WGSL,
+            "softmax_cross_entropy_with_logits",
+        )
+    })
+}
+pub fn softmax_cross_entropy_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SOFTMAX_CROSS_ENTROPY_BWD.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu softmax_cross_entropy_backward",
+            SOFTMAX_CROSS_ENTROPY_BWD_WGSL,
+            "softmax_cross_entropy_backward",
+        )
+    })
+}
+pub fn maxpool2d_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
+    MAXPOOL2D_BWD.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu maxpool2d_backward",
+            MAXPOOL2D_BWD_WGSL,
+            "maxpool2d_backward",
+        )
+    })
+}
+pub fn group_norm_backward_input_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GROUP_NORM_BWD_INPUT.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu group_norm_bwd_input",
+            GROUP_NORM_BWD_WGSL,
+            "group_norm_bwd_input",
+        )
+    })
+}
+pub fn group_norm_backward_gamma_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GROUP_NORM_BWD_GAMMA.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu group_norm_bwd_gamma",
+            GROUP_NORM_BWD_WGSL,
+            "group_norm_bwd_gamma",
+        )
+    })
+}
+pub fn group_norm_backward_beta_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GROUP_NORM_BWD_BETA.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu group_norm_bwd_beta",
+            GROUP_NORM_BWD_WGSL,
+            "group_norm_bwd_beta",
+        )
+    })
+}
+pub fn axial_rope2d_kernel(device: &wgpu::Device) -> &'static Kernel {
+    AXIAL_ROPE2D.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu axial_rope2d",
+            AXIAL_ROPE2D_WGSL,
+            "axial_rope2d",
+        )
+    })
+}
+pub fn fake_quantize_fixed_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FAKE_QUANTIZE_FIXED.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fake_quantize_fixed",
+            FAKE_QUANTIZE_WGSL,
+            "fake_quantize_fixed",
+        )
+    })
+}
+pub fn fake_quantize_perbatch_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FAKE_QUANTIZE_PERBATCH.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fake_quantize_perbatch",
+            FAKE_QUANTIZE_WGSL,
+            "fake_quantize_perbatch",
         )
     })
 }
@@ -2652,6 +2961,16 @@ pub fn conv1d_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn conv3d_kernel(device: &wgpu::Device) -> &'static Kernel {
     CONV3D.get_or_init(|| build_kernel(device, "rlx-wgpu conv3d", CONV3D_WGSL, "conv3d"))
+}
+pub fn conv_transpose3d_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV_TRANSPOSE3D.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv_transpose3d",
+            CONV_TRANSPOSE3D_WGSL,
+            "conv_transpose3d",
+        )
+    })
 }
 pub fn scatter_add_kernel(device: &wgpu::Device) -> &'static Kernel {
     SCATTER_ADD.get_or_init(|| {

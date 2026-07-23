@@ -123,4 +123,88 @@ impl<'a> LowerCtx<'a> {
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }
+
+    /// `matmul(x, W) + bias` then optional activation.
+    pub(crate) fn lower_fused_matmul_bias_act(
+        &mut self,
+        id: NodeId,
+        activation: Option<Activation>,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let shape = node.shape.clone();
+        let x = self.val(node.inputs[0]);
+        let w = self.val(node.inputs[1]);
+        let b = self.val(node.inputs[2]);
+        let mm = format!("{out_name}_mm");
+        self.matmul(&mm, &x, &w, &shape)?;
+        let biased = format!("{out_name}_bias");
+        self.emit(
+            "add",
+            &biased,
+            &shape,
+            vec![("x", bind_name(&mm)), ("y", bind_name(&b))],
+        )?;
+        self.emit_activation(&biased, activation, out_name, &shape)?;
+        self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
+
+    /// Split last axis in half: `up * silu(gate)`.
+    pub(crate) fn lower_fused_swiglu(&mut self, id: NodeId, out_name: &str) -> Result<()> {
+        let node = self.graph.node(id);
+        let in_shape = self.graph.shape(node.inputs[0]).clone();
+        let out_shape = node.shape.clone();
+        let rank = in_shape.rank();
+        let last = in_shape.dim(rank - 1).unwrap_static();
+        if last % 2 != 0 {
+            return Err(CoremlError::Unsupported(format!(
+                "FusedSwiGLU: last dim {last} must be even"
+            )));
+        }
+        let half = last / 2;
+        let x = self.val(node.inputs[0]);
+        let begin_up = vec![0i32; rank];
+        let mut size_up: Vec<i32> = in_shape
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static() as i32)
+            .collect();
+        size_up[rank - 1] = half as i32;
+        let mut begin_g = vec![0i32; rank];
+        begin_g[rank - 1] = half as i32;
+        let size_g = size_up.clone();
+        let up = format!("{out_name}_up");
+        self.emit(
+            "slice_by_size",
+            &up,
+            &out_shape,
+            vec![
+                ("x", bind_name(&x)),
+                ("begin", bind_value(vec_i32(&begin_up))),
+                ("size", bind_value(vec_i32(&size_up))),
+            ],
+        )?;
+        let gate = format!("{out_name}_gate");
+        self.emit(
+            "slice_by_size",
+            &gate,
+            &out_shape,
+            vec![
+                ("x", bind_name(&x)),
+                ("begin", bind_value(vec_i32(&begin_g))),
+                ("size", bind_value(vec_i32(&size_g))),
+            ],
+        )?;
+        let silu = format!("{out_name}_silu");
+        self.emit_activation(&gate, Some(Activation::Silu), &silu, &out_shape)?;
+        self.emit(
+            "mul",
+            out_name,
+            &out_shape,
+            vec![("x", bind_name(&up)), ("y", bind_name(&silu))],
+        )?;
+        self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
 }

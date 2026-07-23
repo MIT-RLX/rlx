@@ -329,6 +329,66 @@ pub enum Thunk {
         groups: u32,
         dt: HalfFlag,
     },
+    /// NCDHW Conv3d (PyTorch layout, no bias).
+    /// Weight: `[C_out, C_in/groups, kD, kH, kW]`.
+    Conv3d {
+        src: usize,
+        weight: usize,
+        dst: usize,
+        n: u32,
+        c_in: u32,
+        d: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        dd: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+        dt: HalfFlag,
+    },
+    /// NCDHW ConvTranspose3d (PyTorch layout, no bias).
+    /// Weight: `[C_in, C_out/groups, kD, kH, kW]`.
+    ConvTranspose3d {
+        src: usize,
+        weight: usize,
+        dst: usize,
+        n: u32,
+        c_in: u32,
+        d: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        dd: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+        dt: HalfFlag,
+    },
     /// Nearest 2× upsample on NCHW.
     ResizeNearest2x {
         src: usize,
@@ -842,6 +902,73 @@ pub enum Thunk {
         dst: usize,
         len: u32,
     },
+    /// Native MSL `Op::ReluBackward`: `dx[i] = (x[i] > 0) ? dy[i] : 0`.
+    ReluBackward {
+        x: usize,
+        dy: usize,
+        dx: usize,
+        len: u32,
+    },
+    /// Native MSL `Op::ActivationBackward` for Fixed kinds (op id 0–16).
+    ActivationBackward {
+        x: usize,
+        dy: usize,
+        dx: usize,
+        len: u32,
+        op: u32,
+    },
+    /// Native MSL `Op::FakeQuantize` Fixed (scale input).
+    FakeQuantizeFixed {
+        src: usize,
+        scale: usize,
+        dst: usize,
+        n: u32,
+        chan_dim: u32,
+        inner: u32,
+        q_max: f32,
+    },
+    /// Native MSL `Op::FakeQuantize` PerBatch (derive scale from max abs).
+    FakeQuantizePerBatch {
+        src: usize,
+        dst: usize,
+        n: u32,
+        chan_dim: u32,
+        inner: u32,
+        q_max: f32,
+    },
+    /// Native MSL `|z|² = re² + im²` (C64 → F32). `len` is the complex-element
+    /// count; `src` is interleaved `[re, im]` pairs.
+    ComplexNormSq {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// Native MSL Wirtinger VJP of ComplexNormSq: `dz = g · z` (C64, F32 → C64).
+    ComplexNormSqBackward {
+        z: usize,
+        g: usize,
+        dz: usize,
+        len: u32,
+    },
+    /// Native MSL element-wise C64 conjugate: `(re, -im)`.
+    ConjugateC64 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
+    /// Native MSL ternary-pruned radix-2 butterfly stage
+    /// (`fft_butterfly_stage`). State/out are interleaved `[batch, n_fft, 2]`.
+    FftButterflyStage {
+        state: usize,
+        out: usize,
+        gate: usize,
+        rev: usize,
+        tw_re: usize,
+        tw_im: usize,
+        batch: u32,
+        n_fft: u32,
+        stage: u32,
+    },
     /// PLAN L2 — fused N-ary element-wise region. Lowered from
     /// `Op::ElementwiseRegion`. Kernel interprets the chain encoding
     /// per-element (saves N kernel dispatches + N global-memory
@@ -1187,6 +1314,55 @@ pub enum Thunk {
         rows: u32,
         h: u32,
         eps: f32,
+    },
+    LayerNormBackwardInput {
+        x: usize,
+        gamma: usize,
+        dy: usize,
+        dx: usize,
+        rows: u32,
+        h: u32,
+        eps: f32,
+    },
+    LayerNormBackwardGamma {
+        x: usize,
+        dy: usize,
+        dgamma: usize,
+        rows: u32,
+        h: u32,
+        eps: f32,
+    },
+    GroupNormBackwardInput {
+        x: usize,
+        gamma: usize,
+        beta: usize,
+        dy: usize,
+        dx: usize,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        num_groups: u32,
+        eps: f32,
+    },
+    GroupNormBackwardGamma {
+        x: usize,
+        dy: usize,
+        dgamma: usize,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
+        num_groups: u32,
+        eps: f32,
+    },
+    GroupNormBackwardBeta {
+        dy: usize,
+        dbeta: usize,
+        n: u32,
+        c: u32,
+        h: u32,
+        w: u32,
     },
     RopeBackward {
         dy: usize,
@@ -1574,6 +1750,8 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::GroupNorm { .. } => "group_norm",
         Thunk::LayerNorm2d { .. } => "layer_norm2d",
         Thunk::ConvTranspose2d { .. } => "conv_transpose2d",
+        Thunk::Conv3d { .. } => "conv3d",
+        Thunk::ConvTranspose3d { .. } => "conv_transpose3d",
         Thunk::RmsNorm { .. } => "rms_norm",
         Thunk::ResizeNearest2x { .. } => "resize_nearest_2x",
         Thunk::BinaryFull { .. } => "binary",
@@ -1597,6 +1775,11 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::RmsNormBackwardInput { .. } => "rms_norm_backward_input",
         Thunk::RmsNormBackwardGamma { .. } => "rms_norm_backward_gamma",
         Thunk::RmsNormBackwardBeta { .. } => "rms_norm_backward_beta",
+        Thunk::LayerNormBackwardInput { .. } => "layer_norm_backward_input",
+        Thunk::LayerNormBackwardGamma { .. } => "layer_norm_backward_gamma",
+        Thunk::GroupNormBackwardInput { .. } => "group_norm_backward_input",
+        Thunk::GroupNormBackwardGamma { .. } => "group_norm_backward_gamma",
+        Thunk::GroupNormBackwardBeta { .. } => "group_norm_backward_beta",
         Thunk::RopeBackward { .. } => "rope_backward",
         Thunk::CumsumBackward { .. } => "cumsum_backward",
         Thunk::GatherBackward { .. } => "gather_backward",
@@ -1622,6 +1805,14 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Conv2D { .. } => "conv2d",
         Thunk::Where { .. } => "where",
         Thunk::Fma { .. } => "fma",
+        Thunk::ReluBackward { .. } => "relu_backward",
+        Thunk::ActivationBackward { .. } => "activation_backward",
+        Thunk::FakeQuantizeFixed { .. } => "fake_quantize_fixed",
+        Thunk::FakeQuantizePerBatch { .. } => "fake_quantize_perbatch",
+        Thunk::ComplexNormSq { .. } => "complex_norm_sq",
+        Thunk::ComplexNormSqBackward { .. } => "complex_norm_sq_backward",
+        Thunk::FftButterflyStage { .. } => "fft_butterfly_stage",
+        Thunk::ConjugateC64 { .. } => "conjugate_c64",
         Thunk::ElementwiseRegion { .. } => "elementwise_region",
         Thunk::BatchElementwiseRegion { .. } => "batch_elementwise_region",
         Thunk::CustomOp { .. } => "custom_op",
@@ -1705,6 +1896,13 @@ impl Thunk {
             | Thunk::Gather { .. }
             | Thunk::Compare { .. }
             | Thunk::Where { .. }
+            | Thunk::Fma { .. }
+            | Thunk::ReluBackward { .. }
+            | Thunk::ActivationBackward { .. }
+            | Thunk::ComplexNormSq { .. }
+            | Thunk::ComplexNormSqBackward { .. }
+            | Thunk::ConjugateC64 { .. }
+            | Thunk::FftButterflyStage { .. }
             | Thunk::FusedSwiGLU { .. }
             | Thunk::ElementwiseRegion { .. }
             | Thunk::BatchElementwiseRegion { .. }
@@ -1727,6 +1925,11 @@ impl Thunk {
             Thunk::RmsNormBackwardInput { .. }
             | Thunk::RmsNormBackwardGamma { .. }
             | Thunk::RmsNormBackwardBeta { .. }
+            | Thunk::LayerNormBackwardInput { .. }
+            | Thunk::LayerNormBackwardGamma { .. }
+            | Thunk::GroupNormBackwardInput { .. }
+            | Thunk::GroupNormBackwardGamma { .. }
+            | Thunk::GroupNormBackwardBeta { .. }
             | Thunk::RopeBackward { .. }
             | Thunk::CumsumBackward { .. }
             | Thunk::GatherBackward { .. }
@@ -2259,6 +2462,24 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
         } => (vec![*lhs, *rhs0, *rhs1], vec![*dst]),
         BiasAdd { src, bias, dst, .. } => (vec![*src, *bias], vec![*dst]),
         Fma { a, b, c, dst, .. } => (vec![*a, *b, *c], vec![*dst]),
+        ReluBackward { x, dy, dx, .. } | ActivationBackward { x, dy, dx, .. } => {
+            (vec![*x, *dy], vec![*dx])
+        }
+        FakeQuantizeFixed {
+            src, scale, dst, ..
+        } => (vec![*src, *scale], vec![*dst]),
+        FakeQuantizePerBatch { src, dst, .. } => (vec![*src], vec![*dst]),
+        ComplexNormSq { src, dst, .. } | ConjugateC64 { src, dst, .. } => (vec![*src], vec![*dst]),
+        ComplexNormSqBackward { z, g, dz, .. } => (vec![*z, *g], vec![*dz]),
+        FftButterflyStage {
+            state,
+            out,
+            gate,
+            rev,
+            tw_re,
+            tw_im,
+            ..
+        } => (vec![*state, *gate, *rev, *tw_re, *tw_im], vec![*out]),
         Where {
             cond,
             on_true,
@@ -4014,6 +4235,22 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::GatedResidualBackward { y, gate, dy, .. } => vec![*y, *gate, *dy],
         Thunk::FusedRmsNormMulSilu { x, g, b, z, .. } => vec![*x, *g, *b, *z],
         Thunk::FusedDepthwiseConv1dBsc { src, weight, .. } => vec![*src, *weight],
+        Thunk::Conv3d { src, weight, .. } | Thunk::ConvTranspose3d { src, weight, .. } => {
+            vec![*src, *weight]
+        }
+        Thunk::ReluBackward { x, dy, .. } | Thunk::ActivationBackward { x, dy, .. } => {
+            vec![*x, *dy]
+        }
+        Thunk::ComplexNormSq { src, .. } | Thunk::ConjugateC64 { src, .. } => vec![*src],
+        Thunk::ComplexNormSqBackward { z, g, .. } => vec![*z, *g],
+        Thunk::FftButterflyStage {
+            state,
+            gate,
+            rev,
+            tw_re,
+            tw_im,
+            ..
+        } => vec![*state, *gate, *rev, *tw_re, *tw_im],
         Thunk::Softmax { data, .. } => vec![*data],
         Thunk::SoftmaxCrossEntropyDense {
             logits, targets, ..
@@ -4075,6 +4312,13 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         } => {
             vec![*x, *gamma, *beta, *dy]
         }
+        Thunk::LayerNormBackwardInput { x, gamma, dy, .. } => vec![*x, *gamma, *dy],
+        Thunk::LayerNormBackwardGamma { x, dy, .. } => vec![*x, *dy],
+        Thunk::GroupNormBackwardInput {
+            x, gamma, beta, dy, ..
+        } => vec![*x, *gamma, *beta, *dy],
+        Thunk::GroupNormBackwardGamma { x, dy, .. } => vec![*x, *dy],
+        Thunk::GroupNormBackwardBeta { dy, .. } => vec![*dy],
         Thunk::RopeBackward { dy, cos, sin, .. } => vec![*dy, *cos, *sin],
         Thunk::CumsumBackward { dy, .. } => vec![*dy],
         Thunk::GatherBackward { dy, indices, .. } => vec![*dy, *indices],

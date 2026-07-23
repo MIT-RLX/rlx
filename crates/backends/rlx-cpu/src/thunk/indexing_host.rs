@@ -186,7 +186,10 @@ pub fn indexing_thunk_regions(thunk: &Thunk) -> Vec<(usize, usize)> {
             data_elem_bytes,
             ..
         } => vec![
-            (*data, *data_len as usize * (*data_elem_bytes as usize).max(1)),
+            (
+                *data,
+                *data_len as usize * (*data_elem_bytes as usize).max(1),
+            ),
             (*indices, idx_nbytes(*indices_len, *indices_i64)),
             (*dst, *out_len as usize * (*data_elem_bytes as usize).max(1)),
         ],

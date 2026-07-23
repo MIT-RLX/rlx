@@ -163,7 +163,11 @@ pub fn limit_inner_threads() {
 pub fn set_blas_num_threads(n: i32) {
     let n = n.max(1);
     use std::sync::atomic::{AtomicI32, Ordering};
-    static LAST: AtomicI32 = AtomicI32::new(1);
+    // Sentinel `0` (not a valid thread count) so the *first* pin actually calls
+    // into the vendor BLAS. Starting at `1` wrongly assumes OpenBLAS/MKL boot
+    // single-threaded — the OpenBLAS pthread build defaults to all cores, so a
+    // no-op first call left it oversubscribed (N rayon workers × N BLAS threads).
+    static LAST: AtomicI32 = AtomicI32::new(0);
     if LAST.swap(n, Ordering::SeqCst) == n {
         return;
     }

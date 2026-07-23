@@ -1,0 +1,27 @@
+#version 450
+// FakeQuantize Fixed: clamp(round(x/s), -q_max, q_max) * s.
+// Channel: c = (i / inner) % chan_dim. Matches rlx-cpu / wgpu.
+layout(local_size_x = 256) in;
+
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint chan_dim;
+    uint inner;
+    float q_max;
+    uint in_off;
+    uint scale_off;
+    uint out_off;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    uint c = (pc.chan_dim <= 1u) ? 0u : ((i / pc.inner) % pc.chan_dim);
+    float s = max(arena_load(pc.scale_off + c), 1e-12);
+    float scaled = arena_load(pc.in_off + i) / s;
+    // Match Rust f32::round (half away from zero), not GLSL roundEven.
+    float rounded = sign(scaled) * floor(abs(scaled) + 0.5);
+    float qv = clamp(rounded, -pc.q_max, pc.q_max);
+    arena_store(pc.out_off + i, qv * s);
+}

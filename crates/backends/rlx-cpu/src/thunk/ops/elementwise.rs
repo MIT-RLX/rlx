@@ -1763,11 +1763,11 @@ pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
                 Activation::Silu => crate::kernels::par_silu_inplace(d),
                 Activation::Relu => apply!(|x: f32| x.max(0.0)),
                 Activation::Sigmoid => apply!(|x: f32| 1.0 / (1.0 + (-x).exp())),
-                Activation::Tanh => apply!(|x: f32| x.tanh()),
-                Activation::Exp => apply!(|x: f32| x.exp()),
-                Activation::Log => apply!(|x: f32| x.ln()),
-                Activation::Sqrt => apply!(|x: f32| x.sqrt()),
-                Activation::Rsqrt => apply!(|x: f32| 1.0 / x.sqrt()),
+                Activation::Tanh => crate::vmath::vvtanhf_hot_inplace(d),
+                Activation::Exp => crate::vmath::vvexpf_hot_inplace(d),
+                Activation::Log => crate::vmath::vvlogf_inplace(d),
+                Activation::Sqrt => crate::vmath::vvsqrtf_inplace(d),
+                Activation::Rsqrt => crate::vmath::vvrsqrtf_inplace(d),
                 Activation::Neg => apply!(|x: f32| -x),
                 Activation::Abs => apply!(|x: f32| x.abs()),
                 Activation::Round => apply!(|x: f32| x.round()),
@@ -1775,6 +1775,7 @@ pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
                 Activation::Cos => apply!(|x: f32| x.cos()),
                 Activation::Tan => apply!(|x: f32| x.tan()),
                 Activation::Atan => apply!(|x: f32| x.atan()),
+                Activation::Recip => crate::vmath::vvrecf_inplace(d),
             }
         }
     }
@@ -2435,6 +2436,7 @@ pub(crate) fn region_activation_scalar(act: rlx_ir::op::Activation, x: f32) -> f
         A::Cos => x.cos(),
         A::Tan => x.tan(),
         A::Atan => x.atan(),
+        A::Recip => 1.0 / x,
         A::Round => x.round(),
     }
 }
@@ -2553,35 +2555,14 @@ pub(crate) fn apply_activation_inplace(d: &mut [f32], act: rlx_ir::op::Activatio
             }
         }
         Activation::Sigmoid => {
-            for v in d.iter_mut() {
-                *v = 1.0 / (1.0 + (-*v).exp());
-            }
+            let x = d.to_vec();
+            crate::vmath::vvsigmoidf(d, &x);
         }
-        Activation::Tanh => {
-            for v in d.iter_mut() {
-                *v = v.tanh();
-            }
-        }
-        Activation::Exp => {
-            for v in d.iter_mut() {
-                *v = v.exp();
-            }
-        }
-        Activation::Log => {
-            for v in d.iter_mut() {
-                *v = v.ln();
-            }
-        }
-        Activation::Sqrt => {
-            for v in d.iter_mut() {
-                *v = v.sqrt();
-            }
-        }
-        Activation::Rsqrt => {
-            for v in d.iter_mut() {
-                *v = 1.0 / v.sqrt();
-            }
-        }
+        Activation::Tanh => crate::vmath::vvtanhf_hot_inplace(d),
+        Activation::Exp => crate::vmath::vvexpf_hot_inplace(d),
+        Activation::Log => crate::vmath::vvlogf_inplace(d),
+        Activation::Sqrt => crate::vmath::vvsqrtf_inplace(d),
+        Activation::Rsqrt => crate::vmath::vvrsqrtf_inplace(d),
         Activation::Neg => {
             for v in d.iter_mut() {
                 *v = -*v;
@@ -2617,6 +2598,7 @@ pub(crate) fn apply_activation_inplace(d: &mut [f32], act: rlx_ir::op::Activatio
                 *v = v.atan();
             }
         }
+        Activation::Recip => crate::vmath::vvrecf_inplace(d),
     }
 }
 
@@ -2760,6 +2742,11 @@ pub(crate) fn activation_backward_kernel(
                 out[i] = dys[i] / (1.0 + x * x);
             }
         }
+        Activation::Recip => {
+            for i in 0..n {
+                out[i] = -dys[i] / (xs[i] * xs[i]);
+            }
+        }
     }
 }
 
@@ -2878,6 +2865,11 @@ pub(crate) fn activation_backward_kernel_f64(
             for i in 0..n {
                 let x = xs[i];
                 out[i] = dys[i] / (1.0 + x * x);
+            }
+        }
+        Activation::Recip => {
+            for i in 0..n {
+                out[i] = -dys[i] / (xs[i] * xs[i]);
             }
         }
     }
@@ -3059,6 +3051,11 @@ pub(crate) fn apply_activation_f64(inp: &[f64], out: &mut [f64], kind: Activatio
         Activation::Atan => {
             for (o, &v) in out.iter_mut().zip(inp) {
                 *o = v.atan();
+            }
+        }
+        Activation::Recip => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = 1.0 / v;
             }
         }
         Activation::Gelu | Activation::GeluApprox | Activation::Silu => {

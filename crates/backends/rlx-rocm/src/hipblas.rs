@@ -13,13 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! hipBLAS shim — sgemm + sgemm_strided_batched.
+//! hipBLAS shim — sgemm + sgemm_strided_batched + batched LU.
 //!
 //! AMD's hipBLAS deliberately mirrors cuBLAS's API surface (Hipify
 //! literally substitutes `cublas` for `hipblas`), so this module is
-//! a near-1:1 port of the cuBLAS bits in `rlx-cuda::backend`. Resolved
-//! via libloading at runtime so the crate compiles on hosts without
-//! ROCm installed (Mac, CI without GPU).
+//! a near-1:1 port of the cuBLAS bits in `rlx-cuda::backend`. Also
+//! loads optional `hipblasSgetrfBatched` / `hipblasSgetrsBatched` for
+//! native `Op::BatchedDenseSolve`. Resolved via libloading at runtime
+//! so the crate compiles on hosts without ROCm installed.
 
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
@@ -165,6 +166,29 @@ type FnHipblasGemmEx = unsafe extern "C" fn(
     c_int, // algo
 ) -> HipblasError;
 
+type FnHipblasSgetrfBatched = unsafe extern "C" fn(
+    HipblasHandle,
+    c_int,
+    *const *mut f32,
+    c_int,
+    *mut c_int,
+    *mut c_int,
+    c_int,
+) -> HipblasError;
+type FnHipblasSgetrsBatched = unsafe extern "C" fn(
+    HipblasHandle,
+    HipblasOperation,
+    c_int,
+    c_int,
+    *const *const f32,
+    c_int,
+    *const c_int,
+    *const *mut f32,
+    c_int,
+    *mut c_int,
+    c_int,
+) -> HipblasError;
+
 // ── Loaded runtime ───────────────────────────────────────────────────
 
 pub struct HipblasRuntime {
@@ -176,6 +200,9 @@ pub struct HipblasRuntime {
     pub sgemm: FnHipblasSgemm,
     pub sgemm_strided: FnHipblasSgemmStridedBatched,
     pub gemm_ex: FnHipblasGemmEx,
+    /// Optional — missing on very old hipBLAS; batched dense solve falls back.
+    pub sgetrf_batched: Option<FnHipblasSgetrfBatched>,
+    pub sgetrs_batched: Option<FnHipblasSgetrsBatched>,
 }
 
 /// Public re-export of the `HIPBLAS_GEMM_DEFAULT` algo selector.
@@ -200,6 +227,9 @@ impl HipblasRuntime {
                     *s.into_raw()
                 }};
             }
+            macro_rules! sym_opt {
+                ($name:literal, $ty:ty) => {{ lib.get::<$ty>($name).ok().map(|s| *s.into_raw()) }};
+            }
             let rt = HipblasRuntime {
                 create: sym!(b"hipblasCreate", FnHipblasCreate),
                 destroy: sym!(b"hipblasDestroy", FnHipblasDestroy),
@@ -208,11 +238,18 @@ impl HipblasRuntime {
                 sgemm: sym!(b"hipblasSgemm", FnHipblasSgemm),
                 sgemm_strided: sym!(b"hipblasSgemmStridedBatched", FnHipblasSgemmStridedBatched),
                 gemm_ex: sym!(b"hipblasGemmEx", FnHipblasGemmEx),
+                sgetrf_batched: sym_opt!(b"hipblasSgetrfBatched", FnHipblasSgetrfBatched),
+                sgetrs_batched: sym_opt!(b"hipblasSgetrsBatched", FnHipblasSgetrsBatched),
                 _lib: lib,
             };
             Some(Arc::new(rt))
         }
     }
+}
+
+/// True when batched LU symbols are present on the loaded hipBLAS.
+pub fn batched_lu_available(rt: &HipblasRuntime) -> bool {
+    rt.sgetrf_batched.is_some() && rt.sgetrs_batched.is_some()
 }
 
 /// hipBLAS handle bound to a stream. Mirrors `cudarc::cublas::CudaBlas`

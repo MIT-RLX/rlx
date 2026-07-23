@@ -335,6 +335,27 @@ impl RocmExecutable {
                         [&mut arena_ptr, &n_s, cond_off, x_off, y_off, out_off]
                     );
                 }
+                Step::Fma {
+                    n,
+                    a_off,
+                    b_off,
+                    c_off,
+                    out_off,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = fma_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, &n_s, a_off, b_off, c_off, out_off]
+                    );
+                }
                 Step::FusedBinaryUnary {
                     n,
                     a_off,
@@ -477,6 +498,130 @@ impl RocmExecutable {
                         (outer_s, 1, 1),
                         (256, 1, 1),
                         [&mut arena_ptr, &outer_s, inner, in_off, out_off]
+                    );
+                }
+                Step::ReluBackward {
+                    n,
+                    x_off,
+                    dy_off,
+                    dx_off,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = relu_backward_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, &n_s, x_off, dy_off, dx_off]
+                    );
+                }
+                Step::ActivationBackward {
+                    n,
+                    x_off,
+                    dy_off,
+                    dx_off,
+                    op,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = activation_backward_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, &n_s, x_off, dy_off, dx_off, op]
+                    );
+                }
+                Step::SoftmaxCrossEntropy {
+                    outer,
+                    inner,
+                    logits_off,
+                    targets_off,
+                    out_off,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = softmax_cross_entropy_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (outer_s, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &outer_s,
+                            inner,
+                            logits_off,
+                            targets_off,
+                            out_off
+                        ]
+                    );
+                }
+                Step::SoftmaxCrossEntropyWithLogits {
+                    outer,
+                    inner,
+                    logits_off,
+                    labels_off,
+                    out_off,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = softmax_cross_entropy_with_logits_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (outer_s, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &outer_s,
+                            inner,
+                            logits_off,
+                            labels_off,
+                            out_off
+                        ]
+                    );
+                }
+                Step::SoftmaxCrossEntropyBackward {
+                    outer,
+                    inner,
+                    logits_off,
+                    labels_off,
+                    d_loss_off,
+                    out_off,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = softmax_cross_entropy_backward_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (outer_s, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &outer_s,
+                            inner,
+                            logits_off,
+                            labels_off,
+                            d_loss_off,
+                            out_off
+                        ]
                     );
                 }
                 Step::LayerNorm {
@@ -2045,6 +2190,39 @@ impl RocmExecutable {
                         *n_bins,
                     );
                 }
+                Step::FftButterflyStage {
+                    state_off,
+                    out_off,
+                    gate_off,
+                    rev_off,
+                    tw_re_off,
+                    tw_im_off,
+                    batch,
+                    n_fft,
+                    stage,
+                } => {
+                    let kernel = fft_butterfly_stage_kernel(&self.ctx);
+                    let block = 256u32;
+                    let grid = (*batch).max(1);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            state_off,
+                            out_off,
+                            gate_off,
+                            rev_off,
+                            tw_re_off,
+                            tw_im_off,
+                            batch,
+                            n_fft,
+                            stage
+                        ]
+                    );
+                }
                 Step::LogMelHost { .. }
                 | Step::LogMelBackwardHost { .. }
                 | Step::WelchPeaksHost { .. } => {}
@@ -2159,9 +2337,9 @@ impl RocmExecutable {
                         *is_max,
                     );
                 }
-                Step::AxialRope2dHost {
-                    src_byte_off,
-                    dst_byte_off,
+                Step::AxialRope2d {
+                    in_off,
+                    out_off,
                     batch,
                     seq,
                     hidden,
@@ -2172,20 +2350,29 @@ impl RocmExecutable {
                     theta,
                     repeat_factor,
                 } => {
-                    crate::host_misc::run_axial_rope2d(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        *src_byte_off as usize,
-                        *dst_byte_off as usize,
-                        *batch as usize,
-                        *seq as usize,
-                        *hidden as usize,
-                        *end_x as usize,
-                        *end_y as usize,
-                        *head_dim as usize,
-                        *num_heads as usize,
-                        *theta,
-                        *repeat_factor as usize,
+                    let n_total = batch * seq * hidden;
+                    let kernel = axial_rope2d_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_total, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            batch,
+                            seq,
+                            hidden,
+                            end_x,
+                            end_y,
+                            head_dim,
+                            num_heads,
+                            repeat_factor,
+                            theta,
+                            in_off,
+                            out_off,
+                            &n_total
+                        ]
                     );
                 }
                 Step::GatedDeltaNet {
@@ -2256,6 +2443,194 @@ impl RocmExecutable {
                         *carry,
                     );
                 }
+                Step::Gru {
+                    x_byte_off,
+                    w_ih_byte_off,
+                    w_hh_byte_off,
+                    b_ih_byte_off,
+                    b_hh_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                } => {
+                    crate::gru_gpu::run_gru(
+                        &self.ctx,
+                        stream,
+                        &self.arena.buffer,
+                        *x_byte_off as usize,
+                        *w_ih_byte_off as usize,
+                        *w_hh_byte_off as usize,
+                        *b_ih_byte_off as usize,
+                        *b_hh_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *input_size as usize,
+                        *hidden as usize,
+                    );
+                }
+                Step::GruHost {
+                    x_byte_off,
+                    w_ih_byte_off,
+                    w_hh_byte_off,
+                    b_ih_byte_off,
+                    b_hh_byte_off,
+                    h0_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                } => {
+                    crate::gru_host::run_gru(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        *x_byte_off as usize,
+                        *w_ih_byte_off as usize,
+                        *w_hh_byte_off as usize,
+                        *b_ih_byte_off as usize,
+                        *b_hh_byte_off as usize,
+                        *h0_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *input_size as usize,
+                        *hidden as usize,
+                        *num_layers as usize,
+                        *bidirectional,
+                        *carry,
+                    );
+                }
+                Step::Rnn {
+                    x_byte_off,
+                    w_ih_byte_off,
+                    w_hh_byte_off,
+                    bias_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                    relu,
+                } => {
+                    crate::rnn_gpu::run_rnn(
+                        &self.ctx,
+                        stream,
+                        &self.arena.buffer,
+                        *x_byte_off as usize,
+                        *w_ih_byte_off as usize,
+                        *w_hh_byte_off as usize,
+                        *bias_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *input_size as usize,
+                        *hidden as usize,
+                        *relu,
+                    );
+                }
+                Step::RnnHost {
+                    x_byte_off,
+                    w_ih_byte_off,
+                    w_hh_byte_off,
+                    bias_byte_off,
+                    h0_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    input_size,
+                    hidden,
+                    num_layers,
+                    bidirectional,
+                    carry,
+                    relu,
+                } => {
+                    crate::rnn_host::run_rnn(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        *x_byte_off as usize,
+                        *w_ih_byte_off as usize,
+                        *w_hh_byte_off as usize,
+                        *bias_byte_off as usize,
+                        *h0_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *input_size as usize,
+                        *hidden as usize,
+                        *num_layers as usize,
+                        *bidirectional,
+                        *carry,
+                        *relu,
+                    );
+                }
+                Step::Mamba2 {
+                    x_byte_off,
+                    dt_byte_off,
+                    a_byte_off,
+                    b_byte_off,
+                    c_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    heads,
+                    head_dim,
+                    state_size,
+                } => {
+                    crate::mamba2_gpu::run_mamba2(
+                        &self.ctx,
+                        stream,
+                        &self.arena.buffer,
+                        *x_byte_off as usize,
+                        *dt_byte_off as usize,
+                        *a_byte_off as usize,
+                        *b_byte_off as usize,
+                        *c_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *heads as usize,
+                        *head_dim as usize,
+                        *state_size as usize,
+                    );
+                }
+                Step::Mamba2Host {
+                    x_byte_off,
+                    dt_byte_off,
+                    a_byte_off,
+                    b_byte_off,
+                    c_byte_off,
+                    dst_byte_off,
+                    batch,
+                    seq,
+                    heads,
+                    head_dim,
+                    state_size,
+                } => {
+                    crate::mamba2_host::run_mamba2(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        *x_byte_off as usize,
+                        *dt_byte_off as usize,
+                        *a_byte_off as usize,
+                        *b_byte_off as usize,
+                        *c_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *batch as usize,
+                        *seq as usize,
+                        *heads as usize,
+                        *head_dim as usize,
+                        *state_size as usize,
+                    );
+                }
                 Step::ScanHost { desc } => {
                     crate::scan_host::run_scan(
                         &self.ctx,
@@ -2310,6 +2685,50 @@ impl RocmExecutable {
                         *out_off,
                         *n,
                         *batch,
+                    );
+                }
+                Step::DenseSolveNative {
+                    a_off,
+                    b_off,
+                    x_off,
+                    n,
+                    nrhs,
+                } => {
+                    crate::dense_solve_native::run_dense(
+                        &self.ctx,
+                        stream,
+                        &self.arena.buffer,
+                        *a_off,
+                        *b_off,
+                        *x_off,
+                        *n,
+                        *nrhs,
+                    );
+                }
+                Step::BatchedDenseSolveNative {
+                    a_off,
+                    b_off,
+                    x_off,
+                    batch,
+                    n,
+                    nrhs,
+                } => {
+                    let blas = self
+                        .blas
+                        .as_ref()
+                        .expect("rlx-rocm: BatchedDenseSolveNative requires hipBLAS");
+                    let blas = blas.lock().unwrap();
+                    crate::dense_solve_native::run_batched(
+                        &self.ctx,
+                        stream,
+                        &blas,
+                        &self.arena.buffer,
+                        *a_off,
+                        *b_off,
+                        *x_off,
+                        *batch,
+                        *n,
+                        *nrhs,
                     );
                 }
                 Step::Llada2GroupLimitedGate {
@@ -2848,6 +3267,173 @@ impl RocmExecutable {
                         ]
                     );
                 }
+                Step::MaxPool2dBackward {
+                    x_byte_off,
+                    dy_byte_off,
+                    dx_byte_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                } => {
+                    let kernel = maxpool2d_backward_kernel(&self.ctx);
+                    let total = n * c * h * w;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    let x_o = (*x_byte_off / 4) as u32;
+                    let dy_o = (*dy_byte_off / 4) as u32;
+                    let dx_o = (*dx_byte_off / 4) as u32;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            c,
+                            h,
+                            w,
+                            h_out,
+                            w_out,
+                            kh,
+                            kw,
+                            sh,
+                            sw,
+                            ph,
+                            pw,
+                            &x_o,
+                            &dy_o,
+                            &dx_o
+                        ]
+                    );
+                }
+                Step::Conv2dBackwardInput {
+                    dy_byte_off,
+                    w_byte_off,
+                    dx_byte_off,
+                    n,
+                    c_in,
+                    h,
+                    w_in,
+                    c_out,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw,
+                    groups,
+                } => {
+                    // Shared gather kernel (CUDA falls back here when cuDNN is
+                    // absent / forced off). No MIOpen backward path yet.
+                    let kernel = conv2d_backward_input_kernel(&self.ctx);
+                    let total = n * c_in * h * w_in;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    let (dy_e, w_e, dx_e) = (
+                        (*dy_byte_off / 4) as u32,
+                        (*w_byte_off / 4) as u32,
+                        (*dx_byte_off / 4) as u32,
+                    );
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            c_in,
+                            c_out,
+                            h,
+                            w_in,
+                            h_out,
+                            w_out,
+                            kh,
+                            kw,
+                            sh,
+                            sw,
+                            ph,
+                            pw,
+                            dh,
+                            dw,
+                            groups,
+                            &dy_e,
+                            &w_e,
+                            &dx_e
+                        ]
+                    );
+                }
+                Step::Conv2dBackwardWeight {
+                    x_byte_off,
+                    dy_byte_off,
+                    dw_byte_off,
+                    n,
+                    c_in,
+                    h,
+                    w,
+                    c_out,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw_dil,
+                    groups,
+                } => {
+                    let kernel = conv2d_backward_weight_kernel(&self.ctx);
+                    let c_in_per_g = c_in / groups;
+                    let total = c_out * c_in_per_g * kh * kw;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    let (x_e, dy_e, dw_e) = (
+                        (*x_byte_off / 4) as u32,
+                        (*dy_byte_off / 4) as u32,
+                        (*dw_byte_off / 4) as u32,
+                    );
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            c_in,
+                            c_out,
+                            h,
+                            w,
+                            h_out,
+                            w_out,
+                            kh,
+                            kw,
+                            sh,
+                            sw,
+                            ph,
+                            pw,
+                            dh,
+                            dw_dil,
+                            groups,
+                            &x_e,
+                            &dy_e,
+                            &dw_e
+                        ]
+                    );
+                }
                 Step::LayerNorm2d {
                     src_off,
                     g_off,
@@ -2934,6 +3520,88 @@ impl RocmExecutable {
                         ]
                     );
                 }
+                Step::ConvTranspose3d {
+                    n,
+                    c_in,
+                    c_out,
+                    d,
+                    h,
+                    w,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                    dd,
+                    dh,
+                    dw,
+                    groups,
+                    in_off,
+                    w_off,
+                    out_off,
+                } => {
+                    let kernel = conv_transpose3d_kernel(&self.ctx);
+                    let total = n * c_out * d_out * h_out * w_out;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            c_in,
+                            c_out,
+                            d,
+                            h,
+                            w,
+                            d_out,
+                            h_out,
+                            w_out,
+                            kd,
+                            kh,
+                            kw,
+                            sd,
+                            sh,
+                            sw,
+                            pd,
+                            ph,
+                            pw,
+                            dd,
+                            dh,
+                            dw,
+                            groups,
+                            in_off,
+                            w_off,
+                            out_off
+                        ]
+                    );
+                }
+                Step::FusedSwiGLU {
+                    in_off,
+                    out_off,
+                    n_half,
+                    total,
+                    gate_first,
+                } => {
+                    let kernel = fused_swiglu_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*total, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, n_half, total, gate_first, in_off, out_off]
+                    );
+                }
                 Step::GroupNorm {
                     src_off,
                     g_off,
@@ -2965,6 +3633,568 @@ impl RocmExecutable {
                             w,
                             num_groups,
                             eps_bits
+                        ]
+                    );
+                }
+                Step::GroupNormBackwardInput {
+                    x_off,
+                    gamma_off,
+                    dy_off,
+                    out_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                    num_groups,
+                    eps_bits,
+                } => {
+                    let kernel = group_norm_bwd_input_kernel(&self.ctx);
+                    let grid = n * num_groups;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            x_off,
+                            gamma_off,
+                            dy_off,
+                            out_off,
+                            n,
+                            c,
+                            h,
+                            w,
+                            num_groups,
+                            eps_bits
+                        ]
+                    );
+                }
+                Step::GroupNormBackwardGamma {
+                    x_off,
+                    dy_off,
+                    out_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                    num_groups,
+                    eps_bits,
+                } => {
+                    let kernel = group_norm_bwd_gamma_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (1, 1, 1),
+                        (1, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            x_off,
+                            dy_off,
+                            out_off,
+                            n,
+                            c,
+                            h,
+                            w,
+                            num_groups,
+                            eps_bits
+                        ]
+                    );
+                }
+                Step::GroupNormBackwardBeta {
+                    dy_off,
+                    out_off,
+                    n,
+                    c,
+                    h,
+                    w,
+                } => {
+                    let kernel = group_norm_bwd_beta_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (1, 1, 1),
+                        (1, 1, 1),
+                        [&mut arena_ptr, dy_off, out_off, n, c, h, w]
+                    );
+                }
+                Step::BatchNormInference {
+                    src_off,
+                    g_off,
+                    b_off,
+                    mean_off,
+                    var_off,
+                    dst_off,
+                    count,
+                    channels,
+                    eps_bits,
+                } => {
+                    let kernel = batch_norm_inference_kernel(&self.ctx);
+                    let n = count * channels;
+                    let (grid, block) = dispatch_grid_1d(n, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            src_off,
+                            g_off,
+                            b_off,
+                            mean_off,
+                            var_off,
+                            dst_off,
+                            count,
+                            channels,
+                            eps_bits
+                        ]
+                    );
+                }
+                Step::BatchNormInferenceBackwardInput {
+                    gamma_off,
+                    var_off,
+                    dy_off,
+                    out_off,
+                    count,
+                    channels,
+                    eps_bits,
+                } => {
+                    let kernel = batch_norm_inference_bwd_input_kernel(&self.ctx);
+                    let n = count * channels;
+                    let (grid, block) = dispatch_grid_1d(n, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            gamma_off,
+                            var_off,
+                            dy_off,
+                            out_off,
+                            count,
+                            channels,
+                            eps_bits
+                        ]
+                    );
+                }
+                Step::BatchNormInferenceBackwardGamma {
+                    x_off,
+                    mean_off,
+                    var_off,
+                    dy_off,
+                    out_off,
+                    count,
+                    channels,
+                    eps_bits,
+                } => {
+                    let kernel = batch_norm_inference_bwd_gamma_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*channels, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            x_off,
+                            mean_off,
+                            var_off,
+                            dy_off,
+                            out_off,
+                            count,
+                            channels,
+                            eps_bits
+                        ]
+                    );
+                }
+                Step::BatchNormInferenceBackwardBeta {
+                    dy_off,
+                    out_off,
+                    count,
+                    channels,
+                } => {
+                    let kernel = batch_norm_inference_bwd_beta_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*channels, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, dy_off, out_off, count, channels]
+                    );
+                }
+                Step::LayerNormBackwardInput {
+                    x_off,
+                    gamma_off,
+                    dy_off,
+                    out_off,
+                    rows,
+                    h,
+                    eps_bits,
+                } => {
+                    let kernel = layer_norm_bwd_input_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (*rows, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            rows,
+                            h,
+                            x_off,
+                            gamma_off,
+                            dy_off,
+                            out_off,
+                            eps_bits
+                        ]
+                    );
+                }
+                Step::LayerNormBackwardGamma {
+                    x_off,
+                    dy_off,
+                    out_off,
+                    rows,
+                    h,
+                    eps_bits,
+                } => {
+                    let kernel = layer_norm_bwd_gamma_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (1, 1, 1),
+                        (1, 1, 1),
+                        [&mut arena_ptr, rows, h, x_off, dy_off, out_off, eps_bits]
+                    );
+                }
+                Step::FakeQuantizeFixed {
+                    in_off,
+                    scale_off,
+                    out_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                } => {
+                    let kernel = fake_quantize_fixed_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            chan_dim,
+                            inner,
+                            q_max_bits,
+                            in_off,
+                            scale_off,
+                            out_off
+                        ]
+                    );
+                }
+                Step::FakeQuantizePerBatch {
+                    in_off,
+                    out_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                } => {
+                    let kernel = fake_quantize_perbatch_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*chan_dim, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            chan_dim,
+                            inner,
+                            q_max_bits,
+                            in_off,
+                            out_off
+                        ]
+                    );
+                }
+                Step::FakeQuantizeEma {
+                    in_off,
+                    scale_off,
+                    out_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                    decay_bits,
+                } => {
+                    let kernel = fake_quantize_ema_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*chan_dim, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            chan_dim,
+                            inner,
+                            q_max_bits,
+                            decay_bits,
+                            in_off,
+                            scale_off,
+                            out_off
+                        ]
+                    );
+                }
+                Step::QuantizeI8 {
+                    in_off,
+                    q_byte_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    meta_idx,
+                } => {
+                    let kernel = quantize_i8_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    let mut meta_ptr = self.meta_buffers[*meta_idx].ptr;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            chan_dim,
+                            inner,
+                            in_off,
+                            q_byte_off,
+                            &mut meta_ptr
+                        ]
+                    );
+                }
+                Step::DequantizeI8 {
+                    q_byte_off,
+                    out_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    meta_idx,
+                } => {
+                    let kernel = dequantize_i8_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    let mut meta_ptr = self.meta_buffers[*meta_idx].ptr;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            chan_dim,
+                            inner,
+                            q_byte_off,
+                            out_off,
+                            &mut meta_ptr
+                        ]
+                    );
+                }
+                Step::QMatMul {
+                    m,
+                    k,
+                    n,
+                    x_byte_off,
+                    w_byte_off,
+                    bias_off,
+                    out_byte_off,
+                    x_zp,
+                    w_zp,
+                    out_zp,
+                    mult_bits,
+                } => {
+                    let total = *m * *n;
+                    let kernel = q_matmul_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            m,
+                            k,
+                            n,
+                            x_byte_off,
+                            w_byte_off,
+                            bias_off,
+                            out_byte_off,
+                            x_zp,
+                            w_zp,
+                            out_zp,
+                            mult_bits
+                        ]
+                    );
+                }
+                Step::QConv2d {
+                    n,
+                    c_in,
+                    c_out,
+                    h,
+                    w,
+                    h_out,
+                    w_out,
+                    kh,
+                    kw,
+                    sh,
+                    sw,
+                    ph,
+                    pw,
+                    dh,
+                    dw,
+                    groups,
+                    x_byte_off,
+                    w_byte_off,
+                    bias_off,
+                    out_byte_off,
+                    x_zp,
+                    w_zp,
+                    out_zp,
+                    mult_bits,
+                } => {
+                    let total = *n * *c_out * *h_out * *w_out;
+                    let kernel = q_conv2d_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            c_in,
+                            c_out,
+                            h,
+                            w,
+                            h_out,
+                            w_out,
+                            kh,
+                            kw,
+                            sh,
+                            sw,
+                            ph,
+                            pw,
+                            dh,
+                            dw,
+                            groups,
+                            x_byte_off,
+                            w_byte_off,
+                            bias_off,
+                            out_byte_off,
+                            x_zp,
+                            w_zp,
+                            out_zp,
+                            mult_bits
+                        ]
+                    );
+                }
+                Step::FakeQuantizeLsqBwdX {
+                    x_off,
+                    scale_off,
+                    dy_off,
+                    dx_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                } => {
+                    let kernel = fake_quantize_lsq_bwd_x_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            chan_dim,
+                            inner,
+                            q_max_bits,
+                            x_off,
+                            scale_off,
+                            dy_off,
+                            dx_off
+                        ]
+                    );
+                }
+                Step::FakeQuantizeLsqBwdScale {
+                    x_off,
+                    scale_off,
+                    dy_off,
+                    dscale_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                } => {
+                    let kernel = fake_quantize_lsq_bwd_scale_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*chan_dim, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            chan_dim,
+                            inner,
+                            q_max_bits,
+                            x_off,
+                            scale_off,
+                            dy_off,
+                            dscale_off
+                        ]
+                    );
+                }
+                Step::FakeQuantizeBackward {
+                    x_off,
+                    dy_off,
+                    dx_off,
+                    n,
+                    chan_dim,
+                    inner,
+                    q_max_bits,
+                    ste_kind,
+                } => {
+                    let kernel = fake_quantize_backward_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(*chan_dim, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            n,
+                            chan_dim,
+                            inner,
+                            q_max_bits,
+                            ste_kind,
+                            x_off,
+                            dy_off,
+                            dx_off
                         ]
                     );
                 }
@@ -3037,6 +4267,71 @@ impl RocmExecutable {
                         (grid, 1, 1),
                         (block, 1, 1),
                         [&mut arena_ptr, &n_s, &a_off, &b_off, &c_off, op, n_a, n_b]
+                    );
+                }
+                Step::ComplexNormSq {
+                    n,
+                    src_byte_off,
+                    dst_byte_off,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = complex_norm_sq_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let src_off: u64 = (*src_byte_off / 4) as u64;
+                    let dst_off: u64 = (*dst_byte_off / 4) as u64;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, &n_s, &src_off, &dst_off]
+                    );
+                }
+                Step::ComplexNormSqBackward {
+                    n,
+                    z_byte_off,
+                    g_byte_off,
+                    dz_byte_off,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = complex_norm_sq_backward_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let z_off: u64 = (*z_byte_off / 4) as u64;
+                    let g_off: u64 = (*g_byte_off / 4) as u64;
+                    let dz_off: u64 = (*dz_byte_off / 4) as u64;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, &n_s, &z_off, &g_off, &dz_off]
+                    );
+                }
+                Step::ConjugateC64 {
+                    n,
+                    src_byte_off,
+                    dst_byte_off,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = conjugate_c64_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let src_off: u64 = (*src_byte_off / 4) as u64;
+                    let dst_off: u64 = (*dst_byte_off / 4) as u64;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [&mut arena_ptr, &n_s, &src_off, &dst_off]
                     );
                 }
                 Step::Pool1d {
@@ -3277,11 +4572,18 @@ impl RocmExecutable {
                     in_off,
                     w_off,
                     out_off,
+                    has_bias,
+                    bias_off_f32,
+                    act_id,
+                    has_residual,
+                    residual_off_f32,
                 } => {
                     // Tier 1: MIOpen forward conv. Bounded to dilation=1
                     // for now since MIOpen's miopenInitConvolutionDescriptor
                     // takes a dilation_h/dilation_w pair (no nd version
                     // here); when dh != 1 || dw != 1 we fall through.
+                    // MIOpen has no fused conv-bias-act; epilogue runs below
+                    // after either MIOpen or the direct kernel.
                     let used_miopen = if let (Some(dnn), Some(workspace), 1, 1) =
                         (self.dnn.as_ref(), self.dnn_workspace.as_ref(), *dh, *dw)
                     {
@@ -3317,42 +4619,66 @@ impl RocmExecutable {
                     } else {
                         false
                     };
-                    if used_miopen {
-                        continue;
+                    if !used_miopen {
+                        // Fallback: custom direct-convolution kernel.
+                        let kernel = conv2d_kernel(&self.ctx);
+                        let total = n * c_out * h_out * w_out;
+                        let (grid, block) = dispatch_grid_1d(total, 256);
+                        crate::launch_kernel!(
+                            kernel,
+                            stream,
+                            (grid, 1, 1),
+                            (block, 1, 1),
+                            [
+                                &mut arena_ptr,
+                                n,
+                                c_in,
+                                c_out,
+                                h,
+                                w,
+                                h_out,
+                                w_out,
+                                kh,
+                                kw,
+                                sh,
+                                sw,
+                                ph,
+                                pw,
+                                dh,
+                                dw,
+                                groups,
+                                in_off,
+                                w_off,
+                                out_off
+                            ]
+                        );
                     }
-
-                    // Fallback: custom direct-convolution kernel.
-                    let kernel = conv2d_kernel(&self.ctx);
-                    let total = n * c_out * h_out * w_out;
-                    let (grid, block) = dispatch_grid_1d(total, 256);
-                    crate::launch_kernel!(
-                        kernel,
-                        stream,
-                        (grid, 1, 1),
-                        (block, 1, 1),
-                        [
-                            &mut arena_ptr,
-                            n,
-                            c_in,
-                            c_out,
-                            h,
-                            w,
-                            h_out,
-                            w_out,
-                            kh,
-                            kw,
-                            sh,
-                            sw,
-                            ph,
-                            pw,
-                            dh,
-                            dw,
-                            groups,
-                            in_off,
-                            w_off,
-                            out_off
-                        ]
-                    );
+                    // Fold bias + activation (+ optional residual) after the
+                    // forward conv — same epilogue CUDA uses without cuDNN.
+                    if *has_bias != 0 {
+                        let ep = conv_bias_act_epilogue_kernel(&self.ctx);
+                        let total = n * c_out * h_out * w_out;
+                        let hw = h_out * w_out;
+                        let (grid, block) = dispatch_grid_1d(total, 256);
+                        crate::launch_kernel!(
+                            ep,
+                            stream,
+                            (grid, 1, 1),
+                            (block, 1, 1),
+                            [
+                                &mut arena_ptr,
+                                &total,
+                                &hw,
+                                c_out,
+                                out_off,
+                                has_bias,
+                                bias_off_f32,
+                                act_id,
+                                has_residual,
+                                residual_off_f32
+                            ]
+                        );
+                    }
                 }
                 Step::Conv3d {
                     n,

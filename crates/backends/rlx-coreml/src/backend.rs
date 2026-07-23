@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rlx_ir::{DType, Graph, Op, OpKind};
+use rlx_ir::{DType, Graph, Op, OpKind, Shape};
 
 use crate::ffi::CoremlModel;
 use crate::host_exec::run_host_node;
@@ -107,6 +107,36 @@ fn promote_int_to_f32(graph: &mut Graph) {
         }
         if is_int(dt) {
             node.shape = node.shape.clone().with_dtype(DType::F32);
+        }
+    }
+}
+
+/// CoreML/MIL has no complex storage. Rewrite every `C64` tensor to interleaved
+/// F32 by doubling the last axis (`[…, n] C64` → `[…, 2n] F32`). Byte payloads
+/// for `Constant` are already interleaved re/im pairs, so they are left as-is.
+/// `Cast { to: C64 }` becomes `Cast { to: F32 }` (shape rewrite covers the
+/// element count). Must run before hybrid planning so complex ops land in MIL.
+pub fn promote_c64_to_interleaved_f32(graph: &mut Graph) {
+    for node in graph.nodes_mut() {
+        if let Op::Cast { to } = &mut node.op {
+            if *to == DType::C64 {
+                *to = DType::F32;
+            }
+        }
+        if node.shape.dtype() == DType::C64 {
+            let mut dims: Vec<usize> = node
+                .shape
+                .dims()
+                .iter()
+                .map(|d| d.unwrap_static())
+                .collect();
+            if dims.is_empty() {
+                dims.push(2);
+            } else {
+                let last = dims.len() - 1;
+                dims[last] = dims[last].saturating_mul(2);
+            }
+            node.shape = Shape::new(&dims, DType::F32);
         }
     }
 }
@@ -275,7 +305,7 @@ fn graph_has_host_split(graph: &Graph) -> bool {
     graph
         .nodes()
         .iter()
-        .any(|n| crate::host_exec::is_host_op(&n.op) || matches!(n.op, Op::Scan { .. }))
+        .any(|n| crate::host_exec::is_host_node(graph, n.id) || matches!(n.op, Op::Scan { .. }))
 }
 
 /// True if any node carries an f16 tensor — the signature of an
@@ -309,6 +339,18 @@ impl CoremlExecutable {
         compute_units: ComputeUnits,
         mut lower_opts: LowerOptions,
     ) -> Self {
+        // Expand control flow + DotGeneral + elementwise regions before hybrid
+        // planning so claimed OpKinds that have no MIL / CPU HostOp path become
+        // primitives CoreML already lowers (or host-evals).
+        {
+            use rlx_opt::pass::Pass as _;
+            graph = rlx_opt::LowerControlFlow.run(graph);
+            graph = rlx_opt::LowerDotGeneral.run(graph);
+            graph = rlx_opt::UnfuseElementwiseRegions::FOR_CPU.run(graph);
+        }
+        // FusedConvBiasAct / PartitionedConv / FusedTransformerLayer: CPU would
+        // Nop them under HostOp — expand to primitives first.
+        graph = crate::hybrid::lower_cpu_nop_fused_for_coreml(graph);
         // `FusedAttentionBlock` is a claimed op (so it legalizes and the
         // fusion pipeline may emit it), but the MIL lowering has no
         // fused-attention op — decompose it to the primitive chain
@@ -317,6 +359,8 @@ impl CoremlExecutable {
         // No-op when no FAB node is present.
         graph = rlx_opt::unfuse::unfuse_attention_block(graph);
         promote_int_to_f32(&mut graph);
+        // C64 → interleaved F32 before hybrid plan (MIL has no complex dtype).
+        promote_c64_to_interleaved_f32(&mut graph);
         // CoreML has no f64/bf16 — demote to f32/f16 before the optional
         // whole-graph f16 pass (so F64→F32→F16 stays consistent under F16 mode).
         demote_unsupported_floats(&mut graph);
@@ -441,7 +485,35 @@ impl CoremlExecutable {
                     crate::mlpackage::write_mlpackage_bytes(&proto_bytes, &lowered.blob, &dir)?;
                     CoremlModel::load(&dir, compute, Some(cache_path.as_path()))?
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Dump I/O feature shapes so "Error in declaring input X"
+                    // failures are actionable (shape / dtype / name collision).
+                    if std::env::var("RLX_COREML_DEBUG_IO").as_deref() == Ok("1") {
+                        eprintln!("[coreml] finalize slot {i} load failed ({e}); inputs:");
+                        for io in &lowered.inputs {
+                            eprintln!(
+                                "  in  '{}' ir='{}' dims={:?} flex={:?} dtype={:?}",
+                                io.feature_name, io.ir_name, io.dims, io.flex_dims, io.dtype
+                            );
+                        }
+                        for io in &lowered.outputs {
+                            eprintln!(
+                                "  out '{}' ir='{}' dims={:?} dtype={:?}",
+                                io.feature_name, io.ir_name, io.dims, io.dtype
+                            );
+                        }
+                        for n in slot.graph.nodes() {
+                            if let Op::Input { name } = &n.op {
+                                eprintln!(
+                                    "  graph Input '{name}' shape={:?} dtype={:?}",
+                                    n.shape.dims(),
+                                    n.shape.dtype()
+                                );
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
             };
             slot.lowered = Some(lowered);
             slot.pkg_dir = Some(dir);
@@ -479,7 +551,13 @@ impl CoremlExecutable {
         segments: &[Segment],
     ) -> Result<Vec<Vec<f32>>> {
         let mut env: HashMap<u32, Vec<f32>> = HashMap::new();
-        seed_leaf_env(&self.graph, inputs, &self.params, &mut env)?;
+        seed_leaf_env(
+            &self.graph,
+            inputs,
+            &self.params,
+            &self.typed_params,
+            &mut env,
+        )?;
         // Host segments run op-by-op on the CPU, so we can localize a NaN to the
         // exact host op (culprit vs propagator) — MIL segments stay opaque.
         let scanner = rlx_ir::numeric_check::DebugScanner::from_env("coreml");
@@ -488,7 +566,8 @@ impl CoremlExecutable {
             match seg {
                 Segment::Host(ids) => {
                     for &id in ids {
-                        let v = run_host_node(&self.graph, id, &env, &self.params)?;
+                        let v =
+                            run_host_node(&self.graph, id, &env, &self.params, &self.typed_params)?;
                         if scanner.enabled() {
                             let mut inbufs: Vec<(rlx_ir::NodeId, &[f32])> = Vec::new();
                             for &inp in &self.graph.node(id).inputs {
@@ -746,6 +825,7 @@ fn seed_leaf_env(
     graph: &Graph,
     inputs: &[(&str, &[f32])],
     params: &HashMap<String, Vec<f32>>,
+    typed_params: &TypedParams,
     env: &mut HashMap<u32, Vec<f32>>,
 ) -> Result<()> {
     for node in graph.nodes() {
@@ -759,11 +839,18 @@ fn seed_leaf_env(
                 env.insert(node.id.0, data);
             }
             Op::Param { name } => {
-                let data = params
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| CoremlError::Runtime(format!("missing param '{name}'")))?;
-                env.insert(node.id.0, data);
+                if let Some(data) = params.get(name) {
+                    env.insert(node.id.0, data.clone());
+                } else if let Some((bytes, dtype)) = typed_params.get(name) {
+                    // Widen every typed param to f32 for the host `env`. Packed
+                    // I8/U8 quant weights are re-narrowed by `run_custom_f32`
+                    // when a host Custom (QMatMul / DynamicQuantizeLSTM) needs
+                    // the original integer dtype.
+                    let floats = bytes_to_f32(bytes, &node.shape.clone().with_dtype(*dtype))?;
+                    env.insert(node.id.0, floats);
+                } else {
+                    return Err(CoremlError::Runtime(format!("missing param '{name}'")));
+                }
             }
             Op::Constant { data } => {
                 let floats = bytes_to_f32(data, &node.shape)?;
@@ -807,10 +894,7 @@ mod tests {
     #[test]
     fn promote_int_to_f32_handles_i16() {
         let mut g = Graph::new("i16_promote");
-        let data: Vec<u8> = [1i16, -2, 3]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let data: Vec<u8> = [1i16, -2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
         let k = g.add_node(Op::Constant { data }, vec![], Shape::new(&[3], DType::I16));
         let x = g.input("x", Shape::new(&[3], DType::F32));
         let c = g.add_node(

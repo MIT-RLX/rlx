@@ -99,6 +99,9 @@ macro_rules! kernel_cache {
 }
 
 kernel_cache!(BINARY, binary_kernel, BINARY_CU, "binary");
+kernel_cache!(GRU, gru_kernel, GRU_CU, "gru");
+kernel_cache!(RNN, rnn_kernel, RNN_CU, "rnn");
+kernel_cache!(MAMBA2, mamba2_kernel, MAMBA2_CU, "mamba2");
 // On-device complex simulation (f32-lane): standalone complex cast + C64
 // binary. Shared CUDA-C sources compiled via hipRTC (identical to rlx-cuda).
 kernel_cache!(
@@ -108,6 +111,26 @@ kernel_cache!(
     "complex_cast"
 );
 kernel_cache!(BINARY_C64, binary_c64_kernel, BINARY_C64_CU, "binary_c64");
+// C64 Wirtinger surface (ComplexNormSq / Backward / Conjugate). Three entry
+// points share `complex_wirtinger.cu`; each gets its own OnceLock cache.
+kernel_cache!(
+    COMPLEX_NORM_SQ,
+    complex_norm_sq_kernel,
+    COMPLEX_WIRINGER_CU,
+    "complex_norm_sq"
+);
+kernel_cache!(
+    COMPLEX_NORM_SQ_BWD,
+    complex_norm_sq_backward_kernel,
+    COMPLEX_WIRINGER_CU,
+    "complex_norm_sq_backward"
+);
+kernel_cache!(
+    CONJUGATE_C64,
+    conjugate_c64_kernel,
+    COMPLEX_WIRINGER_CU,
+    "conjugate_c64"
+);
 kernel_cache!(
     FUSED_BINARY_UNARY,
     fused_binary_unary_kernel,
@@ -183,9 +206,97 @@ kernel_cache!(
 );
 kernel_cache!(COMPARE, compare_kernel, COMPARE_CU, "compare");
 kernel_cache!(WHEREK, where_kernel, WHERE_CU, "where_select");
+kernel_cache!(FMA, fma_kernel, FMA_CU, "fma_elem");
 kernel_cache!(REDUCE, reduce_kernel, REDUCE_CU, "reduce");
 kernel_cache!(SOFTMAX, softmax_kernel, SOFTMAX_CU, "softmax");
+kernel_cache!(
+    RELU_BACKWARD,
+    relu_backward_kernel,
+    ACTIVATION_BACKWARD_CU,
+    "relu_backward"
+);
+kernel_cache!(
+    ACTIVATION_BACKWARD,
+    activation_backward_kernel,
+    ACTIVATION_BACKWARD_CU,
+    "activation_backward"
+);
+kernel_cache!(
+    SOFTMAX_CROSS_ENTROPY,
+    softmax_cross_entropy_kernel,
+    SOFTMAX_CROSS_ENTROPY_CU,
+    "softmax_cross_entropy"
+);
+kernel_cache!(
+    SOFTMAX_CROSS_ENTROPY_WITH_LOGITS,
+    softmax_cross_entropy_with_logits_kernel,
+    SOFTMAX_CROSS_ENTROPY_CU,
+    "softmax_cross_entropy_with_logits"
+);
+kernel_cache!(
+    SOFTMAX_CROSS_ENTROPY_BACKWARD,
+    softmax_cross_entropy_backward_kernel,
+    SOFTMAX_CROSS_ENTROPY_CU,
+    "softmax_cross_entropy_backward"
+);
 kernel_cache!(LAYERNORM, layernorm_kernel, LAYERNORM_CU, "norm");
+kernel_cache!(
+    LAYER_NORM_BWD_INPUT,
+    layer_norm_bwd_input_kernel,
+    LAYER_NORM_BWD_CU,
+    "layer_norm_bwd_input"
+);
+kernel_cache!(
+    LAYER_NORM_BWD_GAMMA,
+    layer_norm_bwd_gamma_kernel,
+    LAYER_NORM_BWD_CU,
+    "layer_norm_bwd_gamma"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_FIXED,
+    fake_quantize_fixed_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_fixed"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_PERBATCH,
+    fake_quantize_perbatch_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_perbatch"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_EMA,
+    fake_quantize_ema_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_ema"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_LSQ_BWD_X,
+    fake_quantize_lsq_bwd_x_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_lsq_bwd_x"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_LSQ_BWD_SCALE,
+    fake_quantize_lsq_bwd_scale_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_lsq_bwd_scale"
+);
+kernel_cache!(
+    FAKE_QUANTIZE_BACKWARD,
+    fake_quantize_backward_kernel,
+    FAKE_QUANTIZE_CU,
+    "fake_quantize_backward"
+);
+kernel_cache!(QUANTIZE_I8, quantize_i8_kernel, QUANTIZE_CU, "quantize_i8");
+kernel_cache!(
+    DEQUANTIZE_I8,
+    dequantize_i8_kernel,
+    QUANTIZE_CU,
+    "dequantize_i8"
+);
+kernel_cache!(Q_MATMUL, q_matmul_kernel, Q_MATMUL_CU, "q_matmul");
+kernel_cache!(Q_CONV2D, q_conv2d_kernel, Q_CONV2D_CU, "q_conv2d");
 kernel_cache!(
     RMS_NORM_BWD,
     rms_norm_backward_kernel,
@@ -308,11 +419,41 @@ kernel_cache!(
 );
 kernel_cache!(POOL1D, pool1d_kernel, POOL1D_CU, "pool1d");
 kernel_cache!(POOL2D, pool2d_kernel, POOL2D_CU, "pool2d");
+kernel_cache!(
+    MAXPOOL2D_BWD,
+    maxpool2d_backward_kernel,
+    MAXPOOL2D_BACKWARD_CU,
+    "maxpool2d_backward"
+);
 kernel_cache!(POOL3D, pool3d_kernel, POOL3D_CU, "pool3d");
 kernel_cache!(CONV1D, conv1d_kernel, CONV1D_CU, "conv1d");
 kernel_cache!(CONV2D, conv2d_kernel, CONV2D_CU, "conv2d");
+kernel_cache!(
+    CONV2D_BACKWARD_INPUT,
+    conv2d_backward_input_kernel,
+    CONV2D_BACKWARD_INPUT_CU,
+    "conv2d_backward_input"
+);
+kernel_cache!(
+    CONV2D_BACKWARD_WEIGHT,
+    conv2d_backward_weight_kernel,
+    CONV2D_BACKWARD_WEIGHT_CU,
+    "conv2d_backward_weight"
+);
+kernel_cache!(
+    CONV_BIAS_ACT_EPILOGUE,
+    conv_bias_act_epilogue_kernel,
+    rlx_gpu_kernels::conv_bias_act_epilogue_cuda_src(),
+    "conv_bias_act_epilogue"
+);
 kernel_cache!(IM2COL, im2col_kernel, IM2COL_CU, "im2col");
 kernel_cache!(CONV3D, conv3d_kernel, CONV3D_CU, "conv3d");
+kernel_cache!(
+    CONV_TRANSPOSE3D,
+    conv_transpose3d_kernel,
+    CONV_TRANSPOSE3D_CU,
+    "conv_transpose3d"
+);
 kernel_cache!(
     LAYER_NORM2D,
     layer_norm2d_kernel,
@@ -325,7 +466,61 @@ kernel_cache!(
     CONV_TRANSPOSE2D_CU,
     "conv_transpose2d"
 );
+kernel_cache!(
+    FUSED_SWIGLU,
+    fused_swiglu_kernel,
+    FUSED_SWIGLU_CU,
+    "fused_swiglu"
+);
+kernel_cache!(
+    AXIAL_ROPE2D,
+    axial_rope2d_kernel,
+    AXIAL_ROPE2D_CU,
+    "axial_rope2d"
+);
 kernel_cache!(GROUP_NORM, group_norm_kernel, GROUP_NORM_CU, "group_norm");
+kernel_cache!(
+    GROUP_NORM_BWD_INPUT,
+    group_norm_bwd_input_kernel,
+    GROUP_NORM_BWD_CU,
+    "group_norm_bwd_input"
+);
+kernel_cache!(
+    GROUP_NORM_BWD_GAMMA,
+    group_norm_bwd_gamma_kernel,
+    GROUP_NORM_BWD_CU,
+    "group_norm_bwd_gamma"
+);
+kernel_cache!(
+    GROUP_NORM_BWD_BETA,
+    group_norm_bwd_beta_kernel,
+    GROUP_NORM_BWD_CU,
+    "group_norm_bwd_beta"
+);
+kernel_cache!(
+    BATCH_NORM_INFERENCE,
+    batch_norm_inference_kernel,
+    BATCH_NORM_INFERENCE_CU,
+    "batch_norm_inference"
+);
+kernel_cache!(
+    BATCH_NORM_INFERENCE_BWD_INPUT,
+    batch_norm_inference_bwd_input_kernel,
+    BATCH_NORM_INFERENCE_CU,
+    "batch_norm_inference_bwd_input"
+);
+kernel_cache!(
+    BATCH_NORM_INFERENCE_BWD_GAMMA,
+    batch_norm_inference_bwd_gamma_kernel,
+    BATCH_NORM_INFERENCE_CU,
+    "batch_norm_inference_bwd_gamma"
+);
+kernel_cache!(
+    BATCH_NORM_INFERENCE_BWD_BETA,
+    batch_norm_inference_bwd_beta_kernel,
+    BATCH_NORM_INFERENCE_CU,
+    "batch_norm_inference_bwd_beta"
+);
 kernel_cache!(
     RESIZE_NEAREST_2X,
     resize_nearest_2x_kernel,
@@ -372,6 +567,12 @@ kernel_cache!(
     WELCH_PEAKS_CU,
     "welch_peaks_gpu"
 );
+kernel_cache!(
+    FFT_BUTTERFLY_STAGE,
+    fft_butterfly_stage_kernel,
+    FFT_BUTTERFLY_STAGE_CU,
+    "fft_butterfly_stage"
+);
 
 pub fn dispatch_grid_1d(n: u32, block_x: u32) -> (u32, u32) {
     (n.div_ceil(block_x), block_x)
@@ -405,6 +606,9 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = binary_kernel(ctx);
     let _ = complex_cast_kernel(ctx);
     let _ = binary_c64_kernel(ctx);
+    let _ = complex_norm_sq_kernel(ctx);
+    let _ = complex_norm_sq_backward_kernel(ctx);
+    let _ = conjugate_c64_kernel(ctx);
     let _ = fused_binary_unary_kernel(ctx);
     let _ = unary_kernel(ctx);
     let _ = copy_kernel(ctx);
@@ -414,6 +618,11 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = where_kernel(ctx);
     let _ = reduce_kernel(ctx);
     let _ = softmax_kernel(ctx);
+    let _ = relu_backward_kernel(ctx);
+    let _ = activation_backward_kernel(ctx);
+    let _ = softmax_cross_entropy_kernel(ctx);
+    let _ = softmax_cross_entropy_with_logits_kernel(ctx);
+    let _ = softmax_cross_entropy_backward_kernel(ctx);
     let _ = layernorm_kernel(ctx);
     let _ = rms_norm_backward_kernel(ctx);
     let _ = rms_norm_bwd_zero_kernel(ctx);
@@ -445,19 +654,49 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = dequant_gguf_kernel(ctx);
     let _ = sample_kernel(ctx);
     let _ = selective_scan_kernel(ctx);
+    let _ = gru_kernel(ctx);
+    let _ = rnn_kernel(ctx);
+    let _ = mamba2_kernel(ctx);
     let _ = pool1d_kernel(ctx);
     let _ = pool2d_kernel(ctx);
+    let _ = maxpool2d_backward_kernel(ctx);
     let _ = pool3d_kernel(ctx);
     let _ = conv1d_kernel(ctx);
     let _ = conv2d_kernel(ctx);
+    let _ = conv2d_backward_input_kernel(ctx);
+    let _ = conv2d_backward_weight_kernel(ctx);
+    let _ = conv_bias_act_epilogue_kernel(ctx);
     let _ = im2col_kernel(ctx);
     let _ = conv3d_kernel(ctx);
     let _ = layer_norm2d_kernel(ctx);
     let _ = conv_transpose2d_kernel(ctx);
+    let _ = conv_transpose3d_kernel(ctx);
+    let _ = fused_swiglu_kernel(ctx);
+    let _ = axial_rope2d_kernel(ctx);
     let _ = group_norm_kernel(ctx);
+    let _ = group_norm_bwd_input_kernel(ctx);
+    let _ = group_norm_bwd_gamma_kernel(ctx);
+    let _ = group_norm_bwd_beta_kernel(ctx);
+    let _ = batch_norm_inference_kernel(ctx);
+    let _ = batch_norm_inference_bwd_input_kernel(ctx);
+    let _ = batch_norm_inference_bwd_gamma_kernel(ctx);
+    let _ = batch_norm_inference_bwd_beta_kernel(ctx);
+    let _ = layer_norm_bwd_input_kernel(ctx);
+    let _ = layer_norm_bwd_gamma_kernel(ctx);
+    let _ = fake_quantize_fixed_kernel(ctx);
+    let _ = fake_quantize_perbatch_kernel(ctx);
+    let _ = fake_quantize_ema_kernel(ctx);
+    let _ = fake_quantize_lsq_bwd_x_kernel(ctx);
+    let _ = fake_quantize_lsq_bwd_scale_kernel(ctx);
+    let _ = fake_quantize_backward_kernel(ctx);
+    let _ = quantize_i8_kernel(ctx);
+    let _ = dequantize_i8_kernel(ctx);
+    let _ = q_matmul_kernel(ctx);
+    let _ = q_conv2d_kernel(ctx);
     let _ = resize_nearest_2x_kernel(ctx);
     let _ = elementwise_region_kernel(ctx);
     let _ = batch_elementwise_region_kernel(ctx);
+    let _ = fma_kernel(ctx);
     let _ = fft_radix2_full_kernel(ctx);
     let _ = fft_bit_reverse_kernel(ctx);
     let _ = fft_inner_kernel(ctx);
@@ -465,4 +704,5 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = fft_outer_r2_kernel(ctx);
     let _ = gaussian_splat_rasterize_kernel(ctx);
     let _ = welch_peaks_gpu_kernel(ctx);
+    let _ = fft_butterfly_stage_kernel(ctx);
 }

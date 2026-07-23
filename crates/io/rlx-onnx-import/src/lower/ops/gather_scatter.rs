@@ -71,7 +71,11 @@ pub(super) fn lower_scatter_nd(
         let uf = m.shape(updates).clone().with_dtype(DType::F32);
         let data_f = m.add_node(Op::Cast { to: DType::F32 }, vec![data], sf.clone());
         let upd_f = m.add_node(Op::Cast { to: DType::F32 }, vec![updates], uf);
-        let scat = m.add_node(Op::ScatterNd { reduction }, vec![data_f, indices, upd_f], sf);
+        let scat = m.add_node(
+            Op::ScatterNd { reduction },
+            vec![data_f, indices, upd_f],
+            sf,
+        );
         let back = m.add_node(Op::Cast { to: dt }, vec![scat], s);
         ctx.env.insert(node.outputs[0].clone(), back);
         return Ok(true);

@@ -427,9 +427,7 @@ pub fn unroll_while(g: Graph) -> Graph {
                         let body_shape = out.node(*body_out).shape.clone();
                         let body_in = if body_shape.dtype() != shape.dtype() {
                             out.add_node(
-                                Op::Cast {
-                                    to: shape.dtype(),
-                                },
+                                Op::Cast { to: shape.dtype() },
                                 vec![*body_out],
                                 body_shape.with_dtype(shape.dtype()),
                             )

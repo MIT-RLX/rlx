@@ -1029,6 +1029,7 @@ fn cpu_activation_backward_matches_finite_difference() {
         Activation::Cos,
         Activation::Tan,
         Activation::Atan,
+        Activation::Recip,
     ] {
         let mut g = Graph::new("act_bwd");
         let xn = g.input("x", shape());

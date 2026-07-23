@@ -122,8 +122,10 @@ impl ExecutableGraph for WgpuExecutableWrapper {
         self.inner.rng()
     }
 
-    /// Typed param upload: widens F16/BF16 to F32 at the host boundary,
-    /// since the wgpu arena is f32-uniform.
+    /// Typed param upload: the wgpu arena is f32-uniform, so widen F16/BF16 and
+    /// small-integer/bool params (I64/I32/U32/Bool — e.g. `input_ids`, duration
+    /// carry, alignment frame count) to F32 at the host boundary. U8/I8 packed
+    /// quant weights keep their raw bytes.
     fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
         match dtype {
             rlx_ir::DType::U8 | rlx_ir::DType::I8 => {
@@ -135,23 +137,19 @@ impl ExecutableGraph for WgpuExecutableWrapper {
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
                 self.inner.set_param(name, f32_slice);
             }
-            rlx_ir::DType::F16 => {
-                let n = data.len() / 2;
-                let f16_slice =
-                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, n) };
-                let f32: Vec<f32> = f16_slice.iter().map(|h| h.to_f32()).collect();
-                self.inner.set_param(name, &f32);
-            }
-            rlx_ir::DType::BF16 => {
-                let n = data.len() / 2;
-                let bf16_slice =
-                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, n) };
-                let f32: Vec<f32> = bf16_slice.iter().map(|h| h.to_f32()).collect();
+            rlx_ir::DType::F16
+            | rlx_ir::DType::BF16
+            | rlx_ir::DType::F64
+            | rlx_ir::DType::I64
+            | rlx_ir::DType::I32
+            | rlx_ir::DType::U32
+            | rlx_ir::DType::Bool => {
+                let f32 = super::widen_bytes_to_f32(data, dtype);
                 self.inner.set_param(name, &f32);
             }
             other => panic!(
                 "rlx-wgpu set_param_typed: dtype {other:?} unsupported \
-                             (F32, F16, BF16 only — wgpu arena is f32-uniform)"
+                             (f32-uniform arena; widen small ints/floats to F32)"
             ),
         }
     }

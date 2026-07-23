@@ -450,6 +450,12 @@ kernel void rsqrt_inplace_h(
     uint gid [[thread_position_in_grid]]
 ) { if (gid >= len) return; data[gid] = half(rsqrt(float(data[gid]))); }
 
+kernel void rec_inplace_h(
+    device half* data  [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = half(1.0f / float(data[gid])); }
+
 kernel void neg_inplace_h(
     device half* data  [[buffer(0)]],
     constant uint& len [[buffer(1)]],
@@ -2522,6 +2528,129 @@ kernel void conv_transpose2d(
     dst[((n * c_out) + co) * h_out * w_out + ho * w_out + wo] = acc;
 }
 
+// 3D NCDHW convolution. Weight: [C_out, C_in/groups, kD, kH, kW].
+// One thread per output element; grid (w_out, h_out, n*c_out*d_out).
+kernel void conv3d(
+    device const float* src    [[buffer(0)]],
+    device const float* wt     [[buffer(1)]],
+    device float* dst          [[buffer(2)]],
+    constant uint4& a          [[buffer(3)]],  // [N, C_in, D, H]
+    constant uint4& b          [[buffer(4)]],  // [W, C_out, D_out, H_out]
+    constant uint4& c          [[buffer(5)]],  // [W_out, kd, kh, kw]
+    constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
+    constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
+    constant uint4& f          [[buffer(8)]],  // [dh, dw, 0, 0]
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint n = a.x; uint c_in = a.y; uint din = a.z; uint hin = a.w;
+    uint win = b.x; uint c_out = b.y; uint d_out = b.z; uint h_out = b.w;
+    uint w_out = c.x; uint kd = c.y; uint kh = c.z; uint kw = c.w;
+    uint sd = d.x; uint sh = d.y; uint sw = d.z; uint groups = d.w;
+    uint pd = e.x; uint ph = e.y; uint pw = e.z; uint dd = e.w;
+    uint dh = f.x; uint dw = f.y;
+
+    uint wo = gid.x;
+    uint ho = gid.y;
+    uint ndco = gid.z;
+    if (wo >= w_out || ho >= h_out || ndco >= n * c_out * d_out) return;
+    uint d_o = ndco % d_out;
+    uint nco = ndco / d_out;
+    uint nn = nco / c_out;
+    uint co = nco % c_out;
+
+    uint c_in_per_g = c_in / groups;
+    uint c_out_per_g = c_out / groups;
+    uint g = co / c_out_per_g;
+    uint ci_start = g * c_in_per_g;
+
+    float acc = 0.0f;
+    for (uint ci_off = 0; ci_off < c_in_per_g; ++ci_off) {
+        uint ci = ci_start + ci_off;
+        for (uint kz = 0; kz < kd; ++kz) {
+            for (uint ky = 0; ky < kh; ++ky) {
+                for (uint kx = 0; kx < kw; ++kx) {
+                    int in_d = (int)(d_o * sd + kz * dd) - (int)pd;
+                    int in_h = (int)(ho * sh + ky * dh) - (int)ph;
+                    int in_w = (int)(wo * sw + kx * dw) - (int)pw;
+                    if (in_d < 0 || in_h < 0 || in_w < 0
+                        || in_d >= (int)din || in_h >= (int)hin || in_w >= (int)win) {
+                        continue;
+                    }
+                    uint in_idx = (((nn * c_in + ci) * din + (uint)in_d) * hin + (uint)in_h) * win
+                                  + (uint)in_w;
+                    uint w_idx = (((co * c_in_per_g + ci_off) * kd + kz) * kh + ky) * kw + kx;
+                    acc += src[in_idx] * wt[w_idx];
+                }
+            }
+        }
+    }
+    dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = acc;
+}
+
+// 3D NCDHW transposed conv (output-centric gather).
+// Weight: [C_in, C_out/groups, kD, kH, kW] (PyTorch ConvTranspose3d).
+kernel void conv_transpose3d(
+    device const float* src    [[buffer(0)]],
+    device const float* wt     [[buffer(1)]],
+    device float* dst          [[buffer(2)]],
+    constant uint4& a          [[buffer(3)]],  // [N, C_in, D, H]
+    constant uint4& b          [[buffer(4)]],  // [W, C_out, D_out, H_out]
+    constant uint4& c          [[buffer(5)]],  // [W_out, kd, kh, kw]
+    constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
+    constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
+    constant uint4& f          [[buffer(8)]],  // [dh, dw, 0, 0]
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint n = a.x; uint c_in = a.y; uint din = a.z; uint hin = a.w;
+    uint win = b.x; uint c_out = b.y; uint d_out = b.z; uint h_out = b.w;
+    uint w_out = c.x; uint kd = c.y; uint kh = c.z; uint kw = c.w;
+    uint sd = d.x; uint sh = d.y; uint sw = d.z; uint groups = d.w;
+    uint pd = e.x; uint ph = e.y; uint pw = e.z; uint dd = e.w;
+    uint dh = f.x; uint dw = f.y;
+
+    uint wo = gid.x;
+    uint ho = gid.y;
+    uint ndco = gid.z;
+    if (wo >= w_out || ho >= h_out || ndco >= n * c_out * d_out) return;
+    uint d_o = ndco % d_out;
+    uint nco = ndco / d_out;
+    uint nn = nco / c_out;
+    uint co = nco % c_out;
+
+    uint c_in_per_g = c_in / groups;
+    uint c_out_per_g = c_out / groups;
+    uint g = co / c_out_per_g;
+    uint oc_off = co % c_out_per_g;
+    uint ci_start = g * c_in_per_g;
+
+    float acc = 0.0f;
+    for (uint kz = 0; kz < kd; ++kz) {
+        int num_d = (int)d_o + (int)pd - (int)(kz * dd);
+        if (num_d < 0 || (num_d % (int)sd) != 0) continue;
+        uint id = (uint)(num_d / (int)sd);
+        if (id >= din) continue;
+        for (uint ky = 0; ky < kh; ++ky) {
+            int num_h = (int)ho + (int)ph - (int)(ky * dh);
+            if (num_h < 0 || (num_h % (int)sh) != 0) continue;
+            uint ih = (uint)(num_h / (int)sh);
+            if (ih >= hin) continue;
+            for (uint kx = 0; kx < kw; ++kx) {
+                int num_w = (int)wo + (int)pw - (int)(kx * dw);
+                if (num_w < 0 || (num_w % (int)sw) != 0) continue;
+                uint iw = (uint)(num_w / (int)sw);
+                if (iw >= win) continue;
+                for (uint ci_off = 0; ci_off < c_in_per_g; ++ci_off) {
+                    uint ci = ci_start + ci_off;
+                    uint in_idx = (((nn * c_in + ci) * din + id) * hin + ih) * win + iw;
+                    uint w_idx = (((ci * c_out_per_g + oc_off) * kd + kz) * kh + ky) * kw + kx;
+                    acc += src[in_idx] * wt[w_idx];
+                }
+            }
+        }
+    }
+    dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = acc;
+}
+
 // NCHW group norm: normalize each (C/G)×H×W block. One threadgroup per
 // (batch, group); 256-wide reduction then normalize.
 kernel void group_norm(
@@ -3275,6 +3404,320 @@ kernel void elem_fma(
     out[gid] = fma(a[gid], b[gid], c[gid]);
 }
 
+// Element-wise ReLU / activation backward. `op` matches CUDA
+// `activation_op_id` / unary forward ids (0=relu … 16=atan).
+// Formulas mirror rlx-cpu `activation_backward_kernel`.
+inline float erf_as(float x) {
+    // Abramowitz & Stegun 7.1.26 — matches rlx-cpu `erf_f32`.
+    float s = x < 0.0f ? -1.0f : 1.0f;
+    float xa = fabs(x);
+    float t = 1.0f / (1.0f + 0.3275911f * xa);
+    float y = 1.0f - (((((1.0614054f * t - 1.4531521f) * t) + 1.4214138f) * t
+                       - 0.28449674f) * t + 0.2548296f) * t * exp(-xa * xa);
+    return s * y;
+}
+
+kernel void relu_backward(
+    device const float* x  [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dx       [[buffer(2)]],
+    constant uint& len     [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    float xv = x[gid];
+    float dyv = dy[gid];
+    dx[gid] = (xv > 0.0f) ? dyv : 0.0f;
+}
+
+kernel void activation_backward(
+    device const float* x  [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dx       [[buffer(2)]],
+    constant uint& len     [[buffer(3)]],
+    constant uint& op      [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    float xv = x[gid];
+    float dyv = dy[gid];
+    float out;
+    switch (op) {
+        case 0u: // relu
+            out = (xv > 0.0f) ? dyv : 0.0f;
+            break;
+        case 1u: { // sigmoid: σ(1-σ)
+            float xc = clamp(xv, -88.0f, 88.0f);
+            float s = 1.0f / (1.0f + exp(-xc));
+            out = s * (1.0f - s) * dyv;
+        } break;
+        case 2u: { // tanh: 1 - t²
+            float t = tanh(clamp(xv, -15.0f, 15.0f));
+            out = (1.0f - t * t) * dyv;
+        } break;
+        case 3u: // exp
+            out = exp(xv) * dyv;
+            break;
+        case 4u: // log
+            out = dyv / xv;
+            break;
+        case 5u: { // sqrt
+            float s = sqrt(xv);
+            out = (s > 0.0f) ? (0.5f * dyv / s) : 0.0f;
+        } break;
+        case 6u: { // rsqrt
+            float s = sqrt(xv);
+            out = (s > 0.0f) ? (-0.5f * dyv / (xv * s)) : 0.0f;
+        } break;
+        case 7u: // neg
+            out = -dyv;
+            break;
+        case 8u: // abs: sign(x), 0 at 0
+            out = (xv > 0.0f) ? dyv : ((xv < 0.0f) ? -dyv : 0.0f);
+            break;
+        case 9u: { // gelu (erf)
+            const float INV_SQRT2 = 0.7071067811865475f;
+            const float INV_SQRT_2PI = 0.3989422804014327f;
+            float phi = 0.5f * (1.0f + erf_as(xv * INV_SQRT2));
+            float pdf = INV_SQRT_2PI * exp(-0.5f * xv * xv);
+            out = (phi + xv * pdf) * dyv;
+        } break;
+        case 10u: { // silu: σ · (1 + x · (1 - σ))
+            float xc = clamp(xv, -88.0f, 88.0f);
+            float s = 1.0f / (1.0f + exp(-xc));
+            out = s * (1.0f + xv * (1.0f - s)) * dyv;
+        } break;
+        case 11u: { // gelu_approx (tanh)
+            const float C = 0.7978845608028654f;
+            const float A = 0.044715f;
+            float inner = clamp(C * (xv + A * xv * xv * xv), -15.0f, 15.0f);
+            float t = tanh(inner);
+            float dinner = C * (1.0f + 3.0f * A * xv * xv);
+            float d = 0.5f * (1.0f + t) + 0.5f * xv * (1.0f - t * t) * dinner;
+            out = d * dyv;
+        } break;
+        case 12u: // round STE: identity
+            out = dyv;
+            break;
+        case 13u: // sin
+            out = cos(xv) * dyv;
+            break;
+        case 14u: // cos
+            out = -sin(xv) * dyv;
+            break;
+        case 15u: { // tan: 1 + tan²
+            float t = tan(xv);
+            out = (1.0f + t * t) * dyv;
+        } break;
+        case 16u: // atan: 1 / (1 + x²)
+            out = dyv / (1.0f + xv * xv);
+            break;
+        case 17u: // reciprocal: -1 / x²
+            out = -dyv / (xv * xv);
+            break;
+        default:
+            out = dyv;
+            break;
+    }
+    dx[gid] = out;
+}
+
+// C64 Wirtinger surface on interleaved [re, im] f32 pairs (mirrors
+// `complex_wirtinger.cu` / rlx-cpu `exec_complex_norm_sq{,_backward}_f32` /
+// `exec_conjugate_c64`). Dispatched over the complex-element index `k ∈ [0, n)`.
+// Buffer pointers are already advanced to each tensor's byte offset.
+kernel void complex_norm_sq(
+    device const float* in [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    constant uint& n       [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float re = in[2u * gid];
+    float im = in[2u * gid + 1u];
+    out[gid] = re * re + im * im;
+}
+
+kernel void complex_norm_sq_backward(
+    device const float* z  [[buffer(0)]],
+    device const float* g  [[buffer(1)]],
+    device float* dz       [[buffer(2)]],
+    constant uint& n       [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float re = z[2u * gid];
+    float im = z[2u * gid + 1u];
+    float gv = g[gid];
+    dz[2u * gid]      = gv * re;
+    dz[2u * gid + 1u] = gv * im;
+}
+
+kernel void conjugate_c64(
+    device const float* in [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    constant uint& n       [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    out[2u * gid]      =  in[2u * gid];
+    out[2u * gid + 1u] = -in[2u * gid + 1u];
+}
+
+// Ternary-pruned radix-2 butterfly stage (interleaved C64 [batch, n_fft, 2]).
+// Mirrors CUDA `fft_butterfly_stage.cu` / CPU `execute_fft_butterfly_stage_f32`.
+// One thread per (batch, butterfly); gate=0 copies the pair, else twiddle + optional rev.
+struct FftButterflyStageParams {
+    uint batch;
+    uint n_fft;
+    uint stage;
+    uint n_half;
+};
+
+kernel void fft_butterfly_stage(
+    device const float* state [[buffer(0)]],
+    device float* out         [[buffer(1)]],
+    device const float* gate  [[buffer(2)]],
+    device const float* rev   [[buffer(3)]],
+    device const float* tw_re [[buffer(4)]],
+    device const float* tw_im [[buffer(5)]],
+    constant FftButterflyStageParams& p [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint bf = gid.x;
+    uint b = gid.y;
+    if (b >= p.batch || bf >= p.n_half) return;
+
+    uint stride = 1u << p.stage;
+    uint row_elems = p.n_fft * 2u;
+    device const float* inp = state + b * row_elems;
+    device float* o = out + b * row_elems;
+
+    uint group = bf / stride;
+    uint k = bf % stride;
+    uint i0 = group * 2u * stride + k;
+    uint i1 = i0 + stride;
+
+    if (gate[bf] == 0.0f) {
+        o[i0 * 2u]      = inp[i0 * 2u];
+        o[i0 * 2u + 1u] = inp[i0 * 2u + 1u];
+        o[i1 * 2u]      = inp[i1 * 2u];
+        o[i1 * 2u + 1u] = inp[i1 * 2u + 1u];
+        return;
+    }
+
+    float w_re = tw_re[bf];
+    float w_im = tw_im[bf];
+    float in_a_re = inp[i0 * 2u];
+    float in_a_im = inp[i0 * 2u + 1u];
+    float in_b_re = inp[i1 * 2u];
+    float in_b_im = inp[i1 * 2u + 1u];
+
+    float b_re = in_b_re * w_re - in_b_im * w_im;
+    float b_im = in_b_re * w_im + in_b_im * w_re;
+    float top_re = in_a_re + b_re;
+    float top_im = in_a_im + b_im;
+    float bot_re = in_a_re - b_re;
+    float bot_im = in_a_im - b_im;
+
+    float oa_re, oa_im, ob_re, ob_im;
+    if (rev[bf] >= 0.5f) {
+        oa_re = bot_re; oa_im = bot_im;
+        ob_re = top_re; ob_im = top_im;
+    } else {
+        oa_re = top_re; oa_im = top_im;
+        ob_re = bot_re; ob_im = bot_im;
+    }
+    o[i0 * 2u]      = oa_re;
+    o[i0 * 2u + 1u] = oa_im;
+    o[i1 * 2u]      = ob_re;
+    o[i1 * 2u + 1u] = ob_im;
+}
+
+// FakeQuantize forward: clamp(round(x / s), -q_max, q_max) * s.
+// Matches `rlx_cpu::thunk::ops::quant::exec_fake_quantize` for Fixed and
+// PerBatch (EMA stays on HostOp). Channel layout: c = (i / inner) % chan_dim.
+// Rounding: Rust `f32::round` (half away from zero), not ties-to-even.
+struct FakeQuantizeParams {
+    uint n;
+    uint chan_dim;
+    uint inner;
+    float q_max;
+};
+
+inline float apply_fq(float x, float s, float q_max) {
+    float scaled = x / s;
+    float rounded = sign(scaled) * floor(fabs(scaled) + 0.5f);
+    float qv = clamp(rounded, -q_max, q_max);
+    return qv * s;
+}
+
+inline uint fq_channel_of(uint i, uint chan_dim, uint inner) {
+    if (chan_dim <= 1u) return 0u;
+    return (i / inner) % chan_dim;
+}
+
+// One thread per element. Scale from `scale[c]` (Fixed).
+kernel void fake_quantize_fixed(
+    device const float* in [[buffer(0)]],
+    device const float* scale [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant FakeQuantizeParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= p.n) return;
+    uint c = fq_channel_of(gid, p.chan_dim, p.inner);
+    float s = max(scale[c], 1e-12f);
+    out[gid] = apply_fq(in[gid], s, p.q_max);
+}
+
+// One thread per channel. s = max(|x|) / q_max, then quantize that channel
+// (PerBatch).
+kernel void fake_quantize_perbatch(
+    device const float* in [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant FakeQuantizeParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint c = gid;
+    if (c >= p.chan_dim) return;
+
+    float max_abs = 0.0f;
+    uint stride = p.chan_dim * p.inner;
+    uint outer = p.n / max(stride, 1u);
+    for (uint o = 0u; o < outer; o++) {
+        uint base = o * stride + c * p.inner;
+        for (uint j = 0u; j < p.inner; j++) {
+            max_abs = max(max_abs, fabs(in[base + j]));
+        }
+    }
+    // axis=None: chan_dim=1, inner=n → outer=1, single scan of all elements.
+    if (outer * stride != p.n) {
+        for (uint i = 0u; i < p.n; i++) {
+            if (fq_channel_of(i, p.chan_dim, p.inner) == c) {
+                max_abs = max(max_abs, fabs(in[i]));
+            }
+        }
+    }
+
+    float s = max(max_abs / p.q_max, 1e-12f);
+
+    for (uint o = 0u; o < outer; o++) {
+        uint base = o * stride + c * p.inner;
+        for (uint j = 0u; j < p.inner; j++) {
+            uint idx = base + j;
+            out[idx] = apply_fq(in[idx], s, p.q_max);
+        }
+    }
+    if (outer * stride != p.n) {
+        for (uint i = 0u; i < p.n; i++) {
+            if (fq_channel_of(i, p.chan_dim, p.inner) == c) {
+                out[i] = apply_fq(in[i], s, p.q_max);
+            }
+        }
+    }
+}
+
 // In-place ReLU: data = max(0, data)
 kernel void relu_inplace(
     device float* data [[buffer(0)]],
@@ -3374,6 +3817,12 @@ kernel void rsqrt_inplace(
     constant uint& len [[buffer(1)]],
     uint gid [[thread_position_in_grid]]
 ) { if (gid >= len) return; data[gid] = rsqrt(data[gid]); }
+
+kernel void rec_inplace(
+    device float* data [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= len) return; data[gid] = 1.0f / data[gid]; }
 
 kernel void neg_inplace(
     device float* data [[buffer(0)]],
@@ -6343,104 +6792,92 @@ kernel void batch_elementwise_region(
 }
 
 // ── Gated DeltaNet scan (f32) ───────────────────────────────────────
-// One threadgroup per (batch, head), `n` threads parallelize the state
-// dimension (n ≤ 128). Matches `execute_gated_delta_net_f32` on CPU.
+// One thread per (batch, head) — same dispatch model as `selective_scan`.
+// Each thread owns the full n×n state in device scratch (exclusive) and
+// scans seq serially. Matches CPU `execute_gated_delta_net_f32`.
+// Offsets are ulong float indices: Fara-sized arenas place ephemeral GDN
+// scratch past 16 GiB, which overflows uint indexing.
 #define GDN_MAX_N 128u
 
 kernel void gated_delta_net(
     device float* arena        [[buffer(0)]],
-    constant uint& q_off       [[buffer(1)]],
-    constant uint& k_off       [[buffer(2)]],
-    constant uint& v_off       [[buffer(3)]],
-    constant uint& g_off       [[buffer(4)]],
-    constant uint& beta_off    [[buffer(5)]],
-    constant uint& state_off   [[buffer(6)]],
-    constant uint& dst_off     [[buffer(7)]],
+    constant ulong& q_off      [[buffer(1)]],
+    constant ulong& k_off      [[buffer(2)]],
+    constant ulong& v_off      [[buffer(3)]],
+    constant ulong& g_off      [[buffer(4)]],
+    constant ulong& beta_off   [[buffer(5)]],
+    constant ulong& state_off  [[buffer(6)]],
+    constant ulong& dst_off    [[buffer(7)]],
     constant uint4& dims       [[buffer(8)]], // batch, seq, heads, n
     constant uint& use_carry   [[buffer(9)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]
+    uint gid [[thread_position_in_grid]]
 ) {
-    uint b = dims.x, s = dims.y, h = dims.z, n = dims.w;
-    if (n > GDN_MAX_N || gid >= b * h || tid >= n) return;
+    const uint b = dims.x, s = dims.y, h = dims.z, n = dims.w;
+    if (n > GDN_MAX_N || n == 0u || gid >= b * h) return;
 
-    uint bi = gid / h;
-    uint hi = gid % h;
-    uint j = tid;
-    float scale = rsqrt(float(n));
-
-    uint s_base = state_off + (bi * h + hi) * n * n;
+    const uint bi = gid / h;
+    const uint hi = gid % h;
+    const float scale = rsqrt(float(n));
+    const uint hs_n = h * n;
+    const ulong s_base = state_off + (ulong)((bi * h + hi) * n * n);
     device float* s_mat = arena + s_base;
 
-    if (use_carry == 0u && tid == 0u) {
-        for (uint i = 0; i < n * n; ++i) {
+    if (use_carry == 0u) {
+        for (uint i = 0u; i < n * n; ++i) {
             s_mat[i] = 0.0f;
         }
     }
-    threadgroup float sk_sh[GDN_MAX_N];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint hs_n = h * n;
+    float sk[GDN_MAX_N];
 
-    for (uint ti = 0; ti < s; ++ti) {
-        uint qkv_step = bi * s * hs_n + ti * hs_n + hi * n;
-        uint gb_step  = bi * s * h + ti * h + hi;
+    for (uint ti = 0u; ti < s; ++ti) {
+        const uint qkv_step = bi * s * hs_n + ti * hs_n + hi * n;
+        const uint gb_step = bi * s * h + ti * h + hi;
+        device const float* q_ptr = arena + q_off + qkv_step;
+        device const float* k_ptr = arena + k_off + qkv_step;
+        device const float* v_ptr = arena + v_off + qkv_step;
+        const float g_exp = exp(arena[g_off + gb_step]);
+        const float beta_t = arena[beta_off + gb_step];
 
-        uint q_row = q_off + qkv_step;
-        uint k_row = k_off + qkv_step;
-        uint v_row = v_off + qkv_step;
-        float g_t = arena[g_off + gb_step];
-        float beta_t = arena[beta_off + gb_step];
-        float g_exp = exp(g_t);
-
-        if (tid == 0u) {
-            for (uint idx = 0; idx < n * n; ++idx) {
-                s_mat[idx] *= g_exp;
+        for (uint i = 0u; i < n * n; ++i) {
+            s_mat[i] *= g_exp;
+        }
+        for (uint j = 0u; j < n; ++j) {
+            float acc = 0.0f;
+            for (uint i = 0u; i < n; ++i) {
+                acc += s_mat[i * n + j] * k_ptr[i];
             }
+            sk[j] = (v_ptr[j] - acc) * beta_t;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float acc = 0.0f;
-        for (uint i = 0; i < n; ++i) {
-            acc += s_mat[i * n + j] * arena[k_row + i];
+        device float* out = arena + dst_off + qkv_step;
+        for (uint j = 0u; j < n; ++j) {
+            const float d = sk[j];
+            float y = 0.0f;
+            for (uint i = 0u; i < n; ++i) {
+                s_mat[i * n + j] += k_ptr[i] * d;
+                y += s_mat[i * n + j] * q_ptr[i];
+            }
+            out[j] = y * scale;
         }
-        sk_sh[j] = acc;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        sk_sh[j] = (arena[v_row + j] - sk_sh[j]) * beta_t;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint i = 0; i < n; ++i) {
-            float ki = arena[k_row + i];
-            s_mat[i * n + j] += ki * sk_sh[j];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        uint out_row = dst_off + qkv_step;
-        acc = 0.0f;
-        for (uint i = 0; i < n; ++i) {
-            acc += s_mat[i * n + j] * arena[q_row + i];
-        }
-        arena[out_row + j] = acc * scale;
     }
 }
-
 // Simdgroup-cooperative GDN for n == 128 (Bonsai / Qwen3.5). llama.cpp-style:
 // one simdgroup owns one state column; 32 threads × 4 floats keep that column
 // in registers and use simd_sum — no threadgroup barriers inside the scan.
 // Grid: (n/NSG, heads, batch) threadgroups, threads (32, NSG, 1).
+// Opt-in via RLX_METAL_GDN_SG=1; column-private kernel above is the default.
 constant uint GDN_SG_N = 128u;
 constant uint GDN_SG_NSG = 4u;
 
 kernel void gated_delta_net_sg(
     device float* arena        [[buffer(0)]],
-    constant uint& q_off       [[buffer(1)]],
-    constant uint& k_off       [[buffer(2)]],
-    constant uint& v_off       [[buffer(3)]],
-    constant uint& g_off       [[buffer(4)]],
-    constant uint& beta_off    [[buffer(5)]],
-    constant uint& state_off   [[buffer(6)]],
-    constant uint& dst_off     [[buffer(7)]],
+    constant ulong& q_off      [[buffer(1)]],
+    constant ulong& k_off      [[buffer(2)]],
+    constant ulong& v_off      [[buffer(3)]],
+    constant ulong& g_off      [[buffer(4)]],
+    constant ulong& beta_off   [[buffer(5)]],
+    constant ulong& state_off  [[buffer(6)]],
+    constant ulong& dst_off    [[buffer(7)]],
     constant uint4& dims       [[buffer(8)]], // batch, seq, heads, n
     constant uint& use_carry   [[buffer(9)]],
     uint3 tgpig                [[threadgroup_position_in_grid]],
@@ -6457,7 +6894,7 @@ kernel void gated_delta_net_sg(
     if (bi >= b || hi >= h || col >= n || tx >= 32u) return;
 
     const float scale = rsqrt(float(n));
-    const uint s_base = state_off + (bi * h + hi) * n * n;
+    const ulong s_base = state_off + (ulong)((bi * h + hi) * n * n);
     device float* s_mat = arena + s_base;
 
     // Register tile of column `col`: S[is][col] for is = tx*4 .. tx*4+3.
@@ -6885,6 +7322,321 @@ kernel void rms_norm_bwd_param_reduce_f32(
         }
     }
     out[i] = acc;
+}
+
+// LayerNorm backward (last-axis rows). Matches CPU `LayerNormBackward*`.
+// One threadgroup per row; power-of-2 TG reduction.
+kernel void layer_norm_bwd(
+    device const float* x [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    device const float* dy [[buffer(2)]],
+    device float* dx [[buffer(3)]],
+    constant uint& inner [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial_a[256];
+    threadgroup float partial_b[256];
+    float n_inv = 1.0f / float(inner);
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < inner; i += tsize) {
+        local_sum += x[row * inner + i];
+    }
+    partial_a[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) partial_a[tid] += partial_a[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = partial_a[0] * n_inv;
+
+    float local_var = 0.0f;
+    for (uint i = tid; i < inner; i += tsize) {
+        float d = x[row * inner + i] - mean;
+        local_var += d * d;
+    }
+    partial_a[tid] = local_var;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) partial_a[tid] += partial_a[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_std = rsqrt(partial_a[0] * n_inv + eps);
+
+    float local_sy = 0.0f;
+    float local_sxh = 0.0f;
+    for (uint i = tid; i < inner; i += tsize) {
+        float xh = (x[row * inner + i] - mean) * inv_std;
+        float sy = dy[row * inner + i] * gamma[i];
+        local_sy += sy;
+        local_sxh += sy * xh;
+    }
+    partial_a[tid] = local_sy;
+    partial_b[tid] = local_sxh;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial_a[tid] += partial_a[tid + stride];
+            partial_b[tid] += partial_b[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float m_sy = partial_a[0] * n_inv;
+    float m_sxh = partial_b[0] * n_inv;
+
+    for (uint i = tid; i < inner; i += tsize) {
+        float xh = (x[row * inner + i] - mean) * inv_std;
+        float sy = dy[row * inner + i] * gamma[i];
+        dx[row * inner + i] = inv_std * (sy - m_sy - xh * m_sxh);
+    }
+}
+
+// Serial dgamma: one thread walks all rows (small-row / no-scratch path).
+kernel void layer_norm_bwd_gamma(
+    device const float* x [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dgamma [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& inner [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0u) return;
+    for (uint i = 0; i < inner; ++i) dgamma[i] = 0.0f;
+    float n_inv = 1.0f / float(inner);
+    for (uint row = 0; row < rows; ++row) {
+        float sum = 0.0f;
+        for (uint i = 0; i < inner; ++i) sum += x[row * inner + i];
+        float mean = sum * n_inv;
+        float var = 0.0f;
+        for (uint i = 0; i < inner; ++i) {
+            float d = x[row * inner + i] - mean;
+            var += d * d;
+        }
+        float inv_std = rsqrt(var * n_inv + eps);
+        for (uint i = 0; i < inner; ++i) {
+            float xh = (x[row * inner + i] - mean) * inv_std;
+            dgamma[i] += dy[row * inner + i] * xh;
+        }
+    }
+}
+
+// Per-row mean + inv_std into scratch[row*2 + {0,1}] for parallel dgamma.
+kernel void layer_norm_bwd_stats_f32(
+    device const float* x [[buffer(0)]],
+    device float* stats [[buffer(1)]],
+    constant uint& inner [[buffer(2)]],
+    constant float& eps [[buffer(3)]],
+    uint row [[thread_position_in_grid]]
+) {
+    float n_inv = 1.0f / float(inner);
+    float sum = 0.0f;
+    for (uint i = 0; i < inner; ++i) sum += x[row * inner + i];
+    float mean = sum * n_inv;
+    float var = 0.0f;
+    for (uint i = 0; i < inner; ++i) {
+        float d = x[row * inner + i] - mean;
+        var += d * d;
+    }
+    stats[row * 2u + 0u] = mean;
+    stats[row * 2u + 1u] = rsqrt(var * n_inv + eps);
+}
+
+// One thread per last-axis index: sum_r dy[r,i] * x_hat[r,i].
+kernel void layer_norm_bwd_gamma_reduce_f32(
+    device const float* x [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device const float* stats [[buffer(2)]],
+    device float* dgamma [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& inner [[buffer(5)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= inner) return;
+    float acc = 0.0f;
+    for (uint row = 0; row < rows; ++row) {
+        float mean = stats[row * 2u + 0u];
+        float inv_std = stats[row * 2u + 1u];
+        float xh = (x[row * inner + i] - mean) * inv_std;
+        acc += dy[row * inner + i] * xh;
+    }
+    dgamma[i] = acc;
+}
+
+// GroupNorm (NCHW) backward — matches CPU `training_bwd::group_norm_backward_*`.
+// One threadgroup per (batch, group); 256-wide reductions.
+kernel void group_norm_bwd_input(
+    device const float* x [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    device const float* dy [[buffer(2)]],
+    device float* dx [[buffer(3)]],
+    constant uint4& nchw [[buffer(4)]],
+    constant uint& num_groups [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint ng [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    uint batch = nchw.x;
+    uint c = nchw.y;
+    uint h = nchw.z;
+    uint w = nchw.w;
+    if (ng >= batch * num_groups) return;
+    uint n = ng / num_groups;
+    uint g = ng % num_groups;
+    uint cpg = c / num_groups;
+    uint c0 = g * cpg;
+    uint spatial = h * w;
+    uint count = cpg * spatial;
+    float n_inv = 1.0f / float(count);
+    uint plane = c * spatial;
+    uint b_base = n * plane;
+
+    threadgroup float partial_a[256];
+    threadgroup float partial_b[256];
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < count; i += tsize) {
+        uint c_off = i / spatial;
+        uint s = i % spatial;
+        local_sum += x[b_base + (c0 + c_off) * spatial + s];
+    }
+    partial_a[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) partial_a[tid] += partial_a[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = partial_a[0] * n_inv;
+
+    float local_var = 0.0f;
+    for (uint i = tid; i < count; i += tsize) {
+        uint c_off = i / spatial;
+        uint s = i % spatial;
+        float d = x[b_base + (c0 + c_off) * spatial + s] - mean;
+        local_var += d * d;
+    }
+    partial_a[tid] = local_var;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) partial_a[tid] += partial_a[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_std = rsqrt(partial_a[0] * n_inv + eps);
+
+    float local_sy = 0.0f;
+    float local_sxh = 0.0f;
+    for (uint i = tid; i < count; i += tsize) {
+        uint c_off = i / spatial;
+        uint s = i % spatial;
+        uint gi = c0 + c_off;
+        float xh = (x[b_base + gi * spatial + s] - mean) * inv_std;
+        float sy = dy[b_base + gi * spatial + s] * gamma[gi];
+        local_sy += sy;
+        local_sxh += sy * xh;
+    }
+    partial_a[tid] = local_sy;
+    partial_b[tid] = local_sxh;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial_a[tid] += partial_a[tid + stride];
+            partial_b[tid] += partial_b[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float m_sy = partial_a[0] * n_inv;
+    float m_sxh = partial_b[0] * n_inv;
+
+    for (uint i = tid; i < count; i += tsize) {
+        uint c_off = i / spatial;
+        uint s = i % spatial;
+        uint gi = c0 + c_off;
+        float xh = (x[b_base + gi * spatial + s] - mean) * inv_std;
+        float sy = dy[b_base + gi * spatial + s] * gamma[gi];
+        dx[b_base + gi * spatial + s] = inv_std * (sy - m_sy - xh * m_sxh);
+    }
+}
+
+kernel void group_norm_bwd_gamma(
+    device const float* x [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dgamma [[buffer(2)]],
+    constant uint4& nchw [[buffer(3)]],
+    constant uint& num_groups [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0u) return;
+    uint n = nchw.x;
+    uint c = nchw.y;
+    uint h = nchw.z;
+    uint w = nchw.w;
+    uint spatial = h * w;
+    uint plane = c * spatial;
+    uint cpg = c / num_groups;
+    float n_inv = 1.0f / float(cpg * spatial);
+    for (uint ch = 0; ch < c; ++ch) dgamma[ch] = 0.0f;
+    for (uint bn = 0; bn < n; ++bn) {
+        uint b_base = bn * plane;
+        for (uint g = 0; g < num_groups; ++g) {
+            uint c0 = g * cpg;
+            float mean = 0.0f;
+            for (uint ci = 0; ci < cpg; ++ci) {
+                uint base = b_base + (c0 + ci) * spatial;
+                for (uint s = 0; s < spatial; ++s) mean += x[base + s];
+            }
+            mean *= n_inv;
+            float var = 0.0f;
+            for (uint ci = 0; ci < cpg; ++ci) {
+                uint base = b_base + (c0 + ci) * spatial;
+                for (uint s = 0; s < spatial; ++s) {
+                    float d = x[base + s] - mean;
+                    var += d * d;
+                }
+            }
+            float inv_std = rsqrt(var * n_inv + eps);
+            for (uint ci = 0; ci < cpg; ++ci) {
+                uint gi = c0 + ci;
+                uint x_base = b_base + gi * spatial;
+                uint dy_base = b_base + gi * spatial;
+                float acc = dgamma[gi];
+                for (uint s = 0; s < spatial; ++s) {
+                    float xh = (x[x_base + s] - mean) * inv_std;
+                    acc += dy[dy_base + s] * xh;
+                }
+                dgamma[gi] = acc;
+            }
+        }
+    }
+}
+
+kernel void group_norm_bwd_beta(
+    device const float* dy [[buffer(0)]],
+    device float* dbeta [[buffer(1)]],
+    constant uint4& nchw [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0u) return;
+    uint n = nchw.x;
+    uint c = nchw.y;
+    uint h = nchw.z;
+    uint w = nchw.w;
+    uint spatial = h * w;
+    uint plane = c * spatial;
+    for (uint ch = 0; ch < c; ++ch) dbeta[ch] = 0.0f;
+    for (uint bn = 0; bn < n; ++bn) {
+        uint b_base = bn * plane;
+        for (uint ch = 0; ch < c; ++ch) {
+            uint dy_base = b_base + ch * spatial;
+            float acc = dbeta[ch];
+            for (uint s = 0; s < spatial; ++s) acc += dy[dy_base + s];
+            dbeta[ch] = acc;
+        }
+    }
 }
 
 kernel void rope_bwd(
@@ -7419,6 +8171,7 @@ pub struct Kernels {
     pub log_inplace_h: ComputePipelineState,
     pub sqrt_inplace_h: ComputePipelineState,
     pub rsqrt_inplace_h: ComputePipelineState,
+    pub rec_inplace_h: ComputePipelineState,
     pub neg_inplace_h: ComputePipelineState,
     pub abs_inplace_h: ComputePipelineState,
     pub sin_inplace_h: ComputePipelineState,
@@ -7544,6 +8297,14 @@ pub struct Kernels {
     pub elem_where: ComputePipelineState,
     pub elem_where_bcast: ComputePipelineState,
     pub elem_fma: ComputePipelineState,
+    pub relu_backward: ComputePipelineState,
+    pub activation_backward: ComputePipelineState,
+    pub complex_norm_sq: ComputePipelineState,
+    pub complex_norm_sq_backward: ComputePipelineState,
+    pub conjugate_c64: ComputePipelineState,
+    pub fft_butterfly_stage: ComputePipelineState,
+    pub fake_quantize_fixed: ComputePipelineState,
+    pub fake_quantize_perbatch: ComputePipelineState,
     pub reduce_axes: ComputePipelineState,
     pub topk_lastax: ComputePipelineState,
     pub grouped_matmul: ComputePipelineState,
@@ -7570,6 +8331,8 @@ pub struct Kernels {
     pub group_norm: ComputePipelineState,
     pub resize_nearest_2x: ComputePipelineState,
     pub conv_transpose2d: ComputePipelineState,
+    pub conv3d: ComputePipelineState,
+    pub conv_transpose3d: ComputePipelineState,
     pub relu_inplace: ComputePipelineState,
     pub sigmoid_inplace: ComputePipelineState,
     pub tanh_inplace: ComputePipelineState,
@@ -7577,6 +8340,7 @@ pub struct Kernels {
     pub log_inplace: ComputePipelineState,
     pub sqrt_inplace: ComputePipelineState,
     pub rsqrt_inplace: ComputePipelineState,
+    pub rec_inplace: ComputePipelineState,
     pub neg_inplace: ComputePipelineState,
     pub abs_inplace: ComputePipelineState,
     pub round_inplace: ComputePipelineState,
@@ -7678,6 +8442,13 @@ pub struct Kernels {
     pub rms_norm_bwd_param: ComputePipelineState,
     pub rms_norm_bwd_inv_r_f32: ComputePipelineState,
     pub rms_norm_bwd_param_reduce_f32: ComputePipelineState,
+    pub layer_norm_bwd: ComputePipelineState,
+    pub layer_norm_bwd_gamma: ComputePipelineState,
+    pub layer_norm_bwd_stats_f32: ComputePipelineState,
+    pub layer_norm_bwd_gamma_reduce_f32: ComputePipelineState,
+    pub group_norm_bwd_input: ComputePipelineState,
+    pub group_norm_bwd_gamma: ComputePipelineState,
+    pub group_norm_bwd_beta: ComputePipelineState,
     pub rope_bwd: ComputePipelineState,
     pub cumsum_fwd: ComputePipelineState,
     pub cumsum_bwd: ComputePipelineState,
@@ -7752,6 +8523,7 @@ impl Kernels {
             log_inplace_h: pipeline("log_inplace_h"),
             sqrt_inplace_h: pipeline("sqrt_inplace_h"),
             rsqrt_inplace_h: pipeline("rsqrt_inplace_h"),
+            rec_inplace_h: pipeline("rec_inplace_h"),
             neg_inplace_h: pipeline("neg_inplace_h"),
             abs_inplace_h: pipeline("abs_inplace_h"),
             sin_inplace_h: pipeline("sin_inplace_h"),
@@ -7869,6 +8641,14 @@ impl Kernels {
             elem_where: pipeline("elem_where"),
             elem_where_bcast: pipeline("elem_where_bcast"),
             elem_fma: pipeline("elem_fma"),
+            relu_backward: pipeline("relu_backward"),
+            activation_backward: pipeline("activation_backward"),
+            complex_norm_sq: pipeline("complex_norm_sq"),
+            complex_norm_sq_backward: pipeline("complex_norm_sq_backward"),
+            conjugate_c64: pipeline("conjugate_c64"),
+            fft_butterfly_stage: pipeline("fft_butterfly_stage"),
+            fake_quantize_fixed: pipeline("fake_quantize_fixed"),
+            fake_quantize_perbatch: pipeline("fake_quantize_perbatch"),
             reduce_axes: pipeline("reduce_axes"),
             topk_lastax: pipeline("topk_lastax"),
             grouped_matmul: pipeline("grouped_matmul"),
@@ -7897,6 +8677,8 @@ impl Kernels {
             group_norm: pipeline("group_norm"),
             resize_nearest_2x: pipeline("resize_nearest_2x"),
             conv_transpose2d: pipeline("conv_transpose2d"),
+            conv3d: pipeline("conv3d"),
+            conv_transpose3d: pipeline("conv_transpose3d"),
             relu_inplace: pipeline("relu_inplace"),
             sigmoid_inplace: pipeline("sigmoid_inplace"),
             tanh_inplace: pipeline("tanh_inplace"),
@@ -7904,6 +8686,7 @@ impl Kernels {
             log_inplace: pipeline("log_inplace"),
             sqrt_inplace: pipeline("sqrt_inplace"),
             rsqrt_inplace: pipeline("rsqrt_inplace"),
+            rec_inplace: pipeline("rec_inplace"),
             neg_inplace: pipeline("neg_inplace"),
             abs_inplace: pipeline("abs_inplace"),
             round_inplace: pipeline("round_inplace"),
@@ -7978,6 +8761,13 @@ impl Kernels {
             rms_norm_bwd_param: pipeline("rms_norm_bwd_param"),
             rms_norm_bwd_inv_r_f32: pipeline("rms_norm_bwd_inv_r_f32"),
             rms_norm_bwd_param_reduce_f32: pipeline("rms_norm_bwd_param_reduce_f32"),
+            layer_norm_bwd: pipeline("layer_norm_bwd"),
+            layer_norm_bwd_gamma: pipeline("layer_norm_bwd_gamma"),
+            layer_norm_bwd_stats_f32: pipeline("layer_norm_bwd_stats_f32"),
+            layer_norm_bwd_gamma_reduce_f32: pipeline("layer_norm_bwd_gamma_reduce_f32"),
+            group_norm_bwd_input: pipeline("group_norm_bwd_input"),
+            group_norm_bwd_gamma: pipeline("group_norm_bwd_gamma"),
+            group_norm_bwd_beta: pipeline("group_norm_bwd_beta"),
             rope_bwd: pipeline("rope_bwd"),
             cumsum_fwd: pipeline("cumsum_fwd"),
             cumsum_bwd: pipeline("cumsum_bwd"),

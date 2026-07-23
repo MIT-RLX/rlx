@@ -13,18 +13,18 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// Fused dense / soft-label softmax cross-entropy along the last axis.
-// One thread per row computes, numerically stably,
+// Softmax cross-entropy along the last axis (one thread per row).
+//
+// Dense / soft-label (`softmax_cross_entropy`):
 //   loss[n] = logsumexp(logits[n]) - Σ_c targets[n,c]·logits[n,c]
-// in a single pass over the class axis (one max pass + one fused
-// sum-exp / dot pass). Slow-but-correct one-thread-per-row form,
-// mirroring `softmax.wgsl`; a workgroup tree reduction is future work.
+// Integer labels (`softmax_cross_entropy_with_logits`):
+//   loss[n] = logsumexp(logits[n]) - logits[n, label]
 
 struct Params {
     outer: u32,        // N rows
     inner: u32,        // C classes
     logits_off: u32,
-    targets_off: u32,
+    targets_off: u32,  // dense targets [N,C], or labels [N] (f32-encoded)
     out_off: u32,
     _p0: u32, _p1: u32, _p2: u32,
 };
@@ -39,13 +39,11 @@ fn softmax_cross_entropy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin
     let lbase = params.logits_off + row * params.inner;
     let tbase = params.targets_off + row * params.inner;
 
-    // Pass 1: row max for numerical stability.
     var m: f32 = arena[lbase];
     for (var i: u32 = 1u; i < params.inner; i = i + 1u) {
         m = max(m, arena[lbase + i]);
     }
 
-    // Pass 2: Σ exp(x - max) and Σ targets·logits in one sweep.
     var s: f32 = 0.0;
     var dot: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
@@ -55,4 +53,25 @@ fn softmax_cross_entropy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin
     }
 
     arena[params.out_off + row] = (m + log(s)) - dot;
+}
+
+@compute @workgroup_size(64)
+fn softmax_cross_entropy_with_logits(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
+    let row = gid.x + gid.y * ngs.x * 64u;
+    if (row >= params.outer || params.inner == 0u) { return; }
+    let lbase = params.logits_off + row * params.inner;
+
+    var m: f32 = arena[lbase];
+    for (var i: u32 = 1u; i < params.inner; i = i + 1u) {
+        m = max(m, arena[lbase + i]);
+    }
+
+    var s: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+        s = s + exp(arena[lbase + i] - m);
+    }
+
+    let label = u32(arena[params.targets_off + row]);
+    let label_c = min(label, params.inner - 1u);
+    arena[params.out_off + row] = (m + log(s)) - arena[lbase + label_c];
 }

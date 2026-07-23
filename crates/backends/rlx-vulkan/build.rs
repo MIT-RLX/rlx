@@ -101,7 +101,11 @@ fn compile_glsl_to_spirv(name: &str, src: &str, shader_dir: &Path) -> Vec<u32> {
     use naga::front::glsl::{Frontend, Options};
     use naga::valid::{Capabilities, ValidationFlags, Validator};
 
-    let u32_arena = name.starts_with("dequant");
+    // Packed-byte / GGUF kernels need the uint+i8 arena helpers (not float-only).
+    let u32_arena = name.starts_with("dequant")
+        || name.starts_with("quantize")
+        || name.starts_with("q_matmul")
+        || name.starts_with("q_conv");
     let inc_name = if u32_arena {
         "arena_u32.inc"
     } else {

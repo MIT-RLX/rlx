@@ -185,15 +185,21 @@ impl<'a> LowerCtx<'a> {
         // weight `[Co,Ci,k,1]`. Collapse to a real rank-3 1D conv over the
         // length (matches CPU/MLX/wgpu/onnxruntime); CoreML's 2D conv over a
         // singleton/degenerate spatial axis is not reliable here.
-        let in_h = in_shape.dim(2).unwrap_static();
-        let in_w = in_shape.dim(3).unwrap_static();
+        // Rank-5 NCDHW (`Conv3d`) skips this collapse and uses MIL `"conv"`
+        // with 3-length strides/pad/dilations.
         let one_d = !transpose
             && in_shape.rank() == 4
             && w_shape.rank() == 4
             && w_shape.dim(3).unwrap_static() == 1
             && w_shape.dim(2).unwrap_static() > 1
-            && (in_h == 1 || in_w == 1);
+            && {
+                let in_h = in_shape.dim(2).unwrap_static();
+                let in_w = in_shape.dim(3).unwrap_static();
+                in_h == 1 || in_w == 1
+            };
         if one_d {
+            let in_h = in_shape.dim(2).unwrap_static();
+            let in_w = in_shape.dim(3).unwrap_static();
             let n = in_shape.dim(0).unwrap_static() as i32;
             let c = in_shape.dim(1).unwrap_static() as i32;
             // length is the non-singleton input spatial axis
@@ -264,26 +270,23 @@ impl<'a> LowerCtx<'a> {
             let cin = in_shape.dim(1).unwrap_static() as i32;
             let cout = shape.dim(1).unwrap_static() as i32;
             let g = groups.max(1) as i32;
-            let (kh, kw) = (
-                w_shape.dim(2).unwrap_static() as i32,
-                w_shape.dim(3).unwrap_static() as i32,
-            );
-            let tgt = [cin, cout / g, kh, kw];
-            if w_shape
+            let spatial: Vec<i32> = (2..w_shape.rank())
+                .map(|i| w_shape.dim(i).unwrap_static() as i32)
+                .collect();
+            let mut tgt = vec![cin, cout / g];
+            tgt.extend_from_slice(&spatial);
+            let cur: Vec<i32> = w_shape
                 .dims()
                 .iter()
                 .map(|d| d.unwrap_static() as i32)
-                .collect::<Vec<_>>()
-                != tgt
-            {
+                .collect();
+            if cur != tgt {
                 let wr = format!("{out_name}_wt");
+                let dims: Vec<usize> = tgt.iter().map(|&d| d as usize).collect();
                 self.emit(
                     "reshape",
                     &wr,
-                    &Shape::new(
-                        &[cin as usize, (cout / g) as usize, kh as usize, kw as usize],
-                        DType::F32,
-                    ),
+                    &Shape::new(&dims, DType::F32),
                     vec![("x", bind_name(&w)), ("shape", bind_value(vec_i32(&tgt)))],
                 )?;
                 w = wr;

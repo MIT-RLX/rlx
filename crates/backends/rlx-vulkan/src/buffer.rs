@@ -16,8 +16,34 @@ use std::collections::HashMap;
 /// High bit on f32 **element** offsets in push constants → binding 1 (weights).
 pub const WEIGHT_ELEM_TAG: u32 = 1 << 31;
 
+/// Shrink recorded U8/I8 activation capacities to packed width (offsets keep the
+/// f32-uniform liveness layout). Word-rounded so CAS i8 stores stay in-slot.
+pub(crate) fn pack_i8_u8_slot_sizes(graph: &Graph, plan: &mut MemoryPlan) {
+    for node in graph.nodes() {
+        if !matches!(node.shape.dtype(), DType::U8 | DType::I8) {
+            continue;
+        }
+        if let Some(slot) = plan.assignments.get_mut(&node.id) {
+            let ne = node.shape.num_elements().unwrap_or(0).max(1);
+            slot.size = ne.div_ceil(4) * 4;
+        }
+    }
+}
+
 /// Bytes reserved at the end of every activation shard for cross-stripe staging.
+/// Override with `RLX_VULKAN_SHARD_STAGE_MIB` (KittenTTS defaults to 64 so long-wave
+/// plans do not snap into multi-×4 GiB arenas that OOM or SIGSEGV host paths).
 pub const SHARD_STAGE_RESERVE: usize = 576 * 1024 * 1024;
+
+/// Effective stage reserve (see [`SHARD_STAGE_RESERVE`]).
+pub fn shard_stage_reserve() -> usize {
+    if let Ok(raw) = std::env::var("RLX_VULKAN_SHARD_STAGE_MIB") {
+        if let Ok(mib) = raw.parse::<usize>() {
+            return (mib.max(1) * 1024 * 1024).min(SHARD_STAGE_RESERVE);
+        }
+    }
+    SHARD_STAGE_RESERVE
+}
 
 #[inline]
 pub fn is_weight_elem(off: u32) -> bool {
@@ -37,8 +63,16 @@ struct BufferMem {
 }
 
 /// Re-place unique buffer slots so no slot crosses a shard boundary.
+///
+/// Mirrors wgpu: scratch may live in the per-stripe stage reserve; do **not**
+/// open a brand-new empty shard just to host tail bytes (that turned KittenTTS
+/// ~4 GiB arenas into 2×4 GiB and broke host indexing via `mapped_ptr`).
 fn snap_plan_to_shards(plan: &mut MemoryPlan, shard_cap: usize) {
-    let usable = shard_cap.saturating_sub(SHARD_STAGE_RESERVE).max(256);
+    snap_plan_to_shards_ex(plan, shard_cap, shard_stage_reserve());
+}
+
+fn snap_plan_to_shards_ex(plan: &mut MemoryPlan, shard_cap: usize, stage_reserve: usize) {
+    let usable = shard_cap.saturating_sub(stage_reserve).max(256);
     let mut slot_size: HashMap<usize, usize> = HashMap::new();
     let mut max_end = 0usize;
     for a in plan.assignments.values() {
@@ -61,7 +95,7 @@ fn snap_plan_to_shards(plan: &mut MemoryPlan, shard_cap: usize) {
             panic!(
                 "rlx-vulkan: tensor slot at byte {old_off} is {size} bytes \
                  ({:.2} GiB) — exceeds the usable shard of {usable} bytes \
-                 ({:.2} GiB = {SHARD_STAGE_RESERVE}-byte stage reserve below the \
+                 ({:.2} GiB = {stage_reserve}-byte stage reserve below the \
                  ~4 GiB storage-buffer cap). Chunk the oversized op at the graph level.",
                 size as f64 / (1u64 << 30) as f64,
                 usable as f64 / (1u64 << 30) as f64,
@@ -85,12 +119,14 @@ fn snap_plan_to_shards(plan: &mut MemoryPlan, shard_cap: usize) {
     cursor = cursor.div_ceil(16) * 16;
     if tail_extra > 0 {
         let local = cursor % shard_cap;
-        if local + tail_extra > usable {
+        // Jump only when even usable+reserve (the full stripe) can't hold it.
+        if local.saturating_add(tail_extra) > shard_cap {
             cursor = cursor.div_ceil(shard_cap) * shard_cap;
         }
-        cursor += tail_extra;
+        cursor = cursor.saturating_add(tail_extra);
     }
-    if !cursor.is_multiple_of(shard_cap) {
+    let local = cursor % shard_cap;
+    if local > 0 && local <= usable {
         cursor = cursor.div_ceil(shard_cap) * shard_cap;
     }
     plan.arena_size = cursor.max(1);
@@ -237,6 +273,8 @@ impl Arena {
             tail += ne * 4;
         }
         new_plan.arena_size = tail;
+
+        pack_i8_u8_slot_sizes(graph, &mut new_plan);
 
         if new_plan.arena_size > max_range {
             snap_plan_to_shards(&mut new_plan, shard_cap);
@@ -435,15 +473,14 @@ impl Arena {
     }
 
     pub fn shard_stage_off(&self, logical_off: usize) -> usize {
+        let reserve = shard_stage_reserve();
         if !self.is_sharded() {
-            return self.size.saturating_sub(SHARD_STAGE_RESERVE);
+            return self.size.saturating_sub(reserve);
         }
         let s = self.shard_size;
         let shard_begin = (logical_off / s) * s;
         let shard_end = (shard_begin + s).min(self.size);
-        shard_end
-            .saturating_sub(SHARD_STAGE_RESERVE)
-            .max(shard_begin)
+        shard_end.saturating_sub(reserve).max(shard_begin)
     }
 
     pub fn resolve_act(&self, global_off: usize) -> (vk::Buffer, *mut u8, usize) {
@@ -860,8 +897,10 @@ mod shard_pack_tests {
 
     #[test]
     fn snap_plan_keeps_slots_out_of_stage_reserve() {
+        // Cap smaller than SHARD_STAGE_RESERVE → usable collapses to 256 bytes.
         let shard_cap = 4096usize;
-        let usable = shard_cap.saturating_sub(SHARD_STAGE_RESERVE).max(256);
+        let stage_reserve = SHARD_STAGE_RESERVE;
+        let usable = shard_cap.saturating_sub(stage_reserve).max(256);
         assert_eq!(usable, 256);
 
         let mut plan = MemoryPlan {
@@ -891,7 +930,7 @@ mod shard_pack_tests {
             ]),
             schedule: Vec::new(),
         };
-        snap_plan_to_shards(&mut plan, shard_cap);
+        snap_plan_to_shards_ex(&mut plan, shard_cap, stage_reserve);
         for a in plan.assignments.values() {
             let local = a.offset % shard_cap;
             assert!(
@@ -901,6 +940,30 @@ mod shard_pack_tests {
                 a.size
             );
         }
-        assert!(plan.arena_size.is_multiple_of(shard_cap));
+    }
+
+    #[test]
+    fn snap_plan_does_not_open_empty_shard_for_scratch() {
+        let shard_cap = 1024usize;
+        let stage_reserve = 256usize;
+        let usable = shard_cap.saturating_sub(stage_reserve).max(256);
+        let mut plan = MemoryPlan {
+            // Tail scratch past the last slot — must not force a second full shard.
+            arena_size: usable + 64,
+            assignments: HashMap::from([(
+                NodeId(0),
+                rlx_opt::memory::BufferSlot {
+                    offset: 0,
+                    size: usable,
+                },
+            )]),
+            schedule: Vec::new(),
+        };
+        snap_plan_to_shards_ex(&mut plan, shard_cap, stage_reserve);
+        assert!(
+            plan.arena_size <= shard_cap,
+            "scratch opened an extra shard: arena={} cap={shard_cap}",
+            plan.arena_size
+        );
     }
 }

@@ -1,0 +1,21 @@
+#version 450
+// Zero destination table before gather-axis scatter-add.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint outer;
+    uint axis_dim;
+    uint num_idx;
+    uint trailing;
+    uint dy_off;
+    uint idx_off;
+    uint dst_off;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint n = pc.outer * pc.axis_dim * pc.trailing;
+    if (i < n) {
+        arena_store(pc.dst_off + i, 0.0);
+    }
+}

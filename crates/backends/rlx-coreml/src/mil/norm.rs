@@ -249,6 +249,215 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
+    /// `LayerNorm(x + residual [+ bias])` — compose Add then layer-norm.
+    pub(crate) fn lower_fused_residual_ln(
+        &mut self,
+        id: NodeId,
+        has_bias: bool,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let shape = node.shape.clone();
+        let x = self.val(node.inputs[0]);
+        let r = self.val(node.inputs[1]);
+        let summed = format!("{out_name}_sum");
+        self.emit(
+            "add",
+            &summed,
+            &shape,
+            vec![("x", bind_name(&x)), ("y", bind_name(&r))],
+        )?;
+        let pre = if has_bias {
+            let bias = self.val(node.inputs[2]);
+            let name = format!("{out_name}_bias");
+            self.emit(
+                "add",
+                &name,
+                &shape,
+                vec![("x", bind_name(&summed)), ("y", bind_name(&bias))],
+            )?;
+            name
+        } else {
+            summed
+        };
+        let (g_idx, b_idx) = if has_bias { (3, 4) } else { (2, 3) };
+        let g = self.val(node.inputs[g_idx]);
+        let b = self.val(node.inputs[b_idx]);
+        // Reuse LayerNorm composition by temporarily wiring through a
+        // synthetic path: emit mean/var/affine on `pre`.
+        let rank = shape.rank() as i32;
+        let axis = -1i32;
+        let norm_axis = (if axis < 0 { axis + rank } else { axis }) as usize;
+        let axes: Vec<i32> = (norm_axis as i32..rank).collect();
+        let red_shape = reduced_shape(&shape, norm_axis);
+        let mean = format!("{out_name}_mean");
+        self.operations.push(self.simple_op(
+            "reduce_mean",
+            &mean,
+            &red_shape,
+            vec![
+                ("x", bind_name(&pre)),
+                ("axes", bind_value(vec_i32(&axes))),
+                ("keep_dims", bind_value(scalar_bool(true))),
+            ],
+        )?);
+        let xc = format!("{out_name}_xc");
+        self.operations.push(self.simple_op(
+            "sub",
+            &xc,
+            &shape,
+            vec![("x", bind_name(&pre)), ("y", bind_name(&mean))],
+        )?);
+        let sq = format!("{out_name}_sq");
+        self.operations.push(self.simple_op(
+            "mul",
+            &sq,
+            &shape,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&xc))],
+        )?);
+        let var = format!("{out_name}_var");
+        self.operations.push(self.simple_op(
+            "reduce_mean",
+            &var,
+            &red_shape,
+            vec![
+                ("x", bind_name(&sq)),
+                ("axes", bind_value(vec_i32(&axes))),
+                ("keep_dims", bind_value(scalar_bool(true))),
+            ],
+        )?);
+        let var_eps = format!("{out_name}_ve");
+        self.operations.push(self.simple_op(
+            "add",
+            &var_eps,
+            &red_shape,
+            vec![("x", bind_name(&var)), ("y", bind_value(scalar_f32(eps)))],
+        )?);
+        let inv = format!("{out_name}_inv");
+        self.operations.push(self.simple_op(
+            "rsqrt",
+            &inv,
+            &red_shape,
+            vec![
+                ("x", bind_name(&var_eps)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?);
+        let normed = format!("{out_name}_n");
+        self.operations.push(self.simple_op(
+            "mul",
+            &normed,
+            &shape,
+            vec![("x", bind_name(&xc)), ("y", bind_name(&inv))],
+        )?);
+        let scaled = format!("{out_name}_g");
+        self.operations.push(self.simple_op(
+            "mul",
+            &scaled,
+            &shape,
+            vec![("x", bind_name(&normed)), ("y", bind_name(&g))],
+        )?);
+        self.emit(
+            "add",
+            out_name,
+            &shape,
+            vec![("x", bind_name(&scaled)), ("y", bind_name(&b))],
+        )?;
+        self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
+
+    /// `RmsNorm(x + residual [+ bias])`.
+    pub(crate) fn lower_fused_residual_rms_norm(
+        &mut self,
+        id: NodeId,
+        has_bias: bool,
+        eps: f32,
+        out_name: &str,
+    ) -> Result<()> {
+        let node = self.graph.node(id);
+        let shape = node.shape.clone();
+        let x = self.val(node.inputs[0]);
+        let r = self.val(node.inputs[1]);
+        let summed = format!("{out_name}_sum");
+        self.emit(
+            "add",
+            &summed,
+            &shape,
+            vec![("x", bind_name(&x)), ("y", bind_name(&r))],
+        )?;
+        let pre = if has_bias {
+            let bias = self.val(node.inputs[2]);
+            let name = format!("{out_name}_bias");
+            self.emit(
+                "add",
+                &name,
+                &shape,
+                vec![("x", bind_name(&summed)), ("y", bind_name(&bias))],
+            )?;
+            name
+        } else {
+            summed
+        };
+        let g_idx = if has_bias { 3 } else { 2 };
+        let g = self.val(node.inputs[g_idx]);
+        let rank = shape.rank();
+        let norm_axis = rank - 1;
+        let axes: Vec<i32> = (norm_axis..rank).map(|a| a as i32).collect();
+        let red_shape = reduced_shape(&shape, norm_axis);
+        let sq = format!("{out_name}_sq");
+        self.operations.push(self.simple_op(
+            "mul",
+            &sq,
+            &shape,
+            vec![("x", bind_name(&pre)), ("y", bind_name(&pre))],
+        )?);
+        let mean = format!("{out_name}_ms");
+        self.operations.push(self.simple_op(
+            "reduce_mean",
+            &mean,
+            &red_shape,
+            vec![
+                ("x", bind_name(&sq)),
+                ("axes", bind_value(vec_i32(&axes))),
+                ("keep_dims", bind_value(scalar_bool(true))),
+            ],
+        )?);
+        let ve = format!("{out_name}_ve");
+        self.operations.push(self.simple_op(
+            "add",
+            &ve,
+            &red_shape,
+            vec![("x", bind_name(&mean)), ("y", bind_value(scalar_f32(eps)))],
+        )?);
+        let inv = format!("{out_name}_inv");
+        self.operations.push(self.simple_op(
+            "rsqrt",
+            &inv,
+            &red_shape,
+            vec![
+                ("x", bind_name(&ve)),
+                ("epsilon", bind_value(scalar_f32(0.0))),
+            ],
+        )?);
+        let normed = format!("{out_name}_n");
+        self.operations.push(self.simple_op(
+            "mul",
+            &normed,
+            &shape,
+            vec![("x", bind_name(&pre)), ("y", bind_name(&inv))],
+        )?);
+        self.emit(
+            "mul",
+            out_name,
+            &shape,
+            vec![("x", bind_name(&normed)), ("y", bind_name(&g))],
+        )?;
+        self.names.insert(id.0, out_name.to_string());
+        Ok(())
+    }
+
     /// RMSNorm backward w.r.t. input. Inputs `[x, gamma, beta, dy]`, output = `x`.
     /// Mirrors `compose_rms_norm_backward_input`:
     ///   inv = rsqrt(mean(x², ax) + eps);  dy_g = dy·gamma

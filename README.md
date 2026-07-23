@@ -12,9 +12,18 @@ backend-specific kernels for CPU, Apple Silicon (Metal / MLX), NVIDIA
 Hexagon (QNN) NPUs, and microcontrollers (Cortex-M).
 
 > Status: **0.2.13**, Apple-Silicon-first. The CPU and Apple GPU paths
-> are mature; CUDA / ROCm / TPU / WGPU work but have seen less mileage;
+> are mature; CUDA / ROCm / TPU / WGPU / Vulkan / oneAPI claim the full
+> **153/`OpKind`** surface (see [`docs/op-coverage.md`](docs/op-coverage.md))
+> with growing native depth — still less field mileage than Metal/MLX.
 > Cortex-M is a separate INT8 product. Multi-backend runtime helpers
 > (`GraphDevices`, `DeviceRouter`) — see [`docs/backend-selection.md`](docs/backend-selection.md).
+> **Unreleased (in tree):** full claim parity + native-depth wave —
+> shared CUDA/ROCm kernels for training bwd, FakeQuantize/LSQ, Gru/Rnn/Mamba2,
+> FftButterflyStage, packed-I8 `QMatMul`/`QConv2d`, DenseSolve (cuSOLVER/
+> hipSOLVER); Vulkan/oneAPI SPIR-V/OpenCL catch-up (RNN/SSM, vision bwd,
+> I8 quant); TPU HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd;
+> CoreML/MLX Complex* + FftButterfly + Scaled* PerTensor. See
+> [`CHANGELOG.md`](CHANGELOG.md) `[Unreleased]`.
 > **Since 0.2.13** (in tree): offline **`rlx-bake`** (graph + weights →
 > optimized deployable `*.rlx`, optional encrypt — [`docs/rlx-bake.md`](docs/rlx-bake.md));
 > on-device **C64** complex binary/cast across CUDA / ROCm / Vulkan / wgpu /
@@ -658,23 +667,24 @@ LAMB / Adafactor / SOAP / Muon / Sophia / MARS.
 
 | Area                         | State                                         |
 |------------------------------|-----------------------------------------------|
-| CPU forward + backward       | Mature; 26 unit tests + integration suites    |
-| Apple Metal forward          | Mature; 78-warning third-party noise silenced |
-| Apple MLX forward + backward | Mature; tier-1/2/3 backward parity            |
-| NVIDIA CUDA                  | Functional; less battle-tested; optional NCCL (`--features nccl`); native LSTM |
-| AMD ROCm                     | Sister-crate parity to CUDA                   |
-| TPU                          | Real-model E2E parity (MiniLM-L6) via PJRT    |
-| WGPU                         | Functional; coop-matrix paths under test; on-device C64/C128 cast + C64 arithmetic |
-| Apple CoreML / ANE (`Device::Ane`) | Full transformer block on-device (IR → MIL ML Program), on-device Q8_0/Q4_0 dequant; backward + on-device gradient training behind the `training` feature |
-| Native Vulkan (`Device::Vulkan`) | `ash` + SPIR-V: ~29 native kernels + host-fallback for the rest; on-device C64/C128 cast + C64 arithmetic; parity validated on MoltenVK / lavapipe (native-driver validation pending) |
-| Intel oneAPI (`Device::OneApi`) | Level Zero + SPIR-V; falls back to a CPU reference when no L0 GPU/kernels; packed DiT reverse kernels; on-device C64/C128 cast + C64 arithmetic |
+| CPU forward + backward       | Mature; full **153/`OpKind`** claim (fused/control expand before thunks) |
+| Apple Metal forward          | Mature; full OpKind claim; native fused Gru/Rnn/Mamba2 + training bwd |
+| Apple MLX forward + backward | Mature; full OpKind claim; tier-1/2/3 backward parity |
+| NVIDIA CUDA                  | Full **153** claim; shared `.cu` training/QAT/RNN/I8 depth; DenseSolve via cuSOLVER; optional NCCL (`--features nccl`); less field mileage than Metal |
+| AMD ROCm                     | Sister-crate parity to CUDA (shared kernels + hipSOLVER DenseSolve/Eigh) |
+| TPU                          | Full **153** claim; HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd; host for DenseSolve/SPD/`FftButterflyStage`; MiniLM-L6 E2E via PJRT |
+| WGPU                         | Full OpKind claim; coop-matrix paths under test; on-device C64 + native Gru/Rnn/Mamba2 / FftButterfly / act bwd |
+| Apple CoreML / ANE (`Device::Ane`) | Full OpKind claim; transformer block on-device (IR → MIL); Complex*/FftButterfly MIL; backward + on-device gradient training behind the `training` feature |
+| Native Vulkan (`Device::Vulkan`) | Full **153** claim; broad SPIR-V set (norms/fused/RNN/vision-bwd/I8 quant/FFT butterfly) + host/unfuse for specialty ops; C64 arithmetic; parity on MoltenVK / lavapipe |
+| Intel oneAPI (`Device::OneApi`) | Full **153** claim; OpenCL-C SPIR-V kernel set mirrors Vulkan depth when `RLX_ONEAPI_BUILD_KERNELS=1`; else CPU reference; DenseSolve stays HostOpDesc→LAPACK |
 | Qualcomm Hexagon (QNN)       | Codegen + FFI runtime (`Device::Hexagon`): on-device INT8/INT4 `QMatMul`, `DequantMatMul`, `FusedAttentionBlock`, persistent session + context-binary save/load; x86 HTP functional sim (`just qnn-htp-sim`) |
 | Cortex-M (INT8)              | Production: 96.6% MNIST on nRF52840 hardware  |
 | FPGA                         | First-class SystemVerilog / bitstream export (`rlx_runtime::export`, `pyrlx.export_fpga`); Int8/Int4/Fp4, soft-port RTL + ECP5 / iCE40 / Xilinx7 synth |
 | Reverse-mode AD              | Phase 1–9 complete; SelectiveScan, FusedTL    |
 | Forward-mode AD (`jvp`/`hvp`)| Functional; thin public API                   |
 | `vmap`                       | MVP — leading-axis batching                   |
-| QAT (PTQ + STE + LSQ)        | Complete: EMA, Fixed, PerBatch, propagation   |
+| QAT (PTQ + STE + LSQ)        | Complete: EMA, Fixed, PerBatch, propagation; native FakeQuantize/LSQ on CUDA/ROCm/Vulkan/Metal/wgpu |
+| OpKind coverage matrix       | **153/153** on CPU / Metal / MLX / wgpu / ANE / CUDA / ROCm / Vulkan / oneAPI / TPU — [`docs/op-coverage.md`](docs/op-coverage.md) (`just gen-op-coverage`) |
 | Qwen3 LM (safetensors + GGUF)| End-to-end on Metal: 100% top-1 parity vs HF; matches/beats Python MPS on most prefill shapes. Q4_K_M GGUF loads + runs |
 | Op::DequantMatMul GGUF schemes | All llama.cpp schemes (incl. Q4_1, Q5_0, Q5_1, IQ/TQ/MX). GPU dequant on Metal/CUDA/ROCm/WGPU (shared scheme ids 0–23); **Metal fused GEMV** for Q4_K, Q4_0/1, Q8_0, IQ4NL, IQ2/3/1 families (`m=1` prefill); WGPU grouped MoE GPU when scratch fits; ANE MIL constexpr for K/IQ/TQ/MX; TPU compile-time + runtime Param bake. **pyrlx:** `quantize`, `load_gguf`, `convert_to_gguf`. See [docs/gguf-backend-paths.md](docs/gguf-backend-paths.md). |
 | Sampler chain                  | `SamplerChain` in `rlx-runtime::samplers`: Temperature, DynamicTemperature, TopK, TopP, TopNSigma, TypicalP, Mirostat v1/v2, XTC, DRY, RepetitionPenalty. Wired into `SampleOpts::into_chain()`; classic top-k/top-p stay on the fast path via `is_classic()`. |

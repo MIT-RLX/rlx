@@ -469,6 +469,58 @@ fn pool_emits_reduce_window() {
 }
 
 #[test]
+fn max_pool2d_backward_emits_select_and_scatter() {
+    let mut g = Graph::new("maxpool_bwd");
+    let f = DType::F32;
+    let x = g.input("x", Shape::new(&[1, 1, 4, 4], f));
+    let dy = g.input("dy", Shape::new(&[1, 1, 2, 2], f));
+    let dx = g.maxpool2d_backward(x, dy, vec![2, 2], vec![2, 2], vec![0, 0]);
+    g.set_outputs(vec![dx]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "select-and-scatter"),
+        "MaxPool2dBackward should emit HLO select-and-scatter"
+    );
+}
+
+#[test]
+fn attention_backward_expands_before_hlo() {
+    use rlx_ir::op::AttentionBwdWrt;
+    let mut g = Graph::new("attn_bwd");
+    let f = DType::F32;
+    let shape = Shape::new(&[1, 2, 4, 8], f);
+    let q = g.input("q", shape.clone());
+    let k = g.input("k", shape.clone());
+    let v = g.input("v", shape.clone());
+    let dy = g.input("dy", shape.clone());
+    let dq = g.attention_backward(
+        AttentionBwdWrt::Query,
+        q,
+        k,
+        v,
+        dy,
+        2,
+        8,
+        MaskKind::None,
+        None,
+    );
+    g.set_outputs(vec![dq]);
+    let prepared = rlx_tpu::ir_passes::prepare_graph_for_hlo(g);
+    assert!(
+        !prepared
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, rlx_ir::Op::AttentionBackward { .. })),
+        "AttentionBackward must expand before HLO"
+    );
+    let b = lower_to_bytes(&prepared);
+    assert!(
+        contains_opcode(&b, "dot") || contains_opcode(&b, "dot-general"),
+        "expanded AttentionBackward should emit matmul/dot HLO"
+    );
+}
+
+#[test]
 fn conv_emits_convolution_opcode() {
     let mut g = Graph::new("conv");
     let f = DType::F32;
@@ -488,6 +540,95 @@ fn conv_emits_convolution_opcode() {
     g.set_outputs(vec![y]);
     let b = lower_to_bytes(&g);
     assert!(contains_opcode(&b, "convolution"));
+}
+
+#[test]
+fn conv2d_backward_input_emits_convolution() {
+    let mut g = Graph::new("conv_bwd_in");
+    let f = DType::F32;
+    let dy = g.input("dy", Shape::new(&[1, 6, 8, 8], f));
+    let w = g.param("w", Shape::new(&[6, 3, 3, 3], f));
+    let dx = g.add_node(
+        rlx_ir::Op::Conv2dBackwardInput {
+            kernel_size: vec![3, 3],
+            stride: vec![1, 1],
+            padding: vec![1, 1],
+            dilation: vec![1, 1],
+            groups: 1,
+        },
+        vec![dy, w],
+        Shape::new(&[1, 3, 8, 8], f),
+    );
+    g.set_outputs(vec![dx]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "convolution"),
+        "Conv2dBackwardInput should emit HLO convolution"
+    );
+    assert!(
+        contains_opcode(&b, "transpose"),
+        "Conv2dBackwardInput flips feature dims via transpose"
+    );
+}
+
+#[test]
+fn conv2d_backward_weight_emits_convolution() {
+    let mut g = Graph::new("conv_bwd_w");
+    let f = DType::F32;
+    let x = g.input("x", Shape::new(&[1, 3, 8, 8], f));
+    let dy = g.input("dy", Shape::new(&[1, 6, 8, 8], f));
+    let dw = g.add_node(
+        rlx_ir::Op::Conv2dBackwardWeight {
+            kernel_size: vec![3, 3],
+            stride: vec![1, 1],
+            padding: vec![1, 1],
+            dilation: vec![1, 1],
+            groups: 1,
+        },
+        vec![x, dy],
+        Shape::new(&[6, 3, 3, 3], f),
+    );
+    g.set_outputs(vec![dw]);
+    let b = lower_to_bytes(&g);
+    assert!(
+        contains_opcode(&b, "convolution"),
+        "Conv2dBackwardWeight should emit HLO convolution"
+    );
+}
+
+#[test]
+fn fused_conv_bias_act_unfuses_to_convolution() {
+    use rlx_ir::op::Activation;
+    let mut g = Graph::new("fcba");
+    let f = DType::F32;
+    let x = g.input("x", Shape::new(&[1, 1, 4, 4], f));
+    let w = g.param("w", Shape::new(&[1, 1, 1, 1], f));
+    let b = g.param("bias", Shape::new(&[1], f));
+    let y = g.add_node(
+        rlx_ir::Op::FusedConvBiasAct {
+            kernel_size: vec![1, 1],
+            stride: vec![1, 1],
+            padding: vec![0, 0],
+            dilation: vec![1, 1],
+            groups: 1,
+            activation: Some(Activation::Relu),
+            has_residual: false,
+        },
+        vec![x, w, b],
+        Shape::new(&[1, 1, 4, 4], f),
+    );
+    g.set_outputs(vec![y]);
+    let prepared = rlx_tpu::ir_passes::prepare_graph_for_hlo(g);
+    assert!(
+        !prepared
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, rlx_ir::Op::FusedConvBiasAct { .. })),
+        "FusedConvBiasAct must expand before HLO"
+    );
+    let b = lower_to_bytes(&prepared);
+    assert!(contains_opcode(&b, "convolution"));
+    assert!(contains_opcode(&b, "maximum"), "ReLU → maximum");
 }
 
 #[test]

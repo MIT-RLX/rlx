@@ -2430,6 +2430,15 @@
         layer: EnvLayer::Tooling,
     },
     EnvVarEntry {
+        name: "RLX_VMATH_ACCURATE",
+        group: "cpu",
+        summary: "CPU vmath exp/tanh/log/sqrt: use Accelerate/libm accurate path (default 0 = SIMD *_fast)",
+        kind: EnvKind::BoolOr { default: false },
+        stability: EnvStability::Public,
+        aliases: &[],
+        layer: EnvLayer::Backend("cpu"),
+    },
+    EnvVarEntry {
         name: "RLX_VERBOSE",
         group: "debug",
         summary: "Extra runtime logging",

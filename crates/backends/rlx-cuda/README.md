@@ -83,11 +83,15 @@ self-hosted Linux box.
   attention, conv, etc.). Compiled via NVRTC at first dispatch and
   cached behind `OnceLock`s.
 - `kernels/mod.rs` — NVRTC compile + module/function loader.
-- `backend.rs` — `CudaExecutable`. Full IR coverage via the dispatch
-  tier ladder below.
+- `backend.rs` — `CudaExecutable`. Full **153/`OpKind`** claim
+  ([`docs/op-coverage.md`](../../docs/op-coverage.md)); native shared
+  `rlx-gpu-kernels` for training bwd, QAT, Gru/Rnn/Mamba2, FftButterfly,
+  packed-I8 `QMatMul`/`QConv2d`; DenseSolve via cuSOLVER / cuBLAS batched LU.
+  Dispatch tier ladder below for matmul.
 - **FFT** — `fft_dispatch.rs` runs the shared `rlx-gpu-kernels` FFT plan
   on pow-2 f32; `fft_host.rs` handles partial sync for other shapes/dtypes.
   Multi-stage row copies use a dtod copy kernel (no D2H/H2D staging).
+  `FftButterflyStage` is a native shared `.cu` kernel.
 
 ## Matmul dispatch tier decision tree
 
@@ -265,6 +269,8 @@ Env diagnostics / ablation:
 | Variable | Effect |
 |----------|--------|
 | `RLX_CUDA_COMPILE_MODE=aot` | NVRTC prewarm all kernels at compile (once per process). |
+| `RLX_CUDA_CONV_T_KERNEL=1` | Force naive `conv_transpose2d` CUDA kernel (skip cuDNN BackwardData). |
+| `RLX_CUDA_CONV_T_CUDNN=1` | (legacy) no-op; cuDNN is the default for ConvTranspose2d. |
 | `RLX_CUDA_EXEC_MODE=graph` | Capture schedule into a CUDA Graph on first run; replay thereafter. D2H for outputs is captured inside the graph. |
 | `RLX_CUDA_PTX_CACHE` | Directory for persistent NVRTC PTX cache (default: `~/.cache/rlx-cuda`). |
 | `RLX_CUDA_PARITY=1` | Encoder/CPU parity: strict f32 cuBLASLt (`CUBLAS_COMPUTE_32F`), tiled `matmul.cu` instead of cuBLASLt/cuBLAS heuristics. Implies `RLX_CUDA_NO_TF32`. |

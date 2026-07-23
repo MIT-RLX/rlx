@@ -33,6 +33,11 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Where,
         Fma,
         ElementwiseRegion,
+        // Claimed for legalize / FK fusion; `expand::prepare_graph_for_thunks`
+        // runs `DecomposeFusionRegions` before thunks (CPU has no native FKL
+        // region executor beyond plain ElementwiseRegion).
+        TransformRegion,
+        BatchElementwiseRegion,
         MatMul,
         DotGeneral,
         DenseSolve,
@@ -85,6 +90,10 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         ScaledQuantize,
         ScaledQuantScale,
         ScaledDequantize,
+        Quantize,
+        Dequantize,
+        QMatMul,
+        QConv2d,
         SelectiveScan,
         GatedDeltaNet,
         Lstm,
@@ -96,6 +105,15 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         FusedResidualLN,
         FusedResidualRmsNorm,
         FusedAttentionBlock,
+        // Claimed then expanded by `expand::expand_cpu_nop_fused` (CPU thunk
+        // catch-all would Nop these — same pattern as Metal / OneAPI).
+        FusedConvBiasAct,
+        FusedTransformerLayer,
+        PartitionedConv,
+        // Claimed; `LowerControlFlow` (fusion + CpuBackend::compile) expands
+        // to Where / unrolled body replicas before thunks.
+        If,
+        While,
         AdaLayerNorm,
         GatedResidual,
         AdaLayerNormBackward,

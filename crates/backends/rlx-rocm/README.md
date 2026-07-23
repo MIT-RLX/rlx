@@ -10,6 +10,8 @@ CUDA driver API.
 - **Matmul** — hipBLAS / hipBLASLt (with `GemmEx` for mixed precision).
 - **Eigensolver** — hipSOLVER `SsyevjBatched` for `Op::Eigh` / `Op::EighBatch`
   (`n ≤ 32`); larger `n` uses the CPU host path.
+- **DenseSolve** — hipSOLVER `Sgetrf`/`Sgetrs` + hipBLAS batched LU for
+  `DenseSolve` / `BatchedDenseSolve` (F32); other dtypes HostOp → LAPACK.
 - **Convolution / pooling** — MIOpen, including 4D and N-D primitives.
 - **Custom kernels** — hipRTC-compiled, cached on disk.
 - **hipGraph** — capture + replay.

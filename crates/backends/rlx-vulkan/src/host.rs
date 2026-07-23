@@ -3,11 +3,12 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! CPU host-fallback for ops that have no native SPIR-V kernel yet (the
-//! sequential / specialized families: RNN, Mamba2, GatedDeltaNet,
-//! ConvTranspose2d, FFT). Each fallback builds a one-op CPU graph, runs it
-//! through `rlx-cpu`'s thunk executor (the same kernels the CPU backend uses,
-//! so results are bit-for-bit the reference), and returns the f32 output.
+//! CPU host-fallback for ops that have no native SPIR-V kernel yet (or that
+//! exceed a native size cap): oversized Lstm/Gru/Rnn/Mamba2, FFT, GGUF
+//! dequant, and specialized families. Each fallback builds a one-op CPU
+//! graph, runs it through `rlx-cpu`'s thunk executor (the same kernels the
+//! CPU backend uses, so results are bit-for-bit the reference), and returns
+//! the f32 output.
 //!
 //! Because the Vulkan arena is HOST_VISIBLE + mapped, the executor reads the
 //! op's inputs straight out of the arena and writes the result straight back —

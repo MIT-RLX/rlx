@@ -1,0 +1,40 @@
+#version 450
+// Softmax cross-entropy backward (integer labels), one invocation per row:
+//   dlogits[n,c] = (softmax(logits[n])[c] - [c==label]) * d_loss[n]
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint outer;
+    uint inner;
+    uint logits_off;
+    uint labels_off;
+    uint d_loss_off;
+    uint out_off;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.outer || pc.inner == 0u) { return; }
+    uint lbase = pc.logits_off + row * pc.inner;
+    uint obase = pc.out_off + row * pc.inner;
+
+    float m = arena_load(lbase);
+    for (uint i = 1u; i < pc.inner; i++) {
+        m = max(m, arena_load(lbase + i));
+    }
+
+    float s = 0.0;
+    for (uint i = 0u; i < pc.inner; i++) {
+        s += exp(arena_load(lbase + i) - m);
+    }
+    float inv = 1.0 / s;
+    float scale = arena_load(pc.d_loss_off + row);
+    uint label = uint(arena_load(pc.labels_off + row));
+    if (label >= pc.inner) { label = pc.inner - 1u; }
+
+    for (uint k = 0u; k < pc.inner; k++) {
+        float p = exp(arena_load(lbase + k) - m) * inv;
+        float oh = (k == label) ? 1.0 : 0.0;
+        arena_store(obase + k, (p - oh) * scale);
+    }
+}

@@ -1,0 +1,80 @@
+#version 450
+// GroupNorm (NCHW) backward w.r.t. input.
+// One invocation per (batch, group); serial reductions. Matches WGSL /
+// CUDA `group_norm_bwd_input`.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint c;
+    uint h;
+    uint w;
+    uint num_groups;
+    uint x_off;
+    uint gamma_off;
+    uint dy_off;
+    uint out_off;
+    float eps;
+} pc;
+
+void main() {
+    uint ng = gl_GlobalInvocationID.x;
+    if (ng >= pc.n * pc.num_groups) { return; }
+    uint bn = ng / pc.num_groups;
+    uint g = ng % pc.num_groups;
+    uint spatial = pc.h * pc.w;
+    uint plane = pc.c * spatial;
+    uint cpg = pc.c / pc.num_groups;
+    float n_inv = 1.0 / float(cpg * spatial);
+    uint c0 = g * cpg;
+    uint b_base = bn * plane;
+
+    float mean = 0.0;
+    for (uint ci = 0u; ci < cpg; ci++) {
+        uint base = pc.x_off + b_base + (c0 + ci) * spatial;
+        for (uint s = 0u; s < spatial; s++) {
+            mean += arena_load(base + s);
+        }
+    }
+    mean *= n_inv;
+
+    float var_ = 0.0;
+    for (uint ci = 0u; ci < cpg; ci++) {
+        uint base = pc.x_off + b_base + (c0 + ci) * spatial;
+        for (uint s = 0u; s < spatial; s++) {
+            float d = arena_load(base + s) - mean;
+            var_ += d * d;
+        }
+    }
+    float inv_std = inversesqrt(var_ * n_inv + pc.eps);
+
+    float s_sy = 0.0;
+    float s_sxh = 0.0;
+    for (uint ci = 0u; ci < cpg; ci++) {
+        uint gi = c0 + ci;
+        float gamm = arena_load(pc.gamma_off + gi);
+        uint x_base = pc.x_off + b_base + gi * spatial;
+        uint dy_base = pc.dy_off + b_base + gi * spatial;
+        for (uint s = 0u; s < spatial; s++) {
+            float xh = (arena_load(x_base + s) - mean) * inv_std;
+            float sy = arena_load(dy_base + s) * gamm;
+            s_sy += sy;
+            s_sxh += sy * xh;
+        }
+    }
+    float m_sy = s_sy * n_inv;
+    float m_sxh = s_sxh * n_inv;
+
+    for (uint ci = 0u; ci < cpg; ci++) {
+        uint gi = c0 + ci;
+        float gamm = arena_load(pc.gamma_off + gi);
+        uint x_base = pc.x_off + b_base + gi * spatial;
+        uint dy_base = pc.dy_off + b_base + gi * spatial;
+        uint out_base = pc.out_off + b_base + gi * spatial;
+        for (uint s = 0u; s < spatial; s++) {
+            float xh = (arena_load(x_base + s) - mean) * inv_std;
+            float sy = arena_load(dy_base + s) * gamm;
+            arena_store(out_base + s, inv_std * (sy - m_sy - xh * m_sxh));
+        }
+    }
+}

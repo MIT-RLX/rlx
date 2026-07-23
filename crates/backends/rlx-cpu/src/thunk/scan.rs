@@ -181,22 +181,50 @@ pub fn eval_single_op_f32(
     out_shape: &rlx_ir::Shape,
     inputs: &[(rlx_ir::Shape, &[f32])],
 ) -> Vec<f32> {
+    let n = out_shape
+        .num_elements()
+        .unwrap_or(0)
+        .max(out_shape.size_bytes().unwrap_or(0).div_ceil(4));
+    // Fast path: Kitten discrete wgpu packs ~1000 Binary/Activation HostOps per
+    // infer. Building a mini-graph + plan_memory + compile_thunks each time was
+    // the dominant cost (~17s hello). Direct kernels keep numerics identical.
+    if let Some(y) = eval_elementwise_fast(op, n, inputs) {
+        return y;
+    }
+    // wgpu (and HostOp packed staging) store every tensor as f32-uniform,
+    // including Bool masks as 0.0/1.0. Building the mini-graph with the IR's
+    // native Bool/I64 dtypes makes `plan_memory` allocate 1-byte Bool slots;
+    // `slice_mut` then returns `size/4` f32 lanes and
+    // `arena.slice_mut(out)[..num_elements]` panics
+    // (`range end index N out of range for slice of length N/4`).
+    //
+    // Wide dtypes (C64/C128/F64) keep their IR dtype so CPU thunks that read
+    // multi-lane elements still see the right layout; lane count is
+    // `size_bytes/4`.
+    fn host_shape(sh: &rlx_ir::Shape) -> rlx_ir::Shape {
+        match sh.dtype() {
+            rlx_ir::DType::C64 | rlx_ir::DType::C128 | rlx_ir::DType::F64 => sh.clone(),
+            _ => sh.clone().with_dtype(rlx_ir::DType::F32),
+        }
+    }
     let mut g = Graph::new("scan_eval_single_op");
     let ids: Vec<NodeId> = inputs
         .iter()
         .enumerate()
         .map(|(i, (sh, _))| {
+            let sh_use = host_shape(sh);
             g.append_node(
                 Op::Input {
                     name: format!("in{i}"),
                 },
                 vec![],
-                sh.clone(),
+                sh_use,
                 None,
             )
         })
         .collect();
-    let out = g.append_node(op.clone(), ids.clone(), out_shape.clone(), None);
+    let out_use = host_shape(out_shape);
+    let out = g.append_node(op.clone(), ids.clone(), out_use.clone(), None);
     g.set_outputs(vec![out]);
     let plan = rlx_opt::memory::plan_memory_aligned(&g, 16);
     let mut arena = crate::arena::Arena::from_plan(plan);
@@ -207,8 +235,117 @@ pub fn eval_single_op_f32(
     }
     let schedule = crate::thunk::compile_thunks(&g, &arena);
     crate::thunk::execute_thunks(&schedule, arena.raw_buf_mut());
-    let n = out_shape.num_elements().unwrap_or(0);
+    let n = out_use
+        .size_bytes()
+        .unwrap_or(0)
+        .div_ceil(4)
+        .max(out_use.num_elements().unwrap_or(0));
     arena.slice_mut(out)[..n].to_vec()
+}
+
+fn eval_elementwise_fast(
+    op: &Op,
+    n: usize,
+    inputs: &[(rlx_ir::Shape, &[f32])],
+) -> Option<Vec<f32>> {
+    use crate::thunk::{apply_activation_inplace, region_binary_scalar};
+    use rayon::prelude::*;
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    match op {
+        Op::Binary(bop) if inputs.len() == 2 => {
+            let a = inputs[0].1;
+            let b = inputs[1].1;
+            let a_n = a.len().max(1);
+            let b_n = b.len().max(1);
+            let mut y = vec![0f32; n];
+            if n < 4096 {
+                if a_n == n && b_n == n {
+                    for i in 0..n {
+                        y[i] = region_binary_scalar(*bop, a[i], b[i]);
+                    }
+                } else if a_n == 1 && b_n == n {
+                    let av = a[0];
+                    for i in 0..n {
+                        y[i] = region_binary_scalar(*bop, av, b[i]);
+                    }
+                } else if a_n == n && b_n == 1 {
+                    let bv = b[0];
+                    for i in 0..n {
+                        y[i] = region_binary_scalar(*bop, a[i], bv);
+                    }
+                } else {
+                    for i in 0..n {
+                        y[i] = region_binary_scalar(*bop, a[i % a_n], b[i % b_n]);
+                    }
+                }
+            } else if a_n == n && b_n == n {
+                y.par_iter_mut().enumerate().for_each(|(i, out)| {
+                    *out = region_binary_scalar(*bop, a[i], b[i]);
+                });
+            } else if a_n == 1 && b_n == n {
+                let av = a[0];
+                y.par_iter_mut().enumerate().for_each(|(i, out)| {
+                    *out = region_binary_scalar(*bop, av, b[i]);
+                });
+            } else if a_n == n && b_n == 1 {
+                let bv = b[0];
+                y.par_iter_mut().enumerate().for_each(|(i, out)| {
+                    *out = region_binary_scalar(*bop, a[i], bv);
+                });
+            } else {
+                // General broadcast via modulus (equal-rank trailing).
+                y.par_iter_mut().enumerate().for_each(|(i, out)| {
+                    *out = region_binary_scalar(*bop, a[i % a_n], b[i % b_n]);
+                });
+            }
+            Some(y)
+        }
+        Op::Activation(act) if inputs.len() == 1 => {
+            let src = inputs[0].1;
+            let mut y = if src.len() >= n {
+                src[..n].to_vec()
+            } else if src.len() == 1 {
+                vec![src[0]; n]
+            } else {
+                (0..n).map(|i| src[i % src.len().max(1)]).collect()
+            };
+            apply_activation_inplace(&mut y, *act);
+            Some(y)
+        }
+        Op::Where if inputs.len() == 3 => {
+            let c = inputs[0].1;
+            let t = inputs[1].1;
+            let f = inputs[2].1;
+            let cn = c.len().max(1);
+            let tn = t.len().max(1);
+            let fn_ = f.len().max(1);
+            let mut y = vec![0f32; n];
+            y.par_iter_mut().enumerate().for_each(|(i, out)| {
+                *out = if c[i % cn] != 0.0 {
+                    t[i % tn]
+                } else {
+                    f[i % fn_]
+                };
+            });
+            Some(y)
+        }
+        Op::Fma if inputs.len() == 3 => {
+            let a = inputs[0].1;
+            let b = inputs[1].1;
+            let c = inputs[2].1;
+            let an = a.len().max(1);
+            let bn = b.len().max(1);
+            let cn = c.len().max(1);
+            let mut y = vec![0f32; n];
+            y.par_iter_mut().enumerate().for_each(|(i, out)| {
+                *out = a[i % an].mul_add(b[i % bn], c[i % cn]);
+            });
+            Some(y)
+        }
+        _ => None,
+    }
 }
 
 /// Selectively unroll short Scans (see [`rlx_opt::control_flow::maybe_unroll_scans`]).

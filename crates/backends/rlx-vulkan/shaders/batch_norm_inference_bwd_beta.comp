@@ -1,0 +1,22 @@
+#version 450
+// BatchNormInferenceBackwardBeta: one work-item per channel.
+// dβ_c = Σ dy over rows.
+layout(local_size_x = 64) in;
+
+
+layout(push_constant) uniform PC {
+    uint count;
+    uint channels;
+    uint dy_off;
+    uint out_off;
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.channels) { return; }
+    float acc = 0.0;
+    for (uint row = 0u; row < pc.count; row++) {
+        acc += arena_load(pc.dy_off + row * pc.channels + c);
+    }
+    arena_store(pc.out_off + c, acc);
+}

@@ -58,7 +58,11 @@ fn c64_add_sub_exact() {
     let a = [1.0f32, 2.0, 3.0, 4.0];
     let b = [5.0f32, 6.0, 7.0, -8.0];
     // add = (6+8i, 10-4i); sub = (-4-4i, -4+12i).
-    approx(&c64_binary(BinaryOp::Add, 2, &a, &b), &[6.0, 8.0, 10.0, -4.0], 0.0);
+    approx(
+        &c64_binary(BinaryOp::Add, 2, &a, &b),
+        &[6.0, 8.0, 10.0, -4.0],
+        0.0,
+    );
     approx(
         &c64_binary(BinaryOp::Sub, 2, &a, &b),
         &[-4.0, -4.0, -4.0, 12.0],
@@ -133,11 +137,7 @@ fn cast_c64_c128_roundtrip() {
     // C64 (1.5+2.5i, -3+4i) → C128 df64 (lo lanes 0 for f32-exact values).
     let c64 = [1.5f32, 2.5, -3.0, 4.0];
     let c128 = cast(2, DType::C64, DType::C128, &c64);
-    approx(
-        &c128,
-        &[1.5, 0.0, 2.5, 0.0, -3.0, 0.0, 4.0, 0.0],
-        0.0,
-    );
+    approx(&c128, &[1.5, 0.0, 2.5, 0.0, -3.0, 0.0, 4.0, 0.0], 0.0);
     // C128 → C64 drops the df64 `lo` lanes (keeps `hi`).
     approx(&cast(2, DType::C128, DType::C64, &c128), &c64, 0.0);
 }
@@ -213,7 +213,11 @@ fn expand_complex_materialized() {
         1.5, 0.0, -2.5, 0.0, 1.5, 0.0, -2.5, 0.0, 1.5, 0.0, -2.5, 0.0, 3.25, 0.0, -4.75, 0.0, 3.25,
         0.0, -4.75, 0.0, 3.25, 0.0, -4.75, 0.0,
     ];
-    approx(&expand(&[2, 1], &[2, 3], DType::C128, &c128), &c128_out, 0.0);
+    approx(
+        &expand(&[2, 1], &[2, 3], DType::C128, &c128),
+        &c128_out,
+        0.0,
+    );
 }
 
 // ── Gate 4: OTHER element-indexed movement ops must stay lane-paired too ─────
@@ -293,7 +297,11 @@ fn concat_complex() {
     let mut g = Graph::new("ccat");
     let x = g.input("a", Shape::new(&[2], DType::C64));
     let y = g.input("b", Shape::new(&[3], DType::C64));
-    let z = g.add_node(Op::Concat { axis: 0 }, vec![x, y], Shape::new(&[5], DType::C64));
+    let z = g.add_node(
+        Op::Concat { axis: 0 },
+        vec![x, y],
+        Shape::new(&[5], DType::C64),
+    );
     g.set_outputs(vec![z]);
     approx(
         &run1(g, &[("a", &a), ("b", &b)]),
@@ -315,7 +323,11 @@ fn gather_complex() {
     let mut g = Graph::new("cgat");
     let t = g.input("t", Shape::new(&[4], DType::C64));
     let ix = g.input("ix", Shape::new(&[4], DType::I64));
-    let z = g.add_node(Op::Gather { axis: 0 }, vec![t, ix], Shape::new(&[4], DType::C64));
+    let z = g.add_node(
+        Op::Gather { axis: 0 },
+        vec![t, ix],
+        Shape::new(&[4], DType::C64),
+    );
     g.set_outputs(vec![z]);
     // gathered: elem2, elem0, elem3, elem1.
     approx(

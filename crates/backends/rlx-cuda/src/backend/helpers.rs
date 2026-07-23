@@ -29,20 +29,27 @@ use crate::device::{
 };
 use crate::kernels::{
     ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, attention_row_kernel, batch_elementwise_region_kernel, binary_kernel,
-    compare_kernel, concat_kernel, conv_transpose2d_kernel, conv1d_kernel, conv2d_kernel,
-    conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel,
-    fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
-    fused_residual_rms_norm_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
-    gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
-    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, layer_norm2d_kernel, layernorm_kernel,
-    matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel,
-    narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
-    resize_nearest_2x_kernel, rms_norm_backward_kernel, rms_norm_bwd_zero_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_acc_kernel,
-    scatter_add_zero_kernel, selective_scan_kernel, softmax_kernel, topk_kernel, transpose_kernel,
-    unary_kernel, where_kernel,
+    attention_kernel, attention_row_kernel, axial_rope2d_kernel, batch_elementwise_region_kernel,
+    batch_norm_inference_bwd_beta_kernel, batch_norm_inference_bwd_gamma_kernel,
+    batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_kernel,
+    compare_kernel, concat_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel,
+    conv2d_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel,
+    dequant_matmul_kernel, dequantize_i8_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw,
+    elementwise_region_kernel, expand_kernel, fake_quantize_backward_kernel,
+    fake_quantize_ema_kernel, fake_quantize_fixed_kernel, fake_quantize_lsq_bwd_scale_kernel,
+    fake_quantize_lsq_bwd_x_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
+    fma_kernel, fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
+    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
+    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
+    gather_backward_kernel, gather_kernel, group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel,
+    group_norm_bwd_input_kernel, group_norm_kernel, grouped_matmul_kernel, gru_kernel,
+    im2col_kernel, layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel, layer_norm2d_kernel,
+    layernorm_kernel, mamba2_kernel, matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel,
+    maxpool2d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
+    quantize_i8_kernel, reduce_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
+    rms_norm_bwd_zero_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
+    scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel, softmax_kernel,
+    topk_kernel, transpose_kernel, unary_kernel, where_kernel,
 };
 
 use super::{CompileMode, ExecMode, Step};
@@ -81,7 +88,13 @@ pub(crate) fn schedule_needs_dnn(schedule: &[Step]) -> bool {
     schedule.iter().any(|s| {
         matches!(
             s,
-            Step::Conv1d { .. } | Step::Conv2d { .. } | Step::Conv3d { .. }
+            Step::Conv1d { .. }
+                | Step::Conv2d { .. }
+                | Step::Conv3d { .. }
+                | Step::ConvTranspose2d { .. }
+                | Step::ConvTranspose3d { .. }
+                | Step::Conv2dBackwardInput { .. }
+                | Step::Conv2dBackwardWeight { .. }
         )
     })
 }
@@ -1656,6 +1669,7 @@ pub(crate) fn activation_op_id(act: Activation) -> u32 {
         Activation::Cos => 14,
         Activation::Tan => 15,
         Activation::Atan => 16,
+        Activation::Recip => 17,
     }
 }
 
@@ -1848,6 +1862,11 @@ pub(crate) fn prewarm_all_kernels(ctx: &Arc<CudaContext>) {
     let _ = where_kernel(ctx);
     let _ = reduce_kernel(ctx);
     let _ = softmax_kernel(ctx);
+    let _ = relu_backward_kernel(ctx);
+    let _ = activation_backward_kernel(ctx);
+    let _ = softmax_cross_entropy_kernel(ctx);
+    let _ = softmax_cross_entropy_with_logits_kernel(ctx);
+    let _ = softmax_cross_entropy_backward_kernel(ctx);
     let _ = layernorm_kernel(ctx);
     let _ = fused_residual_ln_kernel(ctx);
     let _ = fused_residual_rms_norm_kernel(ctx);
@@ -1877,6 +1896,9 @@ pub(crate) fn prewarm_all_kernels(ctx: &Arc<CudaContext>) {
     let _ = sample_kernel(ctx);
     let _ = selective_scan_kernel(ctx);
     let _ = gated_delta_net_kernel(ctx);
+    let _ = gru_kernel(ctx);
+    let _ = rnn_kernel(ctx);
+    let _ = mamba2_kernel(ctx);
     let _ = pool1d_kernel(ctx);
     let _ = pool2d_kernel(ctx);
     let _ = pool3d_kernel(ctx);
@@ -1886,20 +1908,38 @@ pub(crate) fn prewarm_all_kernels(ctx: &Arc<CudaContext>) {
     let _ = conv3d_kernel(ctx);
     let _ = layer_norm2d_kernel(ctx);
     let _ = conv_transpose2d_kernel(ctx);
+    let _ = conv_transpose3d_kernel(ctx);
+    let _ = fused_swiglu_kernel(ctx);
+    let _ = axial_rope2d_kernel(ctx);
+    let _ = fft_butterfly_stage_kernel(ctx);
     let _ = group_norm_kernel(ctx);
+    let _ = group_norm_bwd_input_kernel(ctx);
+    let _ = group_norm_bwd_gamma_kernel(ctx);
+    let _ = group_norm_bwd_beta_kernel(ctx);
+    let _ = batch_norm_inference_kernel(ctx);
+    let _ = batch_norm_inference_bwd_input_kernel(ctx);
+    let _ = batch_norm_inference_bwd_gamma_kernel(ctx);
+    let _ = batch_norm_inference_bwd_beta_kernel(ctx);
+    let _ = layer_norm_bwd_input_kernel(ctx);
+    let _ = layer_norm_bwd_gamma_kernel(ctx);
+    let _ = fake_quantize_fixed_kernel(ctx);
+    let _ = fake_quantize_perbatch_kernel(ctx);
+    let _ = fake_quantize_ema_kernel(ctx);
+    let _ = fake_quantize_lsq_bwd_x_kernel(ctx);
+    let _ = fake_quantize_lsq_bwd_scale_kernel(ctx);
+    let _ = fake_quantize_backward_kernel(ctx);
+    let _ = quantize_i8_kernel(ctx);
+    let _ = dequantize_i8_kernel(ctx);
     let _ = resize_nearest_2x_kernel(ctx);
     let _ = elementwise_region_kernel(ctx);
     let _ = batch_elementwise_region_kernel(ctx);
+    let _ = fma_kernel(ctx);
     // matmul_wmma deliberately excluded: requires SM 70+ and may fail
     // load_module on older GPUs. Compile lazily on first opt-in dispatch.
 }
 
 pub(crate) fn im2col_use_gpu(n: u32, exec_mode: ExecMode) -> bool {
     crate::runtime_config().im2col_use_gpu(n, exec_mode)
-}
-
-pub(crate) fn pinned_host_io_disabled() -> bool {
-    crate::runtime_config().pinned_host_io_disabled()
 }
 
 /// Pinned host output staging (faster D2H). On by default; set `RLX_CUDA_PINNED_IO=0` to disable.

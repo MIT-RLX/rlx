@@ -117,6 +117,20 @@ Vulkan/DX12 visibility correct.
 | `RLX_DISPATCH_REPORT=1` | Per-step dispatch report |
 | `RLX_WGPU_NO_PACKED_BSHD_ATTN=1` | Disable packed QKV attention stride path |
 | `RLX_WGPU_DUMP_NODES=1` | Per-node max-abs dump after run (debug) |
+| `RLX_WGPU_FORCE_HOST=1` | Host-fallback all risky SPIR-V paths |
+| `RLX_WGPU_SHARD_GPU=1` | Opt out of discrete/sharded host packing (unsafe for Kitten NSF) |
+| `RLX_WGPU_DISCRETE_HOST=1` | Extra discrete hosting via `wgpu_prefer_host_fallback` |
+| `RLX_WGPU_HOST_BUFFER_COPY=1` | Force host round-trip for BufferCopy |
+| `RLX_WGPU_HOST_EAGER_H2D=1` | Write every HostOp/Conv output to the device immediately (default: defer until Expand/Concat/GPU/readback) |
+| `RLX_WGPU_HOST_MATMUL=1` | Pack MatMul as HostOp |
+| `RLX_WGPU_CONV_HOST=1` | Force Conv2d host path |
+
+**Discrete Vulkan/DX12 (Kitten NSF):** Binary/Activation/Where/Fma, norms,
+Expand/Concat/Transpose/Narrow, and Conv stay on the host (SPIR-V elementwise
+and structure paths collapse audio). MatMul and unsharded BufferCopy stay on
+GPU. Host→Host streaks reuse a tensor mirror (`HostTensorCache`) and skip empty
+compute encodes between host steps; deferred H2D batches uploads before the
+next device-reading step.
 
 **EEG-DINO parity notes:** compile runs `LegalizeBroadcast` before fusion
 (mid-axis `[1,C,1,D]+[1,C,P,D]` needs `Expand`) and unfuses

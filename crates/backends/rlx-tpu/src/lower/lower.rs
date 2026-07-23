@@ -236,6 +236,203 @@ impl<'a> LowerCtx<'a> {
                 self.lower_fused_residual_ln(&n.inputs, *has_bias, *eps, out_shape)
             }
 
+            Op::Fma => self.lower_fma(n.inputs[0], n.inputs[1], n.inputs[2], out_shape),
+
+            Op::LayerNorm2d { eps } => {
+                self.lower_layer_norm2d(n.inputs[0], n.inputs[1], n.inputs[2], *eps, out_shape)
+            }
+
+            Op::FakeQuantize {
+                bits,
+                axis,
+                ste: _,
+                scale_mode,
+            } => self.lower_fake_quantize(&n.inputs, *bits, *axis, *scale_mode, out_shape),
+
+            Op::FakeQuantizeLSQ { bits, axis } => {
+                self.lower_fake_quantize_lsq(&n.inputs, *bits, *axis, out_shape)
+            }
+            Op::FakeQuantizeBackward { bits, axis, ste } => self.lower_fake_quantize_backward(
+                n.inputs[0],
+                n.inputs[1],
+                *bits,
+                *axis,
+                *ste,
+                out_shape,
+            ),
+            Op::FakeQuantizeLSQBackwardX { bits, axis } => self.lower_fake_quantize_lsq_backward_x(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                *bits,
+                *axis,
+                out_shape,
+            ),
+            Op::FakeQuantizeLSQBackwardScale { bits, axis } => self
+                .lower_fake_quantize_lsq_backward_scale(
+                    n.inputs[0],
+                    n.inputs[1],
+                    n.inputs[2],
+                    *bits,
+                    *axis,
+                    out_shape,
+                ),
+
+            Op::ArgMax { axis, keep_dim } => {
+                self.lower_argmax_argmin(n.inputs[0], *axis, *keep_dim, true, out_shape)
+            }
+            Op::ArgMin { axis, keep_dim } => {
+                self.lower_argmax_argmin(n.inputs[0], *axis, *keep_dim, false, out_shape)
+            }
+
+            Op::ComplexNormSq => self.lower_complex_norm_sq(n.inputs[0], out_shape),
+            Op::Conjugate => self.lower_conjugate(n.inputs[0], out_shape),
+            Op::ComplexNormSqBackward => {
+                self.lower_complex_norm_sq_backward(n.inputs[0], n.inputs[1], out_shape)
+            }
+
+            Op::ReluBackward => self.lower_relu_backward(n.inputs[0], n.inputs[1], out_shape),
+
+            Op::LayerNormBackwardInput { axis, eps } => self.lower_layer_norm_backward_input(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                *axis,
+                *eps,
+                out_shape,
+            ),
+            Op::LayerNormBackwardGamma { axis, eps } => self.lower_layer_norm_backward_gamma(
+                n.inputs[0],
+                n.inputs[1],
+                *axis,
+                *eps,
+                out_shape,
+            ),
+            Op::RmsNormBackwardInput { axis, eps } => self.lower_rms_norm_backward_input(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                n.inputs[3],
+                *axis,
+                *eps,
+                out_shape,
+            ),
+            Op::RmsNormBackwardGamma { axis, eps } => self.lower_rms_norm_backward_gamma(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                n.inputs[3],
+                *axis,
+                *eps,
+                out_shape,
+            ),
+            Op::RmsNormBackwardBeta { axis, .. } => self.lower_rms_norm_backward_beta(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                n.inputs[3],
+                *axis,
+                out_shape,
+            ),
+            Op::GroupNormBackwardInput { num_groups, eps } => self.lower_group_norm_backward_input(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                n.inputs[3],
+                *num_groups,
+                *eps,
+                out_shape,
+            ),
+            Op::GroupNormBackwardGamma { num_groups, eps } => self.lower_group_norm_backward_gamma(
+                n.inputs[0],
+                n.inputs[1],
+                *num_groups,
+                *eps,
+                out_shape,
+            ),
+            Op::GroupNormBackwardBeta { .. } => {
+                self.lower_group_norm_backward_beta(n.inputs[1], out_shape)
+            }
+            Op::CumsumBackward { axis, exclusive } => {
+                self.lower_cumsum_backward(n.inputs[0], *axis, *exclusive, out_shape)
+            }
+            Op::GatherBackward { axis } => {
+                self.lower_gather_backward(n.inputs[0], n.inputs[1], *axis, out_shape)
+            }
+            Op::RopeBackward { head_dim, n_rot } => self.lower_rope_backward(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                *head_dim,
+                *n_rot,
+                out_shape,
+            ),
+
+            Op::Conv2dBackwardInput {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => self.lower_conv2d_backward_input(
+                n.inputs[0],
+                n.inputs[1],
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                *groups,
+                out_shape,
+            ),
+            Op::Conv2dBackwardWeight {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => self.lower_conv2d_backward_weight(
+                n.inputs[0],
+                n.inputs[1],
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                *groups,
+                out_shape,
+            ),
+            Op::MaxPool2dBackward {
+                kernel_size,
+                stride,
+                padding,
+            } => self.lower_max_pool2d_backward(
+                n.inputs[0],
+                n.inputs[1],
+                kernel_size,
+                stride,
+                padding,
+                out_shape,
+            ),
+
+            Op::Conv3d {
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                let w_dims = self.ir_shape_dims(n.inputs[1]);
+                let kernel_size = vec![w_dims[2] as usize, w_dims[3] as usize, w_dims[4] as usize];
+                self.lower_conv(
+                    n.inputs[0],
+                    n.inputs[1],
+                    &kernel_size,
+                    &stride.to_vec(),
+                    &padding.to_vec(),
+                    &dilation.to_vec(),
+                    *groups,
+                    out_shape,
+                )
+            }
+
             Op::AdaLayerNorm { norm, eps } => {
                 self.lower_ada_layer_norm(&n.inputs, *norm, *eps, out_shape)
             }
@@ -296,6 +493,14 @@ impl<'a> LowerCtx<'a> {
                 let x = self.hlo(n.inputs[0]);
                 let in_dims = self.ir_shape_dims(n.inputs[0]);
                 self.broadcast_to_target(x, &in_dims, out_shape)
+            }
+            Op::Reverse { axes } => {
+                let x = self.hlo(n.inputs[0]);
+                let dims: Vec<i64> = axes.iter().map(|&a| a as i64).collect();
+                self.entry.reverse(x, &dims, out_shape)
+            }
+            Op::ResizeNearest2x => {
+                self.lower_resize_nearest_2x_nchw(self.hlo(n.inputs[0]), n.inputs[0], out_shape)
             }
             Op::Gather { axis } => self.lower_gather(n.inputs[0], n.inputs[1], *axis, out_shape),
 
@@ -450,33 +655,38 @@ impl<'a> LowerCtx<'a> {
                 op_seed: _,
             } => self.lower_rng_uniform(*low, *high, out_shape),
 
-            // Backward / training ops — no rlx-tpu support yet.
-            Op::ReluBackward
-            | Op::ActivationBackward { .. }
-            | Op::MaxPool2dBackward { .. }
-            | Op::Conv2dBackwardInput { .. }
-            | Op::Conv2dBackwardWeight { .. }
+            // Backward / QAT / specialty — either composed in `compose_ops`,
+            // expanded by `prepare_graph_for_hlo` (Lower*), or host-segmented.
+            // Reaching here means a claimed op escaped its decomposition path.
+            Op::ActivationBackward { .. }
             | Op::SoftmaxCrossEntropy
             | Op::SoftmaxCrossEntropyWithLogits
             | Op::SoftmaxCrossEntropyBackward
-            | Op::LayerNormBackwardInput { .. }
-            | Op::LayerNormBackwardGamma { .. }
-            | Op::FakeQuantize { .. }
-            | Op::FakeQuantizeBackward { .. }
-            | Op::FakeQuantizeLSQ { .. }
-            | Op::FakeQuantizeLSQBackwardX { .. }
-            | Op::FakeQuantizeLSQBackwardScale { .. } => panic!(
-                "rlx-tpu: training/backward op {:?} not supported — \
-                 inference only.",
+            | Op::GroupNorm { .. }
+            | Op::BatchNormInference { .. }
+            | Op::BatchNormInferenceBackwardInput { .. }
+            | Op::BatchNormInferenceBackwardGamma { .. }
+            | Op::BatchNormInferenceBackwardBeta
+            | Op::AttentionBackward { .. } => panic!(
+                "rlx-tpu: op {:?} should have been decomposed by prepare_graph_for_hlo \
+                 (Lower* / decompose_backward) or is unsupported — bug in pipeline.",
                 n.op
             ),
 
             // Should have been removed by unfuse — reaching here is
             // a bug in the compile pipeline.
             Op::FusedSwiGLU { .. }
+            | Op::FusedResidualRmsNorm { .. }
             | Op::LoraMatMul { .. }
             | Op::FusedAttentionBlock { .. }
             | Op::FusedTransformerLayer { .. }
+            | Op::FusedConvBiasAct { .. }
+            | Op::PartitionedConv { .. }
+            | Op::GatedDeltaNet { .. }
+            | Op::Gru { .. }
+            | Op::Lstm { .. }
+            | Op::Rnn { .. }
+            | Op::Mamba2 { .. }
             | Op::If { .. }
             | Op::While { .. } => panic!(
                 "rlx-tpu: composed op {:?} should have been unfused \
@@ -506,30 +716,150 @@ impl<'a> LowerCtx<'a> {
                 )
             }
             Op::Custom { name, .. } => panic!(
-                "rlx-tpu: Op::Custom('{name}') has no TPU lowering. \
-                 Custom ops are CPU-only today; either move this op \
-                 onto Device::Cpu or contribute an XLA-side lowering.",
+                "rlx-tpu: Op::Custom('{name}') is host-segmented — graphs \
+                 containing it must compile via segmented orchestration.",
             ),
 
-            // DenseSolve is CPU-only today (uses LAPACK dgesv). No
-            // XLA equivalent in our lowering yet.
-            Op::DenseSolve => panic!(
-                "rlx-tpu: Op::DenseSolve has no TPU lowering — \
-                 use Device::Cpu for graphs containing dense solves.",
+            Op::AxialRope2d {
+                end_x,
+                end_y,
+                head_dim,
+                num_heads,
+                theta,
+                repeat_factor,
+            } => self.lower_axial_rope2d(
+                n.inputs[0],
+                *end_x,
+                *end_y,
+                *head_dim,
+                *num_heads,
+                *theta,
+                *repeat_factor,
+                out_shape,
             ),
 
-            // Op::Scan / ScanBackward* should be rewritten by legalize
-            // (`LowerScan` + backward decompose) before HLO. If any escape,
-            // pin the graph to Device::Cpu rather than silently mislowering.
-            Op::Scan { .. } | Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => panic!(
-                "rlx-tpu: Op::Scan / ScanBackward escaped legalize — \
-                 expected LowerScan / backward decompose. Pin this graph \
-                 to Device::Cpu, or ensure legalize_or_rewrite_for_backend runs."
+            Op::Im2Col {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+            } => self.lower_im2col(
+                n.inputs[0],
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                out_shape,
             ),
 
-            Op::BatchedDenseSolve | Op::CustomFn { .. } => panic!(
-                "rlx-tpu: BatchedDenseSolve / CustomFn have no TPU lowering yet — \
-                 use Device::Cpu.",
+            Op::ConvTranspose2d {
+                kernel_size: _,
+                stride,
+                padding,
+                dilation,
+                output_padding: _,
+                groups,
+            } => self.lower_conv_transpose(
+                n.inputs[0],
+                n.inputs[1],
+                stride,
+                padding,
+                dilation,
+                *groups,
+                out_shape,
+            ),
+
+            Op::ConvTranspose3d {
+                stride,
+                padding,
+                dilation,
+                output_padding: _,
+                groups,
+            } => self.lower_conv_transpose(
+                n.inputs[0],
+                n.inputs[1],
+                &stride.to_vec(),
+                &padding.to_vec(),
+                &dilation.to_vec(),
+                *groups,
+                out_shape,
+            ),
+
+            Op::ScaledMatMul {
+                lhs_format,
+                rhs_format,
+                scale_layout,
+                has_bias,
+            } if scaled_fp8_hlo_ok(*lhs_format, *scale_layout)
+                && scaled_fp8_hlo_ok(*rhs_format, *scale_layout) =>
+            {
+                self.lower_scaled_matmul(
+                    &n.inputs,
+                    *lhs_format,
+                    *rhs_format,
+                    *scale_layout,
+                    *has_bias,
+                    out_shape,
+                )
+            }
+
+            Op::ScaledQuantScale {
+                format,
+                scale_layout,
+            } if scaled_fp8_hlo_ok(*format, *scale_layout) => {
+                self.lower_scaled_quant_scale(n.inputs[0], *format, *scale_layout, out_shape)
+            }
+
+            Op::ScaledDequantize {
+                format,
+                scale_layout,
+            } if scaled_fp8_hlo_ok(*format, *scale_layout) => self.lower_scaled_dequantize(
+                n.inputs[0],
+                n.inputs[1],
+                *format,
+                *scale_layout,
+                out_shape,
+            ),
+
+            // Host-segmented specialty / SPD / non-FP8 scaled / scan.
+            Op::DenseSolve
+            | Op::BatchedDenseSolve
+            | Op::Scan { .. }
+            | Op::ScanBackward { .. }
+            | Op::ScanBackwardXs { .. }
+            | Op::FftButterflyStage { .. }
+            | Op::CustomFn { .. }
+            | Op::ScaledQuantize { .. }
+            | Op::ScaledMatMul { .. }
+            | Op::ScaledQuantScale { .. }
+            | Op::ScaledDequantize { .. }
+            | Op::BiMap
+            | Op::ReEig { .. }
+            | Op::LogEig { .. }
+            | Op::SpdBatchNorm { .. }
+            | Op::SpdKarcherMean { .. }
+            | Op::ReEigBackward { .. }
+            | Op::LogEigBackward { .. }
+            | Op::SpdBatchNormBackwardX { .. }
+            | Op::SpdBatchNormBackwardG { .. }
+            | Op::SpdKarcherMeanWeighted { .. }
+            | Op::SpdLogMap
+            | Op::SpdExpMap
+            | Op::SpdParallelTransport
+            | Op::SpdMatrixFnBatch { .. }
+            | Op::SpdLogMapBackward
+            | Op::SpdExpMapBackward
+            | Op::SpdParallelTransportBackward
+            | Op::SpdMatrixFnBatchBackward { .. }
+            | Op::Eigh
+            | Op::EighBackward
+            | Op::EighBatch
+            | Op::EighBatchBackward
+            | Op::GaussianSplatPrepare { .. }
+            | Op::GaussianSplatRasterize { .. } => panic!(
+                "rlx-tpu: {:?} is host-segmented — graphs containing it must \
+                 compile via segmented orchestration (not whole-graph HLO).",
+                n.op
             ),
 
             Op::GaussianSplatRender { .. } | Op::GaussianSplatRenderBackward { .. } => panic!(
@@ -718,7 +1048,9 @@ impl<'a> LowerCtx<'a> {
                 } else {
                     self.entry.constant_f32_scalar(0.0)
                 };
-                let imag = self.entry.broadcast(zero, &[], Shape::array(comp_prim, dims));
+                let imag = self
+                    .entry
+                    .broadcast(zero, &[], Shape::array(comp_prim, dims));
                 self.entry
                     .binary("complex", re, imag, Shape::array(prim_of(to), dims))
             }
@@ -816,6 +1148,7 @@ impl<'a> LowerCtx<'a> {
             }
             Activation::Tan => self.entry.unary("tan", x, shape),
             Activation::Atan => self.entry.unary("atan", x, shape),
+            Activation::Recip => self.entry.unary("reciprocal", x, shape),
         }
     }
 
@@ -2149,6 +2482,7 @@ impl<'a> LowerCtx<'a> {
                 padding_high: 0,
                 window_dilation: 1,
                 base_dilation: 1,
+                window_reversal: false,
             };
             dims.len()
         ];
@@ -2161,6 +2495,7 @@ impl<'a> LowerCtx<'a> {
             padding_high: 0,
             window_dilation: 1,
             base_dilation: 1,
+            window_reversal: false,
         };
         let window = Window {
             dimensions: window_dims,
@@ -2227,6 +2562,7 @@ impl<'a> LowerCtx<'a> {
                 padding_high: padding[i] as i64,
                 window_dilation: dilation[i] as i64,
                 base_dilation: 1,
+                window_reversal: false,
             });
         }
         let window = Window {
@@ -2268,6 +2604,7 @@ impl<'a> LowerCtx<'a> {
                 padding_high: 0,
                 window_dilation: 1,
                 base_dilation: 1,
+                window_reversal: false,
             };
             x_dims.len()
         ];
@@ -2279,6 +2616,7 @@ impl<'a> LowerCtx<'a> {
                 padding_high: padding[i] as i64,
                 window_dilation: 1,
                 base_dilation: 1,
+                window_reversal: false,
             };
         }
         let window = Window {
@@ -2927,6 +3265,7 @@ impl<'a> LowerCtx<'a> {
                 padding_high: padding[i] as i64,
                 window_dilation: dilation[i] as i64,
                 base_dilation: 1,
+                window_reversal: false,
             });
         }
         let window = Window {

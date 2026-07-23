@@ -24,6 +24,7 @@ pub(crate) fn act_f(act: Act, x: f32) -> f32 {
         Act::Sin => x.sin(),
         Act::Cos => x.cos(),
         Act::Silu => x / (1.0 + (-x).exp()),
+        Act::Recip => 1.0 / x,
     }
 }
 
@@ -57,6 +58,7 @@ pub(crate) fn act_df(act: Act, x: f32) -> f32 {
             let s = 1.0 / (1.0 + (-x).exp());
             s + x * s * (1.0 - s)
         }
+        Act::Recip => -1.0 / (x * x),
     }
 }
 

@@ -1,0 +1,62 @@
+#version 450
+// GroupNorm (NCHW) dgamma — single serial invocation (matches WGSL/CUDA).
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint c;
+    uint h;
+    uint w;
+    uint num_groups;
+    uint x_off;
+    uint dy_off;
+    uint out_off;
+    float eps;
+} pc;
+
+void main() {
+    if (gl_GlobalInvocationID.x != 0u) { return; }
+    uint spatial = pc.h * pc.w;
+    uint plane = pc.c * spatial;
+    uint cpg = pc.c / pc.num_groups;
+    float n_inv = 1.0 / float(cpg * spatial);
+
+    for (uint ch = 0u; ch < pc.c; ch++) {
+        arena_store(pc.out_off + ch, 0.0);
+    }
+
+    for (uint bn = 0u; bn < pc.n; bn++) {
+        uint b_base = bn * plane;
+        for (uint g = 0u; g < pc.num_groups; g++) {
+            uint c0 = g * cpg;
+            float mean = 0.0;
+            for (uint ci = 0u; ci < cpg; ci++) {
+                uint base = pc.x_off + b_base + (c0 + ci) * spatial;
+                for (uint s = 0u; s < spatial; s++) {
+                    mean += arena_load(base + s);
+                }
+            }
+            mean *= n_inv;
+            float var_ = 0.0;
+            for (uint ci = 0u; ci < cpg; ci++) {
+                uint base = pc.x_off + b_base + (c0 + ci) * spatial;
+                for (uint s = 0u; s < spatial; s++) {
+                    float d = arena_load(base + s) - mean;
+                    var_ += d * d;
+                }
+            }
+            float inv_std = inversesqrt(var_ * n_inv + pc.eps);
+            for (uint ci = 0u; ci < cpg; ci++) {
+                uint gi = c0 + ci;
+                uint x_base = pc.x_off + b_base + gi * spatial;
+                uint dy_base = pc.dy_off + b_base + gi * spatial;
+                float acc = arena_load(pc.out_off + gi);
+                for (uint s = 0u; s < spatial; s++) {
+                    float xh = (arena_load(x_base + s) - mean) * inv_std;
+                    acc += arena_load(dy_base + s) * xh;
+                }
+                arena_store(pc.out_off + gi, acc);
+            }
+        }
+    }
+}

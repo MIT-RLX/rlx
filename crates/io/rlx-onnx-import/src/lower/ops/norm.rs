@@ -155,10 +155,7 @@ pub(super) fn lower_instance_norm(
     // so the zero padding dilutes the statistics → the F0/N AdaIN blocks over-normalize
     // and the vocoder collapses to near-silence. Route rank-3 `[N,C,T]` InstanceNorms to
     // a host-delegate kernel that reduces over the *active* mel frames only.
-    if rank == 3
-        && ch_axis == 1
-        && std::env::var("RLX_KITTEN_INORM_ACTIVE").is_ok()
-    {
+    if rank == 3 && ch_axis == 1 && std::env::var("RLX_KITTEN_INORM_ACTIVE").is_ok() {
         // Byte 4 flags a VOCODER-generator AdaIN. The generator runs at several upsampled rates
         // (ups.0/ups.1/resblocks/noise_res), and for short utterances some of those axis lengths
         // fall BELOW the prosody cap — so a size threshold in the kernel misclassifies them and

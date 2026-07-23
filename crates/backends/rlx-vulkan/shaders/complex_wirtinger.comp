@@ -1,0 +1,44 @@
+#version 450
+// C64 Wirtinger surface on the f32-uniform arena (interleaved [re, im]).
+// Dispatched over complex-element index k ∈ [0, n). Offsets are f32-ELEMENT
+// offsets. mode:
+//   0 ComplexNormSq:          out[k] = re² + im²           (a→c; b unused)
+//   1 ComplexNormSqBackward: dz = g · z  (Wirtinger)       (a=z, b=g, c=dz)
+//   2 Conjugate:              out = (re, -im)              (a→c; b unused)
+// Matches CUDA `complex_wirtinger.cu` / wgpu `complex_wirtinger.wgsl`.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint a_off;
+    uint b_off;
+    uint c_off;
+    uint mode;
+} pc;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.n) { return; }
+    switch (pc.mode) {
+        case 0u: {
+            float re = arena_load(pc.a_off + 2u * k);
+            float im = arena_load(pc.a_off + 2u * k + 1u);
+            arena_store(pc.c_off + k, re * re + im * im);
+            break;
+        }
+        case 1u: {
+            float re = arena_load(pc.a_off + 2u * k);
+            float im = arena_load(pc.a_off + 2u * k + 1u);
+            float gv = arena_load(pc.b_off + k);
+            arena_store(pc.c_off + 2u * k,      gv * re);
+            arena_store(pc.c_off + 2u * k + 1u, gv * im);
+            break;
+        }
+        case 2u: {
+            arena_store(pc.c_off + 2u * k,      arena_load(pc.a_off + 2u * k));
+            arena_store(pc.c_off + 2u * k + 1u, -arena_load(pc.a_off + 2u * k + 1u));
+            break;
+        }
+        default: { break; }
+    }
+}

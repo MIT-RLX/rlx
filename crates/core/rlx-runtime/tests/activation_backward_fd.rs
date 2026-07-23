@@ -66,6 +66,7 @@ fn activation_deriv_wrt_x_matches_finite_difference() {
         (Activation::Rsqrt, &[0.3, 0.7, 1.5, 3.0]),
         (Activation::Sin, &[-2.0, -0.5, 0.5, 2.0]),
         (Activation::Cos, &[-2.0, -0.5, 0.5, 2.0]),
+        (Activation::Recip, &[-2.0, -0.5, 0.5, 2.0]),
     ];
     let h = 1e-2f32;
     let mut failures = Vec::new();
@@ -76,7 +77,9 @@ fn activation_deriv_wrt_x_matches_finite_difference() {
         // graph 1: the DECOMPOSED derivative under test.
         let mut gd = Graph::new("deriv");
         let xin = gd.input("x", shape.clone());
-        let d = rlx_autodiff::activation_deriv::activation_deriv_wrt_x(&mut gd, *kind, xin, None, &shape);
+        let d = rlx_autodiff::activation_deriv::activation_deriv_wrt_x(
+            &mut gd, *kind, xin, None, &shape,
+        );
         gd.set_outputs(vec![d]);
         // graph 2: the forward activation (for the FD reference).
         let mut gf = Graph::new("fwd");

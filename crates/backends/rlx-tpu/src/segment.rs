@@ -12,11 +12,13 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-//! Partition a graph into HLO segments and host Gaussian-splat steps.
+//! Partition a graph into HLO segments and host Gaussian-splat / specialty steps.
 
 use std::collections::{HashMap, HashSet};
 
 use rlx_ir::{Graph, NodeId, Op};
+
+use crate::host_ops::is_host_op;
 
 /// Collective op names that run as host segments. These are host/transport ops
 /// (`collective.all_reduce` / `all_gather` / `reduce_scatter` and the Megatron
@@ -55,16 +57,22 @@ pub enum Segment {
     Collective {
         node: NodeId,
     },
+    /// DenseSolve / FftButterflyStage / ScaledQuantize / non-FP8 Scaled* /
+    /// SPD / Scan residual / CustomFn — CPU host kernels.
+    Host {
+        node: NodeId,
+    },
 }
 
 /// True when the graph contains any op that must run as a host segment
-/// (Gaussian splat or a `collective.*` custom op) — i.e. needs orchestration.
+/// (Gaussian splat, collective, or specialty host ops) — i.e. needs orchestration.
 pub fn needs_orchestration(graph: &Graph) -> bool {
     graph.nodes().iter().any(|n| {
         matches!(
             n.op,
             Op::GaussianSplatRender { .. } | Op::GaussianSplatRenderBackward { .. }
         ) || is_collective_op(&n.op)
+            || is_host_op(&n.op)
     })
 }
 
@@ -86,6 +94,10 @@ pub fn plan(graph: &Graph) -> Vec<Segment> {
             op if is_collective_op(op) => {
                 flush_hlo(graph, &mut hlo_batch, &mut segments);
                 segments.push(Segment::Collective { node: nid });
+            }
+            op if is_host_op(op) => {
+                flush_hlo(graph, &mut hlo_batch, &mut segments);
+                segments.push(Segment::Host { node: nid });
             }
             Op::Input { .. } | Op::Param { .. } => {}
             _ => hlo_batch.push(nid),

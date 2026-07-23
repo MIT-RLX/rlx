@@ -13,12 +13,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! hipSOLVER shim — batched Jacobi symmetric eigensolver.
+//! hipSOLVER shim — batched Jacobi eigensolver + dense LU solve.
 //!
-//! AMD's hipSOLVER mirrors cuSOLVER's dense LAPACK surface. We only wire
-//! `hipsolverSsyevjBatched` (+ create / set_stream / SyevjInfo / bufferSize)
-//! for the native `Op::Eigh` / `Op::EighBatch` path. Resolved via libloading
-//! at runtime so the crate compiles on hosts without ROCm.
+//! AMD's hipSOLVER mirrors cuSOLVER's dense LAPACK surface. Wired symbols:
+//! - `hipsolverSsyevjBatched` (+ SyevjInfo) for native `Op::Eigh` / `EighBatch`
+//! - `hipsolverSgetrf` / `hipsolverSgetrs` for native `Op::DenseSolve`
+//!
+//! Resolved via libloading at runtime so the crate compiles without ROCm.
 
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
@@ -67,6 +68,15 @@ pub enum HipsolverFillMode {
     Lower = 122,
 }
 
+/// `hipsolverOperation_t` (= `hipblasOperation_t` values).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum HipsolverOperation {
+    N = 111,
+    T = 112,
+    C = 113,
+}
+
 type FnCreate = unsafe extern "C" fn(*mut HipsolverHandle) -> HipsolverError;
 type FnDestroy = unsafe extern "C" fn(HipsolverHandle) -> HipsolverError;
 type FnSetStream = unsafe extern "C" fn(HipsolverHandle, HipStream) -> HipsolverError;
@@ -98,6 +108,51 @@ type FnSsyevjBatched = unsafe extern "C" fn(
     HipsolverSyevjInfo,
     c_int,
 ) -> HipsolverError;
+type FnSgetrfBufferSize = unsafe extern "C" fn(
+    HipsolverHandle,
+    c_int,
+    c_int,
+    *mut f32,
+    c_int,
+    *mut c_int,
+) -> HipsolverError;
+type FnSgetrf = unsafe extern "C" fn(
+    HipsolverHandle,
+    c_int,
+    c_int,
+    *mut f32,
+    c_int,
+    *mut f32,
+    c_int,
+    *mut c_int,
+    *mut c_int,
+) -> HipsolverError;
+type FnSgetrsBufferSize = unsafe extern "C" fn(
+    HipsolverHandle,
+    HipsolverOperation,
+    c_int,
+    c_int,
+    *mut f32,
+    c_int,
+    *mut c_int,
+    *mut f32,
+    c_int,
+    *mut c_int,
+) -> HipsolverError;
+type FnSgetrs = unsafe extern "C" fn(
+    HipsolverHandle,
+    HipsolverOperation,
+    c_int,
+    c_int,
+    *mut f32,
+    c_int,
+    *mut c_int,
+    *mut f32,
+    c_int,
+    *mut f32,
+    c_int,
+    *mut c_int,
+) -> HipsolverError;
 
 pub struct HipsolverRuntime {
     _lib: Library,
@@ -108,6 +163,10 @@ pub struct HipsolverRuntime {
     pub destroy_syevj_info: FnDestroySyevjInfo,
     pub ssyevj_batched_buffer_size: FnSsyevjBatchedBufferSize,
     pub ssyevj_batched: FnSsyevjBatched,
+    pub sgetrf_buffer_size: FnSgetrfBufferSize,
+    pub sgetrf: FnSgetrf,
+    pub sgetrs_buffer_size: FnSgetrsBufferSize,
+    pub sgetrs: FnSgetrs,
 }
 
 unsafe impl Send for HipsolverRuntime {}
@@ -137,6 +196,10 @@ impl HipsolverRuntime {
                     FnSsyevjBatchedBufferSize
                 ),
                 ssyevj_batched: sym!(b"hipsolverSsyevjBatched", FnSsyevjBatched),
+                sgetrf_buffer_size: sym!(b"hipsolverSgetrf_bufferSize", FnSgetrfBufferSize),
+                sgetrf: sym!(b"hipsolverSgetrf", FnSgetrf),
+                sgetrs_buffer_size: sym!(b"hipsolverSgetrs_bufferSize", FnSgetrsBufferSize),
+                sgetrs: sym!(b"hipsolverSgetrs", FnSgetrs),
                 _lib: lib,
             };
             Some(Arc::new(rt))

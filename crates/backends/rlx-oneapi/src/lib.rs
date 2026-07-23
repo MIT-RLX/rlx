@@ -45,6 +45,8 @@ pub mod host;
 pub mod kernels;
 pub mod level_zero;
 pub mod spd;
+pub(crate) mod unfuse;
+pub mod vmath;
 
 /// True when this build can serve `Device::OneApi`.
 ///

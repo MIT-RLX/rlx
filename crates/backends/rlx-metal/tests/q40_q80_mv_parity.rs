@@ -10,7 +10,7 @@ fn read_f16_le(b: &[u8]) -> f32 {
     half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()
 }
 
-/// Reference dot for one output row — matches `q4_0_mv_f32` sequential nibble order.
+/// Reference dot for one output row — GGML Q4_0 nibble order (lows 0..15, highs 16..31).
 fn q4_0_mv_row_ref(x: &[f32], row_packed: &[u8], k: usize) -> f32 {
     let nblocks = k / 32;
     let mut acc = 0.0f32;
@@ -19,15 +19,12 @@ fn q4_0_mv_row_ref(x: &[f32], row_packed: &[u8], k: usize) -> f32 {
         let off = b * 18;
         let d = read_f16_le(&row_packed[off..off + 2]);
         let qs = &row_packed[off + 2..off + 18];
-        for l in 0..32 {
-            let byte_idx = l >> 1;
-            let nib = if l & 1 == 0 {
-                qs[byte_idx] & 0x0F
-            } else {
-                qs[byte_idx] >> 4
-            };
-            let w = d * ((nib as i32) - 8) as f32;
-            acc += x[x_idx] * w;
+        for j in 0..16 {
+            acc += x[x_idx] * (d * ((qs[j] & 0x0F) as i32 - 8) as f32);
+            x_idx += 1;
+        }
+        for j in 0..16 {
+            acc += x[x_idx] * (d * ((qs[j] >> 4) as i32 - 8) as f32);
             x_idx += 1;
         }
     }
@@ -121,9 +118,10 @@ fn run_fused_mv(
 }
 
 #[test]
-fn q4_0_mv_matches_cpu_reference() {
-    let k = 64usize;
-    let n = 8usize;
+fn q4_0_mv_matches_gguf_matmul_bt() {
+    // Ensure fused GEMV agrees with CPU `gguf_matmul_bt` (GGML nibble order).
+    let k = 128usize;
+    let n = 32usize;
     let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.07).cos()).collect();
     let w_row: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.11).sin()).collect();
     let packed = rlx_gguf::quantize::quantize_q4_0(&w_row).unwrap();
@@ -134,7 +132,7 @@ fn q4_0_mv_matches_cpu_reference() {
         &packed,
         k,
         n,
-        Some(q4_0_mv_row_ref),
+        None, // uses gguf_matmul_bt
     );
 }
 

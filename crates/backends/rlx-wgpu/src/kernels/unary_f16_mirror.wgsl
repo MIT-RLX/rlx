@@ -69,6 +69,7 @@ fn unary_f16_mirror(@builtin(global_invocation_id) gid: vec3<u32>,
         case 14u: { y = cos(x); }
         case 15u: { y = tan(x); }
         case 16u: { y = atan(x); }
+        case 17u: { y = 1.0 / x; }
         default: { y = x; }
     }
     arena[params.out_off + i] = y;
