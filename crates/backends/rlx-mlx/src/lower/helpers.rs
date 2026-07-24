@@ -179,7 +179,7 @@ pub(crate) fn build_dequanted_kn(
     let elems_actual = blocks_actual * block_elems;
     let elems_required = k * n;
     let elems_for_dequant = elems_required.min(elems_actual);
-    let mut w_f32 = match scheme {
+    let w_f32 = match scheme {
         rlx_ir::QuantScheme::GgufQ4K => rlx_gguf::dequant_q4_k(w_bytes, elems_for_dequant)
             .map_err(|e| MlxError(format!("GGUF Q4_K dequant: {e}")))?,
         _ => dequant_gguf_weight(w_bytes, k, n, scheme)?,
