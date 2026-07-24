@@ -48,6 +48,9 @@ pub use coverage::{LOWERED_OPS, REWRITTEN_OPS, op_is_supported, registry_op_coun
 pub use lower::{
     DurationLoopLowering, ImportOptions, ImportReport, build_hir_from_bundle, build_hir_from_parts,
 };
-pub use onnx_file::{build_hir_from_onnx_file, prepare_onnx_file};
+pub use onnx_file::{
+    build_hir_from_onnx_file, install_if_branches, install_scalar_consts, prepare_onnx_file,
+    take_if_branches, take_scalar_consts,
+};
 pub use ops::{OpCategory, format_bundle_category_report, format_registry_dashboard};
 pub use tensor_data::TypedParams;

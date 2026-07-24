@@ -268,6 +268,20 @@ pub fn take_if_branches() -> HashMap<String, (Vec<BundleNode>, Vec<BundleNode>)>
     IF_BRANCHES.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
+/// Install `If`-branch subgraphs before [`crate::build_hir_from_parts`] /
+/// [`crate::build_hir_from_bundle`] when loading a pre-exported RLX graph dir
+/// (no live `prepare_onnx_file` call on this thread).
+pub fn install_if_branches(
+    branches: HashMap<String, (Vec<BundleNode>, Vec<BundleNode>)>,
+) {
+    IF_BRANCHES.with(|c| *c.borrow_mut() = branches);
+}
+
+/// Install folded scalar-constant names before lowering a pre-exported graph.
+pub fn install_scalar_consts(names: HashSet<String>) {
+    SCALAR_CONSTS.with(|c| *c.borrow_mut() = names);
+}
+
 fn fold_constant_node(
     n: &rlx_onnx_proto::onnx::NodeProto,
     params: &mut HashMap<String, Vec<f32>>,

@@ -7164,6 +7164,14 @@ name = "kitten_tts_mini_rlx"
 version = "0.2.13"
 
 [[patch.unused]]
+name = "rlx-asr"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-assets"
+version = "0.2.13"
+
+[[patch.unused]]
 name = "rlx-bert"
 version = "0.2.13"
 
@@ -7173,6 +7181,10 @@ version = "0.2.13"
 
 [[patch.unused]]
 name = "rlx-bonsai"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-chatterbox"
 version = "0.2.13"
 
 [[patch.unused]]
@@ -7188,6 +7200,14 @@ name = "rlx-cohere"
 version = "0.2.13"
 
 [[patch.unused]]
+name = "rlx-conformer-ctc"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-dac"
+version = "0.2.13"
+
+[[patch.unused]]
 name = "rlx-diamond"
 version = "0.2.13"
 
@@ -7196,11 +7216,27 @@ name = "rlx-dinov2"
 version = "0.2.13"
 
 [[patch.unused]]
+name = "rlx-dinov3"
+version = "0.2.13"
+
+[[patch.unused]]
 name = "rlx-distributed"
 version = "0.2.13"
 
 [[patch.unused]]
 name = "rlx-embed"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-encodec"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-f5tts"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-fara"
 version = "0.2.13"
 
 [[patch.unused]]
@@ -7220,7 +7256,15 @@ name = "rlx-gemma"
 version = "0.2.13"
 
 [[patch.unused]]
+name = "rlx-gepard"
+version = "0.2.13"
+
+[[patch.unused]]
 name = "rlx-granite"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-hoct"
 version = "0.2.13"
 
 [[patch.unused]]
@@ -7229,6 +7273,10 @@ version = "0.2.13"
 
 [[patch.unused]]
 name = "rlx-kittentts"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-kokoro"
 version = "0.2.13"
 
 [[patch.unused]]
@@ -7256,6 +7304,22 @@ name = "rlx-locateanything"
 version = "0.2.13"
 
 [[patch.unused]]
+name = "rlx-luxtts"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-maya1"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-melotts"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-metavoice"
+version = "0.2.13"
+
+[[patch.unused]]
 name = "rlx-mimi"
 version = "0.2.13"
 
@@ -7265,6 +7329,14 @@ version = "0.2.13"
 
 [[patch.unused]]
 name = "rlx-minimax"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-miotts"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-miratts"
 version = "0.2.13"
 
 [[patch.unused]]
@@ -7281,6 +7353,18 @@ version = "0.2.13"
 
 [[patch.unused]]
 name = "rlx-moshi"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-moss-nano"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-nanbeige"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-nanocodec"
 version = "0.2.13"
 
 [[patch.unused]]
@@ -7308,7 +7392,19 @@ name = "rlx-orpheus"
 version = "0.2.13"
 
 [[patch.unused]]
+name = "rlx-parlertts"
+version = "0.2.13"
+
+[[patch.unused]]
 name = "rlx-phi"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-piper"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-pocket-tts"
 version = "0.2.13"
 
 [[patch.unused]]
@@ -7344,11 +7440,51 @@ name = "rlx-sam3"
 version = "0.2.13"
 
 [[patch.unused]]
+name = "rlx-sesame"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-soprano"
+version = "0.2.13"
+
+[[patch.unused]]
 name = "rlx-ssm"
 version = "0.2.13"
 
 [[patch.unused]]
+name = "rlx-styletts2"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-supertonic"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-tiny-tts"
+version = "0.2.13"
+
+[[patch.unused]]
 name = "rlx-tinyllama"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-trellis2"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-tts"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-tts-bench"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-uni2"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-unlimited-ocr"
 version = "0.2.13"
 
 [[patch.unused]]
@@ -7377,4 +7513,16 @@ version = "0.2.13"
 
 [[patch.unused]]
 name = "rlx-whisper"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-xcodec"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-zipvoice"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "rlx-zonos"
 version = "0.2.13"

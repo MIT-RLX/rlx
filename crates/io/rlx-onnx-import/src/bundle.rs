@@ -18,22 +18,22 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use safetensors::SafeTensors;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorMeta {
     pub shape: Vec<serde_json::Value>,
     pub dtype: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IoMeta {
     pub name: String,
     #[serde(flatten)]
     pub meta: TensorMeta,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleManifest {
     pub source_onnx: String,
     pub inputs: Vec<IoMeta>,
@@ -43,7 +43,7 @@ pub struct BundleManifest {
     pub op_histogram: HashMap<String, usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleNode {
     pub name: String,
     pub op: String,
