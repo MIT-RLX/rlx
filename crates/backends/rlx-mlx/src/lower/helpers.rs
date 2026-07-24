@@ -185,7 +185,12 @@ pub(crate) fn build_dequanted_kn(
         _ => dequant_gguf_weight(w_bytes, k, n, scheme)?,
     };
     if w_f32.len() < elems_required {
-        w_f32.resize(elems_required, 0.0);
+        return Err(MlxError(format!(
+            "GGUF dequant short: got {} elems from {} packed bytes, need {elems_required} \
+             (k={k} n={n} scheme={scheme:?}) — packed U8 param likely missing/truncated",
+            w_f32.len(),
+            w_bytes.len(),
+        )));
     }
     let w_nk = Array::from_f32_slice(&w_f32, &[n, k], DType::F32)?;
     ops::transpose(&w_nk, &[1, 0])

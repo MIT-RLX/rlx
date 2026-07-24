@@ -172,6 +172,7 @@ anyhow = "1"
 inventory = "0.3"
 memmap2 = { version = "0.9", optional = true }
 rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13" }
+rlx-pkg = { path = "../../io/rlx-pkg", version = "0.2.13" }
 # rlx-gpu = { path = "../rlx-gpu", version = "0.2.13", optional = true }
 # rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.13", optional = true }
 

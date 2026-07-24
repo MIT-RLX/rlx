@@ -19,6 +19,9 @@
 
 #[cfg(feature = "encrypt")]
 pub mod crypto;
+pub mod export_rlxp;
+#[cfg(feature = "onnx")]
+pub mod from_onnx;
 pub mod format;
 pub mod load;
 pub mod memory;
@@ -31,6 +34,9 @@ pub use crypto::{
     DEFAULT_M_KIB, DEFAULT_P_COST, DEFAULT_T_COST, RLX_ENC_MAGIC, RLX_ENC_VERSION, decrypt_bytes,
     encrypt_bytes, encrypt_bytes_with_params, is_encrypted,
 };
+pub use export_rlxp::{convert_rlx_to_rlxp, write_rlxp};
+#[cfg(feature = "onnx")]
+pub use from_onnx::{OnnxImportOptions, onnx_to_rlxp};
 #[cfg(feature = "mmap")]
 pub use format::read_rlx_mmap;
 pub use format::{RlxFile, RlxIo, RlxMeta, RlxWeight, read_rlx, write_rlx};
@@ -359,7 +365,7 @@ fn infer_encoding(graph: &Graph, weight_name: &str) -> Option<WeightEncoding> {
         }
     })?;
     for n in graph.nodes() {
-        if !n.inputs.iter().any(|i| *i == wid) {
+        if !n.inputs.contains(&wid) {
             continue;
         }
         if let Op::DequantMatMul { scheme } = &n.op {
@@ -427,7 +433,7 @@ fn param_shape(graph: &Graph, name: &str) -> Option<Vec<usize>> {
 }
 
 /// Like `specialize_params`, but stamps the param name onto the Constant node.
-fn specialize_named(graph: &Graph, bindings: &HashMap<String, Vec<f32>>) -> Graph {
+pub(crate) fn specialize_named(graph: &Graph, bindings: &HashMap<String, Vec<f32>>) -> Graph {
     if bindings.is_empty() {
         return graph.clone();
     }

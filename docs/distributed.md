@@ -184,6 +184,7 @@ recompile:
 - **Worker** (`dist::serve_stage` / `recv_stage`) compiles and runs it, resolving
   weights **locally** so they never cross the wire. Built-in resolvers cover
   `gguf://` (dequant or `packed` → `DequantMatMul` at native quant memory),
+  `rlxp://` (package tensors; f32 or packed),
   `safetensors://`, and `file://`, behind a parse-once `WeightCache`; a caller
   closure handles other schemes.
 

@@ -25,6 +25,22 @@ Also: [weight-compute caching](../../../docs/weight-compute-caching.md).
 Format: magic `RLXBAKE1` + `u32` schema (v2) + bincode. Schema v1
 (graph-only) still loads with an empty weight table.
 
+Ship packages (`.rlxp`): see [docs/rlxp.md](../../../docs/rlxp.md). Default
+container is **flat mmap** (`RLXPFLAT`); use `--container zip|dir` when you need
+inspectability. Convert or bake with `--format rlxp`:
+
+```bash
+cargo run -p rlx-bake -- graph.json -o model.rlxp --format rlxp --weights w.safetensors
+cargo run -p rlx-bake -- convert model.rlx -o model.rlxp
+```
+
+Optional ONNX → RLXP (executable MIR graph by default):
+
+```bash
+cargo run -p rlx-bake --features onnx -- import-onnx model.onnx -o model.rlxp
+cargo run -p rlx-bake --features onnx -- import-onnx model.onnx -o weights.rlxp --no-graph
+```
+
 ## Pipeline
 
 1. Specialize `Op::Param` → named `Op::Constant` from bindings
@@ -82,16 +98,20 @@ write_rlx_encrypted("model.rlx", &file, "secret")?;
 let file = read_rlx_with_password("model.rlx", "secret")?;
 ```
 
-## MNIST demos (train → bake/encrypt → run)
+## MNIST demos
 
-See **[docs/rlx-bake.md](../../../docs/rlx-bake.md)** for the full
-step-by-step (what each stage does, how to read bake stats, env vars).
+See **[docs/rlx-bake.md](../../../docs/rlx-bake.md)** for the full train → bake
+→ encrypt → run walkthrough.
 
 ```bash
 export RLX_BAKE_PASSWORD='demo-secret'
 cargo run -p rlx-bake --example mnist_train_bake --features encrypt,runtime --release
 cargo run -p rlx-bake --example mnist_run_encrypted --features encrypt,runtime --release
 # artifact: examples/out/mnist.rlx  (or $RLX_BAKE_OUT)
+
+# Bench bake → .rlx / .rlxp load+compile+run (no encrypt):
+just throttle
+RLX_ALLOW_THROTTLE=1 cargo run -p rlx-bake --example mnist_bench_rlxp --features runtime --release
 ```
 
 Uses real MNIST from `RLX_MNIST_DIR` / `~/.cache/torchvision-mnist/…` when
@@ -107,7 +127,22 @@ assert!(!file.weights.is_empty());
 write_rlx("model.rlx", &file)?;
 // Compact memory (default for exact/size): materialize before Session::compile
 // let graph = file.into_runtime_graph()?;
+// Ship mmap pack: write_rlxp("model.rlxp", &file, None)?;
 // Smaller compute+payload: BakeProfile::Size.options()
 // With features = ["encrypt"]: write_rlx_encrypted / read_rlx_with_password
 // With features = ["mmap"]: read_rlx_mmap for plaintext loads
+// With features = ["onnx"]: onnx_to_rlxp / CLI import-onnx
 ```
+
+## Features
+
+| Feature | Role |
+|---------|------|
+| `encrypt` | Full-file `RLXENC01` seal |
+| `runtime` | MNIST examples that `Session::compile` / `run` |
+| `mmap` | mmap-backed plaintext `read_rlx` |
+| `onnx` | `onnx_to_rlxp` + `import-onnx` CLI |
+
+## License
+
+GPL-3.0-only.

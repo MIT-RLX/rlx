@@ -92,6 +92,7 @@ pub mod onnx_active;
 pub mod op_registry;
 pub mod options;
 pub mod paged_kv;
+pub mod pkg;
 pub mod precision;
 pub mod precompile;
 pub mod quantized_kv;
@@ -258,6 +259,10 @@ pub use rlx_driver::{
 pub use rlx_ir::env::{self, RlxEnv, RuntimeOverrides};
 pub use rlx_ir::{EnvVarDoc, format_env_catalog, public_catalog_docs as ENV_CATALOG};
 pub use session::Session;
+pub use pkg::{
+    compile_rlxp, compile_rlxp_with, load_rlxp_graph, load_rlxp_placement, open_rlxp,
+    tensors_for_rank, weight_names_for_rank,
+};
 pub use stages::{
     compile_graph_stages, compile_graph_stages_for_backend, compile_hir_stages,
     compile_module_stages, fusion_target_for, graph_from_lir, maybe_log_fusion,

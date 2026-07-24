@@ -171,3 +171,30 @@ fn bake_profiles_change_rewrites() {
     assert_eq!(size_q.optimize.ternary_packed, 0);
     assert_eq!(size_q.optimize.quant_packed, 1);
 }
+
+#[test]
+fn convert_rlx_to_rlxp_roundtrip() {
+    use rlx_bake::{convert_rlx_to_rlxp, write_rlx};
+    use rlx_pkg::Package;
+
+    let s = Shape::new(&[4], DType::F32);
+    let mut g = Graph::new("to_rlxp");
+    let x = g.input("x", s.clone());
+    let w = g.param("w", s.clone());
+    let y = g.binary(BinaryOp::Mul, x, w, s);
+    g.set_outputs(vec![y]);
+
+    let mut bindings = HashMap::new();
+    bindings.insert("w".into(), vec![1.0, 2.0, 3.0, 4.0]);
+    let (file, _) = bake(&g, &bindings, &BakeOptions::default());
+
+    let dir = tempfile::tempdir().unwrap();
+    let rlx = dir.path().join("model.rlx");
+    let rlxp = dir.path().join("model.rlxp");
+    write_rlx(&rlx, &file).unwrap();
+    convert_rlx_to_rlxp(&rlx, &rlxp, Some(rlx_pkg::ContainerKind::Flat)).unwrap();
+
+    let pack = Package::open(&rlxp).unwrap();
+    assert_eq!(pack.tensor_f32("w").unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(pack.graph().unwrap().name, "to_rlxp");
+}

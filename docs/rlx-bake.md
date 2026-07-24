@@ -64,6 +64,23 @@ flowchart TB
 
 Layout: 8-byte magic `RLXBAKE1` + `u32` version + bincode body.
 
+### Ship format (`.rlxp`)
+
+For mmap-friendly weights, sidecars, dist placement, and an optional executable
+MIR graph, export to the **flat** package (default) — see [rlxp.md](rlxp.md).
+ZIP / directory containers remain available for inspectability. Bake still
+produces `RLXBAKE1`; convert or bake with `--format rlxp`:
+
+```bash
+rlx-bake graph.json -o model.rlxp --format rlxp --weights w.safetensors
+rlx-bake convert model.rlx -o model.rlxp
+# optional ONNX path (cargo feature `onnx`):
+rlx-bake --features onnx -- import-onnx model.onnx -o model.rlxp
+```
+
+`RLXENC01` encryption stays on the bake blob path. Optional `RLXSEAL1` seals for
+cold/sidecar blobs are on `rlx-pkg` (`encrypt` feature).
+
 ### Encrypted (`RLXENC01`, cargo feature `encrypt`)
 
 The **entire** plaintext blob is sealed with ChaCha20-Poly1305; the key is

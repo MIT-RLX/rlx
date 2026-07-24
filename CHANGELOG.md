@@ -9,6 +9,19 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ### Added
 
+- **`.rlxp` package format (`rlx-pkg`).** Default **flat mmap** (`RLXPFLAT` +
+  JSON TOC + 64-byte-aligned data) with **hybrid tiers**: hot (raw mmap), warm
+  (`zstd_blocks` / `ZBLK`), cold (whole-blob zstd sidecars). No weight duplex;
+  optional ZIP/dir containers (hybrid codecs in shards). Load path: O(1) name
+  index, hot-only graph materialize, `madvise(WILLNEED)`, parallel warm decode,
+  xxh3 verify, optional bincode TOC / string table, weight-only packs,
+  auto-tier, GGUF→RLXP import, `rlx-pkg` CLI, pyrlx `load_rlxp` /
+  `convert_gguf_to_rlxp`, feature-gated `encrypt` (`RLXSEAL1`) and `remote`
+  HTTP Range. Optional executable MIR graph (ONNX-like) via
+  `rlx-bake --features onnx -- import-onnx` (`--no-graph` for weights-only).
+  Bake: `--format rlxp`; runtime: `rlx_runtime::pkg` + `rlxp://`.
+  Spec: [`docs/rlxp.md`](docs/rlxp.md). `RLXBAKE1` remains supported.
+
 - **CPU activation vmath.** Added `Activation::Recip` and host
   `vvexpf`/`vvtanhf`/`vvrecf`/`vvlogf`/`vvsqrtf`/`vvrsqrtf`; CPU activation hot
   paths use SIMD fast exp/tanh by default (`RLX_VMATH_ACCURATE=1` →

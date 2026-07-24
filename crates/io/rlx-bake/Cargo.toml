@@ -25,12 +25,16 @@ encrypt = ["dep:chacha20poly1305", "dep:argon2", "dep:rand_core"]
 runtime = ["dep:rlx-runtime"]
 # mmap-backed plaintext `read_rlx` (avoids an extra full-file `Vec` copy).
 mmap = ["dep:memmap2"]
+# ONNX → `.rlxp` with optional executable MIR graph.
+onnx = ["dep:rlx-onnx-import"]
 
 [dependencies]
 rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13", features = ["serialize"] }
 rlx-compile = { path = "../../core/rlx-compile", version = "0.2.13" }
 rlx-fusion = { path = "../../core/rlx-fusion", version = "0.2.13" }
 rlx-gguf = { path = "../rlx-gguf", version = "0.2.13" }
+rlx-pkg = { path = "../rlx-pkg", version = "0.2.13" }
+rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.13", optional = true }
 rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.13", optional = true, default-features = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -45,6 +49,12 @@ memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.13", default-features = false, features = ["cpu"] }
+
+[[test]]
+name = "onnx_to_rlxp"
+path = "tests/onnx_to_rlxp.rs"
+required-features = ["onnx"]
 
 [[example]]
 name = "mnist_train_bake"
@@ -53,6 +63,10 @@ required-features = ["encrypt", "runtime"]
 [[example]]
 name = "mnist_run_encrypted"
 required-features = ["encrypt", "runtime"]
+
+[[example]]
+name = "mnist_bench_rlxp"
+required-features = ["runtime"]
 
 [lints]
 workspace = true

@@ -36,6 +36,7 @@
 //! | Multi-backend | `GraphDevices`, `DeviceRouter`, `DevicePolicy` |
 //! | Transforms | `grad`, `jvp`, `hvp`, `vmap`, `nth_order_grad` |
 //! | GGUF | `quantize`, `dequant`, `load_gguf`, `write_gguf`, `convert_to_gguf`, `GgufFile` |
+//! | RLXP | `load_rlxp`, `convert_gguf_to_rlxp` |
 //!
 //! Graphs are consumed at compile time. Use `pyrlx.set_param` / `pyrlx.run` in
 //! Python for dtype-aware NumPy I/O without manual byte packing.
@@ -54,6 +55,7 @@ mod gguf;
 mod gguf_convert;
 mod graph;
 mod graph_devices;
+mod rlxp;
 mod session;
 
 /// Module init — `import pyrlx._pyrlx`.
@@ -91,6 +93,8 @@ fn _pyrlx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<gguf::PyGgufFile>()?;
     m.add_function(wrap_pyfunction!(gguf::load_gguf, m)?)?;
     m.add_function(wrap_pyfunction!(gguf::write_gguf, m)?)?;
+    m.add_function(wrap_pyfunction!(rlxp::load_rlxp, m)?)?;
+    m.add_function(wrap_pyfunction!(rlxp::convert_gguf_to_rlxp, m)?)?;
     #[cfg(feature = "gguf-convert")]
     {
         m.add_function(wrap_pyfunction!(gguf_convert::convert_to_gguf, m)?)?;

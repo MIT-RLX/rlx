@@ -60,7 +60,7 @@ pub use training::*;
 pub struct WeightRef {
     pub name: String,
     /// Opaque to rlx core — the caller's resolver interprets it (e.g.
-    /// `gguf:///models/x.gguf#blk.0.ffn`, `file:///…`, `hf://…`).
+    /// `gguf:///models/x.gguf#blk.0.ffn`, `rlxp:///models/x.rlxp#w`, `file:///…`, `hf://…`).
     pub uri: String,
     /// If set, load the **quantized bytes as-is** (U8 param) instead of
     /// dequantizing to f32 — the graph's `DequantMatMul` decodes them at
@@ -96,6 +96,7 @@ fn split_frag(rest: &str) -> Result<(&str, &str), String> {
 ///   `gguf://<path>#<tensor>`         — dequantize a GGUF tensor (any K-quant)
 ///   `safetensors://<path>#<tensor>`  — read a safetensors tensor (F32/F16/BF16)
 ///   `file://<path>`                  — raw little-endian f32 array
+///   `rlxp://<path>#<tensor>`         — f32 tensor from an `.rlxp` package
 ///
 /// This is model-agnostic (formats, not models); callers can still pass their
 /// own closure to [`recv_stage`]/[`serve_stage`] for other schemes.
@@ -106,6 +107,10 @@ pub fn resolve_weight_uri(uri: &str) -> Result<Vec<f32>, String> {
         let gguf = rlx_gguf::GgufFile::from_reader(&mut f).map_err(|e| e.to_string())?;
         let (data, _dims) = gguf.dequant_f32(tensor).map_err(|e| e.to_string())?;
         Ok(data)
+    } else if let Some(rest) = uri.strip_prefix("rlxp://") {
+        let (path, tensor) = split_frag(rest)?;
+        let pack = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
+        pack.tensor_f32(tensor).map_err(|e| e.to_string())
     } else if let Some(rest) = uri.strip_prefix("safetensors://") {
         let (path, tensor) = split_frag(rest)?;
         let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
@@ -122,7 +127,8 @@ pub fn resolve_weight_uri(uri: &str) -> Result<Vec<f32>, String> {
 
 /// Load the **quantized bytes** of a weight as-is (no dequant), for the
 /// on-device-quant path. `gguf://<path>#<tensor>` returns the packed block
-/// bytes; `file://<path>` returns the raw file. Feed to `set_param_typed(_, _,
+/// bytes; `rlxp://<path>#<tensor>` returns the package shard range;
+/// `file://<path>` returns the raw file. Feed to `set_param_typed(_, _,
 /// U8)` behind a `DequantMatMul` graph.
 pub fn resolve_weight_bytes(uri: &str) -> Result<Vec<u8>, String> {
     if let Some(rest) = uri.strip_prefix("gguf://") {
@@ -133,6 +139,10 @@ pub fn resolve_weight_bytes(uri: &str) -> Result<Vec<u8>, String> {
             .get(tensor)
             .ok_or_else(|| format!("tensor not found: {tensor}"))?;
         Ok(gguf.tensor_bytes(t).map_err(|e| e.to_string())?.to_vec())
+    } else if let Some(rest) = uri.strip_prefix("rlxp://") {
+        let (path, tensor) = split_frag(rest)?;
+        let pack = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
+        pack.tensor_bytes(tensor).map_err(|e| e.to_string())
     } else if let Some(path) = uri.strip_prefix("file://") {
         std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
     } else {
@@ -140,13 +150,15 @@ pub fn resolve_weight_bytes(uri: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Parse-once, serve-many weight cache. A GGUF file is parsed a single time and
-/// then serves any number of its tensors (f32 or packed) — the right shape for
-/// a worker whose stage pulls many tensors (q/k/v/o/ffn) from one model file.
-/// Created per stage inside [`recv_stage`]; also usable standalone.
+/// Parse-once, serve-many weight cache. A GGUF / `.rlxp` file is parsed a
+/// single time and then serves any number of its tensors (f32 or packed) —
+/// the right shape for a worker whose stage pulls many tensors (q/k/v/o/ffn)
+/// from one model file. Created per stage inside [`recv_stage`]; also usable
+/// standalone.
 #[derive(Default)]
 pub struct WeightCache {
     gguf: HashMap<String, rlx_gguf::GgufFile>,
+    rlxp: HashMap<String, rlx_pkg::Package>,
 }
 
 impl WeightCache {
@@ -163,7 +175,15 @@ impl WeightCache {
         Ok(&self.gguf[path])
     }
 
-    /// Dequantized f32 for `uri`, reusing the parsed file for `gguf://`.
+    fn rlxp_pack(&mut self, path: &str) -> Result<&rlx_pkg::Package, String> {
+        if !self.rlxp.contains_key(path) {
+            let p = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
+            self.rlxp.insert(path.to_string(), p);
+        }
+        Ok(&self.rlxp[path])
+    }
+
+    /// Dequantized f32 for `uri`, reusing the parsed file for `gguf://` / `rlxp://`.
     pub fn f32(&mut self, uri: &str) -> Result<Vec<f32>, String> {
         if let Some(rest) = uri.strip_prefix("gguf://") {
             let (path, tensor) = split_frag(rest)?;
@@ -172,6 +192,11 @@ impl WeightCache {
                 .dequant_f32(tensor)
                 .map_err(|e| e.to_string())?;
             Ok(data)
+        } else if let Some(rest) = uri.strip_prefix("rlxp://") {
+            let (path, tensor) = split_frag(rest)?;
+            self.rlxp_pack(path)?
+                .tensor_f32(tensor)
+                .map_err(|e| e.to_string())
         } else if uri.starts_with("safetensors://") || uri.starts_with("file://") {
             resolve_weight_uri(uri) // header parse is cheap / file is the tensor
         } else {
@@ -179,7 +204,7 @@ impl WeightCache {
         }
     }
 
-    /// Packed (quantized) bytes for `uri`, reusing the parsed file for `gguf://`.
+    /// Packed (quantized) bytes for `uri`, reusing the parsed file for `gguf://` / `rlxp://`.
     pub fn bytes(&mut self, uri: &str) -> Result<Vec<u8>, String> {
         if let Some(rest) = uri.strip_prefix("gguf://") {
             let (path, tensor) = split_frag(rest)?;
@@ -188,6 +213,11 @@ impl WeightCache {
                 .get(tensor)
                 .ok_or_else(|| format!("tensor not found: {tensor}"))?;
             Ok(g.tensor_bytes(t).map_err(|e| e.to_string())?.to_vec())
+        } else if let Some(rest) = uri.strip_prefix("rlxp://") {
+            let (path, tensor) = split_frag(rest)?;
+            self.rlxp_pack(path)?
+                .tensor_bytes(tensor)
+                .map_err(|e| e.to_string())
         } else {
             resolve_weight_bytes(uri)
         }
@@ -342,6 +372,47 @@ mod tests {
             .collect();
         assert_eq!(raw_f32, a);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn resolve_rlxp_f32() {
+        use rlx_ir::op::BinaryOp;
+        use rlx_ir::{DType, Graph, Shape};
+        use rlx_pkg::{BakeWeight, WriteOptions, package_from_bake};
+
+        let s = Shape::new(&[4], DType::F32);
+        let mut g = Graph::new("rlxp_uri");
+        let x = g.input("x", s.clone());
+        let w = g.param("w", s.clone());
+        let y = g.binary(BinaryOp::Mul, x, w, s);
+        g.set_outputs(vec![y]);
+        let vals = [1.0f32, 2.0, -3.5, 4.25];
+        let weights = [BakeWeight {
+            name: "w".into(),
+            shape: vec![4],
+            encoding: "f32".into(),
+            data: vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.rlxp");
+        package_from_bake(
+            &path,
+            &g,
+            &weights,
+            WriteOptions {
+                container: rlx_pkg::ContainerKind::Flat,
+                name: "rlxp_uri".into(),
+                ..WriteOptions::default()
+            },
+        )
+        .unwrap();
+        let got = resolve_weight_uri(&format!("rlxp://{}#w", path.display())).unwrap();
+        assert_eq!(got, vals);
+        let mut cache = WeightCache::new();
+        assert_eq!(
+            cache.f32(&format!("rlxp://{}#w", path.display())).unwrap(),
+            vals
+        );
     }
 
     #[test]

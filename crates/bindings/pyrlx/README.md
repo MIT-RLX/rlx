@@ -37,6 +37,9 @@ Python bindings for RLX via [PyO3](https://pyo3.rs/) +
   wraps `rlx-gguf-convert` (safetensors by default; `gguf-onnx` / `gguf-pt` cargo
   features for ONNX / PyTorch checkpoints).
   See `tests/test_gguf_quantize.py`, `test_gguf_file.py`, `test_gguf_convert.py`.
+- **RLXP packages** — `rlx.load_rlxp(path)` (manifest summary) and
+  `rlx.convert_gguf_to_rlxp(gguf, out, include_graph=False)`. Spec:
+  [`docs/rlxp.md`](../../docs/rlxp.md).
 
 ## Install (from source)
 
